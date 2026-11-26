@@ -152,12 +152,10 @@ pub(super) fn presets(config: &RoutingSettings) -> Result<Planned<'_>, RoutingSe
 ///
 /// `None` where the document plans one family: a regular configuration of
 /// one router, the encode mode of one router, a pair mode of one router
-/// over gRPC or ZMQ, and a regular configuration under the manual policy.
-/// Its picker leaves the placement to the binding's session rule, and this
-/// module does not plan its pairs beside its single requests yet: a pair
-/// mode whose two sides are manual is planned, under the one rule. A
-/// gateway of one router in the encode mode counts tokens with no worker,
-/// so its document binds no single request.
+/// over gRPC or ZMQ, and a regular configuration under the manual policy
+/// ([`manual_alone`]). A pair mode whose two sides are manual is planned,
+/// under the one rule. A gateway of one router in the encode mode counts
+/// tokens with no worker, so its document binds no single request.
 ///
 /// A gateway of many routers outside the encode mode plans its three sides
 /// ahead of this plan ([`three_sided`]), and this one stands where that
@@ -165,12 +163,11 @@ pub(super) fn presets(config: &RoutingSettings) -> Result<Planned<'_>, RoutingSe
 pub(super) fn both_families(
     config: &RoutingSettings,
 ) -> Result<Option<Planned<'_>>, RoutingSettingsError> {
-    let (mode, main) = (&config.mode, &config.policy);
+    let mode = &config.mode;
     let (both, encode) = match mode {
-        ModeSettings::Regular | ModeSettings::Provider(_) => (
-            config.enable_igw && !matches!(main, PolicySettings::Manual { .. }),
-            None,
-        ),
+        ModeSettings::Regular | ModeSettings::Provider(_) => {
+            (config.enable_igw && !manual_alone(config), None)
+        }
         ModeSettings::PrefillDecode {
             prefill_policy: _,
             decode_policy: _,
@@ -200,17 +197,35 @@ pub(super) fn both_families(
 ///
 /// `None` for a gateway of one router, which mounts that router under the
 /// encode mode alone, and for the encode mode, whose plan of two families
-/// is this one already. A setting with no document under three sides
-/// leaves the plan where it is written, as the manual policy on the pair's
-/// two sides does, a regular configuration's main policy among them.
+/// is this one already. `None` too for a regular configuration under the
+/// manual policy, which plans its single requests alone ([`manual_alone`]).
+/// A setting with no document under three sides leaves the plan where it
+/// is written, as one manual side of the pair's two does.
+///
+/// The manual policy on both sides of the pair is planned: its rule places
+/// the pair's two sides, each by its own session, and the encode side
+/// places an item by its content.
 pub(super) fn three_sided(
     config: &RoutingSettings,
 ) -> Result<Option<Planned<'_>>, RoutingSettingsError> {
     let encode_mode = matches!(config.mode, ModeSettings::EncodePrefillDecode { .. });
-    if !config.enable_igw || encode_mode {
+    if !config.enable_igw || encode_mode || manual_alone(config) {
         return Ok(None);
     }
     families(config, Some(&ENCODE_DEFAULT)).map(Some)
+}
+
+/// Whether the settings are a regular configuration under the manual
+/// policy. Its picker leaves the placement to the binding's session rule,
+/// and this module does not plan its pairs beside its single requests yet:
+/// such a gateway of many routers plans its single requests alone, under
+/// the plan of two families as under the plan of three sides.
+fn manual_alone(config: &RoutingSettings) -> bool {
+    let regular = matches!(
+        config.mode,
+        ModeSettings::Regular | ModeSettings::Provider(_)
+    );
+    regular && matches!(config.policy, PolicySettings::Manual { .. })
 }
 
 /// The plan of two families: the pair's sides under one binding over their
@@ -401,9 +416,22 @@ pub(super) fn written_with<'a>(
                         policy: policy.name(),
                         part: "profile",
                     })?;
-            write_policy(policy, config, profile, &mut shared)?;
             // The encode side places an item by the item's content: it reads
-            // no key, and the override never places it.
+            // no key, the override never places it and no session rule does.
+            // So the manual policy is no encode side's, as the gateway's own
+            // check holds (`validate_encode_policy`,
+            // `model_gateway/src/config/validation.rs:319-328`).
+            if side == ENCODE_SIDE {
+                if matches!(policy, PolicySettings::Manual { .. }) {
+                    return Err(unsupported(
+                        "encode_policy",
+                        policy.name(),
+                        "a session rule places no item: an item goes to its encoder by its content",
+                    ));
+                }
+                shared.bound.encode_side = true;
+            }
+            write_policy(policy, config, profile, &mut shared)?;
             if side != ENCODE_SIDE {
                 if let Some(sources) = key_sources(policy, config)? {
                     shared.bound.keys.push((policy.name(), sources));
@@ -861,6 +889,9 @@ struct Bound {
     /// The manual policy's sweep interval, idle time and assignment.
     manual: Option<(u64, u64, Assignment)>,
     manual_sides: usize,
+    /// The plan has an encode side. No session rule places an item, so
+    /// the manual policy's rule places the plan's other sides alone.
+    encode_side: bool,
     /// The sides whose keyed requests the sticky override places
     /// ([`override_places`]).
     overridden: usize,
@@ -947,6 +978,11 @@ impl Bound {
     /// Writes what the sides named into their binding, a plan of `sides`
     /// profiles. The headers the manual policy reads are the view's too,
     /// and so are the headers of a key the sticky override places.
+    ///
+    /// The manual policy's rule places every side of the plan but an
+    /// encode side: a single request's side, or the two sides of a pair,
+    /// with an encode side ahead of them or with none. One manual side of
+    /// the two is refused.
     fn write(
         self,
         config: &RoutingSettings,
@@ -978,7 +1014,7 @@ impl Bound {
             binding.routing_key = key;
             return Ok(());
         };
-        if self.manual_sides != sides {
+        if self.manual_sides + usize::from(self.encode_side) != sides {
             return Err(unsupported(
                 "policy",
                 "manual",

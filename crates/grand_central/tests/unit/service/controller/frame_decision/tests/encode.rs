@@ -12,7 +12,7 @@ use std::{
 use smg_worker::load::state::LoadSnapshot;
 
 use super::{
-    a_frame_under_the_second_files_watch, holder, pairs_of, shed_of, staged, stock_pair_plan,
+    a_frame_under_the_second_files_watch, file, holder, pairs_of, shed_of, staged, stock_pair_plan,
     taken_at, ByReports, Checked, FrameBuffers, Part, GATEWAY, OTHER,
 };
 use crate::{
@@ -451,6 +451,43 @@ fn a_frame_with_items_under_a_plan_with_no_encode_side_is_declined_by_its_bindin
             assert_eq!(shed_of(&answer), declined, "{plan}, {keys} keys");
             assert_eq!(placed, None, "{plan}, {keys} keys");
         }
+    }
+}
+
+/// A picker that leaves the placement to an assignment runs on the pair's
+/// two sides of the encode plan in a controller whose catalog holds no
+/// stage that needs the lifecycle's calls, where the binding names no
+/// sessions rule. Each side then takes the worker that holds the fewest
+/// requests, by the leases on file, and an item goes to its encoder beside
+/// the pair. A sessions rule under that plan stays refused in such a build,
+/// by the document's check.
+#[test]
+fn a_picker_by_assignment_places_an_encode_requests_pair_under_no_rule() {
+    let catalog = StageRegistry::builtin().without_lifecycle();
+    let store = Arc::new(MemoryStore::new());
+    let objects = holder(&store);
+    let plan = encode_plan_in(&catalog, 1, ["random", "manual", "manual"]);
+    store.apply(plan).expect("above the unbound start");
+    let members = |role: Role, named: [&str; 3]| {
+        named.map(|name| member(&store, &objects, name, role, PUSHING))
+    };
+    let prefills = members(Role::Prefill, ["p0", "p1", "p2"]);
+    let decodes = members(Role::Decode, ["d0", "d1", "d2"]);
+    let e = member(&store, &objects, "e0", Role::Encode, PUSHING);
+    LeasesStore::set_term(&*store, 1);
+    let now = Instant::now();
+    // The second prefill and the third decode hold no lease.
+    let held = [prefills[0], prefills[0], prefills[2]];
+    let held = held.into_iter().chain([decodes[0], decodes[1], decodes[1]]);
+    for (target, id) in held.zip(1..) {
+        file(&store, id, target, now);
+    }
+    for n in 1..=4 {
+        let frame = encode_frame(n, 1);
+        let (answer, placed) = served_encode(&store, &objects, frame, GATEWAY, now);
+        let pairs = pairs_of(&answer);
+        assert_eq!(pairs.first(), Some(&(prefills[1], decodes[2])), "frame {n}");
+        assert_eq!(encoders_of(placed.as_ref()), [e], "frame {n}");
     }
 }
 

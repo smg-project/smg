@@ -5127,18 +5127,18 @@ fn check_binding(
     check_matcher(&b.matcher, cx, &at, deferred)?;
     let shadow = check_binding_rules(b, cx, &at, deferred)?;
     let mut built = resolve_plan(b, cx, shadow)?;
-    // A picker that leaves the placement to a sessions rule, and a rule runs
-    // under the single plan and on the two sides of a pair: on a side of
-    // `epd` nothing would place its requests. The built picker answers, as
-    // it answers the engine.
+    // A picker that leaves the placement to a sessions rule places a side
+    // of a pair, under `pd-pair` and on the pair's two sides of `epd`: by
+    // the rule, or by its assignment where the binding names none. No rule
+    // places an item, so on the encode side nothing would place its
+    // requests. The built picker answers, as it answers the engine.
     if b.plan.unwrap_or_default() == PlanName::Epd {
-        for (side, name) in &b.profiles {
-            if cx.by_assignment.contains(&name.as_str()) {
-                deferred.note(
-                    at.sub("profiles").field(side),
-                    "a picker that places by the sessions rule under the epd plan",
-                );
-            }
+        let by_rule = |name: &String| cx.by_assignment.contains(&name.as_str());
+        if b.profiles.get("encode").is_some_and(by_rule) {
+            deferred.note(
+                at.sub("profiles").field("encode"),
+                "a picker that places by the sessions rule on the encode side",
+            );
         }
     }
     if let (Some(binding), Some(sessions)) = (built.as_mut(), &b.sessions) {

@@ -10,7 +10,10 @@ use std::sync::{
 
 use super::*;
 use crate::{
-    document::spec::{self, PolicySpec},
+    document::{
+        spec::{self, PolicySpec},
+        ModeSettings, PolicySettings, RoutingSettings,
+    },
     engine::{
         framework::{self, PairTable},
         view::{Health, MediaCounts, Role, WorkerId},
@@ -3397,4 +3400,98 @@ fn an_item_turned_away_behind_its_pair_takes_back_the_pairs_claims() {
     let (next, _) = bed.decide_asked(&engine, &served, &pool);
     assert_eq!(pair_of(&next), (1, 1), "a served key's pins");
     assert_eq!(words(&next), [(PlacedBy::Rule, false); 2]);
+}
+
+/// The engine a gateway's settings mean under the encode mode with the
+/// manual policy on the pair's two sides: a key the rule has not seen goes
+/// to the row that holds the fewest requests.
+fn manual_pairs() -> Engine {
+    let settings = RoutingSettings {
+        mode: ModeSettings::EncodePrefillDecode {
+            encode_policy: None,
+            prefill_policy: None,
+            decode_policy: None,
+        },
+        policy: PolicySettings::Manual {
+            eviction_interval_secs: 60,
+            max_idle_secs: 14_400,
+            assignment_mode: spec::Assignment::MinLoad,
+        },
+        ..RoutingSettings::default()
+    };
+    let spec = settings.policy_document();
+    let spec = spec.expect("the settings have a document");
+    spec.validate().expect("the form validates")
+}
+
+/// Each side's session verdict of a pick: the prefill side's, then the
+/// decode side's as the first target's pair keeps it.
+fn verdicts(decision: &Decision) -> [SessionVerdict; 2] {
+    let pick = decision.pick().expect("a pick");
+    let pair = pick.targets.first().and_then(|target| target.pair);
+    let pair = pair.expect("a pair");
+    [pick.session_verdict, pair.decode_verdict.on(pair.decode_id)]
+}
+
+/// The claims are taken back so where the rule's own assignment made them:
+/// under the manual policy on the pair's two sides, as a gateway's settings
+/// say the encode mode. The rule places a new key's prefill and its decode
+/// on the rows that hold the fewest requests, and claims both. An item's
+/// answer then turns the request away, and the key's next request is placed
+/// again, by the loads as they then stand. A key that was served keeps its
+/// pins behind such an answer.
+///
+/// A gateway's `manual` policy differs here, as its sticky map does. It
+/// writes a key's entry for a role where it selects that role's worker
+/// (`model_gateway/src/policies/manual.rs:357-365`). The three-sided
+/// selection picks its pair first
+/// (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs:2660`)
+/// and assigns the encoders behind it (`:2705-2712`): an assignment that
+/// fails returns with both entries written. The design records the
+/// difference under its decision 13. The lines are main's at `13f5cbe29`.
+#[test]
+fn an_item_turned_away_takes_back_the_claims_the_rules_assignment_made() {
+    let mut engine = manual_pairs();
+    for profile in engine.profiles.iter_mut().map(own) {
+        profile.filters.push(Box::new(RefusesTheKey));
+    }
+    // Two rows a side, the first the emptier. A request of two items: the
+    // first is placed, and the second's stage turns the request away.
+    let both = vec![Identity::hashed(11), Identity::hashed(12)];
+    let kept = vec![Identity::hashed(11)];
+    let mut bed = Bed::new();
+    bed.prefills = vec![row(0, Role::Prefill, 1, 0), row(1, Role::Prefill, 1, 5)];
+    bed.prefill_classes = vec![1, 1];
+    bed.decodes = vec![row(0, Role::Decode, 1, 0), row(1, Role::Decode, 1, 5)];
+    bed.keys.clone_from(&both);
+    let (new, pool) = (keyed(&bed, 7), bed.asked().1);
+    let (turned, _) = bed.decide_asked(&engine, &new, &pool);
+    assert_eq!(shed_of(&turned).1, "refuses-the-key");
+    // The key's next request carries an item the engine keeps, and the
+    // loads point at each side's second row by then. The rule claims that
+    // pair: a claim left standing led the key to the first.
+    bed.keys.clone_from(&kept);
+    (bed.prefills[0].in_flight, bed.decodes[0].in_flight) = (9, 9);
+    let (next, _) = bed.decide_asked(&engine, &new, &pool);
+    assert_eq!(
+        pair_of(&next),
+        (1, 1),
+        "the key followed a pair it never reached"
+    );
+    let claimed = [1_001, 2_001].map(|id| SessionVerdict::Claimed(WorkerId(id)));
+    assert_eq!(verdicts(&next), claimed);
+    // Another key is served on that pair, and the loads then point at each
+    // side's first row. Its request that is turned away moves no pin.
+    let served = keyed(&bed, 8);
+    let (first, _) = bed.decide_asked(&engine, &served, &pool);
+    assert_eq!(pair_of(&first), (1, 1));
+    dispatched(&engine, &served, first.pick().expect("a pair"));
+    (bed.prefills[1].in_flight, bed.decodes[1].in_flight) = (20, 20);
+    bed.keys.clone_from(&both);
+    let (turned, _) = bed.decide_asked(&engine, &served, &pool);
+    assert_eq!(shed_of(&turned).1, "refuses-the-key");
+    bed.keys.clone_from(&kept);
+    let (next, _) = bed.decide_asked(&engine, &served, &pool);
+    assert_eq!(pair_of(&next), (1, 1), "a served key's pins");
+    assert_eq!(verdicts(&next), [SessionVerdict::Pinned; 2]);
 }

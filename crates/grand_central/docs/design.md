@@ -276,11 +276,12 @@ A gateway of many routers serves pairs and single workers, however it reaches th
 document binds both. It also mounts its three-sided router in every mode, and a model with an
 encode pool goes to it, so the first binding plans an encode side beside the pair's two. Where
 that plan of three sides has no document, the settings say what they said before it, and an
-encode request meets no binding with an encode side. Two settings do so until each has a
-document under the `epd` plan. Under the manual policy on a pair's two sides the pair binding
-stands as it did. Under the sticky override, for a policy the override places, the gateway is
-refused by the setting's name as it was. A document of three sides the controller's check
-refuses is not taken either, and the pair binding stands.
+encode request meets no binding with an encode side. One setting does so until it has a
+document under the `epd` plan. Under the sticky override, for a policy the override places, the
+gateway is refused by the setting's name as it was. A document of three sides the controller's
+check refuses is not taken either, and the pair binding stands. The manual policy on a pair's
+two sides runs under the `epd` plan: its sessions rule places the pair, and an item goes to its
+encoder by its content.
 
 In a gateway of one router the second binding of a prefill-decode mode is
 there for one request, the token count. Over HTTP the gateway still places it as a single request,

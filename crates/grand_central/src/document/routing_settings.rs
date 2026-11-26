@@ -80,7 +80,11 @@ use crate::{
 /// - The overload veto's switch and its shed word land on every binding,
 ///   the pairing mode on the pair plan, the index settings under every
 ///   model, and the block size and the cache boundaries in the view.
-/// - The manual policy's settings land in the binding's session rule.
+/// - The manual policy's settings land in the binding's session rule. The
+///   rule places a single request, or the two sides of a pair, with an
+///   encode side ahead of them or with none. Both sides of the pair are
+///   manual or neither is, and a manual encode side is refused by its
+///   setting's name: no rule places an item.
 /// - A keyed policy's key sources land on the binding. The two rings name
 ///   them under `routing_key`. The manual policy names them in its session
 ///   rule while they are headers alone, and under `routing_key` once the
@@ -131,10 +135,8 @@ use crate::{
 /// The encode side is left out of a gateway of many routers, outside the
 /// encode mode, where the plan of three sides has no document. The
 /// settings then say what they said before that plan, and an encode
-/// request meets no binding with an encode side. Two settings leave it
-/// out. The manual policy on a pair's two sides places every side of a
-/// plan or none, so the pair's plan stands. The sticky override's rule
-/// places single requests alone, so under a policy it places such a
+/// request meets no binding with an encode side. The sticky override's
+/// rule places single requests alone, so under a policy it places such a
 /// gateway is refused by the setting's name, as it was. A document of
 /// three sides the controller's check refuses is left out too.
 ///
@@ -655,11 +657,16 @@ impl RoutingSettings {
     /// binding ahead of the main policy's own. Where a setting has no
     /// document under that plan, or the controller's check refuses the
     /// plan's document, the settings say what they said before it: no
-    /// gateway loses a document it has, and a refusal keeps its words. Two
-    /// settings do so. Under the manual policy on a pair's two sides the
-    /// pair's plan stands, and an encode request meets no binding with an
-    /// encode side. The sticky override, under a policy it places, is
-    /// refused by the setting's name, as it was.
+    /// gateway loses a document it has, and a refusal keeps its words. The
+    /// sticky override, under a policy it places, is refused by the
+    /// setting's name, as it was. Where the check refuses the document of
+    /// three sides the pair's plan stands, and an encode request meets no
+    /// binding with an encode side.
+    ///
+    /// The manual policy on both sides of a pair runs under the plan of
+    /// three sides, and under the encode mode's own plan: its rule places
+    /// the pair's two sides, each by its own session, and the encode side
+    /// places an item by its content.
     ///
     /// A pure function of the settings. The document is not validated
     /// here, a plan with an encode side in a gateway of many routers

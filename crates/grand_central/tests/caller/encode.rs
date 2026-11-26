@@ -281,16 +281,84 @@ fn an_item_goes_by_its_content_whatever_the_requests_key() {
     assert!(spread.len() > 1, "sixteen contents on one encoder");
 }
 
+/// The manual policy as a gateway's settings say it: a key it has not seen
+/// goes to the worker that holds the fewest requests.
+fn manual() -> PolicySettings {
+    PolicySettings::Manual {
+        eviction_interval_secs: 60,
+        max_idle_secs: 14_400,
+        assignment_mode: Assignment::MinLoad,
+    }
+}
+
+/// The manual policy runs on the pair's two sides under the encode mode, as
+/// a gateway's settings say it. A key's requests keep the prefill and the
+/// decode its first request took, with an item and with none, while lighter
+/// workers stand beside them. Another key's first request and a request
+/// with no key go to a lighter worker on each side. An item goes to its
+/// encoder by its content, whatever the request's key.
+///
+/// The classic router's `manual` policy keeps a key's worker under the role
+/// it is asked for, and places a key it has not seen, and a request with no
+/// key, by the configured assignment
+/// (`model_gateway/src/policies/manual.rs:381-402`, `:228-236`). Its
+/// three-sided selection asks those two policies for the pair
+/// (`worker_selection.rs:2660`), and places each item under the encode
+/// policy by its content's hash, with no key of the request's
+/// (`:2785-2808`). Its own check starts the mode under that policy on the
+/// prefill and the decode side, and on no encode side
+/// (`model_gateway/src/config/validation.rs:1001-1010`, `:319-328`). The
+/// lines are main's at `13f5cbe29`.
+#[test]
+fn the_manual_policy_places_an_encode_requests_pair_by_its_key() {
+    let fleet = fleet(3, 3, 3);
+    let (program, _loads, _task) = under_encode(manual(), &fleet, served);
+    let (session, other) = (keyed("session-7"), keyed("session-8"));
+    let keys = [Identity::plain("item-a")];
+    let with_item = Asked {
+        headers: Some(&session),
+        ..carrying(&keys)
+    };
+    let bare = Asked {
+        headers: Some(&session),
+        ..PLAIN
+    };
+    let first = program.serve(&with_item);
+    assert_eq!((first.status, first.sent.len()), (200, 3), "{first:?}");
+    let pair = &first.sent[1..];
+    // A key not seen yet, and a request with no key, go to lighter workers.
+    for worker in &fleet {
+        if pair.iter().any(|sent| worker.url() == *sent) {
+            worker.increment_load();
+        }
+    }
+    for _ in 0..4 {
+        assert_eq!(program.serve(&with_item).sent, first.sent, "with an item");
+        assert_eq!(program.serve(&bare).sent, pair, "with no item");
+    }
+    let stranger = Asked {
+        headers: Some(&other),
+        ..carrying(&keys)
+    };
+    for (asked, who) in [(stranger, "another key"), (carrying(&keys), "no key")] {
+        let answer = program.serve(&asked);
+        assert_eq!((answer.status, answer.sent.len()), (200, 3), "{who}");
+        assert_eq!(answer.sent[0], first.sent[0], "{who}: one content");
+        assert_ne!(answer.sent[1], pair[0], "{who}: a lighter prefill");
+        assert_ne!(answer.sent[2], pair[1], "{who}: a lighter decode");
+    }
+}
+
 /// A gateway of many routers mounts its three-sided router in every mode,
 /// so its settings plan an encode side under the regular mode and under a
 /// pair mode as well. An item then goes to its encoder ahead of its pair,
 /// as it does under the encode mode, and a request with no item is placed
-/// as its pair.
+/// as its pair. So it is under the manual policy on the pair's two sides.
 ///
 /// Where the plan of three sides has no document the settings say the
-/// pair's plan, as under the manual policy on a pair's two sides. The
-/// engine then names no worker for a request that carries an item, under
-/// the binding's name.
+/// pair's plan, as where the pair's sides and the main policy name two
+/// block sizes. The engine then names no worker for a request that carries
+/// an item, under the binding's name.
 ///
 /// The classic gateway builds that router in every mode of many routers,
 /// its encode side under `consistent_hashing` where the mode names no
@@ -311,9 +379,17 @@ fn many_routers_place_an_item_in_every_mode_that_plans_three_sides() {
         let spec = AppliedSpec::validate(&document).expect("the document validates");
         started_as(Plan::Encode, spec, fleet, served)
     };
+    let manual_sides = RoutingSettings {
+        mode: ModeSettings::PrefillDecode {
+            prefill_policy: Some(manual()),
+            decode_policy: Some(manual()),
+        },
+        ..settings(PolicySettings::RoundRobin)
+    };
     for one_router in [
         settings(PolicySettings::RoundRobin),
         pair_settings(PolicySettings::RoundRobin),
+        manual_sides,
     ] {
         let mode = format!("{:?}", one_router.mode);
         let fleet = fleet(1, 1, 1);
@@ -338,13 +414,21 @@ fn many_routers_place_an_item_in_every_mode_that_plans_three_sides() {
         );
     }
 
-    let manual = || PolicySettings::of_label("manual");
+    // One view holds one block size: the sides name 16 and the main policy
+    // 32, so the settings plan the pair alone.
+    let over = |blocks: usize| {
+        let mut policy = PolicySettings::of_label("cache_aware").expect("a label's policy");
+        if let PolicySettings::CacheAware { block_size, .. } = &mut policy {
+            *block_size = blocks;
+        }
+        policy
+    };
     let fallen = many_routers(RoutingSettings {
         mode: ModeSettings::PrefillDecode {
-            prefill_policy: manual(),
-            decode_policy: manual(),
+            prefill_policy: Some(over(16)),
+            decode_policy: Some(over(16)),
         },
-        ..settings(PolicySettings::RoundRobin)
+        ..settings(over(32))
     });
     let fleet = fleet(1, 1, 1);
     let (program, _loads, _task) = started(&fallen, &fleet);
