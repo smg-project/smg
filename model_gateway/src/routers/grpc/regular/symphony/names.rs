@@ -418,7 +418,8 @@ fn checked_names(
             }
             (true, None) => {
                 return Err(format!(
-                    "unknown {kind} parser '{name}': neither a legacy parser nor a Symphony table"
+                    "unknown {kind} parser '{name}': neither a legacy {kind} parser nor a \
+                     Symphony table"
                 ));
             }
             (false, Some(selected)) => {
@@ -885,7 +886,16 @@ mod tests {
         let why = check(symphony, &names(None, Some("nonsense")));
         assert_eq!(
             why.expect_err("unknown"),
-            "unknown reasoning parser 'nonsense': neither a legacy parser nor a Symphony table"
+            "unknown reasoning parser 'nonsense': neither a legacy reasoning parser nor a \
+             Symphony table"
+        );
+        // A legacy parser's name of the other kind that no table answers to is unknown too,
+        // and the refusal names the kind whose registry lacks it.
+        let why = check(symphony, &names(None, Some("pythonic")));
+        assert_eq!(
+            why.expect_err("unknown"),
+            "unknown reasoning parser 'pythonic': neither a legacy reasoning parser nor a \
+             Symphony table"
         );
         // A legacy name of the other kind that a table answers to selects that table: a tool
         // parser's given as the reasoning parser passes, one name passes in both flags where
@@ -915,12 +925,14 @@ mod tests {
         let why = check(symphony, &names(Some("QWEN_XML"), None));
         assert_eq!(
             why.expect_err("not as spelled"),
-            "unknown tool-call parser 'QWEN_XML': neither a legacy parser nor a Symphony table"
+            "unknown tool-call parser 'QWEN_XML': neither a legacy tool-call parser nor a \
+             Symphony table"
         );
         let why = check(symphony, &names(None, Some(" hy_v4 ")));
         assert_eq!(
             why.expect_err("not as spelled"),
-            "unknown reasoning parser ' hy_v4 ': neither a legacy parser nor a Symphony table"
+            "unknown reasoning parser ' hy_v4 ': neither a legacy reasoning parser nor a \
+             Symphony table"
         );
         // A launcher's name for a family whose table has no older parser (`muse`) passes in
         // either flag and binds the other name as the table's own name does; under `legacy` it
