@@ -257,14 +257,16 @@ pub(crate) struct Staged {
     part: u32,
     rows: Vec<WorkerRow>,
     /// The leader's standing generation, as the first part that states one
-    /// said it.
+    /// said it: the last part hands it on with the cut.
     generation: Option<proto::GenerationEvent>,
 }
 
 impl Staged {
     /// One batch of the stream inside a snapshot, read at `now`: the
-    /// snapshot's next part, staged, and at the last part the cut the
-    /// store is restored from. A part is its snapshot's next where its
+    /// snapshot's next part, staged, and at the last part the snapshot
+    /// whole, as [`Follower::restore`] takes it: the cut the store is
+    /// restored from, and the leader's standing generation where a part
+    /// stated one. A part is its snapshot's next where its
     /// batch carries no event and says the place and the epoch the first
     /// part said, under the next number. Anything else is refused by its
     /// path, and the stream is left with nothing restored.
@@ -272,7 +274,7 @@ impl Staged {
         &mut self,
         batch: &proto::ReplicationBatch,
         now: Instant,
-    ) -> Result<Option<StoreCheckpoint>, Refused> {
+    ) -> Result<Option<(StoreCheckpoint, Option<proto::GenerationEvent>)>, Refused> {
         let refused = |path, why| Err(Refused { path, why });
         let Some(part) = &batch.snapshot else {
             return refused(
@@ -305,10 +307,13 @@ impl Staged {
             self.generation = part.generation.as_deref().cloned();
         }
         worker_wire::told_part(part, now, &mut self.rows)?;
-        Ok(part.last.then(|| StoreCheckpoint {
-            at,
-            epoch: part.membership_epoch,
-            rows: std::mem::take(&mut self.rows),
+        Ok(part.last.then(|| {
+            let cut = StoreCheckpoint {
+                at,
+                epoch: part.membership_epoch,
+                rows: std::mem::take(&mut self.rows),
+            };
+            (cut, self.generation.take())
         }))
     }
 }
@@ -867,12 +872,11 @@ impl Standby {
                 continue;
             }
             if let Some(staging) = staged.as_mut() {
-                let cut = match staging.take(&batch, now) {
-                    Ok(Some(cut)) => cut,
+                let (cut, generation) = match staging.take(&batch, now) {
+                    Ok(Some(whole)) => whole,
                     Ok(None) => continue,
                     Err(refused) => return Ended::waits(landed, unread(refused)),
                 };
-                let generation = staging.generation.take();
                 staged = None;
                 let (at, rows) = (cut.at, cut.rows.len());
                 match self.follower.restore(cut, generation.as_ref()) {
