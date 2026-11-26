@@ -277,11 +277,11 @@ jobs:
           bash scripts/ci_apt_install.sh sudo -y --no-install-recommends make
 
       # Run every script test in this blocking job. General tests and shell tests
-      # retain Python 3.13; the budget/guarded-entry cohort runs below in its fixed 3.12
+      # retain Python 3.13; the complete tau2 cohort runs below in its fixed 3.12
       # SDK environment. The routing contract checks their union, including new files.
       - name: Run CI tooling unit tests
         run: |
-          python -m pytest -q -rs scripts/tests --ignore-glob='scripts/tests/test_tau2_budget*.py' --ignore-glob='scripts/tests/test_tau2_guarded_cli.py' --ignore-glob='scripts/tests/test_tau2_costmap_shim.py'
+          python -m pytest -q -rs scripts/tests --ignore-glob='scripts/tests/test_tau2*.py'
           for test in scripts/tests/test_*.sh; do bash "$test"; done
 
       # CPU-only unit tests for the e2e harness itself (connection-mode parsing,
@@ -319,7 +319,7 @@ jobs:
           "$RUNNER_TEMP/tau2-budget-venv/bin/python" -m pip install pytest ruff==0.15.0 litellm==1.81.11 openai==2.20.0 httpx==0.28.1 websockets==15.0.1 pydub==0.25.1 'tau2 @ https://github.com/sierra-research/tau2-bench/archive/5bfa7e37b36656b37dc6d022156be6563c1007f3.tar.gz'
 
       - name: Run fixed tau2 tooling unit tests
-        run: '"$RUNNER_TEMP/tau2-budget-venv/bin/python" -m pytest -q -rs --confcutdir=scripts/tests scripts/tests/test_tau2_budget*.py scripts/tests/test_tau2_guarded_cli.py scripts/tests/test_tau2_costmap_shim.py'
+        run: '"$RUNNER_TEMP/tau2-budget-venv/bin/python" -m pytest -q -rs --confcutdir=scripts/tests scripts/tests/test_tau2*.py'
 
   # --- Rust lint and tests (CPU) ---
 

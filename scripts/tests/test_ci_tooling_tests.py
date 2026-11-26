@@ -164,11 +164,5 @@ def test_both_blocking_tau2_entries_share_the_fixed_source_sdk_and_full_cohort()
     ]
     assert tau2_steps[0]["run"] == tau2_steps[1]["run"]
     assert selected_tests(tau2_steps[0]["run"]) == {
-        path.relative_to(ROOT).as_posix()
-        for pattern in (
-            "scripts/tests/test_tau2_budget*.py",
-            "scripts/tests/test_tau2_guarded_cli.py",
-            "scripts/tests/test_tau2_costmap_shim.py",
-        )
-        for path in ROOT.glob(pattern)
+        path.relative_to(ROOT).as_posix() for path in ROOT.glob("scripts/tests/test_tau2*.py")
     }
