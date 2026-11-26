@@ -38,7 +38,7 @@ use crate::{
             replication::{journaled_at, journaled_from},
             spec_store::{tests::names, SpecStore},
             wire::Checked,
-            PROTOCOL_VERSION,
+            PROTOCOL_FLOOR, PROTOCOL_VERSION,
         },
         elector::{
             ConditionalWriteOutcome, ElectError, ElectionSettings, Elector, FileLease,
@@ -670,7 +670,7 @@ fn answer(controller_id: &str, address: &str, term: u64, is_leader: bool) -> pro
         synced: false,
         sync: None,
         groups: Vec::new(),
-        protocol_min: PROTOCOL_VERSION,
+        protocol_min: PROTOCOL_FLOOR,
         protocol_max: PROTOCOL_VERSION,
     }
 }

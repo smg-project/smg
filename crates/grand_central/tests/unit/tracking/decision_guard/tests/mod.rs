@@ -582,7 +582,7 @@ mod linked {
         engine::{
             framework::{EncodeItems, EncodePlaced},
             view::{Identity, Phase},
-            Demands,
+            Demands, References,
         },
         service::{
             client::{poll, DecisionUnavailable, Error, Peer},
@@ -1361,39 +1361,176 @@ mod linked {
         );
     }
 
-    /// This protocol version states no hard demand, and a controller
-    /// that reads none picks among workers the demand rules out. The
-    /// handle refuses a request that states one before anything is
-    /// sent: no credit goes, and no time passes.
+    /// A controller on protocol 1 reads no hard demand, and would pick
+    /// among workers the demand rules out. So the handle refuses a
+    /// request that states a demand before anything is sent, over a
+    /// session whose welcome chose that version or states none. It did
+    /// so before a frame could state one. A welcome on a version the
+    /// hello did not offer is refused so too. No credit goes, and no
+    /// time passes.
     #[tokio::test(start_paused = true)]
     async fn a_request_that_states_a_demand_is_refused_before_anything_is_sent() {
-        let mut peer = Peer::new(1);
+        use crate::service::controller::PROTOCOL_VERSION;
+
+        for protocol in [0, 1, PROTOCOL_VERSION + 1] {
+            let mut peer = Peer::speaking(1, protocol);
+            let mut ask = stated(&[1]);
+            ask.facts.budget_micros = 200_000;
+            ask.constraints.demands = Demands {
+                runtime: 7,
+                ..Demands::default()
+            };
+            let before = tokio::time::Instant::now();
+            let answer = timeout(
+                PATIENCE,
+                pin!(DecisionGuard::<&InProcess>::asked(
+                    &peer.link,
+                    &ask,
+                    Instant::now(),
+                    PATIENCE
+                )),
+            )
+            .await
+            .expect("the ask returns");
+            assert!(
+                matches!(
+                    answer,
+                    Err(DecisionUnavailable::Unsent(Error::OutOfRange(
+                        "constraints.demands"
+                    )))
+                ),
+                "protocol {protocol}: {answer:?}"
+            );
+            assert_eq!(tokio::time::Instant::now(), before);
+            assert!(
+                poll(pin!(peer.requests.next())).is_pending(),
+                "nothing went out"
+            );
+        }
+    }
+
+    /// Over a session whose welcome chose protocol 2, a single request
+    /// that names no worker states its hard demands on its frame. Each
+    /// part goes as the request states it, and the ask is answered as
+    /// any ask is.
+    #[tokio::test(start_paused = true)]
+    async fn a_single_requests_demands_go_out_on_its_frame_over_a_session_on_protocol_two() {
+        let mut peer = Peer::speaking(1, 2);
         let mut ask = stated(&[1]);
         ask.facts.budget_micros = 200_000;
         ask.constraints.demands = Demands {
             runtime: 7,
+            references: References::Caller,
+            input_window: 4_096,
+            output_window: 512,
+            decoding: 3,
             ..Demands::default()
         };
+        peer.read_hello().await;
+        let link = peer.link.clone();
+        let exchange = async {
+            let sent = peer.requests.next().await.expect("an ask went out");
+            peer.answer(1, link.term_floor(), Answer::Decision(picked()));
+            sent
+        };
+        let both = async {
+            let now = Instant::now();
+            let held = pin!(DecisionGuard::<&InProcess>::asked(
+                &link, &ask, now, PATIENCE
+            ));
+            tokio::join!(held, exchange)
+        };
+        let (handle, sent) = timeout(PATIENCE, both).await.expect("an answer came back");
+        assert!(handle.is_ok(), "the ask is answered: {:?}", handle.err());
+        assert_eq!(
+            sent.demands,
+            Some(proto::Demands {
+                runtime: 7,
+                vision: false,
+                references: proto::demands::References::Caller.into(),
+                input_window: 4_096,
+                output_window: 512,
+                decoding: 3,
+            })
+        );
+    }
+
+    /// Over a session on protocol 2 the handle still refuses a demand
+    /// that a controller holds on no frame of the request's kind yet,
+    /// before anything is sent. The kinds are a request that names its
+    /// worker, a request at a side's phase and an encode request. The
+    /// part that demands vision is refused by its own name, on a single
+    /// request too: no registration states whether a worker takes
+    /// images.
+    #[tokio::test(start_paused = true)]
+    async fn a_demand_no_frame_of_its_requests_kind_holds_yet_is_refused_before_anything_is_sent() {
+        let mut peer = Peer::speaking(1, 2);
+        let demand = Demands {
+            runtime: 7,
+            ..Demands::default()
+        };
+        let vision = Demands {
+            vision: true,
+            ..Demands::default()
+        };
+        let both = Demands {
+            vision: true,
+            ..demand
+        };
+        let field = |answer: &Result<DecisionGuard<&InProcess>, DecisionUnavailable>| match answer {
+            Err(DecisionUnavailable::Unsent(Error::OutOfRange(field))) => Some(*field),
+            _ => None,
+        };
         let before = tokio::time::Instant::now();
+        let asks = [
+            (Phase::Single, Some(Some(0)), demand, "constraints.demands"),
+            (Phase::Single, Some(None), demand, "constraints.demands"),
+            (Phase::Prefill, None, demand, "constraints.demands"),
+            (Phase::Decode, None, demand, "constraints.demands"),
+            (Phase::Single, None, vision, "constraints.demands.vision"),
+            (Phase::Single, None, both, "constraints.demands.vision"),
+        ];
+        for (phase, named, demands, refused) in asks {
+            let mut ask = stated(&[1]);
+            ask.facts.budget_micros = 200_000;
+            ask.facts.phase = phase;
+            ask.constraints.demands = demands;
+            let answer = timeout(
+                PATIENCE,
+                pin!(DecisionGuard::<&InProcess>::asked_naming(
+                    &peer.link,
+                    &ask,
+                    named,
+                    Instant::now(),
+                    PATIENCE
+                )),
+            )
+            .await
+            .expect("the ask returns");
+            assert_eq!(field(&answer), Some(refused), "{phase:?} {named:?}");
+        }
+        let mut ask = stated(&[1]);
+        ask.facts.budget_micros = 200_000;
+        ask.facts.phase = Phase::Prefill;
+        ask.constraints.demands = demand;
+        let mut placed = EncodePlaced::new();
         let answer = timeout(
             PATIENCE,
-            pin!(DecisionGuard::<&InProcess>::asked(
+            pin!(DecisionGuard::<&InProcess>::asked_encode(
                 &peer.link,
                 &ask,
+                EncodeItems::default(),
+                &mut placed,
                 Instant::now(),
                 PATIENCE
             )),
         )
         .await
         .expect("the ask returns");
-        assert!(
-            matches!(
-                answer,
-                Err(DecisionUnavailable::Unsent(Error::OutOfRange(
-                    "constraints.demands"
-                )))
-            ),
-            "{answer:?}"
+        assert_eq!(
+            field(&answer),
+            Some("constraints.demands"),
+            "an encode request"
         );
         assert_eq!(tokio::time::Instant::now(), before);
         assert!(

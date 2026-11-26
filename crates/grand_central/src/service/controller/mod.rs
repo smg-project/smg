@@ -125,10 +125,18 @@ use crate::{
 /// The protobuf package of the controller's API.
 pub const PROTOCOL_PACKAGE: &str = "smg.policy.v1";
 
-/// The protocol version this build speaks: `Hello`'s range, `Welcome`'s
-/// pick and the range `Leader` answers (design 5.2). A change within the
-/// package is additive and keeps it.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// The newest protocol version this build speaks: the top of the range its
+/// `Hello` offers and its `Leader` answers, and the newest its `Welcome`
+/// picks (design 5.2). A change a peer must know its controller reads
+/// raises it, and every other additive change within the package keeps
+/// it. Version 2 is the first whose frames state a request's hard demands
+/// (`DecideRequest.demands`).
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// The oldest protocol version this build speaks, the bottom of the same
+/// two ranges: a controller speaks its own version and the one before it,
+/// and upgrades first.
+pub const PROTOCOL_FLOOR: u32 = PROTOCOL_VERSION - 1;
 
 /// The gRPC service every scope is a part of (design 8: one service, four
 /// credentialed scopes), as the health service names it. Every listener

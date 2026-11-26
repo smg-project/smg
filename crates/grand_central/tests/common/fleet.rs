@@ -400,6 +400,9 @@ pub struct Harness {
     /// Whether the feeds run: an engine registered after their start gets
     /// its subscriber at its registration.
     feeding: bool,
+    /// What the next one-rank engines' registrations state for a request's
+    /// hard demands ([`Self::states`]).
+    stating: Option<proto::DemandFacts>,
     held: Vec<Box<dyn std::any::Any>>,
     /// The requests sent so far: the next one's lease id.
     sent: u64,
@@ -1183,6 +1186,7 @@ impl Harness {
             turns: Arc::default(),
             events: Arc::default(),
             feeding: false,
+            stating: None,
             held: Vec::new(),
             sent: 0,
             generation: 0,
@@ -1319,6 +1323,13 @@ impl Harness {
         self.replica.gateway()
     }
 
+    /// What the one-rank engines registered from now on state for a
+    /// request's hard demands: the block of their add on the control
+    /// listener, or none.
+    pub fn states(&mut self, stated: Option<proto::DemandFacts>) {
+        self.stating = stated;
+    }
+
     /// Applies the preset named `preset` as the store's next generation,
     /// in the case's process: no call of the controller applies a spec yet.
     pub fn apply(&mut self, preset: &str) -> Result<(), String> {
@@ -1412,6 +1423,7 @@ impl Harness {
                     events: !counts_resident(shape.runtime),
                     ..proto::Signals::default()
                 }),
+                demand_facts: self.stating,
                 ..proto::WorkerSpec::default()
             }),
             mode: Mode::Add.into(),

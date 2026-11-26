@@ -494,6 +494,203 @@ async fn a_handle_over_a_link_is_answered_the_worker_its_request_names() {
         .expect("the case ends inside its outer bound");
 }
 
+/// A single request's hard demands cross a link, and the controller holds
+/// the request to the workers whose registrations meet them.
+///
+/// Three engines register over the control listener. One states a runtime
+/// and a window, and processes media by reference by its registering
+/// party's pipeline. One states another runtime and a pipeline of its own.
+/// One states nothing.
+///
+/// The link's session is welcomed on protocol 2, so the handle states each
+/// demand on its frame. Every ask of a demand a worker meets is a pick, and
+/// the picks name the workers that meet it and no other. A runtime no
+/// worker states is shed at every ask, and so is an input past the window
+/// of its runtime's one worker: each with no endpoint, under its demand's
+/// stage as the handle reads it. The part that demands vision is refused at
+/// the handle's door, by its name, with nothing sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_handle_over_a_link_is_held_to_the_workers_that_meet_its_requests_demands() {
+    use std::collections::BTreeSet;
+
+    use smg_grand_central::{
+        engine::{
+            Constraints, Decision as Decided, Demands, InProcess, References, Request,
+            RequestFacts, Role, ShedReason as Why,
+        },
+        service::{controller::PROTOCOL_VERSION, proto},
+        tracking::DecisionGuard,
+    };
+
+    use crate::FLEET;
+
+    const GATEWAY: &str = "fleet-demands";
+    /// The asks a demand is given.
+    const ASKS: usize = 12;
+    let case = async {
+        let mut harness = Harness::start().await.expect("a started controller");
+        harness
+            .apply("round_robin")
+            .expect("a preset of this build applies");
+        let stated = [
+            Some(proto::DemandFacts {
+                runtime: 7,
+                references: true,
+                host_pipeline: true,
+                window: 4_096,
+                decoding: 0,
+            }),
+            Some(proto::DemandFacts {
+                runtime: 8,
+                references: true,
+                host_pipeline: false,
+                window: 0,
+                decoding: 0,
+            }),
+            None,
+        ];
+        for (engine, block) in stated.into_iter().enumerate() {
+            harness.states(block);
+            harness
+                .register(&FLEET[engine..=engine])
+                .await
+                .expect("the engine registers");
+        }
+        harness.feed();
+        within("the workers are ready", ROOM, || {
+            harness
+                .pool(MODEL, Role::Single)
+                .is_ok_and(|pool| pool.len() == 3 && pool.iter().all(|row| row.healthy))
+        })
+        .await
+        .expect("three ready workers");
+        let endpoint = Endpoint::from_shared(format!("http://{}", harness.gateway()))
+            .expect("the gateway listener's address");
+        let link = Box::pin(Link::connect(endpoint, GATEWAY))
+            .await
+            .expect("the link's session opens");
+        assert_eq!(link.welcome().protocol, PROTOCOL_VERSION);
+
+        let none = Demands::default();
+        let at_worker = Demands {
+            references: References::Worker,
+            ..none
+        };
+        let past = Demands {
+            input_window: 4_097,
+            ..none
+        };
+        let unstated = Demands { runtime: 9, ..none };
+        let past_its_one = Demands {
+            runtime: 7,
+            input_window: 4_097,
+            ..none
+        };
+        // What a demand's asks are answered: the engines their picks name, or
+        // the reason and the stage of a shed.
+        let demands = [
+            ("no demand", none, Ok(BTreeSet::from([0, 1, 2]))),
+            (
+                "a runtime",
+                Demands { runtime: 7, ..none },
+                Ok(BTreeSet::from([0])),
+            ),
+            ("a pipeline of its own", at_worker, Ok(BTreeSet::from([1]))),
+            ("an input past a window", past, Ok(BTreeSet::from([1, 2]))),
+            (
+                "a runtime none states",
+                unstated,
+                Err((Why::NoEndpoints, "wires")),
+            ),
+            (
+                "an input past the window of its runtime's one worker",
+                past_its_one,
+                Err((Why::NoEndpoints, "context-window")),
+            ),
+        ];
+        let asked = |id: &'static [u8], seed: u64, demands: Demands| Request {
+            id,
+            facts: {
+                let mut facts = RequestFacts::default();
+                facts.model = MODEL;
+                facts.seed = seed;
+                facts.budget_micros = 5_000_000;
+                facts
+            },
+            constraints: {
+                let mut constraints = Constraints::default();
+                constraints.demands = demands;
+                constraints
+            },
+        };
+        let mut seed = 0;
+        for (what, demanded, wanted) in demands {
+            // Every ask counts: the engines the picks name, and each shed.
+            let mut named = BTreeSet::new();
+            let mut shed = Vec::new();
+            for _ in 0..ASKS {
+                seed += 1;
+                let request = asked(b"demanded", seed, demanded);
+                let held = Box::pin(DecisionGuard::<&InProcess>::asked(
+                    &link,
+                    &request,
+                    Instant::now(),
+                    ROOM,
+                ))
+                .await;
+                let handle = held.unwrap_or_else(|refused| panic!("{what}: {refused:?}"));
+                match handle.decision() {
+                    Decided::Pick(pick) => {
+                        for target in pick.targets.as_slice() {
+                            let (engine, _) = harness
+                                .named(target.id.0)
+                                .expect("the picked worker is in the fleet");
+                            named.insert(engine);
+                        }
+                    }
+                    Decided::Shed(told) => shed.push((told.reason, told.emptied_by)),
+                    Decided::Queue(_) => panic!("{what} is queued"),
+                }
+            }
+            let answered = match wanted {
+                Ok(engines) => shed.is_empty() && named == engines,
+                Err(why) => named.is_empty() && shed == [why; ASKS],
+            };
+            assert!(answered, "{what}: picks {named:?}, sheds {shed:?}");
+        }
+
+        // The part that demands vision never leaves the handle.
+        let vision = Demands {
+            vision: true,
+            ..none
+        };
+        let request = asked(b"vision", 0, vision);
+        let held = Box::pin(DecisionGuard::<&InProcess>::asked(
+            &link,
+            &request,
+            Instant::now(),
+            ROOM,
+        ))
+        .await;
+        assert!(
+            matches!(
+                held,
+                Err(DecisionUnavailable::Unsent(client::Error::OutOfRange(
+                    "constraints.demands.vision"
+                )))
+            ),
+            "{:?}",
+            held.err()
+        );
+        assert!(link.stands());
+        drop(link);
+        harness.stop().await.expect("a clean stop");
+    };
+    tokio::time::timeout(CASE, Box::pin(case))
+        .await
+        .expect("the case ends inside its outer bound");
+}
+
 /// A replica that does not lead refuses the client's session and names the
 /// leader: two controllers elect over one lease file, and the client dials
 /// each.

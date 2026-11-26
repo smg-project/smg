@@ -1606,6 +1606,71 @@ fn the_named_worker_field_is_pinned() {
     assert_eq!(found, [pinned], "the named worker's field moved");
 }
 
+/// A request's hard demands on its frame, by name and number: the field of
+/// the request, the message whole, and the places a request's media by
+/// reference may be processed. The field and the places are named by their
+/// own types. The field is a message: its absence says the
+/// request demands nothing, so the frame of a host older than the field is
+/// decided as it was.
+#[test]
+fn the_demands_fields_are_pinned() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let controller =
+        file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
+    let request = message(controller, "DecideRequest").expect("the request is a message");
+    let found: Vec<(String, i32, Type)> = fields(request)
+        .into_iter()
+        .filter(|(name, _, _, _, _)| name == "demands")
+        .map(|(name, number, kind, _, _)| (name, number, kind))
+        .collect();
+    let pinned = ("demands".to_owned(), 9, Type::Message);
+    assert_eq!(found, [pinned], "the demands' field moved");
+
+    let demands = message(controller, "Demands").expect("Demands is in the controller file");
+    let found: Vec<(String, i32, Type)> = fields(demands)
+        .into_iter()
+        .map(|(name, number, kind, _, _)| (name, number, kind))
+        .collect();
+    let parts = [
+        ("runtime", 1, Type::Uint32),
+        ("vision", 2, Type::Bool),
+        ("references", 3, Type::Enum),
+        ("input_window", 4, Type::Uint32),
+        ("output_window", 5, Type::Uint32),
+        ("decoding", 6, Type::Uint32),
+    ];
+    let parts: Vec<(String, i32, Type)> = parts
+        .iter()
+        .map(|(name, number, kind)| ((*name).to_owned(), *number, *kind))
+        .collect();
+    assert_eq!(found, parts, "a part of a demand moved");
+
+    // Each of the two by its own type: a field of another message's or
+    // another enum's type would read by other names.
+    let typed = |message: &DescriptorProto, name: &str| -> Vec<String> {
+        let named = message.field.iter().filter(|field| field.name() == name);
+        named.map(|field| field.type_name().to_owned()).collect()
+    };
+    assert_eq!(typed(request, "demands"), [".smg.policy.v1.Demands"]);
+    assert_eq!(
+        typed(demands, "references"),
+        [".smg.policy.v1.Demands.References"]
+    );
+
+    let places = enum_values(controller, "Demands.References").expect("the places are an enum");
+    let pinned = [
+        ("REFERENCES_NONE", 0),
+        ("REFERENCES_ANY", 1),
+        ("REFERENCES_CALLER", 2),
+        ("REFERENCES_WORKER", 3),
+    ];
+    let pinned: Vec<(String, i32)> = pinned
+        .iter()
+        .map(|(name, number)| ((*name).to_owned(), *number))
+        .collect();
+    assert_eq!(places, pinned, "a place of media by reference moved");
+}
+
 /// What a registration states and its answer tells, by name and number: the
 /// prober's settings (one message for the registration and the row), the
 /// row's rank and engine, the two thresholds a row is judged by, and what a

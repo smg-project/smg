@@ -193,8 +193,8 @@ pub(crate) fn decide(
 /// of its phase. It is decided as a single request's frame is ([`decide`]),
 /// by the binding of its own phase, over the list the registry holds for
 /// the model at that phase's role. The reach and the asking gateway's
-/// vetoes are that role's. A frame states no demand yet, so no list is
-/// held to one here.
+/// vetoes are that role's. Such a frame states no demand yet: one that
+/// states one is refused by the field. So no list is held to one here.
 ///
 /// Out of line: a single request's decision holds no part of it.
 ///

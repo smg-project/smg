@@ -65,7 +65,7 @@ use tonic::{
 };
 
 use crate::service::{
-    controller::{MAX_FRAME, MAX_REQUEST_ID, PRINCIPAL_ENTRY, PROTOCOL_VERSION},
+    controller::{MAX_FRAME, MAX_REQUEST_ID, PRINCIPAL_ENTRY, PROTOCOL_FLOOR, PROTOCOL_VERSION},
     proto::{
         controller_frame, decide_answer, gateway_frame, grand_central_client::GrandCentralClient,
         Busy, Completed, ControllerFrame, DecideAnswer, DecideRequest, Decision, Dispatched,
@@ -103,6 +103,20 @@ pub const ANSWER_WAIT: Duration = Duration::from_secs(5);
 /// of life. A peer that answers none within [`ANSWER_WAIT`] ends the
 /// channel's streams, a watch's wait among them.
 pub const KEEPALIVE: Duration = Duration::from_secs(5);
+
+/// The first protocol version whose frames state a request's hard demands
+/// (`DecideRequest.demands`).
+const DEMANDS_PROTOCOL: u32 = 2;
+
+/// Whether a session welcomed on `protocol` reads a demand its frames
+/// state. It does from [`DEMANDS_PROTOCOL`] to the newest version this
+/// client offers. A controller of an older version reads none. A welcome
+/// on a version the hello did not offer says nothing a client can act
+/// on. So the link and the handle send a demand over neither.
+/// [`Client::decide`] sends the frame its caller wrote.
+pub(crate) fn reads_demands(protocol: u32) -> bool {
+    (DEMANDS_PROTOCOL..=PROTOCOL_VERSION).contains(&protocol)
+}
 
 type Stub = GrandCentralClient<InterceptedService<Channel, Principal>>;
 
@@ -176,10 +190,11 @@ pub enum Error {
     /// frame, and a link's one stream is every caller's: the link refuses
     /// the frame at its own door and sends nothing ([`Link::ask`]).
     ///
-    /// A hard demand of a host's request is refused under this kind too, as
-    /// `constraints.demands`: this protocol version states none, so a
-    /// handle sends no request that states one
+    /// A hard demand of a host's request is refused under this kind too,
+    /// where its controller would not hold it
     /// ([`DecisionGuard::asked`](crate::tracking::decision_guard::DecisionGuard::asked)).
+    /// The handle names `constraints.demands`, or
+    /// `constraints.demands.vision` for that part. The link names `demands`.
     #[error("an ask's {0} is out of its range in this protocol version")]
     OutOfRange(&'static str),
     /// A link's report queue was full: its session took no report for as
@@ -397,14 +412,16 @@ fn numbered(seq: u64, floor: u64, frame: gateway_frame::Frame) -> GatewayFrame {
 /// The session's first frame: the hello of `gateway_id`, numbered 1, which
 /// states `floor` as the term it saw and as its term floor. `generation`
 /// is the controller's generation whose document the gateway's own engine
-/// runs, and 0 where it runs none of the controller's.
+/// runs, and 0 where it runs none of the controller's. It offers every
+/// protocol version this build speaks, so a controller a version behind
+/// welcomes the session on its own.
 fn hello(gateway_id: &str, floor: u64, generation: u64) -> GatewayFrame {
     GatewayFrame {
         seq: 1,
         term_floor: floor,
         frame: Some(gateway_frame::Frame::Hello(Hello {
             gateway_id: gateway_id.to_owned(),
-            protocol_min: PROTOCOL_VERSION,
+            protocol_min: PROTOCOL_FLOOR,
             protocol_max: PROTOCOL_VERSION,
             term_seen: floor,
             generation,
@@ -848,6 +865,12 @@ impl Client {
     /// as encoded loses block hashes at its tail until it fits, counted by
     /// [`Client::hashes_cut`] once the ask is queued; one with none left
     /// to cut is [`Error::TooLarge`].
+    ///
+    /// The client holds no frame to what its session's controller reads. A
+    /// host states a hard demand (`DecideRequest.demands`) only where
+    /// [`Client::welcome`] chose protocol 2 or later. A controller of
+    /// protocol 1 reads none, and would decide the request among the
+    /// workers its demand rules out.
     ///
     /// An answer under a term below the floor is [`Error::BelowFloor`];
     /// one that is no answer to the ask is [`Error::NoDecision`]; a stream
