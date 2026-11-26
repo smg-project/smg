@@ -824,8 +824,8 @@ impl PrefixRecord {
     /// the rest and writes on behind its next picks ([`Waiting`]). `None`
     /// where nothing is left to write: the request stands whole, or a
     /// worker left since the naming, and the record gives no place to a
-    /// worker told gone. A leave told since the naming ends the write ahead
-    /// of the lock too: a thread keeps no write that can write nothing.
+    /// worker told gone. A turn that meets the lock held asks for such a
+    /// leave too: a thread keeps no write that can write nothing.
     fn write(
         &self,
         keys: &[u64],
@@ -843,13 +843,11 @@ impl PrefixRecord {
             // naming's depth or where a kept write stood, then the turns
             // before this one.
             let end = (done + Self::SLICE).min(keys.len());
-            // Asked ahead of the lock: a stale write that met it held would
-            // be kept by its thread, in a place of a write that can stand.
-            if self.left.load(Ordering::Relaxed) != left {
-                return None;
-            }
             let Some(mut predictor) = self.predictor.try_write() else {
-                return Some(done);
+                // Asked where the lock is met held, and at no other turn: a
+                // stale write handed back from here would be kept by its
+                // thread, in a place of a write that can stand.
+                return (self.left.load(Ordering::Relaxed) == left).then_some(done);
             };
             // Under the lock the count is the one the record stands by.
             if self.left.load(Ordering::Relaxed) != left {
