@@ -1382,6 +1382,19 @@ On main three pickers say so: round robin, `random` and `passthrough`.
 7. **Records.** One `Candidate` for each worker is written into the thread's buffer. Over a list
    of 16 workers or more, a profile whose picker draws first (`random`, `round-robin`,
    `passthrough`, power of two, `best` with a sample) has only the drawn workers' records written.
+   A profile whose picker draws two workers and compares them draws so from 8 workers on where
+   every profile of the document is of that kind and its filters are one test of a worker's
+   record; beside a profile of any other kind it draws so from 16, and under `power-of-two` a
+   list that holds the ranks of a data-parallel engine is decided over its engines at any size.
+   Under 16 it draws only where no filter refuses a worker: the request names no worker tried
+   or excluded, is held to no places and stands under no veto of its host, and every worker of
+   the list publishes its routing state available; a request with a session key is not
+   drawn under 16, and neither is a list that holds the ranks of a data-parallel engine. Every
+   other decision under 16 has every
+   record written and is the whole pass's. The two workers such a draw hands out are the two
+   the whole pass hands out for that seed, in that order; a worker whose state moved since the
+   list said so ends the draw at once where the draw asks about it, and the whole pass decides as
+   if nothing had been drawn.
    A request whose session key holds no pin is decided on a draw too, where its sessions rule
    leaves a new key to a profile whose picker takes turns and whose filters are one test of a
    worker's record. The worker the list's counter points at has its record written first, with no

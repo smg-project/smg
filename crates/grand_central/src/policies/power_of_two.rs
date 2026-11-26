@@ -5,7 +5,7 @@ use crate::{
     document::spec::{PolicySpec, ProfileSpec, ResidentWorkParams, ScoreStage, SpecError},
     engine::{
         decision::Targets,
-        framework::{DrawUnit, Picker, Shortlist, TieBand},
+        framework::{DrawUnit, Picker, Shortlist, TieBand, DRAW_BOUND, DRAW_FROM},
         view::{Candidate, PoolFacts, RequestFacts},
     },
     policies::standard_filters,
@@ -73,20 +73,46 @@ impl PolicySpec {
     }
 }
 
+/// The refused rows at which the two draws give a pool under [`DRAW_FROM`]
+/// rows to the whole pass: the first one. The pass draws among the rows it
+/// keeps and the draws among all of them, so behind a refused row a draw is
+/// no longer the pass's pick of the seed. The host of such a pool asks the
+/// draw only where it expects every row kept, so a refused row is rare.
+const SMALL_POOL_BOUND: u32 = 1;
+
+// The small pool's bound is counted against the pickers' own.
+const _: () = assert!(SMALL_POOL_BOUND <= DRAW_BOUND);
+
 /// The two rows the two-draw pickers compare, drawn first: two distinct
 /// uniform draws over the rows the whole pass keeps, each drawn again while
 /// its row is refused. `false` once [`DRAW_BOUND`] rows were refused before
-/// both were held, a pool with one row kept among them: the whole pass
-/// decides.
+/// both were held, a pool with one row kept among them, or
+/// [`SMALL_POOL_BOUND`] row of a pool under [`DRAW_FROM`] rows: the whole
+/// pass decides.
 ///
-/// [`DRAW_BOUND`]: crate::engine::framework::DRAW_BOUND
+/// A pool under [`DRAW_FROM`] rows is drawn from a copy of `draw`, which
+/// leaves the caller's stream where it stood: the whole pass decided such a
+/// pool before a draw did, and orders two rows that tie by the request's own
+/// seed ([`push_two`]). A stream left as it came orders the two drawn rows by
+/// that seed too, so with every row kept the pick of a seed is the pass's;
+/// and the pass behind a refused row reads the stream as if nothing had been
+/// drawn, so its pick of the seed is the one it makes with no draw before it.
 fn draw_two_kept(
     draw: &mut Draw,
     candidates: &[Candidate],
     keep: &mut dyn FnMut(&Candidate) -> bool,
     kept: &mut Vec<u32>,
 ) -> bool {
-    let mut refused = 0;
+    // A small pool's count starts as far over zero as its bound stands
+    // under the one `draw_kept` counts against: its first refused row ends
+    // the draw.
+    let mut own;
+    let (draw, mut refused) = if candidates.len() < DRAW_FROM {
+        own = *draw;
+        (&mut own, DRAW_BOUND - SMALL_POOL_BOUND)
+    } else {
+        (draw, 0)
+    };
     let Some(first) = draw_kept(draw, candidates, None, keep, &mut refused) else {
         return false;
     };
