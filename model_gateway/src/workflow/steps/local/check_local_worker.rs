@@ -1378,7 +1378,10 @@ mod tests {
         // A table no legacy parser shares binds the other override to the same table.
         card.reasoning_parser = Some("qwen3".to_string());
         let err = check(&card, ParserChoice::Symphony).expect_err("bound to the table");
-        assert!(err.contains("same table"), "{err}");
+        assert!(
+            err.contains("is no legacy tool-call parser's name") && err.contains("same table"),
+            "{err}"
+        );
         // A name both registries have passes under either parser.
         card.tool_parser = Some("kimi_k3".to_string());
         card.reasoning_parser = Some("kimi_k3".to_string());

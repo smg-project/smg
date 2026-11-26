@@ -237,7 +237,11 @@ its parser resolution), so a deployment's existing flags keep a working parser u
 gateway's default parser; a legacy name no table answers to keeps the legacy parsers as a tool-call
 name and selects nothing as a reasoning name alone, and the gateway lists each such name with the
 reason (`utils::UNANSWERED`); its test over both legacy registries holds every legacy name to one of
-three: a table's own name (`qwen3`, `gemma4`), a row of `ALIASES`, or a row of `UNANSWERED`. The crate knows a table by its own name only (`Table::named`). The Harmony family (gpt-oss) has a
+three: a table's own name (`qwen3`, `gemma4`), a row of `ALIASES`, or a row of `UNANSWERED`. A name
+that selects a table and that no legacy parser of its own kind has binds the other flag, or a
+worker's other label, to the same table, by any name the table answers to, or to nothing
+(`--tool-call-parser qwen_xml --reasoning-parser qwen3_tagged` names one table twice), else the
+gateway refuses to start, or refuses the worker's registration or label update. The crate knows a table by its own name only (`Table::named`). The Harmony family (gpt-oss) has a
 table, `gpt_oss`, that the registry does not list yet: no name and no model id selects it, and its requests stay on the gateway's Harmony pipeline.
 
 <!-- models: begin -->
