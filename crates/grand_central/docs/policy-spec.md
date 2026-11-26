@@ -64,7 +64,7 @@ score:
   - least-requests
 ```
 
-[Built-in stages](../REFERENCE.md#built-in-stages) lists every stage with its settings.
+[The stages page](stages.md) lists every stage with its settings.
 
 ### The tally of sends
 

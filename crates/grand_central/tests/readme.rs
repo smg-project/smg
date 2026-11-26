@@ -1,8 +1,9 @@
 //! The crate's pages, checked against the crate, so each says what this
 //! build holds. `README.md` is the first page, short enough to read whole.
 //! `docs/policy-spec.md` is the policy spec's page, cut out of the reference
-//! and held to the README's bounds. `REFERENCE.md` holds the rest of the
-//! detail. Nine things are read:
+//! and held to the README's bounds. `docs/stages.md` is the stages' page, cut
+//! out and held the same way. `REFERENCE.md` holds the rest of the detail.
+//! Nine things are read:
 //!
 //! - every fenced `yaml` block of a page is a whole policy document: it
 //!   parses, and the stock catalog validates it (a fragment is fenced as
@@ -10,7 +11,7 @@
 //! - a `yaml` block of the reference under the mark `<!-- refused -->` is a
 //!   document the validator refuses, and the fenced text after it ends with
 //!   the validator's words;
-//! - the three stage tables of the README and of the reference, each
+//! - the three stage tables of the README and of the stages' page, each
 //!   between its `begin` and `end` marks, name the catalog's filters,
 //!   scorers and pickers: every name, no other, in the catalog's order;
 //! - a `yaml` block of the reference under `<!-- preset: <name> -->` is the
@@ -22,7 +23,7 @@
 //!   controller exports: each list is read off the files that declare it.
 //!   Each is read the other way too: a row of the reference's flag tables,
 //!   of its call table or of its metrics table names none that is gone;
-//! - the README and the policy spec's page stay inside the bounds a person
+//! - the README and the two pages cut out stay inside the bounds a person
 //!   reads with ease: no sentence over 30 words, no paragraph over five
 //!   sentences or 100 words, no list item over 50 words, no table cell over
 //!   30 words, no heading over 30 words, and none of the filler words in a
@@ -34,7 +35,7 @@
 //!   them and passes one that stands at a bound, and the reading of a
 //!   page's blocks, headings and links is held to short texts the same
 //!   way;
-//! - every link of the three pages to a path of the checkout resolves, and
+//! - every link of the four pages to a path of the checkout resolves, and
 //!   a link that names a heading names one its page holds;
 //! - each command the README shows names what the checkout holds: this
 //!   package, features and an example of its manifest, a unit test of the
@@ -67,6 +68,9 @@ const DOCUMENTS: usize = 13;
 /// The documents the policy spec's page shows running, counted the same way.
 const PAGE_DOCUMENTS: usize = 4;
 
+/// The documents the stages' page shows running, counted the same way.
+const STAGES_DOCUMENTS: usize = 1;
+
 /// The commands the README shows, counted as its documents are.
 const README_COMMANDS: usize = 4;
 
@@ -88,9 +92,10 @@ const CALLS: usize = 15;
 /// The series the standalone controller exports, at the least.
 const SERIES: usize = 22;
 
-/// The most words a sentence of a short page holds: the README and the
-/// policy spec's page are the short pages. Nothing but a sentence's end
-/// splits one, so a chain joined by semicolons is one sentence.
+/// The most words a sentence of a short page holds: the README, the policy
+/// spec's page and the stages' page are the short pages. Nothing but a
+/// sentence's end splits one, so a chain joined by semicolons is one
+/// sentence.
 const SENTENCE_WORDS: usize = 30;
 
 /// The most sentences a paragraph of a short page holds.
@@ -135,6 +140,11 @@ fn reference() -> PathBuf {
 /// The policy spec's page: its fields, its bindings and its plans.
 fn policy_spec() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/policy-spec.md")
+}
+
+/// The stages' page: each stock filter, scorer and picker with its rules.
+fn stages() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/stages.md")
 }
 
 /// One fenced block of the page.
@@ -213,6 +223,7 @@ fn every_document_of_the_page_runs_over_the_stock_catalog() {
     for (name, path, shown) in [
         ("README", readme(), README_DOCUMENTS),
         ("policy spec's page", policy_spec(), PAGE_DOCUMENTS),
+        ("stages' page", stages(), STAGES_DOCUMENTS),
         ("reference", reference(), DOCUMENTS),
     ] {
         let page = fs::read_to_string(path).expect("the page is readable");
@@ -297,9 +308,9 @@ fn the_stage_tables_name_the_catalogs_stages_and_no_other() {
         ("scorers", catalog.scorers().collect()),
         ("pickers", catalog.pickers().collect()),
     ];
-    // The README's rows are short and the reference's hold each stage's
+    // The README's rows are short and the stages' page holds each stage's
     // rules: both list the same stages.
-    for (name, path) in [("README", readme()), ("reference", reference())] {
+    for (name, path) in [("README", readme()), ("stages' page", stages())] {
         let page = fs::read_to_string(path).expect("the page is readable");
         for (kind, held) in &kinds {
             let listed = listed(&page, kind);
@@ -828,6 +839,17 @@ fn the_policy_spec_pages_prose_stays_inside_the_same_bounds() {
     );
 }
 
+#[test]
+fn the_stages_pages_prose_stays_inside_the_same_bounds() {
+    let page = fs::read_to_string(stages()).expect("the stages' page is readable");
+    let over = over_bounds(&page);
+    assert!(
+        over.is_empty(),
+        "the stages' page is held to the README's bounds, and it is over them:\n{}",
+        over.join("\n")
+    );
+}
+
 /// A sentence of `words` words: a capital first and a full stop last.
 fn sentence(words: usize) -> String {
     let mut sentence = String::from("One");
@@ -1058,6 +1080,7 @@ fn every_link_of_a_page_resolves_heading_and_all() {
     for (name, path) in [
         ("README", readme()),
         ("policy spec's page", policy_spec()),
+        ("stages' page", stages()),
         ("reference", reference()),
     ] {
         let dead = dead_links(&path);

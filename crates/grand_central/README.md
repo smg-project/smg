@@ -52,7 +52,7 @@ The combined score is the weighted average of the scorers. A bare name has weigh
 
 ## Built-in stages
 
-A *stage* is one filter, scorer or picker. The [reference](REFERENCE.md#built-in-stages) has each stage's rules, defaults and limits.
+A *stage* is one filter, scorer or picker. The [stages page](docs/stages.md) has each stage's rules, defaults and limits.
 
 ### Filters
 
