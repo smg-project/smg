@@ -25,11 +25,12 @@ def _generate(**overrides):
     """Compile the actual handler with engine-independent dependencies."""
     path = Path(__file__).parents[1] / "smg_grpc_servicer/vllm/servicer.py"
     module = ast.parse(path.read_text())
-    helper = next(
+    helpers = [
         n
         for n in module.body
-        if isinstance(n, ast.FunctionDef) and n.name == "_valid_cpu_ec_handle"
-    )
+        if isinstance(n, ast.FunctionDef)
+        and n.name in ("_valid_cpu_ec_handle", "_takes_reasoning_ended")
+    ]
     cls = next(
         n for n in module.body if isinstance(n, ast.ClassDef) and n.name == "VllmEngineServicer"
     )
@@ -40,6 +41,7 @@ def _generate(**overrides):
     for arg in method.args.args:
         arg.annotation = None
     namespace = {
+        "inspect": inspect,
         "json": json,
         "asyncio": asyncio,
         "build_media_identity": Mock(),
@@ -66,7 +68,9 @@ def _generate(**overrides):
         "GracefulHTTPError": type("GracefulHTTPError", (Exception,), {}),
     }
     namespace.update(overrides)
-    exec(compile(ast.Module(body=[helper, method], type_ignores=[]), str(path), "exec"), namespace)
+    exec(
+        compile(ast.Module(body=[*helpers, method], type_ignores=[]), str(path), "exec"), namespace
+    )
     return namespace["Generate"]
 
 
@@ -314,15 +318,16 @@ async def test_grammar_from_first_token_reaches_engine_as_reasoning_ended(
         """Make gRPC validation failures observable to the test."""
         raise _Aborted(code, message)
 
-    engine_generate = generate if engine_takes else older_generate
+    handler = _generate()
+    engine = SimpleNamespace(
+        generate=generate if engine_takes else older_generate,
+        renderer=SimpleNamespace(process_for_engine=lambda prompt, **kwargs: prompt),
+        vllm_config=SimpleNamespace(ec_transfer_config=None),
+    )
     servicer = SimpleNamespace(
-        engine=SimpleNamespace(
-            generate=engine_generate,
-            renderer=SimpleNamespace(process_for_engine=lambda prompt, **kwargs: prompt),
-            vllm_config=SimpleNamespace(ec_transfer_config=None),
-        ),
-        # As the constructor reads it, once, off the engine's signature.
-        _takes_reasoning_ended="reasoning_ended" in inspect.signature(engine_generate).parameters,
+        engine=engine,
+        # The servicer's own read, the one its constructor makes once.
+        _takes_reasoning_ended=handler.__globals__["_takes_reasoning_ended"](engine),
         _sampling_params_from_proto=lambda *args, **kwargs: SimpleNamespace(
             extra_args=None, logprobs=None, prompt_logprobs=None
         ),
@@ -331,5 +336,5 @@ async def test_grammar_from_first_token_reaches_engine_as_reasoning_ended(
         _notify_kv_transfer_rejected=AsyncMock(),
     )
     context = SimpleNamespace(abort=abort, invocation_metadata=lambda: ())
-    assert [reply async for reply in _generate()(servicer, request, context)] == []
+    assert [reply async for reply in handler(servicer, request, context)] == []
     assert seen == [True if handed else "unsaid"]

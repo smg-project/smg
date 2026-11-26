@@ -122,6 +122,16 @@ def _prompt_length(prompt) -> int:
     return 0
 
 
+def _takes_reasoning_ended(engine) -> bool:
+    """Whether the engine's generate() takes `reasoning_ended`.
+
+    Read off its signature rather than a version: an engine whose generate()
+    does not name the keyword is never handed it (see Generate).
+    """
+    generate = getattr(engine, "generate", None)
+    return generate is not None and "reasoning_ended" in inspect.signature(generate).parameters
+
+
 def _managed_ranks(engine) -> list[int]:
     """The data-parallel ranks this servicer serves, in order: the engine
     client's managed ranks (a slice of all the ranks under external or
@@ -247,13 +257,8 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         settle_logging()
         self.engine = async_llm
         self.start_time = start_time
-        # Whether the engine's generate() takes `reasoning_ended`, read once
-        # off its signature rather than a version: an engine whose generate()
-        # does not name the keyword is never handed it (see Generate).
-        generate = getattr(async_llm, "generate", None)
-        self._takes_reasoning_ended = (
-            generate is not None and "reasoning_ended" in inspect.signature(generate).parameters
-        )
+        # Read once: the engine's signature does not change under a servicer.
+        self._takes_reasoning_ended = _takes_reasoning_ended(async_llm)
         # Resolve KV-event publishing config from the engine. Non-None only when
         # vLLM was started with --kv-events-config enabling the ZMQ publisher.
         self._kv_events_config = resolve_kv_events_config(async_llm)
