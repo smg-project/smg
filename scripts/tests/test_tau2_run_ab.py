@@ -1843,3 +1843,106 @@ def test_current_staging_copies_marker_after_policy_copy_error(tmp_path, monkeyp
     )
     assert (tmp_path / "tau2_artifact" / sidecar.name).read_bytes() == b"owned marker"
     assert child.returncode != 0
+
+
+@pytest.mark.parametrize("startup", ["begin_refused", "missing_descriptor"])
+def test_startup_budget_rejection_is_not_quality_diagnostic(tmp_path, monkeypatch, startup):
+    candidate = _provenant_arm(tmp_path, "smg")
+    descriptor = candidate.budget
+    # An Arm may retain prior valid budget metadata even if this call lacks it.
+    # The missing-budget invocation itself must stay fatal, not rely on another gate.
+    baseline = run_ab.Arm("vllm", "http://unused.invalid", budget=dict(descriptor))
+    launched = []
+
+    def forbidden_child(*args, **kwargs):
+        launched.append(args)
+        raise AssertionError("startup budget failure must not launch a child")
+
+    original_begin = run_ab.budget_guard.Ledger.begin_invocation
+
+    def begin(self, identity, arm, domain):
+        if arm == "vllm":
+            raise run_ab.budget_guard.BudgetError("owned unhalted startup refusal")
+        return original_begin(self, identity, arm, domain)
+
+    monkeypatch.setattr(run_ab.budget_guard.Ledger, "begin_invocation", begin)
+    monkeypatch.setattr(run_ab.subprocess, "run", forbidden_child)
+    _run_tau2(
+        baseline,
+        tmp_path,
+        domain="retail",
+        num_trials=2,
+        expected_task_ids=["task"],
+        budget_descriptor=None if startup == "missing_descriptor" else descriptor,
+    )
+    assert not launched
+    assert baseline.invocations["retail"]["failure_kind"] == (
+        "missing_budget" if startup == "missing_descriptor" else "invalid_budget"
+    )
+    audit = run_ab.budget_guard.read_descriptor(descriptor).audit()
+    assert not audit["halted"] and audit["pending"] == audit["unknown"] == 0
+    args = types.SimpleNamespace(
+        out=None,
+        json_out=tmp_path / "startup.json",
+        tolerance=0.02,
+        allow_incomplete=True,
+        enforce_budget=True,
+        expected_task_ids={"retail": ["task"]},
+        seed=300,
+    )
+    assert (
+        run_ab.write_report_and_gate(baseline, candidate, ["retail"], 2, args)
+        == run_ab.EXIT_INCOMPLETE
+    )
+
+
+@pytest.mark.parametrize("mode", ["healthy", "malformed"])
+def test_startup_quality_controls_remain_diagnostic(tmp_path, monkeypatch, mode):
+    candidate = _provenant_arm(tmp_path, "smg")
+    descriptor = candidate.budget
+    baseline = run_ab.Arm("vllm", "http://unused.invalid")
+    launched = []
+
+    def child(command, **kwargs):
+        launched.append(command)
+        folder = tmp_path / "simulations" / command[command.index("--save-to") + 1]
+        folder.mkdir(parents=True)
+        result = {
+            "simulations": [
+                {
+                    "task_id": r["task_id"],
+                    "trial": r["trial"],
+                    "seed": r["seed"],
+                    "reward_info": {"reward": r["reward"]},
+                }
+                for r in _rows()
+            ]
+        }
+        (folder / "results.json").write_text(
+            "{broken" if mode == "malformed" else json.dumps(result)
+        )
+        return types.SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(run_ab.subprocess, "run", child)
+    _run_tau2(
+        baseline,
+        tmp_path,
+        domain="retail",
+        num_trials=2,
+        expected_task_ids=["task"],
+        budget_descriptor=descriptor,
+    )
+    assert len(launched) == 1
+    assert baseline.invocations["retail"].get("failure_kind") == (
+        "invalid_results" if mode == "malformed" else None
+    )
+    args = types.SimpleNamespace(
+        out=None,
+        json_out=tmp_path / "control.json",
+        tolerance=0.02,
+        allow_incomplete=True,
+        enforce_budget=True,
+        expected_task_ids={"retail": ["task"]},
+        seed=300,
+    )
+    assert run_ab.write_report_and_gate(baseline, candidate, ["retail"], 2, args) == run_ab.EXIT_OK

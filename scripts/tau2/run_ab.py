@@ -930,6 +930,8 @@ def write_report_and_gate(
                 "timeout",
                 "ledger_refused",
                 "invocation_budget_incomplete",
+                "invalid_budget",
+                "missing_budget",
             }
             for arm in (baseline, candidate)
             for invocation in arm.invocations.values()
