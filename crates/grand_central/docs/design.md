@@ -2891,7 +2891,7 @@ A fact leaves the remainder when the worker object gets a field that holds it as
    host follows the store **[built]**.
 
 **One rule for a registration's write [built].** What a registration makes of the record under
-its address is one function beside the other membership rules (`WorkerFacts::laid_over`,
+its address is one function beside the other membership rules (`WorkerRow::laid_over`,
 `store/membership.rs`): from the record that stands and the facts stated, the change and the
 record it leaves. The store's own write decides by it over the table's record. It then writes
 the decided change by the one body a standby's applier writes a leader's change by

@@ -1787,7 +1787,7 @@ impl WorkersStore for MemoryStore {
         let standing = standing.and_then(|id| workers.rows.get(id));
         let standing = standing.map(|held| &held.row);
         let now = Instant::now();
-        let (change, row) = facts.laid_over(standing, maker, now);
+        let (change, row) = WorkerRow::laid_over(facts, standing, maker, now);
         let fits = self.decided(workers, now, change, Some(row));
         debug_assert!(fits, "a change decided under the membership lock fits");
         change

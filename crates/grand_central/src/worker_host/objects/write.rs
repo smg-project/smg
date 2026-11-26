@@ -79,7 +79,7 @@ impl<G: Generation> Objects<G> {
         let _turn = self.turn.lock();
         let standing = self.row_under(&facts.key);
         let seen = standing.as_ref().map(|row| row.revision);
-        let (change, row) = facts.laid_over(standing.as_ref(), maker, Instant::now());
+        let (change, row) = WorkerRow::laid_over(facts, standing.as_ref(), maker, Instant::now());
         self.lay_decided(store, change, &row, seen)
     }
 
