@@ -7,6 +7,11 @@
 //! for all 256 bytes of all three channels, so the bytes written are the
 //! tables' whichever path runs.
 //!
+//! A reference processor that normalizes in `bfloat16`, rounding after every
+//! step, has values no `PixelNorm` gives: [`Bf16Steps`] is that arithmetic
+//! and [`StepsWriter`] moves its table the same way, with a vector formula
+//! of its own on x86-64 and the lookup on every other target.
+//!
 //! Why not a vector table lookup: a 256-entry table is 512 bytes per output
 //! byte plane, and the vector unit's byte permutes index 64 bytes at a time,
 //! which leaves such a lookup slower than the scalar loop; the arithmetic is
@@ -145,6 +150,26 @@ impl WireWriter {
         }
     }
 
+    /// The writer of `table` narrowed to `dtype`, through the tables alone:
+    /// for values no [`PixelNorm`] describes.
+    fn of_table(table: &[[f32; 256]; 3], dtype: EncoderDtype) -> Option<Self> {
+        let half = |convert: fn(f32) -> u16| Self::Half {
+            tables: Box::new(table.map(|channel| channel.map(convert))),
+            #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+            formula: None,
+        };
+        match dtype {
+            EncoderDtype::Uint8 => None,
+            EncoderDtype::Float32 => Some(Self::Single {
+                tables: Box::new(table.map(|channel| channel.map(f32::to_bits))),
+                #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+                formula: None,
+            }),
+            EncoderDtype::BFloat16 => Some(half(f32_to_bf16_bits)),
+            EncoderDtype::Float16 => Some(half(f32_to_f16_bits)),
+        }
+    }
+
     /// Bytes per written element.
     pub(crate) fn element_size(&self) -> usize {
         match self {
@@ -209,6 +234,177 @@ impl WireWriter {
                     *d = table[usize::from(pixel[channel])].to_le_bytes();
                 }
             }
+        }
+    }
+}
+
+/// The arithmetic of a reference processor that rescales and normalizes in
+/// `bfloat16`, rounding after every step: `byte * factor`, `- mean[c]`,
+/// `/ std[c]`. [`PixelNorm`] fuses the three and rounds once, in `f32`, which
+/// is a neighbouring `bfloat16` for many bytes (half of them at a mean and
+/// std of 0.5), so such a processor's floats of every dtype are cut from
+/// [`Self::table_f32`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Bf16Steps {
+    /// Multiplies the byte, as an `f32` scalar.
+    pub(crate) factor: f32,
+    /// Subtracted next, per channel, as its nearest `bfloat16`.
+    pub(crate) mean: [f32; 3],
+    /// Divides last, per channel, as its nearest `bfloat16`.
+    pub(crate) std: [f32; 3],
+}
+
+impl Bf16Steps {
+    /// The value each byte maps to, per channel: a `bfloat16` held in an
+    /// `f32`.
+    pub(crate) fn table_f32(&self) -> [[f32; 256]; 3] {
+        let channel = |mean: f32, std: f32| -> [f32; 256] {
+            std::array::from_fn(|value| {
+                to_bf16(to_bf16(to_bf16(value as f32 * self.factor) - mean) / std)
+            })
+        };
+        let mean = self.mean.map(to_bf16);
+        let std = self.std.map(to_bf16);
+        let mut table = [channel(mean[0], std[0]); 3];
+        for later in 1..3 {
+            // A channel of the first one's mean and std has its values.
+            if (mean[later].to_bits(), std[later].to_bits())
+                != (mean[0].to_bits(), std[0].to_bits())
+            {
+                table[later] = channel(mean[later], std[later]);
+            }
+        }
+        table
+    }
+}
+
+/// `value` rounded to the nearest `bfloat16` (ties to even), still an `f32`.
+fn to_bf16(value: f32) -> f32 {
+    f32::from_bits(u32::from(f32_to_bf16_bits(value)) << 16)
+}
+
+/// [`WireWriter`] for [`Bf16Steps`]: on x86-64 the vector formula where it
+/// reproduces the steps' values, else (and on every other target) the tables
+/// of those values in the wire's dtype.
+pub(crate) enum StepsWriter {
+    Tables(WireWriter),
+    #[cfg(target_arch = "x86_64")]
+    Formula(StepsFormula),
+}
+
+impl StepsWriter {
+    /// `None` for the `uint8` wire, as [`WireWriter::new`].
+    pub(crate) fn new(steps: &Bf16Steps, dtype: EncoderDtype) -> Option<Self> {
+        let table = steps.table_f32();
+        #[cfg(target_arch = "x86_64")]
+        if let Some(formula) = StepsFormula::reproducing(steps, &table, dtype) {
+            return Some(Self::Formula(formula));
+        }
+        WireWriter::of_table(&table, dtype).map(Self::Tables)
+    }
+
+    /// Bytes per written element.
+    pub(crate) fn element_size(&self) -> usize {
+        match self {
+            Self::Tables(tables) => tables.element_size(),
+            #[cfg(target_arch = "x86_64")]
+            Self::Formula(formula) => formula.element_size(),
+        }
+    }
+
+    /// [`WireWriter::write_run`] with the steps' values.
+    pub(crate) fn write_run(&self, dst: &mut [u8], src: &[u8], channel: usize) {
+        debug_assert_eq!(dst.len(), src.len() * self.element_size());
+        match self {
+            Self::Tables(tables) => tables.write_run(dst, src, channel),
+            #[cfg(target_arch = "x86_64")]
+            Self::Formula(formula) => formula.write(dst, src, channel),
+        }
+    }
+}
+
+/// The vector formula of [`Bf16Steps`]: `r(r(byte * (factor / std)) - mean /
+/// std)`, `r` rounding to `bfloat16` half-up on the bit pattern. Where the
+/// std is a power of two the division commutes with every rounding and the
+/// three steps collapse to these two. Neither that nor the absence of a tie
+/// is assumed: the formula is used only after it has written the table's 768
+/// values, checked with the code that writes.
+#[cfg(target_arch = "x86_64")]
+pub(crate) struct StepsFormula {
+    factor: [f32; 3],
+    mean: [f32; 3],
+    /// `f32` words (each `bfloat16` widened) rather than `bfloat16` words.
+    single: bool,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl StepsFormula {
+    /// The formula for `steps` in `dtype`, if it reproduces `table` for every
+    /// byte of every channel.
+    fn reproducing(
+        steps: &Bf16Steps,
+        table: &[[f32; 256]; 3],
+        dtype: EncoderDtype,
+    ) -> Option<Self> {
+        let single = match dtype {
+            EncoderDtype::BFloat16 => false,
+            EncoderDtype::Float32 => true,
+            // A `float16` word is not the `bfloat16`'s bits: the tables
+            // write it.
+            EncoderDtype::Float16 | EncoderDtype::Uint8 => return None,
+        };
+        if !avx2::detected() {
+            return None;
+        }
+        let std = steps.std.map(to_bf16);
+        let formula = Self {
+            factor: std.map(|std| steps.factor / std),
+            mean: std::array::from_fn(|channel| to_bf16(steps.mean[channel]) / std[channel]),
+            single,
+        };
+        let input: [u8; 256] = std::array::from_fn(|value| value as u8);
+        let mut output = [0u8; 1024];
+        let output = &mut output[..input.len() * formula.element_size()];
+        (0..3)
+            .all(|channel| {
+                formula.write(output, &input, channel);
+                let values = table[channel].iter().map(|value| value.to_bits());
+                // Words of a width the compiler knows: a slice of a width
+                // chosen here compares through a library call per value.
+                if single {
+                    let (written, _) = output.as_chunks::<4>();
+                    written
+                        .iter()
+                        .zip(values)
+                        .all(|(written, value)| *written == value.to_le_bytes())
+                } else {
+                    // A `bfloat16` word is the high half of its `f32`.
+                    let (written, _) = output.as_chunks::<2>();
+                    written
+                        .iter()
+                        .zip(values)
+                        .all(|(written, value)| *written == ((value >> 16) as u16).to_le_bytes())
+                }
+            })
+            .then_some(formula)
+    }
+
+    /// Bytes per written element.
+    fn element_size(&self) -> usize {
+        if self.single {
+            4
+        } else {
+            2
+        }
+    }
+
+    /// Writes `channel`'s words for `src` into `dst`.
+    fn write(&self, dst: &mut [u8], src: &[u8], channel: usize) {
+        let (factor, mean) = (self.factor[channel], self.mean[channel]);
+        if self.single {
+            avx2::write_f32_steps(dst, src, factor, mean);
+        } else {
+            avx2::write_bf16_steps(dst, src, factor, mean);
         }
     }
 }
@@ -492,10 +688,11 @@ mod neon {
 #[cfg(target_arch = "x86_64")]
 mod avx2 {
     use core::arch::x86_64::{
-        __m128i, __m256, __m256i, _mm256_add_epi32, _mm256_castps_si256, _mm256_cvtepi32_ps,
-        _mm256_cvtepu8_epi32, _mm256_div_ps, _mm256_mul_ps, _mm256_packus_epi32,
-        _mm256_permute4x64_epi64, _mm256_set1_epi32, _mm256_set1_ps, _mm256_srli_epi32,
-        _mm256_sub_ps, _mm_srli_si128,
+        __m128i, __m256, __m256i, _mm256_add_epi32, _mm256_and_si256, _mm256_andnot_si256,
+        _mm256_blend_epi16, _mm256_castps_si256, _mm256_castsi256_ps, _mm256_cvtepi32_ps,
+        _mm256_cvtepu8_epi16, _mm256_cvtepu8_epi32, _mm256_div_ps, _mm256_mul_ps,
+        _mm256_packus_epi32, _mm256_permute4x64_epi64, _mm256_set1_epi32, _mm256_set1_ps,
+        _mm256_srli_epi32, _mm256_sub_ps, _mm_srli_si128,
     };
 
     use multiversion::{multiversion, target::match_target};
@@ -649,6 +846,137 @@ mod avx2 {
     fn write_f32_scalar(dst: &mut [u8], src: &[u8], scale: f32, offset: f32, divisor: f32) {
         for (out, &value) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src) {
             *out = ((f32::from(value) * scale - offset) / divisor).to_le_bytes();
+        }
+    }
+
+    /// [`write_bf16`] for the stepped arithmetic: the `bfloat16` words of
+    /// `byte * factor - mean`, the product rounded to `bfloat16` before the
+    /// mean comes off.
+    #[multiversion(targets("x86_64+avx2"))]
+    pub(super) fn write_bf16_steps(dst: &mut [u8], src: &[u8], factor: f32, mean: f32) {
+        match_target! {
+            "x86_64+avx2" => write_bf16_steps_avx2(dst, src, factor, mean),
+            _ => write_bf16_steps_scalar(dst, src, factor, mean),
+        }
+    }
+
+    /// [`write_bf16_steps`] with each word widened to its `f32` (four bytes
+    /// each).
+    #[multiversion(targets("x86_64+avx2"))]
+    pub(super) fn write_f32_steps(dst: &mut [u8], src: &[u8], factor: f32, mean: f32) {
+        match_target! {
+            "x86_64+avx2" => write_f32_steps_avx2(dst, src, factor, mean),
+            _ => write_f32_steps_scalar(dst, src, factor, mean),
+        }
+    }
+
+    /// The bits of `value * factor - mean` for eight `f32`s with the
+    /// `bfloat16` bias added, the product rounded to `bfloat16` on the way:
+    /// the same bias rounds it half-up and `word` clears the half a
+    /// `bfloat16` drops. The high half of each lane is the result's word.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn steps_bits(
+        value: __m256,
+        factor: __m256,
+        mean: __m256,
+        bias: __m256i,
+        word: __m256i,
+    ) -> __m256i {
+        let product = _mm256_add_epi32(_mm256_castps_si256(_mm256_mul_ps(value, factor)), bias);
+        let product = _mm256_castsi256_ps(_mm256_and_si256(product, word));
+        _mm256_add_epi32(_mm256_castps_si256(_mm256_sub_ps(product, mean)), bias)
+    }
+
+    #[target_feature(enable = "avx2")]
+    fn write_bf16_steps_avx2(dst: &mut [u8], src: &[u8], factor: f32, mean: f32) {
+        let (chunks, rest) = src.as_chunks::<16>();
+        let (out, out_rest) = dst.as_chunks_mut::<32>();
+        let factor = _mm256_set1_ps(factor);
+        let mean = _mm256_set1_ps(mean);
+        let bias = _mm256_set1_epi32(0x8000);
+        let word = _mm256_set1_epi32(-0x1_0000);
+        let words = |chunk: [u8; 16]| -> [u8; 32] {
+            // A 32-bit lane takes two neighbouring bytes, the even one in its
+            // low half. Each is converted in its own vector; the even one's
+            // word then moves down and the odd one's stands where it goes, so
+            // a blend puts the sixteen in order with no pack and no permute.
+            let pairs = _mm256_cvtepu8_epi16(bytemuck::must_cast(chunk));
+            let even = _mm256_cvtepi32_ps(_mm256_andnot_si256(word, pairs));
+            let odd = _mm256_cvtepi32_ps(_mm256_srli_epi32::<16>(pairs));
+            let even = _mm256_srli_epi32::<16>(steps_bits(even, factor, mean, bias, word));
+            let odd = steps_bits(odd, factor, mean, bias, word);
+            bytemuck::must_cast(_mm256_blend_epi16::<0b1010_1010>(even, odd))
+        };
+        for (chunk, out) in chunks.iter().zip(out.iter_mut()) {
+            *out = words(*chunk);
+        }
+        if !rest.is_empty() {
+            let mut chunk = [0u8; 16];
+            chunk[..rest.len()].copy_from_slice(rest);
+            let tail = words(chunk);
+            for (out, word) in out_rest
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
+                .zip(tail.as_chunks::<2>().0)
+            {
+                *out = *word;
+            }
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    fn write_f32_steps_avx2(dst: &mut [u8], src: &[u8], factor: f32, mean: f32) {
+        let (chunks, rest) = src.as_chunks::<16>();
+        let (out, out_rest) = dst.as_chunks_mut::<64>();
+        let factor = _mm256_set1_ps(factor);
+        let mean = _mm256_set1_ps(mean);
+        let bias = _mm256_set1_epi32(0x8000);
+        let word = _mm256_set1_epi32(-0x1_0000);
+        let words = |chunk: [u8; 16]| -> [u8; 64] {
+            let [low, high] = widen(chunk);
+            bytemuck::must_cast([
+                _mm256_and_si256(steps_bits(low, factor, mean, bias, word), word),
+                _mm256_and_si256(steps_bits(high, factor, mean, bias, word), word),
+            ])
+        };
+        for (chunk, out) in chunks.iter().zip(out.iter_mut()) {
+            *out = words(*chunk);
+        }
+        if !rest.is_empty() {
+            let mut chunk = [0u8; 16];
+            chunk[..rest.len()].copy_from_slice(rest);
+            let tail = words(chunk);
+            for (out, word) in out_rest
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(tail.as_chunks::<4>().0)
+            {
+                *out = *word;
+            }
+        }
+    }
+
+    /// [`steps_bits`] one value at a time, in the same `f32` operations and
+    /// the same rounding: the clone for a core without AVX2.
+    fn steps_bits_scalar(value: u8, factor: f32, mean: f32) -> u32 {
+        let product = (f32::from(value) * factor).to_bits().wrapping_add(0x8000) & 0xffff_0000;
+        (f32::from_bits(product) - mean)
+            .to_bits()
+            .wrapping_add(0x8000)
+    }
+
+    fn write_bf16_steps_scalar(dst: &mut [u8], src: &[u8], factor: f32, mean: f32) {
+        for (out, &value) in dst.as_chunks_mut::<2>().0.iter_mut().zip(src) {
+            *out = ((steps_bits_scalar(value, factor, mean) >> 16) as u16).to_le_bytes();
+        }
+    }
+
+    fn write_f32_steps_scalar(dst: &mut [u8], src: &[u8], factor: f32, mean: f32) {
+        for (out, &value) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src) {
+            *out = (steps_bits_scalar(value, factor, mean) & 0xffff_0000).to_le_bytes();
         }
     }
 }
@@ -858,5 +1186,152 @@ mod tests {
                 assert_eq!(dst, expected, "f32, block {block}, {n} bytes");
             }
         }
+    }
+
+    /// A rescale by 1/255, then a mean and std of 0.5.
+    fn half_steps() -> Bf16Steps {
+        Bf16Steps {
+            factor: 1.0 / 255.0,
+            mean: [0.5; 3],
+            std: [0.5; 3],
+        }
+    }
+
+    /// `table`'s words for `src` in `dtype`, one value at a time.
+    fn table_words(table: &[f32; 256], src: &[u8], dtype: EncoderDtype) -> Vec<u8> {
+        src.iter()
+            .flat_map(|&byte| {
+                let value = table[usize::from(byte)];
+                match dtype {
+                    EncoderDtype::BFloat16 => f32_to_bf16_bits(value).to_le_bytes().to_vec(),
+                    EncoderDtype::Float16 => f32_to_f16_bits(value).to_le_bytes().to_vec(),
+                    _ => value.to_le_bytes().to_vec(),
+                }
+            })
+            .collect()
+    }
+
+    /// The steps round after every operation: every value is a `bfloat16`,
+    /// byte 128 is one whole `bfloat16` step above zero where the fused
+    /// formula gives half a byte step, and half of the 768 words differ from
+    /// the fused formula's.
+    #[test]
+    fn the_steps_table_is_bfloat16_arithmetic_step_by_step() {
+        let table = half_steps().table_f32();
+        assert_eq!(table[0][0], -1.0);
+        assert_eq!(table[0][128], 0.007_812_5);
+        assert_eq!(table[0][255], 1.0);
+        assert!(table
+            .iter()
+            .flatten()
+            .all(|value| value.to_bits().trailing_zeros() >= 16));
+
+        let fused = PixelNorm {
+            scale: 1.0,
+            offset: [127.5; 3],
+            divisor: [127.5; 3],
+            channel_block: 1,
+        }
+        .table_f32();
+        assert_eq!(fused[0][128], 0.5 / 127.5);
+        let differing = table
+            .iter()
+            .flatten()
+            .zip(fused.iter().flatten())
+            .filter(|(steps, fused)| f32_to_bf16_bits(**steps) != f32_to_bf16_bits(**fused))
+            .count();
+        assert_eq!(differing, 384);
+
+        // A channel of the first one's mean and std holds the first one's
+        // values; a channel of its own mean holds its own.
+        let table = Bf16Steps {
+            mean: [0.5, 0.25, 0.5],
+            ..half_steps()
+        }
+        .table_f32();
+        assert_eq!(table[2], table[0]);
+        assert_eq!((table[1][0], table[1][255]), (-0.5, 1.5));
+    }
+
+    /// On x86-64 the stepped formula reproduces the table of a std that is a
+    /// power of two, for the `bfloat16` and the `f32` wire, and a run of any
+    /// length (whole vectors, every tail, all 256 bytes) takes the table's
+    /// words through it.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_stepped_formula_writes_the_tables_words_at_every_run_length() {
+        if !avx2::detected() {
+            return;
+        }
+        let steps = half_steps();
+        let table = steps.table_f32();
+        for dtype in [EncoderDtype::BFloat16, EncoderDtype::Float32] {
+            let writer = StepsWriter::new(&steps, dtype).unwrap();
+            assert!(
+                matches!(writer, StepsWriter::Formula(_)),
+                "{dtype}: no formula"
+            );
+            for len in (0..=67).chain([256, 259]) {
+                let src: Vec<u8> = (0..len).map(|i: usize| (i * 37 + len) as u8).collect();
+                let mut dst = vec![0xa5; len * writer.element_size()];
+                writer.write_run(&mut dst, &src, 1);
+                assert_eq!(
+                    dst,
+                    table_words(&table[1], &src, dtype),
+                    "{dtype}, {len} bytes"
+                );
+            }
+        }
+    }
+
+    /// A block that is not its run's length is refused on either arm: the
+    /// vector formula would lay its tail behind the block's last whole
+    /// vector, not behind the words it wrote.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "left == right")]
+    fn the_steps_writer_refuses_a_block_that_is_not_its_runs_length() {
+        let writer = StepsWriter::new(&half_steps(), EncoderDtype::BFloat16).unwrap();
+        let src = [0u8; 17];
+        let mut dst = vec![0; (src.len() + 16) * writer.element_size()];
+        writer.write_run(&mut dst, &src, 1);
+    }
+
+    /// Steps the formula does not reproduce (a std that is no power of two)
+    /// and the `float16` wire, whose words are not the `bfloat16`'s, are
+    /// written through the tables; the `uint8` wire has no writer.
+    #[test]
+    fn steps_without_a_formula_are_written_through_the_tables() {
+        let uneven = Bf16Steps {
+            factor: 1.0 / 255.0,
+            mean: [0.485, 0.456, 0.406],
+            std: [0.229, 0.224, 0.225],
+        };
+        let src: Vec<u8> = (0..=255).collect();
+        for (steps, dtype) in [
+            (uneven, EncoderDtype::BFloat16),
+            (uneven, EncoderDtype::Float32),
+            (uneven, EncoderDtype::Float16),
+            (half_steps(), EncoderDtype::Float16),
+        ] {
+            let writer = StepsWriter::new(&steps, dtype).unwrap();
+            // The only form a writer has on another target.
+            #[cfg(target_arch = "x86_64")]
+            assert!(
+                matches!(writer, StepsWriter::Tables(_)),
+                "{dtype}: a formula"
+            );
+            let table = steps.table_f32();
+            for (channel, table) in table.iter().enumerate() {
+                let mut dst = vec![0xa5; src.len() * writer.element_size()];
+                writer.write_run(&mut dst, &src, channel);
+                assert_eq!(
+                    dst,
+                    table_words(table, &src, dtype),
+                    "{dtype}, channel {channel}"
+                );
+            }
+        }
+        assert!(StepsWriter::new(&half_steps(), EncoderDtype::Uint8).is_none());
     }
 }
