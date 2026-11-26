@@ -1036,9 +1036,9 @@ impl Places {
     /// lender that places no head is asked nothing more, and the list is
     /// then none. `APART` parts the copy a pair's sides stated apart
     /// compile ([`Made::stated_apart`]), and a shadow's own statement with
-    /// them ([`Made::stated_heads`]), from the live one list's: a closure
-    /// called from one place is built into its caller, so that statement
-    /// stays whole inside [`Made::stated`].
+    /// them ([`RequestMaker::shadow_ring`], by [`Made::stated_heads`]), from
+    /// the live one list's: a closure called from one place is built into
+    /// its caller, so that statement stays whole inside [`Made::stated`].
     #[inline(always)]
     fn of_heads<const APART: bool>(
         ring: &dyn LentRing,

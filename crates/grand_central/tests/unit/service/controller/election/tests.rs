@@ -14,12 +14,12 @@ use parking_lot::Mutex;
 use tokio::sync::watch;
 
 use super::{
-    elector, identity, run, split_identity, start, ElectionConfig, ElectionObservation, LeaseError,
-    LeasePlace, Running, Said, Word,
+    elector, give_up, identity, publish_end, run_loop, split_identity, start, ElectionConfig,
+    ElectionNotifier, ElectionObservation, LeaseError, LeasePlace, Running, Word,
 };
 use crate::{
     service::{
-        controller::replication::journaled_from,
+        controller::replication::tests::journaled_from,
         elector::{
             ConditionalWriteOutcome, ElectError, ElectionSettings, Elector, Fence, LeaseBackend,
             LeaseRecord, MemoryLease, TickOutcome, TERM_CEILING,
@@ -27,6 +27,53 @@ use crate::{
     },
     store::{LeasesStore, MemoryStore, Position},
 };
+
+/// A door no thread listens behind, for a case of the door's caller. It
+/// stands in for the handle too: the door says while this lives.
+pub(in crate::service::controller) struct Said {
+    /// The handle's part: the door holds these weakly.
+    _words: Arc<mpsc::Sender<Word>>,
+    heard: mpsc::Receiver<Word>,
+}
+
+impl Said {
+    /// The door, and what is said through it.
+    pub(in crate::service::controller) fn door() -> (ElectionNotifier, Self) {
+        let (words, heard) = mpsc::channel();
+        let words = Arc::new(words);
+        let door = ElectionNotifier {
+            words: Arc::downgrade(&words),
+        };
+        let said = Self {
+            _words: words,
+            heard,
+        };
+        (door, said)
+    }
+
+    /// The terms said since the last call, in order.
+    pub(in crate::service::controller) fn terms(&self) -> Vec<u64> {
+        self.heard
+            .try_iter()
+            .filter_map(|word| match word {
+                Word::StepDown(above) => above,
+                Word::HandOver(_) | Word::Stop => None,
+            })
+            .collect()
+    }
+}
+
+/// Runs the loop through its normal cleanup for cases that call it directly.
+fn run(
+    mut elector: Elector,
+    store: &MemoryStore,
+    standing: &watch::Sender<ElectionObservation>,
+    words: &mpsc::Receiver<Word>,
+) {
+    let seen = run_loop(&mut elector, store, standing, words);
+    give_up(&mut elector);
+    publish_end(&elector, standing, seen);
+}
 
 #[test]
 fn the_identity_is_the_id_at_the_address_and_splits_back() {

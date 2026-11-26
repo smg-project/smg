@@ -1155,7 +1155,18 @@ fn a_pair_is_made_among_first_partners_while_one_is_open() {
     assert_eq!(pair_of(&live), (1, 0));
     let pick = live.pick().expect("a pair");
     for (side, shown) in [(PairSide::Prefill, 1), (PairSide::Decode, 0)] {
-        let twin = engine.shadow_side(0, side, &req, &pool, pools, &cx, &cx, pick, scratch);
+        let twin = engine.shadow_side(
+            0,
+            side,
+            &req,
+            &pool,
+            pools,
+            &cx,
+            &cx,
+            pick,
+            scratch,
+            &|_| None,
+        );
         assert_eq!(
             twin.map(|shadow| order(&shadow)[0]),
             Some(shown),
@@ -1275,7 +1286,8 @@ fn a_decode_asked_again_is_a_first_partner_while_one_is_open() {
         let scratch = &mut Scratch::new();
         let again = engine.decide_decode(&req, &pool, pools, held, None, &cx, scratch);
         assert_eq!(pair_of(&again), (1, first));
-        let later = engine.shadow_decode_later(0, &req, &pool, pools, held, None, &cx, scratch);
+        let later =
+            engine.shadow_decode_later(0, &req, &pool, pools, held, None, &cx, scratch, &|_| None);
         assert_eq!(later.map(|shadow| order(&shadow)[0]), Some(first));
     }
 }
@@ -1313,7 +1325,8 @@ fn a_later_decode_shadow_reads_every_partner_its_call_read_past_a_doubt() {
         assert_eq!(again.trace().lifted, LiftedVeto::Liveness, "seed {seed}");
         let live = pair_of(&again).1;
         among_first += u32::from(live != 2);
-        let later = engine.shadow_decode_later(0, &req, &pool, pools, held, None, &cx, scratch);
+        let later =
+            engine.shadow_decode_later(0, &req, &pool, pools, held, None, &cx, scratch, &|_| None);
         assert_eq!(
             later.map(|shadow| order(&shadow)[0]),
             Some(live),
@@ -1621,7 +1634,18 @@ fn a_prefills_shadow_is_lifted_by_its_own_profiles_word() {
         let pair = engine.decide_pair(&req, &pool, pools, &cx, &cx, scratch);
         let pick = pair.pick().expect("a pair");
         let twins = PairSide::BOTH.map(|side| {
-            let twin = engine.shadow_side(0, side, &req, &pool, pools, &cx, &cx, pick, scratch);
+            let twin = engine.shadow_side(
+                0,
+                side,
+                &req,
+                &pool,
+                pools,
+                &cx,
+                &cx,
+                pick,
+                scratch,
+                &|_| None,
+            );
             twin.map(|shadow| order(&shadow)[0])
         });
         (pair_of(&pair).0, pick.trace.lifted, twins)
@@ -2151,10 +2175,22 @@ fn a_pairs_decode_shadow_is_put_to_its_bindings_rule() {
         };
         let first = engine.decide_pair(&req, &pool, pools, &cx, &cx, scratch);
         let pick = first.pick().expect("a pair");
-        let twin = engine.shadow_side(0, side, &req, &pool, pools, &cx, &cx, pick, scratch);
+        let twin = engine.shadow_side(
+            0,
+            side,
+            &req,
+            &pool,
+            pools,
+            &cx,
+            &cx,
+            pick,
+            scratch,
+            &|_| None,
+        );
         let twin = beside(&first, twin);
         let again = engine.decide_decode(&req, &pool, pools, held, None, &cx, scratch);
-        let later = engine.shadow_decode_later(0, &req, &pool, pools, held, None, &cx, scratch);
+        let later =
+            engine.shadow_decode_later(0, &req, &pool, pools, held, None, &cx, scratch, &|_| None);
         (twin, beside(&again, later))
     };
     let none = Some((0, LiftedVeto::None));
@@ -2190,10 +2226,22 @@ fn a_pairs_decode_shadow_reads_its_bindings_word() {
         let first = engine.decide_pair(&req, &pool, pools, &cx, &cx, scratch);
         let live = first.pick().expect("a pair");
         assert_eq!(live.trace.lifted, LiftedVeto::None);
-        let twin = engine.shadow_side(0, side, &req, &pool, pools, &cx, &cx, live, scratch);
+        let twin = engine.shadow_side(
+            0,
+            side,
+            &req,
+            &pool,
+            pools,
+            &cx,
+            &cx,
+            live,
+            scratch,
+            &|_| None,
+        );
         let again = engine.decide_decode(&req, &pool, pools, held, None, &cx, scratch);
         assert!(again.pick().is_some(), "a decode: {again:?}");
-        let later = engine.shadow_decode_later(0, &req, &pool, pools, held, None, &cx, scratch);
+        let later =
+            engine.shadow_decode_later(0, &req, &pool, pools, held, None, &cx, scratch, &|_| None);
         [twin, later].map(|shadow| shadow.expect("the decode's shadow"))
     };
     for steered in said(false) {
@@ -2228,7 +2276,18 @@ fn a_pair_the_default_made_gets_no_shadow() {
         assert_eq!(live.trace().lifted, LiftedVeto::Overload);
         let pick = live.pick().expect("a pair");
         PairSide::BOTH.map(|side| {
-            let twin = engine.shadow_side(0, side, &req, &pool, pools, &cx, &cx, pick, scratch);
+            let twin = engine.shadow_side(
+                0,
+                side,
+                &req,
+                &pool,
+                pools,
+                &cx,
+                &cx,
+                pick,
+                scratch,
+                &|_| None,
+            );
             twin.map(|shadow| order(&shadow)[0])
         })
     };
@@ -3628,7 +3687,12 @@ fn a_claim_made_in_the_gap_beside_a_standing_pin_is_followed() {
         let pinned = ring[2] as usize;
         let table = engine.sessions();
         table.lookup(request.session(), request.now_micros, &rule);
-        table.dispatched(request.session(), SessionVerdict::Pinned, pool[pinned].id);
+        table.dispatched(
+            request.session(),
+            SessionVerdict::Pinned,
+            pool[pinned].id,
+            0,
+        );
         pool[pinned].health.overloaded = true;
         let mut theirs = pool.to_vec();
         theirs[ring[0] as usize].health.healthy = false;

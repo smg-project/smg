@@ -105,10 +105,7 @@ fn signal_cells(rows: &[Candidate]) -> SignalCells {
         let used = row.load.as_ref().map_or(0, |load| load.resident_tokens);
         let sampled_at_micros = row.load_sampled_at_micros;
         for value in [200_000.0, f64::from(used)] {
-            cells.push(SignalCell {
-                value,
-                sampled_at_micros,
-            });
+            cells.push(SignalCell::of(value, sampled_at_micros));
         }
     }
     SignalCells::new(cells, 2)

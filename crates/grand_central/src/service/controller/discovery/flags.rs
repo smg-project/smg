@@ -200,11 +200,6 @@ pub(crate) struct DiscoveryFlags {
 pub(crate) struct Credential(String);
 
 impl Credential {
-    #[cfg(test)]
-    pub(super) fn for_test(value: &str) -> Self {
-        Self(value.to_owned())
-    }
-
     pub(super) fn value(&self) -> &str {
         &self.0
     }

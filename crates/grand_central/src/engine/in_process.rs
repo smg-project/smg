@@ -1039,6 +1039,12 @@ impl Loaded<'_, '_> {
     /// ([`DecisionEngine::decide_decode_under`]). The host files the decode
     /// side's issue and tells the stages of it.
     ///
+    /// `issued_micros` is the instant the pair's lease was issued at, as
+    /// the host's record of that lease states it, `0` where it states none.
+    /// A claim the call makes for its key takes that date
+    /// ([`pair::date_decode_claim`]): the host tells each word of the side
+    /// under that lease's date.
+    ///
     /// A call that hands no pair's lists is decided over no worker.
     ///
     /// # Errors
@@ -1052,12 +1058,13 @@ impl Loaded<'_, '_> {
         self,
         maker: &impl RequestMaker,
         held: &super::decision::Target,
+        issued_micros: u64,
         now: Instant,
     ) -> Result<super::decision::Decision, DecisionRefused> {
         let own = self;
         self.caught(|| {
             let mut request = own.made(maker);
-            Ok(match maker.workers() {
+            let decided = Ok(match maker.workers() {
                 WorkerLists::Pair(lists) | WorkerLists::Encode(EncodeLists { pair: lists, .. }) => {
                     let read = own.loads_read(maker);
                     let loads = read.snapshot();
@@ -1076,7 +1083,14 @@ impl Loaded<'_, '_> {
                     )
                 }
                 _ => single::over_none(own, &request),
-            })
+            });
+            // A claim the call made takes the date of the pair's lease. The
+            // decision is read where the answer stands, as a guard's call
+            // reads it ([`pair::issued`]).
+            if let Ok(decision) = &decided {
+                pair::date_decode_claim(own, &request.facts, decision, issued_micros);
+            }
+            decided
         })
     }
 }
@@ -1272,6 +1286,8 @@ impl Loaded<'_, '_> {
                 let loads = read.snapshot();
                 let sends_to = |target: &_| maker.sends_to(target);
                 let counted = || maker.session_counted_under();
+                let spec = &self.document.spec;
+                let lends = |shadow| maker.shadow_ring(spec, shadow);
                 let decided = pair::decided(
                     self,
                     &lists,
@@ -1281,6 +1297,7 @@ impl Loaded<'_, '_> {
                     now,
                     sends_to,
                     counted,
+                    &lends,
                 );
                 *whole = Some((decided, later));
                 sample::whole(self, maker, &request, now, whole.as_ref(), None);
@@ -1357,6 +1374,8 @@ impl DecisionEngine for InProcess {
                     // The decode asked again is asked which decode it is sent to.
                     let sends_to = |target: &_| maker.sends_to(target);
                     let counted = || maker.session_counted_under();
+                    let spec = &own.document.spec;
+                    let lends = |shadow| maker.shadow_ring(spec, shadow);
                     pair::decided(
                         own,
                         &lists,
@@ -1366,6 +1385,7 @@ impl DecisionEngine for InProcess {
                         now,
                         sends_to,
                         counted,
+                        &lends,
                     )
                 }
                 _ => single::issued(own, single::over_none(own, &request), &request, now),

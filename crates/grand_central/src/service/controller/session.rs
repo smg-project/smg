@@ -58,7 +58,7 @@ use super::{
     principal::Principal,
     service::Shared,
     wire::millis,
-    PROTOCOL_VERSION,
+    PROTOCOL_FLOOR, PROTOCOL_VERSION,
 };
 use crate::{
     engine::view::WorkerId,
@@ -313,12 +313,12 @@ async fn session(
             "Hello names a gateway id that is not its call's principal",
         ));
     }
-    if !(hello.protocol_min..=hello.protocol_max).contains(&PROTOCOL_VERSION) {
+    let Some(protocol) = spoken(hello.protocol_min, hello.protocol_max) else {
         return Some(Status::failed_precondition(format!(
-            "no protocol version in common: the gateway speaks {} to {}, this controller {PROTOCOL_VERSION}",
+            "no protocol version in common: the gateway speaks {} to {}, this controller {PROTOCOL_FLOOR} to {PROTOCOL_VERSION}",
             hello.protocol_min, hello.protocol_max
         )));
-    }
+    };
     if let Some(status) = listed(&hello) {
         return Some(status);
     }
@@ -353,7 +353,7 @@ async fn session(
     let vetoes_restored = seat.restore(&vetoes, now);
     let (generation, needs, hashing) = applied();
     let welcome = proto::Welcome {
-        protocol: PROTOCOL_VERSION,
+        protocol,
         generation,
         controller_id: shared.controller_id.clone(),
         principal: Some(proto::Principal {
@@ -486,6 +486,22 @@ fn floor(shared: &Shared, subject: &str, floor: u64, term: u64) -> Option<Status
 /// The end of a session a newer one of its gateway replaced.
 fn replaced() -> Status {
     Status::aborted("a newer session of this gateway took this one's place")
+}
+
+/// The protocol version a session speaks: the newest that a `Hello`'s range
+/// from `min` to `max` and this build's own have in common, and `None`
+/// where they share none.
+const fn spoken(min: u32, max: u32) -> Option<u32> {
+    let newest = if max < PROTOCOL_VERSION {
+        max
+    } else {
+        PROTOCOL_VERSION
+    };
+    if newest >= PROTOCOL_FLOOR && newest >= min {
+        Some(newest)
+    } else {
+        None
+    }
 }
 
 /// The form of a `Hello`'s veto list, judged before anything is applied and

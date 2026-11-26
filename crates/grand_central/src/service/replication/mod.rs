@@ -20,7 +20,7 @@
 //! load row an older leader tells it. Every other entry of the store stands on one
 //! list with what rebuilds it on a standby ([`ENTRIES`]): a gateway's own
 //! facts return in its hello, each replica hears the engines' cache events
-//! itself, and a decision's writes (pins, reservations, lease ends) are not
+//! itself, and a decision's writes (pins, lease ends) are not
 //! journaled yet. A generation's document is not the log's to hold: the
 //! door that applied it keeps the bytes, and the stream that sends the
 //! event joins them.

@@ -377,8 +377,8 @@ impl InProcess {
     /// A count of sends stands where a profile that reads it is kept,
     /// whichever of its other readers changed, left or came. A profile
     /// built new beside it reads the same count. A count none of whose
-    /// readers is kept is built new and takes over a standing count: which
-    /// one is the count's own rule
+    /// readers is kept is built new and takes over what the standing
+    /// counts hold: how is the count's own rule
     /// ([`Engine::succeed`](crate::engine::Engine::succeed)). Every other
     /// stage starts empty, a registered one too.
     ///

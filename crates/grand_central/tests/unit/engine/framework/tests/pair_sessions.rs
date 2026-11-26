@@ -729,7 +729,7 @@ fn capped_prefill_sides(engine: &Engine, keyed: &RequestFacts<'_>) -> [Vec<Candi
     let served = prefills[0].id;
     engine
         .sessions
-        .dispatched(prefill_session, SessionVerdict::Pinned, served);
+        .dispatched(prefill_session, SessionVerdict::Pinned, served, 0);
     prefills[0].session_in_flight = SESSIONS.inflight_cap;
     sides
 }
@@ -864,7 +864,7 @@ impl Picker for DecidesBeside {
         if let Some((table, session, worker)) = beside.staged.take() {
             beside.read = Some(table.lookup(session, facts.now_micros, &SESSIONS));
             table.respilled(session, worker);
-            table.dispatched(session, SessionVerdict::Respill, worker);
+            table.dispatched(session, SessionVerdict::Respill, worker, 0);
         }
     }
 }
@@ -912,6 +912,151 @@ fn a_request_decided_inside_a_pairs_decision_reads_no_move_and_keeps_its_pin() {
     assert_eq!(engine.sessions.pins(prefill_session), behind);
 }
 
+/// A sessions rule whose keys idle out: a claim made at 10 has ended by
+/// 1,200.
+const IDLES: SessionRule = SessionRule {
+    inflight_cap: 0,
+    ttl_micros: Some(1_000),
+    sweep_micros: 100,
+    ..SESSIONS
+};
+
+/// The table, the session, the worker and the instant of a later
+/// decision that [`ClaimsBeside`] stages.
+type LaterClaim = (Arc<SessionTable>, Session, WorkerId, u64);
+
+/// [`RefusesClass`], with a later decision of the session made inside a
+/// pair's decision. Where the picker declines, between the prefill
+/// side's run and the pair's forming, the key has idled out and the
+/// staged decision claims its worker at its own instant. It is staged
+/// once.
+#[derive(Debug)]
+struct ClaimsBeside(RefusesClass, Arc<Mutex<Option<LaterClaim>>>);
+
+impl Lifecycle for ClaimsBeside {}
+
+impl Picker for ClaimsBeside {
+    fn name(&self) -> &'static str {
+        "claims-beside"
+    }
+
+    fn pick(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        scores: &[f32],
+        band: TieBand,
+        out: &mut Targets,
+    ) {
+        self.0.pick(facts, candidates, kept, scores, band, out);
+        if !out.is_empty() {
+            return;
+        }
+        let staged = self.1.lock().expect("the staged decision").take();
+        if let Some((table, session, worker, later)) = staged {
+            let seen = table.lookup(session, later, &IDLES);
+            assert_eq!(seen, [WorkerId(0); 2], "the key idled out");
+            assert_eq!(
+                table.claim(session, seen, worker, later),
+                Claim::Made(worker)
+            );
+        }
+    }
+}
+
+/// A pair decided at 10 under [`IDLES`], whose decode picker stages a
+/// later decision's claim of the idle prefill at 1,200
+/// ([`ClaimsBeside`]). The two prefills and their decodes are of the
+/// pair classes given: class 7 is declined. The engine, the two sides
+/// and the request.
+fn pair_with_a_later_claim(
+    classes: [u32; 2],
+) -> (Engine, [Vec<Candidate>; 2], RequestFacts<'static>) {
+    let mut sides = two_sides(&[0, 5], &[0, 0]);
+    for side in &mut sides {
+        (side[0].pair_class, side[1].pair_class) = (classes[0], classes[1]);
+    }
+    let keyed = RequestFacts {
+        now_micros: 10,
+        ..pair_request(Some(7))
+    };
+    let [prefill_session, _] = side_sessions(&keyed);
+    let staged = Arc::new(Mutex::new(None));
+    let decode = Profile {
+        picker: Box::new(ClaimsBeside(RefusesClass(7), Arc::clone(&staged))),
+        ..declining_decode_profile()
+    };
+    let binding = Binding {
+        decode_profile: Some(1),
+        sessions: Some(IDLES),
+        ..pair_binding()
+    };
+    let profiles = vec![least_requests_profile(), decode];
+    let engine = Engine::new(profiles, vec![binding], 1, Needs::default());
+    let later = (
+        Arc::clone(&engine.sessions),
+        prefill_session,
+        sides[0][0].id,
+        1_200,
+    );
+    *staged.lock().expect("the staged decision") = Some(later);
+    (engine, sides, keyed)
+}
+
+/// A pair that sheds withdraws its own claim alone. A later decision
+/// claims the same prefill inside the pair's decision, behind the key's
+/// idle end. The pair then forms on no prefill, and its withdrawal
+/// leaves the later claim: the key's pin stands for that decision. The
+/// later decision's own refusal takes it back.
+#[test]
+fn a_pair_that_sheds_leaves_a_later_decisions_claim_on_its_prefill() {
+    let (engine, sides, keyed) = pair_with_a_later_claim([7, 7]);
+    let [prefill_session, _] = side_sessions(&keyed);
+    let claimed = sides[0][0].id;
+    let pools = PairPools {
+        prefills: &sides[0],
+        decodes: &sides[1],
+        ..PairPools::default()
+    };
+    let (pool, cx) = (PoolFacts::default(), Constraints::default());
+    let mut scratch = Scratch::new();
+    let declined = engine.decide_pair(&keyed, &pool, pools, &cx, &cx, &mut scratch);
+    assert!(declined.pick().is_none(), "{declined:?}");
+    let pins = || engine.sessions.pins(prefill_session);
+    assert_eq!(pins(), Some([claimed, WorkerId(0)]), "the later claim");
+    let none = WorkerId(0);
+    engine
+        .sessions
+        .move_claim(prefill_session, claimed, none, 1_200);
+    assert_eq!(pins(), Some([none; 2]), "its own decision's refusal");
+}
+
+/// A pair that passes over the prefill it claimed moves its own claim
+/// alone. A later decision claims that prefill inside the pair's
+/// decision, behind the key's idle end. The pair forms on the next
+/// prefill and moves nothing: the later claim stands where it was made,
+/// and the pair states the key as pinned.
+#[test]
+fn a_pair_that_passes_over_its_prefill_leaves_a_later_decisions_claim_there() {
+    let (engine, sides, keyed) = pair_with_a_later_claim([7, 8]);
+    let [prefill_session, _] = side_sessions(&keyed);
+    let (claimed, paired) = (sides[0][0].id, sides[0][1].id);
+    let pools = PairPools {
+        prefills: &sides[0],
+        decodes: &sides[1],
+        ..PairPools::default()
+    };
+    let (pool, cx) = (PoolFacts::default(), Constraints::default());
+    let mut scratch = Scratch::new();
+    let decision = engine.decide_pair(&keyed, &pool, pools, &cx, &cx, &mut scratch);
+    let pick = decision.pick().expect("a pair");
+    assert_eq!(pick.targets.first().map(|target| target.id), Some(paired));
+    assert_eq!(pick.session_verdict, SessionVerdict::Pinned);
+    let stands = Some([claimed, WorkerId(0)]);
+    assert_eq!(engine.sessions.pins(prefill_session), stands);
+}
+
 /// A decode side under a capped rule hands its key on at the cap among
 /// the partners of the prefill that pairs. The decode taken leads the
 /// decode side's pins where the side is decided, ahead of any
@@ -932,7 +1077,7 @@ fn a_decode_side_at_its_cap_respills_among_its_partners_where_it_is_decided() {
         .lookup(decode_session, keyed.now_micros, &SESSIONS);
     engine
         .sessions
-        .dispatched(decode_session, SessionVerdict::Pinned, served);
+        .dispatched(decode_session, SessionVerdict::Pinned, served, 0);
     sides[1][0].session_in_flight = SESSIONS.inflight_cap;
     let pools = PairPools {
         prefills: &sides[0],
@@ -998,8 +1143,18 @@ fn a_decode_side_under_a_rule_leaves_the_prefills_buffer_to_the_prefill() {
         assert_eq!(pick.trace.lifted, LiftedVeto::Overload, "{key:?}");
         assert_eq!(scratch.single.lifted, LiftedVeto::None, "{key:?}");
         let side = PairSide::Prefill;
-        let shadow =
-            engine.shadow_side(0, side, &facts, &pool, pools, &cx, &cx, pick, &mut scratch);
+        let shadow = engine.shadow_side(
+            0,
+            side,
+            &facts,
+            &pool,
+            pools,
+            &cx,
+            &cx,
+            pick,
+            &mut scratch,
+            &|_| None,
+        );
         let speaks = shadow.is_some_and(|shadow| shadow.pick().is_some());
         assert_eq!(speaks, key.is_none(), "{key:?}");
     }
@@ -1032,12 +1187,31 @@ fn a_side_its_sessions_rule_placed_is_run_no_shadow() {
         let pick = live.pick().expect("a pair");
         let held = pick.targets.first().expect("the pair's first target").id;
         let sides = PairSide::BOTH.map(|side| {
-            let shadow =
-                engine.shadow_side(0, side, &facts, &pool, pools, &cx, &cx, pick, &mut scratch);
+            let shadow = engine.shadow_side(
+                0,
+                side,
+                &facts,
+                &pool,
+                pools,
+                &cx,
+                &cx,
+                pick,
+                &mut scratch,
+                &|_| None,
+            );
             shadow.is_some()
         });
-        let later =
-            engine.shadow_decode_later(0, &facts, &pool, pools, held, None, &cx, &mut scratch);
+        let later = engine.shadow_decode_later(
+            0,
+            &facts,
+            &pool,
+            pools,
+            held,
+            None,
+            &cx,
+            &mut scratch,
+            &|_| None,
+        );
         (sides, later.is_some())
     };
     let rule = SessionRule {

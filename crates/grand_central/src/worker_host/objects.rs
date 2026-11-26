@@ -36,9 +36,9 @@ use super::members::{EncodeColumns, Members, Stated};
 #[cfg(feature = "in-process")]
 use super::reach::{ListReach, Reach};
 use super::{
-    credentials::Credentials,
+    credentials::{Credentials, RegistrationInFlight},
     kv_tables::KvTables,
-    membership_writer::MembershipWriteRefused,
+    membership_writer::{MembershipWriteOutcome, MembershipWriteRefused},
     object::{builder, dial_address, external, status, takes_default, thresholds, unchecked},
     remainder::RowRemainder,
 };
@@ -61,13 +61,6 @@ mod read;
 mod standby;
 mod status;
 mod write;
-
-#[cfg(test)]
-pub(crate) use status::tests::stand;
-#[cfg(all(test, feature = "controller"))]
-pub(crate) use tests::stored_chain;
-#[cfg(test)]
-pub(crate) use write::tests::lay_standing;
 
 /// The row an object stands for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -195,15 +188,14 @@ impl Held {
 /// which carries the standing object's running state over. An entry's
 /// revision never moves under an object that stands.
 ///
-/// With a keeper ([`Self::with_credentials`]), each read of the store has
-/// the keeper forget the rows that left, whoever wrote the removal, and an
-/// entry goes with its last row. The holder reads the store in two
-/// places. A
-/// cut laid whole reads the store's rows once, then the status the table
+/// With a keeper ([`Self::with_credentials`]), two passes have the keeper
+/// forget the rows that left, whoever wrote the removal: a cut laid whole
+/// and a write the store refuses. An entry goes with its last row. A cut
+/// laid whole lays the cut's own rows, then reads the status the table
 /// holds for each. A write
 /// the store refuses reads the write's own record, and
 /// the keeper forgets that one row where it left. The
-/// keeper's clock is read ahead of the store: a row bound behind that read
+/// keeper's clock is read ahead of each pass: a row bound behind that read
 /// stays, and a later pass forgets it where it left.
 /// Two turns forget with no read. A write call that takes a row
 /// out has the keeper forget that row. [`Self::lay_again`] has it forget
@@ -406,11 +398,18 @@ impl<G: Generation> Objects<G> {
     }
 
     /// The keeper the holder reads at an object's build, where the host
-    /// handed one ([`Self::with_credentials`]). A registration line that
-    /// keeps reads it here, so the line's write and the build read one
-    /// keeper.
+    /// handed one ([`Self::with_credentials`]). The registration line that
+    /// keeps is handed no keeper: the holder keeps for it in this one, so
+    /// the line's write and the build read one keeper.
     pub fn credentials(&self) -> Option<&Arc<Credentials>> {
         self.credentials.as_ref()
+    }
+
+    /// Whether the host handed the holder a keeper
+    /// ([`Self::with_credentials`]). A registration line that keeps is
+    /// built over such a holder alone.
+    pub(super) fn keeps_credentials(&self) -> bool {
+        self.credentials.is_some()
     }
 
     /// Hand the holder the KV tables its rows' lanes are made in. The
@@ -566,7 +565,7 @@ impl<G: Generation> Objects<G> {
     /// alone moves no row and lays another object, so an object changes
     /// while its row's revision stands. The call refuses the write as
     /// moved, ahead of it, where another object stands under `url` by then.
-    pub(super) fn keeping<T>(
+    fn keeping<T>(
         &self,
         url: &str,
         over: Option<&Arc<dyn Worker>>,
@@ -580,6 +579,61 @@ impl<G: Generation> Objects<G> {
             }
         }
         Ok(write())
+    }
+
+    /// One registration that keeps its credential, whole, in a turn of its
+    /// own ([`Self::keeping`]). The holder keeps what `stated` holds, the
+    /// facts and the credential of the registration's first worker, ahead
+    /// of `write`: a row's object may be built inside the door's turn.
+    /// `write` writes the rows at the door, as a guarded write over `over`
+    /// under `url` where it names one. The holder answers its keeper with
+    /// the door's answer, with no await between the two: the rows the door
+    /// wrote are accepted, and a refusal puts back what stood. Where the
+    /// keeper says an object may hold another credential than its row
+    /// takes, the holder lays the address again and hands `store` each
+    /// row's count ([`Self::lay_again`]).
+    ///
+    /// One registration is in flight at an address: a second is refused
+    /// ahead of `write` ([`RegistrationInFlight`]), and its caller tries
+    /// again. A registration that states no worker keeps nothing and
+    /// writes all the same, and so does one over a holder with no keeper.
+    pub(super) fn register_keeping<S: WorkersStore + ?Sized>(
+        &self,
+        store: &S,
+        stated: Option<(&WorkerFacts, Option<String>)>,
+        (url, over): (&str, Option<&Arc<dyn Worker>>),
+        write: impl FnOnce() -> Result<Vec<MembershipWriteOutcome>, MembershipWriteRefused>,
+    ) -> Result<Result<Vec<MembershipWriteOutcome>, MembershipWriteRefused>, RegistrationInFlight>
+    {
+        let whole = || {
+            let kept = match (&self.credentials, stated) {
+                (Some(credentials), Some((facts, credential))) => {
+                    Some((credentials.keep(facts, credential)?, facts))
+                }
+                _ => None,
+            };
+            let answer = write();
+            if let Some((kept, facts)) = kept {
+                let rows: Vec<WorkerId> = answer
+                    .iter()
+                    .flatten()
+                    .filter_map(MembershipWriteOutcome::written_row)
+                    .collect();
+                let again = if rows.is_empty() {
+                    kept.put_back()
+                } else {
+                    kept.accepted_rows(&rows)
+                };
+                if again {
+                    self.lay_again(store, facts);
+                }
+            }
+            Ok(answer)
+        };
+        match self.keeping(url, over, whole) {
+            Ok(answer) => answer,
+            Err(moved) => Ok(Err(moved)),
+        }
     }
 
     /// The registry the objects stand in.
@@ -748,7 +802,7 @@ impl<G: Generation> Objects<G> {
         credentials.forget_left(read, |row| row != left || held.facts.contains_key(&row));
     }
 
-    /// The store's rows, whole: the objects of rows that went are dropped
+    /// A cut's rows, whole: the objects of rows that went are dropped
     /// first, each leaving its URL to a later incarnation's, then every row
     /// that does not stand as its object was built is laid again. No
     /// revision held is trusted alone here: in another history, a row
@@ -1302,4 +1356,4 @@ impl Objects<Members> {
 
 #[cfg(test)]
 #[path = "../../tests/unit/worker_host/objects/tests.rs"]
-mod tests;
+pub(super) mod tests;

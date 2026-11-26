@@ -15,7 +15,11 @@ use crate::{
         controller::{
             decision_slots::tests::{followed, frame_for, holder, lent_pick, preset, unserved},
             election::LeasePlace,
-            replication::{journaled, journaled_from, parts, Replication},
+            replication::{
+                journaled,
+                tests::{journaled_from, parts},
+                Replication,
+            },
             worker_objects::WorkerObjects,
         },
         elector::{ElectionSettings, Elector, TickOutcome},
@@ -24,8 +28,27 @@ use crate::{
     },
     stages::registry,
     store::{WorkerFacts, WorkerStatus, WorkersStore},
-    worker_host::lay_standing,
+    worker_host::tests::lay_standing,
 };
+
+impl Lag {
+    /// The age at `now` of the last frame at the head; `None` where the lag
+    /// holds none.
+    pub(in crate::service::controller) fn age(&self, now: Instant) -> Option<Duration> {
+        self.read(now).map(|(age, _)| age)
+    }
+
+    /// Whether this replica is synced at `now`: its last frame at the head
+    /// is younger than the bound.
+    fn synced(&self, now: Instant) -> bool {
+        self.read(now).is_some_and(|(_, lapse)| lapse.is_some())
+    }
+
+    /// The bound [`Lag::synced`] reads under.
+    pub(in crate::service::controller) fn within(&self) -> Duration {
+        self.within
+    }
+}
 
 type Replica = (Arc<MemoryStore>, Arc<Log>);
 

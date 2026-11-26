@@ -85,8 +85,6 @@ use tracing::{info, warn};
 
 #[cfg(any(test, feature = "controller"))]
 use super::spec_store::StoreRefused;
-#[cfg(feature = "controller")]
-use super::SerialTurn;
 use super::{
     answers::OnFile,
     spec_store::{Persisted, SpecStore},
@@ -388,22 +386,6 @@ fn no_spec_store() -> SpecRejected {
 /// document again.
 type Written = (u64, Digest, Option<Vec<NeedsRow>>);
 
-/// How many dry runs may wait their turn: a call past them is refused. What
-/// waits is bounded by count here, and by bytes before it waits: a document
-/// over the size bound takes no turn, and a guard longer than a digest's
-/// text takes none. 32 passes of the heaviest file the
-/// search finds, each under 40 ms at the median by run, are under a second
-/// and a half, and 32 documents of the size bound with their guards are
-/// 4 MiB. A waiting call that ends leaves the wait and frees its place.
-#[cfg(feature = "controller")]
-pub(crate) const DRY_RUNS_WAITING: usize = 32;
-
-/// How many write calls may wait for the door: a call past them is refused.
-/// A waiting call holds its document, so what waits is bounded as the dry
-/// runs are: 32 documents of the size bound are 4 MiB.
-#[cfg(feature = "controller")]
-pub(crate) const WRITES_WAITING: usize = 32;
-
 /// A host's manager of its policy document: the pass, the numbering, the
 /// no-change rule, the held document and counts. With a spec store it also
 /// owns the directory and the generations a rollback can name.
@@ -436,12 +418,6 @@ pub struct DocumentManager {
     /// call answers them. Written under the door's lock, at the bind and at
     /// each write; a reader copies one entry out.
     on_file: Mutex<Vec<Retained>>,
-    /// One dry run at a time for a host that uses this turn.
-    #[cfg(feature = "controller")]
-    pub(crate) dry_turn: SerialTurn,
-    /// Enforce and rollback share one write turn.
-    #[cfg(feature = "controller")]
-    pub(crate) write_turn: SerialTurn,
     /// The standing generation's document. An apply swaps it under this
     /// lock with its call of the store's entry, so a reader sees the number
     /// and the document move together and waits on no validation. `None`
@@ -485,10 +461,6 @@ impl DocumentManager {
             binding: Mutex::new(()),
             dir: OnceLock::new(),
             on_file: Mutex::new(Vec::new()),
-            #[cfg(feature = "controller")]
-            dry_turn: SerialTurn::new(DRY_RUNS_WAITING),
-            #[cfg(feature = "controller")]
-            write_turn: SerialTurn::new(WRITES_WAITING),
             held: Mutex::new(None),
             applied: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
@@ -606,7 +578,7 @@ impl DocumentManager {
     /// behind the count and the log's line. A publication that does not
     /// land runs none. A hook that panics leaves the generation in force,
     /// counted and logged, with what the hook had not done yet.
-    pub(crate) fn enter(
+    fn enter(
         &self,
         next: AppliedSpec,
         kept: Held,
@@ -1153,23 +1125,6 @@ impl DocumentManager {
             })
         })
     }
-
-    #[cfg(test)]
-    fn bound(&self) -> bool {
-        self.writable() || self.held.lock().is_some()
-    }
-}
-
-/// The door's two locks, for a case in another module.
-#[cfg(all(test, feature = "controller"))]
-impl DocumentManager {
-    pub(crate) fn applying_lock(&self) -> &Mutex<Option<SpecStore>> {
-        &self.applying
-    }
-
-    pub(crate) fn held_lock(&self) -> &Mutex<Option<Held>> {
-        &self.held
-    }
 }
 
 /// The door's apply lock, held for a follower's event
@@ -1177,6 +1132,7 @@ impl DocumentManager {
 /// the event's pass to its commit or its drop. No apply and no second
 /// source comes between the two.
 #[cfg(feature = "controller")]
+#[must_use = "the apply lock is let go when the turn drops"]
 pub(crate) struct FollowerTurn<'a> {
     door: &'a DocumentManager,
     applying: MutexGuard<'a, Option<SpecStore>>,

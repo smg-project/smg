@@ -64,7 +64,7 @@ score:
   - least-requests
 ```
 
-[Built-in stages](../REFERENCE.md#built-in-stages) lists every stage with its settings.
+[The stages page](stages.md) lists every stage with its settings.
 
 ### The tally of sends
 
@@ -153,7 +153,9 @@ Where several patterns match one model, the most specific wins:
 
 A spec that holds a `prefix*` and a `*suffix` of equal length is refused.
 
-A host can read these settings for an index of its own. The crate's engine reads `kind` and `max_size` alone, for a pool whose profile reads sent prefixes:
+A host can read these settings for an index of its own. The gateway does: at each sweep it trims each tree of a model toward `max_size`, each tree by itself. Writes take a tree past it until the next sweep. At a `sweep_s` of 4294967295 it starts no sweep, and a tree under that entry is held to no size. The engine's record keeps its bound at any cadence.
+
+The crate's engine reads `kind` and `max_size` alone, for a pool whose profile reads sent prefixes:
 
 - Under `tree`, the engine bounds the model's record of sent prefixes at `max_size` divided by the block size. The record holds one placement for each block a worker was sent.
 - At the defaults that is 4,194,304 placements. The record takes about 55 bytes a block, so about 230 MB a model.

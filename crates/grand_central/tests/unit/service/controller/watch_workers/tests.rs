@@ -22,6 +22,7 @@ use super::{
     WATCHES_MAX,
 };
 use crate::{
+    document::operator::SerialTurn,
     engine::view::WorkerId,
     service::{
         controller::{
@@ -29,19 +30,43 @@ use crate::{
             election::LeasePlace,
             gateways::tests::PATIENT,
             membership::tests::Logged,
-            principal::tests::told,
-            replication::{journaled, journaled_from, FIRST_PLACES, WATCHED_EVENTS},
+            principal::{tests::told, Principal},
+            replication::{journaled, tests::journaled_from, FIRST_PLACES, WATCHED_EVENTS},
             worker_wire,
         },
         elector::{Elector, TickOutcome},
         proto::{self, worker_event::Event},
     },
     store::{
-        Journal, LeasesStore, MembershipChange, MemoryStore, Position, Registrant, WorkerFacts,
-        WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
+        Journal, LeasesStore, MembershipChange, MemoryStore, Position, Registrant, StoreCheckpoint,
+        WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
     },
-    worker_host::{stand, Members, Objects},
+    worker_host::{tests::stand, Members, Objects},
 };
+
+impl Feed {
+    /// The cuts of every row this feed took, for a case.
+    pub(in crate::service::controller) fn cuts(&self) -> usize {
+        self.cuts.load(Ordering::Relaxed)
+    }
+
+    /// The kept cut, for a case.
+    pub(in crate::service::controller) fn kept(&self) -> Option<Arc<StoreCheckpoint>> {
+        self.rows.lock().clone()
+    }
+}
+
+impl Readers {
+    /// The snapshots' turn, for a case that fills it or holds it.
+    pub(in crate::service::controller) fn snapshots(&self) -> &SerialTurn {
+        &self.snapshots
+    }
+
+    /// The watches `by` holds open.
+    fn open_of(&self, by: &Principal) -> usize {
+        self.held.lock().get(&by.gateway()).copied().unwrap_or(0)
+    }
+}
 
 /// A replica that leads under term 1, its store standing in that term.
 struct Leader {
@@ -778,6 +803,32 @@ async fn a_watched_write_wakes_the_feeds_one_task_and_that_task_the_watches() {
     );
 }
 
+/// Each watch parks in a slot of its own: a watched write wakes every
+/// parked stream, not the last to park alone.
+#[tokio::test]
+async fn a_watched_write_wakes_every_stream_that_parked() {
+    let leader = leader();
+    let id = leader.register(0, 1, "model-a");
+    let mut streams: Vec<Watching> = (0..2).map(|_| leader.watch(Start::Snapshot, &[])).collect();
+    for stream in &mut streams {
+        next(stream).await;
+    }
+    turns().await;
+    let wakers: Vec<_> = (0..2).map(|_| Woken::waker()).collect();
+    for (stream, (_, waker)) in streams.iter_mut().zip(&wakers) {
+        parks(stream, waker);
+    }
+    stand(&leader.objects, &leader.store, id, WorkerStatus::Ready);
+    // The write is over, and on this one thread no task has had a turn
+    // since: both streams are parked still.
+    for (woken, _) in &wakers {
+        assert_eq!(woken.wakes(), 0, "a park or the write woke a watch");
+    }
+    for (woken, _) in &wakers {
+        woken.reads(1).await;
+    }
+}
+
 /// A write that lands before the feed's task first parks is kept for
 /// it, once: the task wakes the parked streams at its first turn. A
 /// wake of a parked task alone would lose that write's telling.
@@ -924,6 +975,46 @@ async fn a_stream_that_is_gone_gives_its_slot_to_the_next() {
     assert_eq!(leader.feed.parked.lock().wakers.len(), WATCHES_MAX);
 }
 
+/// A stream that is gone takes its waker with it, and the slot it gives
+/// back is one stream's: a write behind its leave wakes it no more, and
+/// the two streams that open behind it park apart, from each other and
+/// from the stream that stayed.
+#[tokio::test]
+async fn a_stream_that_is_gone_is_woken_no_more_and_leaves_one_slot() {
+    let leader = leader();
+    let id = leader.register(0, 1, "model-a");
+    let mut stays = leader.watch(Start::Snapshot, &[]);
+    let mut goes = leader.watch(Start::Snapshot, &[]);
+    for stream in [&mut stays, &mut goes] {
+        next(stream).await;
+    }
+    turns().await;
+    let (stayed, waker) = Woken::waker();
+    let (gone, left) = Woken::waker();
+    parks(&mut stays, &waker);
+    parks(&mut goes, &left);
+    drop(goes);
+    stand(&leader.objects, &leader.store, id, WorkerStatus::Ready);
+    stayed.reads(1).await;
+    assert_eq!(gone.wakes(), 0, "a stream that is gone was woken");
+    next(&mut stays).await;
+
+    let mut streams = vec![stays];
+    streams.extend((0..2).map(|_| leader.watch(Start::Snapshot, &[])));
+    for stream in &mut streams[1..] {
+        next(stream).await;
+    }
+    turns().await;
+    let wakers: Vec<_> = (0..3).map(|_| Woken::waker()).collect();
+    for (stream, (_, waker)) in streams.iter_mut().zip(&wakers) {
+        parks(stream, waker);
+    }
+    leader.register(1, 1, "model-a");
+    for (woken, _) in &wakers {
+        woken.reads(1).await;
+    }
+}
+
 /// A burst past what a read takes, beside a watcher that takes nothing
 /// meanwhile, ends no watch and loses no event: what a stream has not
 /// read waits in the log, and the stream reads on from its place.
@@ -1038,6 +1129,36 @@ async fn the_last_watch_to_leave_lets_the_kept_cut_go() {
     assert!(leader.feed.rows.lock().is_some(), "a watch is open");
     drop(second);
     leader.holds("gateway-b", 0);
+    assert!(leader.feed.rows.lock().is_none(), "the last watch left");
+}
+
+/// The last watch to leave waits for the kept cut's lock, where a stream
+/// that reads behind a write only tries it: the cut goes whoever holds
+/// the lock at that moment.
+#[tokio::test]
+async fn the_last_watch_to_leave_waits_for_the_kept_cuts_lock() {
+    let leader = leader();
+    leader.register(0, 1, "model-a");
+    let mut stream = leader.watch(Start::Snapshot, &[]);
+    next(&mut stream).await;
+    let (left, leaves) = mpsc::channel();
+    let (going, goes) = mpsc::channel();
+    thread::scope(|scope| {
+        let held = leader.feed.rows.lock();
+        assert!(held.is_some(), "a watch is open");
+        scope.spawn(|| {
+            let _ = going.send(());
+            drop(stream);
+            let _ = left.send(());
+        });
+        // The thread stands at its drop: a leave that only tried the lock
+        // would be over within the wait that follows.
+        assert_eq!(goes.recv_timeout(Duration::from_secs(10)), Ok(()));
+        let early = leaves.recv_timeout(Duration::from_millis(200));
+        drop(held);
+        assert!(early.is_err(), "the leave did not wait for the lock");
+    });
+    assert_eq!(leaves.recv_timeout(Duration::from_secs(10)), Ok(()));
     assert!(leader.feed.rows.lock().is_none(), "the last watch left");
 }
 

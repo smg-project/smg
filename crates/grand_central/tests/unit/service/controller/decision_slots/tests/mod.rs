@@ -59,8 +59,15 @@ use crate::{
         MemoryStore, Registrant, WorkerFacts, WorkerStatus, WorkersStore,
     },
     tracking::lease::{Dispatch, Lease, LeaseId, ReleaseReason, Said, Side, DISPATCH_TTL},
-    worker_host::{stand, Members, Objects},
+    worker_host::{tests::stand, Members, Objects},
 };
+
+impl DecisionSlots {
+    /// What a decider's thread tells at its unwind, told by a case.
+    pub(in crate::service::controller) fn tell_unwound(&self) {
+        self.told.send_replace(true);
+    }
+}
 
 pub(crate) mod encode;
 mod named;
@@ -160,7 +167,7 @@ pub(crate) fn followed(
     (store, feed): (Arc<MemoryStore>, Feed),
 ) -> (Arc<MemoryStore>, Feed, Arc<Objects<Members>>, LoadReceiver) {
     let objects = holder(&store);
-    (store, feed, objects, frame_loads::silent())
+    (store, feed, objects, frame_loads::tests::silent())
 }
 
 /// `standing` with the rest of a run loop's side where no serve runs,

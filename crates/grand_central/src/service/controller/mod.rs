@@ -125,10 +125,18 @@ use crate::{
 /// The protobuf package of the controller's API.
 pub const PROTOCOL_PACKAGE: &str = "smg.policy.v1";
 
-/// The protocol version this build speaks: `Hello`'s range, `Welcome`'s
-/// pick and the range `Leader` answers (design 5.2). A change within the
-/// package is additive and keeps it.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// The newest protocol version this build speaks: the top of the range its
+/// `Hello` offers and its `Leader` answers, and the newest its `Welcome`
+/// picks (design 5.2). A change a peer must know its controller reads
+/// raises it, and every other additive change within the package keeps
+/// it. Version 2 is the first whose frames state a request's hard demands
+/// (`DecideRequest.demands`).
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// The oldest protocol version this build speaks, the bottom of the same
+/// two ranges: a controller speaks its own version and the one before it,
+/// and upgrades first.
+pub const PROTOCOL_FLOOR: u32 = PROTOCOL_VERSION - 1;
 
 /// The gRPC service every scope is a part of (design 8: one service, four
 /// credentialed scopes), as the health service names it. Every listener
@@ -484,14 +492,12 @@ impl Controller {
         // The load monitor is built stopped, ahead of the deciding threads:
         // each takes its channel at its start, and the serve runs its task.
         let monitor = worker_objects::LoadMonitor::new(&workers, config.load_poll_interval);
+        // The feed takes the monitor's two parts ahead of its first stream.
         // The load records on the workers' streams go to the monitor while
-        // this replica leads: the feed takes their sink ahead of its first
-        // stream.
-        kv_feed.set_load_sink(monitor.pushed());
-        // The monitor says whose loads are wanted, so a gRPC worker that is
-        // not indexed streams its load records alone. Every replica opens
-        // that stream: a take finds it open.
-        kv_feed.set_loads_wanted(monitor.wanted());
+        // this replica leads. The monitor says whose loads are wanted, so a
+        // gRPC worker that is not indexed streams its load records alone.
+        // Every replica opens that stream: a take finds it open.
+        monitor.fed_by(&kv_feed);
         // The serve's two words, each said by one task of it: `Shared` holds
         // their receivers, as every listener's instance hears them.
         let (stop, stopped) = watch::channel(false);
@@ -513,8 +519,12 @@ impl Controller {
             config.decide_shards,
         )
         .map_err(Error::DecisionThreads)?;
-        let (phase, readiness) =
-            readiness::channel(elector.fence(), steps, Arc::clone(&shared.lag));
+        let (phase, readiness) = readiness::channel(
+            elector.fence(),
+            steps,
+            Arc::clone(&shared.lag),
+            Arc::clone(&shared.feed.log),
+        );
         let shared = Arc::new(shared);
         #[cfg(feature = "discovery")]
         let discovery = config

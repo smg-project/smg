@@ -10,6 +10,20 @@
 //! `pair_round_robin_three_sided` places the same pair under a document of
 //! three sides, whose encode side places nothing of a pair.
 //!
+//! `pair_sessions_later` states the later decode under a sessions rule,
+//! each turn for a session of its own ([`sessions`], [`session_later`]).
+//! Its decode is asked for once the session's key has ended: a key ends at
+//! its rule's first sweep past its idle time. So the call claims its decode
+//! anew and dates that claim by the pair's lease. The result's
+//! `call_claims=` counts the calls that claimed.
+//!
+//! A session met a second time claims nothing, and the list's first
+//! requests take the seeds of the first caller's first turns: eight a
+//! worker, and 4,096 at the least. So count the cell by two values of
+//! `--decisions` above that count. Where each counted call claims,
+//! `call_claims=` rises by their difference. The rule sweeps nothing
+//! within a run: the table keeps two keys a turn.
+//!
 //! `--entry place` asks the one call a host makes for a request instead
 //! ([`InProcess::place`]): the model, the two lists and a prompt of the
 //! plain request's size, with both dispatches and each side's end said of
@@ -38,18 +52,18 @@ use std::{
     cell::OnceCell,
     ops::Deref,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use smg_grand_central::{
-    document::{AppliedSpec, PolicySpec},
+    document::{AppliedSpec, Assignment, PolicySpec},
     engine::{
-        prefills_full, Decided, Decision, InProcess, PairAdmission, PairLists, PartnerClasses,
-        Phase, PlaceRequest, Plain, Prompt, PublishedList, Request, RequestMaker, ShedReason,
-        Unplaced, WorkerLists,
+        prefills_full, Decided, Decision, DecodeVerdict, Identity, InProcess, PairAdmission,
+        PairLists, PartnerClasses, Phase, PlaceRequest, Plain, Prompt, PublishedList, Request,
+        RequestMaker, ShedReason, Unplaced, WorkerLists,
     },
     store::GatewayId,
     tracking::{DecisionGuard, Outcome, Side, TransportClass},
@@ -63,8 +77,8 @@ use smg_worker::{
 use tokio::runtime::Builder;
 
 use super::{
-    encode, measure, place, plain, published, reports, ruled, signals, Cell, Host, Run, Shadowed,
-    Stated, MODEL,
+    encode, measure, place, plain, preset, published, reports, ruled, signals, Cell, Host, Run,
+    Shadowed, Stated, MODEL,
 };
 
 /// The word of `--entry` that asks the one call with a pair's request
@@ -106,6 +120,39 @@ pub(super) fn request(seed: u64) -> Request<'static> {
 pub(super) fn later(seed: u64) -> Request<'static> {
     let mut request = request(seed);
     request.constraints.decode_later = true;
+    request
+}
+
+/// The decode calls of this run that claimed their decode so far.
+static CALL_CLAIMS: AtomicU64 = AtomicU64::new(0);
+
+/// The result line's word of `pair_sessions_later`: how many of its decode
+/// calls claimed their decode.
+pub(super) fn call_claims() -> String {
+    format!(" call_claims={}", CALL_CLAIMS.load(Ordering::Relaxed))
+}
+
+/// The round-robin pair document under the stock sessions rule, a new
+/// session placed by each side's own stages. The rule's sweep waits as
+/// long as its idle time, so no key leaves the table within a run.
+pub(super) fn sessions() -> PolicySpec {
+    let stock = preset("manual");
+    let mut document = of("round_robin");
+    let rule = stock.bindings.into_iter().next();
+    let rule = rule.and_then(|binding| binding.sessions);
+    let mut rule = rule.expect("the stock rule");
+    rule.assignment = Assignment::Delegate;
+    rule.sweep_s = rule.ttl_s;
+    document.view = stock.view;
+    document.bindings[0].sessions = Some(rule);
+    document
+}
+
+/// The later-decode request of a session of its own: a turn's seed is its
+/// session's key.
+pub(super) fn session_later(seed: u64) -> Request<'static> {
+    let mut request = later(seed);
+    request.facts.session_key = Identity::hashed(seed.max(1));
     request
 }
 
@@ -188,6 +235,11 @@ struct Decodes {
     classes: PartnerClasses,
     admission: &'static (dyn PairAdmission + Sync),
     refused: Refused,
+    /// Under a sessions rule, how far behind a pair's decision its later
+    /// decode is asked for, sent and ended. It is a second more than the
+    /// rule's idle time and its sweep interval together. The pair's key has
+    /// ended by then, at the rule's first sweep past its idle time.
+    idle_out: Option<Duration>,
 }
 
 /// One turn's pair request as its host states it: the request of
@@ -327,16 +379,22 @@ impl Decodes {
             // A request that stated the later decode asks it again here. A
             // call the engine sheds answers the first pick and leaves the
             // decode chosen: no decode was decided again, and the turn
-            // places nothing.
-            let decode = if later {
-                let again = held.decide_decode_under(&stated, now).ok()?;
-                let decode = again.pick()?.targets.first()?.pair?.decode_id;
+            // places nothing. Under a sessions rule the call comes once the
+            // pair's key has ended, and the decode is sent and ended at the
+            // call's instant.
+            let (decode, now) = if later {
+                let call = self.idle_out.map_or(now, |idle| now + idle);
+                let again = held.decide_decode_under(&stated, call).ok()?;
+                let again = again.pick()?.targets.first()?.pair?;
                 if held.decode_chosen() {
                     return None;
                 }
-                decode
+                if again.decode_verdict == DecodeVerdict::CLAIMED {
+                    CALL_CLAIMS.fetch_add(1, Ordering::Relaxed);
+                }
+                (again.decode_id, call)
             } else {
-                decode
+                (decode, now)
             };
             held.dispatched_decode(now);
             let end = |side, served| {
@@ -410,6 +468,9 @@ pub(super) fn runs(run: &Run) -> bool {
     // Every prefill pairs with every decode.
     let partners: Vec<u32> = (0..decodes.len() as u32).collect();
     let every = (0..prefills.len()).map(|_| partners.as_slice());
+    // The sessions rule of the pair's binding, where its document states one.
+    let rule = document.bindings.first();
+    let rule = rule.and_then(|binding| binding.sessions.as_ref());
     let decode_side = Decodes {
         classes: PartnerClasses::number(decodes.len(), every),
         list: published(&decodes),
@@ -419,6 +480,10 @@ pub(super) fn runs(run: &Run) -> bool {
             &Open
         },
         refused: run.refused,
+        idle_out: rule.map(|rule| {
+            let ends = u64::from(rule.ttl_s) + u64::from(rule.sweep_s);
+            Duration::from_secs(ends + 1)
+        }),
     };
     let mut receiver = None;
     let feed = TestFeed::attached_to(|loads| receiver = loads);

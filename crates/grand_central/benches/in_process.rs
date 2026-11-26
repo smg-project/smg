@@ -429,6 +429,16 @@ const CELLS: &[Cell] = &[
         request: pair::request,
         ..Cell::PLAIN
     },
+    // A pair under a sessions rule whose decode is asked for once its
+    // session's key has ended. Each turn's session is new, so the call
+    // claims its decode and dates that claim by the pair's lease.
+    Cell {
+        name: "pair_sessions_later",
+        document: pair::sessions,
+        request: pair::session_later,
+        words: pair::call_claims,
+        ..Cell::PLAIN
+    },
     Cell {
         name: "pair_signal_cost",
         document: signals::pair_document,

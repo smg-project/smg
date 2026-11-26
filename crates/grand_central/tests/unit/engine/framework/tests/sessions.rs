@@ -273,6 +273,58 @@ fn a_respill_fronts_its_worker_where_it_is_decided() {
     assert_eq!(pins(), Some([taken.id, home.id]), "behind its dispatch");
 }
 
+/// A lease's word takes back the claim its own decision made, and no later
+/// decision's claim on the same worker. A key's claim idles out, and a
+/// later decision claims the same worker. The older lease's refusal and
+/// its dispatch elsewhere, both told late, leave that claim. The later
+/// lease's own refusal takes it back. Each lease is dated by its
+/// decision's instant, as a host dates it.
+#[test]
+fn a_leases_word_takes_back_the_claim_of_its_own_decision_alone() {
+    let engine = session_engine(SessionRule {
+        ttl_micros: Some(1_000),
+        sweep_micros: 100,
+        ..SESSIONS
+    });
+    // The fewest requests place the key on the first worker each time.
+    let pool = [candidate(0, 0), candidate(1, 5)];
+    let (claimed, other) = (pool[0].id, pool[1].id);
+    let pins = || engine.sessions().pins(session(7));
+    let leased = |now: u64| {
+        let decision = decide_keyed(&engine, &pool, 7, now);
+        let pick = decision.pick().expect("a pick");
+        assert_eq!(pick.session_verdict, SessionVerdict::Claimed(claimed));
+        Lease {
+            session: session(7),
+            session_verdict: pick.session_verdict,
+            issued_micros: now,
+            ..Lease::default()
+        }
+    };
+    // The key idles out between the two decisions.
+    let (older, later) = (leased(10), leased(1_200));
+    assert_eq!(pins(), Some([claimed, WorkerId(0)]));
+    engine.on_released(&older, ReleaseReason::CommitFailed);
+    assert_eq!(pins(), Some([claimed, WorkerId(0)]), "the later claim");
+    let elsewhere = Target {
+        position: 1,
+        id: other,
+        ..Target::default()
+    };
+    engine.on_dispatched(&older, &elsewhere, Side::Single, 0);
+    assert_eq!(pins(), Some([other, claimed]), "the later claim stands");
+    engine.on_released(&later, ReleaseReason::CommitFailed);
+    assert_eq!(pins(), Some([other, WorkerId(0)]), "its own refusal");
+    // A lease that states no instant reaches a claim by its worker.
+    let undated = Lease {
+        issued_micros: 0,
+        ..leased(2_400)
+    };
+    assert_eq!(pins(), Some([claimed, WorkerId(0)]), "the key started over");
+    engine.on_released(&undated, ReleaseReason::CommitFailed);
+    assert_eq!(pins(), Some([WorkerId(0); 2]), "by its worker");
+}
+
 /// The pin taken again at the cap is the decision's one target. A
 /// dispatch on an alternate would move the pin by the key's recovery,
 /// onto a worker at the cap as onto any other.

@@ -3,6 +3,8 @@
 //! everything it opens: it is numbered once, its budget is seeded once, and
 //! every call of every plugin and side it opens draws the same remainder.
 
+#[cfg(feature = "controller")]
+use std::time::{Duration, Instant};
 use std::{
     cell::{RefCell, RefMut},
     sync::Arc,
@@ -10,6 +12,9 @@ use std::{
 
 use thread_local::ThreadLocal;
 
+use super::breaker::Latency;
+#[cfg(feature = "controller")]
+use super::config::FrameBudget;
 use crate::engine::framework::{self, DecisionScope};
 
 /// The decisions open on a deciding host's threads, one a thread, each with
@@ -51,10 +56,14 @@ impl OpenDecisions {
 }
 
 /// What is left of a decision's budget on its thread, and the budget as
-/// seeded, in microseconds of the request's. The decision's first open
-/// seeds it ([`OpenDecision::open`]), and every call of every plugin and
-/// side the decision opens draws it down here and nowhere else
+/// seeded, in microseconds of the request's. A budget begins at a
+/// decision's first open, which seeds it ([`OpenDecision::open`]), or
+/// outside every decision under a bound of its own ([`Budget::alone`]).
+/// Every call of every plugin and side the decision opens asks here what
+/// it may spend, and draws the remainder down here and nowhere else
 /// ([`Budget::draw`]): the remainder only falls, and never below zero.
+/// That rule is of the two fields: a whole budget can still be assigned
+/// through [`OpenDecision::budget`].
 #[derive(Debug, Default)]
 pub(crate) struct Budget {
     remaining_micros: u64,
@@ -64,15 +73,24 @@ pub(crate) struct Budget {
 impl Budget {
     /// A budget of `micros` that no decision seeded: what a call outside
     /// every decision runs under (a lifecycle event, a destructor), a bound
-    /// of its own. Its seed is zero. So [`own_bound`] answers yes for every
-    /// call under it, and such a call's frame names no decision: its run-out
-    /// is its plugin's own and is never laid on a decision's budget.
+    /// of its own. Its seed is zero. So [`Self::own_bound`] answers yes for
+    /// every call under it, and such a call's frame names no decision: its
+    /// run-out is its plugin's own and is never laid on a decision's budget.
     #[cfg(feature = "wasm")]
     pub(crate) fn alone(micros: u32) -> Self {
         Self {
             remaining_micros: u64::from(micros),
             seed_micros: 0,
         }
+    }
+
+    /// A budget seeded with `micros`, for a case of a kind that closes a
+    /// decision under one.
+    #[cfg(all(test, feature = "controller"))]
+    pub(crate) fn seeded(micros: u32) -> Self {
+        let mut budget = Self::default();
+        budget.seed(micros);
+        budget
     }
 
     /// Seeds the budget from the request's: a decision's first open.
@@ -82,7 +100,8 @@ impl Budget {
     }
 
     /// Draws `micros` from the remainder, which never falls below zero: the
-    /// one write after the seed.
+    /// one write of a field after the budget began, seeded by a decision's
+    /// first open or made alone ([`Budget::alone`]).
     pub(crate) fn draw(&mut self, micros: u64) {
         self.remaining_micros = self.remaining_micros.saturating_sub(micros);
     }
@@ -93,31 +112,103 @@ impl Budget {
         self.remaining_micros == 0
     }
 
-    /// What is left.
-    pub(crate) fn remaining_micros(&self) -> u64 {
-        self.remaining_micros
+    /// What a call of the WebAssembly kind may spend: its fuel at
+    /// `fuel_per_micro` under a frame of `cap` fuel, and its time on the
+    /// clock under a frame of `frame_micros`. Each is the frame, or what is
+    /// left where that is less. The two frames are the call's own and need
+    /// not agree. No fuel says no call. A kind bounds a call here, and
+    /// reads no remainder to bound one.
+    #[cfg(feature = "wasm")]
+    pub(crate) fn grant_call(
+        &self,
+        cap: u64,
+        frame_micros: u32,
+        fuel_per_micro: u64,
+    ) -> (u64, u32) {
+        (
+            cap.min(self.fuel(fuel_per_micro)),
+            frame_micros.min(self.remaining_micros_u32()),
+        )
+    }
+
+    /// What a frame of the gRPC kind is sent with, for a plugin whose
+    /// frame budget is `frame`. First what the frame may spend: the
+    /// plugin's own frame, or what is left where that is less. Then what
+    /// is left, which the frame tells its plugin: zero says no frame.
+    #[cfg(feature = "controller")]
+    pub(crate) fn grant_frame(&self, frame: FrameBudget) -> (u32, u32) {
+        let left = self.remaining_micros_u32();
+        (frame.frame_micros(left), left)
+    }
+
+    /// The whole frame of a plugin whose frame budget is `frame`: its own
+    /// frame under the budget as seeded, whatever is left. A round trip's
+    /// sample is read against it, so a frame that others' draws starved
+    /// is not read against the little it was sent with. A kind asks where
+    /// it takes a frame's answer or its miss.
+    #[cfg(feature = "controller")]
+    pub(crate) fn whole_frame(&self, frame: FrameBudget) -> u32 {
+        frame.frame_micros(self.seed_micros_u32())
+    }
+
+    /// How long a wait for a frame's answer may last. The wait began at
+    /// `started` and the frame's own deadline is `deadline`: the wait ends
+    /// at the deadline, or where what is left runs out if that is sooner.
+    #[cfg(feature = "controller")]
+    pub(crate) fn grant_wait(&self, started: Instant, deadline: Instant) -> Instant {
+        deadline.min(started + Duration::from_micros(self.remaining_micros))
+    }
+
+    /// What a frame with no answer was given. Its wait began
+    /// `before_micros` after a frame of `frame_micros` was sent: the frame
+    /// as sent, or the time ahead of the wait and what is left where that
+    /// is less. A kind asks behind a missed wait, ahead of the frame's
+    /// draw: an answered frame never asks.
+    #[cfg(feature = "controller")]
+    pub(crate) fn grant_missed(&self, frame_micros: u32, before_micros: u64) -> u64 {
+        u64::from(frame_micros).min(before_micros.saturating_add(self.remaining_micros))
     }
 
     /// What is left, in the width a frame and the wire carry it. A budget
     /// is seeded from a `u32` and only falls, so nothing is cut off.
-    pub(crate) fn remaining_micros_u32(&self) -> u32 {
+    fn remaining_micros_u32(&self) -> u32 {
         u32::try_from(self.remaining_micros).unwrap_or(u32::MAX)
     }
 
     /// What is left, as fuel at `fuel_per_micro`.
     #[cfg(feature = "wasm")]
-    pub(crate) fn fuel(&self, fuel_per_micro: u64) -> u64 {
+    fn fuel(&self, fuel_per_micro: u64) -> u64 {
         self.remaining_micros.saturating_mul(fuel_per_micro)
     }
 
-    /// The budget as seeded: a plugin's own spend reads against it.
-    pub(crate) fn seed_micros(&self) -> u64 {
-        self.seed_micros
+    /// Whether the bound a call ran out under was its plugin's own: the call
+    /// had its whole frame, or the plugin alone consumed the budget (its own
+    /// time in the decision before the call, `spent_micros`, and the call's
+    /// grant in full, `granted_micros`, reach the budget as seeded). Short of
+    /// both, the shared remainder clamped the call (other plugins drew it, or
+    /// the host held a call of this one): its run-out is the decision's
+    /// budget spent and no failure. Every kind asks here whose bound a
+    /// run-out was, and nowhere else.
+    pub(crate) fn own_bound(
+        &self,
+        whole_frame: bool,
+        spent_micros: u64,
+        granted_micros: u64,
+    ) -> bool {
+        whole_frame || reaches_the_budget(spent_micros, granted_micros, self.seed_micros)
+    }
+
+    /// The frame a decision's latency sample is taken over, for a plugin
+    /// that was given `frames_micros` of frames in the decision: those
+    /// frames, at most the budget as seeded ([`Latency::frame`]). A kind
+    /// asks at its last close of the decision.
+    pub(crate) fn sample_frame(&self, frames_micros: u64) -> u32 {
+        Latency::frame(self.seed_micros, frames_micros)
     }
 
     /// The budget as seeded, in the width a frame carries it.
     #[cfg(feature = "controller")]
-    pub(crate) fn seed_micros_u32(&self) -> u32 {
+    fn seed_micros_u32(&self) -> u32 {
         u32::try_from(self.seed_micros).unwrap_or(u32::MAX)
     }
 }
@@ -167,22 +258,6 @@ impl OpenDecision {
 /// there is the decision's budget spent.
 fn reaches_the_budget(spent_micros: u64, granted_micros: u64, seed_micros: u64) -> bool {
     spent_micros.saturating_add(granted_micros) >= seed_micros
-}
-
-/// Whether the bound a call ran out under was its plugin's own: the call
-/// had its whole frame, or the plugin alone consumed the decision's budget
-/// (its own time in the decision before the call and the call's grant in
-/// full reach the budget as seeded). Short of both, the shared remainder
-/// clamped the call (other plugins drew it, or the host held a call of this
-/// one): its run-out is the decision's budget spent and no failure. Every
-/// kind asks here whose bound a run-out was, and nowhere else.
-pub(crate) fn own_bound(
-    whole_frame: bool,
-    spent_micros: u64,
-    granted_micros: u64,
-    seed_micros: u64,
-) -> bool {
-    whole_frame || reaches_the_budget(spent_micros, granted_micros, seed_micros)
 }
 
 /// An open of a plugin's bound decision that has not returned yet. The

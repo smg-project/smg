@@ -4,8 +4,6 @@ use std::{sync::Arc, time::Instant};
 
 use tokio::sync::watch;
 
-#[cfg(test)]
-use crate::service::elector;
 use crate::{service::elector::Fence, worker_host::Lead};
 
 /// The lead of a replica that elects: the term the role's word names, while
@@ -39,19 +37,6 @@ impl Lead for ElectedLead {
     }
 }
 
-/// Election settings under which a fence, once taken, stays open through a
-/// case of any length: a case steps its elector by hand and renews nothing.
-#[cfg(test)]
-pub(super) fn lasting() -> elector::ElectionSettings {
-    use std::time::Duration;
-
-    elector::ElectionSettings {
-        duration: Duration::from_secs(3 * 3_600),
-        renew_period: Duration::from_secs(3_600),
-        renew_deadline: Duration::from_secs(2 * 3_600),
-    }
-}
-
 #[cfg(test)]
 #[path = "../../../../tests/unit/service/controller/worker_objects/lead/tests.rs"]
-mod tests;
+pub(super) mod tests;

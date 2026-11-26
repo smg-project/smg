@@ -12,7 +12,7 @@ use crate::{
         membership::life, HealthPolicy, Registrant, WorkerFacts, WorkerPatch,
         WorkerStatus as RowStatus, WorkersStore,
     },
-    worker_host::{object, objects::lay_standing, Members, SoleLead},
+    worker_host::{object, objects::tests::lay_standing, Members, SoleLead},
 };
 
 const URL: &str = "http://a:8000";

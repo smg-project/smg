@@ -3,7 +3,7 @@
 //! fail in it (each side of a pair, each binding), and its last close of the
 //! decision takes the decision's one latency sample: what the decision
 //! charged the plugin, over the frames the plugin was given in it, at most
-//! the decision's budget ([`Latency::frame`]). The ring and its marks are
+//! the decision's budget ([`Budget::sample_frame`]). The ring and its marks are
 //! the in-process form's; no thread is ever armed here, since a remote
 //! plugin's time is not the deciding thread's CPU. An opening writes the
 //! one line every plugin kind writes.
@@ -20,7 +20,7 @@ use super::runtime::RECONNECT_PAUSE;
 use crate::plugins::shared::{
     breaker::{Breaker, Latency, Recorded},
     config::BreakerSpec,
-    Part,
+    Budget, Part,
 };
 
 #[derive(Debug)]
@@ -141,11 +141,11 @@ impl Unit {
 
     /// One of the plugin's closes of decision `decision` on this thread. The
     /// last one takes the decision's latency sample: the charges
-    /// ([`Self::charge`]) over the decision's budget `seed_micros`, or over
-    /// their frames where those are the lesser ([`Latency::frame`]). A
-    /// decision that charged the plugin nothing records nothing; a window
+    /// ([`Self::charge`]) over the decision's `budget` as seeded, or over
+    /// their frames where those are the lesser ([`Budget::sample_frame`]).
+    /// A decision that charged the plugin nothing records nothing; a window
     /// that reads slow opens the breaker at `now()`.
-    pub(crate) fn leave(&self, decision: u64, seed_micros: u64, now: impl FnOnce() -> u64) {
+    pub(crate) fn leave(&self, decision: u64, budget: &Budget, now: impl FnOnce() -> u64) {
         let cell = self.part.get_or_default();
         let (mut part, charged, frames) = cell.get();
         let last = part.close(decision);
@@ -154,7 +154,7 @@ impl Unit {
             return;
         }
         let sample = u32::try_from(charged).unwrap_or(u32::MAX);
-        let frame = Latency::frame(seed_micros, frames);
+        let frame = budget.sample_frame(frames);
         let recorded = self
             .latency
             .get_or(|| RefCell::new(Latency::new()))

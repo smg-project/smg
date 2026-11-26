@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU32, AtomicUsize, Ordering},
         Barrier,
     },
     thread,
@@ -8,6 +8,44 @@ use std::{
 
 use super::{InFlightCounts, WorkerSlot};
 use crate::engine::view::Session;
+
+impl InFlightCounts {
+    /// The counts of `slots`, in their order: one load a slot, the piece
+    /// found once for each run of slots that share it.
+    pub(crate) fn of<'a>(&'a self, slots: &'a [WorkerSlot]) -> impl Iterator<Item = u32> + 'a {
+        let (mut cells, mut first): (&[AtomicU32], u32) = (&[], 0);
+        slots.iter().map(move |&slot| {
+            let at = slot.0.wrapping_sub(first) as usize;
+            if let Some(cell) = cells.get(at) {
+                return cell.load(Ordering::Relaxed);
+            }
+            (cells, first) = self.cells.piece(slot);
+            let at = slot.0.wrapping_sub(first) as usize;
+            cells.get(at).map_or(0, |cell| cell.load(Ordering::Relaxed))
+        })
+    }
+
+    /// How many sessions the place of `slot` keeps: zero once the last
+    /// keyed lease that booked its member left.
+    fn sessions_kept(&self, slot: WorkerSlot) -> usize {
+        let place = self.hosts.cell(slot);
+        place.map_or(0, |place| place.sessions.lock().len())
+    }
+
+    /// How many sessions the table of `slot`'s place has room for: zero
+    /// for a table that holds no memory.
+    fn sessions_room(&self, slot: WorkerSlot) -> usize {
+        let place = self.hosts.cell(slot);
+        place.map_or(0, |place| place.sessions.lock().capacity())
+    }
+
+    /// The count of `slot` at this call: zero for a slot that names no
+    /// cell.
+    fn in_flight(&self, slot: WorkerSlot) -> u32 {
+        self.cell(slot)
+            .map_or(0, |cell| cell.load(Ordering::Relaxed))
+    }
+}
 
 /// Two files book one worker where it serves two models: a write is one
 /// atomic step, so no booking of either writer is lost under the

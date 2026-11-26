@@ -62,13 +62,12 @@ use crate::{
 };
 
 /// Every slice of the contract, in its order.
-const SLICES: [Slice; 10] = [
+const SLICES: [Slice; 9] = [
     Slice::Workers,
     Slice::Health,
     Slice::Loads,
     Slice::Sessions,
     Slice::Leases,
-    Slice::Pairs,
     Slice::Spec,
     Slice::Plugins,
     Slice::KvIndex,

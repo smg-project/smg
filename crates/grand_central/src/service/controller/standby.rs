@@ -402,26 +402,6 @@ impl Lag {
         Some((age, (now < lapse).then_some(lapse)))
     }
 
-    /// The age at `now` of the last frame at the head; `None` where the lag
-    /// holds none.
-    #[cfg(test)]
-    pub(crate) fn age(&self, now: Instant) -> Option<Duration> {
-        self.read(now).map(|(age, _)| age)
-    }
-
-    /// Whether this replica is synced at `now`: its last frame at the head
-    /// is younger than the bound.
-    #[cfg(test)]
-    pub(crate) fn synced(&self, now: Instant) -> bool {
-        self.read(now).is_some_and(|(_, lapse)| lapse.is_some())
-    }
-
-    /// The bound [`Lag::synced`] reads under.
-    #[cfg(test)]
-    pub(crate) fn within(&self) -> Duration {
-        self.within
-    }
-
     /// The standby asks its leader to be restored: an event of the
     /// leader's did not land on it.
     pub(crate) fn asked(&self) {

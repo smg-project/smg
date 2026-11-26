@@ -437,21 +437,174 @@ fn the_limit_ends_a_send_whose_report_is_too_soon_for_the_delay() {
     );
 }
 
+/// A later document's count under a delay no standing count has takes a
+/// copy of the standing send, and its reads release its own entries alone.
+/// The standing document ends a send nine milliseconds behind it and the
+/// later one five: a read under the later delay ends the send in the copy,
+/// and the standing count holds it still.
 #[test]
-fn a_read_under_the_shorter_of_two_documents_delays_ends_a_send_for_both() {
+fn a_read_under_a_later_documents_other_delay_ends_a_send_in_its_copy_alone() {
     let (standing, long) = counting(delayed(None, 9));
     let mut a = row(239, 3);
     send(&standing, &a, START, TOKENS);
     let (next, short) = counting(delayed(None, REPORT_DELAY_MS));
     next.succeed(&standing);
+    let facts = clock(0);
+    assert_eq!(short.read(&facts, &a), one(TOKENS), "a copy of the send");
     // Six milliseconds behind the send: under the delay of nine and past
     // the delay of five.
     a.load = Some(LoadRow::default());
     a.load_sampled_at_micros = START + u64::from(DELAY) + 6_000;
-    let facts = clock(0);
-    assert_eq!(long.read(&facts, &a), one(TOKENS));
     assert_eq!(short.read(&facts, &a), CreditedDispatches::default());
-    assert_eq!(long.read(&facts, &a), CreditedDispatches::default());
+    assert_eq!(long.read(&facts, &a), one(TOKENS), "its own entries");
+}
+
+/// Under the same two settings a later document's count shares the standing
+/// count's entries. A send the later engine records is read through the
+/// standing count, and a send that a read of one releases has left the
+/// other.
+#[test]
+fn a_later_count_under_the_standing_settings_shares_the_standing_entries() {
+    let (standing, stood) = counting(delayed(None, REPORT_DELAY_MS));
+    let mut a = row(281, 3);
+    send(&standing, &a, START, TOKENS);
+    let (next, later) = counting(delayed(None, REPORT_DELAY_MS));
+    next.succeed(&standing);
+    send(&next, &a, START, TOKENS);
+    let facts = clock(0);
+    assert_eq!(stood.read(&facts, &a).requests, 2, "the later engine's too");
+    // A report past the delay, read through the later count alone.
+    a.load = Some(LoadRow::default());
+    a.load_sampled_at_micros = sent_at(START) + REPORT_DELAY;
+    assert_eq!(later.read(&facts, &a), CreditedDispatches::default());
+    assert_eq!(stood.credits().held(a.id), 0, "let go for both");
+}
+
+/// A copy holds each send at its instant and its size, a send of text alone
+/// with its estimate, whichever lane of the standing row held it: the later
+/// count reads what the standing count reads. It then lets go what its own
+/// shorter limit ends, and the standing count, under no limit, holds every
+/// send still.
+#[test]
+fn a_copy_holds_each_send_at_its_instant_and_size_and_reads_under_its_own_limit() {
+    let (standing, stood) = built(None);
+    let a = row(283, 3);
+    take_lane(0);
+    send(&standing, &a, START, TOKENS);
+    send(&standing, &a, START + 5_000, 0);
+    take_lane(1);
+    let text = Lease {
+        issued_micros: START + 9,
+        bytes: 404,
+        ..Lease::default()
+    };
+    standing.on_dispatched(&text, &target(&a), Side::Single, DELAY);
+    let (next, later) = built(Some(2));
+    next.succeed(&standing);
+    // At the clock's start no limit applies. 404 bytes are 101 tokens.
+    let facts = clock(0);
+    let whole = CreditedDispatches {
+        requests: 3,
+        tokens: u64::from(TOKENS),
+        unsized_requests: 2,
+        estimated_tokens: 101,
+    };
+    assert_eq!(later.read(&facts, &a), whole);
+    let oldest_first = [
+        (sent_at(START), TOKENS),
+        (sent_at(START + 9), 0),
+        (sent_at(START + 5_000), 0),
+    ];
+    assert_eq!(instants(&later, &facts, &a), oldest_first);
+    // One millisecond behind the last send and six behind the others: the
+    // limit of two ends those.
+    let now = clock(sent_at(START + 5_000) + 1_000);
+    let last = CreditedDispatches {
+        unsized_requests: 1,
+        ..one(0)
+    };
+    assert_eq!(later.read(&now, &a), last);
+    assert_eq!(
+        stood.read(&now, &a),
+        whole,
+        "under no limit, its own entries"
+    );
+}
+
+/// [`document`] with a second profile, `rest`: the engine and the counts
+/// its two profiles read, `work` under the time limit `limits[0]` and
+/// `rest` under `limits[1]`.
+fn two_counts(limits: [Option<u32>; 2]) -> (Engine, [Arc<DispatchCredit>; 2]) {
+    let stages = json!({ "score": ["avoid-sent"], "pick": "best" });
+    let profile = |limit: Option<u32>| {
+        let mut profile = stages.clone();
+        profile["sent_ttl_ms"] = json!(limit);
+        profile
+    };
+    let document = json!({
+        "apiVersion": API_VERSION,
+        "generation": 4,
+        "profiles": { "work": profile(limits[0]), "rest": profile(limits[1]) },
+        "bindings": [
+            { "match": { "model": "m" }, "profile": "work" },
+            { "match": { "model": "*" }, "profile": "rest" }
+        ]
+    });
+    let document: PolicySpec = serde_json::from_value(document).expect("a document");
+    let (catalog, readers) = catalog();
+    let engine = document.validate_in(&catalog, &[]);
+    let engine = engine.expect("the profiles validate");
+    let readers = readers.lock();
+    let under = |limit: Option<u32>| {
+        let mut counts = readers.iter();
+        let count = counts.find(|count| count.settings.ttl_ms == limit);
+        Arc::clone(count.expect("a count under the limit"))
+    };
+    let counts = limits.map(under);
+    (engine, counts)
+}
+
+/// A copy takes each rank from the standing count that holds the most
+/// there. `work` counts a send for one millisecond and `rest` until a
+/// report. `work` has let go its send to the first worker, past its limit,
+/// and `rest` its send to the second, at that worker's report. A later
+/// count under another limit holds both sends, each once.
+#[test]
+fn a_copy_takes_each_rank_from_the_standing_count_that_holds_the_most() {
+    let (standing, [work, rest]) = two_counts([Some(1), None]);
+    let (a, mut b) = (row(293, 3), row(307, 3));
+    for to in [&a, &b] {
+        send(&standing, to, START, TOKENS);
+    }
+    // Two milliseconds behind the sends, `work` reads the first worker.
+    let later = clock(sent_at(START) + 2_000);
+    assert_eq!(work.read(&later, &a), CreditedDispatches::default());
+    // `rest` reads the second under a report sampled at its send.
+    b.load = Some(LoadRow::default());
+    b.load_sampled_at_micros = sent_at(START);
+    assert_eq!(rest.read(&clock(0), &b), CreditedDispatches::default());
+    let (next, copy) = built(Some(43));
+    next.succeed(&standing);
+    let held = [&a, &b].map(|to| copy.credits().held(to.id));
+    assert_eq!(held, [1, 1], "each from the count that holds it");
+}
+
+/// A later count starts empty where no count stands, and what it held until
+/// the call is let go.
+#[test]
+fn a_later_count_starts_empty_where_no_count_stands() {
+    let unread = json!({
+        "apiVersion": API_VERSION,
+        "profiles": { "work": { "pick": "random" } }
+    });
+    let unread: PolicySpec = serde_json::from_value(unread).expect("a document");
+    let standing = unread.validate().expect("a valid document");
+    assert!(standing.sent_credits.is_empty(), "no stage reads the sends");
+    let (next, sent) = built(None);
+    let a = row(311, 3);
+    send(&next, &a, START, TOKENS);
+    next.succeed(&standing);
+    assert_eq!(sent.read(&clock(0), &a), CreditedDispatches::default());
 }
 
 #[test]
@@ -784,8 +937,8 @@ fn every_word_of_a_count_that_follows_goes_to_the_entries_of_the_count_it_follow
     use super::{ReportedSends, SentSettings};
 
     let settings = SentSettings::default();
-    let followed = Arc::new(DispatchCredit::new("standing", settings));
-    let follows = DispatchCredit::new("built", settings);
+    let followed = Arc::new(DispatchCredit::new(settings));
+    let follows = DispatchCredit::new(settings);
     follows.follow(&followed);
     let reporting = |id: u64| Candidate {
         load: Some(LoadRow::default()),

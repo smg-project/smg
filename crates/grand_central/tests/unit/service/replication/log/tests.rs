@@ -7,6 +7,13 @@ use std::{
 use super::*;
 use crate::{engine::view::WorkerId, service::replication::tests::ascends, store::WorkerStatus};
 
+impl Log {
+    /// The log's lock, held: for a case that shows what waits for it.
+    pub(in crate::service) fn held(&self) -> impl Sized + '_ {
+        self.ring.lock()
+    }
+}
+
 /// The mark a term's first position reads as.
 const TERM: u32 = u32::MAX;
 /// The mark a membership event reads as, above its epoch.

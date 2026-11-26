@@ -10,7 +10,7 @@ use tokio::sync::Notify;
 
 use crate::{
     observability::metrics::Metrics,
-    routers::common::placement::{Placed, Unsent},
+    routers::common::placement::{Placed, RequestEnd, Unsent},
 };
 
 const HEAD_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
@@ -108,7 +108,8 @@ impl Drop for PrefillReservation {
 /// is counted from the selection on, under the route's own key, and
 /// Grand Central is told nothing yet.
 ///
-/// Its `sent` is the only way to the load a route holds through its
+/// Its send (`sent`, or `sent_behind` of a request that goes out as
+/// several) is the only way to the load a route holds through its
 /// Prefill phase ([`PrefillLoadGuard`]), so a route says the send where it
 /// hands the prefill's request to its client. This load has no replica: a
 /// request that goes out as several says its send once, ahead of them. A
@@ -140,6 +141,28 @@ impl PrefillAhead {
             self.load = self.load.sent_by(unsent);
         }
         self.load
+    }
+
+    /// [`Self::sent`] for a request that goes out as several, where what
+    /// refuses one of the several refuses the send. An answer of
+    /// Grand Central asks `refusal` first: a refused request's load is
+    /// dropped as it was acquired, which the engine hears as a release. A
+    /// classic answer's send says nothing, so it asks nothing here, and
+    /// the several make their own refusals behind it.
+    #[inline]
+    pub(crate) fn sent_behind<E>(
+        mut self,
+        refusal: impl FnOnce() -> Result<(), E>,
+    ) -> Result<PrefillLoadGuard, E> {
+        // One test of what the answer left, as `sent` makes it: the
+        // engine's arm alone asks, and alone writes the load again.
+        if self.unsent.is_some() {
+            refusal()?;
+            if let Some(unsent) = self.unsent.take() {
+                self.load = self.load.sent_by(unsent);
+            }
+        }
+        Ok(self.load)
     }
 
     /// A load of the classic policies' answer, for a case that needs one
@@ -190,6 +213,27 @@ impl PrefillLoadGuard {
                 }
                 Self::Admission { _reservation }
             }
+        }
+    }
+
+    /// The handle on the end of the prefill this load counts
+    /// ([`RequestEnd::of`]), asked of the worker guard the load holds: its
+    /// own, or its reservation's. A pair route tells the prefill's end
+    /// through it where it records the prefill's status, and keeps no
+    /// handle past this load: the prefill's end waits for none.
+    ///
+    /// A replica that shares the reservation asks the same side, so a
+    /// later report writes over an earlier one. A replica that is a guard
+    /// of its own keeps no side, and a load whose guard is gone holds
+    /// none: each answers the empty handle.
+    #[inline]
+    pub(crate) fn end(&self) -> RequestEnd {
+        match self {
+            Self::Admission { _reservation } => _reservation
+                .load_guard
+                .as_ref()
+                .map_or_else(RequestEnd::default, RequestEnd::of),
+            Self::Unbounded { _guard } => RequestEnd::of(_guard),
         }
     }
 
@@ -1403,6 +1447,53 @@ mod tests {
             assert_eq!(prefill.load(), 1, "admission {admitted}");
             drop(next);
         }
+    }
+
+    /// A send said behind a refusal's answer asks the refusal for an
+    /// answer of Grand Central alone, with admission off and on. Refused,
+    /// the load is dropped as it was acquired and the engine hears the
+    /// prefill's side released; not refused, the engine hears the dispatch
+    /// as at a plain send. A classic answer's send asks nothing.
+    #[tokio::test]
+    async fn a_send_behind_a_refusal_asks_for_the_engines_answer_alone() {
+        for admitted in [false, true] {
+            let registry = one_pair();
+            let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+            let heard = hearing_pairs_on(&policies, false);
+            let said = || heard.lock().expect("the stage heard").clone();
+            let admission = admitted.then(|| PrefillAdmission::new(1, 0, Duration::from_secs(1)));
+            let inputs = PlacementInputs::default();
+
+            let ((prefill, decode), ahead) =
+                acquired(&registry, &policies, admission.as_ref(), inputs).await;
+            assert!(ahead.sent_behind(|| Err("refused")).is_err());
+            assert_eq!(prefill.load(), 0, "admission {admitted}");
+            assert_eq!(
+                said()[2..],
+                ["released Abandoned"],
+                "refused, with no dispatch and no end: admission {admitted}"
+            );
+            drop(decode);
+
+            let heard_so_far = said().len();
+            let ((_, decode), ahead) =
+                acquired(&registry, &policies, admission.as_ref(), inputs).await;
+            let load = ahead.sent_behind(|| Ok::<(), &str>(()));
+            assert!(load.is_ok(), "admission {admitted}");
+            assert_eq!(
+                said()[heard_so_far..],
+                ["issued", "issued", "dispatched Prefill"],
+                "admission {admitted}"
+            );
+            drop((load, decode));
+        }
+
+        let classic = PrefillAhead::classic(PrefillLoadGuard::Unbounded {
+            _guard: WorkerLoadGuard::with_key(worker("grpc://classic:1"), None),
+        });
+        let sent = classic
+            .sent_behind(|| -> Result<(), &str> { panic!("a classic answer's send asks nothing") });
+        assert!(sent.is_ok());
     }
 
     /// Where Grand Central names a routing value for a pair, the

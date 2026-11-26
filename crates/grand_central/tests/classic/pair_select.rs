@@ -273,10 +273,8 @@ fn derived(row: &Row) -> PartnerClasses {
     }
     let offers = |pool: &[Worker]| -> Vec<PairingDescriptor> {
         let offer = |worker: &Worker| {
-            let mut offer = PairingDescriptor {
-                transport: worker.transport.clone(),
-                ..PairingDescriptor::default()
-            };
+            let mut offer = PairingDescriptor::default();
+            offer.transport.clone_from(&worker.transport);
             offer.normalize();
             offer
         };

@@ -75,10 +75,7 @@ fn row(position: u32, in_flight: u32) -> Candidate {
 
 /// A value sampled `age_ms` before the decisions' instant.
 fn aged(value: f64, age_ms: u64) -> SignalCell {
-    SignalCell {
-        value,
-        sampled_at_micros: NOW - age_ms * 1_000,
-    }
+    SignalCell::of(value, NOW - age_ms * 1_000)
 }
 
 fn fresh(value: f64) -> SignalCell {

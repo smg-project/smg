@@ -3,9 +3,10 @@ use std::cell::Cell;
 use wasmtime::{Trap, UpdateDeadline};
 
 use super::{
-    deadline_ticks, first_deadline, import_version, judge, thread_cpu_micros, tick, End, Latency,
-    ThreadRing, Verdict, Watch, EPOCH_TICK_MICROS,
+    clock::EPOCH_TICK_MICROS, deadline_ticks, first_deadline, import_version, judge,
+    thread_cpu_micros, tick, End, ThreadRing, Verdict, Watch,
 };
+use crate::plugins::shared::breaker::Latency;
 
 /// Whether a tick ended the call; a tick that lets it run asks for the
 /// next one.
@@ -411,7 +412,7 @@ fn the_runtime_keeps_no_state_for_concurrent_calls() {
     // An engine as the runtime builds its own: a config, then the
     // host's settings.
     let mut config = wasmtime::Config::new();
-    super::configure(&mut config);
+    super::runtime::configure(&mut config);
     let engine = wasmtime::Engine::new(&config).expect("an engine");
     // The least component that needs the support: one export lifted the
     // async way.

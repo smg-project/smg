@@ -595,7 +595,9 @@ fn filters_of(plugins: &[&Arc<Plugin>]) -> Profile {
 /// the decision's budget spent, no failure, and its sample is what it was
 /// given, about a third of the budget, which no window reads slow. Judged
 /// by the frame as sent it would fail every decision; sampled at the frame
-/// as sent its window would read slow at its first read.
+/// as sent its window would read slow at its first read. The clock says
+/// so too: the quickest such round ends well short of the budget, where
+/// a wait that lasted to its frame's deadline makes each as long as it.
 #[test]
 fn a_wait_the_remainder_ended_first_is_the_decisions_spend_at_what_the_frame_was_given() {
     let runtime = runtime();
@@ -632,9 +634,13 @@ fn a_wait_the_remainder_ended_first_is_the_decisions_spend_at_what_the_frame_was
     // a count of rounds runs out before a held thread is seen again.
     let started = Instant::now();
     let mut rounds = 0_u32;
+    // The quickest round in which the starved plugin's frame left and
+    // missed.
+    let mut quickest = Duration::MAX;
     loop {
         let stats = last.stats();
-        if stats.missed - stats.stalls >= 64 || stats.breaker_opens != 0 {
+        let waited = stats.missed - stats.stalls;
+        if waited >= 64 || stats.breaker_opens != 0 {
             break;
         }
         rounds += 1;
@@ -642,11 +648,24 @@ fn a_wait_the_remainder_ended_first_is_the_decisions_spend_at_what_the_frame_was
             started.elapsed() < Duration::from_secs(60),
             "the frames do not leave: {stats:?}"
         );
+        let round = Instant::now();
         assert!(matches!(
             decide_with(&engine, &short, &candidates),
             Decision::Pick(_)
         ));
+        let took = round.elapsed();
+        let stats = last.stats();
+        if stats.missed - stats.stalls > waited {
+            quickest = quickest.min(took);
+        }
     }
+    // The fronts' frames fly together and draw the whole budget at a
+    // third of it on the clock, so the starved wait ends there. Its
+    // frame's deadline is the budget's end.
+    assert!(
+        quickest < Duration::from_micros(u64::from(SHORT_MICROS) / 4 * 3),
+        "a wait outlasts what its decision had left: the quickest of {rounds} rounds took {quickest:?}"
+    );
     let stats = last.stats();
     assert_eq!(
         (stats.unread, stats.breaker_opens, stats.bypassed),

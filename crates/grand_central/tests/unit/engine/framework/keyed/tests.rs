@@ -22,7 +22,7 @@ use crate::{
         },
         Scratch, DRAW_BOUND,
     },
-    policies::consistent_hashing::{ConsistentHash, InOrder},
+    policies::consistent_hashing::{tests::InOrder, ConsistentHash},
     stages::{filters::Healthy, lifecycle::Lifecycle, pickers::Best},
     tracking::lease::{Lease, Side},
     Draw,
@@ -825,7 +825,7 @@ fn a_pin_under_a_scope_or_a_shadow_is_left_to_the_whole_decision() {
         };
         let table = engine.sessions();
         table.lookup(request.session(), 1_000, &rule);
-        table.dispatched(request.session(), SessionVerdict::Pinned, rows[0].id);
+        table.dispatched(request.session(), SessionVerdict::Pinned, rows[0].id, 0);
         let followed = engine.decide_keyed(&request, &listed, &cx);
         let left = scoped || shadow.is_some();
         assert_eq!(followed.is_none(), left, "{scoped} {shadow:?}");

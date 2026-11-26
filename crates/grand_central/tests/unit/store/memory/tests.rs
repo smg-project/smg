@@ -125,6 +125,80 @@ fn a_file_its_host_has_not_settled_is_asked_once_before_its_deadline() {
     assert_eq!(store.expire_where(after(1_200), |_| true).len(), 1);
 }
 
+/// The sweep passes a file whose decider works by its first read, with
+/// no turn held: it takes no turn of a thread at work. It ends the
+/// file's due lease once the decider has left.
+#[test]
+fn the_sweep_takes_no_turn_of_a_file_whose_decider_works() {
+    let store = Arc::new(MemoryStore::new());
+    let now = Instant::now();
+    let due = now + Duration::from_secs(1);
+    LeasesStore::set_term(&*store, 1);
+    let filed = store.issue_decided(waiting(now, 1, due), None, |_| {});
+    filed.expect("the lease is filed");
+    let place = store.at_work();
+    store.files[0].clear_takes();
+    let swept = std::thread::scope(|scope| {
+        let sweep = scope.spawn(|| LeasesStore::expire(&*store, due).len());
+        sweep.join().expect("the sweep returns")
+    });
+    assert_eq!(swept, 0, "the file is its decider's while it works");
+    assert_eq!(store.files[0].takes(), 0, "no turn of a thread at work");
+    drop(place);
+    assert_eq!(LeasesStore::expire(&*store, due).len(), 1);
+}
+
+/// Waits until `file`'s turn was taken `count` times since the case
+/// cleared its takes. A thread that takes the turn counts first and
+/// waits for it then.
+fn taken(file: &turn::File, count: usize) {
+    let end = Instant::now() + Duration::from_secs(30);
+    while file.takes() < count {
+        assert!(Instant::now() < end, "take {count} of the turn never came");
+        std::thread::yield_now();
+    }
+}
+
+/// A decider that begins work behind the sweep's first read is read
+/// again under the turn, and the sweep passes its file. The case holds
+/// the turn while the sweep waits for it and the decider writes its
+/// mark.
+#[test]
+fn the_sweep_passes_a_file_whose_decider_began_behind_its_first_read() {
+    let store = Arc::new(MemoryStore::new());
+    let now = Instant::now();
+    let due = now + Duration::from_secs(1);
+    LeasesStore::set_term(&*store, 1);
+    let filed = store.issue_decided(waiting(now, 1, due), None, |_| {});
+    filed.expect("the lease is filed");
+    let file = &store.files[0];
+    let held = file.take();
+    file.clear_takes();
+    let (leave, left) = mpsc::sync_channel::<()>(1);
+    let swept = std::thread::scope(|scope| {
+        // The case's own end goes with it where it fails: the
+        // decider's wait ends, and the case with it.
+        let (leave, store) = (leave, &store);
+        // The sweep reads nobody at work and waits for the turn.
+        let sweep = scope.spawn(move || LeasesStore::expire(&**store, due).len());
+        taken(file, 1);
+        // The decider writes its mark, then waits for the turn too.
+        let decider = scope.spawn(move || {
+            let place = store.at_work();
+            left.recv().expect("the case says when to leave");
+            drop(place);
+        });
+        taken(file, 2);
+        drop(held);
+        let swept = sweep.join().expect("the sweep returns");
+        leave.send(()).expect("the decider waits for the word");
+        decider.join().expect("the decider leaves");
+        swept
+    });
+    assert_eq!(swept, 0, "the file is its decider's from its mark");
+    assert_eq!(LeasesStore::expire(&*store, due).len(), 1);
+}
+
 /// Indexes that hold no index and name one block size: what a case
 /// reads an engine's hold of them by.
 #[cfg(feature = "controller")]
@@ -170,4 +244,62 @@ fn the_stores_engine_holds_the_lent_indexes_across_applies() {
     assert_eq!(size(), Some(16), "the first lending stands");
     store.apply(round_robin(3)).expect("generation 3");
     assert_eq!(size(), Some(16), "under the next policy spec too");
+}
+
+/// The side an issue replaced is answered under its place and its
+/// lease's key, read and left kept, while the side that the issue laid
+/// is issued or dispatched. A place keeps what an issue replaced past
+/// its lease's end. So a lease laid in the place later reads none of
+/// it: not under another key, and not under the same key until a call
+/// issues its side. An issued side that ended answers none.
+#[cfg(feature = "controller")]
+#[test]
+fn the_side_an_issue_replaced_is_read_under_its_place_and_key_while_its_issue_stands() {
+    use crate::engine::SessionVerdict;
+
+    let key = |id: u64| (GatewayId(1), LeaseId(id));
+    let side = |target: u64, state: LeaseState| DecodeSide {
+        target: WorkerId(target),
+        picked: PickRecord::default(),
+        session: Session::NONE,
+        session_verdict: SessionVerdict::None,
+        state,
+        tokens: 0,
+        target_index: 0,
+    };
+    // A side on worker 8 as it stands in `state`, issued by `issues` calls.
+    let laid = |issues: u8, state: LeaseState| FiledDecode {
+        issues,
+        ..FiledDecode::laid(side(8, state), None)
+    };
+    let first = side(7, LeaseState::Chosen);
+    let mut decodes = Decodes::default();
+    assert!(!decodes.keeps_any(), "no issue kept a side yet");
+    // A lease ahead, so the pair's place is not the list's first.
+    decodes.lay(key(1), laid(0, LeaseState::ISSUED));
+    let at = decodes.lay(key(2), laid(1, LeaseState::ISSUED));
+    assert_eq!(decodes.replaced_side(at, &key(2)), None, "nothing kept yet");
+
+    decodes.keep(at, key(2), (first, Instant::now()));
+    assert!(decodes.keeps_any());
+    for _ in 0..2 {
+        assert_eq!(decodes.replaced_side(at, &key(2)), Some(first));
+    }
+    assert_eq!(decodes.replaced_side(0, &key(1)), None, "no issue there");
+
+    // The issued side ends where it stands, then stands dispatched.
+    let ended = LeaseState::Released(ReleaseReason::Abandoned);
+    *decodes.get_mut(at, &key(2)).expect("the pair's side") = laid(1, ended);
+    assert_eq!(decodes.replaced_side(at, &key(2)), None, "its side ended");
+    let dispatched = LeaseState::Dispatched { at: Instant::now() };
+    *decodes.get_mut(at, &key(2)).expect("the pair's side") = laid(1, dispatched);
+    assert_eq!(decodes.replaced_side(at, &key(2)), Some(first));
+
+    // The lease leaves, and the next one laid takes its place.
+    assert!(decodes.take(at, &key(2)).is_some());
+    assert_eq!(decodes.lay(key(3), laid(1, LeaseState::ISSUED)), at);
+    assert_eq!(decodes.replaced_side(at, &key(3)), None, "another key's");
+    assert!(decodes.take(at, &key(3)).is_some());
+    assert_eq!(decodes.lay(key(2), laid(0, LeaseState::ISSUED)), at);
+    assert_eq!(decodes.replaced_side(at, &key(2)), None, "never issued");
 }

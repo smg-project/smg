@@ -17,7 +17,9 @@
 //! stream writes. On a pair's side the engine reads a worker with no block
 //! as one the record of sent prefixes speaks for. A single request of token
 //! ids is decided by the index alone, and names such a worker by nothing.
-//! An index that holds no block is none to the engine.
+//! An index that holds no block is none to the engine: it is lent all the
+//! same, and answers the engine's question of it in constant time
+//! ([`CacheIndex::holds_a_block`]).
 //!
 //! # Locks
 //!
@@ -84,12 +86,12 @@ impl<G: Generation> EventIndexes<G> {
 
 impl<G: Generation> CacheIndexes for EventIndexes<G> {
     /// A lending of the model's index, made anew at each call: the engine
-    /// asks once a table it reads. `None` while the index holds no block.
+    /// asks once a table it reads. It is lent whenever the model has one,
+    /// and says itself whether it holds a block
+    /// ([`CacheIndex::holds_a_block`]): the engine reads one that holds
+    /// none as no index, and reads its table again once that word moved.
     fn index(&self, model: &str) -> Option<Arc<dyn CacheIndex>> {
         let lent = self.tables.lend(model)?;
-        if lent.is_empty() {
-            return None;
-        }
         let objects = Weak::clone(&self.objects);
         Some(Arc::new(EventIndex { lent, objects }))
     }
@@ -118,6 +120,12 @@ impl<G: Generation> CacheIndex for EventIndex<G> {
     /// the id another row freed, ahead of that row's first block.
     fn numbers_reused(&self) -> u64 {
         self.lent.ids_reused()
+    }
+
+    /// The chain's own test of its root, in constant time: no lock, and no
+    /// walk of the rows.
+    fn holds_a_block(&self) -> bool {
+        !self.lent.is_empty()
     }
 
     fn worker_blocks(&self, number: u32) -> usize {

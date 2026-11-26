@@ -54,8 +54,10 @@ const PAST_TEXT: &str =
 /// Each value weighs what it holds: its own size and its text, a key
 /// its own size, its text and its place in the map, and a list keeps no
 /// room it does not fill. What JSON does not write is refused by name: a
-/// tagged value, a number that is not finite, a key written twice. A
-/// whole number past 64 bits reads as a fraction.
+/// value under a local tag, a number that is not finite, a key written
+/// twice. A global tag is read as YAML reads it: `!!str` leaves a number
+/// its text, `!!int` types a quoted one, and `!!null` refuses a text
+/// that is none. A whole number past 64 bits reads as a fraction.
 #[test]
 fn a_yaml_document_reads_as_the_values_json_writes() {
     let read = read_yaml(
@@ -93,10 +95,17 @@ fn a_yaml_document_reads_as_the_values_json_writes() {
     let fractions = serde_json::json!({"a": u128::MAX as f64, "b": -(2f64.powi(64))});
     assert_eq!(long, Ok(fractions));
 
+    let global = read_yaml(b"a: !!str 1\nb: !!int \"5\"\n");
+    assert_eq!(global, Ok(serde_json::json!({"a": "1", "b": 5})));
+
     for (document, named) in [
         (
             "a: !tagged 1\n",
             "the tag `!tagged` is none JSON writes: take the tag out",
+        ),
+        (
+            "a: !!null x\n",
+            "invalid value: string \"x\", expected null",
         ),
         ("a: .inf\n", "is none JSON writes"),
         ("a: 1\na: 2\n", "the key `a` is written twice"),
@@ -106,6 +115,211 @@ fn a_yaml_document_reads_as_the_values_json_writes() {
             Ok(read) => panic!("{document} read as {read}"),
         }
     }
+}
+
+/// A local tag is refused by its name wherever it stands, on a key as on
+/// a value: at the root, in a nested map, in a flow map, on a key that
+/// is a list or a map, with an anchor on either side of the tag, on a
+/// key with nothing under it, and as `!` alone. A handle that a `%TAG`
+/// line resolves to a local name is refused by that name. The name is the
+/// tag's letters as they are written.
+#[test]
+fn a_local_tag_is_refused_by_its_name_on_a_key_as_on_a_value() {
+    for (document, tag) in [
+        ("!mine a: 1\n", "!mine"),
+        ("a:\n  !mine b: 1\n", "!mine"),
+        ("{!mine a: 1}\n", "!mine"),
+        ("a: [{!mine b: 1}]\n", "!mine"),
+        ("? !mine [a]\n: 1\n", "!mine"),
+        ("? !mine {a: 1}\n: 2\n", "!mine"),
+        ("!mine &k a: 1\n", "!mine"),
+        ("&k !mine a: 1\n", "!mine"),
+        ("!mine \"a\": 1\n", "!mine"),
+        ("!mine a:\n", "!mine"),
+        ("!mine ~: 1\n", "!mine"),
+        ("!MiNe a: 1\n", "!MiNe"),
+        ("! a: 1\n", "!"),
+        ("%TAG !e! !my-\n---\n!e!x a: 1\n", "!my-x"),
+        // The same tag where it was refused before: a value, a list, an
+        // item, a map and the document.
+        ("a: !mine 1\n", "!mine"),
+        ("a: !mine [1]\n", "!mine"),
+        ("a: [!mine 1]\n", "!mine"),
+        ("a: !mine {b: 1}\n", "!mine"),
+        ("!mine {a: 1}\n", "!mine"),
+        ("a: !MiNe 1\n", "!MiNe"),
+        ("a: ! 1\n", "!"),
+        ("%TAG !e! !my-\n---\na: !e!x 1\n", "!my-x"),
+    ] {
+        let named = format!("the tag `{tag}` is none JSON writes: take the tag out");
+        match read_yaml(document.as_bytes()) {
+            Err(refused) => assert!(refused.contains(&named), "{document}: {refused}"),
+            Ok(read) => panic!("{document} read as {read}"),
+        }
+    }
+}
+
+/// A global tag is read as YAML reads it, by the parser and ahead of
+/// this read. One of the four that type a scalar types it, or refuses
+/// it where its text is none. Any other reads a scalar as its text, a
+/// tag written whole and one a `%TAG` line makes global among them. On
+/// a list, a map or a key a global tag changes nothing.
+#[test]
+fn a_global_tag_is_read_as_yaml_reads_it() {
+    for (document, read) in [
+        ("a: !!int \"5\"\n", serde_json::json!({"a": 5})),
+        ("a: !!float 5\n", serde_json::json!({"a": 5.0})),
+        ("a: !!bool \"true\"\n", serde_json::json!({"a": true})),
+        ("a: !!null ~\n", serde_json::json!({"a": null})),
+        ("a: !!str 1\n", serde_json::json!({"a": "1"})),
+        ("a: !!binary YQ==\n", serde_json::json!({"a": "YQ=="})),
+        (
+            "a: !<tag:example.com,2000:x> 1\n",
+            serde_json::json!({"a": "1"}),
+        ),
+        (
+            "%TAG ! tag:example.com,2000:\n---\na: !mine 1\n",
+            serde_json::json!({"a": "1"}),
+        ),
+        (
+            "%TAG !e! tag:example.com,2000:\n---\na: !e!x 1\n",
+            serde_json::json!({"a": "1"}),
+        ),
+        ("a: !!int [1]\n", serde_json::json!({"a": [1]})),
+        ("a: !!bool {b: 1}\n", serde_json::json!({"a": {"b": 1}})),
+        ("!!str a: 1\n", serde_json::json!({"a": 1})),
+        ("!!int 1: x\n", serde_json::json!({"1": "x"})),
+        (
+            "!<tag:example.com,2000:x> a: 1\n",
+            serde_json::json!({"a": 1}),
+        ),
+        (
+            "%TAG ! tag:example.com,2000:\n---\n!mine a: 1\n",
+            serde_json::json!({"a": 1}),
+        ),
+        (
+            "%TAG !e! tag:example.com,2000:\n---\n!e!x a: 1\n",
+            serde_json::json!({"a": 1}),
+        ),
+    ] {
+        assert_eq!(read_yaml(document.as_bytes()), Ok(read), "{document}");
+    }
+    for (document, named) in [
+        (
+            "a: !!int five\n",
+            "invalid value: string \"five\", expected an integer",
+        ),
+        (
+            "a: !!null \"\"\n",
+            "invalid value: string \"\", expected null",
+        ),
+    ] {
+        match read_yaml(document.as_bytes()) {
+            Err(refused) => assert!(refused.contains(named), "{document}: {refused}"),
+            Ok(read) => panic!("{document} read as {read}"),
+        }
+    }
+}
+
+/// A key with no local tag reads as it did where the parser's string
+/// entry read it. A key that looks like a number, a boolean or a null is
+/// its text as written, plain and quoted, an empty key too. A key by an
+/// alias is its anchor's text. A key weighs its own size, its text and
+/// its place in the map, under a global tag too. The JSON form reads a
+/// key the same way, and a key that begins with `!` there is its text.
+/// A key that is a list or a map is refused at its own place, in the
+/// words the string entry had for it: it wants a key of text, not a tag.
+#[test]
+fn a_key_with_no_local_tag_reads_as_its_text() {
+    let texts = read_yaml(
+        b"1: a\n007: b\n0x10: c\ntrue: d\n~: e\n\"1.5\": f\n'false': g\nnull: h\n-0: i\n\"\": j\n",
+    );
+    let expected = serde_json::json!({
+        "1": "a", "007": "b", "0x10": "c", "true": "d", "~": "e",
+        "1.5": "f", "false": "g", "null": "h", "-0": "i", "": "j",
+    });
+    assert_eq!(texts, Ok(expected));
+    assert_eq!(read_yaml(b"? \n: a\n"), Ok(serde_json::json!({"": "a"})));
+    assert_eq!(
+        read_yaml(b"&k a: 1\nb: {*k : 2}\nc: &v x\nd: {*v : 3}\n"),
+        Ok(serde_json::json!({"a": 1, "b": {"a": 2}, "c": "x", "d": {"x": 3}}))
+    );
+
+    for document in ["{a: ~}", "{!!str a: ~}", "{&k a: ~}"] {
+        let (read, built, text) = weighed(document);
+        assert_eq!(read, serde_json::json!({"a": null}), "{document}");
+        assert_eq!((built, text), (2 * NODE + KEY + 1, 1), "{document}");
+    }
+
+    let json = read_json(br#"{"1": 1, "true": 2, "": 3, "!mine a": 4}"#);
+    assert_eq!(
+        json.map_err(|refused| refused.to_string()),
+        Ok(serde_json::json!({"1": 1, "true": 2, "": 3, "!mine a": 4}))
+    );
+
+    for (document, refused) in [
+        (
+            "? [a, b]\n: 1\n",
+            "invalid type: sequence, expected a key of text at line 1 column 3",
+        ),
+        (
+            "? {a: 1}\n: 2\n",
+            "invalid type: map, expected a key of text at line 1 column 3",
+        ),
+        (
+            "{[a]: 1}\n",
+            "invalid type: sequence, expected a key of text at line 1 column 2",
+        ),
+        (
+            "a: &k [x]\nb: {*k : 2}\n",
+            "b: invalid type: sequence, expected a key of text at line 1 column 4",
+        ),
+    ] {
+        assert_eq!(
+            read_yaml(document.as_bytes()),
+            Err(refused.to_owned()),
+            "{document}"
+        );
+    }
+    // The rewording is by the parser's phrase: a document that writes
+    // the phrase as a key has it reworded where a refusal quotes the key.
+    let phrase = "invalid type: map, expected a YAML tag starting with '!'";
+    assert_eq!(
+        read_yaml(format!("{{\"{phrase}\": 1, \"{phrase}\": 2}}").as_bytes()),
+        Err("the key `invalid type: map, expected a key of text` is written twice".to_owned())
+    );
+}
+
+/// The parser bounds a nest in its own words. A list reads 128 deep and
+/// no deeper. A map that holds a key reads 127 deep, as every nest of the
+/// JSON form does: the read of a key holds one level of the parser's
+/// count. A map that holds none reads 128 deep, as a list does.
+#[test]
+fn the_parser_reads_a_list_128_deep_and_a_map_127_deep() {
+    let lists = |depth: usize| format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+    let maps = |depth: usize| format!("{}1{}", "{a: ".repeat(depth), "}".repeat(depth));
+    assert!(read_yaml(lists(128).as_bytes()).is_ok());
+    assert_eq!(
+        read_yaml(lists(129).as_bytes()),
+        Err("recursion limit exceeded at line 1 column 129".to_owned())
+    );
+    assert!(read_yaml(maps(127).as_bytes()).is_ok());
+    assert_eq!(
+        read_yaml(maps(128).as_bytes()),
+        Err("recursion limit exceeded at line 1 column 510".to_owned())
+    );
+    let json = |depth: usize| format!("{}1{}", "{\"a\":".repeat(depth), "}".repeat(depth));
+    assert!(read_json(json(127).as_bytes()).is_ok());
+    assert!(read_json(json(128).as_bytes()).is_err());
+    // The level held is a key's, and a map with no key in it holds none:
+    // 128 maps read where the innermost is empty. The JSON form counts the
+    // map itself, and refuses them.
+    let hollow = |depth: usize, open: &str| {
+        format!("{}{{}}{}", open.repeat(depth - 1), "}".repeat(depth - 1))
+    };
+    assert!(read_yaml(hollow(128, "{a: ").as_bytes()).is_ok());
+    assert!(read_json(hollow(127, "{\"a\":").as_bytes()).is_ok());
+    assert!(read_json(hollow(128, "{\"a\":").as_bytes()).is_err());
 }
 
 /// A document reads as no more text than twice the size bound, its keys
@@ -236,6 +450,16 @@ fn a_refusal_names_its_place_and_what_a_writer_does() {
             (
                 binding("!mine batch"),
                 "bindings[0].match.model: the tag `!mine` is none JSON writes: take the tag out at line 5 column 18".to_owned(),
+            ),
+            // A key's local tag is refused under its map's name, at the place
+            // where the map begins. The root has neither: the tag is named.
+            (
+                document("{!mine pick: random}", ""),
+                "profiles.default: the tag `!mine` is none JSON writes: take the tag out at line 3 column 12".to_owned(),
+            ),
+            (
+                document("{pick: random}", "!mine generation: 1\n"),
+                "the tag `!mine` is none JSON writes: take the tag out".to_owned(),
             ),
         ] {
             assert_eq!(

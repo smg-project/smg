@@ -1,7 +1,7 @@
 use super::*;
 
 /// The store's ingress traits, each with its file's text.
-const TRAITS: [(&str, &str); 4] = [
+const TRAITS: [(&str, &str); 3] = [
     (
         "WorkersStore",
         include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/store/workers.rs")),
@@ -9,13 +9,6 @@ const TRAITS: [(&str, &str); 4] = [
     (
         "HealthSink",
         include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/store/health.rs")),
-    ),
-    (
-        "ReservationStore",
-        include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/store/reservations.rs"
-        )),
     ),
     (
         "LeasesStore",

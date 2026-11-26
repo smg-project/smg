@@ -333,15 +333,6 @@ pub(crate) struct SpecStore {
 }
 
 impl SpecStore {
-    /// [`SpecStore::open_within`] as the cases open theirs: a start that
-    /// waits a case's room, as the controller's waits its grace period. A
-    /// directory whose store a case dropped is free a moment later where
-    /// another case's child process holds a copy of the lock file.
-    #[cfg(test)]
-    pub(crate) fn open(dir: PathBuf) -> Result<Self, StoreRefused> {
-        Self::open_within(dir, Duration::from_secs(30))
-    }
-
     /// Takes the directory at `dir` and reads it: the generations on file.
     /// A file left under a temporary name is removed, its write never
     /// ended, or left in place where this user may not remove it. Where
@@ -359,16 +350,6 @@ impl SpecStore {
         let held = Self::hold(&dir, &root, wait)?;
         Self::named_still(&dir, &root)?;
         Self::read_under(dir, root, held)
-    }
-
-    /// A second store on a directory another holds, its lock file open and
-    /// not locked, as a file system whose locks do not hold between two
-    /// hosts lets one in: the cases of two writers open theirs so.
-    #[cfg(test)]
-    pub(crate) fn open_beside(dir: PathBuf) -> Result<Self, StoreRefused> {
-        let (dir, root) = Self::rooted(&dir)?;
-        let unheld = Self::lock_file(&root)?;
-        Self::read_under(dir, root, unheld)
     }
 
     /// What the system reads at a path that leads to a directory. A path

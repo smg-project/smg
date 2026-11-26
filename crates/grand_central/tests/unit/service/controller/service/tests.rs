@@ -35,10 +35,10 @@ use crate::{
                 tests::{stating, told, NO_PRINCIPAL},
                 Layer,
             },
-            replication::{journaled_at, journaled_from},
+            replication::{journaled_at, tests::journaled_from},
             spec_store::{tests::names, SpecStore},
             wire::Checked,
-            PROTOCOL_VERSION,
+            PROTOCOL_FLOOR, PROTOCOL_VERSION,
         },
         elector::{
             ConditionalWriteOutcome, ElectError, ElectionSettings, Elector, FileLease,
@@ -50,6 +50,26 @@ use crate::{
     store::{LeasesStore, Position, WorkersStore},
     tracking::lease::{LeaseId, ReleaseReason},
 };
+
+impl Call {
+    /// Every call, in the contract's order.
+    const ALL: [Call; 14] = [
+        Call::Session,
+        Call::Decide,
+        Call::WatchWorkers,
+        Call::RegisterWorker,
+        Call::PatchWorker,
+        Call::DeregisterWorker,
+        Call::GetSnapshot,
+        Call::Explain,
+        Call::ApplyPolicySpec,
+        Call::GetPolicySpec,
+        Call::RollbackPolicySpec,
+        Call::StepDown,
+        Call::WatchRegime,
+        Call::Replicate,
+    ];
+}
 
 const ID: &str = "controller-0";
 const ADDRESS: &str = "10.0.0.7:30100";
@@ -670,7 +690,7 @@ fn answer(controller_id: &str, address: &str, term: u64, is_leader: bool) -> pro
         synced: false,
         sync: None,
         groups: Vec::new(),
-        protocol_min: PROTOCOL_VERSION,
+        protocol_min: PROTOCOL_FLOOR,
         protocol_max: PROTOCOL_VERSION,
     }
 }

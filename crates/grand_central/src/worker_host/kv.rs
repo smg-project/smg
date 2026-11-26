@@ -345,14 +345,6 @@ struct Sizes {
 }
 
 impl KvAdapter {
-    /// An adapter that writes `tables`, every batch to its stream's row. It
-    /// has no holder to state its rows: the cases that build one state
-    /// theirs to the tables themselves.
-    #[cfg(test)]
-    fn new(tables: Arc<KvTables>) -> Self {
-        Self::over(tables, None)
-    }
-
     fn over(tables: Arc<KvTables>, ranks: Option<Arc<dyn Ranks>>) -> Self {
         Self {
             rows: Mutex::new(Rows::default()),

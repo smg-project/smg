@@ -16,7 +16,7 @@ use crate::{
         GatewayId, HealthPolicy, MemoryStore, Overload, Reachability, Registrant, Signals,
         WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore as _,
     },
-    worker_host::{objects::stand, Members, Objects},
+    worker_host::{objects::tests::stand, Members, Objects},
 };
 
 fn holder() -> Objects<Members> {

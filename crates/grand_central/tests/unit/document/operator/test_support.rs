@@ -6,6 +6,8 @@ use std::{path::Path, process::Command};
 
 use parking_lot::Mutex;
 
+#[cfg(feature = "controller")]
+pub(crate) use crate::document::operator::document_manager::{needs_rows, Validate};
 use crate::{
     document::spec::{AppliedSpec, Digest, PolicySpec, SpecError},
     stages::StageRegistry,

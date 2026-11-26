@@ -149,12 +149,6 @@ impl Floors {
         let _ = door.saw(floor);
         Told::Said
     }
-
-    /// The terms spent so far.
-    #[cfg(test)]
-    pub(crate) fn spent(&self) -> u64 {
-        self.words.lock().spent
-    }
 }
 
 #[cfg(test)]
