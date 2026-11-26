@@ -435,6 +435,10 @@ pub fn extract_forwardable_request_headers(headers: Option<&HeaderMap>) -> HashM
     forwarded
 }
 
+/// Whether a worker is sent a request header of this name: the routers' one
+/// allow-list of request headers. The gateway's own request-id header,
+/// `x-smg-request-id`, never joins it: the gateway states its own id of a
+/// request to Grand Central under that name, and no worker is sent it.
 #[inline]
 pub fn should_forward_request_header(name: &str) -> bool {
     const REQUEST_ID_PREFIX: &str = "x-request-id-";
@@ -761,6 +765,23 @@ mod tests {
             "x-override-disagg-prefill-dp-rank"
         ));
         assert!(!should_forward_request_header("x-override-conversation-id"));
+    }
+
+    /// The gateway's own request-id header is on neither allow-list of
+    /// request headers: not this one, whose prefix rule passes a name that
+    /// begins `x-request-id-`, and not the Messages provider's, where that
+    /// provider is built in.
+    #[test]
+    fn the_gateways_own_request_id_header_is_on_no_allow_list() {
+        #[cfg(feature = "anthropic")]
+        use crate::anthropic::utils::should_propagate_header;
+
+        for name in ["x-smg-request-id", "X-SMG-Request-Id"] {
+            assert!(!should_forward_request_header(name), "{name}");
+            #[cfg(feature = "anthropic")]
+            assert!(!should_propagate_header(name), "{name}");
+        }
+        assert!(should_forward_request_header("x-request-id-of-a-proxy"));
     }
 
     #[test]
