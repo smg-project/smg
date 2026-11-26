@@ -72,13 +72,13 @@ use super::{
 #[cfg(test)]
 pub(crate) use crate::document::operator::Validate;
 pub(crate) use crate::document::operator::{
-    ApplyOutcome, Format, SpecRejected, DRY_RUNS_WAITING, MAX_DOCUMENT_BYTES, WRITES_WAITING,
+    ApplyOutcome, Format, SpecRejected, MAX_DOCUMENT_BYTES,
 };
 use crate::{
     document::{
         operator::{
             above, over_bound, Checked, DocumentManager, DryRun, EnforceOutcome, EnforceRefused,
-            Entered, FollowerTurn, Held, Line,
+            Entered, FollowerTurn, Held, Line, SerialTurn,
         },
         spec::{AppliedSpec, Digest, OverloadSwitch, PolicySpec, SpecError},
     },
@@ -136,6 +136,22 @@ enum Handed {
 /// written longer, so a longer guard names none.
 const DIGEST_TEXT_LEN: usize = "sha256:".len() + 64;
 
+/// How many dry runs may wait their turn: a call past them is refused.
+/// The count bounds what waits. Bytes are bounded before the wait: a
+/// document over the size bound takes no turn, and neither does a guard
+/// longer than a digest's text.
+///
+/// The heaviest file the search finds passes in under 40 ms at the median
+/// by run, so 32 passes take under a second and a half. 32 documents of
+/// the size bound, with their guards, are 4 MiB. A waiting call that ends
+/// leaves the wait and frees its place.
+pub(crate) const DRY_RUNS_WAITING: usize = 32;
+
+/// How many write calls may wait for the door: a call past them is refused.
+/// A waiting call holds its document, so what waits is bounded as the dry
+/// runs are: 32 documents of the size bound are 4 MiB.
+pub(crate) const WRITES_WAITING: usize = 32;
+
 /// Why a spec call gave no answer of its own: a dry run or a write no
 /// verdict, a read no document.
 #[derive(Debug)]
@@ -168,6 +184,11 @@ impl From<EnforceRefused> for Unanswered {
 /// The controller's spec source, with its replica's admissions.
 pub(crate) struct Generations {
     door: DocumentManager,
+    /// One dry run at a time ([`Generations::dry_run_in_turn`]).
+    dry_turn: SerialTurn,
+    /// Enforce and rollback share one write turn
+    /// ([`Generations::in_turn`]).
+    write_turn: SerialTurn,
     /// The start's document of a replica under a shared lease, in its
     /// source's form, from the start that passed it until the replica's
     /// first lead applies it or refuses it, or a followed generation
@@ -338,6 +359,8 @@ impl Generations {
     fn over(door: DocumentManager, fence: Option<Arc<Fence>>) -> Self {
         Self {
             door,
+            dry_turn: SerialTurn::new(DRY_RUNS_WAITING),
+            write_turn: SerialTurn::new(WRITES_WAITING),
             deferred: Mutex::new(None),
             file_sourced: AtomicBool::new(false),
             fence,

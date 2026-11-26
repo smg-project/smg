@@ -1369,6 +1369,11 @@ fn a_deferred_document_that_does_not_run_refuses_the_start() {
     let unrun = LEAST_LOAD.replace("healthy", "no-such-stage");
     door.defer(unrun.into_bytes(), Format::Yaml)
         .expect_err("a stage this build lacks");
+    // A refused start waits for no document: the store takes no mark.
+    assert!(
+        !store.snapshot().spec().awaits_document(),
+        "a refused start marked the store"
+    );
     // Nothing is kept for a take, and the door has no source.
     assert!(!door.bound());
     door.at_take();
