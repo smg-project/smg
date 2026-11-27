@@ -154,7 +154,8 @@ def test_amd_worker_startup_failure_is_not_skipped(monkeypatch, fixture_parts):
         raise error
 
     monkeypatch.setattr(worker_module, "start_workers", fail)
-    with pytest.raises(RuntimeError) as caught:
+    # Catch skip outcomes too, so losing the AMD re-raise fails the identity check.
+    with pytest.raises(BaseException) as caught:
         next(_fixture()(None, "unused.yaml"))
     assert caught.value is error
     assert not state.started and not state.shutdown and not state.stopped
