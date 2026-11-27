@@ -580,8 +580,6 @@ mod tests {
         }
     }
 
-    /// A connection nobody configured keeps what its wire ran before: the
-    /// stamping wire the engine's `auto`, the others no judgement at all.
     /// The tag of a JSON answer's schema alone goes as that schema to a
     /// backend pinned to another name than the one tags are spelled for and
     /// to a backend that compiles a schema and no tag; it stays a tag under
@@ -645,6 +643,8 @@ mod tests {
         assert_eq!(answer_schema_in_place_of_tag(schema, guidance), None);
     }
 
+    /// A connection nobody configured keeps what its wire ran before: the
+    /// stamping wire the engine's `auto`, the others no judgement at all.
     #[test]
     fn an_unconfigured_connection_keeps_its_wires_old_behaviour() {
         use crate::{client::default_structured_outputs_support, ZmqDialect};
