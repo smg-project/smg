@@ -20,12 +20,13 @@
     dead_code,
     reason = "the native floor is the plugin's own shape out of built-ins, not a preset"
 )]
+#[path = "../common/mod.rs"]
 mod common;
 #[expect(
     dead_code,
     reason = "the bench serves the honest plugin; the misbehaving scripts are the tests'"
 )]
-#[path = "../tests/support/grpc_plugin.rs"]
+#[path = "../../tests/support/grpc_plugin.rs"]
 mod served;
 
 use std::{hint::black_box, sync::Arc};

@@ -19,6 +19,7 @@
     reason = "a bench's setup has no caller to answer; a lease that fails to open is a bug the unit tests catch"
 )]
 
+#[path = "../common/mod.rs"]
 mod common;
 
 use std::{hint::black_box, sync::mpsc, thread, time::Instant};

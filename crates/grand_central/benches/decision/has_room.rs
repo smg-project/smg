@@ -27,6 +27,7 @@
     dead_code,
     reason = "this bench builds its engine from a document; `common::engine_of` serves the decision and contention benches"
 )]
+#[path = "../common/mod.rs"]
 mod common;
 
 use std::hint::black_box;
