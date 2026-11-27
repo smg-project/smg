@@ -31,7 +31,7 @@ use crate::{
         view::{Candidate, Constraints, RequestFacts, Role, WireModes, WorkerId},
     },
     service::{
-        controller::frame_decision::{decide_pair, FrameBuffers, PairBooked},
+        controller::frame_decision::{decide_pair, sides_named, FrameBuffers, PairBooked},
         proto,
     },
     stages::{lifecycle::Lifecycle, registry::StageRegistry},
@@ -538,6 +538,92 @@ fn a_side_is_held_where_its_profile_is_the_plain_ring() {
             assert_eq!(asked(Some(number)), owners, "key {key}, {number}");
         }
     }
+}
+
+/// A pair's frame that names its worker and states a hard demand is
+/// answered workers that meet it under every stock pair, whichever sides
+/// read the number: two rings, a ring on one side alone, and no ring. A
+/// frame that stays on a runtime is answered the prefill on it, and one
+/// that demands a way to decide a constraint the decode that states it.
+/// One that states both is answered that prefill beside that decode.
+///
+/// The count reads no record of a side its demand does not hold, and none
+/// under a pair that reads the number on neither side. No case tells
+/// that: a read that is not made and a read that keeps every worker
+/// answer alike.
+///
+/// The first prefill states the runtime 1 and every other worker the
+/// runtime 2. The first decode alone states the way 3. Each frame names
+/// the first worker.
+#[test]
+fn a_named_pairs_frame_is_answered_workers_that_meet_its_demand_under_each_stock_pair() {
+    use super::super::demanding;
+
+    const TURNS: &str = "round_robin";
+    let now = Instant::now();
+    // The names of the prefill and the decode one frame is answered under
+    // a stock pair.
+    let answered = |presets: (&str, &str), demands: proto::Demands| {
+        let store = pair_store(presets.0, presets.1);
+        let objects = holder(&store);
+        let prefills = [("p0", 1, 0, None), ("p1", 2, 0, None)];
+        let prefills = stating(&store, &objects, Role::Prefill, prefills);
+        let decodes = [("d0", 2, 3, None), ("d1", 2, 0, None)];
+        let decodes = stating(&store, &objects, Role::Decode, decodes);
+        let name = |side: &[(&'static str, WorkerId)], id: WorkerId| {
+            let member = side.iter().find(|&&(_, at)| at == id);
+            member.expect("a member of the case").0
+        };
+        let frame = demanding(pair_frame(1, Some(0)), demands);
+        let answer = reached(&served_pair(&store, &objects, frame, GATEWAY, now));
+        answer.map(|(prefill, decode)| (name(&prefills, prefill), name(&decodes, decode)))
+    };
+    let none = proto::Demands::default();
+    let wire = proto::Demands { runtime: 2, ..none };
+    let way = proto::Demands {
+        decoding: 3,
+        ..none
+    };
+    let both = proto::Demands { runtime: 2, ..way };
+    for presets in [(RING, RING), (RING, TURNS), (TURNS, RING), (TURNS, TURNS)] {
+        assert!(answered(presets, none).is_ok(), "{presets:?}");
+        let prefill = answered(presets, wire).map(|(prefill, _)| prefill);
+        assert_eq!(prefill, Ok("p1"), "{presets:?}");
+        let decode = answered(presets, way).map(|(_, decode)| decode);
+        assert_eq!(decode, Ok("d0"), "{presets:?}");
+        assert_eq!(answered(presets, both), Ok(("p1", "d0")), "{presets:?}");
+    }
+}
+
+/// The sides of a pair that read a frame's number are those whose profile
+/// is the plain hash ring, under a binding that names a target source.
+/// Neither side reads it under a pair of two other presets, or under two
+/// rings whose binding names no target source.
+#[test]
+fn the_sides_that_read_a_number_are_the_plain_rings_of_a_binding_that_names_a_target() {
+    use super::super::PAIRED;
+
+    const TURNS: &str = "round_robin";
+    let builtin = StageRegistry::builtin();
+    // The sides read under the stock pair of two presets: as the presets
+    // make its document, or with the target source taken out of its block.
+    let read = |(prefill, decode): (&str, &str), stock: bool| {
+        let presets = PolicySpec::pair_presets(prefill, decode);
+        let mut document = presets.expect("presets of this build");
+        document.generation = 1;
+        if !stock {
+            let block = document.bindings[0].routing_key.as_mut();
+            let block = block.expect("the ring's block of sources");
+            block.sources.retain(|source| !source.target);
+        }
+        sides_named(&staged(&document, &builtin), PAIRED)
+    };
+    assert_eq!(read((RING, RING), true), [true, true]);
+    assert_eq!(read((RING, TURNS), true), [true, false]);
+    assert_eq!(read((TURNS, RING), true), [false, true]);
+    assert_eq!(read((TURNS, TURNS), true), [false, false]);
+    let unsourced = read((RING, RING), false);
+    assert_eq!(unsourced, [false, false]);
 }
 
 /// Where the decode's side alone is the plain hash ring, the prefill is

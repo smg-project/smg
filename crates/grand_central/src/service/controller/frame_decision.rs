@@ -817,7 +817,9 @@ fn decide_sides(
 /// own records (`records`, the prefills' and then the decodes'), by what
 /// its role is held to
 /// ([`Demands::held_by`](crate::engine::demands::Demands::held_by)). A
-/// frame that states no demand reads no record for it.
+/// frame that states no demand reads no record for it. Neither does a
+/// side whose role is held to no part of the demand: the demand leaves
+/// no worker of it out.
 ///
 /// The sides that read the number are the binding's ([`sides_named`]):
 ///
@@ -837,7 +839,9 @@ fn decide_sides(
 ///   sent to and is stated the number ([`FrameRequest::naming_decode`]):
 ///   it counts the number among the partners there of the prefill it
 ///   picks, and sheds the pair under `target-worker` itself.
-/// - **Neither side.** The number is not read.
+/// - **Neither side.** The number is not read, and the frame is decided
+///   as one that names no worker: that decision holds its demand. The
+///   binding is read ahead of the records, so none is read here.
 ///
 /// Where no prefill is counted, or none opens the pair, the frame is
 /// decided as one that names no worker. It keeps its keys there, unlike a
@@ -866,6 +870,12 @@ fn decide_named_pair(
 ) -> Result<(Decision, Option<Shadowed>), DecisionRefused> {
     let model = frame.model();
     let unnamed = || front.decide_without_lease(&maker, now);
+    // The binding first: a pair that reads the number on neither side
+    // leaves here, ahead of the count's reads of the records.
+    let sides = sides_named(spec, model);
+    if sides == [false; 2] {
+        return unnamed();
+    }
     // The places of each side the gateway may take whose worker meets the
     // frame's hard demands, where a demand leaves a worker out: the count
     // reads those.
@@ -880,7 +890,12 @@ fn decide_named_pair(
             (decode_records, Role::Decode, stated[1], decodes),
         ];
         let narrowed = judged.map(|(records, role, among, kept)| {
+            // A side held to no part of the demand keeps every place: its
+            // records are not read.
             let demands = demands.held_by(role);
+            if demands.is_none() {
+                return false;
+            }
             records.meeting(demands, among, kept).is_some()
         });
         for (side, narrowed) in narrowed.into_iter().enumerate() {
@@ -893,13 +908,15 @@ fn decide_named_pair(
         (stated[0], pair.prefill_stalled),
         (stated[1], pair.decode_stalled),
     ];
-    let reached = match sides_named(spec, model) {
+    let reached = match sides {
         [true, decode_named] => {
             let steers = || spec.engine().steers_all_vetoed(model);
             let named = (Some(number), decode_named);
             named_worker::reached_pair(&pair, counted, named, None, steers)
         }
-        [false, true] => {
+        // The decode's side alone: a pair that reads the number on neither
+        // side left above.
+        [false, _] => {
             let lifts = || spec.engine().lifts_prefills(model);
             let Some(decodes) = named_worker::opened(&pair, counted, None, lifts) else {
                 return unnamed();
@@ -911,7 +928,6 @@ fn decide_named_pair(
             let maker = maker.over(WorkerLists::Pair(lent)).naming_decode();
             return front.decide_without_lease(&maker, now);
         }
-        [false, false] => return unnamed(),
     };
     match reached {
         ReachedPair::Places(prefill, decode) => {
