@@ -3405,24 +3405,38 @@ A fact leaves the remainder when the worker object gets a field that holds it as
    log last told of the record. A standby's applier hands its own log the record its applied
    change takes out the same way, read back from the object.
 
-   The table still gives an event six things until step 4. The status the log last told of a
-   record is the first: a handed record is told in it, and a status event names it as the
-   status its record left. It is the log's own word, which the table holds for the log. The
-   second is the instant a record changed in place was admitted at: the one body lays the
-   table's over every writer's record, and a keeper and a standby's applier hand that same
-   instant. The third is the models of a status a standby applies. A status event holds no
-   record: it names the models its record served at the write, the one fact a reader of a
-   status reads, for a watch that asked for some. A leader's keeper hands them off the worker
-   object, under the hold that reads the status **[built]**. A standby's applier hands none,
-   and its log is told the models of the table's record until the applier hands its object's
-   **[planned]**. No watch reads a standby's log: a watch of the leader it becomes reads those
-   entries. The fourth is the record taken out
-   by a decided change that a host hands the store itself (`MemoryStore::follow`), and the models of a status it hands so: no product code hands one so.
-   A keeper's status that hands no models is told the table's too: a keeper hands them wherever a log is told.
-   The fifth is the record a standby's applied change takes out where that record has no
-   object. The sixth is the kind of a change in place: the one body tells a resize where the
-   width of the table's record differs from the handed record's, whatever kind its writer
-   handed.
+   The table still gives an event five things until step 4:
+
+   - The first is the status the log last told of a record. A handed record is told in it,
+     and a status event names it as the status its record left. It is the log's own word,
+     which the table holds for the log.
+   - The second is the instant a record changed in place was admitted at. The one body lays
+     the table's over every writer's record. A keeper and a standby's applier hand that same
+     instant where the record has its object.
+   - The third is for a change that a host hands the store itself through
+     `MemoryStore::follow`: the record it takes out, and the models of a status. No product
+     code calls it. A keeper's status that hands none is told the table's: a keeper hands
+     them wherever a log is told.
+   - The fourth is the record a standby's applied change takes out, and the models of a
+     status it applies, where that record has no object.
+   - The fifth is the kind of a change in place. The one body tells a resize where the width
+     of the table's record differs from the handed record's, whatever kind its writer handed.
+
+   A status event holds no record. It names the models its writer handed, or the table's
+   record's where it handed none. They are the one fact a reader of a status reads, for a
+   watch that asked for some. A leader's keeper hands them off the worker object, under the
+   hold that reads the status, and a standby's applier in its turn **[built]**. No watch reads
+   a standby's log: a watch of the leader it becomes reads those entries.
+
+   While the table stands, a debug build holds the handed models to the table's record's, at
+   a status the store does not refuse first. In a controller they can differ in one window: a
+   cut is laid in two steps, the store's restore and then its objects, in one turn of the
+   keeper. A keeper's own status write takes no turn, so it can fall between the two. It then
+   names the standing object's models, where the cut's record is another history's under the
+   same id and revision.
+
+   A second writer is the other way to such a difference: of an object's facts, as said below,
+   or of the table around the keeper.
 
    Two more reads of the table in that body reach no event, and they end with the table too:
    the test whether a key's next life is the same worker, for its session pins, and the models
