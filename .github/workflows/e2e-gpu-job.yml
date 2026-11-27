@@ -53,7 +53,7 @@ on:
         required: false
         type: boolean
         default: false
-        description: "Set up Oracle DB and Brave MCP for agentic tests"
+        description: "Set up Brave MCP (and Oracle DB unless setup_oracle_deps is false) for agentic tests"
       setup_oracle_deps:
         required: false
         type: boolean
