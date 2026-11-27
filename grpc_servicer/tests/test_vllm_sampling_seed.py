@@ -27,11 +27,15 @@ instead of skipping.
 """
 
 import ast
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
+import grpc
 import pytest
 from smg_grpc_proto.generated import vllm_engine_pb2 as proto
+from test_vllm_ec_handoff import _Aborted, _generate
 
 
 class Capture(dict):
@@ -42,7 +46,7 @@ class Capture(dict):
 
 
 @pytest.fixture(scope="module")
-def convert():
+def convert_sampling_params():
     source = (
         Path(__file__).resolve().parents[1] / "smg_grpc_servicer/vllm/servicer.py"
     ).read_text()
@@ -69,6 +73,11 @@ def convert():
     }
     exec(compile(ast.fix_missing_locations(module), "vllm-servicer", "exec"), namespace)
     return namespace["_sampling_params_from_proto"]
+
+
+@pytest.fixture
+def convert(convert_sampling_params):
+    return partial(convert_sampling_params, SimpleNamespace(_supports_thinking_token_budget=True))
 
 
 def sampling(seed, n):
@@ -103,3 +112,51 @@ def test_seed_reaches_the_engine_as_the_unsigned_word(convert, seed, engine_seed
 def test_no_seed_stays_none(convert):
     result = convert(sampling(None, n=1))
     assert result["seed"] is None
+
+
+@pytest.mark.parametrize(
+    ("supported", "budget"), [(False, None), (True, None), (True, 0), (True, 7)]
+)
+def test_thinking_token_budget_preserves_presence(convert_sampling_params, supported, budget):
+    params = sampling(None, n=1)
+    if budget is not None:
+        params.thinking_token_budget = budget
+    args = convert_sampling_params(
+        SimpleNamespace(_supports_thinking_token_budget=supported), params
+    )
+    if budget is None:
+        assert "thinking_token_budget" not in args
+    else:
+        assert args["thinking_token_budget"] == budget
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("budget", [0, 7])
+async def test_generate_refuses_unsupported_thinking_budget_before_submit(
+    convert_sampling_params, budget
+):
+    engine = SimpleNamespace(
+        generate=Mock(), renderer=SimpleNamespace(process_for_engine=lambda prompt, **_: prompt)
+    )
+    servicer = SimpleNamespace(
+        engine=engine,
+        _supports_thinking_token_budget=False,
+        _notify_kv_transfer_rejected=AsyncMock(),
+        _loads=Mock(),
+    )
+    servicer._sampling_params_from_proto = partial(convert_sampling_params, servicer)
+    request = proto.GenerateRequest(
+        request_id="budget",
+        tokenized=proto.TokenizedInput(input_ids=[1, 2]),
+        sampling_params=proto.SamplingParams(thinking_token_budget=budget),
+    )
+    context = SimpleNamespace(abort=AsyncMock(side_effect=_Aborted))
+    with pytest.raises(_Aborted):
+        _ = [reply async for reply in _generate()(servicer, request, context)]
+    context.abort.assert_awaited_once_with(
+        grpc.StatusCode.INVALID_ARGUMENT,
+        "thinking_token_budget is unsupported by the configured vLLM sampler",
+    )
+    engine.generate.assert_not_called()
+    servicer._loads.submitted.assert_not_called()
+    servicer._loads.finished.assert_not_called()

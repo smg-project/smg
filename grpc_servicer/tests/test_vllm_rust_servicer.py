@@ -729,6 +729,14 @@ def test_model_info_advertises_the_engines_encoder_budget():
     assert rust.model_info_from_config(config, encoder_budget=192000)["mm_encoder_budget"] == 192000
 
 
+def test_model_info_advertises_an_initialized_thinking_token_budget():
+    config = _config()
+    assert rust.model_info_from_config(config)["supports_thinking_token_budget"] is False
+    config.reasoning_config = SimpleNamespace(enabled=True)
+    config.use_v2_model_runner = False
+    assert rust.model_info_from_config(config)["supports_thinking_token_budget"] is True
+
+
 def test_model_info_carries_where_the_engine_starts_a_grammar():
     # The Rust servicer advertises the engine's reasoning parser and where its
     # grammar starts on a thinking prompt, as the Python servicer does; a

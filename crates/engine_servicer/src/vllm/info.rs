@@ -171,6 +171,7 @@ fn server_facts(state: &State) -> vllm::GetServerInfoResponse {
         mm_encoder_budget: model.mm_encoder_budget,
         max_num_seqs: state.shared.running_window(model.max_num_seqs),
         engine_reasoning_parser: model.engine_reasoning_parser.clone(),
+        supports_thinking_token_budget: model.supports_thinking_token_budget,
         constrained_decoding_start: model.constrained_decoding_start.clone(),
         structural_tag_vocabulary: model.structural_tag_vocabulary.clone(),
         // The cache partition fields the adapter's translation reads.
