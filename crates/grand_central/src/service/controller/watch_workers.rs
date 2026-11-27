@@ -46,8 +46,6 @@
 //! with it, so the ceiling of watches bounds what a principal leaves
 //! unread.
 
-#[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
     pin::Pin,
     sync::Arc,
@@ -121,9 +119,6 @@ pub(crate) struct Feed {
     /// watch leaves, and by the last snapshot call out with no watch open:
     /// a copy of every row is held only while a reader can share it.
     rows: Arc<Mutex<Option<Arc<StoreCheckpoint>>>>,
-    /// The cuts of every row this feed took, for a case.
-    #[cfg(test)]
-    cuts: Arc<AtomicUsize>,
 }
 
 impl Feed {
@@ -141,8 +136,6 @@ impl Feed {
             teller: Arc::default(),
             unwired: Arc::default(),
             rows: Arc::default(),
-            #[cfg(test)]
-            cuts: Arc::default(),
         }
     }
 
@@ -244,8 +237,6 @@ impl Feed {
             return Arc::clone(cut);
         }
         let cut = Arc::new(objects.checkpoint(store));
-        #[cfg(test)]
-        self.cuts.fetch_add(1, Ordering::Relaxed);
         *kept = Some(Arc::clone(&cut));
         cut
     }

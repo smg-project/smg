@@ -104,7 +104,9 @@ impl Engine {
     /// their stages read, the build's age limit of load reports and the
     /// number of its stage table. A decision by rank checks a report's age
     /// by that limit, and no call changes it after: an engine made in code
-    /// ([`Engine::new`]) checks none.
+    /// ([`Engine::new`]) checks none. The build's pickers are its stage
+    /// table's, and the engine is told so here
+    /// ([`Engine::made_by_a_catalog`]): one made in code is not.
     pub(crate) fn built(
         build: EngineBuilder,
         bindings: Vec<Binding>,
@@ -114,6 +116,7 @@ impl Engine {
         let mut engine = Self::new(build.profiles, bindings, generation, needs);
         engine.max_report_age_ms = build.max_report_age_ms;
         engine.sent_credits = build.sent_credits;
+        engine.made_by_a_catalog();
         #[cfg(feature = "in-process")]
         {
             engine.sent_of = build.sent_of;

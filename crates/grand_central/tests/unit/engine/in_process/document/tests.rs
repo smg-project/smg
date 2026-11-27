@@ -82,7 +82,7 @@ impl InProcess {
     ) -> Result<Decision, DecisionRefused> {
         let document = self.in_force();
         self.under(&document)
-            .decide_decode_without_lease(maker, held, 0, now)
+            .decide_decode_without_lease(maker, held, Default::default(), 0, now)
     }
 
     /// [`Loaded::decide_encode_without_lease`] under the document in

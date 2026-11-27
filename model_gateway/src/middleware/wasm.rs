@@ -104,6 +104,10 @@ async fn run_request_hook(
 
     let max_body_size = wasm_manager.get_max_body_size();
     let mut body_replaced = false;
+    // The hook reads the body ahead of the request-body deadline layer, so it
+    // reads it under that layer's upload wait. The bytes it hands on are in
+    // memory: the layer's own read of them waits for nothing.
+    let body = super::body_timeout::upload_measured(body);
     let mut body_bytes = match axum::body::to_bytes(body, max_body_size).await {
         Ok(bytes) => bytes.to_vec(),
         Err(e) if super::body_timeout::crossed_payload_limit(&e) => {
@@ -376,7 +380,7 @@ fn now_epoch_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::{io, sync::Arc};
+    use std::{io, sync::Arc, time::Duration};
 
     use axum::{
         body::{Body, Bytes},
@@ -389,8 +393,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        apply_modify, frame_body, is_streaming, rebuild_response, run_request_hook,
-        run_response_hook, RequestHook,
+        super::request_start::RequestStarted, apply_modify, frame_body, is_streaming,
+        rebuild_response, run_request_hook, run_response_hook, RequestHook,
     };
     use crate::wasm::{
         module::{MiddlewareAttachPoint, WasmModule, WasmModuleAttachPoint, WasmModuleMeta},
@@ -490,6 +494,67 @@ mod tests {
         };
         assert_eq!(request.uri(), "/v1/models");
         assert_eq!(body_of(request.into_body()).await, b"body");
+    }
+
+    /// The request hook reads its body through the measure of the body
+    /// layer: with a module loaded, a body that comes in two parts with a
+    /// pause before each leaves the two pauses in the request's stamp at the
+    /// hook's read, and the route's read of the body the hook hands on adds
+    /// nothing to it. A hook without a module reads no body and writes
+    /// nothing.
+    #[tokio::test(start_paused = true)]
+    async fn the_request_hook_measures_the_upload_wait_at_its_own_read() {
+        const PAUSE: Duration = Duration::from_secs(2);
+        const WAIT: Duration = Duration::from_secs(100);
+        let post = || {
+            let parts = futures::StreamExt::then(
+                futures::stream::iter(["{\"k\"", ":1}"]),
+                |part| async move {
+                    tokio::time::sleep(PAUSE).await;
+                    Ok::<_, std::convert::Infallible>(part)
+                },
+            );
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .body(Body::from_stream(parts))
+                .expect("a request")
+        };
+
+        let hooked = manager_with_an_inert_module();
+        let left = RequestStarted::now()
+            .scope(async {
+                let RequestHook::Run(request) = run_request_hook(&hooked, post(), "req-1").await
+                else {
+                    panic!("the request runs");
+                };
+                // What runs behind the hook (authentication, the wait for an
+                // admission permit), then the route's reader.
+                tokio::time::advance(PAUSE).await;
+                body_of(request.into_body()).await;
+                RequestStarted::carried()
+                    .expect("the request's stamp")
+                    .less_upload_wait(WAIT)
+            })
+            .await;
+        assert_eq!(
+            left,
+            WAIT - 2 * PAUSE,
+            "the upload wait is the two pauses of the hook's read"
+        );
+
+        let unhooked = WasmModuleManager::with_default_config();
+        let left = RequestStarted::now()
+            .scope(async {
+                let RequestHook::Run(_) = run_request_hook(&unhooked, post(), "req-2").await else {
+                    panic!("the request runs");
+                };
+                RequestStarted::carried()
+                    .expect("the request's stamp")
+                    .less_upload_wait(WAIT)
+            })
+            .await;
+        assert_eq!(left, WAIT, "a hook without a module read no body");
     }
 
     /// A streaming response passes the response hook untouched, and no

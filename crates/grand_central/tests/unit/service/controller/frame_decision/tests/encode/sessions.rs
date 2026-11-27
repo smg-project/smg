@@ -1,8 +1,8 @@
 //! The cases of an encode request's frame under a sessions rule on its
 //! binding. The rule runs on the pair's two sides as under a pair's plan,
 //! through the entry that issues no lease, and places no item. Each case
-//! names the case it answers as: a pair's case of this folder's first file,
-//! or the engine's own.
+//! names the case it answers as: a pair's case of `sessions.rs` one folder
+//! up, or the engine's own.
 
 use std::{sync::Arc, time::Instant};
 

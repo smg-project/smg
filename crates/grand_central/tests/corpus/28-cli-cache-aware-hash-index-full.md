@@ -26,9 +26,10 @@ profiles:
   cache_aware:
     filter: [healthy, not-overloaded, not-tried]
     score:
-      - warmup-slice: { weight: 8, secs: 0 }
+      - warmup-slice: { weight: 8, secs: 0, thin_ratio: 0 }
       - prefix-affinity:
           weight: 4
+          threshold: 0
           decay: 0.5
           accounting_ttl_ms: 200
           spill: { prefix_margin_tokens: 1024, uncached_credit: true }

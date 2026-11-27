@@ -4535,6 +4535,7 @@ dependencies = [
  "engine-zmq-client",
  "futures",
  "llm-tokenizer",
+ "prost",
  "prost-types",
  "reqwest 0.13.4",
  "rmp-serde",

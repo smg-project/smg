@@ -25,7 +25,7 @@ use parking_lot::{Mutex, MutexGuard};
 use rustc_hash::FxHashMap;
 
 #[cfg(feature = "controller")]
-use crate::engine::CacheIndexes;
+use crate::engine::{sticky_sessions::SessionVerdict, CacheIndexes};
 use crate::{
     document::spec::AppliedSpec,
     engine::{
@@ -728,10 +728,6 @@ impl MemoryStore {
             self.pins_follow(old, new);
         }
         drop(workers);
-        // A case's hook runs here, once the workers lock is let go and before
-        // the gone keys' pins are forgotten.
-        #[cfg(test)]
-        seam::released();
         self.forget_gone(&ended);
         true
     }
@@ -2260,10 +2256,12 @@ type Replaced = (DecodeSide, Instant);
 
 /// What a decode call reads of the lease it names
 /// ([`MemoryStore::held_pair`]). The held prefill's worker comes first,
-/// then the worker and the rank of the decode its first decision chose.
-/// Last comes the instant the lease was issued at.
+/// then the worker and the rank of the decode its first decision chose,
+/// then the claim that decision made for the decode side: its key, and the
+/// worker it claimed, `WorkerId(0)` where it claimed none. Last comes the
+/// instant the lease was issued at.
 #[cfg(feature = "controller")]
-pub(crate) type HeldPair = (WorkerId, Option<(WorkerId, u16)>, u64);
+pub(crate) type HeldPair = (WorkerId, Option<(WorkerId, u16)>, (Session, WorkerId), u64);
 
 impl FiledDecode {
     /// `side` as a door files it with `booked`, the slot of its worker's
@@ -2289,6 +2287,18 @@ impl FiledDecode {
     #[cfg(feature = "controller")]
     fn taken_decode(&self) -> Option<(WorkerId, u16)> {
         self.side.target_at(self.taken)
+    }
+
+    /// The claim the side's decision made for its session: the key, and
+    /// the worker its verdict claimed, `WorkerId(0)` where it claimed
+    /// none. The verdict is of the pick's first target, whichever target
+    /// the prefill's dispatch took.
+    #[cfg(feature = "controller")]
+    const fn claimed(&self) -> (Session, WorkerId) {
+        match self.side.session_verdict {
+            SessionVerdict::Claimed(worker) => (self.side.session, worker),
+            _ => (self.side.session, WorkerId(0)),
+        }
     }
 }
 
@@ -3334,6 +3344,9 @@ impl MemoryStore {
     /// target, or the one that dispatch named. The call reads this before
     /// it decides, and its issue tests the same again under its own turn.
     ///
+    /// Then comes the claim that first decision made for the decode side's
+    /// key, by the side's own verdict.
+    ///
     /// Last comes the instant the lease was issued at, as the record's own
     /// lease states it (`Lease::issued_micros`). Every word of the lease is
     /// told under that date, and a claim the call makes is dated by it.
@@ -3352,7 +3365,12 @@ impl MemoryStore {
             .chosen_decode(&(gateway, lease))
             .map(|(held, decode)| {
                 let issued_micros = held.record.lease.issued_micros;
-                (held.record.target, decode.taken_decode(), issued_micros)
+                (
+                    held.record.target,
+                    decode.taken_decode(),
+                    decode.claimed(),
+                    issued_micros,
+                )
             })
     }
 
@@ -3949,16 +3967,10 @@ impl LeasesStore for MemoryStore {
 #[path = "../../tests/unit/store/memory/tests.rs"]
 mod tests;
 
-/// A seam for the cases: a hook the writing thread runs once, where a write
-/// by the store's one body has let the workers lock go
-/// ([`MemoryStore::decided`]): a followed change, or a change the
-/// replica's worker objects decided. A told status runs none. A second
-/// hook runs inside an apply
-/// of a generation, between the engine's turn and the publication of the
-/// generation's world ([`MemoryStore::apply`]). No case reaches the
-/// second place from outside, and the first only where the store has a
-/// journal, which hears there that the write's locks are let go
-/// ([`Journal::released`]). In no build but the cases'.
+/// A seam for the cases: a hook the applying thread runs once inside an
+/// apply of a generation, between the engine's turn and the publication of
+/// the generation's world ([`MemoryStore::apply`]). No case reaches that
+/// place from outside. In no build but the cases'.
 #[cfg(test)]
 #[path = "../../tests/unit/store/memory/seam.rs"]
 pub(crate) mod seam;

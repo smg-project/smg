@@ -741,19 +741,29 @@ Classic reads exactly one record for a request:
 
 This is classic under its default, `--cache-index tree`. Under `--cache-index hash` classic reads
 none of the three: it keeps a table of placements with a time to live for requests with token
-ids, and balances a text request by load. This design covers the default.
-
-The engine builds no such table yet. A start under the engine whose routing settings state
-`cache_index = hash` runs, and `cache_aware` then remembers no request it placed. The start says
-so in one warning that names the setting. The warning is written for the settings alone: a
-supplied document whose index entry is of kind `hash` runs the same way and gets none, since it
-states its own entries and no setting names them.
+ids, and balances a text request by load. The engine follows it there by its record of sent
+prefixes: under an index of the kind `hash` the record is keyed at `view.boundaries` alone, and
+the settings translate to a `prefix-affinity` threshold of zero and a `warmup-slice` that names
+nobody. So a request of token ids goes back to the worker its head at a boundary was sent to,
+and a request with fewer whole blocks than the first boundary's, or one hashed by its text, is
+recorded nowhere. Five
+things differ from classic. The engine keeps no time to live: a placement stays until the
+record's size bound takes it. It keeps every worker sent a head as its holder, where classic
+keeps three. A key ends at the last whole block under its boundary and keys every request that
+holds those blocks, where classic asks for the boundary's every token. A boundary past the first
+`view.max_block_hashes` blocks of a request keys nothing, where classic keys every boundary the
+prompt reaches. And where the model's index of cache events holds a block, the engine reads
+record A for a request of token ids, which classic under `hash` does not read. The routing
+settings never raise `view.max_block_hashes`, so a gateway whose settings state a boundary past
+those blocks says so at its start in one warning that names the setting, `cache_boundaries`; a
+supplied document states its own view and gets none.
 
 Both trees are read and written in one walk: the walk finds the longest stored prefix, hands the
 match to the policy, and stores the request for the worker the policy chose. So no write is lost
 when many requests decide at once. A tree is brought back under a size bound
-(67,108,864 for a model by default: tokens, or for text its characters plus 1024 for each node
-a worker stands on) by an eviction pass every 120 seconds.
+(67,108,864 for a model by default, summed over the workers: the tokens each worker holds, or for
+text the characters of the nodes each worker stands on plus 1024 for each such node) by an
+eviction pass every 120 seconds.
 Between two passes it grows past the bound.
 
 A request's prompt is stored under its **cache partition** (cache salt, extra value, adapter), so
@@ -1758,7 +1768,7 @@ What an event does:
 
 | Event | What the stages do with it |
 |---|---|
-| Dispatched | the session's pin follows the worker the request went to, unless the dispatch is dated before every decision that read the key's current life; every count of sends takes it, whichever profile placed the request; scorers and pickers that asked hear it. A pick a sessions rule keeps from the profile moves the pin alone. A pin at its rule's cap moved already, to the worker under the cap that the request which met the cap was placed on: where that request was decided, or for a pair's prefill side where the pair formed (decision 13). The dispatch finds the pin there, or fronts the later target the request went to. A request placed on another worker at the cap moves no pin |
+| Dispatched | the session's pin follows the worker the request went to, unless the dispatch is dated before every decision that read the key's current life; every count of sends takes it, whichever profile placed the request; scorers and pickers that asked hear it. A pick a sessions rule keeps from the profile moves the pin alone. A pin at its rule's cap moved already, to the worker under the cap that the request which met the cap was placed on: where that request was decided, or for a pair's prefill side where the pair formed (decision 13). The dispatch finds the pin there, or fronts the later target the request went to. A request placed on another worker at the cap moves no pin. A decode call's claim may stand beside the claim its pair's first decision made for the key, with neither confirmed by a dispatch: the two are one lease's, and the lease goes to one of them. A claim a later request of the key made on the first decision's worker is that request's own, and the call's claim stands beside it as beside any pin. The lease's dispatch on the call's worker takes back the first decision's claim, and the key holds the worker the request went to, alone; a request that followed the first decision's claim ahead of that dispatch and is sent there behind it puts the pin back where it stood, while no write moved the pin that stayed. The lease's dispatch on the first decision's worker by its first pick's own word, behind a call that was taken back, takes back the call's claim. Any other dispatch leaves the two as it leaves any pin and claim, and a move at the cap onto the worker that leads the key's pins, made ahead of the lease's dispatch, ends what ties the two: that dispatch then takes back neither |
 | Completed | scorers and pickers that asked hear the outcome (status, time to first token, tokens in and out, duration) |
 | Released | scorers and pickers that asked for it hear the reason. Under a sessions rule a commit that refused every target takes back the pin its decision claimed, on each side of a pair, and no pin a later decision claimed on the same worker. A pair's later decode, issued no lease, gives its claim back with its prefill, or with a release that names it alone: a controller's file tells that word, and a request's guard says none for a later decode its host gives up by name. On a controller's file a side a decode call issued stands in that later decode's place, and the release that ends the issued side gives the first decision's claim back as well where the call went to the decode that decision claimed |
 
@@ -2162,6 +2172,7 @@ pub struct PlaceRequest<'a> {
     pub headers: &'a dyn HeaderRead,  // the engine reads the headers the document names
     pub request_id: Option<&'a str>,
     pub explain_id: Option<&'a str>,  // its host's name for it: what a kept decision is found by where it states no id
+    pub explain_id_header: Option<&'a str>,  // the header that holds that name: read under a document that keeps a sample
     pub tenant: Option<&'a str>,
     pub priority: i32,
     pub streaming: bool,
@@ -2286,11 +2297,14 @@ request states no hard demand, its host states no places of the prefills or the 
 encode pass is laid for it. One decision more is then held to the rule's prefills, with no decode
 lent.
 
-Under a binding that sheds a list wholly over its thresholds, that decision sheds the request as
-saturated where the rule's prefills that pair with a decode are so. That shed is the answer, for
-the prefill side. Any other
-shed of it leaves the answer as it was. A decision that panics there is answered as refused, as
-any is. The gateway's own selection judges the rule's prefills
+Under a binding that sheds a list wholly over its thresholds, that decision may shed the request
+as saturated: that shed is the answer, for the prefill side. It does where the rule's prefills that
+pair with a decode are so and none of them stands under the prefill side's hard filters, its limit
+set aside. Under a side that lists no overload veto, one over its thresholds may stand, and the
+answer stays as it was.
+
+Any other shed of that decision leaves the answer as it was. A decision that panics there is
+answered as refused, as any is. The gateway's own selection judges the rule's prefills
 first there (`pair_pass` in `model_gateway/src/routers/common/placement.rs`, where no prefill is
 eligible).
 
@@ -2899,7 +2913,7 @@ request ──> route (HTTP or gRPC, any family)
 
   Where the document asks a pair's decode again, the two pair routes make one more call between the prefill's answer and the decode's dispatch (section 8.2).
 
-  The gateway's own id of a request reaches the engine too (`PlaceRequest::explain_id`) **[built]**: the id its response's `x-request-id` header shows. Under a policy spec that keeps a sample the gateway states its own request id under `x-smg-request-id`, and a client's value there is replaced. Under a spec that keeps none the gateway writes nothing there, and a client's value stays as it came. No worker is sent the header in either case. The gateway writes the header in a layer of its own, inside its edge layers and behind the layer that chooses the id. It installs that layer under a document that keeps a sample, and under no other. The choice is made once, at the gateway's start: a document put in force later on the running engine does not move it. The function that fills the engine's request reads the header off the headers a route already hands its placement. No route states the id by a word of its own, and a gateway that places with its classic policies writes and reads no such header. Inside the gateway it is a request header like any other: a request plugin sees it, and a document that names it as a header reads what stands there. A kept decision is found by the id where the route states no id of the request's own, and an id of the request's own wins (decision 7). The id in a request's body is stated as its own by the regular HTTP router where it reads the body, and by the gRPC pipeline. The HTTP pair router states a key of it under the routing-key override, and none without. A request whose route hands its placement no headers states no id of the gateway's: a Responses request of a Harmony model on the gRPC route, and the HTTP pair router's health probe that generates.
+  The gateway's own id of a request reaches the engine too (`PlaceRequest::explain_id_header`) **[built]**: the id its response's `x-request-id` header shows. Under a policy spec that keeps a sample the gateway states its own request id under `x-smg-request-id`, and a client's value there is replaced. Under a spec that keeps none the gateway neither writes nor reads that header, and a client's value stays as it came. A configuration that names that header for a use of its own is served as for any header it names so. Named as a request id header, it is read and rewritten by the request-id layer where it is the first configured header that is present. No worker is sent the header in either case. The gateway writes the header in a layer of its own, inside its edge layers and behind the layer that chooses the id. It installs that layer under a document that keeps a sample, and under no other. The choice is made once, at the gateway's start: a document put in force later on the running engine does not move it. Where a later document keeps a sample and the start's kept none, the engine reads what stands under that name, as its bytes. The explain route asks by UTF-8 text, so a decision kept under bytes that are no UTF-8 text is not found through it. No path of the gateway puts such a later document in force today, and the piece that adds one makes the write follow the document. The function that fills the engine's request states the header's name. The engine reads the id off the headers a route already hands its placement, under a document that keeps a sample and under no other. No route states the id by a word of its own, and a gateway that places with its classic policies writes and reads no such header. Inside the gateway it is a request header like any other: a request plugin sees it, and a document that names it as a header reads what stands there. A kept decision is found by the id where the route states no id of the request's own, and an id of the request's own wins (decision 7). The id in a request's body is stated as its own by the regular HTTP router where it reads the body, and by the gRPC pipeline. The HTTP pair router states a key of it under the routing-key override, and none without. A request whose route hands its placement no headers states no id of the gateway's: a Responses request of a Harmony model on the gRPC route, and the HTTP pair router's health probe that generates.
 
   A retry held to its wire is placed over the pool's whole list and stays on the wire by its demand (section 8.2) **[built]**. The gateway gives each runtime and transport it dials one number. It states that number of each worker where a list is first lent to the engine, and a retry states its wire's number as its demand, as does a first attempt its route pins to a wire. A request pinned to no wire states none. The route's own rule for a worker still holds beside the demand. An encode request that states a demand is held to it a list at a time (section 5.4). The gateway hands the engine no such request yet: its encode entry waits until the two refusals of section 5.4 are named as classic names them **[planned]**.
 
@@ -4093,7 +4107,7 @@ scrape of its metrics endpoint, as the series `smg_policy_shadow_decisions_total
 takes a document that names a pair's shadows, and a served controller asks no side's
 shadow. The explain sample is kept by the served controller, and by the engine in a gateway's
 process for a single request and a pair's first decision. There an encode request decided with
-its items, a decode decided again and a pair's shadows are in no record. The gateway answers a kept record at `GET /policy/explain/{request_id}`, in the JSON the crate writes one in. A request whose route states no id of its own is found by the gateway's own id of it, the one its response's `x-request-id` header shows (section 9.2). Under a policy spec that keeps a sample the gateway states its own request id under `x-smg-request-id`, and a client's value there is replaced. Under a spec that keeps none the gateway writes nothing there, and a client's value stays as it came. No worker is sent the header in either case. A document
+its items, a decode decided again and a pair's shadows are in no record. The gateway answers a kept record at `GET /policy/explain/{request_id}`, in the JSON the crate writes one in. A request whose route states no id of its own is found by the gateway's own id of it, the one its response's `x-request-id` header shows (section 9.2). Under a policy spec that keeps a sample the gateway states its own request id under `x-smg-request-id`, and a client's value there is replaced. Under a spec that keeps none the gateway neither writes nor reads that header, and a client's value stays as it came. A configuration that names that header for a use of its own is served as for any header it names so. Named as a request id header, it is read and rewritten by the request-id layer where it is the first configured header that is present. No worker is sent the header in either case. A document
 that writes `canary`, `override: allowed` or `admission` is refused. No engine runs them.
 
 | Option | Cost |

@@ -1195,4 +1195,5 @@ fn mint_room(dp_placement: DpPlacement, prefill_worker: &Arc<dyn Worker>, bound:
 }
 
 #[cfg(test)]
+#[path = "../../../../../tests/unit/routers/grpc/common/stages/helpers/tests/mod.rs"]
 mod tests;

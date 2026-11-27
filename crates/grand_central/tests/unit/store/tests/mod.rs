@@ -630,22 +630,88 @@ fn a_key_registered_again_as_the_worker_it_was_takes_its_pins() {
     assert_eq!(pins_held(&store), 0, "the old worker's pin");
 }
 
+/// What [`AtTheRelease`] runs for a case.
+type Hook = Box<dyn FnOnce()>;
+
+thread_local! {
+    /// The hook a case armed on this thread for the journal's next
+    /// release.
+    static AT_RELEASE: RefCell<Option<Hook>> = const { RefCell::new(None) };
+}
+
+/// A journal that takes every write. Where the store has let a write's
+/// locks go it runs the hook a case armed on this thread, once: the hook
+/// is taken out first, so a write the hook itself makes meets none.
+struct AtTheRelease;
+
+impl Journal for AtTheRelease {
+    fn member(
+        &self,
+        _: Option<Position>,
+        _: Option<u64>,
+        _: u64,
+        _: MembershipChange,
+        _: Option<&WorkerRow>,
+        _: Option<&WorkerRow>,
+    ) -> bool {
+        true
+    }
+
+    fn status(
+        &self,
+        _: Option<Position>,
+        _: Option<u64>,
+        _: u64,
+        _: WorkerId,
+        _: WorkerStatus,
+        _: WorkerStatus,
+        _: Arc<[String]>,
+    ) -> bool {
+        true
+    }
+
+    fn term_rose(&self, _: u64) {}
+
+    fn generation(&self, _: Option<Position>, _: u64) {}
+
+    fn term_followed(&self, _: Position) {}
+
+    fn head(&self) -> Position {
+        Position::default()
+    }
+
+    fn followed(&self) -> Option<u64> {
+        None
+    }
+
+    fn released(&self) {
+        let hook = AT_RELEASE.with(|held| held.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    fn restart(&self, _: Position) -> bool {
+        true
+    }
+}
+
 /// Two registrations of one key rename its session pins in their order.
 /// The second lands where the first has let the workers lock go, and the
 /// pin names the last life: in place, and for a key that left.
 #[test]
 fn registrations_of_one_key_rename_its_pins_in_their_order() {
-    use std::{cell::Cell, rc::Rc};
+    use std::rc::Rc;
 
-    use super::memory::seam;
-
-    let store = Rc::new(MemoryStore::new());
+    let store = Rc::new(MemoryStore::journaled(Arc::new(AtTheRelease)));
     let of = |key: u64| pin_of(&store, key);
-    // The third life of `key`, registered behind the next registration.
+    // The third life of `key`, registered behind the next registration:
+    // the journal hears there that the write's locks are let go.
     let third_behind = |key: &'static str| {
         let third = Rc::new(Cell::new(None));
         let (behind, seen) = (Rc::clone(&store), Rc::clone(&third));
-        seam::on_release(move || seen.set(Some(behind.upsert(facts(key, 3)).id())));
+        let register = move || seen.set(Some(behind.upsert(facts(key, 3)).id()));
+        AT_RELEASE.set(Some(Box::new(register)));
         third
     };
     // In place: the key's second life is replaced by its third at once.
@@ -664,6 +730,29 @@ fn registrations_of_one_key_rename_its_pins_in_their_order() {
     store.upsert(facts("http://b:8000", 2));
     assert!(third.get().is_some(), "the hook ran");
     assert_eq!(of(12), third.get());
+}
+
+/// A key that comes back as another worker takes no pin, and the pins of
+/// the worker it was are forgotten with the workers lock let go: where the
+/// journal hears of the release, the old pin still stands.
+#[test]
+fn a_returned_keys_old_pins_are_forgotten_behind_the_workers_lock() {
+    use std::rc::Rc;
+
+    let store = Rc::new(MemoryStore::journaled(Arc::new(AtTheRelease)));
+    let a = ready(&store, "http://a:8000");
+    pinned(&store, 11, a);
+    let revision = WorkersStore::get(&*store, a).expect("the row").revision;
+    store.remove(a, revision).expect("removed");
+    let at_release = Rc::new(Cell::new(None));
+    let (behind, seen) = (Rc::clone(&store), Rc::clone(&at_release));
+    AT_RELEASE.set(Some(Box::new(move || seen.set(Some(pin_of(&behind, 11))))));
+    store.upsert(WorkerFacts {
+        role: Role::Decode,
+        ..facts("http://a:8000", 2)
+    });
+    assert_eq!(at_release.get(), Some(Some(a)), "forgotten under the lock");
+    assert_eq!(pin_of(&store, 11), None, "another worker takes no pin");
 }
 
 /// A key that stays away longer than the absence's time takes no pin
@@ -4043,7 +4132,7 @@ fn the_held_pair_names_the_prefill_and_the_decode_of_the_target_its_dispatch_too
         let held = store.held_pair(owner, LeaseId(id));
         assert!(store.unlocked(), "the turn is given back");
         assert_eq!(file(), before, "the read moves nothing");
-        held
+        held.map(|(prefill, decode, _, issued)| (prefill, decode, issued))
     };
     // No prefill was sent yet.
     assert_eq!(held(gateway, 1), Err(PrefillNotHeld));

@@ -43,6 +43,9 @@ use crate::{
 /// the number under.
 const RING: &str = "consistent_hashing";
 
+/// A preset whose profile takes turns: a side under it reads no number.
+const TURNS: &str = "round_robin";
+
 /// A store under the stock pair of the presets `prefill` and `decode` as
 /// generation 1, with the stages of `catalog` and what `edit` changes of
 /// the document. It mints leases under term 1 and holds no member yet. A
@@ -72,6 +75,14 @@ fn pair_store(prefill: &str, decode: &str) -> Arc<MemoryStore> {
 /// The stock pair of two hash rings: both sides read the number.
 fn rings() -> Arc<MemoryStore> {
     pair_store(RING, RING)
+}
+
+/// Takes the target source out of the block of `document`'s one binding:
+/// a frame's host then read its number under another document.
+fn without_target(document: &mut PolicySpec) {
+    let block = document.bindings[0].routing_key.as_mut();
+    let block = block.expect("the ring's block of sources");
+    block.sources.retain(|source| !source.target);
 }
 
 /// The ready members `names` on `role`'s side, written through `objects`,
@@ -490,7 +501,7 @@ fn a_side_is_held_where_its_profile_is_the_plain_ring() {
         let (prefills, decodes): (BTreeSet<WorkerId>, BTreeSet<WorkerId>) = named.unzip();
         (prefills, decodes, ahead, behind)
     };
-    let (prefills, decodes, ahead, _) = turns(&pair_store(RING, "round_robin"), Some(1));
+    let (prefills, decodes, ahead, _) = turns(&pair_store(RING, TURNS), Some(1));
     assert_eq!(prefills, BTreeSet::from([ahead[1]]), "the prefill is held");
     assert_eq!(decodes.len(), 3, "the decodes take their turns");
 
@@ -505,7 +516,7 @@ fn a_side_is_held_where_its_profile_is_the_plain_ring() {
         document.bindings[0].routing_key = Some(block);
     };
     let builtin = StageRegistry::builtin();
-    let turning = ("round_robin", "round_robin");
+    let turning = (TURNS, TURNS);
     for number in [1, u32::MAX] {
         let neither = pair_store_in(&builtin, turning, sourced);
         let (prefills, decodes, ..) = turns(&neither, Some(number));
@@ -521,11 +532,7 @@ fn a_side_is_held_where_its_profile_is_the_plain_ring() {
 
     // Two rings under a block that names no target source: the frame's
     // host read the number under another document.
-    let rings = pair_store_in(&builtin, (RING, RING), |document| {
-        let block = document.bindings[0].routing_key.as_mut();
-        let block = block.expect("the ring's block of sources");
-        block.sources.retain(|source| !source.target);
-    });
+    let rings = pair_store_in(&builtin, (RING, RING), without_target);
     let (objects, ..) = fleet(&rings, ["p0", "p1", "p2"], ["d0", "d1", "d2"]);
     for key in 1..=6_u64 {
         let asked = |number: Option<u32>| {
@@ -541,29 +548,34 @@ fn a_side_is_held_where_its_profile_is_the_plain_ring() {
 }
 
 /// A pair's frame that names its worker and states a hard demand is
-/// answered workers that meet it under every stock pair, whichever sides
-/// read the number: two rings, a ring on one side alone, and no ring. A
-/// frame that stays on a runtime is answered the prefill on it, and one
-/// that demands a way to decide a constraint the decode that states it.
-/// One that states both is answered that prefill beside that decode.
+/// answered workers that meet it under four stock pairs, one for each set
+/// of sides that read the number: two rings, a ring on one side alone, and
+/// no ring. A frame that stays on a runtime is answered the prefill on it,
+/// and one that demands a way to decide a constraint the decode that
+/// states it. One that states both is answered that prefill beside that
+/// decode.
+///
+/// A number past the workers that meet the demand sheds the pair under
+/// `target-worker` where a side reads it. Where neither side does, the
+/// number is not read whatever the frame demands: the frame that states
+/// both demands is answered the one pair that meets them.
 ///
 /// The count reads no record of a side its demand does not hold, and none
 /// under a pair that reads the number on neither side. No case tells
-/// that: a read that is not made and a read that keeps every worker
-/// answer alike.
+/// either skip: a read of a side held to no part of the demand keeps
+/// every worker, and a pair that reads the number on neither side runs
+/// no count for a read to serve.
 ///
 /// The first prefill states the runtime 1 and every other worker the
-/// runtime 2. The first decode alone states the way 3. Each frame names
-/// the first worker.
+/// runtime 2. The first decode alone states the way 3.
 #[test]
-fn a_named_pairs_frame_is_answered_workers_that_meet_its_demand_under_each_stock_pair() {
+fn a_named_pairs_frame_is_answered_workers_that_meet_its_demand_whichever_sides_read_the_number() {
     use super::super::demanding;
 
-    const TURNS: &str = "round_robin";
     let now = Instant::now();
     // The names of the prefill and the decode one frame is answered under
-    // a stock pair.
-    let answered = |presets: (&str, &str), demands: proto::Demands| {
+    // a stock pair, where it names its worker by `number`.
+    let answered = |presets: (&str, &str), number: u32, demands: proto::Demands| {
         let store = pair_store(presets.0, presets.1);
         let objects = holder(&store);
         let prefills = [("p0", 1, 0, None), ("p1", 2, 0, None)];
@@ -574,7 +586,7 @@ fn a_named_pairs_frame_is_answered_workers_that_meet_its_demand_under_each_stock
             let member = side.iter().find(|&&(_, at)| at == id);
             member.expect("a member of the case").0
         };
-        let frame = demanding(pair_frame(1, Some(0)), demands);
+        let frame = demanding(pair_frame(1, Some(number)), demands);
         let answer = reached(&served_pair(&store, &objects, frame, GATEWAY, now));
         answer.map(|(prefill, decode)| (name(&prefills, prefill), name(&decodes, decode)))
     };
@@ -586,12 +598,20 @@ fn a_named_pairs_frame_is_answered_workers_that_meet_its_demand_under_each_stock
     };
     let both = proto::Demands { runtime: 2, ..way };
     for presets in [(RING, RING), (RING, TURNS), (TURNS, RING), (TURNS, TURNS)] {
-        assert!(answered(presets, none).is_ok(), "{presets:?}");
-        let prefill = answered(presets, wire).map(|(prefill, _)| prefill);
+        assert!(answered(presets, 0, none).is_ok(), "{presets:?}");
+        let prefill = answered(presets, 0, wire).map(|(prefill, _)| prefill);
         assert_eq!(prefill, Ok("p1"), "{presets:?}");
-        let decode = answered(presets, way).map(|(_, decode)| decode);
+        let decode = answered(presets, 0, way).map(|(_, decode)| decode);
         assert_eq!(decode, Ok("d0"), "{presets:?}");
-        assert_eq!(answered(presets, both), Ok(("p1", "d0")), "{presets:?}");
+        assert_eq!(answered(presets, 0, both), Ok(("p1", "d0")), "{presets:?}");
+        // One prefill and one decode meet both demands: the number 1 is
+        // past them on a side that reads it.
+        let past = if presets == (TURNS, TURNS) {
+            Ok(("p1", "d0"))
+        } else {
+            Err(MISSED)
+        };
+        assert_eq!(answered(presets, 1, both), past, "{presets:?}: past them");
     }
 }
 
@@ -603,7 +623,6 @@ fn a_named_pairs_frame_is_answered_workers_that_meet_its_demand_under_each_stock
 fn the_sides_that_read_a_number_are_the_plain_rings_of_a_binding_that_names_a_target() {
     use super::super::PAIRED;
 
-    const TURNS: &str = "round_robin";
     let builtin = StageRegistry::builtin();
     // The sides read under the stock pair of two presets: as the presets
     // make its document, or with the target source taken out of its block.
@@ -612,9 +631,7 @@ fn the_sides_that_read_a_number_are_the_plain_rings_of_a_binding_that_names_a_ta
         let mut document = presets.expect("presets of this build");
         document.generation = 1;
         if !stock {
-            let block = document.bindings[0].routing_key.as_mut();
-            let block = block.expect("the ring's block of sources");
-            block.sources.retain(|source| !source.target);
+            without_target(&mut document);
         }
         sides_named(&staged(&document, &builtin), PAIRED)
     };
@@ -640,7 +657,7 @@ fn the_sides_that_read_a_number_are_the_plain_rings_of_a_binding_that_names_a_ta
 /// `the_decodes_number_counts_the_decodes_that_can_be_sent_to` (`D`).
 #[test]
 fn a_decode_named_alone_is_counted_behind_the_prefill_the_decision_picks() {
-    let store = pair_store("round_robin", RING);
+    let store = pair_store(TURNS, RING);
     let objects = holder(&store);
     let prefills = [("p0", None), ("p1", None), ("p2", None)];
     let prefills = side(&store, &objects, Role::Prefill, prefills);
@@ -699,7 +716,7 @@ fn a_decode_named_alone_is_counted_behind_the_prefill_the_decision_picks() {
 /// `where_no_prefill_opens_the_pair_the_decodes_number_is_not_read` (`D`).
 #[test]
 fn where_no_prefill_opens_the_pair_the_decodes_number_is_not_read() {
-    let store = pair_store("round_robin", RING);
+    let store = pair_store(TURNS, RING);
     let (objects, ahead, behind) = fleet(&store, ["p0", "p1"], ["d0", "d1"]);
     let now = Instant::now();
     file(&store, 1, behind[0], now);
@@ -857,6 +874,48 @@ fn but(order: &[WorkerId], out: WorkerId) -> Vec<WorkerId> {
     order.iter().copied().filter(|&id| id != out).collect()
 }
 
+/// A ready member of `role`'s side beside its name, which every gateway
+/// dials. It offers a partner the KV transport `transport` and states
+/// `decoding` as its way to decide a constraint, zero for none: under the
+/// stock pair's pairing a decode on another transport than a prefill's is
+/// no partner of it.
+fn paired_member(
+    store: &MemoryStore,
+    objects: &Objects<Members>,
+    (name, role): (&'static str, Role),
+    (transport, decoding): (&str, u8),
+) -> (&'static str, WorkerId) {
+    use super::super::PAIRED;
+    use crate::{
+        engine::DemandFacts,
+        service::controller::decision_slots::tests::written_ready,
+        store::{pairing::PairingDescriptor, WorkerFacts},
+    };
+
+    let key = format!("http://{name}:8000");
+    let descriptor = PairingDescriptor {
+        transport: Some(transport.to_owned()),
+        ..PairingDescriptor::default()
+    };
+    let facts = WorkerFacts {
+        key: key.clone(),
+        engine: key,
+        incarnation: 1,
+        role,
+        wire_modes: WireModes::HTTP,
+        models: vec![PAIRED.to_owned()],
+        dp_size: 1,
+        max_running: Some(4),
+        pairing: Some(Arc::new(descriptor)),
+        demand_facts: DemandFacts {
+            decoding,
+            ..DemandFacts::default()
+        },
+        ..WorkerFacts::default()
+    };
+    (name, written_ready(store, objects, facts))
+}
+
 /// The numbers count among the workers that meet the frame's hard demands,
 /// each side by its role's part, as the one call counts them in a host's
 /// own process. The asking gateway dials three workers a side: one states
@@ -943,6 +1002,121 @@ fn the_numbers_count_among_the_workers_that_meet_the_frames_demands() {
     assert_eq!(asked(0, unmet), Err(shed));
 }
 
+/// A completion's bound is the decodes' to meet. The decodes' count passes
+/// over a decode whose window is under it, and a prefill under it keeps
+/// its number: a prefill is held to no part of that bound
+/// ([`Demands::held_by`](crate::engine::demands::Demands::held_by)).
+///
+/// Both prefills state a window of 16, one decode states 16 and the other
+/// 64. A frame whose completion needs 32 counts both prefills and the wide
+/// decode alone: the number 0 reaches that decode beside the first
+/// prefill, and the number 1 sheds the pair under `target-worker`. A frame
+/// that states no demand counts both workers of each side.
+///
+/// The wide decode is the first one written, then the second: in one of
+/// the two fleets it stands behind the other.
+#[test]
+fn a_decode_under_a_completions_bound_takes_no_number() {
+    use super::super::{demanding, stating_member};
+    use crate::engine::DemandFacts;
+
+    let now = Instant::now();
+    let none = proto::Demands::default();
+    let long = proto::Demands {
+        output_window: 32,
+        ..none
+    };
+    for wide in [0_usize, 1] {
+        let store = rings();
+        let objects = holder(&store);
+        let member = |name: &'static str, role, window| {
+            let stated = DemandFacts {
+                window,
+                ..DemandFacts::default()
+            };
+            let id = stating_member(&store, &objects, name, role, None, stated);
+            (name, id)
+        };
+        let prefills = [
+            member("p0", Role::Prefill, 16),
+            member("p1", Role::Prefill, 16),
+        ];
+        let window = |at: usize| if at == wide { 64 } else { 16 };
+        let decodes = [
+            member("d0", Role::Decode, window(0)),
+            member("d1", Role::Decode, window(1)),
+        ];
+        let ahead = list_order(&objects, Role::Prefill, &prefills);
+        let behind = list_order(&objects, Role::Decode, &decodes);
+        let asked = |number: u32, demands: proto::Demands| {
+            let frame = demanding(pair_frame(1, Some(number)), demands);
+            reached(&served_pair(&store, &objects, frame, GATEWAY, now))
+        };
+        for (number, pair) in numbered(&ahead, &behind) {
+            assert_eq!(asked(number, none), Ok(pair), "no demand, {number}");
+        }
+        let one = Ok((ahead[0], decodes[wide].1));
+        assert_eq!(asked(0, long), one, "decode {wide} is wide");
+        assert_eq!(asked(1, long), Err(MISSED), "one decode is counted");
+    }
+}
+
+/// A demand the decodes are held to leaves a prefill out of the prefills'
+/// count where none of its partners meets it, though the decodes' side
+/// reads no number: a prefill is counted by a partner that can be sent to.
+///
+/// Under a ring prefill beside a decode that takes turns, one prefill
+/// pairs with the first decode alone and the other two with the second,
+/// which alone states the way 3. A frame that demands that way counts
+/// those two prefills: the numbers 0 and 1 reach them beside that decode,
+/// and the number 2 sheds the pair under `target-worker`. A frame that
+/// states no demand counts all three prefills, each beside its partner.
+///
+/// The lone prefill is each of the three in turn: in two of the three
+/// fleets it stands ahead of another.
+#[test]
+fn a_prefill_none_of_whose_partners_meets_a_demand_takes_no_number() {
+    use super::super::demanding;
+
+    let now = Instant::now();
+    let none = proto::Demands::default();
+    let decided = proto::Demands {
+        decoding: 3,
+        ..none
+    };
+    for lone in 0..3_usize {
+        let store = pair_store(RING, TURNS);
+        let objects = holder(&store);
+        let member = |name: &'static str, role, stated: (&str, u8)| {
+            paired_member(&store, &objects, (name, role), stated)
+        };
+        let on = |at: usize| if at == lone { "a" } else { "b" };
+        let prefills = [
+            member("p0", Role::Prefill, (on(0), 0)),
+            member("p1", Role::Prefill, (on(1), 0)),
+            member("p2", Role::Prefill, (on(2), 0)),
+        ];
+        let first = member("d0", Role::Decode, ("a", 0)).1;
+        let second = member("d1", Role::Decode, ("b", 3)).1;
+        let ahead = list_order(&objects, Role::Prefill, &prefills);
+        let asked = |number: u32, demands: proto::Demands| {
+            let frame = demanding(pair_frame(1, Some(number)), demands);
+            reached(&served_pair(&store, &objects, frame, GATEWAY, now))
+        };
+        let alone = prefills[lone].1;
+        for (number, &prefill) in (0..).zip(&ahead) {
+            let partner = if prefill == alone { first } else { second };
+            let pair = Ok((prefill, partner));
+            assert_eq!(asked(number, none), pair, "no demand, {number}");
+        }
+        for (number, &prefill) in (0..).zip(&but(&ahead, alone)) {
+            let pair = Ok((prefill, second));
+            assert_eq!(asked(number, decided), pair, "the way 3, {number}");
+        }
+        assert_eq!(asked(2, decided), Err(MISSED), "prefill {lone} is alone");
+    }
+}
+
 /// Where the decode's side alone reads the number, the decodes' count
 /// passes over a decode that fails what a decode is held to of the frame's
 /// hard demands. The count of a pair named on both sides does the same.
@@ -963,7 +1137,7 @@ fn the_numbers_count_among_the_workers_that_meet_the_frames_demands() {
 fn a_decode_named_alone_takes_no_number_behind_a_demand() {
     use super::super::{demanding, together};
 
-    let store = pair_store("round_robin", RING);
+    let store = pair_store(TURNS, RING);
     let objects = holder(&store);
     let prefills = [("p0", 2, 0, None), ("p1", 2, 0, None)];
     let prefills = stating(&store, &objects, Role::Prefill, prefills);

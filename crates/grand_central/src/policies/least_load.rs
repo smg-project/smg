@@ -5,8 +5,8 @@
 //! `least-load`.
 //!
 //! Most of the scorer's mechanism is the credit of the sends since a worker's
-//! last report. That credit is shared code: `RankCredit` among the shared
-//! stages, and the sent record in `tracking`.
+//! last report. That credit is shared code in `tracking`: `RankCredit` and
+//! the sent record.
 
 use std::sync::Arc;
 

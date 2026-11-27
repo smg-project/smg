@@ -1083,6 +1083,11 @@ impl Loaded<'_, '_> {
     /// ([`pair::date_decode_claim`]): the host tells each word of the side
     /// under that lease's date.
     ///
+    /// `claimed` is the claim the lease's first decision made for its
+    /// decode side, as the host's record states it: the key, and the
+    /// worker, `WorkerId(0)` where it claimed none. A call that claims
+    /// another worker under that key hands it on with its date.
+    ///
     /// A call that hands no pair's lists is decided over no worker.
     ///
     /// # Errors
@@ -1096,6 +1101,7 @@ impl Loaded<'_, '_> {
         self,
         maker: &impl RequestMaker,
         held: &super::decision::Target,
+        claimed: (super::view::Session, WorkerId),
         issued_micros: u64,
         now: Instant,
     ) -> Result<super::decision::Decision, DecisionRefused> {
@@ -1129,7 +1135,8 @@ impl Loaded<'_, '_> {
             if let Ok(decision) = &decided {
                 let facts = &request.facts;
                 let key = || pair::decode_session(facts);
-                pair::date_decode_claim(own, decision, key, facts.now_micros, issued_micros);
+                let at = facts.now_micros;
+                pair::date_decode_claim(own, decision, key, at, || claimed, issued_micros);
             }
             decided
         })

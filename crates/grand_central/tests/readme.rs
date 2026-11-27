@@ -2,9 +2,10 @@
 //! build holds. `README.md` is the first page, short enough to read whole.
 //! `docs/policy-spec.md` is the policy spec's page, cut out of the reference
 //! and held to the README's bounds. `docs/stages.md` is the stages' page,
-//! `docs/service.md` the service's page and `docs/embedding.md` the page of
-//! a host that embeds the engine, each cut out and held the same way.
-//! `REFERENCE.md` holds the rest of the detail. Ten things are read:
+//! `docs/service.md` the service's page, `docs/embedding.md` the page of a
+//! host that embeds the engine and `docs/worker-rows.md` the page of worker
+//! rows and worker jobs, each cut out and held the same way.
+//! `REFERENCE.md` holds the rest of the detail. Eleven things are read:
 //!
 //! - every fenced `yaml` block of a page is a whole policy document: it
 //!   parses, and the stock catalog validates it (a fragment is fenced as
@@ -30,7 +31,9 @@
 //!   the crate's manifest and no other, a row a feature, each with the
 //!   features of the crate it turns on and no other word, and the page
 //!   names the default build's feature;
-//! - the README and the four pages cut out stay inside the bounds a person
+//! - the worker rows' page states the bounds of its table, and the weights
+//!   a row is charged, as the crate's own constants hold them;
+//! - the README and the five pages cut out stay inside the bounds a person
 //!   reads with ease: no sentence over 30 words, no paragraph over five
 //!   sentences or 100 words, no list item over 50 words, no table cell over
 //!   30 words, no heading over 30 words, and none of the filler words in a
@@ -42,7 +45,7 @@
 //!   them and passes one that stands at a bound, and the reading of a
 //!   page's blocks, headings and links is held to short texts the same
 //!   way;
-//! - every link of the six pages to a path of the checkout resolves, and
+//! - every link of the seven pages to a path of the checkout resolves, and
 //!   a link that names a heading names one its page holds;
 //! - each command the README shows names what the checkout holds: this
 //!   package, features and an example of its manifest, a unit test of the
@@ -57,6 +60,7 @@ use std::{
 use smg_grand_central::{
     document::{PolicySpec, PRESETS},
     stages::StageRegistry,
+    store::WorkerFacts,
 };
 
 /// The mark on the line before a document the validator refuses.
@@ -87,6 +91,10 @@ const SERVICE_DOCUMENTS: usize = 0;
 /// refused one stood ahead of it.
 const EMBEDDING_DOCUMENTS: usize = 0;
 
+/// The documents the worker rows' page shows running: none, by the same
+/// reading.
+const WORKER_ROWS_DOCUMENTS: usize = 0;
+
 /// The commands the README shows, counted as its documents are.
 const README_COMMANDS: usize = 4;
 
@@ -112,7 +120,7 @@ const SERIES: usize = 22;
 /// least: a walk that finds fewer has lost the shape of the manifest.
 const FEATURES: usize = 9;
 
-/// The most words a sentence of a short page holds: the README and the four
+/// The most words a sentence of a short page holds: the README and the five
 /// pages cut out of the reference are the short pages. Nothing but a
 /// sentence's end splits one, so a chain joined by semicolons is one
 /// sentence.
@@ -177,6 +185,12 @@ fn service() -> PathBuf {
 /// the signals its decisions read and the Cargo features it builds with.
 fn embedding() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/embedding.md")
+}
+
+/// The worker rows' page: a row's bounds, the door that writes it, the
+/// controller's probes and the worker jobs of a host with a local store.
+fn worker_rows() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/worker-rows.md")
 }
 
 /// One fenced block of the page.
@@ -258,6 +272,7 @@ fn every_document_of_the_page_runs_over_the_stock_catalog() {
         ("stages' page", stages(), STAGES_DOCUMENTS),
         ("service's page", service(), SERVICE_DOCUMENTS),
         ("embedding page", embedding(), EMBEDDING_DOCUMENTS),
+        ("worker rows' page", worker_rows(), WORKER_ROWS_DOCUMENTS),
         ("reference", reference(), DOCUMENTS),
     ] {
         let page = fs::read_to_string(path).expect("the page is readable");
@@ -712,6 +727,105 @@ fn the_embedding_page_names_every_cargo_feature_of_the_manifest() {
     );
 }
 
+/// A count as a page writes it: its thousands parted by commas.
+fn grouped(count: usize) -> String {
+    let digits = count.to_string();
+    let mut written = String::new();
+    for (at, digit) in digits.chars().enumerate() {
+        if at > 0 && (digits.len() - at).is_multiple_of(3) {
+            written.push(',');
+        }
+        written.push(digit);
+    }
+    written
+}
+
+#[test]
+fn the_worker_rows_page_states_the_bounds_of_its_table_as_the_crate_holds_them() {
+    let page = fs::read_to_string(worker_rows()).expect("the worker rows' page is readable");
+    // The bounds' table whole, written from the constants a registration is
+    // held to and closed by a blank line. A bound that moves fails its row
+    // here. So does a table that loses its ruled line or a row, or gains
+    // a row, and a second table whose header line reads the same.
+    let table = [
+        "| Fact | Bound |".to_owned(),
+        "|---|---|".to_owned(),
+        format!("| The URL | {} bytes |", grouped(WorkerFacts::URL_BYTES)),
+        format!(
+            "| The runtime, the zone, a model id | {} bytes each |",
+            grouped(WorkerFacts::NAME_BYTES)
+        ),
+        format!(
+            "| The labels | {} of them, a key of {} bytes, a value of {} |",
+            grouped(WorkerFacts::LABELS),
+            grouped(WorkerFacts::LABEL_KEY_BYTES),
+            grouped(WorkerFacts::LABEL_VALUE_BYTES)
+        ),
+        format!(
+            "| The row as a whole | {} bytes |",
+            grouped(WorkerFacts::ROW_BYTES)
+        ),
+        String::new(),
+    ];
+    let lines: Vec<&str> = page.lines().collect();
+    let stands = lines
+        .windows(table.len())
+        .filter(|held| held.iter().zip(&table).all(|(line, row)| line == row))
+        .count();
+    let headers = lines.iter().filter(|line| **line == table[0]).count();
+    let mut lost = Vec::new();
+    if stands != 1 || headers != 1 {
+        lost.push(format!(
+            "the bounds' table, which stands {stands} times under {headers} headers as these lines:\n{}",
+            table.join("\n")
+        ));
+    }
+    // The weights a row is charged by the store's measure: each sentence
+    // whole, at its line's end. A number, a unit or a condition that moves
+    // fails it.
+    let weights = [
+        format!(
+            "Its numbers weigh {} bytes, and each text it counts weighs its bytes and {} more.",
+            grouped(WorkerFacts::NUMBERS),
+            grouped(WorkerFacts::FRAME)
+        ),
+        format!(
+            "- Such a row weighs {} bytes more where its worker states a fact for a request's \
+             hard demands, and {} more where it takes images. It weighs {} more where its \
+             encode offer states anything. A priority other than zero weighs {} more, and a \
+             drain window {}.",
+            grouped(WorkerFacts::DEMAND_FACTS),
+            grouped(WorkerFacts::VISION),
+            grouped(WorkerFacts::ENCODE),
+            grouped(WorkerFacts::PRIORITY),
+            grouped(WorkerFacts::DRAIN_WINDOW)
+        ),
+    ];
+    lost.extend(
+        weights
+            .into_iter()
+            .filter(|said| !page.lines().any(|line| line.ends_with(said.as_str()))),
+    );
+    assert!(
+        lost.is_empty(),
+        "the worker rows' page does not state, as the crate holds them:\n{}",
+        lost.join("\n")
+    );
+    // The writing itself, on short counts.
+    assert_eq!(
+        [
+            grouped(0),
+            grouped(5),
+            grouped(128),
+            grouped(2_048),
+            grouped(16_384),
+            grouped(1_000_000)
+        ],
+        ["0", "5", "128", "2,048", "16,384", "1,000,000"],
+        "a count's thousands"
+    );
+}
+
 #[test]
 fn the_page_names_every_series_the_controller_exports() {
     let page = fs::read_to_string(reference()).expect("the reference is readable");
@@ -1061,6 +1175,17 @@ fn the_embedding_pages_prose_stays_inside_the_same_bounds() {
     );
 }
 
+#[test]
+fn the_worker_rows_pages_prose_stays_inside_the_same_bounds() {
+    let page = fs::read_to_string(worker_rows()).expect("the worker rows' page is readable");
+    let over = over_bounds(&page);
+    assert!(
+        over.is_empty(),
+        "the worker rows' page is held to the README's bounds, and it is over them:\n{}",
+        over.join("\n")
+    );
+}
+
 /// A sentence of `words` words: a capital first and a full stop last.
 fn sentence(words: usize) -> String {
     let mut sentence = String::from("One");
@@ -1294,6 +1419,7 @@ fn every_link_of_a_page_resolves_heading_and_all() {
         ("stages' page", stages()),
         ("service's page", service()),
         ("embedding page", embedding()),
+        ("worker rows' page", worker_rows()),
         ("reference", reference()),
     ] {
         let dead = dead_links(&path);

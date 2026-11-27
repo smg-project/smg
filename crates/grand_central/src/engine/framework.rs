@@ -25,11 +25,14 @@ use crate::{
         warm_up::WarmUpRule,
     },
     load::signals::SignalCells,
-    policies::{consistent_hashing::LentRing, prefix_hash::HeadRule, random::Random},
+    policies::{
+        consistent_hashing::LentRing, prefix_hash::HeadRule, random::Random,
+        round_robin::RoundRobin,
+    },
     stages::{
         filters::{HasCapacity, NotOverloaded, RowTests},
         lifecycle::Lifecycle,
-        pickers::{target_of, Best},
+        pickers::{push_turn, target_of, Best},
         scorers::{FewestSessions, LeastRequests},
     },
     tracking::{
@@ -1353,6 +1356,53 @@ struct Buffers {
     /// Whether nobody reads the best rows of a trace made with these
     /// buffers: the word a front states to the scratch.
     unread: bool,
+    /// What a front said of the rows it wrote whole, for the decisions it
+    /// asks over them with these buffers ([`Scratch::whole`]).
+    whole: WholeRows,
+}
+
+/// What a front that wrote a list's every row says of them to the scratch
+/// ([`Scratch::whole`]) ahead of the decisions it asks over them: the key
+/// its list made once, which a pass would read every row to make. A whole
+/// pass reads the word for the very rows it was said of and for no other
+/// ([`Self::of`]). The default says nothing of any rows.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct WholeRows {
+    /// Where the rows stand and how many they are.
+    at: usize,
+    len: usize,
+    /// The key of the rows in their order, as the crate's own rotation
+    /// keys the rows a pass kept: the list makes it once.
+    key: u64,
+}
+
+impl WholeRows {
+    /// The word of `rows` as their front wrote them, with the list's `key`.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn said(rows: &[Candidate], key: u64) -> Self {
+        Self {
+            at: rows.as_ptr().addr(),
+            len: rows.len(),
+            key,
+        }
+    }
+
+    /// The word, where it was said of `candidates`: the very slice, by its
+    /// place and its count. The word outlives the decisions it was said
+    /// for: it stands until the next borrow of the thread's buffers, which
+    /// takes it back before it hands out the scratch
+    /// ([`Scratch::no_whole`]). So a pass reads only a word its own front
+    /// said on the borrow the pass runs on, behind the write of the rows
+    /// it names, and that front holds those rows shared until its
+    /// decisions are answered: a slice at the word's place and of its
+    /// count is those very rows, as they were written. The count is
+    /// compared first: a word of no rows, which is every word under a
+    /// document without the rotation, ends there.
+    #[inline(always)]
+    fn of(self, candidates: &[Candidate]) -> Option<Self> {
+        (self.len == candidates.len() && self.len != 0 && self.at == candidates.as_ptr().addr())
+            .then_some(self)
+    }
 }
 
 impl Buffers {
@@ -1421,6 +1471,28 @@ impl Scratch {
     #[inline(always)]
     pub(crate) fn unread(&mut self, unread: bool) {
         self.single.set_unread(unread);
+    }
+
+    /// States what a front wrote of the rows it hands this scratch's
+    /// decisions from here on ([`WholeRows`]): a single request's rows,
+    /// written whole. The word stands until it is stated again, and the
+    /// borrow of a thread's buffers takes it back where it begins
+    /// ([`Self::no_whole`]), as it does [`Self::unread`]'s. Nothing takes
+    /// it back behind the front's decisions: between two borrows it
+    /// stands unread, as the scratch a front states it to is the calling
+    /// thread's, which that borrow alone hands out.
+    #[cfg(feature = "in-process")]
+    #[inline(always)]
+    pub(crate) fn whole(&mut self, rows: WholeRows) {
+        self.single.whole = rows;
+    }
+
+    /// Takes back the word of [`Self::whole`] by its count alone: a word of
+    /// no rows is read for no slice ([`WholeRows::of`]).
+    #[cfg(feature = "in-process")]
+    #[inline(always)]
+    pub(crate) fn no_whole(&mut self) {
+        self.single.whole.len = 0;
     }
 
     /// The list the last pair's decision or encode decision made with
@@ -1577,6 +1649,34 @@ fn score_and_pick(
     buf: &mut Buffers,
     targets: &mut Targets,
 ) {
+    score_and(
+        profile,
+        facts,
+        candidates,
+        buf,
+        targets,
+        |kept, scores, band, targets| {
+            profile
+                .picker
+                .pick(facts, candidates, kept, scores, band, targets);
+        },
+    );
+}
+
+/// [`score_and_pick`] with its pick step handed in: `pick` is given the
+/// compared set, its scores and the profile's band, and pushes the targets
+/// the picker's `pick` would. Inlined into each of its two callers, so the
+/// pass of a profile's own `pick` holds no test of the other
+/// ([`turn_whole`]).
+#[inline(always)]
+fn score_and(
+    profile: &Profile,
+    facts: &RequestFacts<'_>,
+    candidates: &[Candidate],
+    buf: &mut Buffers,
+    targets: &mut Targets,
+    pick: impl FnOnce(&[u32], &[f32], TieBand, &mut Targets),
+) {
     let narrowed = profile.picker.narrow(facts, candidates, &mut buf.kept);
     let compared = narrowed.compared.min(buf.kept.len());
     let alternates = narrowed.alternates.min(buf.kept.len() - compared);
@@ -1589,14 +1689,7 @@ fn score_and_pick(
         &mut buf.stage,
     );
     let before = targets.len();
-    profile.picker.pick(
-        facts,
-        candidates,
-        &buf.kept[..compared],
-        &buf.scores,
-        band,
-        targets,
-    );
+    pick(&buf.kept[..compared], &buf.scores, band, targets);
     if targets.len() == before {
         return;
     }
@@ -2559,6 +2652,63 @@ fn score_survivors(
     })
 }
 
+/// The scoring half of a whole pass that kept every row of a list under
+/// the crate's own rotation ([`TURNS_ITS_SET`]), where the front that wrote
+/// those very rows said the list's key ([`WholeRows`]): what
+/// [`score_survivors`] answers with no `first`, with the rotation's turn
+/// taken by `set`, that key. The rotation's `pick` takes the turn of the
+/// same set by the same key, which it makes by reading every row kept
+/// ([`push_turn`] hands out the rows for both); the list made it once. A
+/// picker that narrowed the rows is asked for its `pick` as ever.
+///
+/// Out of line, and with the end of [`score_survivors`] written again:
+/// the pass of any other profile holds one test of the scratch's word and
+/// nothing of this ([`run_whole`]). By count, that end shared as one
+/// function that takes the targets cost every whole pass a copy of them,
+/// 30 instructions.
+#[inline(never)]
+fn turn_whole(
+    profile: &Profile,
+    index: u16,
+    facts: &RequestFacts<'_>,
+    pool: &PoolFacts<'_>,
+    candidates: &[Candidate],
+    buf: &mut Buffers,
+    set: u64,
+) -> Decision {
+    let mut targets = Targets::new();
+    score_and(
+        profile,
+        facts,
+        candidates,
+        buf,
+        &mut targets,
+        |kept, scores, band, targets| {
+            if kept.len() != candidates.len() {
+                return profile
+                    .picker
+                    .pick(facts, candidates, kept, scores, band, targets);
+            }
+            debug_assert_eq!(
+                set,
+                RoundRobin::set_key(candidates, kept),
+                "the list's key is the key of every row kept"
+            );
+            let turn = profile.picker.pick_among(set, kept.len());
+            push_turn(candidates, kept, turn, targets);
+        },
+    );
+    let trace = trace_of(index, facts, pool, candidates, &buf.kept, buf.traced());
+    if targets.is_empty() {
+        return shed(ShedReason::PolicyDeclined, profile.picker.name(), trace);
+    }
+    Decision::Pick(Pick {
+        targets,
+        trace,
+        session_verdict: SessionVerdict::None,
+    })
+}
+
 /// One profile over one side of a pair: the filter half of its run, then
 /// the scoring half. The pair plans run their sides through here; the single
 /// plan runs the same two halves from its own opening ([`run_single`]).
@@ -2755,6 +2905,19 @@ fn run_whole(
             // does: no pass of another kind behind it grows a list.
             buf.reserve(candidates.len());
             if keep_folded(tests, facts, candidates, cx, &mut buf.kept) {
+                // The front that wrote these very rows whole said the
+                // list's key ([`WholeRows`]): where the fold kept every
+                // row and the profile's picker is the crate's own
+                // rotation, the pass turns the set by it. The word is
+                // asked first: no front states one under a document
+                // without the rotation, whose pass pays that one test.
+                let turned = buf
+                    .whole
+                    .of(candidates)
+                    .filter(|_| engine.set_turns[at] && buf.kept.len() == candidates.len());
+                if let Some(whole) = turned {
+                    return turn_whole(profile, index, facts, pool, candidates, buf, whole.key);
+                }
                 return score_survivors(profile, index, facts, pool, candidates, buf, None);
             }
         }
@@ -3044,6 +3207,46 @@ fn run_drawn(
         Decision::Queue(queue) => queue.trace.seed = facts.seed,
     }
     decision
+}
+
+/// The crate's own picker that keys a rotation by the rows a whole pass
+/// kept, by name: its `pick` takes the turn of the set of those rows
+/// ([`Picker::pick_among`]) and hands out the row at the turn and the rows
+/// kept behind it. In a document a host's stage takes no built-in's name
+/// and states its own ([`StageRegistry`](crate::stages::StageRegistry)), so
+/// there a picker of this name is the crate's. An engine built in code
+/// holds whatever picker its host handed it, and no word a picker says of
+/// itself tells that its turn among a set is the turn its `pick` takes: so
+/// the name is read only for an engine whose builder says a catalog made
+/// its pickers ([`Engine::made_by_a_catalog`]).
+const TURNS_ITS_SET: &str = "round-robin";
+
+impl Engine {
+    /// States that a catalog made this engine's every picker, as the
+    /// document road does: a picker of the rotation's name is then the
+    /// crate's own ([`TURNS_ITS_SET`]), and a whole pass that kept every
+    /// row of a list its front wrote whole turns the set by the key the
+    /// list made once ([`turn_whole`]). An engine built in code states
+    /// nothing: its picker of that name is asked for its `pick`, as ever.
+    pub(crate) fn made_by_a_catalog(&mut self) {
+        for (turns, profile) in self.set_turns.iter_mut().zip(&self.profiles) {
+            *turns = profile.picker.name() == TURNS_ITS_SET;
+        }
+        #[cfg(feature = "in-process")]
+        {
+            self.turns_a_set = self.set_turns.contains(&true);
+        }
+    }
+
+    /// Whether a profile's picker is the crate's own rotation by its
+    /// builder's word ([`Self::made_by_a_catalog`]): a front that wrote a
+    /// list's rows whole says them to the scratch under such a document,
+    /// and under no other ([`Scratch::whole`]).
+    #[cfg(feature = "in-process")]
+    #[inline(always)]
+    pub(crate) fn turns_a_set(&self) -> bool {
+        self.turns_a_set
+    }
 }
 
 /// The crate's own pickers that draw first, by name. Each one's draw reads
@@ -3967,6 +4170,15 @@ pub struct Engine {
     /// pass keeps the rows of the single plan's pool by it
     /// ([`keep_folded`]).
     row_tests: Vec<Option<RowTests>>,
+    /// Per profile, whether its picker is the crate's own rotation
+    /// ([`TURNS_ITS_SET`]), by the word of the builder that made the
+    /// pickers ([`Self::made_by_a_catalog`]): a whole pass that kept every
+    /// row of a list turns the set by the key the list made once
+    /// ([`turn_whole`]). No profile's is in an engine built in code.
+    set_turns: Box<[bool]>,
+    /// Whether any profile's is ([`Self::turns_a_set`]).
+    #[cfg(feature = "in-process")]
+    turns_a_set: bool,
     /// Per profile, which of its leading stages are ranks ([`Order`]). A
     /// decision reads it where the profile's mark says so, and no other
     /// decision does.
@@ -5566,6 +5778,10 @@ impl Engine {
             .iter()
             .map(|profile| RowTests::of(&profile.filters))
             .collect();
+        // No profile's until the builder that made the pickers says whose
+        // they are ([`Self::made_by_a_catalog`]): a picker handed in here
+        // may be a host's, whatever name it answers.
+        let set_turns: Box<[bool]> = profiles.iter().map(|_| false).collect();
         // A sessions rule that places a new key by a count scores the rows
         // itself, beside every profile ([`Self::place`]).
         #[cfg(feature = "in-process")]
@@ -5722,6 +5938,9 @@ impl Engine {
             profile_needs,
             named_by,
             row_tests,
+            set_turns,
+            #[cfg(feature = "in-process")]
+            turns_a_set: false,
             orders,
             #[cfg(feature = "in-process")]
             written_from,
@@ -9931,12 +10150,20 @@ impl Engine {
     /// its key ([`SessionTable::told_under`]). The call read `key` at `at`,
     /// its own instant, and tells its words under `issued`, the instant of
     /// the lease its pair's first decision issued. A claim it made, of
-    /// `claimed`, takes that date. The pair's decode entries ask here, so
-    /// they read no table of the engine's.
+    /// `claimed`, takes that date. `first` is the worker that decision
+    /// claimed for `key`, `WorkerId(0)` where it claimed none. The pair's
+    /// decode entries ask here, so they read no table of the engine's.
     #[cfg(feature = "in-process")]
     #[inline]
-    pub(crate) fn told_under(&self, key: Session, claimed: Option<WorkerId>, at: u64, issued: u64) {
-        self.sessions.told_under(key, claimed, at, issued);
+    pub(crate) fn told_under(
+        &self,
+        key: Session,
+        claimed: Option<WorkerId>,
+        at: u64,
+        issued: u64,
+        first: WorkerId,
+    ) {
+        self.sessions.told_under(key, claimed, at, issued, first);
     }
 
     /// The stages' part of a release, behind the table's

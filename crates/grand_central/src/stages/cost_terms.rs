@@ -1,6 +1,6 @@
 //! Fields a policy can use in a sum, in the units of the row that holds them.
 
-use crate::{engine::view::LoadRow, tracking::dispatch_credit::DispatchCounts};
+use crate::{engine::view::LoadRow, tracking::rank_credit::DispatchCounts};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum CostTerm {

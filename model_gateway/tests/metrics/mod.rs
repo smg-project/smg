@@ -24,7 +24,9 @@ pub fn recorder() -> PrometheusHandle {
         .clone()
 }
 
+mod dispatch_wait_after_body_test;
 mod engine_metrics_test;
+mod histogram_families_test;
 mod kv_event_lag_histogram_test;
 mod metrics_help_text_test;
 mod multimodal_series_test;

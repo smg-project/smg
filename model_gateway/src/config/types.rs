@@ -237,8 +237,10 @@ pub struct RouterConfig {
     /// backend HTTP server's keep-alive timeout (the engines default to
     /// 5s), or the pool hands out connections the server has already closed
     /// and non-idempotent sends fail. `0` keeps idle connections forever.
-    /// While a nonzero value is below `load_monitor_interval_secs`, an idle
-    /// HTTP worker is connected anew for every load poll; where the server's
+    /// While a nonzero value is below the interval the load monitor polls a
+    /// worker at ([`Self::load_monitor_interval`], unless a worker of its
+    /// group sets `WorkerSpec.load_monitor_interval_secs`), an idle HTTP
+    /// worker is connected anew for every load poll; where the server's
     /// keep-alive can be raised above that interval, a value between the two
     /// keeps the connection.
     #[serde(default = "default_upstream_pool_idle_timeout_secs")]
@@ -386,8 +388,9 @@ pub struct RouterConfig {
     #[serde(default)]
     pub engine_metrics: bool,
     /// Global multimodal tensor transport mode (`inline` | `shm` | `auto` | `rdma`).
-    /// Per-worker `WorkerSpec.multimodal_tensor_transport` overrides this; when
-    /// unset, falls back to `SMG_MM_TENSOR_TRANSPORT`, then `inline`.
+    /// Per-worker `WorkerSpec.multimodal_tensor_transport` overrides this, but
+    /// only this setting (or the legacy `mm_pixel_rdma`) turns the RDMA lane
+    /// on; when unset, falls back to `SMG_MM_TENSOR_TRANSPORT`, then `inline`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multimodal_tensor_transport: Option<TransportMode>,
     /// Global minimum multimodal tensor size (bytes) before SHM transport is used.

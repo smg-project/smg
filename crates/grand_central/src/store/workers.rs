@@ -174,8 +174,10 @@ pub struct WorkerFacts {
     pub overload: Overload,
     /// The seconds a removal waits behind a drain, where the row states a
     /// window: a control call's registration states any, and a found
-    /// worker's is a fact of its row where it is not the default. A host
-    /// that builds the worker's object from the row gives the object this
+    /// worker's is a fact of its row where it is not the default. At the
+    /// default a found worker's row keeps the number where the standing
+    /// row states it, and states none at a replacement by id. A host that
+    /// builds the worker's object from the row gives the object this
     /// window.
     pub drain_settle_secs: Option<u32>,
     /// What the worker states for a request's hard demands beside its

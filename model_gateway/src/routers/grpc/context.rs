@@ -2138,16 +2138,33 @@ impl ExecutionResult {
     }
 }
 
-/// A request's wait ahead of the dispatch its answer's clocks start at, as
-/// [`dispatch_wait`] reads it; `None` when no entry stamp is in scope.
-pub(crate) type DispatchWait = Option<std::time::Duration>;
+/// A request's two waits ahead of the dispatch its answer's clocks start at,
+/// as [`dispatch_wait`] reads them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Waited {
+    /// Since the request's entry at the edge: the dispatch wait.
+    pub(crate) since_entry: std::time::Duration,
+    /// The dispatch wait less what the read of the request's body waited for
+    /// the client (see [`RequestStarted::less_upload_wait`]). The same as
+    /// `since_entry` for a generation whose stamp holds no upload wait (a
+    /// body that came whole, no body, a later turn of a tool loop).
+    pub(crate) since_body: std::time::Duration,
+}
+
+/// A request's waits ahead of the dispatch its answer's clocks start at, as
+/// [`dispatch_wait`] reads them; `None` when no entry stamp is in scope.
+pub(crate) type DispatchWait = Option<Waited>;
 
 /// The wait of the request whose answering attempt was dispatched at
 /// `dispatched` (the single RPC's dispatch, the prefill dispatch of a pair):
 /// the time since its entry at the edge ([`RequestStarted`]). The body read,
 /// auth, admission, tokenizing, templating and worker selection are in it,
 /// and so are a refused attempt with its backoff and an encode call that
-/// runs ahead of the pair.
+/// runs ahead of the pair. That is [`Waited::since_entry`];
+/// [`Waited::since_body`] is the same wait less what the read of the request
+/// body waited for the client: the upload is not in it, while auth, the
+/// wait for an admission permit and the WASM modules' run are, on either
+/// side of that read.
 ///
 /// The stamp is scoped to the request's future. The streaming entry points
 /// run inside it, so they read the wait there, against the dispatch instant
@@ -2171,9 +2188,14 @@ pub(crate) type DispatchWait = Option<std::time::Duration>;
 /// task of its own, outside the request's scope, and record no wait. A
 /// pipeline a test runs bare has none, on any turn of a tool loop either,
 /// and its answer records its other families alone.
+#[inline]
 pub(crate) fn dispatch_wait(dispatched: Instant) -> DispatchWait {
-    let entered = RequestStarted::current()?;
-    Some(dispatched.saturating_duration_since(entered))
+    let stamp = RequestStarted::carried()?;
+    let since_entry = dispatched.saturating_duration_since(stamp.instant());
+    Some(Waited {
+        since_entry,
+        since_body: stamp.less_upload_wait(since_entry),
+    })
 }
 
 /// Timing context threaded from PD execution into the streaming layer so the
