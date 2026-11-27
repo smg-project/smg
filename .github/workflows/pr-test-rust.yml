@@ -2151,6 +2151,8 @@ jobs:
       timeout: 50
       test_timeout: 42
       test_dirs: e2e_test/router/test_pd_topologies.py
+      # Keep selection, floor and 50/42 limits in sync with the default
+      # e2e-4gpu-pd SGLang slice above; these are inherited engineering values.
       test_filter: '-k "(2p2d and not http) or AssembledAtRuntime or SmallWindow or MismatchedTransport or MismatchedProtocol"'
       min_selected: 14
       kv_backend: mooncake
