@@ -1211,6 +1211,10 @@ pub(crate) fn issue_pair(
 /// prefill's dispatch took. A decode profile that keeps its pick answers
 /// that decode again while its filters keep it.
 ///
+/// Then comes the claim that first decision made for the decode side: its
+/// key and its worker. A call that claims another decode under that key
+/// takes the key with it at its dispatch.
+///
 /// Last in `held` comes the instant the lease was issued at. A claim the
 /// call makes for its key is dated by it, as each word of the side it
 /// issues is.
@@ -1249,7 +1253,7 @@ pub(crate) fn decide_decode(
     world: &StoreSnapshot,
     objects: &Objects<Members>,
     taken: &DecisionCall<'_, Checked>,
-    (prefill, first, issued_micros): HeldPair,
+    (prefill, first, claimed, issued_micros): HeldPair,
     buffers: &mut FrameBuffers,
     loads: &Arc<LoadSnapshot>,
     own: &Part,
@@ -1324,15 +1328,19 @@ pub(crate) fn decide_decode(
                     } else {
                         maker
                     };
-                    front.decide_decode_without_lease(&maker, &held, issued_micros, now)
+                    front.decide_decode_without_lease(&maker, &held, claimed, issued_micros, now)
                 }
                 Taken::Emptied(stage) => {
                     let (seed, generation) = (frame.seed(), spec.generation());
                     Ok(shed(ShedReason::NoEndpoints, stage, seed, generation))
                 }
-                Taken::Unreached => {
-                    front.decide_decode_without_lease(&over_none(), &held, issued_micros, now)
-                }
+                Taken::Unreached => front.decide_decode_without_lease(
+                    &over_none(),
+                    &held,
+                    claimed,
+                    issued_micros,
+                    now,
+                ),
             };
             // Counted whatever the decision came to.
             let undialed = decode_places.undialed();
@@ -1342,7 +1350,9 @@ pub(crate) fn decide_decode(
             decided?
         }
         // A model nobody serves, and one with no decode.
-        None => front.decide_decode_without_lease(&over_none(), &held, issued_micros, now)?,
+        None => {
+            front.decide_decode_without_lease(&over_none(), &held, claimed, issued_micros, now)?
+        }
     };
     // What the side's lease takes of its request, read where the frame's
     // lists still stand: a decode call's frame is read at the decode phase.

@@ -1196,3 +1196,118 @@ fn a_pairs_placement_states_what_its_prefill_holds() {
         assert_eq!(placement.overlap, Overlap::NONE);
     }
 }
+
+/// A placement's decode call the rule places on another decode than the
+/// pair's first decision claimed takes the key with it: the decode is sent
+/// there, and the key's next request follows that decode. The decode the
+/// request left is no pin of the key, though it is ready again and the
+/// lighter of the two by then.
+#[test]
+fn a_decode_placed_again_on_another_decode_takes_the_keys_pin_with_it() {
+    let mut document = PolicySpec::pair_presets("manual", "manual").expect("presets");
+    document.generation = 1;
+    document.plans.pd_pair.decode = DecodePick::AfterPrefill;
+    let manual = PolicySpec::preset("manual").expect("a built-in preset");
+    let mut rule = manual.bindings[0].sessions.clone().expect("its rule");
+    rule.assignment = Assignment::MinLoad;
+    document.bindings[0].sessions = Some(rule);
+    let engine = hosted(engine_of(&document));
+    // The first decode is the lighter: the key's first decision claims it.
+    let lists = Lists::of(1, 2);
+    lists.decodes[1].increment_load();
+    let classes = lists.every();
+    let pair = lists.under(&classes, &Open);
+    let headers = [(MANUAL_SESSION_HEADER, "talk-moved")];
+    let keyed = PlaceRequest {
+        decode_again: true,
+        headers: &headers,
+        ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair))
+    };
+    let mut placement = engine.place(&keyed).expect("a placement");
+    assert_eq!(lists.places(&placement), (0, 0), "the lighter decode");
+    placement.sent(Side::Prefill);
+    lists.decodes[0].set_status(WorkerStatus::NotReady);
+    placement.decode_again(&keyed).expect("the other decode");
+    assert_eq!(lists.places(&placement), (0, 1), "the decode that is ready");
+    placement.sent(Side::Decode);
+    drop(placement);
+    // The key's next request, with the first decode ready again and the
+    // second one the busier: the load alone would take the first.
+    lists.decodes[0].set_status(WorkerStatus::Ready);
+    for _ in 0..8 {
+        lists.decodes[1].increment_load();
+    }
+    let next = engine.place(&keyed).expect("a placement");
+    assert_eq!(
+        lists.places(&next),
+        (0, 1),
+        "the decode the key was served on"
+    );
+}
+
+/// A second decode call behind one that took no decode keeps the key's
+/// first pin: the first call's claim left with the side it gave up, and
+/// the second call's claim on a third decode stands behind the decode the
+/// pair's first decision claimed, as any later claim of the key does. The
+/// key's next request follows the first decode, and the third one where
+/// the first is not ready.
+#[test]
+fn a_second_decode_call_behind_one_that_took_no_decode_keeps_the_keys_first_pin() {
+    let mut document = PolicySpec::pair_presets("manual", "manual").expect("presets");
+    document.generation = 1;
+    document.plans.pd_pair.decode = DecodePick::AfterPrefill;
+    let manual = PolicySpec::preset("manual").expect("a built-in preset");
+    let mut rule = manual.bindings[0].sessions.clone().expect("its rule");
+    rule.assignment = Assignment::MinLoad;
+    document.bindings[0].sessions = Some(rule);
+    let engine = hosted(engine_of(&document));
+    // The first decode is the lightest: the key's first decision claims it.
+    let lists = Lists::of(1, 3);
+    lists.decodes[1].increment_load();
+    lists.decodes[2].increment_load();
+    let classes = lists.every();
+    let pair = lists.under(&classes, &Open);
+    let headers = [(MANUAL_SESSION_HEADER, "talk-thrice")];
+    let keyed = PlaceRequest {
+        decode_again: true,
+        headers: &headers,
+        ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair))
+    };
+    let mut placement = engine.place(&keyed).expect("a placement");
+    assert_eq!(lists.places(&placement), (0, 0), "the lightest decode");
+    placement.sent(Side::Prefill);
+    // The first call: the second decode alone is ready, and the route's
+    // rule admits no worker, so the call takes no decode.
+    lists.decodes[0].set_status(WorkerStatus::NotReady);
+    lists.decodes[2].set_status(WorkerStatus::NotReady);
+    let nobody = |_: &dyn Worker| false;
+    let ruled = PlaceRequest {
+        admits: Some(&nobody),
+        ..keyed
+    };
+    assert_eq!(placement.decode_again(&ruled), Err(Unplaced::NoWorkers));
+    // The second call: the third decode alone is ready.
+    lists.decodes[1].set_status(WorkerStatus::NotReady);
+    lists.decodes[2].set_status(WorkerStatus::Ready);
+    placement.decode_again(&keyed).expect("the third decode");
+    assert_eq!(lists.places(&placement), (0, 2), "the decode that is ready");
+    placement.sent(Side::Decode);
+    drop(placement);
+    // The key's next request, with every decode ready and the second one
+    // the lightest by far: the load alone would take the second.
+    for decode in lists.decodes.iter() {
+        decode.set_status(WorkerStatus::Ready);
+    }
+    for _ in 0..4 {
+        lists.decodes[0].increment_load();
+    }
+    for _ in 0..8 {
+        lists.decodes[2].increment_load();
+    }
+    let next = engine.place(&keyed).expect("a placement");
+    assert_eq!(lists.places(&next), (0, 0), "the key's first pin");
+    drop(next);
+    lists.decodes[0].set_status(WorkerStatus::NotReady);
+    let other = engine.place(&keyed).expect("a placement");
+    assert_eq!(lists.places(&other), (0, 2), "the key's other pin");
+}
