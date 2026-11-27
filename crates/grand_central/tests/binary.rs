@@ -157,7 +157,7 @@ fn the_served_benchs_settings_are_the_binarys() {
     ));
     let bench = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/benches/decide_stream.rs"
+        "/benches/decide_stream/shipped.rs"
     ));
     let ours = settings_after(binary, "const SETTINGS").expect("the binary's settings");
     let theirs = settings_after(bench, "pub static MALLOC_CONF").expect("the bench's copy");

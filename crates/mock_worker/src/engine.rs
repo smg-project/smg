@@ -382,7 +382,8 @@ pub enum OutputSeed {
     /// Preserve the existing request-ID-based output sequence.
     #[default]
     RequestId,
-    /// Equal prompt token IDs produce equal outputs across transports and retries.
+    /// Equal prompt token IDs produce equal outputs across transports and retries
+    /// (the ids as the cache keys them: a media item's tokens by the item).
     Prompt,
 }
 
@@ -439,6 +440,10 @@ pub struct EngineParams {
     /// stream shaped for a gateway that parses the engine's tokens (a channel
     /// header, say). Empty by default.
     pub output_prefix: Vec<u32>,
+    /// What the engine sends for each id of its synthetic draw, the draw's
+    /// ids in order: the ids the tokenizer the worker serves decodes. `None`
+    /// sends the id drawn.
+    pub output_table: Option<Arc<[u32]>>,
     /// The data-parallel rank this engine stamps on its KV-event batches
     /// (`KvEventBatch.dp_rank`): 0 for a single-rank engine, the rank's index
     /// for one of a gRPC worker's `--grpc-dp-size` ranks.
@@ -568,6 +573,7 @@ impl Default for EngineParams {
             kv_broadcast_capacity: 1024,
             kv_replay_capacity: 4096,
             output_prefix: Vec::new(),
+            output_table: None,
             dp_rank: 0,
             kv_cache_groups: vec![KvCacheGroup::full_attention()],
             pass_time_scale: 1.0,
@@ -961,7 +967,9 @@ pub(crate) enum Place {
 
 /// Messages into the engine actor.
 enum EngineMsg {
-    Request(NewRequest),
+    /// A request, and the ids the cache keys its prompt by where they differ
+    /// from the ids as sent ([`Engine::submit_keyed`]).
+    Request(NewRequest, Option<Vec<u32>>),
     Abort(String),
     /// Drop every cached block and announce `AllBlocksCleared` (an engine
     /// restart, as far as the gateway's index is concerned).
@@ -1222,7 +1230,15 @@ impl Engine {
 
     /// Submit a request. Dropped silently if the engine has shut down.
     pub fn submit(&self, req: NewRequest) {
-        let _ = self.tx.send(EngineMsg::Request(req));
+        self.submit_keyed(req, None);
+    }
+
+    /// Submit a request whose prompt the cache keys by `key_token_ids`, one
+    /// for each id of the prompt, where they are given: the keyed ids of a
+    /// transport whose engine keys a media item's tokens by the item and
+    /// keeps the ids as sent in its stored-block events.
+    pub(crate) fn submit_keyed(&self, req: NewRequest, key_token_ids: Option<Vec<u32>>) {
+        let _ = self.tx.send(EngineMsg::Request(req, key_token_ids));
     }
 
     /// Abort a queued or running request. Unknown or completed IDs are harmless.
@@ -1392,7 +1408,9 @@ impl Engine {
     /// failure, or a cut when it names a token count), then the admission
     /// delay and rate. `Ok(true)` when the fault asks for a `finish=error`
     /// completion, counted as a cut; `Err` is the status to answer. The
-    /// engine never runs the prompt: nothing is admitted, no record is left.
+    /// engine runs no prompt here: nothing is admitted, no record is left
+    /// (a prefill worker under `--prefill-engine` submits its prompt after
+    /// these hooks).
     pub(crate) async fn admit_without_tokens(&self) -> Result<bool, u16> {
         let mut finish_error = false;
         if let Some(fault) = self.inject() {
@@ -2014,9 +2032,10 @@ fn handle_msg(
     msg: EngineMsg,
 ) {
     match msg {
-        EngineMsg::Request(req) => {
+        EngineMsg::Request(req, key_ids) => {
             let oracle_tokens = if params.prefix_cache {
-                let keys = prompt_blocks(&req.prompt_token_ids, params.block_size as usize).0;
+                let ids = key_ids.as_deref().unwrap_or(&req.prompt_token_ids);
+                let keys = prompt_blocks(ids, params.block_size as usize).0;
                 let fleet_best = fleet_engines()
                     .iter()
                     .map(|e| e.match_prefix(&keys))
@@ -2057,7 +2076,7 @@ fn handle_msg(
             if state.is_idle() {
                 shared.note_output();
             }
-            state.enqueue_with_oracle(req, params, oracle_tokens);
+            state.enqueue_with_oracle(req, key_ids, params, oracle_tokens);
             shared.in_flight.store(state.in_flight(), Ordering::Relaxed);
         }
         EngineMsg::Abort(request_id) => {
@@ -2107,6 +2126,9 @@ struct RunningReq {
     /// Tokens to (re)compute: the prompt, extended by the output generated
     /// before a preemption.
     seq_prompt: Vec<u32>,
+    /// The ids the cache keys `seq_prompt` by, where they differ from it
+    /// ([`Engine::submit_keyed`]), extended as it is by a preemption.
+    seq_key: Option<Vec<u32>>,
     /// Content keys of `seq_prompt`'s full blocks.
     seq_keys: Vec<u64>,
     /// Prompt / cached tokens as reported on the stream (constant per request).
@@ -2174,6 +2196,9 @@ struct Resume {
 /// A request admitted to the queue but not yet running.
 struct WaitingReq {
     req: NewRequest,
+    /// The ids the cache keys the prompt by, where they differ from it
+    /// ([`Engine::submit_keyed`]).
+    key_ids: Option<Vec<u32>>,
     /// Content keys of the prompt's full blocks and the hash of every token.
     keys: Vec<u64>,
     rolling_hash: u64,
@@ -2521,15 +2546,22 @@ impl SchedulerState {
     /// Queue a request with no oracle information (tests).
     #[cfg(test)]
     fn enqueue(&mut self, req: NewRequest, p: &EngineParams) {
-        self.enqueue_with_oracle(req, p, 0);
+        self.enqueue_with_oracle(req, None, p, 0);
     }
 
     /// Queue a request, recording the queued token-work it contributes, together
     /// with the fleet oracle's cached-token count at arrival (what the
     /// best-informed router could have obtained).
-    fn enqueue_with_oracle(&mut self, req: NewRequest, p: &EngineParams, oracle_tokens: u32) {
+    fn enqueue_with_oracle(
+        &mut self,
+        req: NewRequest,
+        key_ids: Option<Vec<u32>>,
+        p: &EngineParams,
+        oracle_tokens: u32,
+    ) {
         let prompt_tokens = req.prompt_token_ids.len() as u32;
-        let (keys, rolling_hash, _) = prompt_blocks(&req.prompt_token_ids, p.block_size as usize);
+        let ids = key_ids.as_deref().unwrap_or(&req.prompt_token_ids);
+        let (keys, rolling_hash, _) = prompt_blocks(ids, p.block_size as usize);
         let cached_blocks = if p.prefix_cache {
             self.pool.match_prefix(&keys, p)
         } else {
@@ -2540,6 +2572,7 @@ impl SchedulerState {
         let cached = ((cached_blocks + restored_blocks) as u32 * p.block_size).min(prompt_tokens);
         self.waiting.push_back(WaitingReq {
             req,
+            key_ids,
             keys,
             rolling_hash,
             prompt_tokens,
@@ -2828,6 +2861,7 @@ impl SchedulerState {
                 events,
                 seq_keys: w.keys,
                 seq_prompt: prompt_token_ids,
+                seq_key: w.key_ids,
                 prompt_tokens: w.prompt_tokens,
                 cached_tokens: reported_cached,
                 computed: cached,
@@ -3036,9 +3070,17 @@ impl SchedulerState {
         };
         self.release(&r, p);
         self.preemptions += 1;
+        let output = &r.output_ids[r.resumed_output as usize..];
         let mut seq = r.seq_prompt;
-        seq.extend_from_slice(&r.output_ids[r.resumed_output as usize..]);
-        let (keys, rolling_hash, _) = prompt_blocks(&seq, p.block_size.max(1) as usize);
+        seq.extend_from_slice(output);
+        let seq_key = r.seq_key.map(|mut ids| {
+            ids.extend_from_slice(output);
+            ids
+        });
+        let (keys, rolling_hash, _) = prompt_blocks(
+            seq_key.as_deref().unwrap_or(&seq),
+            p.block_size.max(1) as usize,
+        );
         let len = seq.len() as u32;
         let cached_blocks = if p.prefix_cache {
             self.pool.match_prefix(&keys, p)
@@ -3055,6 +3097,7 @@ impl SchedulerState {
                 choice: r.choice,
                 events: r.events,
             },
+            key_ids: seq_key,
             keys,
             rolling_hash,
             prompt_tokens: r.prompt_tokens,
@@ -3126,7 +3169,7 @@ impl SchedulerState {
             .output_prefix
             .get(r.generated as usize)
             .copied()
-            .unwrap_or_else(|| next_token(r));
+            .unwrap_or_else(|| next_token(r, p.output_table.as_deref()));
         r.generated += 1;
         r.output_ids.push(token_id);
         r.rolling_hash = fnv_step(r.rolling_hash, token_id);
@@ -3475,14 +3518,49 @@ fn prompt_blocks(ids: &[u32], block_size: usize) -> (Vec<u64>, u64, Vec<u32>) {
     (keys, h, pending)
 }
 
+/// The synthetic output ids: the draw takes one of `OUTPUT_ID_COUNT` ids
+/// from `OUTPUT_ID_FIRST` on.
+const OUTPUT_ID_FIRST: u32 = 100;
+const OUTPUT_ID_COUNT: u32 = 30_000;
+
 /// A synthetic output token derived from the configured identity and position.
 /// Prompt-seeded requests can intentionally share both prompt and decode blocks.
-fn next_token(r: &RunningReq) -> u32 {
+/// Under `sent` ([`EngineParams::output_table`]) the id drawn gives way to the
+/// one the table holds in its place.
+fn next_token(r: &RunningReq, sent: Option<&[u32]>) -> u32 {
     let mixed = r
         .token_seed
         .wrapping_add(r.generated)
         .wrapping_mul(2_654_435_761);
-    100 + (mixed % 30_000)
+    let slot = mixed % OUTPUT_ID_COUNT;
+    sent.and_then(|sent| sent.get(slot as usize))
+        .copied()
+        .unwrap_or(OUTPUT_ID_FIRST + slot)
+}
+
+/// The table of [`EngineParams::output_table`] for a vocabulary, where
+/// `decodes` says whether a gateway gets text for an id. An id of the draw
+/// that decodes stays the id sent, so an output keeps the ids it has without
+/// the table wherever they decode; one that does not (an id outside the
+/// vocabulary, a special token, an end-of-sequence id) gives way to an id
+/// that does. `None` where every id of the draw decodes, and where none does:
+/// the engine then sends the id drawn.
+pub(crate) fn output_table(decodes: impl Fn(u32) -> bool) -> Option<Arc<[u32]>> {
+    let drawn = OUTPUT_ID_FIRST..OUTPUT_ID_FIRST + OUTPUT_ID_COUNT;
+    let decoded: Vec<u32> = drawn.clone().filter(|&id| decodes(id)).collect();
+    if decoded.is_empty() || decoded.len() == drawn.len() {
+        return None;
+    }
+    let mut spare = decoded.iter().copied().cycle();
+    let mut decoded_ids = decoded.iter().copied().peekable();
+    Some(
+        drawn
+            .map(|id| match decoded_ids.next_if_eq(&id) {
+                Some(id) => id,
+                None => spare.next().unwrap_or(id),
+            })
+            .collect(),
+    )
 }
 
 fn ewma(prev: f64, sample: f64, alpha: f64) -> f64 {
@@ -4334,6 +4412,61 @@ mod tests {
         );
     }
 
+    /// Under a table the engine sends, for each id it draws, the id the
+    /// table holds: an id that decodes stays, one that does not gives way to
+    /// one that does. With no table the ids are the ids drawn.
+    #[test]
+    fn the_output_is_drawn_from_the_ids_that_decode() {
+        let output = |p: &EngineParams| {
+            let mut st = SchedulerState::new();
+            let (r, mut rx) = req("drawn", vec![7; 4], 64);
+            st.enqueue(r, p);
+            let mut tokens = Vec::new();
+            for _ in 0..100_000 {
+                let step = st.step(p);
+                for (tx, ev) in step.sends {
+                    let _ = tx.send(ev);
+                }
+                while let Ok(ev) = rx.try_recv() {
+                    if let GenEvent::Token { token_id, .. } = ev {
+                        tokens.push(token_id);
+                    }
+                }
+                if tokens.len() == 64 {
+                    break;
+                }
+            }
+            tokens
+        };
+        let drawn = output(&EngineParams::default());
+        assert_eq!(drawn.len(), 64);
+        assert!(
+            drawn.iter().any(|id| !(100..5_104).contains(id)),
+            "the draw leaves a small vocabulary: {drawn:?}"
+        );
+
+        // A vocabulary of 5,104 ids whose id 4,000 is a special token.
+        let decodes = |id: u32| id < 5_104 && id != 4_000;
+        let table = output_table(decodes).expect("a table");
+        assert_eq!(table.len(), 30_000);
+        assert!(table.iter().all(|&id| decodes(id)));
+        for id in (100..5_104).filter(|&id| decodes(id)) {
+            assert_eq!(table[id as usize - 100], id, "an id that decodes stays");
+        }
+        let sent = output(&EngineParams {
+            output_table: Some(table),
+            ..EngineParams::default()
+        });
+        assert_eq!(sent.len(), 64);
+        assert!(sent.iter().all(|&id| decodes(id)), "{sent:?}");
+        for (drawn, sent) in drawn.iter().zip(&sent) {
+            assert!(!decodes(*drawn) || drawn == sent, "{drawn} became {sent}");
+        }
+
+        assert!(output_table(|_| true).is_none(), "every id decodes");
+        assert!(output_table(|_| false).is_none(), "no id decodes");
+    }
+
     /// Run passes until the given request emits its first Token, returning the
     /// accumulated simulated time (TTFT) and pass count.
     fn run_to_first_token(
@@ -4414,7 +4547,7 @@ mod tests {
         let p = EngineParams::default();
         let mut st = SchedulerState::new();
         let (r1, rx1) = req("first", vec![9; 64], 1);
-        st.enqueue_with_oracle(r1, &p, 48);
+        st.enqueue_with_oracle(r1, None, &p, 48);
         let step = st.step(&p);
         assert_eq!(step.admitted.len(), 1);
         assert_eq!(step.admitted[0].prompt_tokens, 64);
@@ -4430,7 +4563,7 @@ mod tests {
         // The same prompt again: every block is cached, and the last one is
         // recomputed anyway (vLLM's rule), so 48 of 64 tokens are served.
         let (r2, rx2) = req("second", vec![9; 64], 1);
-        st.enqueue_with_oracle(r2, &p, 0);
+        st.enqueue_with_oracle(r2, None, &p, 0);
         let step = st.step(&p);
         let admitted = step
             .admitted

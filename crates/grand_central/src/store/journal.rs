@@ -8,12 +8,12 @@
 //! follow, and a store without one (a gateway deciding in its own process)
 //! pays one branch a write.
 
-#![expect(
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
+use std::sync::Arc;
 
-use crate::store::workers::{MembershipChange, WorkerRow};
+use crate::{
+    engine::view::WorkerId,
+    store::workers::{MembershipChange, WorkerRow, WorkerStatus},
+};
 
 /// A place in a store's history: the number of a replicated write, and the
 /// term the store wrote it under. The default is the place before every
@@ -22,7 +22,11 @@ use crate::store::workers::{MembershipChange, WorkerRow};
 /// Two stores that agree on a position and its term share the history
 /// before it (the replication contract's rejoin rule): a term is led by one
 /// replica, and a follower writes a position only as its leader wrote it.
+///
+/// The record gains fields: code outside this crate starts from the default
+/// and assigns what it knows, and a pattern of it ends with `..`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct Position {
     /// The write's number, above that of the write before it: the next
     /// number under a leader's term, and under no term past every number
@@ -44,27 +48,69 @@ pub struct Position {
 /// hold for long, it never waits on a standby and it calls nothing of the
 /// store.
 pub trait Journal: Send + Sync {
-    /// A membership or status write: the epoch it made, the change, the
-    /// row it is about as the write leaves it (`None` for a removal) and
-    /// the row the write took out of the table (a removal's row, a
-    /// replacement's old incarnation). Where a write's writer handed the
-    /// store the row it leaves, that row is told and the table then takes
-    /// it. A write that hands none, a status among them, tells the row as
-    /// the table holds it. `at` is the place of the
-    /// leader's event the write applies, on a store that follows
-    /// ([`crate::store::MemoryStore::follow`]), and none for a write of the
-    /// store's own: a journal keeps that place for the applier's write
-    /// alone. A write whose place was given up before it came is the
-    /// store's own where the store took a term since, and is journaled
-    /// nowhere otherwise.
+    /// A membership write: the epoch it makes, the change, the row it is
+    /// about as the write leaves it (`None` for a removal) and the row the
+    /// write took out (a removal's row, a replacement's old incarnation).
+    /// Where a write's writer handed the store the row it leaves, that row
+    /// is told and the table then takes it. Where it handed the row the
+    /// write takes out, that row is told with the table's status. A write
+    /// that hands none tells that row as the table held it. A status is
+    /// not told here: it has its own call ([`Journal::status`]), and the
+    /// crate's log refuses one that is handed here. `at` is
+    /// the place of the leader's event the write applies, on a store that
+    /// follows ([`crate::store::MemoryStore::follow`]), and none for a
+    /// write of the store's own: a journal keeps that place for the
+    /// applier's write alone. A write whose place was given up before it
+    /// came is the store's own where the store took a term since, and is
+    /// journaled nowhere otherwise.
+    ///
+    /// `term` is the term the write is made under, where its writer names
+    /// one. The answer is whether the write goes on. To a membership
+    /// write the crate's log says no in one case alone: its store does not
+    /// lead `term` in the moment the event would take its place. The store
+    /// then moves nothing, neither a table nor its epoch. A membership
+    /// write that names no term always goes on. The crate's log answers
+    /// yes to one that names a term where its store leads that term, and
+    /// nowhere else. The store steps its epoch behind a yes: `epoch` is
+    /// the one that step gives. The store hands a write `at`, `term` or
+    /// neither, never both: an applier's write goes by its leader's
+    /// place, and names no term of the store's own.
+    #[must_use = "a write the journal refuses moves nothing in the store"]
     fn member(
         &self,
         at: Option<Position>,
+        term: Option<u64>,
         epoch: u64,
         change: MembershipChange,
         row: Option<&WorkerRow>,
         left: Option<&WorkerRow>,
-    );
+    ) -> bool;
+
+    /// A status write: the epoch it makes, the row's id, the status the
+    /// row leaves and the one it takes. No row is told. `models` are the
+    /// models the row serves at the write, the one fact of its row a
+    /// reader of a status reads: a watch that asked for some. They are the
+    /// writer's where it handed them, as a holder of worker objects does
+    /// on a leader and on a standby, and the table's row's otherwise.
+    /// `at`, `term` and the answer are as [`Journal::member`] has
+    /// them. A status of the store's own is told ahead of the table's
+    /// move, and the table takes the status behind a yes alone. A status
+    /// the store follows names no term.
+    #[must_use = "a write the journal refuses moves nothing in the store"]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a status entry's fields, with the write's place and term"
+    )]
+    fn status(
+        &self,
+        at: Option<Position>,
+        term: Option<u64>,
+        epoch: u64,
+        id: WorkerId,
+        from: WorkerStatus,
+        to: WorkerStatus,
+        models: Arc<[String]>,
+    ) -> bool;
 
     /// A generation applied, by its number: told under the membership lock
     /// behind the publication of its first world, so its place orders it

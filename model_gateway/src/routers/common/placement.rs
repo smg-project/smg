@@ -23,8 +23,8 @@ use rand::RngExt;
 use smg_grand_central::{
     document::DecodePick,
     engine::{
-        DecisionEngine, InProcess, LentList, PairAdmission, PairLists, Phase, PlaceRequest,
-        Unplaced, WorkerLists,
+        DecisionEngine, InProcess, LentList, PairAdmission, PairLists, PairSide, Phase,
+        PlaceRequest, ShedReason, Unplaced, WorkerLists,
     },
     policies::consistent_hashing::LentRing,
     tracking::{Outcome, Placement, PlacementSide, SideEnd, TransportClass},
@@ -376,6 +376,10 @@ pub(crate) enum PlacementFailure {
     /// Every prefill worker that could serve the request is at its Prefill
     /// admission limit. Selection was not run; the request waits for a slot.
     PrefillAtCapacity,
+    /// The policy spec in force binds no plan of the request's kind for the
+    /// model: Grand Central's verdict on the spec, judged from no pool.
+    /// Carries the refusal ([`no_plan_bound`]).
+    NoPlanBound(Response),
 }
 
 impl PrefillCandidateError for PlacementFailure {
@@ -512,28 +516,35 @@ pub(crate) fn accepted_by(
 ///
 /// A route asks it of the guard ([`Self::of`]) and tests nothing of who
 /// placed the request. The handle is empty for a guard that keeps no side
-/// of Grand Central's: a classic guard, a guard made ahead of its send
-/// until that send hands it the side ([`Placed::ahead`] until
-/// [`Placed::sent`], the load of a pair's prefill until [`Unsent::sent`]),
-/// and a guard made of another ([`WorkerLoadGuard::replicate`]). It is
-/// empty too where no stage of the engine's document takes an outcome. An
-/// empty handle holds nothing, and a report through it says nothing.
+/// of Grand Central's. A classic guard keeps none. A guard made ahead of
+/// its send keeps none until that send hands it the side: [`Placed::ahead`]
+/// until [`Placed::sent`], the load of a pair's prefill until
+/// [`Unsent::sent`]. A guard made of another keeps none
+/// ([`WorkerLoadGuard::replicate`]). A replica of a pair's prefill load is
+/// the exception: it keeps the first load's handle
+/// ([`Self::kept_by_replica_of`]). The handle is empty too where no stage
+/// of the engine's document takes an outcome. An empty handle holds
+/// nothing, and a report through it says nothing.
 ///
 /// Where the handle is not empty, the engine hears the request's end once
-/// the guard and every handle are gone: with the status last reported, or
-/// as it heard it before where nobody reported (a client that left).
+/// the guard and every handle are gone. It hears the status last reported,
+/// or the end as it heard it before where nobody reported (a client that
+/// left). A failure reported stands against a good answer reported behind
+/// it: a side several readers tell failed once one of them met a failure.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RequestEnd(SideEnd);
 
 impl RequestEnd {
     /// The handle on the end of the request `guard` counts. A classic
-    /// guard pays one test of the word it keeps nothing in.
+    /// guard pays one test of the word it keeps nothing in: the word is
+    /// compared where it lies, and read only for a guard that keeps
+    /// something.
     #[inline]
     pub(crate) fn of(guard: &WorkerLoadGuard) -> Self {
-        match guard.kept() {
-            None => Self::default(),
-            Some(kept) => Self(kept_side_end(kept)),
+        if guard.kept().is_none() {
+            return Self::default();
         }
+        Self(kept_side_end(guard))
     }
 
     /// The request ended with `status`, as the reader of its answer took
@@ -569,6 +580,24 @@ impl RequestEnd {
     #[inline]
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// A replica of `guard` that keeps the handle on `guard`'s end: asked
+    /// for its own handle, the replica then answers the same side
+    /// ([`Self::of`]). A fan-out's and a batch's prefill loads are such
+    /// replicas, and each child tells the one prefill side through its own.
+    /// A guard whose kept value is no side of Grand Central's leaves its
+    /// replica with nothing kept. Out of line: a guard that keeps nothing
+    /// is replicated where its load stands, and never comes here.
+    #[inline(never)]
+    pub(crate) fn kept_by_replica_of(guard: &WorkerLoadGuard) -> WorkerLoadGuard {
+        let end = Self::of(guard);
+        let replica = guard.replicate();
+        if end.0.is_empty() {
+            replica
+        } else {
+            replica.keeping(Box::new(end))
+        }
     }
 }
 
@@ -612,17 +641,27 @@ impl SharedEnd {
 }
 
 /// [`RequestEnd::of`] for a guard that keeps something, out of line: a
-/// classic guard never comes here.
+/// classic guard never comes here. It takes the guard and reads the kept
+/// value itself, so the caller's test loads nothing.
 #[inline(never)]
-fn kept_side_end(kept: &(dyn std::any::Any + Send + Sync)) -> SideEnd {
-    kept.downcast_ref::<PlacementSide>()
-        .map_or_else(SideEnd::default, PlacementSide::side_end)
+fn kept_side_end(guard: &WorkerLoadGuard) -> SideEnd {
+    let Some(kept) = guard.kept() else {
+        return SideEnd::default();
+    };
+    if let Some(side) = kept.downcast_ref::<PlacementSide>() {
+        return side.side_end();
+    }
+    // A replica keeps the handle of the guard it was made of
+    // ([`RequestEnd::kept_by_replica_of`]): the same side.
+    kept.downcast_ref::<RequestEnd>()
+        .map_or_else(SideEnd::default, |end| end.0.clone())
 }
 
-/// [`RequestEnd::report`] through a handle a stage hears, out of line.
+/// [`RequestEnd::report`] through a handle a stage hears, out of line. No
+/// good answer is written over a failure told on the same side.
 #[inline(never)]
 fn reported(end: &SideEnd, status: u16, answered: bool) {
-    end.reported(Outcome::reported(status, transport_class(status, answered)));
+    end.reported_unless_failed(Outcome::reported(status, transport_class(status, answered)));
 }
 
 /// The class of an end of `status`, the one mapping of the gateway: a
@@ -1081,7 +1120,7 @@ impl ByEngine {
     #[inline(never)]
     #[expect(
         clippy::too_many_arguments,
-        reason = "the pair placement's own arguments, and the decode's guard"
+        reason = "the pair placement's own arguments, the decode's guard and its claim"
     )]
     fn decode_again(
         &self,
@@ -1092,6 +1131,7 @@ impl ByEngine {
         wire: Option<WireConstraint>,
         inputs: PlacementInputs<'_>,
         ahead: WorkerLoadGuard,
+        claimed: bool,
     ) -> (Option<Placed>, WorkerLoadGuard) {
         let Some(engine) = policies.engine() else {
             return (None, ahead);
@@ -1116,6 +1156,7 @@ impl ByEngine {
             &pairs,
             wire,
             None,
+            claimed.then_some(&ahead),
             inputs,
             self.stated,
             |request| {
@@ -1283,6 +1324,47 @@ fn report_unplaced(model_id: &str, unplaced: &Unplaced, placed_none: &'static st
     }
 }
 
+/// What Grand Central declined a request by name for.
+#[derive(Debug, PartialEq, Eq)]
+enum Declined {
+    /// The policy spec in force binds no plan of the request's kind for the
+    /// model: the engine's decline under `binding`.
+    Unbound,
+    /// The stage, the picker or the rule of this name picked nobody: the
+    /// engine's word where a classic pass names its policy.
+    By(&'static str),
+}
+
+/// Whether Grand Central declined by name the request it did not place
+/// ([`ShedReason::PolicyDeclined`]), and under which name. The gateway reads
+/// the engine's names here and nowhere else. The engine declines an unbound
+/// request under `binding` ahead of either side, so that decline names no
+/// side: a picker of a host's own that took the name declines for a side,
+/// and is read as any other. A shed under the worker the
+/// request names (`target-worker`) is a decline whatever its reason: a
+/// classic pass answers a target that its hash policy finds nowhere as that
+/// policy's decline ([`PlacementFailure::PolicyDeclined`]).
+fn declined(unplaced: &Unplaced) -> Option<Declined> {
+    match *unplaced {
+        Unplaced::Shed {
+            reason: ShedReason::PolicyDeclined,
+            emptied_by: "binding",
+            side: None,
+            ..
+        } => Some(Declined::Unbound),
+        Unplaced::Shed {
+            reason: ShedReason::PolicyDeclined,
+            emptied_by,
+            ..
+        }
+        | Unplaced::Shed {
+            emptied_by: emptied_by @ "target-worker",
+            ..
+        } => Some(Declined::By(emptied_by)),
+        _ => None,
+    }
+}
+
 /// The origin a row of a traced request's decision record states where
 /// Grand Central picked. The gateway writes such a row behind the engine's
 /// answer, and it holds no prediction, score or gate: the engine's stages
@@ -1382,6 +1464,13 @@ fn observe_match_ratio(blocks: u16, of: u16) {
 /// list as it stands ahead of the engine's call, and the worker picked, or
 /// no worker, under the row's name ([`row_name`]). Its origin is
 /// [`BY_ENGINE`].
+///
+/// A list of no workers is lent on with a cell of this call's own, because
+/// the worker registry builds that list once and never publishes it again:
+/// the cell kept beside it would take one value of the engine for each spec
+/// put in force, and every request for a model no worker serves would walk
+/// them. The engine decides and refuses over such a list as over any, and
+/// the value it makes falls with the call.
 #[expect(
     clippy::too_many_arguments,
     reason = "the placement's own arguments, the engine it asks and what the request states for it"
@@ -1396,6 +1485,15 @@ fn placed_by_engine(
     inputs: PlacementInputs<'_>,
     stated: Stated,
 ) -> Option<Placed> {
+    // Made where the list holds no worker alone: a list with workers pays
+    // the test of its length.
+    let own;
+    let lent = if lent.workers.is_empty() {
+        own = smg_grand_central::engine::ListCell::default();
+        LentList { cell: &own, ..lent }
+    } else {
+        lent
+    };
     let mut tried = TriedIds::new();
     tried_ids(lent.workers, inputs.tried, &mut tried);
     let mut request = place_request(
@@ -1877,6 +1975,11 @@ pub(crate) const NO_AVAILABLE_WORKERS_CODE: &str = "no_available_workers";
 /// backstop of it answer under this code.
 pub(crate) const NO_MEDIA_REF_CAPABLE_WORKER_CODE: &str = "no_media_ref_capable_worker";
 
+/// The client-visible code of [`no_plan_bound`]: the policy spec in force
+/// binds no plan of the request's kind for the model. One code for the
+/// cause, whichever route answers it.
+pub(crate) const NO_PLAN_BOUND_CODE: &str = "no_policy_plan_for_model";
+
 /// The 503 for a pool whose every worker is unavailable (unhealthy or its
 /// circuit breaker open). Terminal for the retry layer: the verdict clears at
 /// the health interval or the breaker timeout, never inside a backoff window,
@@ -1925,6 +2028,19 @@ pub(crate) fn no_media_ref_capable_worker(message: impl Into<String>) -> Respons
         "no worker of the model processes media references".to_string(),
     ));
     mark_non_retryable(&mut response);
+    response
+}
+
+/// The 501 for a request of a kind that the policy spec in force binds no
+/// plan for, for its model: `plan` names the kind, as "pair". A verdict on
+/// the spec, not a pool state: a 501 is terminal for the retry layer by
+/// status, and it carries no `Retry-After` (a client's pacing fixes nothing
+/// here; the spec does). The client's message names the cause, and the
+/// line's reason is the same words.
+pub(crate) fn no_plan_bound(model_id: &str, plan: &'static str) -> Response {
+    let message = format!("the policy spec in force binds no {plan} plan for model '{model_id}'");
+    let mut response = error::not_implemented(NO_PLAN_BOUND_CODE, message.clone());
+    response.extensions_mut().insert(RefusalReason(message));
     response
 }
 
@@ -2002,9 +2118,11 @@ struct RefusalReason(String);
 
 /// Lines per second the gateway writes for each refusal it answers on its
 /// own: a model whose workers are all unavailable (`no_available_workers`),
-/// a model nobody serves (`model_not_found`) and a model none of whose
+/// a model nobody serves (`model_not_found`), a model none of whose
 /// workers processes the media references forwarded to it
-/// (`no_media_ref_capable_worker`). One line per refusal, with
+/// (`no_media_ref_capable_worker`) and a model the policy spec in force
+/// binds no plan of the request's kind for (`no_policy_plan_for_model`).
+/// One line per refusal, with
 /// the request id, the model and the pool's state, shows the condition and
 /// whom it hits; past this rate the lines are counted and the next one
 /// carries the count, while `smg_router_request_errors_total` keeps the
@@ -2035,6 +2153,12 @@ static NO_MEDIA_REF_CAPABLE_WORKER_LOG: KeyedLogThrottle = KeyedLogThrottle::new
     REFUSAL_LOG_MODELS,
 );
 
+static NO_PLAN_BOUND_LOG: KeyedLogThrottle = KeyedLogThrottle::new(
+    REFUSAL_LINES_PER_SECOND,
+    Duration::from_secs(1),
+    REFUSAL_LOG_MODELS,
+);
+
 /// The router answering a refusal, as its line names it.
 #[derive(Clone, Copy)]
 pub(crate) struct RefusalSite<'a> {
@@ -2057,6 +2181,10 @@ enum Refusal {
     /// verdict that holds until a capable worker registers, so it is keyed
     /// and capped like the pool's 503.
     NoMediaRefCapableWorker,
+    /// The policy spec in force binds no plan of the request's kind for the
+    /// model ([`no_plan_bound`]): a verdict that holds until the spec
+    /// changes, keyed and capped like the pool's 503.
+    NoPlanBound,
 }
 
 impl Refusal {
@@ -2065,6 +2193,7 @@ impl Refusal {
             NO_AVAILABLE_WORKERS_CODE => Some(Self::NoAvailableWorkers),
             MODEL_NOT_FOUND_CODE => Some(Self::ModelNotFound),
             NO_MEDIA_REF_CAPABLE_WORKER_CODE => Some(Self::NoMediaRefCapableWorker),
+            NO_PLAN_BOUND_CODE => Some(Self::NoPlanBound),
             _ => None,
         }
     }
@@ -2074,6 +2203,7 @@ impl Refusal {
             Self::NoAvailableWorkers => &NO_AVAILABLE_WORKERS_LOG,
             Self::ModelNotFound => &MODEL_NOT_FOUND_LOG,
             Self::NoMediaRefCapableWorker => &NO_MEDIA_REF_CAPABLE_WORKER_LOG,
+            Self::NoPlanBound => &NO_PLAN_BOUND_LOG,
         }
     }
 
@@ -2082,6 +2212,7 @@ impl Refusal {
             Self::NoAvailableWorkers => "No available workers for model",
             Self::ModelNotFound => "No worker serves model",
             Self::NoMediaRefCapableWorker => "No worker processes media references for model",
+            Self::NoPlanBound => "No plan of the policy spec in force for model",
         }
     }
 
@@ -2097,15 +2228,23 @@ impl Refusal {
     /// shares one allowance with every other such name, for the same reason.
     fn key(self, model_id: &str, registered: bool) -> &str {
         match self {
-            Self::NoAvailableWorkers | Self::NoMediaRefCapableWorker if registered => model_id,
-            Self::NoAvailableWorkers | Self::NoMediaRefCapableWorker | Self::ModelNotFound => "",
+            Self::NoAvailableWorkers | Self::NoMediaRefCapableWorker | Self::NoPlanBound
+                if registered =>
+            {
+                model_id
+            }
+            Self::NoAvailableWorkers
+            | Self::NoMediaRefCapableWorker
+            | Self::NoPlanBound
+            | Self::ModelNotFound => "",
         }
     }
 }
 
 /// The log line of a refusal the gateway answers on its own, and its marker.
 ///
-/// A `no_available_workers` 503, a `no_media_ref_capable_worker` 503 or a
+/// A `no_available_workers` 503, a `no_media_ref_capable_worker` 503, a
+/// `no_policy_plan_for_model` 501 or a
 /// `model_not_found` 404 gets one WARN with the request id, the model and
 /// the state of the pools `site` draws from, and the reason the refusal
 /// names when it has one (the role that is down, the policy that declined,
@@ -2163,7 +2302,7 @@ pub(crate) fn report_refusal_under(
     // pool lookup per role, no walk over the workers; the 404 needs none.
     let registered = matches!(
         kind,
-        Refusal::NoAvailableWorkers | Refusal::NoMediaRefCapableWorker
+        Refusal::NoAvailableWorkers | Refusal::NoMediaRefCapableWorker | Refusal::NoPlanBound
     ) && site
         .pools
         .iter()
@@ -2596,13 +2735,48 @@ impl PairAdmission for PairGates<'_> {
     }
 }
 
+/// A pair's admission ([`PairGates`]) for a decode asked again by a request
+/// that holds a claim at its decode's gate, which its route made before the
+/// prefill was sent ([`decode_again`]): the decode `claimed` counts has a
+/// room whatever its gate reads, since the room that fills the gate is the
+/// request's own. Every other worker is read as the gates read it.
+struct ClaimedGates<'a> {
+    gates: &'a PairGates<'a>,
+    claimed: &'a WorkerLoadGuard,
+}
+
+impl fmt::Debug for ClaimedGates<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClaimedGates")
+            .field("gates", self.gates)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PairAdmission for ClaimedGates<'_> {
+    fn has_capacity(&self, prefill: usize) -> bool {
+        self.gates.has_capacity(prefill)
+    }
+
+    fn has_room(&self, decode: usize) -> bool {
+        self.gates
+            .decodes
+            .get(decode)
+            .is_some_and(|worker| self.claimed.counts(worker))
+            || self.gates.has_room(decode)
+    }
+}
+
 /// Grand Central's request for a pair over the two pools of `pairs`,
 /// handed to `ask`: each pool's list with its cell and the index's pair
 /// classes ([`PdPairIndex::lent`]), and this gateway's two admission reads
 /// ([`PairGates`]), on the hash ring the registry answers for the model now
 /// ([`ModelRing::read`]). One function for a pair's two decisions: the
 /// first ([`pair_by_engine`]), and the decode asked again behind its
-/// prefill ([`decode_again`]), which reads no prefill's capacity.
+/// prefill ([`decode_again`]), which reads no prefill's capacity and hands
+/// the guard of its first decode as `claimed` where the request holds a
+/// claim at that decode's gate: the engine then reads the gates with that
+/// claim ([`ClaimedGates`]).
 ///
 /// What `inputs` and `stated` state of the request is handed as the engine
 /// reads it ([`place_request`]), the route's own rule among it, which the
@@ -2633,6 +2807,7 @@ fn with_pair_request<R>(
     pairs: &PdPairIndex,
     wire: Option<WireConstraint>,
     prefill_capacity: Option<&PrefillSelectionContext<'_>>,
+    claimed: Option<&WorkerLoadGuard>,
     inputs: PlacementInputs<'_>,
     stated: Stated,
     ask: impl FnOnce(&mut PlaceRequest<'_>) -> R,
@@ -2643,11 +2818,19 @@ fn with_pair_request<R>(
         decodes: decode.workers,
         capacity: prefill_capacity,
     };
+    let claimed = claimed.map(|claimed| ClaimedGates {
+        gates: &gates,
+        claimed,
+    });
+    let admission: &dyn PairAdmission = match &claimed {
+        Some(claimed) => claimed,
+        None => &gates,
+    };
     let lists = PairLists {
         prefill,
         decode,
         classes,
-        admission: &gates,
+        admission,
         // No place of a list is stated. A pinned request is held to its
         // wire by its demand, a side at a time, and the engine asks the
         // route's rule of a list itself.
@@ -2692,9 +2875,18 @@ fn with_pair_request<R>(
 ///
 /// Prefills all at the request's admission limit answer
 /// [`PlacementFailure::PrefillAtCapacity`], on which the route waits for a
-/// slot and asks again. Any other miss is judged from the side that has
-/// nobody the request may use and that is available, the prefills first, as
-/// a classic pass judges its own ([`failure_from`]).
+/// slot and asks again. A request the engine declined by name ([`declined`])
+/// answers by that name. Where the policy spec in force binds no pair plan
+/// for the model it is [`PlacementFailure::NoPlanBound`], an answer a
+/// classic pass has none for: it reads no spec. Under any other name it is
+/// [`PlacementFailure::PolicyDeclined`] with the engine's name, where a
+/// classic pass names its policy, for the side the engine's refusal names.
+/// Any other miss is judged from the pools, as a classic pass judges its own
+/// ([`failure_from`]). A side with nobody the request may use and that is
+/// available is the fleet's own state, and it is the role, the prefills
+/// first: a classic pass answers such a fleet the same. Where both sides
+/// have such a worker the fleet explains nothing, and the role is the side
+/// the engine's refusal names, the decode's where it names none.
 ///
 /// Records the selection metric of each side under that worker's transport
 /// label and the label of the profile that picked the side, and under the
@@ -2719,7 +2911,8 @@ fn with_pair_request<R>(
 /// again behind the prefill's answer ([`decode_again`]), after the route
 /// wrote the record, so the record holds the prefill's row alone. A pair
 /// the engine did not place leaves one row, with no worker: the side
-/// judged to have nobody. Prefills all at the admission limit leave none,
+/// judged to have nobody, or the side that declined. A decline that names
+/// no side leaves none. Prefills all at the admission limit leave none,
 /// as a classic pass leaves none where they leave its candidates ahead of
 /// its policy: the route asks again for every slot it waits for. An
 /// untraced pair pays one lookup for both.
@@ -2758,6 +2951,7 @@ fn pair_by_engine(
         pairs,
         wire,
         prefill_capacity,
+        None,
         inputs,
         stated,
         |request| {
@@ -2780,25 +2974,17 @@ fn pair_by_engine(
             ));
         }
         Err(unplaced) => {
-            report_unplaced(model_id, &unplaced, "Grand Central placed no pair");
-            let admitted = |worker: &Arc<dyn Worker>| {
-                WireConstraint::admits(wire, worker.as_ref())
-                    && inputs
-                        .candidate_filter
-                        .is_none_or(|accepts| accepts(worker.as_ref()))
-            };
-            let open =
-                |pool: &[Arc<dyn Worker>]| pool.iter().any(|w| admitted(w) && w.is_available());
-            let (role, pool) = if open(&pairs.prefill) {
-                engine_row(decode_seen, || side_row(DECODE_ROW, ""), None);
-                (WorkerRole::Decode, &pairs.decode_pool)
-            } else {
-                engine_row(prefill_seen, || side_row(PREFILL_ROW, ""), None);
-                (WorkerRole::Prefill, &pairs.prefill)
-            };
-            let judged = admitted_pool(pool, wire, &inputs);
-            let shedding = registry.overload_shed_enabled();
-            return Err(fail(role, failure_from(&judged, model_id, shedding)));
+            return Err(pair_unplaced(
+                registry,
+                policies,
+                model_id,
+                pairs,
+                wire,
+                &inputs,
+                &unplaced,
+                prefill_seen,
+                decode_seen,
+            ));
         }
     };
     let Some(pair) = pair else {
@@ -2842,6 +3028,92 @@ fn pair_by_engine(
     Ok(pair)
 }
 
+/// The verdict on a pair that Grand Central did not place, for any cause but
+/// prefills all at their admission limit: what [`pair_by_engine`] answers
+/// behind the engine's refusal, with the one row the refusal leaves in a
+/// traced request's decision record. A function of its own, cold and never
+/// inlined: a placed pair's path holds none of its values.
+#[cold]
+#[inline(never)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the pair placement's own arguments, the engine's refusal and the two lists as they stood"
+)]
+fn pair_unplaced(
+    registry: &WorkerRegistry,
+    policies: &PolicyRegistry,
+    model_id: &str,
+    pairs: &PdPairIndex,
+    wire: Option<WireConstraint>,
+    inputs: &PlacementInputs<'_>,
+    unplaced: &Unplaced,
+    prefill_seen: Option<cache_trace::Observed>,
+    decode_seen: Option<cache_trace::Observed>,
+) -> Box<PairFailure> {
+    let fail =
+        |role: WorkerRole, verdict: PlacementFailure| Box::new(PairFailure { role, verdict });
+    let side_row = |side: RowSide, label| row_name(policies, Some(side), label);
+    report_unplaced(model_id, unplaced, "Grand Central placed no pair");
+    // The side the engine's refusal names, as the route's role.
+    let named = match unplaced {
+        Unplaced::Shed {
+            side: Some(PairSide::Prefill),
+            ..
+        } => Some(WorkerRole::Prefill),
+        Unplaced::Shed {
+            side: Some(PairSide::Decode),
+            ..
+        } => Some(WorkerRole::Decode),
+        _ => None,
+    };
+    // The record's one row, with no worker: the role's side.
+    let row = |role: WorkerRole| match role {
+        WorkerRole::Decode => engine_row(decode_seen, || side_row(DECODE_ROW, ""), None),
+        WorkerRole::Prefill => engine_row(prefill_seen, || side_row(PREFILL_ROW, ""), None),
+        WorkerRole::Single => {}
+    };
+    match declined(unplaced) {
+        Some(Declined::Unbound) => {
+            let refusal = no_plan_bound(model_id, "pair");
+            let verdict = PlacementFailure::NoPlanBound(refusal);
+            return fail(WorkerRole::Single, verdict);
+        }
+        Some(Declined::By(name)) => {
+            let role = named.unwrap_or(WorkerRole::Single);
+            row(role);
+            return fail(role, PlacementFailure::PolicyDeclined(name));
+        }
+        None => {}
+    }
+    let admitted = |worker: &Arc<dyn Worker>| {
+        WireConstraint::admits(wire, worker.as_ref())
+            && inputs
+                .candidate_filter
+                .is_none_or(|accepts| accepts(worker.as_ref()))
+    };
+    let open = |pool: &[Arc<dyn Worker>]| pool.iter().any(|w| admitted(w) && w.is_available());
+    // A side with nobody open is the fleet's own state, answered as a
+    // classic pass answers it: the prefills first, then the decodes. With
+    // both sides open the fleet explains nothing: the engine's side where
+    // it names one, and the decode's where it names none.
+    let role = if !open(&pairs.prefill) {
+        WorkerRole::Prefill
+    } else if !open(&pairs.decode_pool) {
+        WorkerRole::Decode
+    } else {
+        named.unwrap_or(WorkerRole::Decode)
+    };
+    row(role);
+    let pool = if role == WorkerRole::Decode {
+        &pairs.decode_pool
+    } else {
+        &pairs.prefill
+    };
+    let judged = admitted_pool(pool, wire, inputs);
+    let shedding = registry.overload_shed_enabled();
+    fail(role, failure_from(&judged, model_id, shedding))
+}
+
 /// A pair's decode asked again behind its prefill's answer: the placement
 /// function a pair route calls once its prefill has answered and before it
 /// sends the decode, where it sends the two sides one behind the other.
@@ -2852,9 +3124,14 @@ fn pair_by_engine(
 /// stands now ([`PairsAgain`]): the route's own rule in `inputs` is asked of
 /// the decode the engine picks. What the request stated for the engine
 /// alone ([`Stated`]) is stated again as the decode's answer kept it, so a
-/// route states it once. The function answers the guard to keep, and
-/// the decode the request goes to now where that is another worker than
-/// `decode`'s:
+/// route states it once. `claimed` says whether the request holds a claim
+/// at `decode`'s admission gate, as it does on a route that claims a
+/// decode's room before it sends the prefill: the engine then reads that
+/// decode with a room whatever its gate reads, since the room that fills
+/// the gate is the request's own. A route that claims no room says `false`,
+/// and every gate is read as it stands. The function answers the guard to
+/// keep, and the decode the request goes to now where that is another
+/// worker than `decode`'s:
 ///
 /// - `(None, ahead)` wherever the first decision's decode stands: under the
 ///   classic policies, under a document that picked the decode with its
@@ -2883,7 +3160,7 @@ fn pair_by_engine(
 #[inline(always)]
 #[expect(
     clippy::too_many_arguments,
-    reason = "the pair placement's own arguments, the decode's answer and its guard"
+    reason = "the pair placement's own arguments, the decode's answer, its guard and its claim"
 )]
 pub(crate) fn decode_again(
     registry: &WorkerRegistry,
@@ -2894,10 +3171,13 @@ pub(crate) fn decode_again(
     inputs: PlacementInputs<'_>,
     decode: &Placed,
     ahead: WorkerLoadGuard,
+    claimed: bool,
 ) -> (Option<Placed>, WorkerLoadGuard) {
     match &decode.engine {
         None => (None, ahead),
-        Some(first) => first.decode_again(registry, policies, model_id, pairs, wire, inputs, ahead),
+        Some(first) => first.decode_again(
+            registry, policies, model_id, pairs, wire, inputs, ahead, claimed,
+        ),
     }
 }
 
@@ -3296,7 +3576,7 @@ pub(crate) mod tests {
         document::{
             AppliedSpec, DecodePick, KeySourceSpec, OverloadSpec, PolicySpec, RoutingKeySpec,
         },
-        engine::{Candidate, Decision, RequestFacts, Scorer, Target, TieBand},
+        engine::{Candidate, Constraints, Decision, Filter, RequestFacts, Scorer, Target, TieBand},
         stages::{Lifecycle, StageRegistry},
         tracking::{EventSet, Lease, Outcome, ReleaseReason, Side},
     };
@@ -3327,6 +3607,7 @@ pub(crate) mod tests {
             common::{
                 pair_index::PdWire,
                 prefill_admission::{PrefillAdmission, PrefillAdmissionAttempt},
+                retry::is_retryable_response,
             },
             grpc::backend_client::BasicWorkerBuilder,
         },
@@ -6229,6 +6510,71 @@ pub(crate) mod tests {
         assert_eq!(count(), 6);
     }
 
+    /// The refusal for a model that the policy spec binds no plan for is
+    /// reported as the pool's 503 is: marked, written at WARN under a
+    /// sentence of its own with the cause as its reason, and keyed by the
+    /// model where the model has workers, so one model's refusals never
+    /// silence another's first line. Its lines stand under an allowance of
+    /// their own: a model whose pool's lines of a window are used up still
+    /// gets its line.
+    #[test]
+    fn an_unbound_plans_refusal_is_written_under_its_own_sentence_and_allowance() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let _subscriber = test_subscriber(EventLines(tracing::Level::WARN, Arc::clone(&lines)));
+        let registry = WorkerRegistry::new();
+        for model in ["unbound-1", "unbound-2"] {
+            let worker = BasicWorkerBuilder::new(format!("http://{model}:8080"))
+                .model(ModelCard::new(model))
+                .worker_type(WorkerType::Regular)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build();
+            registry.register(Arc::new(worker)).unwrap();
+        }
+        let site = RefusalSite {
+            function: "PDRouter::execute_dual_dispatch_attempt",
+            mode: "PrefillDecode",
+            pools: &[("regular", RoutingPool::HttpRegular)],
+        };
+        let throttle = KeyedLogThrottle::new(1, Duration::from_secs(60), REFUSAL_LOG_MODELS);
+        let refuse = |model: &str| {
+            let refusal = no_plan_bound(model, "pair");
+            report_refusal_under(&throttle, &registry, site, None, model, refusal)
+        };
+        let count = || lines.lock().unwrap().len();
+
+        let refused = refuse("unbound-1");
+        assert_eq!(refused.status(), StatusCode::NOT_IMPLEMENTED);
+        assert!(refused.extensions().get::<ReportedRefusal>().is_some());
+        assert_eq!(count(), 1);
+        let line = lines.lock().unwrap()[0].clone();
+        for expected in [
+            "message=No plan of the policy spec in force for model",
+            "model_id=\"unbound-1\"",
+            "reason=\"the policy spec in force binds no pair plan for model 'unbound-1'\"",
+            "suppressed=0",
+        ] {
+            assert!(line.contains(expected), "{expected} missing from {line:?}");
+        }
+        refuse("unbound-1");
+        assert_eq!(count(), 1, "the model's second refusal is counted");
+        refuse("unbound-2");
+        assert_eq!(count(), 2, "another model's first line is its own");
+
+        // The kind's own allowance: with the pool's lines of a window used
+        // up, the model's unbound refusal is still written.
+        let model = "unbound-1";
+        for _ in 0..=REFUSAL_LINES_PER_SECOND {
+            report_refusal(&registry, site, None, model, no_available_workers("down"));
+        }
+        let before = count();
+        let unbound = no_plan_bound(model, "pair");
+        report_refusal(&registry, site, None, model, unbound);
+        assert_eq!(count(), before + 1, "an allowance of its own");
+    }
+
     /// A `no_available_workers` 503 for a name with no workers on any role
     /// (the HTTP PD router's answer for a name nobody serves) is an unknown
     /// name: it shares one allowance with every other such name, as the 404
@@ -7178,12 +7524,27 @@ pub(crate) mod tests {
     /// lease, so the engine leases each pick under it. Where the request it
     /// ranks for states an output limit, it says `limit <tokens>` ahead of
     /// that decision's words: a request that states none adds no word.
+    /// With `sides` it names the side at each end (`completed Prefill Ok
+    /// 200`, `released Decode Abandoned`), for a case that holds which
+    /// side of a pair was told what.
     #[derive(Debug)]
-    struct Hears(Heard);
+    struct Hears {
+        heard: Heard,
+        sides: bool,
+    }
 
     impl Hears {
         fn note(&self, word: String) {
-            self.0.lock().expect("the stage heard").push(word);
+            self.heard.lock().expect("the stage heard").push(word);
+        }
+
+        /// The side an end is said of, where this stage names sides.
+        fn side(&self, lease: &Lease) -> String {
+            if self.sides {
+                format!(" {:?}", lease.side)
+            } else {
+                String::new()
+            }
         }
     }
 
@@ -7200,18 +7561,19 @@ pub(crate) mod tests {
             self.note(format!("dispatched {side:?}"));
         }
 
-        fn on_completed(&self, _: &Lease, outcome: &Outcome) {
+        fn on_completed(&self, lease: &Lease, outcome: &Outcome) {
             // An end nobody reported states no status, and is noted by its
             // class alone.
             let status = match outcome.status {
                 0 => String::new(),
                 status => format!(" {status}"),
             };
-            self.note(format!("completed {:?}{status}", outcome.class));
+            let side = self.side(lease);
+            self.note(format!("completed{side} {:?}{status}", outcome.class));
         }
 
-        fn on_released(&self, _: &Lease, reason: ReleaseReason) {
-            self.note(format!("released {reason:?}"));
+        fn on_released(&self, lease: &Lease, reason: ReleaseReason) {
+            self.note(format!("released{} {reason:?}", self.side(lease)));
         }
     }
 
@@ -7256,8 +7618,12 @@ pub(crate) mod tests {
         let heard = Heard::default();
         let kept = Arc::clone(&heard);
         let mut stages = StageRegistry::builtin();
+        let hears = move || Hears {
+            heard: Arc::clone(&kept),
+            sides: false,
+        };
         stages
-            .scorer("hears", move || Box::new(Hears(Arc::clone(&kept))))
+            .scorer("hears", move || Box::new(hears()))
             .expect("a free name");
         let document: PolicySpec = serde_json::from_str(
             r#"{"apiVersion":"smg.policy/v1","generation":1,"profiles":{"p":{"score":["hears"],"pick":"best"}}}"#,
@@ -7684,13 +8050,9 @@ pub(crate) mod tests {
         let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
         let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
         let mut document = PolicySpec::preset("consistent_hashing").expect("a stock preset");
-        document.bindings[0].routing_key = Some(RoutingKeySpec {
-            sources: vec![KeySourceSpec {
-                rid: true,
-                ..KeySourceSpec::default()
-            }],
-            strip_lineage: false,
-        });
+        let mut source = KeySourceSpec::default();
+        source.rid = true;
+        document.bindings[0].routing_key = Some(RoutingKeySpec::of(vec![source]));
         let spec = AppliedSpec::validate(&document);
         engine_on(&policies, spec.expect("a valid document"));
         let keyed = PlacementInputs {
@@ -8194,6 +8556,461 @@ pub(crate) mod tests {
                 failure.verdict
             );
         }
+    }
+
+    /// A pair that the policy spec in force binds no pair plan for is
+    /// refused as that, on a fleet whose every worker is open: a 501 under
+    /// its own code, with no retry hint, in words that name the cause. The
+    /// engine declines such a pair under `binding`, and no pool is judged.
+    /// A classic placement has no like case: it reads no spec. Judged from
+    /// the pools, this pair read as the decode's role unavailable, with a
+    /// retry hint, on a fleet with nobody down.
+    #[test]
+    fn a_pair_the_spec_binds_no_plan_for_is_refused_as_that_on_an_open_fleet() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        // A stock preset binds single requests alone.
+        preset_on(&policies, "round_robin");
+        let failure = pair_from(&registry, &policies)
+            .err()
+            .expect("no pair plan binds the model");
+        assert_eq!(failure.role, WorkerRole::Single);
+        let refusal = match failure.verdict {
+            PlacementFailure::NoPlanBound(refusal) => refusal,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(refusal.status(), StatusCode::NOT_IMPLEMENTED);
+        // The code by its letters, as a client reads it.
+        assert_eq!(
+            error::extract_error_code_from_response(&refusal),
+            "no_policy_plan_for_model"
+        );
+        assert!(refusal.headers().get(RETRY_AFTER).is_none());
+        assert!(!is_retryable_response(&refusal));
+        assert_eq!(
+            refusal_reason(&refusal),
+            Some("the policy spec in force binds no pair plan for model 'm'")
+        );
+    }
+
+    /// The engine's names are read in one function. A decline under
+    /// `binding` that names no side is a spec that binds no plan: the engine
+    /// declines so ahead of either side. Any other decline names what
+    /// picked nobody, a decline under `binding` for a side among them: a
+    /// host's own picker may bear that name. So does a shed under the worker
+    /// a request names, whatever its reason. A shed for another reason
+    /// under any other name is no decline, and neither is an answer that is
+    /// no shed.
+    #[test]
+    fn the_engines_decline_is_read_by_its_name_in_one_place() {
+        let read_for = |reason, emptied_by, side| {
+            declined(&Unplaced::Shed {
+                reason,
+                emptied_by,
+                retry_after_secs: 1,
+                side,
+            })
+        };
+        let read = |reason, emptied_by| read_for(reason, emptied_by, None);
+        let by = |name| Some(Declined::By(name));
+        let unbound = read(ShedReason::PolicyDeclined, "binding");
+        assert_eq!(unbound, Some(Declined::Unbound));
+        let prefills = Some(PairSide::Prefill);
+        let sided = read_for(ShedReason::PolicyDeclined, "binding", prefills);
+        assert_eq!(sided, by("binding"));
+        assert_eq!(read(ShedReason::PolicyDeclined, "a-picker"), by("a-picker"));
+        let named = "target-worker";
+        assert_eq!(read(ShedReason::PolicyDeclined, named), by(named));
+        assert_eq!(read(ShedReason::NoEndpoints, named), by(named));
+        assert_eq!(read(ShedReason::NoEndpoints, "binding"), None);
+        assert_eq!(read(ShedReason::Saturated, "overload"), None);
+        assert_eq!(declined(&Unplaced::NoWorkers), None);
+    }
+
+    /// A pair that names its worker by a number is refused for the side
+    /// that number reaches nobody on, under the engine as under a classic
+    /// placement: a declined policy with that side's role. A classic pass
+    /// names its hash policy (`pair_pass`: the prefill's decline, then the
+    /// decode's), and the engine the name it sheds such a request under.
+    /// Where every prefill is down the request reaches no policy under
+    /// either: the prefill's role is unavailable, and nothing declined.
+    #[test]
+    fn a_pair_whose_named_worker_is_nowhere_is_declined_for_the_side_it_missed_on() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, None),
+            ("grpc://p:2", WorkerType::Prefill, None),
+            ("grpc://d:1", WorkerType::Decode, None),
+        ]);
+        let classic = PolicyRegistry::new(PolicyConfig::ConsistentHashing);
+        let engine = PolicyRegistry::new(PolicyConfig::ConsistentHashing);
+        let document = PolicySpec::pair_presets("consistent_hashing", "consistent_hashing");
+        let spec = AppliedSpec::validate(&document.expect("the pair presets"));
+        engine_on(&engine, spec.expect("a valid document"));
+        let named = |policies: &PolicyRegistry, number: usize| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-smg-target-worker", number.to_string().parse().unwrap());
+            let failure = select_pair(
+                &registry,
+                policies,
+                MODEL,
+                &pairs_of(&registry, policies),
+                None,
+                None,
+                PlacementInputs {
+                    headers: Some(&headers),
+                    ..Default::default()
+                },
+                Stated::nothing,
+            )
+            .err()
+            .expect("the number reaches nobody on a side");
+            let declined = match failure.verdict {
+                PlacementFailure::PolicyDeclined(name) => Some(name),
+                PlacementFailure::Unavailable => None,
+                other => panic!("{other:?}"),
+            };
+            (failure.role, declined)
+        };
+        // The second prefill has the one decode, which no second number
+        // reaches. No third prefill stands.
+        let sides = [(1, WorkerRole::Decode), (2, WorkerRole::Prefill)];
+        for (number, role) in sides {
+            assert_eq!(
+                named(&classic, number),
+                (role, Some("consistent_hashing")),
+                "classic, number {number}"
+            );
+            assert_eq!(
+                named(&engine, number),
+                (role, Some("target-worker")),
+                "the engine, number {number}"
+            );
+        }
+        for worker in registry.get_all() {
+            if *worker.worker_type() == WorkerType::Prefill {
+                worker.set_status(WorkerStatus::NotReady);
+            }
+        }
+        for policies in [&classic, &engine] {
+            assert_eq!(named(policies, 0), (WorkerRole::Prefill, None));
+        }
+    }
+
+    /// A side that a stage of the spec empties is the role the gateway
+    /// answers for, though a worker of that side stands open in its pool:
+    /// with both sides open the fleet explains nothing, the engine's
+    /// refusal names the side, and the pools give the verdict alone. Here
+    /// no prefill passes its profile's filter, and the prefill's role is
+    /// unavailable. Judged from the pools alone, the open prefill made this
+    /// the decode's role. With the one decode down the fleet's own state is
+    /// the answer again, as a classic placement gives it: the decode's
+    /// role, whatever side the engine names.
+    #[test]
+    fn a_side_its_stages_empty_is_the_role_answered_though_its_pool_stands_open() {
+        #[derive(Debug)]
+        struct Nobody;
+        impl Filter for Nobody {
+            fn name(&self) -> &'static str {
+                "nobody"
+            }
+
+            fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+                false
+            }
+        }
+        let mut stages = StageRegistry::builtin();
+        stages
+            .filter("nobody", || Box::new(Nobody))
+            .expect("a free name");
+        let mut document =
+            PolicySpec::pair_presets("round_robin", "round_robin").expect("the pair presets");
+        let prefill = document.profiles.get_mut("prefill");
+        prefill
+            .expect("the prefill's profile")
+            .filter
+            .push("nobody".into());
+        let spec = AppliedSpec::validate_in(&document, &stages, &[]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        engine_on(&policies, spec.expect("the stages hold the filter"));
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let failure = pair_from(&registry, &policies)
+            .err()
+            .expect("no prefill passes its filter");
+        assert_eq!(failure.role, WorkerRole::Prefill);
+        assert!(
+            matches!(failure.verdict, PlacementFailure::Unavailable),
+            "{:?}",
+            failure.verdict
+        );
+        let decode = registry.get_by_url("grpc://d:1").expect("registered");
+        decode.set_status(WorkerStatus::NotReady);
+        let pairs = pairs_of(&registry, &policies);
+        let inputs = PlacementInputs::default();
+        let read = refused(&registry, &policies, &pairs, None, inputs);
+        assert_eq!(read, (WorkerRole::Decode, "unavailable"));
+    }
+
+    /// What a pair that is not placed reads: the role, and the verdict by
+    /// its kind.
+    fn refused(
+        registry: &WorkerRegistry,
+        policies: &PolicyRegistry,
+        pairs: &PdPairIndex,
+        wire: Option<WireConstraint>,
+        inputs: PlacementInputs<'_>,
+    ) -> (WorkerRole, &'static str) {
+        let stated = Stated::nothing;
+        let placed = select_pair(registry, policies, MODEL, pairs, wire, None, inputs, stated);
+        let failure = placed.err().expect("the fleet takes no pair");
+        let kind = match failure.verdict {
+            PlacementFailure::NoCandidates => "no candidates",
+            PlacementFailure::AllOverloaded(_) => "all overloaded",
+            PlacementFailure::Unavailable => "unavailable",
+            PlacementFailure::PolicyDeclined(_) => "declined",
+            other => panic!("{other:?}"),
+        };
+        (failure.role, kind)
+    }
+
+    /// A gateway that sheds an overloaded pool says so in its document: the
+    /// stock pair of two rotations under that word, on `policies`.
+    fn shedding_pair_engine_on(policies: &PolicyRegistry) {
+        let mut sheds = PolicySpec::pair_presets("round_robin", "round_robin").expect("presets");
+        let mut overload = OverloadSpec::default();
+        overload.shed_when_all_vetoed = true;
+        sheds.bindings[0].overload = Some(overload);
+        engine_on(
+            policies,
+            AppliedSpec::validate(&sheds).expect("a valid document"),
+        );
+    }
+
+    /// A fleet's own state is answered as a classic placement answers it,
+    /// whatever side the engine's refusal names. This is the recorded line
+    /// `pair-every-prefill-over-under-a-weighing-policy-and-every-decode-down`
+    /// of classic's pair sheet
+    /// (`crates/grand_central/tests/classic/sheets/pair_select.json`), by
+    /// its own row: both prefills over their thresholds under a policy that
+    /// weighs load itself, every decode down, no shedding. Classic answers
+    /// the prefill's role, unavailable. The engine's prefills stand by their
+    /// profile's lift, so its refusal names the decode side. No prefill is
+    /// open all the same, and the gateway answers the prefill's role.
+    #[test]
+    fn every_prefill_over_and_every_decode_down_is_the_prefills_role_as_classic_answers() {
+        use crate::{
+            config::{RouterConfig, RoutingMode},
+            policies::PolicyFactory,
+        };
+
+        let prefill = PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096);
+        let fewest = r#"{"type":"power_of_two","load_metric":"least_requests"}"#;
+        let decode: PolicyConfig = serde_json::from_str(fewest).expect("the row's decode policy");
+        let settings = RouterConfig {
+            mode: RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: Some(prefill.clone()),
+                decode_policy: Some(decode.clone()),
+            },
+            policy: prefill.clone(),
+            ..Default::default()
+        };
+        // The row's two prefills and three decodes, on its transports `a`,
+        // `b` and none, with its requests in flight.
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://p:2", WorkerType::Prefill, Some("MooncakeConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+            ("grpc://d:2", WorkerType::Decode, Some("MooncakeConnector")),
+            ("grpc://d:3", WorkerType::Decode, None),
+        ]);
+        for (url, in_flight) in [("grpc://p:1", 4), ("grpc://p:2", 2)] {
+            let worker = registry.get_by_url(url).expect("registered");
+            for _ in 0..in_flight {
+                worker.increment_load();
+            }
+            registry.set_worker_overloaded(&worker, true);
+        }
+        for worker in registry.get_all() {
+            if *worker.worker_type() == WorkerType::Decode {
+                worker.set_status(WorkerStatus::NotReady);
+            }
+        }
+        let classic = PolicyRegistry::new(prefill.clone());
+        classic.set_prefill_policy(PolicyFactory::create_from_config(&prefill));
+        classic.set_decode_policy(PolicyFactory::create_from_config(&decode));
+        let engine = PolicyRegistry::for_engine(
+            settings.policy.clone(),
+            settings.routing_key_override.clone(),
+        );
+        let document = settings.policy_document().expect("the settings' document");
+        let spec = AppliedSpec::validate(&document).expect("a valid document");
+        engine_on(&engine, spec);
+        for (who, policies) in [("classic", &classic), ("the engine", &engine)] {
+            let pairs = pairs_of(&registry, policies);
+            let read = refused(
+                &registry,
+                policies,
+                &pairs,
+                None,
+                PlacementInputs::default(),
+            );
+            assert_eq!(read, (WorkerRole::Prefill, "unavailable"), "{who}");
+        }
+    }
+
+    /// The same on a pinned wire. One prefill is on the request's wire and
+    /// over its thresholds under a gateway that sheds, and no decode is on
+    /// that wire. Classic tests its prefills first and sheds over the
+    /// prefills' pool. The engine refuses for the side its wire leaves
+    /// nobody, the decodes: the gateway still answers the prefills' shed,
+    /// and not the decode pool's verdict over workers of another wire.
+    #[test]
+    fn an_overloaded_prefill_on_a_wire_with_no_decode_is_shed_as_classic_sheds_it() {
+        let registry = registry_of(&[
+            (
+                "grpc://p:1",
+                WorkerType::Prefill,
+                ConnectionMode::Grpc,
+                RuntimeType::Sglang,
+            ),
+            (
+                "zmq://d:1",
+                WorkerType::Decode,
+                ConnectionMode::Zmq,
+                RuntimeType::Sglang,
+            ),
+        ]);
+        let p1 = registry.get_by_url("grpc://p:1").expect("registered");
+        registry.set_worker_overloaded(&p1, true);
+        registry.set_overload_shed(true);
+        let by_type = |worker_type: WorkerType| -> Vec<Arc<dyn Worker>> {
+            registry
+                .get_all()
+                .into_iter()
+                .filter(|w| *w.worker_type() == worker_type)
+                .collect()
+        };
+        let classic = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let engine = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        shedding_pair_engine_on(&engine);
+        let wire = Some(pinned_to(RuntimeType::Sglang, ConnectionMode::Grpc));
+        for (who, policies) in [("classic", &classic), ("the engine", &engine)] {
+            let pairs = PdPairIndex::build(
+                by_type(WorkerType::Prefill).into(),
+                by_type(WorkerType::Decode).into(),
+                PdWire::Http,
+                policies.pd_pairing_mode(),
+            );
+            let read = refused(
+                &registry,
+                policies,
+                &pairs,
+                wire,
+                PlacementInputs::default(),
+            );
+            assert_eq!(read, (WorkerRole::Prefill, "all overloaded"), "{who}");
+        }
+    }
+
+    /// The same beside a prefill that pairs with nobody. The paired prefill
+    /// is over its thresholds under a gateway that sheds, and a prefill of
+    /// another transport stands ready with no decode to pair with. Classic
+    /// holds the unpaired prefill for no candidate and sheds over the
+    /// paired one. The engine counts the unpaired prefill and refuses for
+    /// the decode side: the gateway still answers the prefills' shed.
+    #[test]
+    fn an_overloaded_prefill_beside_an_unpaired_one_is_shed_as_classic_sheds_it() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://p:2", WorkerType::Prefill, Some("MooncakeConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let p1 = registry.get_by_url("grpc://p:1").expect("registered");
+        registry.set_worker_overloaded(&p1, true);
+        registry.set_overload_shed(true);
+        let classic = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let engine = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        shedding_pair_engine_on(&engine);
+        for (who, policies) in [("classic", &classic), ("the engine", &engine)] {
+            let pairs = pairs_of(&registry, policies);
+            let read = refused(
+                &registry,
+                policies,
+                &pairs,
+                None,
+                PlacementInputs::default(),
+            );
+            assert_eq!(read, (WorkerRole::Prefill, "all overloaded"), "{who}");
+        }
+    }
+
+    /// The same under a route's rule. The rule turns the one prefill away,
+    /// and the one decode is down. Classic finds no prefill the request may
+    /// use and answers the prefill's role. The engine reads the down decode
+    /// ahead of the rule and refuses for the decode side: the gateway still
+    /// answers the prefill's role, whose pool a route then reads for the
+    /// request's media.
+    #[test]
+    fn a_prefill_its_rule_turns_away_beside_a_down_decode_is_the_prefills_role_as_classic_answers()
+    {
+        let registry = one_pair();
+        let decode = registry.get_by_url("grpc://d:1").expect("registered");
+        decode.set_status(WorkerStatus::NotReady);
+        let not_the_prefill = |worker: &dyn Worker| worker.url() != "grpc://p:1";
+        let classic = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let engine = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let document = PolicySpec::pair_presets("round_robin", "round_robin");
+        let spec = AppliedSpec::validate(&document.expect("the pair presets"));
+        engine_on(&engine, spec.expect("a valid document"));
+        for (who, policies) in [("classic", &classic), ("the engine", &engine)] {
+            let pairs = pairs_of(&registry, policies);
+            let inputs = PlacementInputs {
+                candidate_filter: Some(&not_the_prefill),
+                ..Default::default()
+            };
+            let read = refused(&registry, policies, &pairs, None, inputs);
+            assert_eq!(read, (WorkerRole::Prefill, "unavailable"), "{who}");
+        }
+    }
+
+    /// A decline by name is answered for the side the engine's refusal
+    /// names, and for the pair's whole where it names none, whatever the
+    /// pools hold: asked of the function that answers a pair not placed,
+    /// with the engine's refusal as given.
+    #[test]
+    fn a_decline_by_name_takes_the_engines_side_and_the_pairs_whole_where_it_names_none() {
+        let registry = one_pair();
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let pairs = pairs_of(&registry, &policies);
+        let answered = |side: Option<PairSide>| {
+            let refusal = Unplaced::Shed {
+                reason: ShedReason::PolicyDeclined,
+                emptied_by: "a-picker",
+                retry_after_secs: 1,
+                side,
+            };
+            let inputs = PlacementInputs::default();
+            let failure = pair_unplaced(
+                &registry, &policies, MODEL, &pairs, None, &inputs, &refusal, None, None,
+            );
+            let by = matches!(
+                failure.verdict,
+                PlacementFailure::PolicyDeclined("a-picker")
+            );
+            (failure.role, by)
+        };
+        assert_eq!(answered(None), (WorkerRole::Single, true));
+        let prefills = Some(PairSide::Prefill);
+        assert_eq!(answered(prefills), (WorkerRole::Prefill, true));
+        let decodes = Some(PairSide::Decode);
+        assert_eq!(answered(decodes), (WorkerRole::Decode, true));
     }
 
     /// The one worker a request's rule admits in a pool of sixteen is found
@@ -9613,8 +10430,10 @@ pub(crate) mod tests {
     }
 
     /// A traced pair Grand Central did not place records one row, with
-    /// no worker: the pool of the side judged to have nobody the request
-    /// may use. In a gateway of settings alone it is under the name the
+    /// no worker, where its refusal is judged from the pools: the pool of
+    /// the side judged to have nobody the request may use. A decline that
+    /// names no side, as an unbound plan's, records none. In a gateway of
+    /// settings alone the row is under the name the
     /// settings give that side's policy, and in one that was supplied its
     /// document under no name. A classic pair whose decode selection names
     /// nobody leaves the prefill's row and then the decode's
@@ -9665,6 +10484,62 @@ pub(crate) mod tests {
         }
     }
 
+    /// A traced pair the engine declined by name records one row with no
+    /// worker too: the pool of the side its refusal names. Two prefills and
+    /// one decode under the stock pair of two hash rings: the number `1`
+    /// reaches the second prefill and none of its partners, so the engine
+    /// declines for the decode side and the row is the decodes'. The number
+    /// `2` reaches no prefill: the engine declines for the prefill side,
+    /// and the row is the prefills'.
+    #[tokio::test]
+    async fn a_traced_pair_the_engine_declined_records_the_side_its_refusal_names() {
+        let (prefills, decode) = (["grpc://p:1", "grpc://p:2"], "grpc://d:1");
+        let registry = pd_registry(&[
+            (prefills[0], WorkerType::Prefill, None),
+            (prefills[1], WorkerType::Prefill, None),
+            (decode, WorkerType::Decode, None),
+        ]);
+        let policies = PolicyRegistry::new(PolicyConfig::ConsistentHashing);
+        let document = PolicySpec::pair_presets("consistent_hashing", "consistent_hashing");
+        let spec = AppliedSpec::validate(&document.expect("the pair presets"));
+        engine_on(&policies, spec.expect("a valid document"));
+        for (number, role, pool) in [
+            ("1", WorkerRole::Decode, &[decode][..]),
+            ("2", WorkerRole::Prefill, &prefills[..]),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-smg-target-worker", number.parse().expect("a value"));
+            let (failure, rows) = cache_trace::scope(true, async {
+                let inputs = PlacementInputs {
+                    headers: Some(&headers),
+                    ..Default::default()
+                };
+                let pairs = pairs_of(&registry, &policies);
+                let stated = Stated::nothing;
+                let placed = select_pair(
+                    &registry, &policies, MODEL, &pairs, None, None, inputs, stated,
+                );
+                let failure = placed.err().expect("the number reaches nobody on a side");
+                (failure, traced_rows())
+            })
+            .await;
+            assert_eq!(failure.role, role, "number {number}");
+            assert!(
+                matches!(
+                    failure.verdict,
+                    PlacementFailure::PolicyDeclined("target-worker")
+                ),
+                "{:?}",
+                failure.verdict
+            );
+            assert_eq!(
+                rows,
+                [by_engine("consistent_hashing", "", pool)],
+                "number {number}"
+            );
+        }
+    }
+
     // ---- a pair under Grand Central ----------------------------------------------------------
 
     /// One prefill and one decode on one KV transport.
@@ -9680,11 +10555,42 @@ pub(crate) mod tests {
     /// sides, and what that stage heard. The document picks a pair's decode
     /// with its prefill, or behind it where `later`.
     pub(crate) fn hearing_pairs_on(policies: &PolicyRegistry, later: bool) -> Heard {
+        hearing_pairs(policies, later, false)
+    }
+
+    /// [`hearing_pairs_on`] under a stage that names the side at each end,
+    /// where the document picks a pair's decode with its prefill.
+    pub(crate) fn hearing_pair_sides_on(policies: &PolicyRegistry) -> Heard {
+        hearing_pairs(policies, false, true)
+    }
+
+    /// [`hearing_pair_sides_on`] where the document picks a pair's decode
+    /// behind its prefill: a decode asked again there may move.
+    pub(crate) fn hearing_later_pair_sides_on(policies: &PolicyRegistry) -> Heard {
+        hearing_pairs(policies, true, true)
+    }
+
+    /// One pair a hearing engine placed, for a case of another module. Its
+    /// stage names the side at each end. Answers what the stage hears and the
+    /// pair's two answers, neither sent yet.
+    pub(crate) fn heard_pair() -> (Heard, PlacedPair) {
+        let registry = one_pair();
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let heard = hearing_pair_sides_on(&policies);
+        let pair = pair_from(&registry, &policies).expect("the engine places the pair");
+        (heard, pair)
+    }
+
+    fn hearing_pairs(policies: &PolicyRegistry, later: bool, sides: bool) -> Heard {
         let heard = Heard::default();
         let kept = Arc::clone(&heard);
         let mut stages = StageRegistry::builtin();
+        let hears = move || Hears {
+            heard: Arc::clone(&kept),
+            sides,
+        };
         stages
-            .scorer("hears", move || Box::new(Hears(Arc::clone(&kept))))
+            .scorer("hears", move || Box::new(hears()))
             .expect("a free name");
         let document = PolicySpec::pair_presets("round_robin", "round_robin");
         let mut document = document.expect("the pair presets");
@@ -9708,13 +10614,9 @@ pub(crate) mod tests {
         let document = PolicySpec::pair_presets("round_robin", "round_robin");
         let mut document = document.expect("the pair presets");
         document.generation = 1;
-        document.bindings[0].routing_key = Some(RoutingKeySpec {
-            sources: vec![KeySourceSpec {
-                rid: true,
-                ..KeySourceSpec::default()
-            }],
-            strip_lineage: false,
-        });
+        let mut source = KeySourceSpec::default();
+        source.rid = true;
+        document.bindings[0].routing_key = Some(RoutingKeySpec::of(vec![source]));
         let spec = AppliedSpec::validate(&document);
         engine_on(policies, spec.expect("a valid document"));
     }
@@ -10041,10 +10943,9 @@ pub(crate) mod tests {
         // and its engine decides under that word.
         let shedding = PolicyRegistry::new(PolicyConfig::RoundRobin);
         let mut sheds = PolicySpec::pair_presets("round_robin", "round_robin").expect("presets");
-        sheds.bindings[0].overload = Some(OverloadSpec {
-            shed_when_all_vetoed: true,
-            ..OverloadSpec::default()
-        });
+        let mut overload = OverloadSpec::default();
+        overload.shed_when_all_vetoed = true;
+        sheds.bindings[0].overload = Some(overload);
         engine_on(
             &shedding,
             AppliedSpec::validate(&sheds).expect("a valid document"),
@@ -10286,6 +11187,7 @@ pub(crate) mod tests {
             inputs,
             &pair.decode,
             ahead,
+            false,
         )
     }
 
@@ -10384,6 +11286,7 @@ pub(crate) mod tests {
             inputs,
             &pair.decode,
             sent,
+            false,
         );
         assert!(moved.is_none());
         assert!(guard.counts(pair.decode.worker()));
@@ -10521,6 +11424,7 @@ pub(crate) mod tests {
             inputs,
             &pair.decode,
             ahead,
+            false,
         );
         assert!(moved.is_none());
         assert!(guard.counts(pair.decode.worker()));

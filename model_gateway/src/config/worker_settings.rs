@@ -246,10 +246,9 @@ mod tests {
     fn a_supplied_documents_switch_decides_the_default_thresholds() {
         let under = |enabled: bool, grand_central: bool| {
             let mut document = PolicySpec::preset("round_robin").expect("a stock policy");
-            document.bindings[0].overload = Some(OverloadSpec {
-                enabled,
-                ..OverloadSpec::default()
-            });
+            let mut overload = OverloadSpec::default();
+            overload.enabled = enabled;
+            document.bindings[0].overload = Some(overload);
             RouterConfig {
                 grand_central,
                 policy_spec: Some(document),

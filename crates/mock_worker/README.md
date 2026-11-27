@@ -110,6 +110,43 @@ inside the prompt and disjoint across the request's items, and, when the item
 names its placeholder token id, spans that cover exactly the prompt's tokens of
 that id; a wrong item is refused with `InvalidArgument` naming the item and the
 field, so a gateway regression in a wire's items reads as a red row on the mock.
+A regular worker takes a request with media once the gateway lets it through:
+on every wire the gateway asks the model's family for a media spec (the model
+directory above), and on the vLLM wire it also asks the workers, refusing the
+request with `multimodal_not_supported` while every worker that would take the
+pixels reports `supports_vision` false, as a regular worker of the mock does
+unless `--supports-vision true` or the admin API's info patch says otherwise
+before the gateway reads the model info. The realistic engine keys a media
+item's tokens by the item. The gateway writes the same placeholder id under
+every image, so the cache reads the ids under each placeholder span as one id
+of the item's hash (below 2^30): on the vLLM wire the i-th entry of a batch's
+`mm_hashes` over the batch's i-th span, on the TokenSpeed wire an item's
+`content_hash` with its modality over the item's spans, on the SGLang wire one
+value over all the spans of a batch (its `feature_hash`, or a fold of its
+pixel tensor where the request carries none, taken where the cache reads the
+request, so a prefill-role or scripted request does not pay for it: one batch
+sent both ways reads as two items, and the mock cuts no batch into items by a
+model family's grid). Where the wire names the item's placeholder id, a token
+of another id under a span stays as sent; a token two spans claim goes to the
+first of them, in the prompt's order, that takes its id. A vLLM request's
+media is read one way, as the engine's servicer reads it: where a batch
+carries tensors (`pixel_values` or `model_specific_tensors`), the batches with
+tensors key their spans and a batch without them keys nothing; where none
+does, as on the decode side of a pair that holds the language model alone,
+every batch's hashes, in order, salt the whole prompt, folded with the first
+token into that token's key (an empty prompt has no token to carry them). The
+prompt's token count stays, a script and `--capture` read the ids as sent, the
+same image is the same prompt to the cache, and another image parts the prompt
+at the image's first token (`cached_tokens`, `GET /admin/truth`).
+`--output-seed prompt` reads the prompt as the cache does: the same image
+gives the same output, another image another. The KV
+events follow each wire's engine. On the vLLM wire a stored block carries the
+ids as sent and the item is in the block's hash alone, so an index built from
+the events reads a prompt by its ids, two images under one placeholder id as
+one prompt, as it does of the engine's events. On the SGLang and TokenSpeed
+wires, whose engines write the item's id under its tokens themselves, the
+events carry the keyed ids (read in the engines' servicers and clients, not
+compared with an engine's events).
 A reference batch on the SGLang wire (media URLs without a pixel tensor, the
 form the gateway hands a worker that processes media itself) is the primary
 batch's alone, travels with no extra batch, and is accepted as it stands: the
@@ -213,7 +250,8 @@ experiments against it transfer to engines:
   leaves it as it is: a restarted engine does not empty a shared store. A
   queued request's `num_waiting_uncached_tokens` leaves out what the tier
   would restore. The tier needs generating workers (a prefill or encode worker
-  runs no passes), `--prefix-cache true` and one main-attention KV cache group
+  runs no passes, but a gRPC prefill worker under `--prefill-engine true`
+  does), `--prefix-cache true` and one main-attention KV cache group
   (`full_attention`, `mla_attention` or `sink_full_attention`): the tier holds
   whole blocks of one group.
 - **repeatable output** — `--output-seed prompt` derives synthetic output from
@@ -223,8 +261,17 @@ experiments against it transfer to engines:
   decode blocks too. Request IDs still identify cancellation and records.
   The default `request-id` mode preserves existing stress workloads. This option
   applies to the realistic engine; canned and scripted responses are unchanged.
-  Synthetic output remains in the existing token range 100–30099; a benchmark
-  must separately verify those IDs against its pinned tokenizer and special IDs.
+  Synthetic output remains in the existing token range 100–30099. Where
+  `--tokenizer` names local tokenizer files, an ID of that range gives way to
+  another when the tokenizer does not decode it to text on its own (an ID
+  outside its vocabulary, a special token, a part of a character) or it is an
+  end-of-sequence ID; the other IDs stay as drawn. A tokenizer that decodes
+  no ID of the range leaves the output as drawn, as does a worker with no
+  local tokenizer: a benchmark must then separately verify those IDs against
+  its pinned tokenizer and special IDs. The worker logs a warning when local
+  tokenizer files give no such table (they do not load, or decode no ID of
+  the range); a `--tokenizer` that is no local path stays quiet. An HTTP
+  worker sends text and no IDs, so it loads no tokenizer for this.
 
 | Flag | Default | Meaning |
 |------|---------|---------|
@@ -239,7 +286,7 @@ experiments against it transfer to engines:
 | `--max-batched-tokens` | 8192 | token budget per pass |
 | `--max-running` | 256 | sequences per pass |
 | `--kv-tokens` / `--kv-blocks` | 524288 tokens | KV pool capacity |
-| `--worker-kv-tokens` | none | `worker=tokens,...`: the named workers' pool capacity instead, at most the fleet's or a calibration's pool, whichever is larger (any size under `--timing linear`, whose decode reads no utilisation; workers named `grpc:<port>`, `http:<port>` or `zmq:<index>`; a data-parallel worker is named once and every rank takes the override). The pool's size is room, not speed: the worker's decode keeps the fleet's pool as its utilisation reference (a calibration's reference when one gave it), so it steps as fast as its peers on the same context. Generating workers only: a prefill or encode worker answers without running its engine |
+| `--worker-kv-tokens` | none | `worker=tokens,...`: the named workers' pool capacity instead, at most the fleet's or a calibration's pool, whichever is larger (any size under `--timing linear`, whose decode reads no utilisation; workers named `grpc:<port>`, `http:<port>` or `zmq:<index>`; a data-parallel worker is named once and every rank takes the override). The pool's size is room, not speed: the worker's decode keeps the fleet's pool as its utilisation reference (a calibration's reference when one gave it), so it steps as fast as its peers on the same context. Generating workers only: a prefill or encode worker answers without running its engine, but a gRPC prefill worker under `--prefill-engine true` takes it |
 | `--worker-pass-time-scale` | none | `worker=factor,...`: every pass of the named workers takes `factor` times the timing model's duration (0.001 to 1000; above 1 a slower engine, below 1 a faster one); the rates the worker reports follow, as a servicer measures them. Named and limited as `--worker-kv-tokens` |
 | `--global-l3-blocks` | 0 (off) | capacity of the process-wide shared KV tier, in blocks (above) |
 | `--global-l3-ms-per-token` | 0 | pass time per token restored from the shared tier |
@@ -251,8 +298,10 @@ experiments against it transfer to engines:
 | `--context-length` | 32768 | advertised context length |
 | `--output-prefix-ids` | none | the token ids every output starts with, before the synthetic ids: a stream shaped for a gateway that parses the engine's tokens (a channel header, say); the canned gRPC and ZMQ workers and the realistic engine shape their output with it (the canned HTTP worker does not read it) |
 | `--loads-like` | mock | `vllm`: report only what the vLLM servicer reports (running, waiting, `token_usage`, maxima), so the gateway's expected-wait routes as it does on a vLLM fleet |
+| `--supports-vision` | unset | what the gRPC workers' model info says of vision input from their start: the `supports_vision` entry of the info the admin API patches (`/admin/info/{port}`), seeded; unset, an encode worker on the vLLM wire says `true` and every other worker `false` |
 | `--admin-port` | off | process-wide admin API (below) |
 | `--drain-timeout-secs` | 5 | on SIGTERM or SIGINT: stop accepting, let the requests in flight finish for this long, then exit 0 either way |
+| `--prefill-engine` | false | a gRPC worker in the prefill role runs each prompt on its engine as a request of no output, so the engine's prefix cache, its request records, its KV events and its load record see the prompt, and the prompt side's completion carries the engine's cached count once the prompt is prefilled; such a worker runs its engine's passes, so it takes `--worker-kv-tokens`, `--worker-pass-time-scale` and `--global-l3-blocks` as a generating worker does; `false` answers without the engine (below) |
 | `--kv-events-zmq-base-port` | off | ZMQ KV-event publishers on vLLM's or SGLang's wire (below) |
 | `--kv-cache-groups` | `full_attention` | the KV cache groups a realistic engine publishes, `kind[:window],...`, one to eight of `full_attention`, `mla_attention`, `sink_full_attention`, `sliding_window:<tokens>`, `sliding_window_mla:<tokens>` and `mamba` (at most one of them one of the three main-attention kinds, at any index, and a model without one starts with a window kind; a window kind with its window, the others without): every group's events carry its index, kind and window, a window group stores only the window tail ending at the prompt's aligned replay boundary and a Mamba group the one state block there (vLLM 0.31.0's default retention), a sparse store's `token_ids` on the vLLM wire spanning the whole step as the engine writes it, and an eviction is published once per group, every group's in one batch from the mock's one pool where the engine's per-group pools may stagger them; one group only on the SGLang wire. The gRPC stream carries every group's events unfiltered (a servicer's relay forwards every group, a sparse group's store as its hashes; the gateway indexes the main group and keeps the other groups' blocks in a per-worker view that bounds its overlap the way the engine does), and the mock's own prefix hit and `cached_tokens` are the engine's fixed point over its groups (a window group's tail ending at the hit or its leading run, a Mamba group's rightmost state block, iterated until nothing moves) |
 
@@ -410,7 +459,7 @@ path has no engine to hook.
 
 | Endpoint | Answer |
 |----------|--------|
-| `POST /admin/truth/{worker}` with `{"token_ids": [...]}` | what the worker would serve from cache for that prompt right now: `cached_tokens`, `cached_blocks`, `restored_tokens`, `block_size` (the engine's own prefix match and, with the shared KV tier on, the run the tier holds after it, as `restored_tokens`; last-block rule included) |
+| `POST /admin/truth/{worker}` with `{"token_ids": [...]}` | what the worker would serve from cache for that prompt right now: `cached_tokens`, `cached_blocks`, `restored_tokens`, `block_size` (the engine's own prefix match and, with the shared KV tier on, the run the tier holds after it, as `restored_tokens`; last-block rule included); the ids are read as sent, with no media item beside them, so of a prompt with media it reads only the blocks in front of the first item, and nothing of a prompt its hashes salt |
 | `GET /admin/truth` | per worker, over every admitted request: `requests`, `prompt_tokens`, `cached_tokens`, `oracle_tokens`, `restored_tokens` (the shared tier's share of `cached_tokens`), so a gateway's hit-rate claim can be checked against what the engines actually served; `injected_failures` and `cut_streams` count what the `fail` hook refused before admission and cut after output |
 | `GET /admin/zmq/{worker}` | a ZMQ rank's output counts since it connected: `batch_messages`, the messages that carried request outputs, and `outputs`, the outputs in them (one per message without a step period, several with one; a utility reply is neither); cumulative, `POST /admin/reset` does not clear them; a rank name, not `all` |
 
@@ -457,6 +506,19 @@ rendezvous, so there is none to read. The encode role stays the gRPC wire's.
   accepts and closes each connection (the gateway probes the port once the
   worker is registered) and advertises it as
   `disaggregation_bootstrap_port`.
+  With `--prefill-engine true` a realistic gRPC prefill worker first runs
+  the prompt on its engine as a request of no output, as a regular worker
+  prefills it: the prefix cache holds the prompt, `/admin/requests` records
+  it with its cached and oracle tokens, the KV events name its blocks and
+  the load record counts it as pending prefill until its answer stream is
+  read to the engine's end or dropped, as a regular worker's request. The
+  answer is the same completion, sent once the engine has prefilled the
+  prompt (the engine's prefill time in place of `--gen-ms`), with the
+  engine's `cached_tokens`. An armed `finish=error` ends it with `error`
+  whatever the engine's end; with none armed, a prompt the engine aborts
+  ends with `abort`. The flag needs `--engine realistic` and gRPC workers
+  with no ZMQ rank: an HTTP worker and a ZMQ rank in the prefill role
+  answer without the engine.
 - A **decode** worker generates as a regular worker (canned, realistic or
   scripted: the answers a test states go to the decode side) and advertises
   `disaggregation_mode: decode`.
@@ -498,7 +560,9 @@ as its status at once, and `finish=error` ends the prompt side with `error`
 whatever the status (a 500 on `/v1/messages`, which has no `error` stop
 reason); both count under `cut_total`, as on any worker. The
 engine itself never runs the prompt: nothing is admitted and no record is
-left.
+left. A gRPC worker under `--prefill-engine true` is the exception: after
+these hooks its engine admits and records the prompt and prefills it in
+its passes, so `pause` holds the prompt side's completion until `resume`.
 
 ## Long prompts
 
@@ -530,7 +594,9 @@ gRPC, ZMQ), ahead of either engine mode. Two sources feed one store:
   `key` may stand in for `input_ids`: `<len>:<fold>`, the prompt's length and
   the FNV-style fold of its ids (`h = (h * 1099511628211) ^ id` over a `u64`
   from 0, wrapping). Everything but one of `output_ids` / `output_text` is
-  optional: `finish_reason` defaults to `stop`; `matched_stop` is a token id
+  optional: `finish_reason` defaults to `stop` (to `error` on a line that
+  states a `status`, whose `code` is the number of a gRPC failure, 1 to 16:
+  a line whose call ends well states none); `matched_stop` is a token id
   or a string; `prompt_tokens` defaults to the request's own count;
   `logprobs` holds the sampled token's logprob per output token and is sent
   when the request asks for logprobs; `token_id_logprobs` holds the logprob
@@ -557,7 +623,8 @@ For a request a worker looks in this order: its own queue, the shared queue,
 the answers filed under a text its prompt holds (its own, then the shared
 ones), the keyed answers under its prompt's key. Nothing found is a miss,
 counted per worker, and the request goes to the canned or realistic engine as
-if no script existed. A scripted answer is served by the wire, not by the
+if no script existed (a gRPC worker fails it instead once a recording is
+loaded: [Recording an engine](#recording-an-engine)). A scripted answer is served by the wire, not by the
 engine simulator: no load, no KV events, no request record. The prompt's text
 is what an HTTP worker was sent (the Messages request's top-level `system`,
 a string or text blocks, read ahead of the messages; a message's string
@@ -569,9 +636,13 @@ worker always does. Either reads the prompt only while answers filed under a
 text wait for it, and a prompt it cannot read then fails the request with
 the reason, the filed answers left where they are.
 
-Per wire: a gRPC worker streams `chunk_tokens` ids per `Chunk` and ends with
-the `Complete` (`output_ids`, `finish_reason`, `matched_stop`,
-`cached_tokens`, `output_logprobs` when `return_logprob` is set); a ZMQ rank
+Per wire: a gRPC worker streams `chunk_tokens` ids per `Chunk` (the cuts of
+`chunks` where the answer states them; cuts that hold none of an output,
+an empty list among them, stream a `Chunk` of no ids each and leave the
+output to the `Complete`) and ends with the `Complete`
+(`output_ids`, `finish_reason`, `matched_stop`, `cached_tokens`,
+`output_logprobs` when `return_logprob` is set), or with the `status` of an
+answer that states one; a ZMQ rank
 pushes one `EngineCoreOutputs` batch per frame, the prompt's prefill stats
 on the first, the finish reason and `stop_reason` on the last; an HTTP worker
 answers `/v1/chat/completions`, `/v1/completions`, `/generate` and `/v1/messages` with the
@@ -600,6 +671,184 @@ cargo run --release -p mock-worker -- \
   --admin-port 9100 --model m --script answers.jsonl
 curl -s -X POST localhost:9100/admin/script/grpc:19000 -H 'content-type: application/json' \
   -d '{"output_ids": [9707, 11, 1879], "finish_reason": "stop", "logprobs": [-0.1, -0.2, -0.3]}'
+```
+
+### Recording an engine
+
+A gRPC worker can stand between a gateway and a real engine and write down
+what the engine says; the file replays later with no engine behind it.
+
+- `--record-upstream URL --record PATH` (a pair): the gRPC workers of the
+  process run no engine of their own. Every call that reaches one, of any
+  service and method, goes to the engine at `URL` as the messages and the
+  metadata it came in, and the engine's answer comes back as the messages it
+  sent, with the trailers of a call that ended well behind the last. A
+  request message the recorder cannot read (one over
+  `--grpc-max-message-bytes`) ends the request it hands on (a call of these
+  wires holds one request message, so the engine is handed none), and the
+  caller reads the status of that message, as a worker answers it itself. A
+  call the transport ends with an error, ahead of the engine's headers or
+  behind them, keeps the code a caller of the engine reads (`UNAVAILABLE`
+  for an engine the recorder cannot reach, the code of its reason for a
+  stream the engine reset) and names `the recorder's upstream` ahead of the
+  reason; every other status passes as it is: one the engine sent, one the
+  client makes of an answer that ended with no gRPC status, and one it
+  makes of an answer it cannot read: a message over
+  `--grpc-max-message-bytes` (`OUT_OF_RANGE`), one cut short or with a
+  compressed flag it cannot follow (`INTERNAL`), an encoding it does not
+  take (`UNIMPLEMENTED`).
+  The recorder never fails a call for its own files: a write that fails
+  is logged and the call goes on, and one that fails part way leaves a part
+  of a line, which `--script` refuses with its line number. The recorder
+  holds the bytes of a request until its call is over and sets no bound of
+  its own on the size of its two files. A recorder that cannot start (an
+  address that does not parse or names no scheme, a file that cannot be
+  opened) ends the process at its start, as a capture file does: `URL` is
+  `http://HOST:PORT` or `grpc://HOST:PORT`, and a bare `HOST:PORT` is
+  refused before a file is made. Each `Generate`
+  exchange of a scheduler wire (vLLM, TokenSpeed, SGLang) is appended to
+  `PATH` when the call is over, one line for each choice the request asked
+  (a call that failed or was let go early keeps a line for each all the
+  same, so the calls of one key hold the same count of lines; a call whose
+  request the recorder did not hand on, the engine not reached or the
+  request message not read, writes none, as does one whose request does
+  not read as a request of its wire: a replay holds nothing of such a
+  call, and where its request reaches the script it finds what other
+  calls of its key left, or nothing), as lines
+  `--script` reads: `input_ids`, `output_ids` (`"output_text": ""` for an
+  answer of no tokens), `chunks` (the tokens of each frame in turn, as the
+  engine cut a streamed answer; a frame may hold none, and where no frame
+  held a token the output is the one of the completion: its cuts hold none
+  of it, an empty list for a streamed call answered by its completion
+  alone), `finish_reason`
+  (`error` where the call ended with a status ahead of the choice's
+  completion, `abort` when the caller let go ahead of it), `matched_stop`,
+  `prompt_tokens`, `cached_tokens` (where no completion came, the two the
+  choice's last frame stated), `completion_tokens` (the engine's
+  count: one more than the output where it took a matched stop token off),
+  `logprobs`, `token_id_logprobs` (on the SGLang wire, the one scores row
+  of a completion where it scores the token ids the request asked),
+  `status` (`{"code", "message", "trailers"}`, the gRPC status
+  the call ended with, on each of its lines, with the trailers named
+  `smg-...` by which a worker says what kind of failure it reports),
+  and under `recorded` the facts of the exchange: the `wire`, the choice's
+  `index`, what the request `asked` beyond its prompt, the fold of that
+  (`variant`) and the count of output ids its completion carried
+  (`complete_ids`). Each gRPC worker of the process keeps the answers of
+  `GetModelInfo` and `GetServerInfo` once each, as the bytes of the message
+  in hex, in the info file: `PATH` with its extension replaced by
+  `info.jsonl` (`session.jsonl` gives `session.info.jsonl`, and two records
+  that differ only in their extension share one info file); an info answer
+  whose line the file took nothing of is written by the next answer of its
+  kind. Of a
+  `GetServerInfo` answer the SGLang and TokenSpeed wires hand two free-form
+  maps, the arguments the engine was started with and its scheduler's
+  state, and a start argument may be a key: the info file keeps of each map
+  the entries the gateway reads as labels and no other. A `PATH` holds one
+  session: a later one appends to it, and a replay answers an info call
+  with the first answer the file holds. Both files hold what the session
+  carried (prompts, outputs, the engine's words in a status, the info
+  answers), so a file the recorder creates is readable by its owner
+  only, as a capture file is. A file that exists already keeps its mode and
+  its owner, and a link is followed, as with a capture file: whoever made
+  it chose who reads it, so a session that must stay private starts on a
+  new path. What a request asked keeps a media reference
+  as the fold of its modality and URL, never as the URL, a batch of the
+  vLLM wire that states no hash as one item with no hash at its place, and
+  pixels that
+  state no hash as the identity the SGLang wire gives their batch (a fold
+  of the tensor, eight bytes a step) under their modality; the
+  engine's words in a status are kept as they came.
+- `--script PATH` on such a file replays it. A recorded line is filed under
+  its prompt and what its request asked (`<len>:<fold>/<ask>`): whether it
+  streams, the limit, the count of choices, the sampling fields, the stops,
+  the logprobs, the constraint and the media, and where the request states
+  one, a further field that shapes the answer: `min_p`, the frequency,
+  presence and repetition penalties, `min_new_tokens`, `ignore_eos`,
+  `no_stop_trim`, `logit_bias` and the token ids it asks a score for. A
+  request that states none of these keeps the key it has on every wire. The
+  lines of one key are served in turn, in file order, and from the first
+  again; a frame carries the tokens of the recorded cut, and the completion
+  the count the line states. On another wire than the line's
+  `recorded.wire` that count is never below the output's ids: a wire whose
+  stream a gateway counts frame by frame may state the last frame's tokens
+  alone, where the completion of the other two carries the total. A
+  recorded `status` ends the call, its trailers
+  with it: the frames the call's lines hold go out first (a line whose
+  finish reason is `error` is a choice the engine left open, sent without a
+  completion), and a call that delivered nothing is answered with the
+  status alone. The status of a call the engine reset at the recording,
+  ahead of its headers or behind them, replays with the code and the words
+  its caller read then, `the recorder's upstream` ahead of the reason.
+  Once a recorded line is held, a gRPC worker of the process fails a request
+  that finds nothing with `INTERNAL` and the key it missed (and whether the
+  prompt is recorded, asked otherwise) instead of going on to its engine: a
+  recording is replayed whole, or the test learns what was not recorded. A
+  record file with no line beside its info file (what a session with no
+  `Generate` call leaves) is such a recording: every request fails so. The
+  HTTP and ZMQ workers do not read what a request asks, so no recorded line
+  serves them. Through the admin API a keyed answer replaces what its key
+  held, a recorded line too: a recording is loaded with `--script`.
+- With the info file beside `PATH` (read beside a file that holds a recorded
+  line or no line at all, never beside hand-written answers), a replay
+  answers `GetModelInfo` and
+  `GetServerInfo` with the recorded answers on the wire that recorded them,
+  as this crate's proto reads and writes them (a field the proto does not
+  know is not handed on; a
+  `--tokenizer` path other than the `--model` path in place of the engine's
+  own, while one equal to it reads as none stated), so
+  that a gateway shapes its requests as it did in front of the engine. On
+  another wire the worker's own model info carries the recorded fields that
+  shape a request (the context length, the vocabulary size, the vision flag,
+  the model type, the end tokens, the sampling defaults); the server info
+  there stays the worker's own. While an info file is loaded the recorded
+  answers stand: `supports_vision` set at the start (`--supports-vision`)
+  or through the admin API is not read on any wire, and neither are the
+  server arguments set there on the wire of the recording.
+- One recording of text requests serves all three wires: the fields the
+  wires state differently for one client request are brought to one form
+  before the fold (a temperature left unstated reads 1.0, a `top_k` that is
+  off reads 0, the seed is left out). The price: requests that differ only in
+  their seed, or in stating a temperature of 1.0, share a key and are served
+  in turn; so do requests that differ only in the special-token settings
+  (the wires state them differently for one client request) or in a field
+  that stands in no key: `logprob_start_len` and `custom_params` (two wires
+  carry them), the adapter `lora_id` and `require_reasoning` (one wire
+  carries them), and every other field one wire alone carries. A media
+  item that states neither a hash nor a reference is one constant in the
+  key on the vLLM and TokenSpeed wires. A media item is keyed as its wire
+  names it (a reference, a hash),
+  so a request with media replays on the wire that recorded it; another
+  wire finds its line only where it names every item by the same text.
+- The limits of a recorded line. A status that arrives as the first item
+  of a stream is written like a refusal of the call and replays as one: a
+  line cannot tell the two apart. A completion whose own finish reason is
+  `error`, in a call that also ended with a status, replays without that
+  completion: its line reads as a choice the engine left open. A line whose
+  finish reason is `abort` (the caller of the recording let go ahead of the
+  completion) replays to a caller that stays as the frames the engine had
+  sent and a completion with that reason, which the engine never sent. A
+  line keeps the counts of its completion, not the ones each frame of a
+  stream stated: a replayed frame states as its completion count the tokens
+  sent so far, whatever the engine's frame stated.
+  `logit_bias`
+  is keyed by token id on the vLLM wire and by text on the other two; the
+  fold reads an id as its plain decimal, so a key a client wrote otherwise
+  (`007`) has another key on the vLLM wire than on the other two. The top
+  alternatives of a position are not kept: a request that asks for them
+  reads at a replay the ones the worker makes for any scripted answer. The
+  scores of a request that also generates (a row for each output token) are
+  not kept either: such a request replays without them.
+- A replay states the tokenizer a gateway reads from its worker:
+  `--tokenizer` names the model's tokenizer files.
+
+```bash
+# record: gateway -> this worker -> the engine
+cargo run --release -p mock-worker -- --grpc-base-port 19000 --grpc-count 1 \
+  --grpc-wire vllm --record-upstream grpc://engine-host:50051 --record session.jsonl
+# replay: gateway -> this worker, no engine
+cargo run --release -p mock-worker -- --grpc-base-port 19000 --grpc-count 1 \
+  --grpc-wire vllm --model m --tokenizer ./tokenizer-dir --script session.jsonl
 ```
 
 ## Capturing requests

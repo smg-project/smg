@@ -578,7 +578,10 @@ pub struct Options {
     pub reasoning_open: bool,
     /// The prompt closed the thought itself and wrote what the template writes after the close (a
     /// request with thinking switched off): the tag owes nothing before its first text, and a
-    /// thought the model writes anyway carries its own ([`Format::thought_closed`]).
+    /// thought the model writes anyway carries its own ([`Format::thought_closed`]). Where the
+    /// template leaves the thought to the model (MiniMax M3) the prompt ends with the close, and
+    /// calls the request owes ([`Self::at_least_one`]) are then written at once: the tag holds
+    /// no thought and no second close.
     pub thought_closed: bool,
     /// At most one call: a named function, or `parallel_tool_calls: false`. The tag stops after
     /// the first call, and the call's end carries what the template writes after the last call to
@@ -918,6 +921,7 @@ impl Format {
             calls,
             options.reasoning_open,
             options.thought_closed,
+            options.at_least_one,
             prefixed,
             options.start,
             after,
@@ -1018,7 +1022,7 @@ impl Format {
                 start => start,
             };
             return self
-                .led(answer, reasoning_open, false, true, start, "")
+                .led(answer, reasoning_open, false, false, true, start, "")
                 .map(|grammar| self.bounded(grammar));
         }
         // The model starts in its thought when the prompt opened it, and otherwise in the turn's
@@ -1134,6 +1138,7 @@ impl Format {
             reasoning_open,
             false,
             false,
+            false,
             start,
             "",
         )
@@ -1150,9 +1155,10 @@ impl Format {
     /// thought's opener, its text, which writes none of the table's terminals nor the call
     /// syntax's inner tags, and its close; `None` when the thought does not open from the turn's
     /// own state, where the output starts, and close back there. A table that leaves the thought
-    /// to the model, the turn's own state opening it and closing an empty one, admits it first
-    /// ([`Self::thought_the_model_may_write_first`]); one that does neither has nothing before
-    /// `body` but, where the grammar starts after the thought's close, `after`.
+    /// to the model, the turn's own state opening it and closing an empty one, admits it first,
+    /// but for a call the request forces (`owed`) on a prompt that closed the thought itself,
+    /// which starts at once ([`Self::thought_the_model_may_write_first`]); one that does neither
+    /// has nothing before `body` but, where the grammar starts after the thought's close, `after`.
     ///
     /// `after` is what the template writes after the thought's close, before what comes next
     /// ([`Message::after`]), where the tag writes the close or starts right after it: after the
@@ -1165,11 +1171,17 @@ impl Format {
     /// the caller writes `after` itself (an answer's tag). Where the prompt closed the thought
     /// itself and wrote `after` (`thought_closed`: a request with thinking switched off), the tag
     /// owes it on no start ([`Self::thought_the_model_may_write_first`]).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the body, whether the request owes it, and where the prompt and the engine \
+                  leave the model"
+    )]
     fn led(
         &self,
         body: Grammar,
         reasoning_open: bool,
         thought_closed: bool,
+        owed: bool,
         prefixed: bool,
         start: GrammarStart,
         after: &str,
@@ -1199,6 +1211,7 @@ impl Format {
                 start,
                 after,
                 thought_closed,
+                owed,
             ));
         }
         let reasoning = self.state_emitting(Emits::Reasoning)?;
@@ -1333,10 +1346,18 @@ impl Format {
     /// the two: a forced call is written at once, and without this the tag would take the thought
     /// away. A table
     /// whose prompt opens the thought has only the opener's row there, if that, and adds nothing.
-    /// A prompt with the thought closed is both the template's adaptive default and a request
-    /// with thinking switched off (its generation prompt ends with the thought's close): the tag
-    /// admits the thought, or a second close, in both, and an answer that writes one with thinking
-    /// off reads back as content, as the legacy parser's tag has it.
+    /// A prompt with no marker is the template's adaptive default: the tag admits the thought
+    /// there, before a forced call and an answer too. A prompt that ends with the thought's
+    /// close is a request with thinking switched off, the template closing the thought in the
+    /// model's place (`thought_closed`, [`Format::thought_closed`]): a call the request forces
+    /// (`owed`) then starts at once, the tag holding no thought and no second close, since a
+    /// model offered the thought again may never leave it, and then spends its tokens there and
+    /// never writes the call. The `auto` tag admits the thought, or a second close, there too,
+    /// and an answer that writes one with thinking off reads back as content, as the legacy
+    /// parser's tag has it. A JSON answer's grammar takes no closed reading
+    /// (`Format::answer_grammar_for`): asked as on a prompt with no marker its tag admits them
+    /// too, and a caller that read the prompt closed asks it as after the thought
+    /// (`reasoning_open` with `GrammarStart::AfterReasoning`) and gets the schema alone.
     ///
     /// A table with the opener's row alone (Seed-OSS, whose template writes no empty thought)
     /// leaves the thought to the model too, and where its grammar starts is the engine's: after
@@ -1358,31 +1379,22 @@ impl Format {
         start: GrammarStart,
         after: &str,
         thought_closed: bool,
+        owed: bool,
     ) -> Grammar {
-        let Some(reasoning) = self.state_emitting(Emits::Reasoning) else {
+        let Some((open, close)) = self.thought_from_the_turn_start() else {
             return body;
         };
-        let opens_from_start = self
-            .transitions()
-            .any(|(source, _, target)| source == 0 && target == reasoning);
-        let Some((open, closes)) = opens_from_start
-            .then(|| self.thought_markers(reasoning))
-            .flatten()
-        else {
-            return body;
-        };
-        let Some(&close) = closes.first() else {
-            return body;
-        };
-        let closes_from_start = self
-            .transitions()
-            .any(|(source, on, _)| source == 0 && self.terminal_text(on) == close);
-        if !closes_from_start {
+        if !self.closes_from_the_turn_start(close) {
             return if start == GrammarStart::AfterReasoning && !thought_closed {
                 after_the_close(after, body)
             } else {
                 body
             };
+        }
+        // The prompt closed the thought in the model's place: a call the request forces starts
+        // at once, since a model offered the thought again may never leave it.
+        if owed && thought_closed {
+            return body;
         }
         let text = Grammar::AnyText {
             excludes: self.excluded_but(&[]),
@@ -1410,6 +1422,54 @@ impl Format {
             elements.push(body);
         }
         Grammar::Sequence(elements)
+    }
+
+    /// The thought's opener and its close, where a row leads from the turn's own state, where the
+    /// output starts, into the thought: the model may open the thought itself.
+    fn thought_from_the_turn_start(&self) -> Option<(&str, &str)> {
+        let reasoning = self.state_emitting(Emits::Reasoning)?;
+        let opens_from_start = self
+            .transitions()
+            .any(|(source, _, target)| source == 0 && target == reasoning);
+        let (open, closes) = opens_from_start
+            .then(|| self.thought_markers(reasoning))
+            .flatten()?;
+        Some((open, *closes.first()?))
+    }
+
+    /// The thought's close where the template leaves the thought to the model, which the table
+    /// says with two rows from the turn's own state, where the output starts: one on the
+    /// thought's opener and one on its close, the model writing the thought or closing an empty
+    /// one (MiniMax M3). A prompt that ends with it closed the thought in the model's place
+    /// ([`Format::thought_closed`]). `None` for a table that writes the thought before every
+    /// call and answer ([`Format::thinks_first`]), one whose turn start has the opener's row
+    /// alone, and one without a thought.
+    pub(crate) fn close_left_to_the_model(&self) -> Option<&str> {
+        if self.writes_thought_first() {
+            return None;
+        }
+        let (_, close) = self.thought_from_the_turn_start()?;
+        self.closes_from_the_turn_start(close).then_some(close)
+    }
+
+    /// Whether a row from the turn's own state, where the output starts, stands on `close`, the
+    /// thought's close: the model may close an empty thought itself.
+    fn closes_from_the_turn_start(&self, close: &str) -> bool {
+        self.transitions()
+            .any(|(source, on, _)| source == 0 && self.terminal_text(on) == close)
+    }
+
+    /// Whether `prompt` ends with the close of a thought the template leaves to the model
+    /// ([`Self::close_left_to_the_model`]). The prompt's end is held against the rows of the
+    /// turn's own state first, which allocates nothing and finds no row for nearly every prompt:
+    /// only a prompt that ends with a terminal of such a row pays the walk of the thought's rows
+    /// that says whether that terminal is the thought's close.
+    pub(crate) fn ends_with_the_close_left_to_the_model(&self, prompt: &str) -> bool {
+        self.transitions()
+            .any(|(source, on, _)| source == 0 && prompt.ends_with(self.terminal_text(on)))
+            && self
+                .close_left_to_the_model()
+                .is_some_and(|close| prompt.ends_with(close))
     }
 
     /// The thought where it is a message of its own, as Inkling's: it opens from the turn's own
@@ -4410,6 +4470,296 @@ mod tests {
             .expect("a grammar")
             .payload();
         assert_eq!(glm["format"]["type"], "triggered_tags");
+    }
+
+    /// The four places an engine may start a grammar at.
+    const STARTS: [GrammarStart; 4] = [
+        GrammarStart::Unknown,
+        GrammarStart::Either,
+        GrammarStart::AfterReasoning,
+        GrammarStart::FirstToken,
+    ];
+
+    /// What MiniMax M3's tags admit first where the thought is the model's: the thought, or the
+    /// bare close of an empty one, or nothing.
+    fn the_thought_the_model_may_write() -> Value {
+        value!({
+            "type": "optional",
+            "content": {"type": "or", "elements": [
+                {
+                    "type": "tag",
+                    "begin": "<mm:think>",
+                    "content": {"type": "any_text", "excludes": [
+                        "<mm:think>", "</mm:think>", "<tool_call>", "</tool_call>",
+                        "<invoke name=\"", "</invoke>", "]<]minimax[>["
+                    ]},
+                    "end": "</mm:think>"
+                },
+                {"type": "const_string", "value": "</mm:think>"}
+            ]}
+        })
+    }
+
+    #[test]
+    fn a_prompt_that_ends_with_the_close_reads_closed_where_the_thought_is_the_models() {
+        // MiniMax M3's template leaves the thought to the model and writes nothing after the
+        // close: a generation prompt that ends with the close (thinking switched off) closed the
+        // thought in the model's place. One with no marker did not, nor did one that opened it.
+        let format = formats::minimax_m3();
+        let turn = "]~b]user\nhi[e~[\n]~b]ai\n";
+        let closed = format!("{turn}</mm:think>");
+        assert!(format.thought_closed(&closed));
+        assert!(!format.reasoning_open(&closed));
+        assert!(!format.thought_closed(turn));
+        assert!(!format.reasoning_open(turn));
+        let open = format!("{turn}<mm:think>");
+        assert!(!format.thought_closed(&open));
+        assert!(format.reasoning_open(&open));
+    }
+
+    #[test]
+    fn a_forced_call_starts_at_once_on_a_prompt_that_closed_the_thought() {
+        // The prompt closed the thought in the model's place: a forced call, named or required,
+        // is the block alone on every start, with no thought and no second close before it. A
+        // tag that offered the thought again could hold the model there until its tokens ran out.
+        let tools = weather_tools();
+        let format = formats::minimax_m3();
+        for start in STARTS {
+            for one_call in [true, false] {
+                let tag = |thought_closed: bool| {
+                    format
+                        .grammar_for(
+                            &tools,
+                            Options {
+                                at_least_one: true,
+                                reasoning_open: false,
+                                thought_closed,
+                                one_call,
+                                start,
+                            },
+                        )
+                        .expect("a grammar")
+                        .payload()
+                };
+                let (closed, unmarked) = (tag(true), tag(false));
+                assert_eq!(
+                    unmarked["format"]["elements"][0],
+                    the_thought_the_model_may_write(),
+                    "{start:?} {one_call}"
+                );
+                assert_eq!(
+                    closed["format"], unmarked["format"]["elements"][1],
+                    "{start:?} {one_call}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_forced_call_starts_at_once_where_the_closed_prompt_wrote_the_text_after_the_close() {
+        // The two rows of MiniMax M3 under a layout that writes a newline after the close, a
+        // table outside the registry: the rule reads the rows. The prompt that closed the
+        // thought wrote the newline too, and a forced call is the block alone on every start:
+        // the tag writes no thought, no second close and no second newline.
+        let tools = weather_tools();
+        let format = formats::minimax_m3().with_layout(Layout {
+            thought: Some(Message {
+                before: "".into(),
+                after: "\n".into(),
+                stops: false,
+                close: Some("</mm:think>".into()),
+            }),
+            ..Layout::default()
+        });
+        let turn = "]~b]user\nhi[e~[\n]~b]ai\n";
+        assert!(format.thought_closed(&format!("{turn}</mm:think>\n")));
+        assert!(!format.thought_closed(&format!("{turn}</mm:think>")));
+        let tag = |thought_closed: bool, start: GrammarStart| {
+            format
+                .grammar_for(
+                    &tools,
+                    Options {
+                        at_least_one: true,
+                        reasoning_open: false,
+                        thought_closed,
+                        one_call: true,
+                        start,
+                    },
+                )
+                .expect("a grammar")
+                .payload()
+        };
+        // With no marker the thought or the bare close come first, each with its newline, and
+        // the block follows.
+        let unmarked = tag(false, GrammarStart::Unknown);
+        assert_eq!(unmarked["format"]["elements"][0]["type"], "optional");
+        assert_eq!(
+            unmarked["format"]["elements"].as_array().map(Vec::len),
+            Some(2)
+        );
+        for start in STARTS {
+            assert_eq!(
+                tag(true, start)["format"],
+                unmarked["format"]["elements"][1],
+                "{start:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_prompt_with_no_marker_and_the_auto_tag_keep_the_thought_the_model_may_write() {
+        // The bound of the rule above. A prompt with no marker (the template's adaptive default)
+        // admits the thought before a forced call, a required one and a JSON answer, on every
+        // start. Under `auto` no call is forced, so the tag is the same whether or not the prompt
+        // closed the thought. A JSON answer's tag takes no closed reading at all: it admits the
+        // thought on a prompt that closed it as on one with no marker.
+        let tools = weather_tools();
+        let format = formats::minimax_m3();
+        let schema = Arc::new(value!({"type": "object"}));
+        let lead = the_thought_the_model_may_write();
+        for start in STARTS {
+            let tag = |at_least_one: bool, one_call: bool, thought_closed: bool| {
+                format
+                    .grammar_for(
+                        &tools,
+                        Options {
+                            at_least_one,
+                            reasoning_open: false,
+                            thought_closed,
+                            one_call,
+                            start,
+                        },
+                    )
+                    .expect("a grammar")
+                    .payload()
+            };
+            for (at_least_one, one_call) in
+                [(true, true), (true, false), (false, true), (false, false)]
+            {
+                let unmarked = tag(at_least_one, one_call, false);
+                assert_eq!(unmarked["format"]["type"], "sequence", "{start:?}");
+                assert_eq!(
+                    unmarked["format"]["elements"][0], lead,
+                    "{start:?} {at_least_one} {one_call}"
+                );
+                if !at_least_one {
+                    assert_eq!(tag(false, one_call, true), unmarked, "{start:?} {one_call}");
+                }
+            }
+            let answer = format
+                .answer_grammar_for(&schema, false, start)
+                .expect("a grammar")
+                .payload();
+            assert_eq!(answer["format"]["elements"][0], lead, "{start:?}");
+            assert_eq!(
+                answer["format"]["elements"][1]["type"], "json_schema",
+                "{start:?}"
+            );
+        }
+    }
+
+    /// The reach of the rule over the whole registry: which tables leave the thought to the
+    /// model, which prompts read closed that the layout's text after the close did not say so
+    /// of, and which tags the closed reading changes. The rule is by rows; the table is named
+    /// here as a gate on purpose: a table registered with the two rows changes its forced call
+    /// with them, and whoever adds it names it here.
+    #[test]
+    fn only_a_forced_call_of_a_table_that_leaves_the_thought_to_the_model_starts_at_once() {
+        use crate::formats::registry::Table;
+        let tools = weather_tools();
+        let turn = "the turn the prompt opened\n";
+        let (mut leaves, mut reads_closed) = (Vec::new(), Vec::new());
+        for table in Table::ALL {
+            let (name, format) = (table.name(), table.format());
+            let thought = format.layout().and_then(|layout| layout.thought.as_ref());
+            // What the template writes after the thought's close, and the reading that text
+            // alone gives: closed where the prompt ends with the close and the text.
+            let after = format.around(|layout| layout.thought.as_ref()).1;
+            let by_the_layout = |prompt: &str| {
+                let close = thought.and_then(|thought| thought.close.as_deref());
+                !after.is_empty()
+                    && close.is_some_and(|close| {
+                        prompt
+                            .strip_suffix(after)
+                            .is_some_and(|before| before.ends_with(close))
+                    })
+            };
+            let left = format.close_left_to_the_model();
+            if left.is_some() {
+                leaves.push(name);
+            }
+            // A prompt with no marker, one that opened the thought, and one that ends with each
+            // of the thought's closes, bare and with the layout's text after it.
+            let mut prompts = vec![turn.to_string()];
+            let markers = format
+                .state_emitting(Emits::Reasoning)
+                .and_then(|reasoning| format.thought_markers(reasoning));
+            if let Some((open, closes)) = markers {
+                prompts.push(format!("{turn}{open}"));
+                for close in closes {
+                    prompts.push(format!("{turn}{close}"));
+                    prompts.push(format!("{turn}{close}{after}"));
+                }
+            }
+            for prompt in &prompts {
+                if format.thought_closed(prompt) == by_the_layout(prompt) {
+                    continue;
+                }
+                // The one reading the rows of a table add: the bare close of a table that
+                // leaves the thought to the model and writes nothing after it.
+                assert!(format.thought_closed(prompt), "{name}: {prompt:?}");
+                assert!(after.is_empty(), "{name}: {prompt:?}");
+                assert!(
+                    left.is_some_and(|close| prompt.ends_with(close)),
+                    "{name}: {prompt:?}"
+                );
+                if !reads_closed.contains(&name) {
+                    reads_closed.push(name);
+                }
+            }
+            for start in STARTS {
+                for (at_least_one, one_call) in
+                    [(true, true), (true, false), (false, true), (false, false)]
+                {
+                    let tag = |thought_closed: bool| {
+                        format
+                            .grammar_for(
+                                &tools,
+                                Options {
+                                    at_least_one,
+                                    reasoning_open: false,
+                                    thought_closed,
+                                    one_call,
+                                    start,
+                                },
+                            )
+                            .map(|grammar| grammar.payload())
+                    };
+                    let (closed, unmarked) = (tag(true), tag(false));
+                    let cell = format!("{name}, {start:?}, forced {at_least_one}, {one_call}");
+                    if left.is_some() && at_least_one {
+                        // The forced call of a prompt read closed is what follows the thought
+                        // the tag of a prompt with no marker admits first: the block alone.
+                        let (closed, unmarked) = (closed.expect(&cell), unmarked.expect(&cell));
+                        assert_eq!(
+                            unmarked["format"]["elements"][0]["type"], "optional",
+                            "{cell}"
+                        );
+                        assert_eq!(
+                            closed["format"], unmarked["format"]["elements"][1],
+                            "{cell}"
+                        );
+                    } else if after.is_empty() {
+                        // Nothing else reads the closed prompt where the template writes
+                        // nothing after the close: the `auto` tag of a table that leaves the
+                        // thought to the model, and every tag of a table that does not.
+                        assert_eq!(closed, unmarked, "{cell}");
+                    }
+                }
+            }
+        }
+        assert_eq!(leaves, ["minimax_m3"]);
+        assert_eq!(reads_closed, leaves);
     }
 
     #[test]

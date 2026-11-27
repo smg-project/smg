@@ -160,29 +160,50 @@ def resolve_tokenizer_dir(tokenizer: str, revision: str | None = None) -> str | 
     downloads the same repo in parallel, and a snapshot it has started to
     populate (its ``config.json`` is there, its ``tokenizer.json`` not yet)
     satisfies a local-only lookup while loading nothing."""
-    if os.path.isdir(tokenizer):
-        return tokenizer
+    return _resolve_metadata_snapshot(
+        tokenizer, revision, TOKENIZER_DOWNLOAD_PATTERNS, holds_tokenizer, (True, False)
+    )
+
+
+def resolve_model_metadata_dir(
+    source: str, revision: str | None, *, require_tokenizer: bool = False
+) -> str | None:
+    """Resolve model metadata files locally or from HF Hub without downloading weights."""
+    accepts = (
+        holds_tokenizer
+        if require_tokenizer
+        else lambda d: os.path.isfile(os.path.join(d, "config.json"))
+    )
+    return _resolve_metadata_snapshot(
+        source, revision, TOKENIZER_DOWNLOAD_PATTERNS + ["*.py"], accepts, (True, False)
+    )
+
+
+def _resolve_metadata_snapshot(source, revision, patterns, accepts, attempts):
+    """Share bounded file selection while retaining each caller's cache validation policy."""
+    if os.path.isdir(source):
+        return source
     try:
         from huggingface_hub import snapshot_download
     except ImportError:
-        logger.warning("huggingface_hub is not installed; cannot resolve tokenizer %r", tokenizer)
+        logger.warning("huggingface_hub is not installed; cannot resolve metadata %r", source)
         return None
     last_error: Exception | None = None
-    for local_files_only in (True, False):
+    for local_files_only in attempts:
         try:
             directory = snapshot_download(
-                tokenizer,
+                source,
                 revision=revision,
-                allow_patterns=TOKENIZER_DOWNLOAD_PATTERNS,
+                allow_patterns=patterns,
                 local_files_only=local_files_only,
             )
-        except Exception as error:  # cache miss, offline, or an unknown repo
+        except Exception as error:
             last_error = error
             continue
-        if holds_tokenizer(directory):
+        if accepts(directory):
             return directory
-        last_error = FileNotFoundError(f"{directory} holds no tokenizer file")
-    logger.warning("Could not resolve tokenizer %r to a local directory: %s", tokenizer, last_error)
+        last_error = FileNotFoundError(f"{directory} lacks required metadata files")
+    logger.warning("Could not resolve metadata %r to a local directory: %s", source, last_error)
     return None
 
 

@@ -3,16 +3,16 @@
 use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
-use openai_protocol::worker::{WorkerModels, WorkerSpec, WorkerStatus};
+use openai_protocol::worker::{GrammarStart, WorkerModels, WorkerSpec, WorkerStatus};
 use smg_service_discovery::DISCOVERY_PROVIDER_LABEL;
 use smg_worker::{
     identity::basic::{merge_labels, BasicWorker, RuntimeType, Worker},
     workflow::{
-        kv_transfer_value, model_card_for_labels, report_for_rank,
+        kv_transfer_value, model_card_for_labels, report_for_rank, unnamed_grammar_start_warning,
         validate_constrained_decoding_label, DP_WIDTH_LABELS,
     },
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use super::check_local_worker::{validate_parser_overrides, warn_on_conflicting_parser_overrides};
@@ -205,6 +205,10 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                 );
                 continue;
             }
+            let lost_start = fresh_engine_labels
+                .as_ref()
+                .filter(|_| refresh)
+                .and_then(|fresh| refresh_left_no_grammar_start(worker, &updated_labels, fresh));
             if !card_fields.is_empty() {
                 info!(
                     worker_url = %worker.redacted_url(),
@@ -354,6 +358,12 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                 }
             };
 
+            // Said only of a refresh the registry took: one dropped above
+            // leaves the worker as a newer registration holds it.
+            if let Some(warning) = lost_start {
+                warn!("{warning}");
+            }
+
             // Same-URL replace preserves the existing shared runtime. If the
             // update disables health checks, force the lifecycle to Ready so
             // the worker does not stay stuck in a non-routable pre-update
@@ -487,6 +497,40 @@ fn fresh_in_rank_space(
         }
     }
     report_for_rank(fresh, worker.dp_rank().zip(worker.dp_size()), &width_source)
+}
+
+/// What a label refresh says, once, of a worker it leaves without a grammar
+/// start: the sentence a registration writes of a worker that names none
+/// (`unnamed_grammar_start_warning`, which also says which workers a
+/// gateway-shaped grammar reaches). It is owed at the refresh that takes the
+/// start away (the worker named one before and `labels` name none), and at
+/// the first refresh of a worker registered on a read that found nothing (no
+/// report is on record), of which a registration says nothing. `None` at a
+/// later refresh of the same state: the worker named no start before and its
+/// report is on record, so its operator was told.
+fn refresh_left_no_grammar_start(
+    worker: &Arc<dyn Worker>,
+    labels: &HashMap<String, String>,
+    fresh: &HashMap<String, String>,
+) -> Option<String> {
+    let before = worker.metadata();
+    let start_before = before
+        .spec
+        .labels
+        .get(GrammarStart::LABEL)
+        .map(String::as_str);
+    let named_before = GrammarStart::from_label(start_before) != GrammarStart::Unknown;
+    if !named_before && !before.discovered_labels.is_empty() {
+        return None;
+    }
+    unnamed_grammar_start_warning(
+        worker.url(),
+        before.spec.connection_mode,
+        before.spec.runtime_type,
+        before.spec.worker_type,
+        fresh,
+        labels,
+    )
 }
 
 /// The labels a worker carries once its engine reports `fresh`: every label

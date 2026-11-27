@@ -246,6 +246,7 @@ struct TimedBody {
     deadline: Option<Pin<Box<Sleep>>>,
     outcome: Arc<AtomicU8>,
     ended: bool,
+    upload_wait: UploadWait,
 }
 
 /// `now + total`, saturated to a far future when the sum does not fit an
@@ -253,9 +254,83 @@ struct TimedBody {
 /// `request_timeout_secs`, a shutdown grace written as the largest number)
 /// are a deadline that never comes, as `tokio::time::sleep` treats them.
 pub(crate) fn deadline_from_now(total: Duration) -> tokio::time::Instant {
-    let now = tokio::time::Instant::now();
+    deadline_after(tokio::time::Instant::now(), total)
+}
+
+/// [`deadline_from_now`] from a `now` the caller has read.
+fn deadline_after(now: tokio::time::Instant, total: Duration) -> tokio::time::Instant {
     now.checked_add(total)
         .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365 * 30))
+}
+
+/// How long one read of a request body waited for the client: from its first
+/// poll that found the body pending to where the reader drops the body. The
+/// drop adds it to the request's stamp (`RequestStarted::upload_waited`), for
+/// the dispatch wait counted without the upload. A body that never waited
+/// reads no clock and writes nothing.
+#[derive(Default)]
+struct UploadWait(Option<tokio::time::Instant>);
+
+impl UploadWait {
+    /// A poll found the body pending. `Some(now)` on the first such poll,
+    /// which starts the wait: its one clock read, handed back for a timer
+    /// armed at the same poll.
+    fn pending(&mut self) -> Option<tokio::time::Instant> {
+        if self.0.is_some() {
+            return None;
+        }
+        let now = tokio::time::Instant::now();
+        self.0 = Some(now);
+        Some(now)
+    }
+}
+
+impl Drop for UploadWait {
+    fn drop(&mut self) {
+        if let Some(since) = self.0 {
+            super::request_start::RequestStarted::upload_waited(since.elapsed());
+        }
+    }
+}
+
+/// `body` under the upload wait this layer's body measures, for a reader
+/// outside the layer: the WASM request hook, which reads the body ahead of
+/// it, and the multipart routes, which stand under no body deadline.
+pub(crate) fn upload_measured(body: Body) -> Body {
+    Body::new(UploadMeasured {
+        inner: body,
+        wait: UploadWait::default(),
+    })
+}
+
+struct UploadMeasured {
+    inner: Body,
+    wait: UploadWait,
+}
+
+impl http_body::Body for UploadMeasured {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.inner).poll_frame(cx);
+        if polled.is_pending() {
+            this.wait.pending();
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 impl TimedBody {
@@ -268,6 +343,7 @@ impl TimedBody {
             deadline: None,
             outcome,
             ended: false,
+            upload_wait: UploadWait::default(),
         }
     }
 
@@ -316,10 +392,16 @@ impl http_body::Body for TimedBody {
                 "request body still incomplete at the request timeout",
             );
         }
+        // The body waits for the client. Its first wait starts the upload
+        // wait, on the clock read the stall timer of that wait is built on.
+        let first_wait = this.upload_wait.pending();
         if let Some(stall) = this.stall {
-            let timer = this
-                .stall_timer
-                .get_or_insert_with(|| Box::pin(tokio::time::sleep(stall)));
+            let timer = this.stall_timer.get_or_insert_with(|| {
+                Box::pin(match first_wait {
+                    Some(now) => tokio::time::sleep_until(deadline_after(now, stall)),
+                    None => tokio::time::sleep(stall),
+                })
+            });
             if timer.as_mut().poll(cx).is_ready() {
                 return this.end(
                     STALLED,
@@ -392,6 +474,77 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], b"payload");
+    }
+
+    /// The upload wait of a body runs from the first poll that found it
+    /// pending to where its reader drops it, before the handler has the
+    /// bytes: under the entry stamp, a body that comes in two parts with a
+    /// pause before each leaves its handler a stamp whose upload wait is the
+    /// two pauses, on the clock the test holds, so a wait counted from the
+    /// entry reads that much less. A body that came whole takes nothing off.
+    #[tokio::test(start_paused = true)]
+    async fn the_upload_wait_of_a_body_that_came_in_parts_is_what_its_read_waited() {
+        const PAUSE: Duration = Duration::from_secs(2);
+        const WAIT: Duration = Duration::from_secs(100);
+        let app = || {
+            Router::new()
+                .route(
+                    ECHO_PATH,
+                    axum::routing::post(|body: Bytes| async move {
+                        let stamp = RequestStarted::carried().expect("the request's stamp");
+                        format!(
+                            "{} {}",
+                            body.len(),
+                            stamp.less_upload_wait(WAIT).as_millis()
+                        )
+                    }),
+                )
+                .layer(timeouts(5, 60).layer())
+        };
+        for (body, expected, what) in [
+            (
+                trickle(2, PAUSE),
+                &b"2 96000"[..],
+                "two bytes, the two pauses off the wait",
+            ),
+            (
+                Body::from("ab"),
+                &b"2 100000"[..],
+                "a body that came whole takes nothing off",
+            ),
+        ] {
+            let response = RequestStarted::now()
+                .scope(app().oneshot(echo_request(body)))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let read = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(&read[..], expected, "{what}");
+        }
+    }
+
+    /// A reader outside the layer measures its body the same way: a body in
+    /// two parts read through the measure leaves the two pauses in the
+    /// request's stamp, and one that came whole leaves nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_body_read_through_the_measure_outside_the_layer_adds_its_wait() {
+        const PAUSE: Duration = Duration::from_secs(2);
+        const WAIT: Duration = Duration::from_secs(100);
+        for (body, expected) in [
+            (trickle(2, PAUSE), Duration::from_secs(96)),
+            (Body::from("ab"), WAIT),
+        ] {
+            let left = RequestStarted::now()
+                .scope(async {
+                    let read = to_bytes(upload_measured(body), usize::MAX).await.unwrap();
+                    assert_eq!(read.len(), 2);
+                    RequestStarted::carried()
+                        .expect("the request's stamp")
+                        .less_upload_wait(WAIT)
+                })
+                .await;
+            assert_eq!(left, expected);
+        }
     }
 
     /// A body that stops after its first bytes ends with 408 once a single

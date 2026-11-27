@@ -116,6 +116,8 @@ pub struct EngineCoreRequest {
     /// a pooling request.
     pub pooling_params: Option<PoolingParams>,
     pub arrival_time: f64,
+    /// The adapter the request names, in the positions of vLLM 0.31 (see
+    /// [`lora::LoraRequest`]): leave it unset toward a release from 0.32 on.
     #[serde(default)]
     pub lora_request: Option<lora::LoraRequest>,
     #[serde(default)]

@@ -20,6 +20,7 @@ pub(crate) mod spec_store;
 #[path = "no_spec_store.rs"]
 pub(crate) mod spec_store;
 #[cfg(test)]
+#[path = "../../../tests/unit/document/operator/test_support.rs"]
 pub(crate) mod test_support;
 mod turn;
 
@@ -27,15 +28,9 @@ pub use answers::{
     ApplyCounts, ApplyOutcome, Document, DryRun, EnforceOutcome, EnforceRefused, NeedsRow, NotHeld,
     OnFile, SpecRejected, Status,
 };
-#[cfg(all(test, feature = "controller"))]
-pub(crate) use document_manager::needs_rows;
-#[cfg(all(test, feature = "controller"))]
-pub(crate) use document_manager::Validate;
 #[cfg(feature = "controller")]
-pub(crate) use document_manager::{above, Checked, Entered, Held, Line};
+pub(crate) use document_manager::{above, Checked, Entered, FollowerTurn, Held, Line};
 pub use document_manager::{dry_run_against, DocumentManager};
-#[cfg(feature = "controller")]
-pub(crate) use document_manager::{DRY_RUNS_WAITING, WRITES_WAITING};
 #[cfg(feature = "controller")]
 pub(crate) use reader::over_bound;
 pub use reader::{Format, MAX_DOCUMENT_BYTES};

@@ -12,8 +12,9 @@ use std::{
 /// same name reuses the allocation.
 pub(crate) fn intern(name: &str) -> &'static str {
     static NAMES: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    // A case's count of calls: only this function sees every call.
     #[cfg(test)]
-    ASKED.with(|asked| asked.set(asked.get() + 1));
+    tests::ASKED.with(|asked| asked.set(asked.get() + 1));
     let names = NAMES.get_or_init(|| Mutex::new(HashSet::new()));
     let mut guard = names
         .lock()
@@ -27,22 +28,5 @@ pub(crate) fn intern(name: &str) -> &'static str {
 }
 
 #[cfg(test)]
-thread_local! {
-    /// How many names this thread asked [`intern`] for: a case reads it
-    /// around a call to show that the call takes no name from the table,
-    /// and so not the table's lock.
-    pub(crate) static ASKED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-mod tests {
-    use super::intern;
-
-    #[test]
-    fn a_name_is_interned_once() {
-        let a = intern("plugin-a");
-        let b = intern("plugin-a");
-        assert!(std::ptr::eq(a, b), "one allocation per distinct name");
-        assert_ne!(intern("plugin-b"), a);
-    }
-}
+#[path = "../tests/unit/names/tests.rs"]
+pub(crate) mod tests;

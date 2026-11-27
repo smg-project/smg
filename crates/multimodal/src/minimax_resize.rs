@@ -8,28 +8,37 @@ use image::{
 
 use crate::{
     buffer_pool,
-    types::{ImageFrame, ImageSize},
+    types::{ImageFrame, ImageSize, VideoClip},
     vision::transforms::{resize_bicubic_torch_aa, round_half_to_even},
     MediaConnectorError,
 };
 
-/// Short-side floor, applied only when the source does not exceed the long-side cap.
+/// Short-side floor of the nearest-grid size, applied only when the source
+/// does not exceed the long-side cap.
 pub const MIN_SHORT_SIDE: u32 = 112;
+/// Floor of the aligned size: of the short side, and squared of the area.
+const ALIGNED_FLOOR: u32 = 168;
 /// Hard limit on aligned image pixels, checked before decoding.
 pub const IMAGE_MAX_TOTAL_PIXELS: u64 = 12_845_056;
 /// Default image long-side cap.
 pub const IMAGE_DEFAULT_LONG_SIDE: u32 = 2016;
+/// Default long-side cap of a video frame's aligned size.
+pub(crate) const VIDEO_DEFAULT_LONG_SIDE: u32 = 672;
 /// Internal processor marker for images whose source geometry was already planned.
 pub const RESIZED_KEY: &str = "minimax_media_resized";
-/// Internal selector for the SGLang MiniMax M3.1 day-0 resize contract.
+/// Internal selector for the SGLang MiniMax M3.1 day-0 resize contract. On a
+/// video preprocessor config it also decides whether a clip's prompt carries
+/// time stamps: the family's registry entry stamps a clip only under it.
 pub const SGLANG_RESIZE_KEY: &str = "minimax_sglang_resize";
 
 #[cfg(test)]
 #[path = "minimax_resize_tests.rs"]
 mod tests;
 
-/// Branch on original dimensions, then use the model's nearest patch-grid
-/// alignment (ties to even, like Python round). Never round the input cap.
+/// The model processor's aligned size for a source within its 200:1 aspect
+/// limit, where that size fits the pixel budget and the same limit. Else
+/// branch on original dimensions, then use the nearest patch-grid alignment
+/// (ties to even, like Python round), never rounding the input cap.
 pub(crate) fn dimensions(
     width: u32,
     height: u32,
@@ -43,6 +52,18 @@ pub(crate) fn dimensions(
             ParameterError::from_kind(ParameterErrorKind::DimensionMismatch),
         )));
     }
+    let (w, h) = aligned(width, height, cap);
+    let within = |long: u32, short: u32| f64::from(long) / f64::from(short) <= 200.0;
+    if u64::from(w) * u64::from(h) <= IMAGE_MAX_TOTAL_PIXELS
+        && within(width.max(height), width.min(height))
+        && within(w.max(h), w.min(h))
+    {
+        return Ok((w, h));
+    }
+    // The model processor sizes no source over 200:1, and a size over the
+    // budget or over 200:1 would be refused. The nearest-grid size, which can
+    // round a side down and does not scale an enlarged source back under the
+    // cap, serves what it served before.
     let long = width.max(height);
     let short = width.min(height);
     let (numerator, denominator) = if long > cap {
@@ -72,6 +93,49 @@ pub(crate) fn dimensions(
         });
     }
     Ok((w as u32, h as u32))
+}
+
+/// The model processor's aligned size. A source under the area floor, then one
+/// under the short-side floor, is enlarged in proportion, each side rounded
+/// up; both sides are rounded up to the patch grid; and where one is over the
+/// cap, both are scaled back by `cap / long`, cut to whole pixels and rounded
+/// up to the grid again. The cap is first rounded down to the grid, so no
+/// side ends above it but for the one cell a side keeps.
+pub(crate) fn aligned(width: u32, height: u32, cap: u32) -> (u32, u32) {
+    // The floors are the processor's float arithmetic, operation for
+    // operation: 153 * (168.0 / 153) lands above 168 and rounds up to 169.
+    // The sides stay whole numbers below 2^40, which f64 holds exactly.
+    let floor = f64::from(ALIGNED_FLOOR);
+    let enlarged = |(w, h): (f64, f64), scale: f64| ((w * scale).ceil(), (h * scale).ceil());
+    let mut sides = (f64::from(width), f64::from(height));
+    if sides.0 * sides.1 < floor * floor {
+        sides = enlarged(sides, (floor * floor / (sides.0 * sides.1)).sqrt());
+    }
+    let short = sides.0.min(sides.1);
+    if short < floor {
+        sides = enlarged(sides, floor / short);
+    }
+    let w = (sides.0 as u64).next_multiple_of(28);
+    let h = (sides.1 as u64).next_multiple_of(28);
+    let (long, cap) = (w.max(h), u64::from(cap - cap % 28));
+    let fit = |side: u64| {
+        let side = if long > cap {
+            // The product of the largest enlarged side and cap passes 64 bits.
+            (u128::from(side) * u128::from(cap) / u128::from(long)) as u64
+        } else {
+            side
+        };
+        // A cap under one cell, or a ratio the cap cannot hold, scales a side
+        // to nothing: it keeps one cell. No side is above the u32 cap.
+        side.next_multiple_of(28).max(28) as u32
+    };
+    (fit(w), fit(h))
+}
+
+/// The aligned size of a clip's frames under the caller's cap, or under the
+/// default cap where the caller names none.
+pub(crate) fn clip_dimensions(width: u32, height: u32, cap: Option<u32>) -> (u32, u32) {
+    aligned(width, height, cap.unwrap_or(VIDEO_DEFAULT_LONG_SIDE))
 }
 
 /// Match SGLang day-0 nearest-grid alignment with a bounded short-side floor.
@@ -155,6 +219,24 @@ fn resized_hash(hash: &str, width: u32, height: u32, sglang: bool) -> String {
     hasher.update(&width.to_le_bytes());
     hasher.update(&height.to_le_bytes());
     hasher.finalize().to_hex().to_string()
+}
+
+/// Include the size the processor gives a clip's frames in its identity, as
+/// [`image`] does for an image: a cache keyed off the identity then never
+/// answers for the same clip sized by another rule.
+pub(crate) fn clip(clip: &mut VideoClip, cap: Option<u32>) {
+    let frame = clip
+        .frames
+        .first()
+        .map(|frame| (frame.width(), frame.height()))
+        .or_else(|| {
+            let frame = clip.rgb_video.as_ref()?.frames.first()?;
+            Some((frame.width, frame.height))
+        });
+    if let Some((width, height)) = frame.filter(|&(width, height)| width > 0 && height > 0) {
+        let (width, height) = clip_dimensions(width, height, cap);
+        clip.hash = resized_hash(&clip.hash, width, height, false);
+    }
 }
 
 /// Plan from the original header while retaining lazy decode and transparency.

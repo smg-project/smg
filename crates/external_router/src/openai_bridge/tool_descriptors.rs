@@ -255,6 +255,12 @@ pub fn inject_client_visible_mcp_output_items(
 /// Parses `ResponseTool::Mcp::require_approval`/`allowed_tools` and forwards
 /// the resolved approval mode + scoping to `session.set_approval_mode`.
 ///
+/// An approval is asked where `require_approval` is the string `always` or
+/// the object form with an `always` filter: a filter of `tool_names` alone
+/// asks it of the named tools, one that reads `read_only` or names nothing
+/// asks it of every tool the entry allows (over-gate, as below). A `never`
+/// filter asks none, and a tool named under both is asked for.
+///
 /// `McpAllowedTools` projection (T11):
 /// - `None` or `Filter { None, None }` → no name constraint (every binding
 ///   on the server inherits the explicit approval mode).
@@ -270,21 +276,31 @@ pub fn configure_response_tools_approval(session: &mut McpToolSession<'_>, tools
             continue;
         };
 
-        let approval_mode = match mcp_tool.require_approval.as_ref() {
-            Some(RequireApproval::Mode(RequireApprovalMode::Always)) => ApprovalMode::Interactive,
-            _ => ApprovalMode::PolicyOnly,
+        // The names an `always` filter narrows the approval to; `None` asks
+        // it of every tool the entry allows.
+        let always_names: Option<&[String]> = match mcp_tool.require_approval.as_ref() {
+            Some(RequireApproval::Mode(RequireApprovalMode::Always)) => None,
+            Some(RequireApproval::Rules(rules)) => match rules.always.as_ref() {
+                Some(always) => always
+                    .tool_names
+                    .as_deref()
+                    .filter(|_| always.read_only.is_none()),
+                None => continue,
+            },
+            _ => continue,
         };
 
-        if approval_mode == ApprovalMode::PolicyOnly {
-            continue;
-        }
-
-        let allowed_tool_names: Option<&[String]> =
+        let allowed_tool_names: Option<&[String]> = always_names.or_else(|| {
             mcp_tool.allowed_tools.as_ref().and_then(|at| match at {
                 McpAllowedTools::List(names) => Some(names.as_slice()),
                 McpAllowedTools::Filter(filter) => filter.tool_names.as_deref(),
-            });
-        session.set_approval_mode(&mcp_tool.server_label, allowed_tool_names, approval_mode);
+            })
+        });
+        session.set_approval_mode(
+            &mcp_tool.server_label,
+            allowed_tool_names,
+            ApprovalMode::Interactive,
+        );
     }
 }
 
@@ -407,80 +423,5 @@ fn is_client_visible_output_item(
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{borrow::Cow, sync::Arc};
-
-    use rmcp::model::{Tool, ToolAnnotations as RmcpToolAnnotations};
-    use smg_mcp::ToolEntry;
-
-    use super::*;
-
-    // `Tool` and `ToolAnnotations` are `#[non_exhaustive]` in rmcp 1.7, so build
-    // them via the constructor/setters rather than struct literals.
-    fn entry_with_rmcp_annotations(annotations: Option<RmcpToolAnnotations>) -> ToolEntry {
-        let mut tool = Tool::new(
-            Cow::Owned("widget".to_string()),
-            Cow::Owned("widget description".to_string()),
-            Arc::new(serde_json::Map::new()),
-        );
-        tool.annotations = annotations;
-        ToolEntry::from_server_tool("srv", tool)
-    }
-
-    fn read_only_hint(value: bool) -> RmcpToolAnnotations {
-        RmcpToolAnnotations::new().read_only(value)
-    }
-
-    #[test]
-    fn build_mcp_tool_infos_surfaces_rmcp_read_only_hint() {
-        let entries = vec![entry_with_rmcp_annotations(Some(read_only_hint(true)))];
-        let infos = build_mcp_tool_infos(&entries);
-        let serialized = serde_json::to_value(&infos[0])
-            .expect("McpToolInfo must serialize")
-            .get("annotations")
-            .cloned()
-            .expect("annotations must serialize");
-        assert_eq!(serialized, json!({ "read_only": true }));
-    }
-
-    #[test]
-    fn build_mcp_tool_infos_defaults_to_false_when_hint_absent() {
-        let entries = vec![entry_with_rmcp_annotations(None)];
-        let infos = build_mcp_tool_infos(&entries);
-        let serialized = serde_json::to_value(&infos[0])
-            .expect("McpToolInfo must serialize")
-            .get("annotations")
-            .cloned()
-            .expect("annotations must serialize");
-        assert_eq!(serialized, json!({ "read_only": false }));
-    }
-
-    /// The JSON tool info is the typed `McpToolInfo` serialised, byte for
-    /// byte: the hint read the same way, the description present or absent,
-    /// the schema's keys in their order.
-    #[test]
-    fn the_json_tool_info_is_the_typed_one() {
-        let mut described = entry_with_rmcp_annotations(Some(read_only_hint(true)));
-        described.tool.input_schema = Arc::new(
-            json!({
-                "type": "object",
-                "properties": {"q": {"type": "string"}, "n": {"type": "integer"}},
-                "required": ["q"]
-            })
-            .as_object()
-            .cloned()
-            .expect("an object schema"),
-        );
-        let mut bare = entry_with_rmcp_annotations(None);
-        bare.tool.description = None;
-        for entry in [described, bare] {
-            let typed =
-                serde_json::to_string(&build_mcp_tool_infos(std::slice::from_ref(&entry))[0])
-                    .expect("McpToolInfo must serialize");
-            assert_eq!(
-                serde_json::to_string(&mcp_tool_info_json(&entry)).expect("a JSON info"),
-                typed
-            );
-        }
-    }
-}
+#[path = "../../tests/unit/openai_bridge/tool_descriptors/tests.rs"]
+mod tests;

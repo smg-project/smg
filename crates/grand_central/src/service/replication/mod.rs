@@ -13,17 +13,18 @@
 //! all: the term it led already named other writes at those positions.
 //!
 //! What the store tells its [`Journal`](crate::store::Journal), each inside
-//! the write's own critical section: a membership or status write with its
-//! row, an applied generation by its number ([`Event::Generation`]), and
-//! the store's take of a term, which is a position of its own
-//! ([`Event::Term`]). A standby journals that event too at the place of a
-//! load row an older leader tells it. Every other entry of the store stands on one
-//! list with what rebuilds it on a standby ([`ENTRIES`]): a gateway's own
-//! facts return in its hello, each replica hears the engines' cache events
-//! itself, and a decision's writes (pins, reservations, lease ends) are not
-//! journaled yet. A generation's document is not the log's to hold: the
-//! door that applied it keeps the bytes, and the stream that sends the
-//! event joins them.
+//! the write's own critical section: a membership write with its row
+//! ([`Event::Member`]), a status write with the models its row serves and
+//! no row ([`Event::Status`]), an applied generation by its number
+//! ([`Event::Generation`]), and the store's take of a term, which is a
+//! position of its own ([`Event::Term`]). A standby journals that event too
+//! at the place of a load row an older leader tells it. Every other entry
+//! of the store stands on one list with what rebuilds it on a standby
+//! ([`ENTRIES`]): a gateway's own facts return in its hello, each replica
+//! hears the engines' cache events itself, and a decision's writes (pins,
+//! lease ends) are not journaled yet. A generation's document is not the
+//! log's to hold: the door that applied it keeps the bytes, and the stream
+//! that sends the event joins them.
 //!
 //! Two readers follow the log: the controller's standby and a watcher of
 //! the rows both read the watched kinds (membership, status, a term's
@@ -48,6 +49,7 @@
 mod entries;
 mod log;
 #[cfg(test)]
+#[path = "../../../tests/unit/service/replication/tests.rs"]
 mod tests;
 
 pub use entries::{EntryReplication, ENTRIES};

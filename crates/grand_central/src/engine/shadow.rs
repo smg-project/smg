@@ -10,8 +10,7 @@
 use std::{sync::atomic::AtomicU64, time::Duration};
 
 use super::{
-    decision::ShadowKind,
-    framework::PairSide,
+    decision::{PairSide, ShadowKind},
     view::{RequestFacts, WorkerId},
 };
 

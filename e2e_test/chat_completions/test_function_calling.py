@@ -752,19 +752,12 @@ class TestOpenAIServerFunctionCalling:
 )
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 @pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
-@pytest.mark.skipif(
-    effective_parser() == "symphony",
-    reason="the registry reads this model with the json table under Symphony, the default; "
-    "the pythonic list is the legacy parsers' reading",
-)
 class TestOpenAIPythonicFunctionCalling:
     """Tests for pythonic function calling format.
 
-    Under Symphony (the default) the registry reads this model with its own table (``json``)
-    whatever ``--tool-call-parser`` names, so the gateway-wide ``pythonic`` name this class
-    relies on does not apply there: the class runs where the legacy parsers read (the
-    ``--parser legacy`` lane), and skips under Symphony at collection, before any fixture
-    starts a worker or a gateway.
+    The gateway-wide ``pythonic`` name reads this model ahead of the registry's own table
+    (``json``) under Symphony too: no table answers to it, so it keeps the legacy parsers, whose
+    pythonic parser reads the list, as on the ``--parser legacy`` lane.
     """
 
     def test_pythonic_tool_call_prompt(self, model, api_client):

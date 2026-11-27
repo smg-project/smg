@@ -118,7 +118,11 @@ pub const UNANSWERED: [(&str, &str); 9] = [
          every family that names pythonic has a table; llama4_pythonic names the Llama 4 \
          table exactly",
     ),
-    ("step3", "Step 3's calls and thought: no table"),
+    (
+        "step3",
+        "Step 3's calls and thought, which the registry reads with the steptml table; the legacy \
+         parser types a value by its look, the table by what the tool declares: no alias yet",
+    ),
     ("sarashina", "Sarashina's calls: no table"),
 ];
 

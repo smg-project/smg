@@ -33,12 +33,5 @@ impl Lead for SoleLead {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_host_with_no_election_leads_under_its_one_term() {
-        assert_eq!(SoleLead::TERM, 0);
-        assert_eq!(SoleLead.term(), Some(0));
-    }
-}
+#[path = "../../tests/unit/worker_host/lead/tests.rs"]
+mod tests;

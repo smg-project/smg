@@ -47,12 +47,12 @@ use super::{
 };
 use crate::{
     observability::metrics::{metrics_labels, LocalStopAbort, Metrics, StreamingMetricsParams},
-    rate_limit::{SharedReservationHandle, UsageSettlement},
+    rate_limit::SharedReservationHandle,
     routers::{
         common::{prefill_admission::PrefillLoadGuard, sse::SseSender, sse_rechunk},
         grpc::{
             common::{
-                response_collection::drain_prefill,
+                response_collection::{drain_prefill, StreamedAnswer},
                 response_formatting::{
                     chat_usage, effective_weight_version, known_spec_drafted,
                     CompletionTokenTracker, TokenCounts,
@@ -209,14 +209,19 @@ impl GenerateStreamUsage {
         *count
     }
 
-    /// Records an index's `Complete`; the index's completion count.
+    /// Records an index's `Complete`; the index's completion count. The
+    /// reasoning count is kept no higher than that count: the terminal frame
+    /// can count more tokens than the stream delivered for the index, and
+    /// the settlement sums what is kept here.
     fn record_complete(&mut self, complete: &ProtoGenerateComplete) -> u32 {
         let index = complete.index();
+        let delivered = self.completion.get(&index).copied().unwrap_or(0);
         self.prompt = complete.prompt_tokens();
         self.cached = self.cached.max(complete.cached_tokens());
-        self.reasoning.insert(index, complete.reasoning_tokens());
+        self.reasoning
+            .insert(index, complete.reasoning_tokens().min(delivered));
         self.completed.insert(index);
-        self.completion.get(&index).copied().unwrap_or(0)
+        delivered
     }
 
     /// The completion tokens counted so far across every index.
@@ -326,7 +331,9 @@ impl GenerateChoice {
         self.prompt_tokens = chunk.prompt_tokens();
         self.completion_tokens = completion_tokens;
         self.cached_tokens = chunk.cached_tokens();
-        self.reasoning_tokens = chunk.reasoning_tokens();
+        // No higher than the delivered count beside it: the event of the
+        // text held to a clean end shows the two as every other event does.
+        self.reasoning_tokens = chunk.reasoning_tokens().min(completion_tokens);
         if self.weight_version != weight_version {
             weight_version.clone_into(&mut self.weight_version);
         }
@@ -389,6 +396,9 @@ struct GenerateMetaInfo<'a> {
     logprobs: Option<GenerateLogprobs<'a>>,
     completion_tokens: u32,
     cached_tokens: u32,
+    /// No higher than `completion_tokens` beside it: the stream's own count
+    /// of the ids it delivered for the choice, where the engine's frame
+    /// counts its own.
     reasoning_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     e2e_latency: Option<f64>,
@@ -808,10 +818,15 @@ impl StreamingProcessor {
         // Phase 1.5: Drain prefill stream. Streaming chat does not emit prompt
         // logprobs, but the Prefill reservation must end with this phase, and
         // the client's prompt-side usage is the prefill side's.
-        let prefill_cached_tokens =
-            drain_prefill(&mut prefill_stream, prefill_guards, true, |_| {})
-                .await
-                .map_err(utils::StreamFailure::prefill)?;
+        let prefill_cached_tokens = drain_prefill(
+            &mut prefill_stream,
+            prefill_guards,
+            true,
+            StreamedAnswer,
+            |_| {},
+        )
+        .await
+        .map_err(utils::StreamFailure::prefill)?;
         let decode_stream = decode_stream.decode_side(prefill_cached_tokens);
 
         // Phase 2-5: Process decode stream (same as single mode). Pass pd_timing
@@ -1095,7 +1110,9 @@ impl StreamingProcessor {
                                 logprobs: None,
                                 completion_tokens: current_completion_tokens,
                                 cached_tokens: chunk.cached_tokens(),
-                                reasoning_tokens: chunk.reasoning_tokens(),
+                                reasoning_tokens: chunk
+                                    .reasoning_tokens()
+                                    .min(current_completion_tokens),
                                 e2e_latency: None,
                             },
                             index,
@@ -1144,7 +1161,9 @@ impl StreamingProcessor {
                                 logprobs: None,
                                 completion_tokens,
                                 cached_tokens: complete.cached_tokens(),
-                                reasoning_tokens: complete.reasoning_tokens(),
+                                reasoning_tokens: complete
+                                    .reasoning_tokens()
+                                    .min(completion_tokens),
                                 e2e_latency: Some(e2e_latency),
                             },
                             index,
@@ -1246,17 +1265,22 @@ impl StreamingProcessor {
         } else {
             None
         };
-        let prefill_cached_tokens =
-            drain_prefill(&mut prefill_stream, prefill_guards, true, |complete| {
+        let prefill_cached_tokens = drain_prefill(
+            &mut prefill_stream,
+            prefill_guards,
+            true,
+            StreamedAnswer,
+            |complete| {
                 if ctx.return_logprob && input_token_logprobs.is_none() {
                     input_token_logprobs = complete
                         .input_logprobs()
                         .as_ref()
                         .map(utils::convert_generate_input_logprobs);
                 }
-            })
-            .await
-            .map_err(utils::StreamFailure::prefill)?;
+            },
+        )
+        .await
+        .map_err(utils::StreamFailure::prefill)?;
         // The client's prompt-side usage is the prefill side's.
         let decode_stream = decode_stream.decode_side(prefill_cached_tokens);
 
@@ -1425,7 +1449,9 @@ impl StreamingProcessor {
                                 }),
                                 completion_tokens: current_completion_tokens,
                                 cached_tokens: chunk.cached_tokens(),
-                                reasoning_tokens: chunk.reasoning_tokens(),
+                                reasoning_tokens: chunk
+                                    .reasoning_tokens()
+                                    .min(current_completion_tokens),
                                 e2e_latency: None,
                             },
                             index,
@@ -1483,7 +1509,9 @@ impl StreamingProcessor {
                                 }),
                                 completion_tokens,
                                 cached_tokens: complete.cached_tokens(),
-                                reasoning_tokens: complete.reasoning_tokens(),
+                                reasoning_tokens: complete
+                                    .reasoning_tokens()
+                                    .min(completion_tokens),
                                 e2e_latency: Some(e2e_latency),
                             },
                             index,
@@ -1587,7 +1615,8 @@ impl StreamingProcessor {
             model_id: &ctx.model,
             endpoint: metrics_labels::ENDPOINT_GENERATE,
             ttft: first_token_time.map(|t| t.duration_since(stream_base)),
-            dispatch_wait: ctx.dispatch_wait,
+            dispatch_wait: ctx.dispatch_wait.map(|waited| waited.since_entry),
+            dispatch_wait_after_body: ctx.dispatch_wait.map(|waited| waited.since_body),
             generation_duration: stream_base.elapsed(),
             input_tokens: Some(u64::from(counts.prompt)),
             cached_tokens: Some(u64::from(counts.cached)),
@@ -2850,10 +2879,15 @@ impl StreamingProcessor {
     ) -> Result<(), utils::StreamFailure> {
         // Consume prefill stream (Messages API does not expose prompt logprobs);
         // the client's prompt-side usage is the prefill side's.
-        let prefill_cached_tokens =
-            drain_prefill(&mut prefill_stream, prefill_guards, true, |_| {})
-                .await
-                .map_err(utils::StreamFailure::prefill)?;
+        let prefill_cached_tokens = drain_prefill(
+            &mut prefill_stream,
+            prefill_guards,
+            true,
+            StreamedAnswer,
+            |_| {},
+        )
+        .await
+        .map_err(utils::StreamFailure::prefill)?;
         let decode_stream = decode_stream.decode_side(prefill_cached_tokens);
 
         let result = self
@@ -3062,6 +3096,25 @@ impl StreamingProcessor {
                         };
                     }
 
+                    // The request's counts, read once: the settlement and the
+                    // usage chunk take the same reasoning count.
+                    let counts = TokenCounts {
+                        prompt: total_prompt,
+                        completion: total_completion,
+                        cached: total_cached,
+                        reasoning: total_reasoning,
+                        spec_accepted: total_spec_accepted,
+                        spec_drafted: if has_unknown_spec_draft_tokens
+                            && (total_spec_drafted > 0
+                                || total_spec_accepted > 0
+                                || has_unavailable_spec_draft_tokens)
+                        {
+                            None
+                        } else {
+                            Some(total_spec_drafted)
+                        },
+                    };
+
                     // All units succeeded (fail-fast `try_join_all` above), so
                     // this is the one settle point for every mode (Single/PD/Batch).
                     // But a unit that never saw a `Complete` message has no
@@ -3070,14 +3123,7 @@ impl StreamingProcessor {
                     // and incorrectly refund part of the reservation.
                     if let Some(handle) = &reservation {
                         if all_saw_complete {
-                            handle
-                                .settle_success(UsageSettlement {
-                                    actual_input_tokens: total_prompt,
-                                    completion_tokens: total_completion,
-                                    cached_input_tokens: total_cached,
-                                    reasoning_tokens: total_reasoning,
-                                })
-                                .await;
+                            handle.settle_success(counts.settlement()).await;
                         } else {
                             handle.close_reserved_only().await;
                         }
@@ -3092,25 +3138,7 @@ impl StreamingProcessor {
                             model: dispatch.model.clone(),
                             system_fingerprint: dispatch.weight_version.clone(),
                             // The usage object the non-streamed answer carries.
-                            usage: Some(
-                                TokenCounts {
-                                    prompt: total_prompt,
-                                    completion: total_completion,
-                                    cached: total_cached,
-                                    reasoning: total_reasoning,
-                                    spec_accepted: total_spec_accepted,
-                                    spec_drafted: if has_unknown_spec_draft_tokens
-                                        && (total_spec_drafted > 0
-                                            || total_spec_accepted > 0
-                                            || has_unavailable_spec_draft_tokens)
-                                    {
-                                        None
-                                    } else {
-                                        Some(total_spec_drafted)
-                                    },
-                                }
-                                .usage(),
-                            ),
+                            usage: Some(counts.usage()),
                         };
                         let mut sse_buffer = Vec::with_capacity(256);
                         Self::format_completion_sse_into(&mut sse_buffer, &usage_chunk);
@@ -3129,7 +3157,8 @@ impl StreamingProcessor {
                         model_id: &dispatch.model,
                         endpoint: metrics_labels::ENDPOINT_COMPLETIONS,
                         ttft: first_token_time.map(|t| t.duration_since(stream_base)),
-                        dispatch_wait,
+                        dispatch_wait: dispatch_wait.map(|waited| waited.since_entry),
+                        dispatch_wait_after_body: dispatch_wait.map(|waited| waited.since_body),
                         generation_duration: stream_base.elapsed(),
                         input_tokens: Some(total_prompt as u64),
                         cached_tokens: Some(u64::from(total_cached)),
@@ -3299,10 +3328,15 @@ impl StreamingProcessor {
         first_frame: Option<&AtomicBool>,
     ) -> Result<CompletionStreamOutcome, utils::StreamFailure> {
         // The client's prompt-side usage is the prefill side's.
-        let prefill_cached_tokens =
-            drain_prefill(&mut prefill_stream, prefill_guards, true, |_| {})
-                .await
-                .map_err(utils::StreamFailure::prefill)?;
+        let prefill_cached_tokens = drain_prefill(
+            &mut prefill_stream,
+            prefill_guards,
+            true,
+            StreamedAnswer,
+            |_| {},
+        )
+        .await
+        .map_err(utils::StreamFailure::prefill)?;
         let decode_stream = decode_stream.decode_side(prefill_cached_tokens);
 
         let result = self
@@ -3399,7 +3433,9 @@ impl StreamingProcessor {
     /// `cache_creation_input_tokens` stays zero, as the gateway writes no
     /// breakpoint-driven cache entries of its own. Cache counters follow the
     /// same integer-not-null contract as [`Self::initial_messages_usage`];
-    /// `thinking_tokens` is reported when the turn ran with thinking.
+    /// `thinking_tokens` is reported when the turn ran with thinking, no higher
+    /// than `output_tokens`: a part of the output, even when a count of
+    /// reasoning ran past the engine's count of its output.
     fn final_messages_delta_usage(
         output_tokens: u32,
         authoritative_prompt: Option<u32>,
@@ -3412,8 +3448,11 @@ impl StreamingProcessor {
             cache_creation_input_tokens: Some(0),
             cache_read_input_tokens: Some(cached_tokens),
             server_tool_use: None,
-            output_tokens_details: thinking_tokens
-                .map(|thinking_tokens| messages::OutputTokensDetails { thinking_tokens }),
+            output_tokens_details: thinking_tokens.map(|thinking_tokens| {
+                messages::OutputTokensDetails {
+                    thinking_tokens: thinking_tokens.min(output_tokens),
+                }
+            }),
         }
     }
 }
@@ -4973,7 +5012,7 @@ impl<'a> ChatStream<'a> {
     }
 
     /// The end: the reservation settled with what the stream used
-    /// ([`Self::counts`], the engine's counts as they are), and the
+    /// ([`Self::counts`] as [`TokenCounts::settlement`] takes them), and the
     /// streaming metrics recorded.
     /// `client_left` says the read ended with the client's leaving, not with the engine's end:
     /// the reservation is still settled, but no terminal router metric is recorded for it, as
@@ -5011,7 +5050,8 @@ impl<'a> ChatStream<'a> {
             model_id: model,
             endpoint: metrics_labels::ENDPOINT_CHAT,
             ttft: self.first_token_time.map(|t| t.duration_since(stream_base)),
-            dispatch_wait: self.dispatch_wait,
+            dispatch_wait: self.dispatch_wait.map(|waited| waited.since_entry),
+            dispatch_wait_after_body: self.dispatch_wait.map(|waited| waited.since_body),
             generation_duration: stream_base.elapsed(),
             input_tokens: Some(total_prompt as u64),
             cached_tokens: Some(u64::from(counts.cached)),
@@ -6308,14 +6348,16 @@ impl<'a> MessagesStream<'a> {
             // The usage is settled by the engine's Complete, or by the
             // gateway's own stop with the counts of the chunk it matched in.
             if self.saw_complete || self.closed_by_stop {
-                handle
-                    .settle_success(UsageSettlement {
-                        actual_input_tokens: self.prompt_tokens,
-                        completion_tokens: self.completion_tokens.total(),
-                        cached_input_tokens: self.cached_tokens,
-                        reasoning_tokens: self.engine_thinking_tokens,
-                    })
-                    .await;
+                // Through the counts, as the collected message settles, so
+                // both take one read of the engine's thinking count.
+                let counts = TokenCounts {
+                    prompt: self.prompt_tokens,
+                    completion: self.completion_tokens.total(),
+                    cached: self.cached_tokens,
+                    reasoning: self.engine_thinking_tokens,
+                    ..TokenCounts::default()
+                };
+                handle.settle_success(counts.settlement()).await;
             } else {
                 handle.close_reserved_only().await;
             }
@@ -6334,7 +6376,8 @@ impl<'a> MessagesStream<'a> {
             model_id: &self.dispatch.model,
             endpoint: metrics_labels::ENDPOINT_MESSAGES,
             ttft: self.first_token_time.map(|t| t.duration_since(stream_base)),
-            dispatch_wait: self.dispatch_wait,
+            dispatch_wait: self.dispatch_wait.map(|waited| waited.since_entry),
+            dispatch_wait_after_body: self.dispatch_wait.map(|waited| waited.since_body),
             generation_duration: stream_base.elapsed(),
             input_tokens: Some(u64::from(self.prompt_tokens)),
             cached_tokens: Some(u64::from(self.cached_tokens)),

@@ -341,9 +341,10 @@ pub(super) struct Follow {
     under: FxHashMap<WorkerId, u32>,
     /// How many workers the follow holds stated each model as their own
     /// ([`Held::first`]). A list keeps its record of sent prefixes under
-    /// the model its first worker states: a record under a model that is
-    /// not here may be one no list reads again, and the upkeep asks the
-    /// registry of it ([`InProcess::follow_registry`]).
+    /// a model its first worker lists, its own or one behind it by the id
+    /// of its card: a record under a model that is not here may be one no
+    /// list reads again, and the upkeep asks the registry of it
+    /// ([`InProcess::follow_registry`]).
     stated: FxHashMap<Box<str>, u32>,
     /// Whether the follow owes a whole read of the registry at the task's
     /// next upkeep: at its start, behind a channel that closed, behind a
@@ -366,6 +367,14 @@ pub(super) struct Follow {
     /// handed its lists: by a whole read, or by the upkeep that found them
     /// handed. A program may hand its lists behind the task's first poll.
     filling: bool,
+    /// The workers the upkeep's last ask of the registry found listing a
+    /// record's model by a card, each with that model. A record no table
+    /// holds, under a model no worker states as its own, stays while that
+    /// worker lists the model: the upkeep asks that worker alone, so a card
+    /// it drops in place is read there ([`InProcess::follow_registry`]).
+    /// Emptied at each word of membership and at a whole read, which may
+    /// take the worker out of the registry.
+    listing: Vec<(Box<str>, Weak<dyn Worker>)>,
 }
 
 impl Follow {
@@ -458,9 +467,9 @@ impl InProcess {
     /// came ahead of, at a replacement that takes a model from the worker,
     /// and behind a whole read where it stands no more. A record under a
     /// model that no worker that stands states as its own
-    /// ([`Worker::model_id`]) leaves with its places at the task's upkeep,
-    /// once no list's table holds it. The session table is told nothing,
-    /// as at the two calls.
+    /// ([`Worker::model_id`]) or lists by the id of a card leaves with its
+    /// places at the task's upkeep, once no list's table holds it. The
+    /// session table is told nothing, as at the two calls.
     ///
     /// An id names one worker. A worker registered under an id that
     /// another worker is held under is read as the id's next life: a leave
@@ -507,10 +516,11 @@ impl InProcess {
     /// leave with their places. The follow's count names them: a record no
     /// table holds, under a model none of the workers it holds stated as
     /// its own ([`super::overlap::Affinity::unstated`]). The count can run
-    /// short of the registry, by a word not heard yet or a worker whose
-    /// code panicked at its take, so the registry is asked where a record
-    /// is named, and there alone: a record leaves where no worker that
-    /// stands states its model, and no table took it during the ask
+    /// short of the registry, by a word not heard yet, a worker whose code
+    /// panicked at its take or a model a worker lists behind its own, so
+    /// the registry is asked where a record is named, and there alone: a
+    /// record leaves where no worker that stands states its model or lists
+    /// it by the id of a card, and no table took it during the ask
     /// ([`super::overlap::Affinity::let_go`]). A panic of the host's own
     /// code in the ask is held and counted, and every record stays. It
     /// answers whether the upkeep before this one owed a whole read and
@@ -533,6 +543,7 @@ impl InProcess {
                     stating: false,
                     owed: Vec::new(),
                     filling: false,
+                    listing: Vec::new(),
                 })
             }
         };
@@ -551,9 +562,11 @@ impl InProcess {
         // The upkeep before this one owed a whole read and did not make it:
         // the load reports wait for this answer. A read the host fails
         // again writes no record of a worker it read, as the host is asked
-        // of every worker ahead of the first write: the telling behind it
-        // tells the workers the subscription told as joined since the
-        // snapshot at hand, and no other.
+        // of every worker ahead of the first write. So the telling behind
+        // it tells the workers whose record a word of the subscription
+        // wrote since the snapshot at hand, and no other. That is a worker
+        // that joined, and one the follow held whose record a registration
+        // or a replacement wrote again.
         let again = follow.late;
         follow.late = follow.unread;
         // The program handed its lists since the follow last owed every
@@ -570,15 +583,47 @@ impl InProcess {
             .affinity
             .unstated(|model| follow.stated.contains_key(model));
         if !unstated.is_empty() {
-            // Each worker that stands is asked once, and no further where
-            // every record named has a worker that states its model.
+            // The worker the last ask found listing a record's model is
+            // asked first, alone, and the record stays while it lists the
+            // model. Then each worker that stands is asked once, for its
+            // first model and for the id of each card it lists (a list keeps
+            // a model's record under the id of its first worker's card), and
+            // no further where every record named has a worker that lists
+            // its model.
             let asked = self.held(|| {
+                follow.listing.retain(|(model, worker)| {
+                    let named = |(named, _): &(Box<str>, u64)| named == model;
+                    let Some(at) = unstated.iter().position(named) else {
+                        return true;
+                    };
+                    let lists =
+                        |worker: Arc<dyn Worker>| worker.any_model(&mut |card| *card.id == **model);
+                    let listed = worker.upgrade().is_some_and(lists);
+                    if listed {
+                        unstated.swap_remove(at);
+                    }
+                    listed
+                });
+                if unstated.is_empty() {
+                    return unstated;
+                }
                 for (_, worker) in follow.registry.standing() {
                     if unstated.is_empty() {
                         break;
                     }
                     let stated = worker.model_id();
                     unstated.retain(|(model, _)| **model != *stated);
+                    worker.any_model(&mut |card| {
+                        unstated.retain(|(model, _)| {
+                            let listed = **model == *card.id;
+                            if listed {
+                                let listing = (model.clone(), Arc::downgrade(&worker));
+                                follow.listing.push(listing);
+                            }
+                            !listed
+                        });
+                        unstated.is_empty()
+                    });
                 }
                 unstated
             });
@@ -707,6 +752,11 @@ impl InProcess {
                 | WorkerEvent::Replaced { .. }
                 | WorkerEvent::Removed { .. })
         );
+        // A word of membership may take the worker the last ask found
+        // listing a model out of the registry: the next upkeep asks anew.
+        if membership {
+            follow.listing.clear();
+        }
         match word {
             Ok(WorkerEvent::Registered { worker_id, worker }) => {
                 let id = follow.id_of(&worker);
@@ -888,6 +938,7 @@ impl InProcess {
     /// follow took it, so a model its cards gained in place since is not
     /// judged. The host is asked of every worker ahead of the first word.
     fn read_whole(&self, follow: &mut Follow) {
+        follow.listing.clear();
         let standing = follow.registry.standing().into_iter();
         let stands: FxHashMap<ObjectId, (WorkerId, Arc<dyn Worker>)> = standing
             .map(|(object, worker)| (object, (follow.id_of(&worker), worker)))
@@ -922,4 +973,5 @@ impl InProcess {
 }
 
 #[cfg(test)]
+#[path = "../../../tests/unit/engine/in_process/membership/tests/mod.rs"]
 pub(super) mod tests;

@@ -1839,13 +1839,12 @@ const V13_CHAT_TEMPLATE: &str =
     "{% for message in messages %}[INST]{{ message.content }}[/INST]{% endfor %}";
 
 /// One gateway serving two families under `--parser symphony
-/// --tool-call-parser mistral_v13`, in both modes: the model the registry
-/// knows, whose workers label no parser, is read by the registry's table
-/// (its own syntax read apart, not the fleet-wide name's), and the model
-/// the registry does not know is read by the fleet-wide name's table; both
-/// answers name Symphony.
+/// --tool-call-parser mistral_v13`, in both modes: the fleet-wide name's
+/// table reads the model the registry knows, whose workers label no parser,
+/// ahead of the registry's own table, as it reads the model the registry
+/// does not know; both answers name Symphony.
 #[tokio::test]
-async fn an_unlabeled_model_the_registry_knows_is_read_by_its_table_beside_the_fleet_wide_names() {
+async fn the_fleet_wide_names_read_a_model_the_registry_knows_ahead_of_its_table() {
     assert_eq!(
         ::symphony::formats::table_for(KNOWN_MODEL).map(|table| table.name()),
         Some("qwen3")
@@ -1858,26 +1857,13 @@ async fn an_unlabeled_model_the_registry_knows_is_read_by_its_table_beside_the_f
             Some("mistral_v13"),
         )
         .await;
-        register_tokenizer_for(
-            &ctx,
-            KNOWN_MODEL,
-            CHAT_TEMPLATE,
-            (TABLE_OUTPUT, TABLE_OUTPUT_ID),
-        )
-        .await;
-        register_tokenizer_for(
-            &ctx,
-            UNKNOWN_MODEL,
-            V13_CHAT_TEMPLATE,
-            (V13_OUTPUT, V13_OUTPUT_ID),
-        )
-        .await;
+        for model in [KNOWN_MODEL, UNKNOWN_MODEL] {
+            register_tokenizer_for(&ctx, model, V13_CHAT_TEMPLATE, (V13_OUTPUT, V13_OUTPUT_ID))
+                .await;
+        }
         for worker_type in roles(mode) {
-            for (model, output_id) in [
-                (KNOWN_MODEL, TABLE_OUTPUT_ID),
-                (UNKNOWN_MODEL, V13_OUTPUT_ID),
-            ] {
-                let port = spawn_engine(vec![output_id]).await;
+            for model in [KNOWN_MODEL, UNKNOWN_MODEL] {
+                let port = spawn_engine(vec![V13_OUTPUT_ID]).await;
                 register_worker(
                     &ctx,
                     &format!("grpc://127.0.0.1:{port}"),
@@ -1917,6 +1903,38 @@ async fn an_unlabeled_model_the_registry_knows_is_read_by_its_table_beside_the_f
             );
         }
     }
+}
+
+/// A worker's message above the client's receive bound ends the request as
+/// an upstream fault: the route answers `502`, not the `400` of a request
+/// the caller got wrong.
+#[tokio::test]
+async fn an_answer_above_the_receive_bound_reads_502_through_the_router() {
+    let ctx = grpc_ctx_with_parsers(
+        routing_mode(Mode::Regular),
+        ParserChoice::Symphony,
+        Some("mistral_v13"),
+    )
+    .await;
+    register_tokenizer_for(
+        &ctx,
+        KNOWN_MODEL,
+        V13_CHAT_TEMPLATE,
+        (V13_OUTPUT, V13_OUTPUT_ID),
+    )
+    .await;
+    // 1.5 million ids of three bytes each: one message of 4.5 MB, above the
+    // 4 MiB a client reads by default.
+    let port = spawn_engine(vec![20_000; 1_500_000]).await;
+    register_worker(
+        &ctx,
+        &format!("grpc://127.0.0.1:{port}"),
+        WorkerType::Regular,
+        ModelCard::new(KNOWN_MODEL),
+    );
+    let router = GrpcRouter::new(&ctx, Mode::Regular).expect("router");
+    let (status, _, answer) = chat(&router, KNOWN_MODEL, &HeaderMap::new()).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{answer}");
 }
 
 /// One gateway under `--parser symphony` with no parser names: the model the registry does

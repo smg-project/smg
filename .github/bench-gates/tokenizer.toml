@@ -1,4 +1,4 @@
-# Regression gate for `cargo bench -p smg --features tokenizers-v1 --bench tokenizer_benchmark`,
+# Regression gate for `cargo bench -p smg --bench tokenizer_benchmark`,
 # run by .github/workflows/benchmark-tokenizer.yml on pull requests through scripts/bench_gate.py.
 #
 # The gate runs the single-threaded gateway-path groups: the native encoder (encode_throughput,
@@ -9,6 +9,10 @@
 # construction, and the concurrent / multithreaded / scaling / memory / l1_cache groups do not
 # fit the time budget: a push to main keeps running the whole file, the pull-request gate does
 # not run them.
+#
+# Every encode row encodes one text again and again on one thread, so it times the warm road of
+# the native encoder: behind the first call the encoder's per-thread piece cache answers the
+# pieces of that text. The first encode of a text is gated by no row of this file.
 #
 # How a threshold was chosen. Two measurements of the repeat spread, (max - min) / median of the
 # per-run criterion medians, the gated groups only, the bench pinned to one core:
@@ -34,6 +38,23 @@
 #
 # Every job uploads bench-gate/results.json with the raw per-run medians of both sides; the hosted
 # runner's own spread can be read from those and the thresholds tightened once it is known.
+#
+# The table and the placement reads below (the null read, the inserted regression) were recorded
+# while this gate's command carried `--features tokenizers-v1`. Under that feature the opt-in
+# pipeline serves this bench's encodes. For the native encoder the gate builds now, one pair of
+# the default build was read through this gate on a busy shared build host: two builds of one
+# commit of main that differ in tokenizer code no repeated encode runs, three interleaved runs a
+# side on one core. 0 of 16 ids failed. The repeat spread of one build and the change of the
+# medians between the two:
+#
+#   group                               one build         between builds   threshold
+#   encode_throughput/*                 0.9 - 10.1 %      0.1 - 6.6 %      10 %, 670 B 20 %, 30 B 30 %
+#   latency/encode_*                    0.8 - 12.7 %      0.7 - 8.6 %      10 %, 670 B 20 %, 30 B 30 %
+#
+# The rows of 30 B (under 200 ns a call) and of 670 B read the largest spread of one build (10.1
+# and 12.7 %; 8.8 and 7.9 %: one run of three apart from the other two), so their thresholds
+# follow the method above from these figures; every other encode row stays at 10 %. The catch of
+# an inserted regression on the native encoder is still to be measured.
 
 #
 # Placement. The workflow's benchmark job builds its binaries, the gate's pair and the summary
@@ -59,9 +80,19 @@ filter = "^(encode_throughput|latency|decode_performance|stop_sequences)/"
 sources = ["model_gateway/benches/tokenizer_benchmark.rs"]
 
 [[gate]]
+pattern = "^(encode_throughput/short_30B|latency/encode_short)$"
+threshold = 0.30
+note = "default build: one build 0.8 - 12.7 %, between builds 6.6 - 8.6 %"
+
+[[gate]]
+pattern = "^(encode_throughput/long_670B|latency/encode_long)$"
+threshold = 0.20
+note = "default build: one build 1.1 - 8.8 %, between builds 0.2 - 0.7 %"
+
+[[gate]]
 pattern = "^(encode_throughput|latency)/"
 threshold = 0.10
-note = "identical build 0.8 - 3.7 %, across builds 1.4 - 5.3 %"
+note = "encode rows, default build: one build 0.9 - 5.0 %, between builds 0.1 - 3.5 %; decode_token: identical build 3.7 %, across builds 2.5 %"
 
 [[gate]]
 pattern = "^decode_performance/decode_stream$"

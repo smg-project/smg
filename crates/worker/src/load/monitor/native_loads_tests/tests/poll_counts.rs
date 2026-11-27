@@ -273,13 +273,13 @@ async fn spawn_cutting(cut: Cut) -> (String, Arc<Notify>) {
     (format!("http://{addr}"), sent_half)
 }
 
-/// Two fetches of the two ranks at `url` over one memo: the first finds the
-/// native route, the second reads it again.
+/// Two fetches of the same two ranks at `url` over one memo: the first
+/// finds the native route, the second reads it again.
 async fn fetch_twice(counts: &PollCounts, url: &str) {
     let memo = DashMap::new();
+    let ranks = two_ranks(url);
     for _ in 0..2 {
-        WorkerMonitor::fetch_engine_loads(two_ranks(url), ConnectionMode::Http, &memo, counts)
-            .await;
+        WorkerMonitor::fetch_engine_loads(ranks.clone(), ConnectionMode::Http, &memo, counts).await;
     }
 }
 
@@ -503,6 +503,31 @@ async fn a_native_read_that_fails_counts_its_reason_once_an_engine() {
             ..PollTotals::default()
         },
         "a cut body, then a strange one and the route it leaves absent"
+    );
+}
+
+/// A native read that fails behind its headers says nothing about its
+/// route, whether the route ever answered or not: the next fetch asks it
+/// again. The engine answers whole once, to a fetch over a memo of its own.
+/// Two fetches over a new memo then each meet half a body and a closed
+/// connection, and each is the transport's.
+#[tokio::test]
+async fn a_native_read_that_fails_leaves_a_route_that_never_answered() {
+    let counts = PollCounts::default();
+    let (cutting, _) = spawn_cutting(Cut::Closes).await;
+    fetch_engine(&counts, two_ranks(&cutting)).await;
+    fetch_twice(&counts, &cutting).await;
+    assert_eq!(
+        counts.totals(),
+        PollTotals {
+            scrapes: 1,
+            scrape_failures: FailureTotals {
+                transport: 2,
+                ..FailureTotals::default()
+            },
+            ..PollTotals::default()
+        },
+        "the second fetch asks the route again: no fetch finds it absent"
     );
 }
 

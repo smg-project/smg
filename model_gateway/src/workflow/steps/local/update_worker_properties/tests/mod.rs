@@ -1810,3 +1810,170 @@ async fn a_refresh_fills_the_fields_an_empty_registration_label_left_unset() {
     );
     assert!(!rebuilt.metadata().spec.labels.contains_key("kv_role"));
 }
+
+/// A gRPC worker a gateway-shaped grammar reaches (its role generates tokens
+/// and its runtime's request carries a constraint), over `labels` with
+/// `discovered` on record as the engine's read.
+fn grpc_worker_a_grammar_reaches(
+    url: &str,
+    labels: HashMap<String, String>,
+    discovered: HashMap<String, String>,
+) -> Arc<dyn Worker> {
+    Arc::new(
+        BasicWorkerBuilder::new(url)
+            .connection_mode(ConnectionMode::Grpc)
+            .runtime_type(RuntimeType::Vllm)
+            .labels(labels)
+            .discovered_labels(discovered)
+            .status(WorkerStatus::Ready)
+            .build(),
+    )
+}
+
+/// One label refresh of the worker registered at `url` with the report
+/// `fresh`; the worker the registry holds behind it.
+async fn refreshed_with(
+    app_ctx: &Arc<AppContext>,
+    url: &str,
+    fresh: &HashMap<String, String>,
+) -> Arc<dyn Worker> {
+    let worker = app_ctx
+        .worker_registry
+        .get_by_url(url)
+        .expect("the worker is registered");
+    let mut refresh = make_refresh_context(Arc::clone(app_ctx), worker, fresh.clone());
+    step_succeeds(UpdateWorkerPropertiesStep.execute(&mut refresh).await);
+    app_ctx
+        .worker_registry
+        .get_by_url(url)
+        .expect("the worker stays registered")
+}
+
+/// The count of grammar start warnings among the captured log `lines`.
+fn grammar_start_warnings(lines: &[&str]) -> usize {
+    lines
+        .iter()
+        .filter(|line| line.contains("names no constrained_decoding_start label"))
+        .count()
+}
+
+/// A label refresh that takes a worker's grammar start away says so once, in
+/// the words of a registration: the engine named a start and names none now.
+/// The same report again says nothing more, and neither does a report that
+/// names a start.
+#[tokio::test]
+#[traced_test]
+async fn a_label_refresh_warns_once_of_a_grammar_start_the_engine_stops_naming() {
+    const URL: &str = "grpc://start-lost:9000";
+    const START: &str = "constrained_decoding_start";
+    let named = labels_of(&[("page_size", "128"), (START, "after_reasoning")]);
+    let worker = grpc_worker_a_grammar_reaches(URL, named.clone(), named);
+    let app_ctx = make_app_context(std::slice::from_ref(&worker));
+    let silent = labels_of(&[("page_size", "128")]);
+
+    let rebuilt = refreshed_with(&app_ctx, URL, &silent).await;
+    assert!(!rebuilt.metadata().spec.labels.contains_key(START));
+    logs_assert(|lines: &[&str]| match grammar_start_warnings(lines) {
+        1 => Ok(()),
+        n => Err(format!(
+            "one warning at the refresh that takes the start, not {n}"
+        )),
+    });
+
+    refreshed_with(&app_ctx, URL, &silent).await;
+    logs_assert(|lines: &[&str]| match grammar_start_warnings(lines) {
+        1 => Ok(()),
+        n => Err(format!(
+            "the same report again adds no warning, yet {n} stand"
+        )),
+    });
+
+    let names_one = labels_of(&[("page_size", "128"), (START, "first_token")]);
+    let rebuilt = refreshed_with(&app_ctx, URL, &names_one).await;
+    assert_eq!(
+        rebuilt
+            .metadata()
+            .spec
+            .labels
+            .get(START)
+            .map(String::as_str),
+        Some("first_token")
+    );
+    logs_assert(|lines: &[&str]| match grammar_start_warnings(lines) {
+        1 => Ok(()),
+        n => Err(format!(
+            "a report that names a start adds no warning, yet {n} stand"
+        )),
+    });
+}
+
+/// A worker registered on a read that found nothing was not warned of, for
+/// its engine had named nothing yet. The first refresh that reads its engine
+/// and finds no start owes the warning, once: not again when the same report
+/// comes back, nor at a later report that still names no start.
+#[tokio::test]
+#[traced_test]
+async fn a_worker_registered_unread_is_warned_at_its_first_refresh_without_a_grammar_start() {
+    const URL: &str = "grpc://unread:9000";
+    let worker = grpc_worker_a_grammar_reaches(URL, HashMap::new(), HashMap::new());
+    let app_ctx = make_app_context(std::slice::from_ref(&worker));
+    let silent = labels_of(&[("page_size", "128")]);
+
+    let rebuilt = refreshed_with(&app_ctx, URL, &silent).await;
+    assert_eq!(*rebuilt.metadata().discovered_labels, silent);
+    logs_assert(|lines: &[&str]| match grammar_start_warnings(lines) {
+        1 => Ok(()),
+        n => Err(format!(
+            "one warning at the first refresh that names no start, not {n}"
+        )),
+    });
+
+    refreshed_with(&app_ctx, URL, &silent).await;
+    refreshed_with(&app_ctx, URL, &labels_of(&[("page_size", "256")])).await;
+    logs_assert(|lines: &[&str]| match grammar_start_warnings(lines) {
+        1 => Ok(()),
+        n => Err(format!(
+            "a later refresh of the same state adds no warning, yet {n} stand"
+        )),
+    });
+}
+
+/// A refresh the registry drops writes no warning: the worker changed while
+/// its engine was read, and it stays as the newer registration holds it, its
+/// grammar start included.
+#[tokio::test]
+#[traced_test]
+async fn a_dropped_label_refresh_does_not_warn_of_a_grammar_start() {
+    const URL: &str = "grpc://start-kept:9000";
+    const START: &str = "constrained_decoding_start";
+    let named = labels_of(&[("page_size", "128"), (START, "after_reasoning")]);
+    let worker = grpc_worker_a_grammar_reaches(URL, named.clone(), named);
+    let app_ctx = make_app_context(std::slice::from_ref(&worker));
+    let silent = labels_of(&[("page_size", "128")]);
+    let mut refresh = make_refresh_context(Arc::clone(&app_ctx), Arc::clone(&worker), silent);
+    // An update lands while the engine is read: the registry replaces the
+    // worker, and the snapshot of the refresh is stale.
+    let id = app_ctx.worker_registry.get_id_by_url(URL).unwrap();
+    let patched: Arc<dyn Worker> = Arc::new(
+        worker
+            .as_any()
+            .downcast_ref::<BasicWorker>()
+            .expect("a BasicWorker")
+            .clone(),
+    );
+    assert!(app_ctx.worker_registry.replace(&id, patched));
+    step_succeeds(UpdateWorkerPropertiesStep.execute(&mut refresh).await);
+    let kept = app_ctx
+        .worker_registry
+        .get_by_url(URL)
+        .expect("the worker stays registered");
+    assert_eq!(
+        kept.metadata().spec.labels.get(START).map(String::as_str),
+        Some("after_reasoning"),
+        "a stale snapshot is not written back"
+    );
+    logs_assert(|lines: &[&str]| match grammar_start_warnings(lines) {
+        0 => Ok(()),
+        n => Err(format!("a dropped refresh wrote {n} warnings")),
+    });
+}

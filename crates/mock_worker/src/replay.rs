@@ -17,6 +17,18 @@ use serde_json::{json, Map, Number, Value};
 use smg_grpc_client::tokenspeed_scheduler::tokenspeed_proto as ts;
 use ts::sampling_params::Constraint;
 
+/// Open `path` for appending, creating it if it does not exist: a file that
+/// holds what requests carried (a capture, a recording), so one this creates
+/// is readable by its owner only (mode 0o600 on Unix). A file that already
+/// exists keeps its mode: it was made by someone who chose who may read it.
+pub(crate) fn append_owner_only(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path)
+}
+
 /// An append-mode capture file holding one JSON object per `Generate` request.
 pub struct Capture {
     file: Mutex<File>,
@@ -28,13 +40,8 @@ impl Capture {
     /// (mode 0o600 on Unix). A file that already exists keeps its mode: it
     /// was made by someone who chose who may read it.
     pub fn open(path: &Path) -> io::Result<Self> {
-        let mut options = OpenOptions::new();
-        options.create(true).append(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let file = options.open(path)?;
         Ok(Self {
-            file: Mutex::new(file),
+            file: Mutex::new(append_owner_only(path)?),
         })
     }
 
@@ -118,7 +125,7 @@ fn capture_json(req: &ts::GenerateRequest) -> Value {
 /// request's `0.7` is captured as `0.7`, not as the `0.699999988079071` that
 /// widening it to `f64` prints. JSON has no NaN or infinity, and `null`
 /// means unset, so a non-finite value is written as its name, e.g. `"NaN"`.
-fn f32_json(value: f32) -> Value {
+pub(crate) fn f32_json(value: f32) -> Value {
     let shortest = value.to_string();
     match shortest.parse::<f64>().ok().and_then(Number::from_f64) {
         Some(number) => Value::Number(number),
@@ -135,7 +142,7 @@ fn constraint_json(constraint: Option<&Constraint>) -> Value {
         Some(Constraint::EbnfGrammar(value)) => ("ebnf_grammar", value),
         Some(Constraint::StructuralTag(value)) => ("structural_tag", value),
     };
-    json!({ "kind": kind, "value": value })
+    crate::grpc::constraint(kind, value.as_str())
 }
 
 #[cfg(test)]

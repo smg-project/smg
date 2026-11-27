@@ -229,11 +229,10 @@ fn under(document: PolicySpec, waiting: Option<usize>, usage: Option<f64>) -> Se
 
 /// An `overload` block that says `enabled` and `shed`.
 fn said(enabled: bool, shed: bool) -> OverloadSpec {
-    OverloadSpec {
-        enabled,
-        shed_when_all_vetoed: shed,
-        ..OverloadSpec::default()
-    }
+    let mut overload = OverloadSpec::default();
+    overload.enabled = enabled;
+    overload.shed_when_all_vetoed = shed;
+    overload
 }
 
 /// A gateway started under a supplied document reads the overload veto's

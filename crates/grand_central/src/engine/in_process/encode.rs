@@ -41,25 +41,18 @@ use super::{
     signals, single, InProcess, Loaded, PoolMembers,
 };
 use crate::engine::{
-    decision::{shed, Decision, ShedReason, Target, WIRES},
+    decision::{shed, Decision, PairSide, ShedReason, Target, DECODE_LATER, WIRES},
     decision_engine::{DecideOutcome, DecisionRefused, Request, RequestMaker, WorkerLists},
-    demands::Demands,
+    demands::{Demands, UnmetDemand},
     framework::{EncodeItems, EncodePlaced, EncodePool, EncoderFacts, PairPools},
     list_cell::LentList,
     records::{HeldCells, Live, PoolRecords},
-    view::{Constraints, Phase, RequestFacts},
+    view::{Constraints, Phase, RequestFacts, Session, SessionCountedUnder},
 };
 
 #[cfg(test)]
+#[path = "../../../tests/unit/engine/in_process/encode/tests/mod.rs"]
 mod tests;
-
-/// What a request that states the later decode is declined under where its
-/// decode is held to the ones that take images, by its demand or by
-/// references beside an image or a video: a decode asked again takes no
-/// items, so nothing there holds it to a decode that takes images. So is
-/// one that leaves a part of its hard demand to its encoders
-/// ([`splits`]): a decode asked again would hold the decode to the whole.
-const DECODE_LATER: &str = "decode-later";
 
 /// Whether an encode request leaves a part of its hard demand to its
 /// encoders: it carries items, and `demands` name its media, which the
@@ -157,7 +150,10 @@ impl EncodeLists<'_> {
     /// whose worker meets its part of the demand, among the places its
     /// host states for it, and a side left nobody sheds the request with
     /// no endpoint under the stage of the demand that took its last
-    /// worker, the prefills' first. The encoders' part is the pass's own
+    /// worker, the prefills' first. Where the pair's other list holds no
+    /// worker, the request is shed as its pair alone is: one side alone
+    /// is no pair, and the engine answers over no candidate, for the side
+    /// of the list with no worker. The encoders' part is the pass's own
     /// to keep, in its one test of an encoder: one that fails a part of
     /// it is no member of its class, and what the encoders lack is named
     /// in the pass's order, a demand's part with the request's own facts
@@ -249,6 +245,7 @@ impl EncodeLists<'_> {
             placed,
             |_| true,
             |_| true,
+            SessionCountedUnder::default,
         )
     }
 
@@ -279,11 +276,13 @@ impl EncodeLists<'_> {
     /// with no item takes no encoder: its pair's sides are held as a
     /// pair's own, and the encoders state no demand.
     ///
-    /// With them comes the stage of the demand that left a side of the
-    /// pair nobody, the prefills' first, where one did: that side's
-    /// constraints are then its host's own and decide nothing. Out of
-    /// line: its code stays off the path of a request that states no
-    /// demand.
+    /// With them comes the demand that left a side of the pair nobody,
+    /// the prefills' first, where one did, and that side. Each side's
+    /// constraints are then the request's own less its demand, with no
+    /// list's places or mask, as a pair's records are handed them: they
+    /// are read for a list of the pair that holds no worker alone.
+    /// Out of line: its code stays off the path of a request that states
+    /// no demand.
     #[inline(never)]
     fn meeting<'s>(
         &self,
@@ -291,7 +290,7 @@ impl EncodeLists<'_> {
         lists: (&PoolRecords, &PoolRecords),
         items: bool,
         kept: &'s mut [Vec<u32>; 2],
-    ) -> ([Constraints<'s>; 3], Option<&'static str>)
+    ) -> ([Constraints<'s>; 3], Option<(UnmetDemand, PairSide)>)
     where
         Self: 's,
     {
@@ -317,10 +316,7 @@ impl EncodeLists<'_> {
         let kept = [prefill_kept, decode_kept];
         match self.pair.sides_meeting(&spent, sides, lists, kept) {
             Ok([prefill_cx, decode_cx]) => ([prefill_cx, decode_cx, encode_cx], None),
-            Err(unmet) => {
-                let [prefill_cx, decode_cx] = self.pair.sides_of(&spent);
-                ([prefill_cx, decode_cx, encode_cx], Some(unmet.stage()))
-            }
+            Err(unmet) => ([spent, spent, encode_cx], Some(unmet)),
         }
     }
 
@@ -335,6 +331,15 @@ impl EncodeLists<'_> {
     /// the decision placed, by its place in the encoders' list: the record
     /// is written for no target where the caller sends to one of them no
     /// more, since it then sends the request to no target of the pick.
+    ///
+    /// `counted` says where a worker's object counts the requests of the
+    /// request's session key ([`RequestMaker::session_counted_under`]). It
+    /// is asked under a document one of whose stages reads that count. Each
+    /// side of the pair then reads it under the name of the side's own
+    /// session, as a pair's own decision does. The encoders' records read
+    /// it under no name: an item goes by its side's policy, whatever the
+    /// request's key. Every entry hands its maker's word, and the lists' own
+    /// decision, which holds no maker, the key's own text ([`Self::decide`]).
     #[expect(
         clippy::too_many_arguments,
         reason = "a pair's inputs and the encode side's"
@@ -351,6 +356,7 @@ impl EncodeLists<'_> {
         placed: &mut EncodePlaced,
         sends_to: impl Fn(&Target) -> bool,
         sends_to_encoder: impl Fn(u32) -> bool,
+        counted: impl FnOnce() -> SessionCountedUnder,
     ) -> Decision {
         let (spec, clock) = (&engine.document.spec, &engine.clock);
         let pair = &self.pair;
@@ -369,9 +375,21 @@ impl EncodeLists<'_> {
                 return pair.decide_over(engine, (prefill, decode), loads, now, request, None);
             }
         }
+        // The name each side of the pair reads the count of the key's
+        // requests under, as a pair's own decision names it. It is the one
+        // its side's session is counted under, as the request's maker
+        // states it. Named under a document that reads the count and under
+        // no other, by the one function that names a pair's sides.
+        let mut names;
+        let [prefill_key, decode_key] = if spec.engine().needs().session_in_flight {
+            names = [[0; Session::TEXT_LEN]; 2];
+            counted().sides(&request.facts, &mut names)
+        } else {
+            [None; 2]
+        };
         // One value for the three lists' records, as a pair's decision
         // takes one for its two.
-        let live = Live::at(spec.engine(), clock, now, loads, None);
+        let live = Live::at(spec.engine(), clock, now, loads, prefill_key);
         request.facts.now_micros = live.now_micros();
         request.facts.budget_micros = super::budget::shown(request.facts.budget_micros);
         // Each side reads the places and the mask its host states beside
@@ -422,9 +440,20 @@ impl EncodeLists<'_> {
                     && records.stands(encode_workers, word)
             });
             let (prefills, pool) = prefill_records.write(workers, &live, prefills);
-            let (decodes, _) = decode_records.write(decode_workers, &live, decodes);
+            // The decodes' records read the key's count under their own
+            // name, and the encoders' under none. A request that names no
+            // count reads its three lists by the one value. Each is
+            // written at rest where the prefills' are.
+            let named;
+            let [decode_live, encode_live] = if prefill_key.is_some() || decode_key.is_some() {
+                named = [live.counted_under(decode_key), live.counted_under(None)];
+                [&named[0], &named[1]]
+            } else {
+                [&live; 2]
+            };
+            let (decodes, _) = decode_records.write(decode_workers, decode_live, decodes);
             stamp(prefills, decodes, pair.classes, pair.admission);
-            let (rows, _) = records.write(encode_workers, &live, &mut buffers.encoders);
+            let (rows, _) = records.write(encode_workers, encode_live, &mut buffers.encoders);
             // A hard demand the request states is judged here for the
             // pair's two sides, and the engine's pass is handed the places
             // that meet it. The encoders' part is the pass's to keep. A
@@ -438,12 +467,22 @@ impl EncodeLists<'_> {
                 (met, unmet) = judged;
                 // A request with no item reads no encoder: a side its
                 // demand leaves nobody sheds it here, as its pair alone
-                // is shed. With items the pass says the side's stage,
-                // behind its answers for the encoders.
-                if let Some(stage) = unmet.filter(|_| !carries) {
+                // is shed, and the shed names that side. One list alone is
+                // no pair, whatever the demand left of the other: the
+                // answer is then its pair's own over no candidate, under
+                // the constraints its judge hands for such a side. With
+                // items the pass says either, behind its answers for the
+                // encoders.
+                if let Some((demand, side)) = unmet.filter(|_| !carries) {
                     placed.clear();
-                    let (seed, generation) = (facts.seed, pool.generation);
-                    return shed(ShedReason::NoEndpoints, stage, seed, generation);
+                    if prefills.is_empty() || decodes.is_empty() {
+                        let (engine, scratch) = (spec.engine(), &mut buffers.scratch);
+                        let (prefills, own) = (!prefills.is_empty(), &met[0]);
+                        return engine
+                            .decide_over_an_empty_list(facts, &pool, prefills, own, scratch);
+                    }
+                    let (stage, seed, generation) = (demand.stage(), facts.seed, pool.generation);
+                    return shed(ShedReason::NoEndpoints, stage, seed, generation).of_side(side);
                 }
                 met.each_ref()
             } else {
@@ -477,6 +516,8 @@ impl EncodeLists<'_> {
                 decode_affinity: decode_column.as_slice(),
                 table: pair.classes.table(),
                 first: pair.classes.first(),
+                // A demand left each side the workers that meet it.
+                part: demanded,
             };
             let encode = EncodePool {
                 encoders: rows,
@@ -600,6 +641,12 @@ impl Loaded<'_, '_> {
     /// is for a single request and for a pair, under the document this
     /// value holds. The wires' test stands in it.
     ///
+    /// It hands its maker's word of where a key's requests are counted, as
+    /// the entry that issues a lease does. Under a document that reads the
+    /// count each side's records carry it, and an encoder's carry none. A
+    /// host that serves no request counts by the leases it holds on file
+    /// ([`RequestMaker::session_counted_under`]).
+    ///
     /// # Errors
     ///
     /// As [`Self::decide_encode_at`].
@@ -620,8 +667,9 @@ impl Loaded<'_, '_> {
         self.over_three(maker, placed, |lists, request, loads, placed| {
             let sends_to = |target: &_| maker.sends_to(target);
             let encoder = |place| maker.sends_to_encoder(place);
+            let counted = || maker.session_counted_under();
             decide(
-                self, lists, request, items, loads, placed, now, sends_to, encoder,
+                self, lists, request, items, loads, placed, now, sends_to, encoder, counted,
             )
         })
     }
@@ -640,6 +688,7 @@ impl Loaded<'_, '_> {
             let later = request.constraints.decode_later;
             let sends_to = |target: &_| maker.sends_to(target);
             let encoder = |place| maker.sends_to_encoder(place);
+            let counted = || maker.session_counted_under();
             let decided = decided(
                 self,
                 lists,
@@ -650,6 +699,7 @@ impl Loaded<'_, '_> {
                 clock(),
                 sends_to,
                 encoder,
+                counted,
             );
             (decided, later)
         })
@@ -742,6 +792,7 @@ pub(super) fn decide(
     now: Instant,
     sends_to: impl Fn(&Target) -> bool,
     sends_to_encoder: impl Fn(u32) -> bool,
+    counted: impl FnOnce() -> SessionCountedUnder,
 ) -> Decision {
     // The engine's own value of each of the pair's lists, asked of the
     // list's cell once. The encoders' is asked where it is read: here
@@ -789,6 +840,7 @@ pub(super) fn decide(
         placed,
         sends_to,
         sends_to_encoder,
+        counted,
     )
 }
 
@@ -813,6 +865,7 @@ pub(super) fn decided(
     now: Instant,
     sends_to: impl Fn(&Target) -> bool,
     sends_to_encoder: impl Fn(u32) -> bool,
+    counted: impl FnOnce() -> SessionCountedUnder,
 ) -> DecideOutcome {
     let decision = decide(
         own,
@@ -824,6 +877,7 @@ pub(super) fn decided(
         now,
         sends_to,
         sends_to_encoder,
+        counted,
     );
     issued(own, request, decision, None, now)
 }

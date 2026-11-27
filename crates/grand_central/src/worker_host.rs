@@ -4,8 +4,9 @@
 //! The store is the truth of who the workers are. What reads a worker's
 //! signals (its loads, its cache events, its health) is the worker crate's
 //! and works over that crate's object and registry. This module is the
-//! projection between the two. [`Objects`] follows the store's membership
-//! and writes the registry: a row arrives and its object is built, a row's
+//! projection between the two. Every writer of a row writes through
+//! [`Objects`], which writes the registry:
+//! a row arrives and its object is built, a row's
 //! facts change and its object is replaced under the same id, a row goes and
 //! its object is dropped. A leader and a standby run the same path over the
 //! same rows.
@@ -54,8 +55,8 @@
 //! the rows its registrations wrote: a row no registration of this host
 //! stated takes none. Where a registration's answer says so, the host has
 //! the holder lay the address's objects again ([`Objects::lay_again`]).
-//! [`registration_into_store_keeping_credentials`] makes these calls with the
-//! keeper the host's holder was built with.
+//! [`registration_into_store_keeping_credentials`] has the holder make these
+//! calls, with the keeper the holder was built with.
 //!
 //! # The adapters
 //!
@@ -107,7 +108,7 @@
 //! # What the module does not hold
 //!
 //! It builds no registry and no engine. The host builds the registry and
-//! hands it in, and calls [`Objects::follow`] where the store moved.
+//! hands it in, and writes its rows through [`Objects`].
 //! [`KvFeed::run`], its follow of the cache events, is a future the host
 //! drives. The collector under it starts a task for each worker it streams
 //! and ends them at the stop. It names nothing of the controller.
@@ -147,14 +148,10 @@ pub use loads::load_monitor;
 pub use members::Members;
 #[cfg(feature = "in-process")]
 pub use members::{EncodeColumns, OpenAdmission};
-#[cfg(all(test, feature = "controller"))]
-pub(crate) use membership_writer::tests::{
-    check_event_signal, check_expectations, check_guard, check_health_scope, check_maker,
-    check_one_row, check_provider, check_rank_rows, check_refresh, FindOne, Rows, StoreDoor,
-};
 #[cfg(feature = "controller")]
 pub(crate) use membership_writer::{
-    drain, lay, lay_one, lay_ready, refresh, stating, take, Ready, Stated, Turn,
+    asks_events_under, awaits_connect, drain, lay, lay_one, lay_ready, refresh, stating, take,
+    Ready, Stated, Turn,
 };
 pub use membership_writer::{
     MembershipWriteOutcome, MembershipWriteRefused, MembershipWriter, Over, Precondition, Remover,
@@ -162,8 +159,6 @@ pub use membership_writer::{
 #[cfg(feature = "controller")]
 pub(crate) use object::dial_address;
 pub use object::object;
-#[cfg(all(test, feature = "controller"))]
-pub(crate) use objects::stand;
 pub use objects::{Objects, RowRevision};
 pub use steps::{
     registrant_of, registration_into_store, registration_into_store_keeping_credentials,
@@ -171,3 +166,7 @@ pub use steps::{
     RemoveWorkersFromStore, WriteWorkersToStore, DISCOVERY, DRAIN_WORKERS_IN_STORE_STEP,
     REMOVE_WORKERS_FROM_STORE_STEP, WRITE_WORKERS_TO_STORE_STEP,
 };
+
+#[cfg(all(test, feature = "controller"))]
+#[path = "../tests/unit/worker_host/tests.rs"]
+pub(crate) mod tests;

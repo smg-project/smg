@@ -33,7 +33,8 @@ use futures::StreamExt;
 use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::worker::{RuntimeType, SchedulerLoadSnapshot, WorkerLoadResponse, WorkerType};
 use smg_grpc_client::{
-    constraint_refused_status, sglang_proto, tokenspeed_proto, trtllm_proto, vllm_proto as vllm,
+    constraint_refused_status, sglang_managed::proto as managed, sglang_proto, tokenspeed_proto,
+    trtllm_proto, vllm_proto as vllm,
 };
 use tokio::time::Instant;
 
@@ -44,10 +45,10 @@ use crate::{
     eos::EosTokenIds,
     pin_yield::PinYieldNote,
     sglang::{
-        aggregate_control, constraint_ref as sglang_constraint_ref, control_outcome,
-        encode_media_refs, fan_out_sglang_requests, translate_embed_request_sglang,
-        translate_request_sglang, RankPlacement, SglangConnection, SglangGenerateStream,
-        SglangProfileStart,
+        aggregate_control, cache_partition_fields_arg, constraint_ref as sglang_constraint_ref,
+        control_outcome, encode_media_refs, fan_out_sglang_requests, room_residue_rank,
+        translate_embed_request_sglang, translate_request_sglang, RankPlacement, SglangConnection,
+        SglangGenerateStream, SglangProfileStart,
     },
     sglang_encode::{EncodeDispatchRequest, EncodeNotice, SglangEncodeDispatcher},
     sglang_v41_items::PerImageItems,
@@ -385,7 +386,205 @@ pub struct ZmqEngineClient {
     meta: Arc<ZmqConnectionMeta>,
 }
 
+/// Lowercase hex-encode raw protobuf bytes for the managed plugin control envelope.
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
 impl ZmqEngineClient {
+    /// Submit one managed SGLang request through the native plugin.
+    /// `external` is `Some((encoder_receive_endpoint, image_count, video_count))` on Prefill.
+    pub async fn generate_sglang_managed(
+        &self,
+        mut req: sglang_proto::GenerateRequest,
+        binding: &managed::InputBinding,
+        external: Option<(&str, u32, u32)>,
+        manifest: Option<&managed::PreparedDecodeInput>,
+    ) -> Result<SglangGenerateStream, tonic::Status> {
+        use prost::Message;
+        let client = self.sglang_client("managed Generate")?;
+        let role = if external.is_some() {
+            "prefill"
+        } else {
+            "decode"
+        };
+        if client.engines().iter().any(|engine| {
+            engine
+                .ready_response
+                .sglang_managed
+                .as_ref()
+                .is_none_or(|cap| {
+                    cap.version != 1 || cap.role != role || cap.layout != binding.layout_contract
+                })
+        }) {
+            return Err(tonic::Status::failed_precondition(
+                "native scheduler lacks matching managed plugin capability",
+            ));
+        }
+        if let Some(input) = manifest {
+            req.tokenized
+                .as_mut()
+                .ok_or_else(|| tonic::Status::invalid_argument("missing managed tokenized input"))?
+                .input_ids
+                .clone_from(&input.unpadded_ids);
+        }
+        if let Some(sp) = req.sampling_params.as_ref() {
+            refuse_unenforceable_constraint(
+                sglang_constraint_ref(sp),
+                self.structured_outputs_support(),
+            )
+            .map_err(constraint_refused_status)?;
+        }
+        let original_text = req.tokenized.as_ref().map(|t| t.original_text.clone());
+        let bootstrap = binding
+            .bootstrap
+            .as_ref()
+            .ok_or_else(|| tonic::Status::invalid_argument("missing managed bootstrap"))?;
+        let bootstrap_port = i32::try_from(bootstrap.port)
+            .map_err(|_| tonic::Status::invalid_argument("managed bootstrap port out of range"))?;
+        let pin = req.data_parallel_rank;
+        let replica_dp = self.meta.engine_ranks_are_replicas.get().is_some();
+        let placement = if role == "prefill" {
+            // Prefill placement follows `binding.bootstrap.room` authoritatively;
+            // clear any caller pin before translation so `room_residue_rank`
+            // below performs the single pin-yield check without pre-rejecting it.
+            req.data_parallel_rank = None;
+            if replica_dp {
+                RankPlacement::ReplicaRoomResidue
+            } else {
+                RankPlacement::RoomResidue
+            }
+        } else {
+            RankPlacement::Pin
+        };
+        if let Ok(room_i32) = i32::try_from(bootstrap.room) {
+            req.disaggregated_params = Some(sglang_proto::DisaggregatedParams {
+                bootstrap_host: bootstrap.host.clone(),
+                bootstrap_port,
+                bootstrap_room: room_i32,
+            });
+        }
+        let connection = SglangConnection {
+            max_model_len: self.prompt_bound()?,
+            ranks: client.engines().len(),
+            placement,
+            yields: &self.meta.pin_yield,
+            per_image: self.meta.per_image,
+        };
+        let mut native =
+            translate_request_sglang(req, &connection).map_err(tonic::Status::invalid_argument)?;
+        native.bootstrap_host = Some(bootstrap.host.clone());
+        native.bootstrap_port = Some(bootstrap_port);
+        native.bootstrap_room = Some(bootstrap.room);
+        if role == "prefill" {
+            let rank = room_residue_rank(
+                bootstrap.room,
+                pin,
+                client.engines().len(),
+                &native.rid,
+                &self.meta.pin_yield,
+            );
+            native.routed_dp_rank = rank;
+            if replica_dp {
+                native.disagg_prefill_dp_rank = rank;
+            }
+        }
+        if let Some((endpoint, images, videos)) = external {
+            if images > 0 || videos > 0 {
+                native.input_text = original_text.filter(|text| !text.is_empty());
+                if native.input_text.is_none() {
+                    return Err(tonic::Status::invalid_argument(
+                        "managed P requires the rendered prompt",
+                    ));
+                }
+                native.need_wait_for_mm_inputs = Some(true);
+                let mut assigned = BTreeMap::new();
+                if images > 0 {
+                    assigned.insert(1, vec![images]);
+                }
+                if videos > 0 {
+                    assigned.insert(2, vec![videos]);
+                }
+                native.num_items_assigned = Some(assigned);
+                native.encoder_urls = Some(vec![endpoint.to_owned()]);
+            }
+        }
+        let mut envelope = vec![
+            (OpaqueValue::from("role"), OpaqueValue::from(role)),
+            (
+                OpaqueValue::from("binding"),
+                OpaqueValue::from(hex_encode(&binding.encode_to_vec())),
+            ),
+            (
+                OpaqueValue::from("text_only"),
+                OpaqueValue::from(
+                    external.is_some_and(|(_, images, videos)| images == 0 && videos == 0),
+                ),
+            ),
+        ];
+        if let Some(manifest) = manifest {
+            envelope.push((
+                OpaqueValue::from("manifest"),
+                OpaqueValue::from(hex_encode(&manifest.encode_to_vec())),
+            ));
+        }
+        let mut custom = match native.sampling_params.custom_params.take() {
+            None => Vec::new(),
+            Some(OpaqueValue::Map(fields)) => fields,
+            _ => {
+                return Err(tonic::Status::invalid_argument(
+                    "custom parameters must be a map",
+                ))
+            }
+        };
+        if custom
+            .iter()
+            .any(|(key, _)| key.as_str() == Some("__smg_managed_epd_v1"))
+        {
+            return Err(tonic::Status::invalid_argument(
+                "client supplied a private managed envelope",
+            ));
+        }
+        custom.push((
+            OpaqueValue::from("__smg_managed_epd_v1"),
+            OpaqueValue::Map(envelope),
+        ));
+        native.sampling_params.custom_params = Some(OpaqueValue::Map(custom));
+        let stream = client
+            .submit_owned(SglangRequest::Generate(native))
+            .await
+            .map_err(|error| {
+                let mut status = zmq_status_of(&error);
+                status.set_source(Arc::new(error));
+                status
+            })?;
+        Ok(SglangGenerateStream::new(stream, 0))
+    }
+
+    /// Managed cancellation keeps the output registration until the engine's terminal response.
+    pub fn abort_sglang_managed(&self, rank: u32, rid: &str) -> Result<(), tonic::Status> {
+        let client = self.sglang_client("managed Abort")?;
+        let engine = client
+            .engines()
+            .iter()
+            .find(|e| {
+                e.engine_id.engine_index() == Some(rank)
+                    || (rank == 0
+                        && client.engines().len() == 1
+                        && e.engine_id.engine_index().is_none())
+            })
+            .ok_or_else(|| tonic::Status::failed_precondition("managed native rank disappeared"))?;
+        client
+            .abort_retaining_output(&engine.engine_id, rid)
+            .map_err(zmq_status)
+    }
+
     /// Bind the frontend sockets and complete the handshake with the engine(s),
     /// which must already be running and dialing `handshake_address`.
     ///
@@ -1967,10 +2166,13 @@ impl ZmqEngineClient {
                 ZmqServerInfo::TokenSpeed(Box::<tokenspeed_proto::GetServerInfoResponse>::default())
             }
             // The handshake carries the version (as `vllm_version`) and the KV
-            // capacity; `server_args` has no source on this wire.
+            // capacity. `server_args` holds only the adapter's own fact.
             ZmqBackend::Sglang(_) => {
                 let ready = self.ready_response();
                 ZmqServerInfo::Sglang(Box::new(sglang_proto::GetServerInfoResponse {
+                    server_args: Some(prost_types::Struct {
+                        fields: BTreeMap::from([cache_partition_fields_arg()]),
+                    }),
                     // The plugin reports `sglang-<version>` in the shared
                     // field; the gRPC servicer reports the bare version.
                     sglang_version: ready
@@ -2185,6 +2387,249 @@ mod tests {
 
     use super::*;
     use crate::{eos::EosTokenIds, test_support::connected_pair};
+
+    async fn managed_decode_pair() -> (
+        ZmqEngineClient,
+        MockEngine,
+        tempfile::TempDir,
+        managed::InputBinding,
+    ) {
+        use engine_zmq_client::protocol::handshake::ManagedSglangHandshake;
+        let mut ready = default_ready_response();
+        ready.sglang_managed = Some(ManagedSglangHandshake {
+            version: 1,
+            role: "decode".into(),
+            layout: smg_grpc_client::sglang_managed::LAYOUT.into(),
+        });
+        let (client, engine, directory) =
+            crate::test_support::connected_pair_declaring(RuntimeType::Sglang, ready).await;
+        let binding = managed::InputBinding {
+            prefill_rid: "prefill-rid".into(),
+            decode_rid: "managed-decode".into(),
+            bootstrap: Some(managed::Bootstrap {
+                host: "prefill".into(),
+                port: 8998,
+                room: 1,
+            }),
+            layout_contract: smg_grpc_client::sglang_managed::LAYOUT.into(),
+            processor_contract: "qwen3".into(),
+            model_revision: "weights".into(),
+        };
+        (client, engine, directory, binding)
+    }
+
+    fn managed_decode_request() -> sglang_proto::GenerateRequest {
+        sglang_proto::GenerateRequest {
+            request_id: "managed-decode".into(),
+            tokenized: Some(sglang_proto::TokenizedInput {
+                input_ids: vec![1, 2, 3],
+                original_text: String::new(),
+            }),
+            sampling_params: Some(sglang_proto::SamplingParams {
+                max_new_tokens: Some(8),
+                ..Default::default()
+            }),
+            logprob_start_len: -1,
+            ..Default::default()
+        }
+    }
+
+    /// Managed Abort bypasses the Add byte budget and keeps the terminal output observer alive.
+    #[tokio::test]
+    async fn managed_abort_bypasses_add_budget_and_preserves_submission_boundary() {
+        use engine_zmq_client::{
+            codec::{decode_msgpack, encode_msgpack},
+            protocol::sglang::{output::BatchTokenIDSlimOutput, request::SglangRequestType},
+        };
+        use futures::StreamExt;
+        let (client, mut engine, _directory, binding) = managed_decode_pair().await;
+        let native = client.sglang_client("test").unwrap();
+        native.set_input_byte_limit(1);
+        assert!(client
+            .generate_sglang_managed(managed_decode_request(), &binding, None, None)
+            .await
+            .is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), engine.recv_request())
+                .await
+                .is_err()
+        );
+        native.set_input_byte_limit(1 << 20);
+        let mut stream = client
+            .generate_sglang_managed(managed_decode_request(), &binding, None, None)
+            .await
+            .unwrap();
+        let _ = engine.recv_request().await.unwrap();
+        native.set_input_byte_limit(1);
+        client
+            .abort_sglang_managed(0, "managed-decode")
+            .expect("Abort must bypass the Add byte budget");
+        let abort = engine.recv_request().await.unwrap();
+        assert_eq!(abort[0], SglangRequestType::Abort.to_frame());
+        assert_eq!(
+            decode_msgpack::<Vec<String>>(&abort[1]).unwrap(),
+            vec!["managed-decode"]
+        );
+        let terminal = BatchTokenIDSlimOutput {
+            rids: vec!["managed-decode".into()],
+            output_ids: vec![vec![]],
+            finished_reasons: vec!["abort".into()],
+            finished_messages: vec![Some("cancelled".into())],
+            finished_matched: vec![None],
+            output_token_logprobs_val: vec![vec![]],
+            output_token_logprobs_idx: vec![vec![]],
+            prompt_tokens: vec![3],
+            completion_tokens: vec![0],
+            cached_tokens: vec![0],
+            ..Default::default()
+        };
+        engine
+            .send_output(vec![bytes::Bytes::from(encode_msgpack(&terminal).unwrap())])
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while stream.next().await.is_some() {}
+        })
+        .await
+        .expect("native terminal must reach the retained observer");
+        assert!(stream.native_terminal_received());
+    }
+
+    #[tokio::test]
+    async fn managed_prefill_stamps_num_items_assigned_for_images_and_videos() {
+        use engine_zmq_client::{
+            codec::decode_msgpack,
+            protocol::{
+                handshake::ManagedSglangHandshake,
+                sglang::request::{SglangRequestType, TokenizedGenerateReqInput},
+            },
+        };
+
+        let mut ready = default_ready_response();
+        ready.sglang_managed = Some(ManagedSglangHandshake {
+            version: 1,
+            role: "prefill".into(),
+            layout: smg_grpc_client::sglang_managed::LAYOUT.into(),
+        });
+        let (client, mut engine, _directory) =
+            crate::test_support::connected_pair_declaring(RuntimeType::Sglang, ready).await;
+        let binding = managed::InputBinding {
+            prefill_rid: "prefill-rid".into(),
+            decode_rid: "decode-rid".into(),
+            bootstrap: Some(managed::Bootstrap {
+                host: "prefill".into(),
+                port: 8998,
+                room: 7,
+            }),
+            layout_contract: smg_grpc_client::sglang_managed::LAYOUT.into(),
+            processor_contract: "qwen3".into(),
+            model_revision: "weights".into(),
+        };
+        let mut req = managed_decode_request();
+        req.request_id = "prefill-rid".into();
+        req.tokenized.as_mut().unwrap().original_text = "media prompt".into();
+
+        let _stream_mixed = client
+            .generate_sglang_managed(
+                req.clone(),
+                &binding,
+                Some(("http://enc:30000", 2, 1)),
+                None,
+            )
+            .await
+            .unwrap();
+        let frame = engine.recv_request().await.unwrap();
+        assert_eq!(frame[0], SglangRequestType::Add.to_frame());
+        let wire: TokenizedGenerateReqInput = decode_msgpack(&frame[1]).unwrap();
+        assert_eq!(wire.need_wait_for_mm_inputs, Some(true));
+        assert_eq!(
+            wire.num_items_assigned,
+            Some(BTreeMap::from([(1, vec![2]), (2, vec![1])]))
+        );
+
+        let mut video_binding = binding;
+        video_binding.prefill_rid = "prefill-rid-video".into();
+        req.request_id = "prefill-rid-video".into();
+        let _stream_video = client
+            .generate_sglang_managed(req, &video_binding, Some(("http://enc:30000", 0, 1)), None)
+            .await
+            .unwrap();
+        let frame = engine.recv_request().await.unwrap();
+        let wire: TokenizedGenerateReqInput = decode_msgpack(&frame[1]).unwrap();
+        assert_eq!(
+            wire.num_items_assigned,
+            Some(BTreeMap::from([(2, vec![1])]))
+        );
+    }
+
+    #[tokio::test]
+    async fn sglang_managed_prefill_sets_disagg_prefill_dp_rank_on_replica_dp() {
+        use engine_zmq_client::{
+            codec::decode_msgpack,
+            mock_engine::connect_to_frontend,
+            protocol::{
+                handshake::ManagedSglangHandshake,
+                sglang::request::{SglangRequestType, TokenizedGenerateReqInput},
+            },
+            EngineId,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
+        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
+        let mut ready = default_ready_response();
+        ready.sglang_managed = Some(ManagedSglangHandshake {
+            version: 1,
+            role: "prefill".into(),
+            layout: smg_grpc_client::sglang_managed::LAYOUT.into(),
+        });
+        let (client, rank0, rank1) = tokio::join!(
+            ZmqEngineClient::connect(
+                &handshake,
+                &input,
+                &output,
+                2,
+                "m".to_string(),
+                crate::eos::EosTokenIds::default(),
+                RuntimeType::Sglang,
+                Duration::from_secs(10),
+            ),
+            connect_to_frontend(&handshake, EngineId::from_engine_index(0), ready.clone()),
+            connect_to_frontend(&handshake, EngineId::from_engine_index(1), ready),
+        );
+        let client = client.unwrap();
+        let _rank0 = rank0.unwrap();
+        let mut rank1 = rank1.unwrap();
+        client.note_engine_ranks_are_replicas();
+
+        let binding = managed::InputBinding {
+            prefill_rid: "prefill-dp-rid".into(),
+            decode_rid: "decode-dp-rid".into(),
+            bootstrap: Some(managed::Bootstrap {
+                host: "prefill".into(),
+                port: 8998,
+                room: 7,
+            }),
+            layout_contract: smg_grpc_client::sglang_managed::LAYOUT.into(),
+            processor_contract: "qwen3".into(),
+            model_revision: "weights".into(),
+        };
+        let mut req = managed_decode_request();
+        req.request_id = "prefill-dp-rid".into();
+        // Disagreeing/out-of-range caller pin must yield to binding.bootstrap.room (7 % 2 == 1).
+        req.data_parallel_rank = Some(0);
+        req.tokenized.as_mut().unwrap().original_text = "media prompt".into();
+
+        let _stream = client
+            .generate_sglang_managed(req, &binding, Some(("http://enc:30000", 1, 0)), None)
+            .await
+            .unwrap();
+        let frame = rank1.recv_request().await.unwrap();
+        assert_eq!(frame[0], SglangRequestType::Add.to_frame());
+        let wire: TokenizedGenerateReqInput = decode_msgpack(&frame[1]).unwrap();
+        assert_eq!(wire.routed_dp_rank, Some(1));
+        assert_eq!(wire.disagg_prefill_dp_rank, Some(1));
+    }
 
     /// A route's JSON body becomes the control call's msgpack argument field
     /// by field: integers stay integers (one above `i64` included), floats

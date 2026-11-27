@@ -54,6 +54,9 @@ pub struct KvEventsConfig {
 /// `EngineCoreReadyResponse` in `vllm/v1/engine/__init__.py`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineCoreReadyResponse {
+    /// Present only when the dedicated managed SGLang plugin validated its native contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sglang_managed: Option<ManagedSglangHandshake>,
     /// Engine-reported maximum model context length (auto-fitted after KV cache
     /// profiling; may differ from the original config value).
     pub max_model_len: u64,
@@ -191,6 +194,14 @@ pub struct EngineCoreReadyResponse {
     /// See `vision_patch_size`.
     #[serde(default)]
     pub vision_downsample_ratio: Option<u64>,
+}
+
+/// Role and layout advertised by the opt-in SMG scheduler plugin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedSglangHandshake {
+    pub version: u32,
+    pub role: String,
+    pub layout: String,
 }
 
 /// The request type an engine lists for the generate path (`add`).

@@ -312,7 +312,9 @@ fn bench_llama4_steps(c: &mut Criterion) {
             },
         );
 
-        // Just resize
+        // Just resize: the generic bilinear resizer. `full_preprocess` runs
+        // it only for an image with an empty side; every other image goes
+        // through the crate's torch `uint8` kernel, which a bench cannot name.
         group.bench_with_input(
             BenchmarkId::new("resize_only", format!("{w}x{h}")),
             &image,
@@ -897,6 +899,27 @@ fn bench_wire_write(c: &mut Criterion<CpuTime>) {
         let image = make_test_image(w, h);
         let images = [&image];
         bench_wire_arms(&mut group, &qwen2, &class, &images, with_float16);
+    }
+    group.finish();
+
+    // The processor that normalizes in `bfloat16` steps, whose vector
+    // formula is its own: one tile without a resize, a full canvas with the
+    // global view, and a photo that resizes first.
+    let llama4 = Llama4VisionProcessor::from_preprocessor_config(
+        &PreProcessorConfig::from_json(
+            r#"{"do_resize": true, "size": {"height": 336, "width": 336}}"#,
+        )
+        .unwrap(),
+    );
+    let mut group = c.benchmark_group("llama4_wire");
+    group
+        .sample_size(20)
+        .warm_up_time(Duration::from_millis(500))
+        .measurement_time(Duration::from_secs(2));
+    for &(w, h) in &[(336u32, 336u32), (1344, 1344), (1920, 1080)] {
+        let image = make_test_image(w, h);
+        let images = [&image];
+        bench_wire_arms(&mut group, &llama4, &format!("{w}x{h}"), &images, true);
     }
     group.finish();
 }

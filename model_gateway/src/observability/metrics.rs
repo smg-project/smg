@@ -94,6 +94,8 @@ mod handles {
         pub(super) ttft: OnceCell<Histogram>,
         /// `smg_router_dispatch_wait_seconds`.
         pub(super) dispatch_wait: OnceCell<Histogram>,
+        /// `smg_router_dispatch_wait_after_body_seconds`.
+        pub(super) dispatch_wait_after_body: OnceCell<Histogram>,
         /// `smg_router_tpot_seconds`.
         pub(super) tpot: OnceCell<Histogram>,
         /// `smg_router_time_to_first_token_seconds`.
@@ -346,6 +348,20 @@ pub(crate) const REQUEST_TIME_PER_OUTPUT_TOKEN_SECONDS: &str =
 /// is not the count of `smg_router_ttft_seconds`. A Responses tool loop
 /// observes one per turn, a later turn's from that turn's start.
 pub(crate) const DISPATCH_WAIT_SECONDS: &str = "smg_router_dispatch_wait_seconds";
+
+/// The dispatch wait without the upload of the request body: the
+/// observation of [`DISPATCH_WAIT_SECONDS`] (once per answer, the same
+/// labels, buckets and end) less the time the read of the body waited for
+/// the client, from the first read that found the body not yet there to
+/// where its reader let go of the body. What the gateway does for the
+/// request is in both, on either side of that read: authentication, the
+/// wait for an admission permit, the run of the WASM modules. A body that
+/// came whole, and a generation that read no body (a later turn of a tool
+/// loop), takes nothing off: its dispatch wait is observed here unchanged.
+/// A multipart upload is measured as any other body: its route stands
+/// outside the request-body deadline layer and takes the measure alone.
+pub(crate) const DISPATCH_WAIT_AFTER_BODY_SECONDS: &str =
+    "smg_router_dispatch_wait_after_body_seconds";
 
 /// Histogram buckets for `smg_router_time_to_first_token_seconds`: six per
 /// decade (1, 1.5, 2, 3, 5, 7.5) from 10 ms to 10 s, where a first-token
@@ -694,6 +710,10 @@ pub(crate) fn init_metrics() {
     describe_histogram!(
         DISPATCH_WAIT_SECONDS,
         "Dispatch wait of streamed and collected answers by router_type, backend_type, model, endpoint (gRPC only; a Responses answer on the Harmony pipeline records none, streamed or collected, nor does a background Responses request that is not streamed): from the request's entry at the edge to the answering attempt's RPC dispatch (the prefill dispatch of a prefill-decode pair, after the encode call when encode pushes), where the clock of smg_router_ttft_seconds starts, so the body read, admission, tokenizing, templating, worker selection, a refused attempt's wait and its backoff are here; observed once per answer, under the labels of smg_router_ttft_seconds; for a streamed answer the two add up to the time to first token from the request's receipt; a collected answer records no first token, so this family's count also holds the collected answers and is not the count of smg_router_ttft_seconds; a Responses tool loop observes one per turn, streamed or collected: the first turn's from the request's entry, a later turn's from that turn's start, after the generations and tool calls before it, so a later streamed turn's two add up to the time to first token from the turn's start"
+    );
+    describe_histogram!(
+        DISPATCH_WAIT_AFTER_BODY_SECONDS,
+        "Dispatch wait without the upload of the request body, by router_type, backend_type, model, endpoint (gRPC only; observed wherever smg_router_dispatch_wait_seconds is, under the same labels and buckets): smg_router_dispatch_wait_seconds less the time the read of the request body waited for the client; authentication, the wait for an admission permit, the run of WASM modules, parsing, tokenizing, templating, worker selection, a refused attempt's wait and its backoff are in both; the body's upload is in smg_router_dispatch_wait_seconds alone; a body that came whole and a later turn of a Responses tool loop take nothing off and observe the same value in both; a multipart upload is measured as any other body"
     );
     describe_histogram!(
         "smg_router_tpot_seconds",
@@ -1221,8 +1241,11 @@ pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
     let handle = recorder.handle();
 
     // Series labelled `worker` live in a store of their own so they can be
-    // dropped with their worker (see `smg_worker::metrics::series`); it renders histograms
-    // with the exporter's buckets and quantiles.
+    // dropped with their worker (see `smg_worker::metrics::series`); it renders
+    // histograms with the exporter's buckets and quantiles. Where a host asks
+    // it to (`keep_histograms`, as the gateway's start does), it also keeps the
+    // bucketed histograms with no `worker` label: they record in fixed cells
+    // and render after the exporter's text.
     let workers = Arc::new(WorkerSeries::new(DistributionBuilder::new(
         parse_quantiles(DEFAULT_SUMMARY_QUANTILES),
         None,
@@ -1287,6 +1310,10 @@ fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Mat
     // keeps the request-latency buckets (an operator's list with them), as
     // the TTFT it adds up with does.
     let dispatch_wait_matcher = Matcher::Full(String::from(DISPATCH_WAIT_SECONDS));
+    // The dispatch wait without the upload lies beside it, on
+    // the same edges.
+    let dispatch_wait_after_body_matcher =
+        Matcher::Full(String::from(DISPATCH_WAIT_AFTER_BODY_SECONDS));
 
     // The first-token and per-output-token families: their own log-spaced
     // edges, which `--prometheus-duration-buckets` does not replace.
@@ -1327,7 +1354,8 @@ fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Mat
         (duration_matcher, duration_bucket.clone()),
         (ttft_matcher, duration_bucket.clone()),
         (tpot_matcher, duration_bucket.clone()),
-        (dispatch_wait_matcher, duration_bucket),
+        (dispatch_wait_matcher, duration_bucket.clone()),
+        (dispatch_wait_after_body_matcher, duration_bucket),
         (first_token_matcher, TIME_TO_FIRST_TOKEN_BUCKETS.to_vec()),
         (
             per_output_token_matcher,
@@ -1367,88 +1395,7 @@ fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Mat
     not(target_env = "msvc"),
     not(target_env = "musl")
 ))]
-pub(crate) mod allocator_stats {
-    use metrics::{describe_gauge, gauge};
-
-    use super::jemalloc_is_global;
-
-    pub(crate) fn describe() {
-        if !jemalloc_is_global() {
-            return;
-        }
-        describe_gauge!(
-            "smg_allocator_allocated_bytes",
-            "Bytes in live Rust allocations managed by SMG's jemalloc instance"
-        );
-        describe_gauge!(
-            "smg_allocator_active_bytes",
-            "Bytes in active pages for SMG's Rust jemalloc heap"
-        );
-        describe_gauge!(
-            "smg_allocator_resident_bytes",
-            "Upper bound on resident bytes for SMG's Rust jemalloc heap"
-        );
-        describe_gauge!(
-            "smg_allocator_metadata_bytes",
-            "Metadata bytes for SMG's Rust jemalloc instance"
-        );
-    }
-
-    fn record() {
-        use tikv_jemalloc_ctl::{epoch, stats};
-        if epoch::advance().is_err() {
-            return;
-        }
-        if let Ok(v) = stats::allocated::read() {
-            gauge!("smg_allocator_allocated_bytes").set(v as f64);
-        }
-        if let Ok(v) = stats::active::read() {
-            gauge!("smg_allocator_active_bytes").set(v as f64);
-        }
-        if let Ok(v) = stats::resident::read() {
-            gauge!("smg_allocator_resident_bytes").set(v as f64);
-        }
-        if let Ok(v) = stats::metadata::read() {
-            gauge!("smg_allocator_metadata_bytes").set(v as f64);
-        }
-    }
-
-    /// The gauges are published where this jemalloc serves the process's Rust
-    /// allocations, and nowhere else.
-    pub(crate) fn start_reporting() {
-        if !jemalloc_is_global() {
-            return;
-        }
-        record();
-        // Plain thread: metrics must not depend on a runtime being alive.
-        let _ = std::thread::Builder::new()
-            .name("smg-allocator-stats".into())
-            .spawn(|| loop {
-                std::thread::sleep(std::time::Duration::from_secs(60));
-                record();
-            });
-    }
-
-    #[cfg(test)]
-    mod tests {
-        #[test]
-        fn the_allocator_of_the_lib_tests_is_found() {
-            // The lib's tests declare jemalloc as their allocator (lib.rs),
-            // so the one allocation moves its count.
-            assert!(super::jemalloc_is_global());
-        }
-
-        #[test]
-        fn jemalloc_stats_interface_readable() {
-            use tikv_jemalloc_ctl::{epoch, stats};
-            epoch::advance().expect("epoch advance");
-            stats::allocated::read().expect("stats.allocated readable");
-            stats::active::read().expect("stats.active readable");
-            stats::resident::read().expect("stats.resident readable");
-            stats::metadata::read().expect("stats.metadata readable");
-        }
-    }
-}
+pub(crate) mod allocator_stats;
 
 /// SMG Metrics helper struct for the new layered metrics architecture.
 ///
@@ -1489,6 +1436,10 @@ pub struct StreamingMetricsParams<'a> {
     /// no first token. None for a generation dispatched under no entry
     /// stamp.
     pub dispatch_wait: Option<Duration>,
+    /// The same wait less what the read of the request's body waited for
+    /// the client: given whenever `dispatch_wait` is, and equal to it for a
+    /// generation whose body came whole or that read none.
+    pub dispatch_wait_after_body: Option<Duration>,
     /// Total generation time
     pub generation_duration: Duration,
     /// Input token count (None for endpoints that don't track this)
@@ -2061,6 +2012,7 @@ impl Metrics {
             endpoint,
             ttft,
             dispatch_wait,
+            dispatch_wait_after_body,
             generation_duration,
             input_tokens,
             cached_tokens,
@@ -2087,6 +2039,8 @@ impl Metrics {
         };
         let ttft_histogram = || duration_histogram("smg_router_ttft_seconds");
         let dispatch_wait_histogram = || duration_histogram(DISPATCH_WAIT_SECONDS);
+        let dispatch_wait_after_body_histogram =
+            || duration_histogram(DISPATCH_WAIT_AFTER_BODY_SECONDS);
         let tpot_histogram = || duration_histogram("smg_router_tpot_seconds");
         let first_token_histogram = || duration_histogram(TIME_TO_FIRST_TOKEN_SECONDS);
         let per_output_token_histogram =
@@ -2114,6 +2068,9 @@ impl Metrics {
             }
             if let Some(wait) = dispatch_wait {
                 dispatch_wait_histogram().record(wait.as_secs_f64());
+            }
+            if let Some(wait) = dispatch_wait_after_body {
+                dispatch_wait_after_body_histogram().record(wait.as_secs_f64());
             }
             if let Some(tpot) = tpot {
                 let seconds = tpot.as_secs_f64();
@@ -2152,6 +2109,11 @@ impl Metrics {
                     if let Some(wait) = dispatch_wait {
                         kept.dispatch_wait
                             .get_or_init(dispatch_wait_histogram)
+                            .record(wait.as_secs_f64());
+                    }
+                    if let Some(wait) = dispatch_wait_after_body {
+                        kept.dispatch_wait_after_body
+                            .get_or_init(dispatch_wait_after_body_histogram)
                             .record(wait.as_secs_f64());
                     }
                     if let Some(tpot) = tpot {
@@ -2580,87 +2542,9 @@ impl Metrics {
 
 /// Metrics helpers for tests elsewhere in the crate.
 #[cfg(test)]
-pub(crate) mod test_support {
-    use std::sync::OnceLock;
-
-    use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
-    use smg_grand_central::document::{AppliedSpec, PolicySpec, ShadowSpec};
-
-    /// The lib test binary's one process-wide recorder, for records made on
-    /// threads no local recorder covers (the blocking pool). Installed once;
-    /// every other test keeps its own local recorder, which takes precedence
-    /// on its thread.
-    pub(crate) fn global_recorder() -> &'static PrometheusHandle {
-        static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
-        HANDLE.get_or_init(|| {
-            PrometheusBuilder::new()
-                .install_recorder()
-                .expect("the lib test binary's one global recorder")
-        })
-    }
-
-    /// The scrape a test renders under its own recorder, with the two
-    /// readers of it: the worker's test support owns them.
-    pub(crate) use smg_worker::test_support::assert_metric;
-    pub(crate) use smg_worker::test_support::{render_with_recorder, sorted_series};
-
-    /// A policy document of two bindings. The first is of another model
-    /// and names no shadow. The second is the `round_robin` preset's, of
-    /// every model, with the `random` preset's profile as its shadow.
-    pub(crate) fn shadowing_document() -> PolicySpec {
-        let preset = |name| PolicySpec::preset(name).expect("a stock preset");
-        let mut document = preset("round_robin");
-        document.profiles.extend(preset("random").profiles);
-        let mut ahead = document.bindings[0].clone();
-        ahead.matcher.model = "another-model".to_owned();
-        document.bindings[0].shadow = Some(ShadowSpec::Profile("random".to_owned()));
-        document.bindings.insert(0, ahead);
-        document
-    }
-
-    /// [`shadowing_document`], as an engine is built from it.
-    pub(crate) fn shadowing_spec() -> AppliedSpec {
-        AppliedSpec::validate(&shadowing_document()).expect("a valid policy document")
-    }
-
-    /// The shadow series of the second binding's single requests in a
-    /// scrape ([`side_kinds`]).
-    pub(crate) fn shadow_kinds(rendered: &str) -> [Option<u64>; 4] {
-        side_kinds(rendered, 1, "single")
-    }
-
-    /// The shadow series of the binding at `binding`, asked beside `side`,
-    /// in a scrape, by kind: agreed, other target, other outcome, skipped.
-    /// `None` where the scrape holds no such series.
-    pub(crate) fn side_kinds(rendered: &str, binding: u32, side: &str) -> [Option<u64>; 4] {
-        ["agreed", "other-target", "other-outcome", "skipped"].map(|kind| {
-            let labels = [
-                format!(r#"binding="{binding}""#),
-                format!(r#"side="{side}""#),
-                format!(r#"kind="{kind}""#),
-            ];
-            let of_kind = |line: &&str| {
-                line.starts_with("smg_policy_shadow_decisions_total{")
-                    && labels.iter().all(|label| line.contains(label.as_str()))
-            };
-            let line = rendered.lines().find(of_kind)?;
-            line.rsplit(' ').next()?.parse().ok()
-        })
-    }
-
-    /// The series of the panics Grand Central held and counted in a
-    /// scrape, by kind: decision, event, upkeep. `None` where the scrape
-    /// holds no such series.
-    pub(crate) fn fault_kinds(rendered: &str) -> [Option<u64>; 3] {
-        ["decision", "event", "upkeep"].map(|kind| {
-            let label = format!(r#"kind="{kind}""#);
-            let of_kind =
-                |line: &&str| line.starts_with("smg_policy_faults_total{") && line.contains(&label);
-            let line = rendered.lines().find(of_kind)?;
-            line.rsplit(' ').next()?.parse().ok()
-        })
-    }
-}
+#[path = "../../tests/unit/observability/metrics/test_support.rs"]
+pub(crate) mod test_support;
 
 #[cfg(test)]
+#[path = "../../tests/unit/observability/metrics/tests.rs"]
 mod tests;

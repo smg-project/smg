@@ -15,7 +15,10 @@
 //! writes the record behind the pick. The host of the cell named `indexed`
 //! keeps an index of cache events that holds a block (`indexed.rs`): the
 //! index then names a turn alone, and the record is neither read nor
-//! written.
+//! written. The index of the cell named `held` holds every conversation
+//! whole, each for one worker, and the head for every worker, ahead of the
+//! list's first request ([`held`]): it names a turn its conversation's
+//! worker and holders of the head beside it.
 //!
 //! A caller makes its prompts before its first turn, about half a kilobyte
 //! a decision, so such a cell is run with a stated `--decisions`, and stops
@@ -43,7 +46,7 @@ use smg_grand_central::engine::{
     PromptHashes, TokenKey,
 };
 
-use super::{mix, place, ruled, stretch, Host, Run, CALLER_WARM, MODEL};
+use super::{indexed, mix, place, ruled, stretch, Host, Run, CALLER_WARM, MODEL};
 
 /// A conversation's sizes in tokens: the head every prompt begins with, a
 /// conversation's first prompt, what a turn adds, and its last prompt.
@@ -169,6 +172,27 @@ pub(super) fn lends(engine: &InProcess) {
         .set_indexes(Arc::new(Lends(Arc::new(tree))));
 }
 
+/// What the cell named `held` stores in its host's index for a run's
+/// callers, ahead of the list's first request ([`indexed::hold`]): each
+/// caller's conversations whole, one worker a conversation, round the list,
+/// then the head alone for a worker no conversation reached.
+pub(super) fn held(run: &Run, engine: &InProcess) {
+    let block = engine.spec().block_size().max(1) as usize;
+    assert!(block <= HEAD, "the head the prompts share holds a block");
+    let mut place = 0;
+    for caller in 0..run.callers as u64 {
+        let said = Said::by(engine, caller, CALLER_WARM + run.decisions);
+        for full in said.tokens.chunks(FULL) {
+            indexed::hold(place, full);
+            place += 1;
+        }
+    }
+    let head: Vec<u32> = (0..HEAD as u32).collect();
+    for place in 0..run.workers {
+        indexed::hold(place, &head);
+    }
+}
+
 /// One caller's turns: each carries one of the caller's conversations on,
 /// by the engine's own entry, under the seed the runner gives that caller's
 /// turn, or by the one call where the run asks it ([`place::turn`]). Timed
@@ -177,7 +201,7 @@ pub(super) fn caller(host: &Host, start: &Barrier, decisions: u64, caller: u64) 
     let said = Said::by(host.engine, caller, CALLER_WARM + decisions);
     let by_call = place::asks();
     let (mut carried, mut returned, mut last) = (0u64, 0u64, None);
-    let timed = stretch(start, decisions, &[], |turn| {
+    let turn = |turn: u64| {
         let (prompt, carries) = said.turn(turn);
         let seed = mix(caller << 40 | turn);
         let place = match by_call {
@@ -190,7 +214,8 @@ pub(super) fn caller(host: &Host, start: &Barrier, decisions: u64, caller: u64) 
         }
         last = place;
         place
-    });
+    };
+    let timed = stretch(start, decisions, || {}, turn);
     CARRIED.fetch_add(carried, Ordering::Relaxed);
     RETURNED.fetch_add(returned, Ordering::Relaxed);
     timed

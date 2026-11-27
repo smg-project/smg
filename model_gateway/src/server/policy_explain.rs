@@ -4,9 +4,22 @@
 //! no other field.
 //!
 //! The engine keeps a sample of its picks and sheds where the policy spec
-//! sets `explain.sample`, each under the id its request states. An id that
-//! finds no record is answered 404 with the reason, in the control plane's
-//! error envelope.
+//! sets `explain.sample`. A kept decision stands under the id its route
+//! stated as the request's own, which is the id in the request's body where
+//! the route reads the body and hands that id on. Where the route stated
+//! none, it stands under the gateway's own id of the request: the one its
+//! response's `x-request-id` header shows. The gateway restates that id on
+//! the request under a policy spec that keeps a sample
+//! (`middleware::request_id`), and the engine reads what stands there as
+//! that id. Of a request that states no id of its own
+//! and whose route hands its placement no headers, no decision is kept. An
+//! id that finds no record is answered 404 with the reason, in the control
+//! plane's error envelope.
+//!
+//! A decision kept under the gateway's own id may be one its route let go:
+//! a request forwarded unread that is handed back to the buffered path
+//! behind its pick is placed again, and where its body states an id the
+//! second decision stands under that id.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -68,6 +81,11 @@ fn addresses(workers: &[Arc<dyn Worker>]) -> HashMap<WorkerId, &str> {
 /// A worker is written with its address ([`addresses`]), read once from
 /// the registry. A worker that has left the registry since is written with
 /// its id and no address.
+///
+/// An id is no secret and no proof of who asked. A client may state any
+/// text as its request's id, in the body or in a request-id header the
+/// gateway reads, and of the records kept under one text the newest is
+/// read.
 pub(super) async fn get(
     State(state): State<Arc<AppState>>,
     AdminPath(request_id): AdminPath<String>,
@@ -89,25 +107,5 @@ pub(super) async fn get(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::routers::grpc::backend_client::BasicWorkerBuilder;
-
-    /// A worker is found by the id the engine knows it by and written with
-    /// the address a request's success path shows. A registered URL that
-    /// carries a credential is written without it.
-    #[test]
-    fn a_worker_is_written_with_the_address_a_success_path_shows() {
-        let plain = "http://127.0.0.1:8001";
-        let keyed = "http://user:secret@127.0.0.1:8002";
-        let workers = [plain, keyed]
-            .map(|url| -> Arc<dyn Worker> { Arc::new(BasicWorkerBuilder::new(url).build()) });
-        let found = addresses(&workers);
-        assert_eq!(found.len(), 2);
-        assert_eq!(found[&worker_id(workers[0].as_ref())], plain);
-        let shown = found[&worker_id(workers[1].as_ref())];
-        assert_eq!(shown, workers[1].redacted_url());
-        assert!(!shown.contains("secret"), "{shown}");
-        assert!(shown.contains("127.0.0.1:8002"), "{shown}");
-    }
-}
+#[path = "../../tests/unit/server/policy_explain/tests.rs"]
+mod tests;

@@ -536,9 +536,13 @@ struct RoutingArgs {
     eviction_interval: u64,
 
     /// Maximum total size of each model's approximation tree for cache-aware
-    /// routing, shared across all workers: for HTTP the chars of its texts
-    /// plus 1024 for each node a worker stands on, for gRPC tokens; eviction
-    /// keeps every tree at or under this bound
+    /// routing, summed over all workers: for requests routed by text the
+    /// chars of the nodes each worker stands on plus 1024 for each such
+    /// node, for requests routed by token ids (gRPC, and HTTP requests that
+    /// carry them) the tokens each worker holds, so a prefix that several
+    /// workers hold counts once for each of them; each eviction cycle trims
+    /// every tree back toward this bound, and writes take a tree past it
+    /// until the next cycle
     #[arg(long, default_value_t = 67108864, help_heading = "Routing Policy")]
     max_tree_size: usize,
 
@@ -722,7 +726,10 @@ struct RoutingArgs {
 
     /// Choose off for the classic routing policies or on for Grand
     /// Central. With on, the routing flags keep their meaning through a
-    /// policy document
+    /// policy document. Under a provider backend alone (such as --backend
+    /// openai, without --enable-igw) the gateway places by no routing
+    /// policy: on without a policy document moves nothing there, and the
+    /// start says so once
     #[arg(
         long,
         value_parser = ["on", "off"],
@@ -733,10 +740,11 @@ struct RoutingArgs {
 
     /// Run this policy document in place of the one the routing flags mean.
     /// The document replaces those flags. A policy name, a policy's own
-    /// setting, the overload switch and shed flag and the warm-up and pairing
-    /// settings are each refused beside it by name. The two overload
-    /// thresholds stand beside it: the gateway builds its workers with them,
-    /// unless the document switches its overload block off.
+    /// setting, the overload switch and shed flag, the warm-up and pairing
+    /// settings, --routing-key-override, --grouped-dp-sticky and
+    /// --dp-minimum-tokens-scheduler are each refused beside it by name. The
+    /// two overload thresholds stand beside it: the gateway builds its workers
+    /// with them, unless the document switches its overload block off.
     /// A file named `.json` is read as JSON, any other name as YAML
     #[arg(
         long,
@@ -901,8 +909,15 @@ struct WorkerArgs {
 
     // ==================== Multimodal ====================
     /// Multimodal tensor transport mode: `inline` (default), `shm` (same-host
-    /// /dev/shm), or `auto` (shm only when the worker shares /dev/shm). A
-    /// per-worker `WorkerSpec.multimodal_tensor_transport` overrides this.
+    /// /dev/shm), `auto` (shm only when the worker shares /dev/shm), or `rdma`
+    /// (the NIXL lane; needs the `mm-rdma` build and `--rdma-listen-ip`, and
+    /// falls back to inline where the lane is unavailable). A per-worker
+    /// `WorkerSpec.multimodal_tensor_transport` overrides this, but only the
+    /// router-level settings turn the lane on (`rdma` here, or the legacy
+    /// `--mm-pixel-rdma`): `rdma` per worker alone does not, and while the
+    /// lane is on, the gateway tries it first for each encoder input of a
+    /// TokenSpeed gRPC worker that did not go to shared memory, under a
+    /// per-worker `inline` too.
     #[arg(long, value_parser = parse_transport_mode, help_heading = "Multimodal")]
     multimodal_tensor_transport: Option<TransportMode>,
 
@@ -1088,7 +1103,11 @@ struct DiscoveryArgs {
     /// including workers registered by Kubernetes service discovery.
     /// Matching is case-sensitive. A vendor-named alias (kimi-*, minimax-*,
     /// ...) also gives the served model that vendor's contract profile under
-    /// both names.
+    /// both names. An alias that is the name of a checkpoint Symphony lists
+    /// gives the served model that checkpoint's table, where the served name
+    /// is not listed, the legacy parsers detect no parser by it and no
+    /// parser name is set for the model; of several such aliases the first
+    /// in sorted order gives its table.
     #[arg(long = "model-alias", action = ArgAction::Append, value_parser = parse_model_alias, help_heading = "Service Discovery (Kubernetes)")]
     model_alias: Vec<String>,
 
@@ -1290,10 +1309,11 @@ struct ServingArgs {
     /// below the backend HTTP server's keep-alive timeout (vLLM and SGLang
     /// default to 5), or reused connections the server already closed fail
     /// non-idempotent sends. 0 keeps idle connections forever. While a
-    /// nonzero value is below --load-monitor-interval, an idle HTTP worker is
-    /// connected anew for every load poll; where the server's keep-alive can
-    /// be raised above that interval, a value between the two keeps the
-    /// connection.
+    /// nonzero value is below the interval the load monitor polls a worker
+    /// at (the router's, unless a worker of its group sets its own), an idle
+    /// HTTP worker is connected anew for every load poll; where the server's
+    /// keep-alive can be raised above that interval, a value between the two
+    /// keeps the connection.
     #[arg(long, default_value_t = 3, help_heading = "Request Handling")]
     upstream_pool_idle_timeout_secs: u64,
 
@@ -1615,9 +1635,11 @@ struct ModelArgs {
 
     // ==================== Parsers ====================
     /// Parser for reasoning models (e.g., deepseek-r1, qwen3). Under --parser
-    /// symphony, a worker's labels decide for its model, else Symphony's
-    /// registry for a model it knows, and this flag for the models the
-    /// registry does not know: a Symphony table's name here (and in
+    /// symphony, a worker's labels decide for its model, else this flag and
+    /// --tool-call-parser, before Symphony's registry, for every model; a
+    /// name here alone that a table answers to leaves a model the registry
+    /// knows to the registry and reads only the models it does not know: a
+    /// Symphony table's name here (and in
     /// --tool-call-parser, or there alone) reads them with that table, and
     /// so does a legacy parser's name whose format a table reads (the
     /// table's aliases); `hf` reads each with the table its tokenizer's
@@ -1627,9 +1649,9 @@ struct ModelArgs {
     reasoning_parser: Option<String>,
 
     /// Parser for tool-call interactions (e.g., json, qwen). Under --parser
-    /// symphony, a worker's labels decide for its model, else Symphony's
-    /// registry for a model it knows, and this flag for the models the
-    /// registry does not know: a Symphony table's name here (and in
+    /// symphony, a worker's labels decide for its model, else this flag, for
+    /// every model, before Symphony's registry, which reads a model it knows
+    /// only where the flags select nothing: a Symphony table's name here (and in
     /// --reasoning-parser, or here alone) reads them with that table, and
     /// so does a legacy parser's name whose format a table reads (the
     /// table's aliases); `hf` reads each with the table its tokenizer's
@@ -1640,9 +1662,10 @@ struct ModelArgs {
 
     /// Which parser reads a chat completion's reasoning and tool calls:
     /// Symphony (the default) or the per-model parsers (legacy). With
-    /// Symphony, a model's worker labels decide, else Symphony's registry
-    /// for a model it knows, else --tool-call-parser and
-    /// --reasoning-parser: a Symphony table's name reads with that table,
+    /// Symphony, a model's worker labels decide, else --tool-call-parser and
+    /// --reasoning-parser, else Symphony's registry for a model it knows (a
+    /// reasoning name alone that a table answers to comes after the
+    /// registry): a Symphony table's name reads with that table,
     /// and so does a legacy parser's name whose format a table reads (qwen
     /// for qwen3, qwen_xml for qwen3_tagged: the table's aliases, so
     /// existing flags keep a working parser); any other legacy parser's

@@ -1,13 +1,15 @@
 //! A retry stays on its wire.
 //!
-//! The program states each worker's wire beside its lists: one number for
-//! the runtime the worker runs and the transport it is dialed over. A retry
-//! states the number of the worker its request went to first as its demand,
-//! since the request a route keeps for a retry was built for that wire, and
-//! the engine holds the retry to the workers that state the same number,
-//! ahead of every stage. A first attempt demands nothing. Each case serves
-//! requests over workers on more than one wire and reads where a retry was
-//! sent.
+//! The program states each worker's wire beside its lists: one number for the
+//! runtime the worker runs and the transport it is dialed over.
+//!
+//! A retry states the number of the worker its request went to first as its
+//! demand, since the request a route keeps for a retry was built for that
+//! wire. The engine holds the retry to the workers that state the same number,
+//! ahead of every stage. A first attempt demands nothing.
+//!
+//! Each case serves requests over workers on more than one wire and reads
+//! where a retry was sent.
 
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -80,21 +82,25 @@ fn failing_at(failing: String) -> impl Fn(&dyn Worker) -> u16 + Send + Sync + 's
 }
 
 /// A retry stays on the wire of its first worker. Three workers take their
-/// turns: the first and the third on one wire, the second on another,
-/// which differs by its transport or by its runtime. The first fails, and
-/// each request that meets it is asked again at the third, though the turn
-/// is the second's. A first attempt demands nothing: the requests that meet
-/// no failure go to the workers of both wires. It holds for the wire that
-/// stands first in the worker crate's lists too, a worker over HTTP that
-/// states no runtime: its number is not zero, which would state no wire.
-/// And it holds for two transports of one runtime ([`OTHER_HTTP`]): a
+/// turns: the first and the third on one wire, the second on another, which
+/// differs by its transport or by its runtime. The first fails, and each
+/// request that meets it is asked again at the third, though the turn is the
+/// second's.
+///
+/// A first attempt demands nothing: the requests that meet no failure go to
+/// the workers of both wires.
+///
+/// A retry stays on its first worker's wire where that wire stands first in
+/// the worker crate's lists too: a worker over HTTP that states no runtime.
+/// That wire's number is not zero, which would state no wire. A retry keeps
+/// its wire between two transports of one runtime too ([`OTHER_HTTP`]): a
 /// wire's number keeps its runtime and its transport in bits of their own.
 ///
-/// The gateway states a wire's number of each worker and of a retry pinned
-/// to its plan's wire (`stated_facts` and the request's demand,
-/// `model_gateway/src/routers/common/place_request.rs:113-123`, `:192-195`):
-/// its case `the_engine_keeps_a_pinned_retry_on_its_runtime_and_transport`
-/// (`model_gateway/src/routers/common/placement.rs:7809-7851`).
+/// The gateway states a wire's number of each worker, and of a retry pinned to
+/// its plan's wire: `stated_facts` and the `demands` of `place_request`
+/// (`model_gateway/src/routers/common/place_request.rs`). Its case is
+/// `the_engine_keeps_a_pinned_retry_on_its_runtime_and_transport`
+/// (`model_gateway/src/routers/common/placement.rs`).
 #[test]
 fn a_retry_stays_on_the_wire_of_its_first_worker() {
     for (wire, another) in [
@@ -124,17 +130,19 @@ fn a_retry_stays_on_the_wire_of_its_first_worker() {
     }
 }
 
-/// A wire that holds one worker keeps it for the retry: the workers a
-/// request tried step aside only while another is left, and the workers of
-/// the other wires are no such workers. Three workers, each alone on its
-/// wire, none of which serves: each request is sent to the worker its first
-/// attempt went to, up to the program's bound of sends, and to no other.
+/// A wire that holds one worker keeps it for the retry. The workers a request
+/// tried step aside only while another is left, and the workers of the other
+/// wires are no such workers.
+///
+/// Three workers stand each alone on its wire, and none serves. Each request
+/// is sent to the worker its first attempt went to, up to the program's bound
+/// of sends, and to no other.
 ///
 /// The gateway narrows a pinned request's pool to its wire, and lets the
-/// workers it tried step aside while another is left: its case
-/// `a_pinned_wire_narrows_to_its_runtime_and_transport`
-/// (`model_gateway/src/routers/common/placement.rs:4665-4687`, and
-/// `:1620-1640`).
+/// workers it tried step aside while another is left. Its case is
+/// `a_pinned_wire_narrows_to_its_runtime_and_transport`, and the `untried`
+/// list of `select_pass` is where they step aside
+/// (`model_gateway/src/routers/common/placement.rs`).
 #[test]
 fn a_wire_with_one_worker_keeps_it_for_the_retry() {
     let fleet = singles(&[GRPC, HTTP, OTHER]);
@@ -150,17 +158,17 @@ fn a_wire_with_one_worker_keeps_it_for_the_retry() {
     }
 }
 
-/// A wire that holds no worker any more leaves the retry no endpoint.
-/// Three workers, each alone on its wire: the one a request is sent to
-/// leaves the model while its send runs, and the retry is placed over the
-/// generation that stands then, whose two workers are on other wires. The
-/// client reads the program's answer for a request the engine named no
-/// worker for, after one send.
+/// A wire that holds no worker any more leaves the retry no endpoint. Three
+/// workers stand each alone on its wire. The one a request is sent to leaves
+/// the model while its send runs. The retry is placed over the generation that
+/// stands then, whose two workers are on other wires. The client reads the
+/// program's answer for a request the engine named no worker for, after one
+/// send.
 ///
-/// The gateway's pinned request has no answer where no worker of its pool
-/// is on the wire: its case
+/// The gateway's pinned request has no answer where no worker of its pool is
+/// on the wire: its case
 /// `the_engine_keeps_a_pinned_retry_on_its_runtime_and_transport`
-/// (`model_gateway/src/routers/common/placement.rs:7809-7851`).
+/// (`model_gateway/src/routers/common/placement.rs`).
 #[test]
 fn a_wire_with_no_worker_left_leaves_the_retry_no_endpoint() {
     let fleet = singles(&[GRPC, HTTP, OTHER]);
@@ -181,6 +189,7 @@ fn a_wire_with_no_worker_left_leaves_the_retry_no_endpoint() {
         reason: ShedReason::NoEndpoints,
         emptied_by: "wires",
         retry_after_secs: 1,
+        side: None,
     };
     assert_eq!(answer.sent.len(), 1, "{answer:?}");
     assert_eq!(answer.status, NO_WORKER);
@@ -188,16 +197,17 @@ fn a_wire_with_no_worker_left_leaves_the_retry_no_endpoint() {
 }
 
 /// A pair's retry holds both sides to its wire, the wire of its first
-/// attempt's prefill. Two prefills over gRPC, the first of which fails, and
-/// two decodes: one over HTTP, one over gRPC. A first attempt takes either
-/// decode, and a request meets the failing prefill beside the decode over
-/// HTTP: the wire it keeps is its prefill's, and not that decode's. Each
-/// retry goes to the second prefill and to the decode over gRPC, and never
-/// to the one over HTTP.
+/// attempt's prefill. Two prefills stand over gRPC, the first of which fails,
+/// and two decodes: one over HTTP, one over gRPC.
 ///
-/// The gateway holds a pinned pair's two sides to the retained wire: its
-/// case `a_pinned_pair_keeps_the_retained_runtime_and_transport`
-/// (`model_gateway/src/routers/common/placement.rs:4738-4803`).
+/// A first attempt takes either decode, and a request meets the failing
+/// prefill beside the decode over HTTP. The wire it keeps is its prefill's,
+/// and not that decode's. Each retry goes to the second prefill and to the
+/// decode over gRPC, and never to the one over HTTP.
+///
+/// The gateway holds a pinned pair's two sides to the retained wire: its case
+/// `a_pinned_pair_keeps_the_retained_runtime_and_transport`
+/// (`model_gateway/src/routers/common/placement.rs`).
 #[test]
 fn a_pairs_retry_holds_both_sides_to_its_wire() {
     let fleet = [
@@ -226,18 +236,19 @@ fn a_pairs_retry_holds_both_sides_to_its_wire() {
     assert!(answers.iter().any(beside_http), "{answers:?}");
 }
 
-/// A pair's retry in turn holds its second ask to its wire too. One
-/// prefill and two decodes, the decode picked behind the prefill by the
-/// fewest requests in flight: one decode on the prefill's wire, and one on
-/// another wire that holds a request. The first attempt takes the idle
-/// decode and fails at its prefill, so the retry is pinned. While the
-/// retry's prefill runs, the decode on the wire takes three requests: the
-/// second ask still names it, though the other decode is the lighter one
-/// and was not tried.
+/// A pair's retry in turn holds its second ask to its wire too. One prefill
+/// and two decodes stand, the decode picked behind the prefill by the fewest
+/// requests in flight. One decode is on the prefill's wire, and one is on
+/// another wire and holds a request.
 ///
-/// The gateway states a pinned request's wire again at its second ask
-/// (`RequestAgain`,
-/// `model_gateway/src/routers/grpc/sequential_pd.rs:702-710`).
+/// The first attempt takes the idle decode and fails at its prefill, so the
+/// retry is pinned. While the retry's prefill runs, the decode on the wire
+/// takes three requests. The second ask still names it, though the other
+/// decode is the lighter one and was not tried.
+///
+/// The gateway states a pinned request's wire again at its second ask:
+/// `RequestAgain`, as `execute_sequential_pd` builds it
+/// (`model_gateway/src/routers/grpc/sequential_pd.rs`).
 #[test]
 fn a_pairs_retry_in_turn_holds_its_second_ask_to_its_wire() {
     let fleet = [

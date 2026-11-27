@@ -69,7 +69,8 @@ pub(crate) type Lends<'a> = &'a dyn Fn(u16) -> Option<(&'a dyn LentRing, &'a [u6
 /// A shadow profile that panics is caught here: the live decision stands
 /// as decided. The thread's buffers are kept, as behind a live decision
 /// that panics: each entry writes the scratch it reads, and the keeping
-/// entry forgets the kept session reading first.
+/// entry forgets the kept session reading first. The word on a trace's
+/// best rows alone is shared: the live decision's stands for its shadow.
 pub(crate) fn decide(
     engine: &Engine,
     pool: &PoolRecords,
@@ -90,6 +91,9 @@ pub(crate) fn decide(
         })
     };
     with_buffers(|buffers: &mut Buffers| {
+        if live.unread {
+            buffers.scratch.unread(true);
+        }
         let Buffers {
             whole,
             stands,
@@ -97,6 +101,9 @@ pub(crate) fn decide(
             ..
         } = buffers;
         let (rows, pool_facts) = pool.write_over::<true, false>(workers, live, whole, stands);
+        if engine.turns_a_set() {
+            scratch.whole(pool.whole_rows(rows));
+        }
         let written;
         let cx = if cx.stalled.is_empty() {
             cx

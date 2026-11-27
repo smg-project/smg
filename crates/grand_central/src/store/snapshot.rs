@@ -70,12 +70,13 @@ use crate::{
     store::{
         applied::Applied,
         workers::{WorkerFacts, WorkerRow},
-        GatewayId,
+        GatewayId, StaleGeneration,
     },
     tracking::in_flight::{InFlightCounts, WorkerSlot},
 };
 
 #[cfg(test)]
+#[path = "../../tests/unit/store/snapshot/tests/mod.rs"]
 mod tests;
 
 /// How long a build the membership writes left owed may wait for its
@@ -456,17 +457,6 @@ impl Vetoes {
     }
 }
 
-/// Why a generation was not applied: its number is not above the standing
-/// one. The store's number only rises.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("generation {offered} is not above the standing generation {standing}")]
-pub struct StaleGeneration {
-    /// The number of the generation the store holds.
-    pub standing: u64,
-    /// The number of the generation that was offered.
-    pub offered: u64,
-}
-
 /// How many members of the standing membership name an engine family or a
 /// zone that the standing generation's list, which holds entries, does not
 /// hold: each reads position 0 in that field. Counted wherever the members
@@ -703,7 +693,8 @@ pub(super) struct Writer {
     /// order, beside the revision of its row it was read at. A
     /// membership build reads a member again only where that revision
     /// moved, so it reads the members written since the last build and
-    /// carries every other's. Empty while the generation declares no list.
+    /// carries every other's. Empty while the generation's lists name no
+    /// engine family and no zone: no member stands outside such lists.
     listed: Vec<Held>,
     /// The build before's `listed`, kept for its room.
     listed_spare: Vec<Held>,
@@ -813,7 +804,8 @@ impl Writer {
     /// Read every member under the standing generation's lists and count
     /// those outside them. For an apply whose lists differ: a membership
     /// build reads the members written since the last and carries every
-    /// other's ([`Writer::relist`]).
+    /// other's ([`Writer::relist`]). Lists that name no engine family and
+    /// no zone leave no member outside: no member is read under them.
     fn list<'a>(&mut self, members: impl Iterator<Item = (&'a WorkerRow, WorkerSlot)>) {
         let Self {
             spec,
@@ -822,16 +814,16 @@ impl Writer {
             ..
         } = self;
         let lists = spec.lists();
-        let listing = !lists.is_empty();
         *outside = OutsideLists::default();
         held.clear();
+        if !lists.names_a_family_or_zone() {
+            return;
+        }
         for (member, ..) in members {
             let read = Held::read(lists, member);
             outside.engines += u32::from(read.engine_outside);
             outside.zones += u32::from(read.zone_outside);
-            if listing {
-                held.push(read);
-            }
+            held.push(read);
         }
         held.sort_unstable_by_key(|held| held.id);
     }
@@ -852,8 +844,16 @@ impl Writer {
     /// from the last read where a member's row stands at the revision it
     /// was read at, read again where it moved or is new. A build so reads
     /// the members written since the last. `members` stand in id order.
+    ///
+    /// Lists that name no engine family and no zone leave no member outside
+    /// them. Under such lists the pass ends at its first test: nothing was
+    /// read under them, and the apply that brought them cleared what stood
+    /// ([`Self::list`]).
     fn relist(&mut self, members: &[(WorkerId, &WorkerRow, WorkerSlot)]) {
         let lists = self.spec.lists();
+        if !lists.names_a_family_or_zone() {
+            return;
+        }
         let outgoing = mem::take(&mut self.listed);
         let mut incoming = mem::take(&mut self.listed_spare);
         incoming.clear();

@@ -87,7 +87,7 @@ use smg_worker::{
 use super::{
     decision::Decision,
     demands::{DemandFacts, Demands, UnmetDemand},
-    framework::{Engine, Scratch},
+    framework::{Engine, Scratch, WholeRows},
     view::{
         Candidate, Constraints, Engines, FixedFacts, Health, LoadRow, OverloadRegime, PoolFacts,
         RequestFacts, Role, SignalSource, WireModes, WorkerId, LOAD_REPORT_CLOCK_HISTORY_MS,
@@ -96,6 +96,7 @@ use super::{
 use crate::{
     document::spec::AppliedSpec,
     load::{load_row, signal_values, ReportSignals, SignalCells, SignalColumn},
+    policies::round_robin::RoundRobin,
 };
 
 /// A worker's id in the engine's own state (a load stage's credit of
@@ -184,6 +185,14 @@ impl DecisionClock {
     fn membership_epoch(&self) -> u64 {
         self.pools.load(Ordering::Relaxed)
     }
+
+    /// One more pool on this clock: counts it and answers its number, the
+    /// membership epoch until the next pool is counted. The first pool is
+    /// number one: an epoch of zero says no membership.
+    #[inline]
+    fn next_pool(&self) -> u64 {
+        self.pools.fetch_add(1, Ordering::Relaxed) + 1
+    }
 }
 
 impl Default for DecisionClock {
@@ -211,6 +220,9 @@ pub struct Live<'a> {
     /// Whether a stage of the document reads a worker's count of session
     /// keys with a request in flight.
     sessions: bool,
+    /// Whether nobody reads the best rows of the decision's trace
+    /// ([`Self::unread`]).
+    unread: bool,
     /// The list's own word, where the decision is over one list
     /// ([`Self::turning`]).
     word: Option<&'a AtomicU64>,
@@ -249,6 +261,7 @@ impl<'a> Live<'a> {
             loads,
             counted_key: session_key.filter(|_| needs.session_in_flight),
             sessions: needs.active_sessions,
+            unread: false,
             word: None,
             rest: false,
         }
@@ -289,6 +302,18 @@ impl<'a> Live<'a> {
             word: Some(word),
             ..self
         }
+    }
+
+    /// These reads for a decision nobody reads the best rows of, where
+    /// `unread`: one kept behind a placement, which hands out no trace,
+    /// under a document none of whose stages takes its issue and that
+    /// keeps no sample. The front that runs the decision states the word
+    /// to the engine's scratch ([`Scratch::unread`]), which the borrow of
+    /// the thread's buffers hands it cleared, and no pass over the
+    /// decision's scores runs for the best rows of its trace.
+    #[must_use]
+    pub(crate) fn unread(self, unread: bool) -> Self {
+        Self { unread, ..self }
     }
 
     /// These reads with the request's key counted under `session_key`: for
@@ -463,10 +488,10 @@ pub(super) fn stated_report(
 }
 
 /// A report's named values as a record states them, written into the row
-/// of `cells` at `position`, and whether a named value is read of the
-/// report at all. They are made by the crate's one conversion
+/// of `cells` at `position`, and whether the report is the whole of its
+/// worker object. They are made by the crate's one conversion
 /// ([`signal_values`]) under `columns`, the document's, and written where
-/// a decision may read them ([`SignalCells::write`]): under the signal's
+/// a decision may read them ([`SignalColumn::write`]): under the signal's
 /// own unit and in range, each sample instant on `clock`. A report that
 /// is not the whole of its worker object states none ([`whole`]), and
 /// nothing is written of it: `ranks` says how many ranks the object stands
@@ -485,7 +510,7 @@ fn write_signals(
         return false;
     }
     signal_values(report, columns, sampled_at, |column, unit, value, at| {
-        cells.write(position, column, unit, value, clock.micros(at));
+        column.write(cells, position, unit, value, clock.micros(at));
     });
     true
 }
@@ -563,6 +588,14 @@ impl Reported {
     #[inline]
     fn is_of(&self, loads: &Arc<LoadSnapshot>) -> bool {
         ptr::eq(self.snapshot.as_ptr(), Arc::as_ptr(loads))
+    }
+
+    /// Whether a decision that began at `now_micros` leaves the rows in
+    /// place: it began no later than the decision that converted them, so
+    /// it holds a snapshot no newer than theirs.
+    #[inline]
+    fn outlasts(&self, now_micros: u64) -> bool {
+        now_micros <= self.since_micros
     }
 }
 
@@ -652,6 +685,10 @@ pub struct PoolRecords {
     /// The claim to ask the list's workers ([`Self::ask`]): taken by one
     /// compare and exchange and never waited for, as the conversion's is.
     asking: Mutex<()>,
+    /// The key of the list's rows in their order, as a rotation keys the
+    /// rows a pass kept: made once, here, and said to the engine's scratch
+    /// with the rows a decision wrote whole ([`Self::whole_rows`]).
+    whole_key: u64,
 }
 
 impl PoolRecords {
@@ -751,10 +788,9 @@ impl PoolRecords {
             places.clear();
         }
         let (engine_rows, engine_ends) = engines_of(workers, &mut fixed);
-        // The first pool is number one: an epoch of zero says no
-        // membership.
-        let number = clock.pools.fetch_add(1, Ordering::Relaxed) + 1;
+        let number = clock.next_pool();
         Self {
+            whole_key: RoundRobin::whole_key(&fixed),
             regular: fixed.iter().all(|row| row.role == Role::Single),
             fixed,
             ids,
@@ -882,32 +918,51 @@ impl PoolRecords {
         !self.engine_ends.is_empty()
     }
 
-    /// The workers of the engines a retry tried, written into `whole`:
-    /// `tried` as its host named them, and behind them the id of every
-    /// other row of the engine that holds a tried worker's row
-    /// ([`Engines`]), each once. A retry that names one rank of a
-    /// data-parallel engine so names them all: its ranks share the engine a
-    /// failed attempt reached.
+    /// The workers of the engines a retry tried, over the lists of one
+    /// decision: `tried` as its host named them, and behind them the id of
+    /// every other row of an engine that holds a tried worker's row
+    /// ([`Engines`]), each once and each list read by its own engines. A
+    /// retry that names one rank of a data-parallel engine so names them
+    /// all: its ranks share the engine a failed attempt reached. A single
+    /// request hands its one list, a pair its two and an encode request
+    /// its three.
     ///
-    /// An id the list does not hold stays as it was named and adds nothing:
-    /// the list says nothing of its engine. Where two rows of the list
-    /// carry one id, no id has a place ([`Self::place_of`]) and nothing is
-    /// added.
+    /// Only a list where an engine holds several rows is read
+    /// ([`Self::has_ranks`]). `None` where `lists` holds no such list: the
+    /// request's own list stands, and `whole` is not asked. Else `whole`
+    /// hands the list that is written and returned. It is asked once, and
+    /// what its list held is not kept.
     ///
-    /// One binary search for each tried id, and nothing allocated once
-    /// `whole` has grown: what a retry pays, and only over a list with
-    /// such an engine ([`Self::has_ranks`]).
-    pub(crate) fn tried_engines(&self, tried: &[WorkerId], whole: &mut Vec<WorkerId>) {
+    /// An id a list does not hold stays as it was named and adds nothing
+    /// there: that list says nothing of its engine. Where two rows of a
+    /// list carry one id, no id has a place in it ([`Self::place_of`]) and
+    /// it adds nothing.
+    ///
+    /// One binary search for each tried id in each list read, and nothing
+    /// allocated once the list `whole` hands has grown: what a retry pays.
+    #[must_use]
+    pub(crate) fn tried_engines<'a>(
+        lists: impl IntoIterator<Item = &'a Self>,
+        tried: &[WorkerId],
+        whole: impl FnOnce() -> Vec<WorkerId>,
+    ) -> Option<Vec<WorkerId>> {
+        let mut ranked = lists.into_iter().filter(|list| list.has_ranks()).peekable();
+        ranked.peek()?;
+        let mut whole = whole();
         whole.clear();
         whole.extend_from_slice(tried);
-        self.more_tried_engines(tried, whole);
+        for list in ranked {
+            list.add_engines_of(tried, &mut whole);
+        }
+        Some(whole)
     }
 
-    /// [`Self::tried_engines`] for a further list of the same decision, as
-    /// a pair's second list is: adds to `whole` the id of every row of an
-    /// engine of this list that holds a row `tried` names, where `whole`
-    /// does not hold it yet, and takes nothing out of `whole`.
-    pub(crate) fn more_tried_engines(&self, tried: &[WorkerId], whole: &mut Vec<WorkerId>) {
+    /// One list's part of [`Self::tried_engines`]: adds to `whole` the id
+    /// of every row of an engine of this list that holds a row `tried`
+    /// names, where `whole` does not hold it yet, and takes nothing out of
+    /// `whole`. A further list of the same decision, as a pair's second
+    /// list is, so adds to what the lists before it wrote.
+    fn add_engines_of(&self, tried: &[WorkerId], whole: &mut Vec<WorkerId>) {
         for &id in tried {
             let Some(place) = self.place_of(id) else {
                 continue;
@@ -1029,6 +1084,15 @@ impl PoolRecords {
             engines: Engines::new(self.number, &self.engine_rows, &self.engine_ends),
             word: live.word,
         }
+    }
+
+    /// What the list says to the engine's scratch of `rows`, its rows as one
+    /// decision wrote them whole ([`Self::write_over`]): where they stand,
+    /// how many they are and the list's key. The one place a front makes
+    /// the word.
+    #[inline]
+    fn whole_rows(&self, rows: &[Candidate]) -> WholeRows {
+        WholeRows::said(rows, self.whole_key)
     }
 
     /// Every worker's record for one decision, written into `rows` in the
@@ -1221,7 +1285,9 @@ impl PoolRecords {
     ///
     /// A decision that began no later than the decision that converted
     /// the list's rows holds a snapshot no newer than theirs, and does not
-    /// replace them.
+    /// replace them. That holds for the rows it read as `held` and for the
+    /// rows it finds under the claim, where another decision left them
+    /// since: it converts nothing and counts nothing.
     ///
     /// The conversion is one look-up of each worker's address in the
     /// snapshot, one conversion of each report, and one allocation of the
@@ -1240,7 +1306,7 @@ impl PoolRecords {
     ) -> Option<Arc<Reported>> {
         if held
             .as_deref()
-            .is_some_and(|reported| live.now_micros <= reported.since_micros)
+            .is_some_and(|reported| reported.outlasts(live.now_micros))
         {
             return None;
         }
@@ -1248,6 +1314,14 @@ impl PoolRecords {
         let again = self.reported.load();
         if let Some(reported) = again.as_ref().filter(|reported| reported.is_of(loads)) {
             return Some(Arc::clone(reported));
+        }
+        // The same rule again, for rows another decision left since `held`
+        // was read.
+        if again
+            .as_deref()
+            .is_some_and(|reported| reported.outlasts(live.now_micros))
+        {
+            return None;
         }
         if !claim.paid(loads, looked_up, self.fixed.len()) {
             return None;
@@ -1303,6 +1377,102 @@ impl PoolRecords {
         let mut row = *fixed;
         Singly::new(self, workers, live).write(fixed, &mut row);
         Some(row)
+    }
+
+    /// [`decide`]'s plain draw over the list ([`Engine::decide_drawn`]):
+    /// the engine draws over the list's fixed rows, and a worker's record
+    /// is written when the draw asks about the worker, as [`Self::read`]
+    /// writes it. The look-ups the draw made are paid toward the
+    /// conversion of the list's reports at its end ([`LookUps`]).
+    ///
+    /// `rows` is the buffer the decision lends: it grows to the list's
+    /// length here where it is shorter.
+    // In line at its one caller: a plain draw's decision pays no call for
+    // it.
+    #[inline(always)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one decision's inputs and the calling thread's two buffers"
+    )]
+    fn draw(
+        &self,
+        engine: &Engine,
+        drawn: super::framework::Drawn,
+        workers: &[Arc<dyn Worker>],
+        live: &Live<'_>,
+        facts: &RequestFacts<'_>,
+        unsaid: &PoolFacts<'_>,
+        cx: &Constraints<'_>,
+        rows: &mut Vec<Candidate>,
+        scratch: &mut Scratch,
+    ) -> Decision {
+        if rows.len() < self.len() {
+            rows.resize(self.len(), Candidate::default());
+        }
+        let rows = &mut rows[..self.len()];
+        let singly = Singly::new(self, workers, live);
+        let mut write = |fixed: &Candidate, row: &mut Candidate| singly.write(fixed, row);
+        let decision = engine.decide_drawn(
+            drawn,
+            facts,
+            unsaid,
+            &self.fixed,
+            rows,
+            &mut write,
+            cx,
+            scratch,
+        );
+        singly.paid();
+        decision
+    }
+
+    /// [`decide`]'s draw for a key with no pin under a sessions rule
+    /// ([`Engine::decide_claimed`]), as the plain draw runs
+    /// ([`Self::draw`]): a worker's record is written when the draw asks
+    /// about the worker, and the look-ups are paid at its end. `None`
+    /// where the whole decision answers, as it does over a list where two
+    /// rows carry one id ([`Self::place_of`]): the rule's cap is asked of
+    /// every row of an id, and a draw keeps a few rows.
+    ///
+    /// Out of line: a draw that claims nothing holds none of this.
+    #[inline(never)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one decision's inputs and the calling thread's two buffers"
+    )]
+    fn claim(
+        &self,
+        engine: &Engine,
+        drawn: super::framework::Drawn,
+        workers: &[Arc<dyn Worker>],
+        live: &Live<'_>,
+        facts: &RequestFacts<'_>,
+        unsaid: &PoolFacts<'_>,
+        cx: &Constraints<'_>,
+        rows: &mut Vec<Candidate>,
+        scratch: &mut Scratch,
+    ) -> Option<Decision> {
+        if self.places.is_empty() {
+            return None;
+        }
+        if rows.len() < self.len() {
+            rows.resize(self.len(), Candidate::default());
+        }
+        let rows = &mut rows[..self.len()];
+        let singly = Singly::new(self, workers, live);
+        let mut write = |fixed: &Candidate, row: &mut Candidate| singly.write(fixed, row);
+        let claimed = engine.decide_claimed(
+            drawn,
+            facts,
+            unsaid,
+            &self.fixed,
+            rows,
+            &mut write,
+            cx,
+            scratch,
+        );
+        singly.paid();
+        claimed
     }
 
     /// Writes into `cells` the list's signal cells as the reports of
@@ -1718,6 +1888,9 @@ pub fn decide(
     facts.now_micros = live.now_micros;
     let facts = &*facts;
     let decide = |buffers: &mut Buffers| {
+        if live.unread {
+            buffers.scratch.unread(true);
+        }
         let Buffers {
             rows,
             whole,
@@ -1727,37 +1900,55 @@ pub fn decide(
         // No record says yet whether it carries a report: a draw reads that
         // fact of no pool.
         let unsaid = pool.facts(live, false);
-        let drawn = engine.drawn_for(facts, &unsaid, pool.len());
+        // Under the draw's floor of every profile ([`DRAW_FROM`]) a draw is
+        // asked only where no filter refuses it a row: of a request that
+        // names no worker tried or excluded, is held to no places and
+        // stands under no veto of its host, over a list whose every worker
+        // publishes its routing state available ([`PoolRecords::stands`]):
+        // one load where no published state moved. The whole pass draws
+        // among the rows it keeps and a draw among all of them, so the two
+        // hand out one pick of a seed only where every row is kept. Every
+        // other decision under that floor is written whole and read by the
+        // pass: no refused row costs it a draw, and its pick is the pass's
+        // own. The request and the list are asked before the draw is: a
+        // decision the pass makes resolves its request's binding once.
+        // A request with a session key is written whole under that floor:
+        // under a sessions rule a profile that draws two is asked no draw
+        // of a key ([`Engine::drawn_for`]'s last test), and the question
+        // would resolve the request's binding a second time. So is a list
+        // that holds an engine's ranks ([`PoolRecords::has_ranks`]): a
+        // profile that decides over the engines is asked no draw of it.
+        let drawn = if engine.asks_standing(pool.len())
+            && !(facts.tried.is_empty()
+                && cx.excluded.is_empty()
+                && cx.places.is_none()
+                && cx.stalled.is_empty()
+                && facts.session_key.is_none()
+                && !pool.has_ranks()
+                && pool.stands(workers, published_word()))
+        {
+            None
+        } else {
+            engine.drawn_for(facts, &unsaid, pool.len())
+        };
         if let Some(drawn) = drawn.filter(|drawn| !drawn.claims()) {
-            if rows.len() < pool.len() {
-                rows.resize(pool.len(), Candidate::default());
-            }
-            let rows = &mut rows[..pool.len()];
-            let singly = Singly::new(pool, workers, live);
-            let mut write = |fixed: &Candidate, row: &mut Candidate| singly.write(fixed, row);
-            let decision = engine.decide_drawn(
-                drawn,
-                facts,
-                &unsaid,
-                &pool.fixed,
-                rows,
-                &mut write,
-                cx,
-                scratch,
+            return pool.draw(
+                engine, drawn, workers, live, facts, &unsaid, cx, rows, scratch,
             );
-            singly.paid();
-            return decision;
         } else if let Some(decision) = drawn.and_then(|drawn| {
             // A key with no pin takes the list's turn, and the turn's
             // worker is claimed for it. Where the whole decision answers
             // by another way it is asked below, over every record.
-            claimed(
-                engine, drawn, pool, workers, live, facts, &unsaid, cx, rows, scratch,
+            pool.claim(
+                engine, drawn, workers, live, facts, &unsaid, cx, rows, scratch,
             )
         }) {
             return decision;
         }
         let (rows, pool_facts) = pool.write_over::<true, false>(workers, live, whole, stands);
+        if engine.turns_a_set() {
+            scratch.whole(pool.whole_rows(rows));
+        }
         let written;
         let cx = if cx.stalled.is_empty() {
             cx
@@ -1773,6 +1964,14 @@ pub fn decide(
 /// Runs one decision over the calling thread's own buffers: the one borrow
 /// of them, for a decision without a shadow ([`decide`]) and for one
 /// followed by its binding's shadow profile ([`with_shadow::decide`]).
+///
+/// The scratch is handed out with its word on the best rows of a trace
+/// cleared ([`Live::unread`]): the word of the thread's last decision
+/// never stands for this one, and a decision that states none reads them.
+/// A live decision and the shadow profile decided behind it on this
+/// borrow share the word: the front states it once, for both. Its word on
+/// the rows written whole is taken back here too ([`Scratch::whole`]): a
+/// front states it behind its write, for the decisions of this borrow.
 #[inline]
 fn with_buffers<T>(decide: impl FnOnce(&mut Buffers) -> T) -> T {
     // The key's own call hands out the pointer alone: what a decision
@@ -1783,56 +1982,11 @@ fn with_buffers<T>(decide: impl FnOnce(&mut Buffers) -> T) -> T {
         // thread: that decision takes buffers of its own.
         return decide(&mut Buffers::default());
     };
+    buffers.scratch.unread(false);
+    buffers.scratch.no_whole();
     decide(&mut buffers)
 }
 
-/// [`decide`]'s draw for a key with no pin under a sessions rule
-/// ([`Engine::decide_claimed`]), as the plain draw runs: a worker's record
-/// is written when the draw asks about the worker, and the look-ups are
-/// paid at its end. `None` where the whole decision answers, as it does
-/// over a list where two rows carry one id ([`PoolRecords::place_of`]): the
-/// rule's cap is asked of every row of an id, and a draw keeps a few rows.
-///
-/// Out of line: a draw that claims nothing holds none of this.
-#[inline(never)]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one decision's inputs and the calling thread's two buffers"
-)]
-fn claimed(
-    engine: &Engine,
-    drawn: super::framework::Drawn,
-    pool: &PoolRecords,
-    workers: &[Arc<dyn Worker>],
-    live: &Live<'_>,
-    facts: &RequestFacts<'_>,
-    unsaid: &PoolFacts<'_>,
-    cx: &Constraints<'_>,
-    rows: &mut Vec<Candidate>,
-    scratch: &mut Scratch,
-) -> Option<Decision> {
-    if pool.places.is_empty() {
-        return None;
-    }
-    if rows.len() < pool.len() {
-        rows.resize(pool.len(), Candidate::default());
-    }
-    let rows = &mut rows[..pool.len()];
-    let singly = Singly::new(pool, workers, live);
-    let mut write = |fixed: &Candidate, row: &mut Candidate| singly.write(fixed, row);
-    let claimed = engine.decide_claimed(
-        drawn,
-        facts,
-        unsaid,
-        &pool.fixed,
-        rows,
-        &mut write,
-        cx,
-        scratch,
-    );
-    singly.paid();
-    claimed
-}
-
 #[cfg(test)]
+#[path = "../../tests/unit/engine/records/tests/mod.rs"]
 mod tests;

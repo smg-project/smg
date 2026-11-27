@@ -1,0 +1,263 @@
+//! The exposure: what a row reveals to its plugin, and what it withholds.
+
+use smg_grand_central::{
+    document::Needs,
+    engine::{Header, Identity},
+    plugins::{
+        grpc::{GrpcPluginSpec, Plugin, Tls, Transport},
+        shared::{Exposure, HeaderSet, Reveal},
+    },
+    service::proto,
+    stages::Lifecycle,
+    tracking::Lease,
+};
+
+use crate::{
+    decide_with, facts, lead, pool, profile, runtime, single_engine, spec,
+    support::grpc_plugin::{eventually, TestPlugin, ALL},
+};
+
+#[test]
+fn the_exposure_withholds_what_the_row_does_not_reveal() {
+    let served = TestPlugin::serve();
+    let runtime = runtime();
+    let mut spec = spec(&served, "narrow-view");
+    spec.view = Exposure::default();
+    spec.view.tenant = Reveal::None;
+    spec.view.session_key = Reveal::Plain;
+    spec.view.headers = HeaderSet::of([2]);
+    let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
+    let engine = single_engine(profile(&plugin, ALL));
+    let headers = [
+        {
+            let mut header = Header::default();
+            header.name = 2;
+            header.value = "exposed";
+            header
+        },
+        {
+            let mut header = Header::default();
+            header.name = 9;
+            header.value = "hidden";
+            header
+        },
+    ];
+    let mut request = facts(1);
+    request.tenant = Identity::plain("acme");
+    request.session_key = Identity::plain("s-1");
+    request.headers = &headers;
+    let candidates = pool(4);
+    assert_eq!(
+        lead(&decide_with(&engine, &request, &candidates)),
+        Some(103)
+    );
+    let seen = served.seen();
+    let sent = seen.frames[0].request.as_ref().expect("the request");
+    assert_eq!(sent.tenant, None, "withheld");
+    assert_eq!(
+        sent.session_key.as_ref().and_then(|id| id.form.clone()),
+        Some(proto::identity::Form::Plain("s-1".to_owned())),
+        "in the clear, as the row asks and the host holds it"
+    );
+    assert_eq!(
+        sent.headers,
+        [proto::Header {
+            name: 2,
+            value: "exposed".to_owned(),
+        }],
+        "the allow-listed header alone"
+    );
+}
+
+/// A plugin's picker stands across a later document that changes the
+/// view's header list alone. Its row exposes the first place, so behind
+/// the new list the picker is shown the header that stands first there. A
+/// picker built anew from the later document is shown the same.
+#[test]
+fn a_picker_kept_across_a_new_header_list_is_shown_its_rows_place() {
+    use std::sync::Arc;
+
+    use smg_grand_central::{
+        document::{AppliedSpec, PolicySpec},
+        engine::{InProcess, Picker},
+        plugins::grpc::GrpcPicker,
+        stages::{Best, StageRegistry},
+    };
+
+    let served = TestPlugin::serve();
+    let runtime = runtime();
+    let mut row = spec(&served, "first-place");
+    row.view = Exposure::default();
+    row.view.tenant = Reveal::None;
+    row.view.session_key = Reveal::None;
+    row.view.headers = HeaderSet::of([0]);
+    let plugin = Plugin::load(&runtime, row).expect("the plugin loads");
+    let mut stages = StageRegistry::builtin();
+    let make = move || -> Box<dyn Picker> {
+        Box::new(GrpcPicker::new(plugin.bind(), Some(Box::new(Best))))
+    };
+    stages.picker("first-place", make).expect("a free name");
+    let listing = |generation: u64, headers: &[&str]| {
+        let mut document = PolicySpec::preset("random").expect("a built-in preset");
+        document.generation = generation;
+        let profile = document.profiles.get_mut("random");
+        profile.expect("the preset's profile").pick = "first-place".into();
+        document.view.headers = headers.iter().map(|name| (*name).to_owned()).collect();
+        let spec = AppliedSpec::validate_in(&document, &stages, &[]);
+        spec.expect("the stages hold the picker")
+    };
+    let candidates = pool(4);
+    // What the plugin is shown of a request that carries two headers, each
+    // stated by its place in the list of the document it is decided under.
+    let shown = |spec: &AppliedSpec| {
+        let carried = [("x-a", "one"), ("x-b", "two")];
+        let stated = |(name, at): (&str, u8)| {
+            let &(_, value) = carried.iter().find(|(listed, _)| *listed == name)?;
+            let mut header = Header::default();
+            header.name = at;
+            header.value = value;
+            Some(header)
+        };
+        let listed = spec.view_headers().zip(0..=u8::MAX);
+        let headers: Vec<Header<'_>> = listed.filter_map(stated).collect();
+        let mut request = facts(1);
+        request.headers = &headers;
+        // This call's own frame: a picker that sent none would leave the
+        // frame of the call before as the last one.
+        let before = served.frames();
+        let decision = decide_with(spec.engine(), &request, &candidates);
+        assert!(lead(&decision).is_some(), "a pick");
+        let seen = served.seen();
+        assert_eq!(seen.frames.len(), before + 1, "one frame of this call");
+        let frame = seen.frames.last().expect("a frame");
+        let sent = frame.request.as_ref().expect("the request");
+        sent.headers.clone()
+    };
+    let first = |value: &str| {
+        [proto::Header {
+            name: 0,
+            value: value.to_owned(),
+        }]
+    };
+    let host = InProcess::new(listing(1, &["x-a"]));
+    let stood = host.spec();
+    assert_eq!(shown(&stood), first("one"));
+    let applied = host.apply(listing(2, &["x-b", "x-a"]));
+    applied.expect("a number above the standing one");
+    let stands = host.spec();
+    let (new, old) = (stands.engine().profiles(), stood.engine().profiles());
+    assert!(Arc::ptr_eq(&new[0], &old[0]), "the picker stands");
+    assert_eq!(shown(&stands), first("two"), "the picker kept");
+    let anew = listing(2, &["x-b", "x-a"]);
+    assert_eq!(shown(&anew), first("two"), "a picker built anew");
+}
+
+/// A frame carries the request's block hashes to a plugin whose row
+/// declares them, in either form, and none to one whose row declares
+/// neither: a prompt's length sizes no frame of a plugin that reads none.
+#[test]
+fn a_frame_carries_block_hashes_to_a_row_that_declares_them_alone() {
+    let runtime = runtime();
+    let hashes: Vec<u64> = (1..=300).collect();
+    let mut request = facts(1);
+    request.block_hashes = &hashes;
+    let candidates = pool(4);
+    let sent = |name: &str, needs: Needs| {
+        let served = TestPlugin::serve();
+        let mut spec = spec(&served, name);
+        spec.needs = needs;
+        let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
+        let engine = single_engine(profile(&plugin, ALL));
+        assert_eq!(
+            lead(&decide_with(&engine, &request, &candidates)),
+            Some(103),
+            "{name}: the plugin answers"
+        );
+        let seen = served.seen();
+        let sent = seen.frames[0].request.as_ref().expect("the request");
+        sent.block_hashes.clone()
+    };
+    assert!(
+        sent("reads-none", Needs::default()).is_empty(),
+        "a row that declares no hashes is sent none"
+    );
+    let tokens = Needs::NONE.with_token_hashes();
+    assert_eq!(sent("reads-tokens", tokens), hashes);
+    let text = Needs::NONE.with_text_hashes();
+    assert_eq!(sent("reads-text", text), hashes);
+}
+
+/// A lease on the lifecycle carries the session's value, and a request
+/// shows the same value in the hash form, so a plugin matches the two: a
+/// row that withholds the session key withholds both.
+#[test]
+fn a_lease_and_its_request_show_one_session_value_or_none() {
+    let mut keyed = facts(1);
+    keyed.session_key = Identity::plain("s-1");
+    let mut lease = Lease::default();
+    lease.session = keyed.session();
+    let value = lease.session.get();
+    assert_ne!(value, 0, "a keyed request has a session");
+    let runtime = runtime();
+    // The session as the request's frame and as the lease's event show it.
+    let shown_under = |name: &str, session_key: Reveal| {
+        let served = TestPlugin::serve();
+        let mut spec = spec(&served, name);
+        spec.view = Exposure::default();
+        spec.view.session_key = session_key;
+        let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
+        let engine = single_engine(profile(&plugin, ALL));
+        let decision = decide_with(&engine, &keyed, &pool(4));
+        engine.on_decision_issued(&lease, &decision);
+        assert!(eventually(|| served.seen().events.len() == 1));
+        let seen = served.seen();
+        let request = seen.frames[0].request.as_ref().expect("the request");
+        let in_the_frame = request.session_key.as_ref().and_then(|id| id.form.clone());
+        let on_the_lease = match &seen.events[0].event {
+            Some(proto::lifecycle_event::Event::Issued(issued)) => {
+                issued.decision.as_ref().expect("the decision").leases[0].session_key
+            }
+            other => panic!("issued, not {other:?}"),
+        };
+        (in_the_frame, on_the_lease)
+    };
+    assert_eq!(
+        shown_under("session-withheld", Reveal::None),
+        (None, 0),
+        "withheld from both"
+    );
+    assert_eq!(
+        shown_under("session-hashed", Reveal::Hash),
+        (Some(proto::identity::Form::Hash(value)), value),
+        "one value in both, under a row that reveals the key's hash"
+    );
+}
+
+/// A row printed in its debug form writes none of its PEMs: one of them
+/// is the private key.
+#[test]
+fn a_printed_row_withholds_its_pems() {
+    let pems: [&[u8]; 3] = [b"AUTHORITY", b"CERTIFICATE", b"PRIVATE"];
+    let row = GrpcPluginSpec::new(
+        "printed",
+        Transport::Tls {
+            address: "plugin.example:9000".to_owned(),
+            tls: Tls::of(
+                "plugin.example".to_owned(),
+                pems[0].to_vec(),
+                pems[1].to_vec(),
+                pems[2].to_vec(),
+            ),
+        },
+    );
+    let printed = format!("{row:?}");
+    assert!(printed.contains("plugin.example"), "{printed}");
+    for pem in pems {
+        // A byte vector prints as its numbers between brackets.
+        let numbers = format!("{pem:?}");
+        assert!(
+            !printed.contains(&numbers[1..numbers.len() - 1]),
+            "a PEM's bytes are printed: {printed}"
+        );
+    }
+}

@@ -9,8 +9,10 @@ use arc_swap::Guard;
 
 use crate::{
     engine::{Candidate, RequestFacts, Target},
-    stages::scorers::{Credits, RankTable, SentCredit},
-    tracking::{Lease, Membership, Side},
+    tracking::{
+        rank_credit::{Credits, DispatchCounts, RankTable, SentCredit},
+        Lease, Membership, Side,
+    },
 };
 
 /// What the deciding host sent a row that no report of the row reflects.
@@ -35,27 +37,6 @@ pub struct CreditedDispatches {
     /// a host that can send a request on without reading its prompt states
     /// a text's bytes only where a stage asks.
     pub estimated_tokens: u64,
-}
-
-/// The sends a row holds and their prompt tokens: the two numbers a
-/// document's `sent.` terms read ([`DispatchCreditPass::counts`]). A send
-/// that stated no token count is one of `requests` and adds its estimate,
-/// the bytes of its text over four: [`CreditedDispatches`] states the
-/// stated tokens and the estimates apart, and how many such sends there
-/// are. The pair is closed: a further number goes on
-/// [`CreditedDispatches`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[expect(clippy::exhaustive_structs, reason = "the pair is closed: see its doc")]
-pub struct DispatchCounts {
-    /// The number of sends.
-    pub requests: u32,
-    /// The prompt tokens of the sends: the count each one stated, and for
-    /// a send that stated none the bytes of its text over four. A send of
-    /// no tokens and no text adds none. A stage that reads this number
-    /// asks for each request's size
-    /// ([`Needs::prompt_size`](crate::document::Needs::prompt_size)), as
-    /// the document's two stages do where a term names `sent.tokens`.
-    pub tokens: u64,
 }
 
 /// A profile's two settings on its count of sends, as its document writes
@@ -83,14 +64,14 @@ pub(crate) struct SentSettings {
 /// goes on with that count, and the count built for the document's
 /// readers follows it (`follow`): the readers kept and the readers
 /// built new read one set of entries. Any other count of a new document
-/// takes over the rows' entries of the standing
-/// count under the same two settings, or else of the one that a profile
-/// of its maker's name made, or else of one that no count of the new
-/// document took, and shares them with it
-/// ([`Engine::succeed`](crate::engine::Engine::succeed)). Each count reads them
-/// under its own time limit and its own report delay, and a send that one
-/// read releases has left the other count too: of two report delays, a
-/// read under the shorter ends a send for both counts.
+/// takes over the rows' entries of the standing count under the same two
+/// settings and shares them with it
+/// ([`Engine::succeed`](crate::engine::Engine::succeed)): a send that a
+/// read of one releases has left the other count too. A count under two
+/// settings no standing count has shares none. A standing count has let
+/// go what its own settings ended, so such a count takes a copy of the
+/// sends that stand, of each row those of the standing count that holds
+/// the most, and its own reads let go what its own settings end.
 ///
 /// Two stages of a decision read under the same row sample and clock. With
 /// the same membership, their reads differ only if a send lands or another
@@ -123,17 +104,14 @@ pub struct DispatchCredit {
     /// ([`Self::limited`]).
     limited: bool,
     /// The two settings as the document writes them: a later profile of
-    /// the document that writes the same two reads this count.
-    pub(crate) settings: SentSettings,
-    /// The name of the profile that made the count, the first of its
-    /// readers: a later document's count that finds no standing count
-    /// under its settings is matched by this name
+    /// the document that writes the same two reads this count, and a
+    /// later document's count under the same two takes its entries over
     /// ([`Engine::succeed`](crate::engine::Engine::succeed)).
-    pub(crate) profile: String,
+    pub(crate) settings: SentSettings,
 }
 
 impl DispatchCredit {
-    pub(crate) fn new(profile: &str, settings: SentSettings) -> Self {
+    pub(crate) fn new(settings: SentSettings) -> Self {
         let micros = |ms: u32| u64::from(ms) * 1000;
         Self {
             credits: Credits::default(),
@@ -142,7 +120,6 @@ impl DispatchCredit {
             report_delay_micros: settings.report_delay_ms.map_or(0, micros),
             limited: settings.ttl_ms.is_some() || settings.report_delay_ms.is_some(),
             settings,
-            profile: profile.to_owned(),
         }
     }
 
@@ -176,16 +153,37 @@ impl DispatchCredit {
         debug_assert!(set.is_ok(), "a count follows one count");
     }
 
-    /// Takes over the rows' entries `standing` holds: the map as it
-    /// stands, so both counts credit and release the same entries, and
-    /// each enters a rank the other never saw in a map of its own.
-    /// Neither count follows another: an engine holds the count followed
-    /// in the place of each count that follows, and it alone calls this.
+    /// Takes over the rows' entries `standing` holds, a count under the
+    /// same two settings: the map as it stands, so both counts credit and
+    /// release the same entries, and each enters a rank the other never
+    /// saw in a map of its own. Neither count follows another: an engine
+    /// holds the count followed in the place of each count that follows,
+    /// and it alone calls this. A count an engine kept is the standing
+    /// one itself and takes nothing over: stored over itself, its map
+    /// would lose a rank another thread entered meanwhile.
     pub(crate) fn succeed(&self, standing: &Self) {
+        debug_assert!(!std::ptr::eq(self, standing), "a count kept takes none");
+        debug_assert_eq!(self.settings, standing.settings, "one pair of settings");
         debug_assert!(self.follows.get().is_none(), "an engine's own count");
         debug_assert!(standing.follows.get().is_none(), "an engine's own count");
         let held = standing.credits.tally.load_full();
         self.credits.tally.store(held);
+    }
+
+    /// Takes a copy of the sends the `standing` counts hold, none of them
+    /// under this count's two settings: of each row, the sends of the
+    /// standing count that holds the most there, each at its instant and
+    /// its size ([`Credits::copy_fullest`]). The count shares no entry
+    /// with them: a read of it releases its own alone, and it starts
+    /// empty where no count stands. An engine alone calls this, with its
+    /// own count and a standing engine's own.
+    pub(crate) fn copy_fullest(&self, standing: &[Arc<Self>]) {
+        debug_assert!(self.follows.get().is_none(), "an engine's own count");
+        let standing = standing.iter().map(|count| {
+            debug_assert!(count.follows.get().is_none(), "an engine's own count");
+            &count.credits
+        });
+        self.credits.copy_fullest(standing);
     }
 
     /// Counts one send. `present` is asked only where the send would
@@ -406,4 +404,5 @@ fn reported_through(
 }
 
 #[cfg(test)]
+#[path = "../../tests/unit/tracking/dispatch_credit/tests.rs"]
 mod tests;

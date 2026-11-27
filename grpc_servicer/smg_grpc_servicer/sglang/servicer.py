@@ -79,6 +79,7 @@ from ..constrained_decoding import (
     grammar_start_labels,
     sglang_constrained_decoding_start,
     sglang_grammar_backend,
+    structural_tag_vocabulary_entry,
 )
 from ..mm_item_limits import MM_ITEM_LIMITS_KEY, sglang_item_limits
 from ..pd_pairing import pairing_protocol_from_env
@@ -265,6 +266,11 @@ def _scheduler_abort_detail(finish_reason: dict) -> str:
     return (
         f"the scheduler aborted the request: {finish_reason.get('message') or 'no reason reported'}"
     )
+
+
+def _reads_cache_partition() -> bool:
+    """Whether the installed proto package declares ``GenerateRequest.cache_partition``."""
+    return "cache_partition" in sglang_scheduler_pb2.GenerateRequest.DESCRIPTOR.fields_by_name
 
 
 class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer):
@@ -737,6 +743,10 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         item_limits = sglang_item_limits(self.server_args)
         if item_limits:
             serializable_args[MM_ITEM_LIMITS_KEY] = item_limits
+        # The fields of `GenerateRequest.cache_partition` that this servicer
+        # gives to the scheduler.
+        if _reads_cache_partition():
+            serializable_args["cache_partition_fields"] = "cache_salt,extra_key"
         # The engine's reasoning parser and where it starts a grammar on a
         # thinking prompt (after the thought with a parser, from the first
         # token without), for the gateway to shape a forced tool call's
@@ -748,7 +758,12 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         )
         # The grammar backend the scheduler runs, resolved (the raw argument
         # is None unless set), under the same key the Rust servicer reads.
-        grammar_backend_entry(serializable_args, sglang_grammar_backend(self.server_args))
+        grammar_backend = sglang_grammar_backend(self.server_args)
+        grammar_backend_entry(serializable_args, grammar_backend)
+        # The vocabulary of structural-tag nodes that backend takes, as the
+        # Rust launcher reports it: the Router spells an older xgrammar's
+        # structural tags in the older vocabulary.
+        structural_tag_vocabulary_entry(serializable_args, grammar_backend)
         # The gateway reads this worker's running window (its PD admission
         # bound, its share of the fleet's capacity) from `max_running_requests`
         # here, which is None unless the operator set the flag: the scheduler
@@ -1142,6 +1157,13 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             refuse_hidden_states_above_server_mode()
             refuse_hidden_states_on_this_servicer()
 
+        # An empty string is unset. SGLang's tokenizer manager applies that
+        # rule, and a request on this path does not pass through it.
+        extra_key = cache_salt = None
+        if _reads_cache_partition():
+            extra_key = grpc_req.cache_partition.extra_key or None
+            cache_salt = grpc_req.cache_partition.cache_salt or None
+
         return TokenizedGenerateReqInput(
             rid=grpc_req.request_id,
             input_text=input_text,
@@ -1164,6 +1186,8 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
             require_reasoning=require_reasoning,
+            extra_key=extra_key,
+            cache_salt=cache_salt,
         )
 
     @staticmethod

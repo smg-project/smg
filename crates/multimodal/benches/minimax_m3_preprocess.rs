@@ -126,12 +126,12 @@ fn bench_source_resize(c: &mut Criterion) {
     for (w, h, cap, count, expected_grids) in [
         (224, 224, 2016, 1, [[16, 16], [16, 16]]),
         (1000, 500, 1008, 1, [[36, 72], [36, 72]]),
-        (1920, 1080, 1008, 1, [[40, 72], [40, 72]]),
-        (3840, 2160, 2016, 1, [[80, 144], [80, 144]]),
-        (1000, 50, 1008, 1, [[8, 160], [8, 160]]),
+        (1920, 1080, 1008, 1, [[40, 72], [42, 72]]),
+        (3840, 2160, 2016, 1, [[80, 144], [82, 144]]),
+        (1000, 50, 1008, 1, [[8, 160], [4, 72]]),
         (2000, 100, 1008, 1, [[8, 162], [4, 72]]),
-        (1920, 1080, 1008, 4, [[40, 72], [40, 72]]),
-        (3840, 2160, 2016, 4, [[80, 144], [80, 144]]),
+        (1920, 1080, 1008, 4, [[40, 72], [42, 72]]),
+        (3840, 2160, 2016, 4, [[80, 144], [82, 144]]),
     ] {
         let mut encoded = std::io::Cursor::new(Vec::new());
         make_test_image(w, h)
@@ -191,8 +191,8 @@ fn bench_source_resize(c: &mut Criterion) {
                     futures::future::join_all(jobs).await
                 })
             };
-            // Pin token counts as well as timing: thin images deliberately differ
-            // because the mutually exclusive source branches replace two stages.
+            // Pin token counts as well as timing: the arms differ where the source
+            // policy rounds a side up to the grid or caps an enlarged thin image.
             let [grid_h, grid_w] = expected_grids[usize::from(source_policy)];
             for out in run() {
                 assert_eq!(out.feature_token_counts, vec![grid_h * grid_w / 4]);

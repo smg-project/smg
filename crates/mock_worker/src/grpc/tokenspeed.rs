@@ -17,6 +17,7 @@ use std::{collections::BTreeMap, pin::Pin};
 use enc::token_speed_encoder_server::{TokenSpeedEncoder, TokenSpeedEncoderServer};
 use engine_zmq_adapter::{tensor_dtype_width, wire_tensor_tokenspeed};
 use futures::{Stream, StreamExt};
+use prost::Message;
 use smg_grpc_client::{
     common_proto as common, tokenspeed_encoder_proto as enc,
     tokenspeed_scheduler::tokenspeed_proto as ts,
@@ -27,8 +28,96 @@ use ts::{
     token_speed_scheduler_server::{TokenSpeedScheduler, TokenSpeedSchedulerServer},
 };
 
-use super::{Frame, GenerateInput, LogProbs, MockScheduler, Rendezvous, TokenizerStream};
-use crate::{config::Role, drain::InFlight, engine::KvEventStream, script::MatchedStop};
+use super::{
+    constraint, media_id, media_identity, Frame, GenerateInput, LogProbs, MediaSpan, MockScheduler,
+    Rendezvous, Shaping, TokenizerStream,
+};
+use crate::{
+    config::Role,
+    drain::InFlight,
+    engine::KvEventStream,
+    replay::f32_json,
+    script::{self, MatchedStop},
+};
+
+/// The gRPC paths of this wire's two info calls, as a recorder writes them
+/// beside a record file ([`script::recorded_info`]).
+const MODEL_INFO_CALL: &str = "/tokenspeed.grpc.scheduler.TokenSpeedScheduler/GetModelInfo";
+const SERVER_INFO_CALL: &str = "/tokenspeed.grpc.scheduler.TokenSpeedScheduler/GetServerInfo";
+
+/// The model of a record file made on this wire ([`super::recorded_model`]).
+pub(super) fn recorded_model() -> Option<super::RecordedModel> {
+    let recorded = script::recorded_info(MODEL_INFO_CALL)?;
+    let info = ts::GetModelInfoResponse::decode(recorded.as_slice()).ok()?;
+    Some(super::RecordedModel {
+        max_context_length: info.max_context_length,
+        max_req_input_len: info.max_req_input_len,
+        vocab_size: info.vocab_size,
+        supports_vision: info.supports_vision,
+        model_type: info.model_type,
+        architectures: info.architectures,
+        eos_token_ids: info.eos_token_ids,
+        pad_token_id: info.pad_token_id,
+        bos_token_id: info.bos_token_id,
+        default_sampling_params_json: info.default_sampling_params_json,
+    })
+}
+
+/// What a `Generate` request asks beyond its prompt, under the names every
+/// wire's recorded lines use (`recorded.asked`): the recorder writes it and a
+/// replay keys on it ([`script::ask_fold`]). A media item reads as its
+/// content hash in hex ([`media_id`]).
+pub(super) fn asked(request: &ts::GenerateRequest) -> serde_json::Value {
+    use ts::sampling_params::Constraint;
+    let media: Vec<String> = request
+        .mm_inputs
+        .iter()
+        .flat_map(|inputs| &inputs.items)
+        .map(|item| {
+            let hash: String = item
+                .content_hash
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            media_id(&hash, &[])
+        })
+        .collect();
+    let unset = ts::SamplingParams::default();
+    let params = request.sampling_params.as_ref().unwrap_or(&unset);
+    let shaping = Shaping {
+        min_p: params.min_p.unwrap_or(0.0),
+        frequency_penalty: params.frequency_penalty.unwrap_or(0.0),
+        presence_penalty: params.presence_penalty.unwrap_or(0.0),
+        repetition_penalty: params.repetition_penalty.unwrap_or(1.0),
+        min_new_tokens: params.min_new_tokens,
+        ignore_eos: params.ignore_eos,
+        no_stop_trim: params.no_stop_trim,
+        logit_bias: (params.logit_bias.iter())
+            .map(|(token, bias)| (token.clone(), *bias))
+            .collect(),
+        score_ids: &request.token_ids_logprob,
+    };
+    shaping.join(serde_json::json!({
+        "stream": request.stream,
+        "max_new_tokens": params.max_new_tokens,
+        "n": params.n,
+        "temperature": params.temperature.map(f32_json),
+        "top_p": params.top_p.map(f32_json),
+        "top_k": params.top_k,
+        "seed": params.sampling_seed,
+        "stop": params.stop,
+        "stop_token_ids": params.stop_token_ids,
+        "logprobs": request.return_logprob.then_some(request.top_logprobs_num),
+        "media": media.len(),
+        "media_ids": media,
+        "constraint": params.constraint.as_ref().map(|c| match c {
+            Constraint::JsonSchema(v) => constraint("json_schema", v.as_str()),
+            Constraint::Regex(v) => constraint("regex", v.as_str()),
+            Constraint::EbnfGrammar(v) => constraint("ebnf_grammar", v.as_str()),
+            Constraint::StructuralTag(v) => constraint("structural_tag", v.as_str()),
+        }),
+    }))
+}
 
 pub(super) type Server = TokenSpeedSchedulerServer<MockScheduler>;
 /// The encoder service an encode worker mounts beside [`Server`].
@@ -63,6 +152,24 @@ impl TokenSpeedScheduler for MockScheduler {
         }
         check_encode_bootstrap(&req)?;
         check_mm_inputs(&req, self.cfg.role)?;
+        let ask = script::recorded().then(|| script::ask_fold(&asked(&req)));
+        // An item's content hash, with its modality, keys each of the item's
+        // placeholder spans.
+        let media: Vec<MediaSpan> = req
+            .mm_inputs
+            .iter()
+            .flat_map(|mm| &mm.items)
+            .flat_map(|item| {
+                let identity = media_identity(&item.content_hash)
+                    .wrapping_add(u64::from(item.modality.unsigned_abs()));
+                item.placeholders.iter().map(move |span| MediaSpan {
+                    identity,
+                    offset: span.offset,
+                    length: span.length,
+                    slot: item.placeholder_token_id,
+                })
+            })
+            .collect();
         let tokenized = req.tokenized.unwrap_or_default();
         let params = req.sampling_params.unwrap_or_default();
         let rendezvous = req
@@ -88,6 +195,8 @@ impl TokenSpeedScheduler for MockScheduler {
                 score_ids: Vec::new(),
                 pin: req.data_parallel_rank,
                 rendezvous,
+                media: Box::new(move || media),
+                ask,
             })
             .await?;
         let request_id = req.request_id;
@@ -124,7 +233,18 @@ impl TokenSpeedScheduler for MockScheduler {
         _request: Request<ts::GetModelInfoRequest>,
     ) -> Result<Response<ts::GetModelInfoResponse>, Status> {
         self.overrides.model_info().refusal("model info")?;
-        Ok(Response::new(ts::GetModelInfoResponse {
+        // A replay of a record file made on this wire answers what the
+        // recorded engine did; a tokenizer stated on the command line is the
+        // one of this host, so its path goes in place of the engine's own.
+        if let Some(recorded) = script::recorded_info(MODEL_INFO_CALL) {
+            let mut info = ts::GetModelInfoResponse::decode(recorded.as_slice())
+                .map_err(|e| Status::internal(format!("the recorded model info: {e}")))?;
+            if self.cfg.tokenizer_path != self.cfg.model_id {
+                info.tokenizer_path.clone_from(&self.cfg.tokenizer_path);
+            }
+            return Ok(Response::new(info));
+        }
+        let mut info = ts::GetModelInfoResponse {
             model_path: self.cfg.model_id.clone(),
             tokenizer_path: self.cfg.tokenizer_path.clone(),
             served_model_name: self.cfg.model_id.clone(),
@@ -140,7 +260,20 @@ impl TokenSpeedScheduler for MockScheduler {
             default_sampling_params_json: self.cfg.default_sampling_params_json.clone(),
             supports_vision: self.overrides.info_bool("supports_vision").unwrap_or(false),
             ..Default::default()
-        }))
+        };
+        if let Some(model) = super::recorded_model() {
+            info.max_context_length = model.max_context_length;
+            info.max_req_input_len = model.max_req_input_len;
+            info.vocab_size = model.vocab_size;
+            info.supports_vision = model.supports_vision;
+            info.model_type = model.model_type;
+            info.architectures = model.architectures;
+            info.eos_token_ids = model.eos_token_ids;
+            info.pad_token_id = model.pad_token_id;
+            info.bos_token_id = model.bos_token_id;
+            info.default_sampling_params_json = model.default_sampling_params_json;
+        }
+        Ok(Response::new(info))
     }
 
     async fn get_server_info(
@@ -148,6 +281,11 @@ impl TokenSpeedScheduler for MockScheduler {
         _request: Request<ts::GetServerInfoRequest>,
     ) -> Result<Response<ts::GetServerInfoResponse>, Status> {
         self.overrides.server_info().refusal("server info")?;
+        if let Some(recorded) = script::recorded_info(SERVER_INFO_CALL) {
+            return ts::GetServerInfoResponse::decode(recorded.as_slice())
+                .map(Response::new)
+                .map_err(|e| Status::internal(format!("the recorded server info: {e}")));
+        }
         Ok(Response::new(ts::GetServerInfoResponse {
             server_args: self.server_args(),
             scheduler_info: None,
@@ -1085,5 +1223,105 @@ mod tests {
                 && status.message().contains("remote payload"),
             "{status:?}"
         );
+    }
+
+    /// The realistic engine keys a media item's tokens by the item's content
+    /// hash: the same item is served from the cache, another item under the
+    /// same placeholder id parts the prompt at the item's first token.
+    #[tokio::test]
+    async fn a_media_items_tokens_are_cached_by_the_item() {
+        let (service, _stop) = MockScheduler::for_tests(
+            Config {
+                realistic: true,
+                engine: crate::engine::EngineParams {
+                    timing: crate::engine::TimingModel::linear(),
+                    ..Default::default()
+                },
+                ..Config::default()
+            },
+            65_262,
+        );
+        // A block of text, two blocks under the placeholder id, text again.
+        let ids: Vec<u32> = (100..116).chain([9; 32]).chain(200..219).collect();
+        let mut cached = Vec::new();
+        // The last request carries the hash of the one before it under
+        // another modality: another item.
+        for (id, hash, modality) in [
+            ("tw-media-a1", 1, common::Modality::Image),
+            ("tw-media-a2", 1, common::Modality::Image),
+            ("tw-media-b", 2, common::Modality::Image),
+            ("tw-media-video", 2, common::Modality::Video),
+        ] {
+            let mut item = image_item(16, 32);
+            item.content_hash = vec![hash; 8];
+            item.modality = modality as i32;
+            let mut frames = service
+                .generate(Request::new(with_items(request(id, &ids), vec![item])))
+                .await
+                .expect("accepted")
+                .into_inner();
+            while frames.next().await.is_some() {}
+            cached.push(
+                crate::engine::records_since(0, usize::MAX)
+                    .into_iter()
+                    .find(|record| record.request_id == id)
+                    .map(|record| record.cached_tokens),
+            );
+        }
+        assert_eq!(cached, [Some(0), Some(64), Some(16), Some(16)]);
+    }
+
+    /// A prefill worker under `--prefill-engine true` keys a media item's
+    /// tokens by the item as a regular worker does: the same item is served
+    /// from the cache, another item parts the prompt at its first token.
+    #[tokio::test]
+    async fn a_prefill_worker_on_its_engine_caches_a_media_items_tokens_by_the_item() {
+        let (service, _stop) = MockScheduler::for_tests(
+            Config {
+                realistic: true,
+                role: Some(Role::Prefill),
+                prefill_engine: true,
+                engine: crate::engine::EngineParams {
+                    timing: crate::engine::TimingModel::linear(),
+                    ..Default::default()
+                },
+                ..Config::default()
+            },
+            65_264,
+        );
+        // A block of text, two blocks under the placeholder id, text again.
+        let ids: Vec<u32> = (100..116).chain([9; 32]).chain(200..219).collect();
+        let mut cached = Vec::new();
+        // The last request carries the hash of the one before it under
+        // another modality: another item.
+        for (id, hash, modality) in [
+            ("tw-prefill-media-a1", 1, common::Modality::Image),
+            ("tw-prefill-media-a2", 1, common::Modality::Image),
+            ("tw-prefill-media-b", 2, common::Modality::Image),
+            ("tw-prefill-media-video", 2, common::Modality::Video),
+        ] {
+            let mut item = image_item(16, 32);
+            item.content_hash = vec![hash; 8];
+            item.modality = modality as i32;
+            let mut req = with_items(request(id, &ids), vec![item]);
+            req.kv_bootstrap_info = Some(ts::KvBootstrapInfo {
+                bootstrap_host: "127.0.0.1".to_string(),
+                bootstrap_port: 8998,
+                bootstrap_room: 7,
+            });
+            let mut frames = service
+                .generate(Request::new(req))
+                .await
+                .expect("accepted")
+                .into_inner();
+            while frames.next().await.is_some() {}
+            cached.push(
+                crate::engine::records_since(0, usize::MAX)
+                    .into_iter()
+                    .find(|record| record.request_id == id)
+                    .map(|record| record.cached_tokens),
+            );
+        }
+        assert_eq!(cached, [Some(0), Some(64), Some(16), Some(16)]);
     }
 }

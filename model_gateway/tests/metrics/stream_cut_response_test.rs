@@ -19,8 +19,11 @@ use http_body_util::BodyExt;
 use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
 use serde_json::{json, Value};
+use serial_test::serial;
 use smg::{
-    middleware::AuthConfig,
+    app_context::AppContext,
+    config::RouterConfigBuilder,
+    middleware::{AdmissionQueue, AuthConfig},
     routers::RouterFactory,
     server::{build_app, health::ProbeState, AppState},
 };
@@ -39,10 +42,12 @@ const MODEL: &str = "stream-cut-count-test-model";
 /// chat and text completions, the Messages route and the native generate
 /// route all end a cut stream with an error event (the first three then
 /// `[DONE]`; Messages ends on its `error` event). The last flag says whether
-/// this test alone writes the route's clean `200` row in this binary: the
+/// no other test writes the route's clean `200` row while this one runs: the
 /// worker request counter test sends non-streamed `/generate` requests
 /// through the same recorder, so on that route only the `stream_error` row,
-/// which no other test writes, is read.
+/// which no other test writes, is read. The dispatch wait tests answer chat
+/// requests through it too; they run under this test's `serial` key, never
+/// beside it.
 fn routes() -> Vec<(&'static str, Value, bool, bool)> {
     let prompt = "count to twenty";
     vec![
@@ -75,8 +80,8 @@ fn routes() -> Vec<(&'static str, Value, bool, bool)> {
 
 /// An in-process realistic mock engine with its admin API, both stopped
 /// when the test ends.
-struct MockEngine {
-    port: u16,
+pub(super) struct MockEngine {
+    pub(super) port: u16,
     admin_port: u16,
     name: String,
     client: reqwest::Client,
@@ -91,7 +96,7 @@ impl MockEngine {
         reason = "test helper: the serve tasks end with their stop signals, which the fixture \
                   sends when it is dropped; a fixture that does not come up fails the test"
     )]
-    async fn start() -> Self {
+    pub(super) async fn start(model: &str) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind the mock engine");
@@ -116,8 +121,8 @@ impl MockEngine {
             zmq_handshake: None,
             zmq_count: 0,
             zmq_start_index: 0,
-            model_id: MODEL.to_string(),
-            tokenizer_path: MODEL.to_string(),
+            model_id: model.to_string(),
+            tokenizer_path: model.to_string(),
             gen_delay: Duration::ZERO,
             output_tokens: 16,
             realistic: true,
@@ -202,7 +207,7 @@ impl MockEngine {
         );
     }
 
-    async fn stop(mut self) {
+    pub(super) async fn stop(mut self) {
         if let Some((stop, stop_admin)) = self.stop.take() {
             let _ = stop.send(());
             let _ = stop_admin.send(());
@@ -215,27 +220,57 @@ impl MockEngine {
 }
 
 /// The gateway's HTTP app (every layer of the edge, the metrics layer at
-/// its outside) over a gRPC regular router with the one worker at `port`.
+/// its outside) over a gRPC regular router with the one worker at `port`,
+/// which serves `model`.
+pub(super) async fn gateway_app(port: u16, model: &str) -> axum::Router {
+    gateway_app_over(grpc_router_config(), port, model).await.0
+}
+
+/// [`gateway_app`] over `config` (its mode, policy and retries are set
+/// here), with the context the app is built from. A configuration that
+/// bounds the requests in flight gets the admission queue it names, as the
+/// server builds it.
+pub(super) async fn gateway_app_over(
+    config: RouterConfigBuilder,
+    port: u16,
+    model: &str,
+) -> (axum::Router, Arc<AppContext>) {
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(ScriptedTokenizer::from_chunks(
+        (0..32).map(|i| format!("w{i} ")).collect(),
+    ));
+    gateway_app_with(config, port, model, tokenizer).await
+}
+
+/// [`gateway_app_over`] with `tokenizer` as the one the gateway reads
+/// `model` with.
 #[expect(
     clippy::expect_used,
     reason = "test helper: an app that does not build fails the fixture"
 )]
-async fn gateway_app(port: u16) -> axum::Router {
-    let config = grpc_router_config()
+pub(super) async fn gateway_app_with(
+    config: RouterConfigBuilder,
+    port: u16,
+    model: &str,
+    tokenizer: Arc<dyn Tokenizer>,
+) -> (axum::Router, Arc<AppContext>) {
+    let config = config
         .regular_mode(vec![])
         .random_policy()
         .disable_retries()
         .build_unchecked();
-    let tokenizer: Arc<dyn Tokenizer> = Arc::new(ScriptedTokenizer::from_chunks(
-        (0..32).map(|i| format!("w{i} ")).collect(),
-    ));
-    let app_context = grpc_test_context_with_tokenizer(config, MODEL, tokenizer).await;
+    let (queue_size, queue_timeout) = (
+        config.queue_size,
+        Duration::from_secs(config.queue_timeout_secs),
+    );
+    let app_context = grpc_test_context_with_tokenizer(config, model, tokenizer).await;
+    let admission_queue = (app_context.rate_limiter.is_some() && queue_size > 0)
+        .then(|| Arc::new(AdmissionQueue::new(queue_size, queue_timeout)));
     let worker: Arc<dyn Worker> = Arc::new(
         grpc_worker(
             port,
             WorkerType::Regular,
             RuntimeType::TokenSpeed,
-            ModelCard::new(MODEL),
+            ModelCard::new(model),
         )
         .build(),
     );
@@ -250,15 +285,15 @@ async fn gateway_app(port: u16) -> axum::Router {
     let app_state = Arc::new(AppState {
         router: Arc::from(router),
         probe_state: ProbeState::new(app_context.inflight_tracker.clone()),
-        context: app_context,
-        admission_queue: None,
+        context: Arc::clone(&app_context),
+        admission_queue,
         gateway: None,
         mesh_handler: None,
         mesh_adapters: None,
         secret_sources: Default::default(),
         secrets: None,
     });
-    build_app(
+    let app = build_app(
         app_state,
         AuthConfig::new(None),
         AuthConfig::new(None),
@@ -267,7 +302,8 @@ async fn gateway_app(port: u16) -> axum::Router {
         vec!["x-request-id".to_string()],
         vec![],
     )
-    .expect("the gateway app")
+    .expect("the gateway app");
+    (app, app_context)
 }
 
 /// One streamed request of `body` to `path` through `app`, read to its end:
@@ -329,9 +365,10 @@ fn count(samples: &[(String, String, u64)], status_code: &str, error_code: &str)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial(chat_response_row)]
 async fn a_stream_the_engine_cut_counts_as_a_body_that_failed() {
-    let engine = MockEngine::start().await;
-    let app = gateway_app(engine.port).await;
+    let engine = MockEngine::start(MODEL).await;
+    let app = gateway_app(engine.port, MODEL).await;
 
     for (path, body, ends_with_done, clean_row_is_ours) in routes() {
         let before = responses_of_path(path);

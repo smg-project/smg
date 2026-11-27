@@ -23,7 +23,7 @@ use smg_grand_central::engine::{
 use smg_worker::identity::basic::{ConnectionMode, RuntimeType, Worker};
 
 use super::placement::{was_tried, PlacementInputs, Stated, WireConstraint};
-use crate::policies::CacheNamespace;
+use crate::{middleware::request_id, policies::CacheNamespace};
 
 /// The workers at the engines a request's failed attempts were sent to,
 /// each by the id the engine knows it by ([`tried_ids`]): every rank of a
@@ -142,6 +142,15 @@ pub(crate) fn stated_facts(workers: &[Arc<dyn Worker>]) -> Box<[FixedFacts]> {
 ///   handed: it lost its suffixes once, and stands only under the sticky
 ///   override. The one exception is the HTTP pair route: its attempt holds
 ///   the derived key alone, and states it as the id.
+/// - The name of the header that holds the gateway's own id of the request
+///   ([`request_id::OWN_REQUEST_ID`]): the id the response's `x-request-id`
+///   header shows. The gateway restates it on the request under a policy
+///   spec that keeps a sample ([`request_id::restate`]), and under no other.
+///   The engine reads the id there, off the same headers, where the
+///   request states no id of its own: it finds a kept decision by the
+///   id, and reads it for nothing else. This function reads the header
+///   for no request. No route hands the id on by a word of its own, and a
+///   request whose route hands no headers holds none.
 /// - The route's own rule for a worker (the candidate filter). The engine
 ///   asks it of the worker it picked, where classic placement narrows the
 ///   list by it.
@@ -189,6 +198,7 @@ pub(crate) fn place_request<'a>(
             .candidate_filter
             .map(|rule| -> WorkerRule<'a> { rule }),
         max_output_tokens: stated.max_output_tokens,
+        explain_id_header: Some(request_id::OWN_REQUEST_ID.as_str()),
         demands: Demands {
             runtime: wire.map_or(0, |wire| wire_number(wire.runtime, wire.connection)),
             ..Demands::default()
@@ -231,13 +241,16 @@ mod tests {
 
     /// Each input a placement function takes reaches the engine under the
     /// field that names it, over the list its caller hands, with the output
-    /// limit its route states for the engine alone, and the request states
-    /// nothing else.
+    /// limit its route states for the engine alone and the name of the
+    /// header that holds the gateway's own id of the request, and the
+    /// request states nothing else.
     #[test]
     fn a_request_states_what_its_placement_inputs_hold() {
         let tokens = [7_u32, 8, 9];
         let mut headers = HeaderMap::new();
         headers.insert("x-smg-routing-key", HeaderValue::from_static("conv"));
+        let own = HeaderValue::from_static("gnt-own");
+        headers.insert(&request_id::OWN_REQUEST_ID, own);
         let partition = CachePartition {
             cache_salt: Some("tenant"),
             extra_key: Some("k"),
@@ -308,6 +321,30 @@ mod tests {
 
         // The body's output limit, as the route stated it for the engine.
         assert_eq!(request.max_output_tokens, 256);
+        // The gateway's own id of the request, by the name of the header
+        // that holds it and by no word: the engine reads the value off the
+        // request's headers, and finds none where the route hands no
+        // headers or they hold none.
+        let own = request_id::OWN_REQUEST_ID.as_str();
+        assert_eq!(request.explain_id, None);
+        assert_eq!(request.explain_id_header, Some(own));
+        assert_eq!(request.headers.header(own), Some(&b"gnt-own"[..]));
+        let bare = PlacementInputs {
+            headers: None,
+            ..inputs
+        };
+        let request_of_none = place_request(MODEL, WorkerLists::None, &bare, &ids, None, stated);
+        assert_eq!(request_of_none.explain_id_header, Some(own));
+        assert_eq!(request_of_none.headers.header(own), None);
+        let unnamed = HeaderMap::new();
+        let unstated = PlacementInputs {
+            headers: Some(&unnamed),
+            ..inputs
+        };
+        let request_of_none =
+            place_request(MODEL, WorkerLists::None, &unstated, &ids, None, stated);
+        assert_eq!(request_of_none.explain_id, None);
+        assert_eq!(request_of_none.headers.header(own), None);
 
         // What neither the inputs nor the route's statement hold is not
         // stated.

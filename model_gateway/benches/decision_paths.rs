@@ -109,9 +109,12 @@
 //! shows the guard to an opaque reader and reports nothing. `answer` is an
 //! answer read whole: the route reports through the answer it keeps past
 //! its guard. It is counted against `kept`, which keeps that answer and
-//! reports nothing. A pair route tells no end yet: under `streamed` its
-//! decode's reader tests the empty handle it is handed, and a pair cell
-//! takes no other form but `passed`.
+//! reports nothing. A pair route tells each side through that side's own
+//! guard. `answer` is a pair read whole. Under `streamed` the prefill is
+//! told through its guard, and the decode's reader reports through the
+//! handle asked of the decode's guard. Both are counted against `passed`. A
+//! pair route keeps no answer, so a pair cell takes no `kept`, and none of
+//! the forms below, which are a single request's.
 //!
 //! `told` is a single request of the gRPC execution stage, behind a
 //! dispatch that answered: the stage asks its selection whether the request
@@ -772,8 +775,12 @@ fn build(cell: &Cell) -> Built {
         "a pair cell sends no routing key"
     );
     assert!(
-        !pair || matches!(end, None | Some(Ended::Passed | Ended::Streamed)),
-        "a pair cell reports through no answer and runs no single request's stage"
+        !pair
+            || matches!(
+                end,
+                None | Some(Ended::Passed | Ended::Streamed | Ended::Answer)
+            ),
+        "a pair cell keeps no answer and runs no single request's stage"
     );
     assert!(
         !(cell.grow > 0 && cell.models > 1),

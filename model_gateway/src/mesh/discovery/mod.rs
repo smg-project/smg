@@ -8,5 +8,5 @@
 mod kubernetes;
 
 #[cfg(feature = "test-util")]
-pub use kubernetes::start_mesh_discovery_with_client;
+pub use kubernetes::start_mesh_discovery_on;
 pub use kubernetes::{start_mesh_discovery, MeshDiscoveryConfig};

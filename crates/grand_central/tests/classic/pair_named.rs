@@ -26,9 +26,11 @@
 //! row's partner lists, each prefill's first partners on the wire that
 //! carries one runtime's request, and a host's admission that answers the
 //! row's bound and rooms. A retry states the two workers its failed attempt
-//! was sent to. Of a refusal the replay holds why, and not the role, as the
+//! was sent to. Of a refusal the replay holds why and the role, as the
 //! pair placement's replay does: the engine sheds a number that reaches no
-//! worker under `target-worker`, which is the gateway's `declined`.
+//! worker under `target-worker`, which is the gateway's `declined`, on the
+//! side the worker was missed on, which is the role of the policy that
+//! refused. The wait at the prefill admission's bound is the prefill's.
 
 use std::sync::Arc;
 
@@ -36,8 +38,8 @@ use serde::Deserialize;
 use smg_grand_central::{
     document::{AppliedSpec, OverloadSpec, PolicySpec},
     engine::{
-        InProcess, LentList, ListCell, PairAdmission, PairLists, PartnerClasses, PlaceRequest,
-        ShedReason, Unplaced, WorkerId, WorkerLists,
+        InProcess, LentList, ListCell, PairAdmission, PairLists, PairSide, PartnerClasses,
+        PlaceRequest, ShedReason, Unplaced, WorkerId, WorkerLists,
     },
 };
 use smg_worker::{
@@ -110,12 +112,13 @@ impl Member {
 }
 
 /// The gateway's answer to one request: the pair, the prefill's place and
-/// then the decode's, or no pair and why.
+/// then the decode's, or no pair, with the role it refuses for (`prefill`
+/// or `decode`) and why.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Answer {
     Pair([usize; 2]),
-    None { why: String },
+    None { role: String, why: String },
 }
 
 /// What a row recorded: each request's answer, in order.
@@ -180,10 +183,9 @@ fn engine(row: &Row) -> Result<&'static InProcess, String> {
         .bindings
         .first_mut()
         .ok_or("the presets bind nothing")?;
-    binding.overload = Some(OverloadSpec {
-        shed_when_all_vetoed: row.shed,
-        ..OverloadSpec::default()
-    });
+    let mut overload = OverloadSpec::default();
+    overload.shed_when_all_vetoed = row.shed;
+    binding.overload = Some(overload);
     let applied = AppliedSpec::validate(&spec).map_err(|err| err.to_string())?;
     // An engine as its host holds it: for the life of the process.
     Ok(Box::leak(Box::new(InProcess::new(applied))))
@@ -261,11 +263,23 @@ impl PairAdmission for Gates<'_> {
     }
 }
 
-/// What this crate answers one request of a row: the pair, or why none.
+/// What this crate answers one request of a row: the pair, or why none
+/// and for which side.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Here {
     Pair([usize; 2]),
-    None(&'static str),
+    None(&'static str, Option<PairSide>),
+}
+
+/// The side the call's answer names: a shed's own, and the prefills' for
+/// the wait at the prefill admission's bound, which alone left the request
+/// no prefill.
+fn side(unplaced: Unplaced) -> Option<PairSide> {
+    match unplaced {
+        Unplaced::PrefillsFull => Some(PairSide::Prefill),
+        Unplaced::Shed { side, .. } => side,
+        _ => None,
+    }
 }
 
 /// Why the gateway answers no pair, read from the call's answer: the wait
@@ -349,18 +363,21 @@ fn run(row: &Row) -> Result<Vec<Here>, String> {
                     at(&decodes, decode)?,
                 ]))
             }
-            Err(unplaced) => Ok(Here::None(why(unplaced))),
+            Err(unplaced) => Ok(Here::None(why(unplaced), side(unplaced))),
         })
         .collect::<Result<Vec<Here>, &str>>()
         .map_err(str::to_string)
 }
 
 /// Whether an answer of this crate is the recorded one: the pair, or no
-/// pair for the recorded reason.
+/// pair for the recorded reason and for the recorded role, which is the
+/// side the answer names.
 fn same(recorded: &Answer, here: &Here) -> bool {
     match (recorded, here) {
         (Answer::Pair(pair), Here::Pair(ours)) => pair == ours,
-        (Answer::None { why }, Here::None(ours)) => why == ours,
+        (Answer::None { role, why }, Here::None(ours, side)) => {
+            why == ours && side.is_some_and(|side| side.as_str() == role)
+        }
         _ => false,
     }
 }

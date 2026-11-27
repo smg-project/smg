@@ -373,10 +373,11 @@ pub(crate) struct ProcessingState {
     pub response: ResponseState,
 }
 
-/// Worker-selection inputs that outlive the parsed request. The prompt's
-/// token ids are not kept: a retry reads them off the retained plan
+/// Worker-selection inputs that outlive the parsed request, and the media's
+/// answer a pair's dispatch reads for its decode side
+/// (`language_model_reads_grids`). The prompt's token ids are not kept: a
+/// retry reads them off the retained plan
 /// ([`ExecutionPlan::routing_token_ids`]).
-#[derive(Default)]
 pub(crate) struct RoutingSnapshot {
     /// Exact context checks retained for initial selection and retries.
     pub context_requirements: super::common::stages::ContextRequirements,
@@ -400,6 +401,16 @@ pub(crate) struct RoutingSnapshot {
     /// mode only), noted at first selection so a retry re-selects under the
     /// same demand.
     pub decode_needs_vision: bool,
+    /// The model's language model computes token positions from the grid
+    /// tensors (the spec's answer the preprocessed media carries,
+    /// `MultimodalIntermediate::language_model_reads_grids`), noted at first
+    /// selection so dispatch picks the decode side's form under the same
+    /// answer: a language-model-only decode worker takes a grid-bearing
+    /// request's decode side stripped only when it is `false`. `true` for a
+    /// request the gateway did not preprocess, the answer that keeps the
+    /// refusal. The snapshot has no default: worker selection writes every
+    /// field.
+    pub language_model_reads_grids: bool,
 }
 
 pub(crate) use crate::routers::common::placement::{PipelinePin, WireConstraint};
@@ -1113,19 +1124,33 @@ impl LoadGuards {
         }
     }
 
-    /// [`Self::new`] for a pair whose decode is owed its ask and its send
-    /// behind its prefill ([`Placed::owed_behind_prefill`]): one request of
-    /// a sequential dispatch that Grand Central placed. A classic
-    /// pair's takes [`Self::new`]. The decode's guard is made
-    /// ahead of its send ([`Placed::ahead`]): the decode is counted from
-    /// here, and the dispatch says its send where the decode goes out
-    /// ([`Self::map_decode`], in `execute_sequential_pd`).
-    pub fn behind_prefill(selection: &WorkerSelection, routing_key: Option<&str>) -> Self {
-        match selection {
+    /// [`Self::scaled`] for a pair whose dispatch says the decode's send
+    /// apart from its guards' making: a pair Grand Central placed
+    /// ([`Placed::owed_behind_prefill`]) whose dispatch may refuse the
+    /// request, or wait for the prefill, ahead of that send. A classic
+    /// pair's takes [`Self::scaled`]. Each decode guard is made ahead of
+    /// its send ([`Placed::ahead`]): the decode is counted from here, once
+    /// for each of the `count` sub-requests, and the dispatch says the send
+    /// where the decode goes out ([`Self::map_decode`]: in
+    /// `execute_sequential_pd` for one request, in `execute_batch_dispatch`
+    /// for a batch).
+    pub fn behind_prefill(
+        selection: &WorkerSelection,
+        routing_key: Option<&str>,
+        count: usize,
+    ) -> Self {
+        let ahead = || match selection {
             WorkerSelection::Disaggregated { decode, .. } => LoadGuards::Disaggregated {
                 _decode: decode.ahead(routing_key),
             },
             single @ WorkerSelection::Single { .. } => Self::new(single, routing_key),
+        };
+        if count <= 1 {
+            ahead()
+        } else {
+            Self::Batch {
+                _guards: (0..count).map(|_| ahead()).collect(),
+            }
         }
     }
 
@@ -1161,6 +1186,17 @@ impl LoadGuards {
                 _guards.decode_guards()
             }
             Self::Single { .. } => None,
+        }
+    }
+
+    /// Whether an admission claim rides with these guards
+    /// ([`Self::admitted`]): the dispatch then holds its rooms at its
+    /// decode's gate.
+    pub(crate) fn claimed(&self) -> bool {
+        match self {
+            Self::Admitted { .. } => true,
+            Self::Traced { _guards, .. } => _guards.claimed(),
+            Self::Single { .. } | Self::Disaggregated { .. } | Self::Batch { .. } => false,
         }
     }
 
@@ -1222,13 +1258,28 @@ impl LoadGuards {
     /// ([`RequestEnd::of`]), asked of its guard under whatever rides with
     /// it. A batch's sub-requests are one placement: the first guard made
     /// from its answer keeps Grand Central's side of it, and that guard
-    /// is asked. A pair's guards hand the empty handle.
+    /// is asked. A pair's guards hand the empty handle here: its decode's
+    /// is asked apart ([`Self::decode_end`]).
     pub(crate) fn end(&self) -> RequestEnd {
         match self {
             Self::Single { _guard } => RequestEnd::of(_guard),
             Self::Batch { _guards } => _guards.first().map_or_else(RequestEnd::default, Self::end),
             Self::Admitted { _guards, .. } | Self::Traced { _guards, .. } => _guards.end(),
             Self::Disaggregated { .. } => RequestEnd::default(),
+        }
+    }
+
+    /// [`Self::end`] for a pair: the handle on the end of the decode these
+    /// guards count. The pair's prefill tells its own end through its load.
+    /// A single request's guards hand the empty handle here.
+    pub(crate) fn decode_end(&self) -> RequestEnd {
+        match self {
+            Self::Disaggregated { _decode } => RequestEnd::of(_decode),
+            Self::Batch { _guards } => _guards
+                .first()
+                .map_or_else(RequestEnd::default, Self::decode_end),
+            Self::Admitted { _guards, .. } | Self::Traced { _guards, .. } => _guards.decode_end(),
+            Self::Single { .. } => RequestEnd::default(),
         }
     }
 }
@@ -1690,7 +1741,8 @@ impl WorkerSelection {
     /// ([`Placed::end_of`]): a request the classic policies placed walks no
     /// guards and takes the empty handle. Every sub-request of a batch
     /// takes the handle of the batch's one placement. A pair takes the
-    /// empty handle: nobody tells the engine a pair's end yet.
+    /// empty handle here: its decode's is asked apart
+    /// ([`Self::decode_end`]).
     #[inline]
     pub(crate) fn end(&self, guards: Option<&LoadGuards>) -> RequestEnd {
         match self {
@@ -1701,16 +1753,44 @@ impl WorkerSelection {
         }
     }
 
-    /// Whether this selection's request tells Grand Central its end:
-    /// the test [`Self::end`] makes ahead of its guards, for a place that
-    /// holds no guards or would make something for the report alone. True
-    /// for a single request whose answer says so ([`Placed::tells_end`]). A
-    /// request the classic policies placed and a pair tell none.
+    /// Whether this selection's single request tells Grand Central its
+    /// end. It is the test [`Self::end`] makes ahead of its guards, for a
+    /// place that holds no guards or would make something for the report
+    /// alone. True for a single request whose answer says so
+    /// ([`Placed::tells_end`]). A request the classic policies placed tells
+    /// none. A pair answers no here: its decode is asked apart
+    /// ([`Self::decode_tells_end`]), so a single request's test reads one
+    /// worker's word and no more.
     #[inline]
     pub(crate) fn tells_end(&self) -> bool {
         match self {
             Self::Single { worker } => worker.tells_end(),
             Self::Disaggregated { .. } => false,
+        }
+    }
+
+    /// [`Self::tells_end`] for a pair: whether its decode tells Grand
+    /// Central its end, by the one word of the decode's answer. The pair's
+    /// prefill tells its own end through its load. A single request answers
+    /// no here.
+    #[inline]
+    pub(crate) fn decode_tells_end(&self) -> bool {
+        match self {
+            Self::Single { .. } => false,
+            Self::Disaggregated { decode, .. } => decode.tells_end(),
+        }
+    }
+
+    /// [`Self::end`] for a pair: the handle its decode tells its end
+    /// through, asked of `guards` ([`LoadGuards::decode_end`]). The plan's
+    /// teller for a pair asks it, behind the plan's test of the decode's
+    /// word: a pair the classic policies placed never comes here.
+    pub(crate) fn decode_end(&self, guards: Option<&LoadGuards>) -> RequestEnd {
+        match self {
+            Self::Single { .. } => RequestEnd::default(),
+            Self::Disaggregated { decode, .. } => {
+                decode.end_of(|| guards.map_or_else(RequestEnd::default, LoadGuards::decode_end))
+            }
         }
     }
 
@@ -2017,22 +2097,23 @@ impl ExecutionResult {
         }
     }
 
-    /// From here on the result tells Grand Central its request's end
-    /// through `end`, the handle the execution plan asked of the attempt's
-    /// guards ([`WorkerSelection::end`]). The one worker's stream tells its
-    /// own end ([`ProtoStream::report_through`]). The streams of a batch
-    /// share its one placement's end ([`SharedEnd`]): the first failure one
-    /// of them meets stands, and the worker's 200 is told once every stream
-    /// ended well. An embedding is its answers, in hand
-    /// and all good: the worker's 200 is told here, the status the circuit
-    /// breaker sampled for them, and nothing for an embedding of no answer,
-    /// which the breaker took no sample of.
+    /// From here on the result tells Grand Central its request's end through
+    /// `end`, the handle the execution plan asked of the attempt's guards
+    /// ([`WorkerSelection::end`]). The one worker's stream tells its own end
+    /// ([`ProtoStream::report_through`]). A pair's decode stream tells the
+    /// decode's end the same way: the handle is the decode's
+    /// ([`WorkerSelection::decode_end`]). The pair's prefill tells its own end
+    /// through its load. The streams of a batch share
+    /// its one placement's end ([`SharedEnd`]): the first failure one of them
+    /// meets stands, and the worker's 200 is told once every stream ended well.
+    /// A batch of pairs shares it among its decode streams. An embedding is its
+    /// answers, in hand and all good. The worker's 200 is told here, the status
+    /// the circuit breaker sampled for them. An embedding of no answer tells
+    /// nothing: the breaker took no sample of it.
     pub(crate) fn report_through(&mut self, end: RequestEnd) {
         match self {
             Self::Single { stream, .. } => stream.report_through(end),
-            // Nobody tells the engine a pair's end yet. The change that
-            // makes a pair's two sides tell theirs turns this arm on.
-            Self::PrefillDecode { .. } => {}
+            Self::PrefillDecode { decode, .. } => decode.report_through(end),
             Self::Embedding { responses } => {
                 if !responses.is_empty() {
                     end.report(200, || true);
@@ -2040,17 +2121,26 @@ impl ExecutionResult {
             }
             Self::Batch { results } if !end.is_empty() => {
                 let shared = SharedEnd::among(end);
+                // Every reader takes its share before a layer is put. A
+                // layer may meet its stream's end where it is put, and a
+                // good end is the batch's only behind every reader's.
+                let streams = results.iter().filter(|result| {
+                    matches!(result, Self::Single { .. } | Self::PrefillDecode { .. })
+                });
+                let mut shares: Vec<_> = streams.map(|_| shared.reader()).collect();
                 for result in results {
                     match result {
                         Self::Single { stream, .. } => {
-                            stream.put_report_layer(RequestEnd::default(), Some(shared.reader()));
+                            stream.put_report_layer(RequestEnd::default(), shares.pop());
                         }
-                        // A single request's batch holds its streams alone.
-                        // A result of another kind takes no share of the
-                        // end: the batch's good end does not wait on it.
-                        Self::PrefillDecode { .. }
-                        | Self::Embedding { .. }
-                        | Self::Batch { .. } => {}
+                        Self::PrefillDecode { decode, .. } => {
+                            decode.put_report_layer(RequestEnd::default(), shares.pop());
+                        }
+                        // A batch holds the streams of its sub-requests
+                        // alone. A result of another kind takes no share
+                        // of the end: the batch's good end does not wait
+                        // on it.
+                        Self::Embedding { .. } | Self::Batch { .. } => {}
                     }
                 }
             }
@@ -2059,16 +2149,33 @@ impl ExecutionResult {
     }
 }
 
-/// A request's wait ahead of the dispatch its answer's clocks start at, as
-/// [`dispatch_wait`] reads it; `None` when no entry stamp is in scope.
-pub(crate) type DispatchWait = Option<std::time::Duration>;
+/// A request's two waits ahead of the dispatch its answer's clocks start at,
+/// as [`dispatch_wait`] reads them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Waited {
+    /// Since the request's entry at the edge: the dispatch wait.
+    pub(crate) since_entry: std::time::Duration,
+    /// The dispatch wait less what the read of the request's body waited for
+    /// the client (see [`RequestStarted::less_upload_wait`]). The same as
+    /// `since_entry` for a generation whose stamp holds no upload wait (a
+    /// body that came whole, no body, a later turn of a tool loop).
+    pub(crate) since_body: std::time::Duration,
+}
+
+/// A request's waits ahead of the dispatch its answer's clocks start at, as
+/// [`dispatch_wait`] reads them; `None` when no entry stamp is in scope.
+pub(crate) type DispatchWait = Option<Waited>;
 
 /// The wait of the request whose answering attempt was dispatched at
 /// `dispatched` (the single RPC's dispatch, the prefill dispatch of a pair):
 /// the time since its entry at the edge ([`RequestStarted`]). The body read,
 /// auth, admission, tokenizing, templating and worker selection are in it,
 /// and so are a refused attempt with its backoff and an encode call that
-/// runs ahead of the pair.
+/// runs ahead of the pair. That is [`Waited::since_entry`];
+/// [`Waited::since_body`] is the same wait less what the read of the request
+/// body waited for the client: the upload is not in it, while auth, the
+/// wait for an admission permit and the WASM modules' run are, on either
+/// side of that read.
 ///
 /// The stamp is scoped to the request's future. The streaming entry points
 /// run inside it, so they read the wait there, against the dispatch instant
@@ -2092,9 +2199,14 @@ pub(crate) type DispatchWait = Option<std::time::Duration>;
 /// task of its own, outside the request's scope, and record no wait. A
 /// pipeline a test runs bare has none, on any turn of a tool loop either,
 /// and its answer records its other families alone.
+#[inline]
 pub(crate) fn dispatch_wait(dispatched: Instant) -> DispatchWait {
-    let entered = RequestStarted::current()?;
-    Some(dispatched.saturating_duration_since(entered))
+    let stamp = RequestStarted::carried()?;
+    let since_entry = dispatched.saturating_duration_since(stamp.instant());
+    Some(Waited {
+        since_entry,
+        since_body: stamp.less_upload_wait(since_entry),
+    })
 }
 
 /// Timing context threaded from PD execution into the streaming layer so the

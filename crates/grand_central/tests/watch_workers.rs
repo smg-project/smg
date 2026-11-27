@@ -46,11 +46,11 @@ const FLEET: usize = 130;
 /// an agreement, so a leader whose lead opens one deadline after its take
 /// is seen in time.
 fn settings() -> ElectionSettings {
-    ElectionSettings {
-        duration: Duration::from_secs(60),
-        renew_period: Duration::from_millis(500),
-        renew_deadline: Duration::from_secs(10),
-    }
+    let mut settings = ElectionSettings::default();
+    settings.duration = Duration::from_secs(60);
+    settings.renew_period = Duration::from_millis(500);
+    settings.renew_deadline = Duration::from_secs(10);
+    settings
 }
 
 async fn client(addr: SocketAddr) -> GrandCentralClient<Channel> {

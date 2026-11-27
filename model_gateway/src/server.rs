@@ -49,6 +49,7 @@ use smg_mesh::{
     ClusterState, MeshServer, MeshServerBuilder, MeshServerConfig, MeshServerHandler,
     PreparedMeshServer,
 };
+use smg_worker::metrics::series as worker_series;
 use tokio::{signal, spawn};
 use tracing::{debug, error, info, warn, Level};
 use wfaas::LoggingSubscriber;
@@ -1519,7 +1520,9 @@ pub fn build_apps(
     // The WASM OnRequest phase buffers the full body into a `Vec<u8>` subject
     // to the WASM manager's `max_body_size` (10MB default). Audio uploads
     // routinely exceed that, so WASM middleware would reject them with 400
-    // before reaching the handler.
+    // before reaching the handler. No request-body deadline either: the
+    // innermost layer only measures how long the read of the upload waited
+    // for the client, for the dispatch wait counted without the upload.
     let multipart_upload_routes = Router::new()
         .route("/v1/audio/transcriptions", post(v1_audio_transcriptions))
         .route_layer(
@@ -1527,7 +1530,10 @@ pub fn build_apps(
                 .layer(InertLayer(serving_auth_layer.clone()))
                 .layer(tenant_resolution_state.layer())
                 .layer(InertLayer(priority_admission))
-                .layer(InertLayer(legacy_limit)),
+                .layer(InertLayer(legacy_limit))
+                .layer(tower::util::MapRequestLayer::new(|request: Request| {
+                    request.map(middleware::body_timeout::upload_measured)
+                })),
         );
 
     let public_routes = Router::new()
@@ -1650,9 +1656,13 @@ pub fn build_apps(
     let access_log_fields = middleware::AccessLogFields::from_fields(
         &app_state.context.router_config.access_log_fields,
     );
+    // Under a policy spec that keeps a sample, each router also gets the
+    // write of a request's own id, directly inside the edge layers
+    // ([`own_request_id_layer`]). Every other gateway installs nothing.
+    let own_request_id = own_request_id_layer(app_state.context.policy_registry.engine());
     let finish = |app: Router<Arc<AppState>>| {
         attach_edge_layers(
-            app,
+            app.layer_if_some(own_request_id.clone()),
             max_payload_size,
             app_state.context.inflight_tracker.clone(),
             request_id_headers.clone(),
@@ -1680,6 +1690,27 @@ pub fn build_apps(
             admin: None,
         })
     }
+}
+
+/// The layer that restates each request's chosen id on the request
+/// (`middleware::request_id::restate`), for a gateway whose Grand Central
+/// keeps a sample of its decisions: `engine` runs under a policy spec whose
+/// `explain.sample` is not zero. `None` for every other gateway, a classic
+/// one among them: it installs nothing and its requests pay nothing for it
+/// (see [`LayerIfSome`]).
+///
+/// The engine reads a host's id of a request only where it keeps a
+/// decision, so the id is stated only there. The engine starts with the
+/// context, ahead of the applications' build, and the answer is taken once,
+/// at that build. A policy spec put in force later on the running engine
+/// does not move it.
+fn own_request_id_layer(
+    engine: Option<&smg_grand_central::engine::InProcess>,
+) -> Option<tower::util::MapRequestLayer<impl Fn(Request) -> Request + Clone + Send + Sync + 'static>>
+{
+    engine
+        .is_some_and(|engine| engine.spec().engine().explain_sample() != 0)
+        .then(|| tower::util::MapRequestLayer::new(middleware::request_id::restate))
 }
 
 /// The middleware every request crosses, matched or not: body limits, the
@@ -1983,8 +2014,9 @@ async fn start_workflow_engines(
         info!("Startup tokenizer job submitted (will complete in background)");
     }
 
-    // A worker that no workflow registers here (a mesh peer's) gets its
-    // model's tokenizer job from the registry's events.
+    // A worker that no workflow registers or removes here (a mesh peer's)
+    // gets its model's tokenizer job and the close of its pooled encode
+    // connections from the registry's events.
     spawn_worker_event_reactions(app_context);
 
     info!(
@@ -2485,7 +2517,7 @@ pub async fn startup_with(
     // resolved router config; per-worker specs still override at request time.
     use crate::routers::grpc::multimodal::{
         enforce_jpeg_decoder_policy, init_mm_settings, init_mm_transport_defaults,
-        report_jpeg_decoder, MultimodalSettings,
+        report_jpeg_decoder, spawn_buffer_pool_trim, MultimodalSettings,
     };
     init_mm_transport_defaults(
         config.router_config.multimodal_tensor_transport,
@@ -2506,6 +2538,15 @@ pub async fn startup_with(
     // before a fatal configuration error.
     let metrics_handle = config.prometheus_config.as_ref().map(|prometheus_config| {
         let handle = metrics::start_prometheus(prometheus_config.clone());
+        // This start hands the handle to its own metrics listener and to
+        // nothing else, and that listener's scrape appends the per-worker
+        // store's text to the exporter's: the histogram families record in
+        // the store's fixed cells, from the first series on.
+        if worker_series::keep_histograms() {
+            debug!("Histogram families record in the per-worker series store's cells");
+        } else {
+            warn!("Histogram families stay with the exporter: one registered there first");
+        }
         metrics::init_startup_series();
         // Under Symphony the series of a request no table reads exist at zero
         // from the start; a table's own follow its model's first registration.
@@ -2555,6 +2596,8 @@ pub async fn startup_with(
     if config.prometheus_config.is_some() {
         history_metrics::spawn_sampler(Arc::clone(&app_context));
     }
+    // The media crate's buffer pool gives its idle buffers back at rest.
+    spawn_buffer_pool_trim();
 
     // Register the CRDT namespaces and start the inbound sync adapters now;
     // gossip starts further down, after the metrics and probe listeners are
@@ -3939,6 +3982,85 @@ mod tests {
                 response.headers().contains_key("x-request-id"),
                 "{path} skipped the edge middleware"
             );
+        }
+    }
+
+    /// The write of a request's own id stands under a policy spec that
+    /// keeps a sample, and under no other. A gateway with no engine and one
+    /// whose policy spec keeps no sample get no layer: a client's value
+    /// under the private name reaches the route as it came. Under a
+    /// sampling spec the route sees the id the response's `x-request-id`
+    /// shows, whatever the client sent under the name. Each router is built
+    /// as `build_apps` finishes one: the write, then the edge layers around
+    /// it.
+    #[tokio::test]
+    async fn the_own_request_id_is_written_under_a_sampling_policy_spec_alone() {
+        use axum::body::Body;
+        use http_body_util::BodyExt;
+        use smg_grand_central::{
+            document::{AppliedSpec, PolicySpec},
+            engine::InProcess,
+        };
+        use tower::ServiceExt;
+
+        /// Every value the route received under the private name, joined
+        /// by `,`.
+        async fn seen(request: Request) -> String {
+            let values: Vec<_> = request
+                .headers()
+                .get_all(&middleware::request_id::OWN_REQUEST_ID)
+                .iter()
+                .map(|value| value.to_str().unwrap_or("?"))
+                .collect();
+            values.join(",")
+        }
+
+        let engine = |sample: u32| {
+            let mut document = PolicySpec::preset("round_robin").expect("a stock preset");
+            document.explain.sample = sample;
+            InProcess::new(AppliedSpec::validate(&document).expect("a valid policy spec"))
+        };
+        let (keeps_none, keeps_all) = (engine(0), engine(1));
+        let own = middleware::request_id::OWN_REQUEST_ID.as_str();
+        for (engine, written) in [
+            (None, false),
+            (Some(&keeps_none), false),
+            (Some(&keeps_all), true),
+        ] {
+            let own_request_id = own_request_id_layer(engine);
+            assert_eq!(own_request_id.is_some(), written);
+            let app = attach_edge_layers(
+                Router::new()
+                    .route("/seen", get(seen))
+                    .layer_if_some(own_request_id),
+                1024,
+                InFlightRequestTracker::new(),
+                vec![],
+                vec![],
+                middleware::AccessLogFields::NONE,
+            );
+            let response = app
+                .oneshot(
+                    http::Request::builder()
+                        .uri("/seen")
+                        .header(own, "a-clients")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let echoed = response.headers()["x-request-id"]
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            let expected = if written {
+                echoed.as_str()
+            } else {
+                "a-clients"
+            };
+            assert_eq!(body, expected, "written: {written}");
         }
     }
 

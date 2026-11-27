@@ -46,9 +46,35 @@ use crate::{
     script::{self, Answer, MatchedStop},
 };
 
+mod record;
 mod sglang;
 mod tokenspeed;
 mod vllm;
+
+/// What a recorded engine's model info says that shapes the requests a
+/// gateway sends on (the sampling defaults, the context length, whether it
+/// takes media, its end tokens), read off whichever wire recorded it: a
+/// replay on another wire states the same in that wire's model info.
+struct RecordedModel {
+    max_context_length: i32,
+    max_req_input_len: i32,
+    vocab_size: i32,
+    supports_vision: bool,
+    model_type: String,
+    architectures: Vec<String>,
+    eos_token_ids: Vec<i32>,
+    pad_token_id: i32,
+    bos_token_id: i32,
+    default_sampling_params_json: String,
+}
+
+/// The model of the record file a replay holds, where an info file stands
+/// beside it ([`script::recorded_info`]).
+fn recorded_model() -> Option<RecordedModel> {
+    vllm::recorded_model()
+        .or_else(tokenspeed::recorded_model)
+        .or_else(sglang::recorded_model)
+}
 
 /// Serve the mock gRPC service of the configured wire on `port` until the
 /// process exits.
@@ -81,12 +107,27 @@ pub async fn serve_with_listener(cfg: Arc<Config>, listener: TcpListener) {
     serve_with_listener_until(cfg, listener, pending()).await;
 }
 
+/// Whether the recorder `cfg` asks for can start: the engine's address
+/// parses and its two files open. `Ok` where `cfg` asks for none. Each gRPC
+/// worker opens the recorder again, and one that cannot would stop while the
+/// process kept running, so a process checks it once as it reads its flags
+/// ([`Config::from_args`]).
+pub(crate) fn recorder_starts(cfg: &Config) -> Result<(), String> {
+    match &cfg.replay.record_upstream {
+        Some(upstream) => record::parts(cfg, upstream).map(drop),
+        None => Ok(()),
+    }
+}
+
 /// [`serve_with_listener`] with the shutdown of [`serve_until`].
 pub async fn serve_with_listener_until(
     cfg: Arc<Config>,
     listener: TcpListener,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) {
+    if let Some(upstream) = cfg.replay.record_upstream.clone() {
+        return record::serve(&cfg, &upstream, listener, shutdown).await;
+    }
     let addr = listener.local_addr().ok();
     let capture = match &cfg.replay.capture {
         Some(path) => match Capture::open(path) {
@@ -146,7 +187,7 @@ pub async fn serve_with_listener_until(
         shutdown.await;
         let _ = stop.send(true);
     };
-    let overrides = for_port(addr.map(|a| a.port()).unwrap_or(0));
+    let overrides = overrides_at_start(&cfg, addr.map(|a| a.port()).unwrap_or(0));
     let wire = cfg.grpc_wire;
     let health = MockHealth {
         overrides: Arc::clone(&overrides),
@@ -408,7 +449,11 @@ impl MockScheduler {
 /// logprobs it wants (the alternatives per token; `None` for none), the token
 /// ids it asks a score for (a prefill-only scoring request's; empty on the
 /// wires without the field), the rank it is pinned to, and the KV
-/// rendezvous a disaggregated request carries ([`Rendezvous`]).
+/// rendezvous a disaggregated request carries ([`Rendezvous`]), and the
+/// placeholder spans of its media items ([`MediaSpan`]; none for a text
+/// request), built where the realistic engine's cache reads them: a
+/// prefill-role or scripted request never asks for them, but a gRPC prefill
+/// worker under `--prefill-engine true` does.
 pub(crate) struct GenerateInput {
     pub(crate) request_id: String,
     pub(crate) prompt_ids: Vec<u32>,
@@ -420,6 +465,133 @@ pub(crate) struct GenerateInput {
     pub(crate) score_ids: Vec<u32>,
     pub(crate) pin: Option<i32>,
     pub(crate) rendezvous: Rendezvous,
+    pub(crate) media: Box<dyn FnOnce() -> Vec<MediaSpan> + Send>,
+    /// The fold of what the request asks beyond its prompt, for the recorded
+    /// lines of a script ([`script::ask_fold`]); read off the request only
+    /// while such lines are held.
+    pub(crate) ask: Option<u64>,
+}
+
+/// One placeholder span of a media item as the realistic engine's cache keys
+/// it: where the item's tokens sit in the prompt, and the item's identity, a
+/// fold of the hash its wire carries ([`media_identity`]). The gateway
+/// writes one placeholder id under every image, so the ids alone read two
+/// requests with the same text and different images as one prompt, where an
+/// engine tells them apart by the item.
+pub(crate) struct MediaSpan {
+    pub(crate) identity: u64,
+    pub(crate) offset: u32,
+    pub(crate) length: u32,
+    /// The placeholder id the wire names for the item, if any: under the
+    /// span the tokens of that id alone are the item's, and a token of
+    /// another id (a marker around the item, the end of a row) stays as
+    /// sent.
+    pub(crate) slot: Option<u32>,
+}
+
+/// The identity a media item's hash gives its tokens: FNV-1a over the hash's
+/// bytes, the same for the same item on every request.
+pub(crate) fn media_identity(hash: &[u8]) -> u64 {
+    hash.iter().fold(0xcbf2_9ce4_8422_2325, |digest, byte| {
+        (digest ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// The overrides of the worker on `port` as it starts: `--supports-vision`
+/// seeds the `supports_vision` entry of its info, which the admin API's info
+/// patch then reads, replaces and removes like an entry of its own.
+fn overrides_at_start(cfg: &Config, port: u16) -> Arc<WorkerOverrides> {
+    let overrides = for_port(port);
+    if let Some(vision) = cfg.supports_vision {
+        overrides.patch_info(&serde_json::Map::from_iter([(
+            "supports_vision".to_string(),
+            serde_json::Value::Bool(vision),
+        )]));
+    }
+    overrides
+}
+
+/// The identity of a media item for [`GenerateInput::ask`]: what the request
+/// states for it (a content hash), else the fold of its payload. A reference
+/// is handed in as a payload, so its URL is folded whatever its length; a
+/// statement past 200 bytes is folded too.
+pub(crate) fn media_id(stated: &str, payload: &[u8]) -> String {
+    match stated.len() {
+        0 => format!("fold:{:016x}", script::fold_bytes(payload)),
+        1..=200 => stated.to_string(),
+        _ => format!("fold:{:016x}", script::fold_bytes(stated.as_bytes())),
+    }
+}
+
+/// A request's constraint for [`GenerateInput::ask`], as `{"kind", "value"}`.
+pub(crate) fn constraint(kind: &str, value: impl Into<serde_json::Value>) -> serde_json::Value {
+    serde_json::json!({ "kind": kind, "value": value.into() })
+}
+
+/// The fields of a request that shape its answer and that most requests
+/// leave alone, as every wire carries them, for [`GenerateInput::ask`].
+pub(crate) struct Shaping<'a> {
+    pub(crate) min_p: f32,
+    pub(crate) frequency_penalty: f32,
+    pub(crate) presence_penalty: f32,
+    pub(crate) repetition_penalty: f32,
+    pub(crate) min_new_tokens: u32,
+    pub(crate) ignore_eos: bool,
+    pub(crate) no_stop_trim: bool,
+    /// The bias of each token the request names, under the token as text.
+    pub(crate) logit_bias: Vec<(String, f32)>,
+    /// The token ids the request asks a score for, on a wire that scores.
+    pub(crate) score_ids: &'a [u32],
+}
+
+impl Shaping<'_> {
+    /// `asked` with each of these fields the request states: one that
+    /// differs from the value that leaves the answer alone (a number a wire
+    /// reads as 0 where the request left it out counts as left out). A
+    /// request that states none asks what it asked without them, so it keeps
+    /// its key on every wire.
+    pub(crate) fn join(self, mut asked: serde_json::Value) -> serde_json::Value {
+        use serde_json::json;
+        let other_than = |alone: f32, value: f32| {
+            (value != 0.0 && value != alone).then(|| crate::replay::f32_json(value))
+        };
+        let stated = [
+            ("min_p", other_than(0.0, self.min_p)),
+            ("frequency_penalty", other_than(0.0, self.frequency_penalty)),
+            ("presence_penalty", other_than(0.0, self.presence_penalty)),
+            (
+                "repetition_penalty",
+                other_than(1.0, self.repetition_penalty),
+            ),
+            (
+                "min_new_tokens",
+                (self.min_new_tokens > 0).then(|| json!(self.min_new_tokens)),
+            ),
+            ("ignore_eos", self.ignore_eos.then(|| json!(true))),
+            ("no_stop_trim", self.no_stop_trim.then(|| json!(true))),
+            (
+                "logit_bias",
+                (!self.logit_bias.is_empty()).then(|| {
+                    let bias = self.logit_bias.iter();
+                    bias.map(|(token, bias)| (token.clone(), crate::replay::f32_json(*bias)))
+                        .collect::<serde_json::Map<String, serde_json::Value>>()
+                        .into()
+                }),
+            ),
+            (
+                "token_ids_logprob",
+                (!self.score_ids.is_empty()).then(|| json!(self.score_ids)),
+            ),
+        ];
+        if let Some(asked) = asked.as_object_mut() {
+            for (name, value) in stated {
+                if let Some(value) = value {
+                    asked.insert(name.to_string(), value);
+                }
+            }
+        }
+        asked
+    }
 }
 
 /// The KV rendezvous a disaggregated request carries, read from each
@@ -638,11 +810,7 @@ impl MockScheduler {
     ) -> Result<bool, Status> {
         let mut finish_error = false;
         if !self.ranks.is_empty() {
-            let (rank, _placed) = self.place(pin)?;
-            if self.ranks.len() > 1 {
-                let line = rank_line(request_id, pin, rank);
-                tracing::info!("{line}");
-            }
+            let (rank, _placed) = self.place_logged(request_id, pin)?;
             finish_error = self.ranks[rank]
                 .engine
                 .admit_without_tokens()
@@ -653,6 +821,77 @@ impl MockScheduler {
             tokio::time::sleep(self.cfg.gen_delay).await;
         }
         Ok(finish_error)
+    }
+
+    /// Place a request on a rank ([`Self::place`]) and, where the worker
+    /// runs several ranks, log the rank it went to.
+    fn place_logged(&self, request_id: &str, pin: Option<i32>) -> Result<(usize, Placed), Status> {
+        let (rank, placed) = self.place(pin)?;
+        if self.ranks.len() > 1 {
+            let line = rank_line(request_id, pin, rank);
+            tracing::info!("{line}");
+        }
+        Ok((rank, placed))
+    }
+
+    /// A prefill worker's answer under `--prefill-engine true`: after the
+    /// fault and admission hooks of the answer without the engine, the
+    /// prompt goes to the rank's engine as a request of no output, so the
+    /// engine prefills it as a regular worker's prompt: its prefix cache,
+    /// its request record, its KV events and its load record see it, and
+    /// the rank counts it as pending prefill until its relay settles: the
+    /// engine's end once the stream is read, or the drop of the stream. The
+    /// answer stays the prompt side's completion alone, sent once the
+    /// engine has prefilled the prompt, with the engine's cached count; the
+    /// engine's prefill paces it in place of the canned delay. An armed
+    /// `finish=error` ends it with `error` whatever the engine's end, as it
+    /// ends the other answer; with none armed, a prompt the engine aborts
+    /// keeps the engine's `abort`. A media item's tokens are keyed by the
+    /// item, as on a regular worker ([`key_by_media`]).
+    async fn prefill_on_engine(
+        &self,
+        mut input: GenerateInput,
+        in_flight: InFlight,
+    ) -> Result<FrameStream, Status> {
+        let (rank, placed) = self.place_logged(&input.request_id, input.pin)?;
+        let rank = &self.ranks[rank];
+        let finish_error = rank
+            .engine
+            .admit_without_tokens()
+            .await
+            .map_err(injected_status)?;
+        let key_ids = key_by_media(
+            self.cfg.grpc_wire == SchedulerWire::Vllm,
+            (input.media)(),
+            &mut input.prompt_ids,
+        );
+        let (relay, frames) =
+            submit_choice(rank, input.request_id, input.prompt_ids, key_ids, 0, 0);
+        let fan_out = FanOut {
+            relays: vec![relay],
+            streams: VecDeque::from([generate_stream(frames, false, None, 0)]),
+            current: None,
+        };
+        // The hook counted an armed `finish=error` as a cut: the prompt
+        // side's completion says `error` whatever the engine's end. With none
+        // armed the engine ends a request of no output at its limit, where
+        // the completion says `stop`; any other end keeps the engine's word
+        // (an abort).
+        let stream = fan_out.map(move |item| {
+            let _placed = &placed;
+            item.map(|frame| match frame {
+                Frame::Complete(mut complete) => {
+                    if finish_error {
+                        complete.finish_reason = "error".to_string();
+                    } else if complete.finish_reason == "length" {
+                        complete.finish_reason = "stop".to_string();
+                    }
+                    Frame::Complete(complete)
+                }
+                chunk @ Frame::Chunk(_) => chunk,
+            })
+        });
+        Ok(Box::pin(in_flight.until_done(stream)))
     }
 
     /// A prefill or decode worker refuses a request without its KV rendezvous,
@@ -717,7 +956,7 @@ impl MockScheduler {
     /// for and this worker's load report counts it.
     pub(crate) async fn generate_frames(
         &self,
-        input: GenerateInput,
+        mut input: GenerateInput,
     ) -> Result<FrameStream, Status> {
         self.ops.record_request();
         self.check_rendezvous(&input.rendezvous)?;
@@ -731,7 +970,12 @@ impl MockScheduler {
         // admission hooks apply as to any request (`admit_without_tokens`):
         // `finish=error` ends the prompt side with `error` whatever the
         // status; with no output to cut after, a status cut fires at once.
+        // Under `--prefill-engine` the realistic engine prefills the prompt
+        // before that answer ([`Self::prefill_on_engine`]).
         if self.cfg.role == Some(Role::Prefill) {
+            if self.cfg.prefill_engine && !self.ranks.is_empty() {
+                return self.prefill_on_engine(input, in_flight).await;
+            }
             let finish_reason = if self
                 .admit_without_tokens(&input.request_id, input.pin)
                 .await?
@@ -764,14 +1008,29 @@ impl MockScheduler {
             &input.prompt_ids,
             &input.rendered,
             input.choices,
+            input.ask,
         )
         .map_err(Status::failed_precondition)?;
         if let Some(answers) = scripted {
-            // The request's limit ends each answer as it would an engine's.
-            let answers = answers
+            // The request's limit ends each answer as it would an engine's,
+            // and a count recorded on another wire reads as this wire's.
+            let answers: Vec<Answer> = answers
                 .into_iter()
-                .map(|answer| answer.cut_to(input.max_new))
+                .map(|answer| answer.cut_to(input.max_new).counted_on(self.cfg.grpc_wire))
                 .collect();
+            // A call the recorded engine failed. With nothing to send ahead
+            // of the status (every choice left open, none with a chunk for
+            // this request) the status answers the call, as the engine
+            // refused it; else it ends the stream behind what the call
+            // delivered.
+            if let Some(refusal) = answers.iter().find_map(|answer| answer.status.as_ref()) {
+                let delivers = |answer: &Answer| {
+                    !answer.left_open() || (input.stream && !answer.chunk_frames().is_empty())
+                };
+                if !answers.iter().any(delivers) {
+                    return Err(refusal.status());
+                }
+            }
             let stream = scripted_stream(
                 answers,
                 input.prompt_ids.len(),
@@ -780,6 +1039,16 @@ impl MockScheduler {
                 input.score_ids,
             );
             return Ok(Box::pin(in_flight.until_done(stream)));
+        }
+        // A recording is replayed whole: a request none of its lines answers
+        // fails as a request an engine took and failed on, with the key it
+        // missed, and reads no answer of the worker's own engine.
+        if let Some(why) = input
+            .ask
+            .and_then(|ask| script::not_recorded(&input.prompt_ids, ask))
+        {
+            tracing::error!("{}: {why}", self.name);
+            return Err(Status::internal(why));
         }
 
         // Realistic mode: place the request on a rank, submit it to that
@@ -793,11 +1062,7 @@ impl MockScheduler {
                     input.choices
                 )));
             }
-            let (rank, placed) = self.place(input.pin)?;
-            if self.ranks.len() > 1 {
-                let line = rank_line(&input.request_id, input.pin, rank);
-                tracing::info!("{line}");
-            }
+            let (rank, placed) = self.place_logged(&input.request_id, input.pin)?;
             let rank = &self.ranks[rank];
             let engine = &rank.engine;
             // The fault hook's answer for this request, when one is armed: a
@@ -846,24 +1111,23 @@ impl MockScheduler {
             // gateway and the engine, as a backlog in transit would hold it;
             // the load record does not see it until it lands.
             engine.admit().await;
-            let prompt_tokens = input.prompt_ids.len() as u64;
+            // The cache keys a media item's tokens by the item
+            // ([`key_by_media`]).
+            let key_ids = key_by_media(
+                self.cfg.grpc_wire == SchedulerWire::Vllm,
+                (input.media)(),
+                &mut input.prompt_ids,
+            );
             for index in 0..choices {
-                let (to_engine, from_engine) = mpsc::unbounded_channel();
-                let (to_frames, frames) = mpsc::unbounded_channel();
-                rank.prefill_pending
-                    .fetch_add(prompt_tokens, Ordering::Relaxed);
-                engine.submit(NewRequest {
-                    request_id: input.request_id.clone(),
-                    prompt_token_ids: input.prompt_ids.clone(),
+                let (relay, frames) = submit_choice(
+                    rank,
+                    input.request_id.clone(),
+                    input.prompt_ids.clone(),
+                    key_ids.clone(),
                     max_new,
-                    choice: index,
-                    events: to_engine,
-                });
-                relays.push(ChoiceRelay {
-                    from_engine: Some(from_engine),
-                    to_frames: Some(to_frames),
-                    share: Some((Arc::clone(&rank.prefill_pending), prompt_tokens)),
-                });
+                    index,
+                );
+                relays.push(relay);
                 streams.push_back(generate_stream(frames, input.stream, cut.clone(), index));
             }
             let stream = stream::unfold(
@@ -1234,7 +1498,7 @@ impl MockScheduler {
             capture: None,
             stopped,
             in_flight: WorkerInFlight::default(),
-            overrides: for_port(port),
+            overrides: overrides_at_start(&cfg, port),
             bootstrap_port: cfg.bootstrap_base_port,
             ops: AdminOps::register(&name),
             name,
@@ -1596,12 +1860,109 @@ fn generate_stream(
     }))
 }
 
+/// The cache keys a media item's tokens by the item: the ids
+/// under each of its placeholder spans give way to one id of its
+/// identity (below 2^30), so the same item is the same prompt
+/// and another item parts the prompt at its first token; where
+/// the span names the item's placeholder id, a token of another
+/// id under it stays. The count stays; the script and a
+/// capture read the ids as sent.
+/// The spans in the prompt's order: a token goes to the first
+/// span over it that takes its id. One sweep over the prompt
+/// finds it: the spans over a position wait in that order under
+/// their slot, and a span that has ended leaves the head of its
+/// row, so the work is the tokens and the spans, whatever the
+/// spans cover.
+/// An engine that writes the item's id under its tokens itself
+/// (SGLang, TokenSpeed) publishes those ids in its stored-block
+/// events, so there the keyed ids are the prompt. The vLLM engine
+/// keeps the ids as sent in its events and puts the item into
+/// the block's hash beside them, so on that wire the engine gets
+/// the keyed ids beside the prompt.
+/// Returns the keyed ids where the wire hands them beside the prompt
+/// (`vllm`); on the other wires the prompt's ids are keyed in place.
+fn key_by_media(
+    vllm: bool,
+    mut media: Vec<MediaSpan>,
+    prompt_ids: &mut Vec<u32>,
+) -> Option<Vec<u32>> {
+    media.sort_by_key(|span| span.offset);
+    let mut key_ids = None;
+    if !media.is_empty() {
+        let ids = if vllm {
+            key_ids.insert(prompt_ids.clone())
+        } else {
+            prompt_ids
+        };
+        let mut open = std::collections::BTreeMap::<Option<u32>, VecDeque<usize>>::new();
+        let mut next = 0;
+        for (at, id) in ids.iter_mut().enumerate() {
+            while media
+                .get(next)
+                .is_some_and(|span| span.offset as usize <= at)
+            {
+                open.entry(media[next].slot).or_default().push_back(next);
+                next += 1;
+            }
+            let mut first = |slot: Option<u32>| {
+                let row = open.get_mut(&slot)?;
+                while row.front().is_some_and(|&span| {
+                    let span = &media[span];
+                    (span.offset as usize).saturating_add(span.length as usize) <= at
+                }) {
+                    row.pop_front();
+                }
+                row.front().copied()
+            };
+            let (any, own) = (first(None), first(Some(*id)));
+            if let Some(span) = any.into_iter().chain(own).min() {
+                *id = (media[span].identity % (1 << 30)) as u32;
+            }
+        }
+    }
+    key_ids
+}
+
+/// Submit one choice of a request to a rank's engine. The prompt counts as
+/// the rank's pending prefill until the choice's relay settles its share;
+/// the engine's events for the choice come back for its frame stream.
+fn submit_choice(
+    rank: &Rank,
+    request_id: String,
+    prompt_ids: Vec<u32>,
+    key_ids: Option<Vec<u32>>,
+    max_new: u32,
+    choice: u32,
+) -> (ChoiceRelay, mpsc::UnboundedReceiver<engine::GenEvent>) {
+    let prompt_tokens = prompt_ids.len() as u64;
+    let (to_engine, from_engine) = mpsc::unbounded_channel();
+    let (to_frames, frames) = mpsc::unbounded_channel();
+    rank.prefill_pending
+        .fetch_add(prompt_tokens, Ordering::Relaxed);
+    let request = NewRequest {
+        request_id,
+        prompt_token_ids: prompt_ids,
+        max_new,
+        choice,
+        events: to_engine,
+    };
+    rank.engine.submit_keyed(request, key_ids);
+    let relay = ChoiceRelay {
+        from_engine: Some(from_engine),
+        to_frames: Some(to_frames),
+        share: Some((Arc::clone(&rank.prefill_pending), prompt_tokens)),
+    };
+    (relay, frames)
+}
+
 /// The generate stream of the scripted answers of a request, one per choice
 /// in order: a chunk per frame when the request streams, then the choice's
 /// completion with its index, with the answer's pause before every frame but
 /// the first; the logprobs ride along when the request asked for them
 /// (`logprobs`, the alternatives per token). The completions that follow no
 /// chunk are what a non-streaming request reads, as it reads the engine's.
+/// Where an answer holds a status, the stream ends with it behind every
+/// choice; a choice the engine left open sends its frames and no completion.
 fn scripted_stream(
     answers: Vec<Answer>,
     prompt_len: usize,
@@ -1623,13 +1984,19 @@ fn scripted_stream(
         stream_chunks: bool,
         logprobs: Option<usize>,
         score_ids: Vec<u32>,
+        /// The status a failed call ends with, behind what it delivered.
+        failed: Option<Status>,
     }
+    let failed = answers
+        .iter()
+        .find_map(|answer| answer.status.as_ref())
+        .map(script::Refusal::status);
     let choices = answers
         .into_iter()
         .enumerate()
         .map(|(index, answer)| Choice {
             index: u32::try_from(index).unwrap_or(u32::MAX),
-            frames: answer.token_frames().into(),
+            frames: answer.chunk_frames().into(),
             answer,
             sent: 0,
             started: false,
@@ -1641,6 +2008,7 @@ fn scripted_stream(
         stream_chunks,
         logprobs,
         score_ids,
+        failed,
     };
     Box::pin(stream::unfold(init, |mut st| async move {
         loop {
@@ -1653,6 +2021,9 @@ fn scripted_stream(
                 // the next choice from its first frame.
                 let choice = st.choices.pop_front()?;
                 let answer = &choice.answer;
+                if answer.left_open() {
+                    continue;
+                }
                 let mut logprobs = st.logprobs.and_then(|top| {
                     answer
                         .logprobs
@@ -1713,7 +2084,10 @@ fn scripted_stream(
                 });
                 return Some((Ok(complete), st));
             }
-            let choice = st.choices.front_mut()?;
+            let Some(choice) = st.choices.front_mut() else {
+                let status = st.failed.take()?;
+                return Some((Err(status), st));
+            };
             let frame = choice.frames.pop_front()?;
             if choice.started && !choice.answer.delay.is_zero() {
                 tokio::time::sleep(choice.answer.delay).await;
@@ -2905,6 +3279,141 @@ mod tests {
         );
     }
 
+    /// An armed `finish=error` is counted as a cut when the prompt is
+    /// admitted, so the prompt side's completion says `error` also where the
+    /// engine ends the prompt another way: here an abort under a pause.
+    #[tokio::test]
+    async fn an_armed_finish_error_ends_an_aborted_prefill_prompt_with_error() {
+        let (service, _stop) = MockScheduler::for_tests(
+            Config {
+                realistic: true,
+                role: Some(Role::Prefill),
+                prefill_engine: true,
+                engine: engine::EngineParams {
+                    timing: engine::TimingModel::linear(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            65_152,
+        );
+        let engine = &service.ranks[0].engine;
+        engine.pause();
+        engine.fault_fail(Some(RequestFault {
+            status: 503,
+            stall: Duration::ZERO,
+            after_tokens: Some(1),
+            finish_error: true,
+            scope: FaultScope::Requests(1),
+        }));
+        let mut request = generate_request("aborted-prompt-side", None, 4);
+        request.kv_bootstrap_info = Some(ts::KvBootstrapInfo {
+            bootstrap_host: "127.0.0.1".to_string(),
+            bootstrap_port: 8998,
+            bootstrap_room: 7,
+        });
+        let stream = service
+            .generate(Request::new(request))
+            .await
+            .expect("accepted")
+            .into_inner();
+        service.abort_everywhere("aborted-prompt-side");
+        let frames: Vec<_> = stream.collect().await;
+        let [Ok(ts::GenerateResponse {
+            response: Some(ts::generate_response::Response::Complete(complete)),
+            ..
+        })] = &frames[..]
+        else {
+            panic!("the prompt side's completion alone: {frames:?}");
+        };
+        assert_eq!(
+            complete.finish_reason, "error",
+            "the word of the counted cut"
+        );
+        assert_eq!(engine.fault_status().cut_total, 1, "one cut, counted once");
+    }
+
+    /// `--prefill-engine true`: a prefill worker's realistic engine prefills
+    /// the prompt as a regular worker's, so a prompt sent again reads its
+    /// blocks from the cache, the request records hold both prompts with
+    /// their cached counts and the KV subscription carries the stored
+    /// blocks, while each answer stays the prompt side's completion alone.
+    #[tokio::test]
+    async fn a_prefill_worker_under_prefill_engine_runs_the_prompt_on_its_engine() {
+        let (service, _stop) = MockScheduler::for_tests(
+            Config {
+                realistic: true,
+                role: Some(Role::Prefill),
+                prefill_engine: true,
+                engine: engine::EngineParams {
+                    timing: engine::TimingModel::linear(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            65_151,
+        );
+        let mut events = service
+            .subscribe_kv_events(Request::new(common::SubscribeKvEventsRequest {
+                start_sequence_number: 0,
+                load_records_before_first_batch: false,
+                loads_only: false,
+            }))
+            .await
+            .expect("subscribed")
+            .into_inner();
+        let mut cached = Vec::new();
+        for id in ["prompt-side-1", "prompt-side-2"] {
+            let mut request = generate_request(id, None, 4);
+            request.tokenized = Some(ts::TokenizedInput {
+                input_ids: (100..180).collect(),
+                ..Default::default()
+            });
+            request.kv_bootstrap_info = Some(ts::KvBootstrapInfo {
+                bootstrap_host: "127.0.0.1".to_string(),
+                bootstrap_port: 8998,
+                bootstrap_room: 7,
+            });
+            let frames: Vec<_> = service
+                .generate(Request::new(request))
+                .await
+                .expect("accepted")
+                .into_inner()
+                .collect()
+                .await;
+            let [Ok(ts::GenerateResponse {
+                response: Some(ts::generate_response::Response::Complete(complete)),
+                ..
+            })] = &frames[..]
+            else {
+                panic!("the prompt side's completion alone: {frames:?}");
+            };
+            assert_eq!(
+                (
+                    complete.finish_reason.as_str(),
+                    complete.prompt_tokens,
+                    complete.completion_tokens,
+                    complete.output_ids.len(),
+                ),
+                ("stop", 80, 0, 0),
+            );
+            cached.push(complete.cached_tokens);
+        }
+        assert_eq!(cached, [0, 64], "the second reads the first's blocks");
+        let recorded: Vec<u32> = engine::records_since(0, usize::MAX)
+            .into_iter()
+            .filter(|record| record.request_id.starts_with("prompt-side-"))
+            .map(|record| record.cached_tokens)
+            .collect();
+        assert_eq!(recorded, [0, 64], "a record a prompt");
+        let batch = tokio::time::timeout(Duration::from_secs(5), events.next())
+            .await
+            .expect("a batch in time")
+            .expect("an item")
+            .expect("a batch");
+        assert!(!batch.events.is_empty(), "the prompt's stored blocks");
+    }
+
     /// Unpinned requests go to the rank holding the fewest of the worker's
     /// requests, the scan start rotating, so three in a row on an idle worker
     /// cover its three ranks; the counts come down when the streams end.
@@ -3904,5 +4413,310 @@ mod tests {
             embedding_of(&long),
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
         );
+    }
+
+    /// A field that shapes an answer joins what a request asks where the
+    /// request states it, under one name on the three wires: a request that
+    /// states none keeps its key, and one that states them has another, the
+    /// same on every wire.
+    #[test]
+    fn a_field_that_shapes_an_answer_joins_the_ask_where_it_is_stated() {
+        use smg_grpc_client::{sglang_proto as sg, vllm_proto as vl};
+        // One client request as a gateway states it on each wire, with the
+        // fields that shape an answer left alone or all of them stated.
+        let on_vllm = |shaped: bool| {
+            let stated = vl::SamplingParams {
+                min_p: 0.1,
+                frequency_penalty: 0.2,
+                presence_penalty: -0.3,
+                repetition_penalty: 1.2,
+                min_tokens: 4,
+                ignore_eos: true,
+                include_stop_str_in_output: true,
+                logit_bias: [(7, 2.0)].into(),
+                ..Default::default()
+            };
+            let alone = vl::SamplingParams {
+                repetition_penalty: 1.0,
+                ..Default::default()
+            };
+            vllm::asked(&vl::GenerateRequest {
+                sampling_params: Some(vl::SamplingParams {
+                    top_p: 1.0,
+                    n: 1,
+                    ..if shaped { stated } else { alone }
+                }),
+                ..Default::default()
+            })
+        };
+        let on_sglang = |shaped: bool| {
+            let stated = sg::SamplingParams {
+                min_p: 0.1,
+                frequency_penalty: 0.2,
+                presence_penalty: -0.3,
+                repetition_penalty: 1.2,
+                min_new_tokens: 4,
+                ignore_eos: true,
+                no_stop_trim: true,
+                logit_bias: [("7".to_string(), 2.0)].into(),
+                ..Default::default()
+            };
+            let alone = sg::SamplingParams {
+                repetition_penalty: 1.0,
+                ..Default::default()
+            };
+            sglang::asked(&sg::GenerateRequest {
+                sampling_params: Some(sg::SamplingParams {
+                    temperature: 1.0,
+                    top_p: 1.0,
+                    top_k: -1,
+                    n: 1,
+                    ..if shaped { stated } else { alone }
+                }),
+                ..Default::default()
+            })
+        };
+        let on_tokenspeed = |shape: &dyn Fn(&mut ts::SamplingParams)| {
+            let mut params = ts::SamplingParams {
+                temperature: Some(1.0),
+                top_p: Some(1.0),
+                top_k: Some(-1),
+                n: 1,
+                min_p: Some(0.0),
+                frequency_penalty: Some(0.0),
+                presence_penalty: Some(0.0),
+                repetition_penalty: Some(1.0),
+                ..Default::default()
+            };
+            shape(&mut params);
+            tokenspeed::asked(&ts::GenerateRequest {
+                sampling_params: Some(params),
+                ..Default::default()
+            })
+        };
+        type Shape = fn(&mut ts::SamplingParams);
+        let each: [Shape; 8] = [
+            |p| p.min_p = Some(0.1),
+            |p| p.frequency_penalty = Some(0.2),
+            |p| p.presence_penalty = Some(-0.3),
+            |p| p.repetition_penalty = Some(1.2),
+            |p| p.min_new_tokens = 4,
+            |p| p.ignore_eos = true,
+            |p| p.no_stop_trim = true,
+            |p| p.logit_bias = [("7".to_string(), 2.0)].into(),
+        ];
+
+        let alone = [on_vllm(false), on_sglang(false), on_tokenspeed(&|_| {})];
+        for asked in &alone {
+            let names = asked.as_object().map(serde_json::Map::len);
+            assert_eq!(
+                names,
+                Some(13),
+                "nothing joins an ask that states none: {asked}"
+            );
+        }
+        let alone = alone.map(|asked| script::ask_fold(&asked));
+        assert_eq!((alone[0], alone[1]), (alone[1], alone[2]), "one key");
+
+        let all = |p: &mut ts::SamplingParams| each.iter().for_each(|shape| shape(p));
+        let shaped = [on_vllm(true), on_sglang(true), on_tokenspeed(&all)]
+            .map(|asked| script::ask_fold(&asked));
+        assert_eq!((shaped[0], shaped[1]), (shaped[1], shaped[2]), "one key");
+        assert_ne!(
+            shaped[0], alone[0],
+            "and not the key of a request that states none"
+        );
+
+        // Each field alone is a key of its own.
+        let mut keys: Vec<u64> = each
+            .iter()
+            .map(|shape| script::ask_fold(&on_tokenspeed(&|p| shape(p))))
+            .collect();
+        keys.push(alone[0]);
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), 9);
+    }
+
+    /// A batch of the vLLM wire that states two hashes asks two media items,
+    /// as the TokenSpeed wire counts the same two, so the two requests share
+    /// what they ask of media. A batch of one hash and a batch that states
+    /// none count one, and a batch that states none holds its place among
+    /// the others.
+    #[test]
+    fn a_batch_of_two_hashes_asks_two_media_items_on_either_wire() {
+        use smg_grpc_client::vllm_proto as vl;
+        let on_vllm = |hashes: &[&str]| {
+            vllm::asked(&vl::GenerateRequest {
+                mm_inputs: Some(vl::MultimodalInputs {
+                    mm_hashes: hashes.iter().map(ToString::to_string).collect(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+        };
+        let item = |hash: u8| ts::MultimodalItem {
+            content_hash: vec![hash],
+            ..Default::default()
+        };
+        let on_tokenspeed = tokenspeed::asked(&ts::GenerateRequest {
+            mm_inputs: Some(ts::MultimodalInputs {
+                items: vec![item(0xaa), item(0xbb)],
+            }),
+            ..Default::default()
+        });
+        let two = on_vllm(&["aa", "bb"]);
+        assert_eq!(two["media"], serde_json::json!(2));
+        assert_eq!(
+            (&two["media"], &two["media_ids"]),
+            (&on_tokenspeed["media"], &on_tokenspeed["media_ids"]),
+            "one count and one list of ids on the two wires"
+        );
+        assert_eq!(on_vllm(&["aa"])["media"], serde_json::json!(1));
+        assert_eq!(on_vllm(&[])["media"], serde_json::json!(1));
+
+        // A batch that states no hash ahead of a hashed one and behind it:
+        // two requests, two keys, each the list the TokenSpeed wire makes of
+        // an item with no hash at that place.
+        let batch = |hashes: &[&str]| vl::MultimodalInputs {
+            mm_hashes: hashes.iter().map(ToString::to_string).collect(),
+            ..Default::default()
+        };
+        let in_turn = |first: &[&str], second: &[&str]| {
+            vllm::asked(&vl::GenerateRequest {
+                mm_inputs: Some(batch(first)),
+                extra_mm_inputs: vec![batch(second)],
+                ..Default::default()
+            })
+        };
+        let (ahead, behind) = (in_turn(&[], &["aa"]), in_turn(&["aa"], &[]));
+        assert_eq!(
+            (&ahead["media"], &behind["media"]),
+            (&two["media"], &two["media"])
+        );
+        assert_ne!(ahead["media_ids"], behind["media_ids"]);
+        assert_ne!(script::ask_fold(&ahead), script::ask_fold(&behind));
+        let unstated_ahead = tokenspeed::asked(&ts::GenerateRequest {
+            mm_inputs: Some(ts::MultimodalInputs {
+                items: vec![ts::MultimodalItem::default(), item(0xaa)],
+            }),
+            ..Default::default()
+        });
+        assert_eq!(ahead["media_ids"], unstated_ahead["media_ids"]);
+    }
+
+    /// A recorded line states its completion count as the wire it was read
+    /// off carried it: a worker of that wire reports it as it stands, were
+    /// it the tokens of the last frame alone. The completion of the other
+    /// two wires carries the total, so a worker of theirs never reports a
+    /// count below the output's ids. A count above them (the engine took a
+    /// matched stop token off) and the count of a hand-written line stand
+    /// on every wire.
+    #[tokio::test]
+    async fn a_recorded_count_stands_on_its_wire_and_is_a_total_on_the_other_two() {
+        // Three frames of one token each, and the count the completion states.
+        let line = |stated: u32, recorded: bool| {
+            let mut line = serde_json::json!({
+                "output_ids": [7, 8, 9], "chunks": [1, 1, 1], "completion_tokens": stated
+            });
+            if recorded {
+                line["recorded"] = serde_json::json!({"wire": "vllm"});
+            }
+            Answer::parse(&line).expect("a line")
+        };
+        for (port, grpc_wire, of_the_last_frame) in [
+            (65_161, SchedulerWire::Vllm, 1),
+            (65_162, SchedulerWire::Sglang, 3),
+            (65_163, SchedulerWire::TokenSpeed, 3),
+        ] {
+            let cfg = Config {
+                grpc_wire,
+                ..Config::default()
+            };
+            let (service, _stop) = MockScheduler::for_tests(cfg, port);
+            for (stated, recorded, reported) in
+                [(1, true, of_the_last_frame), (4, true, 4), (1, false, 1)]
+            {
+                script::enqueue(&service.name, vec![line(stated, recorded)])
+                    .expect("a registered worker");
+                let frames = service
+                    .generate_frames(GenerateInput {
+                        request_id: format!("count-{port}-{stated}"),
+                        prompt_ids: vec![1, 2],
+                        rendered: String::new(),
+                        choices: 1,
+                        max_new: None,
+                        stream: true,
+                        logprobs: None,
+                        score_ids: Vec::new(),
+                        pin: None,
+                        rendezvous: Rendezvous::None,
+                        media: Box::new(Vec::new),
+                        ask: None,
+                    })
+                    .await
+                    .expect("accepted");
+                // The tokens and the count of each frame, the completion last.
+                let counts: Vec<(usize, u32)> = frames
+                    .map(|frame| match frame.expect("a frame") {
+                        Frame::Chunk(chunk) => (chunk.token_ids.len(), chunk.completion_tokens),
+                        Frame::Complete(complete) => {
+                            (complete.output_ids.len(), complete.completion_tokens)
+                        }
+                    })
+                    .collect()
+                    .await;
+                assert_eq!(
+                    counts,
+                    [(1, 1), (1, 2), (1, 3), (3, reported)],
+                    "{grpc_wire:?}: stated {stated}, recorded {recorded}"
+                );
+            }
+        }
+    }
+
+    /// Cuts that hold none of the output: on every wire the stream is a
+    /// chunk of no ids for each cut, and the completion carries the output.
+    #[tokio::test]
+    async fn cuts_that_hold_none_leave_the_output_to_the_completion_on_every_wire() {
+        for (port, grpc_wire) in [
+            (65_171, SchedulerWire::Vllm),
+            (65_172, SchedulerWire::Sglang),
+            (65_173, SchedulerWire::TokenSpeed),
+        ] {
+            let cfg = Config {
+                grpc_wire,
+                ..Config::default()
+            };
+            let (service, _stop) = MockScheduler::for_tests(cfg, port);
+            let line = serde_json::json!({"output_ids": [7, 8, 9], "chunks": [0]});
+            script::enqueue(&service.name, vec![Answer::parse(&line).expect("a line")])
+                .expect("a registered worker");
+            let frames = service
+                .generate_frames(GenerateInput {
+                    request_id: format!("alone-{port}"),
+                    prompt_ids: vec![1, 2],
+                    rendered: String::new(),
+                    choices: 1,
+                    max_new: None,
+                    stream: true,
+                    logprobs: None,
+                    score_ids: Vec::new(),
+                    pin: None,
+                    rendezvous: Rendezvous::None,
+                    media: Box::new(Vec::new),
+                    ask: None,
+                })
+                .await
+                .expect("accepted");
+            let ids: Vec<Vec<u32>> = frames
+                .map(|frame| match frame.expect("a frame") {
+                    Frame::Chunk(chunk) => chunk.token_ids,
+                    Frame::Complete(complete) => complete.output_ids,
+                })
+                .collect()
+                .await;
+            assert_eq!(ids, [vec![], vec![7, 8, 9]], "{grpc_wire:?}");
+        }
     }
 }

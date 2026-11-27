@@ -491,9 +491,12 @@ async fn removed_event_evicts_cached_loads() {
         vec![(Arc::clone(&worker), Arc::new(WorkerLoadResponse::default()))],
     );
     assert!(monitor.load_state.snapshot().contains(&url));
-    monitor
-        .native_loads_memo
-        .insert(url.clone(), NativeLoadsMemo::default());
+    let file = NativeLoadsFile {
+        memo: NativeLoadsMemo::default(),
+        prober: Arc::downgrade(&worker),
+        number: 0,
+    };
+    monitor.native_loads_memo.insert(url.clone(), file);
     let mut dp_loads: HashMap<String, HashMap<isize, isize>> = HashMap::new();
     let mut inner = HashMap::new();
     inner.insert(0, 5);
@@ -528,9 +531,15 @@ async fn stop_all_groups_clears_native_probe_memo() {
     // A worker removed during a `RecvError::Lagged` window never
     // fires an eviction, so the reset path must drop the memo too.
     let (_registry, monitor) = build_monitor();
+    let worker = ready_worker("http://w1:8080", "llama-3");
+    let file = NativeLoadsFile {
+        memo: NativeLoadsMemo::default(),
+        prober: Arc::downgrade(&worker),
+        number: 0,
+    };
     monitor
         .native_loads_memo
-        .insert("http://w1:8080".to_string(), NativeLoadsMemo::default());
+        .insert(worker.url().to_string(), file);
 
     monitor.stop_all_groups();
 

@@ -54,6 +54,16 @@ impl RemoveFromPolicyRegistryStep {
             error!(%error, "Cache-aware worker cleanup task failed");
         }
     }
+
+    /// Closes the encode connections pooled to `url` unless a worker stands
+    /// under it. The pool is keyed by the URL alone: a URL a worker stands
+    /// under again when a removal's close runs keeps its pool, the
+    /// connections dialled before the removal included.
+    pub(crate) fn forget_encode_pool_if_unserved(registry: &WorkerRegistry, url: &str) {
+        if registry.get_by_url(url).is_none() {
+            TokenSpeedEncoderClient::forget_cached(url);
+        }
+    }
 }
 
 #[async_trait]
@@ -90,8 +100,10 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromPolicyRegistryStep {
                 .policy_registry
                 .remove_worker_from_policies(worker.url());
             // Its pooled encode connections go too: the pool is keyed by
-            // this URL and outlived the worker otherwise.
-            TokenSpeedEncoderClient::forget_cached(worker.url());
+            // this URL and outlived the worker otherwise. A worker
+            // registered under the URL while the cleanups above ran keeps
+            // the pool.
+            Self::forget_encode_pool_if_unserved(&app_context.worker_registry, worker.url());
         }
 
         // The removed workers' URLs leave their models' trees too, those of

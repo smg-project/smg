@@ -150,8 +150,8 @@ pub struct WorkerFacts {
     /// shared pointer: a worker that reports none holds one word for it,
     /// and every copy of a row shares the one its worker reported.
     pub pairing: Option<Arc<PairingDescriptor>>,
-    /// The worker's end of the encode handoff, as the handshake learned it;
-    /// the default states none. A worker host derives its encode classes
+    /// The worker's end of the encode handoff, as its registration states
+    /// it; the default states none. A worker host derives its encode classes
     /// from it by the engine's rule, with the engine kind as the runtime
     /// ([`EncodeClasses`](crate::engine::EncodeClasses)). The door drops a
     /// blank connector and reads its name past its blanks.
@@ -172,9 +172,13 @@ pub struct WorkerFacts {
     pub signals: Signals,
     pub health: HealthPolicy,
     pub overload: Overload,
-    /// The seconds a removal waits behind a drain, where the worker's
-    /// registration states another window than the default. A host that
-    /// builds the worker's object from the row gives the object this window.
+    /// The seconds a removal waits behind a drain, where the row states a
+    /// window: a control call's registration states any, and a found
+    /// worker's is a fact of its row where it is not the default. At the
+    /// default a found worker's row keeps the number where the standing
+    /// row states it, and states none at a replacement by id. A host that
+    /// builds the worker's object from the row gives the object this
+    /// window.
     pub drain_settle_secs: Option<u32>,
     /// What the worker states for a request's hard demands beside its
     /// vision ([`DemandFacts`]), in its registering host's own numbers. A
@@ -183,13 +187,18 @@ pub struct WorkerFacts {
     pub demand_facts: DemandFacts,
 }
 
+/// The bytes of a URL: the bound of a worker's URL and of a provider's key.
+const URL_BYTES: usize = 2_048;
+/// The bytes of a label's key: its bound, and the bound of a provider's name.
+const LABEL_KEY_BYTES: usize = 128;
+
 impl WorkerFacts {
     /// A URL's bytes.
-    pub const URL_BYTES: usize = 2_048;
+    pub const URL_BYTES: usize = URL_BYTES;
     /// The bytes of a name: a runtime, a zone, a model id.
     pub const NAME_BYTES: usize = 256;
     /// A label's key, in bytes.
-    pub const LABEL_KEY_BYTES: usize = 128;
+    pub const LABEL_KEY_BYTES: usize = LABEL_KEY_BYTES;
     /// A label's value, in bytes.
     pub const LABEL_VALUE_BYTES: usize = 4_096;
     /// The labels of one row.
@@ -230,9 +239,9 @@ pub enum Registrant {
 
 impl Registrant {
     /// The bytes of a provider's name: a label key's bound.
-    pub const NAME_BYTES: usize = WorkerFacts::LABEL_KEY_BYTES;
+    pub const NAME_BYTES: usize = LABEL_KEY_BYTES;
     /// The bytes of a provider's key for one worker: a URL's bound.
-    pub const KEY_BYTES: usize = WorkerFacts::URL_BYTES;
+    pub const KEY_BYTES: usize = URL_BYTES;
 
     /// The maker `provider` is for the worker it knows by `key`, or the part
     /// that breaks its rule. The rules are checked here and nowhere else, so
@@ -411,24 +420,18 @@ impl MembershipChange {
     }
 }
 
-/// A watcher's tail since the epoch it last saw.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum MembershipTail {
-    /// The changes after the epoch, each with the epoch it made.
-    Changes(Vec<(u64, MembershipChange)>),
-    /// The epoch is past the store's buffer: re-read a snapshot, then tail
-    /// from its epoch (a lagged registry subscriber reconciles the same way
-    /// today).
-    SnapshotRequired,
-}
-
-/// The membership store's write side and its watch.
+/// The membership store's rows, as a host reads them.
+///
+/// The trait holds no write. A host writes a row through the holder of its
+/// worker objects. A store with no holder takes a decided change
+/// ([`crate::store::MemoryStore::follow`]).
 ///
 /// Every write moves the store's epoch; a write of a row's facts moves the
-/// row's revision, a status change does not. A watcher
-/// reads a snapshot with its epoch, then the changes since it; past the
-/// store's buffer it is told to snapshot again, and it snapshots again
-/// where the store took another store's rows ([`Self::history`]). The
+/// row's revision, a status change does not. The store keeps no log of
+/// its changes. A journaled store tells each write to its journal
+/// ([`Journal::member`](super::Journal::member), and a status write
+/// [`Journal::status`](super::Journal::status)), and a watcher reads
+/// the journal's log. A
 /// snapshot carries the
 /// facts the gateways' pools derive from (role, wire modes, engine kind,
 /// reachability), never a pool list.
@@ -449,43 +452,6 @@ pub enum MembershipTail {
 /// decision reads a worker's status on its worker object, which the holder
 /// of the objects moves with the row's.
 pub trait WorkersStore: Send + Sync {
-    /// A registration or its refresh. A new key is `Registered`; the same key
-    /// with another incarnation is `Replaced` (the old id leaves with its
-    /// state); the same key and incarnation refresh the facts in place
-    /// (`Resized` when the data-parallel width moved, else `Relabelled`).
-    /// A new key's row is a control call's ([`Registrant::Control`]).
-    fn upsert(&self, facts: WorkerFacts) -> MembershipChange {
-        self.upsert_by(facts, Registrant::Control)
-    }
-
-    /// [`Self::upsert`] from `maker`: a new key's row is made by it. A row
-    /// that stands under the key keeps the maker it has, through a refresh
-    /// and through a new incarnation, whoever calls. Who may write a row is
-    /// the membership door's test, not the store's.
-    ///
-    /// The store takes the incarnation as stated. A caller numbers a new
-    /// life of a key with a number no life of the key had: the membership
-    /// doors do ([`life`](super::membership::life)), and a row they made
-    /// never comes back under its id.
-    fn upsert_by(&self, facts: WorkerFacts, maker: Registrant) -> MembershipChange;
-
-    /// Change a row's mutable facts; `None` when the row is gone or
-    /// `revision` moved.
-    fn patch(&self, id: WorkerId, patch: WorkerPatch, revision: u64) -> Option<MembershipChange>;
-
-    /// Remove a row; `None` when it is gone already or `revision` moved (a
-    /// removal never takes a newer incarnation of the same key).
-    fn remove(&self, id: WorkerId, revision: u64) -> Option<MembershipChange>;
-
-    /// Move a row's status; `None` when the row is gone, `revision` moved or
-    /// the status already stood (nothing is emitted then, as today).
-    fn set_status(
-        &self,
-        id: WorkerId,
-        status: WorkerStatus,
-        revision: u64,
-    ) -> Option<MembershipChange>;
-
     fn get(&self, id: WorkerId) -> Option<WorkerRow>;
 
     /// The row under a registration key, whatever its incarnation.
@@ -496,22 +462,6 @@ pub trait WorkersStore: Send + Sync {
 
     /// Every row with the epoch it stands at.
     fn all_rows(&self) -> (u64, Vec<WorkerRow>);
-
-    /// The changes after `epoch`, or the instruction to snapshot again.
-    fn changes_since(&self, epoch: u64) -> MembershipTail;
-
-    /// Which history of rows the store holds: it moves when the rows are
-    /// replaced from a snapshot
-    /// ([`MemoryStore::restore_from`](super::MemoryStore::restore_from) or
-    /// [`MemoryStore::watch_from`](super::MemoryStore::watch_from)).
-    /// An epoch names a place in one history, and a row
-    /// under one id and one revision may state other facts in the next, so
-    /// a watcher that keeps its place keeps this beside it and starts again
-    /// from a snapshot, trusting nothing it held, when it moves. A store
-    /// that never takes another's rows stays at `0`.
-    fn history(&self) -> u64 {
-        0
-    }
 
     /// Takes the count the store's host keeps for the row `id`
     /// ([`HostCount`]): the store keeps it equal to the count its leases

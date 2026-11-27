@@ -15,8 +15,11 @@
 //! hash kind: a host that makes its own hashes keeps a text request's
 //! apart from a token request's.
 //!
-//! This is the `tree` kind of the document's index settings
-//! ([`IndexKind`](crate::document::spec::IndexKind)). The `hash` kind is not built.
+//! The record serves both kinds of the document's index settings
+//! ([`IndexKind`](crate::document::spec::IndexKind)). Under `tree` a key is
+//! a block of the request. Under `hash` the engine hands in one key for
+//! each boundary of the view the request reaches, and the record is the
+//! same.
 //!
 //! Nothing here is locked or ordered against another thread. A read takes
 //! the predictor by a shared reference and writes nothing, so an owner may
@@ -1030,4 +1033,5 @@ impl PrefixPredictor {
 }
 
 #[cfg(test)]
+#[path = "../../tests/unit/tracking/prefix_predictor/tests.rs"]
 mod tests;

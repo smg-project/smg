@@ -75,10 +75,7 @@ fn row(position: u32, in_flight: u32) -> Candidate {
 
 /// A value sampled `age_ms` before the decisions' instant.
 fn aged(value: f64, age_ms: u64) -> SignalCell {
-    SignalCell {
-        value,
-        sampled_at_micros: NOW - age_ms * 1_000,
-    }
+    SignalCell::of(value, NOW - age_ms * 1_000)
 }
 
 fn fresh(value: f64) -> SignalCell {
@@ -733,6 +730,20 @@ fn a_profile_whose_stage_names_a_signal_declares_the_cells_and_no_other_does() {
     assert!(!unread.needs().signal_cells);
     let plain = has_room("used: {candidate.in_flight: 1}, capacity: 10");
     assert!(!plain.needs().signal_cells);
+}
+
+/// A scorer that names a signal asks for the reports where a term beside
+/// the signal reads one. A signal is no report, and the count in flight
+/// is none either.
+#[test]
+fn a_scorer_that_names_a_signal_asks_for_the_reports_a_term_beside_it_reads() {
+    let beside = |term: &str| {
+        least_cost(&format!(
+            "terms: {{{term}: 1, signal.{PENDING}: 1}}, unreported: missing-as-zero"
+        ))
+    };
+    assert!(beside("load.queued").needs().loads);
+    assert!(!beside("candidate.in_flight").needs().loads);
 }
 
 /// A document with no `signals` section, as every document stood before

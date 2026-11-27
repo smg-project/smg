@@ -98,6 +98,14 @@ ENV_GPU_VENDOR = "E2E_GPU_VENDOR"  # The GPU vendor a lane runs on — see get_g
 ENV_WORKER_RUST_LOG = "E2E_WORKER_RUST_LOG"
 ENV_SKIP_MODEL_POOL = "SKIP_MODEL_POOL"
 ENV_SKIP_BACKEND_SETUP = "SKIP_BACKEND_SETUP"
+# Opt-in external/persistent worker pool configuration: inline JSON or path to
+# a JSON file listing pre-started HTTP/gRPC workers that WorkerPool can attach
+# to without launching or stopping them. Unset or blank disables external attach.
+ENV_EXTERNAL_WORKERS = "E2E_EXTERNAL_WORKERS"
+# Optional boolean override ("1"/"true"/"yes" or "0"/"false"/"no") for flushing
+# KV cache via the gateway after attaching external workers. Unset follows the
+# external worker configuration (which defaults to enabled).
+ENV_EXTERNAL_WORKERS_FLUSH_CACHE = "E2E_EXTERNAL_WORKERS_FLUSH_CACHE"
 
 
 # Runtime detection helpers

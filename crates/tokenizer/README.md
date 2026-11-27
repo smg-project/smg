@@ -251,13 +251,16 @@ line and exit without them; `encode_cost` (`ENCODE_BENCH_TOKENIZERS`, `ENCODE_BE
 `RUSTFLAGS="-C llvm-args=-enable-machine-outliner=never -C llvm-args=-align-all-functions=6"` (every function on a 64-byte
 boundary, the placement rule the gate file describes), so a pair built without them can read differently. On a pull request
 the workflow builds the pull request's bench binary and the base branch's (the merge commit's first parent) with
-`scripts/bench_gate.py build --gates .github/bench-gates/tokenizer.toml --out <binary> -- cargo bench -p smg --features tokenizers-v1 --bench tokenizer_benchmark --no-run`
+`scripts/bench_gate.py build --gates .github/bench-gates/tokenizer.toml --out <binary> -- cargo bench -p smg --bench tokenizer_benchmark --no-run`
 (`--out` is the path the built executable is copied to; the base with `--sources-from <head>`, so the two differ in the
 measured code alone), then runs them interleaved and compares them with
 `scripts/bench_gate.py run --gates .github/bench-gates/tokenizer.toml --base <binary> --pr <binary> --out <dir> --cwd model_gateway`
 (`--out` is the directory for `results.json` and `gate.md`); the job fails on a gated regression. A push to `main`, the
-weekly schedule and a manual dispatch run the single `cargo bench -p smg --features tokenizers-v1 --bench tokenizer_benchmark`
-without the gate.
+weekly schedule and a manual dispatch run the single `cargo bench -p smg --bench tokenizer_benchmark`
+without the gate. Both are the default build, so the encode rows measure the encoder a default build ships; with the
+`tokenizers-v1` feature the opt-in pipeline would serve this bench's encodes. Every encode row encodes one text again
+and again, so it measures that encoder's warm road (behind the first call its per-thread piece cache answers the pieces
+of the text); no row of the gate times the first encode of a text.
 
 ### Against other implementations
 
@@ -307,7 +310,9 @@ two of the `tokenizers` crate's other model types (BERT base, WordPiece; T5 smal
 BERT base itself since 1.16.0 and hands T5 small to that crate, and the reference hands it both.
 
 Setup: one x86-64 core per cell with its sibling idle, release builds (opt-level 3, fat LTO, one codegen unit; the
-fastokens stack under its own workspace's profile, thin LTO), three rounds and eight on the edge cells, medians. Measured
+fastokens stack under its own workspace's profile, thin LTO), three rounds and eight on the edge cells, medians. A batch
+change between the two releases is shown where both hold ten rounds or every round of one stands beyond every round of
+the other, and reads `-` otherwise. Measured
 on the SMG 1.16.0 release candidate, commit 378df2a52 (2026-11-18); v1.15.0 is the crate at the `v1.15.0` tag, built by
 the same toolchain. Other work ran on the machine's other cores during part of the run, so absolute figures may read
 high; the implementations of a cell run within the same minute, so the margins hold. Numbers are nanoseconds per token
@@ -413,7 +418,7 @@ difference between implementations.
 | MiniMax M3 | -4.9 % | +0.4 % | +0.0 % | -20.0 % | +0.8 % | +29.2 % |
 | MiMo V2.6 | -6.8 % | +0.3 % | +0.0 % | -18.0 % | -6.9 % | +32.6 % |
 | Mistral (tekken) | -12.9 % | +0.1 % | +0.0 % | -2.4 % | +100.8 % | +10.8 % |
-| Gemma 3 | -0.8 % | +0.9 % | +0.0 % | -15.0 % | -7.1 % | +8.9 % |
+| Gemma 3 | -0.8 % | +0.9 % | +0.0 % | -15.0 % | -7.1 % | - |
 | Gemma 4 | +2.5 % | +1.6 % | -0.4 % | -15.0 % | -5.1 % | +49.1 % |
 | Llama 2 (byte fallback) | +2.0 % | +0.7 % | -3.6 % | +0.0 % | +2.8 % | +6.6 % |
 | Kimi K3 | -9.7 % | -0.3 % | +0.0 % | +0.0 % | +0.0 % | +48.6 % |
@@ -446,7 +451,7 @@ difference between implementations.
 - Of 192 encode cells SMG 1.16.0 reads a lower time than every reference in the csv files (fastokens, tiktoken-rs, tokenizers, v1) on 127: 42 of 96 cold and 85 of 96 warm; SMG v1.15.0 in the same rounds reads 83.
 - Against v1.15.0, cold: of 96 encode cells 91 read faster and 0 slower by more than 5 %, 5 within it; the median change is -17.3 %.
 - Against v1.15.0, warm: of 96 encode cells 95 read faster and 0 slower by more than 5 %, 1 within it; the median change is -23.7 %.
-- Against v1.15.0, decode, streaming and batch: of 96 cells 47 read faster and 2 slower by more than 5 %, 47 within it. Slower: Mistral (tekken), 64 streams: first delta, 241.0 against 120.0 ns (+100.8 %); Llama 3.2, 64 streams: first delta, 120.0 against 110.0 ns (+9.1 %, one step of the clock). The step and first-delta cells read a clock that moves in steps of about 10 ns; 9 of the faster cells differ by one step or less.
+- Against v1.15.0, decode, streaming and batch: of 95 cells 46 read faster and 2 slower by more than 5 %, 47 within it. Slower: Mistral (tekken), 64 streams: first delta, 241.0 against 120.0 ns (+100.8 %); Llama 3.2, 64 streams: first delta, 120.0 against 110.0 ns (+9.1 %, one step of the clock). The step and first-delta cells read a clock that moves in steps of about 10 ns; 9 of the faster cells differ by one step or less.
 - Against fastokens, cold: of 96 encode cells SMG is ahead beyond the placement band (20 %) on 40 and behind beyond it on 36; 20 read inside the band (the margins run from -43 % to +1647 %).
 - Against fastokens, warm: of 96 encode cells SMG is ahead beyond the placement band (20 %) on 82 and behind beyond it on 0; 14 read inside the band (the margins run from -14 % to +6873 %).
 - Against v1, cold: of 72 encode cells SMG is ahead beyond the placement band (20 %) on 66 and behind beyond it on 0; 6 read inside the band (the margins run from +9 % to +2120 %).

@@ -87,9 +87,21 @@ pub trait RequestMaker {
     /// An engine that runs a shadow asks this inside the shadow's own
     /// run, behind the live decision of that ask, and only where the
     /// shadow profile reads a ring, the profile that decides the request
-    /// reads none and a worker stands to be placed. A panic here is the
-    /// shadow's fault, and the time it takes is the shadow's: spent, like
-    /// the rest of a shadow's run, ahead of a later ask of the same call.
+    /// reads none and a worker stands to be placed. Under a pair's binding
+    /// it asks this for a side's shadow profile, inside that side's run,
+    /// where neither side's profile reads a ring and the shadow's filters
+    /// kept a worker: one decision may ask a maker for its two sides' shadow
+    /// profiles, which may read the ring by two words (a key's text and
+    /// heads, or the heads of two rules): a maker answers each by the
+    /// profile it names, and what it keeps of one answer is no answer for
+    /// the other. A panic here is the shadow's fault, and the time it
+    /// takes is the shadow's: spent, like the rest of a shadow's run,
+    /// ahead of a later ask of the same call.
+    ///
+    /// There, for a side's shadow profile one of whose filters declares
+    /// the ring need ([`Needs::ring`](crate::document::spec::Needs::ring)),
+    /// it asks this ahead of the shadow's filters, which read the answer:
+    /// it asks whether or not they keep a worker, and once a decision.
     fn shadow_ring<'w>(
         &'w self,
         spec: &'w AppliedSpec,

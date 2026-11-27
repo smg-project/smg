@@ -37,19 +37,19 @@ use std::{
 use net::{http_get, loopback};
 use prost::Message as _;
 use smg_grand_central::{
-    engine::{WireModes, WorkerId},
+    engine::{DemandFacts, WireModes, WorkerId},
     service::{
-        controller::{
-            Config, Controller, ElectionConfig, Error, LeasePlace, Listener, Readiness, Scope,
-            State,
-        },
+        controller::{Config, Controller, Error, LeasePlace, Listener, Readiness, Scope, State},
         elector::{ElectionSettings, Elector, FileLease, TickOutcome},
         proto::{
             self, grand_central_client::GrandCentralClient, replica_frame::Frame,
             replication_event::Event as Sent, worker_event::Event,
         },
     },
-    store::{HealthPolicy, MemoryStore, Registrant, WorkerFacts, WorkerStatus, WorkersStore},
+    store::{
+        EncodeHandoff, EncodeOffer, HealthPolicy, MemoryStore, Registrant, WorkerFacts,
+        WorkerStatus, WorkersStore,
+    },
     worker_host::{HealthAdapter, Members, Objects, SoleLead},
 };
 use smg_worker::health::port::{HealthSink, ProbeAnswer};
@@ -65,23 +65,20 @@ use tonic_health::pb::{
     health_check_response::ServingStatus, health_client::HealthClient, HealthCheckRequest,
 };
 
-/// Long against a loaded host: the leader of the case's start leads to its
-/// end.
+/// Long against a loaded host: the leader of a case's start leads to its
+/// end, unless the case makes it leave. A replica that left its lease
+/// holds its takes back for the duration, so it takes none again inside
+/// the case.
 fn settings() -> ElectionSettings {
-    ElectionSettings {
-        duration: Duration::from_secs(60),
-        renew_period: Duration::from_millis(500),
-        renew_deadline: Duration::from_secs(40),
-    }
+    let mut settings = ElectionSettings::default();
+    settings.duration = Duration::from_secs(60);
+    settings.renew_period = Duration::from_millis(500);
+    settings.renew_deadline = Duration::from_secs(40);
+    settings
 }
 
 fn listener(name: &str, scopes: &[Scope]) -> Listener {
-    Listener {
-        name: name.to_owned(),
-        addr: loopback(),
-        scopes: scopes.to_vec(),
-        tls: None,
-    }
+    Listener::of(name.to_owned(), loopback(), scopes.to_vec(), None)
 }
 
 /// What a case reaches of the controller it runs against.
@@ -129,28 +126,27 @@ where
 {
     // A replica under a shared lease follows, and one that follows names
     // its replication port: a number of the pairs' own.
-    let config = |port| Config {
-        controller_id: "replication-0".to_owned(),
-        listeners: vec![
-            listener("gateway", &[Scope::Gateway]),
-            listener("control", &[Scope::Control]),
-            Listener {
-                addr: SocketAddr::new(LEADER, port),
-                ..listener("replication", &[Scope::Replication])
-            },
-        ],
-        admin: loopback(),
-        shutdown_settle: Duration::from_millis(50),
-        shutdown_grace: Duration::from_secs(5),
-        load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
-        worker_overload: Config::DEFAULT_WORKER_OVERLOAD,
-        decide_shards: 2,
-        discovery: None,
-        election: ElectionConfig {
-            lease: place.clone(),
-            settings: settings(),
-            advertise: None,
-        },
+    let config = |port| {
+        let mut configuration = Config::of(
+            "replication-0".to_owned(),
+            vec![
+                listener("gateway", &[Scope::Gateway]),
+                listener("control", &[Scope::Control]),
+                {
+                    let mut listening = listener("replication", &[Scope::Replication]);
+                    listening.addr = SocketAddr::new(LEADER, port);
+                    listening
+                },
+            ],
+            loopback(),
+        );
+        configuration.shutdown_settle = Duration::from_millis(50);
+        configuration.shutdown_grace = Duration::from_secs(5);
+        configuration.decide_shards = 2;
+        configuration.election.lease = place.clone();
+        configuration.election.settings = settings();
+        configuration.election.advertise = None;
+        configuration
     };
     let mut controller = bind_drawn(LEADER, None, config).await;
     // Each listener takes an identity as told.
@@ -652,6 +648,16 @@ async fn a_standby_is_sent_the_log_from_its_place_and_restored_from_any_other() 
             assert_eq!((beat.first_seq, beat.term), (nth(7), term));
         }
 
+        // A second hello ends the stream.
+        joined
+            .frames
+            .send(proto::ReplicaFrame {
+                frame: Some(Frame::Hello(place(nth(6), term))),
+            })
+            .await
+            .expect("the stream's own channel");
+        assert_eq!(joined.ended().await, Some(Code::FailedPrecondition));
+
         // A standby that saw a later term than this replica leads under.
         let later = proto::ReplicaHello {
             term_seen: term + 1,
@@ -676,8 +682,14 @@ async fn a_standby_is_sent_the_log_from_its_place_and_restored_from_any_other() 
         let named = proto::NotLeader::decode(detail.value.as_slice()).expect("a NotLeader");
         assert_eq!(named.leader_address, "", "this replica knows no leader");
 
+        // The hello's term went to the election, and the leader left its
+        // lease: a stream that stood open under its term ends at its next
+        // look.
+        assert_eq!(fresh.ended().await, Some(Code::Aborted));
+
         // So is one whose place stands under a later term, whatever floor
-        // it states: a deposed leader restores no standby.
+        // it states. A replica that left its lease holds its takes back for
+        // the lease's duration (`settings`), and restores no standby.
         let ahead = proto::ReplicaHello {
             term_seen: term,
             ..place(nth(5), term + 1)
@@ -686,16 +698,6 @@ async fn a_standby_is_sent_the_log_from_its_place_and_restored_from_any_other() 
             panic!("a standby ahead of this replica's term is not served");
         };
         assert_eq!(deposed.code(), Code::FailedPrecondition);
-
-        // A second hello ends the stream.
-        joined
-            .frames
-            .send(proto::ReplicaFrame {
-                frame: Some(Frame::Hello(place(nth(6), term))),
-            })
-            .await
-            .expect("the stream's own channel");
-        assert_eq!(joined.ended().await, Some(Code::FailedPrecondition));
     })
     .await;
 }
@@ -932,7 +934,7 @@ fn churn(leader: &impl Hands, stop: &AtomicBool) -> u32 {
         rounds += 1;
         let index = draw(4) as usize;
         let name = format!("http://w{index}:8000");
-        match (store.by_key(&name), draw(8)) {
+        match (workers.read_row_under(&name), draw(8)) {
             (None, _) | (Some(_), 0) => {
                 lives[index] += 1;
                 lays(leader, facts(&name, lives[index], 0));
@@ -945,7 +947,11 @@ fn churn(leader: &impl Hands, stop: &AtomicBool) -> u32 {
                 lays(leader, facts(&name, lives[index], more));
             }
             (Some(row), 3) => {
-                probed(leader, row.id, row.status != WorkerStatus::Ready);
+                // By the table's status: the object's own leads it. This
+                // thread is the one writer of the leader's rows, so the
+                // table holds the row the holder read a line above.
+                let told = store.get(row.id).expect("the table's row").status;
+                probed(leader, row.id, told != WorkerStatus::Ready);
             }
             // The other half of the draws writes nothing.
             (Some(_), _) => {}
@@ -955,10 +961,10 @@ fn churn(leader: &impl Hands, stop: &AtomicBool) -> u32 {
     rounds
 }
 
-/// Waits, within 20 s, until `store` wrote past position `seq`.
-async fn written_past(store: &MemoryStore, seq: u64) {
+/// Waits, within 20 s, until `replica`'s store wrote past position `seq`.
+async fn written_past(replica: &impl Hands, seq: u64) {
     let deadline = Instant::now() + Duration::from_secs(20);
-    while store.checkpoint().at.seq <= seq {
+    while replica.workers().checkpoint(replica.store()).at.seq <= seq {
         assert!(Instant::now() < deadline, "no write past {seq} in 20 s");
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
@@ -985,12 +991,12 @@ async fn a_snapshot_and_the_batches_after_it_are_the_next_snapshot_under_a_write
             let taken = standby.restored().await.expect("a snapshot");
             // The next snapshot parts from this one by a write: the writer
             // is waited for, never taken to have run meanwhile.
-            written_past(&leader.store, taken.replication_seq).await;
+            written_past(&leader, taken.replication_seq).await;
             streams.push((standby, taken));
         }
         // The events the case counts are waited for, never timed.
         let first = streams[0].1.replication_seq;
-        written_past(&leader.store, first + 100).await;
+        written_past(&leader, first + 100).await;
         stop.store(true, Ordering::Relaxed);
         let rounds = writer.join().expect("the writer");
         let last = snapshot(leader.replication).await.expect("a snapshot");
@@ -1132,13 +1138,19 @@ async fn a_store_past_one_message_restores_a_standby_whole_on_its_stream() {
         let page = 2 * 1024 * 1024 + 64;
         assert!(standby.parts.iter().all(|part| *part <= page));
         // Every row the leader holds, at its head, and no load row.
-        let held = leader.store.checkpoint();
+        let held = leader.workers.checkpoint(&leader.store);
+        // The cut is whole by the case's own count: the wide rows and the
+        // one row of `writes`.
+        assert_eq!(held.rows.len(), 1_501, "every row the case laid");
         let at = (restored.replication_seq, restored.replication_term);
         assert_eq!(at, (held.at.seq, held.at.term));
         assert_eq!(restored.membership_epoch, held.epoch);
         let told: Vec<u64> = restored.workers.iter().map(|row| row.id).collect();
         let rows: Vec<u64> = held.rows.iter().map(|row| row.id.0).collect();
         assert_eq!(told, rows);
+        // The order is held here: the snapshot was sent from such a cut.
+        let keys: Vec<&str> = held.rows.iter().map(|row| &*row.facts.key).collect();
+        assert!(keys.windows(2).all(|pair| pair[0] < pair[1]), "by key");
         assert!(restored.loads.is_empty());
         // The log follows from the snapshot's place, on the same stream.
         turn(&leader, id, 3);
@@ -1239,15 +1251,18 @@ async fn snapshots_numbers(workers: u32) {
 /// 53-byte address, one 36-byte model, four labels, a zone), asked whole
 /// and under a limit of one row. Each line: the rows told and whether a
 /// bound cut them, the answer's bytes, how long the call takes over the
-/// wire (the store's cut, the rows' build, the client's read), and how long
-/// the store's cut takes alone: what a membership write waits behind a
+/// wire (the holder's cut, the rows' build, the client's read), and how long
+/// the holder's cut takes alone: more than a membership write waits behind a
 /// snapshot that copies every row, as a call with no limit and no models
 /// does, and a call let in beside another. A lone call under a limit
 /// copies its limit's worth alone, and a third line asks one row of the
 /// widest list of models a call may state: each row's model is searched
-/// in that list under the membership lock. A last line, with a watch
+/// in that list in the holder's turn. A last line, with a watch
 /// open: one row asked eleven times, where each call shares the cut the
 /// feed keeps and copies nothing.
+///
+/// The cut's own figure holds its sort, which runs behind the holder's
+/// turn: a write waits for the copy of the rows, and not for the sort.
 async fn operators_snapshot_numbers(workers: u32) {
     let dir = tempfile::tempdir().expect("a temp dir");
     with_leader(shared(&dir), |leader| async move {
@@ -1257,7 +1272,7 @@ async fn operators_snapshot_numbers(workers: u32) {
         let mut cuts = Vec::new();
         for _ in 0..11 {
             let began = Instant::now();
-            let cut = leader.store.checkpoint();
+            let cut = leader.workers.checkpoint(&leader.store);
             cuts.push(began.elapsed().as_micros());
             assert_eq!(cut.rows.len(), workers as usize);
         }
@@ -1297,7 +1312,7 @@ async fn operators_snapshot_numbers(workers: u32) {
             micros.sort_unstable();
             writeln!(
                 out,
-                "OPERATORS_SNAPSHOT workers={workers} limit={limit} models={asked} rows={} truncated={} bytes={} median_us={} store_cut_median_us={}",
+                "OPERATORS_SNAPSHOT workers={workers} limit={limit} models={asked} rows={} truncated={} bytes={} median_us={} holder_cut_median_us={}",
                 told.0, told.1, told.2, micros[5], cuts[5]
             )
             .expect("stdout");
@@ -1651,31 +1666,31 @@ impl Replica {
     /// leader, on its standby's address too ([`pair::free`]): the number a
     /// standby of this replica then binds on its own address.
     async fn serve(id: &str, ip: IpAddr, port: u16, place: LeasePlace) -> Self {
-        let listener = |name: &str, scopes: &[Scope], port| Listener {
-            name: name.to_owned(),
-            addr: SocketAddr::new(ip, port),
-            scopes: scopes.to_vec(),
-            tls: None,
+        let listener = |name: &str, scopes: &[Scope], port| {
+            Listener::of(
+                name.to_owned(),
+                SocketAddr::new(ip, port),
+                scopes.to_vec(),
+                None,
+            )
         };
-        let config = |port| Config {
-            controller_id: id.to_owned(),
-            listeners: vec![
-                listener("gateway", &[Scope::Gateway], 0),
-                listener("control", &[Scope::Control], 0),
-                listener("replication", &[Scope::Replication], port),
-            ],
-            admin: SocketAddr::new(ip, 0),
-            shutdown_settle: Duration::from_millis(50),
-            shutdown_grace: Duration::from_secs(5),
-            load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
-            worker_overload: Config::DEFAULT_WORKER_OVERLOAD,
-            decide_shards: 2,
-            discovery: None,
-            election: ElectionConfig {
-                lease: place.clone(),
-                settings: settings(),
-                advertise: None,
-            },
+        let config = |port| {
+            let mut configuration = Config::of(
+                id.to_owned(),
+                vec![
+                    listener("gateway", &[Scope::Gateway], 0),
+                    listener("control", &[Scope::Control], 0),
+                    listener("replication", &[Scope::Replication], port),
+                ],
+                SocketAddr::new(ip, 0),
+            );
+            configuration.shutdown_settle = Duration::from_millis(50);
+            configuration.shutdown_grace = Duration::from_secs(5);
+            configuration.decide_shards = 2;
+            configuration.election.lease = place.clone();
+            configuration.election.settings = settings();
+            configuration.election.advertise = None;
+            configuration
         };
         let mut controller = if port == 0 {
             bind_drawn(ip, (ip == LEADER).then_some(FOLLOWER), config).await
@@ -1744,7 +1759,7 @@ impl Replica {
     /// What the replica holds, without its instants: its place, then its
     /// epoch and its rows.
     fn held(&self) -> ((u64, u64), impl PartialEq + std::fmt::Debug) {
-        let cut = self.store.checkpoint();
+        let cut = self.workers.checkpoint(&self.store);
         let rows: Vec<_> = cut
             .rows
             .into_iter()
@@ -1818,8 +1833,29 @@ async fn a_promoted_standby_holds_every_row_of_its_leader() {
     let port = leader.replication.port();
     let mut standby = Replica::serve("replication-1", FOLLOWER, port, shared(&dir)).await;
     // A ready worker the load monitor polls, at an address nobody answers.
+    // It states what a worker states for a request's hard demands, it
+    // takes images, and it states an end of the encode handoff, a priority
+    // and a drain window: the log's row tells the five, so the standby
+    // holds the row whole. The offer's connector holds a blank: a holder's
+    // write takes any text, the log tells it, and a standby reads it as
+    // told.
+    let mut stated = DemandFacts::default();
+    stated.runtime = 7;
+    stated.references = true;
+    stated.host_pipeline = true;
+    stated.window = 32_768;
+    stated.decoding = 3;
+    let mut offered = EncodeOffer::default();
+    offered.handoff = EncodeHandoff::Push;
+    offered.producer = true;
+    offered.connector = Some("a b".to_owned());
     let polled = WorkerFacts {
         wire_modes: WireModes::GRPC,
+        demand_facts: stated,
+        vision: true,
+        encode: offered,
+        priority: -5,
+        drain_settle_secs: Some(45),
         ..facts("grpc://127.0.0.1:1", 1, 0)
     };
     let written = leader
@@ -1828,7 +1864,17 @@ async fn a_promoted_standby_holds_every_row_of_its_leader() {
     let polled = written.expect("the store took the registration").id();
     let revision = leader.store.get(polled).expect("the row").revision;
     leader.workers.connect_row(&leader.store, polled, revision);
-    // A row nobody polls.
+    // A row nobody polls, whose offer states a connector past a name's 256
+    // bytes, and one that states no offer.
+    let mut taking = EncodeOffer::default();
+    taking.handoff = EncodeHandoff::Push;
+    taking.consumer = true;
+    taking.connector = Some("c".repeat(300));
+    let wide = WorkerFacts {
+        encode: taking,
+        ..facts("http://wide:8000", 1, 0)
+    };
+    lays(&leader, wide);
     writes(&leader, 0);
     // The leader writes while the standby follows.
     let stop = Arc::new(AtomicBool::new(false));
@@ -1838,7 +1884,7 @@ async fn a_promoted_standby_holds_every_row_of_its_leader() {
         thread::spawn(move || churn(&hands, &stop))
     };
     // The events the case counts are waited for, never timed.
-    written_past(&leader.store, began.0 + 100).await;
+    written_past(&leader, began.0 + 100).await;
     stop.store(true, Ordering::Relaxed);
     let rounds = writer.join().expect("the writer");
     let (head, wrote) = leader.held();
@@ -2090,7 +2136,9 @@ async fn a_followed_row_reaches_the_published_world_of_a_standby() {
     let mut standby = Replica::serve("replication-1", FOLLOWER, port, shared(&dir)).await;
     standby.reads(State::Follower).await;
     let published = |replica: &Replica| {
-        let on_file = replica.store.by_key("http://a:8000").is_some();
+        // The table's row, by the id the holder reads under the key.
+        let row = replica.workers.read_row_under("http://a:8000");
+        let on_file = row.is_some_and(|row| replica.store.get(row.id).is_some());
         on_file && replica.store.publish_due().is_none()
     };
     assert!(!published(&standby), "no row is written yet");

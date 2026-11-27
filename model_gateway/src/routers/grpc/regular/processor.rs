@@ -512,13 +512,15 @@ impl ResponseProcessor {
         // answer makes at its end; a collected answer shows no first token.
         // Its dispatch wait needs none: it is read here, inside the request's
         // future, against the dispatch the generation clock starts at.
+        let waited = context::dispatch_wait(started);
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: self.backend_type,
             model_id: &dispatch.model,
             endpoint: metrics_labels::ENDPOINT_CHAT,
             ttft: None,
-            dispatch_wait: context::dispatch_wait(started),
+            dispatch_wait: waited.map(|waited| waited.since_entry),
+            dispatch_wait_after_body: waited.map(|waited| waited.since_body),
             generation_duration: started.elapsed(),
             input_tokens: Some(u64::from(counts.prompt)),
             cached_tokens: Some(u64::from(counts.cached)),
@@ -771,13 +773,15 @@ impl ResponseProcessor {
         // per request, the completion tokens of every choice. No first
         // token, and the dispatch wait, as the collected chat answer.
         let counts = response_formatting::TokenCounts::of_generated(&result_array);
+        let waited = context::dispatch_wait(started);
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: self.backend_type,
             model_id: &dispatch.model,
             endpoint: metrics_endpoint,
             ttft: None,
-            dispatch_wait: context::dispatch_wait(started),
+            dispatch_wait: waited.map(|waited| waited.since_entry),
+            dispatch_wait_after_body: waited.map(|waited| waited.since_body),
             generation_duration: started.elapsed(),
             input_tokens: Some(u64::from(counts.prompt)),
             cached_tokens: Some(u64::from(counts.cached)),
@@ -846,13 +850,15 @@ impl ResponseProcessor {
         // shows no first token and records its dispatch wait, as the
         // collected chat answer. Made once the read succeeded, on either path.
         let record = || {
+            let waited = context::dispatch_wait(started);
             Metrics::record_streaming_metrics(StreamingMetricsParams {
                 router_type: metrics_labels::ROUTER_GRPC,
                 backend_type: self.backend_type,
                 model_id: &dispatch.model,
                 endpoint: metrics_labels::ENDPOINT_MESSAGES,
                 ttft: None,
-                dispatch_wait: context::dispatch_wait(started),
+                dispatch_wait: waited.map(|waited| waited.since_entry),
+                dispatch_wait_after_body: waited.map(|waited| waited.since_body),
                 generation_duration: started.elapsed(),
                 input_tokens: Some(u64::from(counts.prompt)),
                 cached_tokens: Some(u64::from(counts.cached)),
@@ -1266,13 +1272,15 @@ impl ResponseProcessor {
         // The records a streamed completion makes at its end; a collected
         // one shows no first token and records its dispatch wait, as the
         // collected chat answer (a batch's ends at its earliest dispatch).
+        let waited = context::dispatch_wait(started);
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: self.backend_type,
             model_id: &dispatch.model,
             endpoint: metrics_labels::ENDPOINT_COMPLETIONS,
             ttft: None,
-            dispatch_wait: context::dispatch_wait(started),
+            dispatch_wait: waited.map(|waited| waited.since_entry),
+            dispatch_wait_after_body: waited.map(|waited| waited.since_body),
             generation_duration: started.elapsed(),
             input_tokens: Some(u64::from(total_prompt)),
             cached_tokens: Some(u64::from(total_cached)),
@@ -1631,7 +1639,9 @@ fn messages_usage_from_counts(
         messages::Usage::from_counts(prompt_tokens.saturating_sub(cached_tokens), output_tokens)
             .with_cache_read_input_tokens(cached_tokens);
     match thinking_tokens {
-        Some(thinking_tokens) => usage.with_thinking_tokens(thinking_tokens),
+        // A part of the output, even when a count of reasoning ran past the
+        // engine's count of its output.
+        Some(thinking_tokens) => usage.with_thinking_tokens(thinking_tokens.min(output_tokens)),
         None => usage,
     }
 }

@@ -8,11 +8,6 @@
 //! A connector is free text. The store's door normalizes it once a write
 //! ([`EncodeOffer::normalized`]), so a blank one states no connector.
 
-#![expect(
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
-
 use super::pairing::normalize;
 
 /// The form a worker's registration states for the encode handoff.
@@ -30,7 +25,11 @@ pub enum EncodeHandoff {
 
 /// A worker's end of the encode handoff, as its registration states it. The
 /// default states nothing.
+///
+/// The record gains fields: code outside this crate starts from the default
+/// and assigns what it knows, and a pattern of it ends with `..`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct EncodeOffer {
     pub handoff: EncodeHandoff,
     /// The worker states the producer role: an encoder's, under a push.

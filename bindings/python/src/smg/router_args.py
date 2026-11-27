@@ -950,10 +950,11 @@ class RouterArgs:
                 "Idle timeout in seconds for pooled upstream connections. Must"
                 " stay below the backend HTTP server's keep-alive timeout (vLLM"
                 " and SGLang default to 5). 0 keeps idle connections forever."
-                " While a nonzero value is below the load monitor interval, an"
-                " idle HTTP worker is connected anew for every load poll; where"
-                " the server's keep-alive can be raised above that interval, a"
-                " value between the two keeps the connection."
+                " While a nonzero value is below the interval the load monitor"
+                " polls a worker at (the router's, unless a worker of its group"
+                " sets its own), an idle HTTP worker is connected anew for every"
+                " load poll; where the server's keep-alive can be raised above"
+                " that interval, a value between the two keeps the connection."
                 " Defaults to 3."
             ),
         )
@@ -1031,6 +1032,9 @@ class RouterArgs:
             help=(
                 "Choose off for the classic routing policies or on for Grand Central."
                 " With on, the routing options keep their meaning through a policy document."
+                f" Under a provider backend alone (such as --{prefix}backend openai, without"
+                f" --{prefix}enable-igw) the gateway places by no routing policy: on without a"
+                " policy document moves nothing there, and the start says so once."
             ),
         )
         routing_group.add_argument(
@@ -1039,10 +1043,13 @@ class RouterArgs:
             default=RouterArgs.policy_spec,
             help=(
                 "Run a policy document with Grand Central."
-                " The document replaces the routing options: one that is not at its"
-                " default is refused beside it by name. The two overload thresholds"
-                " stand beside it: the gateway builds its workers with them, unless"
-                " the document switches its overload block off."
+                " The document replaces the routing options. A policy name, a policy's"
+                " own setting, the overload switch and shed flag, the warm-up and"
+                f" pairing settings, --{prefix}routing-key-override,"
+                f" --{prefix}grouped-dp-sticky and --{prefix}dp-minimum-tokens-scheduler"
+                " are each refused beside it by name where not at the default. The two"
+                " overload thresholds stand beside it: the gateway builds its workers"
+                " with them, unless the document switches its overload block off."
             ),
         )
         routing_group.add_argument(
@@ -1473,10 +1480,13 @@ class RouterArgs:
             type=int,
             default=RouterArgs.max_tree_size,
             help="Maximum total size of each model's approximation tree for "
-            "cache-aware routing, shared across all workers: for HTTP the "
-            "chars of its texts plus 1024 for each node a worker stands on, "
-            "for gRPC tokens; eviction keeps every tree at or under this "
-            "bound",
+            "cache-aware routing, summed over all workers: for requests "
+            "routed by text the chars of the nodes each worker stands on plus "
+            "1024 for each such node, for requests routed by token ids (gRPC, "
+            "and HTTP requests that carry them) the tokens each worker holds, "
+            "so a prefix that several workers hold counts once for each of "
+            "them; each eviction cycle trims every tree back toward this "
+            "bound, and writes take a tree past it until the next cycle",
         )
         routing_group.add_argument(
             f"--{prefix}block-size",
@@ -1800,7 +1810,8 @@ class RouterArgs:
             type=str,
             choices=["inline", "shm", "auto", "rdma"],
             default=RouterArgs.multimodal_tensor_transport,
-            help="Multimodal tensor transport: inline (default), shm, auto, or rdma (NIXL lane; needs mm-rdma build)",
+            help="Multimodal tensor transport: inline (default), shm, auto, or rdma "
+            f"(NIXL lane; needs mm-rdma build and --{prefix}rdma-listen-ip)",
         )
         parser.add_argument(
             f"--{prefix}multimodal-shm-min-bytes",
@@ -1863,7 +1874,7 @@ class RouterArgs:
             default=RouterArgs.mm_pixel_rdma,
             help=(
                 "Serve cached pixels over RDMA instead of inline bytes (the legacy"
-                " switch; --multimodal-tensor-transport rdma is the first-class one)."
+                f" switch; --{prefix}multimodal-tensor-transport rdma is the first-class one)."
                 " Falls back to SMG_MM_PIXEL_RDMA"
             ),
         )
@@ -2209,7 +2220,12 @@ class RouterArgs:
                 " Format: <alias>=<canonical>. Repeat for multiple aliases."
                 " Matching is case-sensitive. A vendor-named alias (kimi-*,"
                 " minimax-*, ...) also gives the served model that vendor's"
-                " contract profile under both names."
+                " contract profile under both names. An alias that is the name"
+                " of a checkpoint Symphony lists gives the served model that"
+                " checkpoint's table, where the served name is not listed, the"
+                " legacy parsers detect no parser by it and no parser name is"
+                " set for the model; of several such aliases the first in"
+                " sorted order gives its table."
             ),
         )
         # Prometheus configuration
@@ -2596,7 +2612,10 @@ class RouterArgs:
             f"--{prefix}decode-expected-workers",
             type=_positive_int,
             default=None,
-            help="Desired decode fleet size, used only as the fixed percentage denominator",
+            help=(
+                "Desired decode fleet size: the fixed percentage denominator."
+                " The minimum of healthy decode workers may not exceed it."
+            ),
         )
         health_group.add_argument(
             f"--{prefix}decode-min-ready-percent",
@@ -2616,7 +2635,10 @@ class RouterArgs:
             f"--{prefix}prefill-expected-workers",
             type=_positive_int,
             default=None,
-            help="Desired prefill fleet size, used only as the fixed percentage denominator",
+            help=(
+                "Desired prefill fleet size: the fixed percentage denominator."
+                " The minimum of healthy prefill workers may not exceed it."
+            ),
         )
         health_group.add_argument(
             f"--{prefix}prefill-min-ready-percent",
@@ -2749,7 +2771,8 @@ class RouterArgs:
             help="Which parser reads a chat completion's reasoning and tool calls: Symphony "
             "(symphony, the default) or the per-model parsers (legacy). With Symphony, a model's "
             "worker labels decide, "
-            "else Symphony's registry for a model it knows, else --tool-call-parser and --reasoning-parser: "
+            "else --tool-call-parser and --reasoning-parser, else Symphony's registry for a model it knows "
+            "(a reasoning name alone that a table answers to comes after the registry): "
             "a Symphony table's name reads with that table, and so does a legacy parser's name whose format "
             "a table reads (qwen for qwen3, qwen_xml for qwen3_tagged: the table's aliases, so existing flags "
             "keep a working parser); any other legacy parser's name keeps the legacy parsers (the Symphony "
@@ -2795,8 +2818,10 @@ class RouterArgs:
             default=None,
             choices=reasoning_parser_choices,
             help="Specify the parser for reasoning models (e.g., deepseek_r1, qwen3). Under --parser symphony, "
-            "a worker's labels decide for its model, else Symphony's registry for a model it knows, and this "
-            "flag for the models the registry does not know: a Symphony table's name here (and in "
+            "a worker's labels decide for its model, else this flag and --tool-call-parser, before Symphony's "
+            "registry, for every model; a name here alone that a table answers to leaves a model the registry "
+            "knows to the registry and reads only the models it does not know: a Symphony table's name here "
+            "(and in "
             "--tool-call-parser, or here alone) reads them with that table, and so does a legacy parser's "
             "name whose format a table reads (the table's aliases); any other legacy parser's name keeps "
             "the legacy parsers for them",
@@ -2808,8 +2833,9 @@ class RouterArgs:
             default=None,
             choices=tool_call_parser_choices,
             help="Specify the parser for tool-call interactions (e.g., json, qwen). Under --parser symphony, "
-            "a worker's labels decide for its model, else Symphony's registry for a model it knows, and this "
-            "flag for the models the registry does not know: a Symphony table's name here (and in "
+            "a worker's labels decide for its model, else this flag, for every model, before Symphony's "
+            "registry, which reads a model it knows only where the flags select nothing: a Symphony table's "
+            "name here (and in "
             "--reasoning-parser, or here alone) reads them with that table, and so does a legacy parser's "
             "name whose format a table reads (the table's aliases); any other legacy parser's name keeps "
             "the legacy parsers for them",

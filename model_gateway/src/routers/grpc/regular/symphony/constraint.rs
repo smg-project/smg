@@ -21,7 +21,7 @@ use symphony::{
 #[cfg(test)]
 use super::names::reading;
 use super::{
-    names::{reads, table_reading, Reading},
+    names::{reads, table_reading, ByAlias, Reading},
     template::Templates,
     SymphonyError,
 };
@@ -772,8 +772,9 @@ pub(crate) fn constraint(
 /// the request: the response template's table cannot constrain the call it is asked (the answer's
 /// refusal comes with the derivation), or a chat request's `regex` or `ebnf` constraint would
 /// apply outside its format. `thought_closed` says the prompt closed the thought itself and wrote
-/// the template's text after it, which the calls' tag then owes nothing of. The tests ask through
-/// `constraint`, which reads the decision first.
+/// the template's text after it, which the calls' tag then owes nothing of; where the template
+/// writes nothing after the close, the thought is over and a JSON answer is asked as after it
+/// ([`AnswerTag::for_start`]). The tests ask through `constraint`, which reads the decision first.
 pub(crate) fn constraint_for(
     read: &Reading,
     asks: Asks<'_>,
@@ -810,14 +811,26 @@ pub(crate) fn constraint_for(
         );
     }
     Ok(match asks.answer_schema() {
-        Some(schema) => Prepared::Answer(Arc::new(AnswerTag {
-            format,
-            compiled,
-            model: asks.model().to_string(),
-            schema: Arc::new(schema.into_owned()),
-            reasoning_open,
-            continues,
-        })),
+        Some(schema) => {
+            // Past the thought where the prompt closed it in the model's place. The layout read
+            // below is the first arm of `Format::thought_closed` (a template that writes text
+            // after the close), which keeps its tag: the rule is for its other arm alone, the
+            // table that leaves the thought to the model, and an arm added there is weighed here.
+            let past_the_thought = thought_closed
+                && !matches!(
+                    format.layout().and_then(|layout| layout.thought.as_ref()),
+                    Some(thought) if !thought.after.is_empty()
+                );
+            Prepared::Answer(Arc::new(AnswerTag {
+                format,
+                compiled,
+                model: asks.model().to_string(),
+                schema: Arc::new(schema.into_owned()),
+                reasoning_open,
+                past_the_thought,
+                continues,
+            }))
+        }
         None => Prepared::None,
     })
 }
@@ -1049,6 +1062,9 @@ pub(crate) struct AnswerTag {
     schema: Arc<Value>,
     /// The prompt leaves the model inside its thought.
     reasoning_open: bool,
+    /// The prompt closed the thought in the model's place and its template writes nothing after
+    /// the close: the thought is over where the prompt ends.
+    past_the_thought: bool,
     /// The prompt continues the assistant's message.
     continues: bool,
 }
@@ -1063,12 +1079,20 @@ impl AnswerTag {
         start: GrammarStart,
         vocabulary: TagVocabulary,
     ) -> Result<Option<ToolConstraint>, SymphonyError> {
+        // A prompt past the thought leaves the answer to start where the prompt ends, wherever
+        // the engine starts its grammar: asked as after the thought, the table gives the answer
+        // alone, with no thought and no second close before it.
+        let (reasoning_open, start) = if self.past_the_thought {
+            (true, GrammarStart::AfterReasoning)
+        } else {
+            (self.reasoning_open, start)
+        };
         answer_tag(
             &self.format,
             self.compiled,
             &self.model,
             &self.schema,
-            self.reasoning_open,
+            reasoning_open,
             start,
             vocabulary,
             self.continues,
@@ -1099,6 +1123,7 @@ impl fmt::Debug for AnswerTag {
             .field("compiled", &self.compiled)
             .field("model", &self.model)
             .field("reasoning_open", &self.reasoning_open)
+            .field("past_the_thought", &self.past_the_thought)
             .field("continues", &self.continues)
             .finish_non_exhaustive()
     }
@@ -1162,6 +1187,9 @@ pub(crate) struct AutoTag {
     /// resolver, which the stamp outlives).
     pub labels: Names,
     pub flags: Names,
+    /// The served models an alias reads, as the context of the names read them
+    /// ([`ModelNames`]); `None` where it read none.
+    pub by_alias: Option<Arc<[ByAlias]>>,
     pub request: AutoRequest,
     /// The prompt leaves the model inside its thought.
     pub reasoning_open: bool,
@@ -1217,6 +1245,7 @@ impl AutoTag {
             &ModelNames {
                 labels: self.labels.clone(),
                 flags: &self.flags,
+                by_alias: self.by_alias.as_deref().unwrap_or_default(),
             },
             asks,
             &tools,
@@ -2253,6 +2282,370 @@ mod tests {
         ));
     }
 
+    /// The four places the workers of a model may start a grammar at.
+    const STARTS: [symphony::GrammarStart; 4] = [
+        symphony::GrammarStart::Unknown,
+        symphony::GrammarStart::Either,
+        symphony::GrammarStart::AfterReasoning,
+        symphony::GrammarStart::FirstToken,
+    ];
+
+    /// The generation prompt of a table whose template leaves the thought to the model (MiniMax
+    /// M3's) with no marker, and the one that ends with the thought's close: the template closed
+    /// the thought in the model's place, as it does with thinking switched off.
+    const TURN_WITH_NO_MARKER: &str = "]~b]user\nhi[e~[\n]~b]ai\n";
+    const TURN_THAT_CLOSED_THE_THOUGHT: &str = "]~b]user\nhi[e~[\n]~b]ai\n</mm:think>";
+
+    /// What a request (`ask`, over the `lookup` tool unless it asks for a JSON answer) takes on
+    /// `prompt` from the table that reads `MiniMaxAI/MiniMax-M3`, for workers that start the
+    /// grammar at `start`, the request's thinking switch saying `switch`: the table's replay of
+    /// the prompt decides with it as preparation does (`PromptThought::or_switch`). An ask with
+    /// an `output_config` is a Messages request's, every other a chat request's.
+    fn found_where_the_thought_is_the_models(
+        ask: &Value,
+        prompt: &str,
+        switch: bool,
+        start: symphony::GrammarStart,
+    ) -> Result<Option<ToolConstraint>, SymphonyError> {
+        let model = "MiniMaxAI/MiniMax-M3";
+        let mut body = ask.clone();
+        body["model"] = json!(model);
+        let of_messages = !ask["output_config"].is_null();
+        let (chat, messages);
+        let asks = if of_messages {
+            body["max_tokens"] = json!(8);
+            body["messages"] = json!([{"role": "user", "content": "hi"}]);
+            messages =
+                serde_json::from_value::<CreateMessageRequest>(body).expect("a Messages request");
+            Asks::for_messages(&messages, false)
+        } else {
+            chat = request(body);
+            Asks::Chat(&chat)
+        };
+        let thought = reasoning_open(
+            ParserChoice::Symphony,
+            &names(None, None),
+            model,
+            &templates(),
+            prompt,
+        )
+        .expect("a table reads");
+        let (open, closed) = (thought.or_switch(|| switch), thought.closed);
+        let tools = if ask["response_format"].is_null() && !of_messages {
+            tools()
+        } else {
+            Vec::new()
+        };
+        if ask["tool_choice"] == "auto" {
+            auto_constraint(
+                ParserChoice::Symphony,
+                &names(None, None),
+                asks,
+                &tools,
+                open,
+                closed,
+                start,
+                TagVocabulary::Current,
+                &templates(),
+            )
+        } else {
+            super::constraint(
+                ParserChoice::Symphony,
+                &names(None, None),
+                asks,
+                &tools,
+                open,
+                closed,
+                start,
+                TagVocabulary::Current,
+                &templates(),
+            )
+            .and_then(|prepared| prepared.for_start(start, TagVocabulary::Current))
+        }
+    }
+
+    /// The structural tag [`found_where_the_thought_is_the_models`] finds.
+    fn tag_where_the_thought_is_the_models(
+        ask: &Value,
+        prompt: &str,
+        switch: bool,
+        start: symphony::GrammarStart,
+    ) -> Value {
+        tag_of(found_where_the_thought_is_the_models(
+            ask, prompt, switch, start,
+        ))
+    }
+
+    /// A forced call by name and by `required`, the `auto` choice, and a JSON answer by
+    /// `json_object` and by `json_schema`: every ask that takes a tag from the table.
+    fn asks_that_take_a_tag() -> [Value; 5] {
+        [
+            json!({"tool_choice": {"type": "function", "function": {"name": "lookup"}}}),
+            json!({"tool_choice": "required"}),
+            json!({"tool_choice": "auto"}),
+            json!({"response_format": {"type": "json_object"}}),
+            json!({"response_format": {"type": "json_schema", "json_schema": {
+                "name": "city",
+                "schema": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"]
+                }
+            }}}),
+        ]
+    }
+
+    /// A prompt that ends with the thought's close, of a table whose template leaves the thought
+    /// to the model, is past the thought whatever the request's thinking switch says, and a
+    /// forced call, named or required, takes the block alone wherever the workers start the
+    /// grammar: no thought and no second close stand before it. A tag that offered the thought
+    /// again could hold the model there until its tokens ran out.
+    #[test]
+    fn a_forced_call_takes_the_block_alone_on_a_prompt_that_closed_the_thought() {
+        let thought = reasoning_open(
+            ParserChoice::Symphony,
+            &names(None, None),
+            "MiniMaxAI/MiniMax-M3",
+            &templates(),
+            TURN_THAT_CLOSED_THE_THOUGHT,
+        )
+        .expect("a table reads");
+        assert!(thought.closed && !thought.open && !thought.alone);
+        assert!(!thought.or_switch(|| true));
+        assert!(!thought.or_switch(|| false));
+        let named = json!({"tool_choice": {"type": "function", "function": {"name": "lookup"}}});
+        let required = json!({"tool_choice": "required"});
+        for start in STARTS {
+            for ask in [&named, &required] {
+                let unmarked =
+                    tag_where_the_thought_is_the_models(ask, TURN_WITH_NO_MARKER, false, start);
+                assert_eq!(
+                    unmarked["format"]["elements"][0]["type"], "optional",
+                    "{start:?}: {unmarked}"
+                );
+                for switch in [false, true] {
+                    let closed = tag_where_the_thought_is_the_models(
+                        ask,
+                        TURN_THAT_CLOSED_THE_THOUGHT,
+                        switch,
+                        start,
+                    );
+                    assert_eq!(
+                        closed["format"], unmarked["format"]["elements"][1],
+                        "{start:?}, switch {switch}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The bound of the rule above, which holds before it too. A prompt with no marker hears the
+    /// request's thinking switch and admits the thought the model may write before a forced
+    /// call, a JSON answer (`json_object` and `json_schema`) and the calls of the `auto` tag.
+    /// For a request that switched thinking off, the `auto` tag is the same on a prompt that
+    /// closed the thought as on one with no marker, wherever the workers start the grammar: the
+    /// forced call and the JSON answer read the closed thought, the `auto` tag does not.
+    #[test]
+    fn the_auto_tag_keeps_its_thought_on_a_prompt_that_closed_it() {
+        let unmarked = reasoning_open(
+            ParserChoice::Symphony,
+            &names(None, None),
+            "MiniMaxAI/MiniMax-M3",
+            &templates(),
+            TURN_WITH_NO_MARKER,
+        )
+        .expect("a table reads");
+        assert!(!unmarked.closed && !unmarked.open && !unmarked.alone);
+        assert!(unmarked.or_switch(|| true));
+        assert!(!unmarked.or_switch(|| false));
+        let the_models_thought = json!({
+            "type": "optional",
+            "content": {"type": "or", "elements": [
+                {
+                    "type": "tag",
+                    "begin": "<mm:think>",
+                    "content": {"type": "any_text", "excludes": [
+                        "<mm:think>", "</mm:think>", "<tool_call>", "</tool_call>",
+                        "<invoke name=\"", "</invoke>", "]<]minimax[>["
+                    ]},
+                    "end": "</mm:think>"
+                },
+                {"type": "const_string", "value": "</mm:think>"}
+            ]}
+        });
+        let asks = asks_that_take_a_tag();
+        for start in STARTS {
+            for ask in &asks {
+                let unmarked =
+                    tag_where_the_thought_is_the_models(ask, TURN_WITH_NO_MARKER, false, start);
+                assert_eq!(
+                    unmarked["format"]["elements"][0], the_models_thought,
+                    "{start:?}: {ask}"
+                );
+                if ask["tool_choice"] == "auto" {
+                    assert_eq!(
+                        tag_where_the_thought_is_the_models(
+                            ask,
+                            TURN_THAT_CLOSED_THE_THOUGHT,
+                            false,
+                            start
+                        ),
+                        unmarked,
+                        "{start:?}: {ask}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A JSON answer on a prompt that closed the thought: the thought is over before the answer
+    /// starts, so the answer's tag (a chat request's `json_object` and `json_schema`, a Messages
+    /// request's `output_config.format`) owes the schema alone,
+    /// wherever the workers start the grammar and whatever the request's thinking switch says.
+    /// No thought and no second close stand before it, as before a forced call: the reader is
+    /// past the thought on such a prompt, and a thought the tag let through would come back as
+    /// content ahead of the JSON.
+    #[test]
+    fn a_json_answer_is_the_schema_alone_on_a_prompt_that_closed_the_thought() {
+        let of_messages = json!({"output_config": {"format": {"type": "json_schema", "schema": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"]
+        }}}});
+        let mut kept = Vec::new();
+        for start in STARTS {
+            for switch in [false, true] {
+                for ask in asks_that_take_a_tag()
+                    .iter()
+                    .filter(|ask| !ask["response_format"].is_null())
+                    .chain([&of_messages])
+                {
+                    // The schema alone is the engine's own constraint: the table sends no tag.
+                    let found = found_where_the_thought_is_the_models(
+                        ask,
+                        TURN_THAT_CLOSED_THE_THOUGHT,
+                        switch,
+                        start,
+                    );
+                    if !matches!(found, Ok(None)) {
+                        kept.push(format!("{start:?}, the switch {switch}, {ask}: {found:?}"));
+                    }
+                }
+            }
+        }
+        assert!(
+            kept.is_empty(),
+            "JSON answers that take a tag on a prompt that closed the thought:\n{}",
+            kept.join("\n")
+        );
+    }
+
+    /// The corner of the two rules above: the request's thinking switch says the model thinks
+    /// while the prompt ends with the thought's close (a template closes the thought for a
+    /// request whose word the switch does not hear). The prompt decides, as it does for every
+    /// table whose template writes text after the close: a forced call, the `auto` tag and a
+    /// JSON answer take what the same prompt takes with the switch off, wherever the workers
+    /// start the grammar. Before, the switch decided and each was built as inside an open
+    /// thought.
+    #[test]
+    fn a_prompt_that_closed_the_thought_takes_the_tags_of_the_switch_off_under_any_switch() {
+        let asks = asks_that_take_a_tag();
+        let mut turned = Vec::new();
+        for start in STARTS {
+            for ask in &asks {
+                let [off, on] = [false, true].map(|switch| {
+                    match found_where_the_thought_is_the_models(
+                        ask,
+                        TURN_THAT_CLOSED_THE_THOUGHT,
+                        switch,
+                        start,
+                    ) {
+                        Ok(Some(ToolConstraint::StructuralTag(tag))) => tag,
+                        other => format!("{other:?}"),
+                    }
+                });
+                if on != off {
+                    turned.push(format!(
+                        "{start:?}: {ask}\n  the switch off: {off}\n  the switch on: {on}"
+                    ));
+                }
+            }
+        }
+        assert!(
+            turned.is_empty(),
+            "{} of {} differ:\n{}",
+            turned.len(),
+            STARTS.len() * asks.len(),
+            turned.join("\n")
+        );
+    }
+
+    /// The reach of the rule over the whole registry. Every table is asked on prompts that end
+    /// with each of its markers and what its layout writes after the thought, and those that
+    /// read one closed are asked for a JSON answer both ways, with the closed reading and
+    /// without, wherever the workers start the grammar. The answer turns for the one table
+    /// that leaves the thought to the model and writes nothing after the close; a table whose
+    /// template writes text after the close reads the prompt closed too and keeps its tag. The
+    /// rule is by the table's rows and layout; the table is named here as a gate on purpose:
+    /// whoever registers a table the rule reaches names it here.
+    #[test]
+    fn a_closed_prompt_turns_the_json_answer_of_the_table_that_leaves_the_thought_to_the_model() {
+        use ::symphony::formats::registry::Table;
+        let mut closed = Vec::new();
+        let mut reached = Vec::new();
+        for table in Table::ALL {
+            let name = table.name();
+            let format = table.shared();
+            let after = format
+                .layout()
+                .and_then(|layout| layout.thought.as_ref())
+                .map_or("", |thought| &*thought.after);
+            // A prompt that ends with a marker of the table and what its layout writes after
+            // the thought: the table says which marker closed the thought.
+            let reads_closed = format.terminal_texts().any(|marker| {
+                format.thought_closed(&format!("the turn the prompt opened\n{marker}{after}"))
+            });
+            if !reads_closed {
+                continue;
+            }
+            closed.push(name);
+            let read = Reading::Table(Arc::clone(&format), false);
+            for start in STARTS {
+                for ask in asks_that_take_a_tag()
+                    .iter()
+                    .filter(|ask| !ask["response_format"].is_null())
+                {
+                    let asked = request(ask.clone());
+                    let [without, with] = [false, true].map(|thought_closed| {
+                        let found = constraint_for(
+                            &read,
+                            Asks::Chat(&asked),
+                            &[],
+                            false,
+                            thought_closed,
+                            start,
+                            TagVocabulary::Current,
+                        )
+                        .and_then(|prepared| prepared.for_start(start, TagVocabulary::Current));
+                        format!("{found:?}")
+                    });
+                    if without != with && !reached.contains(&name) {
+                        reached.push(name);
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            reached,
+            ["minimax_m3"],
+            "of the tables that read the prompt closed: {closed:?}"
+        );
+        assert!(
+            closed.len() > reached.len(),
+            "no table whose template writes text after the close was asked: {closed:?}"
+        );
+    }
+
     #[test]
     fn the_legacy_choice_assigns_nothing_and_asks_for_no_constraint() {
         assert!(assign(
@@ -2910,6 +3303,7 @@ mod tests {
             parser: ParserChoice::Symphony,
             labels: pair(Some("deepseek_v4"), Some("deepseek_v4")),
             flags: Names::default(),
+            by_alias: None,
             request: AutoRequest::Chat(Arc::new(request(json!({"tools": tools()})))),
             reasoning_open: true,
             thought_closed: false,
@@ -2991,6 +3385,7 @@ mod tests {
             parser: ParserChoice::Symphony,
             labels: pair(Some("deepseek_v4"), Some("deepseek_v4")),
             flags: Names::default(),
+            by_alias: None,
             request: AutoRequest::Chat(Arc::new(request(json!({"tools": tools()})))),
             reasoning_open: true,
             thought_closed: false,
@@ -3161,6 +3556,7 @@ mod tests {
                 parser: ParserChoice::Symphony,
                 labels: pair(Some("deepseek_v4"), Some("deepseek_v4")),
                 flags: Names::default(),
+                by_alias: None,
                 request: AutoRequest::Chat(Arc::new(request(json!({})))),
                 reasoning_open: true,
                 thought_closed: false,
@@ -3331,6 +3727,7 @@ mod tests {
                 parser: ParserChoice::Symphony,
                 labels: names.labels.clone(),
                 flags: Names::default(),
+                by_alias: None,
                 request: AutoRequest::Chat(Arc::new(chat.clone())),
                 reasoning_open: true,
                 thought_closed: false,
@@ -3340,6 +3737,7 @@ mod tests {
                 parser: ParserChoice::Symphony,
                 labels: names.labels.clone(),
                 flags: Names::default(),
+                by_alias: None,
                 request: AutoRequest::Messages {
                     request: Arc::new(messages.clone()),
                     tools: tools().into(),
@@ -3405,6 +3803,7 @@ mod tests {
             parser: ParserChoice::Symphony,
             labels: names.labels,
             flags: Names::default(),
+            by_alias: None,
             request: AutoRequest::Chat(Arc::new(request(json!({})))),
             reasoning_open: true,
             thought_closed: false,

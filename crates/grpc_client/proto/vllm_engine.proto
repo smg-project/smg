@@ -249,6 +249,12 @@ message GenerateRequest {
 
   // Effective chat-template kwargs consumed by the engine reasoning parser.
   optional string chat_template_kwargs_json = 13;
+
+  // Prefix-cache salt of the request; unset for none. Requests share cached
+  // blocks only under one salt. The servicer refuses a salt that is empty,
+  // has more than 128 characters, has `@`, `/`, `\` or NUL, or starts with the
+  // reserved prefix `mm:`.
+  optional string cache_salt = 14;
 }
 
 // KV cache transfer parameters for Mooncake PD disaggregation
@@ -537,6 +543,11 @@ message GetServerInfoResponse {
   // E/P must agree on the connector and advertise complementary roles.
   string ec_connector = 29;
   string ec_role = 30;
+
+  // The cache partition fields of GenerateRequest that the servicer reads,
+  // comma-separated: "cache_salt". "" when the servicer reads none. Flattened
+  // into the `cache_partition_fields` worker label.
+  string cache_partition_fields = 31;
 }
 
 // =====================

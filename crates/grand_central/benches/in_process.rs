@@ -32,7 +32,9 @@
 //! partners` takes its every decode out of service: each decision is then
 //! refused, and a turn refused that way counts. `--refused overload` puts
 //! its every decode over its thresholds under a binding that sheds such a
-//! list: each request is then shed as saturated. `--shadow twin` names a
+//! list: each request is then shed as saturated. `--refused outage` takes
+//! its every decode out of service under such a binding: each request is
+//! then shed with no endpoint. `--shadow twin` names a
 //! copy of the cell's profile as its binding's shadow, so each decision is
 //! followed by its shadow profile's. `--shadow other` names that shadow at
 //! a binding of another model: the cell's decisions then have no shadow,
@@ -69,10 +71,15 @@
 //! buffer of N KiB, which pushes what the decision reads out of a cache
 //! smaller than the buffer, and then writes 16 KiB of stack under its own
 //! frame again, as the stack of a thread that serves stays warm. Count
-//! such a run under callgrind's cache model: a function's data misses are
-//! then the lines of memory outside the stack that it is first to touch.
-//! The walk is inside the stretch, so its time says nothing; a cell whose
-//! callers time their own turns refuses the flag.
+//! such a run with one caller under callgrind's cache model, its caches
+//! smaller than the buffer: a function's data misses are then the lines
+//! of memory it is first to touch in a decision outside those 16 KiB.
+//! What the run keeps on the main thread's stack is among them. With more
+//! callers than one, a line another caller's decision has just read is
+//! met warm, so such a run counts fewer. The walk is inside the stretch:
+//! the row of such a run says `cold_kb=N`, and its times hold the walk and
+//! say nothing of a decision. A size above 1,048,576 (1 GiB) is refused,
+//! and so is the flag by a cell whose callers time their own turns.
 
 #![expect(
     clippy::expect_used,
@@ -200,6 +207,9 @@ struct Cell {
     /// The request of one turn of the cell's callers by the turn's seed. It
     /// is plain for every seed or for none: the bench asks it once a cell.
     request: fn(u64) -> Request<'static>,
+    /// What the cell stores behind its engine for a run's callers, ahead of
+    /// the list's first request.
+    stores: fn(&Run, &InProcess),
     /// The words the cell adds at the end of its result line.
     words: fn() -> String,
 }
@@ -207,8 +217,8 @@ struct Cell {
 impl Cell {
     /// A cell of plain requests that makes nothing behind its engine, whose
     /// callers ask the run's `decide`, which takes every run, which writes
-    /// nothing into its reports and whose line gains no word. An entry names
-    /// itself and its document.
+    /// nothing into its reports, which stores nothing for a run's callers
+    /// and whose line gains no word. An entry names itself and its document.
     const PLAIN: Self = Self {
         behind: |_| (),
         caller: None,
@@ -217,6 +227,7 @@ impl Cell {
         name: "",
         reports: |_| (),
         request: plain,
+        stores: |_, _| (),
         words: String::new,
     };
 
@@ -241,6 +252,16 @@ const CELLS: &[Cell] = &[
         behind: conversations::lends,
         caller: Some(conversations::caller),
         fits: conversations::fits,
+        words: conversations::words,
+        ..Cell::PLAIN
+    },
+    Cell {
+        name: "cache_aware_held",
+        document: || preset("cache_aware"),
+        behind: indexed::holds,
+        caller: Some(conversations::caller),
+        fits: conversations::fits,
+        stores: conversations::held,
         words: conversations::words,
         ..Cell::PLAIN
     },
@@ -353,6 +374,15 @@ const CELLS: &[Cell] = &[
         document: || preset("least_load"),
         ..Cell::PLAIN
     },
+    // The hash ring's pair document with a request that carries no key
+    // and bounds its completion: a pair's decodes alone are held to that
+    // demand. `--entry place_named` counts the pair's numbers under it.
+    Cell {
+        name: "pair_consistent_hashing_bounded",
+        document: || pair::of("consistent_hashing"),
+        request: pair::bounded,
+        ..Cell::PLAIN
+    },
     // The hash ring's pair document with a request that carries no key:
     // through the one call (`--entry place`) a pair's headers are read for
     // the worker it may name, and `--entry place_named` names one.
@@ -388,6 +418,14 @@ const CELLS: &[Cell] = &[
         request: pair::request,
         ..Cell::PLAIN
     },
+    // Every prefill over its thresholds beside open decodes: the prefill
+    // side's run sheds, and the pair's default makes each pair.
+    Cell {
+        name: pair::DEFAULT,
+        document: || pair::of("round_robin"),
+        request: pair::request,
+        ..Cell::PLAIN
+    },
     Cell {
         name: "pair_least_load",
         document: || pair::of("least_load"),
@@ -404,6 +442,25 @@ const CELLS: &[Cell] = &[
         name: "pair_round_robin_later",
         document: || pair::of("round_robin"),
         request: pair::later,
+        ..Cell::PLAIN
+    },
+    // A pair under the document of three sides, its encode side under the
+    // plain ring: what a pair pays for a side it does not use, counted
+    // against `pair_round_robin`, the same two sides under the pair plan.
+    Cell {
+        name: "pair_round_robin_three_sided",
+        document: encode::ringed,
+        request: pair::request,
+        ..Cell::PLAIN
+    },
+    // A pair under a sessions rule whose decode is asked for once its
+    // session's key has ended. Each turn's session is new, so the call
+    // claims its decode and dates that claim by the pair's lease.
+    Cell {
+        name: "pair_sessions_later",
+        document: pair::sessions,
+        request: pair::session_later,
+        words: pair::call_claims,
         ..Cell::PLAIN
     },
     Cell {
@@ -704,6 +761,10 @@ struct Run {
     workers: usize,
 }
 
+/// The most KiB a caller walks before a timed decision, 1 GiB: above every
+/// cache a decision reads from, and its bytes fit a `usize` on any target.
+const COLD_KB_MOST: u64 = 1 << 20;
+
 fn run() -> Run {
     let mut run = Run {
         callers: 1,
@@ -730,7 +791,13 @@ fn run() -> Run {
         match switch.as_str() {
             "--callers" => run.callers = number() as usize,
             "--cell" => run.cell = Cell::named(&value),
-            "--cold-kb" => run.cold_kb = number() as usize,
+            "--cold-kb" => {
+                // Here, where the size is read: the bytes of a greater one
+                // can wrap, down to a run that walks nothing.
+                let kb = number();
+                assert!(kb <= COLD_KB_MOST, "--cold-kb: at most {COLD_KB_MOST}");
+                run.cold_kb = kb as usize;
+            }
             "--decisions" => run.decisions = number(),
             "--engines" => run.engines = number(),
             "--entry" => run.entry = place::named(&value),
@@ -923,13 +990,15 @@ fn ask(beside: Option<&InProcess>) {
 }
 
 /// One caller's turns by `turn`: its first untimed, then, behind the start
-/// every caller waits at, its timed ones as one stretch. Says how many of
-/// those were placed, the stretch in nanoseconds and its allocations.
-/// A caller with `cold` to walk walks it before each timed turn.
+/// every caller waits at, its timed ones as one stretch, each behind
+/// `before`. Says how many of those were placed, the stretch in
+/// nanoseconds and its allocations. A caller with nothing ahead of a turn
+/// hands `|| {}`: its stretch then runs the instructions of a loop
+/// without `before`.
 fn stretch<T>(
     start: &Barrier,
     decisions: u64,
-    cold: &[u8],
+    mut before: impl FnMut(),
     mut turn: impl FnMut(u64) -> Option<T>,
 ) -> (u64, u64, u64) {
     for at in 0..CALLER_WARM {
@@ -938,19 +1007,9 @@ fn stretch<T>(
     start.wait();
     let (allocated, started) = (calls(), Instant::now());
     let mut took = 0;
-    // Two loops: a run that walks nothing runs the instructions it ran.
-    if cold.is_empty() {
-        for at in CALLER_WARM..CALLER_WARM + decisions {
-            took += u64::from(black_box(turn(at)).is_some());
-        }
-    } else {
-        for at in CALLER_WARM..CALLER_WARM + decisions {
-            // The buffer is hidden at every turn: a walk of a buffer the
-            // build knows unchanged is done once, ahead of the loop.
-            black_box(cold_walk(black_box(cold)));
-            warm_stack();
-            took += u64::from(black_box(turn(at)).is_some());
-        }
+    for at in CALLER_WARM..CALLER_WARM + decisions {
+        before();
+        took += u64::from(black_box(turn(at)).is_some());
     }
     let nanos = started.elapsed().as_nanos() as u64;
     (took, nanos, (calls() - allocated) as u64)
@@ -986,6 +1045,7 @@ fn main() {
         document,
         fits,
         request,
+        stores,
         ..
     } = run.cell;
     fits(&run);
@@ -993,7 +1053,8 @@ fn main() {
     // others at their start.
     assert!(
         run.cold_kb == 0 || run.cell.caller.is_none(),
-        "--cold-kb: this cell's callers time their own turns"
+        "--cold-kb: the callers of cell {} time their own turns",
+        run.cell.name
     );
     let workers: Arc<[Arc<dyn Worker>]> = (0..run.workers)
         .map(|at| ready_worker(&address(at), MODEL))
@@ -1028,6 +1089,7 @@ fn main() {
     let spec = AppliedSpec::validate(&document).expect("a valid document");
     let engine: &'static InProcess = Box::leak(Box::new(InProcess::new(spec)));
     behind(engine);
+    stores(&run, engine);
     assert!(matches!(run.engines, 1 | 2), "one engine or two");
     // A cell whose callers make turns of their own times those turns
     // itself, and they ask one engine.
@@ -1060,6 +1122,10 @@ fn main() {
     let (publish, converted) = (|| feed.publish(&loads), || host.conversions());
     // The one call a host makes for a request, where the run asks it.
     if place::asked(&run, &host) {
+        assert!(
+            run.entry != ruled::ALONE,
+            "a pair's cell alone takes place_alone"
+        );
         let (rule, ring) = (ruled::stated(&run), place::lent(&host));
         if worded::stated(&run) {
             measure(&run, &host, upkeep, publish, converted, |_| {
@@ -1144,9 +1210,26 @@ fn measure(
             // itself; any other caller asks the run's `decide`.
             let (took, nanos, allocated) = match run.cell.caller {
                 Some(turns) => turns(host, &start, run.decisions, caller),
-                None => stretch(&start, run.decisions, &cold, |turn| {
-                    decide(black_box(seed(turn)))
-                }),
+                None => {
+                    let turn = |turn: u64| decide(black_box(seed(turn)));
+                    // Chosen ahead of the start: no timed turn pays for it.
+                    if cold.is_empty() {
+                        stretch(&start, run.decisions, || {}, turn)
+                    } else {
+                        // The walk holds the buffer as a slice of its own:
+                        // no turn reads the vector's place on the main
+                        // thread's stack.
+                        let cold = cold.as_slice();
+                        let walk = move || {
+                            // The buffer is hidden at every turn: a walk
+                            // of a buffer the build knows unchanged is
+                            // done once, ahead of the loop.
+                            black_box(cold_walk(black_box(cold)));
+                            warm_stack();
+                        };
+                        stretch(&start, run.decisions, walk, turn)
+                    }
+                }
             };
             busy_nanos.fetch_add(nanos, Ordering::Relaxed);
             allocations.fetch_add(allocated, Ordering::Relaxed);
@@ -1191,6 +1274,10 @@ fn measure(
         total as f64 / wall.as_secs_f64(),
         busy_nanos.into_inner() as f64 / total as f64,
     );
+    // A run that walked says so on its row: its times hold the walk.
+    if run.cold_kb > 0 {
+        print!(" cold_kb={}", run.cold_kb);
+    }
     // The words a file of its own adds, then the cell's, and the line's end.
     print!("{}", place::word());
     println!("{}", (run.cell.words)());

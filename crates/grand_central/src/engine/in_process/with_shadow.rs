@@ -7,10 +7,12 @@
 //!
 //! **The path.** A single request of a binding that names a shadow comes
 //! here for its whole decision ([`decide`]). Its list keeps the document's
-//! word of the binding, so a request of a binding that names no shadow is
+//! word of the binding. So a request of a binding that names no shadow is
 //! decided as it is under any other document, behind one read of that
-//! word. A shadow profile runs inside the whole decision, over the records
-//! the live decision read and before that decision is returned
+//! word.
+//!
+//! A shadow profile runs inside the whole decision, over the records the
+//! live decision read and before that decision is returned
 //! ([`records::with_shadow`]). So no request of a binding with a shadow is
 //! answered by one pick of its picker or by its key's rows: each takes the
 //! whole decision.
@@ -23,18 +25,19 @@
 //! is caught where it ran: the live answer is returned as decided, and the
 //! panic is counted with the engine's faults.
 //!
-//! **The counts.** A shadow decision is counted in the engine's tables
-//! ([`ShadowCounts`]): a single request's in one, and each side of a
-//! pair's in its own ([`count`], [`ShadowSide`]). It is
-//! counted behind the issue of its live decision: a pick's lease is issued
-//! first, and a live shed, which issues none, counts its shadow too. The
-//! entry that issues a lease counts by itself ([`issued`]): a stage that
-//! panics at that issue is held, so the decision stands and its shadow is
-//! counted. The entry that issues none answers what the shadow said, and
-//! its caller counts it behind its own filing
-//! ([`Loaded::count_shadow`]): a decision whose filing fails counts
-//! none. A host reads every count in one call
-//! ([`InProcess::shadow_counts`]).
+//! **The counts.** A shadow decision is counted in the tables of its
+//! document ([`ShadowCounts`](crate::engine::shadow::ShadowCounts)): a
+//! single request's in one, and each side of a pair's in its own
+//! ([`count`], [`ShadowSide`]). It is counted behind the issue of its
+//! live decision: a pick's lease is issued first, and a live shed, which
+//! issues none, counts its shadow too.
+//!
+//! The entry that issues a lease counts by itself ([`issued`]): a stage
+//! that panics at that issue is held, so the decision stands and its
+//! shadow is counted. The entry that issues none answers what the shadow
+//! said, and its caller counts it behind its own filing
+//! ([`Loaded::count_shadow`]): a decision whose filing fails counts none.
+//! A host reads every count in one call ([`InProcess::shadow_counts`]).
 //!
 //! **A pair.** A pair's binding names its shadows by side. Its first
 //! decision asks them where its entry lends room for what they say
@@ -53,11 +56,11 @@ use super::{
     InProcess, Loaded, PoolMembers,
 };
 use crate::engine::{
-    decision::{Decision, ShadowKind},
+    decision::Decision,
     decision_engine::{DecideOutcome, Request, RequestMaker},
-    framework::{Engine, PairSide, ShadowRows},
+    framework::{Engine, ShadowRows},
     records,
-    shadow::{Shadow, ShadowCount, ShadowCounts, ShadowSide, Shadowed, SHADOW_ROWS},
+    shadow::{Shadow, ShadowCount, ShadowSide, Shadowed},
     view::{Constraints, RequestFacts},
 };
 
@@ -147,8 +150,11 @@ impl InProcess {
     /// too. A binding of one profile counts beside its single requests. A
     /// pair's binding counts beside each side that names a shadow, and
     /// its decode side beside a decode decided again as well, in a count
-    /// of its own. A row is told once, in the order of the rows: the
-    /// bindings from the last row on share it ([`SHADOW_ROWS`]). A shadow
+    /// of its own.
+    ///
+    /// A row is told once, in the order of the rows: the bindings from the
+    /// last row on share it
+    /// ([`SHADOW_ROWS`](crate::engine::shadow::SHADOW_ROWS)). A shadow
     /// that panicked is in no count here: it is one of the engine's faults
     /// ([`DecisionEngine::faults`](crate::engine::DecisionEngine::faults)).
     ///
@@ -156,39 +162,8 @@ impl InProcess {
     /// answered. The call takes no lock and allocates nothing: a count is
     /// one read of its cell, and a document no shadow was counted under
     /// yet reads as zeros.
-    pub fn shadow_counts(&self, mut each: impl FnMut(ShadowCount)) -> u64 {
-        let document = self.in_force();
-        let (engine, counts) = (document.spec.engine(), document.shadow_counts.get());
-        // Which sides each row counts by, a side at its place.
-        let mut due = [[false; ShadowSide::COUNT]; SHADOW_ROWS];
-        for at in (0..).take_while(|&at| engine.binding_at(at).is_some()) {
-            let word = engine.shadow_at(at);
-            let single = word.is_some_and(|(_, rows)| rows != ShadowRows::Sides);
-            let [prefill, decode] = PairSide::BOTH.map(|side| engine.shadows_side(at, side));
-            let row = &mut due[(at as usize).min(SHADOW_ROWS - 1)];
-            for side in ShadowSide::ALL {
-                row[side.index()] |= match side {
-                    ShadowSide::Single => single,
-                    ShadowSide::Prefill => prefill,
-                    ShadowSide::Decode | ShadowSide::DecodeAgain => decode,
-                };
-            }
-        }
-        for (binding, due) in (0..).zip(due) {
-            for side in ShadowSide::ALL.into_iter().filter(|side| due[side.index()]) {
-                for kind in ShadowKind::ALL {
-                    let cell = counts.map(|counts| counts.of(binding, side, kind));
-                    let count = cell.map_or(0, |cell| cell.load(Ordering::Relaxed));
-                    each(ShadowCount {
-                        binding,
-                        side,
-                        kind,
-                        count,
-                    });
-                }
-            }
-        }
-        document.applied
+    pub fn shadow_counts(&self, each: impl FnMut(ShadowCount)) -> u64 {
+        self.in_force().shadow_counts(each)
     }
 }
 
@@ -243,13 +218,11 @@ pub(super) fn decide(
 
 /// Counts what a shadow said, for its binding, in the table of the place
 /// it was asked: beside a single request, or beside a side of a pair. The
-/// tables are allocated at the first count.
+/// count is the document's own, which allocates its tables at the first.
 pub(super) fn count(own: Loaded<'_, '_>, said: Shadowed, asked: ShadowSide) {
-    let counts = &own.document.shadow_counts;
-    let counts = counts.get_or_init(Box::<ShadowCounts>::default);
-    let count = counts.of(said.binding, asked, said.kind);
-    count.fetch_add(1, Ordering::Relaxed);
+    own.document.count_shadow(said, asked);
 }
 
 #[cfg(test)]
+#[path = "../../../tests/unit/engine/in_process/with_shadow/tests.rs"]
 pub(super) mod tests;

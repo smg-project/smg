@@ -210,25 +210,27 @@ fn offers(row: &Row) -> Option<(Vec<EncodeOffer>, Vec<EncodeOffer>)> {
     let encoders = row
         .encoders
         .iter()
-        .map(|encoder| EncodeOffer {
-            handoff: handoff(encoder.handoff),
-            producer: encoder.ec_producer,
-            consumer: false,
-            connector: encoder.connector.clone(),
-            references: encoder.references,
+        .map(|encoder| {
+            let mut offer = EncodeOffer::default();
+            offer.handoff = handoff(encoder.handoff);
+            offer.producer = encoder.ec_producer;
+            offer.consumer = false;
+            offer.connector.clone_from(&encoder.connector);
+            offer.references = encoder.references;
+            offer
         })
         .collect();
     let prefills = row
         .prefills
         .iter()
         .map(|prefill| {
-            Some(EncodeOffer {
-                handoff: handoff(form_of(&prefill.runtime)?),
-                producer: false,
-                consumer: prefill.ec_consumer,
-                connector: prefill.connector.clone(),
-                references: false,
-            })
+            let mut offer = EncodeOffer::default();
+            offer.handoff = handoff(form_of(&prefill.runtime)?);
+            offer.producer = false;
+            offer.consumer = prefill.ec_consumer;
+            offer.connector.clone_from(&prefill.connector);
+            offer.references = false;
+            Some(offer)
         })
         .collect::<Option<Vec<_>>>()?;
     Some((encoders, prefills))

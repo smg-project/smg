@@ -3,8 +3,14 @@
 //! and replacements of its workers, and dropped with the last worker this
 //! node owns, so the model's next registration builds the policy its own
 //! labels name.
+//!
+//! The cases run a second time with Grand Central on ([`engine_on`]):
+//! there the label names the policy of the profile that places the model's
+//! single requests in the spec in force, and no policy object is built.
 
-use std::sync::Arc;
+mod engine_on;
+
+use std::{cell::Cell, sync::Arc};
 
 use openai_protocol::{
     model_card::ModelCard,
@@ -30,17 +36,24 @@ use crate::{
     config::RouterConfig,
     policies::{kv_index::event_monitor::KvEventMonitor, CacheAwarePolicy},
     routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder},
-    workflow::data::WorkerRegistrationMode,
+    workflow::data::{WorkerRegistrationMode, WorkerRemovalWorkflowData},
 };
 
+thread_local! {
+    /// Whether the case on this thread runs with Grand Central on
+    /// ([`engine_on::with_the_engine_on`]): its context then starts the
+    /// engine, and its policy is read of the spec in force.
+    static ENGINE_ON: Cell<bool> = const { Cell::new(false) };
+}
+
 fn app_context() -> Arc<AppContext> {
-    app_context_for_tests(
-        RouterConfig::builder()
-            .round_robin_policy()
-            .build_unchecked(),
-        Arc::new(WorkerRegistry::new()),
-        None,
-    )
+    let config = RouterConfig::builder()
+        .round_robin_policy()
+        .build_unchecked();
+    if ENGINE_ON.get() {
+        return engine_on::app_context(config);
+    }
+    app_context_for_tests(config, Arc::new(WorkerRegistry::new()), None)
 }
 
 fn worker(url: &str, model: &str) -> Arc<dyn Worker> {
@@ -61,6 +74,9 @@ fn endpoint(url: &str, models: &[&str]) -> Arc<dyn Worker> {
 /// The model's own policy entry, `None` once it is dropped: routing would
 /// fall back to the default policy, this does not.
 fn policy_of(app_context: &AppContext, model: &str) -> Option<&'static str> {
+    if ENGINE_ON.get() {
+        return engine_on::policy_of(app_context, model);
+    }
     app_context
         .policy_registry
         .get_policy(model)
@@ -119,8 +135,11 @@ async fn update(app_context: &Arc<AppContext>, worker: Arc<dyn Worker>) {
         .unwrap();
 }
 
-/// `DELETE /workers/{id}`: out of the worker registry, then the policies.
-async fn remove(app_context: &Arc<AppContext>, worker: Arc<dyn Worker>) {
+/// The removal job of `DELETE /workers/{id}` for `worker`, before its steps.
+fn removal_of(
+    app_context: &Arc<AppContext>,
+    worker: Arc<dyn Worker>,
+) -> WorkflowContext<WorkerRemovalWorkflowData> {
     let url = worker.url().to_string();
     let mut data = create_worker_removal_workflow_data(
         url.clone(),
@@ -130,7 +149,12 @@ async fn remove(app_context: &Arc<AppContext>, worker: Arc<dyn Worker>) {
     );
     data.worker_urls = vec![url];
     data.actual_workers_to_remove = Some(vec![worker]);
-    let mut context = WorkflowContext::new(WorkflowInstanceId::new(), data);
+    WorkflowContext::new(WorkflowInstanceId::new(), data)
+}
+
+/// `DELETE /workers/{id}`: out of the worker registry, then the policies.
+async fn remove(app_context: &Arc<AppContext>, worker: Arc<dyn Worker>) {
+    let mut context = removal_of(app_context, worker);
     RemoveFromWorkerRegistryStep
         .execute(&mut context)
         .await
@@ -527,14 +551,37 @@ async fn a_mesh_import_removed_here_leaves_the_local_workers_policy() {
     assert_eq!(policy_of(&app_context, "llama"), Some("cache_aware"));
 }
 
+/// Sends one encode call to a peer that answers nothing and hands back the
+/// connection the call dialled: the send ends at its bound and leaves that
+/// connection in the pool. The accept is bounded too: a client that never
+/// dials fails the test instead of hanging it.
+async fn dial_pooled_encode_connection(
+    listener: &tokio::net::TcpListener,
+    url: &str,
+) -> tokio::net::TcpStream {
+    use std::time::Duration;
+
+    use smg_grpc_client::tokenspeed_encoder::tokenspeed_encoder_proto::EncodeRequest;
+
+    use crate::routers::grpc::backend_client::send_tokenspeed_encode_rpc;
+
+    let send = tokio::time::timeout(
+        Duration::from_millis(200),
+        send_tokenspeed_encode_rpc(url.to_string(), EncodeRequest::default()),
+    );
+    let accept = tokio::time::timeout(Duration::from_secs(2), listener.accept());
+    let (_, dialled) = tokio::join!(send, accept);
+    let (pooled, _) = dialled
+        .expect("the client dials inside its bound")
+        .expect("the dialled connection");
+    pooled
+}
+
 #[tokio::test]
 async fn a_removal_closes_the_encode_connection_pooled_to_its_worker() {
     use std::time::Duration;
 
-    use smg_grpc_client::tokenspeed_encoder::tokenspeed_encoder_proto::EncodeRequest;
     use tokio::io::AsyncReadExt;
-
-    use crate::routers::grpc::backend_client::send_tokenspeed_encode_rpc;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -543,14 +590,7 @@ async fn a_removal_closes_the_encode_connection_pooled_to_its_worker() {
     let app_context = app_context();
     let encoder = worker(&url, "vision");
     register(&app_context, Arc::clone(&encoder), "random").await;
-    // The peer answers nothing: the send ends at its bound and leaves the
-    // connection it dialled in the pool.
-    let send = tokio::time::timeout(
-        Duration::from_millis(200),
-        send_tokenspeed_encode_rpc(url.clone(), EncodeRequest::default()),
-    );
-    let (_, dialled) = tokio::join!(send, listener.accept());
-    let (mut pooled, _) = dialled.expect("the dialled connection");
+    let mut pooled = dial_pooled_encode_connection(&listener, &url).await;
     // Open before the removal (past the client preface), so the close below
     // is the removal's.
     let mut preface = Vec::new();
@@ -567,5 +607,191 @@ async fn a_removal_closes_the_encode_connection_pooled_to_its_worker() {
     tokio::time::timeout(Duration::from_secs(2), pooled.read_to_end(&mut received))
         .await
         .expect("the removal closes the pooled connection")
+        .expect("a read to its end");
+}
+
+/// The removal step closes the pool of a URL only while no worker stands
+/// under it: a worker registered again under the URL between the registry
+/// step and the policy step, where the removal waits for its KV cleanups,
+/// keeps the URL's pool.
+#[tokio::test]
+async fn a_worker_registered_again_during_its_removal_keeps_its_pooled_encode_connection() {
+    use std::time::Duration;
+
+    use tokio::io::AsyncReadExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a loopback listener");
+    let url = format!("grpc://{}", listener.local_addr().expect("its address"));
+    let app_context = app_context();
+    let encoder = worker(&url, "vision");
+    register(&app_context, Arc::clone(&encoder), "random").await;
+    let mut pooled = dial_pooled_encode_connection(&listener, &url).await;
+
+    // A registration job does not wait for a removal job in flight: it can
+    // land between the removal's two steps.
+    let mut removal = removal_of(&app_context, encoder);
+    RemoveFromWorkerRegistryStep
+        .execute(&mut removal)
+        .await
+        .unwrap();
+    let again = worker(&url, "vision");
+    register(&app_context, Arc::clone(&again), "random").await;
+    RemoveFromPolicyRegistryStep
+        .execute(&mut removal)
+        .await
+        .unwrap();
+
+    let mut received = Vec::new();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(300),
+            pooled.read_to_end(&mut received)
+        )
+        .await
+        .is_err(),
+        "the connection pooled to a URL that has a worker again stays open"
+    );
+
+    // The removal that leaves no worker under the URL closes it.
+    remove(&app_context, again).await;
+    tokio::time::timeout(Duration::from_secs(2), pooled.read_to_end(&mut received))
+        .await
+        .expect("the removal that leaves no worker under the URL closes the pooled connection")
+        .expect("a read to its end");
+}
+
+/// A worker imported from a mesh peer leaves by the mesh sync's registry
+/// removal, which runs no removal workflow here: the task that follows the
+/// registry's events closes the connections pooled to it.
+async fn a_mesh_removal_closes_the_pooled_encode_connection(tokenizer_autoload_off: bool) {
+    use std::time::Duration;
+
+    use smg_worker::registry::{RemoteWorkerState, WorkerId};
+    use tokio::io::AsyncReadExt;
+
+    use crate::workflow::worker_events::spawn_worker_event_reactions;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a loopback listener");
+    let url = format!("grpc://{}", listener.local_addr().expect("its address"));
+    let config = RouterConfig::builder()
+        .round_robin_policy()
+        .disable_tokenizer_autoload(tokenizer_autoload_off)
+        .build_unchecked();
+    let app_context = app_context_for_tests(config, Arc::new(WorkerRegistry::new()), None);
+    spawn_worker_event_reactions(&app_context);
+    app_context
+        .worker_registry
+        .on_remote_worker_state(&RemoteWorkerState {
+            worker_id: "peer-encoder".to_string(),
+            model_id: "vision".to_string(),
+            url: url.clone(),
+            health: true,
+            version: 1,
+            spec: vec![],
+        });
+    let mut pooled = dial_pooled_encode_connection(&listener, &url).await;
+    let mut preface = Vec::new();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), pooled.read_to_end(&mut preface))
+            .await
+            .is_err(),
+        "the pooled connection is open before the removal"
+    );
+
+    // What the mesh sync does with a peer's tombstone.
+    app_context
+        .worker_registry
+        .remove_remote(&WorkerId::from_string("peer-encoder".to_string()))
+        .expect("the import leaves the registry");
+
+    let mut received = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), pooled.read_to_end(&mut received))
+        .await
+        .expect("the mesh removal closes the pooled connection")
+        .expect("a read to its end");
+}
+
+#[tokio::test]
+async fn a_mesh_removal_closes_the_encode_connection_pooled_to_its_worker() {
+    a_mesh_removal_closes_the_pooled_encode_connection(false).await;
+}
+
+#[tokio::test]
+async fn a_mesh_removal_closes_the_pooled_encode_connection_with_tokenizer_autoload_off() {
+    a_mesh_removal_closes_the_pooled_encode_connection(true).await;
+}
+
+/// The task closes the pool of a URL only while no worker stands under it: a
+/// worker registered again under the URL before the task reads the removal
+/// keeps the connection it dialled.
+#[tokio::test]
+async fn a_worker_imported_again_under_its_url_keeps_its_pooled_encode_connection() {
+    use std::time::Duration;
+
+    use smg_worker::registry::{RemoteWorkerState, WorkerId};
+    use tokio::io::AsyncReadExt;
+
+    use crate::workflow::worker_events::spawn_worker_event_reactions;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a loopback listener");
+    let url = format!("grpc://{}", listener.local_addr().expect("its address"));
+    let config = RouterConfig::builder()
+        .round_robin_policy()
+        .disable_tokenizer_autoload(true)
+        .build_unchecked();
+    let app_context = app_context_for_tests(config, Arc::new(WorkerRegistry::new()), None);
+    spawn_worker_event_reactions(&app_context);
+    let import = |worker_id: &str| RemoteWorkerState {
+        worker_id: worker_id.to_string(),
+        model_id: "vision".to_string(),
+        url: url.clone(),
+        health: true,
+        version: 1,
+        spec: vec![],
+    };
+    app_context
+        .worker_registry
+        .on_remote_worker_state(&import("peer-encoder"));
+    let mut pooled = dial_pooled_encode_connection(&listener, &url).await;
+
+    // No await between the two calls: the task reads the removal with the
+    // second import already under the URL.
+    app_context
+        .worker_registry
+        .remove_remote(&WorkerId::from_string("peer-encoder".to_string()))
+        .expect("the import leaves the registry");
+    app_context
+        .worker_registry
+        .on_remote_worker_state(&import("peer-encoder-again"));
+    assert!(
+        app_context.worker_registry.get_by_url(&url).is_some(),
+        "the second import stands under the URL"
+    );
+
+    let mut received = Vec::new();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(300),
+            pooled.read_to_end(&mut received)
+        )
+        .await
+        .is_err(),
+        "the connection pooled to a URL that has a worker again stays open"
+    );
+
+    // The removal that leaves no worker under the URL closes it.
+    app_context
+        .worker_registry
+        .remove_remote(&WorkerId::from_string("peer-encoder-again".to_string()))
+        .expect("the second import leaves the registry");
+    tokio::time::timeout(Duration::from_secs(2), pooled.read_to_end(&mut received))
+        .await
+        .expect("the removal that leaves no worker under the URL closes the pooled connection")
         .expect("a read to its end");
 }

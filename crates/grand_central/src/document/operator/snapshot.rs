@@ -8,18 +8,16 @@
 //! A page writes itself as JSON ([`WorkerRowsPage`]): a host in process serves
 //! the rows an operator reads with no mapping of its own.
 
-#![expect(
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
-
 use std::{borrow::Cow, collections::BTreeMap, sync::Arc, time::Instant};
 
 use serde::{Serialize, Serializer};
 
 use crate::{
     address::{split, Address, UNPARSABLE},
-    engine::view::{Role, WireModes},
+    engine::{
+        view::{Role, WireModes},
+        DemandFacts,
+    },
     store::{
         membership::blank, pairing::LAYOUT_FACTS, EncodeHandoff, Reachability, Registrant,
         StoreCheckpoint, WorkerFacts, WorkerRow, WorkerStatus,
@@ -33,13 +31,28 @@ pub(crate) const PAGE_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) const MODELS: usize = 128;
 
 /// What a snapshot caller asks of the worker rows.
+///
+/// The default asks for every model's rows under the byte bound alone. The
+/// record gains fields: code outside this crate starts from the default and
+/// assigns what it asks otherwise, and a pattern of it ends with `..`.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct WorkerRowsQuery {
     /// The model ids to include. An empty list includes every model.
     pub models: Vec<String>,
     /// The maximum number of rows to return. `usize::MAX` uses only the
     /// byte bound.
     pub limit: usize,
+}
+
+impl Default for WorkerRowsQuery {
+    /// Every model's rows, under the byte bound alone.
+    fn default() -> Self {
+        Self {
+            models: Vec::new(),
+            limit: usize::MAX,
+        }
+    }
 }
 
 impl WorkerRowsQuery {
@@ -81,7 +94,14 @@ pub(crate) fn unnamed(models: &[String]) -> Option<&'static str> {
 /// searched in a sorted list (the `rows_serving` of its worker objects'
 /// holder): the two change together.
 pub(crate) fn serves(models: &[String], row: &WorkerRow) -> bool {
-    models.is_empty() || row.facts.models.iter().any(|model| models.contains(model))
+    serves_models(models, &row.facts.models)
+}
+
+/// The rule of [`serves`] over the models a row serves, `served`: the one
+/// fact of a row the rule reads. A status entry of the membership log holds
+/// that list in its row's place, and a watch reads it by this rule.
+pub(crate) fn serves_models(models: &[String], served: &[String]) -> bool {
+    models.is_empty() || served.iter().any(|model| models.contains(model))
 }
 
 /// The store rows read for a snapshot.
@@ -112,21 +132,27 @@ pub struct WorkerRowsPage {
 /// a status and a handoff are names, and the wires a list of names. The age
 /// is in milliseconds at the take. A fact the row does not state is `null`,
 /// and `pairing` is `null` for a row that states nothing of a pair or of an
-/// encode handoff.
+/// encode handoff. `demand_facts` is `null` for a row whose worker states
+/// nothing for a request's hard demands. Inside that block a fact the
+/// worker does not state reads `0` or `false`, as the contract's block
+/// tells it.
 impl Serialize for WorkerRowsPage {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        #[derive(Serialize)]
-        struct Page<'a> {
-            rows: Vec<RowJson<'a>>,
-            truncated: bool,
-        }
         let rows = self.rows.iter().map(|row| RowJson::of(row, self.taken));
-        Page {
+        PageJson {
             rows: rows.collect(),
             truncated: self.truncated,
         }
         .serialize(serializer)
     }
+}
+
+/// A page's JSON ([`WorkerRowsPage`]): its rows, and whether a matching
+/// row was left out.
+#[derive(Serialize)]
+struct PageJson<'a> {
+    rows: Vec<RowJson<'a>>,
+    truncated: bool,
 }
 
 /// One row of a page's JSON ([`WorkerRowsPage`]).
@@ -156,6 +182,7 @@ struct RowJson<'a> {
     health_policy: HealthPolicyJson,
     admitted_age_ms: u64,
     maker: Option<RegistrantJson<'a>>,
+    demand_facts: Option<DemandFactsJson>,
 }
 
 /// From where a row is reachable: every gateway, or the one that holds its
@@ -167,8 +194,11 @@ enum ReachableJson {
     GatewayId(String),
 }
 
-/// What a row states of a pair and of an encode handoff, under the names
-/// of the contract's pairing descriptor.
+/// What a row states of a pair and of an encode handoff, in one object. A
+/// pair's fields stand under the names of the contract's pairing
+/// descriptor. `vision` and the encode offer's five fields keep the names
+/// the descriptor reserves: the contract states them on the registration
+/// and on the row themselves.
 #[derive(Serialize)]
 struct PairingJson<'a> {
     protocol: Option<&'a str>,
@@ -212,6 +242,17 @@ struct HealthPolicyJson {
 struct RegistrantJson<'a> {
     provider: &'a str,
     key: &'a str,
+}
+
+/// What a row's worker states for a request's hard demands, under the
+/// names of the contract's block (`WorkerRow.demand_facts`).
+#[derive(Serialize)]
+struct DemandFactsJson {
+    runtime: u32,
+    references: bool,
+    host_pipeline: bool,
+    window: u32,
+    decoding: u8,
 }
 
 impl<'a> RowJson<'a> {
@@ -287,7 +328,31 @@ impl<'a> RowJson<'a> {
                     key: maker.key(),
                 }),
             },
+            demand_facts: DemandFactsJson::of(facts.demand_facts),
         }
+    }
+}
+
+impl DemandFactsJson {
+    /// What a row's worker states for a request's hard demands: none for a
+    /// worker that states no fact, as the contract's row tells no block.
+    fn of(stated: DemandFacts) -> Option<Self> {
+        // Every fact by its name: one the engine's type gains stops the
+        // build here, so no fact stays off the page.
+        let DemandFacts {
+            runtime,
+            references,
+            host_pipeline,
+            window,
+            decoding,
+        } = stated;
+        (stated != DemandFacts::default()).then_some(Self {
+            runtime,
+            references,
+            host_pipeline,
+            window,
+            decoding,
+        })
     }
 }
 
@@ -330,23 +395,42 @@ impl<'a> PairingJson<'a> {
     }
 }
 
-/// Takes a redacted page at `now`, limited by row count and a conservative
-/// measure of the rows' facts. A row admitted after `now` reads as new at
-/// that instant. The first row must fit the byte bound too.
+/// Takes a redacted page at `now`, limited by row count and by the bytes
+/// its JSON takes ([`WorkerRowsPage`]), written compact. A host that writes
+/// the page another way, as with indentation, can write more. A row
+/// admitted after `now` reads as new at that instant. The first row must
+/// fit the byte bound too.
 pub fn worker_rows_page(asked: &WorkerRowsQuery, read: Rows, now: Instant) -> WorkerRowsPage {
-    let (rows, truncated) = worker_rows_page_with(asked, read, now, false, |row| {
-        let bytes = measure(&row);
+    counted_page(asked, read, now).0
+}
+
+/// [`worker_rows_page`], with the bytes its paging counted for the page's
+/// JSON. The count is the JSON's own length with `truncated` at its longer
+/// word: a page that left a row out writes one byte fewer.
+fn counted_page(asked: &WorkerRowsQuery, read: Rows, now: Instant) -> (WorkerRowsPage, usize) {
+    let framing = Framing {
+        around: written(&PageJson {
+            rows: Vec::new(),
+            truncated: false,
+        }),
+        between: 1,
+    };
+    let (rows, truncated, bytes) = paged(asked, read, now, false, framing, |row| {
+        // The row as the page writes it: redacted, at the take's instant.
+        let bytes = written(&RowJson::of(&row, now));
         (row.into_owned(), bytes)
     });
-    WorkerRowsPage {
+    let page = WorkerRowsPage {
         rows,
         truncated,
         taken: now,
-    }
+    };
+    (page, bytes)
 }
 
 /// Pages the redacted rows using the host's measure of the answer. A host
 /// that sends an oversized first row alone can keep that rule here.
+#[cfg(feature = "controller")]
 pub(crate) fn worker_rows_page_with<T>(
     asked: &WorkerRowsQuery,
     read: Rows,
@@ -354,6 +438,30 @@ pub(crate) fn worker_rows_page_with<T>(
     allow_oversized_first: bool,
     map: impl Fn(Cow<'_, WorkerRow>) -> (T, usize),
 ) -> (Vec<T>, bool) {
+    let framing = Framing::default();
+    let (rows, truncated, _) = paged(asked, read, now, allow_oversized_first, framing, map);
+    (rows, truncated)
+}
+
+/// What a page's bytes hold beside its rows' own: the bytes around the
+/// rows, and the bytes between two of them. A host whose measure frames
+/// each row states neither.
+#[derive(Clone, Copy, Default)]
+struct Framing {
+    around: usize,
+    between: usize,
+}
+
+/// The redacted rows `asked` serves out of `read`, paged by `map`'s measure
+/// of each under `framing`, with the bytes counted for the page.
+fn paged<T>(
+    asked: &WorkerRowsQuery,
+    read: Rows,
+    now: Instant,
+    allow_oversized_first: bool,
+    framing: Framing,
+    map: impl Fn(Cow<'_, WorkerRow>) -> (T, usize),
+) -> (Vec<T>, bool, usize) {
     let told = |row| map(redacted(row, now));
     match read {
         Rows::Shared(cut) => page(
@@ -364,6 +472,7 @@ pub(crate) fn worker_rows_page_with<T>(
                 .map(Cow::Borrowed),
             None,
             allow_oversized_first,
+            framing,
             told,
         ),
         Rows::Told(rows, serving) => page(
@@ -371,6 +480,7 @@ pub(crate) fn worker_rows_page_with<T>(
             rows.into_iter().map(Cow::Owned),
             Some(serving),
             allow_oversized_first,
+            framing,
             told,
         ),
     }
@@ -379,25 +489,29 @@ pub(crate) fn worker_rows_page_with<T>(
 /// A single pass over the serving rows, stopping at the first bound.
 /// The store supplies the serving count when it has already selected a
 /// prefix. A shared cut needs just one more matching row to say it was cut.
+/// The bytes counted are the page's: a row that did not fit adds none.
 fn page<'a, T>(
     limit: usize,
     mut rows: impl Iterator<Item = Cow<'a, WorkerRow>>,
     serving: Option<usize>,
     allow_oversized_first: bool,
+    framing: Framing,
     told: impl Fn(Cow<'a, WorkerRow>) -> (T, usize),
-) -> (Vec<T>, bool) {
+) -> (Vec<T>, bool, usize) {
     let mut page = Vec::new();
-    let mut bytes: usize = 0;
+    let mut bytes = framing.around;
     for row in rows.by_ref().take(limit) {
         let (row, size) = told(row);
-        bytes = bytes.saturating_add(size);
-        if bytes > PAGE_BYTES && !(allow_oversized_first && page.is_empty()) {
-            return (page, true);
+        let between = if page.is_empty() { 0 } else { framing.between };
+        let with = bytes.saturating_add(between).saturating_add(size);
+        if with > PAGE_BYTES && !(allow_oversized_first && page.is_empty()) {
+            return (page, true, bytes);
         }
+        bytes = with;
         page.push(row);
     }
     let truncated = serving.map_or_else(|| rows.next().is_some(), |count| page.len() < count);
-    (page, truncated)
+    (page, truncated, bytes)
 }
 
 /// Only copy a shared row here if an address or timestamp needs changing.
@@ -479,329 +593,34 @@ pub(crate) fn without_userinfo(address: &str) -> Option<String> {
     userinfo.then(|| format!("{scheme}{host}{tail}"))
 }
 
-/// Count each text with room for its framing and allow 512 bytes for
-/// fixed fields and the row envelope. Count the addresses and facts that
-/// can be told twice and include the pairing and encode descriptors.
-fn measure(row: &WorkerRow) -> usize {
-    let facts = &row.facts;
-    let text = |text: &str| text.len().saturating_add(16);
-    let mut bytes = 512usize
-        .saturating_add(text(&facts.key).saturating_mul(2))
-        .saturating_add(text(&facts.engine))
-        .saturating_add(text(&facts.engine_kind).saturating_mul(2));
-    for field in [
-        facts.zone.as_deref(),
-        facts.labels.get("policy").map(String::as_str),
-        facts.encode.connector.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        bytes = bytes.saturating_add(text(field));
+/// The bytes the JSON writer writes for `value`, written compact. The
+/// count goes through the writer itself, so it holds no second copy of the
+/// JSON's layout. No value a page counts fails to write: its maps are
+/// keyed by texts, and the writer that counts takes every byte. A count
+/// that failed all the same reads as the largest number, past the page's
+/// bound.
+fn written<T: Serialize>(value: &T) -> usize {
+    let mut counted = Counted(0);
+    match serde_json::to_writer(&mut counted, value) {
+        Ok(()) => counted.0,
+        Err(_) => usize::MAX,
     }
-    if let Registrant::Provider(maker) = &row.maker {
-        bytes = bytes
-            .saturating_add(text(maker.provider()))
-            .saturating_add(text(maker.key()));
+}
+
+/// A writer that counts the bytes it is given and keeps none.
+struct Counted(usize);
+
+impl std::io::Write for Counted {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        Ok(bytes.len())
     }
-    if let Some(pairing) = &facts.pairing {
-        for field in [&pairing.protocol, &pairing.transport, &pairing.version]
-            .into_iter()
-            .chain(&pairing.kv_layout)
-            .flatten()
-        {
-            bytes = bytes.saturating_add(text(field));
-        }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
-    for model in &facts.models {
-        bytes = bytes.saturating_add(text(model));
-    }
-    for (name, value) in &facts.labels {
-        bytes = bytes
-            .saturating_add(text(name))
-            .saturating_add(text(value))
-            .saturating_add(16);
-    }
-    bytes
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// An address is told without its userinfo and with every other byte as
-    /// registered. One with no userinfo is told as it is. One whose `@`
-    /// stands past the authority's end is told by the marker: no part of
-    /// what may be a userinfo is told.
-    #[test]
-    fn an_address_is_told_without_its_userinfo() {
-        for (address, told) in [
-            (
-                "grpc://user:secret@10.0.0.5:8000",
-                Some("grpc://10.0.0.5:8000"),
-            ),
-            (
-                "https://user@host.example:8443/v1?x=1#top",
-                Some("https://host.example:8443/v1?x=1#top"),
-            ),
-            ("user:secret@10.0.0.5:8000", Some("10.0.0.5:8000")),
-            // An `@` inside the userinfo: the authority's last one ends it.
-            (
-                "grpc://us@er:se@cret@10.0.0.5:8000",
-                Some("grpc://10.0.0.5:8000"),
-            ),
-            (
-                "grpc+tls://user@10.0.0.5:8000",
-                Some("grpc+tls://10.0.0.5:8000"),
-            ),
-            // A `://` behind the authority is no scheme's: the authority
-            // starts at the address's first byte, and its userinfo goes.
-            (
-                "user:secret@10.0.0.5:8000/next/http://other",
-                Some("10.0.0.5:8000/next/http://other"),
-            ),
-            (
-                "user:secret@10.0.0.5:8000?next=http://other",
-                Some("10.0.0.5:8000?next=http://other"),
-            ),
-            (
-                "user:secret@10.0.0.5:8000#http://other",
-                Some("10.0.0.5:8000#http://other"),
-            ),
-            (
-                "grpc://user:secret@10.0.0.5:8000?next=http://other",
-                Some("grpc://10.0.0.5:8000?next=http://other"),
-            ),
-            // No userinfo: every byte stays.
-            ("grpc://10.0.0.5:8000", None),
-            ("10.0.0.5:8000?next=http://other", None),
-            ("http://[::1]:8000/v1?x=1", None),
-            ("10.0.0.5:8000", None),
-            ("1http://10.0.0.5:8000", None),
-            ("", None),
-            // A userinfo that holds a raw `/`, `?` or `#` reads like these,
-            // and so does a path that holds an `@`.
-            ("http://user:se/cret@10.0.0.5:8000", Some(UNPARSABLE)),
-            ("http://user:se?cret@10.0.0.5:8000", Some(UNPARSABLE)),
-            ("http://user:se#cret@10.0.0.5:8000", Some(UNPARSABLE)),
-            ("http://10.0.0.5:8000/a@b", Some(UNPARSABLE)),
-            // No scheme by its form stands before `://`: its `/` ends the
-            // authority, and the `@` behind it stands past that end.
-            ("user:se://cret@10.0.0.5:8000", Some(UNPARSABLE)),
-            ("1http://user:secret@10.0.0.5:8000", Some(UNPARSABLE)),
-        ] {
-            assert_eq!(without_userinfo(address).as_deref(), told, "{address}");
-        }
-    }
-
-    #[test]
-    fn a_plain_page_stops_at_its_bytes_even_for_its_first_row() {
-        use crate::store::{MemoryStore, WorkerFacts, WorkersStore};
-
-        let store = MemoryStore::new();
-        let asked = WorkerRowsQuery {
-            models: Vec::new(),
-            limit: usize::MAX,
-        };
-        let now = Instant::now();
-        for n in 0..2 {
-            let key = format!("grpc://{n}.{}", "x".repeat((2 * 1024 * 1024) / 4));
-            store.upsert(WorkerFacts {
-                key: key.clone(),
-                engine: key,
-                incarnation: 1,
-                dp_size: 1,
-                models: vec!["m".to_owned()],
-                ..WorkerFacts::default()
-            });
-        }
-        // Every row, by key, with the count that serve: a lone read's
-        // answer for a call with no model and no limit.
-        let read = || {
-            let rows = store.checkpoint().rows;
-            let serving = rows.len();
-            (rows, serving)
-        };
-        let (rows, serving) = read();
-        let page = worker_rows_page(&asked, Rows::Told(rows, serving), now);
-        assert_eq!(page.rows.len(), 1);
-        assert!(page.truncated);
-
-        let (mut rows, _) = read();
-        rows.truncate(1);
-        rows[0].facts.key = "x".repeat(2 * 1024 * 1024);
-        let too_large = worker_rows_page(&asked, Rows::Told(rows, 1), now);
-        assert!(too_large.rows.is_empty() && too_large.truncated);
-    }
-
-    /// A page's JSON, literally: a row that states every fact, a
-    /// provider's among them with a credential in its key and in its own,
-    /// and a row that states the least, admitted after the take.
-    #[test]
-    fn a_page_writes_its_rows_as_an_operator_reads_them() {
-        use std::time::Duration;
-
-        use crate::{
-            engine::view::WorkerId,
-            store::{
-                pairing::PairingDescriptor, EncodeOffer, GatewayId, Overload, Signals, WorkerFacts,
-                WorkerStatus,
-            },
-        };
-
-        let admitted = Instant::now();
-        let taken = admitted + Duration::from_millis(1500);
-        let full = WorkerRow {
-            id: WorkerId(0xab),
-            facts: WorkerFacts {
-                key: "grpc://user:secret@10.0.0.5:8000".to_owned(),
-                engine: "grpc://user:secret@10.0.0.5:8000".to_owned(),
-                incarnation: 7,
-                role: Role::Prefill,
-                wire_modes: WireModes::from_bits(3),
-                engine_kind: "runtime-a".to_owned(),
-                models: vec!["m1".to_owned(), "m2".to_owned()],
-                dp_rank: 1,
-                dp_size: 2,
-                labels: BTreeMap::from([("policy".to_owned(), "default".to_owned())]),
-                zone: Some("zone-a".to_owned()),
-                pairing: Some(Arc::new(PairingDescriptor {
-                    protocol: Some("p1".to_owned()),
-                    transport: Some("t1".to_owned()),
-                    version: Some("v1".to_owned()),
-                    kv_layout: [
-                        Some("float16".to_owned()),
-                        None,
-                        Some("a1".to_owned()),
-                        None,
-                    ],
-                })),
-                encode: EncodeOffer {
-                    handoff: EncodeHandoff::Push,
-                    consumer: true,
-                    connector: Some("c1".to_owned()),
-                    ..EncodeOffer::default()
-                },
-                vision: true,
-                max_running: Some(8),
-                kv_block_size: Some(16),
-                bootstrap_port: Some(9000),
-                priority: 5,
-                reachable_from: Reachability::Gateway(GatewayId(0x1f)),
-                signals: Signals {
-                    events: true,
-                    loads: true,
-                    scrape_interval_ms: 0,
-                },
-                overload: Overload {
-                    kv_usage_permille: Some(900),
-                    waiting_requests: Some(64),
-                },
-                ..WorkerFacts::default()
-            },
-            status: WorkerStatus::Ready,
-            revision: 3,
-            admitted_at: admitted,
-            maker: Registrant::provider("finder", "http://u:p@host/x").expect("a maker"),
-        };
-        let least = WorkerRow {
-            id: WorkerId(1),
-            facts: WorkerFacts {
-                key: "http://b:1".to_owned(),
-                engine: "http://b:1".to_owned(),
-                incarnation: 1,
-                dp_size: 1,
-                ..WorkerFacts::default()
-            },
-            status: WorkerStatus::Pending,
-            revision: 1,
-            admitted_at: taken + Duration::from_secs(2),
-            maker: Registrant::Control,
-        };
-        let asked = WorkerRowsQuery {
-            models: Vec::new(),
-            limit: usize::MAX,
-        };
-        let page = worker_rows_page(&asked, Rows::Told(vec![full, least], 2), taken);
-        let probes = serde_json::json!({
-            "failure_threshold": 3,
-            "success_threshold": 2,
-            "check_interval_ms": 60_000,
-            "timeout_ms": 5_000,
-            "disabled": false
-        });
-        let expected = serde_json::json!({
-            "rows": [
-                {
-                    "id": "00000000000000ab",
-                    "registration_key": "grpc://10.0.0.5:8000",
-                    "incarnation": 7,
-                    "engine": "grpc://10.0.0.5:8000",
-                    "wire": ["http", "grpc"],
-                    "role": "prefill",
-                    "runtime": "runtime-a",
-                    "models": ["m1", "m2"],
-                    "dp_rank": 1,
-                    "dp_size": 2,
-                    "labels": {"policy": "default"},
-                    "zone": "zone-a",
-                    "status": "ready",
-                    "revision": 3,
-                    "reachable": {"gateway_id": "000000000000001f"},
-                    "pairing": {
-                        "protocol": "p1",
-                        "transport": "t1",
-                        "version": "v1",
-                        "bootstrap_port": 9000,
-                        "kv_layout": {"kv_cache_dtype": "float16", "attention_backend": "a1"},
-                        "ec_producer": false,
-                        "ec_consumer": true,
-                        "vision": true,
-                        "encode_handoff": "push",
-                        "ec_connector": "c1",
-                        "encode_references": false
-                    },
-                    "max_running": 8,
-                    "kv_block_size": 16,
-                    "priority": 5,
-                    "overload": {"queue_limit": 64, "kv_usage_permille": 900},
-                    "signals": {"events": true, "loads": true, "scrape_interval_ms": 0},
-                    "health_policy": probes,
-                    "admitted_age_ms": 1500,
-                    "maker": {"provider": "finder", "key": "http://host/x"}
-                },
-                {
-                    "id": "0000000000000001",
-                    "registration_key": "http://b:1",
-                    "incarnation": 1,
-                    "engine": "http://b:1",
-                    "wire": [],
-                    "role": "single",
-                    "runtime": "",
-                    "models": [],
-                    "dp_rank": 0,
-                    "dp_size": 1,
-                    "labels": {},
-                    "zone": null,
-                    "status": "pending",
-                    "revision": 1,
-                    "reachable": {"any": true},
-                    "pairing": null,
-                    "max_running": null,
-                    "kv_block_size": null,
-                    "priority": 0,
-                    "overload": {"queue_limit": null, "kv_usage_permille": null},
-                    "signals": {"events": false, "loads": false, "scrape_interval_ms": 0},
-                    "health_policy": probes,
-                    "admitted_age_ms": 0,
-                    "maker": null
-                }
-            ],
-            "truncated": false
-        });
-        assert_eq!(
-            serde_json::to_value(&page).expect("a page's JSON"),
-            expected
-        );
-    }
-}
+#[path = "../../../tests/unit/document/operator/snapshot/tests.rs"]
+mod tests;

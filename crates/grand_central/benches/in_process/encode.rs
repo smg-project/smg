@@ -393,6 +393,10 @@ pub(super) fn runs(run: &Run) -> bool {
     assert!(run.shadow == Shadowed::No, "an encode cell runs no shadow");
     assert!(!run.overloaded, "an encode cell's lists are open");
     let one_call = place::asked_with_lists(run, false);
+    assert!(
+        run.entry != ruled::ALONE,
+        "a pair's cell alone takes place_alone"
+    );
     // The run's rule of its route, where its entry states one.
     let rule = one_call && ruled::stated(run);
     let side = |side: &str, count: usize, worker_type| -> Arc<[Arc<dyn Worker>]> {
