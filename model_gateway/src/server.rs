@@ -106,7 +106,9 @@ use crate::{
         common::realtime::ws::RealtimeQueryParams,
         error as route_error,
         gateway::Gateway,
-        grpc::{common::responses::spawn_unstored_sweeper, regular::symphony::telemetry},
+        grpc::{
+            common::responses::spawn_unstored_sweeper, regular::symphony::telemetry, server_info,
+        },
         http::router::StreamBodyState,
         RouterTrait,
     },
@@ -851,7 +853,12 @@ async fn inflight_requests(State(state): State<Arc<AppState>>) -> Response {
 /// The control-plane reads the `admin` role alone may make: the gate
 /// refuses the `user` role there before any handler and writes the denial
 /// line, as for a mutation ([`smg_auth::ControlPlaneAuthState::with_admin_only_reads`]).
-pub const ADMIN_ONLY_READS: &[&str] = &["/config", "/rate-limits/tenants"];
+/// A route with a parameter stands here by its template.
+pub const ADMIN_ONLY_READS: &[&str] = &[
+    "/config",
+    "/rate-limits/tenants",
+    "/workers/{worker_id}/server_info",
+];
 
 /// `GET /config`: the effective configuration with every secret
 /// redacted and the keys in force named by fingerprint. The `admin` role
@@ -961,6 +968,28 @@ async fn get_worker(
             result.into_response()
         }
         Err(err) => err.into_response(),
+    }
+}
+
+/// `GET /workers/{worker_id}/server_info`: the server info answer of that
+/// worker's engine as a JSON object ([`server_info::answer`]); `501` where
+/// the engine is not asked or sends no answer. Under the control-plane
+/// check the `admin` role alone reads it ([`ADMIN_ONLY_READS`]). An id
+/// `GET /workers/{worker_id}` refuses is refused as there. An id that
+/// answers there with no registered worker of its own (a registration in
+/// flight, a data-parallel group) has no engine to ask and reads `501`.
+async fn get_worker_server_info(
+    State(state): State<Arc<AppState>>,
+    AdminPath(worker_id_raw): AdminPath<String>,
+) -> Response {
+    let found = match state.context.worker_service.get_worker(&worker_id_raw) {
+        Ok(found) => found,
+        Err(err) => return err.into_response(),
+    };
+    let id = WorkerId::from_string(found.0.id);
+    match state.context.worker_registry.get(&id) {
+        Some(worker) => server_info::answer(&*worker).await,
+        None => server_info::not_implemented(),
     }
 }
 
@@ -1582,6 +1611,10 @@ pub fn build_apps(
                 .put(replace_worker)
                 .patch(update_worker)
                 .delete(delete_worker),
+        )
+        .route(
+            "/workers/{worker_id}/server_info",
+            get(get_worker_server_info),
         );
 
     // Fallback (no control-plane auth) normally uses `admin_auth_config`.

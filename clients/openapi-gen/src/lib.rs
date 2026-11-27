@@ -434,6 +434,7 @@ pub const CONTROL_PLANE_ROUTES: &[(&str, &str)] = &[
     ("PUT", "/workers/{worker_id}"),
     ("PATCH", "/workers/{worker_id}"),
     ("DELETE", "/workers/{worker_id}"),
+    ("GET", "/workers/{worker_id}/server_info"),
 ];
 
 /// The RL control-plane routes, behind the same authentication, mounted only
@@ -807,6 +808,26 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
                     &worker_error_name,
                 ),
             )),
+        },
+    );
+    // GET /workers/{worker_id}/server_info
+    paths.insert(
+        "/workers/{worker_id}/server_info".to_string(),
+        PathItem {
+            get: Some(operation(
+                "getWorkerServerInfo",
+                "The server info answer of one worker's engine, under the names of the engine's wire: the admin role alone under control-plane authentication; 501 where the engine is not asked or sends no answer",
+                Some(vec![path_param("worker_id")]),
+                None,
+                refused_with(
+                    inline_response(
+                        "The engine's answer as a JSON object",
+                        serde_json::json!({"type": "object"}),
+                    ),
+                    &worker_error_name,
+                ),
+            )),
+            ..PathItem::default()
         },
     );
 

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use axum::{
     body::Body,
-    extract::{Request, State},
+    extract::{MatchedPath, Request, State},
     http::{header, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -94,7 +94,9 @@ pub struct ControlPlaneAuthState {
 
     /// The paths whose reads the `admin` role alone may make: a view that
     /// shows what the `user` role's reads do not. The gate refuses a user
-    /// there like any other control-plane 403, denial line included.
+    /// there like any other control-plane 403, denial line included. A
+    /// route with a parameter is named by its template
+    /// (`/workers/{worker_id}/server_info`).
     pub admin_only_reads: &'static [&'static str],
 
     /// What a recorded mutation's task takes for its lifetime, when the
@@ -123,7 +125,9 @@ impl ControlPlaneAuthState {
     }
 
     /// The same state with `paths` as the reads the `admin` role alone may
-    /// make; the gateway names them where it attaches the layer.
+    /// make; the gateway names them where it attaches the layer. Each is
+    /// the template of its route, which for a route without a parameter is
+    /// the path itself.
     #[must_use]
     pub fn with_admin_only_reads(mut self, paths: &'static [&'static str]) -> Self {
         self.admin_only_reads = paths;
@@ -143,9 +147,10 @@ impl ControlPlaneAuthState {
         self
     }
 
-    /// Whether a read of `path` needs the `admin` role.
-    fn is_admin_only_read(&self, path: &str) -> bool {
-        self.admin_only_reads.contains(&path)
+    /// Whether a read of the route `route` names (its template, or the
+    /// path of a request no route matched) needs the `admin` role.
+    fn is_admin_only_read(&self, route: &str) -> bool {
+        self.admin_only_reads.contains(&route)
     }
 
     /// Create from config, initializing JWT validator if needed.
@@ -270,9 +275,14 @@ struct Attempt {
 impl Attempt {
     fn of(request: &Request<Body>, auth_state: &ControlPlaneAuthState) -> Self {
         let path = request.uri().path();
+        // The template names every path of a route with a parameter.
+        let route = request
+            .extensions()
+            .get::<MatchedPath>()
+            .map_or(path, MatchedPath::as_str);
         Self {
             method: request.method().to_string(),
-            admin_only: auth_state.is_admin_only_read(path),
+            admin_only: auth_state.is_admin_only_read(route),
             path: path.to_string(),
             request_id: request.extensions().get::<RequestId>().map(|r| r.0.clone()),
         }

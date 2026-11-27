@@ -838,6 +838,82 @@ async fn an_admin_only_read_refuses_the_user_role_with_the_denial_line() {
     assert_eq!(status, StatusCode::OK, "a plain read stays the user's");
 }
 
+/// An admin-only read is named by the template of its route, so a route
+/// with a parameter can be one: the `user` role is refused on every path
+/// the template matches and the `admin` role reads it. An entry without a
+/// parameter is its own template, and a path no route matched is asked by
+/// the path, both as before.
+#[tokio::test]
+async fn an_admin_only_read_is_known_by_its_route_template() {
+    use axum::{middleware::from_fn_with_state, routing::get, Router};
+    use tower::ServiceExt;
+
+    use crate::config::ApiKeyEntry;
+
+    async fn view() -> Response {
+        StatusCode::OK.into_response()
+    }
+    let state = ControlPlaneAuthState::new(
+        ControlPlaneAuthConfig {
+            jwt: None,
+            api_keys: vec![
+                ApiKeyEntry::new("admin", "Admin", "admin-key", Role::Admin),
+                ApiKeyEntry::new("reader", "Reader", "reader-key", Role::User),
+            ],
+            audit_enabled: false,
+        },
+        None,
+    )
+    .with_admin_only_reads(&["/config", "/workers/{worker_id}/server_info", "/unrouted"]);
+    let app = Router::new()
+        .route("/config", get(view))
+        .route("/workers", get(view))
+        .route("/workers/{worker_id}", get(view))
+        .route("/workers/{worker_id}/server_info", get(view))
+        .layer(from_fn_with_state(state, control_plane_auth_middleware));
+
+    let status = |path: &'static str, key: &'static str| {
+        let app = app.clone();
+        async move {
+            let request = Request::builder()
+                .uri(path)
+                .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                .body(Body::empty())
+                .unwrap();
+            app.oneshot(request).await.unwrap().status()
+        }
+    };
+
+    for path in ["/workers/w-1/server_info", "/workers/another/server_info"] {
+        assert_eq!(
+            status(path, "reader-key").await,
+            StatusCode::FORBIDDEN,
+            "{path}"
+        );
+        assert_eq!(status(path, "admin-key").await, StatusCode::OK, "{path}");
+    }
+
+    assert_eq!(status("/config", "reader-key").await, StatusCode::FORBIDDEN);
+    assert_eq!(status("/config", "admin-key").await, StatusCode::OK);
+
+    for path in ["/workers", "/workers/w-1"] {
+        assert_eq!(status(path, "reader-key").await, StatusCode::OK, "{path}");
+    }
+
+    assert_eq!(
+        status("/unrouted", "reader-key").await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        status("/unrouted", "admin-key").await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        status("/elsewhere", "reader-key").await,
+        StatusCode::NOT_FOUND
+    );
+}
+
 #[tokio::test]
 async fn a_mutation_the_role_may_not_make_writes_the_denial_line_alone() {
     use crate::audit::tests::field;
