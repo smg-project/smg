@@ -512,7 +512,7 @@ Router code should use `McpToolSession` so exposed tool names are collision-safe
 | `PolicyOnly` | Batch processing, Chat API | Auto-decide via PolicyEngine |
 | `Interactive` | Responses API | Return approval request to client |
 
-On a Responses request through the OpenAI-compatible HTTP router or the regular pipeline of the gRPC router, a tool the request's `tools` admit under `"require_approval": "always"` is not run without approval. The approval request reaches the client on a non-streamed request through the HTTP router; on the others the call fails with the approval error. The setting's object form, with its `always` and `never` lists, is not applied yet: it requires approval for no tool. The Harmony pipeline of the gRPC router does not apply `require_approval` yet: its tools run under the policy engine alone.
+On a Responses request through the OpenAI-compatible HTTP router or the regular pipeline of the gRPC router, a tool the request's `tools` admit under `"require_approval": "always"` is not run without approval. The approval request reaches the client on a non-streamed request through the HTTP router; on the others the call fails with the approval error. The setting's object form, with its `always` and `never` filters, is not applied yet: it requires approval for no tool. The Harmony pipeline of the gRPC router does not apply `require_approval` yet: its tools run under the policy engine alone.
 
 ### Trust Levels
 
