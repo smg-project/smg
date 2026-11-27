@@ -13,6 +13,7 @@ use crate::{
         body_format, completion_constraint, logit_bias_by_token_text, plain_constraint,
         stop_strings, ConstraintKind, FormatSetAside, OutputConstraint, PlainSampling,
     },
+    sglang_encoder_proto::sglang_encoder_client::SglangEncoderClient,
     BoxedTraceInjector,
 };
 
@@ -30,6 +31,10 @@ pub mod proto {
 /// alias for the generic `crate::AbortOnDropStream`.
 pub type AbortOnDropStream =
     crate::AbortOnDropStream<Box<proto::GenerateResponse>, SglangSchedulerClient>;
+
+/// Managed EPD manifests (up to 32 MiB per `sglang_managed::Limits`) ride on
+/// `GenerateResponse.prepared_input` and can exceed tonic's 4 MiB default limit.
+const GENERATE_MAX_DECODING_MESSAGE_SIZE: usize = 36 * 1024 * 1024;
 
 /// gRPC client for SGLang scheduler
 #[derive(Clone)]
@@ -73,10 +78,27 @@ impl SglangSchedulerClient {
         proto::sglang_scheduler_client::SglangSchedulerClient<Channel>,
         "SGLang scheduler",
         "sglang.grpc.scheduler.SglangScheduler",
-        proto::sglang_scheduler_server::SERVICE_NAME
+        proto::sglang_scheduler_server::SERVICE_NAME,
+        Some(GENERATE_MAX_DECODING_MESSAGE_SIZE)
     );
 
     crate::impl_embed!(proto);
+
+    /// Reuse the registered encoder's connection for native SGLang control.
+    pub async fn encode_native(
+        &self,
+        request: crate::sglang_encoder_proto::EncodeRequest,
+        timeout: std::time::Duration,
+    ) -> Result<(), tonic::Status> {
+        let mut request = Request::new(request);
+        request.set_timeout(timeout);
+        let mut client =
+            SglangEncoderClient::new(self.channel.clone()).max_encoding_message_size(usize::MAX);
+        tokio::time::timeout(timeout, client.encode(request))
+            .await
+            .map_err(|_| tonic::Status::deadline_exceeded("encoder deadline expired"))??;
+        Ok(())
+    }
 
     /// Abort a request
     pub async fn abort_request(
@@ -821,6 +843,7 @@ impl SglangSchedulerClient {
                 "/sglang.grpc.scheduler.SglangScheduler/Generate",
                 metadata.into_headers(),
                 frames,
+                Some(GENERATE_MAX_DECODING_MESSAGE_SIZE),
             )
             .await?;
             Ok(AbortOnDropStream::new(stream, request_id, self.clone()))
@@ -834,6 +857,15 @@ mod tests {
 
     use super::*;
     use crate::channel::testing::refused_endpoint;
+
+    /// The future of each generate call holds a request, inside jemalloc's
+    /// 640-byte size class. A field that needs more room goes in a box (see
+    /// `build.rs`).
+    #[test]
+    fn the_request_stays_in_the_640_byte_allocator_class() {
+        let bytes = size_of::<proto::GenerateRequest>();
+        assert!(bytes <= 640, "an SGLang request is {bytes} bytes");
+    }
 
     #[test]
     fn score_request_uses_unscaled_prefill_only_logprobs() {
@@ -1445,5 +1477,12 @@ mod tests {
             );
         }
         assert_eq!(SglangSchedulerClient::constraint_of(None), None);
+    }
+
+    #[test]
+    fn decode_limit_covers_managed_manifest_budget() {
+        use crate::sglang_managed::Limits;
+
+        assert!(GENERATE_MAX_DECODING_MESSAGE_SIZE > Limits::default().manifest_bytes);
     }
 }

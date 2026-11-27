@@ -40,10 +40,8 @@ fn a_missed_deadline_under_the_plugins_own_bound_is_one_failure_of_its_decision(
     let runtime = runtime();
     let mut spec = spec(&served, "silent");
     // One failure opens the breaker: the miss is one.
-    spec.breaker = BreakerSpec {
-        failures: 1,
-        ..BreakerSpec::default()
-    };
+    spec.breaker = BreakerSpec::default();
+    spec.breaker.failures = 1;
     let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
     let engine = single_engine(profile(&plugin, ALL));
     let started = Instant::now();
@@ -252,10 +250,8 @@ fn a_plugin_that_answers_past_half_the_budget_opens_its_breaker_through_the_late
     // A loaded host turns some of these answers into misses of the plugin's
     // own, and five of those would open the breaker by the failure rule
     // first. That rule is set out of reach: the latency sample alone opens.
-    spec.breaker = BreakerSpec {
-        failures: u32::MAX,
-        ..BreakerSpec::default()
-    };
+    spec.breaker = BreakerSpec::default();
+    spec.breaker.failures = u32::MAX;
     let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
     let engine = single_engine(profile(&plugin, ALL));
     let candidates = pool(4);
@@ -413,10 +409,8 @@ fn two_missed_frames_in_a_window_of_fast_answers_do_not_open_by_the_tail() {
     // The window's tail alone is read here. An honest answer a loaded host
     // delivers late is one more miss, and five misses in the window open
     // the breaker by the failure rule before the window is read.
-    spec.breaker = BreakerSpec {
-        failures: u32::MAX,
-        ..BreakerSpec::default()
-    };
+    spec.breaker = BreakerSpec::default();
+    spec.breaker.failures = u32::MAX;
     let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
     let engine = single_engine(profile(&plugin, ALL));
     let candidates = pool(4);
@@ -473,10 +467,8 @@ fn late_answers_the_thread_finds_without_waiting_are_used_and_sampled_at_their_f
     let runtime = runtime();
     let mut spec = spec(&served, "late-answers");
     // The latency rule alone opens here.
-    spec.breaker = BreakerSpec {
-        failures: u32::MAX,
-        ..BreakerSpec::default()
-    };
+    spec.breaker = BreakerSpec::default();
+    spec.breaker.failures = u32::MAX;
     let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
     let hold = Arc::new(AtomicU64::new(0));
     // The host's filter runs ahead of the plugin's: the frame left at the
@@ -541,17 +533,13 @@ fn a_miss_under_the_remainders_clamp_is_the_decisions_budget_spent_and_no_failur
     // its own misses never open it here.
     let mut quarter = spec(&silent, "silent-filter");
     quarter.budget_micros = SHORT_MICROS / 4;
-    quarter.breaker = BreakerSpec {
-        failures: u32::MAX,
-        ..BreakerSpec::default()
-    };
+    quarter.breaker = BreakerSpec::default();
+    quarter.breaker.failures = u32::MAX;
     let filter = Plugin::load(&runtime, quarter).expect("the plugin loads");
     // One failure would open the picker's breaker: a clamped miss is none.
     let mut clamped = spec(&mute, "clamped-picker");
-    clamped.breaker = BreakerSpec {
-        failures: 1,
-        ..BreakerSpec::default()
-    };
+    clamped.breaker = BreakerSpec::default();
+    clamped.breaker.failures = 1;
     let picker = Plugin::load(&runtime, clamped).expect("the plugin loads");
     let engine = single_engine(filter_then_picker(&filter, &picker));
     let mut short = facts(1);
@@ -595,7 +583,9 @@ fn filters_of(plugins: &[&Arc<Plugin>]) -> Profile {
 /// the decision's budget spent, no failure, and its sample is what it was
 /// given, about a third of the budget, which no window reads slow. Judged
 /// by the frame as sent it would fail every decision; sampled at the frame
-/// as sent its window would read slow at its first read.
+/// as sent its window would read slow at its first read. The clock says
+/// so too: the quickest such round ends well short of the budget, where
+/// a wait that lasted to its frame's deadline makes each as long as it.
 #[test]
 fn a_wait_the_remainder_ended_first_is_the_decisions_spend_at_what_the_frame_was_given() {
     let runtime = runtime();
@@ -611,11 +601,9 @@ fn a_wait_the_remainder_ended_first_is_the_decisions_spend_at_what_the_frame_was
             // zero that opening bypasses nothing.
             let mut spec = spec(served, &format!("front-{i}"));
             spec.budget_micros = 7_000;
-            spec.breaker = BreakerSpec {
-                failures: u32::MAX,
-                cooldown_micros: 0,
-                ..BreakerSpec::default()
-            };
+            spec.breaker = BreakerSpec::default();
+            spec.breaker.failures = u32::MAX;
+            spec.breaker.cooldown_micros = 0;
             Plugin::load(&runtime, spec).expect("the plugin loads")
         })
         .collect();
@@ -632,9 +620,13 @@ fn a_wait_the_remainder_ended_first_is_the_decisions_spend_at_what_the_frame_was
     // a count of rounds runs out before a held thread is seen again.
     let started = Instant::now();
     let mut rounds = 0_u32;
+    // The quickest round in which the starved plugin's frame left and
+    // missed.
+    let mut quickest = Duration::MAX;
     loop {
         let stats = last.stats();
-        if stats.missed - stats.stalls >= 64 || stats.breaker_opens != 0 {
+        let waited = stats.missed - stats.stalls;
+        if waited >= 64 || stats.breaker_opens != 0 {
             break;
         }
         rounds += 1;
@@ -642,11 +634,24 @@ fn a_wait_the_remainder_ended_first_is_the_decisions_spend_at_what_the_frame_was
             started.elapsed() < Duration::from_secs(60),
             "the frames do not leave: {stats:?}"
         );
+        let round = Instant::now();
         assert!(matches!(
             decide_with(&engine, &short, &candidates),
             Decision::Pick(_)
         ));
+        let took = round.elapsed();
+        let stats = last.stats();
+        if stats.missed - stats.stalls > waited {
+            quickest = quickest.min(took);
+        }
     }
+    // The fronts' frames fly together and draw the whole budget at a
+    // third of it on the clock, so the starved wait ends there. Its
+    // frame's deadline is the budget's end.
+    assert!(
+        quickest < Duration::from_micros(u64::from(SHORT_MICROS) / 4 * 3),
+        "a wait outlasts what its decision had left: the quickest of {rounds} rounds took {quickest:?}"
+    );
     let stats = last.stats();
     assert_eq!(
         (stats.unread, stats.breaker_opens, stats.bypassed),
@@ -683,20 +688,16 @@ fn a_frame_sent_under_the_rest_is_read_against_its_plugins_whole_frame() {
     // an opening by its own slow samples lasts no time.
     let mut front = spec(&silent, "silent-front");
     front.budget_micros = SHORT_MICROS / 4 * 3;
-    front.breaker = BreakerSpec {
-        failures: u32::MAX,
-        cooldown_micros: 0,
-        ..BreakerSpec::default()
-    };
+    front.breaker = BreakerSpec::default();
+    front.breaker.failures = u32::MAX;
+    front.breaker.cooldown_micros = 0;
     let filter = Plugin::load(&runtime, front).expect("the plugin loads");
     // The picker's own frame is the whole budget. A round whose filter frame
     // did not leave asks it under that, and such a miss is its own: its
     // failures never open it here.
     let mut rest = spec(&mute, "under-the-rest");
-    rest.breaker = BreakerSpec {
-        failures: u32::MAX,
-        ..BreakerSpec::default()
-    };
+    rest.breaker = BreakerSpec::default();
+    rest.breaker.failures = u32::MAX;
     let picker = Plugin::load(&runtime, rest).expect("the plugin loads");
     let engine = single_engine(filter_then_picker(&filter, &picker));
     let mut short = facts(1);
@@ -735,10 +736,8 @@ fn a_miss_under_a_remainder_the_plugin_alone_spent_is_its_own() {
     let mut spec = spec(&served, "spends-alone");
     // Its failures never open it here: a loaded host takes more than one
     // decision to show one whole.
-    spec.breaker = BreakerSpec {
-        failures: u32::MAX,
-        ..BreakerSpec::default()
-    };
+    spec.breaker = BreakerSpec::default();
+    spec.breaker.failures = u32::MAX;
     let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
     let engine = single_engine(filter_then_picker(&plugin, &plugin));
     let candidates = pool(4);
@@ -985,6 +984,73 @@ fn a_pick_only_ask_after_the_budget_is_spent_sends_no_frame() {
     assert_eq!(quick.frames(), 0);
 }
 
+/// A plugin opened under a budget that an earlier open spent is not asked,
+/// and its open says so ahead of anything else it would read. A WebAssembly
+/// plugin stands in front on a cold slot: its `init` takes 20 ms of its
+/// host's clock under a 10 ms decision, so the remote plugin's open finds
+/// no remainder. That open is the decision's budget spent and no failure,
+/// and no frame leaves. The view is one row too large for this plugin: it
+/// is not counted, since the open did not come to it.
+#[cfg(feature = "wasm")]
+#[test]
+fn a_plugin_opened_under_a_spent_budget_is_not_asked() {
+    use smg_grand_central::plugins::wasm;
+
+    use crate::{
+        guest_loaded,
+        support::wasm_guest::{mode, record_guest},
+    };
+
+    let open = OpenDecisions::new();
+    // The guests' clock naps where the case says so, and answers zero: an
+    // `init` that asks it goes on.
+    let naps = Arc::new(AtomicBool::new(false));
+    let steer = Arc::clone(&naps);
+    let guests = wasm::Runtime::with_clock(&open, move || {
+        if steer.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        0
+    })
+    .expect("a runtime");
+    let guests = Arc::new(guests);
+    let mut row = wasm::PluginSpec::new("init-asks", record_guest());
+    row.config = vec![mode::LEAST_IN_FLIGHT, mode::INIT_ASKS_THE_CLOCK];
+    row.budget_micros = 10_000;
+    let guest = guest_loaded(&guests, &row);
+    let served = TestPlugin::serve();
+    let runtime = Runtime::new(&open).expect("a runtime");
+    let mut small = spec(&served, "behind-the-init");
+    small.max_candidates = 3;
+    let remote = Plugin::load(&runtime, small).expect("the plugin loads");
+    let healthy: Option<Box<dyn Filter>> = Some(Box::new(Healthy));
+    let least: Option<Box<dyn Scorer>> = Some(Box::new(LeastRequests));
+    let mut profile = Profile::of("behind-an-init".into(), Box::new(Best));
+    profile.filters = vec![Box::new(wasm::WasmFilter::new(guest.bind(), healthy))];
+    profile.scorers = vec![WeightedScorer::of(
+        Box::new(GrpcScorer::new(remote.bind(), least)),
+        1.0,
+    )];
+    let engine = single_engine(profile);
+    guest.forget_instance();
+    naps.store(true, Ordering::Relaxed);
+    let mut short = facts(1);
+    short.budget_micros = 10_000;
+    let decision = decide_with(&engine, &short, &pool(4));
+    naps.store(false, Ordering::Relaxed);
+    assert!(
+        matches!(decision, Decision::Pick(_)),
+        "the fallbacks decide"
+    );
+    let stats = remote.stats();
+    assert_eq!(
+        (stats.budget_spent, stats.too_many, stats.breaker_opens),
+        (1, 0, 0),
+        "the open is the decision's budget spent, said ahead of the view's size: {stats:?}"
+    );
+    assert_eq!(served.frames(), 0, "no frame left");
+}
+
 #[test]
 fn an_answer_after_its_deadline_is_late() {
     let served = TestPlugin::serve();
@@ -1035,10 +1101,8 @@ fn a_frame_past_the_window_is_refused_without_a_fault() {
     let runtime = runtime();
     let mut spec = spec(&served, "nine");
     // One failure would open the breaker: a refused frame is none.
-    spec.breaker = BreakerSpec {
-        failures: 1,
-        ..BreakerSpec::default()
-    };
+    spec.breaker = BreakerSpec::default();
+    spec.breaker.failures = 1;
     let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
     // Nine bound sets of one build score in one profile: each opens its own
     // frame at the decision's open, on the deciding thread's one stream,
@@ -1086,10 +1150,8 @@ fn a_gone_budget_sends_no_frame_and_counts_on_the_breaker() {
     let served = TestPlugin::serve();
     let runtime = runtime();
     let mut spec = spec(&served, "budgetless");
-    spec.breaker = BreakerSpec {
-        failures: 2,
-        ..BreakerSpec::default()
-    };
+    spec.breaker = BreakerSpec::default();
+    spec.breaker.failures = 2;
     let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
     let engine = single_engine(profile(&plugin, ALL));
     let mut gone = facts(1);
@@ -1244,10 +1306,8 @@ fn a_plugins_close_that_stops_half_way_leaves_its_scope_closed() {
     // Every answer below is slow or a miss. Five misses of the plugin's own
     // would open the breaker by the failure rule first, so that rule is set
     // out of reach: the window's read is what asks the clock.
-    spec.breaker = BreakerSpec {
-        failures: u32::MAX,
-        ..BreakerSpec::default()
-    };
+    spec.breaker = BreakerSpec::default();
+    spec.breaker.failures = u32::MAX;
     let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
     // The plugin is bound at one stage, so a decision closes its scope
     // once. Bound at two, the engine closes the same bound set twice, and
@@ -1307,11 +1367,10 @@ fn the_breaker_opens_on_a_run_of_faults_and_closes_after_the_cool_down() {
     let runtime = Runtime::with_clock(&OpenDecisions::new(), move || reads.load(Ordering::Relaxed))
         .expect("a runtime");
     let mut spec = spec(&served, "breaking");
-    spec.breaker = BreakerSpec {
-        failures: 2,
-        window_micros: 1_000_000,
-        cooldown_micros: 5_000_000,
-    };
+    spec.breaker = BreakerSpec::default();
+    spec.breaker.failures = 2;
+    spec.breaker.window_micros = 1_000_000;
+    spec.breaker.cooldown_micros = 5_000_000;
     let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
     let engine = single_engine(profile(&plugin, ALL));
     let candidates = pool(4);

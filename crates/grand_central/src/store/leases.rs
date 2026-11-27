@@ -1,11 +1,6 @@
 //! The leases store: every issued decision, per gateway, with the term of
 //! the leader that issued it (design 4.3, 5.1 the leases row, 5.3 fencing).
 
-#![expect(
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
-
 use std::{mem, time::Instant};
 
 /// The table of counts the leases on file book and a member's place in
@@ -126,7 +121,15 @@ impl PickRecord {
 /// The decode side of a pair's lease, as the store keeps it beside the
 /// lease's record ([`Sides`]). The sides share the lease's id and generation.
 /// Each has its own target, session verdict, state, and, when live, booking.
+///
+/// The record is closed: a store's door takes one whole and books by its
+/// fields, so a field that joins stops each writer's build until the writer
+/// states it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::exhaustive_structs,
+    reason = "closed by its doc: a store's door takes one whole, and each writer states every field"
+)]
 pub struct DecodeSide {
     /// The first decode target of the pick, or the worker the side moved
     /// to at dispatch.
@@ -187,7 +190,15 @@ pub struct DecodeMark;
 
 /// One lease as the store holds it: a single's whole, or the prefill part
 /// of a pair's.
+///
+/// The record is closed: a store's door takes one whole and books by its
+/// fields, so a field that joins stops each writer's build until the writer
+/// states it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::exhaustive_structs,
+    reason = "closed by its doc: a store's door takes one whole, and each writer states every field"
+)]
 pub struct LeaseRecord {
     pub lease: Lease,
     /// The gateway the lease was issued to; the pair (gateway, lease id) is
@@ -267,7 +278,14 @@ impl LeaseRecord {
 /// the record and, where the record carries the mark of a pair's lease,
 /// its decode side. The prefill side of a pair is the record's own lease,
 /// target and state. What a frame on a side names is read here.
+///
+/// The record is closed: a store builds it as its answer, so a part that
+/// joins stops each store's build until the store states it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::exhaustive_structs,
+    reason = "closed by its doc: a store builds it as its answer and states every part"
+)]
 pub struct Sides {
     pub record: LeaseRecord,
     /// The decode side of a pair's lease; `None` for a single's.

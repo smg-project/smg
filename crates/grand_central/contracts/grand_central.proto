@@ -4,11 +4,15 @@
 //
 // Versioning: design appendix A (additive within v1). The package is
 // pre-release until the first shipped release that carries it; the rule
-// binds from then on. Hello carries the range of protocol versions the
-// gateway speaks and Welcome the one the controller picked; a range that
-// holds no version the controller speaks is refused with
-// FAILED_PRECONDITION, the status message naming the range and the
-// controller's version.
+// binds from then on.
+//
+// Hello carries the range of protocol versions the gateway speaks, and
+// Welcome the one the controller picked. The controller speaks two
+// versions, its own and the one before it, and picks the newest that the
+// range holds. A range that holds neither is refused with
+// FAILED_PRECONDITION, and the status message names the range and the
+// controller's own. Version 2 is the first whose frames state a request's
+// hard demands (DecideRequest.demands).
 //
 // Scopes and principals: design 5.2. Three credentialed scopes, each
 // mountable on its own listener; the verified principal is transport
@@ -102,8 +106,9 @@
 // term, on a membership write, a spec write, its dry run and a rollback,
 // Replicate and the open of a WatchWorkers (the moment after
 // its take, until its store is told the term, and a call admitted under a
-// take its store has since passed: retry; or its whole lead, until a later
-// take, where its log followed a term at or above the one it took), or a
+// take its store has since passed: retry; or the one step of a lead whose
+// log followed a term at or above the one it took, which the election
+// leaves for a take above that term), or a
 // Decide stream open when the controller closes its listeners at its
 // shutdown (its gateway opens the next one on the leader);
 // ABORTED fenced mid-stream, reconnect through Leader, a Hello read
@@ -537,6 +542,74 @@ message DecideRequest {
   // such a pool, the decode goes by load and its number is not read. The
   // pair's decode_later stands as it is stated.
   optional uint32 named_worker = 8;
+  // The request's hard demands of the worker that takes it. Absent, or with
+  // no part stated, the request demands nothing and the frame is decided as
+  // it was.
+  //
+  // A stated demand is read on every frame. A worker is held by its role:
+  // - a single worker, a decode and a decode call's decode: to every part
+  // - a prefill, in a pair or alone: to every part but output_window and
+  //   decoding
+  // - an encoder that takes an encode request's items: to runtime, vision
+  //   and references. The request's pair is then held to neither of the
+  //   last two
+  //
+  // A decode call states its request's demands again: the lease keeps
+  // none. A frame that states named_worker counts its number among the
+  // workers that meet the demand.
+  //
+  // An encode request that states an item leaves a demand for vision or
+  // references to its encoders. One that states such a demand and
+  // decode_later is declined under `decode-later`: its decode call states
+  // no items, and would hold the decode to both.
+  //
+  // A host states a demand only on a session whose Welcome chose protocol 2
+  // or later. A controller of protocol 1 reads no such field, and would
+  // place the request among the workers its demand rules out. A controller
+  // that speaks protocol 2 reads a stated demand on a session of either
+  // version.
+  Demands demands = 9;
+}
+
+// What a request demands of the worker that takes it. A worker meets a
+// demand by what its registration states (DemandFacts). The two numbers
+// are the asking party's own: the controller compares each with a worker's
+// and reads no more of it.
+//
+// Whether a worker takes images is its row's own bit, which its
+// registration states (WorkerSpec.vision). A list the demands leave nobody
+// is shed with no endpoint, under the stage of the demand that took its
+// last worker.
+message Demands {
+  // Where a request's media by reference may be processed.
+  enum References {
+    // The request carries no media by reference.
+    REFERENCES_NONE = 0;
+    // By a worker that processes media by reference, whichever pipeline it
+    // runs.
+    REFERENCES_ANY = 1;
+    // By a worker that processes it by its registering party's pipeline.
+    REFERENCES_CALLER = 2;
+    // By a worker that processes it by a pipeline of its own.
+    REFERENCES_WORKER = 3;
+  }
+  // The runtime the request stays on, as a number: only a worker that
+  // states the same number takes it. 0 demands none.
+  uint32 runtime = 1;
+  // The request needs a worker that takes images.
+  bool vision = 2;
+  // A value this contract does not name is out of range, by this field.
+  References references = 3;
+  // The context window the request's input needs, in tokens: only a worker
+  // whose window is as wide, or that states none, takes it. 0 demands none.
+  uint32 input_window = 4;
+  // The context window the request's completion needs, in tokens, held
+  // against a worker's window alone as the input is. 0 demands none.
+  uint32 output_window = 5;
+  // How the request's constraint was decided, as a number of at most 255:
+  // out of range above, by this field. Only a worker that states the same
+  // number takes it. 0 demands none.
+  uint32 decoding = 6;
 }
 
 // The encode items of a request and what it asks for them.
@@ -791,6 +864,24 @@ message WorkerRow {
   // states none, and the row reads as it did before this field. A reader
   // that knows no such field reads every row as one that states none.
   DemandFacts demand_facts = 28;
+  // Whether the worker takes images. A reader that knows no such field
+  // reads every row as one that takes none, so it sends the worker no
+  // request that demands vision.
+  bool vision = 29;
+  // The worker's end of the encode handoff. Absent: it states none, and the
+  // row reads as it did before this field. A reader that knows no such
+  // field reads every row as one that states no end, so a decision it
+  // makes from its own rows hands the worker no item.
+  EncodeOffer encode = 30;
+  // The worker's priority. No decision reads it. It crosses so that a
+  // standby's row and an operator's snapshot are the leader's. A reader
+  // that knows no such field reads every row at priority zero.
+  sint32 priority = 31;
+  // The seconds a removal waits behind the worker's drain, where the row
+  // states a window. Absent: the default window. A stated window may be
+  // the default's own number, and zero is a window of no wait. A reader
+  // that knows no such field reads every row at the default window.
+  optional uint32 drain_settle_secs = 32;
 }
 
 // A provider that finds workers by itself, as a row's maker. Neither
@@ -831,18 +922,43 @@ message PairingDescriptor {
   // is read as one that states none.
   reserved 8;
   reserved "pair_class";
-  bool ec_producer = 9;
-  bool ec_consumer = 10;
-  bool vision = 11;
-  // The worker's end of the encode handoff, with its two EC roles: the form
-  // its registration states and, under a push, the connector the role is
-  // stated on. Unspecified is no end, as a registration that names no form
-  // reads; the connector above is the pair's. A host derives from them
-  // which encoders hand an item to which prefills.
-  EncodeHandoff encode_handoff = 12;
-  string ec_connector = 13;
+  // Whether the worker takes images, which no build took or told under
+  // this number: it is the registration's and the row's own field
+  // (WorkerSpec.vision, WorkerRow.vision). No later field takes the number
+  // or the name. A registration or a told row that still states it is read
+  // as one that states none.
+  reserved 11;
+  reserved "vision";
+  // The worker's end of the encode handoff, which no build took or told
+  // under these five numbers: it is a message of its own on the
+  // registration and on the row (EncodeOffer: WorkerSpec.encode,
+  // WorkerRow.encode). No later field takes a number or a name of the
+  // five. A registration or a told row that still states one is read as
+  // one that states none.
+  reserved 9, 10, 12, 13, 14;
+  reserved "ec_producer", "ec_consumer", "encode_handoff";
+  reserved "ec_connector", "encode_references";
+}
+
+// A worker's end of the encode handoff, with its two EC roles: the form its
+// registration states and, under a push, the connector the role is stated
+// on. A pairing descriptor's connector is the pair's, and no part of this.
+// A host derives from the offers of its workers which encoders hand an item
+// to which prefills.
+message EncodeOffer {
+  // Unspecified is no end, as a registration that names no form reads.
+  EncodeHandoff handoff = 1;
+  // The worker states the producer role: an encoder's, under a push.
+  bool producer = 2;
+  // The worker states the consumer role: a prefill's, under a push.
+  bool consumer = 3;
+  // The connector the role is stated on: any text, compared whole and never
+  // parsed. No rule holds its words, and the row's size is its one bound. A
+  // registration's is read past the blanks around it. Empty, or blank in a
+  // registration, states none.
+  string connector = 4;
   // The worker, an encoder, processes an item's references itself.
-  bool encode_references = 14;
+  bool references = 5;
 }
 
 // How an encoder hands an encoded item to a prefill.
@@ -874,7 +990,9 @@ message HealthPolicy {
   uint32 success_threshold = 2;
   uint32 check_interval_ms = 3;
   uint32 timeout_ms = 4;
-  // The checks are off: the worker is ready from its registration and the
+  // The checks are off: the worker is ready from its registration, where
+  // the call's term holds through its connect signal, and from a
+  // MODE_UPSERT of that registration where it did not. The
   // prober never judges it. The registrant says "do not check", never
   // "healthy".
   bool disabled = 5;
@@ -896,15 +1014,19 @@ message Signals {
 // and reads no more of them. A worker that states none meets no demand for
 // a runtime, for media by reference or for a way to decide a constraint,
 // and it takes a request of any size. Whether the worker takes images is
-// no field here. No frame states a demand in this protocol version, so a
-// frame's decision reads none of these facts yet.
+// no field here: its registration states it beside this block
+// (WorkerSpec.vision). A frame states the demands these facts are held
+// against (DecideRequest.demands).
 message DemandFacts {
   // The worker's runtime, as a number. 0 states none.
   uint32 runtime = 1;
   // The worker processes media by reference.
   bool references = 2;
   // It processes that media by its registering party's pipeline, and not
-  // by one of its own. Read only beside `references`.
+  // by one of its own. Read only beside `references`. The bit is carried
+  // and compared as stated. No decision reads it where the party states no
+  // references. A change of it alone changes the row, as a change of any
+  // other stated fact does.
   bool host_pipeline = 3;
   // The worker's context window, in tokens. 0 states none.
   uint32 window = 4;
@@ -928,22 +1050,30 @@ message RegisterWorkerRequest {
     // INVALID_ARGUMENT first, whether the URL stands or not. A caller that
     // did not make the standing row is PERMISSION_DENIED (WorkerRow.maker).
     MODE_REPLACE = 2;
-    // Registers an absent URL. Over a standing row: equal facts write nothing
-    // and answer the row unmoved, a change of role, wire, models or demand
-    // facts is a new incarnation, any other change is made in place. The
-    // models change when their set does: the same ids in another order are
-    // written in place, and the row tells the stated order. Over a draining
-    // row every registration is the URL's next incarnation, whatever its
-    // facts: a drain ends with the registration it named. A caller that did
-    // not make the standing row is PERMISSION_DENIED, whatever the facts.
+    // Registers an absent URL. Over a standing row: equal facts write no row
+    // and answer the row unmoved, a change of role, wire, models, demand
+    // facts or whether the worker takes images is a new incarnation, any
+    // other change is made in place. Equal facts send a worker whose checks
+    // are off its connect signal again, where it is neither ready nor
+    // draining: its status alone moves. The models change when their set
+    // does: the same ids in another order are written in place, and the row
+    // tells the stated order. Over a draining row every registration is the
+    // URL's next incarnation, whatever its facts: a drain ends with the
+    // registration it named. A caller that did not make the standing row is
+    // PERMISSION_DENIED, whatever the facts.
     MODE_UPSERT = 3;
   }
   Mode mode = 2;
   // Wait for the handshake; otherwise the row is answered PENDING and the
   // handshake's result is a StatusChanged on WatchWorkers. A worker whose
   // checks are off is ready from its registration: its wait ends in the call
-  // and the answer is the row after it. INVALID_ARGUMENT, by this field's
-  // name, where the controller runs no handshake that ends the wait.
+  // and the answer is the row after it. A call whose term ended between its
+  // write and its connect signal answers that row as it stands, PENDING for
+  // a new worker: read the status the answer holds, and send the
+  // registration again as MODE_UPSERT, which sends the signal again. As
+  // MODE_ADD it is ALREADY_EXISTS and sends none. INVALID_ARGUMENT, by this
+  // field's name, where the controller runs no handshake that ends the
+  // wait.
   bool wait_ready = 3;
 }
 
@@ -952,8 +1082,9 @@ message RegisterWorkerRequest {
 // character is INVALID_ARGUMENT. Over a standing row (MODE_REPLACE,
 // MODE_UPSERT) the labels and the health policy are the registration's,
 // whole; any other field left unset or empty keeps the row's value, and an
-// overload, a signals or a demand facts block that is present replaces the
-// row's. A URL's first registration names its wire and its role:
+// overload, a signals, a demand facts or an encode offer block that is
+// present replaces the row's. A URL's first registration names its wire and
+// its role:
 // INVALID_ARGUMENT by the field it leaves unset. A wire or a role that
 // states a number this contract does not name is INVALID_ARGUMENT at every
 // registration.
@@ -966,10 +1097,9 @@ message RegisterWorkerRequest {
 // incarnation, revision and status) and the overload block at their widest:
 // no later status, revision or patched block adds a byte.
 //
-// A limit of this build, not a number of the contract: a row names at most
-// 128 model ids (INVALID_ARGUMENT by `spec.models`). A gateway's own
-// registration takes a worker of more ids, and this door refuses it; the
-// count is said again once the store's cost of a row's ids is measured.
+// No count bounds a row's model ids: the row's size does. A registration
+// whose ids carry its row past the 16,384 bytes is INVALID_ARGUMENT by
+// `spec`, as any row past that bound is.
 message WorkerSpec {
   string url = 1;
   // WIRE_MODE_ZMQ is INVALID_ARGUMENT here: a host-local wire is reachable
@@ -1023,6 +1153,19 @@ message WorkerSpec {
   // present is the row's, whole: an empty one states none. Unset keeps the
   // row's.
   DemandFacts demand_facts = 15;
+  // Whether the worker takes images. Unset keeps the row's, and a new row
+  // that states none takes no images.
+  optional bool vision = 16;
+  // The worker's end of the encode handoff. A block that is present is the
+  // row's, whole: an empty one states no end. Unset keeps the row's.
+  EncodeOffer encode = 17;
+  // The worker's priority. Unset keeps the row's, and a new row that states
+  // none stands at zero.
+  optional sint32 priority = 18;
+  // The seconds a removal waits behind the worker's drain. Unset keeps the
+  // row's, and a new row that states none waits the default window. Zero
+  // is a window of no wait.
+  optional uint32 drain_settle_secs = 19;
 }
 
 message PatchWorkerRequest {
@@ -1068,8 +1211,11 @@ message SnapshotRequest {
     SLICE_LOADS = 3;
     SLICE_SESSIONS = 4;
     SLICE_LEASES = 5;
-    // Its rows left the answer (Snapshot's number 9): no build serves it.
-    SLICE_PAIRS = 6;
+    // The pair rows' slice, which no build served: no later slice takes its
+    // number or its name. A request that still names it is refused as one
+    // that names no slice: INVALID_ARGUMENT by `slices`.
+    reserved 6;
+    reserved "SLICE_PAIRS";
     SLICE_SPEC = 7;
     SLICE_PLUGINS = 8;
     SLICE_KV_INDEX = 9;
@@ -1344,6 +1490,8 @@ message LeaderInfo {
   bool synced = 5;
   SyncState sync = 6;
   repeated GroupLeader groups = 7;
+  // The oldest and the newest protocol version the answering controller
+  // speaks.
   uint32 protocol_min = 8;
   uint32 protocol_max = 9;
 }

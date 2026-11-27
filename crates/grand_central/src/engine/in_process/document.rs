@@ -25,17 +25,23 @@ use std::{
     ops::Deref,
     rc::Rc,
     sync::{atomic::Ordering, Arc, OnceLock},
+    time::Instant,
 };
+
+use parking_lot::Mutex;
 
 use super::{labels, next_applied, InProcess};
 use crate::{
     document::spec::AppliedSpec,
     engine::{
-        framework::{Engine, SHADOWS},
-        shadow::ShadowCounts,
+        decision::{Decision, PairSide, ShadowKind},
+        explain::{DecisionRecord, Samples},
+        framework::{Engine, ShadowRows, SHADOWS},
+        shadow::{ShadowCount, ShadowCounts, ShadowSide, Shadowed, SHADOW_ROWS},
+        view::{fingerprint, Phase},
     },
     stages::Lifecycle,
-    store::StaleGeneration,
+    store::{GatewayId, StaleGeneration},
     tracking::lease::{EventKind, EventSet, Membership},
 };
 
@@ -125,16 +131,16 @@ pub(in crate::engine) struct InForce {
     /// ([`super::single::decide`]).
     pub(super) samples: bool,
     /// The decisions kept under the document, newest last
-    /// ([`super::sample`]): one ring of them, behind one lock that a kept
-    /// decision takes for its push and a reader for one scan
-    /// ([`InProcess::explained`]). The ring is allocated at its first
-    /// push: a document that keeps no sample holds none.
-    pub(super) kept: super::sample::Kept,
-    /// The shadow decisions counted so far
-    /// ([`InProcess::shadow_counts`]), by binding, side and kind. The
-    /// tables are allocated at the first of them: a document that names no
-    /// shadow keeps none.
-    pub(super) shadow_counts: OnceLock<Box<ShadowCounts>>,
+    /// ([`super::sample`]): one ring of them behind one lock. A kept
+    /// decision takes the lock for its push ([`Self::keep_sample`]), and a
+    /// reader for one scan ([`Self::kept_sample`]). The ring is allocated
+    /// at its first push: a document that keeps no sample holds none.
+    kept: Mutex<Samples>,
+    /// The shadow decisions counted so far ([`Self::shadow_counts`]), by
+    /// binding, side and kind. The tables are allocated at the first of
+    /// them ([`Self::count_shadow`]): a document that names no shadow keeps
+    /// none.
+    shadow_tables: OnceLock<Box<ShadowCounts>>,
 }
 
 impl InForce {
@@ -160,10 +166,10 @@ impl InForce {
             reads_loads: needs.loads || needs.signal_cells,
             any_shadow,
             samples,
-            kept: super::sample::Kept::default(),
+            kept: Mutex::default(),
             spec,
             applied: next_applied(),
-            shadow_counts: OnceLock::new(),
+            shadow_tables: OnceLock::new(),
         }
     }
 
@@ -198,6 +204,84 @@ impl InForce {
             std::cmp::Ordering::Less => Some(self.stood_at(generation)),
             std::cmp::Ordering::Greater => None,
         }
+    }
+
+    /// `decision` pushed onto the document's ring as the decision of the
+    /// request `id` names, taken at `at`. It is kept under the binding a
+    /// request of `asked`'s model at its phase matches, and with what a
+    /// single's shadow said. The document states its own number for the
+    /// push, so no push of its own starts the ring over, and it holds the
+    /// lock for that one push.
+    pub(super) fn keep_sample(
+        &self,
+        id: &[u8],
+        asked: (&str, Phase),
+        at: Instant,
+        decision: &Decision,
+        shadow: Option<Shadowed>,
+    ) {
+        let binding = self.spec.engine().binding_position(asked.0, asked.1);
+        let taken = (at, GatewayId::LOCAL, id);
+        let mut kept = self.kept.lock();
+        kept.push(self.applied, binding, taken, decision, shadow, [None; 2]);
+    }
+
+    /// The newest decision the document kept of the request `request_id`
+    /// names, where it kept one ([`InProcess::explained`]): one scan of
+    /// the ring under its lock, by the document's own number.
+    pub(super) fn kept_sample(&self, request_id: &[u8]) -> Option<DecisionRecord> {
+        let kept = self.kept.lock();
+        kept.find(self.applied, GatewayId::LOCAL, fingerprint(request_id))
+    }
+
+    /// Counts what a shadow said, for its binding, in the table of the
+    /// place it was asked: beside a single request, or beside a side of a
+    /// pair. The tables are allocated at the first count.
+    pub(super) fn count_shadow(&self, said: Shadowed, asked: ShadowSide) {
+        let counts = self.shadow_tables.get_or_init(Box::<ShadowCounts>::default);
+        let count = counts.of(said.binding, asked, said.kind);
+        count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Tells `each` every count of the shadow decisions made under the
+    /// document, and answers the document's number
+    /// ([`InProcess::shadow_counts`]). The counts are of each binding that
+    /// names a shadow, by the sides its plan asks one at and by each kind,
+    /// a count of zero too. It takes no lock and allocates nothing: a count
+    /// is one read of its cell, and a document no shadow was counted under
+    /// yet reads as zeros.
+    pub(super) fn shadow_counts(&self, mut each: impl FnMut(ShadowCount)) -> u64 {
+        let (engine, counts) = (self.spec.engine(), self.shadow_tables.get());
+        // Which sides each row counts by, a side at its place.
+        let mut due = [[false; ShadowSide::COUNT]; SHADOW_ROWS];
+        for at in (0..).take_while(|&at| engine.binding_at(at).is_some()) {
+            let word = engine.shadow_at(at);
+            let single = word.is_some_and(|(_, rows)| rows != ShadowRows::Sides);
+            let [prefill, decode] = PairSide::BOTH.map(|side| engine.shadows_side(at, side));
+            let row = &mut due[(at as usize).min(SHADOW_ROWS - 1)];
+            for side in ShadowSide::ALL {
+                row[side.index()] |= match side {
+                    ShadowSide::Single => single,
+                    ShadowSide::Prefill => prefill,
+                    ShadowSide::Decode | ShadowSide::DecodeAgain => decode,
+                };
+            }
+        }
+        for (binding, due) in (0..).zip(due) {
+            for side in ShadowSide::ALL.into_iter().filter(|side| due[side.index()]) {
+                for kind in ShadowKind::ALL {
+                    let cell = counts.map(|counts| counts.of(binding, side, kind));
+                    let count = cell.map_or(0, |cell| cell.load(Ordering::Relaxed));
+                    each(ShadowCount {
+                        binding,
+                        side,
+                        kind,
+                        count,
+                    });
+                }
+            }
+        }
+        self.applied
     }
 }
 
@@ -358,24 +442,34 @@ impl InProcess {
     /// and its record of sent prompts. The table takes the new document's
     /// two times. The stages of a profile whose name and text did not
     /// change stand too, with what they hold: the new document keeps their
-    /// objects. A profile's stages are built from its own block, the
-    /// document's `view` and its `signals`, so a new document that changes
-    /// `view` or `signals` builds every profile anew. A profile is built
-    /// anew too where one of its stages, built again, says otherwise of
-    /// itself than the standing one: another name, other words of a
-    /// request's life to hear, or anything else the engine reads of a
-    /// stage when it builds a profile. A factory of the host's own may
-    /// build such a stage. A count of sends stands where a profile that
-    /// reads it is kept, whichever of its other readers changed, left or
-    /// came: a profile built new beside it reads the same count. A count
-    /// none of whose readers is kept is built new and takes over a
-    /// standing count: which one is the count's own rule
+    /// objects.
+    ///
+    /// A profile's stages are built from its own block, the document's
+    /// `view` and its `signals`. So a new document that changes `view` or
+    /// `signals` builds every profile anew. One change of `view` keeps
+    /// them: another header list, where nothing else of the view changed.
+    /// No stage is built from that list. A stage that reads a header by a
+    /// place its host wrote is kept as it stands, and reads that place of
+    /// the new list.
+    ///
+    /// A profile is built anew too where one of its stages, built again,
+    /// says otherwise of itself than the standing one. That is another
+    /// name, other words of a request's life to hear, or anything else the
+    /// engine reads of a stage when it builds a profile. A factory of the
+    /// host's own may build such a stage.
+    ///
+    /// A count of sends stands where a profile that reads it is kept,
+    /// whichever of its other readers changed, left or came. A profile
+    /// built new beside it reads the same count. A count none of whose
+    /// readers is kept is built new and takes over what the standing
+    /// counts hold: how is the count's own rule
     /// ([`Engine::succeed`](crate::engine::Engine::succeed)). Every other
-    /// stage starts empty, a registered one too. The keep stands between
-    /// two documents validated over the stock table, or over one table of
-    /// the host's own as it stood at both validations
-    /// ([`StageRegistry`](crate::stages::StageRegistry)): a host that
-    /// builds its table anew for each document keeps nothing.
+    /// stage starts empty, a registered one too.
+    ///
+    /// The keep stands between two documents validated over the stock
+    /// table, or over one table of the host's own as it stood at both
+    /// validations ([`StageRegistry`](crate::stages::StageRegistry)). A
+    /// host that builds its table anew for each document keeps nothing.
     ///
     /// What a caller may rely on when the call returns: the stages built
     /// new have heard every worker that stands in the registry the
@@ -540,4 +634,5 @@ impl InProcess {
 }
 
 #[cfg(test)]
+#[path = "../../../tests/unit/engine/in_process/document/tests.rs"]
 mod tests;

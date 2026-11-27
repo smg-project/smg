@@ -39,8 +39,8 @@ pub(crate) mod view;
 pub(crate) mod warm_up;
 
 pub use decision::{
-    Decision, DecodePlacing, LiftedVeto, Overlap, OverlapSource, Pair, Pick, PlacedBy, Queue,
-    ShadowKind, Shed, ShedReason, Survivors, Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
+    Decision, DecodePlacing, LiftedVeto, Overlap, OverlapSource, Pair, PairSide, Pick, PlacedBy,
+    Queue, ShadowKind, Shed, ShedReason, Survivors, Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
 };
 pub use decision_engine::{
     AlonePick, DecideOutcome, Decided, DecisionEngine, DecisionRefused, DecodeRefused,
@@ -55,9 +55,9 @@ pub use explain::{DecisionNames, DecisionRecord};
 pub use framework::{
     AloneProfile, Binding, DecisionScope, DrawUnit, EncodeItems, EncodePlaced, EncodePool,
     EncoderFacts, Engine, Filter, FirstPartners, FirstPartnersError, InTheWay, NotAlone, PairPools,
-    PairSide, PairTable, PairTableError, Picker, Place, Plan, PoolRows, PoolWord, Profile,
-    ScoreFront, ScoreSpread, Scorer, Scratch, Shortlist, TieBand, WeightedScorer, DRAW_BOUND,
-    DRAW_FROM, RANK_FROM,
+    PairTable, PairTableError, Picker, Place, Plan, PoolRows, PoolWord, Profile, ScoreFront,
+    ScoreSpread, Scorer, Scratch, Shortlist, TieBand, WeightedScorer, DRAW_BOUND, DRAW_FROM,
+    RANK_FROM,
 };
 #[cfg(feature = "in-process")]
 pub use in_process::encode::EncodeLists;
@@ -90,6 +90,7 @@ pub use view::{
     fingerprint, key_of_session, permille, AffinityFacts, AffinityHolder, AffinityRows, Candidate,
     Constraints, Engines, FixedFacts, HashKind, Header, Health, Identity, LoadRow, MediaCounts,
     ModelFingerprint, OverloadRegime, Phase, PoolFacts, RequestFacts, Role, Session,
-    SessionCountedUnder, SignalSource, WireModes, WorkerId, ZoneCapacity, TEXT_BYTES_PER_TOKEN,
+    SessionCountedUnder, SignalSource, TreeMatch, WireModes, WorkerId, ZoneCapacity,
+    TEXT_BYTES_PER_TOKEN,
 };
 pub use warm_up::{WarmUpRule, WarmUpState};

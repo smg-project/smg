@@ -10,14 +10,31 @@
 //! `pair_round_robin_three_sided` places the same pair under a document of
 //! three sides, whose encode side places nothing of a pair.
 //!
+//! `pair_sessions_later` states the later decode under a sessions rule,
+//! each turn for a session of its own ([`sessions`], [`session_later`]).
+//! Its decode is asked for once the session's key has ended: a key ends at
+//! its rule's first sweep past its idle time. So the call claims its decode
+//! anew and dates that claim by the pair's lease. The result's
+//! `call_claims=` counts the calls that claimed.
+//!
+//! A session met a second time claims nothing, and the list's first
+//! requests take the seeds of the first caller's first turns: eight a
+//! worker, and 4,096 at the least. So count the cell by two values of
+//! `--decisions` above that count. Where each counted call claims,
+//! `call_claims=` rises by their difference. The rule sweeps nothing
+//! within a run: the table keeps two keys a turn.
+//!
 //! `--entry place` asks the one call a host makes for a request instead
 //! ([`InProcess::place`]): the model, the two lists and a prompt of the
 //! plain request's size, with both dispatches and each side's end said of
 //! the placement. Such a request states no later decode, and its run
-//! refuses no pair but by `--refused overload`. `--entry place_ruled` and
+//! takes every `--refused` but `limit`. `--entry place_ruled` and
 //! `--entry place_held` state a route's rule with it (the bench's `ruled`
 //! file). `--entry place_named` asks the one call with a pair that names
-//! its worker ([`NAMED`]).
+//! its worker ([`NAMED`]). `--entry place_alone` states a rule that takes
+//! every prefill behind the first and no decode, over a cell whose every
+//! such prefill is over its thresholds under a binding that sheds a list
+//! wholly over them: each request is shed, and a turn counts the shed.
 //!
 //! Every worker has a load report, and a prefill states its rate as its
 //! measured input rate too: the one drain a prefill's record reads. Under
@@ -25,31 +42,35 @@
 //! decode's report states a value of it (`pair_signal_cost`).
 //! `--overloaded 1` puts a pair's decodes alone over their thresholds: the
 //! rule for such a list steers a pair's decode side. A pair whose prefills
-//! are all over theirs goes to the pair's default, which no cell runs.
+//! are all over theirs goes to the pair's default: the cell `pair_default`
+//! puts them there ([`DEFAULT`]).
 //! `--refused` states what refuses every pair ([`Refused`]): the engine
 //! then names the refusal of each request, and a turn counts where it was
 //! refused the way the run states. A cell that leaves that path counts no
 //! turn. `--refused overload` puts every decode over its thresholds under
 //! a binding that sheds a list wholly over them: each request is shed as
-//! saturated, by the engine's entry and by the one call alike. The
-//! result's `conversions=` counts the two lists together.
+//! saturated, by the engine's entry and by the one call alike. `--refused
+//! outage` takes every decode out of service under such a binding, and
+//! `--refused partners` under the cell's own: each request is shed with no
+//! endpoint, by either entry too. The result's `conversions=` counts the
+//! two lists together.
 
 use std::{
     cell::OnceCell,
     ops::Deref,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use smg_grand_central::{
-    document::{AppliedSpec, PolicySpec},
+    document::{AppliedSpec, Assignment, PolicySpec},
     engine::{
-        prefills_full, Decided, Decision, InProcess, PairAdmission, PairLists, PartnerClasses,
-        Phase, PlaceRequest, Plain, Prompt, PublishedList, Request, RequestMaker, ShedReason,
-        Unplaced, WorkerLists,
+        prefills_full, Decided, Decision, DecodeVerdict, Identity, InProcess, LiftedVeto,
+        PairAdmission, PairLists, PartnerClasses, Phase, PlaceRequest, Plain, Prompt,
+        PublishedList, Request, RequestMaker, ShedReason, Unplaced, WorkerLists,
     },
     store::GatewayId,
     tracking::{DecisionGuard, Outcome, Side, TransportClass},
@@ -63,8 +84,8 @@ use smg_worker::{
 use tokio::runtime::Builder;
 
 use super::{
-    encode, measure, place, plain, published, reports, ruled, signals, Cell, Host, Run, Shadowed,
-    Stated, MODEL,
+    encode, measure, place, plain, preset, published, reports, ruled, signals, Cell, Host, Run,
+    Shadowed, Stated, MODEL,
 };
 
 /// The word of `--entry` that asks the one call with a pair's request
@@ -76,6 +97,11 @@ pub(super) const NAMED: &str = "place_named";
 
 /// The header such a request carries: the first worker a side.
 const NUMBER: [(&str, &str); 1] = [("x-smg-target-worker", "0")];
+
+/// The cell whose pairs the pair's default makes. Every prefill is over its
+/// thresholds beside open decodes, so the prefill side's run sheds. A turn
+/// counts where the pair's trace names the lifted overload veto.
+pub(super) const DEFAULT: &str = "pair_default";
 
 /// Whether this run's pairs name their worker: what the result line's word
 /// says.
@@ -109,6 +135,39 @@ pub(super) fn later(seed: u64) -> Request<'static> {
     request
 }
 
+/// The decode calls of this run that claimed their decode so far.
+static CALL_CLAIMS: AtomicU64 = AtomicU64::new(0);
+
+/// The result line's word of `pair_sessions_later`: how many of its decode
+/// calls claimed their decode.
+pub(super) fn call_claims() -> String {
+    format!(" call_claims={}", CALL_CLAIMS.load(Ordering::Relaxed))
+}
+
+/// The round-robin pair document under the stock sessions rule, a new
+/// session placed by each side's own stages. The rule's sweep waits as
+/// long as its idle time, so no key leaves the table within a run.
+pub(super) fn sessions() -> PolicySpec {
+    let stock = preset("manual");
+    let mut document = of("round_robin");
+    let rule = stock.bindings.into_iter().next();
+    let rule = rule.and_then(|binding| binding.sessions);
+    let mut rule = rule.expect("the stock rule");
+    rule.assignment = Assignment::Delegate;
+    rule.sweep_s = rule.ttl_s;
+    document.view = stock.view;
+    document.bindings[0].sessions = Some(rule);
+    document
+}
+
+/// The later-decode request of a session of its own: a turn's seed is its
+/// session's key.
+pub(super) fn session_later(seed: u64) -> Request<'static> {
+    let mut request = later(seed);
+    request.facts.session_key = Identity::hashed(seed.max(1));
+    request
+}
+
 /// A ready worker of `worker_type` at `url`, with no health checker behind it.
 pub(super) fn typed(url: String, worker_type: WorkerType) -> Arc<dyn Worker> {
     let spec = WorkerSpec {
@@ -120,6 +179,20 @@ pub(super) fn typed(url: String, worker_type: WorkerType) -> Arc<dyn Worker> {
         .build();
     worker.set_status(WorkerStatus::Ready);
     Arc::new(worker)
+}
+
+/// Puts every worker of `side` over its thresholds and gives each requests
+/// in flight: its place plus one, the middle worker none. The rule for
+/// such a list then has loads to steer by.
+fn over(side: &[Arc<dyn Worker>]) {
+    for (at, worker) in side.iter().enumerate() {
+        worker.set_overloaded(true);
+        if at != side.len() / 2 {
+            for _ in 0..=at {
+                worker.increment_load();
+            }
+        }
+    }
 }
 
 /// A pair's host with no limit of its own: every prefill has capacity and
@@ -166,6 +239,9 @@ pub(super) enum Refused {
     /// thresholds: every decode is over them, and each request is shed as
     /// saturated.
     Overload,
+    /// The decode side under such a binding: no decode is ready, and each
+    /// request is shed with no endpoint.
+    Outage,
 }
 
 impl Refused {
@@ -175,6 +251,7 @@ impl Refused {
             "limit" => Self::Limit,
             "partners" => Self::Partners,
             "overload" => Self::Overload,
+            "outage" => Self::Outage,
             other => panic!("nothing refuses a pair by {other}"),
         }
     }
@@ -188,6 +265,14 @@ struct Decodes {
     classes: PartnerClasses,
     admission: &'static (dyn PairAdmission + Sync),
     refused: Refused,
+    /// Under a sessions rule, how far behind a pair's decision its later
+    /// decode is asked for, sent and ended. It is a second more than the
+    /// rule's idle time and its sweep interval together. The pair's key has
+    /// ended by then, at the rule's first sweep past its idle time.
+    idle_out: Option<Duration>,
+    /// Whether the run's rule takes the prefills behind the first alone
+    /// ([`ruled::ALONE`]): each request is then shed behind the rule.
+    alone: bool,
 }
 
 /// One turn's pair request as its host states it: the request of
@@ -266,14 +351,26 @@ impl Decodes {
             request.headers = &NUMBER;
         }
         let mut answer = host.engine.place(&request);
-        if self.refused == Refused::Overload {
-            // A run whose every decode is over its thresholds counts the
-            // turns shed as saturated.
-            let shed = |unplaced: &Unplaced| {
-                let saturated = ShedReason::Saturated;
-                matches!(unplaced, Unplaced::Shed { reason, .. } if *reason == saturated)
+        // A rule that takes prefills over their thresholds alone: the turn
+        // is a shed, as saturated behind the one decision more that is held
+        // to them, and with no endpoint where no such decision is made.
+        if self.alone {
+            return matches!(answer, Err(Unplaced::Shed { .. })).then_some(0);
+        }
+        // A run whose every decode is over its thresholds counts the turns
+        // shed as saturated, and one whose every decode is out of service
+        // the turns shed with no endpoint.
+        let counted = match self.refused {
+            Refused::Overload => Some(ShedReason::Saturated),
+            Refused::Partners | Refused::Outage => Some(ShedReason::NoEndpoints),
+            Refused::Limit | Refused::No => None,
+        };
+        if let Some(counted) = counted {
+            let reason = match &answer {
+                Err(Unplaced::Shed { reason, .. }) => Some(*reason),
+                _ => None,
             };
-            return answer.as_ref().err().is_some_and(shed).then_some(0);
+            return (reason == Some(counted)).then_some(0);
         }
         let placement = answer.as_mut().ok()?;
         if placement.owes_events() {
@@ -284,8 +381,10 @@ impl Decodes {
 
     /// One pair request of `host` by the engine's one entry: the prefill's
     /// place in its list, with both dispatches and each side's end told
-    /// where the decision is leased.
-    fn place(&self, host: &Host, seed: u64) -> Option<u32> {
+    /// where the decision is leased. Under `DEFAULTED` a turn counts where
+    /// the pair's default made the pair ([`DEFAULT`]). The test is that
+    /// cell's alone: every other cell's turn is compiled without it.
+    fn place<const DEFAULTED: bool>(&self, host: &Host, seed: u64) -> Option<u32> {
         let stated = StatedPair {
             stated: Stated {
                 host,
@@ -301,21 +400,29 @@ impl Decodes {
         };
         // A run that refuses every pair counts the turns refused the way it
         // states: by full prefills under the limit, by a shed as saturated
-        // under the overload veto, by any other shed where the decode side
-        // refuses.
+        // under the overload veto, by a shed with no endpoint under an
+        // outage, by any other answer where the decode side refuses.
         if self.refused != Refused::No {
             let decision = &decided.decision;
             let full = prefills_full(decision);
-            let saturated =
-                matches!(decision, Decision::Shed(shed) if shed.reason == ShedReason::Saturated);
+            let reason = match decision {
+                Decision::Shed(shed) => Some(shed.reason),
+                _ => None,
+            };
             let stated = match self.refused {
                 Refused::Limit => full,
-                Refused::Overload => saturated && !full,
+                Refused::Overload => reason == Some(ShedReason::Saturated) && !full,
+                Refused::Outage => reason == Some(ShedReason::NoEndpoints) && !full,
                 Refused::Partners | Refused::No => !full,
             };
             return (decision.pick().is_none() && stated).then_some(0);
         }
-        let target = *decided.decision.pick()?.targets.first()?;
+        let pick = decided.decision.pick()?;
+        // The default's pair says the overload veto it lifted.
+        if DEFAULTED && pick.trace.lifted != LiftedVeto::Overload {
+            return None;
+        }
+        let target = *pick.targets.first()?;
         let decode = target.pair?.decode_id;
         if decided.lease.is_some() {
             let now = *dated.get()?;
@@ -327,16 +434,22 @@ impl Decodes {
             // A request that stated the later decode asks it again here. A
             // call the engine sheds answers the first pick and leaves the
             // decode chosen: no decode was decided again, and the turn
-            // places nothing.
-            let decode = if later {
-                let again = held.decide_decode_under(&stated, now).ok()?;
-                let decode = again.pick()?.targets.first()?.pair?.decode_id;
+            // places nothing. Under a sessions rule the call comes once the
+            // pair's key has ended, and the decode is sent and ended at the
+            // call's instant.
+            let (decode, now) = if later {
+                let call = self.idle_out.map_or(now, |idle| now + idle);
+                let again = held.decide_decode_under(&stated, call).ok()?;
+                let again = again.pick()?.targets.first()?.pair?;
                 if held.decode_chosen() {
                     return None;
                 }
-                decode
+                if again.decode_verdict == DecodeVerdict::CLAIMED {
+                    CALL_CLAIMS.fetch_add(1, Ordering::Relaxed);
+                }
+                (again.decode_id, call)
             } else {
-                decode
+                (decode, now)
             };
             held.dispatched_decode(now);
             let end = |side, served| {
@@ -375,19 +488,30 @@ pub(super) fn runs(run: &Run) -> bool {
     };
     let prefills = side("prefill", WorkerType::Prefill);
     let decodes = side("decode", WorkerType::Decode);
+    // The rule of `place_alone` takes every prefill behind the first: the
+    // cell puts those over their thresholds beside the open first one.
+    let alone = run.entry == ruled::ALONE;
+    if alone {
+        let own = run.refused == Refused::No && !run.overloaded && run.workers > 1;
+        assert!(
+            own,
+            "place_alone states its own lists, of two workers or more"
+        );
+        for worker in prefills.iter().skip(1) {
+            worker.set_overloaded(true);
+        }
+    }
     if run.overloaded {
         // A pair's prefill side is put to no rule: the cell puts its decodes
         // over their thresholds and leaves its prefills open.
-        for (at, worker) in decodes.iter().enumerate() {
-            worker.set_overloaded(true);
-            if at != decodes.len() / 2 {
-                for _ in 0..=at {
-                    worker.increment_load();
-                }
-            }
-        }
+        over(&decodes);
     }
-    if run.refused == Refused::Partners {
+    if name == DEFAULT {
+        // The prefill side's run sheds over such prefills, and the pair's
+        // default makes the pair of the least load.
+        over(&prefills);
+    }
+    if matches!(run.refused, Refused::Partners | Refused::Outage) {
         for worker in decodes.iter() {
             worker.set_status(WorkerStatus::NotReady);
         }
@@ -397,6 +521,8 @@ pub(super) fn runs(run: &Run) -> bool {
         for worker in decodes.iter() {
             worker.set_overloaded(true);
         }
+    }
+    if alone || matches!(run.refused, Refused::Overload | Refused::Outage) {
         // Each binding sheds a list wholly over its thresholds.
         for binding in &mut document.bindings {
             let mut overload = binding.overload.take().unwrap_or_default();
@@ -410,6 +536,9 @@ pub(super) fn runs(run: &Run) -> bool {
     // Every prefill pairs with every decode.
     let partners: Vec<u32> = (0..decodes.len() as u32).collect();
     let every = (0..prefills.len()).map(|_| partners.as_slice());
+    // The sessions rule of the pair's binding, where its document states one.
+    let rule = document.bindings.first();
+    let rule = rule.and_then(|binding| binding.sessions.as_ref());
     let decode_side = Decodes {
         classes: PartnerClasses::number(decodes.len(), every),
         list: published(&decodes),
@@ -419,6 +548,11 @@ pub(super) fn runs(run: &Run) -> bool {
             &Open
         },
         refused: run.refused,
+        idle_out: rule.map(|rule| {
+            let ends = u64::from(rule.ttl_s) + u64::from(rule.sweep_s);
+            Duration::from_secs(ends + 1)
+        }),
+        alone,
     };
     let mut receiver = None;
     let feed = TestFeed::attached_to(|loads| receiver = loads);
@@ -448,8 +582,17 @@ pub(super) fn runs(run: &Run) -> bool {
     let converted = || host.conversions() + engine.conversions(decode_side.list.lent());
     // The one call a host makes for a request, where the run asks it.
     if place::asked_with_lists(run, true) {
-        let open = matches!(run.refused, Refused::No | Refused::Overload);
-        assert!(open, "the one call's pair is open, or shed as saturated");
+        let answered = run.refused != Refused::Limit;
+        assert!(
+            answered,
+            "the one call's pair is open, or shed by its decodes"
+        );
+        // The one call answers workers and no trace: nothing there says
+        // which pairs the default made.
+        assert!(
+            name != DEFAULT,
+            "the default's cell asks the engine's entry"
+        );
         let rule = ruled::stated(run);
         let named = run.entry == NAMED;
         NAMES.store(named, Ordering::Relaxed);
@@ -459,13 +602,13 @@ pub(super) fn runs(run: &Run) -> bool {
         });
         return true;
     }
-    measure(
-        run,
-        &host,
-        upkeep,
-        || feed.publish(&loads),
-        converted,
-        |seed| decode_side.place(&host, seed),
-    );
+    let publish = || feed.publish(&loads);
+    if name == DEFAULT {
+        let decide = |seed| decode_side.place::<true>(&host, seed);
+        measure(run, &host, upkeep, publish, converted, decide);
+        return true;
+    }
+    let decide = |seed| decode_side.place::<false>(&host, seed);
+    measure(run, &host, upkeep, publish, converted, decide);
     true
 }

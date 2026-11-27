@@ -50,6 +50,11 @@ pub(crate) fn is_upstream_answer(response: &Response) -> bool {
     response.extensions().get::<UpstreamAnswer>().is_some()
 }
 
+/// Error code of the 502 a route answers for a worker's body over the
+/// limit. The worker answered, and the route refused what it gave: the
+/// refusal bears no mark ([`UpstreamAnswer`]) and is known by this code.
+pub(crate) const WORKER_BODY_TOO_LARGE: &str = "upstream_response_too_large";
+
 /// Response extension: the attempt failed on one side of a disaggregated pair,
 /// named by its engine, and that side alone is what the request must not be
 /// replayed on (see [`AttemptLedger::settle`]).

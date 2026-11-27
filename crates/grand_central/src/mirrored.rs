@@ -406,6 +406,7 @@ pub fn shed() -> &'static [&'static str] {
             emptied_by,
             retry_after_secs,
             wait_allowed,
+            side,
             trace
         }
     )

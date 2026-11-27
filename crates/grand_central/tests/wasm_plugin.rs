@@ -485,7 +485,7 @@ fn a_component_with_an_async_export_is_refused_at_its_compile() {
 fn the_abi_pin_the_memory_floor_the_init_failure_and_bad_bytes_are_refused() {
     let runtime = runtime();
     let mut pinned = spec("pinned", guest::record_guest(), mode::LEAST_IN_FLIGHT);
-    pinned.abi = Some(Abi { major: 1, minor: 3 });
+    pinned.abi = Some(Abi::of(1, 3));
     let err = Plugin::load(&runtime, pinned).expect_err("refused");
     assert!(
         matches!(
@@ -1191,11 +1191,10 @@ fn a_declined_score_has_no_veto_under_either_failure_mode() {
 fn the_breaker_opens_on_the_failure_threshold_and_bypasses_the_guest() {
     let runtime = runtime();
     let mut spec = spec("breaking", guest::record_guest(), mode::TRAP_IN_FILTER);
-    spec.breaker = BreakerSpec {
-        failures: 2,
-        window_micros: 60_000_000,
-        cooldown_micros: 60_000_000,
-    };
+    spec.breaker = BreakerSpec::default();
+    spec.breaker.failures = 2;
+    spec.breaker.window_micros = 60_000_000;
+    spec.breaker.cooldown_micros = 60_000_000;
     let plugin = loaded(&runtime, spec);
     let engine = plugin_engine(&plugin);
     let candidates = pool(4);
@@ -1354,11 +1353,10 @@ fn an_opening_under_the_failure_rule_writes_one_line() {
     said();
     let runtime = runtime();
     let mut spec = spec("trapper", guest::record_guest(), mode::TRAP_IN_FILTER);
-    spec.breaker = BreakerSpec {
-        failures: 2,
-        window_micros: 60_000_000,
-        cooldown_micros: 60_000_000,
-    };
+    spec.breaker = BreakerSpec::default();
+    spec.breaker.failures = 2;
+    spec.breaker.window_micros = 60_000_000;
+    spec.breaker.cooldown_micros = 60_000_000;
     let plugin = loaded(&runtime, spec);
     let engine = plugin_engine(&plugin);
     let candidates = pool(4);
@@ -3962,10 +3960,8 @@ fn a_plugins_close_that_stops_half_way_leaves_its_scope_closed() {
         filler.budget_micros = SLOW_FRAME_MICROS;
         // Every decision's destructor runs out: the failure rule is set out
         // of reach, so the breaker stays shut through the later decisions.
-        filler.breaker = BreakerSpec {
-            failures: u32::MAX,
-            ..BreakerSpec::default()
-        };
+        filler.breaker = BreakerSpec::default();
+        filler.breaker.failures = u32::MAX;
         let plugin = loaded(&runtime, filler);
         let mut profile = Profile::of(
             "one-stage".into(),
@@ -4254,11 +4250,10 @@ fn a_hold_is_checked_by_the_open_that_reaches_the_bring_behind_an_open_breaker()
         );
         let mode = mode::TRAP_ON_FIVE_AND_LOG_IN_DESTRUCTOR;
         let mut row = spec("corner", guest::record_guest(), mode);
-        row.breaker = BreakerSpec {
-            failures: 1,
-            window_micros: 60_000_000,
-            cooldown_micros: COOL_DOWN,
-        };
+        row.breaker = BreakerSpec::default();
+        row.breaker.failures = 1;
+        row.breaker.window_micros = 60_000_000;
+        row.breaker.cooldown_micros = COOL_DOWN;
         let left = LeftLent::of(&runtime, row);
         let anew = left.heard_as_decider_1();
         let five: Vec<WorkerId> = (100..105).map(WorkerId).collect();
@@ -4522,11 +4517,10 @@ fn a_destructor_the_host_held_past_its_bound_is_not_ended() {
     const ENDED: [u64; 5] = [1, 0, 1, 1, 0];
     let runtime = runtime();
     let mut held = spec("held-dtor", guest::record_guest(), mode::LOG_IN_DESTRUCTOR);
-    held.breaker = BreakerSpec {
-        failures: 1,
-        window_micros: 60_000_000,
-        cooldown_micros: 60_000_000,
-    };
+    held.breaker = BreakerSpec::default();
+    held.breaker.failures = 1;
+    held.breaker.window_micros = 60_000_000;
+    held.breaker.cooldown_micros = 60_000_000;
     let plugin = loaded(&runtime, held);
     let engine = plugin_engine(&plugin);
     let candidates = pool(4);
@@ -4691,11 +4685,10 @@ fn a_stage_the_host_held_past_its_frame_fails_nothing_and_opens_nothing() {
 fn a_score_the_host_held_that_then_traps_is_the_plugins_failure_and_no_stall() {
     let runtime = runtime();
     let mut held = spec("held-trap", guest::record_guest(), mode::LOG_IN_SCORE);
-    held.breaker = BreakerSpec {
-        failures: 2,
-        window_micros: 60_000_000,
-        cooldown_micros: 60_000_000,
-    };
+    held.breaker = BreakerSpec::default();
+    held.breaker.failures = 2;
+    held.breaker.window_micros = 60_000_000;
+    held.breaker.cooldown_micros = 60_000_000;
     let plugin = loaded(&runtime, held);
     let engine = plugin_engine(&plugin);
     // On three candidates the guest's score traps after its log line.
@@ -4772,11 +4765,10 @@ fn burn_after_a_hold(
     let mut slow = spec(name, guest::record_guest(), mode::LOG_THEN_BURN);
     slow.fuel_per_micro = SLOW_CALIBRATION;
     slow.budget_micros = frame_micros;
-    slow.breaker = BreakerSpec {
-        failures: 1,
-        window_micros: 60_000_000,
-        cooldown_micros: 60_000_000,
-    };
+    slow.breaker = BreakerSpec::default();
+    slow.breaker.failures = 1;
+    slow.breaker.window_micros = 60_000_000;
+    slow.breaker.cooldown_micros = 60_000_000;
     let plugin = loaded(&runtime, slow);
     let engine = plugin_engine(&plugin);
     let candidates = pool(4);
@@ -5499,11 +5491,10 @@ fn a_guest_slow_in_what_fuel_does_not_price_is_opened_by_its_samples_at_the_firs
     );
     slow.fuel_per_micro = 20_000_000;
     slow.budget_micros = BUDGET_MICROS;
-    slow.breaker = BreakerSpec {
-        failures: 1_000,
-        window_micros: 60_000_000,
-        cooldown_micros: 60_000_000,
-    };
+    slow.breaker = BreakerSpec::default();
+    slow.breaker.failures = 1_000;
+    slow.breaker.window_micros = 60_000_000;
+    slow.breaker.cooldown_micros = 60_000_000;
     let plugin = loaded(&runtime, slow);
     let engine = plugin_engine(&plugin);
     let hold = std::time::Duration::from_micros(u64::from(BUDGET_MICROS) / 2);
@@ -6891,6 +6882,41 @@ fn a_lazy_init_long_on_the_clock_is_the_decisions_budget_spent() {
     );
 }
 
+/// A cold slot opened under a budget an earlier open spent makes no
+/// instance. The plugin in front is the one of the case above, whose `init`
+/// outlasts the 10 ms decision. The neighbour's slot is cold at its open:
+/// the open is the decision's budget spent, no `init` runs under nothing,
+/// and the close has no slot of the decision's to rebuild. Nothing counts
+/// on the breaker, and the slot stays as cold as the open found it.
+#[test]
+fn a_cold_slot_opened_under_a_spent_budget_makes_no_instance() {
+    let (clock, runtime, cold) = plugin_whose_init_asks(20, |_| {});
+    let neighbour = load(
+        &runtime,
+        "after-the-init",
+        guest::record_guest(),
+        mode::LEAST_IN_FLIGHT,
+    );
+    neighbour.forget_instance();
+    let made = neighbour.stats().instantiations;
+    decide_on_a_cold_slot(&clock, 1, &cold, &neighbour, FRAME_MICROS);
+    let n = neighbour.stats();
+    assert_eq!(
+        (n.budget_spent, n.answered, n.breaker_opens),
+        (1, 0, 0),
+        "the open is the decision's budget spent and no failure: {n:?}"
+    );
+    assert_eq!(
+        (n.instantiations - made, n.lazy_instantiations),
+        (0, 0),
+        "no `init` ran under nothing and the close rebuilt nothing: {n:?}"
+    );
+    assert!(
+        !neighbour.is_warm(),
+        "the slot is as cold as its open found it"
+    );
+}
+
 /// The same `init` refusing after its 20 ms: the failure is the breaker's,
 /// and the time it took is the decision's all the same.
 #[test]
@@ -6923,7 +6949,9 @@ fn a_lazy_init_that_fails_long_on_the_clock_is_the_decisions_budget_spent_too() 
 /// wall time is charged its fuel at the calibration, the 100 ms of the init
 /// frame, which is the whole of a 100 ms decision. One failure on the breaker
 /// (the frame it ran out under was its own), and the neighbour's open finds
-/// the remainder gone. An `init` the wall clock ended with its thread off
+/// the remainder gone. The plugin itself counts no budget spent: its `init`
+/// was granted its whole frame, so no clamp ended it, though its charge took
+/// all that was left. An `init` the wall clock ended with its thread off
 /// the CPU burnt no frame: such a decision says so and is made again,
 /// [`TRIES`] at most.
 #[test]
@@ -6959,9 +6987,14 @@ fn a_lazy_init_that_burns_its_frame_out_is_charged_its_fuel_at_the_calibration()
             "the fuel the failed init burnt is in the plugin's count (try {made}, the thread off the CPU {held:?}): {s:?}"
         );
         assert_eq!(
-            (s.lazy_instantiations, s.answered, s.breaker_opens),
-            (0, 0, 0),
-            "the init ran its own frame out: one failure, short of the breaker's five: {s:?}"
+            (
+                s.lazy_instantiations,
+                s.answered,
+                s.breaker_opens,
+                s.budget_spent
+            ),
+            (0, 0, 0, 0),
+            "the init ran its own frame out: one failure, short of the breaker's five, and no budget spent of its own: {s:?}"
         );
         assert!(!cold.is_warm(), "an init that ran out leaves no instance");
         let n = neighbour.stats();
@@ -7103,10 +7136,8 @@ fn a_lazy_init_the_host_holds_on_every_cold_slot_is_one_slow_sample_however_it_e
     const BUDGET_MICROS: u32 = 4_000;
     for steer in [1, 2] {
         let (clock, _runtime, plugin) = plugin_whose_init_asks(3, |row| {
-            row.breaker = BreakerSpec {
-                failures: 100,
-                ..BreakerSpec::default()
-            };
+            row.breaker = BreakerSpec::default();
+            row.breaker.failures = 100;
         });
         let engine = plugin_engine(&plugin);
         let half = std::time::Duration::from_micros(u64::from(BUDGET_MICROS) / 2);
@@ -7438,10 +7469,8 @@ fn an_inits_sample_is_read_over_the_init_frame_alone_behind_a_decision_that_char
     let (clock, _runtime, plugin) = plugin_whose_init_asks(0, |row| {
         row.fuel_per_micro = SLOW_CALIBRATION;
         row.budget_micros = SLOW_FRAME_MICROS;
-        row.breaker = BreakerSpec {
-            failures: 100,
-            ..BreakerSpec::default()
-        };
+        row.breaker = BreakerSpec::default();
+        row.breaker.failures = 100;
     });
     let engine = plugin_engine(&plugin);
     let decide_at = |steer: u8, seed: u64| {
@@ -7819,10 +7848,8 @@ fn a_cold_init_that_traps_short_of_its_clamp_is_its_own_failure() {
         let runtime = runtime_steered_for(&clock, &asks);
         let mut row = spec("traps-once", guest::record_guest(), mode::LEAST_IN_FLIGHT);
         row.config.push(mode::INIT_ASKS_THE_CLOCK);
-        row.breaker = BreakerSpec {
-            failures: 2,
-            ..BreakerSpec::default()
-        };
+        row.breaker = BreakerSpec::default();
+        row.breaker.failures = 2;
         let cold = loaded(&runtime, row);
         let neighbour = load(
             &runtime,
@@ -7888,10 +7915,8 @@ fn a_cold_init_that_traps_short_of_its_clamp_is_its_own_failure() {
 #[test]
 fn a_refused_cold_init_fails_its_decision_once_on_a_pair() {
     let (clock, _runtime, plugin) = plugin_whose_init_asks(0, |row| {
-        row.breaker = BreakerSpec {
-            failures: 2,
-            ..BreakerSpec::default()
-        };
+        row.breaker = BreakerSpec::default();
+        row.breaker.failures = 2;
     });
     let pair = pair_engine(
         vec![
@@ -7926,10 +7951,8 @@ fn a_refused_cold_init_fails_its_decision_once_on_a_pair() {
 fn a_gone_budget_fails_its_decision_once_on_a_pair() {
     let runtime = runtime();
     let mut row = spec("gone", guest::record_guest(), mode::LEAST_IN_FLIGHT);
-    row.breaker = BreakerSpec {
-        failures: 2,
-        ..BreakerSpec::default()
-    };
+    row.breaker = BreakerSpec::default();
+    row.breaker.failures = 2;
     let plugin = loaded(&runtime, row);
     let pair = pair_engine(
         vec![
@@ -7976,10 +7999,8 @@ fn a_rebuild_refused_after_a_counted_trap_is_no_second_failure_in_a_try(made: u3
         mode::TRAP_IN_FILTER,
     );
     row.config.push(mode::INIT_ASKS_THE_CLOCK);
-    row.breaker = BreakerSpec {
-        failures: 2,
-        ..BreakerSpec::default()
-    };
+    row.breaker = BreakerSpec::default();
+    row.breaker.failures = 2;
     let plugin = loaded(&runtime, row);
     let engine = plugin_engine(&plugin);
     let decide = |seed: u64| {
@@ -9776,11 +9797,10 @@ fn a_pair_that_straddles_the_cool_down_hears_the_feed_at_the_open_that_reaches_i
         guest::record_guest(),
         mode::TRAP_ON_FIVE_MEMBERS,
     );
-    row.breaker = BreakerSpec {
-        failures: 1,
-        window_micros: 60_000_000,
-        cooldown_micros: COOL_DOWN,
-    };
+    row.breaker = BreakerSpec::default();
+    row.breaker.failures = 1;
+    row.breaker.window_micros = 60_000_000;
+    row.breaker.cooldown_micros = COOL_DOWN;
     let plugin = loaded(&runtime, row);
     let plain = Arc::new(plugin_engine(&plugin));
     // The first side's profile: the plugin's open, then the host's scope

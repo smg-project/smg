@@ -813,7 +813,9 @@ impl Assembler {
     /// The member the end of the stream cut inside its value ([`Self::finish`]), written as far
     /// as the JSON the assembler writes for it can be known from the bytes so far, with the key,
     /// the `=`, the value's bytes and the whitespace before them as its source: a string still
-    /// open, in either quote, as an open JSON string holding its text so far ([`open_string`]); a
+    /// open, in either quote, as an open JSON string holding its text so far ([`open_string`]), and
+    /// so a value under [`Values::Quoted`] that went on behind a quote that closed its string,
+    /// or as `"key": ` alone where a quote in it was the model's own and no string is declared; a
     /// value whole before the separator that never came (`"Paris"`, `3`, `None`) as it would
     /// have been written ([`Self::whole_value`]); a number's digits, the start of a word or a
     /// list or a dict still open as the JSON they stand for so far ([`cut_word`], [`cut_json`]:
@@ -830,6 +832,20 @@ impl Assembler {
         out: &mut Events,
     ) {
         let raw = self.carried[start..].trim_start();
+        // A value the template quoted, read below where the scan no longer stands in its string:
+        // it went on behind a quote that closed that string, into text, a bracket or the other
+        // quote, so that quote was one of its characters and the value is still open, and it is
+        // read again as that open string. No quote of the template is open at its end, so no
+        // backslash there is in doubt.
+        let template_quoted = self.values == Values::Quoted && raw.starts_with('"');
+        // The scan of that second reading: in the quote `raw` begins with, at depth 0, so one of
+        // the two `Some` arms below takes it and it is never read a third time.
+        let open = Extent {
+            quote: Some('"'),
+            escapes: false,
+            own_quote: scan.own_quote,
+            ..Extent::new(self.values)
+        };
         let value = match scan.quote {
             _ if raw.is_empty() => String::new(),
             // A model's escaped quote under a kind that is no string: the value may still read
@@ -844,9 +860,13 @@ impl Assembler {
             }
             None if scan.depth == 0 => {
                 let text = raw.trim_end();
-                self.whole_value(text, kind, scan.own_quote)
-                    .unwrap_or_else(|| cut_word(text))
+                match self.whole_value(text, kind, scan.own_quote) {
+                    Some(whole) => whole,
+                    None if template_quoted => return self.cut_value(key, start, open, kind, out),
+                    None => cut_word(text),
+                }
             }
+            _ if template_quoted => return self.cut_value(key, start, open, kind, out),
             // A list or a dict still open: as written where its spelling is JSON's so far, else
             // a string holding it, since its JSON is not known until it closes.
             _ => cut_json(raw),
@@ -1490,6 +1510,28 @@ mod tests {
             (r#"command="5\" s"#, r#"{"command": "5\" s"#),
             (r#"command="a\"\"#, r#"{"command": "a\""#),
             (r#"tags="['a\\"b', 'c']"#, r#"{"tags": "#),
+            // The stream's end behind a quote that closed the string with more of the value
+            // after it, whatever is open there: that quote was one of the value's characters,
+            // so the value is still open and the fragment holds the text behind its opening
+            // quote, not that quote, and a last backslash too, which no quote of the template
+            // is open to leave in doubt.
+            (r#"command="say "hi"#, r#"{"command": "say \"hi"#),
+            (r#"command="x\"y" \"#, r#"{"command": "x\"y\" \\"#),
+            (r#"command="x\"y" 'q' z"#, r#"{"command": "x\"y\" 'q' z"#),
+            (r#"command="x\"y" [1"#, r#"{"command": "x\"y\" [1"#),
+            (r#"command="x\"y" {a"#, r#"{"command": "x\"y\" {a"#),
+            (r#"command="x\"y" (a"#, r#"{"command": "x\"y\" (a"#),
+            (r#"command="x\"y" 'q"#, r#"{"command": "x\"y\" 'q"#),
+            (r#"command="x\"y" ['q"#, r#"{"command": "x\"y\" ['q"#),
+            (r#"tags="['a\"b']" x"#, r#"{"tags": "#),
+            (r#"tags="['a\"b']" [x"#, r#"{"tags": "#),
+            // A parameter no tool declares holds a model's quote as a list does; a list with no
+            // such quote is an open string; a string open in a bracket and whitespace at the
+            // end are the value's text.
+            (r#"q="x\"y" z"#, r#"{"q": "#),
+            (r#"tags="['a']" x"#, r#"{"tags": "['a']\" x"#),
+            (r#"command="x" ["q"#, r#"{"command": "x\" [\"q"#),
+            (r#"command="say "hi "#, r#"{"command": "say \"hi "#),
         ] {
             let output = format!("[cmd_controller_execute({cut}");
             let read = calls(&run_bare(&declared, &[&output]));
@@ -1683,7 +1725,7 @@ mod tests {
     /// one character at a time.
     #[test]
     fn a_member_the_stream_end_cuts_leaves_as_the_calls_own_fragment_and_nothing_as_content() {
-        let cases: [(Dialect, &str, &str, &[&str]); 30] = [
+        let cases: [(Dialect, &str, &str, &[&str]); 31] = [
             // JSON values: an open string, decoded and escaped as JSON.
             (
                 Dialect::OLMO3,
@@ -1827,6 +1869,14 @@ mod tests {
                 Dialect::LFM2_5,
                 "[get_weather(city='Paris', options={'a': 'b",
                 r#"{"city": "Paris", "options": "{'a': 'b"#,
+                &[],
+            ),
+            // Text behind a closed double quote under a dialect whose quotes are Python's: no
+            // template wrote that quote, so the value stands as written, a string holding it.
+            (
+                Dialect::LFM2_5,
+                "[get_weather(city=\"a\" b",
+                r#"{"city": "\"a\" b"#,
                 &[],
             ),
             // Quoted values: the text between the quotes as written, nothing decoded; a value

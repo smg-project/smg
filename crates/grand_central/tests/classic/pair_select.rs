@@ -22,13 +22,15 @@
 //! The replay asks the pair's decision of the engine a document builds:
 //! each side under its preset, the binding's word for a pool vetoed on
 //! every worker, and each worker's bits as a host writes them. A host
-//! answers two lists of which one is empty over no worker, and so does the
-//! replay. Of a refusal the replay holds why, and not the role: a shed
-//! names the stage that left nobody, and the gateway the pool its search
-//! failed on.
+//! answers two lists of which one is empty over no worker, and names the
+//! side of the list that holds none, the prefills' first; so does the
+//! replay. Of a refusal the replay holds why and the role: a shed names
+//! the stage that left nobody and the side it left with nobody
+//! ([`Shed::side`](smg_grand_central::engine::Shed::side)), and the
+//! gateway the pool its search failed on.
 //!
-//! [`APART`] names each recorded row this crate decides apart from the
-//! gateway, with its answer here.
+//! Every recorded row replays so: this crate decides none of them apart
+//! from the gateway.
 //!
 //! A row's pair classes are numbered by the replay from the row itself
 //! ([`pairing`]). A sheet replays a second way over the classes a
@@ -40,8 +42,9 @@ use serde_json::Value;
 use smg_grand_central::{
     document::{self, OverloadSpec, PolicySpec},
     engine::{
-        Candidate, Constraints, Decision, Engine, FirstPartners, Health, PairPools, PairTable,
-        PartnerClasses, PoolFacts, RequestFacts, Role, Scratch, ShedReason, WireModes, WorkerId,
+        Candidate, Constraints, Decision, Engine, FirstPartners, Health, PairPools, PairSide,
+        PairTable, PartnerClasses, PoolFacts, RequestFacts, Role, Scratch, ShedReason, WireModes,
+        WorkerId,
     },
     policies::power_of_two::PowerOfTwoMetric,
     store::pairing::{Member, PairClasses, PairingDescriptor},
@@ -113,12 +116,13 @@ impl Worker {
 }
 
 /// The gateway's answer to one request: the pair, the prefill's place and
-/// then the decode's, or no pair.
+/// then the decode's, or no pair, with the role it refuses for (`prefill`
+/// or `decode`) and why.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum Answer {
     Pair([usize; 2]),
-    None { why: String },
+    None { role: String, why: String },
 }
 
 /// What a row recorded: each request's answer in order, or how often each
@@ -269,10 +273,8 @@ fn derived(row: &Row) -> PartnerClasses {
     }
     let offers = |pool: &[Worker]| -> Vec<PairingDescriptor> {
         let offer = |worker: &Worker| {
-            let mut offer = PairingDescriptor {
-                transport: worker.transport.clone(),
-                ..PairingDescriptor::default()
-            };
+            let mut offer = PairingDescriptor::default();
+            offer.transport.clone_from(&worker.transport);
             offer.normalize();
             offer
         };
@@ -351,12 +353,12 @@ pub(super) fn why(reason: ShedReason, stage: &str) -> &'static str {
     }
 }
 
-/// What this crate answers one request of a row: the pair, or why none and
-/// the stage its shed names.
+/// What this crate answers one request of a row: the pair, or why none,
+/// the stage its shed names and the side it names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Here {
     Pair([usize; 2]),
-    None(&'static str, &'static str),
+    None(&'static str, &'static str, Option<PairSide>),
 }
 
 /// The row's requests decided one after another over `classes`, with
@@ -386,7 +388,11 @@ fn run(row: &Row, engine: &Engine, draw: u64, classes: &Classes<'_>) -> Result<V
         .within(&table)
         .map_err(|clause| format!("the row's first partners: {clause}"))?;
     // One side alone is no pair: a host answers such lists over no worker.
-    let (pools, pool_size) = if prefills.is_empty() || decodes.is_empty() {
+    // The engine then reads neither list and names the prefills' side, and
+    // the host names the decodes' where the prefills hold a record.
+    let alone = prefills.is_empty() || decodes.is_empty();
+    let no_decode = alone && !prefills.is_empty();
+    let (pools, pool_size) = if alone {
         (PairPools::default(), 0)
     } else {
         let mut pools = PairPools::default();
@@ -413,9 +419,11 @@ fn run(row: &Row, engine: &Engine, draw: u64, classes: &Classes<'_>) -> Result<V
                     Here::Pair([target.position as usize, decode as usize])
                 }
                 Decision::Shed(shed) => {
-                    Here::None(why(shed.reason, shed.emptied_by), shed.emptied_by)
+                    let decodes = |side| if no_decode { PairSide::Decode } else { side };
+                    let side = shed.side.map(decodes);
+                    Here::None(why(shed.reason, shed.emptied_by), shed.emptied_by, side)
                 }
-                Decision::Queue(_) => Here::None("queued", "queue"),
+                Decision::Queue(_) => Here::None("queued", "queue", None),
             }
         })
         .collect())
@@ -465,11 +473,14 @@ fn replayed(row: &Row, by_rule: bool) -> Result<Replayed, String> {
 }
 
 /// Whether an answer of this crate is the recorded one: the pair, or no
-/// pair for the recorded reason.
+/// pair for the recorded reason and for the recorded role, which is the
+/// side the shed names.
 fn same(recorded: &Answer, here: &Here) -> bool {
     match (recorded, here) {
         (Answer::Pair(pair), Here::Pair(ours)) => pair == ours,
-        (Answer::None { why }, Here::None(ours, _)) => why == ours,
+        (Answer::None { role, why }, Here::None(ours, _, side)) => {
+            why == ours && side.is_some_and(|side| side.as_str() == role)
+        }
         _ => false,
     }
 }
@@ -524,70 +535,12 @@ pub(super) fn differences(recorded: &Outcome, here: &Replayed) -> Vec<String> {
     }
 }
 
-/// What an entry of [`APART`] holds its row to: every request of the row,
-/// in every draw, answered no pair, and why.
-#[derive(Clone, Copy, Debug)]
-struct Held(&'static str);
-
-impl Held {
-    fn is(self, here: &Replayed) -> bool {
-        let Self(why) = self;
-        let holds = |answer: &Here| matches!(answer, Here::None(ours, _) if why == *ours);
-        match here {
-            Replayed::Sequence(answers) => answers.iter().all(holds),
-            Replayed::Counts(counts) => counts.iter().all(|(answer, _)| holds(answer)),
-        }
-    }
-}
-
-/// A recorded row this crate decides apart from the gateway, by a rule of
-/// its own or for want of one of the gateway's: what it answers every
-/// request of the row, and the rule.
-struct Apart {
-    row: &'static str,
-    here: Held,
-    rule: &'static str,
-}
-
-/// The row decided apart: one refusal's reason. Where the only ready
-/// prefill's partners are all over their thresholds beside a free decode of
-/// another transport, the gateway reads the whole decode pool, finds it not
-/// vetoed on every worker and answers unavailable. The pair's decision
-/// reads the partners of the prefills it could use and names the overload
-/// veto.
-///
-/// The four rows of a prefill policy that weighs load against cache
-/// affinity itself replay as recorded: the gateway lifts the overload veto
-/// for such a policy while shedding is off, and a prefill profile one of
-/// whose scorers says the same of itself runs with that veto lifted under
-/// a binding that steers.
-const APART: &[Apart] = &[Apart {
-    row: "pair-the-only-ready-prefills-partners-over-beside-a-free-decode",
-    here: Held("overloaded"),
-    rule: "a refusal names the overload veto where the usable prefills' partners are all over",
-}];
-
 /// What of one row's outcome this crate does not replay: nothing when its
-/// answers are the recorded ones, or when [`APART`] names the row and its
-/// answers are its entry's. A row decided apart that replays as recorded is
-/// a defect too: its rule no longer decides it.
+/// answers are the recorded ones.
 fn replay(row: &Row, by_rule: bool) -> Vec<String> {
-    let here = match replayed(row, by_rule) {
-        Ok(here) => here,
-        Err(refused) => return vec![format!("refused here: {refused}")],
-    };
-    let found = differences(&row.outcome, &here);
-    match APART.iter().find(|apart| apart.row == row.name) {
-        None => found,
-        Some(apart) if found.is_empty() => vec![format!(
-            "it replays as recorded now ({}): take the row out of APART",
-            apart.rule
-        )],
-        Some(apart) if apart.here.is(&here) => Vec::new(),
-        Some(apart) => vec![format!(
-            "apart by its entry {:?}, replayed {here:?}",
-            apart.here
-        )],
+    match replayed(row, by_rule) {
+        Ok(here) => differences(&row.outcome, &here),
+        Err(refused) => vec![format!("refused here: {refused}")],
     }
 }
 
@@ -626,33 +579,36 @@ fn replay_by(text: &str, source: &str, by_rule: bool) -> (usize, Vec<String>) {
     (sheet.rows.len(), defects)
 }
 
-/// Every row decided apart is an inline row, so a run that reads no sheet
-/// still checks that its rule decides it, and how: the row passes on its
-/// entry's answer, and the same row with that answer recorded is a defect
-/// that names the entry's rule.
+/// Two recorded rows replay as recorded where the pair's decision once
+/// answered apart, and both are inline rows, so a run that reads no sheet
+/// holds them. In the first the only ready prefill's partners are all over
+/// their thresholds beside a free decode of another transport: the decode
+/// pool is not wholly over its thresholds, and the gateway answers
+/// unavailable, for the decode's role. In the second every prefill is over
+/// its thresholds under a policy that weighs load against cache affinity
+/// itself, and every decode is down: the gateway judges the prefill pool
+/// as it stood before its lift, and refuses for the prefill's role
+/// (`pair_pass` in `model_gateway/src/routers/common/placement.rs`, where
+/// no prefill is open). The pair's decision asks that selection's one
+/// question behind its prefill side's shed: it sheds as saturated where
+/// the list judged is wholly over its thresholds, under a binding that
+/// sheds, and names that list's side.
 #[test]
-fn every_row_decided_apart_is_an_inline_row_held_to_its_entry() {
+fn the_rows_a_pairs_own_shed_once_parted_replay_as_recorded() {
     let inline: Value = serde_json::from_str(INLINE).expect("the inline rows");
     let rows = inline["rows"].as_array().expect("rows");
-    let alone = |row: &Value| {
+    for name in [
+        "pair-the-only-ready-prefills-partners-over-beside-a-free-decode",
+        "pair-every-prefill-over-under-a-weighing-policy-and-every-decode-down",
+    ] {
+        let row = rows.iter().find(|row| row["name"] == name);
+        let row = row.unwrap_or_else(|| panic!("{name} is no inline row"));
         let text = serde_json::json!({ "rows": [row] }).to_string();
-        replay_rows(&text, "inline").1
-    };
-    for apart in APART {
-        let row = rows.iter().find(|row| row["name"] == apart.row);
-        let row = row.unwrap_or_else(|| panic!("{} is no inline row", apart.row));
-        assert_eq!(alone(row), Vec::<String>::new(), "{}", apart.row);
-        let requests = row["requests"].as_u64().expect("a number of requests");
-        let mut as_here = row.clone();
-        let Held(why) = apart.here;
-        as_here["outcome"] = serde_json::json!({
-            "sequence": vec![serde_json::json!({ "none": { "role": "prefill", "why": why } }); requests as usize]
-        });
-        let found = alone(&as_here);
-        assert!(
-            matches!(&found[..], [one] if one.contains("take the row out of APART") && one.contains(apart.rule)),
-            "{}: {found:?}",
-            apart.row
+        assert_eq!(replay_rows(&text, "inline"), (1, Vec::new()), "{name}");
+        assert_eq!(
+            replay_rows_by_rule(&text, "inline"),
+            (1, Vec::new()),
+            "{name}"
         );
     }
 }
@@ -662,7 +618,7 @@ fn every_row_decided_apart_is_an_inline_row_held_to_its_entry() {
 #[test]
 fn the_inline_rows_replay() {
     let (rows, found) = replay_rows(INLINE, "inline");
-    assert!(rows >= APART.len(), "{rows} inline rows");
+    assert!(rows > 0, "{rows} inline rows");
     assert_eq!(found, Vec::<String>::new());
 }
 
@@ -677,9 +633,10 @@ fn a_text_that_is_no_pair_sheet_is_a_defect() {
     );
 }
 
-/// Rows copied from the recorded sheet, whole: every row decided apart, the
-/// four of a prefill policy that weighs load against affinity, and one or
-/// more of each form the replay reads.
+/// Rows copied from the recorded sheet, whole: the row of a decode pool
+/// that is not wholly over its thresholds, the four of a prefill policy
+/// that weighs load against affinity, and one or more of each form the
+/// replay reads.
 pub const INLINE: &str = r#"{
   "recorded_from": "4ba2a6431357be5411a2383cdc4916b41471d722",
   "policy": "pair-select",

@@ -1,14 +1,15 @@
 //! One relay of a worker's streaming body to the client, for the HTTP
 //! routers: the regular router's answer and the disaggregated router's decode
-//! side read through the same task. The head's success is the worker's before
-//! the task can sample the body's failure; a body the worker ends with an
-//! error after a successful head is accounted to its source and, when the
-//! head was SSE, ended with the typed error event on its own frame; the load
-//! guard rides in the body's own stream; a client that leaves ends the
-//! upstream read. The regular relay re-chunks SSE deltas when the wire of
-//! the model the client asked for asks, by the wire's numbers; the decode
-//! relay reads each chunk through a hook (the prefill log-probability merge
-//! and the `[DONE]` cut).
+//! side read through the same task. A closed breaker samples a stream once,
+//! at its end; on a breaker that is not closed the head's success is the
+//! worker's before the task can sample the body's failure; a body the worker
+//! ends with an error after a successful head is accounted to its source
+//! and, when the head was SSE, ended with the typed error event on its own
+//! frame; the load guard rides in the body's own stream; a client that
+//! leaves ends the upstream read. The regular relay re-chunks SSE deltas
+//! when the wire of the model the client asked for asks, by the wire's
+//! numbers; the decode relay reads each chunk through a hook (the prefill
+//! log-probability merge and the `[DONE]` cut).
 
 use std::time::Duration;
 
@@ -19,7 +20,7 @@ use axum::{
 };
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
-use smg_worker::identity::basic::WorkerLoadGuard;
+use smg_worker::{health::circuit_breaker::CircuitState, identity::basic::WorkerLoadGuard};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::Instrument;
@@ -130,9 +131,11 @@ pub(crate) struct Relay {
     pub(crate) mode: ChunkMode,
 }
 
-/// Relay `stream` to the client as the response's body. The head's success
-/// is recorded before the task starts; the task runs under the request's
-/// span; the response carries the head-success mark the callers read.
+/// Relay `stream` to the client as the response's body. A closed breaker
+/// samples the stream once, at its end; on a breaker that is not closed the
+/// head's success is recorded before the task starts; the task runs under
+/// the request's span; the response carries the head-success mark the
+/// callers read.
 pub(crate) fn relay_streaming_body<S>(stream: S, relay: Relay) -> Response
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
@@ -158,15 +161,33 @@ where
     // relay await on `send` instead of buffering the whole response.
     let (tx, rx) = mpsc::channel(SSE_CHANNEL_BUFFER);
 
-    // The head's success is the worker's before the relay can sample
-    // the body's failure: on a multi-threaded runtime the task may
-    // run first with a body error already buffered behind the head,
-    // and the head's success recorded by the caller afterwards would
+    // A good head's stream is one sample of a closed breaker, taken by the
+    // task at the stream's end: the cut's failure alone, or the success of
+    // an end the worker did not cut. A success recorded at the head would
+    // reset the failure streak the cut then counts into, and a worker that
+    // cuts every stream behind a good head would read one failure for ever
+    // and never open. On a breaker that is not closed the head's success
+    // stays the worker's before the relay can sample the body's failure: a
+    // trial is answered by its head, and on a multi-threaded runtime the
+    // task may run first with a body error already buffered behind the
+    // head, so the head's success recorded by the caller afterwards would
     // reset the breaker's failure streak and erase the cut's sample.
+    // The two ends differ there on purpose: a good head is the worker
+    // answering now, whichever request it answers, and a trial cannot wait
+    // for a stream's end, so the head counts; the end's success is the
+    // closed breaker's sample of the whole stream, and a stream that began
+    // before a trip is no part of the trial.
     // A failed head is the caller's to record (through its ledger on
     // the typed route); the relay never accounts its body.
-    let head_success_recorded = status.is_success();
-    if head_success_recorded {
+    // The read below is the worker's one read of its breaker, and it moves
+    // an open breaker whose timeout has passed to half-open as a
+    // selection's read does: the trial then starts at this head, and the
+    // routing state's series follows at the next selection's read, which
+    // publishes the move it finds made.
+    let good_head = status.is_success();
+    let sampled_at_end =
+        good_head && source.worker().circuit_breaker_state() == CircuitState::Closed;
+    if good_head && !sampled_at_end {
         source.worker().record_outcome(status.as_u16());
     }
     // A good head's end is the relay's to report, as its cut is the
@@ -174,7 +195,7 @@ where
     // failed head is the caller's to report with its record, so the handle
     // is let go here and that report waits for no task. A client that
     // leaves is reported by nobody.
-    let end = if head_success_recorded {
+    let end = if good_head {
         end
     } else {
         drop(end);
@@ -205,6 +226,9 @@ where
             // channel and drops it on every chunk; kept, it registers once.
             let client_gone = tx.closed();
             tokio::pin!(client_gone);
+            // The success a closed breaker is owed at the stream's end,
+            // unless the worker cuts the stream: the cut is then its sample.
+            let mut owes_success = sampled_at_end;
             loop {
                 tokio::select! {
                     chunk = stream.next() => {
@@ -255,6 +279,7 @@ where
                                     if status.is_success() {
                                         let cut = UpstreamCut::of(&e);
                                         source.account(&cut, relayed);
+                                        owes_success = false;
                                         end.report(cut.status().as_u16(), || false);
                                     }
                                     break;
@@ -268,6 +293,7 @@ where
                                 if status.is_success() {
                                     let cut = UpstreamCut::of(&e);
                                     source.account(&cut, relayed);
+                                    owes_success = false;
                                     end.report(cut.status().as_u16(), || false);
                                     if upstream_sse {
                                         // On its own frame: a cut inside a frame leaves
@@ -310,6 +336,19 @@ where
                     () = &mut client_gone => break,
                 }
             }
+            // The closed breaker's one sample of a stream the worker did
+            // not cut: a clean end, a hook's or an observer's stop, a
+            // client that left. A breaker that is not closed at the stream's
+            // end takes none: the success belongs to the closed breaker the
+            // head found, and on a tripped one it would count toward a
+            // trial this stream never was. The state is read at the two ends
+            // alone, so a breaker that tripped and closed again in between
+            // takes the success as one that stayed closed does. The read is
+            // the head's: it moves an open breaker past its timeout to
+            // half-open, with no sample.
+            if owes_success && source.worker().circuit_breaker_state() == CircuitState::Closed {
+                source.worker().record_outcome(status.as_u16());
+            }
         }
         .instrument(span),
     );
@@ -321,7 +360,9 @@ where
     let mut response = Response::new(body);
     *response.status_mut() = status;
     *response.headers_mut() = headers;
-    if head_success_recorded {
+    // Every good head carries the mark: the breaker's sample of its stream
+    // is the relay's, at the head or at the end, and the caller records none.
+    if good_head {
         mark_head_success_recorded(&mut response);
     }
     response
@@ -346,6 +387,7 @@ mod tests {
     use futures_util::{stream, Stream, StreamExt};
     use http_body_util::BodyExt;
     use smg_worker::{
+        health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
         identity::basic::{Worker, WorkerLoadGuard},
         test_support::RefusedAddress,
     };
@@ -642,6 +684,192 @@ mod tests {
             "{error_event}"
         );
         assert_eq!(done, "data: [DONE]");
+    }
+
+    /// A worker with `breaker` as its circuit breaker's settings.
+    fn worker_with(breaker: CircuitBreakerConfig) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new("http://127.0.0.1:1")
+                .circuit_breaker_config(breaker)
+                .build(),
+        )
+    }
+
+    /// A worker whose closed breaker opens at its second failure in a row.
+    fn worker_opening_at_two() -> Arc<dyn Worker> {
+        worker_with(CircuitBreakerConfig {
+            failure_threshold: 2,
+            ..Default::default()
+        })
+    }
+
+    /// A stream of `worker` that runs until the returned sender is dropped:
+    /// its good head is out, its body is still open.
+    fn a_running_stream(
+        worker: &Arc<dyn Worker>,
+    ) -> (mpsc::Sender<Result<Bytes, reqwest::Error>>, Response) {
+        let (worker_side, upstream) = mpsc::channel(1);
+        let response = relay_from(worker, ReceiverStream::new(upstream));
+        (worker_side, response)
+    }
+
+    /// The plain relay of `upstream` from `worker`: a successful SSE head.
+    fn relay_from<S>(worker: &Arc<dyn Worker>, upstream: S) -> Response
+    where
+        S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    {
+        relay_streaming_body(
+            upstream,
+            Relay {
+                status: StatusCode::OK,
+                upstream_sse: true,
+                source: RelaySource::new("m", "/v1/chat/completions", Arc::clone(worker)),
+                guard: WorkerLoadGuard::with_key(Arc::clone(worker), None),
+                end: RequestEnd::default(),
+                headers: HeaderMap::new(),
+                mode: ChunkMode::Plain,
+            },
+        )
+    }
+
+    /// One stream `worker` cuts behind a good head, read to its end: the
+    /// client reads a 200 that ends in the error event and the done mark.
+    async fn a_cut_stream(worker: &Arc<dyn Worker>) {
+        let error = upstream_error().await;
+        let upstream = stream::iter(vec![Ok(delta("Hel")), Err(error)]);
+        let events = events_of(&frames_of(relay_from(worker, upstream).into_body()).await);
+        assert_eq!(
+            events.last().map(String::as_str),
+            Some("data: [DONE]"),
+            "{events:?}"
+        );
+    }
+
+    /// A worker that cuts every stream behind a good head fails every
+    /// request it takes: its breaker opens at the failure threshold, as it
+    /// does where the same cuts end bodies that are not streamed.
+    #[tokio::test]
+    async fn a_worker_that_cuts_every_stream_behind_a_good_head_opens_its_breaker() {
+        let worker = worker_opening_at_two();
+        a_cut_stream(&worker).await;
+        a_cut_stream(&worker).await;
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
+    }
+
+    /// A stream the worker ends cleanly is the closed breaker's one success,
+    /// taken at the stream's end: between two cut streams it starts the
+    /// failure streak anew, and the breaker stays closed.
+    #[tokio::test]
+    async fn a_clean_stream_between_two_cut_ones_starts_the_failure_streak_anew() {
+        let worker = worker_opening_at_two();
+        a_cut_stream(&worker).await;
+        let upstream = stream::iter([Ok::<_, reqwest::Error>(delta("Hello"))]);
+        let events = events_of(&frames_of(relay_from(&worker, upstream).into_body()).await);
+        assert_eq!(contents(&events), ["Hello"], "{events:?}");
+        a_cut_stream(&worker).await;
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+    }
+
+    /// A stream its client leaves is no cut of the worker's: the closed
+    /// breaker takes its one success when the relay ends, as it does at a
+    /// clean end.
+    #[tokio::test]
+    async fn a_stream_its_client_leaves_between_two_cut_ones_starts_the_failure_streak_anew() {
+        let worker = worker_opening_at_two();
+        a_cut_stream(&worker).await;
+        let (worker_side, response) = a_running_stream(&worker);
+        drop(response);
+        // The relay lets go of the upstream once its sample is in.
+        worker_side.closed().await;
+        a_cut_stream(&worker).await;
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+    }
+
+    /// A good head that finds an open breaker past its timeout, before any
+    /// selection read it, starts the trial itself: the relay reads the state
+    /// with the worker's own read, which moves such a breaker to half-open
+    /// as a selection's read does, and the head is the trial's success.
+    #[tokio::test]
+    async fn a_good_head_on_an_open_breaker_past_its_timeout_starts_its_trial_with_a_success() {
+        let worker = worker_with(CircuitBreakerConfig {
+            failure_threshold: 1,
+            success_threshold: 1,
+            timeout_duration: Duration::ZERO,
+            ..Default::default()
+        });
+        // Open and past its timeout of zero; nothing has read the state since.
+        worker.record_circuit_breaker_outcome(false);
+        let upstream = stream::iter([Ok::<_, reqwest::Error>(delta("Hello"))]);
+        let response = relay_from(&worker, upstream);
+        // The head is out and the relay task has not run: one success closed the trial.
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+        let events = events_of(&frames_of(response.into_body()).await);
+        assert_eq!(contents(&events), ["Hello"], "{events:?}");
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+    }
+
+    /// The same head where the trial needs two successes: the breaker is
+    /// half-open behind it with one of the two counted, and a second good
+    /// head closes it.
+    #[tokio::test]
+    async fn a_good_head_on_an_open_breaker_past_its_timeout_counts_toward_the_trials_close() {
+        let worker = worker_with(CircuitBreakerConfig {
+            failure_threshold: 1,
+            success_threshold: 2,
+            timeout_duration: Duration::ZERO,
+            ..Default::default()
+        });
+        worker.record_circuit_breaker_outcome(false);
+        let _first = a_running_stream(&worker);
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::HalfOpen);
+        let _second = a_running_stream(&worker);
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+    }
+
+    /// The good head of a stream that still runs is no sample of a closed
+    /// breaker: a failed request before it and one behind it are two
+    /// failures in a row, and the breaker opens.
+    #[tokio::test]
+    async fn a_running_streams_head_leaves_a_failure_streak_unbroken() {
+        let worker = worker_opening_at_two();
+        worker.record_outcome(503);
+        let _running = a_running_stream(&worker);
+        worker.record_outcome(503);
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
+    }
+
+    /// The closed breaker's success of a stream lands at the stream's end,
+    /// not at its head: a failed request while the stream runs and one
+    /// behind its clean end are not two failures in a row.
+    #[tokio::test]
+    async fn a_streams_success_lands_at_its_end_between_two_failed_requests() {
+        let worker = worker_opening_at_two();
+        let (worker_side, response) = a_running_stream(&worker);
+        worker.record_outcome(503);
+        drop(worker_side);
+        let _frames = frames_of(response.into_body()).await;
+        worker.record_outcome(503);
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+    }
+
+    /// A breaker that tripped while a stream ran takes no success from that
+    /// stream's end: half-open, it still waits for its trial.
+    #[tokio::test]
+    async fn a_streams_end_on_a_breaker_that_tripped_meanwhile_is_no_trial_success() {
+        let worker = worker_with(CircuitBreakerConfig {
+            failure_threshold: 2,
+            success_threshold: 1,
+            timeout_duration: Duration::ZERO,
+            ..Default::default()
+        });
+        let (worker_side, response) = a_running_stream(&worker);
+        worker.record_outcome(503);
+        worker.record_outcome(503);
+        // Tripped, and past its timeout of zero: this read starts the trial.
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::HalfOpen);
+        drop(worker_side);
+        let _frames = frames_of(response.into_body()).await;
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::HalfOpen);
     }
 
     /// The idle flush waits for the policy's silence since the last upstream

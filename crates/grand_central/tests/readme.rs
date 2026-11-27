@@ -1,8 +1,10 @@
 //! The crate's pages, checked against the crate, so each says what this
 //! build holds. `README.md` is the first page, short enough to read whole.
 //! `docs/policy-spec.md` is the policy spec's page, cut out of the reference
-//! and held to the README's bounds. `REFERENCE.md` holds the rest of the
-//! detail. Nine things are read:
+//! and held to the README's bounds. `docs/stages.md` is the stages' page,
+//! `docs/service.md` the service's page and `docs/embedding.md` the page of
+//! a host that embeds the engine, each cut out and held the same way.
+//! `REFERENCE.md` holds the rest of the detail. Ten things are read:
 //!
 //! - every fenced `yaml` block of a page is a whole policy document: it
 //!   parses, and the stock catalog validates it (a fragment is fenced as
@@ -10,19 +12,25 @@
 //! - a `yaml` block of the reference under the mark `<!-- refused -->` is a
 //!   document the validator refuses, and the fenced text after it ends with
 //!   the validator's words;
-//! - the three stage tables of the README and of the reference, each
+//! - the three stage tables of the README and of the stages' page, each
 //!   between its `begin` and `end` marks, name the catalog's filters,
 //!   scorers and pickers: every name, no other, in the catalog's order;
 //! - a `yaml` block of the reference under `<!-- preset: <name> -->` is the
 //!   crate's preset of that name but for its `generation` line, which the
 //!   page leaves out, and the reference shows every preset. The README's
 //!   preset table names every preset too, in the crate's order;
-//! - the reference names, each in a code span, every flag of the standalone
-//!   binary, every call of the controller's contract and every series the
-//!   controller exports: each list is read off the files that declare it.
-//!   Each is read the other way too: a row of the reference's flag tables,
-//!   of its call table or of its metrics table names none that is gone;
-//! - the README and the policy spec's page stay inside the bounds a person
+//! - the service's page names, each in a row of its tables, every flag of
+//!   the standalone binary and every call of the controller's contract, and
+//!   the reference names, each in a code span, every series the controller
+//!   exports: each list is read off the files that declare it. Each is read
+//!   the other way too: a row of the service page's flag tables or of its
+//!   call table, or of the reference's metrics table, names none that is
+//!   gone;
+//! - the embedding page's table of Cargo features names every feature of
+//!   the crate's manifest and no other, a row a feature, each with the
+//!   features of the crate it turns on and no other word, and the page
+//!   names the default build's feature;
+//! - the README and the four pages cut out stay inside the bounds a person
 //!   reads with ease: no sentence over 30 words, no paragraph over five
 //!   sentences or 100 words, no list item over 50 words, no table cell over
 //!   30 words, no heading over 30 words, and none of the filler words in a
@@ -32,12 +40,13 @@
 //!   as code;
 //! - the walk that holds those bounds refuses a short text over each of
 //!   them and passes one that stands at a bound, and the reading of a
-//!   page's headings and links is held to short texts the same way;
-//! - every link of the three pages to a path of the checkout resolves, and
+//!   page's blocks, headings and links is held to short texts the same
+//!   way;
+//! - every link of the six pages to a path of the checkout resolves, and
 //!   a link that names a heading names one its page holds;
 //! - each command the README shows names what the checkout holds: this
-//!   package, features and an example of its manifest, a test of the
-//!   library's source, and flags the standalone binary's command line
+//!   package, features and an example of its manifest, a unit test of the
+//!   library, and flags the standalone binary's command line
 //!   declares.
 
 use std::{
@@ -61,10 +70,22 @@ const PRESET: &str = "<!-- preset: ";
 const README_DOCUMENTS: usize = 2;
 
 /// The documents the reference shows running, counted as the README's are.
-const DOCUMENTS: usize = 13;
+const DOCUMENTS: usize = 12;
 
 /// The documents the policy spec's page shows running, counted the same way.
-const PAGE_DOCUMENTS: usize = 4;
+const PAGE_DOCUMENTS: usize = 5;
+
+/// The documents the stages' page shows running, counted the same way.
+const STAGES_DOCUMENTS: usize = 1;
+
+/// The documents the service's page shows running: none. Its fences are
+/// commands and Rust, and one named `yaml` there would be read as a document.
+const SERVICE_DOCUMENTS: usize = 0;
+
+/// The documents the embedding page shows running: none. A fence it gains
+/// under the name `yaml` would be read as a document, unless the mark of a
+/// refused one stood ahead of it.
+const EMBEDDING_DOCUMENTS: usize = 0;
 
 /// The commands the README shows, counted as its documents are.
 const README_COMMANDS: usize = 4;
@@ -87,9 +108,14 @@ const CALLS: usize = 15;
 /// The series the standalone controller exports, at the least.
 const SERIES: usize = 22;
 
-/// The most words a sentence of a short page holds: the README and the
-/// policy spec's page are the short pages. Nothing but a sentence's end
-/// splits one, so a chain joined by semicolons is one sentence.
+/// The features the crate's manifest declares beside `default`, at the
+/// least: a walk that finds fewer has lost the shape of the manifest.
+const FEATURES: usize = 9;
+
+/// The most words a sentence of a short page holds: the README and the four
+/// pages cut out of the reference are the short pages. Nothing but a
+/// sentence's end splits one, so a chain joined by semicolons is one
+/// sentence.
 const SENTENCE_WORDS: usize = 30;
 
 /// The most sentences a paragraph of a short page holds.
@@ -136,6 +162,23 @@ fn policy_spec() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/policy-spec.md")
 }
 
+/// The stages' page: each stock filter, scorer and picker with its rules.
+fn stages() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/stages.md")
+}
+
+/// The service's page: the standalone binary's flags, its worker discovery
+/// and the calls it serves.
+fn service() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/service.md")
+}
+
+/// The embedding page: the calls of a host that decides in its own process,
+/// the signals its decisions read and the Cargo features it builds with.
+fn embedding() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/embedding.md")
+}
+
 /// One fenced block of the page.
 struct Block<'a> {
     /// The fence's language: `yaml`, `text`, `rust` or `sh`.
@@ -145,30 +188,42 @@ struct Block<'a> {
     body: String,
 }
 
-/// The page's fenced blocks, in its order.
+/// How many spaces and tabs `line` begins with.
+fn indent(line: &str) -> usize {
+    line.len() - line.trim_start_matches([' ', '\t']).len()
+}
+
+/// The page's fenced blocks, in its order. A fence line is read as every
+/// walk of a page reads one ([`fence`]), so a block that stands indented,
+/// as under a list item, is a block too: its lines lose the indentation of
+/// the fence that opens it.
 fn blocks(page: &str) -> Vec<Block<'_>> {
     let mut blocks = Vec::new();
     let mut before = "";
-    let mut open: Option<Block<'_>> = None;
+    // The block that stands open, and where its opening fence begins.
+    let mut open: Option<(Block<'_>, usize)> = None;
     for line in page.lines() {
-        match open.take() {
-            Some(block) if line == "```" => blocks.push(block),
-            Some(mut block) => {
-                block.body.push_str(line);
+        match (open.take(), fence(line)) {
+            (Some((block, _)), Some("")) => blocks.push(block),
+            // A fence that names a language inside a block is the block's
+            // text here. On a short page the walk of the fences refuses it.
+            // The reference has no such walk: a lost fence shows there
+            // where a document stops running or a count of documents moves.
+            (Some((mut block, margin)), _) => {
+                block.body.push_str(&line[indent(line).min(margin)..]);
                 block.body.push('\n');
-                open = Some(block);
+                open = Some((block, margin));
             }
-            None => match line.strip_prefix("```") {
-                Some(language) => {
-                    open = Some(Block {
-                        language,
-                        before,
-                        body: String::new(),
-                    });
-                }
-                None if line.trim().is_empty() => {}
-                None => before = line,
-            },
+            (None, Some(language)) => {
+                let block = Block {
+                    language,
+                    before,
+                    body: String::new(),
+                };
+                open = Some((block, indent(line)));
+            }
+            (None, None) if line.trim().is_empty() => {}
+            (None, None) => before = line.trim(),
         }
     }
     blocks
@@ -200,6 +255,9 @@ fn every_document_of_the_page_runs_over_the_stock_catalog() {
     for (name, path, shown) in [
         ("README", readme(), README_DOCUMENTS),
         ("policy spec's page", policy_spec(), PAGE_DOCUMENTS),
+        ("stages' page", stages(), STAGES_DOCUMENTS),
+        ("service's page", service(), SERVICE_DOCUMENTS),
+        ("embedding page", embedding(), EMBEDDING_DOCUMENTS),
         ("reference", reference(), DOCUMENTS),
     ] {
         let page = fs::read_to_string(path).expect("the page is readable");
@@ -225,6 +283,23 @@ fn every_document_of_the_page_runs_over_the_stock_catalog() {
             "the {name} shows {shown} documents that run: a fence was lost, or a new document raises the count"
         );
     }
+    // The reading itself, on a short text: a block under a list item is a
+    // block, with the mark above it, and its lines lose the fence's
+    // indentation. A fence that stands indented closes a block too.
+    let page = "- An item:\n\n  <!-- refused -->\n  ```yaml\n  profiles:\n    default: {pick: random}\n  ```\n\nA command:\n```sh\ncargo test\n  ```\nBehind them.\n";
+    let blocks = blocks(page);
+    let read: Vec<(&str, &str, &str)> = blocks
+        .iter()
+        .map(|block| (block.language, block.before, block.body.as_str()))
+        .collect();
+    assert_eq!(
+        read,
+        [
+            ("yaml", REFUSED, "profiles:\n  default: {pick: random}\n"),
+            ("sh", "A command:", "cargo test\n"),
+        ],
+        "an indented block"
+    );
 }
 
 #[test]
@@ -267,9 +342,9 @@ fn the_stage_tables_name_the_catalogs_stages_and_no_other() {
         ("scorers", catalog.scorers().collect()),
         ("pickers", catalog.pickers().collect()),
     ];
-    // The README's rows are short and the reference's hold each stage's
+    // The README's rows are short and the stages' page holds each stage's
     // rules: both list the same stages.
-    for (name, path) in [("README", readme()), ("reference", reference())] {
+    for (name, path) in [("README", readme()), ("stages' page", stages())] {
         let page = fs::read_to_string(path).expect("the page is readable");
         for (kind, held) in &kinds {
             let listed = listed(&page, kind);
@@ -387,11 +462,53 @@ fn series() -> Vec<&'static str> {
         .collect()
 }
 
+/// The entries of the manifest's `[features]` table: each name with every
+/// word its list holds, in either kind of quotes, a quoted name read
+/// bare. A `#` begins a comment: no word of the table holds one.
+fn feature_entries() -> Vec<(&'static str, Vec<&'static str>)> {
+    let manifest = include_str!("../Cargo.toml");
+    let table = manifest
+        .split_once("\n[features]\n")
+        .map_or("", |(_, behind)| behind);
+    // The table ends where the next one's head stands.
+    let table = table.split("\n[").next().unwrap_or_default();
+    let mut entries: Vec<(&str, Vec<&str>)> = Vec::new();
+    for line in table.lines() {
+        let line = line.split('#').next().unwrap_or_default();
+        let listed = match line.split_once('=') {
+            Some((name, listed)) => {
+                entries.push((name.trim().trim_matches(['"', '\'']), Vec::new()));
+                listed
+            }
+            None => line,
+        };
+        if let Some((_, words)) = entries.last_mut() {
+            words.extend(listed.split(['"', '\'']).skip(1).step_by(2));
+        }
+    }
+    entries
+}
+
 /// The declared names the page holds in no code span.
 fn left_out<'a>(page: &str, declared: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
     declared
         .into_iter()
         .filter(|name| !page.contains(&format!("`{name}`")))
+        .collect()
+}
+
+/// The rows of a page's flag tables: each line outside a fenced block that
+/// begins a row with a flag's name.
+fn flag_rows(page: &str) -> Vec<&str> {
+    let mut fenced = false;
+    page.lines()
+        .filter(|line| {
+            if fence(line).is_some() {
+                fenced = !fenced;
+                return false;
+            }
+            !fenced && line.starts_with("| `--")
+        })
         .collect()
 }
 
@@ -416,27 +533,34 @@ fn table<'a>(page: &'a str, heading: &str, cell: usize) -> Vec<&'a str> {
 
 #[test]
 fn the_page_names_every_flag_of_the_standalone_binary() {
-    let page = fs::read_to_string(reference()).expect("the reference is readable");
+    let page = fs::read_to_string(service()).expect("the service's page is readable");
     let flags = flags();
     assert!(
         flags.len() >= FLAGS,
         "the command line declares {} flags by this walk",
         flags.len()
     );
-    let left_out = left_out(&page, flags.iter().map(String::as_str));
-    assert!(
-        left_out.is_empty(),
-        "the reference's flag table leaves out {left_out:?}"
-    );
-    // The other way: a row of the flag tables names no flag that is gone.
-    let named: Vec<&str> = page
-        .lines()
-        .filter(|line| line.starts_with("| `--"))
+    // A flag's row defines it: its name in a sentence alone defines none,
+    // and neither does a row inside a fenced block. The two flags the
+    // parser adds have their row too.
+    let named: Vec<&str> = flag_rows(&page)
+        .into_iter()
         .flat_map(|row| spans(row, 1))
         .collect();
+    let left_out: Vec<&str> = flags
+        .iter()
+        .map(String::as_str)
+        .chain(PARSERS_OWN)
+        .filter(|flag| !named.contains(flag))
+        .collect();
+    assert!(
+        left_out.is_empty(),
+        "the service page's flag tables leave out {left_out:?}"
+    );
+    // The other way: a row of the flag tables names no flag that is gone.
     assert!(
         named.len() >= FLAGS,
-        "the reference's flag rows name {} flags by this walk",
+        "the service page's flag rows name {} flags by this walk",
         named.len()
     );
     let gone: Vec<&str> = named
@@ -446,29 +570,34 @@ fn the_page_names_every_flag_of_the_standalone_binary() {
         .collect();
     assert!(
         gone.is_empty(),
-        "the reference's flag table names {gone:?}, which the command line does not declare"
+        "the service page's flag tables name {gone:?}, which the command line does not declare"
     );
 }
 
 #[test]
 fn the_page_names_every_call_of_the_contract() {
-    let page = fs::read_to_string(reference()).expect("the reference is readable");
+    let page = fs::read_to_string(service()).expect("the service's page is readable");
     let calls = calls();
     assert!(
         calls.len() >= CALLS,
         "the contract holds {} calls by this walk",
         calls.len()
     );
-    let left_out = left_out(&page, calls.iter().copied());
+    // A call's row defines it: its name in a sentence alone defines none.
+    let named = table(&page, "| Scope | Call |", 2);
+    let left_out: Vec<&str> = calls
+        .iter()
+        .copied()
+        .filter(|call| !named.contains(call))
+        .collect();
     assert!(
         left_out.is_empty(),
-        "the reference's call table leaves out {left_out:?}"
+        "the service page's call table leaves out {left_out:?}"
     );
     // The other way: the table of calls names no call that is gone.
-    let named = table(&page, "| Scope | Call |", 2);
     assert!(
         named.len() >= CALLS,
-        "the reference's call table names {} calls by this walk",
+        "the service page's call table names {} calls by this walk",
         named.len()
     );
     let gone: Vec<&str> = named
@@ -478,7 +607,108 @@ fn the_page_names_every_call_of_the_contract() {
         .collect();
     assert!(
         gone.is_empty(),
-        "the reference's call table names {gone:?}, which the contract does not hold"
+        "the service page's call table names {gone:?}, which the contract does not hold"
+    );
+}
+
+#[test]
+fn the_embedding_page_names_every_cargo_feature_of_the_manifest() {
+    let page = fs::read_to_string(embedding()).expect("the embedding page is readable");
+    let entries = feature_entries();
+    // `default` is the table's own word: it names what a plain build takes.
+    let declared: Vec<&(&str, Vec<&str>)> = entries
+        .iter()
+        .filter(|(name, _)| *name != "default")
+        .collect();
+    assert!(
+        declared.len() >= FEATURES,
+        "the manifest declares {} features by this walk",
+        declared.len()
+    );
+    // A feature's row defines it: its name alone in the first cell, and in
+    // the third the features of the crate it turns on, and no other word.
+    let mut lines = page
+        .lines()
+        .skip_while(|line| !line.starts_with("| Feature | What it adds | It enables |"));
+    let mut faults = Vec::new();
+    // The line under the head rules the table: without it none is shown.
+    if !lines.nth(1).is_some_and(|line| line.starts_with("|---")) {
+        faults.push("the features' table has no ruled line under its head".to_owned());
+    }
+    let mut rows: Vec<(&str, Vec<&str>)> = Vec::new();
+    // A row may stand behind blanks. A bar that a cell escapes is no end
+    // of a cell on the page, and this walk would read it as one.
+    for row in lines
+        .map(str::trim_start)
+        .take_while(|line| line.starts_with('|'))
+    {
+        if row.contains("\\|") {
+            faults.push(format!(
+                "a row escapes a bar, which this walk reads as the end of a cell: {row}"
+            ));
+        }
+        let name = spans(row, 1).next().unwrap_or_default();
+        let enables: Vec<&str> = spans(row, 3).collect();
+        let listed: Vec<String> = enables.iter().map(|on| format!("`{on}`")).collect();
+        let mut cells = row.split('|').map(str::trim);
+        let (first, third) = (cells.nth(1), cells.nth(1));
+        let alone = first == Some(format!("`{name}`").as_str())
+            && third == Some(listed.join(", ").as_str());
+        if !alone {
+            faults.push(format!(
+                "a row holds one feature's name, and the names it enables alone: {row}"
+            ));
+        }
+        if rows.iter().any(|(other, _)| *other == name) {
+            faults.push(format!("the table has two rows for `{name}`"));
+        }
+        rows.push((name, enables));
+    }
+    for (name, words) in &declared {
+        // What a feature turns on of the crate: the words of its list that
+        // are features themselves, `default` among them. A dependency's
+        // name is none.
+        let mut on: Vec<&str> = words
+            .iter()
+            .copied()
+            .filter(|word| entries.iter().any(|(other, _)| other == word))
+            .collect();
+        on.sort_unstable();
+        match rows.iter().find(|(row, _)| row == name) {
+            None => faults.push(format!("the table has no row for `{name}`")),
+            Some((_, enables)) => {
+                let mut enables = enables.clone();
+                enables.sort_unstable();
+                if enables != on {
+                    faults.push(format!(
+                        "the row of `{name}` says it enables {enables:?}, and the manifest says {on:?}"
+                    ));
+                }
+            }
+        }
+    }
+    // The other way: a row names no feature that is gone.
+    for (row, _) in &rows {
+        if !declared.iter().any(|(name, _)| name == row) {
+            faults.push(format!(
+                "the table names `{row}`, which the manifest does not declare"
+            ));
+        }
+    }
+    // The default build's features, in the page's one sentence of them.
+    let default: Vec<&str> = entries
+        .iter()
+        .filter(|(name, _)| *name == "default")
+        .flat_map(|(_, words)| words.iter().copied())
+        .collect();
+    let sentence = format!("The crate defaults to `{}`.", default.join("` and `"));
+    if !page.contains(&sentence) {
+        faults.push(format!("the page does not say: {sentence}"));
+    }
+    assert!(
+        faults.is_empty(),
+        "the embedding page's Cargo features are not the manifest's:\n{}",
+        faults.join("\n")
     );
 }
 
@@ -535,7 +765,7 @@ fn item(line: &str) -> Option<&str> {
 
 /// The language a fence line names, where `line` is one: what stands behind
 /// its three backticks, nothing on the line that closes a block. Each walk
-/// of a short page's text reads a fence line by this.
+/// of a page's text reads a fence line by this.
 fn fence(line: &str) -> Option<&str> {
     line.trim().strip_prefix("```").map(str::trim)
 }
@@ -798,6 +1028,39 @@ fn the_policy_spec_pages_prose_stays_inside_the_same_bounds() {
     );
 }
 
+#[test]
+fn the_stages_pages_prose_stays_inside_the_same_bounds() {
+    let page = fs::read_to_string(stages()).expect("the stages' page is readable");
+    let over = over_bounds(&page);
+    assert!(
+        over.is_empty(),
+        "the stages' page is held to the README's bounds, and it is over them:\n{}",
+        over.join("\n")
+    );
+}
+
+#[test]
+fn the_service_pages_prose_stays_inside_the_same_bounds() {
+    let page = fs::read_to_string(service()).expect("the service's page is readable");
+    let over = over_bounds(&page);
+    assert!(
+        over.is_empty(),
+        "the service's page is held to the README's bounds, and it is over them:\n{}",
+        over.join("\n")
+    );
+}
+
+#[test]
+fn the_embedding_pages_prose_stays_inside_the_same_bounds() {
+    let page = fs::read_to_string(embedding()).expect("the embedding page is readable");
+    let over = over_bounds(&page);
+    assert!(
+        over.is_empty(),
+        "the embedding page is held to the README's bounds, and it is over them:\n{}",
+        over.join("\n")
+    );
+}
+
 /// A sentence of `words` words: a capital first and a full stop last.
 fn sentence(words: usize) -> String {
     let mut sentence = String::from("One");
@@ -1028,6 +1291,9 @@ fn every_link_of_a_page_resolves_heading_and_all() {
     for (name, path) in [
         ("README", readme()),
         ("policy spec's page", policy_spec()),
+        ("stages' page", stages()),
+        ("service's page", service()),
+        ("embedding page", embedding()),
         ("reference", reference()),
     ] {
         let dead = dead_links(&path);
@@ -1083,8 +1349,8 @@ fn held_under(folder: &Path, text: &str) -> bool {
 }
 
 /// What a command names that the checkout does not hold. A cargo command
-/// names this package, features and an example of its manifest, and a test
-/// of the library's source. A command of the standalone binary names flags
+/// names this package, features and an example of its manifest, and a unit
+/// test of the library. A command of the standalone binary names flags
 /// its command line declares. A command of another kind is a fault too: the
 /// case reads it once it is taught to.
 fn command_faults(command: &str) -> Vec<String> {
@@ -1135,10 +1401,11 @@ fn command_faults(command: &str) -> Vec<String> {
             _ => None,
         };
         if let Some(name) = name {
-            let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-            if !held_under(&source, &format!("fn {name}(")) {
+            // The library's unit tests stand under `tests/unit`.
+            let unit_tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/unit");
+            if !held_under(&unit_tests, &format!("fn {name}(")) {
                 faults.push(format!(
-                    "`{command}`: the library's source holds no test {name}"
+                    "`{command}`: the library's unit tests hold no test {name}"
                 ));
             }
         }

@@ -163,14 +163,14 @@
           "default": 180
         },
         "max_size": {
-          "description": "The size bound of a tree index: on a text host its characters plus\n1024 for each node a worker stands on, tokens otherwise.\nThe crate's own store reads it for a pool whose profile\nreads sent prefixes: the model's record is bound to `max_size` over\nthe block size placements, never under one, one a block a worker\nwas sent. A lowered bound is met by sweeps at the record's next\nwrites, and a pool whose lanes are all heard writes none.",
+          "description": "The size bound of a tree index: on a text host its characters plus\n1024 for each node a worker stands on, tokens otherwise.\nThe crate's engine reads it for a pool whose profile reads sent\nprefixes: the model's record is bound to `max_size` over the block\nsize placements, never under one, one a block a worker was sent. A\nlowered bound is met by sweeps, at the record's next writes and at\nthe engine's upkeep.",
           "type": "integer",
           "format": "uint64",
           "minimum": 1,
           "default": 67108864
         },
         "sweep_s": {
-          "description": "The index's sweep cadence, in seconds.",
+          "description": "The index's sweep cadence, in seconds. At each sweep the gateway trims\neach tree of a model, by itself, toward `max_size`, and writes take a\ntree past it until the next. At `4294967295` it starts no sweep: a\ntree under such an entry is held to no size. The engine's record\nkeeps its bound at any cadence.",
           "type": "integer",
           "format": "uint32",
           "minimum": 1,
@@ -284,7 +284,7 @@
           "minimum": 1
         },
         "sent_report_delay_ms": {
-          "description": "The least number of milliseconds between a send and the sample of a\nload report that ends it: a report sampled less than that long after\na send leaves the send counted. Unset, a report sampled at or after\na send ends it. A written zero is refused, as a zero limit is. A\nprofile whose stages do not read its count of sends is refused if it\nsets a delay. The limit ends a send whatever the delay. The\nprofiles of a document that set the same limit and the same delay\nread one count, under the name of the first of them that reads it,\nin the order of their names. A new document's count takes over the\nsends of the standing count under the same limit and delay,\nwhichever profiles read that one. Where none stands under them, it\ntakes over those of the standing count under the same name, unless\na count of the new document took that one by its settings, or else\nof a standing count that no count of the new document took. The\ntwo counts share the sends: a read under the shorter of two delays\nends such a send for both. A count that finds none starts empty.",
+          "description": "The least number of milliseconds between a send and the sample of a\nload report that ends it: a report sampled less than that long after\na send leaves the send counted. Unset, a report sampled at or after\na send ends it. A written zero is refused, as a zero limit is. A\nprofile whose stages do not read its count of sends is refused if it\nsets a delay. The limit ends a send whatever the delay. The\nprofiles of a document that set the same limit and the same delay\nread one count. A new document's count takes over the sends of the\nstanding count under the same limit and delay, whichever profiles\nread that one, and the two counts share them. Where none stands\nunder them, it takes a copy of the sends the standing counts hold,\nfor each rank of a worker those of the count that holds the most,\nand counts each under its own limit and delay from there. A send\nthat every standing count has ended is in no copy. A count starts\nempty where no count stands.",
           "type": [
             "integer",
             "null"
@@ -816,7 +816,7 @@
       "additionalProperties": false
     },
     "WarmupSliceParams": {
-      "description": "The warm-up slice: the share of misses offered to workers whose index is\nstill thin.",
+      "description": "The warm-up slice: the share of misses offered to workers whose index is\nstill thin. A single request warms nobody while the model's index of\ncache events holds no block.",
       "type": "object",
       "properties": {
         "weight": {
@@ -1578,7 +1578,7 @@
           "const": "pd-pair"
         },
         {
-          "description": "The encode profile once per encode item, then the pair; all three\nsides named.",
+          "description": "The pair, then the encode profile over the encoders of the chosen\nprefill's class, once per encode item or once for the items taken\nas one; all three sides named. A request with items that no encoder\nis open to is refused ahead of the pair.",
           "type": "string",
           "const": "epd"
         }
@@ -1864,7 +1864,7 @@
       "type": "object",
       "properties": {
         "sample": {
-          "description": "Keep every Nth pick or shed per decider under this generation. Zero\nturns sampling off and one keeps every pick and shed.",
+          "description": "Each decider of a controller, and each calling thread in a host's\nown process, keeps every Nth pick or shed it counts. The count\nstarts over under a new generation, and in a controller under a new\nlead. Zero keeps none. In a host's own process a request is counted\nonly where an id names it.",
           "type": "integer",
           "format": "uint32",
           "minimum": 0,

@@ -15,6 +15,8 @@
 //! no `..`, so a setting added to one of them does not build until the map
 //! carries it.
 
+use std::collections::BTreeMap;
+
 use smg_grand_central::{
     document::{
         AppliedSpec, Assignment, ConnectionModeSetting, IndexKind, LoadMetricSetting, ModeSettings,
@@ -51,6 +53,24 @@ impl RouterConfig {
     /// its build does not run yet.
     pub fn policy_document(&self) -> Result<PolicySpec, RoutingSettingsError> {
         self.routing_settings().policy_document()
+    }
+
+    /// The policy document this configuration says, with a policy of its
+    /// own for each model a worker's `policy` label named one for
+    /// ([`RoutingSettings::policy_document_with_labels`]): `labels` maps a
+    /// model's exact id to the name of a policy's preset. With no label it
+    /// is [`Self::policy_document`]. A label the document has no binding
+    /// for is refused by its model and its policy, and no document is
+    /// answered: the caller leaves that label out and asks again.
+    ///
+    /// A pure function of the configuration and the labels, and not
+    /// validated here. It reads no supplied document: beside one no label
+    /// is read.
+    pub fn policy_document_with_labels(
+        &self,
+        labels: &BTreeMap<String, String>,
+    ) -> Result<PolicySpec, RoutingSettingsError> {
+        self.routing_settings().policy_document_with_labels(labels)
     }
 
     /// The document this gateway runs. Without a supplied document, it is
@@ -213,6 +233,39 @@ impl RouterConfig {
             return Err(SpecError::NotInBuild { path, what });
         }
         Ok(applied)
+    }
+
+    /// The checked spec this gateway hosts with a set of labels, numbered
+    /// `generation`: the document of [`Self::policy_document_with_labels`]
+    /// under that number, validated over `stages` as the start validates
+    /// its own ([`Self::hosted_policy`]). `stages` is the table the start
+    /// was handed, or the stock one: an engine keeps a profile's stages
+    /// from one spec to the next only where both were validated over the
+    /// stock table or over one table of the host's own.
+    ///
+    /// The document is answered beside its checked spec, so a caller that
+    /// reads both builds it once. The trees the engine is lent are sized by
+    /// that document.
+    ///
+    /// A refusal is answered in its own words and no spec. A label's
+    /// refusal is answered by its reason alone: the caller names the model
+    /// and the policy.
+    pub(crate) fn hosted_policy_with_labels(
+        &self,
+        labels: &BTreeMap<String, String>,
+        generation: u64,
+        stages: &StageRegistry,
+    ) -> Result<(PolicySpec, AppliedSpec), String> {
+        let mut document = match self.policy_document_with_labels(labels) {
+            Ok(document) => document,
+            Err(RoutingSettingsError::Label { reason, .. }) => return Err(reason),
+            Err(refused) => return Err(refused.to_string()),
+        };
+        document.generation = generation;
+        let spec = self
+            .hosted_policy(&document, stages)
+            .map_err(|refused| refused.to_string())?;
+        Ok((document, spec))
     }
 
     /// The header names this gateway denies the view of a document it
@@ -499,6 +552,199 @@ mod tests {
                 "{name} at its flags' defaults is the preset, with nothing written over it"
             );
         }
+    }
+
+    /// The policy a classic registry builds from a name alone, as a
+    /// configuration: each policy's type at the settings it builds itself
+    /// with (`PolicyFactory::create_by_name`). A worker's `policy` label
+    /// carries a name and no setting, so a labelled model runs these.
+    /// Each record is taken apart with no `..`: a setting added to a type
+    /// does not build until this case carries it.
+    fn built_by_name(name: &str) -> PolicyConfig {
+        use crate::policies::{
+            expected_wait::{
+                DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS, DEFAULT_THROUGHPUT,
+            },
+            BucketConfig, CacheAwareConfig, ManualConfig, PrefixHashConfig,
+        };
+
+        match name {
+            "random" => PolicyConfig::Random,
+            "round_robin" => PolicyConfig::RoundRobin,
+            "passthrough" => PolicyConfig::Passthrough,
+            "consistent_hashing" => PolicyConfig::ConsistentHashing,
+            "power_of_two" => PolicyConfig::PowerOfTwo {
+                load_metric: PowerOfTwoLoadMetric::default(),
+            },
+            "least_load" => PolicyConfig::LeastLoad {
+                kv_pressure_weight: DEFAULT_KV_PRESSURE_WEIGHT,
+                mean_prefill_tokens: DEFAULT_MEAN_PREFILL_TOKENS,
+                default_throughput: DEFAULT_THROUGHPUT,
+            },
+            "cache_aware" => {
+                let CacheAwareConfig {
+                    cache_threshold,
+                    balance_abs_threshold,
+                    balance_rel_threshold,
+                    balance_prefix_margin_tokens,
+                    balance_uncached_credit,
+                    eviction_interval_secs,
+                    max_tree_size,
+                    block_size,
+                    balance_token_usage_threshold,
+                    overload_token_usage_threshold,
+                    overlap_decay,
+                    selection_temperature,
+                    cache_index,
+                    cache_ttl_secs,
+                    cache_boundaries,
+                    selection_policy,
+                    selection_accounting_ttl_ms,
+                } = CacheAwareConfig::default();
+                PolicyConfig::CacheAware {
+                    cache_threshold,
+                    balance_abs_threshold,
+                    balance_rel_threshold,
+                    balance_prefix_margin_tokens,
+                    balance_uncached_credit,
+                    eviction_interval_secs,
+                    max_tree_size,
+                    block_size,
+                    balance_token_usage_threshold,
+                    overload_token_usage_threshold,
+                    overlap_decay,
+                    selection_temperature,
+                    cache_index,
+                    cache_ttl_secs,
+                    cache_boundaries,
+                    selection_policy,
+                    selection_accounting_ttl_ms,
+                }
+            }
+            "bucket" => {
+                let BucketConfig {
+                    balance_abs_threshold,
+                    balance_rel_threshold,
+                    bucket_adjust_interval_secs,
+                } = BucketConfig::default();
+                PolicyConfig::Bucket {
+                    balance_abs_threshold,
+                    balance_rel_threshold,
+                    bucket_adjust_interval_secs,
+                }
+            }
+            "manual" => {
+                let ManualConfig {
+                    eviction_interval_secs,
+                    max_idle_secs,
+                    assignment_mode,
+                } = ManualConfig::default();
+                PolicyConfig::Manual {
+                    eviction_interval_secs,
+                    max_idle_secs,
+                    assignment_mode,
+                }
+            }
+            "prefix_hash" => {
+                let PrefixHashConfig {
+                    prefix_token_count,
+                    load_factor,
+                    balance_abs_threshold,
+                    cache_boundaries,
+                } = PrefixHashConfig::default();
+                PolicyConfig::PrefixHash {
+                    prefix_token_count,
+                    load_factor,
+                    balance_abs_threshold,
+                    cache_boundaries,
+                }
+            }
+            other => panic!("no policy is built by the name {other}"),
+        }
+    }
+
+    /// A worker's `policy` label names a policy and carries no setting. A
+    /// classic registry builds that policy from the name alone, at its
+    /// type's own settings. The Grand Central crate's table of labels
+    /// (`PolicySettings::of_label`) says each of the ten names at those
+    /// settings, number for number: this case is red where the two part.
+    /// For eight names they are the name's preset, and for `cache_aware`
+    /// and `bucket` they are not, since those flags' defaults are other
+    /// numbers than their types'.
+    #[tokio::test]
+    async fn a_label_of_each_name_says_the_policy_a_classic_registry_builds_by_that_name() {
+        use crate::policies::PolicyFactory;
+
+        let mut parted = Vec::new();
+        for name in PRESETS {
+            let built = PolicyFactory::create_by_name(name);
+            assert!(built.is_some_and(|policy| policy.name() == name), "{name}");
+            let by_name = policy_settings(&built_by_name(name));
+            assert_eq!(
+                PolicySettings::of_label(name),
+                Some(by_name.clone()),
+                "{name}"
+            );
+            if by_name != policy_settings(&at_flag_defaults(name)) {
+                parted.push(name);
+            }
+        }
+        assert_eq!(parted, ["cache_aware", "bucket"]);
+    }
+
+    /// The settings' document with labels: each label's model is placed by
+    /// the profile of the policy its label names, right ahead of every
+    /// model's binding, and every other model by the settings' own. With no
+    /// label it is the settings' document. A refused label answers its
+    /// reason, the caller having named its model and policy, and no spec.
+    #[test]
+    fn a_label_places_its_model_by_the_profile_of_its_policy() {
+        let labels = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(model, policy)| ((*model).to_owned(), (*policy).to_owned()))
+                .collect()
+        };
+        let settings = config(PolicyConfig::RoundRobin);
+        let stock = StageRegistry::builtin();
+        assert_eq!(
+            settings.policy_document_with_labels(&labels(&[])),
+            settings.policy_document()
+        );
+        let (_, checked) = settings
+            .hosted_policy_with_labels(&labels(&[("llama", "cache_aware")]), 7, &stock)
+            .expect("a label that builds");
+        assert_eq!(checked.generation(), 7);
+        let placing = |model| {
+            let (_, profile) = checked.engine().profile_for(model, Phase::Single)?;
+            Some(profile.name.as_str())
+        };
+        assert_eq!(placing("llama"), Some("cache_aware"));
+        assert_eq!(placing("qwen"), Some("round_robin"));
+
+        let refused = settings
+            .hosted_policy_with_labels(&labels(&[("llama*", "cache_aware")]), 8, &stock)
+            .expect_err("a model's id that holds a `*` names no binding");
+        assert!(refused.starts_with("a binding reads a `*`"), "{refused}");
+        assert!(!refused.contains("llama"), "{refused}");
+    }
+
+    /// The document answered beside a checked spec is the one the spec was
+    /// checked from: the builder's own with the same labels, under the
+    /// spec's number. A caller that reads both builds it once.
+    #[test]
+    fn a_checked_spec_is_answered_with_the_document_it_was_checked_from() {
+        let labels = BTreeMap::from([("llama".to_owned(), "cache_aware".to_owned())]);
+        let settings = config(PolicyConfig::RoundRobin);
+        let (document, checked) = settings
+            .hosted_policy_with_labels(&labels, 7, &StageRegistry::builtin())
+            .expect("a label that builds");
+        let mut built = settings
+            .policy_document_with_labels(&labels)
+            .expect("the same label builds");
+        built.generation = 7;
+        assert_eq!(document, built);
+        assert_eq!(checked.generation(), document.generation);
     }
 
     /// The comparison with a supplied document reads the gateway's own
@@ -1359,7 +1605,9 @@ mod tests {
     /// binding. The single binding's shadow loads, and so do the shadows
     /// by side of the pair's binding, with that binding's phase list empty
     /// or naming its two phases. Scoped to the decode phase, the single
-    /// binding's shadow is refused, beside the pair's shadows and alone.
+    /// binding's shadow is refused, beside the pair's shadows and alone,
+    /// and behind a pair's binding with shadows too: the loader's walk
+    /// does not end there.
     ///
     /// The classic router reads no policy document and runs no second
     /// policy beside a request: the load is the engine's own.
@@ -1403,6 +1651,19 @@ mod tests {
         let pair = document.bindings.last_mut().expect("the pair's binding");
         pair.shadow = None;
         assert_eq!(refused(&document), outside);
+
+        // The walk goes on past a pair's binding with shadows: behind one
+        // scoped to a model of its own, the single binding's shadow is
+        // refused at its own place.
+        let pair = document.bindings.last_mut().expect("the pair's binding");
+        pair.shadow = Some(ShadowSpec::Sides(by_side.into()));
+        pair.matcher.model = "another-model".to_owned();
+        document.bindings.swap(0, 1);
+        let behind = Some(SpecError::NotInBuild {
+            path: "bindings[1].shadow".to_owned(),
+            what: "a shadow outside the single phase",
+        });
+        assert_eq!(refused(&document), behind);
     }
 
     #[test]

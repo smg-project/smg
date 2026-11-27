@@ -284,4 +284,5 @@ impl<const UNKEYED: bool, const NAMES_DECODE: bool> RequestMaker
 }
 
 #[cfg(test)]
+#[path = "../../../tests/unit/service/controller/frame_request/tests.rs"]
 mod tests;

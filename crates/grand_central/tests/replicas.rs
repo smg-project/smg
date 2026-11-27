@@ -55,11 +55,11 @@ use tonic::Code;
 /// The order of the design's settings at a fifth of their size: a take
 /// after a kill lands in under a second on an idle host.
 fn short() -> ElectionSettings {
-    ElectionSettings {
-        duration: Duration::from_millis(600),
-        renew_period: Duration::from_millis(200),
-        renew_deadline: Duration::from_millis(400),
-    }
+    let mut settings = ElectionSettings::default();
+    settings.duration = Duration::from_millis(600);
+    settings.renew_period = Duration::from_millis(200);
+    settings.renew_deadline = Duration::from_millis(400);
+    settings
 }
 
 /// A stopped replica's listeners stay open a second: it answers `Leader`
@@ -827,10 +827,8 @@ async fn lost_under_a_live_leader(loss: Loss) {
                     .find_map(|_| {
                         let held = store.read().expect("the lease file reads");
                         let held = held.expect("the lease file holds a record");
-                        let cleared = LeaseRecord {
-                            holder: String::new(),
-                            ..held.clone()
-                        };
+                        let mut cleared = held.clone();
+                        cleared.holder = String::new();
                         let written = store.write(Some(&held), &cleared).expect("the clearing");
                         (written == ConditionalWriteOutcome::Done).then_some(held.term)
                     })

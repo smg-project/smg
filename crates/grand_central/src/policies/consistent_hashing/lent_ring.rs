@@ -35,14 +35,15 @@ pub trait LentRing: fmt::Debug + Send + Sync {
     /// No part of a recipe is held here, and nothing is hashed for one.
     ///
     /// What makes a request under the prefix form asks once for each head
-    /// of the prompt, or once for the routing value, and states the
-    /// answers as the request's places, the deepest head's first
-    /// ([`RequestFacts::ring_positions`]). The order of the asks is its
-    /// own. Under `None` the request is lent no ring and states no place,
-    /// so the stage's own ring places it. The lender is then asked about
-    /// no further head, and [`Self::position`] is asked nothing for a
-    /// head: one recipe's place is never read under the other form. A ring
-    /// that holds no worker answers too, as [`Self::position`] does.
+    /// of the prompt, or once for the routing value, under each rule a
+    /// request is cut by, and states the answers as the request's places,
+    /// the deepest head's first ([`RequestFacts::ring_positions`]). The
+    /// order of the asks is its own. Under `None` the request is lent no
+    /// ring and states no place, so the stage's own ring places it. The
+    /// lender is then asked about no further head, and [`Self::position`]
+    /// is asked nothing for a head: one recipe's place is never read under
+    /// the other form. A ring that holds no worker answers too, as
+    /// [`Self::position`] does.
     ///
     /// A pair whose two sides read the ring by two forms is asked both
     /// questions, each for the side of its form
@@ -76,32 +77,6 @@ pub trait LentRing: fmt::Debug + Send + Sync {
     }
 }
 
-/// A ring for the crate's cases, of the addresses it holds in the order
-/// stated: a walk starts as many workers along that order as its position
-/// says, and goes round once.
 #[cfg(test)]
-#[derive(Debug)]
-pub(crate) struct InOrder(pub(crate) Vec<String>);
-
-#[cfg(test)]
-impl LentRing for InOrder {
-    fn position(&self, key: &str) -> u64 {
-        crate::engine::fingerprint(key.as_bytes())
-    }
-
-    // Another recipe than a key's text has: the fingerprint of the head's
-    // bytes turned half round, so a case that asks the one place for the
-    // other reads another number.
-    fn head_position(&self, head: Head<'_>) -> Option<u64> {
-        let bytes = match head {
-            Head::Tokens(ids) => ids.iter().flat_map(|id| id.to_ne_bytes()).collect(),
-            Head::Text(text) => text.as_bytes().to_vec(),
-        };
-        Some(crate::engine::fingerprint(&bytes).rotate_left(32))
-    }
-
-    fn walk(&self, position: u64, take: &mut dyn FnMut(&str) -> bool) {
-        let (before, behind) = self.0.split_at(position as usize % self.0.len().max(1));
-        let _ = behind.iter().chain(before).any(|address| take(address));
-    }
-}
+#[path = "../../../tests/unit/policies/consistent_hashing/lent_ring/tests.rs"]
+pub(super) mod tests;

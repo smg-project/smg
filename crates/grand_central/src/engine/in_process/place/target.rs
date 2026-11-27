@@ -78,7 +78,7 @@ use crate::engine::decision::{Decision, Shed};
 use crate::{
     document::spec::AppliedSpec,
     engine::{
-        decision::{ShedReason, TARGET_WORKER},
+        decision::{PairSide, ShedReason, TARGET_WORKER},
         in_process::Loaded,
         list_cell::LentList,
         view::Role,
@@ -88,25 +88,36 @@ use crate::{
 };
 
 /// The shed of a request whose named worker cannot take it: the request
-/// has no worker, and moves to no other.
-const MISSED: Unplaced = Unplaced::Shed {
-    reason: ShedReason::NoEndpoints,
-    emptied_by: TARGET_WORKER,
-    retry_after_secs: 1,
-};
+/// has no worker, and moves to no other. `side` is the side of a pair the
+/// worker was missed on: the side whose count the number reached nobody of
+/// ([`ReachedPair::NoWorker`]), or the side the decision held to the
+/// worker's place was left with nobody on ([`held`]).
+const fn missed(side: Option<PairSide>) -> Unplaced {
+    Unplaced::Shed {
+        reason: ShedReason::NoEndpoints,
+        emptied_by: TARGET_WORKER,
+        retry_after_secs: 1,
+        side,
+    }
+}
+
+/// [`missed`] on no side: a single request's, and a pair's whose asks
+/// named pairs none of which could be sent to.
+const MISSED: Unplaced = missed(None);
 
 /// What a decision held to a named worker answers, as the request's
 /// answer: where it named no worker because of the worker (no worker for
 /// the call's asks, its own shed with no endpoint, or for workers over
-/// their thresholds), the request is shed under [`TARGET_WORKER`]. Any
-/// other answer stands as it is.
+/// their thresholds), the request is shed under [`TARGET_WORKER`], on the
+/// side that decision's shed names. Any other answer stands as it is.
 fn held<'a>(placed: Result<Placement<'a>, Unplaced>) -> Result<Placement<'a>, Unplaced> {
     placed.map_err(|unplaced| match unplaced {
-        Unplaced::NoWorkers
-        | Unplaced::Shed {
+        Unplaced::NoWorkers => MISSED,
+        Unplaced::Shed {
             reason: ShedReason::NoEndpoints | ShedReason::Saturated,
+            side,
             ..
-        } => MISSED,
+        } => missed(side),
         other => other,
     })
 }
@@ -115,14 +126,16 @@ fn held<'a>(placed: Result<Placement<'a>, Unplaced>) -> Result<Placement<'a>, Un
 /// to a named worker's place: the decision's own, but that a shed with no
 /// endpoint, or for workers over their thresholds, is the request's shed
 /// under [`TARGET_WORKER`]. The decision named no worker because of that
-/// worker, and the request moves to no other. The shed keeps the trace
-/// of the decision that ran: it names the profile that decision was made
-/// under, as any shed made once a profile is resolved does.
+/// worker, and the request moves to no other. The shed keeps the side and
+/// the trace of the decision that ran: the trace names the profile that
+/// decision was made under, as any shed made once a profile is resolved
+/// does.
 #[cfg(feature = "controller")]
 pub(crate) fn held_answer(decision: Decision) -> Decision {
     match decision {
         Decision::Shed(Shed {
             reason: ShedReason::NoEndpoints | ShedReason::Saturated,
+            side,
             trace,
             ..
         }) => Decision::Shed(Shed {
@@ -130,6 +143,7 @@ pub(crate) fn held_answer(decision: Decision) -> Decision {
             emptied_by: TARGET_WORKER,
             retry_after_secs: 1,
             wait_allowed: false,
+            side,
             trace,
         }),
         other => other,
@@ -398,7 +412,14 @@ fn taking(
 /// The pair's shed with no endpoint, under [`TARGET_WORKER`], where a
 /// prefill was counted: the header's text is no number, fewer workers than
 /// the number asks were counted on a side, or the decision held to the
-/// places named no pair that can be sent to ([`held`]). Prefills at the
+/// places named no pair that can be sent to ([`held`]). The shed names the
+/// side the worker was missed on ([`missed`]): the gateway's own pair
+/// selection names the role of the policy that found its target nowhere,
+/// the prefill's and then the decode's
+/// (`model_gateway/src/routers/common/placement.rs:3044`, `:3090`, with
+/// the policy's miss at
+/// `model_gateway/src/policies/consistent_hashing.rs:187-193`, on main
+/// `d43c7b2a9`). Prefills at the
 /// caller's admission limit answer [`Unplaced::PrefillsFull`] as for any
 /// pair: the named prefill is waited for. Any other answer of
 /// [`super::pair::place`] stands as it is.
@@ -468,9 +489,10 @@ pub(crate) enum ReachedPair {
     /// No prefill is counted: there is nobody to name, and the pair leaves
     /// its hold.
     NoneToCount,
-    /// A prefill is counted and the number reaches no worker on a side:
-    /// its text is no number, or fewer workers are counted there.
-    NoWorker,
+    /// A prefill is counted and the number reaches no worker on the side
+    /// named: its text is no number, or fewer workers are counted there.
+    /// The prefills are counted first.
+    NoWorker(PairSide),
     /// The place of the prefill the number reaches, and of the decode it
     /// reaches among that prefill's partners. No decode where the
     /// decode's number is not read: its side is no plain ring's, or a
@@ -546,7 +568,7 @@ pub(crate) fn reached_pair(
     };
     let mut counted = iter::once(lead).chain(counted);
     let Some(prefill) = named.and_then(|number| counted.nth(number as usize)) else {
-        return ReachedPair::NoWorker;
+        return ReachedPair::NoWorker(PairSide::Prefill);
     };
     let decode = if decode_named && !lifted {
         let mut partners = decodes
@@ -554,7 +576,7 @@ pub(crate) fn reached_pair(
             .filter(|&&decode| partner(prefill, decode, first));
         let reached = named.and_then(|number| partners.nth(number as usize));
         let Some(&decode) = reached else {
-            return ReachedPair::NoWorker;
+            return ReachedPair::NoWorker(PairSide::Decode);
         };
         Some(decode)
     } else {
@@ -584,7 +606,7 @@ fn held_pair<'a>(
 ) -> Result<Placement<'a>, Unplaced> {
     let (prefill, decode) = match reached {
         ReachedPair::NoneToCount => return super::pair::place(engine, request, lists, &mut call),
-        ReachedPair::NoWorker => return Err(MISSED),
+        ReachedPair::NoWorker(side) => return Err(missed(Some(side))),
         ReachedPair::Places(prefill, decode) => ([prefill], decode.map(|decode| [decode])),
     };
     // The pair's lists as the call's asks read them: the prefill's place,

@@ -33,7 +33,7 @@ A profile runs three steps over the workers that serve the request's model.
 2. **Score.** Each scorer rates the workers that are left from 0 to 1. Above, `least-requests` rates the worker with the fewest requests in flight highest.
 3. **Pick.** One picker chooses from the scores. A pick names the chosen worker and up to three alternates, best first.
 
-A decision that finds no worker is a *shed*: a refusal that names its reason and the stage that stopped it. By default a single profile first tries again with the overload veto lifted, then with liveness doubts lifted. See [Decisions and refusals](REFERENCE.md#decisions-and-refusals).
+A decision that finds no worker is a *shed*: a refusal that names its reason and a stage or constraint. As a rule it names the one that stopped the decision; a pair's shed can name another. By default a single profile first tries again with the overload veto lifted, then with liveness doubts lifted. See [Decisions and refusals](REFERENCE.md#decisions-and-refusals).
 
 A profile can weigh one scorer over another:
 
@@ -52,7 +52,7 @@ The combined score is the weighted average of the scorers. A bare name has weigh
 
 ## Built-in stages
 
-A *stage* is one filter, scorer or picker. The [reference](REFERENCE.md#built-in-stages) has each stage's rules, defaults and limits.
+A *stage* is one filter, scorer or picker. The [stages page](docs/stages.md) has each stage's rules, defaults and limits.
 
 ### Filters
 
@@ -77,7 +77,7 @@ A *stage* is one filter, scorer or picker. The [reference](REFERENCE.md#built-in
 | `session-affinity` | The worker the request's session is pinned to. | None |
 | `prefix-affinity` | The deepest holders of the prompt's prefix, within its spill and pressure rules. | `threshold`, `source`, `spill` |
 | `kv-pressure` | No worker. It sets the KV pressure limits that the affinity stages read. | `spread`, `ceiling` |
-| `warmup-slice` | Young or thin-cache workers, for a share of the cache misses. | `secs`, `share`, `blocks`, `thin_ratio`, `divert_every`, `miss_share` |
+| `warmup-slice` | Young or thin-cache workers, for a share of the cache misses. A single request warms nobody while the model's index holds no block. | `secs`, `share`, `blocks`, `thin_ratio`, `divert_every`, `miss_share` |
 | `bucket` | The worker that owns the prompt's size range, at prefill. | `abs_threshold`, `rel_threshold`, `adjust_interval_s` |
 | `consistent-hash` | The routing key's owner on a hash ring, then its successors. | `prefix_tokens`, `bounded_load` |
 | `resident-work` | The least resident work. | `request_tokens` |
@@ -136,7 +136,7 @@ target/release/smg-grand-central --controller-id controller-0 --spec-file policy
 - Ask for a worker with `Session` and `Decide` on the gateway listener.
 - The service checks a changed policy spec before it replaces the running one.
 
-[The controller's wire test](tests/controller.rs) shows registration and the decision stream end to end. The reference lists every [flag](REFERENCE.md#standalone-service) and every [call](REFERENCE.md#remote-calls-from-a-gateway).
+[The controller's wire test](tests/controller.rs) shows registration and the decision stream end to end. The service page lists every [flag](docs/service.md#start-the-service) and every [call](docs/service.md#a-gateway-that-calls-the-service).
 
 ## Presets
 
@@ -171,11 +171,11 @@ A host can add stages of its own in three ways:
 
 - [The policy spec](docs/policy-spec.md): its fields, [bindings](docs/policy-spec.md#bindings) and [plans](docs/policy-spec.md#plans)
 - [Prefill and decode pairs](docs/policy-spec.md#prefill-and-decode) and [encode with a pair](docs/policy-spec.md#encode-with-a-pair)
-- [Overload, shadows and reserved fields](REFERENCE.md#bindings-and-plans) and [session keys](REFERENCE.md#session-keys)
-- [Signals a decision can read](REFERENCE.md#signals-a-decision-can-read)
+- [Overload](docs/policy-spec.md#overload), [sessions](docs/policy-spec.md#sessions), [a request's key](docs/policy-spec.md#the-requests-key), [shadows](docs/policy-spec.md#a-shadow-profile) and [reserved fields](docs/policy-spec.md#reserved-fields)
+- [Signals a decision can read](docs/embedding.md#signals-a-decision-can-read)
 - [Decisions and refusals](REFERENCE.md#decisions-and-refusals) and [updating a policy spec](REFERENCE.md#updating-a-document)
 - [Explain and metrics](REFERENCE.md#explain-and-metrics)
-- [Worker discovery](REFERENCE.md#worker-discovery) for the standalone service
+- [Worker discovery](docs/service.md#worker-discovery) for the standalone service
 - [Cost and regression gates](REFERENCE.md#cost-and-regression-gates)
 - [The design document](docs/design.md)
 

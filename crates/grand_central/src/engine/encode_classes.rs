@@ -54,6 +54,7 @@ use super::framework::EncoderFacts;
 use crate::store::{pairing::known, EncodeHandoff, EncodeOffer};
 
 #[cfg(test)]
+#[path = "../../tests/unit/engine/encode_classes/tests.rs"]
 mod tests;
 
 /// One encoder or prefill as the derivation reads it.

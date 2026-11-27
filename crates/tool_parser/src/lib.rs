@@ -13,6 +13,7 @@ pub mod types;
 pub mod parsers;
 
 #[cfg(test)]
+#[path = "../tests/unit/tests.rs"]
 mod tests;
 
 // Re-export types used outside this module

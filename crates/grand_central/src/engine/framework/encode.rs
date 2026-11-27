@@ -46,16 +46,17 @@
 
 use super::{
     carries_a_column, column_fits, debug_assert_cells, debug_assert_indexed, reason_of,
-    run_profile, shed, Buffers, ClassBits, Engine, PairPools, PairTable, Plan, Profile, Scratch,
-    Set, ShedOver, AFFINITY_COLUMN,
+    run_profile, shed, Buffers, ClassBits, Engine, PairPools, PairSide, PairTable, Plan, Profile,
+    Scratch, Set, ShedOver, AFFINITY_COLUMN,
 };
 use crate::{
     engine::{
-        decision::{Decision, ShedReason, Target, Targets, Trace, PLACES, TARGET_WORKER},
-        demands::{DemandFacts, Demands, References},
+        decision::{Decision, Pick, ShedReason, Target, Trace, PLACES, TARGET_WORKER},
+        demands::{DemandFacts, Demands, References, UnmetDemand},
+        sticky_sessions::SessionVerdict,
         view::{
             AffinityFacts, Candidate, Constraints, Identity, Phase, PoolFacts, RequestFacts,
-            WireModes,
+            WireModes, WorkerId,
         },
     },
     load::signals::{SignalCell, SignalCells},
@@ -64,6 +65,7 @@ use crate::{
 };
 
 #[cfg(test)]
+#[path = "../../../tests/unit/engine/framework/encode/tests/mod.rs"]
 mod tests;
 
 /// The stage named when no encoder is open for the request though one that
@@ -213,6 +215,16 @@ impl EncodeItems<'_> {
     pub const fn holds_decode_to_images(&self, pixels: bool) -> bool {
         self.decode_images || (self.references && pixels)
     }
+
+    /// Whether the encode side lays its pass for the request: it carries
+    /// an item, or its decode is held to the decodes that take images
+    /// ([`Self::holds_decode_to_images`]). A request the pass is not laid
+    /// for is its pair's alone. The one test of it: the pass asks it, and
+    /// so does a call's test of a shed that goes to its route's rule.
+    #[must_use]
+    pub(crate) const fn lays_a_pass(&self, pixels: bool) -> bool {
+        !self.keys.is_empty() || self.holds_decode_to_images(pixels)
+    }
 }
 
 /// Where an encode-pair decision puts each placed key's encoder. The host
@@ -263,35 +275,94 @@ impl EncodePlaced {
 }
 
 /// Rows admitted from a pool, each standing at its index here, with where
-/// it stood in the pool, its affinity facts and its signal cells.
+/// it stood in the pool, its affinity facts and its signal cells. One
+/// operation admits them ([`Self::admit`]). What it returns lends them in
+/// the pool's stead ([`Lent`]), and nothing else reads them.
 #[derive(Debug, Default)]
 struct Admitted {
     rows: Vec<Candidate>,
     /// Each row's index in the pool it was admitted from.
     from: Vec<u32>,
     affinity: Vec<AffinityFacts>,
-    /// The rows' signal cells, a row's after the row's before it: emptied
-    /// and filled for a side that was handed cells
-    /// ([`Admitted::copy_cells`]) and lent to that side alone. A pass that
-    /// was handed none leaves them as they were: it pays nothing for them.
+    /// The rows' signal cells, a row's after the row's before it. Where
+    /// the pool handed none they are an earlier admission's: such an
+    /// admission pays nothing for them, and lends none.
     cells: SignalCells,
-    /// The rows here that a mask over the pool names, by their index here:
-    /// empty until a mask is numbered anew ([`Admitted::renumber`]). Its
-    /// room is taken with the rows ([`Admitted::take_room`]).
+    /// The rows here that a mask over the pool names, by their index here.
     masked: Vec<u32>,
-    /// The rows here that the mask's held rows name, by their index here.
-    /// Emptied and filled where a mask is numbered anew
-    /// ([`Admitted::renumber`]) and read with that mask alone: a decision
-    /// under no mask leaves it as it was. Its room is taken where a hold is
-    /// numbered, not with the rows: a decision under no hold pays nothing
-    /// for it.
+    /// The rows here that the mask's held rows name, by their index here:
+    /// an earlier admission's where this one numbered nothing.
     held: Vec<u32>,
     /// The rows here at the places of the pool its host holds the request
-    /// to, by their index here. Emptied and filled where the places are
-    /// numbered anew ([`Admitted::renumber`]) and read with those places
-    /// alone. Its room is taken there: a decision held to no place pays
-    /// nothing for it.
+    /// to, by their index here: an earlier admission's where this one
+    /// numbered nothing.
     places: Vec<u32>,
+}
+
+/// A pool as its host handed it, for one admission from it: its affinity
+/// column, its signal cells where it handed any, and its count of rows.
+#[derive(Clone, Copy)]
+struct Handed<'a> {
+    affinity: &'a [AffinityFacts],
+    cells: Option<&'a SignalCells>,
+    rows: usize,
+}
+
+/// What one admission lends in its pool's stead ([`Admitted::admit`]): the
+/// rows admitted, and what this admission did for them. It borrows the rows
+/// for as long as anything of them is read, so no later admission
+/// overwrites what a reader still holds.
+struct Lent<'a> {
+    admitted: &'a Admitted,
+    /// The side's constraints, as the admission was handed them.
+    cx: &'a Constraints<'a>,
+    /// Whether the pool handed cells: this admission copied them.
+    copied: bool,
+    /// Whether this admission numbered the side's lists anew.
+    numbered: bool,
+    held_off: bool,
+}
+
+impl<'a> Lent<'a> {
+    /// What stands in the pool's stead, together: the rows admitted, each
+    /// at its index here, their entries of the pool's affinity column, and
+    /// their signal cells where this admission copied any. One call hands
+    /// all three, so no reader pairs one list's rows with another's column.
+    #[inline(always)]
+    fn stand_in(
+        &self,
+    ) -> (
+        &'a [Candidate],
+        &'a [AffinityFacts],
+        Option<&'a SignalCells>,
+    ) {
+        (
+            &self.admitted.rows,
+            &self.admitted.affinity,
+            self.copied.then_some(&self.admitted.cells),
+        )
+    }
+
+    /// The side's constraints over its mask, the mask's held rows and its
+    /// places as the rows admitted number them: `None` where the admission
+    /// numbered nothing, and the side's own constraints stand.
+    #[inline(always)]
+    fn numbered(&self) -> Option<Constraints<'a>> {
+        self.numbered.then(|| self.admitted.numbered(self.cx))
+    }
+
+    /// Whether the request is held off every row admitted
+    /// ([`Admitted::held_off`]). A side whose host states places asks.
+    #[inline(always)]
+    fn held_off(&self) -> bool {
+        self.held_off
+    }
+
+    /// The pool's index of the row at `position` here.
+    #[inline(always)]
+    fn origin(&self, position: u32) -> u32 {
+        self.admitted.origin(position)
+    }
 }
 
 /// One mask over a pool's rows numbered by the rows admitted from it, whose
@@ -311,6 +382,62 @@ fn number(from: &[u32], mask: &[u32], numbered: &mut Vec<u32>) {
 }
 
 impl Admitted {
+    /// Admits `kept`, rows of a pool each with its index there, and lends
+    /// them in the pool's stead. The rows of the admission before are
+    /// emptied. Each row kept is pushed with its entry of the pool's
+    /// affinity column, the pool's cells are copied where it handed any,
+    /// and the mask's room is taken. Under a mask or places of `cx`, the
+    /// side's constraints, the lists are numbered anew by the rows
+    /// admitted ([`Self::renumber`]), unless those are the whole pool: a
+    /// whole pool's rows stand where the host numbered them.
+    #[inline(always)]
+    fn admit<'a, 'r>(
+        &'a mut self,
+        kept: impl Iterator<Item = (usize, &'r Candidate)>,
+        pool: Handed<'_>,
+        cx: &'a Constraints<'a>,
+    ) -> Lent<'a> {
+        self.clear();
+        kept.for_each(|(at, row)| self.push(row, at, pool.affinity));
+        if let Some(cells) = pool.cells {
+            self.copy_cells(cells);
+        }
+        self.take_room();
+        let numbered =
+            (!cx.stalled.is_empty() || cx.places.is_some()) && self.rows.len() != pool.rows;
+        if numbered {
+            self.renumber(cx.stalled, cx.held, cx.places);
+        }
+        Lent {
+            held_off: numbered && self.held_off(cx.places, pool.rows),
+            admitted: self,
+            cx,
+            copied: pool.cells.is_some(),
+            numbered,
+        }
+    }
+
+    /// `cx` over the lists as the rows here number them
+    /// ([`Self::renumber`]).
+    #[inline(always)]
+    fn numbered<'a>(&'a self, cx: &Constraints<'a>) -> Constraints<'a> {
+        Constraints {
+            stalled: &self.masked,
+            held: &self.held,
+            places: cx.places.map(|_| self.places.as_slice()),
+            ..*cx
+        }
+    }
+
+    /// The pool's index of the row at `position` here.
+    #[inline(always)]
+    fn origin(&self, position: u32) -> u32 {
+        self.from
+            .get(position as usize)
+            .copied()
+            .unwrap_or(position)
+    }
+
     fn clear(&mut self) {
         self.rows.clear();
         self.from.clear();
@@ -322,9 +449,8 @@ impl Admitted {
     /// here. The host's cells are by the pool's positions, and a stage
     /// reads an admitted row by its index here: left on the host's cells
     /// it would read another row's value. A row outside the host's cells
-    /// takes cells of no value. Asked once a pass, after its last row is
-    /// admitted, and only for a side that was handed cells. The cells here
-    /// keep their room from pass to pass.
+    /// takes cells of no value. The cells here keep their room from
+    /// admission to admission.
     fn copy_cells(&mut self, cells: &SignalCells) {
         let signals = cells.signals();
         let admitted = self.cells.refill(signals);
@@ -393,14 +519,6 @@ impl Admitted {
             self.affinity.push(*facts);
         }
     }
-
-    /// The pool's index of the row at `position` here.
-    fn origin(&self, position: u32) -> u32 {
-        self.from
-            .get(position as usize)
-            .copied()
-            .unwrap_or(position)
-    }
 }
 
 /// The encode side's scratch, inside the host's [`Scratch`].
@@ -408,8 +526,34 @@ impl Admitted {
 pub(super) struct EncodeScratch {
     /// The encode profile's runs.
     run: Buffers,
+    /// The encode classes with a registered encoder that takes the request,
+    /// those with an open one, and the open encoders.
+    encoders: EncoderClasses,
+    /// The decode classes with a registered decode, and those whose decode
+    /// takes images.
+    decode_classes: DecodeClasses,
+    /// The prefills the encode side admits, when it does not admit all.
+    prefills: Admitted,
+    /// The decodes it admits, when it does not admit all.
+    decodes: Admitted,
+    /// The chosen class's open encoders that take the request's media.
+    offered: Admitted,
+}
+
+/// The encode classes of the encoders one decision reads: the classes with
+/// a registered encoder that takes the request's media, the classes with an
+/// open one, and the open encoders by their row. One pass fills it
+/// ([`Self::read`]), and behind it the type only answers.
+///
+/// A host states each encoder's class, and no class is held to the count of
+/// the rows handed: one bit a number up to that count, and a list for the
+/// numbers above it. No number is dropped and no set is wider than the
+/// fleet. The pass sorts both lists before it ends, so no answer reads one
+/// unsorted.
+#[derive(Debug, Default)]
+struct EncoderClasses {
     /// The classes with an open encoder that takes the request's media: one
-    /// bit a class, no wider than the rows handed.
+    /// bit a class.
     open: ClassBits,
     /// The classes with a registered encoder that takes it.
     member: ClassBits,
@@ -422,22 +566,59 @@ pub(super) struct EncodeScratch {
     /// items are offered from this list.
     opened: Vec<u32>,
     /// The opened encoders at the places the request is held to, each by
-    /// its index among the opened: filled where a request states places of
-    /// the encode pool ([`EncodeScratch::hold_opened`]), and read there
-    /// alone.
+    /// its index among the opened: the buffer of [`Self::hold`] alone.
     reached: Vec<u32>,
-    /// The decode classes with a registered decode, and those whose decode
-    /// takes images.
-    decode_classes: DecodeClasses,
-    /// The prefills the encode side admits, when it does not admit all.
-    prefills: Admitted,
-    /// The decodes it admits, when it does not admit all.
-    decodes: Admitted,
-    /// The chosen class's open encoders that take the request's media.
-    offered: Admitted,
 }
 
-impl EncodeScratch {
+impl EncoderClasses {
+    /// Reads `encoders`, whose facts are `facts`. An encoder that states a
+    /// class and takes the request (`takes`) makes its class a member.
+    /// Where its hard filters keep it (`open`), it is opened and its class
+    /// is open. A request held to `places` of the encode pool keeps the
+    /// opened encoders at them alone ([`Self::hold`]). The membership is
+    /// read over every encoder all the same: it says what the model takes,
+    /// and a place says what this request may reach.
+    ///
+    /// The answer is whether a registered encoder that states a class takes
+    /// the request, whatever its filters and the places say.
+    #[inline(always)]
+    fn read(
+        &mut self,
+        encoders: &[Candidate],
+        facts: &[EncoderFacts],
+        places: Option<&[u32]>,
+        takes: impl Fn(usize, &Candidate, EncoderFacts) -> bool,
+        open: impl Fn(&Candidate) -> bool,
+    ) -> bool {
+        let width = encoders.len() + 1;
+        self.open.reset(width);
+        self.member.reset(width);
+        self.far_open.clear();
+        self.far_member.clear();
+        let mut any_member = false;
+        self.opened.clear();
+        for (at, (row, of)) in (0u32..).zip(encoders.iter().zip(facts)) {
+            if of.class != 0 && takes(at as usize, row, *of) {
+                any_member = true;
+                if !self.member.insert(of.class) {
+                    self.far_member.push(of.class);
+                }
+                if open(row) {
+                    self.opened.push(at);
+                    if !self.open.insert(of.class) {
+                        self.far_open.push(of.class);
+                    }
+                }
+            }
+        }
+        if let Some(places) = places {
+            self.hold(facts, width, places);
+        }
+        self.far_open.sort_unstable();
+        self.far_member.sort_unstable();
+        any_member
+    }
+
     /// Holds the opened encoders to `places`, the places of the encode pool
     /// the request's host holds it to: an encoder outside them takes no key
     /// and opens no class. The places are numbered over the opened
@@ -447,7 +628,7 @@ impl EncodeScratch {
     /// place runs none of it.
     #[cold]
     #[inline(never)]
-    fn hold_opened(&mut self, facts: &[EncoderFacts], width: usize, places: &[u32]) {
+    fn hold(&mut self, facts: &[EncoderFacts], width: usize, places: &[u32]) {
         super::places::debug_assert_ascending(places);
         self.reached.clear();
         number(&self.opened, places, &mut self.reached);
@@ -467,6 +648,58 @@ impl EncodeScratch {
                 self.far_open.push(class);
             }
         }
+    }
+
+    /// Whether an encoder is open for the request.
+    #[inline(always)]
+    fn any_open(&self) -> bool {
+        !self.opened.is_empty()
+    }
+
+    /// Whether a registered encoder that takes the request is of `class`.
+    #[inline(always)]
+    fn serves(&self, class: u32) -> bool {
+        holds(&self.member, &self.far_member, class)
+    }
+
+    /// The open classes, bound for a pass that asks them once a row. Read
+    /// through the scratch, each row loaded the set's place and its count
+    /// again.
+    #[inline(always)]
+    fn open(&self) -> OpenClasses<'_> {
+        OpenClasses {
+            words: self.open.words(),
+            far: &self.far_open,
+        }
+    }
+
+    /// Whether each of `classes` has an open encoder.
+    #[inline(always)]
+    fn every_open(&self, classes: &[u32]) -> bool {
+        let open = self.open();
+        classes.iter().all(|&class| open.holds(class))
+    }
+
+    /// The open encoders that take the request, by their row, ascending.
+    #[inline(always)]
+    fn opened(&self) -> &[u32] {
+        &self.opened
+    }
+}
+
+/// The open classes of one decision, bound for a pass
+/// ([`EncoderClasses::open`]): the set's words and its far list.
+#[derive(Clone, Copy, Debug)]
+struct OpenClasses<'a> {
+    words: &'a [u64],
+    far: &'a [u32],
+}
+
+impl OpenClasses<'_> {
+    /// Whether an open encoder is of `class`.
+    #[inline(always)]
+    fn holds(self, class: u32) -> bool {
+        holds_in(self.words, self.far, class)
     }
 }
 
@@ -794,6 +1027,15 @@ impl Engine {
     /// row admitted the pools are handed on as they are. A shed of the pair
     /// is returned as the pair gave it.
     ///
+    /// Under the binding's sessions rule each side of the pair is decided
+    /// by its own session, as the pair entry decides it. The pick states
+    /// each side's word of who placed it beside a list this side numbered
+    /// anew as beside the host's own. Where an item's answer turns the
+    /// request away behind its pair, the claims that pair's decision made
+    /// for the request's key are taken back, each side's under its own
+    /// session: the key's next request is placed again. A pin the decision
+    /// followed stands, and so does one it moved at the rule's cap.
+    ///
     /// An encoder takes a request on a wire its host states
     /// ([`Constraints::wire_modes`] of `encode_cx`): one dialed on none of
     /// them is left out, as one that takes none of the media is, and a
@@ -903,13 +1145,18 @@ impl Engine {
 
     /// [`Self::decide_encode_pair`] for a caller that judged a hard demand
     /// of the pair's two sides ahead of this call, each among its own
-    /// places. `unmet` is the stage of the demand that left a side nobody,
-    /// where one did: a request with items is shed under it with no
-    /// endpoint, behind three answers for its encoders (a gap of their
+    /// places. `unmet` is the demand that left a side nobody, and that
+    /// side, where one did: a request with items is shed under its stage
+    /// with no endpoint, for that side, behind three answers for its
+    /// encoders (a gap of their
     /// membership, none open, a saturated fleet) and ahead of the pair's.
-    /// Those three stand first, whatever its pair lacks. The encoders'
-    /// `places` answer waits behind the side's stage, as it waits behind
-    /// a gap of the pair's membership. A
+    /// Those three stand first, whatever its pair lacks. Where a list of
+    /// the pair holds no row, the request is answered there as its pair
+    /// alone is, over no candidate ([`Self::decide_over_an_empty_list`]):
+    /// with `unmet`, `cx` and `decode_cx` are the request's own
+    /// constraints, with no list's places or mask. The
+    /// encoders' `places` answer waits behind the side's stage, as it
+    /// waits behind a gap of the pair's membership. A
     /// request with no item reads no encoder: its caller sheds it ahead of
     /// this call, and `unmet` is not read for it.
     #[expect(
@@ -926,7 +1173,7 @@ impl Engine {
         cx: &Constraints<'_>,
         decode_cx: &Constraints<'_>,
         encode_cx: &Constraints<'_>,
-        unmet: Option<&'static str>,
+        unmet: Option<(UnmetDemand, PairSide)>,
         scratch: &mut Scratch,
         placed: &mut EncodePlaced,
     ) -> Decision {
@@ -962,7 +1209,7 @@ impl Engine {
         cx: &Constraints<'_>,
         decode_cx: &Constraints<'_>,
         encode_cx: &Constraints<'_>,
-        unmet: Option<&'static str>,
+        unmet: Option<(UnmetDemand, PairSide)>,
         scratch: &mut Scratch,
         side: &mut EncodeScratch,
         placed: &mut EncodePlaced,
@@ -1047,7 +1294,7 @@ impl Engine {
         // A request with no item that asks no images of its decode is the
         // pair's alone: the pair entry answers it over the pools as handed,
         // and no pass of the encode side is laid for it.
-        if !needs && !images {
+        if !items.lays_a_pass(pixels) {
             return self.decide_pair(facts, pool, pools, cx, decode_cx, scratch);
         }
         let encode_facts = RequestFacts {
@@ -1090,49 +1337,27 @@ impl Engine {
                 .all(|f| f.keep(&encode_facts, row, encode_cx))
         };
         if needs {
-            // A host states each encoder's class, and no class is held to
-            // the count of the rows handed: one bit a number up to that
-            // count, and a list for the numbers above it. No number is
-            // dropped and no set is wider than the fleet.
-            let width = encode.encoders.len() + 1;
-            side.open.reset(width);
-            side.member.reset(width);
-            side.far_open.clear();
-            side.far_member.clear();
-            let mut any_open = false;
-            let mut any_member = false;
-            side.opened.clear();
-            for (at, (row, of)) in (0u32..).zip(encode.encoders.iter().zip(encode.facts)) {
-                if of.class != 0 && wanted.takes(at as usize, row, *of) {
-                    any_member = true;
-                    if !side.member.insert(of.class) {
-                        side.far_member.push(of.class);
-                    }
-                    if open(row) {
-                        any_open = true;
-                        side.opened.push(at);
-                        if !side.open.insert(of.class) {
-                            side.far_open.push(of.class);
-                        }
-                    }
-                }
-            }
+            // The encoders' classes, read by one pass ([`EncoderClasses`]).
+            let any_member = side.encoders.read(
+                encode.encoders,
+                encode.facts,
+                encode_cx.places,
+                |at, row, of| wanted.takes(at, row, of),
+                open,
+            );
             // A request held to places of the encode pool takes no encoder
-            // outside them. The membership above is read over every
-            // encoder: it says what the model takes, and a place says what
-            // this request may reach. Encoders at the places that take no
-            // such request, beside one outside them that does, hold it off
-            // every encoder that takes it: the pass says so behind the
-            // pair's gaps. Places that name no encoder leave the request
-            // none, and the gap below says so.
+            // outside them, and the pass kept the opened encoders at them
+            // alone. Encoders at the places that take no such request,
+            // beside one outside them that does, hold it off every encoder
+            // that takes it: the pass says so behind the pair's gaps.
+            // Places that name no encoder leave the request none, and the
+            // gap below says so.
             if let Some(places) = encode_cx.places {
                 let mut at_places = reached(&encode, Some(places)).peekable();
                 let named = at_places.peek().is_some();
                 held_off = any_member
                     && named
                     && !at_places.any(|(at, row, of)| of.class != 0 && wanted.takes(at, row, *of));
-                side.hold_opened(encode.facts, width, places);
-                any_open = !side.opened.is_empty();
                 unplaced = Constraints {
                     places: None,
                     ..*encode_cx
@@ -1141,7 +1366,7 @@ impl Engine {
             }
             // A request the places hold off has no open encoder at them, and
             // its answer waits: the gap of no open encoder is not its own.
-            if !any_open && !held_off {
+            if !side.encoders.any_open() && !held_off {
                 // Encoders the overload veto left none of are a saturated
                 // fleet where the binding sheds a pool the veto empties, and
                 // the shed says so. Where it steers no encoder is steered
@@ -1160,16 +1385,26 @@ impl Engine {
                 }
                 return gap(encode_gap(&encode, &wanted, any_member));
             }
-            side.far_open.sort_unstable();
-            side.far_member.sort_unstable();
             // A side of the pair that a hard demand left nobody, as this
             // call's caller judged it: said behind the encoders' own
-            // answers above and ahead of the pair's, under no profile, as
-            // the judge itself says it for a request with no item.
-            if let Some(stage) = unmet {
-                return turned_away(ShedReason::NoEndpoints, stage, unbound);
+            // answers above and ahead of the pair's, under no profile and
+            // for that side, as the judge itself says it for a request
+            // with no item. One list of the pair alone is no pair,
+            // whatever the demand left of the other: the answer is then
+            // its pair's own over no candidate, under the request's own
+            // constraints, which the caller hands for such a side.
+            if let Some((demand, lacking)) = unmet {
+                if pools.prefills.is_empty() || pools.decodes.is_empty() {
+                    let prefills = !pools.prefills.is_empty();
+                    return self.decide_over_an_empty_list(facts, pool, prefills, cx, scratch);
+                }
+                let stage = demand.stage();
+                return turned_away(ShedReason::NoEndpoints, stage, unbound).of_side(lacking);
             }
         }
+        // What the pass over the encoders found, read below. A request with
+        // no item ran no pass, and asks none of it.
+        let encoders = &side.encoders;
         // The pairs by membership: one at all, one an encoder serves, and
         // one whose decode takes images. The request with no item that asks
         // none of them left by the early answer.
@@ -1184,11 +1419,7 @@ impl Engine {
         // with every prefill's class open there is no such pair: no answer
         // is read, and the two passes below walk no row. Such a request is
         // asked that ahead, and the admission below reads the same word.
-        let every_open = || {
-            let (open, far_open) = (side.open.words(), side.far_open.as_slice());
-            let classes = encode.prefill_classes;
-            classes.iter().all(|&class| holds_in(open, far_open, class))
-        };
+        let every_open = || encoders.every_open(encode.prefill_classes);
         let ahead = (needs && !images).then(&every_open);
         let (decodes, prefills): (&[Candidate], &[Candidate]) = match ahead {
             Some(true) => (&[], &[]),
@@ -1204,7 +1435,7 @@ impl Engine {
             let listed = pools.table.of(&row.pair_class);
             if listed.iter().any(|&class| decode_classes.holds(class)) {
                 any_pair = true;
-                if !needs || holds(&side.member, &side.far_member, class_of(at)) {
+                if !needs || encoders.serves(class_of(at)) {
                     any_served = true;
                     if !images {
                         break;
@@ -1236,80 +1467,84 @@ impl Engine {
         // a pool of their own and the targets are read back by where a row
         // stood.
         let mut admitted = pools;
+        // The pass is laid: the pools the pair is handed are a part
+        // ([`PairPools::part`]), whether a list is cut below or not. The
+        // gateway's own selection hands its pair selection such a request
+        // under a filter of its own
+        // (`placed_encode_prefill_decode_workers` in
+        // `model_gateway/src/routers/grpc/common/stages/worker_selection.rs`).
+        // This pass's cuts follow that filter in part. It also leaves out
+        // a decode where no available encoder is of its runtime, and its
+        // pair selection judges its paired workers with no filter where
+        // the filter takes none of them. So the pair's decision asks no
+        // question of its shed here: the request is answered as it was
+        // before the question stood.
+        admitted.part = true;
         let every_prefill = !needs || ahead.unwrap_or_else(&every_open);
         // A list handed on in a pool's stead is numbered anew. A mask and
         // the places a side's host holds the request to number the rows of
         // the host's pool: beside such a list both are numbered with the
-        // rows, by one walk. A side whose places name rows and none that
-        // was admitted is held off every worker that takes the request,
-        // and says so.
-        let (prefill_mask, decode_mask);
+        // rows, by one walk ([`Admitted::admit`]). A side whose places name
+        // rows and none that was admitted is held off every worker that
+        // takes the request, and says so.
         let (mut cx, mut decode_cx) = (cx, decode_cx);
-        if !every_prefill {
-            side.prefills.clear();
-            // The open classes are read once a row here. Their words and
-            // their far list are bound ahead of the pass: read through the
-            // scratch, each row loaded their place and their count again.
-            let (open, far_open) = (side.open.words(), side.far_open.as_slice());
-            for (at, row) in pools.prefills.iter().enumerate() {
-                if holds_in(open, far_open, class_of(at)) {
-                    side.prefills.push(row, at, pools.prefill_affinity);
-                }
+        let (prefill_lists, decode_lists);
+        let prefill_side = if every_prefill {
+            None
+        } else {
+            // The open classes are read once a row here, so they are bound
+            // ahead of the pass.
+            let open = encoders.open();
+            let kept = pools.prefills.iter().enumerate();
+            let handed = Handed {
+                affinity: pools.prefill_affinity,
+                cells: pools.prefill_signal_cells,
+                rows: pools.prefills.len(),
+            };
+            let lent =
+                side.prefills
+                    .admit(kept.filter(|&(at, _)| open.holds(class_of(at))), handed, cx);
+            if lent.held_off() {
+                return gap(PLACES);
             }
-            if let Some(cells) = pools.prefill_signal_cells {
-                side.prefills.copy_cells(cells);
+            (
+                admitted.prefills,
+                admitted.prefill_affinity,
+                admitted.prefill_signal_cells,
+            ) = lent.stand_in();
+            if let Some(numbered) = lent.numbered() {
+                prefill_lists = numbered;
+                cx = &prefill_lists;
             }
-            side.prefills.take_room();
-            if !cx.stalled.is_empty() || cx.places.is_some() {
-                side.prefills.renumber(cx.stalled, cx.held, cx.places);
-                if side.prefills.held_off(cx.places, pools.prefills.len()) {
-                    return gap(PLACES);
-                }
-                prefill_mask = Constraints {
-                    stalled: &side.prefills.masked,
-                    held: &side.prefills.held,
-                    places: cx.places.map(|_| side.prefills.places.as_slice()),
-                    ..*cx
-                };
-                cx = &prefill_mask;
-            }
-            admitted.prefills = &side.prefills.rows;
-            admitted.prefill_affinity = &side.prefills.affinity;
-            // The side's cells are numbered with its rows: the admitted
-            // rows' cells stand in the host's stead, where it handed any.
-            admitted.prefill_signal_cells =
-                pools.prefill_signal_cells.map(|_| &side.prefills.cells);
-        }
+            Some(lent)
+        };
         let every_decode = !vision || pools.decodes.iter().all(|row| row.vision);
-        if !every_decode {
-            side.decodes.clear();
-            for (at, row) in pools.decodes.iter().enumerate() {
-                if row.vision {
-                    side.decodes.push(row, at, pools.decode_affinity);
-                }
+        let decode_side = if every_decode {
+            None
+        } else {
+            let kept = pools.decodes.iter().enumerate();
+            let handed = Handed {
+                affinity: pools.decode_affinity,
+                cells: pools.decode_signal_cells,
+                rows: pools.decodes.len(),
+            };
+            let lent = side
+                .decodes
+                .admit(kept.filter(|(_, row)| row.vision), handed, decode_cx);
+            if lent.held_off() {
+                return gap(PLACES);
             }
-            if let Some(cells) = pools.decode_signal_cells {
-                side.decodes.copy_cells(cells);
+            (
+                admitted.decodes,
+                admitted.decode_affinity,
+                admitted.decode_signal_cells,
+            ) = lent.stand_in();
+            if let Some(numbered) = lent.numbered() {
+                decode_lists = numbered;
+                decode_cx = &decode_lists;
             }
-            side.decodes.take_room();
-            if !decode_cx.stalled.is_empty() || decode_cx.places.is_some() {
-                side.decodes
-                    .renumber(decode_cx.stalled, decode_cx.held, decode_cx.places);
-                if side.decodes.held_off(decode_cx.places, pools.decodes.len()) {
-                    return gap(PLACES);
-                }
-                decode_mask = Constraints {
-                    stalled: &side.decodes.masked,
-                    held: &side.decodes.held,
-                    places: decode_cx.places.map(|_| side.decodes.places.as_slice()),
-                    ..*decode_cx
-                };
-                decode_cx = &decode_mask;
-            }
-            admitted.decodes = &side.decodes.rows;
-            admitted.decode_affinity = &side.decodes.affinity;
-            admitted.decode_signal_cells = pools.decode_signal_cells.map(|_| &side.decodes.cells);
-        }
+            Some(lent)
+        };
         // The pair's pick is turned where its decision stands and returned
         // as that decision: taking it out and putting it back copies it
         // twice.
@@ -1331,18 +1566,15 @@ impl Engine {
             return pair;
         };
         if !every_prefill || !every_decode {
-            let mut targets = Targets::new();
-            for target in pick.targets.iter() {
-                let mut target = *target;
-                if !every_prefill {
-                    target.position = side.prefills.origin(target.position);
-                }
-                if let Some(decode) = target.pair.as_mut().filter(|_| !every_decode) {
-                    decode.decode_position = side.decodes.origin(decode.decode_position);
-                }
-                targets.push(target);
-            }
-            pick.targets = targets;
+            // The pick names the rows this pass numbered. It is handed back
+            // by the host's rows where it stands, each side that was cut
+            // by where its rows stood, so the list keeps the prefill
+            // side's word of who placed it: a sessions rule's pick stays
+            // the rule's, told or untold, beside a pool that was cut.
+            pick.targets.renumber(
+                prefill_side.as_ref().map(|lent| move |at| lent.origin(at)),
+                decode_side.as_ref().map(|lent| move |at| lent.origin(at)),
+            );
         }
         if !needs {
             return pair;
@@ -1351,39 +1583,35 @@ impl Engine {
         // class is every target's.
         let chosen = pick.targets.first().map(|target| target.position as usize);
         let class = chosen.map_or(0, class_of);
-        side.offered.clear();
+        // The chosen class's opened encoders are offered to each key. A
+        // key's constraints state no place, so the admission asks none and
+        // nothing holds a key off them.
         let mut pushes = false;
-        for &at in &side.opened {
+        let kept = encoders.opened().iter().filter_map(|&at| {
             let at = at as usize;
-            let (Some(row), Some(of)) = (encode.encoders.get(at), encode.facts.get(at)) else {
-                continue;
-            };
-            if of.class == class {
+            let (row, of) = (encode.encoders.get(at)?, encode.facts.get(at)?);
+            (of.class == class).then(|| {
                 pushes = of.pushes;
-                side.offered.push(row, at, encode.affinity);
-            }
-        }
-        // The offered encoders' cells, numbered with them: the pool's are
-        // by the pool's positions.
-        if let Some(cells) = encode.signal_cells {
-            side.offered.copy_cells(cells);
-        }
-        side.offered.take_room();
-        // The offered encoders are numbered anew unless they are the whole
-        // pool, and the encode side's mask is numbered with them.
-        let offered_mask;
+                (at, row)
+            })
+        });
+        let handed = Handed {
+            affinity: encode.affinity,
+            cells: encode.signal_cells,
+            rows: encode.encoders.len(),
+        };
+        let offered = side.offered.admit(kept, handed, key_cx);
+        debug_assert!(
+            key_cx.places.is_none() && !offered.held_off(),
+            "a key's constraints state no place, so nothing holds a key off the encoders offered"
+        );
+        let (offered_rows, offered_affinity, offered_cells) = offered.stand_in();
+        let offered_lists;
         let mut encode_cx = key_cx;
-        if !encode_cx.stalled.is_empty() && side.offered.rows.len() != encode.encoders.len() {
-            side.offered
-                .renumber(encode_cx.stalled, encode_cx.held, None);
-            offered_mask = Constraints {
-                stalled: &side.offered.masked,
-                held: &side.offered.held,
-                ..*encode_cx
-            };
-            encode_cx = &offered_mask;
+        if let Some(numbered) = offered.numbered() {
+            offered_lists = numbered;
+            encode_cx = &offered_lists;
         }
-        let offered_cells = encode.signal_cells.map(|_| &side.offered.cells);
         let one = items.one.filter(|_| pushes);
         placed.one = one.is_some();
         let keys = one.as_ref().map_or(items.keys, std::slice::from_ref);
@@ -1419,7 +1647,7 @@ impl Engine {
             let key_facts = RequestFacts {
                 session_key: *key,
                 seed: seeds.next_u64(),
-                affinity: &side.offered.affinity,
+                affinity: offered_affinity,
                 signal_cells: offered_cells,
                 ring,
                 ring_positions,
@@ -1430,25 +1658,71 @@ impl Engine {
                 index,
                 &key_facts,
                 pool,
-                Set::side(&side.offered.rows, None, None),
+                Set::side(offered_rows, None, None),
                 encode_cx,
                 &mut side.run,
             );
-            match of_key {
-                // A key's pick is read where its decision stands.
-                Decision::Pick(ref of_key) => {
-                    let Some(target) = of_key.targets.first() else {
-                        return gap(ENCODERS);
-                    };
-                    placed.encoders.push(Target {
-                        position: side.offered.origin(target.position),
-                        pair: None,
-                        ..*target
-                    });
-                }
-                Decision::Shed(_) | Decision::Queue(_) => return of_key,
-            }
+            // A key's pick is read where its decision stands.
+            let target = match &of_key {
+                Decision::Pick(of_key) => of_key.targets.first(),
+                Decision::Shed(_) | Decision::Queue(_) => None,
+            };
+            let Some(target) = target else {
+                // The item's answer is the request's, and the pair goes
+                // with it: the claims its two sides made go too, at the
+                // one place this pass turns a request away behind its
+                // pair. The pair routine's own queue is its decode side's
+                // and keeps the prefill's claim for the pair it waits on
+                // ([`Self::decide_pair`]). An item's queue names no pair
+                // to wait on, so its claims are taken back as at a shed.
+                self.withdraw(facts, pick);
+                return match of_key {
+                    Decision::Pick(_) => gap(ENCODERS),
+                    answered => answered,
+                };
+            };
+            placed.encoders.push(Target {
+                position: offered.origin(target.position),
+                pair: None,
+                ..*target
+            });
         }
         pair
+    }
+
+    /// Takes back the claims a pair's pick made for the request's key, each
+    /// side's under that side's own session. The pick is this pass's own
+    /// ([`Self::decide_pair`]) and the pass returns without it, so the
+    /// request goes to no worker of it. A claim is a pin ahead of its
+    /// dispatch: left standing, it would lead the key's next requests to a
+    /// pair this request never reached. The table takes back a claim this
+    /// decision made where it still stands unconfirmed, as the pair's
+    /// decision takes back its prefill side's where no prefill pairs. A
+    /// verdict that is no claim writes nothing: a pin the decision
+    /// followed stands, and so does one it moved at the rule's cap. The
+    /// key's next request is then placed again.
+    ///
+    /// The table knows a claim of this decision by the request's instant:
+    /// both sides claimed under it, each side's facts being the request's
+    /// with the side's phase. A later decision's claim on the same worker
+    /// is dated later and stands.
+    ///
+    /// Cold and out of line: an item's answer that turns its request away
+    /// is the rare end of a key's run, and the keys' loop holds one call.
+    #[cold]
+    #[inline(never)]
+    fn withdraw(&self, facts: &RequestFacts<'_>, pick: &Pick) {
+        let session = |phase| RequestFacts { phase, ..*facts }.session();
+        let at = facts.now_micros;
+        if let SessionVerdict::Claimed(claimed) = pick.session_verdict {
+            self.sessions
+                .move_claim(session(Phase::Prefill), claimed, WorkerId(0), at);
+        }
+        let decode = pick.targets.first().and_then(|target| target.pair);
+        let decode = decode.map(|pair| pair.decode_verdict.on(pair.decode_id));
+        if let Some(SessionVerdict::Claimed(claimed)) = decode {
+            self.sessions
+                .move_claim(session(Phase::Decode), claimed, WorkerId(0), at);
+        }
     }
 }

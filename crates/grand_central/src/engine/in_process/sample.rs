@@ -30,25 +30,15 @@
 
 use std::{cell::Cell, time::Instant};
 
-use parking_lot::Mutex;
-
 use super::{InProcess, Loaded, PoolMembers};
-use crate::{
-    engine::{
-        decision::Decision,
-        decision_engine::{AlonePick, DecideOutcome, Request, RequestMaker},
-        explain::{DecisionRecord, SampleCount, Samples},
-        records,
-        shadow::Shadowed,
-        view::{fingerprint, Phase},
-    },
-    store::GatewayId,
+use crate::engine::{
+    decision::Decision,
+    decision_engine::{AlonePick, DecideOutcome, Request, RequestMaker},
+    explain::{DecisionRecord, SampleCount},
+    records,
+    shadow::Shadowed,
+    view::Phase,
 };
-
-/// The decisions kept under one document, newest last: one ring of them
-/// behind one lock, which a kept decision takes for its push and a reader
-/// for one scan ([`InProcess::explained`]).
-pub(super) type Kept = Mutex<Samples>;
 
 thread_local! {
     /// The calling thread's count toward its next sample, under the
@@ -78,32 +68,6 @@ fn nth(own: Loaded<'_, '_>, id: &[u8], decision: Option<&Decision>) -> bool {
         kept.set(count);
         nth
     })
-}
-
-/// `decision` pushed onto the document's ring as the decision of the
-/// request `id` names, taken at `at`: under the binding a request of
-/// `asked`'s model at its phase matches, and with what a single's shadow
-/// said.
-fn keep(
-    own: Loaded<'_, '_>,
-    id: &[u8],
-    asked: (&str, Phase),
-    at: Instant,
-    decision: &Decision,
-    shadow: Option<Shadowed>,
-) {
-    let document = own.document;
-    let binding = document.spec.engine().binding_position(asked.0, asked.1);
-    let taken = (at, GatewayId::LOCAL, id);
-    let mut kept = document.kept.lock();
-    kept.push(
-        document.applied,
-        binding,
-        taken,
-        decision,
-        shadow,
-        [None; 2],
-    );
 }
 
 /// The id a decision is kept under: `own_id`, the request's own, or where
@@ -201,7 +165,8 @@ fn counted(
 ) {
     let Some((decided, _)) = written else { return };
     if nth(own, id, Some(&decided.decision)) {
-        keep(own, id, asked, at, &decided.decision, shadow);
+        own.document
+            .keep_sample(id, asked, at, &decided.decision, shadow);
     }
 }
 
@@ -234,14 +199,8 @@ pub(super) fn place(
     let worker = members.workers().get(position);
     if let Some((worker, &named)) = worker.zip(records.ids().get(position)) {
         let decision = pick.decision(named, records::worker_rank(worker.as_ref()));
-        keep(
-            own,
-            id,
-            (maker.model(), Phase::Single),
-            clock(),
-            &decision,
-            None,
-        );
+        let asked = (maker.model(), Phase::Single);
+        document.keep_sample(id, asked, clock(), &decision, None);
     }
 }
 
@@ -270,11 +229,10 @@ impl InProcess {
     /// to, counts each of its decisions.
     #[must_use]
     pub fn explained(&self, request_id: &[u8]) -> Option<DecisionRecord> {
-        let document = self.in_force();
-        let kept = document.kept.lock();
-        kept.find(document.applied, GatewayId::LOCAL, fingerprint(request_id))
+        self.in_force().kept_sample(request_id)
     }
 }
 
 #[cfg(test)]
+#[path = "../../../tests/unit/engine/in_process/sample/tests.rs"]
 mod tests;

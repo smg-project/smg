@@ -13,32 +13,89 @@
 //! and the sweep's pass. A host in process is pinned
 //! too, in a build
 //! with the `in-process` feature: a request held from its decision to its
-//! completion allocates nothing after the first ones. A separate
+//! completion allocates nothing after the first ones. A keeper of worker
+//! objects is pinned in a build with the `worker-host` feature: a status
+//! tell copies each id of its worker's models once, and only for a store
+//! that tells a journal. A separate
 //! executable, so it can declare the counting allocator the pins need.
+//!
+//! One pin reads frees: a decision that spans a write frees nothing on its
+//! thread. The allocator here counts each thread's frees for it.
+//!
+//! One pin is of the token index: its fused walk of one page allocates one
+//! list. It stands here because this target declares the counting allocator.
 
 #![expect(clippy::expect_used, reason = "tests that stop on a broken setup")]
 
 mod common;
 
-use std::time::{Duration, Instant};
+use std::{
+    alloc::{GlobalAlloc, Layout, System},
+    cell::Cell,
+    time::{Duration, Instant},
+};
 
 use common::counting_alloc::{calls, Counting};
 use smg_grand_central::{
-    document::{PolicySpec, PRESETS},
+    document::{AppliedSpec, PolicySpec, PRESETS},
     engine::{
         AffinityFacts, AffinityHolder, AffinityRows, Candidate, Constraints, Engine, LoadRow,
         PairPools, PoolFacts, RequestFacts, Scratch, SignalSource, Target, WorkerId,
     },
     stages::Lifecycle,
     store::{
-        GatewayId, Hand, LeaseRecord, LeaseState, LeasesStore, MemoryStore, PickRecord,
-        WorkerFacts, WorkerStatus, WorkersStore,
+        identity, GatewayId, Hand, HealthSink, LeaseRecord, LeaseState, LeasesStore,
+        MembershipChange, MemoryStore, PickRecord, Position, Registrant, WorkerFacts, WorkerRow,
+        WorkerStatus, WorkersStore,
     },
     tracking::{Dispatch, Lease, LeaseId, Outcome, Said, Side, TransportClass},
 };
 
+thread_local! {
+    /// Frees this thread made. A constant without a destructor, so the
+    /// allocator reaches it without one.
+    static FREES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Frees the calling thread has made so far.
+fn frees() -> usize {
+    FREES.with(Cell::get)
+}
+
+/// The pins' counting allocator, which counts each thread's frees too. The
+/// count of frees is this executable's own. A bench registers [`Counting`]
+/// itself, and a count there would stand in every free the bench measures.
+struct CountingFrees(Counting);
+
+#[expect(
+    unsafe_code,
+    reason = "a counting global allocator is the only way to see what a decision freed"
+)]
+unsafe impl GlobalAlloc for CountingFrees {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: the same layout contract as the caller's, forwarded to the allocator counted over.
+        unsafe { self.0.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: the same layout contract as the caller's.
+        unsafe { self.0.alloc_zeroed(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        FREES.with(|frees| frees.set(frees.get() + 1));
+        // SAFETY: `ptr` came from `alloc` with this layout.
+        unsafe { self.0.dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: `ptr` came from `alloc` with this layout; the caller upholds `new_size`.
+        unsafe { self.0.realloc(ptr, layout, new_size) }
+    }
+}
+
 #[global_allocator]
-static GLOBAL: Counting = Counting(std::alloc::System);
+static GLOBAL: CountingFrees = CountingFrees(Counting(System));
 
 /// What `work` returns, and the allocation calls this thread made during it.
 fn allocations_during<T>(work: impl FnOnce() -> T) -> (T, usize) {
@@ -555,27 +612,48 @@ fn a_pair_decision_after_the_first_allocates_nothing() {
     assert_eq!(allocations, 0, "a pair decision allocated");
 }
 
+/// The row of `facts` as a registration by a control call leaves it. The
+/// stores here have no holder of worker objects: each takes a row as a
+/// decided change ([`MemoryStore::follow`]), and the test counts the
+/// epoch the write steps to.
+fn row_of(facts: WorkerFacts) -> WorkerRow {
+    WorkerRow {
+        id: identity(&facts.key, facts.incarnation),
+        facts,
+        status: WorkerStatus::Pending,
+        revision: 1,
+        admitted_at: Instant::now(),
+        maker: Registrant::Control,
+    }
+}
+
 /// A store of two pools: `n` ready members serving `m` and one member
 /// serving another model, each published. The store and the members of
 /// `m`.
 fn store_of(n: usize) -> (MemoryStore, Vec<WorkerId>) {
     let store = MemoryStore::new();
     let register = |key: String, model: &str| {
-        let id = store
-            .upsert(WorkerFacts {
-                key: key.clone(),
-                engine: key,
-                incarnation: 1,
-                models: vec![model.to_string()],
-                dp_size: 1,
-                ..WorkerFacts::default()
-            })
-            .id();
+        let row = row_of(WorkerFacts {
+            key: key.clone(),
+            engine: key,
+            incarnation: 1,
+            models: vec![model.to_string()],
+            dp_size: 1,
+            ..WorkerFacts::default()
+        });
+        let id = row.id;
+        let epoch = WorkersStore::epoch(&store) + 1;
+        let registered = MembershipChange::Registered { id };
+        store.follow(Position::default(), epoch, registered, Some(row));
         store.publish_now();
-        let revision = WorkersStore::get(&store, id).expect("the row").revision;
-        store
-            .set_status(id, WorkerStatus::Ready, revision)
-            .expect("ready");
+        let ready = MembershipChange::StatusChanged {
+            id,
+            from: WorkerStatus::Pending,
+            to: WorkerStatus::Ready,
+        };
+        store.follow(Position::default(), epoch + 1, ready, None);
+        let landed = WorkersStore::epoch(&store);
+        assert_eq!(landed, epoch + 1, "the member's two writes landed");
         id
     };
     let ids = (0..n)
@@ -678,16 +756,102 @@ fn a_registrations_allocations_do_not_follow_the_fleet() {
                 dp_size: 1,
                 ..WorkerFacts::default()
             };
-            allocations_during(|| {
-                store.upsert(facts);
+            // The row is stated ahead of the count: the count holds the
+            // store's write and the build it owes.
+            let row = row_of(facts);
+            let epoch = WorkersStore::epoch(&store) + 1;
+            let registered = MembershipChange::Registered { id: row.id };
+            let counted = allocations_during(|| {
+                store.follow(Position::default(), epoch, registered, Some(row));
                 store.publish_now();
-            })
-            .1
+            });
+            let landed = WorkersStore::epoch(&store);
+            assert_eq!(landed, epoch, "the registration landed");
+            counted.1
         };
         (0..8).map(one).min()
     };
     let (few, many) = (fewest(8), fewest(512));
     assert_eq!(many, few, "a registration's allocations follow the fleet");
+}
+
+/// A generation of the round-robin preset under `number`.
+fn generation(number: u64) -> AppliedSpec {
+    let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
+    document.generation = number;
+    AppliedSpec::validate(&document).expect("a preset validates")
+}
+
+/// A decision that spans a write frees nothing on its thread. The decision
+/// borrows the world of its instant ([`MemoryStore::deciding`]). A write
+/// that publishes meanwhile replaces that world, so the decision is its
+/// last reader. The writer keeps a replaced world a reader holds until a
+/// later publication finds nobody on it. So the decision's end frees
+/// neither the world, its vetoes, its derived tables nor its generation.
+#[test]
+fn a_decision_that_spans_a_write_frees_nothing_on_its_thread() {
+    let (store, ids) = store_of(64);
+    let gateway = GatewayId(7);
+    let until = Some(Instant::now() + Duration::from_secs(7_200));
+    let member = |key: String, incarnation: u64| WorkerFacts {
+        key: key.clone(),
+        engine: key,
+        incarnation,
+        models: vec!["m".to_string()],
+        dp_size: 1,
+        ..WorkerFacts::default()
+    };
+    // Each membership write is a decided change the store takes
+    // ([`MemoryStore::follow`]), at the epoch it steps to.
+    let follow = |change: MembershipChange, row: Option<WorkerRow>| {
+        let epoch = WorkersStore::epoch(&store) + 1;
+        store.follow(Position::default(), epoch, change, row);
+        let landed = WorkersStore::epoch(&store);
+        assert_eq!(landed, epoch, "the store took {change:?}");
+    };
+    let write = |kind: usize, turn: usize| match kind {
+        // A veto of the asking gateway.
+        0 => store.gateway_veto(gateway, ids[10 + turn], until),
+        // A membership write, and the build it owes.
+        1 => {
+            let row = row_of(member(format!("http://new{turn}:8000"), 1));
+            follow(MembershipChange::Registered { id: row.id }, Some(row));
+            store.publish_now();
+        }
+        // A generation applied.
+        2 => store
+            .apply(generation(turn as u64 + 1))
+            .expect("above the standing one"),
+        // A leave: it pays its build at its answer.
+        3 => follow(MembershipChange::Removed { id: ids[40 + turn] }, None),
+        // A new incarnation: the write pays its build at its answer.
+        _ => {
+            let row = row_of(member(format!("http://w{}:8000", 20 + turn), 2));
+            let replaced = MembershipChange::Replaced {
+                old: ids[20 + turn],
+                new: row.id,
+            };
+            follow(replaced, Some(row));
+        }
+    };
+    for kind in 0..5 {
+        for turn in 0..3 {
+            // The decision holds its world across the write: it is the last
+            // reader of the world the write replaces.
+            let freed = store.deciding(|world| {
+                write(kind, turn);
+                let standing = store.snapshot();
+                assert!(!std::ptr::eq(world, &*standing), "write {kind} published");
+                drop(standing);
+                frees()
+            });
+            assert_eq!(
+                frees() - freed,
+                0,
+                "a decision that spanned write {kind} freed on its thread"
+            );
+        }
+    }
 }
 
 /// A validation builds an index key's error path at the key's refusal
@@ -709,6 +873,20 @@ fn index_keys_that_pass_add_no_allocation_to_a_validation() {
         allocations
     };
     assert_eq!(allocations(2_000), allocations(1_000));
+}
+
+/// The fused walk of the token tree keeps its path in one list: a prompt of
+/// one page that matches nothing in an empty tree allocates that list and
+/// nothing else.
+#[test]
+fn a_fused_walk_of_one_page_allocates_one_list_for_its_path() {
+    let tree = kv_index::TokenTree::new();
+    // One page of the tree, whatever its page size.
+    let page = vec![7u32; tree.page_size()];
+    let walk = || allocations_during(|| tree.match_and_insert_with(&page, |_| None)).1;
+    // The first call interns the tenant an empty tree answers with: unmeasured.
+    let _ = walk();
+    assert_eq!(walk(), 1);
 }
 
 /// The pin of a host in process: the engine over the host's own worker
@@ -1018,6 +1196,78 @@ mod in_process {
             }
             let allocations: usize = (0..256).map(|_| serve()).sum();
             assert_eq!(allocations, 256 * (1 + 2 * a_side), "a pair's two sides");
+        }
+    }
+}
+
+/// What a status tell copies of its worker's models, through a host's
+/// write call on the keeper of its worker objects.
+#[cfg(feature = "worker-host")]
+mod status_tells {
+    use std::sync::Arc;
+
+    use smg_grand_central::{
+        service::replication::Log,
+        store::{MemoryStore, Registrant, WorkerFacts, WorkerStatus, WorkersStore},
+        worker_host::{Members, Objects},
+    };
+    use smg_worker::registry::WorkerRegistry;
+
+    use super::allocations_during;
+
+    /// The fewest allocation calls of one connect signal among a few rows
+    /// that each serve `models` models, over a store that tells a log or
+    /// tells none. The fewest, as the pin of a registration keeps it: a
+    /// tell that paid for a table's growth would not move the count. No
+    /// tell here pays for one: the log's ring is reserved whole where the
+    /// log is built, and the registry makes a worker's lock at its
+    /// registration.
+    fn a_connect_signal(journaled: bool, models: usize) -> usize {
+        let store = if journaled {
+            MemoryStore::journaled(Arc::new(Log::new(64)))
+        } else {
+            MemoryStore::new()
+        };
+        let objects: Objects<Members> = Objects::new(Arc::new(WorkerRegistry::new()));
+        let one = |turn: usize| {
+            let key = format!("http://w{turn}:8000");
+            let facts = WorkerFacts {
+                key: key.clone(),
+                engine: key,
+                incarnation: 1,
+                models: (0..models).map(|at| format!("m{at}")).collect(),
+                dp_size: 1,
+                ..WorkerFacts::default()
+            };
+            let laid = objects.upsert(&store, facts, Registrant::Control);
+            let id = laid.expect("a registration").id();
+            let row = WorkersStore::get(&store, id).expect("the row");
+            let signal = || objects.connect_row(&store, id, row.revision);
+            let ((), allocations) = allocations_during(signal);
+            let stands = WorkersStore::get(&store, id).expect("the row").status;
+            assert_eq!(stands, WorkerStatus::Ready, "the signal readied the row");
+            allocations
+        };
+        (0..8).map(one).min().expect("eight rows")
+    }
+
+    /// A status tell copies each id of its worker's models once where its
+    /// store tells a journal: the list its entry holds, built by the
+    /// keeper. Neither the store nor the log copies an id again. A store
+    /// that tells no journal is handed no list and none is built: its tell
+    /// allocates the same whatever its worker serves.
+    #[test]
+    fn a_status_tell_copies_its_models_once_and_for_a_journal_alone() {
+        const MODELS: usize = 4;
+        for journaled in [false, true] {
+            let one = a_connect_signal(journaled, 1);
+            let many = a_connect_signal(journaled, MODELS);
+            let more = if journaled { MODELS - 1 } else { 0 };
+            assert_eq!(
+                many,
+                one + more,
+                "a journal {journaled}: {one} for one model, {many} for {MODELS}"
+            );
         }
     }
 }

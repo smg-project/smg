@@ -282,7 +282,9 @@ pub mod bench_support {
     /// reports is counted against the form named with it, which holds the
     /// guard or the answer as it does and reports nothing: the difference
     /// is the report alone. Each shows what it holds to an opaque reader,
-    /// as a route hands it to another function or task.
+    /// as a route hands it to another function or task. A pair route
+    /// tells each side through that side's own guard and keeps no answer:
+    /// both of its reporting forms are counted against [`Self::Passed`].
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum Ended {
         /// The guard is shown to an opaque reader and nobody reports: what
@@ -290,14 +292,14 @@ pub mod bench_support {
         Passed,
         /// A streamed answer: its route asks the guard a handle on the
         /// request's end, and the stream's reader reports through it while
-        /// the guard stands. A pair route tells no end yet: its decode's
-        /// reader is handed an empty handle and tests it.
+        /// the guard stands. On a pair route that reader is the decode's,
+        /// and the prefill is told through its guard.
         Streamed,
         /// The route keeps its answer past the guard and nobody reports:
         /// what [`Self::Answer`] is counted against.
         Kept,
         /// An answer read whole: the route keeps its answer and reports
-        /// through it.
+        /// through it. A pair route tells each side through its guard.
         Answer,
         /// The gRPC execution stage's steps behind a placement, and what the
         /// stage's plan does behind a dispatch that answered: it asks the
@@ -651,11 +653,15 @@ pub mod bench_support {
         Some(went)
     }
 
-    /// [`route_pair`] with both guards standing where they are, shown to an
-    /// opaque reader. Under [`Ended::Streamed`] the decode's reader tests
-    /// the empty handle a pair route hands its relay. A pair route keeps no
-    /// answer to report through, and the gRPC stage's forms are a single
-    /// request's: every other form ends as [`Ended::Passed`] does.
+    /// [`route_pair`] on a route that tells each side's end. Both loads
+    /// stand where they are, shown to an opaque reader: the prefill's as a
+    /// pair route holds it with no admission bound (`hold_unbounded`),
+    /// the decode's as its guard. Under [`Ended::Answer`] each side is told
+    /// through its guard, as a pair read whole. Under [`Ended::Streamed`]
+    /// the prefill is told through its guard, and the decode's reader
+    /// reports through the handle asked of the decode's guard. A pair route
+    /// keeps no answer, and the gRPC stage's forms are a single request's:
+    /// every other form ends as [`Ended::Passed`] does.
     pub fn route_pair_ended(
         registry: &WorkerRegistry,
         policies: &PolicyRegistry,
@@ -694,9 +700,19 @@ pub mod bench_support {
         let decode_guard = decode.ahead(key);
         let decode_guard = decode.sent(decode_guard);
         black_box((&prefill, &decode_guard));
-        if end == Ended::Streamed {
-            let reader = black_box(RequestEnd::default());
-            reader.report(200, || true);
+        match end {
+            Ended::Answer => {
+                prefill.end().report(200, || true);
+                RequestEnd::of(&decode_guard).report(200, || false);
+            }
+            Ended::Streamed => {
+                prefill.end().report(200, || true);
+                let reader = black_box(RequestEnd::of(&decode_guard));
+                reader.report(200, || true);
+            }
+            // A pair route keeps no answer, and every other form is a
+            // single request's: each ends as `Passed` does.
+            _ => {}
         }
         Some(went)
     }

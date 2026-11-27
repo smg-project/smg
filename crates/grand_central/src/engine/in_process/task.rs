@@ -378,4 +378,5 @@ impl Loaded<'_, '_> {
 }
 
 #[cfg(test)]
+#[path = "../../../tests/unit/engine/in_process/task/tests.rs"]
 pub(super) mod tests;

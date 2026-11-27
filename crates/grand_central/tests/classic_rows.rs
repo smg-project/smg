@@ -45,10 +45,9 @@
 //! them: the workers the request may be placed on, or its refusal. Each
 //! must replay answer for answer, a refusal by its status and its code.
 //! A pair-select row holds the gateway's answers to the requests of a
-//! prefill pool and a decode pool: the pair, or no pair and why. It must
-//! replay answer for answer, and a drawn row pair for pair and share for
-//! share. The pair-select module holds five recorded rows the pair's
-//! decision answers apart to the answer each entry gives.
+//! prefill pool and a decode pool: the pair, or no pair, for which role
+//! and why. It must replay answer for answer, a refusal by its reason and
+//! its role, and a drawn row pair for pair and share for share.
 //! A pair-bound row is a pair-select row behind the prefill admission,
 //! where a prefill that holds the admission's bound has an open partner or
 //! has none. Its sheet is its own and its replay the pair-select module's,

@@ -23,6 +23,7 @@ use engine_zmq_client::{
 use futures::StreamExt;
 use mock_worker::{
     config::{Config, ReplayConfig, Role},
+    engine::{EngineParams, TimingModel},
     grpc, http, script, zmq,
 };
 use serde_json::{json, Value};
@@ -296,6 +297,56 @@ async fn grpc_encodes_a_scripted_text_with_the_workers_tokenizer() {
         frames.last().and_then(|f| f.response.as_ref()),
         Some(GenResp::Complete(c)) if c.output_ids == vec![1, 2, 3, 4] && c.completion_tokens == 4
     ));
+}
+
+/// A realistic worker whose `--tokenizer` names local files streams only ids
+/// that tokenizer decodes: 300 words (ids 0 to 299) and a special
+/// end-of-sequence token (300), where the engine draws from 100 up.
+#[tokio::test]
+async fn grpc_streams_engine_output_the_workers_tokenizer_decodes() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let vocab: Vec<String> = (0..300).map(|id| format!(r#""w{id}":{id}"#)).collect();
+    let special = r#"{"id":300,"content":"</s>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}"#;
+    let model = format!(
+        r#"{{"type":"WordLevel","vocab":{{{}}},"unk_token":"w0"}}"#,
+        vocab.join(",")
+    );
+    let json = format!(
+        r#"{{"version":"1.0","truncation":null,"padding":null,"added_tokens":[{special}],"normalizer":null,"pre_tokenizer":{{"type":"Whitespace"}},"post_processor":null,"decoder":null,"model":{model}}}"#
+    );
+    std::fs::write(dir.path().join("tokenizer.json"), json).expect("write the tokenizer");
+    let cfg = Config {
+        realistic: true,
+        tokenizer_path: dir.path().display().to_string(),
+        output_tokens: 48,
+        engine: EngineParams {
+            timing: TimingModel::Linear {
+                prefill_tps: 8000.0,
+                decode_base_ms: 1.0,
+                decode_per_req_ms: 0.0,
+            },
+            ..EngineParams::default()
+        },
+        ..config(None)
+    };
+    let (client, _worker) = start_grpc(cfg).await.expect("the worker starts");
+
+    let frames = generate(&client, grpc_request("t", &[7, 7], true, false))
+        .await
+        .expect("the worker answers");
+    let ids: Vec<u32> = frames
+        .iter()
+        .filter_map(|f| match &f.response {
+            Some(GenResp::Chunk(chunk)) => Some(chunk.token_ids.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(ids.len(), 48, "the worker's output tokens, streamed");
+    assert!(
+        ids.iter().all(|id| (100..300).contains(id)),
+        "only ids the worker's tokenizer decodes: {ids:?}"
+    );
 }
 
 #[tokio::test]

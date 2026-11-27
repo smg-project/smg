@@ -61,10 +61,7 @@ fn signals(c: &mut Criterion) {
             })
             .collect();
         // Two cells a row, in the names' order: `pending`, then `used`.
-        let cell = |value: u32| SignalCell {
-            value: f64::from(value),
-            sampled_at_micros: NOW - 1_000,
-        };
+        let cell = |value: u32| SignalCell::of(f64::from(value), NOW - 1_000);
         let cells: Vec<_> = (0..n)
             .flat_map(|row| [cell(row % 7), cell(row % 11)])
             .collect();

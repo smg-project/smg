@@ -38,9 +38,10 @@ use crate::{
             common::stages::{
                 request_execution::{
                     decode_silence_response, dispatch_prefill_within,
-                    first_prefill_response_within, is_prefill_silence, pd_start_failure_response,
-                    prefill_silence_response, retire_pd_side, PdSides, PrefillBound, PrefillWait,
-                    Retirement, SideDispatch, StreamResult,
+                    first_prefill_response_within, is_prefill_silence, owe_decode_end,
+                    pd_start_failure_response, prefill_silence_response, retire_pd_side,
+                    tell_prefill_failure, PdSides, PrefillBound, PrefillWait, Retirement,
+                    SideDispatch, StreamResult,
                 },
                 MovedDecode, RequestAgain, WorkerSelectionStage,
             },
@@ -56,7 +57,7 @@ use crate::{
             utils::{
                 account_pd_side_failure, mark_error_reason,
                 stream_failure::UpstreamClass,
-                tonic_ext::{is_the_engines_own_report, TonicStatusExt},
+                tonic_ext::{is_receive_bound_refusal, is_the_engines_own_report, TonicStatusExt},
             },
         },
     },
@@ -270,6 +271,8 @@ async fn first_decode_response_within(
 /// The attempt's answer for a decode side that failed to start or fell
 /// silent on the sequential path: the breaker sample, the worker-error
 /// counter (the silence verdict counted itself) and the client response.
+/// The answer bears the end the decode owes Grand Central, as the breaker
+/// sampled it: the plan holds the decode's guard and tells it.
 fn sequential_decode_failure(
     e: &tonic::Status,
     workers: &WorkerSelection,
@@ -279,6 +282,17 @@ fn sequential_decode_failure(
     if let Some(status) = e.breaker_status() {
         workers.record_outcome_decode(ledger, status);
     }
+    let mut response = sequential_decode_answer(e, workers, connection);
+    owe_decode_end(&mut response, workers, || e.end_status());
+    response
+}
+
+/// The client response of [`sequential_decode_failure`], with its counter.
+fn sequential_decode_answer(
+    e: &tonic::Status,
+    workers: &WorkerSelection,
+    connection: &'static str,
+) -> Response {
     if is_decode_side_silence(e) {
         if let Some(decode) = workers.decode_worker() {
             return decode_silence_response(e, decode);
@@ -342,6 +356,10 @@ enum SequentialPdDecodeForm {
 /// Worker selection keeps such a request off such workers while the model
 /// pairs a decode worker with the vision encoder (`decode_needs_vision`), so
 /// a refusal here means none is paired.
+// Always in line: the plan's decision ran this built in, on every sequential
+// request's path, before the check of its refusals called it too. With two
+// callers it stood alone, and a request read 32 instructions more.
+#[inline(always)]
 fn sequential_pd_decode_form(
     request: &ProtoGenerateRequest,
     decode_language_model_only: bool,
@@ -401,6 +419,15 @@ fn sequential_pd_decode_form(
     Ok(SequentialPdDecodeForm::TextPlusHashes)
 }
 
+/// What refuses a pair on the MoRI-IO connector, for the plan's decision and
+/// for the check of its refusals alike.
+fn moriio_unsupported() -> Response {
+    error::not_implemented(
+        "moriio_grpc_pd_unsupported",
+        "MoRIIOConnector PD is supported by the HTTP PD router only",
+    )
+}
+
 /// What the sequential dispatch decides before either side is sent: the pair's
 /// KV connector mode, whether the KV handoff is relayed through the router,
 /// the transfer id the router mints for Mooncake, and the decode side's form.
@@ -424,11 +451,12 @@ pub(crate) struct SequentialPlan {
 
 impl SequentialPlan {
     /// Decide the plan from the pair and the request; a pairing this pipeline
-    /// cannot serve (a MoRI-IO decode, a language-model-only decode the
-    /// request's multimodal payload needs more of) is refused here, before
-    /// either side is sent. The dispatch decides it ahead of
+    /// cannot serve (a MoRI-IO decode or prefill, a language-model-only
+    /// decode the request's multimodal payload needs more of) is refused
+    /// here, before either side is sent. The dispatch decides it ahead of
     /// [`execute_sequential_pd`], so a refused request's prefill was never
-    /// said to be sent.
+    /// said to be sent. [`Self::refuses`] makes the same refusals without
+    /// the plan: a refusal added here is added there.
     pub(crate) fn decide(
         proto_request: &ProtoGenerateRequest,
         workers: &WorkerSelection,
@@ -459,12 +487,7 @@ impl SequentialPlan {
             ),
             // Relaying nothing would let the decode engine compute over KV that
             // never arrives, so refuse until this pipeline speaks the protocol.
-            KvConnectorMode::MoriIo => {
-                return Err(error::not_implemented(
-                    "moriio_grpc_pd_unsupported",
-                    "MoRIIOConnector PD is supported by the HTTP PD router only",
-                ));
-            }
+            KvConnectorMode::MoriIo => return Err(moriio_unsupported()),
             KvConnectorMode::Store => debug!(
                 "vLLM PD (KV store): the prefill writes its blocks to the shared store and the \
                  decode reads them back by prefix hash; no connector params on either side"
@@ -515,6 +538,34 @@ impl SequentialPlan {
             stripped_mm_decode,
             streaming: proto_request.stream(),
         })
+    }
+
+    /// What [`Self::decide`] refuses of the pair and the request, asked
+    /// without the plan: of each side's connector it asks one thing,
+    /// whether it is MoRI-IO, and it logs no line and mints no transfer id.
+    /// For a caller that asks ahead of the dispatch that decides the plan.
+    /// `decide` makes the same two refusals in its own lines, which every
+    /// sequential request runs.
+    pub(crate) fn refuses(
+        proto_request: &ProtoGenerateRequest,
+        workers: &WorkerSelection,
+    ) -> Result<(), Response> {
+        // The plan's mode is MoRI-IO for a MoRI-IO decode, and else what the
+        // prefill's connector says.
+        let moriio = [workers.decode_worker(), workers.prefill_worker()]
+            .into_iter()
+            .flatten()
+            .any(|worker| is_moriio_worker(worker.as_ref()));
+        if moriio {
+            return Err(moriio_unsupported());
+        }
+        let relay_kv_params = proto_request.sampling_n() <= 1;
+        let decode_language_model_only = proto_request.is_vllm()
+            && workers
+                .decode_worker()
+                .is_some_and(|worker| worker_language_model_only(worker.as_ref()));
+        sequential_pd_decode_form(proto_request, decode_language_model_only, relay_kv_params)
+            .map(drop)
     }
 
     /// The prefill request carried KV params, so the servicer was asked for
@@ -600,6 +651,11 @@ pub(crate) struct PrefillHarvest {
 /// another decode, and the send said on the decode the request goes to. A
 /// decode the classic policies picked is owed neither, and its dispatch
 /// holds nothing for it.
+///
+/// A batch's dispatch is handed the same for its decode guards, which were
+/// made ahead of their send too: it asks no decode again, and says the send
+/// once, behind what refuses a sub-request. A dispatch that refuses its
+/// request drops this as it is, and the guards are dropped unsent.
 pub(crate) struct DecodeBehindPrefill<'a> {
     /// The selection stage, which states the request again.
     pub stage: &'a WorkerSelectionStage,
@@ -635,8 +691,8 @@ pub(crate) struct DecodeBehindPrefill<'a> {
 /// ([`DecodeBehindPrefill`]): once the prefill has answered the decode is
 /// asked again, and its send is said where it goes out. `None` for a
 /// dispatch that owes its decode neither: a batch's sub-request, whose
-/// decode guard said the send where it was made, and a pair the classic
-/// policies picked.
+/// decode's send the batch or the guard's making said, and a pair the
+/// classic policies picked.
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn execute_sequential_pd(
     plan: SequentialPlan,
@@ -707,6 +763,7 @@ pub(crate) async fn execute_sequential_pd(
                 wire,
                 tried,
                 ledger,
+                claimed: held.claimed(),
             };
             let mut moved = None;
             held.map_decode(|ahead| {
@@ -834,7 +891,10 @@ pub(crate) async fn sequential_prefill_side(
         sides.prompt_tokens,
     )
     .await
-    .map_err(|e| sequential_prefill_failure(&e, workers, sides.ledger, sides.prefill_label))?;
+    .map_err(|e| {
+        tell_prefill_failure(&prefill_guard, &e);
+        sequential_prefill_failure(&e, workers, sides.ledger, sides.prefill_label)
+    })?;
     // The prompt has been pending prefill on its worker since the dispatch,
     // until the first response, which teaches the worker's rate; the stream
     // takes the booking over.
@@ -862,6 +922,7 @@ pub(crate) async fn sequential_prefill_side(
     {
         // Dropping the stream aborts the side's room: nothing was handed off.
         drop(prefill_stream);
+        tell_prefill_failure(&prefill_guard, &e);
         return Err(sequential_prefill_failure(
             &e,
             workers,
@@ -901,6 +962,7 @@ pub(crate) async fn sequential_prefill_side(
                     .filter(|_| sides.streaming || !is_the_engines_own_report(&e))
                 {
                     workers.record_outcome_prefill(sides.ledger, status);
+                    tell_prefill_failure(&prefill_guard, &e);
                 }
                 UpstreamClass::account_dispatch_failure(
                     metrics_labels::WORKER_PREFILL,
@@ -911,13 +973,20 @@ pub(crate) async fn sequential_prefill_side(
                 error!(function = "execute_sequential_pd", error = %e, "Prefill stream error");
                 let mut response =
                     PdSide::Prefill.answer(SidePhase::Stream, e.http_status(), e.message());
+                // An answer above the receive bound is as large from any
+                // prefill worker: final, as the collector's drain makes it.
+                if is_receive_bound_refusal(&e) {
+                    mark_non_retryable(&mut response);
+                }
                 mark_error_reason(&mut response, e.error_reason());
                 return Err(response);
             }
         }
     }
     prefill_stream.mark_completed();
-    // Prefill is drained: its admission slot is free while decode runs.
+    // Prefill is drained: it is told its good answer through its load, and
+    // its admission slot is free while decode runs.
+    prefill_guard.end().report(200, || true);
     drop(prefill_guard);
     workers.record_outcome_prefill(sides.ledger, 200);
     // The prefill phase ends at the drain; recorded by the executor only once
@@ -1665,6 +1734,136 @@ mod tests {
             prefill,
             decode: decode.into(),
             runtime_type: RuntimeType::Vllm,
+        }
+    }
+
+    /// The check of a plan's refusals answers as the plan's own decision
+    /// does: the same refusal, by its code, for every pairing and request
+    /// the decision refuses, and none where the decision makes a plan.
+    #[test]
+    fn the_check_of_a_plans_refusals_answers_as_the_plan_does() {
+        use smg_worker::{identity::basic::MORIIO_CONNECTOR, labels::SUPPORTS_VISION_LABEL};
+
+        let side = |url: &str, worker_type, connector: Option<&str>, vision: Option<&str>| {
+            let mut worker = BasicWorkerBuilder::new(url)
+                .worker_type(worker_type)
+                .runtime_type(RuntimeType::Vllm)
+                .connection_mode(ConnectionMode::Grpc);
+            if let Some(connector) = connector {
+                worker = worker.kv_connector(connector);
+            }
+            if let Some(vision) = vision {
+                worker = worker.label(SUPPORTS_VISION_LABEL, vision);
+            }
+            let worker: Arc<dyn Worker> = Arc::new(worker.build());
+            worker
+        };
+        let pair = |prefill: Option<&str>, decode: Option<&str>, vision: Option<&str>| {
+            WorkerSelection::Disaggregated {
+                encode_assignments: None,
+                prefill: side("grpc://prefill:30000", WorkerType::Prefill, prefill, None),
+                decode: side("grpc://decode:30000", WorkerType::Decode, decode, vision).into(),
+                runtime_type: RuntimeType::Vllm,
+            }
+        };
+        let code = |refused: Response| {
+            refused
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .and_then(|code| code.to_str().ok())
+                .map(str::to_owned)
+        };
+
+        // A multimodal request in the three forms a language-model-only
+        // decode is refused, as the decode form's own case builds them.
+        let gridded = vllm_pd_mm_request();
+        let mut refs_only = vllm_pd_mm_request();
+        let ProtoGenerateRequest::Vllm(req) = &mut refs_only else {
+            panic!("expected vLLM request");
+        };
+        req.mm_inputs = None;
+        req.extra_mm_inputs.clear();
+        // Pixels alone in one sample, which such a decode takes: the same
+        // pixels in two samples are the third form it is refused.
+        let mut pixels = vllm_pd_mm_request();
+        let ProtoGenerateRequest::Vllm(req) = &mut pixels else {
+            panic!("expected vLLM request");
+        };
+        req.media_refs = None;
+        req.mm_inputs
+            .as_mut()
+            .unwrap()
+            .model_specific_tensors
+            .clear();
+        req.sampling_params.get_or_insert_with(Default::default).n = 1;
+        let mut fanout = pixels.clone();
+        let ProtoGenerateRequest::Vllm(req) = &mut fanout else {
+            panic!("expected vLLM request");
+        };
+        req.sampling_params.get_or_insert_with(Default::default).n = 2;
+        let text = recorded_request(1);
+
+        let nixl = Some(NIXL_CONNECTOR);
+        let moriio = Some(MORIIO_CONNECTOR);
+        let rows = [
+            ("a NIXL pair", pair(nixl, None, None), &text, None),
+            (
+                "a MoRI-IO decode",
+                pair(nixl, moriio, None),
+                &text,
+                Some("moriio_grpc_pd_unsupported"),
+            ),
+            (
+                "a MoRI-IO prefill",
+                pair(moriio, None, None),
+                &text,
+                Some("moriio_grpc_pd_unsupported"),
+            ),
+            (
+                "grids for a language-model-only decode",
+                pair(nixl, None, Some("false")),
+                &gridded,
+                Some("pd_decode_language_model_only_mrope"),
+            ),
+            (
+                "media references for a language-model-only decode",
+                pair(nixl, None, Some("false")),
+                &refs_only,
+                Some("pd_decode_language_model_only_media_refs"),
+            ),
+            (
+                "samples of a multimodal prompt for a language-model-only decode",
+                pair(nixl, None, Some("false")),
+                &fanout,
+                Some("pd_decode_language_model_only_n_samples"),
+            ),
+            (
+                "one sample of a multimodal prompt for a language-model-only decode",
+                pair(nixl, None, Some("false")),
+                &pixels,
+                None,
+            ),
+            (
+                "text for a language-model-only decode",
+                pair(nixl, None, Some("false")),
+                &text,
+                None,
+            ),
+            (
+                "grids for a decode with the vision encoder",
+                pair(nixl, None, Some("true")),
+                &gridded,
+                None,
+            ),
+        ];
+        for (name, workers, request, refused) in rows {
+            // A refusal is read as one whatever it bears: a refusal with no
+            // code is not a row's `None`.
+            let refused = refused.map(|code| Some(code.to_owned()));
+            let checked = SequentialPlan::refuses(request, &workers).err().map(code);
+            let decided = SequentialPlan::decide(request, &workers).err().map(code);
+            assert_eq!(checked, refused, "{name}: the check");
+            assert_eq!(decided, refused, "{name}: the plan's decision");
         }
     }
 

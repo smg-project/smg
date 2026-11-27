@@ -178,7 +178,8 @@ impl SglangScheduler for MockScheduler {
         // gateway's carries none. The tensor is tens of megabytes an image,
         // so the fold takes eight bytes a step and waits until the cache
         // reads the spans: a prefill-role or scripted request, and the
-        // canned engine, never pay for it.
+        // canned engine, never pay for it, but a gRPC prefill worker under
+        // `--prefill-engine true` does.
         let (batch, extra) = (req.mm_inputs, req.extra_mm_inputs);
         let media = move || -> Vec<MediaSpan> {
             let batches = batch.as_deref().into_iter().chain(&extra);
@@ -452,6 +453,7 @@ fn response(request_id: &str, frame: Frame) -> sg::GenerateResponse {
     sg::GenerateResponse {
         request_id: request_id.to_string(),
         media_identity: None,
+        prepared_input: Vec::new(),
         response: Some(response),
     }
 }

@@ -23,13 +23,13 @@
 //! A request whose host names its entry in a token tree ([`TokenKey`]) is
 //! decided another way where the host lends the tree of the request's place
 //! ([`CacheIndexes::token_tree`]) and the model has no index of cache
-//! events: inside the tree's match ([`TokenTree`]). The match names the
-//! workers sent the deepest prefix of the request, and the same descent
-//! writes the request for the worker picked. The pick states its first
-//! target's entry of the rows the match named, as every other pick states
-//! its rows'. The tree is the host's own, the one its policy reads and
-//! writes: the engine keeps none. A request its host holds as text is
-//! decided the same way inside the host's string tree
+//! events that holds a block: inside the tree's match ([`TokenTree`]). The
+//! match names the workers sent the deepest prefix of the request, and the
+//! same descent writes the request for the worker picked. The pick states
+//! its first target's entry of the rows the match named, as every other
+//! pick states its rows'. The tree is the host's own, the one its policy
+//! reads and writes: the engine keeps none. A request its host holds as
+//! text is decided the same way inside the host's string tree
 //! ([`CacheIndexes::string_tree`], [`TextKey`]), whether or not the model
 //! has an index: an index speaks of token blocks.
 //!
@@ -38,11 +38,13 @@
 //! - **Once a list of workers** ([`PoolAffinity`]): each worker's number in
 //!   the model's index, what the index held for it and when it was
 //!   admitted, and the list's warming rows by the profile's own ruling
-//!   ([`WarmUpRule`]). It is a ruling read from the index and the worker
+//!   ([`WarmUpRule`]), none while the model's index holds no block. It is
+//!   a ruling read from the index and the worker
 //!   objects, never a copy of a worker's health or load. One decision reads
-//!   it again once its second is up, or once the index handed one of its
-//!   numbers on to another worker, behind one atomic flag, and swaps it in
-//!   by pointer. A decision loads the pointer and writes no shared word.
+//!   it again once its second is up, once the index handed one of its
+//!   numbers on to another worker, or once the index's word of holding a
+//!   block moved, behind one atomic flag, and swaps it in by pointer. A
+//!   decision loads the pointer and writes no shared word.
 //! - **Once a model** ([`Affinity`]): the record of the prefixes sent to the
 //!   workers the index does not speak for, and to every worker by a request
 //!   hashed by its text or decided by a profile that reads sent prefixes
@@ -97,7 +99,7 @@ use crate::{
         prompt_hashes::PromptHashes,
         view::{
             blocks_within, fingerprint, AffinityFacts, AffinityHolder, AffinityRows, Feed,
-            HashKind, Phase, RequestFacts, WorkerId,
+            HashKind, Phase, RequestFacts, TreeMatch, WorkerId,
         },
         warm_up::WarmUpState,
     },
@@ -109,8 +111,9 @@ use crate::{
 const NONE: u32 = u32::MAX;
 
 /// How long a list's table stands before one decision reads it again, in
-/// microseconds. One whose numbers the index handed on is read again
-/// before that ([`Table::numbered`]).
+/// microseconds. One whose numbers the index handed on, or whose index's
+/// word of holding a block moved, is read again before that
+/// ([`Table::stands_by_index`]).
 const TABLE_STANDS_MICROS: u64 = 1_000_000;
 
 /// The index numbers a table maps. An index hands its numbers out from zero
@@ -149,6 +152,17 @@ pub trait CacheIndex: Send + Sync {
         0
     }
 
+    /// Whether the index holds a block for any worker. A list's table reads
+    /// it ahead of the numbers, reads an index that holds none as no index,
+    /// and is read again once the word moved: a decision asks it where it
+    /// takes the list's table, so the answer must cost as little as a
+    /// count's read. The default is an index that holds one, which is the
+    /// word of a host that hands no index while its index is empty
+    /// ([`CacheIndexes::index`]).
+    fn holds_a_block(&self) -> bool {
+        true
+    }
+
     /// How many blocks the index holds for the worker of `number`.
     fn worker_blocks(&self, number: u32) -> usize;
 
@@ -180,6 +194,11 @@ impl CacheIndex for ChainIndex {
 
     fn numbers_reused(&self) -> u64 {
         self.ids_reused()
+    }
+
+    /// The root's own test, in constant time.
+    fn holds_a_block(&self) -> bool {
+        !self.is_empty()
     }
 
     fn worker_blocks(&self, number: u32) -> usize {
@@ -353,12 +372,20 @@ fn keep_deepest(kept: &mut Vec<(u32, u32)>, cap: usize, below: &mut dyn FnMut(u3
 /// of the prompts it sent.
 pub trait CacheIndexes: Send + Sync {
     /// The index of `model`, the model id its workers registered under.
-    /// `None` where no worker of the model streams cache events, and while
-    /// the index holds no block: a request is then decided by the host's
-    /// token tree, where it lends one ([`Self::token_tree`]). An index
-    /// handed decides a single request of token ids alone where a prefix
-    /// stage of its profile reads cache events: no record of sent
-    /// prefixes is read or written for it.
+    /// `None` where no worker of the model streams cache events. An index
+    /// that holds no block is read as none: a request is then decided by
+    /// the host's token tree, where it lends one ([`Self::token_tree`]).
+    /// A host says so in one of two ways. It hands the index whenever the
+    /// model has one, and the index answers whether it holds a block
+    /// ([`CacheIndex::holds_a_block`]): a list's table is read again by
+    /// the first decision that finds the word moved, so a model's first
+    /// block and its last block's leaving decide from that table on. Or
+    /// it hands none while the index holds no block and keeps the word's
+    /// default: the engine then learns of either with the list's next
+    /// table, up to a second later. An index that holds a block decides a
+    /// single request of token ids alone where a prefix stage of its
+    /// profile reads cache events: no record of sent prefixes is read or
+    /// written for it.
     fn index(&self, model: &str) -> Option<Arc<dyn CacheIndex>>;
 
     /// The size of one cache block of `model` in tokens, as its workers'
@@ -404,8 +431,8 @@ pub trait CacheIndexes: Send + Sync {
 #[derive(Default)]
 pub struct Affinity {
     indexes: OnceLock<Arc<dyn CacheIndexes>>,
-    /// The record of sent prefixes of each model, by the model id its
-    /// workers registered under. Locked where a list's table is read, at a
+    /// The record of sent prefixes of each model, by the id a list's first
+    /// worker lists the model under. Locked where a list's table is read, at a
     /// change of membership and at the timer's sweep: never by a decision's naming
     /// or its write, which hold their record by the list's table. A write
     /// a thread keeps holds its record itself ([`Waiting`]).
@@ -486,9 +513,10 @@ impl Affinity {
     /// registry: each one the map alone holds that holds a worker's place,
     /// under a model `stated` says none of the follow's workers states as
     /// its own, with the number of its last taking. A list keeps its
-    /// record under the model its first worker states, so no list reads a
-    /// record whose model no worker that stands states. The follow asks
-    /// its registry of each ahead of [`Self::let_go`].
+    /// record under a model its first worker lists (the id of the card
+    /// that answers to the request's name, else its first model), so no
+    /// list reads a record whose model no worker that stands lists. The
+    /// follow asks its registry of each ahead of [`Self::let_go`].
     pub(super) fn unstated(&self, stated: impl Fn(&str) -> bool) -> Vec<(Box<str>, u64)> {
         let mut records = self.records.lock();
         let unstated = records.iter_mut().filter_map(|(model, record)| {
@@ -600,16 +628,24 @@ impl Affinity {
             .collect()
     }
 
-    /// The record of `model`, made at its first asking and held to `bound`
-    /// placements.
-    fn record_of(&self, model: &str, bound: usize) -> Arc<PrefixRecord> {
+    /// The record of `model`, made at its first asking and held to the
+    /// placements `max_size` tokens make at `size` tokens a block, the size
+    /// the list's first worker is hashed by. A record a list reads from
+    /// `behind` its first worker's first model is read by lists of other
+    /// first models and other sizes: it is held by the smallest size asked
+    /// ([`PrefixRecord::hold`]).
+    fn record_of(&self, model: &str, max_size: u64, size: u32, behind: bool) -> Arc<PrefixRecord> {
+        let bound = |size: u32| {
+            let bound = (max_size / u64::from(size.max(1))).max(1);
+            usize::try_from(bound).unwrap_or(usize::MAX)
+        };
         let record = {
             let mut records = self.records.lock();
             let record = if let Some(record) = records.get(model) {
                 Arc::clone(record)
             } else {
                 let left = self.left_past.load(Ordering::Relaxed);
-                let record = Arc::new(PrefixRecord::new(bound, left));
+                let record = Arc::new(PrefixRecord::new(bound(size), left));
                 records.insert(model.into(), Arc::clone(&record));
                 record
             };
@@ -621,7 +657,7 @@ impl Affinity {
             record
         };
         // Outside the map's mutex: a bound that moved takes the record.
-        record.bound_to(bound);
+        record.hold(size, behind, bound);
         record
     }
 }
@@ -635,6 +671,13 @@ struct PrefixRecord {
     /// The record's bound as the last table set it: a table's read takes
     /// the record, which the deciders hold, only where the bound moved.
     bound: AtomicUsize,
+    /// The block sizes the record's lists asked it with, which hold its
+    /// bound once a list read it from behind its first model. Such a
+    /// record is read by lists hashed at different sizes: held by the
+    /// size of each, its bound would follow which worker heads a list.
+    /// One table's read at a time takes them, to size the record
+    /// ([`Self::hold`]).
+    sizes: Mutex<Sizes>,
     /// Work waits for a sweep: a worker left, or the bound came down.
     sweeping: AtomicBool,
     /// How many leaves were told, counted on from where the map's records
@@ -700,6 +743,14 @@ const fn tick_of(now_micros: u64) -> u16 {
     (now_micros >> 20) as u16
 }
 
+/// The block sizes a record's lists asked it with ([`PrefixRecord::hold`]).
+struct Sizes {
+    /// The smallest size a list asked with since the record was made.
+    smallest: u32,
+    /// A list read the record from behind its first model.
+    shared: bool,
+}
+
 impl PrefixRecord {
     /// A write gives the lock back after this many blocks.
     const SLICE: usize = 16;
@@ -710,6 +761,10 @@ impl PrefixRecord {
         Self {
             predictor: RwLock::new(PrefixPredictor::new(bound)),
             bound: AtomicUsize::new(bound),
+            sizes: Mutex::new(Sizes {
+                smallest: u32::MAX,
+                shared: false,
+            }),
             sweeping: AtomicBool::new(false),
             left: AtomicU64::new(left),
             left_out: AtomicU64::new(0),
@@ -724,6 +779,21 @@ impl PrefixRecord {
             self.predictor.write().set_bound(bound);
             self.sweeping.store(true, Ordering::Relaxed);
         }
+    }
+
+    /// Holds the record to the placements `bound` makes of the block size
+    /// a list asks with: `size` while every list reads the record under
+    /// its first model, as its bound always was; the smallest size asked
+    /// since the record was made, by the lists ahead too, once a list read
+    /// it from `behind` its first model. That size does not rise while the
+    /// record lives. The size is picked and the bound set under one lock:
+    /// a list that picked ahead of a smaller size sets no bound behind it.
+    fn hold(&self, size: u32, behind: bool, bound: impl Fn(u32) -> usize) {
+        let mut sizes = self.sizes.lock();
+        sizes.smallest = sizes.smallest.min(size);
+        sizes.shared |= behind;
+        let size = if sizes.shared { sizes.smallest } else { size };
+        self.bound_to(bound(size));
     }
 
     /// Counts the leave also where the record holds no place for `worker`:
@@ -798,7 +868,8 @@ impl PrefixRecord {
     /// the rest and writes on behind its next picks ([`Waiting`]). `None`
     /// where nothing is left to write: the request stands whole, or a
     /// worker left since the naming, and the record gives no place to a
-    /// worker told gone.
+    /// worker told gone. A turn that meets the lock held asks for such a
+    /// leave too: a thread keeps no write that can write nothing.
     fn write(
         &self,
         keys: &[u64],
@@ -817,8 +888,12 @@ impl PrefixRecord {
             // before this one.
             let end = (done + Self::SLICE).min(keys.len());
             let Some(mut predictor) = self.predictor.try_write() else {
-                return Some(done);
+                // Asked where the lock is met held, and at no other turn: a
+                // stale write handed back from here would be kept by its
+                // thread, in a place of a write that can stand.
+                return (self.left.load(Ordering::Relaxed) == left).then_some(done);
             };
+            // Under the lock the count is the one the record stands by.
             if self.left.load(Ordering::Relaxed) != left {
                 return None;
             }
@@ -864,8 +939,9 @@ impl Drop for Reading<'_> {
 /// One list of workers as the affinity stages' rows are named from it, for
 /// the decisions of one model and phase: read in one pass over the list and
 /// standing for a second, or until the index hands one of its numbers on
-/// ([`Self::numbered`]). It holds what the index and the worker objects
-/// said at its read, as a ruling: who the index speaks for, and who warms.
+/// or its word of holding a block moves ([`Self::stands_by_index`]). It
+/// holds what the index and the worker objects said at its read, as a
+/// ruling: who the index speaks for, and who warms.
 struct Table {
     /// The place the table answers for.
     model: Box<str>,
@@ -894,8 +970,19 @@ struct Table {
     /// worker where this costs one copy of the list. Empty where the stages
     /// read no affinity.
     column: Box<[AffinityFacts]>,
-    /// The model's index of cache events, where it has one.
+    /// The model's index of cache events, where its host handed one. It is
+    /// kept while it holds no block too: its word is asked again where a
+    /// decision takes the table ([`Self::stands_by_index`]).
     index: Option<Arc<dyn CacheIndex>>,
+    /// The index's word of holding a block ([`CacheIndex::holds_a_block`])
+    /// as the table was built under it, read ahead of the count and the
+    /// numbers below. An index that holds none is read as no index: no
+    /// number, no worker heard, and the host's token tree where it lends
+    /// one.
+    holds: bool,
+    /// Whether the index decides a single request of token ids by itself
+    /// ([`Self::index_alone`]): said once, at the table's read.
+    decides: bool,
     /// The index's count of numbers handed out a second time
     /// ([`CacheIndex::numbers_reused`]), read ahead of the numbers below:
     /// they are the index's while it reads the same ([`Self::numbered`]).
@@ -913,11 +1000,16 @@ struct Table {
     /// token blocks. The row holds a number in the index and a block or more
     /// there. The record of sent prefixes speaks for every other row, and
     /// for every row on a request hashed by its text or read by a profile
-    /// that reads sent prefixes alone ([`Self::recorded`]).
+    /// that reads sent prefixes alone ([`Self::recorded`]). That is the
+    /// answer for a pair's side, and for a single request where the table
+    /// holds no index that holds a block: where the index decides a single
+    /// request alone, the record speaks for no row ([`Self::index_alone`]).
     heard: Box<[u64]>,
     /// Whether the index speaks for any row, and whether the record does on
     /// a request hashed by token blocks that a profile reading cache events
-    /// decides.
+    /// decides. The second is asked for a pair's side, and for a single
+    /// request where the table holds no index that holds a block
+    /// ([`Self::index_alone`]).
     heard_any: bool,
     unheard_any: bool,
     /// The model's record of sent prefixes, where the profile reads one.
@@ -943,10 +1035,10 @@ struct Table {
     /// [`Engine::side_reads_sent_alone`]: crate::engine::Engine::side_reads_sent_alone
     side_alone: bool,
     /// The host's token tree for the place, where it lends one, the
-    /// profile reads a record and the model has no index of cache events: a
-    /// request whose host names its entry is decided inside the tree's
-    /// match. The handle is the host's own tree, kept while the table
-    /// stands.
+    /// profile reads a record and the model has no index of cache events
+    /// that holds a block ([`Self::holds`]): a request whose host names its
+    /// entry is decided inside the tree's match. The handle is the host's
+    /// own tree, kept while the table stands.
     sent: Option<Arc<TokenTree>>,
     /// The host's string tree for the place, where it lends one and the
     /// profile reads a record: a request hashed by its text whose host
@@ -1002,7 +1094,8 @@ impl Table {
     /// number in the model's index (one lookup by address), the blocks the
     /// index holds for it, what its index gained since its admission and
     /// its admission instant. Then the profile's ruling of who warms, over
-    /// those columns.
+    /// those columns, asked while the index holds a block: under an index
+    /// that holds none the table names no warming row.
     fn read(asked: &Asked<'_>) -> Self {
         let Asked {
             affinity,
@@ -1028,6 +1121,8 @@ impl Table {
             states: engine.profile_reads_affinity(model, phase),
             column: Box::default(),
             index: None,
+            holds: false,
+            decides: false,
             reused: 0,
             row_of: Box::default(),
             within: Box::default(),
@@ -1059,9 +1154,17 @@ impl Table {
             .indexes
             .get()
             .and_then(|indexes| indexes.index(registered));
+        // The word first, ahead of the count and the numbers: a first block
+        // or a last one's leaving under this pass leaves the table a word
+        // the index has moved past, and the next decision reads it again.
+        table.holds = index.as_ref().is_some_and(|index| index.holds_a_block());
+        table.decides = table.holds && phase == Phase::Single;
         // Ahead of the numbers: one that changes hands under this pass
         // leaves the table a count the index has moved past.
         table.reused = index.as_ref().map_or(0, |index| index.numbers_reused());
+        // An index that holds no block is read as none: no worker is asked
+        // for its number, as under a host that hands no such index.
+        let heard_by = index.as_ref().filter(|_| table.holds);
         let rows = workers.len();
         let mut numbers = vec![NONE; rows];
         let mut sizes = vec![0u32; rows];
@@ -1073,7 +1176,7 @@ impl Table {
             let age = micros(worker.admitted_age());
             admitted[row] = now.saturating_sub(age);
             column[row].admitted_age_ms = millis(age);
-            let Some(index) = &index else {
+            let Some(index) = heard_by else {
                 continue;
             };
             let number = index.worker_number(worker.url());
@@ -1111,7 +1214,12 @@ impl Table {
         table.within = within.into();
         table.numbers = numbers.into();
         table.heard = heard.into();
-        if let Some(rule) = engine.pool_rule_for(model, phase) {
+        // A warming row catches up to what the index holds: under an index
+        // that holds no block a single request is named none, as the classic
+        // policy calls its warm-up slice on its road of cache events alone.
+        // A pair's side reads the list's column, which its stage rules by
+        // age and size.
+        if let Some(rule) = engine.pool_rule_for(model, phase).filter(|_| table.holds) {
             let (mut level, mut warming) = (Vec::new(), Vec::new());
             table.ruled = rule.list_warming_rows_grown(
                 &sizes,
@@ -1126,24 +1234,37 @@ impl Table {
             table.warming = warming.into();
         }
         let record = engine.pool_record_for(model, phase);
-        // The record is the registered model's, and so are its settings.
-        let settings = spec.index_for(registered);
+        // The record is the model's the request names, and so are its
+        // settings and the trees lent for it, by the id of the first
+        // worker's card that answers to the name, an id ahead of an alias
+        // as the registry reads a name: a list of a model holds workers of
+        // different first models. A name no card answers to is the
+        // caller's own word, and reads the first model's record.
+        let mut named = None;
+        first.any_model(&mut |card| {
+            let id = card.id == model;
+            if id || (named.is_none() && card.matches(model)) {
+                named = Some(card.id.clone());
+            }
+            id
+        });
+        let named = named.as_deref().unwrap_or(registered);
+        let settings = spec.index_for(named);
         if let Some(alone) = record.filter(|_| settings.kind == IndexKind::Tree) {
             let size = affinity.block_size(registered);
             let size = size.unwrap_or_else(|| spec.block_size()).max(1);
-            let bound = (settings.max_size / u64::from(size)).max(1);
-            let bound = usize::try_from(bound).unwrap_or(usize::MAX);
-            table.record = Some(affinity.record_of(registered, bound));
+            let behind = named != registered;
+            table.record = Some(affinity.record_of(named, settings.max_size, size, behind));
             table.alone = alone;
             table.side_alone = engine.side_reads_sent_alone(model, phase);
             if cap != 0 {
                 let lent = affinity.indexes.get();
-                if table.index.is_none() {
-                    table.sent = lent.and_then(|indexes| indexes.token_tree(registered, phase));
+                if !table.holds {
+                    table.sent = lent.and_then(|indexes| indexes.token_tree(named, phase));
                 }
                 // A request of text reads no index: its tree is asked for
                 // beside one too.
-                table.sent_text = lent.and_then(|indexes| indexes.string_tree(registered, phase));
+                table.sent_text = lent.and_then(|indexes| indexes.string_tree(named, phase));
             }
             if table.sent.is_some() || table.sent_text.is_some() {
                 let print = |worker: &Arc<dyn Worker>| fingerprint(worker.url().as_bytes());
@@ -1172,6 +1293,23 @@ impl Table {
     fn numbered(&self) -> bool {
         let index = self.index.as_ref();
         index.is_none_or(|index| index.numbers_reused() == self.reused)
+    }
+
+    /// Whether the table still stands by its index, asked where a decision
+    /// takes the table: the index's word of holding a block is the one the
+    /// table was built under ([`CacheIndex::holds_a_block`]), and under an
+    /// index that held one its numbers are still the index's
+    /// ([`Self::numbered`]). A table built under an index that held none
+    /// read no number, and is asked the word alone. So a model's first
+    /// block, and its last block's leaving, read the table again at the
+    /// first decision that finds the word moved. A table that was handed no
+    /// index answers at one test.
+    fn stands_by_index(&self) -> bool {
+        let Some(index) = self.index.as_ref() else {
+            return true;
+        };
+        index.holds_a_block() == self.holds
+            && (!self.holds || index.numbers_reused() == self.reused)
     }
 
     /// Whom the record of sent prefixes speaks for on a request hashed by
@@ -1211,13 +1349,17 @@ impl Table {
     /// a worker the index holds nothing for is named nothing. Each side of
     /// a pair is decided at its own phase and keeps both.
     ///
-    /// An index the table was handed holds a block: its host hands none
-    /// while the index holds none ([`CacheIndexes::index`]). The table
-    /// stands for a second, so the word is as old as the table.
+    /// The answer is the table's own, said once at its read from the
+    /// index's word of holding a block ([`CacheIndex::holds_a_block`]): the
+    /// rule asks this at every question and reads one field. The word is
+    /// as old as the table. A decision that finds it moved reads the table
+    /// again ([`Self::stands_by_index`]), and while it does, the others
+    /// decide by the table that stands: the old word decides for the
+    /// length of one read. Under a host that hands no index while its
+    /// index is empty the word keeps its default, and a model's first
+    /// block is seen with the list's next table, up to a second later.
     fn index_alone(&self) -> bool {
-        // The index first: the rule asks this at every question, and a
-        // table that was handed none answers at one test.
-        self.index.is_some() && self.phase == Phase::Single
+        self.decides
     }
 
     /// The row of the worker `id` where the record of sent prefixes speaks
@@ -1251,8 +1393,11 @@ impl Table {
     /// request's prefix reaches, each holding its first `blocks` blocks, and
     /// the list's warming rows. Each list is at most the cap, ascending by
     /// row: past the cap the holders are a draw. A match under one block
-    /// names no holder. A request held to `places` is named the rows among
-    /// them, and the cap counts no other.
+    /// names its workers with no block held: its caller hands the workers
+    /// of any match that holds something, and the decision reads how much
+    /// from the match's own two numbers ([`AffinityRows::tree`]). A request
+    /// held to `places` is named the rows among them, and the cap counts no
+    /// other.
     fn name_sent(
         &self,
         sent: &[TenantId],
@@ -1273,7 +1418,7 @@ impl Table {
         warming.clear();
         let mut draw = Draw::new(facts.seed ^ HOLDERS_STREAM);
         let mut seen = 0usize;
-        for address in sent.iter().filter(|_| blocks > 0) {
+        for address in sent {
             self.rows_at(workers, address, |row| {
                 if !among(places, row) {
                     return;
@@ -1813,6 +1958,11 @@ impl Waiting {
     /// the request of `keys`, which that request's own write continues, and
     /// returns how many of its blocks stand. A write named before a leave
     /// told since (`left`) hands on no progress: the worker may be a new one.
+    ///
+    /// Where the two counts differ and the kept write's is its record's
+    /// still, the request's own naming is the older one. Its write stops
+    /// at the record ([`PrefixRecord::write`]), so the kept write is not
+    /// taken out: it stays for its own turn ([`Self::write_on`]).
     fn take_leading(
         &mut self,
         record: &PrefixRecord,
@@ -1820,12 +1970,16 @@ impl Waiting {
         target: WorkerId,
         left: u64,
     ) -> Option<usize> {
-        let at = self.writes.iter().position(|write| {
+        let found = self.writes.iter().enumerate().find(|(_, write)| {
             // A key folds every block up to its own: the last one says all.
             let last = write.keys.last();
             let leads = last.is_some_and(|key| keys.get(write.keys.len() - 1) == Some(key));
             leads && write.target == target && std::ptr::eq(&*write.record, record)
-        })?;
+        });
+        let (at, kept) = found?;
+        if kept.left != left && kept.left == record.left.load(Ordering::Relaxed) {
+            return None;
+        }
         let write = self.writes.remove(at);
         self.spare.push(write.keys);
         (write.left == left).then_some(write.done)
@@ -1858,9 +2012,13 @@ impl Waiting {
         });
     }
 
-    /// Writes on, the oldest first, until a turn meets a held lock. A write
-    /// that waited is a use at `tick`, the tick of the pick that writes it
-    /// on: it sets no block's last use back.
+    /// Writes on, the oldest first, until a write that can stand meets a
+    /// held lock. A stale one ends at its turn, at a held lock too, and the
+    /// next is written on. A write that waited is a use at `tick`, the tick
+    /// of the pick that writes it on, and not at its own older one: it sets
+    /// no block's last use back. A pick named ahead of the write may hold
+    /// the older tick: a pair's, where a stage asked for the write's
+    /// decision inside the pair's own.
     fn write_on(&mut self, tick: u16) {
         while let Some(write) = self.writes.first_mut() {
             let (record, keys) = (&write.record, &write.keys);
@@ -1902,7 +2060,8 @@ fn shared(one: &[u64], other: &[u64]) -> usize {
 /// request of the thread's keys, on from the blocks the target holds, then
 /// the writes the thread keeps ([`Waiting`]). `held` says the naming found
 /// the target among the workers sent the request's deepest block. A request
-/// that meets the lock held is kept, with whatever waits behind it.
+/// that meets the lock held is kept, with whatever waits behind it. A stale
+/// one is not: it ends there, and what waits behind it is written on.
 fn write_behind(
     record: &Arc<PrefixRecord>,
     buffers: &mut Buffers,
@@ -2024,17 +2183,16 @@ struct Asked<'a> {
 /// reads no affinity states nothing, whether it is given no rows or the
 /// rows of its binding's shadow.
 ///
-/// A request decided inside a tree's match states what the match's rows
-/// say: the match's tokens, or the bytes of text it matched, counted in the
-/// request's blocks for a worker named among its holders, and a miss for
-/// any other. A gateway's classic cache-aware policy observes another
-/// thing of such a request, the match's share of the prompt's tokens or
-/// chars whoever it chose, so the two differ in three places. A match
-/// under one block states a miss: a prompt shorter than one block always
-/// does, where the classic policy may observe it whole. A pick that is
-/// none of the match's holders states a miss, where the classic policy
-/// observes the match's share. Past the cap the holders named are a draw,
-/// so a holder the draw left out states a miss too.
+/// A request decided inside a tree's match states the match's own two
+/// numbers for a worker named among its holders: the match's size and the
+/// request's, in the tree's unit, tokens or chars
+/// ([`OverlapSource::Tree`](crate::engine::OverlapSource::Tree)). Any
+/// other worker is a miss of the request's blocks. A gateway's classic
+/// cache-aware policy observes the same two numbers of such a request,
+/// whoever it chose, so the two differ in two places. A pick that is none
+/// of the match's holders states a miss, where the classic policy observes
+/// the match's share. Past the cap the holders named are a draw, so a
+/// holder the draw left out states a miss too.
 ///
 /// The rows live in the calling thread's buffers until this returns:
 /// `decide` reads them and keeps nothing of them. Nothing is allocated once
@@ -2249,6 +2407,10 @@ pub(super) fn column(
 /// is the document's block size, by which the request is counted where its
 /// host counted with none.
 ///
+/// Rows a tree's match named carry the match ([`AffinityRows::tree`]), and
+/// a worker named among them is stated the match's own two numbers
+/// ([`Overlap::in_tree`]): what the classic policy's series divides.
+///
 /// The feed is handed by itself, and not the facts the decision was made
 /// over: a decision that reads no fact, as a pin's answer handed through
 /// here, then makes no copy of them for this statement.
@@ -2267,9 +2429,17 @@ pub(super) fn state(decision: &mut Decision, feed: Feed<'_>, facts: &RequestFact
     let Some(row) = told_target(decision).map(|target| target.position) else {
         return;
     };
-    let held = feed.entry_or_default(row);
+    // The tree is asked first: rows no tree named cost no search here.
+    let tree = match feed {
+        Feed::Named(named) => named.tree.filter(|_| named.names(row)),
+        Feed::Column(_) => None,
+    };
+    let stated = match tree {
+        Some(tree) => Overlap::in_tree(tree.matched, tree.of, false),
+        None => Overlap::held(feed.entry_or_default(row), facts.blocks(block)),
+    };
     if let Decision::Pick(pick) = decision {
-        pick.targets.state(Overlap::held(held, facts.blocks(block)));
+        pick.targets.state(stated);
     }
 }
 
@@ -2362,12 +2532,13 @@ impl PoolAffinity {
         let table = standing.as_deref();
         if let Some(table) = table.filter(|table| table.is_of(asked.model, asked.phase)) {
             // It stands for its second, while the index hands none of its
-            // numbers on.
-            let stands =
-                asked.now.saturating_sub(table.read_at) < TABLE_STANDS_MICROS && table.numbered();
+            // numbers on and keeps its word of holding a block.
+            let stands = asked.now.saturating_sub(table.read_at) < TABLE_STANDS_MICROS
+                && table.stands_by_index();
             // One decision reads a table again; the others decide by the
             // one that stands, whose lookup names nobody once a number of
-            // it was handed on.
+            // it was handed on, and whose word of the index is the old one
+            // for the length of that read.
             if stands || self.reading.swap(true, Ordering::AcqRel) {
                 return with(table);
             }
@@ -2427,15 +2598,18 @@ fn sent_address<'w>(
 }
 
 /// What a tree's walk hands its match to ([`Table::decide_in_tree`]): the
-/// workers the match found and the request's blocks it holds, answered
-/// with the address the walk writes the request for, where it writes it.
-type Over<'a, 'w> = dyn FnMut(&[TenantId], u32) -> Option<&'w str> + 'a;
+/// workers the match found, the match's own two numbers and the request's
+/// whole blocks it holds, answered with the address the walk writes the
+/// request for, where it writes it.
+type Over<'a, 'w> = dyn FnMut(&[TenantId], TreeMatch, u32) -> Option<&'w str> + 'a;
 
 /// The bytes of the leading `matched` chars of `text` that lie behind its
 /// first `marker` chars: what a string tree's match holds of a prompt whose
 /// key begins with a partition's marker. A string tree counts chars, and a
 /// request of text is sized in bytes. One pass over the matched chars,
-/// which its caller makes only for a key of several bytes a char.
+/// which its caller makes only for a key of several bytes a char. A
+/// holder's entry alone reads it, for the request's whole windows: the
+/// decision divides the match's chars by the request's.
 fn bytes_behind(text: &str, marker: usize, matched: usize) -> usize {
     let matched = text.chars().take(matched);
     matched.skip(marker).map(char::len_utf8).sum()
@@ -2482,9 +2656,11 @@ impl Table {
             let facts = &*facts;
             let walk = |over: &mut Over<'_, '_>| {
                 sent.match_and_insert_with(&key.tokens, |found| {
-                    // The marker is no part of the prompt.
+                    // The marker is no part of the prompt, nor of its size.
                     let matched = found.matched_token_count.saturating_sub(key.marker);
-                    over(&found.matched_tenants, self.blocks_of(matched, facts))
+                    let of = found.input_token_count.saturating_sub(key.marker);
+                    let tree = TreeMatch::new(count(matched), count(of));
+                    over(&found.matched_tenants, tree, self.blocks_of(matched, facts))
                 });
             };
             return self.decide_in_tree(walk, sends_to, workers, facts, places, buffers, decide);
@@ -2497,15 +2673,23 @@ impl Table {
             let facts = &*facts;
             let walk = |over: &mut Over<'_, '_>| {
                 sent.match_and_insert_with(&key.text, |found| {
-                    // The match counts the marker's chars too. A key of
-                    // as many bytes as chars holds one byte a char: its
-                    // chars are its bytes, and no pass is made over it.
+                    // The match and the key count the marker's chars too.
+                    let chars = found.matched_char_count.saturating_sub(key.marker);
+                    let of = found.input_char_count.saturating_sub(key.marker);
+                    let tree = TreeMatch::new(count(chars), count(of));
+                    // A key of as many bytes as chars holds one byte a
+                    // char: its chars are its bytes, and no pass is made
+                    // over it.
                     let bytes = if found.input_char_count == key.text.len() {
-                        found.matched_char_count.saturating_sub(key.marker)
+                        chars
                     } else {
                         bytes_behind(&key.text, key.marker, found.matched_char_count)
                     };
-                    over(&found.matched_tenants, self.blocks_of_text(bytes, facts))
+                    over(
+                        &found.matched_tenants,
+                        tree,
+                        self.blocks_of_text(bytes, facts),
+                    )
                 });
             };
             return self.decide_in_tree(walk, sends_to, workers, facts, places, buffers, decide);
@@ -2550,6 +2734,7 @@ impl Table {
             warming: &buffers.warming,
             thin: self.ruled.thin,
             mean_in_flight: None,
+            tree: None,
         }
     }
 
@@ -2597,7 +2782,8 @@ impl Table {
     /// for its place: the token tree, or the string tree for a request of
     /// text. `walk` runs the tree's match by the request's entry in it and
     /// hands [`Over`] what the match found: the workers sent the deepest
-    /// prefix of the request, and how many of the request's blocks that
+    /// prefix of the request, the match's size and the request's in the
+    /// tree's own unit, and how many of the request's whole blocks that
     /// prefix holds. The decision is made over them, and the same descent
     /// writes the request for the worker it goes to, whose address `Over`
     /// answers: the first target of the pick its caller sends to
@@ -2607,9 +2793,11 @@ impl Table {
     /// used, as every match of a tree does. The record of hashed prefixes
     /// is neither read nor written.
     ///
-    /// The pick states its first target's entry of the rows the match named
-    /// ([`state`]), where the request's own profile reads affinity: the
-    /// match's blocks for a holder named, and a miss for any other worker.
+    /// The rows carry the match's two numbers ([`AffinityRows::tree`]): the
+    /// profile's prefix stage divides them as the classic policy divides a
+    /// tree's match, with no count rounded to a block. The pick states them
+    /// for a holder named ([`state`]), where the request's own profile
+    /// reads affinity, and a miss for any other worker.
     #[expect(
         clippy::too_many_arguments,
         reason = "the tree's walk, the target the caller takes, the list, the request's facts and its places, the buffers, and the decision"
@@ -2624,9 +2812,17 @@ impl Table {
         buffers: &mut Buffers,
         mut decide: impl FnMut(&mut RequestFacts<'_>) -> Decision,
     ) -> Decision {
-        let mut decide_over = |holders: &[TenantId], blocks: u32| {
+        let mut decide_over = |holders: &[TenantId], tree: Option<TreeMatch>, blocks: u32| {
+            // A match of anything behind the marker names its workers, as
+            // the classic policy makes every tenant of a match a candidate.
+            // A match of nothing names nobody.
+            let found = tree.is_some_and(|tree| tree.matched > 0);
+            let holders = if found { holders } else { &[] };
             self.name_sent(holders, blocks, workers, facts, places, buffers);
-            let named = self.named_rows(buffers);
+            let named = AffinityRows {
+                tree,
+                ..self.named_rows(buffers)
+            };
             let mut decision = decide(&mut RequestFacts {
                 named: Some(named),
                 ..*facts
@@ -2635,8 +2831,8 @@ impl Table {
             decision
         };
         let mut decided = None;
-        walk(&mut |holders, blocks| {
-            let decision = decide_over(holders, blocks);
+        walk(&mut |holders, tree, blocks| {
+            let decision = decide_over(holders, Some(tree), blocks);
             let to = sent_address(workers, &decision, &sends_to);
             decided = Some(decision);
             to
@@ -2644,7 +2840,7 @@ impl Table {
         // The tree asks for the worker once, so the decision was made
         // there. Were it not asked, the request is decided here, with no
         // holder named and nothing written: its pick states a miss.
-        decided.unwrap_or_else(|| decide_over(&[], 0))
+        decided.unwrap_or_else(|| decide_over(&[], None, 0))
     }
 
     /// One decision of a profile that reads the column whole: the fill, the
@@ -2688,4 +2884,5 @@ impl Table {
 }
 
 #[cfg(test)]
+#[path = "../../../tests/unit/engine/in_process/overlap/tests.rs"]
 mod tests;

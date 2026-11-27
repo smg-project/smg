@@ -250,7 +250,8 @@ experiments against it transfer to engines:
   leaves it as it is: a restarted engine does not empty a shared store. A
   queued request's `num_waiting_uncached_tokens` leaves out what the tier
   would restore. The tier needs generating workers (a prefill or encode worker
-  runs no passes), `--prefix-cache true` and one main-attention KV cache group
+  runs no passes, but a gRPC prefill worker under `--prefill-engine true`
+  does), `--prefix-cache true` and one main-attention KV cache group
   (`full_attention`, `mla_attention` or `sink_full_attention`): the tier holds
   whole blocks of one group.
 - **repeatable output** — `--output-seed prompt` derives synthetic output from
@@ -260,8 +261,17 @@ experiments against it transfer to engines:
   decode blocks too. Request IDs still identify cancellation and records.
   The default `request-id` mode preserves existing stress workloads. This option
   applies to the realistic engine; canned and scripted responses are unchanged.
-  Synthetic output remains in the existing token range 100–30099; a benchmark
-  must separately verify those IDs against its pinned tokenizer and special IDs.
+  Synthetic output remains in the existing token range 100–30099. Where
+  `--tokenizer` names local tokenizer files, an ID of that range gives way to
+  another when the tokenizer does not decode it to text on its own (an ID
+  outside its vocabulary, a special token, a part of a character) or it is an
+  end-of-sequence ID; the other IDs stay as drawn. A tokenizer that decodes
+  no ID of the range leaves the output as drawn, as does a worker with no
+  local tokenizer: a benchmark must then separately verify those IDs against
+  its pinned tokenizer and special IDs. The worker logs a warning when local
+  tokenizer files give no such table (they do not load, or decode no ID of
+  the range); a `--tokenizer` that is no local path stays quiet. An HTTP
+  worker sends text and no IDs, so it loads no tokenizer for this.
 
 | Flag | Default | Meaning |
 |------|---------|---------|
@@ -276,7 +286,7 @@ experiments against it transfer to engines:
 | `--max-batched-tokens` | 8192 | token budget per pass |
 | `--max-running` | 256 | sequences per pass |
 | `--kv-tokens` / `--kv-blocks` | 524288 tokens | KV pool capacity |
-| `--worker-kv-tokens` | none | `worker=tokens,...`: the named workers' pool capacity instead, at most the fleet's or a calibration's pool, whichever is larger (any size under `--timing linear`, whose decode reads no utilisation; workers named `grpc:<port>`, `http:<port>` or `zmq:<index>`; a data-parallel worker is named once and every rank takes the override). The pool's size is room, not speed: the worker's decode keeps the fleet's pool as its utilisation reference (a calibration's reference when one gave it), so it steps as fast as its peers on the same context. Generating workers only: a prefill or encode worker answers without running its engine |
+| `--worker-kv-tokens` | none | `worker=tokens,...`: the named workers' pool capacity instead, at most the fleet's or a calibration's pool, whichever is larger (any size under `--timing linear`, whose decode reads no utilisation; workers named `grpc:<port>`, `http:<port>` or `zmq:<index>`; a data-parallel worker is named once and every rank takes the override). The pool's size is room, not speed: the worker's decode keeps the fleet's pool as its utilisation reference (a calibration's reference when one gave it), so it steps as fast as its peers on the same context. Generating workers only: a prefill or encode worker answers without running its engine, but a gRPC prefill worker under `--prefill-engine true` takes it |
 | `--worker-pass-time-scale` | none | `worker=factor,...`: every pass of the named workers takes `factor` times the timing model's duration (0.001 to 1000; above 1 a slower engine, below 1 a faster one); the rates the worker reports follow, as a servicer measures them. Named and limited as `--worker-kv-tokens` |
 | `--global-l3-blocks` | 0 (off) | capacity of the process-wide shared KV tier, in blocks (above) |
 | `--global-l3-ms-per-token` | 0 | pass time per token restored from the shared tier |
@@ -291,6 +301,7 @@ experiments against it transfer to engines:
 | `--supports-vision` | unset | what the gRPC workers' model info says of vision input from their start: the `supports_vision` entry of the info the admin API patches (`/admin/info/{port}`), seeded; unset, an encode worker on the vLLM wire says `true` and every other worker `false` |
 | `--admin-port` | off | process-wide admin API (below) |
 | `--drain-timeout-secs` | 5 | on SIGTERM or SIGINT: stop accepting, let the requests in flight finish for this long, then exit 0 either way |
+| `--prefill-engine` | false | a gRPC worker in the prefill role runs each prompt on its engine as a request of no output, so the engine's prefix cache, its request records, its KV events and its load record see the prompt, and the prompt side's completion carries the engine's cached count once the prompt is prefilled; such a worker runs its engine's passes, so it takes `--worker-kv-tokens`, `--worker-pass-time-scale` and `--global-l3-blocks` as a generating worker does; `false` answers without the engine (below) |
 | `--kv-events-zmq-base-port` | off | ZMQ KV-event publishers on vLLM's or SGLang's wire (below) |
 | `--kv-cache-groups` | `full_attention` | the KV cache groups a realistic engine publishes, `kind[:window],...`, one to eight of `full_attention`, `mla_attention`, `sink_full_attention`, `sliding_window:<tokens>`, `sliding_window_mla:<tokens>` and `mamba` (at most one of them one of the three main-attention kinds, at any index, and a model without one starts with a window kind; a window kind with its window, the others without): every group's events carry its index, kind and window, a window group stores only the window tail ending at the prompt's aligned replay boundary and a Mamba group the one state block there (vLLM 0.31.0's default retention), a sparse store's `token_ids` on the vLLM wire spanning the whole step as the engine writes it, and an eviction is published once per group, every group's in one batch from the mock's one pool where the engine's per-group pools may stagger them; one group only on the SGLang wire. The gRPC stream carries every group's events unfiltered (a servicer's relay forwards every group, a sparse group's store as its hashes; the gateway indexes the main group and keeps the other groups' blocks in a per-worker view that bounds its overlap the way the engine does), and the mock's own prefix hit and `cached_tokens` are the engine's fixed point over its groups (a window group's tail ending at the hit or its leading run, a Mamba group's rightmost state block, iterated until nothing moves) |
 
@@ -495,6 +506,19 @@ rendezvous, so there is none to read. The encode role stays the gRPC wire's.
   accepts and closes each connection (the gateway probes the port once the
   worker is registered) and advertises it as
   `disaggregation_bootstrap_port`.
+  With `--prefill-engine true` a realistic gRPC prefill worker first runs
+  the prompt on its engine as a request of no output, as a regular worker
+  prefills it: the prefix cache holds the prompt, `/admin/requests` records
+  it with its cached and oracle tokens, the KV events name its blocks and
+  the load record counts it as pending prefill until its answer stream is
+  read to the engine's end or dropped, as a regular worker's request. The
+  answer is the same completion, sent once the engine has prefilled the
+  prompt (the engine's prefill time in place of `--gen-ms`), with the
+  engine's `cached_tokens`. An armed `finish=error` ends it with `error`
+  whatever the engine's end; with none armed, a prompt the engine aborts
+  ends with `abort`. The flag needs `--engine realistic` and gRPC workers
+  with no ZMQ rank: an HTTP worker and a ZMQ rank in the prefill role
+  answer without the engine.
 - A **decode** worker generates as a regular worker (canned, realistic or
   scripted: the answers a test states go to the decode side) and advertises
   `disaggregation_mode: decode`.
@@ -536,7 +560,9 @@ as its status at once, and `finish=error` ends the prompt side with `error`
 whatever the status (a 500 on `/v1/messages`, which has no `error` stop
 reason); both count under `cut_total`, as on any worker. The
 engine itself never runs the prompt: nothing is admitted and no record is
-left.
+left. A gRPC worker under `--prefill-engine true` is the exception: after
+these hooks its engine admits and records the prompt and prefills it in
+its passes, so `pause` holds the prompt side's completion until `resume`.
 
 ## Long prompts
 
