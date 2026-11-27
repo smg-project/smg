@@ -1929,7 +1929,9 @@ fn one_router_and_the_encode_mode_say_the_document_they_said() {
                 }
                 for settings in kinds {
                     let row = format!("{name}, {:?}, {connection_mode:?}", settings.mode);
-                    assert!(matches!(three_sided(&settings), Ok(None)), "{row}");
+                    let (mode, main) = (&settings.mode, &settings.policy);
+                    let three = three_sided(mode, main, settings.enable_igw);
+                    assert!(matches!(three, Ok(None)), "{row}");
                     let document = settings.policy_document();
                     assert_eq!(document, before_three_sides(&settings), "{row}");
                     said += usize::from(document.is_ok());
@@ -1980,7 +1982,8 @@ fn many_routers_keep_the_plan_they_had_where_three_sides_have_no_document() {
     // What the plan of three sides says alone: the setting it is
     // refused by, or a document the check refuses.
     let three = |settings: &RoutingSettings| {
-        let plan = three_sided(settings).expect("the plan's presets");
+        let plan = three_sided(&settings.mode, &settings.policy, settings.enable_igw);
+        let plan = plan.expect("the plan's presets");
         written(settings, plan.expect("a plan of three sides"))
     };
     let refused_by = |settings: &RoutingSettings| match three(settings) {
@@ -2187,21 +2190,18 @@ fn the_manual_policy_on_both_sides_of_a_pair_runs_under_three_sides() {
     // A regular configuration under the manual policy: no plan of three
     // sides, and the document of its single requests alone.
     let regular = config(at_flag_defaults("manual"));
-    assert!(matches!(
-        three_sided(&many_routers(regular.clone())),
-        Ok(None)
-    ));
-    assert_eq!(
-        many_routers(regular.clone()).policy_document(),
-        regular.policy_document()
-    );
+    let many = many_routers(regular.clone());
+    let three = three_sided(&many.mode, &many.policy, many.enable_igw);
+    assert!(matches!(three, Ok(None)));
+    assert_eq!(many.policy_document(), regular.policy_document());
     // A provider's configuration under it, the same: of many routers it
     // plans the gateway's own workers, their single requests alone.
     let provider = many_routers(RoutingSettings {
         mode: ModeSettings::Provider("a_provider"),
         ..config(at_flag_defaults("manual"))
     });
-    assert!(matches!(three_sided(&provider), Ok(None)));
+    let three = three_sided(&provider.mode, &provider.policy, provider.enable_igw);
+    assert!(matches!(three, Ok(None)));
     assert_eq!(provider.policy_document(), regular.policy_document());
 }
 
