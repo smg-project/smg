@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import logging
 
+import openai
 import pytest
+from infra import ConnectionMode, get_connection_mode_override
 
 logger = logging.getLogger(__name__)
 
@@ -131,13 +133,22 @@ class _ThinkingTokenBudget:
         options = {"chat_template_kwargs": {"enable_thinking": True}}
         if budget is not None:
             options.update(budget)
-        response = api_client.chat.completions.create(
+        request = dict(
             model=model,
             messages=[{"role": "user", "content": "What is 17 times 23?"}],
             temperature=0,
             max_tokens=256,
             extra_body=options,
         )
+        # The direct ZMQ lanes reuse these gRPC cases. Their registered workers
+        # do not advertise a reasoning budget to placement.
+        if budget is not None and get_connection_mode_override() == ConnectionMode.ZMQ:
+            with pytest.raises(openai.BadRequestError) as exc:
+                api_client.chat.completions.create(**request)
+            assert exc.value.code == "unsupported_thinking_token_budget"
+            return
+
+        response = api_client.chat.completions.create(**request)
         message = response.choices[0].message
         reasoning = (getattr(message, "reasoning_content", None) or "").strip()
         if budget is None:
