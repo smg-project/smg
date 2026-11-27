@@ -840,6 +840,14 @@ fn a_named_worker_that_cannot_take_an_encode_request_after_all_is_missed_on_its_
 /// under `target-worker` and not under the rule's own name. A pair's own
 /// call answers so.
 ///
+/// Where that prefill stops being ready as the count takes it, the first
+/// decision finds nobody on the prefill's side and sheds the request with
+/// that side. A request the encode pass is laid for keeps such a shed
+/// from the rule (`pair::goes_to_the_rule`): the miss names the prefill's
+/// side. With no item the request is its pair's alone: the shed goes to
+/// the rule, the rule takes nobody at the one place, and the miss names
+/// no side.
+///
 /// The classic router asks its filter of the workers it gathers as
 /// candidates, ahead of its policies (`P:3208-3213`, `P:3329-3344`).
 #[test]
@@ -862,6 +870,35 @@ fn a_rule_that_refuses_the_named_prefill_behind_the_count_misses_the_target() {
     };
     assert_eq!(placed(engine, &three, &request, 1), Err(MISSED));
     assert!(of_prefill.get() > 2, "asked again at the one place");
+
+    // The same rule over a prefill that stops being ready as the count
+    // takes it: the answer of the request with its item or with none, and
+    // how often the rule was asked of that prefill.
+    let left = |item: bool| {
+        let three = Three::of([3, 3, 2], |_, _| false);
+        let of_prefill = Cell::new(0_u32);
+        let rule = |worker: &dyn Worker| {
+            if worker_id(worker) != three.id(0, 1) {
+                return true;
+            }
+            worker.set_status(WorkerStatus::NotReady);
+            of_prefill.set(of_prefill.get() + 1);
+            of_prefill.get() == 1
+        };
+        let mut request = carrying(three.lists((&[PLAIN; 2], &[1; 3])), &headers);
+        request.admits = Some(&rule);
+        if !item {
+            request.encode = None;
+        }
+        let answer = placed(engine, &three, &request, usize::from(item));
+        (answer, of_prefill.get())
+    };
+    // The pass is laid for the request with its item: the first decision's
+    // shed answers the call with its side, and no rule is asked behind it.
+    assert_eq!(left(true), (Err(missed_on(PairSide::Prefill)), 1));
+    // With no item the request is its pair's alone: that shed goes to the
+    // rule, which takes nobody at the place, and the miss names no side.
+    assert_eq!(left(false), (Err(MISSED), 2));
 }
 
 /// A request that names no worker is placed as under a document with no
