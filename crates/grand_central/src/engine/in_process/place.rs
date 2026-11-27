@@ -2184,10 +2184,13 @@ impl InProcess {
     /// held to the workers the rule takes on each of its two lists, as a
     /// single request's are to those of its one: three decisions a call.
     /// Which workers pair is the caller's word, in the classes its lists
-    /// carry: no pair is tested here again. Prefills with an open partner
-    /// that are all at the caller's limit answer
+    /// carry: no pair is tested here again. Where the prefill side's
+    /// filters leave its run nobody and a prefill with an open partner
+    /// stands but for the caller's limit, the answer is
     /// [`Unplaced::PrefillsFull`], on which the caller waits for room and
-    /// places the request again.
+    /// places the request again. So it is where the pair's default takes a
+    /// prefill at that limit, under a profile that lists it as a hard
+    /// filter.
     ///
     /// A request with an encode request's three lists is decided over the
     /// three ([`InProcess::decide_encode_at`]), with the items it
@@ -2251,8 +2254,9 @@ impl InProcess {
     /// Where it is not, the decision is
     /// held to the prefill's place and the decode is its own profile's
     /// pick. A named prefill at the caller's admission limit is waited
-    /// for ([`Unplaced::PrefillsFull`]), a named decode with no free room
-    /// is taken, and a retry is handed the pair again. A number that
+    /// for where that decision says so ([`Unplaced::PrefillsFull`]), a
+    /// named decode with no free room is taken, and a retry is handed
+    /// the pair again. A number that
     /// reaches no worker on a side, and a pair the held decision cannot
     /// place, shed the request under `target-worker`. Where no decode can
     /// be sent to and the binding steers decodes that are all over their

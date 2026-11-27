@@ -8927,6 +8927,18 @@ impl Engine {
     /// request wait: its refusal is named by what its partners' own stages
     /// say, as the refusal of a prefill under its limit is.
     ///
+    /// Behind the pair's default and its question of saturation, where no
+    /// prefill at the request's places stands but for its limit, the limit
+    /// names no shed: its name is the word a host waits on for room. The
+    /// prefill side's stage is read there with the limit set aside
+    /// (`vetoed::Half::emptied_limit_aside`): a prefill at its limit stays
+    /// in that pass until another filter refuses it. So where the prefill
+    /// side's profile lists the limit among its filters changes no answer
+    /// there, under filters whose word on a row does not turn on how
+    /// often they are asked. The gateway's own pair selection asks its
+    /// overload shed ahead of its capacity test (`pair_pass` in
+    /// `model_gateway/src/routers/common/placement.rs`).
+    ///
     /// Where the prefill side's run sheds, no default pairs and no prefill
     /// waits on its limit alone, one question says whether the request is
     /// shed as saturated: the count of the one list the gateway's own pair
@@ -9278,14 +9290,20 @@ impl Engine {
             // then to the admission limit's shed, for a prefill with an open
             // partner alone, and then to the one question that says whether
             // the request is shed as saturated: the count of the list the
-            // gateway's own pair selection judges. Every other shed has no
-            // endpoint, and is named by the stage that left a pass nobody:
-            // the prefill side's where no prefill stands but for its
-            // admission limit, "partnered" for a class with no decode at all
-            // and for a routable prefill of class 0, and else what the
-            // decode pool's own stages say about the partners of the
-            // prefills that stand so (those were dropped by the partnered
-            // test alone). A picker's decline passes through.
+            // gateway's own pair selection judges, asked over whole lists
+            // alone. Every other shed is named by a stage. It is the
+            // prefill side's where no prefill stands but for its admission
+            // limit, read with that limit set aside, and "none" where that
+            // pass ends at no stage. It is "partnered" for a class with no
+            // decode at all and for a routable prefill of class 0, and else
+            // what the decode pool's own stages say about the partners of
+            // the prefills that stand so (those were dropped by the
+            // partnered test alone). Where those stages name none, the
+            // prefill's own shed stands. Over whole lists each such shed
+            // has no endpoint, and where its stage is the overload veto,
+            // the list judged names it again ([`Half::refused_room`]).
+            // Behind a part a pass the overload veto ended is shed as
+            // saturated. A picker's decline passes through.
             if let Decision::Shed(prefill_shed) = &prefill {
                 if prefill_shed.reason != ShedReason::PolicyDeclined {
                     // A refused pool vetoed on every usable worker goes to
@@ -9408,17 +9426,27 @@ impl Engine {
                         scratch.shed_over = Some(over);
                         return shed(reason_of(veto), veto, prefill_shed.trace).of_side(side);
                     }
-                    // Else the request has no endpoint, and the stage that
-                    // left a pass nobody names the shed: the prefill side's
-                    // where no prefill of the request's stands but for its
-                    // limit, `partnered` where those that stand pair with no
-                    // decode, and else what the decode pool's own stages say
-                    // about the partners of the prefills that stand.
+                    // Else the shed takes a first name. Where no prefill of
+                    // the request's stands but for its limit it is the
+                    // stage that leaves the prefill side's pass nobody, the
+                    // limit aside, and `none` where that pass ends at no
+                    // stage. Where those that stand pair with no decode it
+                    // is `partnered`. Else it is what the decode pool's own
+                    // stages say about the partners of the prefills that
+                    // stand, and the prefill's own shed stands where they
+                    // name none. A first name that is the overload veto's
+                    // sheds as saturated behind a part, and over whole
+                    // lists gives way to the name the list judged gives
+                    // it, below. Every other shed has no endpoint.
                     let named = if routable == 0 {
-                        let whole = Set::side(prefills, None, None);
+                        // The limit's name says a wait for room, and no
+                        // prefill here stands but for its limit. So the
+                        // side's stage is read by a pass that sets the
+                        // limit aside, wherever the profile lists it: a
+                        // prefill at its limit stays in that pass until
+                        // another filter refuses it.
                         let buf = &mut scratch.single;
-                        let stage = filter(prefill_profile, &prefill_facts, run_cx, buf, whole);
-                        Some(stage.unwrap_or(NO_STAGE))
+                        Some(takes.emptied_limit_aside(buf).unwrap_or(NO_STAGE))
                     } else if scratch.classes.is_empty() {
                         Some(PARTNERED)
                     } else {

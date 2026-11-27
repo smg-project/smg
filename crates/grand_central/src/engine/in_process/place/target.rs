@@ -427,9 +427,9 @@ fn taking(
 /// (`model_gateway/src/routers/common/placement.rs:3044`, `:3090`, with
 /// the policy's miss at
 /// `model_gateway/src/policies/consistent_hashing.rs:187-193`, on main
-/// `d43c7b2a9`). Prefills at the
-/// caller's admission limit answer [`Unplaced::PrefillsFull`] as for any
-/// pair: the named prefill is waited for. Any other answer of
+/// `d43c7b2a9`). Where the decision held to the places says that its
+/// prefills are full, the answer is [`Unplaced::PrefillsFull`] as for any
+/// pair's decision: the named prefill is waited for. Any other answer of
 /// [`super::pair::place`] stands as it is.
 #[inline(never)]
 pub(super) fn pair<'a>(

@@ -300,11 +300,12 @@ fn first_partners_are_counted_alone_while_one_can_be_sent_to() {
     );
 }
 
-/// A named worker that is full answers as its side's own gate does. A
-/// named prefill at its caller's admission limit is waited for: the call
-/// answers the word its caller waits on, though another prefill has room.
-/// A named decode with no free room is taken, and the request waits at
-/// that decode's gate.
+/// A named worker that is full answers as its side's own gate does. Where
+/// the number reaches a pair, a named prefill that stands but for its
+/// caller's admission limit beside its open decode is waited for: the
+/// call answers the word its caller waits on, though another prefill has
+/// room. A named decode with no free room is taken, and the request waits
+/// at that decode's gate.
 ///
 /// The classic router runs neither admission filter under a named worker
 /// (`P:2804-2814`, `P:2895`, `P:2978-2987`): the named prefill at its
