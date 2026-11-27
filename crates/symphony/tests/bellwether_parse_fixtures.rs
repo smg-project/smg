@@ -1478,6 +1478,169 @@ fn every_recorded_models_text_after_the_thoughts_close_is_the_registrys() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// The tags a call of the Qwen3 table and of its tagged form stands between, one pair a call.
+const CALL_TAGS: (&str, &str) = ("<tool_call>", "</tool_call>");
+
+/// The text between two calls of one turn, read from each recorded model's recorded
+/// `calls-parallel-two` (`parse/common.jsonl`, the reference's `text`: the oracle's rendering of
+/// the assistant turn that made the two calls), or from its rendered
+/// `tools-history-parallel-calls` (`render/common.jsonl`, the reference's `text`: the prompt whose
+/// history holds such a turn) where the tree holds no such recorded turn, is one the tag of a
+/// required turn takes there: the registry's for the model (the layout's text between calls),
+/// that text twice, or nothing, since the tag takes that text after a call once or twice or
+/// leaves it out. The models of the Qwen3
+/// table and of its tagged form are read, the groups with a template of their own
+/// ([`MEASURED_AFTER`]) among them. Skipped where the tree is not given; a model the tree has not
+/// recorded and a table whose layout says no text between calls are not read; a tree under which
+/// nothing is read fails, and so does a measured group the tree records but this test cannot
+/// read.
+#[test]
+#[expect(
+    clippy::print_stderr,
+    reason = "the skip notice and the count are test diagnostic output"
+)]
+fn every_recorded_qwen3_models_text_between_two_calls_is_one_its_tag_takes() {
+    let Some(root) = std::env::var_os(FIXTURES_ENV).map(PathBuf::from) else {
+        eprintln!(
+            "skipping: {FIXTURES_ENV} is not set; \
+             point it at the fixtures/ directory of a bellwether checkout"
+        );
+        return;
+    };
+    let (open, close) = CALL_TAGS;
+    let (mut read, mut none, mut twice, mut wrong) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for (slug, _) in MODELS {
+        let model = model_of(slug);
+        if !matches!(table_for(&model), Some(Table::Qwen3 | Table::Qwen3Tagged)) {
+            continue;
+        }
+        let format = for_model(&model).unwrap_or_else(|| panic!("{slug}: not in the registry"));
+        let Some(expected) = format
+            .layout()
+            .and_then(|layout| layout.between_calls.as_deref())
+        else {
+            continue;
+        };
+        // The recorded turn first: it holds the calls alone, where a rendered prompt shows the
+        // tags in its template's instructions too.
+        let sets = [
+            (
+                "the recorded two calls",
+                "parse",
+                "/parse/calls-parallel-two",
+            ),
+            (
+                "the rendered history of two calls",
+                "render",
+                "/render/tools-history-parallel-calls",
+            ),
+        ]
+        .map(|(source, kind, suffix)| {
+            let sets = sets_of(&root, slug, kind).unwrap_or_else(|e| panic!("{e}"));
+            (source, sets, suffix)
+        });
+        if sets.iter().all(|(_, sets, _)| sets.is_none()) {
+            continue;
+        }
+        let between = sets.into_iter().find_map(|(source, sets, suffix)| {
+            let text = fs::read_to_string(sets?.dir.join("common.jsonl")).ok()?;
+            let text = text
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .find(|case| case["id"].as_str().is_some_and(|id| id.ends_with(suffix)))
+                .and_then(|case| case["reference"]["text"].as_str().map(str::to_string))?;
+            let between = between_the_last_two_calls(&text, open, close)?;
+            Some((source, between.to_string()))
+        });
+        let Some((source, between)) = between else {
+            // A measured group the tree records must be read: a rendering that cannot be read
+            // as this test reads it would leave its text unchecked without a word.
+            if MEASURED_AFTER.iter().any(|(measured, _)| measured == slug) {
+                wrong.push(format!(
+                    "{slug}: no two calls between {open:?} and {close:?} in the recorded \
+                     calls-parallel-two nor in the rendered tools-history-parallel-calls"
+                ));
+            }
+            continue;
+        };
+        if between.is_empty() {
+            none.push(*slug);
+        } else if between == expected.repeat(2) {
+            twice.push(*slug);
+        } else if between != expected {
+            wrong.push(format!(
+                "{slug} ({}): the template writes {:?} between two calls in {source}, the registry {expected:?}",
+                format.name(),
+                between.chars().take(80).collect::<String>()
+            ));
+        }
+        read.push(*slug);
+    }
+    eprintln!(
+        "{} recorded models' text between two calls read: {}; {} of them write nothing there: {}; \
+         {} write the registry's text twice: {}",
+        read.len(),
+        read.join(", "),
+        none.len(),
+        none.join(", "),
+        twice.len(),
+        twice.join(", ")
+    );
+    assert!(
+        !read.is_empty(),
+        "no text between two calls read under {}: is it the fixtures/ directory?",
+        root.display()
+    );
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The text between the last two calls of `text`, each call between the tags `open` and `close`:
+/// what stands between the last call's opening tag and the close before it. None when `text`
+/// holds no two such calls.
+fn between_the_last_two_calls<'a>(text: &'a str, open: &str, close: &str) -> Option<&'a str> {
+    let second = text.rfind(open)?;
+    let first = text[..second].rfind(close)?;
+    // The close ends a call of its own: an opening tag stands before it.
+    text[..first]
+        .contains(open)
+        .then(|| &text[first + close.len()..second])
+}
+
+#[test]
+fn the_text_between_two_calls_is_read_between_the_last_calls_tags() {
+    let (open, close) = CALL_TAGS;
+    let between = |text| between_the_last_two_calls(text, open, close);
+    assert_eq!(
+        between("<tool_call>\n{\"name\": \"a\"}\n</tool_call>\n<tool_call>\n{\"name\": \"b\"}\n</tool_call>"),
+        Some("\n")
+    );
+    assert_eq!(
+        between("<tool_call>\n{\"name\": \"a\"}\n</tool_call><tool_call>\n{\"name\": \"b\"}\n</tool_call>"),
+        Some(""),
+        "a template that writes nothing between two calls"
+    );
+    // A prompt shows the tags in its instructions before the history: the last two calls count.
+    assert_eq!(
+        between(
+            "within <tool_call></tool_call> XML tags:\n<tool_call>\n{}\n</tool_call><|im_end|>\n\
+             <|im_start|>assistant\n<tool_call>\n{\"name\": \"a\"}\n</tool_call>\n\n<tool_call>\n\
+             {\"name\": \"b\"}\n</tool_call><|im_end|>\n"
+        ),
+        Some("\n\n")
+    );
+    assert_eq!(
+        between("<tool_call>\n{\"name\": \"a\"}\n</tool_call>"),
+        None,
+        "one call"
+    );
+    assert_eq!(
+        between("</tool_call>\n<tool_call>\n{}"),
+        None,
+        "a close no call opened"
+    );
+}
+
 /// A slug's recorded sets of one kind under the tree: their directory, and the primary whose sets
 /// they are when the slug is a member of a checkpoint group.
 #[derive(Debug)]
