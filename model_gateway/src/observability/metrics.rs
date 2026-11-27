@@ -1221,8 +1221,11 @@ pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
     let handle = recorder.handle();
 
     // Series labelled `worker` live in a store of their own so they can be
-    // dropped with their worker (see `smg_worker::metrics::series`); it renders histograms
-    // with the exporter's buckets and quantiles.
+    // dropped with their worker (see `smg_worker::metrics::series`); it renders
+    // histograms with the exporter's buckets and quantiles. Where a host asks
+    // it to (`keep_histograms`, as the gateway's start does), it also keeps the
+    // bucketed histograms with no `worker` label: they record in fixed cells
+    // and render after the exporter's text.
     let workers = Arc::new(WorkerSeries::new(DistributionBuilder::new(
         parse_quantiles(DEFAULT_SUMMARY_QUANTILES),
         None,

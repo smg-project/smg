@@ -1,4 +1,5 @@
-//! Per-worker series that leave `/metrics` with their worker.
+//! Per-worker series that leave `/metrics` with their worker, and histogram
+//! series that record into fixed cells.
 //!
 //! Every family labelled `worker` is keyed by the worker URL, and with
 //! pod-based discovery a replaced engine pod comes back under a new address.
@@ -17,6 +18,15 @@
 //! all gone, so the retired set is bounded by the removed and replaced
 //! workers still referenced. The series render after the exporter's output,
 //! in the exporter's format and with the exporter's histogram configuration.
+//!
+//! Histograms record here in one of two ways. A series of a family the bucket
+//! configuration renders as a histogram records into fixed cells (one count a
+//! bucket and a sum), so it holds the same bytes however many samples it
+//! takes; a series of any other family keeps its samples until the upkeep
+//! folds them. The per-worker histograms take this road for every host. The
+//! bucketed families with no `worker` label stay with the exporter unless the
+//! host asks the store to keep them too ([`keep_histograms`]); they then
+//! render here as well, and no family is split between the two texts.
 
 use std::{
     borrow::Cow,
@@ -52,7 +62,8 @@ use crate::identity::basic::Worker;
 /// The label that keys a series to a worker; its value is the worker URL.
 const WORKER_LABEL: &str = "worker";
 
-/// The store the installed recorder routes per-worker series to.
+/// The store the installed recorder routes per-worker series to, and the
+/// bucketed histograms a host has it keep.
 static INSTALLED: OnceLock<Arc<WorkerSeries>> = OnceLock::new();
 
 /// Install the store the global recorder routes to. The first call wins, as
@@ -105,10 +116,15 @@ pub fn render_into(out: &mut String) {
 /// exporter's handle alone does not call it, and reads every such family
 /// there as before. No family is split between the two texts: the call takes
 /// only while no such series has registered with the exporter.
-pub fn keep_histograms() {
-    if let Some(series) = INSTALLED.get() {
-        series.keep_histograms();
-    }
+///
+/// Returns whether the store keeps those families from here on. `false`
+/// leaves every one of them with the exporter: no store is installed, or a
+/// series of one, a summary too, registered before the call.
+#[must_use]
+pub fn keep_histograms() -> bool {
+    INSTALLED
+        .get()
+        .is_some_and(|series| series.keep_histograms())
 }
 
 /// Fold the installed store's histogram samples, as the exporter's upkeep does.
@@ -268,13 +284,15 @@ impl WorkerSeries {
 
     /// Keep the histogram families with no worker label too, unless a series
     /// of one has registered with the exporter (see [`keep_histograms`]).
-    fn keep_histograms(&self) {
-        let _ = self.unkeyed_histograms.compare_exchange(
+    /// Whether the store keeps them.
+    fn keep_histograms(&self) -> bool {
+        let settled = self.unkeyed_histograms.compare_exchange(
             UNSETTLED,
             IN_CELLS,
             Ordering::Relaxed,
             Ordering::Relaxed,
         );
+        settled.is_ok() || settled == Err(IN_CELLS)
     }
 
     /// The handle of `key`, a series with no worker label, where the host
@@ -495,8 +513,10 @@ impl WorkerSeries {
     }
 }
 
-/// The gateway's recorder: series labelled `worker` go to the store, every
-/// other series to the Prometheus exporter.
+/// The gateway's recorder: series labelled `worker` go to the store, and so
+/// do the bucketed histograms with no such label once a host has asked the
+/// store to keep them ([`keep_histograms`]); every other series goes to the
+/// Prometheus exporter.
 pub struct WorkerSeriesRecorder<R> {
     inner: R,
     series: Arc<WorkerSeries>,
@@ -602,6 +622,8 @@ impl Samples {
     }
 }
 
+/// The registry's storage asks this of its histogram type. No record takes
+/// this road: every handle comes from [`Samples::handle`].
 impl HistogramFn for Samples {
     fn record(&self, value: f64) {
         match self {
@@ -1154,7 +1176,7 @@ mod tests {
         ];
         for samples in lists {
             let series = store();
-            series.keep_histograms();
+            assert!(series.keep_histograms());
             let (exporter, stored) = scrape(&series, || {
                 metrics::describe_histogram!("apply_seconds", "Time of an apply");
                 let series = histogram!("apply_seconds", "model" => "m");
@@ -1196,7 +1218,7 @@ mod tests {
         let series = store();
         let (exporter, stored) = scrape(&series, || {
             histogram!("apply_seconds", "model" => "m").record(0.005);
-            series.keep_histograms();
+            assert!(!series.keep_histograms());
             histogram!("apply_seconds", "model" => "n").record(0.005);
         });
         assert!(!stored.contains("apply_seconds"), "{stored}");
@@ -1209,9 +1231,22 @@ mod tests {
     }
 
     #[test]
+    fn a_summary_that_registered_first_leaves_every_family_with_the_exporter() {
+        let series = store();
+        let (exporter, stored) = scrape(&series, || {
+            histogram!("lag_seconds").record(0.005);
+            assert!(!series.keep_histograms());
+            histogram!("apply_seconds", "model" => "m").record(0.005);
+        });
+        assert!(!stored.contains("apply_seconds"), "{stored}");
+        let count = "apply_seconds_count{model=\"m\"} 1";
+        assert!(exporter.lines().any(|line| line == count), "{exporter}");
+    }
+
+    #[test]
     fn a_summary_with_no_worker_label_stays_with_the_exporter_when_the_host_asked() {
         let series = store();
-        series.keep_histograms();
+        assert!(series.keep_histograms());
         let (exporter, stored) = scrape(&series, || {
             histogram!("lag_seconds").record(0.005);
         });
@@ -1228,7 +1263,7 @@ mod tests {
         // More threads than a series has stripes, so some share one.
         let threads = 3 * STRIPES;
         let series = store();
-        series.keep_histograms();
+        assert!(series.keep_histograms());
         let (_, stored) = scrape(&series, || {
             metrics::describe_histogram!("apply_seconds", "Time of an apply");
             let histogram = histogram!("apply_seconds", "model" => "m");

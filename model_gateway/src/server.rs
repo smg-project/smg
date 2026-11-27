@@ -2536,7 +2536,11 @@ pub async fn startup_with(
         // nothing else, and that listener's scrape appends the per-worker
         // store's text to the exporter's: the histogram families record in
         // the store's fixed cells, from the first series on.
-        worker_series::keep_histograms();
+        if worker_series::keep_histograms() {
+            debug!("Histogram families record in the per-worker series store's cells");
+        } else {
+            warn!("Histogram families stay with the exporter: one registered there first");
+        }
         metrics::init_startup_series();
         // Under Symphony the series of a request no table reads exist at zero
         // from the start; a table's own follow its model's first registration.

@@ -24,7 +24,7 @@ async fn the_scrape_reads_a_family_the_cells_keep_and_the_handle_alone_does_not(
         host: "127.0.0.1".to_string(),
         duration_buckets: None,
     });
-    worker_series::keep_histograms();
+    assert!(worker_series::keep_histograms());
     let (addr, _server) = start_metrics_server(handle.clone(), "127.0.0.1".to_string(), 0, None)
         .await
         .expect("metrics server binds an ephemeral port");
