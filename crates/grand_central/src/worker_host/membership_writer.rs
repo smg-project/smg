@@ -295,7 +295,10 @@ pub trait MembershipWriter: Send + Sync + 'static {
 /// What a door owns of a write and of the reads ahead of it, beside the
 /// rules every door shares.
 pub(crate) trait Turn {
-    fn store(&self) -> &MemoryStore;
+    /// Whether a found row of `facts` asks for its engine's cache events:
+    /// the door's answer under the generation in force at its own store
+    /// ([`asks_events_under`]).
+    fn asks_events(&self, facts: &WorkerFacts) -> bool;
 
     /// The row that stands under the id `id`, as the door reads a record:
     /// a door with a holder reads it off its worker objects
@@ -361,6 +364,13 @@ pub(crate) trait Turn {
 
     /// Hear a row's write at its place in the turn.
     fn told(&self, _: MembershipWriteOutcome) {}
+}
+
+/// Whether a found row of `facts` asks for its engine's cache events under
+/// the generation in force at `store` ([`asks_events`]): what a door over
+/// that store answers its turn ([`Turn::asks_events`]).
+pub(crate) fn asks_events_under(facts: &WorkerFacts, store: &MemoryStore) -> bool {
+    store.deciding(|world| asks_events(facts, world.spec().engine()))
 }
 
 fn made_by(row: &WorkerRow, maker: &Registrant) -> Result<(), MembershipWriteRefused> {
@@ -445,7 +455,7 @@ fn standing_under(
 /// Check one stated row by its own rule, over the row its write expects to
 /// stand under its URL ([`standing_under`]). Nothing is written. The row's
 /// event signal is stated here, over the facts its callback states
-/// ([`asks_events`]).
+/// ([`Turn::asks_events`]).
 fn ready_row(
     turn: &impl Turn,
     maker: &Registrant,
@@ -453,7 +463,6 @@ fn ready_row(
     Stated { url, state }: &Stated<'_>,
     standing: Option<WorkerRow>,
 ) -> Result<Ready, MembershipWriteRefused> {
-    let store = turn.store();
     if let Some(row) = &standing {
         // An add of several rows asks no maker here. What it meets is
         // judged over its rows together, and its refusal is the same
@@ -478,7 +487,7 @@ fn ready_row(
     // The host states the row's stream in the write that makes the row: the
     // follow is told of a worker once for each object laid, and reads the
     // row then.
-    facts.signals.events = store.deciding(|world| asks_events(&facts, world.spec().engine()));
+    facts.signals.events = turn.asks_events(&facts);
     if let Some(row) = &standing {
         facts.incarnation = row.facts.incarnation;
     }
