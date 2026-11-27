@@ -8,7 +8,7 @@ use std::{
 
 use dashmap::DashMap;
 use serde::Serialize;
-use tokio::sync::Notify;
+use tokio::sync::{futures::OwnedNotified, Notify};
 use uuid::Uuid;
 
 use super::{
@@ -37,6 +37,13 @@ pub struct InFlightRequestTracker {
     draining: AtomicBool,
     /// Signaled when requests drain to zero during shutdown.
     drain_complete: Notify,
+    /// Monotonic flag: false → true. Never reset. Raised when the shutdown's
+    /// drain gives up on what is still in flight.
+    gave_up: AtomicBool,
+    /// Wakes the requests that are waiting for their handler at that moment
+    /// (see `middleware::shutdown_notice`): nothing else polls a handler
+    /// parked on a worker that does not answer.
+    gave_up_notice: Arc<Notify>,
 }
 
 impl InFlightRequestTracker {
@@ -49,6 +56,8 @@ impl InFlightRequestTracker {
             sampler: OnceLock::new(),
             draining: AtomicBool::new(false),
             drain_complete: Notify::new(),
+            gave_up: AtomicBool::new(false),
+            gave_up_notice: Arc::new(Notify::new()),
         })
     }
 
@@ -135,6 +144,28 @@ impl InFlightRequestTracker {
         })
         .await
         .is_ok()
+    }
+
+    /// The drain gave up: every request still waiting for its handler is
+    /// woken to answer for itself (see `middleware::shutdown_notice`)
+    /// before the listeners close what stands. Idempotent.
+    pub fn give_up_drain(&self) {
+        self.gave_up.store(true, Ordering::Release);
+        self.gave_up_notice.notify_waiters();
+    }
+
+    /// Returns `true` once the drain gave up.
+    #[inline]
+    pub fn gave_up_drain(&self) -> bool {
+        self.gave_up.load(Ordering::Acquire)
+    }
+
+    /// Resolves when the drain gives up, for a request to park on. One made
+    /// after the drain gave up never resolves: a waiter registers it (polls
+    /// it once) and then reads [`Self::gave_up_drain`], so a giving up on
+    /// either side of the registration is seen.
+    pub fn drain_given_up(&self) -> OwnedNotified {
+        Arc::clone(&self.gave_up_notice).notified_owned()
     }
 
     pub fn compute_bucket_counts(&self) -> Vec<usize> {

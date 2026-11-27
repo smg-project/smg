@@ -1743,19 +1743,26 @@ where
         // the access log; the trace context on the response; the Messages
         // envelope outside the body-size limit (a declared over-limit length
         // is refused by the limit layer before any route layer runs, and
-        // still leaves in the envelope); the payload limit on the request
+        // still leaves in the envelope); the shutdown's answer to a request
+        // its drain gave up on (inside the envelope and the log, so it is
+        // shaped, logged and counted); the payload limit on the request
         // body (a declared over-limit length is refused there, in the
         // gateway's envelope, before any layer inside runs; a chunked upload
         // is capped on its way in); innermost, the default body limit.
         .layer(
             tower::ServiceBuilder::new()
                 .layer(middleware::RequestIdLayer::new(request_id_headers))
-                .layer(middleware::HttpMetricsLayer::new(inflight_tracker))
+                .layer(middleware::HttpMetricsLayer::new(Arc::clone(
+                    &inflight_tracker,
+                )))
                 .layer(middleware::create_logging_layer(access_log_fields))
                 .layer(tower::util::MapResponseLayer::new(
                     middleware::trace_context_on_response,
                 ))
                 .layer(middleware::MessagesErrorEnvelopeLayer)
+                .layer(middleware::shutdown_notice::ShutdownNoticeLayer::new(
+                    inflight_tracker,
+                ))
                 .layer(middleware::RequestBodyLimitLayer::new(max_payload_size))
                 .layer(axum::extract::DefaultBodyLimit::max(max_payload_size)),
         )
@@ -2908,8 +2915,12 @@ pub async fn startup_with(
             leave_mesh,
             stop_mesh,
             |drain_timeout| {
-                handle_clone.graceful_shutdown(Some(drain_timeout));
-                admin_handle_clone.graceful_shutdown(Some(drain_timeout));
+                // The connections that still stand are closed one notice
+                // behind the drain's end: the 503 of a request the drain
+                // gave up on leaves inside it.
+                let forced_close = drain_timeout.saturating_add(SHUTDOWN_NOTICE);
+                handle_clone.graceful_shutdown(Some(forced_close));
+                admin_handle_clone.graceful_shutdown(Some(forced_close));
             },
         )
         .await
@@ -3015,13 +3026,20 @@ fn stop_the_mesh(mesh_handler: Option<&MeshServerHandler>) {
     }
 }
 
+/// How long after the drain gave up the listeners close the connections that
+/// still stand: the time the `503` of a request still waiting for its handler
+/// has to leave (see `middleware::shutdown_notice`).
+const SHUTDOWN_NOTICE: Duration = Duration::from_secs(1);
+
 /// The graceful shutdown after the signal, in its phases. Phase 1: readiness
 /// flips to 503 and the listeners stay open through the settle window, during
 /// which `leave_mesh` runs (with no window, it gets what the grace allows;
 /// one that does not finish in time is cut short and `stop_mesh` is called),
 /// then `stop_listeners` gates new connections with what is left of the
 /// grace. Phase 2: the in-flight requests drain within that, or the drain
-/// gives up and says so. Phase 3, the teardown, is the caller's once the
+/// gives up and says so, and a request still waiting for its handler is
+/// woken to answer `503` (see `middleware::shutdown_notice`). Phase 3,
+/// the teardown, is the caller's once the
 /// listeners have stopped and this drain has ended (see
 /// [`drain_before_teardown`]). Returns the end of the grace, the deadline
 /// the phases share, for the caller's own wait to end by; `None` when this
@@ -3085,6 +3103,10 @@ async fn graceful_shutdown(
                 timeout_secs = drain_timeout.as_secs(),
                 "Drain timed out, forcing shutdown with requests still in-flight"
             );
+            // Who still waits for a handler answers now, a 503 that names
+            // the shutdown; the listeners close what stands one
+            // `SHUTDOWN_NOTICE` behind this.
+            inflight_tracker.give_up_drain();
             return None;
         }
     }
@@ -3558,6 +3580,72 @@ mod graceful_shutdown_tests {
             Some((Duration::ZERO, Duration::ZERO))
         );
         assert!(tracker.is_draining());
+    }
+
+    /// A request still waiting for its handler when the drain gives up is
+    /// answered through the edge's layers: `503` in the gateway's envelope
+    /// with the code that names the shutdown, and it leaves the in-flight
+    /// count. (Its future was dropped with its connection before, and its
+    /// client read nothing.) The shutdown itself ends on the deadline, as it
+    /// did.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_still_waiting_when_the_drain_gives_up_is_answered_503() {
+        use axum::{body::Body, http::StatusCode, routing::get, Router};
+        use tower::ServiceExt;
+
+        use crate::middleware::{self, shutdown_notice::SERVER_SHUTTING_DOWN_CODE};
+
+        let tracker = InFlightRequestTracker::new();
+        let app = super::attach_edge_layers(
+            Router::new().route("/never", get(std::future::pending::<StatusCode>)),
+            1024,
+            Arc::clone(&tracker),
+            vec![],
+            vec![],
+            middleware::AccessLogFields::NONE,
+        );
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the request waits in a task of its own while the shutdown runs"
+        )]
+        let waiting = tokio::spawn(
+            app.oneshot(
+                http::Request::builder()
+                    .uri("/never")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        );
+        while tracker.is_empty() {
+            tokio::task::yield_now().await;
+        }
+        let start = tokio::time::Instant::now();
+        let ended = graceful_shutdown(
+            &tracker,
+            ShutdownBudget::from_grace_secs(10, None),
+            async {},
+            || panic!("a completed mesh leave must not be stopped again"),
+            |_| {},
+        )
+        .await;
+        assert_eq!(ended, None, "the drain gave up");
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_secs(10),
+            "the deadline held"
+        );
+        let response = tokio::time::timeout(super::SHUTDOWN_NOTICE, waiting)
+            .await
+            .expect("the waiting request is answered inside the notice")
+            .expect("the request's task ended")
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], SERVER_SHUTTING_DOWN_CODE, "{body}");
+        assert!(tracker.is_empty(), "the answered request left the count");
     }
 }
 
