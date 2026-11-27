@@ -17,9 +17,19 @@ pub(crate) struct CharacterTokenizer {
     pub(crate) eager_steps: AtomicUsize,
     /// The ids `eos_token_ids` reports (none by default).
     eos: Vec<u32>,
+    #[cfg(test)]
+    closed_prefill_think_block: bool,
 }
 
 impl CharacterTokenizer {
+    #[cfg(test)]
+    pub(crate) fn with_closed_prefill_think_block() -> Self {
+        Self {
+            closed_prefill_think_block: true,
+            ..Self::default()
+        }
+    }
+
     /// A tokenizer whose EOS ids are `eos`: the gateway's stop decoder takes
     /// them as stops, as it does a model's. The tests' constructor: the
     /// benchmark decodes with no stop, so the integration build leaves it out.
@@ -70,6 +80,16 @@ impl llm_tokenizer::traits::Decoder for CharacterTokenizer {
 }
 
 impl Tokenizer for CharacterTokenizer {
+    #[cfg(test)]
+    fn think_in_prefill(&self) -> bool {
+        self.closed_prefill_think_block
+    }
+
+    #[cfg(test)]
+    fn prefill_opens_think_block(&self) -> bool {
+        false
+    }
+
     fn vocab_size(&self) -> usize {
         128
     }
