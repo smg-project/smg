@@ -64,3 +64,26 @@ def test_the_other_sampling_scalars_pass_through_as_sent(convert):
     )
     assert (params.temperature, params.min_p) == (0.0, 0.0)
     assert (params.frequency_penalty, params.presence_penalty) == (0.0, 0.5)
+
+
+def test_an_answer_tag_reaches_another_backend_as_its_schema(monkeypatch, servicer_mod):
+    # A structural tag is spelled for xgrammar. One that is a JSON answer's
+    # schema alone reaches a scheduler started with llguidance or outlines as
+    # that schema, its keys in the order written; under xgrammar, the default,
+    # a backend the servicer does not know and no server arguments the tag
+    # goes on.
+    monkeypatch.setattr(servicer_mod, "SGLSamplingParams", lambda **kw: SimpleNamespace(**kw))
+    convert = servicer_mod.SGLangSchedulerServicer._convert_sampling_params
+    schema = '{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"integer"}}}'
+    tag = '{"format":{"type":"json_schema","json_schema":' + schema + ',"max_whitespace_cnt":32}}'
+    sent = pb.SamplingParams(temperature=0.0, structural_tag=tag)
+    for backend in ("llguidance", "outlines"):
+        servicer = SimpleNamespace(server_args=SimpleNamespace(grammar_backend=backend))
+        params = convert(servicer, sent)
+        assert (params.json_schema, params.structural_tag) == (schema, None), backend
+    for backend in ("xgrammar", None, "a-plugin"):
+        servicer = SimpleNamespace(server_args=SimpleNamespace(grammar_backend=backend))
+        params = convert(servicer, sent)
+        assert (params.json_schema, params.structural_tag) == (None, tag), backend
+    params = convert(None, sent)
+    assert (params.json_schema, params.structural_tag) == (None, tag)

@@ -35,6 +35,7 @@ Router reads their other labels.
 from __future__ import annotations
 
 import importlib.metadata
+import json
 import re
 from typing import Any
 
@@ -253,3 +254,50 @@ def structural_tag_vocabulary_entry(args_dict: dict[str, Any], grammar_backend: 
     vocabulary = structural_tag_vocabulary(grammar_backend)
     if vocabulary:
         args_dict[STRUCTURAL_TAG_VOCABULARY_KEY] = vocabulary
+
+
+# The resolved grammar backends, by engine, that are known, enforce a JSON
+# schema themselves and are not xgrammar, the one backend a structural tag is
+# spelled for (:func:`answer_schema_in_place_of_tag`). vLLM names a backend
+# with or without options (``guidance:...``); SGLang's ``outlines`` compiles
+# no structural tag at all. TokenSpeed runs xgrammar or nothing, so its
+# servicer has no such backend and hands every tag on; TensorRT-LLM's Python
+# servicer lives with its engine.
+VLLM_SCHEMA_BACKENDS = ("guidance", "outlines", "lm-format-enforcer")
+SGLANG_SCHEMA_BACKENDS = ("llguidance", "outlines")
+
+
+def answer_schema_in_place_of_tag(
+    structural_tag: str, grammar_backend: str, schema_backends: tuple[str, ...]
+) -> str | None:
+    """The JSON schema to send in place of a structural tag that is a JSON
+    answer's schema alone, where the engine's resolved ``grammar_backend`` is
+    one of its ``schema_backends``; None for every other tag and backend,
+    which leaves the tag as it came.
+
+    A structural tag is spelled for xgrammar, and a caller that bounds the
+    white space of a JSON answer wraps its schema in a tag of that one node.
+    A backend the tag is not spelled for enforces the schema itself: it gets
+    the schema, as it does where nothing bounds the white space, and the
+    bound only the tag carries is dropped. Under xgrammar, the engine's
+    default, no backend and a name the servicer does not know the tag goes
+    on. The tag is the schema alone when its ``format`` is a ``json_schema``
+    node in the plain JSON style that excludes nothing: a call's tag, and an
+    answer's tag with anything around its schema, stay tags. The schema is
+    written with its keys in the order the tag carries them, the order a
+    grammar writes an object's properties in."""
+    if str(grammar_backend).strip().split(":", 1)[0] not in schema_backends:
+        return None
+    try:
+        tag = json.loads(structural_tag)
+    except ValueError:
+        return None
+    node = tag.get("format") if isinstance(tag, dict) else None
+    if not isinstance(node, dict) or node.get("type") != "json_schema":
+        return None
+    excludes = node.get("excludes")
+    if node.get("style", "json") != "json" or (isinstance(excludes, list) and excludes):
+        return None
+    if "json_schema" not in node:
+        return None
+    return json.dumps(node["json_schema"], separators=(",", ":"), ensure_ascii=False)

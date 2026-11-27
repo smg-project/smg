@@ -75,6 +75,8 @@ from smg_grpc_servicer.tensor_wire import tensor_from_parts
 from smg_grpc_servicer.tokenizer_bundle import tokenizer_bundle, tokenizer_chunks
 
 from ..constrained_decoding import (
+    SGLANG_SCHEMA_BACKENDS,
+    answer_schema_in_place_of_tag,
     grammar_backend_entry,
     grammar_start_labels,
     sglang_constrained_decoding_start,
@@ -1318,6 +1320,16 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             ebnf_grammar = grpc_params.ebnf_grammar
         elif grpc_params.HasField("structural_tag"):
             structural_tag = grpc_params.structural_tag
+            # A tag that is a JSON answer's schema alone goes as that schema
+            # to a backend the tag is not spelled for (llguidance, outlines);
+            # a servicer with no server arguments keeps the tag.
+            schema = answer_schema_in_place_of_tag(
+                structural_tag,
+                sglang_grammar_backend(getattr(self, "server_args", None)),
+                SGLANG_SCHEMA_BACKENDS,
+            )
+            if schema is not None:
+                json_schema, structural_tag = schema, None
 
         # Handle optional parameters conversion
         custom_params = (
