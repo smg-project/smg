@@ -5,6 +5,7 @@ mod hop_budget;
 mod ico_png_entry;
 mod max_long_side_pixel;
 mod plain_bmp;
+mod pooled_general;
 mod pooled_png;
 mod seek_decode;
 mod sixteen_bit_colour;

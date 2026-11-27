@@ -180,6 +180,24 @@ impl BufferPool {
         self.sized(len, zeroed)
     }
 
+    /// A buffer of `len` zero bytes, for a producer that may leave some of
+    /// them unwritten. A kept buffer is cleared here; a fresh one is the
+    /// zeroed allocation the producer had without the pool, of the whole
+    /// class as in [`Self::take`].
+    pub(crate) fn take_zeroed(&self, len: usize) -> Vec<u8> {
+        let Some(capacity) = class_capacity(len) else {
+            return vec![0u8; len];
+        };
+        let Some(mut buf) = self.kept(capacity) else {
+            let mut buf = vec![0u8; capacity];
+            buf.truncate(len);
+            return buf;
+        };
+        buf.clear();
+        buf.resize(len, 0);
+        buf
+    }
+
     /// The buffer of both takes; `fresh` allocates a zeroed one.
     fn sized<E>(
         &self,
@@ -293,6 +311,11 @@ pub(crate) fn take(len: usize) -> Vec<u8> {
 /// [`BufferPool::try_take`] on the process's pool.
 pub(crate) fn try_take(len: usize) -> Result<Vec<u8>, TryReserveError> {
     shared().try_take(len)
+}
+
+/// [`BufferPool::take_zeroed`] on the process's pool.
+pub(crate) fn take_zeroed(len: usize) -> Vec<u8> {
+    shared().take_zeroed(len)
 }
 
 /// [`BufferPool::take_empty`] on the process's pool.
@@ -457,6 +480,25 @@ mod tests {
         let other = pool.take(SMALLEST);
         assert_ne!(other.as_ptr(), address);
         assert_eq!(pool.held(), 2 * SMALLEST);
+    }
+
+    #[test]
+    fn a_zeroed_take_clears_a_kept_buffer() {
+        let pool = BufferPool::new();
+        let mut buf = pool.take(2 * SMALLEST);
+        buf.fill(0x17);
+        let address = buf.as_ptr();
+        pool.recycle(buf);
+        // A shorter length of the same class: the same buffer, zero in
+        // every byte handed out.
+        let again = pool.take_zeroed(SMALLEST + 1);
+        assert_eq!(again.as_ptr(), address);
+        assert_eq!(again.len(), SMALLEST + 1);
+        assert!(again.iter().all(|&byte| byte == 0));
+        // A fresh buffer of a class and one outside the pooled range are
+        // zeroed allocations.
+        assert!(pool.take_zeroed(SMALLEST).iter().all(|&byte| byte == 0));
+        assert!(pool.take_zeroed(SMALLEST - 1).iter().all(|&byte| byte == 0));
     }
 
     #[test]

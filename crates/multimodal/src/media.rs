@@ -5288,11 +5288,15 @@ pub(crate) fn decode_frame_bytes(
                         None
                     };
                     let image = if is_png {
-                        png_into_pool(decoder)?
+                        // The PNG decoder writes every byte of the image
+                        // it reports.
+                        eight_bit_into_pool(decoder, false)?
                     } else if let Some(image) = plain_bmp {
                         image
                     } else {
-                        image::DynamicImage::from_decoder(decoder)?
+                        // No other decoder is held to that: its buffer
+                        // arrives zeroed, as the crate's own vector does.
+                        eight_bit_into_pool(decoder, true)?
                     };
                     oriented(image, orientation)
                 }
@@ -5310,14 +5314,19 @@ pub(crate) fn decode_frame_bytes(
     Ok(image)
 }
 
-/// What `DynamicImage::from_decoder` returns for a PNG of an eight-bit
+/// What `DynamicImage::from_decoder` returns for an image of an eight-bit
 /// layout, with the pixels in a buffer of the pool the JPEG and WebP decoders
 /// take theirs from. The crate's own vector is a zeroed allocation of the
-/// image's size, which is fresh pages on every request; the PNG decoder
-/// writes every byte of the image it reports, so the buffer need not arrive
-/// zeroed. A sixteen-bit layout, which the pool does not take back, keeps the
-/// crate's path.
-fn png_into_pool(decoder: impl image::ImageDecoder) -> image::ImageResult<image::DynamicImage> {
+/// image's size, which is fresh pages on every request. With `zeroed` the
+/// pooled buffer arrives zeroed too, so a byte the decoder leaves alone
+/// reads as it does in the crate's vector; without it the buffer holds a
+/// previous request's bytes, for a decoder that writes every byte of the
+/// image it reports. A sixteen-bit layout, which the pool does not take
+/// back, keeps the crate's path.
+fn eight_bit_into_pool(
+    decoder: impl image::ImageDecoder,
+    zeroed: bool,
+) -> image::ImageResult<image::DynamicImage> {
     type Layout = fn(u32, u32, Vec<u8>) -> Option<image::DynamicImage>;
     let layout: Layout = match decoder.color_type() {
         image::ColorType::Rgb8 => |width, height, pixels| {
@@ -5339,7 +5348,11 @@ fn png_into_pool(decoder: impl image::ImageDecoder) -> image::ImageResult<image:
         return image::DynamicImage::from_decoder(decoder);
     };
     let (width, height) = decoder.dimensions();
-    let mut pixels = buffer_pool::take(len);
+    let mut pixels = if zeroed {
+        buffer_pool::take_zeroed(len)
+    } else {
+        buffer_pool::take(len)
+    };
     if let Err(error) = decoder.read_image(&mut pixels) {
         // A refused decode hands its buffer back; the next take is warm.
         buffer_pool::recycle(pixels);
