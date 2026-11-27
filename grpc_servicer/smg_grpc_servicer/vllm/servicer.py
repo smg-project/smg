@@ -41,7 +41,13 @@ from smg_grpc_servicer.trace_context import trace_headers
 from smg_grpc_servicer.vllm import attach_vllm_logging, settle_logging
 from smg_grpc_servicer.vllm.admin import flush_cache, start_profile, stop_profile
 from smg_grpc_servicer.vllm.config_view import EngineConfigView, uses_mrope
-from smg_grpc_servicer.vllm.errors import GracefulHTTPError, VLLMClientError, grpc_code_for
+from smg_grpc_servicer.vllm.errors import (
+    GracefulHTTPError,
+    VLLMClientError,
+    grpc_code_for,
+    grpc_refusal_message,
+    grpc_trailer_for,
+)
 from smg_grpc_servicer.vllm.kv_events import (
     rank_sources_for,
     resolve_kv_events_config,
@@ -760,14 +766,21 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             # after the hand-over reaches here through the engine's own abort,
             # which answers it; an EngineGenerateError that wraps a ValueError
             # could come from either side and stays without the notice.
+            # A failed compile came from the engine core, which held the request.
+            trailer = grpc_trailer_for(e)
             refused = (
                 isinstance(e, (VLLMClientError, GracefulHTTPError, ValueError))
                 and not engine_started
+                and not trailer
             )
             await self._notify_kv_transfer_rejected(
                 request_id, kv_transfer_params, handed_to_engine and not refused
             )
-            await context.abort(code, str(e))
+            # A grammar the engine core failed to compile is refused under the constraint trailer.
+            if trailer:
+                await context.abort(code, grpc_refusal_message(str(e)), trailing_metadata=trailer)
+            else:
+                await context.abort(code, str(e))
         finally:
             self._loads.finished(request_id)
 

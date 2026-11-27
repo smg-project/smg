@@ -62,6 +62,16 @@ def constraint_failed_trailer() -> tuple[tuple[str, str], ...]:
     return ((CONSTRAINT_FAILED_METADATA_KEY, _REPORTED_BY_ENGINE),)
 
 
+# The trailer on a worker's refusal of a constraint its engine cannot enforce, as on the Rust wires.
+CONSTRAINT_REFUSED_METADATA_KEY = "smg-constraint-refused"
+_REFUSED_BY_WORKER = "worker"
+
+
+def constraint_refused_trailer() -> tuple[tuple[str, str], ...]:
+    """The trailing metadata that marks an ``INVALID_ARGUMENT`` as a refused constraint."""
+    return ((CONSTRAINT_REFUSED_METADATA_KEY, _REFUSED_BY_WORKER),)
+
+
 async def abort_for_constraint_failure(context: grpc.aio.ServicerContext, detail: str) -> None:
     """End the stream with the constraint-failure status: ``FAILED_PRECONDITION``,
     the message of :func:`constraint_failed_message`, the trailer of

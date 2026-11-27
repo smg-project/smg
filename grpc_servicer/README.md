@@ -787,6 +787,10 @@ refuses it alike) and samples no circuit breaker against the worker. On
 `/v1/messages` the answer is the request's `invalid_request_error`, whose
 envelope carries no code (it rides in `X-SMG-Error-Code`). A router that
 predates the trailer answers a 400 under the code of whatever failed to start.
+A grammar vLLM's engine core fails to compile ends its request with the
+engine's `validation_error` (`Invalid structured outputs: ...`), which both
+vLLM servicers refuse the same way, in the engine's words naming the grammar
+(`Invalid structured outputs: the grammar failed to compile: ...`).
 
 A constraint the engine admitted and then could not continue the request under
 (a sampled token the grammar rejects, as speculative decoding can produce) is
