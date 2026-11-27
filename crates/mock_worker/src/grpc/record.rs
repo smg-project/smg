@@ -363,8 +363,11 @@ fn taken(unread: &Mutex<Option<Status>>) -> Option<Status> {
 /// of its words and keeps its code, the one a caller of the engine itself
 /// reads (`UNAVAILABLE` for a failed connect, the code of its reason for a
 /// reset). Every other status carries no source and passes as it is: one
-/// read off the wire, and one the client made of an answer that ended with
-/// no gRPC status.
+/// read off the wire, one the client made of an answer that ended with no
+/// gRPC status, and one it made of an answer it could not read: a message
+/// over the recorder's size limit (`OUT_OF_RANGE`), one cut short or with
+/// a compressed flag it could not follow (`INTERNAL`), an encoding it does
+/// not take (`UNIMPLEMENTED`).
 fn unreached(status: Status) -> Status {
     match std::error::Error::source(&status) {
         Some(_) => {
@@ -376,7 +379,10 @@ fn unreached(status: Status) -> Status {
 }
 
 /// One call as the recorder saw it: written when the call is over, however
-/// it ended (the engine's completion, a status, or the gateway letting go).
+/// it ended (the engine's completion, a status, or the gateway letting go),
+/// where it holds a request message that reads as a request of its wire:
+/// a call that held none (the engine not reached, the request message not
+/// read) writes no line.
 struct Exchange {
     kept: Kept,
     path: String,

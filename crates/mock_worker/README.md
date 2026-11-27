@@ -691,8 +691,12 @@ what the engine says; the file replays later with no engine behind it.
   behind them, keeps the code a caller of the engine reads (`UNAVAILABLE`
   for an engine the recorder cannot reach, the code of its reason for a
   stream the engine reset) and names `the recorder's upstream` ahead of the
-  reason; every other status passes as it is: one the engine sent, and one
-  the client makes of an answer that ended with no gRPC status.
+  reason; every other status passes as it is: one the engine sent, one the
+  client makes of an answer that ended with no gRPC status, and one it
+  makes of an answer it cannot read: a message over
+  `--grpc-max-message-bytes` (`OUT_OF_RANGE`), one cut short or with a
+  compressed flag it cannot follow (`INTERNAL`), an encoding it does not
+  take (`UNIMPLEMENTED`).
   The recorder never fails a call for its own files: a write that fails
   is logged and the call goes on, and one that fails part way leaves a part
   of a line, which `--script` refuses with its line number. The recorder
@@ -705,7 +709,12 @@ what the engine says; the file replays later with no engine behind it.
   exchange of a scheduler wire (vLLM, TokenSpeed, SGLang) is appended to
   `PATH` when the call is over, one line for each choice the request asked
   (a call that failed or was let go early keeps a line for each all the
-  same, so the calls of one key hold the same count of lines), as lines
+  same, so the calls of one key hold the same count of lines; a call whose
+  request the recorder did not hand on, the engine not reached or the
+  request message not read, writes none, as does one whose request does
+  not read as a request of its wire: a replay holds nothing of such a
+  call, and where its request reaches the script it finds what other
+  calls of its key left, or nothing), as lines
   `--script` reads: `input_ids`, `output_ids` (`"output_text": ""` for an
   answer of no tokens), `chunks` (the tokens of each frame in turn, as the
   engine cut a streamed answer; a frame may hold none, and where no frame
@@ -768,7 +777,9 @@ what the engine says; the file replays later with no engine behind it.
   with it: the frames the call's lines hold go out first (a line whose
   finish reason is `error` is a choice the engine left open, sent without a
   completion), and a call that delivered nothing is answered with the
-  status alone.
+  status alone. The status of a call the engine reset at the recording,
+  ahead of its headers or behind them, replays with the code and the words
+  its caller read then, `the recorder's upstream` ahead of the reason.
   Once a recorded line is held, a gRPC worker of the process fails a request
   that finds nothing with `INTERNAL` and the key it missed (and whether the
   prompt is recorded, asked otherwise) instead of going on to its engine: a
