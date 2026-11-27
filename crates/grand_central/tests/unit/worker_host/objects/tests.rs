@@ -1845,6 +1845,81 @@ fn a_new_incarnation_of_a_key_drops_the_old_object_and_builds_one_under_a_new_id
     );
 }
 
+/// Models another writer of the registry set on a standing object read
+/// back as set. A cut laid whole holds its row against the row read
+/// back off the object. A row that states other models is laid again,
+/// and the object in its place states the cut's row. The row beside it
+/// keeps the very object.
+///
+/// Classic sets models the same way, in its model refresh
+/// (`model_gateway/src/routers/common/worker_selection.rs:290`). It
+/// builds no holder, so no cut is laid whole over its registry.
+#[test]
+fn a_cut_laid_whole_lays_a_row_again_where_models_were_set_on_its_object() {
+    let mut replica = Replica::new();
+    replica.write(facts(A, 1));
+    replica.write(facts(B, 1));
+    let (a, set, kept) = (replica.id(A), replica.at(A), replica.at(B));
+    let card = openai_protocol::model_card::ModelCard::new;
+    let registry = Arc::clone(replica.objects.registry());
+    assert!(registry.refresh_models(&set, vec![card("m"), card("late")]));
+    replica.told();
+
+    let cut = replica.store.checkpoint();
+    assert!(replica.objects.restore_from(&replica.store, cut));
+
+    // A's object is another under its id, and states the row's models.
+    assert_eq!(replica.id(A), a);
+    assert!(!Arc::ptr_eq(&set, &replica.at(A)), "A is laid again");
+    let row = replica.objects.row_of(&a).expect("A's row");
+    assert_eq!(row.facts, replica.row(A).facts);
+    // B's row reads back as stated: the very object.
+    assert!(Arc::ptr_eq(&kept, &replica.at(B)), "B is kept");
+    assert_eq!(replica.told(), [("replaced", a)]);
+}
+
+/// The entry keeps what stands for a row under two keys: the row's id and
+/// its object's id. A reader by either key reads one remainder and one
+/// object. Behind each write of the entry the pointers under the two keys
+/// are the same allocations, for every row. The writes are a lay, a lay
+/// in a standing object's place, a key's next life, a row stated again
+/// and a row's end.
+#[test]
+fn a_rows_two_entries_name_one_remainder_and_one_object() {
+    /// How many rows the entry holds, the same count each way, where each
+    /// row's two entries name one remainder and one object.
+    fn shared(replica: &Replica) -> usize {
+        let held = replica.objects.held.read();
+        for (row, (id, by_row)) in &held.objects {
+            let laid = held.rows.get(id).expect("the object's entry");
+            assert_eq!(laid.remainder.standing.row, *row);
+            assert!(Arc::ptr_eq(&by_row.remainder, &laid.remainder), "{row:?}");
+            assert!(Arc::ptr_eq(&by_row.object, &laid.object), "{row:?}");
+        }
+        assert_eq!(held.objects.len(), held.rows.len(), "one entry each way");
+        held.rows.len()
+    }
+
+    let replica = Replica::new();
+    for url in [A, B, C] {
+        replica.write(facts(url, 1));
+    }
+    assert_eq!(shared(&replica), 3, "a lay of each row");
+    replica.write(labelled(A, 1, "gold"));
+    replica.write(facts(B, 2));
+    assert_eq!(shared(&replica), 3, "a lay in place and a next life");
+    // The same facts and revision, admitted at another time.
+    let mut row = replica.row(C);
+    row.admitted_at += Duration::from_secs(1);
+    replica.objects.restate(&row);
+    let stated = replica.objects.remainder(&replica.id(C));
+    let stated = stated.expect("C's remainder");
+    assert_eq!(stated.admitted_at, row.admitted_at, "stated again");
+    assert_eq!(shared(&replica), 3, "a row stated again");
+    replica.remove(A);
+    assert_eq!(shared(&replica), 2, "a row's end");
+}
+
 /// A cut laid whole reads every row once: one write of each kind went
 /// around the holder ahead of it. The objects of
 /// the rows that went leave first, then each row that does not stand as
@@ -2164,6 +2239,22 @@ fn an_engines_ranks_are_answered_by_their_rows() {
     assert_eq!(objects.rank_row(alone, 1), None);
 }
 
+/// An engine's address that ends in a slash is the address its ranks
+/// stand under, as its rows state it. A rank above 0 is answered by its
+/// row, and by none once that row left.
+#[test]
+fn an_engines_ranks_stand_under_an_address_that_ends_in_a_slash() {
+    const SLASHED: &str = "http://e:8000/";
+    let replica = Replica::new();
+    let lower = replica.write(rank_facts(A, SLASHED, 0));
+    let upper = replica.write(rank_facts(B, SLASHED, 1));
+    assert_eq!(replica.objects.rank_row(lower, 1), Some(upper));
+
+    replica.remove(B);
+    assert_eq!(replica.objects.rank_row(lower, 1), None, "the rank left");
+    assert_eq!(replica.objects.rank_row(lower, 0), Some(lower));
+}
+
 #[test]
 fn a_rank_row_that_leaves_is_answered_no_longer() {
     let replica = Replica::new();
@@ -2193,6 +2284,20 @@ fn a_row_stands_at_its_own_rank_until_it_leaves() {
     replica.remove(B);
     assert!(!objects.lists_rank(upper, 1), "a row that left");
     assert!(objects.lists_rank(lower, 0));
+}
+
+/// A row that states a rank beside a width of one stands at the rank it
+/// states. Its object holds no rank, so the answer is the row's own.
+#[test]
+fn a_row_of_width_one_stands_at_the_rank_it_states() {
+    let replica = Replica::new();
+    let row = replica.write(WorkerFacts {
+        dp_rank: 3,
+        dp_size: 1,
+        ..facts(A, 1)
+    });
+    assert!(replica.objects.lists_rank(row, 3), "the rank it states");
+    assert!(!replica.objects.lists_rank(row, 0), "its object's rank");
 }
 
 /// A rank's key that comes back as a new incarnation is another row, and

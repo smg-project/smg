@@ -31,7 +31,9 @@
 //! A watch of some models is told a write when a row it names serves one of
 //! them: the row the write left in the table, or the row it took out. A
 //! row's models change with its incarnation at the door, so a row leaves a
-//! watcher's models by a replacement, which names both rows.
+//! watcher's models by a replacement, which names both rows. A status
+//! entry names no row. It holds the models its row served at the write,
+//! and the same rule reads them.
 //!
 //! A membership entry the wire has no form for is told to no watch. The
 //! store writes none; one that lands is logged once a replica.
@@ -67,7 +69,10 @@ use tracing::{info, warn};
 use super::{principal::Principal, worker_wire};
 pub(super) use crate::document::operator::snapshot::PAGE_BYTES;
 use crate::{
-    document::operator::{snapshot::serves, SerialTurn},
+    document::operator::{
+        snapshot::{serves, serves_models},
+        SerialTurn,
+    },
     service::{
         elector::Fence,
         proto,
@@ -687,7 +692,9 @@ impl Asked {
 
     /// Whether a watch comes to the write: a row it names serves an asked
     /// model. A membership entry that names no row has no wire form, and
-    /// every watch comes to it: the first logs it ([`Feed::untold`]).
+    /// every watch comes to it: the first logs it ([`Feed::untold`]). A
+    /// status entry is read by its kind: it holds the models its row
+    /// serves, which is all the rule reads of a row.
     fn tells(&self, entry: &Entry) -> bool {
         match &entry.event {
             Event::Member { row, left, .. } => {
@@ -697,6 +704,7 @@ impl Asked {
                         .flatten()
                         .any(|row| self.serves(row))
             }
+            Event::Status { models, .. } => serves_models(&self.models, models),
             Event::Term | Event::Generation { .. } => false,
         }
     }

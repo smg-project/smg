@@ -296,6 +296,9 @@ fn a_row_laid_in_place_tells_the_status_its_object_took() {
         .into_iter()
         .filter_map(|entry| match entry.event {
             Event::Member { change, .. } => Some(change),
+            Event::Status { id, from, to, .. } => {
+                Some(MembershipChange::StatusChanged { id, from, to })
+            }
             Event::Term | Event::Generation { .. } => None,
         })
         .collect();

@@ -165,6 +165,13 @@ fn told(log: &Log) -> Vec<(Position, String)> {
         .map(|entry| {
             let what = match entry.event {
                 Event::Member { epoch, change, .. } => format!("{epoch} {change:?}"),
+                Event::Status {
+                    epoch,
+                    id,
+                    from,
+                    to,
+                    models,
+                } => format!("{epoch} {id:?} {from:?} to {to:?} serving {models:?}"),
                 Event::Term => "term".to_owned(),
                 Event::Generation { generation } => format!("generation {generation}"),
             };
@@ -2262,6 +2269,78 @@ fn a_snapshot_restores_its_leaders_standing_generation_or_nothing() {
         spec_document(following.document(0).expect("held")),
         spec_document(leading.document(0).expect("held"))
     );
+}
+
+/// A snapshot of one part is whole at that part: the part that states
+/// its leader's standing generation is the first and the last, and hands
+/// it on with the cut.
+#[test]
+fn a_snapshot_of_one_part_hands_on_the_generation_its_part_states() {
+    use crate::service::controller::generations::{tests::LEAST_LOAD, Format};
+
+    let (leader, _, _) = pair();
+    let leading = door(&leader);
+    let at = Instant::now();
+    first(&leader.0);
+    leading
+        .apply(LEAST_LOAD.into(), Format::Yaml)
+        .expect("a valid document");
+    let told = leading.standing_sent().expect("a held document");
+    let mut parts = snapshot(&leader, at);
+    assert_eq!(parts.len(), 1, "one part of rows");
+    parts[0].snapshot.as_mut().expect("a part").generation = Some(Box::new(told.clone()));
+    let (_, stated) = Staged::default()
+        .take(&parts[0], at)
+        .expect("the snapshot's one part")
+        .expect("the last part");
+    assert_eq!(stated, Some(told));
+}
+
+/// A snapshot whose parts state no generation, as a leader that holds no
+/// document sends it, hands on none with the cut.
+#[test]
+fn a_snapshot_that_states_no_generation_hands_on_none() {
+    let (leader, _, _) = pair();
+    let at = Instant::now();
+    first(&leader.0);
+    let parts = snapshot(&leader, at);
+    assert_eq!(parts.len(), 1, "one part of rows");
+    let (_, stated) = Staged::default()
+        .take(&parts[0], at)
+        .expect("the snapshot's one part")
+        .expect("the last part");
+    assert_eq!(stated, None);
+}
+
+/// Two parts of one snapshot that each state a generation: the last part
+/// hands on the one stated first. A leader of this build states its
+/// generation on the first part alone.
+#[test]
+fn a_later_parts_generation_does_not_replace_the_one_stated_first() {
+    use crate::service::controller::generations::{tests::LEAST_LOAD, Format};
+
+    let (leader, _, _) = pair();
+    let leading = door(&leader);
+    let at = Instant::now();
+    first(&leader.0);
+    a_page_and_one(&leader.0);
+    leading
+        .apply(LEAST_LOAD.into(), Format::Yaml)
+        .expect("a valid document");
+    let told = leading.standing_sent().expect("a held document");
+    let mut later = told.clone();
+    later.status.as_mut().expect("a status").generation += 1;
+    let mut parts = snapshot(&leader, at);
+    assert_eq!(parts.len(), 2, "two parts of rows");
+    parts[0].snapshot.as_mut().expect("a part").generation = Some(Box::new(told.clone()));
+    parts[1].snapshot.as_mut().expect("a part").generation = Some(Box::new(later));
+    let mut staging = Staged::default();
+    assert!(matches!(staging.take(&parts[0], at), Ok(None)));
+    let (_, stated) = staging
+        .take(&parts[1], at)
+        .expect("the snapshot's next part")
+        .expect("the last part");
+    assert_eq!(stated, Some(told));
 }
 
 /// A restore lands the snapshot's generation behind the cut's rows: the

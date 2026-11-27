@@ -768,7 +768,8 @@ impl Config {
     /// not how long its steps take: its decode cost keeps the fleet's pool as
     /// its reference, unless a calibration gave the reference. Its synthetic
     /// output keeps to the ids the worker's tokenizer decodes, where
-    /// `--tokenizer` names local files.
+    /// `--tokenizer` names local files; an HTTP worker sends text and no id,
+    /// so its engine keeps the ids drawn and loads no tokenizer for them.
     pub fn engine_for(&self, worker: &str) -> EngineParams {
         let mut params = self.engine.clone();
         if let Some(&tokens) = self.worker_kv_tokens.get(worker) {
@@ -780,7 +781,9 @@ impl Config {
         if let Some(&scale) = self.worker_pass_time_scale.get(worker) {
             params.pass_time_scale = scale;
         }
-        params.output_table = crate::script::output_table(self);
+        if !worker.starts_with("http:") {
+            params.output_table = crate::script::output_table(self);
+        }
         params
     }
 

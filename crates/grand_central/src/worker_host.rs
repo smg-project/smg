@@ -150,7 +150,8 @@ pub use members::Members;
 pub use members::{EncodeColumns, OpenAdmission};
 #[cfg(feature = "controller")]
 pub(crate) use membership_writer::{
-    awaits_connect, drain, lay, lay_one, lay_ready, refresh, stating, take, Ready, Stated, Turn,
+    asks_events_under, awaits_connect, drain, lay, lay_one, lay_ready, refresh, stating, take,
+    Ready, Stated, Turn,
 };
 pub use membership_writer::{
     MembershipWriteOutcome, MembershipWriteRefused, MembershipWriter, Over, Precondition, Remover,

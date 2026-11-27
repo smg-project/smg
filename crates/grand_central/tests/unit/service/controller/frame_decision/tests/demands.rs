@@ -132,17 +132,25 @@ fn a_pairs_frame_that_demands_vision_is_answered_workers_that_take_images_on_eac
         let seeing = |name: &str, role, takes| seeing_member(&store, &objects, name, role, takes);
         let prefills = [seeing("p0", prefill, false), seeing("p1", prefill, ahead)];
         let decodes = [seeing("d0", decode, false), seeing("d1", decode, behind)];
+        // Every frame is answered the same way: a pair, or the one shed. A
+        // pair named ahead of a shed is not dropped: frames that part fail
+        // the case.
         let answered = |demands: proto::Demands| -> Named<(WorkerId, WorkerId)> {
-            let mut named = BTreeSet::new();
+            let (mut named, mut sheds) = (BTreeSet::new(), Vec::new());
             for n in 1..=64 {
                 let frame = demanding(at_prefill(n, WireModes::NONE, None), demands);
                 let answer = served_pair(&store, &objects, frame, GATEWAY, now);
                 if answer.pick().is_none() {
-                    return Err(shed_of(&answer));
+                    sheds.push(shed_of(&answer));
                 }
                 named.extend(pairs_of(&answer));
             }
-            Ok(named)
+            sheds.dedup();
+            match (named.is_empty(), sheds.as_slice()) {
+                (false, []) => Ok(named),
+                (true, [shed]) => Err(*shed),
+                _ => panic!("the frames part: pairs {named:?}, sheds {sheds:?}"),
+            }
         };
         assert_eq!(answered(none), Ok(every(&prefills, &decodes)));
         let meeting = if ahead && behind {

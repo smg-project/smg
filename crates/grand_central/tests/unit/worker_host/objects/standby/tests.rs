@@ -609,6 +609,7 @@ fn a_cut_that_names_an_id_under_another_address_ends_its_first_object() {
         leader.upsert(facts(1, "gold"));
         let cut = leader.store.checkpoint();
         assert!(lay(&standby.objects, &standby.store, cut), "{name}");
+        let first = standby.object(A).expect("the first object");
         // The same id, under another address.
         let mut cut = leader.store.checkpoint();
         let id = cut.rows[0].id;
@@ -621,6 +622,8 @@ fn a_cut_that_names_an_id_under_another_address_ends_its_first_object() {
         assert!(lay(&standby.objects, &standby.store, cut), "{name}");
         let registry = standby.objects.registry();
         assert!(registry.get_by_url(A).is_none(), "{name}: the first one");
+        let entry = standby.objects.standing(&first);
+        assert_eq!(entry, None, "{name}: the first one's entry");
         let object = standby.object(B).expect("the row's object");
         assert_eq!(standby.objects.row_of(&object), Some(moved), "{name}");
         assert_eq!(registry.len(), 1, "{name}: one object an id");
@@ -628,6 +631,40 @@ fn a_cut_that_names_an_id_under_another_address_ends_its_first_object() {
         let left = MembershipChange::Removed { id };
         assert!(hand(&standby, 1, left, None), "{name}: the removal");
         assert!(registry.is_empty(), "{name}: no object with no row");
+    }
+}
+
+/// A cut that swaps the addresses of two standing rows leaves two
+/// objects, by a restore and by a watch's snapshot. The first row's lay
+/// ends the object the other row holds at its new address, and then its
+/// own at the old one. The other row's lay finds its new address free.
+/// Each row's object stands at its new address and states the cut's row.
+#[test]
+fn a_cut_that_swaps_two_rows_addresses_leaves_each_row_its_object() {
+    for (name, lay) in LAYS {
+        let (leader, standby) = (Replica::new(), Replica::new());
+        leader.upsert(facts(1, "gold"));
+        leader.upsert(WorkerFacts {
+            key: B.to_owned(),
+            engine: B.to_owned(),
+            ..facts(1, "gold")
+        });
+        let cut = leader.store.checkpoint();
+        assert!(lay(&standby.objects, &standby.store, cut), "{name}");
+        // Each id under the other's address.
+        let mut cut = leader.store.checkpoint();
+        let (one, two) = (cut.rows[0].facts.clone(), cut.rows[1].facts.clone());
+        (cut.rows[0].facts, cut.rows[1].facts) = (two, one);
+        let swapped = cut.rows.clone();
+        assert!(lay(&standby.objects, &standby.store, cut), "{name}");
+        let registry = standby.objects.registry();
+        assert_eq!(registry.len(), 2, "{name}: two objects");
+        assert_eq!(standby.objects.len(), 2, "{name}: two rows");
+        for row in swapped {
+            let object = standby.object(&row.facts.key).expect("an object");
+            assert_eq!(standby.objects.object(row.id).as_ref(), Some(&object));
+            assert_eq!(standby.objects.row_of(&object), Some(row), "{name}");
+        }
     }
 }
 

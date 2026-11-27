@@ -40,6 +40,7 @@ use crate::{
 };
 
 mod alone;
+mod builder;
 mod encode;
 mod engines;
 mod keyed;
@@ -3997,6 +3998,9 @@ pub struct Engine {
     /// What the door needs of a seat, zero on the plain path.
     seat_flags: u8,
     explain_sample: u32,
+    /// The age limit of load reports a decision by rank checks a report
+    /// by: the limit its document's build started under
+    /// ([`Engine::built`]), and none for an engine made in code.
     max_report_age_ms: Option<u64>,
     /// The stages that keep a number of the reports
     /// ([`Lifecycle::keeps_loads`]), each by its place: listed once at the
@@ -4010,7 +4014,7 @@ pub struct Engine {
     /// Beside each profile, the place in `sent_credits` of the tally its
     /// stages read, where one asked for it at the build.
     #[cfg(feature = "in-process")]
-    pub(crate) sent_of: Vec<Option<usize>>,
+    sent_of: Vec<Option<usize>>,
     /// Beside each tally, the generation whose build made its object.
     /// Empty until the engine keeps one ([`Engine::keep_from`]): every
     /// tally is its own.
@@ -4019,7 +4023,7 @@ pub struct Engine {
     /// The number of the stage table a spec's build made the stages over
     /// (`StageRegistry::own`): none for an engine made in code.
     #[cfg(feature = "in-process")]
-    pub(crate) stage_table: Option<u64>,
+    stage_table: Option<u64>,
     /// The kinds of event the document takes, but for its counts of sends
     /// ([`Lifecycle::hears`] adds those): each stage's answer, asked once at
     /// the build, with the engine's own. A word of a request is told to
@@ -5665,10 +5669,6 @@ impl Engine {
             hears,
             stages_hear,
         }
-    }
-
-    pub(crate) fn limit_report_age(&mut self, max_age_ms: Option<u64>) {
-        self.max_report_age_ms = max_age_ms;
     }
 
     pub fn generation(&self) -> u64 {

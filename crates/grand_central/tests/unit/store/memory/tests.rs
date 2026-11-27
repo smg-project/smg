@@ -177,7 +177,9 @@ impl MemoryStore {
     ) -> Option<MembershipChange> {
         let mut workers = self.writing();
         let from = workers.guarded(id, revision)?.row.status;
-        match workers.set_status(id, status) {
+        // This road hands no models: the journal is told the table's
+        // row's.
+        match workers.set_status(id, status, None) {
             StatusSet::Moved => Some(MembershipChange::StatusChanged {
                 id,
                 from,
