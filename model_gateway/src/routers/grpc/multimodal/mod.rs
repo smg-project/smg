@@ -22,14 +22,44 @@ use std::{collections::HashSet, fmt::Display, sync::Arc};
 use axum::response::Response;
 use llm_multimodal::{
     hub::HubFetchError, AudioClip, EncoderFieldLayouts, EncoderInputFormat, ImageFrame,
-    MediaConnectorError, MediaErrorCode, MediaFault, Modality, MultiModalError, PlaceholderRange,
-    PreprocessedEncoderInputs, VideoClip,
+    MediaConnectorError, MediaErrorCode, MediaFault, Modality, ModelMetadata, ModelRegistry,
+    MultiModalError, PlaceholderRange, PreprocessedEncoderInputs, VideoClip,
 };
-use llm_tokenizer::{Encoding, TokenizerTrait};
+use llm_tokenizer::{registry::TokenizerRegistry, Encoding, TokenizerTrait};
 
 use crate::routers::{
     common::retry::mark_non_retryable, error, grpc::proto_wrapper::VLLM_MROPE_GRID_KEYS,
 };
+
+/// Whether the prepared images or videos of `model_id` carry the grid
+/// tensors of [`MultimodalIntermediate::has_mrope_grids`]: its spec lays out
+/// a grid field ([`VLLM_MROPE_GRID_KEYS`]) for one of them. It reads only the
+/// cached config, so it waits on no load. `None` while the model has no
+/// tokenizer entry or no cached config, or while no spec matches it.
+pub(crate) fn model_media_carries_mrope_grids(
+    tokenizers: &TokenizerRegistry,
+    configs: &MultimodalConfigRegistry,
+    specs: &ModelRegistry,
+    model_id: &str,
+) -> Option<bool> {
+    let entry = tokenizers
+        .get_by_name(model_id)
+        .or_else(|| tokenizers.get_by_id(model_id))?;
+    let config = configs.get(&entry.id)?;
+    let tokenizer = RegistryTokenizer(entry.tokenizer.as_ref());
+    let metadata = ModelMetadata {
+        model_id,
+        tokenizer: &tokenizer,
+        config: &config.config,
+    };
+    let spec = specs.lookup(&metadata)?;
+    let lays_out_grids = |modality| {
+        let layouts = spec.encoder_field_layouts_for(modality);
+        let mut fields = layouts.model_specific.keys();
+        fields.any(|field| VLLM_MROPE_GRID_KEYS.contains(&field.as_str()))
+    };
+    Some(lays_out_grids(Modality::Image) || lays_out_grids(Modality::Video))
+}
 
 /// Bridges the gateway's tokenizer to the model registry's local tokenizer
 /// seam: `llm-multimodal` deliberately depends on no tokenizer crate, so the
