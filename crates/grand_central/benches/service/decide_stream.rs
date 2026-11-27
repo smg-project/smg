@@ -181,7 +181,7 @@
 mod allocator;
 #[path = "decide_stream/clients.rs"]
 mod clients;
-#[path = "common/filled.rs"]
+#[path = "../common/filled.rs"]
 mod filled;
 #[path = "decide_stream/served.rs"]
 mod served;

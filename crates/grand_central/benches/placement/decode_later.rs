@@ -21,6 +21,7 @@
     dead_code,
     reason = "this bench builds its engine from the epd presets; `common::engine_of` serves the decision and contention benches"
 )]
+#[path = "../common/mod.rs"]
 mod common;
 
 use std::hint::black_box;

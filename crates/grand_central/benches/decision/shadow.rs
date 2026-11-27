@@ -5,6 +5,7 @@
 //! and each iteration gives both decisions the same fresh seed.
 #![expect(clippy::expect_used, reason = "the bench requires a valid binding")]
 
+#[path = "../common/mod.rs"]
 mod common;
 
 use std::hint::black_box;

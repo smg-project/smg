@@ -17,6 +17,7 @@
     reason = "a bench's setup has no caller to answer; a preset that fails to validate is a bug the unit tests catch"
 )]
 
+#[path = "../common/mod.rs"]
 mod common;
 
 use std::hint::black_box;

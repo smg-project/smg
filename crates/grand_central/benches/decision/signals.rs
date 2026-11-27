@@ -8,7 +8,7 @@
     reason = "the benchmark requires a valid policy to measure a decision"
 )]
 
-#[path = "common/reads_two.rs"]
+#[path = "../common/reads_two.rs"]
 mod reads_two;
 
 use std::hint::black_box;

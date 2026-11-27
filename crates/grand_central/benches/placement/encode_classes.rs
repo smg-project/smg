@@ -32,7 +32,7 @@
     reason = "a bench's setup has no caller to answer"
 )]
 
-#[path = "common/filled.rs"]
+#[path = "../common/filled.rs"]
 mod filled;
 
 use std::{hint::black_box, time::Instant};

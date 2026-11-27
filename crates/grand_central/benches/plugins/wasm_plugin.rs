@@ -24,18 +24,19 @@
     reason = "a bench's setup has no caller to answer; a guest that fails to load is a bug the tests catch"
 )]
 
-#[path = "common/column.rs"]
+#[path = "../common/column.rs"]
 mod column;
 #[expect(
     dead_code,
     reason = "the native floor is the guest's own shape out of built-ins, not a preset"
 )]
+#[path = "../common/mod.rs"]
 mod common;
 #[expect(
     dead_code,
     reason = "the bench assembles the honest guests; the misbehaving modes are the tests'"
 )]
-#[path = "../tests/support/wasm_guest.rs"]
+#[path = "../../tests/support/wasm_guest.rs"]
 mod guest;
 
 use std::{hint::black_box, sync::Arc};
