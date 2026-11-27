@@ -817,7 +817,11 @@ fn decide_sides(
 /// own records (`records`, the prefills' and then the decodes'), by what
 /// its role is held to
 /// ([`Demands::held_by`](crate::engine::demands::Demands::held_by)). A
-/// frame that states no demand reads no record for it.
+/// frame that states no demand reads no record for the count. Neither
+/// does the count read a side whose role is held to no part of the
+/// demand: by its own records the demand leaves no worker of it out. A
+/// prefill none of whose partners meets the decodes' part takes no number
+/// all the same.
 ///
 /// The sides that read the number are the binding's ([`sides_named`]):
 ///
@@ -837,7 +841,10 @@ fn decide_sides(
 ///   sent to and is stated the number ([`FrameRequest::naming_decode`]):
 ///   it counts the number among the partners there of the prefill it
 ///   picks, and sheds the pair under `target-worker` itself.
-/// - **Neither side.** The number is not read.
+/// - **Neither side.** The number is not read, and the frame is decided
+///   as one that names no worker: that decision holds its demand. The
+///   binding is read ahead of the count's reads of the records, so the
+///   count reads none here.
 ///
 /// Where no prefill is counted, or none opens the pair, the frame is
 /// decided as one that names no worker. It keeps its keys there, unlike a
@@ -866,6 +873,12 @@ fn decide_named_pair(
 ) -> Result<(Decision, Option<Shadowed>), DecisionRefused> {
     let model = frame.model();
     let unnamed = || front.decide_without_lease(&maker, now);
+    // The binding first: a pair that reads the number on neither side
+    // leaves here, ahead of the count's reads of the records.
+    let sides = sides_named(spec, model);
+    if sides == [false; 2] {
+        return unnamed();
+    }
     // The places of each side the gateway may take whose worker meets the
     // frame's hard demands, where a demand leaves a worker out: the count
     // reads those.
@@ -880,7 +893,12 @@ fn decide_named_pair(
             (decode_records, Role::Decode, stated[1], decodes),
         ];
         let narrowed = judged.map(|(records, role, among, kept)| {
+            // A side held to no part of the demand keeps every place: its
+            // records are not read.
             let demands = demands.held_by(role);
+            if demands.is_none() {
+                return false;
+            }
             records.meeting(demands, among, kept).is_some()
         });
         for (side, narrowed) in narrowed.into_iter().enumerate() {
@@ -893,13 +911,15 @@ fn decide_named_pair(
         (stated[0], pair.prefill_stalled),
         (stated[1], pair.decode_stalled),
     ];
-    let reached = match sides_named(spec, model) {
+    let reached = match sides {
         [true, decode_named] => {
             let steers = || spec.engine().steers_all_vetoed(model);
             let named = (Some(number), decode_named);
             named_worker::reached_pair(&pair, counted, named, None, steers)
         }
-        [false, true] => {
+        // The decode's side alone: a pair that reads the number on neither
+        // side left above.
+        [false, _] => {
             let lifts = || spec.engine().lifts_prefills(model);
             let Some(decodes) = named_worker::opened(&pair, counted, None, lifts) else {
                 return unnamed();
@@ -911,7 +931,6 @@ fn decide_named_pair(
             let maker = maker.over(WorkerLists::Pair(lent)).naming_decode();
             return front.decide_without_lease(&maker, now);
         }
-        [false, false] => return unnamed(),
     };
     match reached {
         ReachedPair::Places(prefill, decode) => {
@@ -1195,6 +1214,10 @@ pub(crate) fn issue_pair(
 /// prefill's dispatch took. A decode profile that keeps its pick answers
 /// that decode again while its filters keep it.
 ///
+/// Then comes the claim that first decision made for the decode side: its
+/// key and its worker. A call that claims another decode under that key
+/// takes the key with it at its dispatch.
+///
 /// Last in `held` comes the instant the lease was issued at. A claim the
 /// call makes for its key is dated by it, as each word of the side it
 /// issues is.
@@ -1233,7 +1256,7 @@ pub(crate) fn decide_decode(
     world: &StoreSnapshot,
     objects: &Objects<Members>,
     taken: &DecisionCall<'_, Checked>,
-    (prefill, first, issued_micros): HeldPair,
+    (prefill, first, claimed, issued_micros): HeldPair,
     buffers: &mut FrameBuffers,
     loads: &Arc<LoadSnapshot>,
     own: &Part,
@@ -1308,15 +1331,19 @@ pub(crate) fn decide_decode(
                     } else {
                         maker
                     };
-                    front.decide_decode_without_lease(&maker, &held, issued_micros, now)
+                    front.decide_decode_without_lease(&maker, &held, claimed, issued_micros, now)
                 }
                 Taken::Emptied(stage) => {
                     let (seed, generation) = (frame.seed(), spec.generation());
                     Ok(shed(ShedReason::NoEndpoints, stage, seed, generation))
                 }
-                Taken::Unreached => {
-                    front.decide_decode_without_lease(&over_none(), &held, issued_micros, now)
-                }
+                Taken::Unreached => front.decide_decode_without_lease(
+                    &over_none(),
+                    &held,
+                    claimed,
+                    issued_micros,
+                    now,
+                ),
             };
             // Counted whatever the decision came to.
             let undialed = decode_places.undialed();
@@ -1326,7 +1353,9 @@ pub(crate) fn decide_decode(
             decided?
         }
         // A model nobody serves, and one with no decode.
-        None => front.decide_decode_without_lease(&over_none(), &held, issued_micros, now)?,
+        None => {
+            front.decide_decode_without_lease(&over_none(), &held, claimed, issued_micros, now)?
+        }
     };
     // What the side's lease takes of its request, read where the frame's
     // lists still stand: a decode call's frame is read at the decode phase.

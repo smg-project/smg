@@ -1110,7 +1110,9 @@ async fn a_shim_whose_layout_moved_fails_the_link_by_name() {
 
 #[test]
 fn structured_outputs_support_follows_the_launcher_facts() {
-    use engine_zmq_adapter::{StructuredOutputsBackendConfig, StructuredOutputsSupport};
+    use engine_zmq_adapter::{
+        ConstraintKinds, StructuredOutputsBackendConfig, StructuredOutputsSupport,
+    };
     let support = |backend: &str| {
         structured_outputs_support(&TrtllmModelInfo {
             guided_decoding_backend: backend.to_string(),
@@ -1122,9 +1124,19 @@ fn structured_outputs_support_follows_the_launcher_facts() {
         support("xgrammar"),
         StructuredOutputsBackendConfig::Pinned(StructuredOutputBackend::Xgrammar).into()
     );
+    // llguidance has no matcher for a structural tag: the kind is refused
+    // before the engine instead of failing there at compile.
     assert_eq!(
         support("llguidance"),
-        StructuredOutputsBackendConfig::Pinned(StructuredOutputBackend::Guidance).into()
+        StructuredOutputsSupport::new(
+            StructuredOutputsBackendConfig::Pinned(StructuredOutputBackend::Guidance),
+            ConstraintKinds {
+                json_schema: true,
+                regex: true,
+                ebnf: true,
+                structural_tag: false,
+            },
+        )
     );
     assert_eq!(support(""), StructuredOutputsBackendConfig::Other.into());
     let _ = Arc::new(());

@@ -41,8 +41,8 @@ pub use registry::{
     ModelRegistry, Tokenizer, DEEPSEEK_V41_IMAGE_PLACEHOLDER,
 };
 pub use tracker::{
-    AsyncMultiModalTracker, FetchObserver, FetchOutcome, FetchReport, FetchSourceKind,
-    TrackerOutput,
+    sample_fps_in_range, AsyncMultiModalTracker, FetchObserver, FetchOutcome, FetchReport,
+    FetchSourceKind, TrackerOutput,
 };
 pub use types::{
     AudioClip, AudioSource, EncoderFieldLayouts, FieldLayout, ImageDetail, ImageFrame, ImageSize,

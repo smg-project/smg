@@ -28,13 +28,18 @@
 //! the store takes the snapshot, and the store keeps none there.
 //!
 //! A told status is the leader's word. A status event is handed to the
-//! store, and the holder lays the status on the object in the same turn.
+//! store by its own door ([`MemoryStore::status_followed`]), and the
+//! holder lays the status on the object in the same turn. A store that
+//! tells a journal is handed the models the row's object serves with it,
+//! so this replica's own log entry of the status names no model read
+//! from the table. A row with no object has the table's told.
 //! So are the statuses of a cut laid whole, each on its row's object. A
 //! told row lays its status too: an object laid in another's place takes
 //! the standing object's, and a probe of a term that ended can have moved
-//! that one ahead of the row's event. This is one of the two ways from a
-//! table's status to an object's where the objects lead. The other is a
-//! tell the store refuses ([`mod@super::status`]).
+//! that one ahead of the row's event. This is one of the three ways from
+//! a table's status to an object's where the objects lead. The others
+//! are a tell the store refuses ([`mod@super::status`]) and a removal
+//! the store refuses for its term ([`mod@super::write`]).
 //!
 //! A restore is the store's restore and the lay of the cut's own rows in
 //! one turn of the holder. No row of the table is read back to lay an
@@ -54,10 +59,15 @@
 //! turn under the lock of the document's door, which its applier holds
 //! from the generation's pass: nothing under the turn takes that door.
 
+use std::sync::Arc;
+
 use smg_worker::registry::Generation;
 
-use super::Objects;
-use crate::store::{MembershipChange, MemoryStore, Position, StoreCheckpoint, WorkerRow};
+use super::{status::served, Objects};
+use crate::{
+    engine::view::WorkerId,
+    store::{MembershipChange, MemoryStore, Position, StoreCheckpoint, WorkerRow},
+};
 
 #[cfg_attr(
     not(any(test, feature = "controller")),
@@ -119,14 +129,32 @@ impl<G: Generation> Objects<G> {
                 landed
             }
             // A told status: the table takes it, and the object behind it.
-            (change, None) => {
-                let landed = store.follow_landed(at, epoch, change, None, None);
-                if let (true, MembershipChange::StatusChanged { id, .. }) = (landed, change) {
+            // A store that tells a journal is handed the models the row's
+            // object serves, read here in the holder's turn: the entry of
+            // this replica's own log names them and no row.
+            (MembershipChange::StatusChanged { id, from, to }, None) => {
+                let models = store.journals().then(|| self.served_by(id)).flatten();
+                let landed = store.status_followed(at, epoch, id, from, to, models);
+                if landed {
                     self.copy_status(store, id);
                 }
                 landed
             }
+            // A change that names a row and comes with none fits no table.
+            (change, None) => store.follow_landed(at, epoch, change, None, None),
         }
+    }
+
+    /// The models the object under the row `id` serves, as the one shared
+    /// list a status entry holds, and none where no object stands under
+    /// the id. The holder's turn is the hold that reads them: on a replica
+    /// that follows, the turn's holder alone lays an object. A second
+    /// writer of an object's cards is not held out by it: a controller has
+    /// none, and a gateway's watcher, which has one, reads no list here,
+    /// because its store tells no journal.
+    fn served_by(&self, id: WorkerId) -> Option<Arc<[String]>> {
+        let object = self.registry.get(&self.object(id)?)?;
+        Some(served(object.as_ref()))
     }
 
     /// `row` takes the instant its object's entry holds, where an object
@@ -171,8 +199,10 @@ impl<G: Generation> Objects<G> {
     /// One body for a cut the store takes whole, under the holder's turn
     /// its caller holds: `door` is the store's own entry for it. The
     /// holder lays the cut's own rows, copied ahead of that entry, which
-    /// takes the cut whole: a cut the store refuses is copied too. The one
-    /// read of the table left is each row's status. Each row is held
+    /// takes the cut whole: a cut the store refuses is copied too. The
+    /// pass uses one thing of the table, a row's status where the row
+    /// stands at its object's revision, and hands the store each row's
+    /// count. Each row is held
     /// against the object that stands for it ([`Self::reconcile`]), and
     /// the registry takes new objects in the rows' order. The keeper
     /// forgets the rows that left behind the store's write.

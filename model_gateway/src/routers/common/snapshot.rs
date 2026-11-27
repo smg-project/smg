@@ -562,4 +562,5 @@ impl WorkerRegistryExt for WorkerRegistry {
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_support;
 #[cfg(test)]
+#[path = "../../../tests/unit/routers/common/snapshot/tests.rs"]
 mod tests;

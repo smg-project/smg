@@ -248,7 +248,9 @@ impl Held {
 ///
 /// [`Self::upsert`], [`Self::patch`], [`Self::remove`], [`Self::connect_row`]
 /// and [`Self::drain_row`] are the write side of a host that keeps worker
-/// objects: a controller's registration calls write a row through them. Each
+/// objects, and each names no term. A controller's registration calls write
+/// through the entries the five stand on, which are private to the crate
+/// and take the call's term. Each
 /// call decides over the object that stands and tells `store` what it
 /// decided. The object the call leaves stands when it returns, and a
 /// removed row's object is gone by then. The three calls that write a row
@@ -280,6 +282,28 @@ impl Held {
 /// registration call's. A host that does not lead must not write: such a
 /// write lands in its own store alone, its leader's next event no longer
 /// fits that store, and the leader's snapshot takes the write back.
+///
+/// # A host's read calls
+///
+/// [`Self::read_row`], [`Self::read_row_under`] and [`Self::checkpoint`]
+/// are what a host with a holder reads of its rows. Each takes the
+/// holder's turn: a writer of a row waits for the read, and no decision
+/// does. A row read alone carries the status its object states, and a
+/// cut's row the status the store holds. Either carries the models its
+/// object serves now. Each builds the rows it hands back again from
+/// their objects: a copy of their facts a call.
+///
+/// The turn is taken once at a time, and the thread that holds it does
+/// not take it again. So code that the holder runs inside a turn must
+/// call nothing of the holder that takes the turn: these reads,
+/// [`Self::upsert`], [`Self::patch`] and [`Self::remove`] among them.
+/// Such a call never returns: it waits for the turn its own thread holds.
+///
+/// A host's own code runs there too. The store tells its journal of a
+/// row's write inside that write's turn. The journal's last call of a
+/// write, [`crate::store::Journal::released`], arrives under no lock of
+/// the store, and still inside that turn. The overload switch asks the
+/// host's `leads` inside its turn ([`Self::state_overload_switch`]).
 ///
 /// The registry numbers its own objects, so an object's id is not its row's.
 /// The holder keeps the two together ([`Self::standing`], [`Self::object`]).
@@ -537,8 +561,11 @@ impl<G: Generation> Objects<G> {
     /// does behind a put that replaces ([`Self::upsert`]): a move a health
     /// driver made on the standing object ahead of its telling finds that
     /// object replaced, and tells nothing. `leads` is the host's own word
-    /// of its lead, asked under the object's lock and again under the
-    /// store's. Where it holds, the table is told the object's status.
+    /// of its lead, asked inside the holder's turn, under the object's
+    /// lock and again under the store's. It must call nothing that takes
+    /// the turn, that object's lock or the store's lock: none of the
+    /// holder's read, write or status calls. Where it holds, the table is
+    /// told the object's status.
     /// Where it does not, the table is not written, and the object takes
     /// the status its row holds.
     /// Return how many objects were laid again.
@@ -767,6 +794,21 @@ impl<G: Generation> Objects<G> {
             .map(|&(_, row)| row)
     }
 
+    /// The rows of every rank of the engine whose rank 0 row is `row`,
+    /// its own among them: the rows that dial the address `row`'s object
+    /// dials. None where the holder holds no object for `row`, or `row`
+    /// stands above rank 0 by the facts it is laid from: such a row's
+    /// stream is routed no rank ([`Self::rank_row`]). One read of the
+    /// entry under its read lock.
+    pub(crate) fn rank_rows(&self, row: WorkerId) -> Vec<WorkerId> {
+        let held = self.held.read();
+        let lowest = held.objects.get(&row);
+        let lowest = lowest.filter(|(_, laid)| laid.remainder.dp_rank == 0);
+        let ranks = lowest.and_then(|(_, laid)| held.ranks.get(engine_of(laid.object.as_ref())));
+        let ranks = ranks.into_iter().flatten();
+        ranks.map(|&(_, ranked)| ranked).collect()
+    }
+
     /// Whether the row `row` stands at rank `rank`, by the facts its
     /// object was laid from. `false` for a row the holder holds no object
     /// for. Asked of the worker a dispatch report names, which may have
@@ -885,23 +927,22 @@ impl<G: Generation> Objects<G> {
 
     /// The status the table holds for the row an object was built from,
     /// where the row stands at that revision still: what an object takes
-    /// from the table. Read under the object's mutation lock, so of two
-    /// such reads the later one's status stands on the object.
-    fn table_status<S: WorkersStore + ?Sized>(
-        store: &S,
-        standing: RowRevision,
-    ) -> Option<ObjectStatus> {
+    /// from the table. It is the store's read of one told status
+    /// ([`MemoryStore::told_status`]): no row is copied. Read under the
+    /// object's mutation lock, so of two such reads the later one's
+    /// status stands on the object.
+    fn table_status(store: &MemoryStore, standing: RowRevision) -> Option<ObjectStatus> {
         store
-            .get(standing.row)
-            .filter(|row| row.revision == standing.revision)
-            .map(|row| status(row.status))
+            .told_status(standing.row, standing.revision)
+            .map(status)
     }
 
-    /// Read the row under the lock the health adapter writes under. The
-    /// object's entry must still name that row and its current revision.
-    /// The registry writes the status it is handed and tells it.
+    /// Read the row's told status under the lock the health adapter
+    /// writes under. The object's entry must still name that row and its
+    /// current revision. The registry writes the status it is handed and
+    /// tells it.
     #[inline(never)]
-    fn copy_status<S: WorkersStore + ?Sized>(&self, store: &S, row: WorkerId) {
+    fn copy_status(&self, store: &MemoryStore, row: WorkerId) {
         let Some(id) = self.object(row) else {
             return;
         };
@@ -1002,7 +1043,8 @@ impl<G: Generation> Objects<G> {
     /// A row holds one object. Where the row's own object stands under
     /// another URL, that one is dropped first too. A cut that names an id
     /// again under another address lays its rows in order: the first's
-    /// object ends, and the last stands, as the store keeps it.
+    /// object ends, and the last stands until a later row of the cut takes
+    /// its address.
     fn put<S: WorkersStore + ?Sized>(&self, store: &S, row: &WorkerRow, object: Arc<dyn Worker>) {
         // The id first, then the entry, then the registry's write: its
         // event finds the entry.

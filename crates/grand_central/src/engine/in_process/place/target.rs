@@ -442,6 +442,10 @@ pub(super) fn pair<'a>(
     // where a demand leaves a worker out. A request that states none reads
     // no record. The reads may be the lists' first, and so the fill of
     // their cells: they stand under the engine's catch, as a decision's do.
+    // A side whose role is held to no part of the demands keeps every
+    // place. Its list's value is read all the same, so a list lent wrong
+    // is refused where this read makes its value, as before, and its
+    // records are not walked.
     let mut meeting = [Vec::new(), Vec::new()];
     let mut stated = [lists.prefill_places, lists.decode_places];
     if !request.demands.is_none() {
@@ -455,6 +459,9 @@ pub(super) fn pair<'a>(
                 Ok(judged.map(|(list, role, among, kept)| {
                     let records = engine.members_of(list).records(spec, &engine.clock);
                     let demands = request.demands.held_by(role);
+                    if demands.is_none() {
+                        return false;
+                    }
                     records.meeting(demands, among, kept).is_some()
                 }))
             })

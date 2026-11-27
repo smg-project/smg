@@ -95,7 +95,9 @@ use crate::{
         DerivedKeys, KeySource,
     },
     engine::{
-        decision::{Decision, PairSide, Pick, ShedReason, Target, MAX_TARGETS},
+        decision::{
+            Decision, PairSide, Pick, ShedReason, Target, ADMITS, BUDGET, ENCODE_ITEMS, MAX_TARGETS,
+        },
         decision_engine::{
             AlonePick, DecideOutcome, DecisionRefused, Plain, Request, RequestMaker, TextKey,
             TokenKey, WorkerLists,
@@ -122,9 +124,11 @@ use crate::{
 
 /// A request's headers, as its caller holds them.
 ///
-/// The engine reads the headers the document names and no other: the
-/// sources of a request's routing value and of its client's value, and the
-/// headers its view shows a stage ([`AppliedSpec::view_headers`]).
+/// The engine reads the headers the document names: the sources of a
+/// request's routing value and of its client's value, and the headers its
+/// view shows a stage ([`AppliedSpec::view_headers`]). It reads one more
+/// where the request's host names it, for the id a kept decision is found
+/// by ([`PlaceRequest::explain_id_header`]), and no other.
 pub trait HeaderRead {
     /// The value of the header `name`, where the request carries it. `name`
     /// is lowercase, as a document writes it.
@@ -276,14 +280,22 @@ pub struct PlaceRequest<'a> {
     /// The request's own id, where it has one: a source of its routing
     /// value where the document names it, and what a decision the engine
     /// kept of the request is found by ([`InProcess::explained`]). A
-    /// request with none is found by its `explain_id`, and is not kept
-    /// where it states neither.
+    /// request with none is found by its `explain_id`, or else by the
+    /// header its `explain_id_header` names, and is not kept where it
+    /// states none of the three.
     pub request_id: Option<&'a str>,
     /// The id a decision the engine kept of the request is found by where
     /// the request states no id of its own: its host's name for it. It is
     /// no source of a routing value and no lease holds it. The engine
     /// reads it under a document that keeps a sample, and nowhere else.
     pub explain_id: Option<&'a str>,
+    /// The name of the header that holds its host's id of the request,
+    /// lowercase: for a host that holds that id among the request's
+    /// headers and states no `explain_id`, which wins. Under a document
+    /// that keeps a sample the engine reads the header's value off
+    /// `headers`, for a request that states no id of its own. Under a
+    /// document that keeps none, no request pays a read for it.
+    pub explain_id_header: Option<&'a str>,
     /// The tenant the request is of.
     pub tenant: Option<&'a str>,
     /// The request's priority band.
@@ -452,6 +464,7 @@ impl<'a> PlaceRequest<'a> {
             headers: &(),
             request_id: None,
             explain_id: None,
+            explain_id_header: None,
             tenant: None,
             priority: 0,
             streaming: false,
@@ -1279,9 +1292,16 @@ impl RequestMaker for Made<'_, '_> {
         self.request.request_id.map_or(&[], str::as_bytes)
     }
 
-    // The id its host states for a kept decision alone, as it stated it.
+    // The id its host states for a kept decision alone: the word it
+    // stated, or else the value of the header it named, read here and
+    // nowhere ahead of the call.
     fn explain_id(&self) -> &[u8] {
-        self.request.explain_id.map_or(&[], str::as_bytes)
+        let request = self.request;
+        match (request.explain_id, request.explain_id_header) {
+            (Some(id), _) => id.as_bytes(),
+            (None, Some(name)) => request.headers.header(name).unwrap_or(&[]),
+            (None, None) => &[],
+        }
     }
 
     // Asked where a plain request's pick is leased, ahead of its making:
@@ -1520,20 +1540,6 @@ fn admitted(request: &PlaceRequest<'_>, worker: &dyn Worker) -> bool {
 pub(super) fn sendable(request: &PlaceRequest<'_>, worker: &dyn Worker) -> bool {
     ready(worker) && admitted(request, worker)
 }
-
-/// What a request that carries encode items over other lists than an
-/// encode request's three is declined under: no list of it holds an encoder.
-const ENCODE_ITEMS: &str = "encode-items";
-
-/// What a request is shed under where its route's rule takes no worker of
-/// its list: the rule's own name on a request ([`PlaceRequest::admits`]).
-/// A pair's first decision's shed as saturated is the answer in its place
-/// where that shed stands ([`pair::again`]).
-const ADMITS: &str = "admits";
-
-/// What a request is shed under where its call's earlier decisions left
-/// none of its budget ([`PlaceRequest::budget_micros`]).
-const BUDGET: &str = "budget";
 
 /// The refusal of a request this call does not place, by name: the shed a
 /// decision answers for what no stage of it runs.

@@ -29,9 +29,9 @@
 use std::sync::{Arc, OnceLock};
 
 use kv_index::{ModelTrees, TenantId, TokenTree, Tree as StringTree};
-use parking_lot::Mutex;
+use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 use smg_grand_central::{
-    document::{IndexSpec, PolicySpec},
+    document::{IndexKind, IndexSpec, PolicySpec},
     engine::{CacheIndex, CacheIndexes, Phase},
 };
 use smg_worker::registry::event::WorkerEvent;
@@ -72,6 +72,9 @@ struct SizedTrees {
     max_size: u64,
     sweep_s: u32,
     trees: Arc<ModelTrees>,
+    /// Whether the line of a size no pass holds is still owed: the store's
+    /// first token tree takes it ([`LentTrees::token_tree`]).
+    unsaid: bool,
     /// The size pass on its timer. It ends with the owner.
     _size_pass: Option<PeriodicTask>,
 }
@@ -81,9 +84,10 @@ impl SizedTrees {
     /// `max_size` by the classic policy's pass every `sweep_s` seconds: a
     /// token tree to that many tokens, a string tree to that size in its
     /// own unit (its chars and a weight for each node). The document's
-    /// longest cadence spawns no pass: it says a tree that is never trimmed,
-    /// which the routing settings' interval of zero is written as, and the
-    /// classic policy runs no pass at that interval.
+    /// longest cadence spawns no pass: the routing settings' interval of
+    /// zero is written as that cadence, and the classic policy runs no pass
+    /// at that interval. A store with no pass holds its trees to no size,
+    /// whatever `max_size` reads.
     fn new(page: usize, max_size: u64, sweep_s: u32) -> Self {
         let trees = Arc::new(ModelTrees::new(page));
         let size_pass = (sweep_s != u32::MAX).then(|| {
@@ -97,6 +101,7 @@ impl SizedTrees {
             max_size,
             sweep_s,
             trees,
+            unsaid: size_pass.is_none() && max_size != u64::MAX,
             _size_pass: size_pass,
         }
     }
@@ -188,9 +193,48 @@ impl LentTrees {
     /// under the same `index` entry is handed the same tree. It stands with
     /// the trees of its size and its cadence ([`Self::store_of`]). The
     /// engine asks when it builds a model's table, not for a request.
+    ///
+    /// The first token tree of a size under the largest that no pass holds
+    /// ([`SizedTrees::new`]) is lent with one line at warn that says so and
+    /// names the `index` entries of the tree kind that state that size and
+    /// that cadence in the document in force when the line is written:
+    /// under an entry of the hash kind no tree is asked for.
     pub(crate) fn token_tree(&self, model: &str) -> Arc<TokenTree> {
-        self.store_of(model)
-            .token_tree_or_new(normalize_model_key(model))
+        let mut store = self.store_of(model);
+        let (max_size, sweep_s) = (store.max_size, store.sweep_s);
+        // The store's first token tree takes the line the store owes.
+        let unheld = std::mem::take(&mut store.unsaid);
+        let trees = Arc::clone(&store.trees);
+        // The tree is looked up and the line is written with the lock let
+        // go: a decision that builds a model's table asks for its tree
+        // under it.
+        drop(store);
+        let tree = trees.token_tree_or_new(normalize_model_key(model));
+        if unheld {
+            // Entries of one size and one cadence share the store, and a
+            // tree is asked for under the tree kind alone: an entry of the
+            // hash kind is not named. The document is read behind the drop
+            // of the store: no caller holds the two locks.
+            let index: Vec<String> = self
+                .document
+                .lock()
+                .index
+                .iter()
+                .filter(|(_, entry)| {
+                    entry.kind == IndexKind::Tree
+                        && entry.max_size == max_size
+                        && entry.sweep_s == sweep_s
+                })
+                .map(|(key, _)| key.clone())
+                .collect();
+            warn!(
+                ?index,
+                max_size,
+                sweep_s,
+                "The lent token trees of this max_size are held to no size: this sweep_s is the longest cadence, at which no size pass starts"
+            );
+        }
+        tree
     }
 
     /// The string tree of `model`, for the prompts sent as text: made at
@@ -198,16 +242,18 @@ impl LentTrees {
     /// store that keeps the model's token tree. The engine asks when it
     /// builds a model's table, whatever the model's index holds.
     pub(crate) fn string_tree(&self, model: &str) -> Arc<StringTree> {
-        self.store_of(model)
-            .string_tree_or_new(normalize_model_key(model))
+        let trees = Arc::clone(&self.store_of(model).trees);
+        trees.string_tree_or_new(normalize_model_key(model))
     }
 
     /// The store of the trees of `model`'s size and cadence, made at the
     /// first ask for a tree of that size and cadence. The two are the
     /// model's `index` entry of the document in force at the ask
     /// ([`Self::follow`]), or the entry's defaults where that document
-    /// writes none for it.
-    fn store_of(&self, model: &str) -> Arc<ModelTrees> {
+    /// writes none for it. It is handed under the lock of the stores: a
+    /// caller takes what it reads of the store and lets the lock go before
+    /// it looks a tree up.
+    fn store_of(&self, model: &str) -> MappedMutexGuard<'_, SizedTrees> {
         let document = self.document.lock();
         let (max_size, sweep_s) = document.index_for(model).map_or_else(
             || {
@@ -226,7 +272,7 @@ impl LentTrees {
             stores.push(SizedTrees::new(self.page, max_size, sweep_s));
             stores.len() - 1
         });
-        Arc::clone(&stores[at].trees)
+        MutexGuard::map(stores, |stores| &mut stores[at])
     }
 
     /// Starts the task that takes a worker the registry lost out of the
@@ -483,11 +529,10 @@ mod tests {
     /// An `index` entry of `max_size` tokens trimmed every `sweep_s`
     /// seconds.
     fn entry(max_size: u64, sweep_s: u32) -> IndexSpec {
-        IndexSpec {
-            max_size,
-            sweep_s,
-            ..IndexSpec::default()
-        }
+        let mut index = IndexSpec::default();
+        index.max_size = max_size;
+        index.sweep_s = sweep_s;
+        index
     }
 
     /// Whether each of `model`'s two trees holds a prompt for `workers` and
@@ -970,6 +1015,54 @@ mod tests {
             stores[0]._size_pass.is_none(),
             "no pass at an interval of zero"
         );
+    }
+
+    /// A size under the largest beside the longest cadence is held by no
+    /// pass, and one line at warn says so when the first token tree of that
+    /// size is lent: a string tree lent before it writes none. The line
+    /// names every `index` entry of the tree kind that states the two
+    /// numbers and no other: an entry of the hash kind is lent no tree.
+    /// The largest size beside that cadence asks for no pass, and writes
+    /// none.
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_size_no_pass_holds_is_said_when_its_trees_are_lent() {
+        const LINE: &str = "are held to no size";
+        let lender = |max_size: u64| {
+            let mut stated = document(128, 1);
+            let unheld = entry(max_size, u32::MAX);
+            stated.index.insert("*".to_owned(), unheld.clone());
+            stated.index.insert("roomy*".to_owned(), unheld);
+            stated.index.insert("held*".to_owned(), entry(max_size, 1));
+            let mut hashed = entry(max_size, u32::MAX);
+            hashed.kind = IndexKind::Hash;
+            stated.index.insert("hashed*".to_owned(), hashed);
+            owner(stated)
+        };
+        lender(u64::MAX).token_tree(MODEL);
+        assert!(
+            !logs_contain(LINE),
+            "the largest size leaves nothing to say"
+        );
+
+        let trees = lender(4_096);
+        trees.string_tree(MODEL);
+        assert!(!logs_contain(LINE), "a string tree takes no line");
+        trees.token_tree(MODEL);
+        assert!(logs_contain(LINE), "the first token tree takes the line");
+        trees.token_tree("another");
+        trees.token_tree("roomy-a");
+        logs_assert(|lines: &[&str]| {
+            let said: Vec<_> = lines.iter().filter(|line| line.contains(LINE)).collect();
+            let warns = |line: &&&str| {
+                line.contains("WARN")
+                    && line.contains(r#"index=["*", "roomy*"] max_size=4096 sweep_s=4294967295"#)
+            };
+            match said.as_slice() {
+                [line] if warns(line) => Ok(()),
+                _ => Err(format!("one line at warn for the four trees: {said:?}")),
+            }
+        });
     }
 
     /// The engine is lent the two trees of a single request's model, the

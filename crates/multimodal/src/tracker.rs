@@ -728,9 +728,15 @@ pub(crate) const MAX_VIDEO_LONG_SIDE: u32 = 3584;
 /// Vision patch factor the per-frame cap must align to.
 pub(crate) const VIDEO_LONG_SIDE_FACTOR: u32 = 28;
 
+/// Whether `value` is a rate a video clip can be sampled at: a finite number
+/// inside the accepted range, bounds included.
+pub fn sample_fps_in_range(value: f64) -> bool {
+    value.is_finite() && (MIN_SAMPLE_FPS..=MAX_SAMPLE_FPS).contains(&value)
+}
+
 /// Reject a sampling rate outside M3's accepted range.
 fn validate_sample_fps(value: f64) -> MultiModalResult<f64> {
-    if !value.is_finite() || !(MIN_SAMPLE_FPS..=MAX_SAMPLE_FPS).contains(&value) {
+    if !sample_fps_in_range(value) {
         return Err(MediaConnectorError::InvalidSampleFps {
             value,
             min: MIN_SAMPLE_FPS,

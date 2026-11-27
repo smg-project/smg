@@ -72,6 +72,7 @@ mod reader;
 pub(crate) mod telemetry;
 pub(crate) mod template;
 #[cfg(test)]
+#[path = "../../../../../tests/unit/routers/grpc/regular/symphony/testing.rs"]
 pub(crate) mod testing;
 
 use axum::http::HeaderMap;
@@ -156,8 +157,8 @@ pub(crate) use self::{
     },
     names::{
         check_names, keeps_special_tokens_for, labels_select_nothing, named_table, names_template,
-        reading, reasoning_open, reasoning_open_for, set_aside_by_the_registry, table_label_read,
-        PromptReplay, Reading,
+        read_by_alias, reading, reasoning_open, reasoning_open_for, set_aside_by_the_registry,
+        table_label_read, tables_by_alias, ByAlias, PromptReplay, Reading,
     },
     reader::{assign_for, engine_finish, finished, Assignment, Delta, Reader},
 };

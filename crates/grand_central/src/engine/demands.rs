@@ -49,7 +49,7 @@
     reason = "a caller still builds or matches these types whole: each mark comes with its call"
 )]
 
-use crate::engine::{decision, framework, view::Role};
+use crate::engine::{decision, view::Role};
 
 /// Where a request's media by reference may be processed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -273,23 +273,6 @@ pub struct DemandFacts {
     pub decoding: u8,
 }
 
-/// The stage a pool is shed under when none of its rows processes media by
-/// reference ([`UnmetDemand::References`]).
-pub(crate) const REFERENCES: &str = "references";
-
-/// The stage a pool is shed under when its rows that process media by
-/// reference all run the other pipeline than the request names
-/// ([`UnmetDemand::Pipeline`]).
-pub(crate) const PIPELINE: &str = "pipeline";
-
-/// The stage a pool is shed under when each of its rows states a context
-/// window that holds less than the request needs ([`UnmetDemand::Window`]).
-pub(crate) const CONTEXT_WINDOW: &str = "context-window";
-
-/// The stage a pool is shed under when none of its rows decides a
-/// constraint as the request's was decided ([`UnmetDemand::Decoding`]).
-pub(crate) const DECODING: &str = "decoding";
-
 /// The demand a worker fails first. The order is the order a host answers
 /// for them: a pool is cut to its request's runtime, then to the workers
 /// that take images, then to those that process media by reference, then
@@ -327,11 +310,11 @@ impl UnmetDemand {
     pub const fn stage(self) -> &'static str {
         match self {
             Self::Runtime => decision::WIRES,
-            Self::Vision => framework::VISION,
-            Self::References => REFERENCES,
-            Self::Pipeline => PIPELINE,
-            Self::Window => CONTEXT_WINDOW,
-            Self::Decoding => DECODING,
+            Self::Vision => decision::VISION,
+            Self::References => decision::REFERENCES,
+            Self::Pipeline => decision::PIPELINE,
+            Self::Window => decision::CONTEXT_WINDOW,
+            Self::Decoding => decision::DECODING,
         }
     }
 }

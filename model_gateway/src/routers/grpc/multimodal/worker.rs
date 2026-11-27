@@ -2242,6 +2242,15 @@ mod tests {
             loaded.video_preprocessor_config.as_ref().unwrap().do_resize,
             Some(false)
         );
+        // The family's entry stamps a video only where its config carries the mark.
+        assert_eq!(
+            loaded
+                .video_preprocessor_config
+                .as_ref()
+                .unwrap()
+                .get_extra::<bool>(llm_multimodal::minimax_resize::SGLANG_RESIZE_KEY),
+            Some(true)
+        );
         // Independent day-0 source resize: 112², 504², 1036², and 2016x112.
         for (width, height, tokens) in [
             (56, 56, 16),

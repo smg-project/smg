@@ -22,7 +22,7 @@
 //! `ElectionNotifier::saw` for a term a caller says it saw) is taken by the
 //! same thread between two steps: the fence closed, the lease released, no take
 //! for one lease duration (a replica alone over a lease in its own process
-//! takes it again at once: its next step follows the word). The thread goes on
+//! takes it again at its next step, behind the word). The thread goes on
 //! stepping. A decider says the planned hand-over itself where its term's lease
 //! ids pass their mark: the next take brings a term whose ids start again. The
 //! hand-over names that term, and the thread drops one whose term this replica
@@ -34,6 +34,14 @@
 //! ahead of the standing, as at a word of a term seen. The next take stands
 //! above the followed term, and the log leads it. Where no term is left to
 //! take above the followed term, the thread keeps the lease.
+//!
+//! Behind either leave of a replica alone over its lease, the wait for the
+//! next step is none. The thread first reads the words on its channel, in
+//! their order, until it finds none, and works each as at any other time.
+//! So a stop read there ends the thread with no further take, as a closed
+//! channel does, and a take the next step makes stands above a term
+//! counted there. A word behind a stop is never read, and a word that
+//! comes behind the last read is read behind that step.
 
 use std::{
     fmt, io,
@@ -336,7 +344,8 @@ fn leave(words: &mpsc::Sender<Word>, above: u64) -> Result<(), ElectError> {
 /// leads under a lower term, or no term is said, it closes the fence,
 /// releases the lease under the highest term it saw and takes nothing for
 /// one lease duration: but a replica alone over its lease takes it again at
-/// once. A replica that leads at or above the term said keeps on as it is.
+/// its next step. A replica that leads at or above the term said keeps on as
+/// it is.
 /// So does one that holds no lease: where it saw the lease released under a
 /// lower term, it writes that release again under the highest term it saw.
 #[derive(Clone)]
@@ -444,7 +453,7 @@ fn run_loop(
         // holder restored under a lower term is named.
         seen.term = seen.term.max(elector.highest_term());
         // Whether this step left a lease that no other candidate can take:
-        // the next step then follows at once.
+        // the next step then follows at once, behind the words that came.
         let mut again = false;
         match ticked {
             Ok(tick) => {
@@ -573,16 +582,15 @@ fn run_loop(
             }
         }
         standing.send_replace(seen.clone());
-        // No other candidate can take the lease this step left: the time
-        // with no leader ends at this replica's own take.
-        if again {
-            continue;
-        }
         // A step that took the period or more is followed at once, never
-        // sooner. A word to leave is taken when it comes, and the wait for
-        // the next step goes on: but for a replica alone over its lease
-        // that the word left with no leader, whose next step comes now.
-        let next = began + period;
+        // sooner. So is a step that left a lease no other candidate can
+        // take: the time with no leader ends at this replica's own take.
+        // The wait for the next step is then none: the words on the channel
+        // are read in their order until none is found, and the step follows.
+        // A stop or the channel's end ends the loop there, with no further
+        // take and with the words behind it unread. A take that step makes
+        // stands above a term counted there.
+        let mut next = if again { began } else { began + period };
         let stop = loop {
             let above = match words.recv_timeout(next.saturating_duration_since(Instant::now())) {
                 Err(mpsc::RecvTimeoutError::Timeout) => break false,
@@ -611,10 +619,15 @@ fn run_loop(
             if left.moved {
                 standing.send_replace(seen.clone());
             }
-            // No other candidate can take the lease this replica left: the
-            // time with no leader ends at its own take.
+            // A word to leave is taken when it comes, and the wait for the
+            // next step goes on. Where the word left a lease no other
+            // candidate can take, the wait ends as behind such a step: the
+            // words still queued are read in their order, and the next
+            // step follows the last. A stop among them ends the loop with
+            // no take and with the words behind it unread, and so does
+            // the channel's end.
             if left.alone {
-                break false;
+                next = began;
             }
         };
         if stop {
@@ -817,7 +830,7 @@ fn step_down(elector: &mut Elector, above: Option<u64>) -> Option<bool> {
                 info!(
                     identity = elector.identity(),
                     above,
-                    "stepped down; the lease is released and this replica, alone over its lease, takes it again at once"
+                    "stepped down; the lease is released and this replica, alone over its lease, takes it again at its next step"
                 );
             } else {
                 info!(
@@ -905,5 +918,5 @@ fn give_up(elector: &mut Elector) {
 }
 
 #[cfg(test)]
-#[path = "../../../tests/unit/service/controller/election/tests.rs"]
+#[path = "../../../tests/unit/service/controller/election/tests/mod.rs"]
 pub(super) mod tests;

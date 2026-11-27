@@ -87,7 +87,7 @@ use smg_worker::{
 use super::{
     decision::Decision,
     demands::{DemandFacts, Demands, UnmetDemand},
-    framework::{Engine, Scratch},
+    framework::{Engine, Scratch, WholeRows},
     view::{
         Candidate, Constraints, Engines, FixedFacts, Health, LoadRow, OverloadRegime, PoolFacts,
         RequestFacts, Role, SignalSource, WireModes, WorkerId, LOAD_REPORT_CLOCK_HISTORY_MS,
@@ -96,6 +96,7 @@ use super::{
 use crate::{
     document::spec::AppliedSpec,
     load::{load_row, signal_values, ReportSignals, SignalCells, SignalColumn},
+    policies::round_robin::RoundRobin,
 };
 
 /// A worker's id in the engine's own state (a load stage's credit of
@@ -684,6 +685,10 @@ pub struct PoolRecords {
     /// The claim to ask the list's workers ([`Self::ask`]): taken by one
     /// compare and exchange and never waited for, as the conversion's is.
     asking: Mutex<()>,
+    /// The key of the list's rows in their order, as a rotation keys the
+    /// rows a pass kept: made once, here, and said to the engine's scratch
+    /// with the rows a decision wrote whole ([`Self::whole_rows`]).
+    whole_key: u64,
 }
 
 impl PoolRecords {
@@ -785,6 +790,7 @@ impl PoolRecords {
         let (engine_rows, engine_ends) = engines_of(workers, &mut fixed);
         let number = clock.next_pool();
         Self {
+            whole_key: RoundRobin::whole_key(&fixed),
             regular: fixed.iter().all(|row| row.role == Role::Single),
             fixed,
             ids,
@@ -1078,6 +1084,15 @@ impl PoolRecords {
             engines: Engines::new(self.number, &self.engine_rows, &self.engine_ends),
             word: live.word,
         }
+    }
+
+    /// What the list says to the engine's scratch of `rows`, its rows as one
+    /// decision wrote them whole ([`Self::write_over`]): where they stand,
+    /// how many they are and the list's key. The one place a front makes
+    /// the word.
+    #[inline]
+    fn whole_rows(&self, rows: &[Candidate]) -> WholeRows {
+        WholeRows::said(rows, self.whole_key)
     }
 
     /// Every worker's record for one decision, written into `rows` in the
@@ -1827,6 +1842,102 @@ thread_local! {
     static BUFFERS: Rc<RefCell<Buffers>> = Rc::new(RefCell::new(Buffers::default()));
 }
 
+/// One side of a pair whose records are
+/// written as its draw asks about them: its list's records, the workers
+/// the list was made from, how they are read, and the stamp a pair writes
+/// on a record beside a single's.
+pub(crate) type DrawnRecords<'a> = (
+    &'a PoolRecords,
+    &'a [Arc<dyn Worker>],
+    &'a Live<'a>,
+    &'a dyn Fn(&mut Candidate),
+);
+
+/// A pair's decision where each side's
+/// records are written as its draw asks about them ([`Singly`], the
+/// writer of a single's draw), two a side for a pick of two, whatever the
+/// lists hold. Asked where both lists stand and neither is read at rest
+/// or holds an engine's ranks, under the engine's own question
+/// ([`Engine::pair_drawn_for`]); the caller says that the request states
+/// nothing beside its lists, and answers two questions of the two lists:
+/// whether its host's admission refuses no row (`admits`, asked once at
+/// most: it may read its host) and whether every row of a side pairs with
+/// every row of the other (`pairs`). A side's stamp is called behind the
+/// yes of `admits` alone. `None` leaves the decision to the whole pass,
+/// which writes every record itself.
+#[cfg(feature = "in-process")]
+pub(crate) fn decide_pair_drawn(
+    engine: &Engine,
+    facts: &RequestFacts<'_>,
+    cx: &Constraints<'_>,
+    [prefills, decodes]: [DrawnRecords<'_>; 2],
+    (admits, pairs): (&mut dyn FnMut() -> bool, &dyn Fn() -> bool),
+    rows: [&mut Vec<Candidate>; 2],
+    scratch: &mut Scratch,
+) -> Option<Decision> {
+    let (prefills, prefill_workers, prefill_live, prefill_stamp) = prefills;
+    let (decodes, decode_workers, decode_live, decode_stamp) = decodes;
+    if prefill_live.rest || prefills.has_ranks() || decodes.has_ranks() {
+        return None;
+    }
+    let unsaid = prefills.facts(prefill_live, false);
+    let drawn = engine.pair_drawn_for(facts, &unsaid, [prefills.len(), decodes.len()], cx)?;
+    // The lists are asked first, by one load each where no published state
+    // moved: a list with a worker that is not available leaves here before
+    // the host is asked, and its whole pass asks the host itself.
+    let word = published_word();
+    if !(prefills.stands(prefill_workers, word) && decodes.stands(decode_workers, word)) {
+        return None;
+    }
+    // The host's admission is asked behind the engine's own question and
+    // the lists', so that a pair no draw is asked of pays none of it, and
+    // ahead of the classes: a pair with a refused row leaves here.
+    if !admits() {
+        return None;
+    }
+    // The classes are asked last: the question reads every row's class.
+    if !pairs() {
+        return None;
+    }
+    let [prefill_rows, decode_rows] = rows;
+    if prefill_rows.len() < prefills.len() {
+        prefill_rows.resize(prefills.len(), Candidate::default());
+    }
+    if decode_rows.len() < decodes.len() {
+        decode_rows.resize(decodes.len(), Candidate::default());
+    }
+    let prefill_singly = Singly::new(prefills, prefill_workers, prefill_live);
+    let decode_singly = Singly::new(decodes, decode_workers, decode_live);
+    let mut write_prefill = |fixed: &Candidate, row: &mut Candidate| {
+        prefill_singly.write(fixed, row);
+        prefill_stamp(row);
+    };
+    let mut write_decode = |fixed: &Candidate, row: &mut Candidate| {
+        decode_singly.write(fixed, row);
+        decode_stamp(row);
+    };
+    let decision = engine.decide_pair_drawn(
+        drawn,
+        facts,
+        &unsaid,
+        (
+            &prefills.fixed,
+            &mut prefill_rows[..prefills.len()],
+            &mut write_prefill,
+        ),
+        (
+            &decodes.fixed,
+            &mut decode_rows[..decodes.len()],
+            &mut write_decode,
+        ),
+        cx,
+        scratch,
+    );
+    prefill_singly.paid();
+    decode_singly.paid();
+    decision
+}
+
 /// One decision of a single request over a gateway's own data: the records
 /// of `workers`, the list `pool` was made from, read as `live` says and put
 /// to the engine's whole decision ([`Engine::decide`]), which runs the
@@ -1931,6 +2042,9 @@ pub fn decide(
             return decision;
         }
         let (rows, pool_facts) = pool.write_over::<true, false>(workers, live, whole, stands);
+        if engine.turns_a_set() {
+            scratch.whole(pool.whole_rows(rows));
+        }
         let written;
         let cx = if cx.stalled.is_empty() {
             cx
@@ -1951,7 +2065,9 @@ pub fn decide(
 /// cleared ([`Live::unread`]): the word of the thread's last decision
 /// never stands for this one, and a decision that states none reads them.
 /// A live decision and the shadow profile decided behind it on this
-/// borrow share the word: the front states it once, for both.
+/// borrow share the word: the front states it once, for both. Its word on
+/// the rows written whole is taken back here too ([`Scratch::whole`]): a
+/// front states it behind its write, for the decisions of this borrow.
 #[inline]
 fn with_buffers<T>(decide: impl FnOnce(&mut Buffers) -> T) -> T {
     // The key's own call hands out the pointer alone: what a decision
@@ -1963,6 +2079,7 @@ fn with_buffers<T>(decide: impl FnOnce(&mut Buffers) -> T) -> T {
         return decide(&mut Buffers::default());
     };
     buffers.scratch.unread(false);
+    buffers.scratch.no_whole();
     decide(&mut buffers)
 }
 

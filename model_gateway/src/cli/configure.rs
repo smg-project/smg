@@ -1633,4 +1633,5 @@ impl PolicySpecPrint {
 }
 
 #[cfg(test)]
+#[path = "../../tests/unit/cli/configure/tests.rs"]
 mod tests;

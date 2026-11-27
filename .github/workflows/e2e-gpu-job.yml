@@ -44,6 +44,11 @@ on:
         type: string
         default: ""
         description: "Extra model ids to download by id (space-separated), for skip_tier_download models"
+      startup_profile:
+        required: false
+        type: string
+        default: ""
+        description: "Optional declared startup profile; blank preserves ordinary startup behavior"
       parser:
         required: false
         type: string
@@ -53,7 +58,12 @@ on:
         required: false
         type: boolean
         default: false
-        description: "Set up Oracle DB and Brave MCP for agentic tests"
+        description: "Set up Brave MCP (and Oracle DB unless setup_oracle_deps is false) for agentic tests"
+      setup_oracle_deps:
+        required: false
+        type: boolean
+        default: true
+        description: "Prepare Oracle when agentic dependencies are enabled; disable only for a reviewed memory-only suite"
       provider_api_keys:
         required: false
         type: boolean
@@ -156,6 +166,7 @@ jobs:
     env:
       E2E_ENGINE: ${{ inputs.engine }}
       E2E_RUNTIME: ${{ inputs.engine }}
+      E2E_STARTUP_PROFILE: ${{ inputs.startup_profile }}
       E2E_GPU_TIER: ${{ inputs.gpu_tier }}
       E2E_VLLM_KV_BACKEND: ${{ inputs.vllm_kv_backend }}
       E2E_VLLM_MORIIO_MODE: ${{ inputs.vllm_moriio_mode }}
@@ -175,6 +186,31 @@ jobs:
       TOKENSPEED_PREBUILT_IMAGE: ${{ inputs.tokenspeed_prebuilt_image }}
       ROUTER_LOCAL_MODEL_PATH: /models
     steps:
+      - name: Validate Mooncake PD startup contract
+        if: inputs.startup_profile == 'vllm-mooncake-pd2'
+        env:
+          PROFILE_INPUTS: ${{ toJSON(inputs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          actual = json.loads(os.environ["PROFILE_INPUTS"])
+          expected = {
+              "engine": "vllm", "gpu_vendor": "amd", "gpu_tier": "2",
+              "test_dirs": "e2e_test/router", "test_filter": "", "min_selected": 15,
+              "timeout": 50, "test_timeout": 34, "vllm_kv_backend": "mooncake",
+              "kv_backend": "", "vllm_extra_kv_backends": "", "mm_processing": "",
+              "servicer_impl": "", "parser": "", "connection_mode": "", "zmq_engine_count": "",
+          }
+          mismatched = [key for key, value in expected.items() if actual.get(key) != value]
+          if mismatched:
+              raise SystemExit("Mooncake PD startup contract mismatch: " + ", ".join(mismatched))
+          floor = os.environ.get("E2E_STARTUP_TIMEOUT", "").strip()
+          if floor and not 0 < int(floor) <= 60:
+              raise SystemExit("Mooncake PD gateway startup floor must not exceed 60 seconds")
+          PY
+
       - name: Checkout code
         uses: actions/checkout@v7
 
@@ -244,7 +280,12 @@ jobs:
       # Agentic service dependencies (Oracle DB, Brave MCP)
       - name: Check shared services
         if: inputs.setup_agentic_deps
-        run: bash scripts/ci_agentic_svc_deps.sh check --oracle oracle-db --brave brave-search-mcp
+        run: |
+          if [ "${{ inputs.setup_oracle_deps }}" = true ]; then
+            bash scripts/ci_agentic_svc_deps.sh check --oracle oracle-db --brave brave-search-mcp
+          else
+            bash scripts/ci_agentic_svc_deps.sh check --brave brave-search-mcp
+          fi
 
       # Install
       - name: Install wheel and test dependencies
@@ -264,7 +305,7 @@ jobs:
           pytest -q grpc_servicer/tests -p no:cacheprovider -rs
 
       - name: Setup Oracle
-        if: inputs.setup_agentic_deps
+        if: inputs.setup_agentic_deps && inputs.setup_oracle_deps
         run: |
           bash scripts/ci_agentic_svc_deps.sh setup-oracle-client
           bash scripts/ci_agentic_svc_deps.sh create-oracle-user oracle-db
@@ -408,7 +449,7 @@ jobs:
         run: rm -rf "$TOKENSPEED_PREBUILT_JOB_DIR"
 
       - name: Cleanup Oracle test users
-        if: always() && inputs.setup_agentic_deps
+        if: always() && inputs.setup_agentic_deps && inputs.setup_oracle_deps
         run: |
           bash scripts/ci_agentic_svc_deps.sh cleanup-oracle-flyway-user oracle-db
           bash scripts/ci_agentic_svc_deps.sh cleanup-oracle-user oracle-db

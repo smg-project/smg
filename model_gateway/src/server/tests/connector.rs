@@ -353,7 +353,11 @@ async fn stock_startup_uses_the_stock_connector_on_each_path() {
 async fn the_host_can_delegate_a_stock_engine_to_the_stock_connector() {
     let (url, _) = mock_grpc_engine().await;
     let app = gateway(Extensions::new().connector(Arc::new(HostConnector))).await;
-    let worker = register_grpc(&app, &url).await;
+    // The engine listens and the registration's probes dial it: they get
+    // time enough on a loaded host.
+    let mut registering = registration(&app, &url);
+    registering.data.config.health.timeout_secs = Some(30);
+    let worker = register_grpc_from(&app, &url, registering).await;
     let connector = app.engine_connector();
     assert!(Arc::ptr_eq(&worker.engine_connector().unwrap(), &connector));
     // The gateway's client the host delegated to passes the wrap as it is.
@@ -554,9 +558,21 @@ async fn the_load_feed_holds_the_value_a_stock_grpc_polls_answer_states_by_name(
             engines.push((worker, free));
         }
         let (first, _) = &engines[0];
-        poll_once(&app, first.as_ref()).await;
-
         let feed = app.worker_monitor.as_ref().unwrap().subscribe();
+        // A poll moves on without an engine whose answer misses the poll's
+        // deadline, as on a loaded host: the case polls until the feed
+        // holds every engine's report.
+        for _ in 0..10 {
+            poll_once(&app, first.as_ref()).await;
+            let published = feed.borrow();
+            if engines
+                .iter()
+                .all(|(worker, _)| published.get(worker.url()).is_some())
+            {
+                break;
+            }
+        }
+
         let published = feed.borrow();
         for (worker, free) in &engines {
             let report = published.get(worker.url()).unwrap();

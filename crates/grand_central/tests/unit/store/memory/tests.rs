@@ -129,7 +129,7 @@ impl MemoryStore {
     /// The cases' road: a registration or its refresh by `maker`, decided
     /// over the table's own row. It leaves with the table.
     pub(crate) fn upsert_by(&self, facts: WorkerFacts, maker: Registrant) -> MembershipChange {
-        let workers = self.writing();
+        let workers = self.writing_under(None);
         let standing = workers.by_key.get(&facts.key);
         let standing = standing.and_then(|id| workers.rows.get(id));
         let standing = standing.map(|held| &held.row);
@@ -148,7 +148,7 @@ impl MemoryStore {
         patch: WorkerPatch,
         revision: u64,
     ) -> Option<MembershipChange> {
-        let mut workers = self.writing();
+        let mut workers = self.writing_under(None);
         let mut row = workers.guarded(id, revision)?.row.clone();
         patch.laid_on(&mut row.facts);
         row.revision += 1;
@@ -160,7 +160,7 @@ impl MemoryStore {
     /// The cases' road: the removal of the row `id` where it stands at
     /// `revision`. It leaves with the table.
     pub(crate) fn remove(&self, id: WorkerId, revision: u64) -> Option<MembershipChange> {
-        let mut workers = self.writing();
+        let mut workers = self.writing_under(None);
         workers.guarded(id, revision)?;
         let change = MembershipChange::Removed { id };
         self.decided(workers, Instant::now(), change, None, None)
@@ -175,7 +175,7 @@ impl MemoryStore {
         status: WorkerStatus,
         revision: u64,
     ) -> Option<MembershipChange> {
-        let mut workers = self.writing();
+        let mut workers = self.writing_under(None);
         let from = workers.guarded(id, revision)?.row.status;
         // This road hands no models: the journal is told the table's
         // row's.

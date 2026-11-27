@@ -31,9 +31,10 @@
 //!   in `minimax_resize`, from the frame size under the request's
 //!   `max_long_side_pixel` or a long side of 672. Where the config sets
 //!   `max_pixels`, that area bounds each frame instead (not the sampled volume)
-//!   and a request's tier is not read. Where the config turns resizing off,
-//!   or its grid (patch_size * merge_size) is not 28, 602,112 (768 * 28 * 28)
-//!   bounds each frame, or the square of a request's tier.
+//!   and a request's tier is not read. Where the config sets `min_pixels`,
+//!   turns resizing off, or has a grid (patch_size * merge_size) other than
+//!   28, 602,112 (768 * 28 * 28) bounds each frame, or, under a request's
+//!   tier, the greater of the tier's square and `min_pixels`.
 //! - normalization: CLIP mean/std
 //!
 //! The bounds differ from Qwen2-VL's (200,704 / 1,003,520), so M3 cannot simply
@@ -266,7 +267,8 @@ impl MiniMaxM3VisionProcessor {
     /// `max_long_side_pixel` tier or the default long side, unless
     /// `max_pixels` was set explicitly. Frames that are not resized, those of
     /// a config that set `min_pixels`, and those of a config whose grid is not
-    /// 28 pixels, keep the tier's square as their budget.
+    /// 28 pixels, keep as their budget the greater of the tier's square and
+    /// `min_pixels`.
     fn for_clip(&self, clip: &VideoClipOptions, frame: Option<(u32, u32)>) -> Cow<'_, Self> {
         if self.explicit_max_pixels {
             return Cow::Borrowed(self);

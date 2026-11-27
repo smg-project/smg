@@ -47,6 +47,7 @@ use crate::{
     sglang::{
         aggregate_control, cache_partition_fields_arg, constraint_ref as sglang_constraint_ref,
         control_outcome, encode_media_refs, fan_out_sglang_requests, room_residue_rank,
+        send_answer_tag_as_schema as sglang_send_answer_tag_as_schema,
         translate_embed_request_sglang, translate_request_sglang, RankPlacement, SglangConnection,
         SglangGenerateStream, SglangProfileStart,
     },
@@ -59,18 +60,21 @@ use crate::{
     },
     tokenspeed::{
         constraint_ref as tokenspeed_constraint_ref, fan_out_tokenspeed_requests, loads_by_rank,
+        send_answer_tag_as_schema as tokenspeed_send_answer_tag_as_schema,
         translate_encode_request, translate_request_tokenspeed_for, EncodeRendezvous, GridTensors,
         TokenSpeedConnection, TokenSpeedGenerateStream, TokenSpeedHandshakes,
     },
     trtllm::{
-        constraint_ref as trtllm_constraint_ref, fan_out_trtllm_requests, translate_request_trtllm,
+        constraint_ref as trtllm_constraint_ref, fan_out_trtllm_requests,
+        send_answer_tag_as_schema as trtllm_send_answer_tag_as_schema, translate_request_trtllm,
         TrtllmGenerateStream,
     },
     vllm::{
         constraint_ref as vllm_constraint_ref, fan_out_requests, has_media, kv_transfer_params,
         now_secs, pulls_on_do_remote_prefill, ranked_candidate_count, refuse_greedy_choices,
-        translate_media, translate_request_with_media, translated_from_processed,
-        validate_token_ids, ProcessedMedia, TranslatedMedia, VllmGenerateStream, VocabBounds,
+        send_answer_tag_as_schema as vllm_send_answer_tag_as_schema, translate_media,
+        translate_request_with_media, translated_from_processed, validate_token_ids,
+        ProcessedMedia, TranslatedMedia, VllmGenerateStream, VocabBounds,
     },
 };
 
@@ -434,12 +438,11 @@ impl ZmqEngineClient {
                 .input_ids
                 .clone_from(&input.unpadded_ids);
         }
-        if let Some(sp) = req.sampling_params.as_ref() {
-            refuse_unenforceable_constraint(
-                sglang_constraint_ref(sp),
-                self.structured_outputs_support(),
-            )
-            .map_err(constraint_refused_status)?;
+        if let Some(sp) = req.sampling_params.as_mut() {
+            let support = self.structured_outputs_support();
+            sglang_send_answer_tag_as_schema(sp, support);
+            refuse_unenforceable_constraint(sglang_constraint_ref(sp), support)
+                .map_err(constraint_refused_status)?;
         }
         let original_text = req.tokenized.as_ref().map(|t| t.original_text.clone());
         let bootstrap = binding
@@ -1134,7 +1137,8 @@ impl ZmqEngineClient {
         };
         let support = self.structured_outputs_support();
         // On the request's own `n`: every sub below carries `n = 1`.
-        if let Some(sp) = req.sampling_params.as_ref() {
+        if let Some(sp) = req.sampling_params.as_mut() {
+            vllm_send_answer_tag_as_schema(sp, support);
             refuse_greedy_choices(sp).map_err(tonic::Status::invalid_argument)?;
             // A constraint the engine's grammar backend cannot enforce is
             // refused here, before anything reaches the engine, as on every
@@ -1307,7 +1311,7 @@ impl ZmqEngineClient {
     /// [`GridTensors`]).
     pub async fn generate_tokenspeed_streams_for_model(
         &self,
-        req: tokenspeed_proto::GenerateRequest,
+        mut req: tokenspeed_proto::GenerateRequest,
         grid_tensors: GridTensors,
     ) -> Result<Vec<TokenSpeedGenerateStream>, tonic::Status> {
         let ZmqBackend::TokenSpeed(client) = &self.backend else {
@@ -1323,12 +1327,11 @@ impl ZmqEngineClient {
         }
         // A constraint the engine's grammar backend cannot enforce is refused
         // here, before anything reaches the engine, as on every wire.
-        if let Some(sp) = req.sampling_params.as_ref() {
-            refuse_unenforceable_constraint(
-                tokenspeed_constraint_ref(sp),
-                self.structured_outputs_support(),
-            )
-            .map_err(constraint_refused_status)?;
+        if let Some(sp) = req.sampling_params.as_mut() {
+            let support = self.structured_outputs_support();
+            tokenspeed_send_answer_tag_as_schema(sp, support);
+            refuse_unenforceable_constraint(tokenspeed_constraint_ref(sp), support)
+                .map_err(constraint_refused_status)?;
         }
         let connection = TokenSpeedConnection {
             grid_tensors,
@@ -1479,7 +1482,7 @@ impl ZmqEngineClient {
     /// identity supplied by an untrusted RPC caller.
     pub async fn generate_sglang_streams_dispatching_with_mm_hasher(
         &self,
-        req: sglang_proto::GenerateRequest,
+        mut req: sglang_proto::GenerateRequest,
         trace_headers: Option<BTreeMap<String, String>>,
         dispatcher: Option<&Arc<dyn SglangEncodeDispatcher>>,
         hasher: Option<&crate::SglangCpuMmHasher>,
@@ -1491,12 +1494,11 @@ impl ZmqEngineClient {
         };
         // A constraint the engine's grammar backend cannot enforce is refused
         // here, before anything reaches the engine, as on every wire.
-        if let Some(sp) = req.sampling_params.as_ref() {
-            refuse_unenforceable_constraint(
-                sglang_constraint_ref(sp),
-                self.structured_outputs_support(),
-            )
-            .map_err(constraint_refused_status)?;
+        if let Some(sp) = req.sampling_params.as_mut() {
+            let support = self.structured_outputs_support();
+            sglang_send_answer_tag_as_schema(sp, support);
+            refuse_unenforceable_constraint(sglang_constraint_ref(sp), support)
+                .map_err(constraint_refused_status)?;
         }
         let max_model_len = self.prompt_bound()?;
         // The connected scheduler ranks: a request is placed among them as
@@ -1660,7 +1662,7 @@ impl ZmqEngineClient {
     /// engine's own spans.
     pub async fn generate_trtllm_streams(
         &self,
-        req: trtllm_proto::GenerateRequest,
+        mut req: trtllm_proto::GenerateRequest,
         trace_headers: Option<BTreeMap<String, String>>,
     ) -> Result<Vec<TrtllmGenerateStream>, tonic::Status> {
         let ZmqBackend::Trtllm(client) = &self.backend else {
@@ -1670,11 +1672,10 @@ impl ZmqEngineClient {
         };
         // A constraint the engine's grammar backend cannot enforce is refused
         // here, before anything reaches the engine, as on every wire.
-        refuse_unenforceable_constraint(
-            trtllm_constraint_ref(&req),
-            self.structured_outputs_support(),
-        )
-        .map_err(constraint_refused_status)?;
+        let support = self.structured_outputs_support();
+        trtllm_send_answer_tag_as_schema(&mut req, support);
+        refuse_unenforceable_constraint(trtllm_constraint_ref(&req), support)
+            .map_err(constraint_refused_status)?;
         let max_model_len = self.prompt_bound()?;
         let mut streams = Vec::new();
         for (index, sub) in fan_out_trtllm_requests(req).into_iter().enumerate() {
