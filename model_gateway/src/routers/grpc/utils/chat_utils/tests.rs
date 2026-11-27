@@ -1823,7 +1823,10 @@ fn minimax_template_without_a_thinking_switch_gets_the_thought_prefix() {
 /// parser's start are the template's own. The renderer continues the message
 /// in place, or cannot (here: the template renders no message text, so the
 /// text never reaches the prompt) and writes a generation prompt and the
-/// message's text behind it.
+/// message's text behind it. A message that leaves its thought open (the
+/// opening marker and no closing one) reads the same under every thinking
+/// switch: the gateway writes nothing, and the parser starts outside the
+/// thought, where the template's own prompt starts it.
 #[test]
 fn minimax_continued_final_message_takes_no_thought_prefix() {
     const FALLS_BACK: &str = "{% for message in messages %}[{{ message.role }}]{% endfor %}\
@@ -1944,6 +1947,54 @@ fn minimax_continued_final_message_takes_no_thought_prefix() {
             true,
             "continued in place, disabled",
         ),
+        (
+            &falls_back,
+            Some("enabled"),
+            "<mm:think>plan",
+            "[user]ai\n<mm:think>plan",
+            false,
+            "fell back on a message that leaves its thought open, enabled",
+        ),
+        (
+            &falls_back,
+            Some("disabled"),
+            "<mm:think>plan",
+            "[user]ai\n<mm:think>plan",
+            false,
+            "fell back on a message that leaves its thought open, disabled",
+        ),
+        (
+            &falls_back,
+            None,
+            "<mm:think>plan",
+            "[user]ai\n<mm:think>plan",
+            false,
+            "fell back on a message that leaves its thought open, no switch",
+        ),
+        (
+            &continues,
+            Some("enabled"),
+            "<mm:think>plan",
+            "[user]hello[assistant]<mm:think>plan",
+            true,
+            "continued in place on a message that leaves its thought open, enabled",
+        ),
+        (
+            &continues,
+            Some("disabled"),
+            "<mm:think>plan",
+            "[user]hello[assistant]<mm:think>plan",
+            true,
+            "continued in place on a message that leaves its thought open, disabled",
+        ),
+        (
+            &continues,
+            None,
+            "<mm:think>plan",
+            "[user]hello[assistant]<mm:think>plan",
+            true,
+            "continued in place on a message that leaves its thought open, no switch",
+        ),
     ] {
         let request = chat(thinking, text);
         let rendered = process_chat_messages(&request, tokenizer.as_ref(), None).expect("render");
@@ -1979,6 +2030,18 @@ fn minimax_continued_final_message_takes_no_thought_prefix() {
             json!([{"type": "text", "text": "plan</mm:think>"}, {"type": "text", "text": "Answer:"}]),
             "[user]ai\nplan</mm:think>Answer:",
             "enabled, a message that closes its thought",
+        ),
+        (
+            json!({"type": "enabled", "budget_tokens": 1024}),
+            json!("<mm:think>plan"),
+            "[user]ai\n<mm:think>plan",
+            "enabled, a message that leaves its thought open",
+        ),
+        (
+            json!({"type": "disabled"}),
+            json!("<mm:think>plan"),
+            "[user]ai\n<mm:think>plan",
+            "disabled, a message that leaves its thought open",
         ),
     ] {
         let messages = serde_json::from_value(json!({
