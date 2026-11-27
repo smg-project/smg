@@ -3536,7 +3536,8 @@ A fact leaves the remainder when the worker object gets a field that holds it as
 
    First the store's log of its changes
    **[built]**, then a cut's read back **[built]** and the store's own write entries **[built]**. Then its read
-   entries with its own cut, and last the store's reads of the record before a write. The
+   entries with its own cut: the read of one record by its id has no caller in the product
+   **[built]**. Last come the store's reads of the record before a write. The
    records themselves stay for the published copy's membership build, and go with that copy.
 
    The task is deleted
@@ -3574,7 +3575,7 @@ hands the store the event at its place in the log, and puts the object in the re
 the store took the event. A removal's object leaves the registry first. A record changed in
 place keeps the instant it was admitted at. A status the leader tells is written to the table and
 laid on the object in the same turn. A restore is the store's restore and the lay of the cut's own
-records in one turn of that code. No record of the table is read back to lay an object: each record's status alone is read off it. A record of a watch's snapshot whose
+records in one turn of that code. No record of the table is read back to lay an object: each record's told status alone is read, by a read of the store's that copies no record. A record of a watch's snapshot whose
 object stands keeps the instant it was admitted at: that code states it before the store takes
 the snapshot. A first copy is cut from the objects, by the last
 part of step 2.
@@ -3630,7 +3631,8 @@ code that keeps the gateway's worker objects (the third part of step 2), as a st
 applier does. So the object of a record stands when the event that told it returns, and the
 host of the watcher follows nothing behind the watch. A first copy keeps the object of a
 record that stands through it. The store's two entries for a watcher, a told change and a
-first copy, have no caller in the product but that code.
+first copy, have no caller in the product but that code. A told status goes by a door of its
+own, which the first entry hands it to and that code calls directly.
 
 **An object's status leads [built].** On the replica that leads, a status is written on the
 worker object and the store is told it (the first part of step 3). A probe's outcome goes to

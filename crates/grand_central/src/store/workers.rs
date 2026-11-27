@@ -452,6 +452,10 @@ impl MembershipChange {
 /// decision reads a worker's status on its worker object, which the holder
 /// of the objects moves with the row's.
 pub trait WorkersStore: Send + Sync {
+    /// The row under `id`, copied whole. No product code of this
+    /// repository calls it: the holder of a host's worker objects reads
+    /// one row's told status by a read of the crate's own store
+    /// (`MemoryStore::told_status`).
     fn get(&self, id: WorkerId) -> Option<WorkerRow>;
 
     /// The row under a registration key, whatever its incarnation.

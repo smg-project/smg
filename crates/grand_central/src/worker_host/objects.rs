@@ -927,23 +927,22 @@ impl<G: Generation> Objects<G> {
 
     /// The status the table holds for the row an object was built from,
     /// where the row stands at that revision still: what an object takes
-    /// from the table. Read under the object's mutation lock, so of two
-    /// such reads the later one's status stands on the object.
-    fn table_status<S: WorkersStore + ?Sized>(
-        store: &S,
-        standing: RowRevision,
-    ) -> Option<ObjectStatus> {
+    /// from the table. It is the store's read of one told status
+    /// ([`MemoryStore::told_status`]): no row is copied. Read under the
+    /// object's mutation lock, so of two such reads the later one's
+    /// status stands on the object.
+    fn table_status(store: &MemoryStore, standing: RowRevision) -> Option<ObjectStatus> {
         store
-            .get(standing.row)
-            .filter(|row| row.revision == standing.revision)
-            .map(|row| status(row.status))
+            .told_status(standing.row, standing.revision)
+            .map(status)
     }
 
-    /// Read the row under the lock the health adapter writes under. The
-    /// object's entry must still name that row and its current revision.
-    /// The registry writes the status it is handed and tells it.
+    /// Read the row's told status under the lock the health adapter
+    /// writes under. The object's entry must still name that row and its
+    /// current revision. The registry writes the status it is handed and
+    /// tells it.
     #[inline(never)]
-    fn copy_status<S: WorkersStore + ?Sized>(&self, store: &S, row: WorkerId) {
+    fn copy_status(&self, store: &MemoryStore, row: WorkerId) {
         let Some(id) = self.object(row) else {
             return;
         };
