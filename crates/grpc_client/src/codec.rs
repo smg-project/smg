@@ -1050,6 +1050,7 @@ mod tests {
                 items: vec![vllm_proto::MediaRef {
                     modality: Modality::Image as i32,
                     url: "data:image/png;base64,iVBORw0KGgo=".to_string(),
+                    ..Default::default()
                 }],
             }),
             ..Default::default()

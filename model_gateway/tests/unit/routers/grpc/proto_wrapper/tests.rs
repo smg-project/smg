@@ -9,6 +9,7 @@ fn sglang_media_refs_preserve_video_and_refuse_lossy_conversion() {
         items: vec![vllm::MediaRef {
             modality: common::Modality::Video as i32,
             url: "data:video/mp4;base64,AA==".into(),
+            ..Default::default()
         }],
     };
     request.set_media_refs(refs.clone()).unwrap();
@@ -32,11 +33,55 @@ fn sglang_media_refs_preserve_video_and_refuse_lossy_conversion() {
     mixed.items.push(vllm::MediaRef {
         modality: common::Modality::Image as i32,
         url: "https://example.test/image.png".into(),
+        ..Default::default()
     });
     request.set_media_refs(mixed).unwrap();
     let mm = request.as_sglang().mm_inputs.as_ref().unwrap();
     assert_eq!(mm.image_urls, ["https://example.test/image.png"]);
     assert_eq!(mm.video_urls, ["data:video/mp4;base64,AA=="]);
+}
+
+/// The SGLang wire has no field for a per-item hint: a hinted reference
+/// is refused there, never sent with its hint dropped, and the request
+/// keeps what it held. The vLLM wire carries the hints as they came.
+#[test]
+fn a_hinted_reference_is_refused_on_the_sglang_wire_and_kept_on_vllms() {
+    let plain = vllm::MediaRefs {
+        items: vec![vllm::MediaRef {
+            modality: common::Modality::Image as i32,
+            url: "https://example.test/image.png".into(),
+            ..Default::default()
+        }],
+    };
+    for hints in [
+        smg_grpc_client::MediaItemHints {
+            max_long_side_pixel: Some(504),
+            fps: None,
+        },
+        smg_grpc_client::MediaItemHints {
+            max_long_side_pixel: None,
+            fps: Some(2.0),
+        },
+    ] {
+        let mut hinted = plain.clone();
+        hinted.items[0].set_item_hints(hints);
+
+        let mut request = ProtoGenerateRequest::Sglang(Box::default());
+        request.set_media_refs(plain.clone()).unwrap();
+        let refusal = request
+            .set_media_refs(hinted.clone())
+            .expect_err("a hint the SGLang wire would drop");
+        assert!(refusal.contains("per-item hints"), "{refusal}");
+        let mm = request.as_sglang().mm_inputs.as_ref().unwrap();
+        assert_eq!(mm.image_urls, ["https://example.test/image.png"]);
+
+        let mut request = ProtoGenerateRequest::Vllm(Box::default());
+        request.set_media_refs(hinted.clone()).unwrap();
+        let ProtoGenerateRequest::Vllm(inner) = &request else {
+            panic!("expected vLLM request")
+        };
+        assert_eq!(inner.media_refs.as_ref(), Some(&hinted));
+    }
 }
 
 /// The raw-file request's wire bytes are the files, length-delimited in

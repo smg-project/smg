@@ -343,6 +343,21 @@ mod tests {
         assert!(!older.contains_key("cache_partition_fields"));
     }
 
+    /// A vLLM worker that applies a media reference's per-item hints says so
+    /// as the `mm_item_hints` label, `"true"`, the spelling the router reads;
+    /// one that does not (any processor but `smg`, the Python servicer) reads
+    /// `"false"`, which the router treats as no capability.
+    #[test]
+    fn vllm_item_hints_flatten_into_a_label() {
+        let info = ServerInfo::Vllm(Box::new(vllm_proto::GetServerInfoResponse {
+            mm_item_hints: true,
+            ..Default::default()
+        }));
+        assert_eq!(info.to_labels()["mm_item_hints"], "true");
+        let without = ServerInfo::Vllm(Box::default()).to_labels();
+        assert_eq!(without["mm_item_hints"], "false");
+    }
+
     /// A vLLM worker's `GetServerInfo` fields flatten into labels as they
     /// are: the engine's per-prompt media limits arrive as `mm_item_limits`
     /// and its encoder budget as `mm_encoder_budget`, and an engine without

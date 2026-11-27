@@ -403,7 +403,10 @@ impl ProtoGenerateRequest {
         self.token_ids().len()
     }
 
-    /// Attach media references for worker-side multimodal processing.
+    /// Attach media references for worker-side multimodal processing. The
+    /// vLLM wire carries a reference whole, its per-item hints included; the
+    /// SGLang wire carries its URL alone, so a hinted reference is refused
+    /// there instead of sent with the hints dropped.
     pub fn set_media_refs(&mut self, refs: vllm::MediaRefs) -> Result<(), String> {
         match self {
             Self::Vllm(req) => {
@@ -413,6 +416,11 @@ impl ProtoGenerateRequest {
             Self::Sglang(req) => {
                 let mut mm = sglang::MultimodalInputs::default();
                 for item in refs.items {
+                    if item.has_item_hints() {
+                        return Err("SGLang media references carry no per-item hints \
+                                    (max_long_side_pixel, fps)"
+                            .into());
+                    }
                     match smg_grpc_client::common_proto::Modality::try_from(item.modality) {
                         Ok(smg_grpc_client::common_proto::Modality::Image) => {
                             mm.image_urls.push(item.url);

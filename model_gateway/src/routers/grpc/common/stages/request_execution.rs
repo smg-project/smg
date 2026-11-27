@@ -6115,6 +6115,7 @@ pub(crate) mod tests {
             items: vec![vllm::MediaRef {
                 modality: smg_grpc_client::common_proto::Modality::Image as i32,
                 url: "https://a/1.png".to_string(),
+                ..Default::default()
             }],
         };
         let mut request = ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
@@ -6154,6 +6155,7 @@ pub(crate) mod tests {
                 items: vec![vllm::MediaRef {
                     modality: smg_grpc_client::common_proto::Modality::Image as i32,
                     url: "https://a/1.png".to_string(),
+                    ..Default::default()
                 }],
             })
             .expect("vLLM request accepts media refs");
@@ -6339,6 +6341,7 @@ pub(crate) mod tests {
                 items: vec![vllm::MediaRef {
                     modality: smg_grpc_client::common_proto::Modality::Image as i32,
                     url: "https://a/1.png".to_string(),
+                    ..Default::default()
                 }],
             })
             .expect("vLLM request accepts media refs");

@@ -24,13 +24,13 @@ use engine_servicer::{
     sglang::encoder::{EncoderMediaItem, EncoderModality, EncoderServer},
     BoxFuture, EncodeDispatchErrorSink, EncodeDispatchOutcome, EncodeDispatchRequest, EncodeFuture,
     EncodeMediaRefs, EncodeRelease, EncodeTransport, EncoderDispatchErrorReq, MediaError,
-    MediaFeatures, MediaProcessor, MediaRequest, ProcessedMedia, ServicerConfig, ServicerError,
-    SglangEncodeDispatcher, SglangMediaProcessor, SglangModelInfo, SglangServicerConfig,
-    SglangServicerServer, TokenSpeedModelInfo, TokenSpeedServicerConfig, TokenSpeedServicerServer,
-    TrtllmModelInfo, TrtllmServicerConfig, TrtllmServicerServer, VllmModelInfo, VllmServicerConfig,
-    VllmServicerServer, ALL_MODALITIES, DEFAULT_ENGINE_PREFILL_TOKENS_PER_SEC,
-    DEFAULT_ENGINE_SILENCE_TIMEOUT, DEFAULT_ENGINE_STARTUP_CEILING, DEFAULT_ENGINE_STARTUP_TIMEOUT,
-    PIXEL_MODALITIES,
+    MediaFeatures, MediaProcessor, MediaRefItem, MediaRequest, ProcessedMedia, ServicerConfig,
+    ServicerError, SglangEncodeDispatcher, SglangMediaProcessor, SglangModelInfo,
+    SglangServicerConfig, SglangServicerServer, TokenSpeedModelInfo, TokenSpeedServicerConfig,
+    TokenSpeedServicerServer, TrtllmModelInfo, TrtllmServicerConfig, TrtllmServicerServer,
+    VllmModelInfo, VllmServicerConfig, VllmServicerServer, ALL_MODALITIES,
+    DEFAULT_ENGINE_PREFILL_TOKENS_PER_SEC, DEFAULT_ENGINE_SILENCE_TIMEOUT,
+    DEFAULT_ENGINE_STARTUP_CEILING, DEFAULT_ENGINE_STARTUP_TIMEOUT, PIXEL_MODALITIES,
 };
 use llm_multimodal::{jpeg_turbo::TurboJpegPolicy, MediaErrorCode, Modality};
 use prost::Message;
@@ -147,6 +147,12 @@ struct PythonMediaProcessor {
 }
 
 impl PythonMediaProcessor {
+    /// The bridge hands over a reference's modality and URL alone, and the
+    /// engine's own processors behind it (`inprocess`, `redis`) take no
+    /// per-item hints: a worker running them never advertises
+    /// `mm_item_hints`.
+    const APPLIES_ITEM_HINTS: bool = false;
+
     fn new(bridge: &Bound<'_, PyAny>) -> PyResult<Self> {
         Ok(Self {
             name: bridge.getattr("name")?.extract()?,
@@ -195,6 +201,10 @@ impl MediaProcessor for PythonMediaProcessor {
     /// item over under the same modality name.
     fn modalities(&self) -> &'static [&'static str] {
         ALL_MODALITIES
+    }
+
+    fn applies_item_hints(&self) -> bool {
+        Self::APPLIES_ITEM_HINTS
     }
 
     fn probe(&self) -> BoxFuture<bool> {
@@ -486,6 +496,12 @@ struct SmgMediaProcessor {
     max_inflight: usize,
 }
 
+impl SmgMediaProcessor {
+    /// The pipeline applies a reference's long-side cap and sampling rate as
+    /// the Router's does ([`smg_worker_media_items`] hands them over).
+    const APPLIES_ITEM_HINTS: bool = true;
+}
+
 impl MediaProcessor for SmgMediaProcessor {
     fn name(&self) -> &str {
         "smg"
@@ -509,6 +525,10 @@ impl MediaProcessor for SmgMediaProcessor {
         PIXEL_MODALITIES
     }
 
+    fn applies_item_hints(&self) -> bool {
+        Self::APPLIES_ITEM_HINTS
+    }
+
     fn probe(&self) -> BoxFuture<bool> {
         // In-process and stateless between requests: serving whenever up.
         Box::pin(async { true })
@@ -517,23 +537,7 @@ impl MediaProcessor for SmgMediaProcessor {
     fn process(&self, request: MediaRequest) -> BoxFuture<Result<ProcessedMedia, MediaError>> {
         let pipeline = Arc::clone(&self.pipeline);
         Box::pin(async move {
-            let items = request
-                .items
-                .into_iter()
-                .enumerate()
-                .map(|(index, item)| {
-                    let modality = match item.modality.as_str() {
-                        "image" => Modality::Image,
-                        "video" => Modality::Video,
-                        other => {
-                            return Err(MediaError::Invalid(format!(
-                                "media_refs[{index}]: unsupported modality {other}"
-                            )))
-                        }
-                    };
-                    Ok(WorkerMediaItem::new(modality, item.url))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            let items = smg_worker_media_items(request.items)?;
             let output = pipeline
                 .process(request.prompt_token_ids, items, request.want_identity)
                 .await
@@ -557,6 +561,30 @@ impl MediaProcessor for SmgMediaProcessor {
             })
         })
     }
+}
+
+/// A request's references as smg's pipeline takes them: image and video
+/// items, each with the per-item hints it carried.
+fn smg_worker_media_items(items: Vec<MediaRefItem>) -> Result<Vec<WorkerMediaItem>, MediaError> {
+    items
+        .into_iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let modality = match item.modality.as_str() {
+                "image" => Modality::Image,
+                "video" => Modality::Video,
+                other => {
+                    return Err(MediaError::Invalid(format!(
+                        "media_refs[{index}]: unsupported modality {other}"
+                    )))
+                }
+            };
+            Ok(WorkerMediaItem {
+                hints: item.hints,
+                ..WorkerMediaItem::new(modality, item.url)
+            })
+        })
+        .collect()
 }
 
 /// Convert a worker-side media pipeline error into a typed tonic status.
@@ -2064,9 +2092,8 @@ fn encoder_items_to_worker_items(
         .map(|item| {
             let detail = parse_image_detail(item.detail.as_deref())?;
             Ok(WorkerMediaItem {
-                modality: target_modality,
-                url: item.url,
                 detail,
+                ..WorkerMediaItem::new(target_modality, item.url)
             })
         })
         .collect()
@@ -2175,6 +2202,67 @@ impl PyManagedEncoderServer {
         let duration = Duration::try_from_secs_f64(timeout)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
         py.detach(|| self.server.stop(duration).map_err(to_py_err))
+    }
+}
+
+#[cfg(test)]
+mod media_processor_tests {
+    use smg_grpc_client::MediaItemHints;
+
+    use super::*;
+
+    /// Only smg's own pipeline applies per-item hints: the bridge to the
+    /// engine's processors (`inprocess`, `redis`) says it does not, so a
+    /// worker running them never advertises `mm_item_hints` and refuses a
+    /// hinted reference.
+    #[test]
+    fn only_the_smg_processor_applies_item_hints() {
+        const {
+            assert!(SmgMediaProcessor::APPLIES_ITEM_HINTS);
+            assert!(!PythonMediaProcessor::APPLIES_ITEM_HINTS);
+        }
+    }
+
+    /// smg's pipeline gets each reference with the per-item hints it
+    /// carried, and a plain one with none.
+    #[test]
+    fn the_smg_processor_hands_each_items_hints_to_the_pipeline() {
+        let item = |modality: &str, max_long_side_pixel, fps| MediaRefItem {
+            modality: modality.to_string(),
+            url: format!("https://example.test/{modality}"),
+            hints: MediaItemHints {
+                max_long_side_pixel,
+                fps,
+            },
+        };
+        let items = smg_worker_media_items(vec![
+            item("image", Some(504), None),
+            item("video", Some(1008), Some(2.0)),
+            item("image", None, None),
+        ])
+        .unwrap();
+        let hints: Vec<_> = items
+            .iter()
+            .map(|item| {
+                (
+                    item.modality,
+                    item.hints.max_long_side_pixel,
+                    item.hints.fps,
+                )
+            })
+            .collect();
+        assert_eq!(
+            hints,
+            [
+                (Modality::Image, Some(504), None),
+                (Modality::Video, Some(1008), Some(2.0)),
+                (Modality::Image, None, None),
+            ]
+        );
+        assert!(matches!(
+            smg_worker_media_items(vec![item("audio", None, None)]),
+            Err(MediaError::Invalid(message)) if message.contains("unsupported modality audio")
+        ));
     }
 }
 

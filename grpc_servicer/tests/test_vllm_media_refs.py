@@ -69,6 +69,16 @@ class TestParseMediaRefs:
         with pytest.raises(ValueError, match="no items"):
             media_refs.parse_media_refs(vllm_engine_pb2.MediaRefs())
 
+    @pytest.mark.parametrize(("hint", "value"), [("max_long_side_pixel", 504), ("fps", 2.0)])
+    def test_rejects_a_reference_that_carries_a_per_item_hint(self, hint, value):
+        ref = vllm_engine_pb2.MediaRef(modality=common_pb2.VIDEO, url="https://a/clip.mp4")
+        if hint not in ref.DESCRIPTOR.fields_by_name:
+            pytest.skip("the installed proto predates the per-item hints")
+        setattr(ref, hint, value)
+        refs = vllm_engine_pb2.MediaRefs(items=[ref])
+        with pytest.raises(ValueError, match=f"does not apply per-item hints \\({hint}\\)"):
+            media_refs.parse_media_refs(refs)
+
 
 class TestSchemes:
     @pytest.mark.parametrize(

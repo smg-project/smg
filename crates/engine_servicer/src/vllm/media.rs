@@ -19,7 +19,7 @@ use std::{
 
 pub use engine_zmq_adapter::ProcessedMedia as MediaFeatures;
 use smg_grpc_client::{
-    common_proto as common, stamp_media_code, vllm_proto as vllm, WorkerMediaFault,
+    common_proto as common, stamp_media_code, vllm_proto as vllm, MediaItemHints, WorkerMediaFault,
 };
 use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 use tonic::Status;
@@ -37,12 +37,14 @@ pub const PIXEL_MODALITIES: &[&str] = &["image", "video"];
 /// the model takes.
 pub const ALL_MODALITIES: &[&str] = &["image", "video", "audio"];
 
-/// One `media_refs` item: the modality name (`image`, `video`, `audio`) and
-/// the reference to fetch.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One `media_refs` item: the modality name (`image`, `video`, `audio`), the
+/// reference to fetch, and the per-item hints it carries, which reach only a
+/// processor that applies them ([`MediaProcessor::applies_item_hints`]).
+#[derive(Debug, Clone, PartialEq)]
 pub struct MediaRefItem {
     pub modality: String,
     pub url: String,
+    pub hints: MediaItemHints,
 }
 
 /// What a processor gets: the request's prompt as the Router sent it (one
@@ -145,6 +147,11 @@ pub trait MediaProcessor: Send + Sync + 'static {
     /// states its set: a default would let the next bridge refuse audio
     /// without a word.
     fn modalities(&self) -> &'static [&'static str];
+    /// Whether it applies a reference's per-item hints (`max_long_side_pixel`,
+    /// `fps`) itself, advertised as `mm_item_hints`; a hinted reference to a
+    /// processor that does not is refused before any work, never served
+    /// unsized. Every processor states it, as it states its modalities.
+    fn applies_item_hints(&self) -> bool;
     /// Whether it can take requests now (a sidecar's liveness); the backend
     /// is advertised only while this holds.
     fn probe(&self) -> BoxFuture<bool>;
@@ -232,7 +239,10 @@ fn outcome_of(error: &MediaError) -> MediaOutcome {
 /// servicer checks them (`parse_media_refs`): a fetchable modality and a
 /// non-empty reference each, at least one item; and, on this servicer, a
 /// modality the configured processor takes, so a reference it would refuse
-/// after the fetch is refused before it.
+/// after the fetch is refused before it. A reference's per-item hints go to a
+/// processor that applies them as sent, their bounds being that processor's
+/// (smg's pipeline refuses one out of range as the router's own does); any
+/// other processor refuses a hinted reference here.
 fn parse_media_refs(
     refs: &vllm::MediaRefs,
     processor: &dyn MediaProcessor,
@@ -268,9 +278,17 @@ fn parse_media_refs(
                 "media_refs[{index}]: empty url"
             )));
         }
+        if item.has_item_hints() && !processor.applies_item_hints() {
+            return Err(Status::invalid_argument(format!(
+                "media_refs[{index}]: the {} media processor on this worker does not apply \
+                 per-item hints (max_long_side_pixel, fps); --mm-processor smg applies them",
+                processor.name(),
+            )));
+        }
         items.push(MediaRefItem {
             modality: modality.to_string(),
             url: item.url.clone(),
+            hints: item.item_hints(),
         });
     }
     if items.is_empty() {

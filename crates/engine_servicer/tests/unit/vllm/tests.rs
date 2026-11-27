@@ -39,7 +39,7 @@ use smg_grpc_client::{
     tokenizer_bundle::{validate_bundle_sha256, with_extracted_bundle, StreamBundle},
     vllm_proto as vllm,
     vllm_proto::vllm_engine_client::VllmEngineClient,
-    WorkerMediaFault,
+    MediaItemHints, WorkerMediaFault,
 };
 use tonic::{transport::Channel, Code};
 use tonic_health::pb::{
@@ -429,10 +429,12 @@ fn the_request_line_spells_the_python_servicers_words() {
             vllm::MediaRef {
                 modality: common::Modality::Image as i32,
                 url: "https://example.test/a.jpg".to_string(),
+                ..Default::default()
             },
             vllm::MediaRef {
                 modality: common::Modality::Video as i32,
                 url: "https://example.test/b.mp4".to_string(),
+                ..Default::default()
             },
         ],
     });
@@ -3836,6 +3838,7 @@ fn media_refs(urls: &[&str]) -> vllm::MediaRefs {
             .map(|url| vllm::MediaRef {
                 modality: common::Modality::Image as i32,
                 url: url.to_string(),
+                ..Default::default()
             })
             .collect(),
     }
@@ -3870,7 +3873,8 @@ fn processed_media() -> ProcessedMedia {
 }
 
 /// A scripted processor: one outcome for every request, the requests it was
-/// handed, an optional delay, and a switchable probe.
+/// handed, an optional delay, a switchable probe, and whether it applies
+/// per-item hints (as smg's pipeline does) or not (as the bridge does).
 struct MockMediaProcessor {
     outcome: Mutex<Result<ProcessedMedia, MediaError>>,
     requests: Mutex<Vec<MediaRequest>>,
@@ -3880,6 +3884,7 @@ struct MockMediaProcessor {
     probe_ok: AtomicBool,
     max_inflight: usize,
     modalities: &'static [&'static str],
+    applies_item_hints: bool,
 }
 
 impl MockMediaProcessor {
@@ -3891,6 +3896,14 @@ impl MockMediaProcessor {
     /// processors do behind the Python bridge.
     fn taking_audio(outcome: Result<ProcessedMedia, MediaError>) -> Arc<Self> {
         Self::build(outcome, Duration::ZERO, 4, ALL_MODALITIES)
+    }
+
+    /// A processor that applies a reference's per-item hints, as smg's
+    /// pipeline does.
+    fn applying_hints(outcome: Result<ProcessedMedia, MediaError>) -> Arc<Self> {
+        let mut processor = Self::unshared(outcome, Duration::ZERO, 4, PIXEL_MODALITIES);
+        processor.applies_item_hints = true;
+        Arc::new(processor)
     }
 
     fn slow(
@@ -3907,7 +3920,16 @@ impl MockMediaProcessor {
         max_inflight: usize,
         modalities: &'static [&'static str],
     ) -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new(Self::unshared(outcome, delay, max_inflight, modalities))
+    }
+
+    fn unshared(
+        outcome: Result<ProcessedMedia, MediaError>,
+        delay: Duration,
+        max_inflight: usize,
+        modalities: &'static [&'static str],
+    ) -> Self {
+        Self {
             outcome: Mutex::new(outcome),
             requests: Mutex::new(Vec::new()),
             started: Mutex::new(Vec::new()),
@@ -3915,7 +3937,8 @@ impl MockMediaProcessor {
             probe_ok: AtomicBool::new(true),
             max_inflight,
             modalities,
-        })
+            applies_item_hints: false,
+        }
     }
 
     fn requests(&self) -> Vec<MediaRequest> {
@@ -3946,6 +3969,10 @@ impl MediaProcessor for MockMediaProcessor {
 
     fn modalities(&self) -> &'static [&'static str] {
         self.modalities
+    }
+
+    fn applies_item_hints(&self) -> bool {
+        self.applies_item_hints
     }
 
     fn probe(&self) -> BoxFuture<bool> {
@@ -4071,6 +4098,7 @@ async fn media_refs_are_processed_worker_side_and_relayed_as_encoded() {
         vec![MediaRefItem {
             modality: "image".to_string(),
             url: "https://example.com/x.png".to_string(),
+            hints: MediaItemHints::default(),
         }]
     );
     assert!(!seen[0].want_identity);
@@ -4098,6 +4126,7 @@ async fn audio_refs_reach_a_processor_that_takes_them() {
         items: vec![vllm::MediaRef {
             modality: common::Modality::Audio as i32,
             url: "https://example.com/x.wav".to_string(),
+            ..Default::default()
         }],
     });
     let _stream = h
@@ -4120,6 +4149,7 @@ async fn audio_refs_reach_a_processor_that_takes_them() {
         vec![MediaRefItem {
             modality: "audio".to_string(),
             url: "https://example.com/x.wav".to_string(),
+            hints: MediaItemHints::default(),
         }]
     );
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
@@ -4146,6 +4176,7 @@ async fn malformed_media_refs_are_refused_before_processing() {
         items: vec![vllm::MediaRef {
             modality: common::Modality::Audio as i32,
             url: "https://example.com/x.wav".to_string(),
+            ..Default::default()
         }],
     });
     let mut empty = generate_request("mr5", false, Vec::new());
@@ -4509,6 +4540,147 @@ async fn server_info_advertises_a_serving_media_processor() {
         .unwrap()
         .into_inner();
     assert_eq!(info.mm_processor, "");
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// `GetServerInfo` says the worker applies per-item hints only for a
+/// processor that applies them, and only while that processor is
+/// advertised; one that does not never says so.
+#[tokio::test]
+async fn server_info_advertises_item_hints_only_for_a_processor_that_applies_them() {
+    let mut vision = model_info();
+    vision.supports_vision = true;
+
+    let applying = MockMediaProcessor::applying_hints(Ok(processed_media()));
+    let mut h = harness_with(vision.clone(), None, Some(applying.clone())).await;
+    let info = h
+        .client
+        .get_server_info(vllm::GetServerInfoRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(info.mm_item_hints);
+    applying.probe_ok.store(false, Ordering::Release);
+    let info = h
+        .client
+        .get_server_info(vllm::GetServerInfoRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        !info.mm_item_hints,
+        "a processor that is not serving advertises nothing"
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+
+    let bridge = MockMediaProcessor::answering(Ok(processed_media()));
+    let mut h = harness_with(vision, None, Some(bridge)).await;
+    let info = h
+        .client
+        .get_server_info(vllm::GetServerInfoRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(info.mm_processor, "mock");
+    assert!(!info.mm_item_hints);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A reference's per-item hints reach a processor that applies them as the
+/// Router sent them.
+#[tokio::test]
+async fn hinted_refs_reach_a_processor_that_applies_hints() {
+    let processor = MockMediaProcessor::applying_hints(Ok(processed_media()));
+    let mut h = harness_with(model_info(), None, Some(processor.clone())).await;
+    let image_hints = MediaItemHints {
+        max_long_side_pixel: Some(504),
+        fps: None,
+    };
+    let video_hints = MediaItemHints {
+        max_long_side_pixel: Some(1008),
+        fps: Some(2.0),
+    };
+    let reference = |modality: common::Modality, url: &str, hints| {
+        let mut reference = vllm::MediaRef {
+            modality: modality as i32,
+            url: url.to_string(),
+            ..Default::default()
+        };
+        reference.set_item_hints(hints);
+        reference
+    };
+    let mut request = generate_request("mr30", true, Vec::new());
+    request.media_refs = Some(vllm::MediaRefs {
+        items: vec![
+            reference(
+                common::Modality::Image,
+                "https://example.com/x.png",
+                image_hints,
+            ),
+            reference(
+                common::Modality::Video,
+                "https://example.com/x.mp4",
+                video_hints,
+            ),
+        ],
+    });
+    let _stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    let _ = recv_add(&mut h.engine_in).await;
+    let seen = processor.requests();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(
+        seen[0].items,
+        vec![
+            MediaRefItem {
+                modality: "image".to_string(),
+                url: "https://example.com/x.png".to_string(),
+                hints: image_hints,
+            },
+            MediaRefItem {
+                modality: "video".to_string(),
+                url: "https://example.com/x.mp4".to_string(),
+                hints: video_hints,
+            },
+        ]
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A processor that applies no per-item hints refuses a reference that
+/// carries one before any work, naming the reason and the mode that applies
+/// them, instead of serving the media unsized.
+#[tokio::test]
+async fn a_processor_that_applies_no_hints_refuses_a_hinted_reference() {
+    let processor = MockMediaProcessor::answering(Ok(processed_media()));
+    let mut h = harness_with(model_info(), None, Some(processor.clone())).await;
+    for (max_long_side_pixel, fps) in [(Some(504), None), (None, Some(2.0))] {
+        let mut request = generate_request("mr31", false, Vec::new());
+        request.media_refs = Some(vllm::MediaRefs {
+            items: vec![vllm::MediaRef {
+                modality: common::Modality::Video as i32,
+                url: "https://example.com/x.mp4".to_string(),
+                max_long_side_pixel,
+                fps,
+            }],
+        });
+        let status = h.client.generate(request).await.expect_err("refused");
+        assert_eq!(status.code(), Code::InvalidArgument, "{}", status.message());
+        assert!(
+            status
+                .message()
+                .contains("does not apply per-item hints (max_long_side_pixel, fps)")
+                && status.message().contains("--mm-processor smg"),
+            "{}",
+            status.message()
+        );
+    }
+    assert!(processor.requests().is_empty());
+    assert_engine_idle(&mut h.engine_in).await;
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
@@ -5442,6 +5614,7 @@ async fn media_processing_records_its_families() {
         items: vec![vllm::MediaRef {
             modality: common::Modality::Audio as i32,
             url: "https://example.com/x.wav".to_string(),
+            ..Default::default()
         }],
     });
     let status = h.client.generate(audio).await.expect_err("refused");

@@ -191,6 +191,14 @@ message MultimodalInputs {
 message MediaRef {
   smg.grpc.common.Modality modality = 1;  // IMAGE | VIDEO
   string url = 2;
+  // The item's per-item hints as the API request carried them: the long-side
+  // cap of an image or of each video frame, and a video's sampling rate. A
+  // servicer older than these fields drops them as unknown fields and serves
+  // the media unsized, so they are sent only to a worker whose
+  // `GetServerInfoResponse.mm_item_hints` says it applies them; a current
+  // worker that does not refuses a reference that carries one.
+  optional uint32 max_long_side_pixel = 3;
+  optional double fps = 4;
 }
 
 // Media references in prompt (media-part) order. `tokenized.input_ids` carries
@@ -548,6 +556,13 @@ message GetServerInfoResponse {
   // comma-separated: "cache_salt". "" when the servicer reads none. Flattened
   // into the `cache_partition_fields` worker label.
   string cache_partition_fields = 31;
+
+  // Whether the worker applies the per-item hints of `MediaRef`
+  // (`max_long_side_pixel`, `fps`) itself: true for the Rust servicer running
+  // the gateway's own pipeline (`mm_processor` "smg"), false for every other
+  // processor and for the Python servicer. Flattened into the `mm_item_hints`
+  // worker label.
+  bool mm_item_hints = 32;
 }
 
 // =====================

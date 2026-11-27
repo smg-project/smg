@@ -15,6 +15,7 @@ fn fixture() -> (ProtoGenerateRequest, Vec<EncodeWorkerAssignment>) {
                 .map(|url| vllm::MediaRef {
                     modality: Modality::Image as i32,
                     url: url.into(),
+                    ..Default::default()
                 })
                 .collect(),
         }),

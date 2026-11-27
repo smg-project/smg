@@ -789,6 +789,7 @@ fn set_field(info: &mut vllm::GetServerInfoResponse, key: &str, value: &Value) {
             }
         }
         "mm_device_do_normalize" => info.mm_device_do_normalize = flag(),
+        "mm_item_hints" => info.mm_item_hints = flag(),
         // The model info's, read there.
         "supports_vision" => {}
         other => tracing::warn!(
@@ -1325,6 +1326,7 @@ mod tests {
                 .map(|url| vllm::MediaRef {
                     modality: common::Modality::Image as i32,
                     url: (*url).to_string(),
+                    ..Default::default()
                 })
                 .collect(),
         };
@@ -1456,6 +1458,7 @@ mod tests {
         set_field(&mut info, "dp_size", &json!("4"));
         set_field(&mut info, "kv_engine_id", &json!("engine-a"));
         set_field(&mut info, "mm_device_do_normalize", &json!(true));
+        set_field(&mut info, "mm_item_hints", &json!("true"));
         set_field(&mut info, "supports_ec_transfer", &json!("true"));
         set_field(&mut info, "ec_role", &json!("ec_consumer"));
         set_field(&mut info, "ec_connector", &json!("ECMooncakeConnector"));
@@ -1470,6 +1473,7 @@ mod tests {
             (8, 4, "engine-a")
         );
         assert!(info.mm_device_do_normalize);
+        assert!(info.mm_item_hints);
         assert_eq!(
             (
                 info.supports_ec_transfer,
@@ -1803,6 +1807,7 @@ mod tests {
                 items: vec![vllm::MediaRef {
                     modality: modality as i32,
                     url: url.to_string(),
+                    ..Default::default()
                 }],
             });
             asked(&req)

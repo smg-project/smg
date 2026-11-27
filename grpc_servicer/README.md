@@ -198,7 +198,9 @@ Media the request got wrong as it sent it (a data URL that is malformed or not
 base64, a payload that is not the media it claims to be, a URL that does not
 parse or names a host the policy refuses, an `fps` or `max_long_side_pixel`
 out of range) is a 400 `invalid_multimodal_request`, the media stage's own
-code, on the Router's pipeline and the vLLM Rust worker's alike. A fetch that
+code, on the Router's pipeline and the vLLM Rust worker's alike (the hints
+reach that worker under `--mm-processor smg` only, which bounds them as the
+Router's pipeline does). A fetch that
 was attempted and failed is answered under `media_fetch_failed` by whose fault
 it is: a host that cannot be resolved, refuses the connection or answers 4xx
 is a 400; a host that does not deliver within the budget, answers 5xx or
@@ -752,6 +754,19 @@ An audio reference (a family whose audio the engine's own processor takes)
 reaches `inprocess` and `redis` on the Rust servicer as it does on the Python
 servicer; the `smg` pipeline takes image and video references and refuses an
 audio one before any work, naming the modes that take it.
+
+A reference may carry its item's per-item hints (`max_long_side_pixel`, an
+image's or each video frame's long-side cap, and a video's `fps`). The `smg`
+pipeline applies them as the router's own pipeline does and says so in
+`GetServerInfo`: `mm_item_hints` is true, and the worker label of the same
+name reads `"true"`. `inprocess`, `redis` and the Python servicer apply none,
+report `mm_item_hints` false, and refuse a hinted reference with
+`INVALID_ARGUMENT` naming the reason. Every vLLM worker carries the label: it
+reads `"false"` for those processors and for a servicer older than the hints,
+which drops them as unknown fields. The router forwards no hints yet: under
+`--mm-processing worker` it preprocesses a hinted request itself
+(`hint_fallback`), or refuses one it cannot preprocess with
+`multimodal_hint_unsupported_in_worker_mode`.
 
 The in-flight cap, the saturation refusal, the advertised `mm_processor` /
 `mm_media_ref_schemes` / `mm_processor_source` and the PD prefill side's

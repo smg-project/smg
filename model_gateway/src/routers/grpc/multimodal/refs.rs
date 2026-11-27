@@ -961,6 +961,7 @@ pub(crate) fn assemble_media_refs(plan: &MediaPlan) -> Result<vllm::MediaRefs, M
         items.push(vllm::MediaRef {
             modality: modality as i32,
             url: url.into_owned(),
+            ..Default::default()
         });
     }
     Ok(vllm::MediaRefs { items })

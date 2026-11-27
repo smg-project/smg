@@ -20,7 +20,9 @@ use llm_multimodal::{
 };
 use llm_tokenizer::TokenizerTrait;
 use openai_protocol::worker::MmProcessingMode;
-use smg_grpc_client::{sglang_proto as sglang, vllm_proto as vllm, WorkerMediaFault};
+use smg_grpc_client::{
+    sglang_proto as sglang, vllm_proto as vllm, MediaItemHints, WorkerMediaFault,
+};
 use smg_worker::{
     connection::http_client::build_with,
     identity::basic::{RuntimeType, WorkerType},
@@ -332,21 +334,25 @@ fn check_item_counts(
     Ok(())
 }
 
-/// One `media_refs` item.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One `media_refs` item, with the per-item hints the request carried, which
+/// the pipeline applies and bounds as it does on the Router.
+#[derive(Debug, Clone, PartialEq)]
 pub struct WorkerMediaItem {
     pub modality: Modality,
     pub url: String,
     pub detail: Option<ImageDetail>,
+    pub hints: MediaItemHints,
 }
 
 impl WorkerMediaItem {
-    /// Construct a plain item without per-item image detail overrides.
+    /// Construct a plain item without per-item image detail overrides or
+    /// hints.
     pub fn new(modality: Modality, url: String) -> Self {
         Self {
             modality,
             url,
             detail: None,
+            hints: MediaItemHints::default(),
         }
     }
 }
@@ -957,7 +963,9 @@ impl WorkerMediaPipeline {
     /// the worker as the flag's owner: the router relays the refusal in its
     /// 400, and its own per-item input bound (`SMG_*_MAX_INPUT_BYTES`, 256 MiB
     /// by default) is checked earlier with a message of its own, so a reader
-    /// of either knows which launcher to set.
+    /// of either knows which launcher to set. The item's hints become the
+    /// part's, as the Router's request would have carried them; a sampling
+    /// rate on an image is refused, since an image part has none.
     fn part(
         &self,
         index: usize,
@@ -981,18 +989,25 @@ impl WorkerMediaPipeline {
                 )));
             }
         }
+        let hints = item.hints;
         Ok(match item.modality {
+            Modality::Image if hints.fps.is_some() => {
+                return Err(WorkerMediaError::Invalid(format!(
+                    "media_refs[{index}]: fps is a video hint; an image takes max_long_side_pixel \
+                     alone"
+                )))
+            }
             Modality::Image => MediaContentPart::ImageUrl {
                 url: Arc::new(item.url),
                 detail: item.detail,
-                max_long_side_pixel: None,
+                max_long_side_pixel: hints.max_long_side_pixel,
                 uuid: None,
             },
             Modality::Video => MediaContentPart::VideoUrl {
                 url: Arc::new(item.url),
                 uuid: None,
-                fps: None,
-                max_long_side_pixel: None,
+                fps: hints.fps,
+                max_long_side_pixel: hints.max_long_side_pixel,
             },
             other => {
                 return Err(WorkerMediaError::Invalid(format!(
@@ -1991,6 +2006,28 @@ mod tests {
                 output.batches[0].pixel_values.as_ref().unwrap().shape,
                 vec![(tokens * 4) as u32, 1176]
             );
+            // The same cap on the worker's own item is applied as the router
+            // applies it below.
+            let hinted = WorkerMediaItem {
+                hints: MediaItemHints {
+                    max_long_side_pixel: Some(1000),
+                    fps: None,
+                },
+                ..item.clone()
+            };
+            let worker_side = pipeline
+                .process(vec![1, 32000, 2], vec![hinted], false)
+                .await
+                .unwrap();
+            assert_eq!(
+                worker_side
+                    .prompt_token_ids
+                    .iter()
+                    .filter(|&&id| id == 32000)
+                    .count(),
+                router_tokens,
+                "{width}x{height}: the worker applies the item's cap"
+            );
             // The router also accepts a non-grid request cap, before handing
             // the aligned dimensions to the same cached image processor.
             let plan = MediaPlan::new(vec![MediaContentPart::ImageUrl {
@@ -2072,6 +2109,123 @@ mod tests {
         }
         std::fs::remove_file(config).unwrap();
         std::fs::remove_dir(dir).unwrap();
+    }
+
+    /// The hints of `max_long_side_pixel` and `fps`.
+    fn hints(max_long_side_pixel: Option<u32>, fps: Option<f64>) -> MediaItemHints {
+        MediaItemHints {
+            max_long_side_pixel,
+            fps,
+        }
+    }
+
+    /// An item's hints become its content part's, as the Router's request
+    /// would carry them; a sampling rate on an image is refused before any
+    /// fetch, since an image part has none.
+    #[tokio::test]
+    async fn an_items_hints_become_its_content_parts() {
+        let (_dir, pipeline) = glm_video_test_pipeline().await;
+        let image = WorkerMediaItem {
+            hints: hints(Some(504), None),
+            ..WorkerMediaItem::new(Modality::Image, "https://a/1.png".to_string())
+        };
+        let MediaContentPart::ImageUrl {
+            max_long_side_pixel,
+            ..
+        } = pipeline.part(0, image.clone()).unwrap()
+        else {
+            panic!("an image item is an image part");
+        };
+        assert_eq!(max_long_side_pixel, Some(504));
+        let video = WorkerMediaItem {
+            hints: hints(Some(1008), Some(2.0)),
+            ..WorkerMediaItem::new(Modality::Video, "https://a/1.mp4".to_string())
+        };
+        let MediaContentPart::VideoUrl {
+            max_long_side_pixel,
+            fps,
+            ..
+        } = pipeline.part(1, video).unwrap()
+        else {
+            panic!("a video item is a video part");
+        };
+        assert_eq!((max_long_side_pixel, fps), (Some(1008), Some(2.0)));
+        let error = pipeline
+            .part(
+                2,
+                WorkerMediaItem {
+                    hints: hints(Some(504), Some(2.0)),
+                    ..image
+                },
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&error, WorkerMediaError::Invalid(message) if message.contains("fps is a video hint")),
+            "{error}"
+        );
+    }
+
+    /// The worker holds an item's hints to the bounds the Router's pipeline
+    /// holds them to, as the request's own media fault the Router answers a
+    /// 400 `invalid_multimodal_request` for: a video's rate outside 0.2 to
+    /// 5 fps, a frame cap outside 150 to 3584 pixels or off the 28-pixel
+    /// grid, an image cap off that grid.
+    #[tokio::test]
+    async fn a_hint_out_of_the_pipelines_bounds_is_the_requests_media_fault() {
+        let (_dir, pipeline) = glm_video_test_pipeline().await;
+        let video = |hinted| WorkerMediaItem {
+            hints: hinted,
+            ..testsrc_video_item()
+        };
+        let image = |hinted| WorkerMediaItem {
+            hints: hinted,
+            ..blank_png_item()
+        };
+        for (name, item, prompt) in [
+            ("fps below the range", video(hints(None, Some(0.1))), 32003),
+            ("fps above the range", video(hints(None, Some(6.0))), 32003),
+            (
+                "fps not a number",
+                video(hints(None, Some(f64::NAN))),
+                32003,
+            ),
+            (
+                "frame cap below the range",
+                video(hints(Some(140), None)),
+                32003,
+            ),
+            (
+                "frame cap above the range",
+                video(hints(Some(3612), None)),
+                32003,
+            ),
+            (
+                "frame cap off the grid",
+                video(hints(Some(1000), None)),
+                32003,
+            ),
+            (
+                "image cap off the grid",
+                image(hints(Some(500), None)),
+                32000,
+            ),
+        ] {
+            let error = pipeline
+                .process(vec![1, prompt, 2], vec![item], false)
+                .await
+                .expect_err(name);
+            assert!(
+                matches!(
+                    error,
+                    WorkerMediaError::Media {
+                        fault: WorkerMediaFault::Client,
+                        code: MediaErrorCode::InvalidRequest,
+                        ..
+                    }
+                ),
+                "{name}: {error}"
+            );
+        }
     }
 
     #[test]

@@ -17,6 +17,7 @@ pub mod engine_load;
 pub mod engine_port;
 mod framed;
 pub mod media_fault;
+pub mod media_hints;
 pub mod media_identity;
 pub mod mlx_engine;
 pub mod request_deadline;
@@ -46,6 +47,7 @@ pub use constraint_failure::{
 /// or classify the transport faults [`is_transport_failure`] recognises.
 pub use h2;
 pub use media_fault::{media_code, stamp_media_code, WorkerMediaFault, MEDIA_CODE_METADATA_KEY};
+pub use media_hints::MediaItemHints;
 pub use mlx_engine::{proto as mlx_proto, MlxEngineClient};
 pub use request_deadline::{is_request_timeout, RequestDeadline};
 pub use request_fields::{FormatSetAside, OutputConstraint};
