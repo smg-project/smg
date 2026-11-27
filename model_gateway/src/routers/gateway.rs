@@ -67,7 +67,10 @@ use crate::{
         factory::{router_ids, RouterId},
         grpc::{
             common::stages::encodes_for,
-            multimodal::{media_plan_chat, media_plan_messages},
+            multimodal::{
+                media_plan_chat, media_plan_messages, request_needs_vision,
+                worker_language_model_only, MediaPlan,
+            },
             regular::stages::decisions::supports_worker as supports_decisions_worker,
         },
         message_threads::{MessageThreads, ThreadTurn},
@@ -155,33 +158,46 @@ enum EpdDemand {
     Pair,
     /// A request with a media item (an image, audio or video): a pair, and
     /// an encode worker for it. The EPD router sends each media item to an
-    /// encode worker.
-    PairAndEncoder,
+    /// encode worker. With an image or a video (`vision`), that worker needs
+    /// a vision encoder.
+    PairAndEncoder { vision: bool },
 }
 
 impl EpdDemand {
     /// The demand of a chat request, whose media is read as the gRPC chat
     /// pipeline reads it.
     fn of_chat(request: &ChatCompletionRequest) -> Self {
-        Self::with_media(!media_plan_chat(&request.messages).is_empty())
+        Self::of_plan(&media_plan_chat(&request.messages))
     }
 
     /// The demand of a Messages request, whose media is read as the gRPC
     /// Messages pipeline reads it.
     fn of_messages(request: &CreateMessageRequest) -> Self {
-        Self::with_media(!media_plan_messages(&request.messages).is_empty())
+        Self::of_plan(&media_plan_messages(&request.messages))
     }
 
-    /// The demand of a generate request.
+    /// The demand of a generate request: `image_data` and `video_data` need
+    /// vision, `audio_data` does not.
     fn of_generate(request: &GenerateRequest) -> Self {
-        Self::with_media(request.carries_media())
+        let fields = request.media_fields();
+        if fields.is_empty() {
+            return Self::Pair;
+        }
+        let vision = fields
+            .iter()
+            .any(|field| matches!(*field, "image_data" | "video_data"));
+        Self::PairAndEncoder { vision }
     }
 
-    fn with_media(carried: bool) -> Self {
-        if carried {
-            Self::PairAndEncoder
-        } else {
+    /// The demand of a request whose media is `plan`. It needs vision as
+    /// the EPD router reads it ([`request_needs_vision`]).
+    fn of_plan(plan: &MediaPlan) -> Self {
+        if plan.is_empty() {
             Self::Pair
+        } else {
+            Self::PairAndEncoder {
+                vision: request_needs_vision(None, Some(plan)),
+            }
         }
     }
 }
@@ -436,12 +452,15 @@ impl Gateway {
     /// serve, it refuses the request. So when more than one family has
     /// weight, a family weighs only its workers that can serve. A PD or EPD
     /// family gets weight only if a compatible prefill and decode pair can
-    /// serve. An EPD family gets no weight on a route its router refuses.
+    /// serve. An EPD family gets no weight on a route its router refuses, or
+    /// for a request with media under Grand Central, which places no encode
+    /// worker.
     ///
     /// For a request with media, each worker of that pair also needs an
     /// encode worker that the EPD router can use: one that is available
-    /// ([`Worker::is_available`]) and can encode for it ([`encodes_for`]).
-    /// The EPD router does not use a stalled or overloaded encode worker.
+    /// ([`Worker::is_available`]), has a vision encoder if the request needs
+    /// vision, and can encode for it ([`encodes_for`]). The EPD router does
+    /// not use a stalled or overloaded encode worker.
     ///
     /// A worker can serve if it is ready, permitted by the circuit breaker,
     /// and not stalled. If no family gets weight, a stalled worker can serve
@@ -461,6 +480,15 @@ impl Gateway {
         epd: EpdDemand,
         takes: impl Fn(RoutingPool, &dyn Worker) -> bool,
     ) -> Option<Arc<dyn RouterTrait>> {
+        // Under Grand Central the EPD router refuses a request with media.
+        let engine = self
+            .policies
+            .as_ref()
+            .and_then(|policies| policies.engine());
+        let epd = match epd {
+            EpdDemand::PairAndEncoder { .. } if engine.is_some() => EpdDemand::Refused,
+            epd => epd,
+        };
         // An EPD family takes no request on a route its router refuses.
         let mut registered = *registered;
         if epd == EpdDemand::Refused {
@@ -478,6 +506,7 @@ impl Gateway {
             .as_ref()
             .map(|policies| policies.pd_pairing_mode())
             .unwrap_or_default();
+        let vision = matches!(epd, EpdDemand::PairAndEncoder { vision: true });
         // Whether `pool` holds an encode worker that the EPD router can use
         // for `worker`. The EPD router has no fallback to a stalled encode
         // worker, so this does not change with the check.
@@ -485,6 +514,7 @@ impl Gateway {
             snapshot.pool(pool).iter().any(|encoder| {
                 encoder.is_available()
                     && takes(pool, encoder.as_ref())
+                    && (!vision || !worker_language_model_only(encoder.as_ref()))
                     && encodes_for(encoder.as_ref(), worker)
             })
         };
@@ -513,7 +543,9 @@ impl Gateway {
             };
             let mut weights = [0usize; ROUTER_FAMILIES.len()];
             for (i, family) in ROUTER_FAMILIES.iter().enumerate() {
-                let encode = family.encode.filter(|_| epd == EpdDemand::PairAndEncoder);
+                let encode = family
+                    .encode
+                    .filter(|_| matches!(epd, EpdDemand::PairAndEncoder { .. }));
                 // A family with no registered weight stays at zero, so the
                 // gRPC PD family stays behind the EPD family.
                 let can_take =
@@ -636,7 +668,9 @@ impl Gateway {
     /// set itself) and the default router otherwise, never the PD router,
     /// whose refusal would count and log it as prefill/decode traffic.
     /// `None` when no pool of the model is registered on either wire, or no
-    /// family's router is mounted: the default router's answer stands.
+    /// family's router is mounted: the default router's answer stands. An
+    /// EPD family alone also comes here on a route that its router refuses
+    /// ([`EpdDemand::Refused`]), so that router gives the refusal.
     fn incomplete_disaggregated_router(
         &self,
         grpc_encode: usize,
@@ -3227,7 +3261,12 @@ mod tests {
         ] {
             let gateway = named_family_gateway(&fleet);
             assert_drawn(&gateway, EpdDemand::Pair, &fleet, &text);
-            assert_drawn(&gateway, EpdDemand::PairAndEncoder, &fleet, &media);
+            assert_drawn(
+                &gateway,
+                EpdDemand::PairAndEncoder { vision: true },
+                &fleet,
+                &media,
+            );
         }
     }
 
@@ -3265,7 +3304,12 @@ mod tests {
             }
             let fleet = format!("ready TokenSpeed encode worker, {serving:?} pair can serve");
             assert_drawn(&gateway, EpdDemand::Pair, &fleet, &[("grpc_epd", 1.0)]);
-            assert_drawn(&gateway, EpdDemand::PairAndEncoder, &fleet, &[(media, 1.0)]);
+            assert_drawn(
+                &gateway,
+                EpdDemand::PairAndEncoder { vision: true },
+                &fleet,
+                &[(media, 1.0)],
+            );
         }
     }
 
@@ -3288,6 +3332,108 @@ mod tests {
             let gateway = named_family_gateway(&fleet);
             assert_drawn(&gateway, EpdDemand::Refused, &fleet, &[(expected, 1.0)]);
         }
+    }
+
+    /// A request with an image or a video needs an encode worker with a
+    /// vision encoder. The ready encode worker has none
+    /// (`supports_vision=false`), and the one with a vision encoder is down.
+    /// So an image goes to the stalled HTTP worker, and audio goes to the
+    /// EPD family.
+    #[test]
+    fn an_epd_family_takes_an_image_only_if_an_encode_worker_has_a_vision_encoder() {
+        use smg_worker::labels::SUPPORTS_VISION_LABEL;
+        use WorkerStatus::{NotReady, Ready};
+        let gateway = named_family_gateway(&[
+            (GRPC, WorkerType::Prefill, Serving::Yes),
+            (GRPC, WorkerType::Decode, Serving::Yes),
+            (HTTP, WorkerType::Regular, Serving::Stalled),
+        ]);
+        for (url, status, vision) in [
+            ("grpc://audio:8000", Ready, "false"),
+            ("grpc://vision:8000", NotReady, "true"),
+        ] {
+            gateway
+                .worker_registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .connection_mode(GRPC)
+                        .worker_type(WorkerType::Encode)
+                        .runtime_type(RuntimeType::TokenSpeed)
+                        .label(SUPPORTS_VISION_LABEL, vision)
+                        .model(ModelCard::new("m"))
+                        .status(status)
+                        .build(),
+                ))
+                .unwrap();
+        }
+        let fleet = "ready pair, ready encode worker with no vision encoder, stalled HTTP";
+        let image = EpdDemand::PairAndEncoder { vision: true };
+        let audio = EpdDemand::PairAndEncoder { vision: false };
+        assert_drawn(&gateway, image, fleet, &[("http", 1.0)]);
+        assert_drawn(&gateway, audio, fleet, &[("grpc_epd", 1.0)]);
+    }
+
+    /// A request needs vision for an image or a video, not for audio.
+    #[test]
+    fn a_request_needs_vision_for_an_image_or_a_video() {
+        use serde_json::json;
+        let media = |vision| EpdDemand::PairAndEncoder { vision };
+        let generate = |field: Option<&str>| {
+            let mut request = json!({"model": "m", "text": "hi"});
+            if let Some(field) = field {
+                request[field] = json!("https://example.com/item");
+            }
+            EpdDemand::of_generate(&body(request))
+        };
+        assert_eq!(generate(None), EpdDemand::Pair);
+        assert_eq!(generate(Some("image_data")), media(true));
+        assert_eq!(generate(Some("video_data")), media(true));
+        assert_eq!(generate(Some("audio_data")), media(false));
+        let chat = |content| {
+            let request = json!({"model": "m", "messages": [{"role": "user", "content": content}]});
+            EpdDemand::of_chat(&body(request))
+        };
+        let image = json!({"type": "image_url", "image_url": {"url": "https://example.com/a.png"}});
+        let audio = json!({"type": "audio_url", "audio_url": {"url": "https://example.com/a.wav"}});
+        assert_eq!(chat(json!("hi")), EpdDemand::Pair);
+        assert_eq!(chat(json!([image])), media(true));
+        assert_eq!(chat(json!([audio])), media(false));
+    }
+
+    /// Under Grand Central the EPD router refuses a request with media,
+    /// because the engine places no encode worker. So a stalled HTTP worker
+    /// gets it. Text still goes to the EPD family.
+    #[test]
+    fn under_grand_central_an_epd_family_takes_no_media() {
+        use smg_grand_central::document::{AppliedSpec, PolicySpec};
+        use Serving::{Stalled, Yes};
+        use WorkerType::{Decode, Encode, Prefill, Regular};
+
+        use crate::routers::common::placement::tests::engine_on;
+
+        let fleet = [
+            (GRPC, Encode, Yes),
+            (GRPC, Prefill, Yes),
+            (GRPC, Decode, Yes),
+            (HTTP, Regular, Stalled),
+        ];
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let document = PolicySpec::preset("round_robin").expect("a stock preset");
+        engine_on(
+            &policies,
+            AppliedSpec::validate(&document).expect("a valid document"),
+        );
+        let gateway =
+            Gateway::new(Arc::new(WorkerRegistry::new())).with_policies(Arc::new(policies));
+        let gateway = named_families_over(gateway, &fleet);
+        let fleet = ("Grand Central", fleet);
+        assert_drawn(
+            &gateway,
+            EpdDemand::PairAndEncoder { vision: true },
+            fleet,
+            &[("http", 1.0)],
+        );
+        assert_drawn(&gateway, EpdDemand::Pair, fleet, &[("grpc_epd", 1.0)]);
     }
 
     /// The chat, generate and Messages routes tell the draw if the request
@@ -3371,16 +3517,11 @@ mod tests {
     }
 
     /// The draw pairs workers by the routers' pairing mode. Under `strict`,
-    /// workers that report no KV transport cannot pair, so a stalled HTTP
-    /// worker gets the requests.
+    /// workers that name no runtime cannot pair, so a stalled HTTP worker
+    /// gets the requests.
     #[test]
     fn the_draw_pairs_workers_by_the_routers_pairing_mode() {
         use WorkerType::{Decode, Prefill, Regular};
-        let workers = [
-            (HTTP, Regular, Serving::Stalled),
-            (GRPC, Prefill, Serving::Yes),
-            (GRPC, Decode, Serving::Yes),
-        ];
         for (mode, expected) in [
             (PdPairingMode::Lenient, "grpc_pd"),
             (PdPairingMode::Strict, "http"),
@@ -3388,11 +3529,17 @@ mod tests {
             let policies = PolicyRegistry::new(PolicyConfig::RoundRobin).with_pd_pairing_mode(mode);
             let gateway =
                 Gateway::new(Arc::new(WorkerRegistry::new())).with_policies(Arc::new(policies));
-            let gateway = named_families_over(gateway, &workers);
+            let gateway = named_families_over(gateway, &[(HTTP, Regular, Serving::Stalled)]);
+            // The fixture's workers run TokenSpeed, which always names a KV
+            // transport, so they pair under `strict`. This pair names no
+            // runtime.
+            for (url, role) in [("grpc://p:8000", Prefill), ("grpc://d:8000", Decode)] {
+                register_worker_in(&gateway, url, GRPC, role, WorkerStatus::Ready);
+            }
             assert_drawn(
                 &gateway,
                 EpdDemand::Pair,
-                (mode, workers),
+                format!("{mode:?}, stalled HTTP worker, pair with no runtime"),
                 &[(expected, 1.0)],
             );
         }

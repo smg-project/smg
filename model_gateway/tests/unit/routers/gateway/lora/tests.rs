@@ -382,7 +382,11 @@ fn an_adapter_request_with_media_needs_an_encode_worker_the_epd_router_can_use()
             .router_type()
     };
     for draw_index in 0..100 {
-        assert_eq!(draw(EpdDemand::PairAndEncoder), "grpc", "draw {draw_index}");
+        assert_eq!(
+            draw(EpdDemand::PairAndEncoder { vision: true }),
+            "grpc",
+            "draw {draw_index}"
+        );
     }
     let text: Vec<_> = (0..100).map(|_| draw(EpdDemand::Pair)).collect();
     assert!(
