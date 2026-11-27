@@ -161,10 +161,11 @@ pub fn merge_labels(
 /// [`Any`] is a supertrait: a caller that must know the concrete type of a
 /// worker asks the object itself (`let object: &dyn Any = worker;` from a
 /// `&dyn Worker`), where [`Worker::as_any`] is each implementation's own
-/// answer. A handle (`Arc<dyn Worker>`) is [`Any`] too: from a handle the
-/// same line compiles and names the handle, never the worker, so deref
-/// first. Every `'static` type is [`Any`], so an implementation writes
-/// nothing for it.
+/// answer. A handle (`Arc<dyn Worker>`) is [`Any`] too: from a reference to
+/// a handle (`&Arc<dyn Worker>`) the same line compiles and names the
+/// handle, never the worker, so deref down to the `dyn Worker` first:
+/// `&*worker` from a handle, `&**worker` from a reference to one. Every
+/// `'static` type is [`Any`], so an implementation writes nothing for it.
 ///
 /// ```
 /// use std::{any::Any, sync::Arc};
@@ -180,7 +181,11 @@ pub fn merge_labels(
 /// let object: &dyn Any = &*worker;
 /// assert!(object.is::<BasicWorker>());
 ///
-/// let handle: &dyn Any = &worker;
+/// let held: &Arc<dyn Worker> = &worker;
+/// let object: &dyn Any = &**held;
+/// assert!(object.is::<BasicWorker>());
+///
+/// let handle: &dyn Any = held;
 /// assert!(!handle.is::<BasicWorker>());
 /// ```
 #[async_trait]
