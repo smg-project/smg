@@ -231,6 +231,13 @@ pub struct Live<'a> {
     rest: bool,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many records the decisions of this thread wrote: a case reads
+    /// it to tell a pair decided by its draws from one decided whole.
+    pub(crate) static RECORDS_WRITTEN: Cell<u32> = const { Cell::new(0) };
+}
+
 impl<'a> Live<'a> {
     /// The reads of one decision at `now` on `clock`, under `engine`'s
     /// document: the workers' reports from `loads`, the load monitor's
@@ -382,6 +389,8 @@ impl<'a> Live<'a> {
     /// once, and its loop over the rows is compiled without the question.
     #[inline(always)]
     fn object_as<const REST: bool>(&self, worker: &dyn Worker, row: &mut Candidate) {
+        #[cfg(test)]
+        RECORDS_WRITTEN.with(|written| written.set(written.get() + 1));
         if REST {
             row.health = Health {
                 healthy: true,

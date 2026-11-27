@@ -432,3 +432,37 @@ fn a_pair_with_a_worker_that_is_not_available_asks_its_places_behind_its_rows() 
         );
     }
 }
+
+#[test]
+fn a_pair_decided_by_its_draws_writes_two_records_a_side() {
+    // The draw writes the two rows a side its seed's stream names; the
+    // whole pass writes every row of both lists. Both name the same pick
+    // behind the same questions, so the count of the records a decision
+    // writes is what tells them apart.
+    use crate::engine::records::RECORDS_WRITTEN;
+
+    let host = drawing(8, 8);
+    let written = |admission: &Counted, seed| {
+        RECORDS_WRITTEN.with(|written| written.set(0));
+        let _decision = host.decide_vetoed(
+            admission,
+            (seed, None),
+            Constraints::default(),
+            [None, None],
+            UNMASKED,
+        );
+        RECORDS_WRITTEN.with(Cell::get)
+    };
+    let full = Counted {
+        full: Some(7),
+        ..Counted::default()
+    };
+    let mut drawn = BTreeSet::new();
+    let mut whole = BTreeSet::new();
+    for seed in 0..256 {
+        drawn.insert(written(&Counted::default(), seed));
+        whole.insert(written(&full, seed));
+    }
+    assert_eq!(drawn, BTreeSet::from([4]), "a drawn pair's records");
+    assert_eq!(whole, BTreeSet::from([16]), "a refused pair's records");
+}
