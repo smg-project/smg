@@ -581,3 +581,151 @@ fn an_epd_pair_gap_is_judged_before_the_encoder_health() {
         Err(EpdSelectionFailure::CachePartitionUnsupported(_))
     ));
 }
+
+/// A vLLM worker fit for an EPD set on the EC connector `connector`, with the
+/// cache partition fields `fields`. `vision` says whether it has an encoder.
+fn ec_worker(
+    port: u16,
+    role: WorkerType,
+    connector: &str,
+    fields: Option<&str>,
+    vision: bool,
+) -> Arc<dyn Worker> {
+    let mut builder = BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
+        .model(ModelCard::new("test-model"))
+        .worker_type(role)
+        .runtime_type(RuntimeType::Vllm)
+        .connection_mode(ConnectionMode::Grpc)
+        .health_config(no_health_check())
+        .label("supports_ec_transfer", "true")
+        .label("ec_connector", connector)
+        .label(
+            "ec_role",
+            if role == WorkerType::Encode {
+                "ec_producer"
+            } else {
+                "ec_consumer"
+            },
+        )
+        .label("kv_connector", "NixlConnector")
+        .label("mm_processor", "inprocess")
+        .label("mm_media_ref_schemes", "http,https,data")
+        .label(SUPPORTS_VISION_LABEL, if vision { "true" } else { "false" });
+    if let Some(fields) = fields {
+        builder = builder.label(CACHE_PARTITION_FIELDS_LABEL, fields);
+    }
+    Arc::new(builder.build())
+}
+
+/// The pair gap counts only the pairs that the encoder can feed. Here the pair
+/// that lists the salt cannot take the encoder's output, and the pair that can
+/// lacks the salt. With the encoder down, the salted request still gets the
+/// 400.
+#[test]
+fn an_epd_pair_gap_counts_only_the_pairs_that_the_encoder_feeds() {
+    let encoder = ec_worker(9701, WorkerType::Encode, "ECCPUConnector", None, true);
+    let registry = registry_of(&[
+        Arc::clone(&encoder),
+        ec_worker(9702, WorkerType::Prefill, "ECCPUConnector", None, true),
+        ec_worker(
+            9703,
+            WorkerType::Prefill,
+            "OtherConnector",
+            Some("cache_salt"),
+            true,
+        ),
+        ec_worker(
+            9704,
+            WorkerType::Decode,
+            "ECCPUConnector",
+            Some("cache_salt"),
+            true,
+        ),
+    ]);
+    let stage = stage(&registry, WorkerSelectionMode::EncodePrefillDecode);
+    let pick = |partition| {
+        stage.select_encode_prefill_decode_workers(
+            "test-model",
+            PlacementInputs::default(),
+            &[vec![1]],
+            EpdDemands {
+                wire: None,
+                encode: MediaDemands::NONE,
+                decode_vision: false,
+                image_fanout: false,
+                partition,
+            },
+            None,
+        )
+    };
+    // With the encoder ready, the later gate refuses the salted request.
+    assert!(matches!(
+        pick(salt()),
+        Err(EpdSelectionFailure::CachePartitionUnsupported(_))
+    ));
+    encoder.set_status(WorkerStatus::NotReady);
+    assert!(matches!(
+        pick(CachePartitionDemand::default()),
+        Err(EpdSelectionFailure::Unavailable)
+    ));
+    // With the encoder down, the answer stays the same 400.
+    assert!(matches!(
+        pick(salt()),
+        Err(EpdSelectionFailure::CachePartitionUnsupported(_))
+    ));
+}
+
+/// The pair gap also counts the decode vision that the request needs. One
+/// decode lists the salt but has no vision. The other has vision but lacks
+/// the salt. With the encoder down, the salted request still gets the 400.
+#[test]
+fn an_epd_pair_gap_counts_the_decode_vision_that_the_request_needs() {
+    let encoder = ec_worker(9711, WorkerType::Encode, "ECCPUConnector", None, true);
+    let registry = registry_of(&[
+        Arc::clone(&encoder),
+        ec_worker(
+            9712,
+            WorkerType::Prefill,
+            "ECCPUConnector",
+            Some("cache_salt"),
+            true,
+        ),
+        ec_worker(
+            9713,
+            WorkerType::Decode,
+            "ECCPUConnector",
+            Some("cache_salt"),
+            false,
+        ),
+        ec_worker(9714, WorkerType::Decode, "ECCPUConnector", None, true),
+    ]);
+    let stage = stage(&registry, WorkerSelectionMode::EncodePrefillDecode);
+    let pick = |partition| {
+        stage.select_encode_prefill_decode_workers(
+            "test-model",
+            PlacementInputs::default(),
+            &[vec![1]],
+            EpdDemands {
+                wire: None,
+                encode: MediaDemands::NONE,
+                decode_vision: true,
+                image_fanout: false,
+                partition,
+            },
+            None,
+        )
+    };
+    assert!(matches!(
+        pick(salt()),
+        Err(EpdSelectionFailure::CachePartitionUnsupported(_))
+    ));
+    encoder.set_status(WorkerStatus::NotReady);
+    assert!(matches!(
+        pick(CachePartitionDemand::default()),
+        Err(EpdSelectionFailure::Unavailable)
+    ));
+    assert!(matches!(
+        pick(salt()),
+        Err(EpdSelectionFailure::CachePartitionUnsupported(_))
+    ));
+}

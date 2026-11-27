@@ -2694,14 +2694,44 @@ impl WorkerSelectionStage {
         let capable = |worker: &Arc<dyn Worker>| capable_for(worker, demand.encode);
         available_encode.retain(capable);
         let registered_encode = snapshot.pool(RoutingPool::GrpcEncode);
-        // A pair that lacks the request's cache partition fields is a fact of
-        // membership. An encoder that is down is not. So the pair gap comes
-        // first: when no pair lists the fields, no encoder can help.
-        let partition = demand.partition;
+        // References go to E only; P consumes EC and D consumes KV. Diagnose
+        // permanent constraints against membership, not transient health.
+        let compatible = |encoder: &Arc<dyn Worker>, worker: &dyn Worker| {
+            let runtime = worker.metadata().spec.runtime_type;
+            encoder.metadata().spec.runtime_type == runtime
+                && (PdProtocol::encode_handoff(runtime) != Some(EncodeHandoff::Push)
+                    || worker.worker_type() != &WorkerType::Prefill
+                    || ec_pair(encoder.as_ref(), worker))
+        };
+        let registered_ec = |worker: &dyn Worker| {
+            !needs_encode
+                || registered_encode
+                    .iter()
+                    .any(|e| capable(e) && compatible(e, worker))
+        };
+        let decode_vision = |worker: &dyn Worker| {
+            worker.metadata().spec.runtime_type != RuntimeType::Vllm
+                || worker.worker_type() != &WorkerType::Decode
+                || vision_capable(worker)
+        };
         let pairs = snapshot.pd_pairs(PdWire::Grpc, self.policy_registry.pd_pairing_mode());
+        let ec_pair_exists = pair_admitted_by(&pairs, demand.wire, &registered_ec);
+        let vision_pair_exists = pair_admitted_by(&pairs, demand.wire, &|worker| {
+            registered_ec(worker) && decode_vision(worker)
+        });
+        // The encoders take no cache partition field; the pair takes them all.
+        // The pair must also take the encoder's output and meet the decode
+        // vision demand. A pair that lacks the fields is a fact of membership.
+        // An encoder that is down is not. So this check runs before encoder
+        // health. It waits for a pair that the EC and vision checks below pass.
+        let partition = demand.partition;
+        let applies = |worker: &dyn Worker| registered_ec(worker) && partition.met_by(worker);
         if partition.any()
-            && pair_admitted_by(&pairs, demand.wire, &|_| true)
-            && !pair_admitted_by(&pairs, demand.wire, &|worker| partition.met_by(worker))
+            && ec_pair_exists
+            && (!demand.decode_vision || vision_pair_exists)
+            && !pair_admitted_by(&pairs, demand.wire, &|worker| {
+                applies(worker) && (!demand.decode_vision || decode_vision(worker))
+            })
         {
             return Err(EpdSelectionFailure::CachePartitionUnsupported(partition));
         }
@@ -2733,46 +2763,11 @@ impl WorkerSelectionStage {
                 EpdSelectionFailure::Unavailable
             });
         }
-        // References go to E only; P consumes EC and D consumes KV. Diagnose
-        // permanent constraints against membership, not transient health.
-        let compatible = |encoder: &Arc<dyn Worker>, worker: &dyn Worker| {
-            let runtime = worker.metadata().spec.runtime_type;
-            encoder.metadata().spec.runtime_type == runtime
-                && (PdProtocol::encode_handoff(runtime) != Some(EncodeHandoff::Push)
-                    || worker.worker_type() != &WorkerType::Prefill
-                    || ec_pair(encoder.as_ref(), worker))
-        };
-        let registered_ec = |worker: &dyn Worker| {
-            !needs_encode
-                || registered_encode
-                    .iter()
-                    .any(|e| capable(e) && compatible(e, worker))
-        };
-        let decode_vision = |worker: &dyn Worker| {
-            worker.metadata().spec.runtime_type != RuntimeType::Vllm
-                || worker.worker_type() != &WorkerType::Decode
-                || vision_capable(worker)
-        };
-        let ec_pair_exists = pair_admitted_by(&pairs, demand.wire, &registered_ec);
         if !ec_pair_exists && pair_admitted_by(&pairs, demand.wire, &|_| true) {
             return Err(EpdSelectionFailure::EcIncompatible);
         }
-        let vision_pair_exists = pair_admitted_by(&pairs, demand.wire, &|worker| {
-            registered_ec(worker) && decode_vision(worker)
-        });
         if demand.decode_vision && ec_pair_exists && !vision_pair_exists {
             return Err(EpdSelectionFailure::DecodeVisionUnsupported);
-        }
-        // The encoders take no cache partition field; the pair takes them all.
-        // The pair must also meet the decode vision demand above.
-        let applies = |worker: &dyn Worker| registered_ec(worker) && partition.met_by(worker);
-        if partition.any()
-            && ec_pair_exists
-            && !pair_admitted_by(&pairs, demand.wire, &|worker| {
-                applies(worker) && (!demand.decode_vision || decode_vision(worker))
-            })
-        {
-            return Err(EpdSelectionFailure::CachePartitionUnsupported(partition));
         }
         // Unknown reference identities may be grid-free. Prefer a vision D
         // when registered, but retain the stripped-hash path otherwise; the
