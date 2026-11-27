@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from infra import mcp_readiness
+from infra import constants, mcp_readiness
 
 
 class Clock:
@@ -94,6 +94,7 @@ def _fixture():
         "time": time,
         "logger": logging.getLogger(__name__),
         "pytest": pytest,
+        "get_gpu_vendor": constants.get_gpu_vendor,
         "openai": SimpleNamespace(OpenAI=lambda **_: object()),
         "DEFAULT_ROUTER_TIMEOUT": 60,
         "wait_for_single_mcp_registration": mcp_readiness.wait_for_single_mcp_registration,
@@ -140,6 +141,38 @@ def fixture_parts(monkeypatch):
     )
     monkeypatch.setattr(worker_module, "stop_workers", lambda _: setattr(state, "stopped", True))
     return gateway, state
+
+
+def test_amd_worker_startup_failure_is_not_skipped(monkeypatch, fixture_parts):
+    from infra import worker as worker_module
+
+    _, state = fixture_parts
+    monkeypatch.setenv(constants.ENV_GPU_VENDOR, "amd")
+    error = RuntimeError("owned worker startup failure")
+
+    def fail(*_, **__):
+        raise error
+
+    monkeypatch.setattr(worker_module, "start_workers", fail)
+    with pytest.raises(RuntimeError) as caught:
+        next(_fixture()(None, "unused.yaml"))
+    assert caught.value is error
+    assert not state.started and not state.shutdown and not state.stopped
+
+
+def test_nvidia_worker_startup_failure_retains_skip(monkeypatch, fixture_parts):
+    from infra import worker as worker_module
+
+    _, state = fixture_parts
+    monkeypatch.setenv(constants.ENV_GPU_VENDOR, "nvidia")
+
+    def fail(*_, **__):
+        raise RuntimeError("owned worker startup failure")
+
+    monkeypatch.setattr(worker_module, "start_workers", fail)
+    with pytest.raises(pytest.skip.Exception, match="owned worker startup failure"):
+        next(_fixture()(None, "unused.yaml"))
+    assert not state.started and not state.shutdown and not state.stopped
 
 
 def test_fixture_waits_for_registration_after_worker_health(fixture_parts):
