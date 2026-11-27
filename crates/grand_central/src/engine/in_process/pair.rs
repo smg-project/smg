@@ -468,9 +468,12 @@ impl<'a> PairLists<'a> {
     /// prefills' first. A request that states places of its own beside a
     /// demand is declined under the places' name.
     ///
-    /// Prefills with an open partner that are all at their admission limit
-    /// shed a first decision, which reads as a request that waits
-    /// ([`prefills_full`]).
+    /// Where the prefill side's filters leave its run nobody and a prefill
+    /// with an open partner stands but for its admission limit, a first
+    /// decision is shed under that limit's name, which reads as a request
+    /// that waits ([`prefills_full`]). So is one whose pair's default takes
+    /// a prefill at that limit, under a profile that lists it as a hard
+    /// filter.
     ///
     /// The call writes the widest budget into the facts of a request that
     /// states none: a decision in process is unbounded

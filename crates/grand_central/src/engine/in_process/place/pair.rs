@@ -86,13 +86,16 @@ pub(super) fn decode_label(engine: Loaded<'_, '_>, model: &str) -> &'static str 
 ///
 /// # Errors
 ///
-/// The decision's shed, its queue or its refusal. Prefills with an open
-/// partner that are all at the caller's admission limit shed the decision
-/// under the capacity filter's name ([`prefills_full`]): that is no
+/// The decision's shed, its queue or its refusal. Where the prefill
+/// side's filters leave its run nobody and a prefill with an open
+/// partner stands but for the caller's admission limit, the decision is
+/// shed under the capacity filter's name ([`prefills_full`]): that is no
 /// refusal, and the answer is [`Unplaced::PrefillsFull`], on which the
-/// caller waits for room. A place answered for a pair is the engine's
-/// fault ([`DecisionRefused::Faulted`]): no ask after it would leave
-/// anything new out.
+/// caller waits for room. So it is where the pair's default takes a
+/// prefill at that limit, under a profile that lists it as a hard
+/// filter. A place answered for a pair is the engine's fault
+/// ([`DecisionRefused::Faulted`]): no ask after it would leave anything
+/// new out.
 pub(super) fn ask<'a>(
     engine: Loaded<'static, '_>,
     request: &PlaceRequest<'a>,

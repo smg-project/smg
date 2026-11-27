@@ -2367,6 +2367,24 @@ veto ended the pass. That is the decode list whole beside a prefill that stands,
 prefills that pair, each where wholly over its thresholds. The count is read there for that word
 alone, and names no shed.
 
+Over whole lists and behind a part alike, a shed under the prefill side's admission limit says a
+wait for room. A picker's decline aside, where the side's own run sheds the request, the decision
+names that limit for a prefill with an open partner that stands but for its limit. It names it too
+where the pair's default takes a prefill at its limit, under a profile that lists the limit as a
+hard filter.
+
+The wait can answer a call ahead of the route's rule. So a host can wait for a prefill its rule
+refuses, where the gateway's own selection asks its route's test first.
+
+Behind the pair's default and its question of saturation, where no prefill at the request's places
+stands but for its limit, the limit names no shed. The prefill side's stage is read there with the
+limit set aside. So the limit's place among the prefill side's filters changes no answer there,
+under filters whose word on a row does not turn on how often they are asked.
+
+Under this rule the limit is set aside on the prefill side alone. A decode side that lists the
+limit reads it in its own profile's order, where the pass over the partners names the shed. That
+pass can end at the limit.
+
 The pass takes the decision's word back where it cut a list: to the prefills an open encoder
 serves, or to the decodes that take the images. The places a host states for the prefills or the
 decodes hand the decision the workers at them, and it counts those. Places are judged as stated,
@@ -2574,7 +2592,9 @@ those partners of the prefill reached, and the pair's one decision is held to th
 to the prefill's place and the decode is its own profile's pick.
 
 A named prefill at the admission
-limit is waited for (`Unplaced::PrefillsFull`), as classic waits for it. A named decode with no
+limit is waited for (`Unplaced::PrefillsFull`) where the count reached its pair and the decision
+held to it says the wait. Classic's selection tests the capacity of its prefill pick too, ahead
+of its decode. A named decode with no
 free room is taken, because the `has-room` filter is soft (classic,
 `retain_decodes_with_a_room`). A retry is handed the pair again. A number that reaches no worker
 on a side sheds the pair under `target-worker` and names that side, as classic refuses for the
@@ -2914,9 +2934,14 @@ request ──> route (HTTP or gRPC, any family)
   itself, by classic's own judgement of the pool. The engine's word for the refusal goes to a log
   line and no further: at `debug`, or at `warn` where the engine refused the decision itself.
 
-  A pair's route answers by the engine's word. A pair's prefills all at their admission limit make
-  the route wait for a slot, as under classic. A pair the policy spec in force binds no pair plan
-  for is refused with a 501 under the code `no_policy_plan_for_model`, with no retry hint.
+  A pair's route answers by the engine's word. It is told to wait for a slot where the prefill
+  side's filters leave its run nobody and a prefill with an open partner stands but for its
+  admission limit. It is told so too where the pair's default takes a prefill at that limit, under
+  a profile that lists it as a hard filter. That word can come ahead of the route's own test,
+  where classic asks that test first.
+
+  A pair the policy spec in force binds no pair plan for is refused with a 501 under the code
+  `no_policy_plan_for_model`, with no retry hint.
   A model with no worker on a side, or with no pair that shares a transfer protocol, is answered
   for that ahead of the engine, as under classic.
   A pair the engine declined under any other name is answered as classic answers a policy that
@@ -3278,10 +3303,9 @@ client states for no request.
   with the controller (10.2), and a gateway's own process counts in the order of its own list. It
   ends when a gateway under a controller follows the controller's list and keeps its order
   (section 11) **[planned]**.
-- **A named prefill at its admission limit is not waited for.** A gateway's own process waits for
-  the prefill a pair names where it stands at that gateway's admission limit (section 8.2). A
-  controller keeps no gate: its count takes the prefill, and the gateway finds the limit. It ends
-  when a controller keeps a pair's admission **[planned]**.
+- **A named prefill at its admission limit is not waited for.** A gateway's own process can wait
+  for it (section 8.2). A controller keeps no gate: its count takes the prefill, and the gateway
+  finds the limit. It ends when a controller keeps a pair's admission **[planned]**.
 - **A later decode is booked at its dispatch.** A gateway's own process books the decode a pair
   names with its prefill. A controller files it chosen, as the contract has a later decode, and
   books it where a dispatch names it.

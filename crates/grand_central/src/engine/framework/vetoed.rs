@@ -845,6 +845,44 @@ impl<'a> Half<'a> {
             .map_or(PARTNERED, |stage| stage.name())
     }
 
+    /// The stage that leaves the side's rows at the request's places nobody
+    /// with the admission limit set aside: the side's hard filters in the
+    /// profile's order ([`Self::hard`]), each over the rows the ones before
+    /// it kept, from the rows at those places ([`places::open`]). `None`
+    /// where no row is at them, and where a row passes every such filter.
+    ///
+    /// A pair's decision asks it behind its default and its question of
+    /// saturation, where no prefill at the request's places stands but
+    /// for its limit ([`Engine::decide_pair`]). The limit's name says
+    /// that a prefill waits for room, and a host waits on it
+    /// (`prefills_full`). No prefill there stands but for its limit, so
+    /// the prefill side's stage is read with the limit set aside. Where
+    /// this names a stage, a pass of all the side's hard filters over
+    /// those rows ends at that stage too under a profile that lists the
+    /// limit behind its other hard filters, or lists none. That holds for
+    /// filters whose word on a row does not turn on how often they are
+    /// asked.
+    ///
+    /// The rows are left in `buf.kept` as the last filter asked left them.
+    /// Cold and out of line: asked behind a pair's shed alone.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn emptied_limit_aside(&self, buf: &mut Buffers) -> Option<&'static str> {
+        let kept = &mut buf.kept;
+        kept.clear();
+        places::open(kept, self.rows.len(), self.cx);
+        if kept.is_empty() {
+            return None;
+        }
+        for hard in self.limit_aside().hard() {
+            hard.retain(self.facts, self.rows, self.cx, kept);
+            if kept.is_empty() {
+                return Some(hard.name());
+            }
+        }
+        None
+    }
+
     /// Whether one of the side's rows of `classes` stands but for the
     /// side's admission limit ([`Self::but_for_the_limit`]): the limit
     /// alone left the side's run nobody among them. A pair's decision sheds

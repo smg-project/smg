@@ -89,9 +89,12 @@ thread_local! {
 ///
 /// # Errors
 ///
-/// The decision's shed, its queue or its refusal. Prefills with an open
-/// partner that are all at the caller's admission limit answer
-/// [`Unplaced::PrefillsFull`], as a pair's do.
+/// The decision's shed, its queue or its refusal. Where the prefill
+/// side's filters leave its run nobody and a prefill with an open
+/// partner stands but for the caller's admission limit, the answer is
+/// [`Unplaced::PrefillsFull`], as for a pair. So it is where the pair's
+/// default takes a prefill at that limit, under a profile that lists it
+/// as a hard filter.
 pub(super) fn ask<'a>(
     engine: Loaded<'static, '_>,
     request: &PlaceRequest<'a>,
