@@ -16,5 +16,5 @@ pub(crate) use tool_loop::{
     execute_streaming_tool_calls, execute_tool_loop, inject_mcp_metadata_last,
     prepare_mcp_tools_as_functions, resume_payload_in_place, retained_output_items,
     send_mcp_list_tools_events, skip_streaming_tool_calls, ToolLoopExecutionContext, ToolLoopState,
-    TOOL_CALL_LIMIT_REASON,
+    NOT_EXECUTED_AT_STREAM_BREAK, NOT_EXECUTED_AT_TOOL_CALL_LIMIT, TOOL_CALL_LIMIT_REASON,
 };

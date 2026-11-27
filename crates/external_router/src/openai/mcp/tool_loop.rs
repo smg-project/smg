@@ -419,10 +419,13 @@ async fn close_streaming_call(
     true
 }
 
-/// The calls of a batch beyond the request's tool-call allowance: none runs.
-/// Each is closed on the wire under the type the stream announced for it,
-/// with the item the non-streamed loop renders for the same call
-/// ([`not_executed_tool_call_item`]): an `mcp_call` gets
+/// The calls the streamed loop does not run: those of a batch beyond the
+/// request's tool-call allowance ([`NOT_EXECUTED_AT_TOOL_CALL_LIMIT`]), or a
+/// call an upstream turn left half-open when its stream broke
+/// ([`NOT_EXECUTED_AT_STREAM_BREAK`]); `error` says which. None runs. Each
+/// is closed on the wire under the type the stream announced for it, with
+/// the item of [`not_executed_tool_call_item`] (the item the non-streamed
+/// loop renders for a call past the allowance): an `mcp_call` gets
 /// `response.mcp_call.failed` and then its `response.output_item.done`; a
 /// call in a hosted format gets its `response.output_item.done` alone (the
 /// API has no failed sub-event for those item types; the item's status says
@@ -431,6 +434,7 @@ async fn close_streaming_call(
 /// when the client left.
 pub(crate) async fn skip_streaming_tool_calls(
     skipped: Vec<FunctionCallInProgress>,
+    error: &str,
     session: &McpToolSession<'_>,
     format_registry: &FormatRegistry,
     tx: &SseSender,
@@ -453,6 +457,7 @@ pub(crate) async fn skip_streaming_tool_calls(
             &server_label,
             &call.name,
             arguments,
+            error,
         );
         if let Some(obj) = item.as_object_mut() {
             obj.insert("id".to_string(), Value::String(item_id.clone()));
@@ -1142,12 +1147,18 @@ pub(crate) const TOOL_CALL_LIMIT_REASON: &str = "max_tool_calls";
 /// allowance was spent before it, in both modes.
 pub(crate) const NOT_EXECUTED_AT_TOOL_CALL_LIMIT: &str =
     "Not executed - response stopped due to limit";
+/// The error of a call the streamed loop did not run because the upstream
+/// turn's stream broke before the call was complete.
+pub(crate) const NOT_EXECUTED_AT_STREAM_BREAK: &str =
+    "Not executed - the upstream stream ended before this call was complete";
 
-/// The item of a call the loop did not run because the request's tool-call
-/// allowance was spent before it, in the call's own format, in both modes:
-/// an `mcp_call` that `failed` with [`NOT_EXECUTED_AT_TOOL_CALL_LIMIT`], or,
-/// for a tool answered in a hosted format, the item type the stream announces
-/// for the call (`web_search_call`, ...) with the status `failed`. The id is
+/// The item of a call the loop did not run, in the call's own format, in
+/// both modes: an `mcp_call` that `failed` with `error`
+/// ([`NOT_EXECUTED_AT_TOOL_CALL_LIMIT`] where the request's tool-call
+/// allowance was spent before the call, [`NOT_EXECUTED_AT_STREAM_BREAK`]
+/// where the turn's stream broke before the call was complete), or, for a
+/// tool answered in a hosted format, the item type the stream announces for
+/// the call (`web_search_call`, ...) with the status `failed`. The id is
 /// derived from the call's, as an executed call's is.
 fn not_executed_tool_call_item(
     response_format: ResponseFormat,
@@ -1155,16 +1166,11 @@ fn not_executed_tool_call_item(
     server_label: &str,
     tool_name: &str,
     arguments: &str,
+    error: &str,
 ) -> Value {
     if response_format == ResponseFormat::Passthrough {
-        let mut item = build_mcp_call_item(
-            tool_name,
-            arguments,
-            "",
-            server_label,
-            false,
-            Some(NOT_EXECUTED_AT_TOOL_CALL_LIMIT),
-        );
+        let mut item =
+            build_mcp_call_item(tool_name, arguments, "", server_label, false, Some(error));
         if let Some(obj) = item.as_object_mut() {
             obj.insert(
                 "id".to_string(),
@@ -1174,7 +1180,7 @@ fn not_executed_tool_call_item(
         return item;
     }
     let mut item = build_transformed_mcp_call_item(
-        &json!({ "error": NOT_EXECUTED_AT_TOOL_CALL_LIMIT }),
+        &json!({ "error": error }),
         response_format,
         item_id_source,
         server_label,
@@ -1473,6 +1479,7 @@ fn build_incomplete_response(
                     &resolved_label,
                     tool_name,
                     args,
+                    NOT_EXECUTED_AT_TOOL_CALL_LIMIT,
                 ));
             }
         }

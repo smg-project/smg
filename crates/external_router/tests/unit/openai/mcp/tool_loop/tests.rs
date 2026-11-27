@@ -42,6 +42,7 @@ fn a_not_executed_call_item_keeps_the_format_the_stream_announced() {
         "mock",
         "brave_web_search",
         "{}",
+        NOT_EXECUTED_AT_TOOL_CALL_LIMIT,
     );
     assert_eq!(plain["type"], "mcp_call");
     assert_eq!(plain["status"], "failed");
@@ -60,6 +61,7 @@ fn a_not_executed_call_item_keeps_the_format_the_stream_announced() {
         "mock",
         "brave_web_search",
         r#"{"query":"q"}"#,
+        NOT_EXECUTED_AT_TOOL_CALL_LIMIT,
     );
     assert_eq!(hosted["type"], "web_search_call");
     assert_eq!(hosted["status"], "failed");

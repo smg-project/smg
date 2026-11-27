@@ -1030,8 +1030,9 @@ fn assert_served_from_the_first_call(requests: &[Value], text: &str) {
 
 /// A turn's stream that breaks behind a call the loop ran ends the turn,
 /// not the request: the call that ran stays, the item the stream left open
-/// is closed, and the upstream is asked again, the way it was asked after
-/// every call before one stream served a whole turn.
+/// is closed with the error of a broken stream (not the one of a spent
+/// tool-call allowance), and the upstream is asked again, the way it was
+/// asked after every call before one stream served a whole turn.
 #[tokio::test]
 async fn a_stream_that_breaks_behind_a_call_that_ran_ends_the_turn_not_the_request() {
     use crate::test_support::http_client;
@@ -1042,6 +1043,18 @@ async fn a_stream_that_breaks_behind_a_call_that_ran_ends_the_turn_not_the_reque
         text.matches("event: response.output_item.added").count(),
         text.matches("event: response.output_item.done").count(),
         "no item the stream announced stays open: {text}"
+    );
+    assert_eq!(
+        text.split("\n\n")
+            .filter(|frame| frame.starts_with("event: response.output_item.done\n"))
+            .filter(|frame| frame.contains(NOT_EXECUTED_AT_STREAM_BREAK))
+            .count(),
+        1,
+        "the half-open call says that the stream broke: {text}"
+    );
+    assert!(
+        !text.contains(NOT_EXECUTED_AT_TOOL_CALL_LIMIT),
+        "no call reads as stopped at the limit: {text}"
     );
 }
 

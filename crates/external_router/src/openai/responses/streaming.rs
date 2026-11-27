@@ -65,7 +65,7 @@ use crate::{
             execute_streaming_tool_calls, inject_mcp_metadata_last, prepare_mcp_tools_as_functions,
             resume_payload_in_place, retained_output_items, send_mcp_list_tools_events,
             skip_streaming_tool_calls, StreamAction, StreamingToolHandler, ToolLoopState,
-            TOOL_CALL_LIMIT_REASON,
+            NOT_EXECUTED_AT_STREAM_BREAK, NOT_EXECUTED_AT_TOOL_CALL_LIMIT, TOOL_CALL_LIMIT_REASON,
         },
     },
     persistence_utils::persist_conversation_items_owned,
@@ -1276,6 +1276,7 @@ pub(super) fn handle_streaming_with_tool_interception(
                     let half_open = handler.take_pending_calls();
                     if !skip_streaming_tool_calls(
                         half_open,
+                        NOT_EXECUTED_AT_STREAM_BREAK,
                         &session,
                         &format_registry,
                         &tx,
@@ -1353,6 +1354,7 @@ pub(super) fn handle_streaming_with_tool_interception(
                     );
                     if !skip_streaming_tool_calls(
                         skipped,
+                        NOT_EXECUTED_AT_TOOL_CALL_LIMIT,
                         &session,
                         &format_registry,
                         &tx,
