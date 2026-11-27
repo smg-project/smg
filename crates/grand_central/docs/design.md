@@ -1827,8 +1827,9 @@ prefixes gets a bounded step of clean-up. A record leaves the engine's map once 
 holds it and it holds no worker's place.
 
 Under the follow of a host's registry a record no table holds leaves with its places too, once no
-worker that stands states its model as its own: the follow asks the registry behind its own step
-of the upkeep, and a record a table took during the ask stays.
+worker that stands states its model as its own or lists it by the id of a model card: the follow
+asks the registry behind its own step of the upkeep, and a record a table took during the ask
+stays.
 
 ## 7. The ten built-in policies **[built]**
 

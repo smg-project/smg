@@ -160,7 +160,9 @@ The crate's engine reads `kind` and `max_size` alone, for a pool whose profile r
 - Under `tree`, the engine bounds the model's record of sent prefixes at `max_size` divided by the block size. The record holds one placement for each block a worker was sent.
 - At the defaults that is 4,194,304 placements. The record takes about 55 bytes a block, so about 230 MB a model.
 - Under `hash`, the pool keeps no record.
-- The entry read is the one for the workers' primary model id. A request that names the model by another id shares that record and its settings.
+- The entry read is the one for the model the request names, under the id by which the first worker of its list lists that model. A model that workers list behind their primary one keeps its own record under its own entry.
+- A record read for a model behind a first worker's primary one is bounded by the smallest block size any list asked with, for as long as it lives.
+- An id and an alias of one model share one record. A name no model of that worker answers to reads the record and the entry of the worker's primary model id.
 
 ## Signals
 
