@@ -449,8 +449,9 @@ fn by_facts<const RETRY: bool>(
         Some(keyed) => handed_on(own, members, records, facts, maker, late, keyed, leaves),
         // A profile whose stages read who holds the prompt is named its
         // rows from the gateway's own data, at the decision's instant the
-        // keyed entry wrote, and its pick is recorded behind it; any other
-        // passes straight to the whole pass.
+        // keyed entry wrote. Behind its pick the prompt goes to a tree its
+        // host lends, or to the hash table behind a column. Any other
+        // profile passes straight to the whole pass.
         None => overlap::decide_hashed(
             &own.affinity,
             members.affinity(),
@@ -476,8 +477,9 @@ fn by_facts<const RETRY: bool>(
 /// Where the profile's stages read who holds the prompt, the lookup does
 /// behind this answer what it does behind any pick. It states in the pick
 /// what the pin's worker holds of the request, from the rows it names. It
-/// hands the prompt to the record of sent prefixes, or to a tree its host
-/// lends by the entry and the target its maker names. It may read its list's
+/// hands the prompt to a tree its host lends, by the entry and the target
+/// its maker names, or to the record of sent prefixes under a profile that
+/// is handed its column whole. It may read its list's
 /// table again, as any decision that finds the table expired, and a tree's
 /// match marks the path it walked as used. Where no binding of the phase
 /// reads affinity, the lookup is one test.

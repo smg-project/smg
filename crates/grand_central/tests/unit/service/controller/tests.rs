@@ -219,10 +219,10 @@ async fn a_served_controller_decides_under_its_next_term_past_a_terms_mark() {
 
 /// The serve's presence sweep runs the upkeep of the engine its store
 /// decides by, which runs no task of its own, and the store tells that
-/// engine each worker that leaves. Served picks write the record of the
-/// prefixes sent for their model. Once the model's last worker left,
-/// the record is gone within the sweep's period, with no request behind
-/// the leaves.
+/// engine each worker that leaves. Served picks of a profile handed its
+/// column whole write the record of the prefixes sent for their model.
+/// Once the model's last worker left, the record is gone within the
+/// sweep's period, with no request behind the leaves.
 #[tokio::test]
 async fn a_served_controller_keeps_no_sent_prefixes_of_a_model_whose_workers_left() {
     let controller = Controller::bind(valid()).await.expect("the listeners bind");
@@ -239,7 +239,7 @@ async fn a_served_controller_keeps_no_sent_prefixes_of_a_model_whose_workers_lef
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         let (singles, sides) = bed::fleet(&store, &workers);
-        let applied = store.apply(bed::preset("cache_aware", 1));
+        let applied = store.apply(bed::whole_cache_aware(1));
         applied.expect("above the unbound start");
         let records = || store.deciding(|world| world.front().affinity().held());
         let (sender, mut answers) = mpsc::channel(64);

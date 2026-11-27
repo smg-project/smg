@@ -220,6 +220,30 @@ pub(crate) fn preset(name: &str, generation: u64) -> AppliedSpec {
     applied(&document)
 }
 
+/// The `cache_aware` preset as generation `generation`, with a second
+/// warm-up stage in its profile that rules by another window. No one
+/// ruling names that profile's warming rows, so it is named no row: its
+/// decision is handed the column whole, and reads and writes the engine's
+/// record of sent prefixes. A decision that is named its rows reads no
+/// record, and a served controller lends no tree, so the preset itself is
+/// named no holder here ([`a_served_request_named_its_rows_goes_by_load`]).
+pub(crate) fn whole_cache_aware(generation: u64) -> AppliedSpec {
+    let mut document = PolicySpec::preset("cache_aware").expect("a preset of this build");
+    document.generation = generation;
+    let profile = document.profiles.get_mut("cache_aware");
+    let stage = spec::WarmupSliceParams {
+        weight: 1.0,
+        secs: Some(7),
+        ..spec::WarmupSliceParams::default()
+    };
+    let stage = spec::ScoreStage::WarmupSlice(stage).into();
+    profile.expect("the preset's profile").score.push(stage);
+    let whole = applied(&document);
+    let cap = whole.engine().affinity_rows_cap(MODEL, view::Phase::Single);
+    assert_eq!(cap, 0, "the profile is named no row");
+    whole
+}
+
 /// The `random` preset as generation 1 with the case's picker, laid
 /// under `name`, in its profile's pick.
 fn picking(
@@ -1161,12 +1185,12 @@ async fn the_in_process_front_and_the_served_path_decide_alike() {
     }
 }
 
-/// A served decision writes the record of sent prefixes at its lease's
-/// issue, as the door does in process: on workers that publish no cache
-/// events a request lands where its prefix was sent.
+/// A served decision handed its column whole writes the record of sent
+/// prefixes at its lease's issue, as the door does in process: on workers
+/// that publish no cache events a request lands where its prefix was sent.
 #[tokio::test]
 async fn a_served_request_lands_where_its_prefix_was_sent() {
-    let mut bed = bed(Some(preset("cache_aware", 1)), true, (1, 8), []);
+    let mut bed = bed(Some(whole_cache_aware(1)), true, (1, 8), []);
     let sent = picked(&bed.ask(hashed(1, 100)).await);
     // Each lease on file books its worker: load alone would send the
     // next request to another.
@@ -1176,13 +1200,30 @@ async fn a_served_request_lands_where_its_prefix_was_sent() {
     }
 }
 
+/// A served decision that is named its rows reads and writes no record of
+/// sent prefixes: the `cache_aware` preset's. Its holders are the index's
+/// or a lent tree's, and a served controller lends no tree
+/// (`EventIndexes`). So on workers that publish no cache events the
+/// request is named no holder: the record holds no worker behind it, and
+/// the next request of its prefix goes by load, to another worker than
+/// the one a lease books.
+#[tokio::test]
+async fn a_served_request_named_its_rows_goes_by_load() {
+    let mut bed = bed(Some(preset("cache_aware", 1)), true, (1, 8), []);
+    let sent = picked(&bed.ask(hashed(1, 100)).await);
+    assert_eq!(sent_prefixes(&bed).unwrap_or_default(), Vec::new());
+    let next = picked(&bed.ask(hashed(2, 101)).await);
+    assert_ne!(next, sent, "the lease on file books the first worker");
+    assert_eq!(sent_prefixes(&bed).unwrap_or_default(), Vec::new());
+}
+
 /// An entry of the record of sent prefixes is a prediction made at the
-/// decision. A served decision whose last read of the clock finds its
-/// budget gone leaves as `Busy` and gives its lease up. Its entry
-/// stays, and the next request with that prefix follows it.
+/// decision. A served decision handed its column whole whose last read of
+/// the clock finds its budget gone leaves as `Busy` and gives its lease
+/// up. Its entry stays, and the next request with that prefix follows it.
 #[tokio::test]
 async fn a_decision_that_leaves_as_busy_keeps_its_prefix_for_the_next_request() {
-    let fresh = |steps: Vec<Step>| bed(Some(preset("cache_aware", 1)), true, (1, 8), steps);
+    let fresh = |steps: Vec<Step>| bed(Some(whole_cache_aware(1)), true, (1, 8), steps);
     // Where the late request lands, and a second request that lands
     // elsewhere as the first of its prefix, each on a bed of its own.
     let late = picked(&fresh(Vec::new()).ask(hashed(1, 100)).await);
@@ -1215,12 +1256,13 @@ fn sent_prefixes(bed: &Bed) -> Option<Vec<WorkerId>> {
     held.into_iter().find(of_model).map(|(_, workers)| workers)
 }
 
-/// The bed under the `cache_aware` preset behind one request of a hashed
-/// prompt, with the worker the request was sent to and the facts that
-/// worker is registered under: the model's record holds a place for
-/// that worker alone.
+/// The bed under the `cache_aware` preset handed its column whole
+/// ([`whole_cache_aware`]) behind one request of a hashed prompt, with
+/// the worker the request was sent to and the facts that worker is
+/// registered under: the model's record holds a place for that worker
+/// alone.
 async fn sent_one_prefix() -> (Bed, WorkerId, WorkerFacts) {
-    let mut bed = bed(Some(preset("cache_aware", 1)), true, (1, 8), []);
+    let mut bed = bed(Some(whole_cache_aware(1)), true, (1, 8), []);
     let sent = picked(&bed.ask(hashed(1, 100)).await);
     assert_eq!(sent_prefixes(&bed), Some(vec![sent]));
     let row = WorkersStore::get(&*bed.store, sent).expect("the row");
@@ -1234,7 +1276,7 @@ async fn sent_one_prefix() -> (Bed, WorkerId, WorkerFacts) {
 #[tokio::test]
 async fn a_request_lands_where_its_prefix_was_sent_under_the_generation_before() {
     let (mut bed, sent, _) = sent_one_prefix().await;
-    let next = preset("cache_aware", 2);
+    let next = whole_cache_aware(2);
     bed.store.apply(next).expect("a later generation");
     assert_eq!(sent_prefixes(&bed), Some(vec![sent]));
     // Each lease on file books its worker: load alone would send the
@@ -1253,7 +1295,7 @@ async fn a_request_lands_where_its_prefix_was_sent_under_the_generation_before()
 #[tokio::test]
 async fn a_worker_that_left_behind_an_apply_is_named_for_no_prefix_it_held_before() {
     let (bed, sent, facts) = sent_one_prefix().await;
-    let next = preset("cache_aware", 2);
+    let next = whole_cache_aware(2);
     bed.store.apply(next).expect("a later generation");
     assert_eq!(sent_prefixes(&bed), Some(vec![sent]));
     let row = WorkersStore::get(&*bed.store, sent).expect("the row");

@@ -1894,12 +1894,14 @@ mod tests {
     /// A model whose index of cache events holds no block is decided in the
     /// token tree the gateway lends, and its list leaves the tree once the
     /// index holds a block. A gRPC model's index stands from the enrolment
-    /// of its first worker, so the gateway answers the engine no index
-    /// while it holds none (`KvEventMonitor`'s `CacheIndexes::index`).
+    /// of its first worker, and the gateway hands it to the engine while
+    /// it holds no block too (`KvEventMonitor`'s `CacheIndexes::index`):
+    /// the index says so itself, and the engine reads it as none.
     /// Until the first cache event a conversation's turns are stored in the
-    /// tree and return by it. The engine reads the index again when it
-    /// reads its table of the list again, a second at most behind the
-    /// block, and from then on no prompt is written to the tree.
+    /// tree and return by it. The next decision behind the first block
+    /// finds the index's word moved and reads its table of the list again.
+    /// A decision that meets that read decides by the old table, and none
+    /// behind the read writes a prompt to the tree.
     ///
     /// The classic policy reads an index that holds no block as no index
     /// and then reads its own token tree

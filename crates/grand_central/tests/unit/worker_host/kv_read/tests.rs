@@ -193,11 +193,10 @@ fn a_stored_chain_is_named_under_its_workers_number_within_the_cap() {
 /// (`KvEventMonitor::index`,
 /// `model_gateway/src/policies/kv_index/event_monitor.rs`). The word is
 /// the chain's own at each ask, so the lending made while the index was
-/// empty says its first block. In
-/// an index that holds a block, a row whose lane heard no batch has its
-/// number and no block: its place is made where the holder states it,
-/// as a gateway's index numbers a worker where its stream's task opens
-/// its place
+/// empty says its first block. In an index that holds a block, a row
+/// whose lane heard no batch has its number and no block: its place is
+/// made where the holder states it, as a gateway's index numbers a worker
+/// where its stream's task opens its place
 /// (`model_gateway/src/policies/kv_index/event_monitor/index_sink.rs:186-196`).
 /// On a pair's side the engine reads a numbered worker with no block
 /// as the record's of sent prefixes, and a single request of token ids

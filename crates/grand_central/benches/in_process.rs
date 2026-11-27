@@ -266,10 +266,9 @@ const CELLS: &[Cell] = &[
         ..Cell::PLAIN
     },
     // The cache-aware preset over one prompt at every turn, under a host
-    // that lends no tree. Asked by the one call (`--entry place`), a turn
-    // is named its worker by the engine's record of sent prefixes. Under
-    // `--entry place_text` the prompt is stated as text, hashed by its
-    // windows and read from the same record.
+    // that lends no tree and keeps no index. A turn is named no holder,
+    // asked by the one call (`--entry place`) or with its prompt stated as
+    // text (`--entry place_text`): the preset's other stages decide it.
     Cell {
         name: "cache_aware_one_prompt",
         document: || preset("cache_aware"),
@@ -279,14 +278,6 @@ const CELLS: &[Cell] = &[
         name: "cache_aware_indexed",
         document: || preset("cache_aware"),
         behind: indexed::keeps,
-        caller: Some(conversations::caller),
-        fits: conversations::fits,
-        words: conversations::words,
-        ..Cell::PLAIN
-    },
-    Cell {
-        name: "cache_aware_recorded",
-        document: || preset("cache_aware"),
         caller: Some(conversations::caller),
         fits: conversations::fits,
         words: conversations::words,

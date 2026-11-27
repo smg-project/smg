@@ -1599,14 +1599,15 @@ fn a_keyed_request_held_to_places_takes_the_rings_next_members() {
 }
 
 /// The default policy holds a request to its places ahead of its
-/// prompt's holder. A prompt is sent to a worker, and the same prompt
-/// held to places that worker is outside of is handed none but them,
-/// as a request with no prompt is: over a list under the draw's floor
-/// and one over it.
+/// prompt's holder. Its host lends its token tree. A prompt is sent to
+/// a worker and goes back to it at every seed. The same prompt held to
+/// places that worker is outside of is handed none but them, as a
+/// request with no prompt is: over a list under the draw's floor and
+/// one over it.
 #[test]
 fn a_prompts_holder_outside_the_places_is_not_handed() {
     for workers in [8_u32, 32] {
-        let engine = preset("cache_aware");
+        let (engine, _tree) = lent("cache_aware", Also::Nothing);
         let list = pool(workers as usize);
         let members = PublishedList::new(Arc::clone(&list));
         let tokens: Vec<u32> = (0..1_024).collect();
@@ -1618,12 +1619,20 @@ fn a_prompts_holder_outside_the_places_is_not_handed() {
             if prompted {
                 hashes.write_to(&mut asked.facts);
             }
-            let decided = decided(&engine, &Asks::of(asked, Some(&members)));
+            let asks = Asks {
+                key: prompted.then_some(&tokens[..]),
+                ..Asks::of(asked, Some(&members))
+            };
+            let decided = decided(&engine, &asks);
             let pick = decided.decision.pick().expect("a pick");
             let places = pick.targets.iter().map(|target| target.position);
             places.collect::<Vec<u32>>()
         };
         let holder = sent(None, 0, true)[0];
+        for seed in 1..32 {
+            let again = sent(None, seed, true)[0];
+            assert_eq!(again, holder, "{workers} workers, seed {seed}");
+        }
         let others: Vec<u32> = (0..workers)
             .filter(|&place| place != holder)
             .take(2)
@@ -1637,40 +1646,6 @@ fn a_prompts_holder_outside_the_places_is_not_handed() {
                 );
             }
         }
-    }
-}
-
-/// A request held to places is handed its prompt's holder among them,
-/// where more workers outside them were sent the prompt than the
-/// profile's sample of sixteen. Forty workers are sent one prompt, each
-/// by a request held to it alone. The prompt held to one of them, and
-/// to seven workers it was never sent to, is then handed that one under
-/// every seed. The classic policy narrows its workers first and takes
-/// every candidate its tree matched
-/// (`model_gateway/src/routers/common/placement.rs:474-484`,
-/// `model_gateway/src/policies/cache_aware.rs:2541-2552`).
-#[test]
-fn a_held_request_is_handed_its_prompts_holder_among_its_places() {
-    let engine = preset("cache_aware");
-    let list = pool(64);
-    let members = PublishedList::new(Arc::clone(&list));
-    let tokens: Vec<u32> = (0..1_024).collect();
-    let hashes = engine.prompt_hashes(MODEL, Some(&tokens), None, HashSeeds::PLAIN);
-    let sent = |places: &[u32], seed: u64| {
-        let mut asked = request();
-        asked.facts.seed = seed;
-        asked.constraints.places = Some(places);
-        hashes.write_to(&mut asked.facts);
-        let decided = decided(&engine, &Asks::of(asked, Some(&members)));
-        let pick = decided.decision.pick().expect("a pick");
-        pick.targets.iter().next().expect("a target").position
-    };
-    for place in 0..40 {
-        assert_eq!(sent(&[place], 0), place);
-    }
-    for seed in 1..=32 {
-        let handed = sent(&[7, 40, 41, 42, 43, 44, 45, 46], seed);
-        assert_eq!(handed, 7, "seed {seed}");
     }
 }
 
@@ -1692,14 +1667,17 @@ fn a_held_request_over_its_thresholds_everywhere_is_steered_among_its_places() {
     assert!(pick.targets.iter().all(|target| target.position == 1));
 }
 
-/// The default policy's single request is named the worker its prompt
-/// was sent to. The whole pass reads the engine's record of sent
-/// prefixes, which the pick before it wrote: a prompt goes back to its
-/// worker whatever the request's seed, other prompts are not held to
-/// that worker, and a worker told gone holds no prompt.
+/// A single request under a profile handed its column whole goes to the
+/// worker its prompt was sent to. The whole pass reads the engine's
+/// record of sent prefixes, which the pick before it wrote: a prompt goes
+/// back to its worker whatever the request's seed, other prompts are not
+/// held to that worker, and a worker told gone holds no prompt. A profile
+/// that is named its rows reads no record: its prompt goes back by the
+/// tree its host lends
+/// ([`a_long_conversation_of_text_goes_back_to_its_worker_by_the_string_tree`]).
 #[test]
-fn the_default_policy_sends_a_prompt_back_to_the_worker_it_was_sent_to() {
-    let engine = preset("cache_aware");
+fn a_column_reader_sends_a_prompt_back_to_the_worker_it_was_sent_to() {
+    let engine = InProcess::new(whole_cache_aware(1));
     let list = pool(8);
     let members = PublishedList::new(Arc::clone(&list));
     let prompt = |first: u32| (first..first + 1_024).collect::<Vec<u32>>();
@@ -1787,6 +1765,11 @@ fn a_pinned_key_under_round_robin_goes_back_to_its_worker() {
 /// sessions rule, a new key placed by the profile's own stages, and
 /// `kept`, the rule's word of a request it places alone.
 pub(crate) fn default_under_sessions(kept: RulePlaced) -> AppliedSpec {
+    AppliedSpec::validate(&under_sessions(kept)).expect("the document validates")
+}
+
+/// [`default_under_sessions`] as a document, before it is applied.
+pub(crate) fn under_sessions(kept: RulePlaced) -> PolicySpec {
     let mut document = PolicySpec::preset("manual").expect("a built-in preset");
     let default = PolicySpec::preset("cache_aware").expect("a built-in preset");
     document.profiles = default.profiles;
@@ -1796,7 +1779,36 @@ pub(crate) fn default_under_sessions(kept: RulePlaced) -> AppliedSpec {
     rule.assignment = Assignment::Delegate;
     rule.rule_placed = kept;
     document.generation = 1;
-    AppliedSpec::validate(&document).expect("the document validates")
+    document
+}
+
+/// `document` with a second warm-up stage in its profile `cache_aware`
+/// that rules by another window. No one ruling names that profile's
+/// warming rows, so it is named no row: its decision is handed the column
+/// whole, and reads and writes the engine's record of sent prefixes. A
+/// decision that is named its rows reads no record.
+pub(crate) fn handed_whole_of(mut document: PolicySpec) -> PolicySpec {
+    let profile = document.profiles.get_mut("cache_aware");
+    profile.expect("the preset's profile").score.push(
+        ScoreStage::WarmupSlice(WarmupSliceParams {
+            weight: 1.0,
+            secs: Some(7),
+            ..WarmupSliceParams::default()
+        })
+        .into(),
+    );
+    document
+}
+
+/// The `cache_aware` preset under the generation `number`, its profile
+/// handed its column whole ([`handed_whole_of`]).
+pub(crate) fn whole_cache_aware(number: u64) -> AppliedSpec {
+    let mut document = PolicySpec::preset("cache_aware").expect("a built-in preset");
+    document.generation = number;
+    let whole = handed_whole_of(document);
+    let spec = AppliedSpec::validate(&whole).expect("the document validates");
+    assert_eq!(spec.engine().affinity_rows_cap(MODEL, Phase::Single), 0);
+    spec
 }
 
 /// What `engine`'s record of sent prefixes holds of the prompt `tokens`
@@ -1853,7 +1865,8 @@ fn held_at(place: u32) -> Vec<u32> {
     held
 }
 
-/// The default policy under a sessions rule. A key's first request is
+/// The default policy's stages, handed their column whole, under a
+/// sessions rule. A key's first request is
 /// placed by the whole decision, and its dispatch makes the key's pin.
 /// The key's next request follows that pin by one worker's record under
 /// either word of the rule: the whole decision does not run, so no
@@ -1878,7 +1891,11 @@ fn the_default_policy_follows_a_sessions_pin_by_one_record() {
     // The pinned requests' picks under the rule's word `kept`, a key
     // each.
     let followed = |kept: RulePlaced| {
-        let engine = InProcess::new(default_under_sessions(kept));
+        // The profile is handed its column whole: the record is written
+        // behind its picks, and behind none of a profile named its rows.
+        let whole = handed_whole_of(under_sessions(kept));
+        let whole = AppliedSpec::validate(&whole).expect("the document validates");
+        let engine = InProcess::new(whole);
         let list = pool(8);
         let members = PublishedList::new(Arc::clone(&list));
         let prompt = |first: u32| (first..first + 1_024).collect::<Vec<u32>>();
@@ -1990,7 +2007,11 @@ fn the_default_policy_follows_a_sessions_pin_by_one_record() {
 #[test]
 fn a_retrys_followed_pin_is_recorded_by_the_rules_word() {
     for kept in [RulePlaced::Untold, RulePlaced::Told] {
-        let engine = InProcess::new(default_under_sessions(kept));
+        // The profile is handed its column whole: the record is written
+        // behind its picks, and behind none of a profile named its rows.
+        let whole = handed_whole_of(under_sessions(kept));
+        let whole = AppliedSpec::validate(&whole).expect("the document validates");
+        let engine = InProcess::new(whole);
         // Two engines of two ranks, then two workers alone.
         let (list, engine_of) = engines(&[2, 2, 1, 1]);
         let members = PublishedList::new(Arc::clone(&list));
@@ -2295,12 +2316,13 @@ fn a_decision_without_a_lease_over_no_list_names_no_worker() {
 }
 
 /// A request its sessions rule places alone says so on its pick, and its
-/// prompt is recorded by the rule's own word of it, in four forms. A pin
+/// prompt is recorded by the rule's own word of it, in five forms. A pin
 /// followed by its one worker's record. A pin the whole decision
 /// follows: for a request held to places of its list, and under a
 /// binding with a shadow. And a key's first request under a rule whose
 /// own assignment places it behind the profile's filters, where no
-/// scorer and no picker of the profile is asked.
+/// scorer and no picker of the profile is asked, with a shadow and with
+/// none.
 ///
 /// Where the rule keeps what it places from the profile no form leaves
 /// a block of the prompt in the record: a gateway's sticky map hands
@@ -2312,52 +2334,21 @@ fn a_decision_without_a_lease_over_no_list_names_no_worker() {
 /// by one record as the pin the whole decision follows. That prompt
 /// then goes back to the session's worker with no key.
 ///
-/// The forms under a shadow run again under a profile that reads the
-/// column whole, where the record's other write stands. No recorded
-/// sheet runs this.
+/// Every form runs under a profile that reads the column whole, where
+/// the record's one write stands: a decision that is named its rows
+/// writes no record. No recorded sheet runs this.
 #[test]
 fn a_request_its_sessions_rule_places_alone_is_recorded_by_the_rules_word() {
     let forms = [
-        (
-            "a pin by one record",
-            false,
-            false,
-            Assignment::Delegate,
-            false,
-        ),
-        (
-            "a pin held to places",
-            false,
-            true,
-            Assignment::Delegate,
-            false,
-        ),
-        ("a shadow", true, false, Assignment::Delegate, false),
-        (
-            "the rule's assignment",
-            false,
-            false,
-            Assignment::Random,
-            false,
-        ),
-        (
-            "a shadow, the column",
-            true,
-            false,
-            Assignment::Delegate,
-            true,
-        ),
-        (
-            "the rule's, the column",
-            true,
-            false,
-            Assignment::Random,
-            true,
-        ),
+        ("a pin by one record", false, false, Assignment::Delegate),
+        ("a pin held to places", false, true, Assignment::Delegate),
+        ("a shadow", true, false, Assignment::Delegate),
+        ("the rule's assignment", false, false, Assignment::Random),
+        ("the rule's, a shadow", true, false, Assignment::Random),
     ];
     let words = [RulePlaced::Untold, RulePlaced::Told];
     for (kept, form) in words.into_iter().flat_map(|w| forms.map(|f| (w, f))) {
-        let (form, shadowed, held, assignment, whole) = form;
+        let (form, shadowed, held, assignment) = form;
         let case = format!("{kept:?}, {form}");
         let engine = {
             let mut document = PolicySpec::preset("manual").expect("a built-in preset");
@@ -2373,24 +2364,13 @@ fn a_request_its_sessions_rule_places_alone_is_recorded_by_the_rules_word() {
                 document.profiles.insert("twin".into(), twin);
                 document.bindings[0].shadow = Some(ShadowSpec::Profile("twin".into()));
             }
-            if whole {
-                // A second warm-up stage that rules by another window:
-                // the live profile is named no row, reads the column
-                // whole and keeps the record by its own word.
-                let profile = document.profiles.get_mut("cache_aware");
-                profile.expect("the preset's profile").score.push(
-                    ScoreStage::WarmupSlice(WarmupSliceParams {
-                        weight: 1.0,
-                        secs: Some(7),
-                        ..WarmupSliceParams::default()
-                    })
-                    .into(),
-                );
-            }
             document.generation = 1;
-            let applied = AppliedSpec::validate(&document).expect("the document validates");
+            // The live profile is named no row, reads the column whole
+            // and keeps the record by its own word.
+            let whole = handed_whole_of(document);
+            let applied = AppliedSpec::validate(&whole).expect("the document validates");
             let cap = applied.engine().affinity_rows_cap(MODEL, Phase::Single);
-            assert_eq!(cap == 0, whole, "{case}: the form of the record's write");
+            assert_eq!(cap, 0, "{case}: the profile reads the column whole");
             let record = applied.engine().pool_record_for(MODEL, Phase::Single);
             assert!(record.is_some(), "{case}: the list keeps a record");
             InProcess::new(applied)
@@ -2770,7 +2750,8 @@ fn a_long_conversation_of_text_goes_back_to_its_worker_by_the_string_tree() {
 /// worker up to what the index of cache events holds, so under an index
 /// that holds no block a single request warms nobody, whatever warm-up
 /// window the settings name, and a turn is placed where the turn before it
-/// was sent.
+/// was sent. The host lends its token tree, as a gateway does, and each
+/// turn names its entry in it: the tree's match places the turn.
 #[test]
 fn a_conversation_stays_with_its_worker_beside_a_new_one_where_no_cache_event_came() {
     use crate::document::routing_settings::{PolicySettings, RoutingSettings};
@@ -2784,13 +2765,17 @@ fn a_conversation_stays_with_its_worker_beside_a_new_one_where_no_cache_event_ca
     let mut document = settings.policy_document().expect("the settings translate");
     document.generation = 1;
     let spec = AppliedSpec::validate(&document).expect("the document validates");
-    let engine = InProcess::new(spec);
+    let (engine, _tree) = lending(spec);
     let sent = |members: &PublishedList, tokens: &[u32], seed: u64| {
         let hashes = engine.prompt_hashes(MODEL, Some(tokens), None, HashSeeds::PLAIN);
         let mut asked = request();
         asked.facts.seed = seed;
         hashes.write_to(&mut asked.facts);
-        let decision = decided(&engine, &Asks::of(asked, Some(members))).decision;
+        let asks = Asks {
+            key: Some(tokens),
+            ..Asks::of(asked, Some(members))
+        };
+        let decision = decided(&engine, &asks).decision;
         let pick = decision.pick().expect("a pick");
         pick.targets.first().expect("a target").position
     };
@@ -4502,12 +4487,13 @@ fn a_demand_for_a_model_no_member_serves_is_shed_under_no_stage() {
     );
 }
 
-/// The first pick records the block for the blind worker.
-/// An unrestricted repeat picks that worker again.
-/// A vision request for the same block picks the sighted worker.
+/// The first pick stores the prompt for the blind worker, in the token
+/// tree its host lends.
+/// An unrestricted repeat picks that worker again, at every seed.
+/// A vision request for the same prompt picks the sighted worker.
 #[test]
 fn a_vision_demand_skips_the_blind_holder_of_the_first_block() {
-    let engine = preset("cache_aware");
+    let (engine, _tree) = lent("cache_aware", Also::Nothing);
     let list = pool(2);
     let (blind, sighted) = (&list[0], &list[1]);
     let members = PublishedList::with_facts(Arc::clone(&list), |worker| FixedFacts {
@@ -4515,8 +4501,10 @@ fn a_vision_demand_skips_the_blind_holder_of_the_first_block() {
         ..FixedFacts::default()
     });
 
+    let tokens: Vec<u32> = (0..256).collect();
+    let hashes = engine.prompt_hashes(MODEL, Some(&tokens), None, HashSeeds::PLAIN);
     let mut prompt = request();
-    prompt.facts.block_hashes = &[17];
+    hashes.write_to(&mut prompt.facts);
     let mut to_blind = prompt;
     to_blind.constraints.places = Some(&[0]);
     let mut vision = prompt;
@@ -4527,10 +4515,19 @@ fn a_vision_demand_skips_the_blind_holder_of_the_first_block() {
         (prompt, blind, "unrestricted repeat"),
         (vision, sighted, "vision request"),
     ] {
-        let outcome = decided(&engine, &Asks::of(asked, Some(&members)));
-        let pick = outcome.decision.pick().expect("a pick");
-        let first = pick.targets.first().expect("a target");
-        assert_eq!(first.id, worker_id(expected.as_ref()), "{step}");
+        for seed in 0..16 {
+            let mut asked = asked;
+            asked.facts.seed = seed;
+            let asks = Asks {
+                key: Some(&tokens),
+                ..Asks::of(asked, Some(&members))
+            };
+            let outcome = decided(&engine, &asks);
+            let pick = outcome.decision.pick().expect("a pick");
+            let first = pick.targets.first().expect("a target");
+            let expected = worker_id(expected.as_ref());
+            assert_eq!(first.id, expected, "{step}, seed {seed}");
+        }
     }
 }
 

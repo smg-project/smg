@@ -743,9 +743,10 @@ async fn a_spec_file_that_binds_a_sessions_rule_under_a_pair_starts() {
     }
 }
 
-/// A served decision writes the record of sent prefixes at its lease's
-/// issue: a spec file starts under each source of prefix affinity, and
-/// one that names none reads the prefixes sent, as `merged` does.
+/// A spec file starts under each source of prefix affinity, and one that
+/// names none reads the prefixes sent, as `merged` does. A served
+/// decision that reads a column writes their record at its lease's
+/// issue: a pair's side, and a single decision handed its column whole.
 #[tokio::test]
 async fn a_spec_file_starts_under_each_source_of_prefix_affinity() {
     let dir = tempfile::tempdir().expect("a directory");

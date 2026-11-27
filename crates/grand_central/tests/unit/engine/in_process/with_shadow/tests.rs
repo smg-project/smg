@@ -864,25 +864,27 @@ fn a_shadow_leaves_the_live_rotation_one_turn_a_request() {
     }
 }
 
-/// The default policy's prompt goes back to the worker it was sent to, by
-/// the engine's record of sent prefixes. Its shadow writes nothing there:
+/// A prompt goes back to the worker it was sent to under a profile handed
+/// its column whole, by the engine's record of sent prefixes. Its shadow
+/// writes nothing there:
 /// each prompt returns to its live pick at every seed, never to the worker
 /// the shadow picked, and every answer is the one the document gives with
-/// no shadow. The shadow profile reads no affinity column, so it runs
-/// without the rows named for the live one.
+/// no shadow. The shadow profile reads no affinity: it is handed the
+/// request as the live decision read it, and no row.
 #[test]
 fn a_shadow_writes_nothing_to_the_record_of_sent_prefixes() {
     let seen = Seen::default();
     let stages = seen.stages(Rule::Nobody, Rule::Place(0));
     let mut twin = profile_of("random");
     twin.pick = "takes-shadow".into();
-    let engine = engine_of(with_shadow_profile("cache_aware", twin), &stages);
+    let whole = single::tests::handed_whole_of;
+    let engine = engine_of(whole(with_shadow_profile("cache_aware", twin)), &stages);
     let unshadowed = engine_of(
-        PolicySpec::preset("cache_aware").expect("a built-in preset"),
+        whole(PolicySpec::preset("cache_aware").expect("a built-in preset")),
         &stages,
     );
     let word = engine.spec().engine().shadow_for(MODEL, Phase::Single);
-    assert_eq!(word, Some((0, ShadowRows::Unnamed)));
+    assert_eq!(word, Some((0, ShadowRows::Same)));
 
     let list = pool(8);
     let (members, plain) = (

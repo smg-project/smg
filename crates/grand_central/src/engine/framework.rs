@@ -1021,21 +1021,28 @@ impl Profile {
         !later && (folded || called())
     }
 
-    /// Whether a scorer of this profile reads sent prefixes and no cache
-    /// events ([`Engine::reads_sent_alone_for`]): asked of its scorers at
-    /// the engine's build.
+    /// Whether a scorer of this profile reads sent prefixes and no stage
+    /// of it reads a request's holders from the cache events
+    /// ([`Engine::reads_sent_alone_for`]): asked of its stages at the
+    /// engine's build.
     ///
-    /// The cache events meant are a request's holders, which a scorer
+    /// The cache events meant are a request's holders, which a stage
     /// reads from the index where it declares token hashes beside the
-    /// events. One scorer that reads them there has the index name a
+    /// events: a scorer, a filter or the picker, as [`Self::needs`] folds
+    /// them. One stage that reads them there has the index name a
     /// single request of token ids alone where the model's index holds a
-    /// block, and keeps the index's holders first for every other
+    /// block, and keeps the index's holders for every other
     /// request, whatever another reads. A scorer that reads the events for
-    /// a row's warm-up reads no holder and turns nothing here.
+    /// a row's warm-up turns nothing here. Where such a profile is named
+    /// its rows the index names it no holder, so that scorer reads each
+    /// row's overlap as none.
     fn reads_sent_alone(&self) -> bool {
-        let needs = || self.scorers.iter().map(|stage| stage.scorer.needs());
-        needs().any(|needs| needs.sent_prefixes)
-            && !needs().any(|needs| needs.events && needs.token_hashes)
+        let scorers = || self.scorers.iter().map(|stage| stage.scorer.needs());
+        let filters = self.filters.iter().map(|filter| filter.needs());
+        let holders = |needs: Needs| needs.events && needs.token_hashes;
+        scorers().any(|needs| needs.sent_prefixes)
+            && !filters.chain(scorers()).any(holders)
+            && !holders(self.picker.needs())
     }
 
     /// What a host names this profile's rows by ([`NamedBy`]), asked of
@@ -3596,11 +3603,11 @@ impl Glob {
 /// What a host names a profile's rows by, where it names them in the
 /// affinity column's place: the cap of each list
 /// ([`Engine::affinity_rows_cap`]), the one ruling of the warming rows
-/// ([`Engine::warm_up_rule_for`]), and the record of sent prefixes, whether
-/// the profile's pool keeps it ([`Engine::reads_sent_for`]) and whether
-/// its holders are named ahead of the index's
-/// ([`Engine::reads_sent_alone_for`]). A naming that
-/// fills its cap is held to a test of the profile's own too
+/// ([`Engine::warm_up_rule_for`]), and what it reads of the prefixes sent:
+/// whether the profile's pool keeps the record of them
+/// ([`Engine::reads_sent_for`]), and whether it reads them alone, so that
+/// the index names it nothing ([`Engine::reads_sent_alone_for`]). A naming
+/// that fills its cap is held to a test of the profile's own too
 /// ([`Engine::keeps_for`]). Every input of a naming that is a profile's
 /// own stands here: two profiles are named the same rows where
 /// [`Self::names_as`] says so. `==` asks another thing, whether two
@@ -3617,8 +3624,8 @@ pub(crate) struct NamedBy {
     /// handed whole.
     sent: bool,
     /// Whether it reads a request's holders from the record of sent
-    /// prefixes alone: a scorer of it reads the record and none reads the
-    /// holders from the index.
+    /// prefixes alone: a scorer of it reads the record and no stage of it
+    /// reads the holders from the index.
     sent_alone: bool,
     /// The test a naming that fills its cap is held to: the profile's
     /// filters, asked of a row ahead of its naming.
@@ -3827,7 +3834,7 @@ fn side_reads_another_column(
         PairSide::Decode => binding.decode_profile.unwrap_or(binding.profile),
     };
     // The ruling, and the record where the pool keeps one: whether its
-    // holders are named ahead of the index's.
+    // reader reads sent prefixes alone.
     let carried = |index: u16| {
         let by = named_by.get(usize::from(index))?;
         Some((by.rule, by.sent.then_some(by.sent_alone)))
@@ -6560,16 +6567,15 @@ impl Engine {
     /// Whether that profile reads a request's holders from the record of
     /// sent prefixes alone: a scorer of it reads the record, as the prefix
     /// stage does under the source that reads the record alone, and no
-    /// prefix stage reads the index. A host names the record's holders
-    /// ahead of the index's then, and the engine over worker lists reads
-    /// and writes its record for every worker of that profile's list,
-    /// whatever the index holds for the worker. One prefix stage that
-    /// reads cache events
-    /// keeps the index's holders first, whatever another reads: under a
-    /// cap it would lose them. For a single request of token ids under a
-    /// model whose index holds a block they are the only holders named. A
-    /// stage that reads cache events for a row's warm-up reads no holder
-    /// and turns nothing here.
+    /// stage of it reads the index, be it a scorer, a filter or the picker.
+    /// The index names such a profile's request no holder then. The engine
+    /// over worker lists asks for the request's token tree beside an
+    /// index, and fills a column of that profile with its record's word
+    /// for every worker of the list, whatever the index holds for the
+    /// worker. One stage that reads a request's holders from the cache
+    /// events keeps the index's holders, whatever another reads. A stage
+    /// that reads cache events for a row's warm-up reads no holder and
+    /// turns nothing here.
     /// Kept at the build, as [`Self::reads_sent_for`] is.
     #[cfg(any(test, feature = "in-process"))]
     pub(crate) fn reads_sent_alone_for(&self, model: &str, phase: Phase) -> bool {
@@ -6597,18 +6603,17 @@ impl Engine {
     /// The record of sent prefixes a host keeps for a pool, for the
     /// decisions of `phase` for `model`: `None` where it keeps none, and
     /// whether the reader of a single decision over the pool reads sent
-    /// prefixes alone. The record's holders are named ahead of the
-    /// index's then, and the record speaks to that decision for every
-    /// worker of the pool. It
-    /// is the live profile's word ([`Self::reads_sent_for`],
-    /// [`Self::reads_sent_alone_for`]) and, where that profile is named
-    /// no row and its binding's shadow is named rows of its own, the
-    /// shadow profile's. A live profile that is named no row and reads
-    /// no sent prefix reads nothing of the record its pool keeps there.
-    /// A document that names no such shadow keeps none there. A shadow
-    /// is named no such rows where a live profile reads the record of
-    /// the same model ([`live_reader_beside`]): the entries kept for a
-    /// shadow share a bound with no live reader's.
+    /// prefixes alone. A decision that is named its rows is then named
+    /// nothing by the index, and one handed its column whole reads the
+    /// record for every worker of the pool. It is the live profile's word
+    /// ([`Self::reads_sent_for`], [`Self::reads_sent_alone_for`]) and,
+    /// where that profile is named no row and its binding's shadow is
+    /// named rows of its own, the shadow profile's. A live profile that is
+    /// named no row and reads no sent prefix reads nothing of the record
+    /// its pool keeps there. A document that names no such shadow keeps
+    /// none there. A shadow is named no such rows where a live profile
+    /// reads the record of the same model ([`live_reader_beside`]): the
+    /// entries kept for a shadow share a bound with no live reader's.
     ///
     /// A decode pool is read by its model's pair too: the pair's decode
     /// side runs under the pair's binding ([`Self::pair_binding`]),
@@ -6625,8 +6630,10 @@ impl Engine {
     /// pair's decode profile the pool keeps the record and the word is
     /// `false`: a decode request asked alone is decided there by a
     /// profile that reads no record, and no single reader reads alone.
-    /// That decision keeps the index's holders first, and reads and
-    /// writes the record as a profile that reads cache events does.
+    /// That decision reads and writes the record only where it is handed
+    /// its column whole, and then as a profile that reads cache events
+    /// does. Named its rows, it is named by the index or by a tree its
+    /// host lends, and writes no record: nothing but a tree's own store.
     #[cfg(any(test, feature = "in-process"))]
     pub(crate) fn pool_record_for(&self, model: &str, phase: Phase) -> Option<bool> {
         if self.reads_sent_for(model, phase) {

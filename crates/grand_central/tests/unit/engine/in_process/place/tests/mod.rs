@@ -1240,8 +1240,9 @@ fn placing_a_request_asks_the_table_of_names_for_nothing() {
 /// A placement states what its pick states of the worker the request goes
 /// to ([`Placement::overlap`]): a host observes its cache series from it.
 /// A prompt's first request reads a miss of its blocks. Its next request
-/// reads every block held, by the record of sent prefixes, and a kept
-/// placement says the same. A pick states its first target's worker alone:
+/// reads every block held, by the record of sent prefixes a profile handed
+/// its column whole keeps, and a kept placement says the same. A pick
+/// states its first target's worker alone:
 /// a single request its route's rule sends to the target behind goes to
 /// another worker and is stated nothing, though one decision placed it.
 /// Neither is a place one pick decides. A pair's statement stands with a
@@ -1251,9 +1252,12 @@ fn placing_a_request_asks_the_table_of_names_for_nothing() {
 /// (`model_gateway/src/policies/cache_aware.rs:2676-2688`).
 #[test]
 fn a_placement_states_what_its_pick_states_of_the_worker_taken() {
-    use crate::engine::decision::{Overlap, OverlapSource};
+    use crate::engine::{
+        decision::{Overlap, OverlapSource},
+        in_process::single::tests::whole_cache_aware,
+    };
 
-    let engine = hosted(preset("cache_aware"));
+    let engine = hosted(InProcess::new(whole_cache_aware(1)));
     let list = pool(4);
     let members = PublishedList::new(Arc::clone(&list));
     let tokens: Vec<u32> = (0..256).collect();

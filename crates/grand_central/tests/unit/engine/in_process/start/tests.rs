@@ -20,7 +20,7 @@ use crate::{
                 handed, id, in_id_order, register, registry, remove, told, Registry,
             },
             overlap::{CacheIndex, CacheIndexes},
-            single::tests::hearing_spec,
+            single::tests::{handed_whole_of, hearing_spec, whole_cache_aware},
             task::tests::{asks, monitor, picked, reports, settle, spawned, url, MODEL},
             InProcess,
         },
@@ -248,7 +248,8 @@ async fn a_started_engine_reads_the_cache_indexes_it_was_handed() {
 }
 
 /// Beside an index of cache events that holds a block for every worker of
-/// its list, a request of text is placed by the prefixes the engine sent:
+/// its list, a request of text is placed by the prefixes the engine sent,
+/// under a profile handed its column whole:
 /// each request of the text goes to the worker its first one went to,
 /// whatever its seed. An index speaks of token blocks, so the engine's
 /// record of sent prefixes speaks for every worker on such a request, as
@@ -265,7 +266,7 @@ async fn a_started_engine_places_a_text_by_the_prefix_it_sent_beside_the_index()
         loads: None,
         cache_indexes: Some(indexes(&index)),
     };
-    let (engine, task) = InProcess::start(preset("cache_aware"), data);
+    let (engine, task) = InProcess::start(whole_cache_aware(1), data);
     let task = spawned(task).await;
 
     let tokens: Vec<u32> = (0..1_024).collect();
@@ -334,7 +335,8 @@ async fn placed_beside_blocks(spec: AppliedSpec) -> Vec<u32> {
 
 /// Beside an index of cache events that holds a block for every worker of
 /// its list, an engine whose prefix stage reads sent prefixes alone
-/// (`source: predictor`) places a request of token ids by the prefixes it
+/// (`source: predictor`), its profile handed its column whole, places a
+/// request of token ids by the prefixes it
 /// sent: each request of the prompt goes to the worker its first one went
 /// to, whatever its seed. No stage of that profile reads what the index
 /// holds, so the engine's record of sent prefixes speaks to it for every
@@ -355,7 +357,8 @@ async fn a_started_engine_that_reads_sent_prefixes_alone_places_by_them_beside_t
             }
         }
     }
-    let alone = AppliedSpec::validate(&document).expect("the document validates");
+    let whole = handed_whole_of(document);
+    let alone = AppliedSpec::validate(&whole).expect("the document validates");
     let places = placed_beside_blocks(alone).await;
     assert_eq!(places, [places[0]; 32], "the worker its first went to");
 

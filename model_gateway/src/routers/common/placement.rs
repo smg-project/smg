@@ -7603,6 +7603,30 @@ pub(crate) mod tests {
         policies.set_engine(Box::leak(Box::new(InProcess::new(spec))));
     }
 
+    /// [`engine_on`] with the caches the gateway's start hands its engine
+    /// (`AppContext::engine_caches`): the trees of the prompts this process
+    /// sent, which `policies` keeps where `document` reads the prefixes sent
+    /// to each worker, over the workers of `registry`. The engine keeps no
+    /// such record of its own for a request it is named the holders of.
+    fn lending_engine_on(
+        policies: &PolicyRegistry,
+        document: &PolicySpec,
+        registry: &WorkerRegistry,
+    ) {
+        use crate::policies::EngineCaches;
+
+        let spec = AppliedSpec::validate(document).expect("a valid document");
+        if spec.needs().sent_prefixes {
+            policies.lend_trees(document, spec.block_size(), registry);
+        }
+        let engine = InProcess::new(spec);
+        // No later spec: this registry holds no maker of one.
+        if let Some(caches) = EngineCaches::of(None, policies.lent_cell(), false) {
+            engine.affinity().set_indexes(Arc::new(caches));
+        }
+        policies.set_engine(Box::leak(Box::new(engine)));
+    }
+
     /// Hands `policies` an engine over a stock preset.
     fn preset_on(policies: &PolicyRegistry, preset: &str) {
         let document = PolicySpec::preset(preset).expect("a stock preset");
@@ -10025,8 +10049,7 @@ pub(crate) mod tests {
                 settings.routing_key_override.clone(),
             );
             let document = settings.policy_document().expect("the settings' document");
-            let spec = AppliedSpec::validate(&document);
-            engine_on(&policies, spec.expect("a valid document"));
+            lending_engine_on(&policies, &document, &registry);
             assert_eq!(
                 policies.any_policy_needs_request_text(None),
                 reads_text,
@@ -10089,8 +10112,7 @@ pub(crate) mod tests {
                 settings.routing_key_override.clone(),
             );
             let document = settings.policy_document().expect("the settings' document");
-            let spec = AppliedSpec::validate(&document);
-            engine_on(&policies, spec.expect("a valid document"));
+            lending_engine_on(&policies, &document, &registry);
             let went_back = metrics::with_local_recorder(&recorder, || {
                 let first = pick(&registry, &policies, inputs);
                 pick(&registry, &policies, inputs).url() == first.url()

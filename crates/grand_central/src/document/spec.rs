@@ -254,10 +254,10 @@ pub struct Needs {
     /// KV events into an index. A stage that declares this beside
     /// `token_hashes` reads the request's holders from the index. For its
     /// profile a host names a single request of token ids by the index
-    /// alone where the model's index holds a block, and every other
-    /// request's holders in the index ahead of the record's. A stage that
-    /// reads the events for another fact of a row, as a warm-up does,
-    /// declares no hashes beside it.
+    /// alone where the model's index holds a block, and keeps the index's
+    /// holders for every other request. A stage that reads the events for
+    /// another fact of a row, as a warm-up does, declares no hashes beside
+    /// it.
     pub events: bool,
     /// The stage reads the prefixes sent to each worker. Beside a stage of
     /// its profile that reads a request's holders from the index, it is

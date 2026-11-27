@@ -31,19 +31,16 @@ use tokio::{
 };
 
 use super::{Follow, Members};
-use crate::{
-    document::spec::{AppliedSpec, PolicySpec},
-    engine::{
-        decision_engine::DecisionEngine,
-        in_process::{
-            single::tests::{decided, hearing, pool, request, Asks, Heard},
-            InProcess,
-        },
-        list_cell::PublishedList,
-        prompt_hashes::HashSeeds,
-        records::worker_id,
-        view::{FixedFacts, WorkerId},
+use crate::engine::{
+    decision_engine::DecisionEngine,
+    in_process::{
+        single::tests::{decided, hearing, pool, request, whole_cache_aware, Asks, Heard},
+        InProcess,
     },
+    list_cell::PublishedList,
+    prompt_hashes::HashSeeds,
+    records::worker_id,
+    view::{FixedFacts, WorkerId},
 };
 
 pub(in crate::engine::in_process) mod fills;
@@ -825,10 +822,8 @@ fn a_worker_given_another_id_leaves_the_id_it_shared_standing() {
 /// holds.
 #[test]
 fn a_join_and_a_leave_of_the_follow_forget_the_ids_sent_prefixes() {
-    let mut document = PolicySpec::preset("cache_aware").expect("a built-in preset");
-    document.generation = 1;
-    let spec = AppliedSpec::validate(&document).expect("the document validates");
-    let engine = InProcess::new(spec);
+    // The profile is handed its column whole: its decisions read the records.
+    let engine = InProcess::new(whole_cache_aware(1));
     let registry = registry(0);
     engine.set_registry(handed(&registry));
     let mut follow = started(&engine).expect("a registry was handed");
@@ -877,10 +872,8 @@ fn a_join_and_a_leave_of_the_follow_forget_the_ids_sent_prefixes() {
 /// what it was sent.
 #[test]
 fn a_whole_read_forgets_the_sent_prefixes_of_an_id_that_stands_no_more() {
-    let mut document = PolicySpec::preset("cache_aware").expect("a built-in preset");
-    document.generation = 1;
-    let spec = AppliedSpec::validate(&document).expect("the document validates");
-    let engine = InProcess::new(spec);
+    // The profile is handed its column whole: its decisions read the records.
+    let engine = InProcess::new(whole_cache_aware(1));
     let registry = registry(0);
     engine.set_registry(handed(&registry));
     let mut follow = started(&engine).expect("a registry was handed");
@@ -932,10 +925,8 @@ fn a_whole_read_forgets_the_sent_prefixes_of_an_id_that_stands_no_more() {
 /// workers by their addresses, whatever the registry holds.
 #[test]
 fn a_replacement_that_takes_a_model_forgets_the_workers_sent_prefixes() {
-    let mut document = PolicySpec::preset("cache_aware").expect("a built-in preset");
-    document.generation = 1;
-    let spec = AppliedSpec::validate(&document).expect("the document validates");
-    let engine = InProcess::new(spec);
+    // The profile is handed its column whole: its decisions read the records.
+    let engine = InProcess::new(whole_cache_aware(1));
     let registry = registry(8);
     engine.set_registry(handed(&registry));
     let mut follow = started(&engine).expect("a registry was handed");
@@ -1011,10 +1002,8 @@ fn a_replacement_that_takes_a_model_forgets_the_workers_sent_prefixes() {
 /// list is published again and no request follows.
 #[tokio::test(start_paused = true)]
 async fn a_record_leaves_once_no_worker_states_its_model() {
-    let mut document = PolicySpec::preset("cache_aware").expect("a built-in preset");
-    document.generation = 1;
-    let spec = AppliedSpec::validate(&document).expect("the document validates");
-    let engine = Arc::new(InProcess::new(spec));
+    // The profile is handed its column whole: its decisions read the records.
+    let engine = Arc::new(InProcess::new(whole_cache_aware(1)));
     let registry = registry(2);
     engine.set_registry(handed(&registry));
     let task = running(&engine);
@@ -1072,10 +1061,8 @@ async fn a_record_leaves_once_no_worker_states_its_model() {
 #[tokio::test(start_paused = true)]
 async fn a_record_of_a_model_listed_behind_the_first_stays() {
     const SHARED: &str = "model-s";
-    let mut document = PolicySpec::preset("cache_aware").expect("a built-in preset");
-    document.generation = 1;
-    let spec = AppliedSpec::validate(&document).expect("the document validates");
-    let engine = Arc::new(InProcess::new(spec));
+    // The profile is handed its column whole: its decisions read the records.
+    let engine = Arc::new(InProcess::new(whole_cache_aware(1)));
     let registry = registry(2);
     engine.set_registry(handed(&registry));
     let task = running(&engine);
@@ -1141,10 +1128,8 @@ fn the_registry_is_asked_once_of_a_listed_model_no_list_holds() {
         }
     }
     const SHARED: &str = "model-s";
-    let mut document = PolicySpec::preset("cache_aware").expect("a built-in preset");
-    document.generation = 1;
-    let spec = AppliedSpec::validate(&document).expect("the document validates");
-    let engine = InProcess::new(spec);
+    // The profile is handed its column whole: its decisions read the records.
+    let engine = InProcess::new(whole_cache_aware(1));
     let registry = registry(2);
     let host = Arc::new(Counting {
         registry: Arc::clone(&registry),

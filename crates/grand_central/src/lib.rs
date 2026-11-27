@@ -35,8 +35,10 @@
 //!   scorer owns its ring ([`policies::consistent_hashing`]), fed by the
 //!   membership hooks. The
 //!   prefixes sent to a model's workers without cache events are kept by
-//!   the sent-prefix predictor ([`tracking`]). A profile that reads sent
-//!   prefixes reads that record at the naming.
+//!   the sent-prefix predictor ([`tracking`]) for the decisions that read
+//!   a column: each side of a pair, and a single decision handed its
+//!   column whole. A profile that reads sent prefixes reads that record
+//!   where its column is filled. A decision named its rows reads none.
 //! - 4.5, the stages in code ([`stages`]): the [`StageRegistry`] of the stages
 //!   a build knows by name, the stock build's and the ones a host registers. A
 //!   document names either kind the same way, and the validator resolves every
