@@ -10,6 +10,17 @@ fn tokenizer() -> Arc<dyn Tokenizer> {
 }
 
 #[test]
+fn a_direct_chat_refuses_an_unenforceable_or_invalid_budget() {
+    for budget in [0, -2] {
+        let body = json!({"model":"m","messages":[], "thinking_token_budget":budget});
+        assert!(matches!(
+            prepare_chat(&body.to_string(), tokenizer().as_ref()),
+            Err((SglErrorCode::InvalidArgument, _))
+        ));
+    }
+}
+
+#[test]
 fn the_fingerprint_is_the_reported_version_or_the_gateways_default() {
     assert_eq!(fingerprint_of(Some("v7")), "v7");
     assert_eq!(fingerprint_of(Some(" v7 ")), "v7");
