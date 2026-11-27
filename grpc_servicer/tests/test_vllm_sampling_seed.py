@@ -158,3 +158,5 @@ async def test_generate_refuses_unsupported_thinking_budget_before_submit(
         "thinking_token_budget is unsupported by the configured vLLM sampler",
     )
     engine.generate.assert_not_called()
+    servicer._loads.submitted.assert_not_called()
+    servicer._loads.finished.assert_not_called()

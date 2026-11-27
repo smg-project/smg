@@ -277,16 +277,6 @@ async fn submit(
             "This model does not support generation",
         ));
     }
-    if !state.model.supports_thinking_token_budget
-        && req
-            .sampling_params
-            .as_ref()
-            .is_some_and(|params| params.thinking_token_budget.is_some())
-    {
-        return Err(Status::invalid_argument(
-            "thinking_token_budget is unsupported by the configured vLLM sampler",
-        ));
-    }
     // An encode-prefill-decode request (the encoder's with the consumer's
     // destination, or the prefill side's with the encoder's handles) rides
     // the engine's encoder-cache connector, which the launcher reports off
@@ -331,6 +321,16 @@ async fn submit(
                     notice.disarm();
                 }
             })?;
+    if !state.model.supports_thinking_token_budget
+        && req
+            .sampling_params
+            .as_ref()
+            .is_some_and(|params| params.thinking_token_budget.is_some())
+    {
+        return Err(Status::invalid_argument(
+            "thinking_token_budget is unsupported by the configured vLLM sampler",
+        ));
+    }
     // Refuse a bad salt before the media stage fetches anything, and after
     // the registry, which keeps a live id from getting a notice. The adapter
     // checks the salt again for its direct-ZMQ lane.

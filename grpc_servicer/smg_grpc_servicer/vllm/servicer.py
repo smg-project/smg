@@ -773,7 +773,8 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             )
             await context.abort(code, str(e))
         finally:
-            self._loads.finished(request_id)
+            if handed_to_engine:
+                self._loads.finished(request_id)
 
     async def _notify_kv_transfer_rejected(
         self,

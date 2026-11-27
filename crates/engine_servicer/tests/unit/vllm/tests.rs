@@ -2111,12 +2111,20 @@ async fn duplicate_in_flight_request_ids_are_refused() {
         .expect("generate")
         .into_inner();
     recv_add(&mut h.engine_in).await;
-    let status = h
-        .client
-        .generate(generate_request("r5", true, Vec::new()))
-        .await
-        .expect_err("duplicate id");
-    assert_eq!(status.code(), Code::AlreadyExists);
+    for budget in [None, Some(0)] {
+        let mut duplicate = generate_request("r5", true, Vec::new());
+        duplicate
+            .sampling_params
+            .as_mut()
+            .unwrap()
+            .thinking_token_budget = budget;
+        let status = h
+            .client
+            .generate(duplicate)
+            .await
+            .expect_err("duplicate id");
+        assert_eq!(status.code(), Code::AlreadyExists);
+    }
     drop(stream);
     assert_eq!(recv_abort(&mut h.engine_in).await, vec!["r5".to_string()]);
 }
