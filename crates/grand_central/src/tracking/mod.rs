@@ -11,6 +11,7 @@ pub(crate) mod placement;
 #[cfg(feature = "in-process")]
 pub(crate) mod placement_side;
 pub(crate) mod prefix_predictor;
+pub(crate) mod rank_credit;
 
 pub use decision_guard::DecisionGuard;
 pub use dispatch_credit::{CreditedDispatches, DispatchCounts, DispatchCredit, DispatchCreditPass};

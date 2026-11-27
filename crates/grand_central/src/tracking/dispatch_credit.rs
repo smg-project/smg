@@ -9,8 +9,10 @@ use arc_swap::Guard;
 
 use crate::{
     engine::{Candidate, RequestFacts, Target},
-    stages::scorers::{Credits, RankTable, SentCredit},
-    tracking::{Lease, Membership, Side},
+    tracking::{
+        rank_credit::{Credits, RankTable, SentCredit},
+        Lease, Membership, Side,
+    },
 };
 
 /// What the deciding host sent a row that no report of the row reflects.
