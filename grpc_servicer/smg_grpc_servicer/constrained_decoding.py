@@ -159,6 +159,32 @@ def sglang_grammar_backend(server_args: Any) -> str:
     return str(backend or SGLANG_DEFAULT_GRAMMAR_BACKEND)
 
 
+def sglang_supports_thinking_budget(server_args: Any, tokenizer: Any) -> bool:
+    """Whether SGLang installs a reasoner grammar with a live token filter.
+
+    The scheduler initializes the filter from its parser's excluded tokens or
+    the server-wide limit. A per-request value alone cannot activate it.
+    """
+    parser_name = engine_reasoning_parser(server_args)
+    if (
+        not parser_name
+        or tokenizer is None
+        or _resolved_argument(server_args, "enable_strict_thinking") is not True
+        or sglang_grammar_backend(server_args) != "xgrammar"
+    ):
+        return False
+
+    from sglang.srt.environ import envs
+    from sglang.srt.parser.reasoning_parser import ReasoningParser
+
+    detector = ReasoningParser(
+        model_type=parser_name, stream_reasoning=False, tokenizer=tokenizer
+    ).detector
+    return bool(detector.get_think_end_token_ids(tokenizer)) and (
+        bool(detector.think_excluded_tokens) or envs.SGLANG_MAX_THINK_TOKENS.get() >= 0
+    )
+
+
 def tokenspeed_grammar_backend(server_args: Any) -> str:
     """The grammar backend TokenSpeed's scheduler runs, as its server arguments
     resolve it: ``--grammar-backend`` when given (``xgrammar`` or ``none``);

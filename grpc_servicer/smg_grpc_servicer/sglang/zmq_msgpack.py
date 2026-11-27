@@ -52,6 +52,7 @@ from typing import TYPE_CHECKING, Any
 import msgspec
 import zmq
 
+from smg_grpc_servicer.constrained_decoding import sglang_supports_thinking_budget
 from smg_grpc_servicer.sglang.compat import SchedulerOutputAdapter
 from smg_grpc_servicer.sglang.config_view import EngineConfigView, v41_vision
 from smg_grpc_servicer.sglang.hidden_states import new_hidden_rows
@@ -163,6 +164,7 @@ class WireEngineCoreReadyResponse(msgspec.Struct):
     # tensor of 32 KiB or more that way to a scheduler that declares it, and
     # inline to one that does not (an older plugin, which reads no such key).
     tensor_aux_frames: bool = True
+    supports_thinking_token_budget: bool = False
     # A served DeepSeek-V4.1 model's patch size and downsample ratio, off the
     # model config this scheduler loads from its server arguments, as its
     # model's is loaded (model overrides applied): SMG checks a V4.1 image
@@ -1297,6 +1299,9 @@ def ready_response_for_scheduler(scheduler: Scheduler) -> WireEngineCoreReadyRes
     vision_patch_size, vision_downsample_ratio = vision or (None, None)
     return WireEngineCoreReadyResponse(
         max_model_len=int(scheduler.model_config.context_len),
+        supports_thinking_token_budget=sglang_supports_thinking_budget(
+            args, getattr(scheduler, "tokenizer", None)
+        ),
         num_gpu_blocks=max_total // page_size,
         block_size=page_size,
         dtype=wire_dtype(scheduler.model_config.dtype),
