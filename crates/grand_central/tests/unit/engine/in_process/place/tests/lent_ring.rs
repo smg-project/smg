@@ -198,6 +198,23 @@ fn a_lender_that_places_no_head_lends_no_ring_under_the_prefix_form() {
     }
 }
 
+/// The `prefix_hash` preset over a view of `boundaries`, whose binding
+/// reads a client's value too, from the header `x-client`.
+fn prefixed(boundaries: &[u32]) -> InProcess {
+    let mut document = PolicySpec::preset("prefix_hash").expect("a built-in preset");
+    document.view.boundaries = boundaries.to_vec();
+    let header = |name: &str, client| KeySourceSpec {
+        header: Some(name.to_owned()),
+        client,
+        ..KeySourceSpec::default()
+    };
+    document.bindings[0].routing_key = Some(RoutingKeySpec {
+        sources: vec![header("x-smg-routing-key", false), header("x-client", true)],
+        strip_lineage: false,
+    });
+    engine_of(&document)
+}
+
 /// Under the prefix form a request through the one call states where its
 /// lender puts each of its heads, the deepest first: a head at each of the
 /// view's boundaries the prompt reaches, and for a prompt that reaches
@@ -279,33 +296,6 @@ fn a_request_under_the_prefix_form_states_where_its_heads_stand() {
     assert_eq!(stated(None, None, &client), [0_u64; 0]);
 }
 
-/// The `prefix_hash` preset over a view of `boundaries`, whose binding
-/// reads a routing value from the header `x-smg-routing-key` and then from
-/// the request's own id, the turn and retry suffixes off: the sources a
-/// gateway's sticky override names. The view lists the header, so its
-/// value leaves in the clear as the id's does. `rule` is the binding's
-/// sessions rule.
-fn prefixed_by_id(boundaries: &[u32], rule: Option<SessionsSpec>) -> InProcess {
-    let mut document = PolicySpec::preset("prefix_hash").expect("a built-in preset");
-    document.view.boundaries = boundaries.to_vec();
-    document.view.headers.push("x-smg-routing-key".to_owned());
-    let header = KeySourceSpec {
-        header: Some("x-smg-routing-key".to_owned()),
-        ..KeySourceSpec::default()
-    };
-    let rid = KeySourceSpec {
-        rid: true,
-        ..KeySourceSpec::default()
-    };
-    let binding = &mut document.bindings[0];
-    binding.routing_key = Some(RoutingKeySpec {
-        sources: vec![header, rid],
-        strip_lineage: true,
-    });
-    binding.sessions = rule;
-    engine_of(&document)
-}
-
 /// Under the prefix form a routing value leads the prompt only where a
 /// header handed it. The gateway's own policy hashes a header's value
 /// (`model_gateway/src/policies/prefix_hash.rs:358`) and places every other
@@ -367,57 +357,6 @@ fn a_value_the_requests_own_id_handed_leads_no_prompt_under_the_prefix_form() {
         assert_eq!((led.1, led.2.as_deref()), (false, Some("conv-1")));
     }
     assert_ne!(heads[0], at(Head::Text("conv-1")), "two places");
-}
-
-/// A sessions rule pins the value the request's own id handed, as it pins
-/// a header's: the key's next request follows the pin, whatever its
-/// prompt. The ring placed the key's first request by its prompt, where a
-/// request of that prompt with no value lands, and another id's request of
-/// the second prompt lands on that prompt's worker.
-#[test]
-fn a_sessions_rule_pins_the_value_the_requests_own_id_handed() {
-    let rule = SessionsSpec {
-        sticky_header: String::new(),
-        assignment: Assignment::Delegate,
-        recovery: Recovery::Latest,
-        ..PolicySpec::preset("manual")
-            .expect("a built-in preset")
-            .bindings
-            .remove(0)
-            .sessions
-            .expect("the manual preset's rule")
-    };
-    let engine = hosted(prefixed_by_id(&[], Some(rule)));
-    let list = pool(8);
-    let members = PublishedList::new(Arc::clone(&list));
-    let went = |tokens: &[u32], id: Option<&str>| {
-        let request = PlaceRequest {
-            prompt: Prompt {
-                tokens: Some(tokens),
-                ..Prompt::NONE
-            },
-            request_id: id,
-            ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
-        };
-        let placement = engine.place(&request).expect("a placement");
-        let worker = |held: &Arc<dyn Worker>| Arc::ptr_eq(held, &placement.worker);
-        list.iter().position(worker).expect("a worker of the list")
-    };
-    let prompt = |from: u32| (from..from + 256).collect::<Vec<u32>>();
-    let first = prompt(500);
-    let home = went(&first, None);
-    // A second prompt whose worker is another.
-    let (second, other) = (1..)
-        .map(|n| prompt(n * 1000))
-        .map(|tokens| {
-            let worker = went(&tokens, None);
-            (tokens, worker)
-        })
-        .find(|&(_, worker)| worker != home)
-        .expect("a prompt with another worker");
-    assert_eq!(went(&first, Some("conv-1_t1")), home, "by its prompt");
-    assert_eq!(went(&second, Some("conv-1_t2")), home, "by its pin");
-    assert_eq!(went(&second, Some("conv-2_t1")), other, "another id");
 }
 
 /// A prompt that reaches more boundaries than its list of places holds in

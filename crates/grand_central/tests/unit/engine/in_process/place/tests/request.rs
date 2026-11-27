@@ -725,6 +725,57 @@ fn the_output_limit_a_caller_states_reserves_room_under_the_documents_rule() {
     assert_eq!(placed_at(501), Some(1));
 }
 
+/// A sessions rule pins the value the request's own id handed, as it pins
+/// a header's: the key's next request follows the pin, whatever its
+/// prompt. The ring placed the key's first request by its prompt, where a
+/// request of that prompt with no value lands, and another id's request of
+/// the second prompt lands on that prompt's worker.
+#[test]
+fn a_sessions_rule_pins_the_value_the_requests_own_id_handed() {
+    let rule = SessionsSpec {
+        sticky_header: String::new(),
+        assignment: Assignment::Delegate,
+        recovery: Recovery::Latest,
+        ..PolicySpec::preset("manual")
+            .expect("a built-in preset")
+            .bindings
+            .remove(0)
+            .sessions
+            .expect("the manual preset's rule")
+    };
+    let engine = hosted(prefixed_by_id(&[], Some(rule)));
+    let list = pool(8);
+    let members = PublishedList::new(Arc::clone(&list));
+    let went = |tokens: &[u32], id: Option<&str>| {
+        let request = PlaceRequest {
+            prompt: Prompt {
+                tokens: Some(tokens),
+                ..Prompt::NONE
+            },
+            request_id: id,
+            ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
+        };
+        let placement = engine.place(&request).expect("a placement");
+        let worker = |held: &Arc<dyn Worker>| Arc::ptr_eq(held, &placement.worker);
+        list.iter().position(worker).expect("a worker of the list")
+    };
+    let prompt = |from: u32| (from..from + 256).collect::<Vec<u32>>();
+    let first = prompt(500);
+    let home = went(&first, None);
+    // A second prompt whose worker is another.
+    let (second, other) = (1..)
+        .map(|n| prompt(n * 1000))
+        .map(|tokens| {
+            let worker = went(&tokens, None);
+            (tokens, worker)
+        })
+        .find(|&(_, worker)| worker != home)
+        .expect("a prompt with another worker");
+    assert_eq!(went(&first, Some("conv-1_t1")), home, "by its prompt");
+    assert_eq!(went(&second, Some("conv-1_t2")), home, "by its pin");
+    assert_eq!(went(&second, Some("conv-2_t1")), other, "another id");
+}
+
 /// A filter of the host's own. It keeps a worker for a request that is
 /// shown `blue` in the second header of the document's view and nothing
 /// else, and for no other request.
