@@ -49,6 +49,7 @@ use smg_mesh::{
     ClusterState, MeshServer, MeshServerBuilder, MeshServerConfig, MeshServerHandler,
     PreparedMeshServer,
 };
+use smg_worker::metrics::series as worker_series;
 use tokio::{signal, spawn};
 use tracing::{debug, error, info, warn, Level};
 use wfaas::LoggingSubscriber;
@@ -973,7 +974,8 @@ async fn get_worker(
 
 /// `GET /workers/{worker_id}/server_info`: the server info answer of that
 /// worker's engine as a JSON object ([`server_info::answer`]); `501` where
-/// the engine is not asked or sends no answer. Under the control-plane
+/// the engine is not asked or does not offer the call, `504` where it sends
+/// no answer in time, `502` where the call fails. Under the control-plane
 /// check the `admin` role alone reads it ([`ADMIN_ONLY_READS`]). An id
 /// `GET /workers/{worker_id}` refuses is refused as there. An id that
 /// answers there with no registered worker of its own (a registration in
@@ -2041,8 +2043,9 @@ async fn start_workflow_engines(
         info!("Startup tokenizer job submitted (will complete in background)");
     }
 
-    // A worker that no workflow registers here (a mesh peer's) gets its
-    // model's tokenizer job from the registry's events.
+    // A worker that no workflow registers or removes here (a mesh peer's)
+    // gets its model's tokenizer job and the close of its pooled encode
+    // connections from the registry's events.
     spawn_worker_event_reactions(app_context);
 
     info!(
@@ -2564,6 +2567,15 @@ pub async fn startup_with(
     // before a fatal configuration error.
     let metrics_handle = config.prometheus_config.as_ref().map(|prometheus_config| {
         let handle = metrics::start_prometheus(prometheus_config.clone());
+        // This start hands the handle to its own metrics listener and to
+        // nothing else, and that listener's scrape appends the per-worker
+        // store's text to the exporter's: the histogram families record in
+        // the store's fixed cells, from the first series on.
+        if worker_series::keep_histograms() {
+            debug!("Histogram families record in the per-worker series store's cells");
+        } else {
+            warn!("Histogram families stay with the exporter: one registered there first");
+        }
         metrics::init_startup_series();
         // Under Symphony the series of a request no table reads exist at zero
         // from the start; a table's own follow its model's first registration.

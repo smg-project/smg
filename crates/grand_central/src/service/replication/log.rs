@@ -98,13 +98,6 @@ pub enum NotLeading {
 #[derive(Debug, Default)]
 pub struct ReadStamp(Option<u64>);
 
-#[cfg(test)]
-thread_local! {
-    /// How many times this thread searched the ring ([`Kept::until`]): a
-    /// case reads it to count the searches of one read.
-    static SEARCHES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-}
-
 /// The ring: the retained events, oldest first.
 struct Kept {
     events: VecDeque<Entry>,
@@ -145,8 +138,9 @@ impl Kept {
     /// ([`first_after`]). A reader stands near the head, and its search
     /// takes steps by its distance from there, not by the ring's size.
     fn until(&self, seq: u64) -> usize {
+        // A case's count of searches: only this function sees every one.
         #[cfg(test)]
-        SEARCHES.with(|searches| searches.set(searches.get() + 1));
+        tests::SEARCHES.with(|searches| searches.set(searches.get() + 1));
         first_after(self.events.len(), |index| {
             self.events
                 .get(index)
@@ -905,6 +899,15 @@ impl Journal for Log {
         row: Option<&WorkerRow>,
         left: Option<&WorkerRow>,
     ) -> bool {
+        // A status has its own call and its own kind of entry. Taken
+        // here as a membership write, it would be kept where such a write
+        // is kept, as an entry with no wire form: no watch is told such
+        // an entry, and a standby that is sent one stops. So the log
+        // takes none: nothing is appended, no applier's hold ends, and
+        // the answer is no.
+        if matches!(change, MembershipChange::StatusChanged { .. }) {
+            return false;
+        }
         // The rows are copied before the log's lock is taken.
         let copy = |row: &WorkerRow| Arc::new(row.clone());
         self.push(

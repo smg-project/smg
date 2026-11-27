@@ -33,7 +33,9 @@ use super::{
 };
 use crate::{
     middleware::RequestStarted,
-    observability::metrics::{test_support::render_with_recorder, DISPATCH_WAIT_SECONDS},
+    observability::metrics::{
+        test_support::render_with_recorder, DISPATCH_WAIT_AFTER_BODY_SECONDS, DISPATCH_WAIT_SECONDS,
+    },
     routers::grpc::{
         common::responses::streaming::ResponseStreamEventEmitter,
         context::ExecutionResult,
@@ -910,4 +912,100 @@ fn a_collected_answer_outside_an_entry_stamp_records_no_dispatch_wait() {
         None,
         "{rendered}"
     );
+}
+
+/// How long before its dispatch a case's request body had been read whole.
+const WAIT_AFTER_BODY: Duration = Duration::from_millis(15);
+
+/// The stamp of [`entered_before`] whose body's read waited for the client
+/// until `WAIT_AFTER_BODY` before the dispatch: the upload wait is the rest
+/// of the dispatch wait, to the nanosecond.
+fn entered_and_read_before(dispatched: Instant) -> RequestStarted {
+    entered_before(dispatched).with_upload_wait(DISPATCH_WAIT - WAIT_AFTER_BODY)
+}
+
+/// The chat answer's two waits: each family holds one record under one
+/// label set, the dispatch wait from the entry stamp and that wait less
+/// the upload wait, `after_body`.
+fn assert_both_waits(rendered: &str, route: &str, after_body: Duration) {
+    let label = format!("endpoint=\"{}\"", metrics_labels::ENDPOINT_CHAT);
+    for (family, expected) in [
+        (DISPATCH_WAIT_SECONDS, DISPATCH_WAIT),
+        (DISPATCH_WAIT_AFTER_BODY_SECONDS, after_body),
+    ] {
+        assert_eq!(
+            sample(rendered, family, "count", &label),
+            Some(1.0),
+            "{route}: one record of {family}; rendered:\n{rendered}"
+        );
+        let wait = sample(rendered, family, "sum", &label).unwrap_or(f64::NAN);
+        assert!(
+            (wait - expected.as_secs_f64()).abs() < 1e-9,
+            "{route}: {family} reads {wait} s, not {expected:?}"
+        );
+    }
+    assert_eq!(
+        count_labels(rendered, DISPATCH_WAIT_AFTER_BODY_SECONDS, &label),
+        count_labels(rendered, DISPATCH_WAIT_SECONDS, &label),
+        "{route}: the two families carry one label set"
+    );
+}
+
+/// A chat stream of `result` read to its end under the stamp `entered`.
+async fn streamed_chat(result: ExecutionResult, entered: RequestStarted) {
+    let response = Arc::new(processor(false))
+        .process_streaming_response(
+            result,
+            ChatResponseSpec::from(&chat_request()),
+            dispatch(),
+            Arc::new(CharacterTokenizer::default()),
+            false,
+            None,
+            None,
+            source(metrics_labels::ENDPOINT_CHAT),
+        )
+        .entered(entered)
+        .await;
+    read_to_end(response).await;
+}
+
+/// A streamed answer whose request's body waited for the client records
+/// both waits: the dispatch wait from the entry stamp, as before, and
+/// beside it the wait without the upload, shorter by what the read of the
+/// body waited.
+#[test]
+fn a_stream_records_its_wait_after_the_body_beside_its_dispatch_wait() {
+    let rendered = render_after(|| async {
+        let (result, servers) = single_result(text_frames()).await;
+        let entered = entered_and_read_before(dispatched_at(&result));
+        streamed_chat(result, entered).await;
+        servers
+    });
+    assert_both_waits(&rendered, "single chat", WAIT_AFTER_BODY);
+}
+
+/// A collected answer records the two waits as a streamed one does.
+#[test]
+fn a_collected_answer_records_its_wait_after_the_body_beside_its_dispatch_wait() {
+    let rendered = render_after(|| async {
+        let (result, servers) = single_result(text_frames()).await;
+        let entered = entered_and_read_before(dispatched_at(&result));
+        collected_chat(result).entered(entered).await;
+        servers
+    });
+    assert_both_waits(&rendered, "single collected chat", WAIT_AFTER_BODY);
+}
+
+/// Under a stamp no reader added an upload wait to (a request with no body
+/// or a body that came whole, a later turn of a tool loop), the wait
+/// without the upload reads what the dispatch wait reads.
+#[test]
+fn a_stamp_with_no_upload_wait_reads_the_same_in_both_waits() {
+    let rendered = render_after(|| async {
+        let (result, servers) = single_result(text_frames()).await;
+        let entered = entered_before(dispatched_at(&result));
+        streamed_chat(result, entered).await;
+        servers
+    });
+    assert_both_waits(&rendered, "single chat, no body end", DISPATCH_WAIT);
 }

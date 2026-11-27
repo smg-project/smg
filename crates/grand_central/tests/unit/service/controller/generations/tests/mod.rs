@@ -8,7 +8,6 @@ mod rollback;
 mod start;
 
 use std::{
-    cell::Cell,
     path::Path,
     thread,
     time::{Duration, Instant},
@@ -61,22 +60,6 @@ impl Generations {
     pub(in crate::service::controller) fn source_writes(&self) -> bool {
         self.lead().is_some()
     }
-}
-
-thread_local! {
-    static REPLICA_NOTICES: Cell<Option<u32>> = const { Cell::new(None) };
-}
-
-pub(super) fn count_replica_notice(door: &Generations, holds_document: bool) {
-    REPLICA_NOTICES.with(|notices| {
-        let Some(count) = notices.get() else {
-            return;
-        };
-        assert!(door.applying_lock().try_lock().is_none());
-        assert_eq!(door.held_lock().try_lock().is_none(), holds_document);
-        assert_eq!(door.generation(), u64::from(holds_document));
-        notices.set(Some(count + 1));
-    });
 }
 
 fn generations() -> (Arc<MemoryStore>, Generations) {

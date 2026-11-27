@@ -1,7 +1,8 @@
 use std::{
+    cell::RefCell,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Barrier,
+        Arc, Barrier, Mutex,
     },
     thread,
 };
@@ -259,34 +260,132 @@ fn a_call_builds_a_rows_object_at_its_write_and_its_status_follows() {
     assert_eq!(told(), ["registered", "status"]);
 }
 
+/// The door's log as its store's journal, for a case that stands behind
+/// a membership write. It hands every call on and keeps each membership
+/// change it is told. At the first release behind one it runs the hook
+/// the case armed, once.
+struct BehindAMembershipWrite {
+    log: Arc<replication::Log>,
+    /// The membership changes told since the case last took them.
+    told: Mutex<Vec<store::MembershipChange>>,
+    /// Whether a membership change was told and its release has not come.
+    owed: AtomicBool,
+}
+
+thread_local! {
+    /// What [`BehindAMembershipWrite`] runs on this thread at the first
+    /// release behind a membership change.
+    static BEHIND: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+}
+
+impl store::Journal for BehindAMembershipWrite {
+    fn member(
+        &self,
+        at: Option<Position>,
+        term: Option<u64>,
+        epoch: u64,
+        change: store::MembershipChange,
+        row: Option<&WorkerRow>,
+        left: Option<&WorkerRow>,
+    ) -> bool {
+        let goes_on = self.log.member(at, term, epoch, change, row, left);
+        self.told.lock().expect("the case's own lock").push(change);
+        self.owed.store(true, Ordering::Relaxed);
+        goes_on
+    }
+
+    fn status(
+        &self,
+        at: Option<Position>,
+        term: Option<u64>,
+        epoch: u64,
+        id: WorkerId,
+        from: WorkerStatus,
+        to: WorkerStatus,
+        models: Arc<[String]>,
+    ) -> bool {
+        self.log.status(at, term, epoch, id, from, to, models)
+    }
+
+    fn generation(&self, at: Option<Position>, generation: u64) {
+        self.log.generation(at, generation);
+    }
+
+    fn term_rose(&self, term: u64) {
+        self.log.term_rose(term);
+    }
+
+    fn term_followed(&self, at: Position) {
+        self.log.term_followed(at);
+    }
+
+    fn head(&self) -> Position {
+        self.log.head()
+    }
+
+    fn followed(&self) -> Option<u64> {
+        self.log.followed()
+    }
+
+    fn released(&self) {
+        self.log.released();
+        if self.owed.swap(false, Ordering::Relaxed) {
+            let hook = BEHIND.with(|held| held.borrow_mut().take());
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+    }
+
+    fn restart(&self, at: Position) -> bool {
+        self.log.restart(at).is_ok()
+    }
+}
+
 /// A door's patch and removal are decided over the worker objects, as
-/// its registration is: each runs the store's one body,
-/// and a removal's object has
-/// left the registry when the store hears of it. So it is for a control
-/// call and for a removal by the replica's own writer.
+/// its registration is: each runs the store's one body, and a removal's
+/// object has left the registry when the store hears of it. So it is for
+/// a control call and for a removal by the replica's own writer.
+///
+/// The store's journal is the witness. The one body alone tells it a
+/// membership change, so one change told with the release behind it is
+/// that body's run: one for the patch and one for each removal. A patch's
+/// call takes the write's hold a second time, for its object's status.
+/// That hold tells no membership change, so the case does not count it.
 #[test]
 fn a_doors_patch_and_removal_are_decided_over_the_worker_objects() {
     use std::{cell::Cell, rc::Rc};
 
-    use crate::store::memory::seam;
+    use store::MembershipChange::{Relabelled, Removed};
 
-    let (store, feed) = journaled_from(&LeasePlace::Process, 0);
+    let (_, feed) = journaled_from(&LeasePlace::Process, 0);
+    let journal = Arc::new(BehindAMembershipWrite {
+        log: Arc::clone(&feed.log),
+        told: Mutex::default(),
+        owed: AtomicBool::new(false),
+    });
+    let handed = Arc::clone(&journal);
+    let store = Arc::new(MemoryStore::journaled(handed).with_decision_slots(1));
     store::LeasesStore::set_term(store.as_ref(), TERM);
     let objects = holder(&store);
     let calls = MembershipCalls::based(Arc::clone(&store), feed.log, 0, Arc::clone(&objects));
     let door = Arc::new(calls);
-    // Whether `write` ran the one body, with the object of the row
-    // `gone` out of the registry by then.
+    // The membership changes `write` told the journal, and whether the
+    // first release behind one came with the object of the row `gone`
+    // out of the registry.
     let decided = |gone: Option<WorkerId>, write: &dyn Fn()| {
         let ran = Rc::new(Cell::new(false));
-        let (told, objects) = (Rc::clone(&ran), Arc::clone(&objects));
-        seam::on_release(move || {
+        let (released, objects) = (Rc::clone(&ran), Arc::clone(&objects));
+        let told = || std::mem::take(&mut *journal.told.lock().expect("the case's own lock"));
+        // What was told ahead of `write` is another call's.
+        drop(told());
+        BEHIND.set(Some(Box::new(move || {
             let stands = gone.and_then(|gone| objects.object(gone));
             assert_eq!(stands, None, "the object leaves first");
-            told.set(true);
-        });
+            released.set(true);
+        })));
         write();
-        ran.get()
+        (told(), ran.get())
     };
     door.register(&operator(), under(TERM), &ask(spec(URL), Mode::Add))
         .expect("registered");
@@ -302,7 +401,11 @@ fn a_doors_patch_and_removal_are_decided_over_the_worker_objects() {
         door.patch(&operator(), under(TERM), &patch)
             .expect("patched");
     });
-    assert!(patched, "a patch call");
+    assert_eq!(
+        patched,
+        (vec![Relabelled { id: row.id }], true),
+        "a patch call"
+    );
     let row = store.by_key(URL).expect("the row");
     let leave = proto::DeregisterWorkerRequest {
         worker_id: row.id.0,
@@ -313,7 +416,11 @@ fn a_doors_patch_and_removal_are_decided_over_the_worker_objects() {
         door.deregister(&operator(), under(TERM), &leave)
             .expect("removed");
     });
-    assert!(removed, "a removal call");
+    assert_eq!(
+        removed,
+        (vec![Removed { id: row.id }], true),
+        "a removal call"
+    );
     let hosted = ReplicaMembershipWriter::new(Arc::clone(&door), operator(), under(TERM));
     let maker = found("pods/a");
     hosted
@@ -325,7 +432,11 @@ fn a_doors_patch_and_removal_are_decided_over_the_worker_objects() {
             .gone(Remover::Registrant(&maker), URL, standing(&made))
             .expect("gone");
     });
-    assert!(gone, "a removal by the replica's own writer");
+    assert_eq!(
+        gone,
+        (vec![Removed { id: made.id }], true),
+        "a removal by the replica's own writer"
+    );
 }
 
 #[test]
@@ -2110,6 +2221,38 @@ fn a_providers_write_on_a_replica_that_does_not_lead_is_refused_and_writes_nothi
     assert_eq!(hosted.door.place(), at);
 }
 
+/// A provider's write on the replica that leads is made in the door's
+/// turn: the fence is read and the row's facts are stated while the turn
+/// is held, and the call holds it no more once it answers.
+#[test]
+fn a_providers_write_on_the_replica_that_leads_is_made_in_the_doors_turn() {
+    let (store, door) = door();
+    let door = Arc::new(door);
+    let fenced = Arc::clone(&door);
+    let hosted = ReplicaMembershipWriter::new(Arc::clone(&door), operator(), move || {
+        assert!(fenced.turn.is_locked(), "the fence is read inside the turn");
+        Ok(TERM)
+    });
+    let maker = found("pods/a");
+    let stated = AtomicBool::new(false);
+    hosted
+        .found_one(&maker, URL, &|_| {
+            assert!(
+                door.turn.is_locked(),
+                "the facts are stated inside the turn"
+            );
+            stated.store(true, Ordering::Relaxed);
+            found_facts()
+        })
+        .expect("registered");
+    assert!(
+        stated.load(Ordering::Relaxed),
+        "the write asked for the facts"
+    );
+    assert!(!door.turn.is_locked(), "the call let the turn go");
+    assert!(store.by_key(URL).is_some(), "the row stands");
+}
+
 #[test]
 fn a_providers_registration_numbers_its_life_under_the_term_the_log_leads() {
     use super::{ReplicaTurn, Turn};
@@ -3588,6 +3731,52 @@ fn a_worker_that_reports_pairing_facts_is_laid_with_no_descriptor() {
     assert_eq!(version.map(String::as_str), Some("2"));
 }
 
+/// A registration may state the default's own window in so many words:
+/// its row keeps the number, and the object built from the row waits it.
+/// A refresh reads that object back as its row states it, so it moves the
+/// row's labels, as it does for a row that states another window or none.
+#[test]
+fn a_row_that_states_the_default_window_takes_a_label_refresh() {
+    use smg_worker::worker::HealthCheckConfig;
+
+    let default = u32::try_from(HealthCheckConfig::default().drain_settle_secs)
+        .expect("the default window in a row's width");
+    let (store, door) = door();
+    let door = Arc::new(door);
+    let hosted = ReplicaMembershipWriter::new(Arc::clone(&door), operator(), under(TERM));
+    for (host, window) in [(1, None), (2, Some(default + 40)), (3, Some(default))] {
+        let url = format!("grpc://10.0.1.{host}:8000");
+        let stated = proto::WorkerSpec {
+            drain_settle_secs: window,
+            ..unchecked(&url)
+        };
+        door.register(&operator(), under(TERM), &ask(stated, Mode::Add))
+            .expect("one row");
+        let row = store.by_key(&url).expect("the registered row");
+        assert_eq!(row.facts.drain_settle_secs, window);
+        // What a refresh rebuilt: the row's object under another label.
+        let first = crate::worker_host::object(&row);
+        let relabelled = WorkerRow {
+            facts: WorkerFacts {
+                labels: [("tier".to_owned(), "silver".to_owned())].into(),
+                ..row.facts.clone()
+            },
+            ..row.clone()
+        };
+        let built = crate::worker_host::object(&relabelled);
+        let wrote = hosted.refreshed(standing(&row), &built, &first);
+        assert_eq!(
+            wrote,
+            Ok(MembershipWriteOutcome::InPlace(row.id)),
+            "a row that states {window:?}"
+        );
+        let refreshed = store.by_key(&url).expect("the refreshed row");
+        assert_eq!(refreshed.facts.drain_settle_secs, window);
+        let tier = refreshed.facts.labels.get("tier");
+        assert_eq!(tier.map(String::as_str), Some("silver"));
+    }
+}
+
 #[test]
 fn every_write_of_a_provider_leaves_its_audit_line() {
     let lines = Logged::default();
@@ -3720,11 +3909,18 @@ fn every_write_of_a_provider_leaves_its_audit_line() {
 }
 
 /// A provider's write on a replica that does not lead leaves a refusal's
-/// audit line under the call's own name: the code and the words the fence
-/// answered, and a removal's asker. No line holds the URL or the
-/// provider's key.
+/// audit line under the call's own name: the code and the words that
+/// call's read of the fence answered, and an asker on the drain's line and
+/// on the removal's alone. No line holds the URL or the provider's key.
 #[test]
 fn a_write_refused_where_the_replica_does_not_lead_leaves_its_audit_line() {
+    // What the fence answers at each read, another code or other words
+    // each time: a line carries the code and the words of its own call.
+    const READS: [(Code, &str); 3] = [
+        (Code::FailedPrecondition, "this replica does not lead"),
+        (Code::Unavailable, "the lease of this replica ran out"),
+        (Code::FailedPrecondition, "this replica follows another"),
+    ];
     let lines = Logged::default();
     let writer = lines.clone();
     let subscriber = tracing_subscriber::fmt()
@@ -3735,41 +3931,116 @@ fn a_write_refused_where_the_replica_does_not_lead_leaves_its_audit_line() {
     let _kept = tracing::subscriber::set_default(subscriber);
 
     let (_store, door) = door();
-    let follower = ReplicaMembershipWriter::new(Arc::new(door), operator(), || {
-        Err(Status::failed_precondition("this replica does not lead"))
+    let reads = AtomicUsize::new(0);
+    let follower = ReplicaMembershipWriter::new(Arc::new(door), operator(), move || {
+        let (code, words) = READS[reads.fetch_add(1, Ordering::Relaxed)];
+        Err(Status::new(code, words))
     });
     let key = "private/provider-key";
     let maker = found(key);
-    let refused = Err(MembershipWriteRefused::NotLeading(
-        "this replica does not lead".to_owned(),
-    ));
-    assert_eq!(follower.found_one(&maker, URL, &|_| found_facts()), refused);
+    let refused = |read: usize| {
+        let (_, words) = READS[read];
+        Err(MembershipWriteRefused::NotLeading(words.to_owned()))
+    };
+    assert_eq!(
+        follower.found_one(&maker, URL, &|_| found_facts()),
+        refused(0)
+    );
     let seen = RowRevision {
         row: WorkerId(1),
         revision: 1,
     };
-    assert_eq!(
-        follower.drained(Remover::Provider("cluster"), URL, seen),
-        refused
-    );
+    let by = Remover::Provider("cluster");
+    assert_eq!(follower.drained(by, URL, seen), refused(1));
+    assert_eq!(follower.gone(by, URL, seen), refused(2));
 
     let logged = String::from_utf8(lines.0.lock().clone()).expect("the lines are text");
     let lines: Vec<&str> = logged.lines().collect();
-    let want = [("worker registration", false), ("worker drain", true)];
-    assert_eq!(lines.len(), want.len(), "{logged}");
-    for (line, (call, asked)) in lines.iter().zip(want) {
-        let refusal = format!(
-            "call=\"{call}\" by=operator-a code=FailedPrecondition why=\"this replica does not lead\""
-        );
+    let calls = [
+        ("worker registration", false),
+        ("worker drain", true),
+        ("worker removal", true),
+    ];
+    assert_eq!(lines.len(), calls.len(), "{logged}");
+    for ((line, (call, asked)), (code, words)) in lines.iter().zip(calls).zip(READS) {
+        let refusal = format!("call=\"{call}\" by=operator-a code={code:?} why=\"{words}\"");
         assert!(
             line.contains("membership call refused") && line.contains(&refusal),
             "{line}"
         );
-        assert_eq!(line.contains("asker=\"cluster\""), asked, "{line}");
+        assert_eq!(line.contains("asker="), asked, "{line}");
+        assert!(!asked || line.contains("asker=\"cluster\""), "{line}");
     }
     for private in [URL, key] {
         assert!(!logged.contains(private), "{logged}");
     }
+}
+
+/// A refusal's audit line is written once its call has let the door's
+/// turn go, at both doors: the line of a control call the fence refuses,
+/// of a provider's write the fence refuses, and of a provider's write the
+/// door refuses under a term that leads.
+#[test]
+fn a_refusals_audit_line_is_written_once_the_turn_is_let_go() {
+    let (_store, door) = door();
+    let door = Arc::new(door);
+    let maker = found("pods/a");
+    // The row stands before the lines are kept: a write's own line is
+    // written inside the turn.
+    let leader = ReplicaMembershipWriter::new(Arc::clone(&door), operator(), under(TERM));
+    leader
+        .found_one(&maker, URL, &|_| found_facts())
+        .expect("registered");
+
+    // The lines' writer reads the door's turn as each line reaches it.
+    let lines = Logged::default();
+    let held = Arc::new(AtomicUsize::new(0));
+    let (writer, watched, seen) = (lines.clone(), Arc::clone(&door), Arc::clone(&held));
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(move || {
+            seen.fetch_add(usize::from(watched.turn.is_locked()), Ordering::Relaxed);
+            writer.clone()
+        })
+        .finish();
+    let _beside = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+    let _kept = tracing::subscriber::set_default(subscriber);
+
+    let follows = || -> Result<u64, Status> {
+        Err(Status::failed_precondition("this replica does not lead"))
+    };
+    door.register(&operator(), follows, &ask(spec(URL), Mode::Add))
+        .expect_err("the fence refuses the control call");
+    ReplicaMembershipWriter::new(Arc::clone(&door), operator(), follows)
+        .found_one(&maker, URL, &|_| found_facts())
+        .expect_err("the fence refuses the provider's write");
+    assert_eq!(
+        leader.found(&maker, Precondition::Absent, URL, &|_| found_facts()),
+        Err(MembershipWriteRefused::Stands)
+    );
+
+    // A line a refusal, in the calls' order, each told by its call and
+    // its code.
+    let logged = String::from_utf8(lines.0.lock().clone()).expect("the lines are text");
+    let lines: Vec<&str> = logged.lines().collect();
+    let want = [
+        ("RegisterWorker", "FailedPrecondition"),
+        ("worker registration", "FailedPrecondition"),
+        ("worker registration", "AlreadyExists"),
+    ];
+    assert_eq!(lines.len(), want.len(), "{logged}");
+    for (line, (call, code)) in lines.iter().zip(want) {
+        let refusal = format!("call=\"{call}\" by=operator-a code={code} ");
+        assert!(
+            line.contains("membership call refused") && line.contains(&refusal),
+            "{line}"
+        );
+    }
+    assert_eq!(
+        held.load(Ordering::Relaxed),
+        0,
+        "a line arrived with the turn held: {logged}"
+    );
 }
 
 #[test]

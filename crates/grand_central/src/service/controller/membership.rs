@@ -394,6 +394,41 @@ impl MembershipCalls {
         answer
     }
 
+    /// One call of the replica's own writer ([`ReplicaMembershipWriter`]),
+    /// from `by`: its turn, the term `leading` (the replica's read of the
+    /// fence) tells once the turn is held, and its write under that term.
+    /// A refusal, the fence's or the write's, leaves its audit line once
+    /// the turn is let go, with `asker` where the write was asked for.
+    #[cfg_attr(
+        not(any(test, feature = "discovery")),
+        expect(dead_code, reason = "the replica's own writer makes the call")
+    )]
+    fn writer_call<T>(
+        &self,
+        call: &'static str,
+        by: &Principal,
+        asker: Option<&str>,
+        leading: impl FnOnce() -> Result<u64, Status>,
+        write: impl FnOnce(u64) -> Result<T, MembershipWriteRefused>,
+    ) -> Result<T, MembershipWriteRefused> {
+        match self.in_turn(|| leading().map(write)) {
+            // The worker objects hold the write when the call answers, as
+            // behind a control call's ([`Self::call`]).
+            Ok(Ok(answer)) => Ok(answer),
+            Ok(Err(refusal)) => {
+                let status = refused(&refusal);
+                audit_refusal(call, by, status.code(), status.message(), asker);
+                Err(refusal)
+            }
+            Err(status) => {
+                audit_refusal(call, by, status.code(), status.message(), asker);
+                Err(MembershipWriteRefused::NotLeading(
+                    status.message().to_owned(),
+                ))
+            }
+        }
+    }
+
     /// `RegisterWorker`, admitted from `by` under the term `leading` reads.
     ///
     /// `ADD` (and no mode) wants the URL absent; `REPLACE` wants it standing
@@ -972,24 +1007,10 @@ impl ReplicaMembershipWriter {
         asker: Option<&str>,
         write: impl FnOnce(u64) -> Result<T, MembershipWriteRefused>,
     ) -> Result<T, MembershipWriteRefused> {
-        // The term is read and the write is made in the door's turn. A
-        // refusal's audit line is written once the turn is let go.
-        match self.door.in_turn(|| (self.leading)().map(write)) {
-            // The worker objects hold the write when the call answers, as
-            // behind a control call's ([`MembershipCalls::call`]).
-            Ok(Ok(answer)) => Ok(answer),
-            Ok(Err(refusal)) => {
-                let status = refused(&refusal);
-                audit_refusal(call, &self.by, status.code(), status.message(), asker);
-                Err(refusal)
-            }
-            Err(status) => {
-                audit_refusal(call, &self.by, status.code(), status.message(), asker);
-                Err(MembershipWriteRefused::NotLeading(
-                    status.message().to_owned(),
-                ))
-            }
-        }
+        // The door reads the term and makes the write in its own turn, and
+        // writes a refusal's audit line ([`MembershipCalls::writer_call`]).
+        self.door
+            .writer_call(call, &self.by, asker, || (self.leading)(), write)
     }
 
     /// The registration's write over rows of stated facts, in the door's

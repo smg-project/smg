@@ -562,8 +562,20 @@ pub enum IndexKind {
     /// Radix trees over the prefixes seen.
     #[default]
     Tree,
-    /// A placement map keyed by the request's head at `view.boundaries`,
-    /// each placement living `ttl_s`.
+    /// The record of sent prefixes keyed by the request's head at
+    /// `view.boundaries` alone, as the classic hash index keys it. The
+    /// crate's engine reads and writes the record at the last whole block
+    /// under each boundary, where the request holds that many blocks: one
+    /// with fewer whole blocks than the first boundary's, or one hashed by
+    /// its text, reads and writes nothing. A
+    /// boundary past the first `view.max_block_hashes` blocks of a request
+    /// keys nothing either. A holder's depth is its boundary's, so a
+    /// `prefix-affinity` stage counts it only where that share of the
+    /// request clears the stage's `threshold`. The settings of the classic
+    /// hash index translate to a threshold of zero, which counts a holder
+    /// at any boundary; a document written by hand writes `threshold: 0`
+    /// for the same. The engine keeps no clock an entry: a placement stays
+    /// until the record's size bound takes it.
     Hash,
 }
 
@@ -575,14 +587,19 @@ pub enum IndexKind {
 #[serde(deny_unknown_fields, default)]
 pub struct IndexSpec {
     pub kind: IndexKind,
-    /// How long a hash-index placement stays routable, in seconds.
+    /// How long a placement of the classic hash index stays routable, in
+    /// seconds. The crate's engine keeps no clock an entry and does not
+    /// read it: a placement of its record stays until `max_size` takes it.
     #[schemars(range(min = 1))]
     pub ttl_s: u32,
-    /// The size bound of a tree index: on a text host its characters plus
-    /// 1024 for each node a worker stands on, tokens otherwise.
+    /// The size bound of a tree index, summed over the workers: on a text
+    /// host the characters of the nodes each worker stands on plus 1024 for
+    /// each such node, otherwise the tokens each worker holds, so a prefix
+    /// that several workers hold counts once for each of them.
     /// The crate's engine reads it for a pool whose profile reads sent
     /// prefixes: the model's record is bound to `max_size` over the block
-    /// size placements, never under one, one a block a worker was sent. A
+    /// size placements, never under one. A placement is a block a worker
+    /// was sent, and under a hash index a boundary a worker was sent. A
     /// lowered bound is met by sweeps, at the record's next writes and at
     /// the engine's upkeep.
     #[schemars(range(min = 1))]

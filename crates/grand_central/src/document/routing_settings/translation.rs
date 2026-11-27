@@ -716,8 +716,16 @@ fn write_policy<'a>(
                 ),
                 uncached_credit: unless(*balance_uncached_credit, false),
             };
+            // The classic hash index reads no match threshold: a holder at
+            // any boundary is its hit, however small its share of the
+            // request. The record of the kind hash states a holder at its
+            // boundary, so its stage counts a holder at every share.
+            let match_threshold = match cache_index {
+                IndexKind::Hash => 0.0,
+                IndexKind::Tree => *cache_threshold,
+            };
             let affinity = PrefixAffinityParams {
-                threshold: unless(*cache_threshold, DEFAULT_THRESHOLD),
+                threshold: unless(match_threshold, DEFAULT_THRESHOLD),
                 decay: unless(*overlap_decay, 0.0),
                 accounting_ttl_ms: unless(*selection_accounting_ttl_ms, 0),
                 spill: unless(spill, SpillParams::default()),
@@ -744,20 +752,29 @@ fn write_policy<'a>(
                     ScoreStage::KvPressure(KvPressureParams { weight, ..pressure })
                 })?;
             }
+            // The classic hash index calls no warm-up slice: a worker
+            // admitted beside older ones takes no share of the requests,
+            // so a turn of a conversation stays with its holder. A window
+            // and a thin ratio of zero keep nobody young and nobody thin.
+            let (warmup_secs, warmup_thin_ratio) = match cache_index {
+                IndexKind::Hash => (0, 0.0),
+                IndexKind::Tree => (config.worker_warmup_secs, config.worker_warmup_thin_ratio),
+            };
             let warmup = WarmupSliceParams {
-                secs: unless(config.worker_warmup_secs, DEFAULT_WARMUP_SECS),
+                secs: unless(warmup_secs, DEFAULT_WARMUP_SECS),
                 share: unless(config.worker_warmup_share, DEFAULT_WARMUP_SHARE),
                 blocks: unless(
                     narrow("worker_warmup_blocks", config.worker_warmup_blocks)?,
                     DEFAULT_WARMUP_BLOCKS,
                 ),
-                thin_ratio: unless(config.worker_warmup_thin_ratio, DEFAULT_WARMUP_THIN_RATIO),
+                thin_ratio: unless(warmup_thin_ratio, DEFAULT_WARMUP_THIN_RATIO),
                 divert_every: unless(
                     config.worker_warmup_divert_every,
                     DEFAULT_WARMUP_DIVERT_EVERY,
                 ),
-                // The slice counts a hit as a miss by the affinity's own
-                // threshold: the one setting is written in both stages.
+                // The slice counts a hit as a miss by the settings' match
+                // threshold under an index of either kind: it judges what
+                // the cache events hold, which no boundary keys.
                 miss_share: unless(*cache_threshold, DEFAULT_THRESHOLD),
                 ..WarmupSliceParams::default()
             };
@@ -965,10 +982,13 @@ fn index_spec((kind, ttl_s, max_size, sweep_s): IndexNumbers) -> IndexSpec {
     // The document's cadence and size both start at one, so its longest
     // cadence and its largest size say it. No sweep falls inside a
     // process's life, and no write meets the bound.
-    let (max_size, sweep_s) = if sweep_s == 0 {
-        (u64::MAX, u32::MAX)
-    } else {
-        (max_size, sweep_s)
+    // An index of kind hash keeps its named size at that interval too: its
+    // record of sent prefixes is trimmed at its own write, the least used
+    // end first, and waits for no sweep.
+    let (max_size, sweep_s) = match (sweep_s, kind) {
+        (0, IndexKind::Hash) => (max_size, u32::MAX),
+        (0, _) => (u64::MAX, u32::MAX),
+        _ => (max_size, sweep_s),
     };
     IndexSpec {
         kind,

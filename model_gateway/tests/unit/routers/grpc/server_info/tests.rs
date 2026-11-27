@@ -1,12 +1,14 @@
 use axum::{body::to_bytes, http::StatusCode, response::Response};
-use mock_worker::config::SchedulerWire;
+use mock_worker::{config::SchedulerWire, overrides::InfoAnswer};
 use openai_protocol::worker::{RuntimeType, WorkerType};
 use prost_types::{value::Kind, ListValue, Struct};
 use serde_json::{json, Value};
-use smg_grpc_client::{engine_labels::ServerInfo, mlx_proto, trtllm_proto};
+use smg_grpc_client::{
+    engine_labels::ServerInfo, mlx_proto, sglang_proto, tokenspeed_proto, trtllm_proto,
+};
 use smg_worker::identity::basic::{ConnectionMode, Worker};
 
-use super::{answer, body_of, json_of, record};
+use super::{answer, body_of, json_of, record, within};
 use crate::routers::grpc::{backend_client::BasicWorkerBuilder, test_engine::mock_engine_on_wire};
 
 /// The status and the JSON body of `response`.
@@ -158,4 +160,158 @@ fn a_struct_of_the_engine_reads_as_a_json_object() {
     // not finite reads null.
     assert_eq!(json_of(&wire(Kind::NumberValue(1e300))), json!(1e300));
     assert_eq!(json_of(&wire(Kind::NumberValue(f64::NAN))), Value::Null);
+}
+
+/// A gRPC worker on a mock engine of the TokenSpeed wire, with the engine's
+/// port and its server task.
+async fn asked_worker() -> (impl Worker, u16, tokio::task::JoinHandle<()>) {
+    let (url, engine) = mock_engine_on_wire("m", SchedulerWire::TokenSpeed).await;
+    let port = url
+        .rsplit(':')
+        .next()
+        .and_then(|port| port.parse().ok())
+        .expect("the engine has a port");
+    let worker = BasicWorkerBuilder::new(url.replacen("http://", "grpc://", 1))
+        .worker_type(WorkerType::Regular)
+        .connection_mode(ConnectionMode::Grpc)
+        .runtime_type(RuntimeType::TokenSpeed)
+        .build();
+    (worker, port, engine)
+}
+
+/// An engine that does not offer the call reads `501`, as a worker that is
+/// not asked does.
+#[tokio::test]
+async fn an_engine_without_the_call_reads_501() {
+    let (worker, port, engine) = asked_worker().await;
+    mock_worker::overrides::for_port(port).set_server_info(InfoAnswer::Unimplemented);
+    let (status, body) = read(&worker).await;
+    engine.abort();
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+    assert_eq!(
+        body["error"]["code"], "server_info_not_implemented",
+        "{body}"
+    );
+}
+
+/// An engine that fails the call reads `502`: the worker was asked, and its
+/// failure is not the answer of a worker without the call.
+#[tokio::test]
+async fn an_engine_that_fails_the_call_reads_502() {
+    let (worker, port, engine) = asked_worker().await;
+    mock_worker::overrides::for_port(port).set_server_info(InfoAnswer::Failing);
+    let (status, body) = read(&worker).await;
+    engine.abort();
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(body["error"]["code"], "server_info_failed", "{body}");
+}
+
+/// A worker that sends no answer within the bound reads `504`: with no time
+/// at all, the engine that would answer is not waited for.
+#[tokio::test]
+async fn no_answer_within_the_bound_reads_504() {
+    let (worker, _, engine) = asked_worker().await;
+    let (status, body) = parts(within(&worker, std::time::Duration::ZERO).await).await;
+    engine.abort();
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+    assert_eq!(body["error"]["code"], "server_info_timeout", "{body}");
+}
+
+/// A struct of `fields` as an engine sends it.
+fn sent<const N: usize>(fields: [(&str, Kind); N]) -> Struct {
+    Struct {
+        fields: fields
+            .into_iter()
+            .map(|(name, kind)| (name.to_string(), wire(kind)))
+            .collect(),
+    }
+}
+
+/// The body leaves out every field of a struct whose name marks a secret,
+/// at every depth, on both wires that carry a struct, and keeps the others:
+/// a name that only holds the word `token` is no secret's.
+#[tokio::test]
+async fn a_field_named_as_a_secret_is_left_out_at_every_depth() {
+    let text = |value: &str| Kind::StringValue(value.to_string());
+    let args = sent([
+        ("api_key", text("k-1")),
+        ("ADMIN_API_KEY", text("k-2")),
+        ("hf_token", text("t-1")),
+        ("token", text("t-2")),
+        ("tp_size", Kind::NumberValue(2.0)),
+        ("max_total_tokens", Kind::NumberValue(4096.0)),
+        ("tokenizer", text("m")),
+        (
+            "store",
+            Kind::StructValue(sent([("db_password", text("p-1")), ("host", text("h"))])),
+        ),
+        (
+            "peers",
+            Kind::ListValue(ListValue {
+                values: vec![wire(Kind::StructValue(sent([
+                    ("client_secret", text("s-1")),
+                    ("name", text("n")),
+                ])))],
+            }),
+        ),
+    ]);
+    let kept = json!({
+        "tp_size": 2,
+        "max_total_tokens": 4096,
+        "tokenizer": "m",
+        "store": {"host": "h"},
+        "peers": [{"name": "n"}],
+    });
+    let facts = sent([
+        ("rl_control_api_key", text("k-3")),
+        ("waiting", Kind::NumberValue(1.0)),
+    ]);
+    for info in [
+        ServerInfo::TokenSpeed(Box::new(tokenspeed_proto::GetServerInfoResponse {
+            server_args: Some(args.clone()),
+            scheduler_info: Some(facts.clone()),
+            ..Default::default()
+        })),
+        ServerInfo::Sglang(Box::new(sglang_proto::GetServerInfoResponse {
+            server_args: Some(args.clone()),
+            scheduler_info: Some(facts.clone()),
+            ..Default::default()
+        })),
+    ] {
+        let (status, body) = parts(body_of(&info)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["server_args"], kept, "{body}");
+        assert_eq!(body["scheduler_info"], json!({"waiting": 1}), "{body}");
+    }
+}
+
+/// The route leaves such a field out of what an engine sends over either
+/// wire that carries a struct, and keeps the argument beside it.
+#[tokio::test]
+async fn the_route_leaves_out_a_field_named_as_a_secret() {
+    for (spoken, runtime) in [
+        (SchedulerWire::TokenSpeed, RuntimeType::TokenSpeed),
+        (SchedulerWire::Sglang, RuntimeType::Sglang),
+    ] {
+        let (url, engine) = mock_engine_on_wire("m", spoken).await;
+        let port: u16 = url
+            .rsplit(':')
+            .next()
+            .and_then(|port| port.parse().ok())
+            .expect("the engine has a port");
+        let patch = json!({"api_key": "k-1", "shown_arg": "v"});
+        mock_worker::overrides::for_port(port)
+            .patch_info(patch.as_object().expect("an object of arguments"));
+        let worker = BasicWorkerBuilder::new(url.replacen("http://", "grpc://", 1))
+            .worker_type(WorkerType::Regular)
+            .connection_mode(ConnectionMode::Grpc)
+            .runtime_type(runtime)
+            .build();
+        let (status, body) = read(&worker).await;
+        engine.abort();
+        assert_eq!(status, StatusCode::OK, "{runtime:?}: {body}");
+        let args = &body["server_args"];
+        assert_eq!(args["shown_arg"], "v", "{runtime:?}: {body}");
+        assert!(args.get("api_key").is_none(), "{runtime:?}: {body}");
+    }
 }

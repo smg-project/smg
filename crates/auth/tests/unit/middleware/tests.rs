@@ -842,7 +842,8 @@ async fn an_admin_only_read_refuses_the_user_role_with_the_denial_line() {
 /// with a parameter can be one: the `user` role is refused on every path
 /// the template matches and the `admin` role reads it. An entry without a
 /// parameter is its own template, and a path no route matched is asked by
-/// the path, both as before.
+/// the path, both as before. A listed path stays the admin's where a route
+/// with a parameter matches it: the path is asked beside the template.
 #[tokio::test]
 async fn an_admin_only_read_is_known_by_its_route_template() {
     use axum::{middleware::from_fn_with_state, routing::get, Router};
@@ -864,7 +865,12 @@ async fn an_admin_only_read_is_known_by_its_route_template() {
         },
         None,
     )
-    .with_admin_only_reads(&["/config", "/workers/{worker_id}/server_info", "/unrouted"]);
+    .with_admin_only_reads(&[
+        "/config",
+        "/workers/{worker_id}/server_info",
+        "/unrouted",
+        "/workers/internal",
+    ]);
     let app = Router::new()
         .route("/config", get(view))
         .route("/workers", get(view))
@@ -911,6 +917,17 @@ async fn an_admin_only_read_is_known_by_its_route_template() {
     assert_eq!(
         status("/elsewhere", "reader-key").await,
         StatusCode::NOT_FOUND
+    );
+
+    // A listed path that a route with a parameter matches is asked by the
+    // path too: it stays the admin's.
+    assert_eq!(
+        status("/workers/internal", "reader-key").await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        status("/workers/internal", "admin-key").await,
+        StatusCode::OK
     );
 }
 

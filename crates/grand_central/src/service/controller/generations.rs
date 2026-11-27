@@ -399,9 +399,6 @@ impl Generations {
             |store, spec| store.apply_admitted(spec, || self.leads(lead)),
             |passed| {
                 if news {
-                    // A case counts a replica's notices, and this step itself tells each one.
-                    #[cfg(test)]
-                    tests::count_replica_notice(self, false);
                     match passed {
                         Some((digest, line)) => self.sourced(digest, line),
                         None => *self.handed.lock() = Handed::Undigested,
@@ -804,8 +801,6 @@ impl Generations {
     /// document that states its own number is that one under that number
     /// alone. The caller holds the lock of the bytes held.
     fn stands(&self, generation: u64, digest: Digest) {
-        #[cfg(test)]
-        tests::count_replica_notice(self, true);
         let mut handed = self.handed.lock();
         let stood = matches!(
             *handed,

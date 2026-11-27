@@ -816,7 +816,7 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
         PathItem {
             get: Some(operation(
                 "getWorkerServerInfo",
-                "The server info answer of one worker's engine, under the names of the engine's wire: the admin role alone under control-plane authentication; 501 where the engine is not asked or sends no answer",
+                "The server info answer of one worker's engine, under the names of the engine's wire: the admin role alone under control-plane authentication; 501 where the engine is not asked or does not offer the call, 504 where it sends no answer in time, 502 where the call fails",
                 Some(vec![path_param("worker_id")]),
                 None,
                 refused_with(

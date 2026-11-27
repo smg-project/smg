@@ -3621,7 +3621,7 @@ fn an_eviction_from_the_index_takes_the_handle_and_not_its_address() {
     let (leaving, newcomer) = (built(), built());
     // What the slice holds once the newcomer registered at the freed URL:
     // its handle, in the place of the one that leaves.
-    registry.add_worker_to_model_index("llama", Arc::clone(&newcomer));
+    registry.add_worker_to_model_index("llama", Arc::clone(&newcomer), WorkerOrigin::Local);
 
     registry.remove_worker_from_model_index("llama", &leaving);
     let llama = registry.get_by_model("llama");
@@ -3667,4 +3667,382 @@ fn publishing_again_hands_every_model_a_new_value_over_its_list() {
     assert_eq!(now.members().len(), 3);
     assert!(events.try_recv().is_err(), "no event");
     assert!(registry.model_generation("phi").is_none());
+}
+
+/// A worker of `model_id` at `url` whose spec carries the retry `overrides`,
+/// resolved against default router settings as a registration resolves it.
+fn worker_overriding(
+    url: &str,
+    model_id: &str,
+    overrides: crate::worker::ResilienceUpdate,
+) -> Arc<dyn Worker> {
+    use crate::{health::resilience::resolve_resilience, worker::WorkerSpec};
+
+    let (resolved, _breaker) = resolve_resilience(
+        &RetryConfig::default(),
+        &CircuitBreakerConfig::default(),
+        true,
+        true,
+        &overrides,
+    );
+    let mut spec = WorkerSpec::new(url);
+    spec.resilience = overrides;
+    Arc::new(
+        BasicWorkerBuilder::from_spec(spec)
+            .model(ModelCard::new(model_id))
+            .resilience(resolved)
+            .build(),
+    )
+}
+
+/// A worker of `model_id` at `url` whose spec overrides the retry count.
+fn worker_overriding_retries(url: &str, model_id: &str, max_retries: u32) -> Arc<dyn Worker> {
+    worker_overriding(
+        url,
+        model_id,
+        crate::worker::ResilienceUpdate {
+            max_retries: Some(max_retries),
+            ..Default::default()
+        },
+    )
+}
+
+/// A worker of `model_id` at `url` whose spec carries no retry override.
+fn worker_without_override(url: &str, model_id: &str) -> Arc<dyn Worker> {
+    Arc::new(
+        BasicWorkerBuilder::new(url)
+            .model(ModelCard::new(model_id))
+            .build(),
+    )
+}
+
+/// The retry count the registry holds for `model_id`.
+fn retries_of(registry: &WorkerRegistry, model_id: &str) -> Option<u32> {
+    registry
+        .get_retry_config(model_id)
+        .map(|retry| retry.max_retries)
+}
+
+/// A model's retry settings follow the overrides its workers carry at every
+/// change of them: the newest worker that carries one gives them, and none
+/// are held once no worker carries one.
+#[test]
+fn a_models_retries_follow_the_overrides_its_workers_carry() {
+    let registry = WorkerRegistry::new();
+
+    let first = registry
+        .register(worker_overriding_retries("http://a:8080", "model", 2))
+        .unwrap();
+    assert_eq!(retries_of(&registry, "model"), Some(2), "one override");
+
+    let second = registry
+        .register(worker_overriding_retries("http://b:8080", "model", 8))
+        .unwrap();
+    assert_eq!(
+        retries_of(&registry, "model"),
+        Some(8),
+        "the newest registration wins"
+    );
+
+    assert!(registry.replace(
+        &first,
+        worker_overriding_retries("http://a:8080", "model", 2)
+    ));
+    assert_eq!(
+        retries_of(&registry, "model"),
+        Some(2),
+        "a replacement is the newest registration"
+    );
+
+    assert!(registry.remove(&first).is_some());
+    assert_eq!(
+        retries_of(&registry, "model"),
+        Some(8),
+        "the override of the worker that stands"
+    );
+
+    assert!(registry.replace(&second, worker_without_override("http://b:8080", "model")));
+    assert_eq!(
+        retries_of(&registry, "model"),
+        None,
+        "no worker of the model carries an override"
+    );
+}
+
+/// The override of a worker that is removed leaves with it, while other
+/// workers of the model stay.
+#[test]
+fn a_removed_workers_retry_override_leaves_with_it() {
+    let registry = WorkerRegistry::new();
+    let overriding = registry
+        .register(worker_overriding_retries("http://a:8080", "model", 8))
+        .unwrap();
+    registry
+        .register(worker_without_override("http://b:8080", "model"))
+        .unwrap();
+    assert_eq!(retries_of(&registry, "model"), Some(8));
+
+    assert!(registry.remove(&overriding).is_some());
+
+    assert_eq!(retries_of(&registry, "model"), None);
+    assert_eq!(registry.get_by_model("model").len(), 1);
+}
+
+/// A replacement that moves a worker to another model takes its override
+/// along: the model it left reads none while other workers stay there.
+#[test]
+fn a_retry_override_follows_its_worker_to_another_model() {
+    let registry = WorkerRegistry::new();
+    let mover = registry
+        .register(worker_overriding_retries("http://a:8080", "left", 8))
+        .unwrap();
+    registry
+        .register(worker_without_override("http://b:8080", "left"))
+        .unwrap();
+
+    assert!(registry.replace(
+        &mover,
+        worker_overriding_retries("http://a:8080", "joined", 8)
+    ));
+
+    assert_eq!(retries_of(&registry, "left"), None);
+    assert_eq!(retries_of(&registry, "joined"), Some(8));
+}
+
+/// An override that turns retries off holds the model at one attempt, and
+/// stays in force over a later worker without an override.
+#[test]
+fn a_retry_override_that_turns_retries_off_stays_in_force() {
+    let registry = WorkerRegistry::new();
+    registry
+        .register(worker_overriding(
+            "http://a:8080",
+            "model",
+            crate::worker::ResilienceUpdate {
+                disable_retry: Some(true),
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    assert_eq!(retries_of(&registry, "model"), Some(1));
+
+    let later = registry
+        .register(worker_without_override("http://b:8080", "model"))
+        .unwrap();
+    assert!(registry.remove(&later).is_some());
+
+    assert_eq!(retries_of(&registry, "model"), Some(1));
+}
+
+/// A host's own write stands as it did: a worker without an override that
+/// enters or leaves does not touch it, a worker with one writes over it, and
+/// what the registry settled follows the workers again.
+#[test]
+fn a_hosts_own_retry_config_stands_until_an_override_enters() {
+    let registry = WorkerRegistry::new();
+    let first = registry
+        .register(worker_without_override("http://a:8080", "model"))
+        .unwrap();
+    registry.set_model_retry_config(
+        "model",
+        RetryConfig {
+            max_retries: 5,
+            ..RetryConfig::default()
+        },
+        true,
+    );
+
+    registry
+        .register(worker_without_override("http://b:8080", "model"))
+        .unwrap();
+    assert_eq!(
+        retries_of(&registry, "model"),
+        Some(5),
+        "a registration without an override"
+    );
+    assert!(registry.remove(&first).is_some());
+    assert_eq!(
+        retries_of(&registry, "model"),
+        Some(5),
+        "a removal while a worker stays"
+    );
+
+    let overriding = registry
+        .register(worker_overriding_retries("http://c:8080", "model", 8))
+        .unwrap();
+    assert_eq!(
+        retries_of(&registry, "model"),
+        Some(8),
+        "a worker with an override enters"
+    );
+    assert!(registry.remove(&overriding).is_some());
+    assert_eq!(
+        retries_of(&registry, "model"),
+        None,
+        "the override left with its worker"
+    );
+}
+
+/// Registrations, replacements and removals of one model's workers from
+/// several threads, beside a worker that keeps entering and leaving, end on
+/// the override of the newest worker that stands, however they interleave.
+#[test]
+fn side_by_side_changes_of_a_models_workers_end_on_the_newest_override() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const ROUNDS: usize = 200;
+    let registry = Arc::new(WorkerRegistry::new());
+    let done = Arc::new(AtomicBool::new(false));
+
+    let writers: Vec<_> = (0..3_u32)
+        .map(|writer| {
+            let registry = Arc::clone(&registry);
+            std::thread::spawn(move || {
+                let url = format!("http://writer-{writer}:8080");
+                for round in 0..ROUNDS {
+                    let id = registry
+                        .register(worker_overriding_retries(&url, "model", 10 + writer))
+                        .unwrap();
+                    assert!(registry.replace(&id, worker_without_override(&url, "model")));
+                    assert!(registry
+                        .replace(&id, worker_overriding_retries(&url, "model", 20 + writer)));
+                    if round + 1 < ROUNDS {
+                        assert!(registry.remove(&id).is_some());
+                    }
+                }
+            })
+        })
+        .collect();
+    let unending = {
+        let registry = Arc::clone(&registry);
+        let done = Arc::clone(&done);
+        std::thread::spawn(move || {
+            while !done.load(Ordering::Relaxed) {
+                let id = registry
+                    .register(worker_without_override("http://unending:8080", "model"))
+                    .unwrap();
+                assert!(registry.remove(&id).is_some());
+            }
+        })
+    };
+    for writer in writers {
+        writer.join().unwrap();
+    }
+    done.store(true, Ordering::Relaxed);
+    unending.join().unwrap();
+
+    // Each writer left its worker standing with an override; the index
+    // holds them in the order they entered.
+    let members = registry.get_by_model("model");
+    assert_eq!(members.len(), 3);
+    let newest = members
+        .iter()
+        .rev()
+        .find_map(|member| member.metadata().spec.resilience.max_retries);
+    assert!(newest.is_some());
+    assert_eq!(retries_of(&registry, "model"), newest);
+}
+
+/// The state a peer publishes for its worker of `model` at `url` whose spec
+/// overrides the retry count.
+fn published_overriding_retries(url: &str, version: u64, max_retries: u32) -> RemoteWorkerState {
+    let owner = worker_overriding_retries(url, "model", max_retries);
+    let mut state = remote_state(
+        "peer-w1",
+        url,
+        true,
+        serde_json::to_vec(&owner.metadata().spec).unwrap(),
+    );
+    state.version = version;
+    state
+}
+
+/// A worker imported from a peer gives its model no retry settings, whatever
+/// its published spec overrides: an import is built without resolved
+/// settings, so the importing node keeps reading its own until a worker
+/// registered on it carries an override.
+#[test]
+fn an_imported_workers_retry_override_gives_its_model_no_settings() {
+    let registry = WorkerRegistry::new();
+    let url = "http://remote:8080";
+    registry.on_remote_worker_state(&published_overriding_retries(url, 1, 8));
+    let import_id = registry.get_id_by_url(url).unwrap();
+    assert_eq!(registry.origin_of(&import_id), Some(WorkerOrigin::Mesh));
+    let import = registry.get(&import_id).unwrap();
+    assert_eq!(
+        import.metadata().spec.resilience.max_retries,
+        Some(8),
+        "the import carries the override its owner published"
+    );
+    assert_eq!(retries_of(&registry, "model"), None);
+
+    // A worker registered here gives its own, and keeps giving it when the
+    // owner publishes the import again, the model's newest member.
+    let local_id = registry
+        .register(worker_overriding_retries("http://local:8080", "model", 4))
+        .unwrap();
+    assert_eq!(retries_of(&registry, "model"), Some(4));
+    registry.on_remote_worker_state(&published_overriding_retries(url, 2, 9));
+    assert_eq!(retries_of(&registry, "model"), Some(4));
+
+    assert!(registry.remove(&local_id).is_some());
+    assert_eq!(retries_of(&registry, "model"), None);
+}
+
+/// An import whose spec overrides nothing leaves its model without retry
+/// settings, as a local worker without an override does.
+#[test]
+fn an_imported_worker_without_a_retry_override_gives_its_model_no_settings() {
+    let registry = WorkerRegistry::new();
+    let url = "http://remote:8080";
+    registry.on_remote_worker_state(&remote_state(
+        "peer-w1",
+        url,
+        true,
+        spec_bytes(url, "model", WorkerType::Regular),
+    ));
+    assert!(registry.get_id_by_url(url).is_some());
+    assert_eq!(retries_of(&registry, "model"), None);
+}
+
+/// A local registration that takes an import's address over is no import
+/// any more: its retry override is in force.
+#[test]
+fn a_local_takeover_of_an_import_puts_its_retry_override_in_force() {
+    let registry = WorkerRegistry::new();
+    let url = "http://remote:8080";
+    registry.on_remote_worker_state(&published_overriding_retries(url, 1, 8));
+    assert_eq!(retries_of(&registry, "model"), None);
+
+    let id = registry.register_or_replace(worker_overriding_retries(url, "model", 3));
+    assert_eq!(registry.origin_of(&id), Some(WorkerOrigin::Local));
+    assert_eq!(retries_of(&registry, "model"), Some(3));
+}
+
+/// A rebuild that carries an import on, as a metadata update of the worker
+/// on the importing node does, claims it local and still gives its model no
+/// retry settings: no registration resolved them. A registration at its
+/// address puts its override in force.
+#[test]
+fn a_carried_rebuild_of_an_import_gives_its_model_no_settings() {
+    let registry = WorkerRegistry::new();
+    let url = "http://remote:8080";
+    registry.on_remote_worker_state(&published_overriding_retries(url, 1, 8));
+    let id = registry.get_id_by_url(url).unwrap();
+    assert_eq!(retries_of(&registry, "model"), None);
+
+    let import = registry.get(&id).unwrap();
+    let carried: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::carrying(&import).build());
+    assert!(registry.replace_claiming_local(&id, carried, import.revision()));
+    assert_eq!(registry.origin_of(&id), Some(WorkerOrigin::Local));
+    assert_eq!(retries_of(&registry, "model"), None);
+
+    let claimed = registry.get(&id).unwrap();
+    let carried_again: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::carrying(&claimed).build());
+    assert!(registry.replace(&id, carried_again));
+    assert_eq!(retries_of(&registry, "model"), None);
+
+    let id = registry.register_or_replace(worker_overriding_retries(url, "model", 3));
+    assert_eq!(registry.origin_of(&id), Some(WorkerOrigin::Local));
+    assert_eq!(retries_of(&registry, "model"), Some(3));
 }

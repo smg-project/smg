@@ -41,6 +41,7 @@ use crate::{
     encoder_inputs::{EncoderDtype, EncoderInput, PixelNorm},
     pixel_convert::{Bf16Steps, StepsWriter},
     vision::{
+        execution,
         preprocessor_config::PreProcessorConfig,
         processor::{ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor},
         rgb_runs::RgbSplitter,
@@ -327,24 +328,35 @@ impl Llama4VisionProcessor {
     fn write_image(&self, image: &DynamicImage, plan: &Plan, mut run: impl FnMut(usize, &[u8])) {
         let tile = self.tile_size as usize;
         let (width, height) = plan.resized;
-        // The resizer's same-size pass is a copy of the bytes.
-        let resized = if image.dimensions() == plan.resized {
-            Cow::Borrowed(image)
+        let global = (self.tile_size, self.tile_size);
+        let (resized, view) = if image.dimensions() == plan.resized {
+            // An image already at its size is its own bytes, and it has no
+            // empty side: a planned size has none.
+            let (_, _, rgb) = transforms::rgb_bytes(image);
+            let view = plan.has_global().then(|| {
+                execution::on_caller(|| {
+                    transforms::resize_bilinear_torch_aa_rgb_bytes(
+                        &rgb, width, height, global.0, global.1,
+                    )
+                })
+            });
+            (rgb, view)
+        } else if plan.has_global() {
+            let [resized, view] = resized_rgb(image, [plan.resized, global]);
+            (Cow::Owned(resized), Some(view))
         } else {
-            Cow::Owned(transforms::resize(
-                image,
-                width,
-                height,
-                FilterType::Triangle,
-            ))
+            let [resized] = resized_rgb(image, [plan.resized]);
+            (Cow::Owned(resized), None)
         };
-        let (width, height, rgb) = transforms::rgb_bytes(&resized);
-        tile_blocks(&rgb, (width, height), plan.grid, tile, &mut run);
-        if plan.has_global() {
-            let global =
-                transforms::resize(image, self.tile_size, self.tile_size, FilterType::Triangle);
-            let (width, height, rgb) = transforms::rgb_bytes(&global);
-            tile_blocks(&rgb, (width, height), (1, 1), tile, &mut run);
+        let size = (width as usize, height as usize);
+        tile_blocks(&resized, size, plan.grid, tile, &mut run);
+        // The resized bytes are the pool's: back they go behind their tiles.
+        if let Cow::Owned(resized) = resized {
+            buffer_pool::recycle(resized);
+        }
+        if let Some(view) = view {
+            tile_blocks(&view, (tile, tile), (1, 1), tile, &mut run);
+            buffer_pool::recycle(view);
         }
     }
 
@@ -421,6 +433,28 @@ impl Plan {
     fn tiles(&self) -> usize {
         self.grid.0 * self.grid.1 + usize::from(self.has_global())
     }
+}
+
+/// `image`'s RGB bytes resized to each of `targets`. The reference resizes
+/// the decoded RGB bytes with torchvision's `uint8` BILINEAR. An image with
+/// an empty side has no pixel to resample and keeps the generic resizer. So
+/// does a colour image of more than four megapixels on a processor whose
+/// width pass runs its AVX2 rows, where the exact kernel trails that resizer
+/// ([`transforms::bilinear_torch_aa_trails_generic`]): there the image keeps
+/// the bytes it had before this resize was exact, not the reference's. The
+/// resize stays on the caller's thread, where this family has always
+/// resized: its bands on the pool would save wall time and cost CPU time.
+fn resized_rgb<const N: usize>(image: &DynamicImage, targets: [(u32, u32); N]) -> [Vec<u8>; N] {
+    let empty = image.width() == 0 || image.height() == 0;
+    if empty || transforms::bilinear_torch_aa_trails_generic(image) {
+        return targets.map(|(width, height)| {
+            match transforms::resize(image, width, height, FilterType::Triangle) {
+                DynamicImage::ImageRgb8(rgb) => rgb.into_raw(),
+                resized => transforms::rgb_bytes(&resized).2.into_owned(),
+            }
+        });
+    }
+    execution::on_caller(|| transforms::resize_bilinear_torch_aa_image(image, targets))
 }
 
 /// The tiles of a `rows` x `columns` canvas in output order, `rgb` at its
@@ -575,10 +609,10 @@ impl VisionPreProcessor for Llama4VisionProcessor {
 
 #[cfg(test)]
 mod tests {
-    use image::Rgb;
+    use image::{GrayImage, Rgb, RgbaImage};
 
     use super::*;
-    use crate::test_support::create_test_image;
+    use crate::test_support::{assert_same_bytes, create_test_image, lcg_bytes, lcg_rgb_image};
 
     #[test]
     fn test_llama4_vision_processor_default() {
@@ -809,6 +843,204 @@ mod tests {
         }
     }
 
+    /// The tile bytes `write_image` hands on for `image` at a tile of 8.
+    fn tile_bytes(image: &DynamicImage) -> Vec<u8> {
+        tile_bytes_within(image, DEFAULT_MAX_PATCHES)
+    }
+
+    /// [`tile_bytes`] on a canvas of at most `max_patches` tiles.
+    fn tile_bytes_within(image: &DynamicImage, max_patches: usize) -> Vec<u8> {
+        let processor = Llama4VisionProcessor {
+            tile_size: 8,
+            max_patches,
+            ..Llama4VisionProcessor::new()
+        };
+        let mut bytes = Vec::new();
+        let plan = processor.plan(image.dimensions());
+        processor.write_image(image, &plan, |_, channel| bytes.extend_from_slice(channel));
+        bytes
+    }
+
+    /// A resized image's tiles hold the reference processor's bytes:
+    /// torchvision's `resize` of the `uint8` image (bilinear, antialiased), on
+    /// generator bytes at a tile of 8. A 6x4 image is scaled up to 8x5 inside
+    /// its one tile; a 13x7 and a 7x13 image fill two tiles as they are, and
+    /// the global view of each is the image scaled to 8x8, the one down its
+    /// width, the other down its height. The bytes are what the reference
+    /// class (transformers 5.17, torch 2.13, torchvision 0.28) hands its
+    /// normalize step for the same images. To make them again: build the
+    /// class with `size={"height": 8, "width": 8}`, call it on the image and
+    /// read the `uint8` tensors it hands `rescale_and_normalize`, the canvas
+    /// and then the global view.
+    #[test]
+    fn a_resized_image_holds_the_reference_bytes() {
+        let scaled_up: [u8; 192] = [
+            68, 174, 153, 17, 42, 20, 64, 162, 123, 137, 153, 165, 158, 140, 147, 170, 116, 87, 87,
+            128, 198, 161, 141, 154, 123, 87, 49, 41, 151, 111, 107, 159, 209, 166, 115, 72, 63,
+            68, 125, 216, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            50, 162, 174, 91, 148, 215, 190, 91, 93, 114, 98, 69, 179, 227, 203, 133, 117, 117,
+            103, 97, 213, 206, 148, 78, 141, 127, 129, 156, 222, 154, 95, 74, 187, 95, 104, 209,
+            196, 97, 113, 237, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 84, 63, 114, 221, 223, 90, 31, 66, 174, 95, 105, 201, 217, 166, 130, 125, 199, 113,
+            119, 212, 197, 194, 167, 122, 147, 130, 159, 217, 173, 161, 133, 92, 58, 164, 214, 186,
+            160, 95, 69, 86, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0,
+        ];
+        let wide_global_view: [u8; 192] = [
+            107, 111, 83, 54, 182, 186, 193, 90, 141, 142, 140, 129, 163, 93, 134, 118, 143, 195,
+            145, 141, 113, 82, 138, 125, 154, 152, 177, 176, 131, 91, 122, 130, 155, 124, 145, 181,
+            155, 143, 116, 122, 134, 159, 120, 165, 164, 179, 107, 89, 134, 163, 216, 183, 197,
+            134, 76, 74, 223, 126, 143, 113, 162, 194, 174, 178, 180, 82, 186, 191, 82, 145, 73,
+            41, 118, 132, 152, 106, 157, 134, 71, 64, 162, 193, 120, 138, 169, 145, 162, 163, 194,
+            195, 144, 131, 110, 116, 156, 183, 144, 159, 173, 83, 99, 120, 124, 149, 109, 130, 175,
+            77, 148, 120, 119, 132, 155, 106, 163, 134, 175, 71, 100, 152, 6, 38, 112, 130, 208,
+            242, 129, 189, 128, 126, 90, 104, 126, 77, 119, 235, 114, 84, 88, 127, 64, 118, 171,
+            227, 123, 39, 95, 94, 64, 120, 137, 94, 151, 50, 86, 128, 63, 117, 97, 132, 165, 96,
+            110, 125, 50, 84, 94, 195, 133, 128, 146, 85, 64, 71, 126, 152, 68, 114, 132, 113, 117,
+            138, 147, 105, 63, 53, 151, 87, 138, 143, 75, 167,
+        ];
+        let tall_global_view: [u8; 192] = [
+            76, 18, 128, 170, 131, 113, 161, 180, 159, 143, 144, 156, 172, 163, 111, 80, 148, 142,
+            96, 121, 181, 182, 117, 138, 131, 128, 81, 59, 138, 227, 173, 79, 74, 106, 113, 92,
+            129, 197, 191, 145, 139, 154, 181, 139, 148, 189, 148, 187, 167, 104, 162, 156, 134,
+            135, 124, 152, 54, 41, 108, 184, 159, 67, 51, 114, 129, 100, 159, 205, 189, 135, 121,
+            213, 167, 110, 116, 87, 84, 91, 48, 133, 162, 102, 149, 111, 104, 126, 69, 131, 144,
+            85, 98, 68, 53, 84, 100, 92, 142, 152, 171, 139, 105, 116, 141, 130, 155, 107, 124,
+            167, 183, 164, 142, 157, 156, 126, 133, 166, 148, 104, 123, 162, 124, 164, 163, 130,
+            111, 90, 33, 32, 104, 165, 173, 148, 107, 93, 144, 191, 71, 171, 196, 128, 86, 123,
+            171, 194, 148, 148, 162, 169, 124, 105, 198, 223, 168, 154, 123, 153, 193, 174, 109,
+            110, 104, 155, 133, 153, 173, 121, 53, 152, 62, 135, 110, 127, 113, 51, 58, 165, 109,
+            123, 145, 101, 107, 149, 127, 222, 132, 196, 144, 120, 162, 186, 127, 107,
+        ];
+        assert_same_bytes(
+            &tile_bytes(&lcg_rgb_image(6, 4, 21)),
+            &scaled_up,
+            "6x4 scaled up to 8x5",
+        );
+        let wide = tile_bytes(&lcg_rgb_image(13, 7, 22));
+        assert_same_bytes(
+            &wide[wide.len() - 192..],
+            &wide_global_view,
+            "the global view of 13x7",
+        );
+        let tall = tile_bytes(&lcg_rgb_image(7, 13, 25));
+        assert_same_bytes(
+            &tall[tall.len() - 192..],
+            &tall_global_view,
+            "the global view of 7x13",
+        );
+    }
+
+    /// An image larger than every canvas takes the arm a large photo takes:
+    /// it is scaled down on both axes into more than one tile, and its global
+    /// view is the image itself scaled to one tile. A 37x21 image of
+    /// generator bytes on a canvas of at most two tiles is scaled to 14x8;
+    /// the bytes are the reference class's for the same image (the recipe of
+    /// [`a_resized_image_holds_the_reference_bytes`] with `max_patches=2`):
+    /// its two tiles, then its global view. Pillow's bilinear taps give
+    /// other bytes for this image, on the canvas and on the global view.
+    #[test]
+    fn an_image_scaled_down_into_two_tiles_holds_the_reference_bytes() {
+        let tiles_and_global_view: [u8; 576] = [
+            156, 165, 145, 133, 144, 135, 126, 129, 105, 97, 124, 125, 100, 109, 103, 153, 141,
+            152, 141, 121, 94, 115, 115, 127, 143, 123, 127, 134, 136, 132, 133, 92, 149, 149, 116,
+            151, 144, 167, 154, 116, 159, 156, 131, 144, 172, 165, 152, 132, 126, 149, 119, 116,
+            115, 137, 140, 153, 135, 128, 102, 117, 163, 121, 125, 142, 102, 107, 96, 139, 137,
+            129, 143, 134, 86, 102, 117, 127, 148, 120, 136, 108, 140, 144, 146, 141, 152, 136,
+            120, 125, 110, 147, 136, 149, 153, 137, 133, 102, 121, 153, 124, 154, 145, 104, 140,
+            131, 139, 148, 114, 104, 116, 102, 103, 144, 120, 125, 114, 95, 133, 135, 109, 127,
+            119, 129, 131, 109, 151, 127, 119, 113, 92, 112, 133, 154, 109, 124, 148, 121, 150,
+            140, 129, 108, 96, 118, 115, 116, 122, 108, 123, 151, 123, 115, 151, 123, 99, 111, 110,
+            112, 125, 110, 110, 128, 113, 135, 85, 119, 135, 144, 116, 146, 141, 136, 137, 126,
+            123, 131, 107, 134, 118, 156, 148, 148, 115, 137, 124, 128, 154, 154, 111, 127, 168,
+            163, 126, 140, 148, 98, 107, 106, 123, 170, 0, 0, 144, 105, 111, 134, 121, 117, 0, 0,
+            146, 131, 118, 111, 104, 99, 0, 0, 107, 108, 149, 132, 136, 115, 0, 0, 108, 93, 120,
+            71, 121, 152, 0, 0, 106, 118, 136, 103, 115, 149, 0, 0, 114, 89, 101, 98, 102, 139, 0,
+            0, 123, 128, 102, 138, 148, 126, 0, 0, 111, 93, 122, 137, 139, 138, 0, 0, 92, 109, 133,
+            117, 107, 144, 0, 0, 98, 108, 135, 119, 145, 111, 0, 0, 124, 145, 161, 119, 116, 141,
+            0, 0, 112, 140, 126, 136, 119, 98, 0, 0, 136, 108, 116, 139, 123, 124, 0, 0, 115, 103,
+            97, 140, 146, 148, 0, 0, 132, 116, 104, 165, 116, 150, 0, 0, 129, 138, 148, 149, 126,
+            142, 0, 0, 109, 136, 129, 123, 147, 150, 0, 0, 127, 112, 77, 102, 125, 129, 0, 0, 151,
+            137, 114, 100, 104, 94, 0, 0, 149, 140, 124, 131, 137, 105, 0, 0, 103, 92, 116, 149,
+            123, 127, 0, 0, 92, 102, 111, 139, 117, 128, 0, 0, 102, 118, 137, 139, 127, 135, 0, 0,
+            162, 143, 139, 132, 135, 109, 109, 147, 103, 121, 109, 108, 147, 111, 126, 117, 149,
+            136, 105, 116, 134, 128, 112, 102, 136, 126, 134, 132, 101, 118, 139, 125, 148, 131,
+            150, 157, 114, 103, 95, 133, 156, 137, 165, 155, 123, 121, 114, 132, 139, 123, 118,
+            140, 136, 95, 98, 123, 132, 109, 143, 126, 135, 118, 127, 140, 104, 109, 137, 137, 123,
+            105, 134, 136, 93, 117, 138, 129, 102, 114, 120, 125, 140, 144, 147, 126, 115, 112,
+            126, 131, 126, 142, 151, 132, 113, 147, 129, 130, 134, 138, 140, 124, 125, 130, 131,
+            108, 145, 114, 112, 103, 140, 112, 133, 121, 125, 109, 124, 120, 122, 102, 130, 145,
+            124, 125, 136, 121, 120, 116, 141, 133, 100, 137, 125, 133, 129, 139, 145, 133, 145,
+            126, 102, 116, 113, 129, 129, 146, 112, 130, 129, 132, 127, 105, 100, 124, 102, 112,
+            121, 108, 138, 134, 103, 101, 121, 101, 137, 127, 144, 138, 130, 119, 141, 133, 128,
+            118, 117, 100, 137, 124, 137, 150, 129, 129, 112, 102, 128, 123, 152, 122, 157, 143,
+            123, 119, 137, 130,
+        ];
+        assert_same_bytes(
+            &tile_bytes_within(&lcg_rgb_image(37, 21, 43), 2),
+            &tiles_and_global_view,
+            "37x21 scaled down to 14x8 in two tiles",
+        );
+    }
+
+    /// An image with alpha is resized as the reference resizes it: the alpha
+    /// is dropped first and the RGB bytes are resampled as they stand, never
+    /// weighted by it. A 5x3 RGBA image of generator bytes is scaled up to
+    /// 8x4 inside its one tile; the bytes are the reference class's for the
+    /// same image.
+    #[test]
+    fn an_image_with_alpha_is_resized_as_its_rgb_bytes() {
+        let scaled_up: [u8; 192] = [
+            234, 207, 174, 182, 150, 78, 140, 194, 164, 125, 80, 136, 149, 121, 146, 167, 143, 112,
+            77, 136, 160, 149, 141, 136, 179, 173, 167, 182, 177, 152, 127, 110, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 41,
+            100, 177, 223, 238, 236, 233, 17, 85, 172, 148, 166, 225, 182, 144, 24, 99, 188, 105,
+            109, 200, 151, 105, 21, 77, 142, 62, 72, 172, 152, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 71, 74, 83, 143, 126,
+            31, 36, 47, 44, 93, 152, 102, 73, 65, 61, 58, 104, 155, 209, 101, 52, 58, 100, 132,
+            232, 237, 235, 142, 69, 14, 140, 243, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let image = RgbaImage::from_raw(5, 3, lcg_bytes(5 * 3 * 4, 27)).expect("image size");
+        assert_same_bytes(
+            &tile_bytes(&DynamicImage::ImageRgba8(image)),
+            &scaled_up,
+            "5x3 with alpha scaled up to 8x4",
+        );
+    }
+
+    /// A grey image is written as its RGB conversion: a 6x4 image, which is
+    /// scaled up inside its one tile; a 13x7 image's two tiles (the image as
+    /// it is) and global view (the image scaled to 8x8) as those of the
+    /// converted image; and so a 700x600 image, which is resized on both
+    /// axes.
+    #[test]
+    fn a_grey_image_is_written_as_its_rgb_conversion() {
+        for (width, height) in [(6, 4), (13, 7), (700, 600)] {
+            let levels = lcg_bytes((width * height) as usize, 31);
+            let grey = GrayImage::from_raw(width, height, levels).expect("image size");
+            let grey = DynamicImage::ImageLuma8(grey);
+            assert_same_bytes(
+                &tile_bytes(&grey),
+                &tile_bytes(&DynamicImage::ImageRgb8(grey.to_rgb8())),
+                &format!("{width}x{height} grey"),
+            );
+        }
+    }
+
+    /// An image with an empty side has no pixel to resample: it keeps the
+    /// generic resizer and writes one black tile.
+    #[test]
+    fn an_image_with_an_empty_side_writes_a_black_tile() {
+        for (width, height) in [(0, 5), (5, 0)] {
+            assert_same_bytes(
+                &tile_bytes(&DynamicImage::new_rgb8(width, height)),
+                &[0; 192],
+                &format!("{width}x{height}"),
+            );
+        }
+    }
+
     /// `tile_blocks` against the canvas read pixel by pixel: the image's byte
     /// inside it, black (0) beyond it, no stale byte in a partial tile behind a
     /// full one (no pixel byte here is 0).
@@ -871,6 +1103,54 @@ mod tests {
         }
         // Three channels of a 336x336 tile, 338,688 bytes: the 512 KiB class.
         assert_eq!(MINE.held(), 512 << 10);
+    }
+
+    /// A resized image's bytes, its global view's and the band buffer of
+    /// their resizes are the pool's and go back behind the tiles: the pool
+    /// holds them all when the image is written. A band buffer that had
+    /// grown would hold no class's capacity, and the pool would not keep it.
+    #[test]
+    fn the_resized_bytes_go_back_to_the_pool() {
+        static MINE: buffer_pool::BufferPool = buffer_pool::BufferPool::new();
+        let processor = Llama4VisionProcessor::new();
+        let image = lcg_rgb_image(1500, 1100, 7);
+        let plan = processor.plan(image.dimensions());
+        assert!(plan.has_global() && plan.resized != image.dimensions());
+        buffer_pool::with_pool(&MINE, || processor.write_image(&image, &plan, |_, _| {}));
+        let (width, height) = plan.resized;
+        let resized = buffer_pool::allocation_capacity(width as usize * height as usize * 3);
+        // The band buffer (512 KiB of rows and a block's rounding: the
+        // 1 MiB class, one for both resizes), the view and the tile buffer
+        // (338,688 bytes each: the 512 KiB class), the resized bytes. Off
+        // x86-64 the resize rows allocate vectors of their exact length,
+        // which the pool does not keep: the tile buffer alone is its own.
+        let held = if cfg!(target_arch = "x86_64") {
+            (1 << 20) + 2 * (512 << 10) + resized
+        } else {
+            512 << 10
+        };
+        assert_eq!(MINE.held(), held);
+    }
+
+    /// A colour image of more than four megapixels holds the bytes of the
+    /// road its processor's rows name: the generic resizer's where the width
+    /// pass runs its AVX2 rows, the exact kernel's elsewhere.
+    #[test]
+    fn a_large_colour_image_takes_the_road_of_its_rows() {
+        let (width, height) = (2001, 2000);
+        let image = lcg_rgb_image(width, height, 11);
+        let targets = [(1344, 1343), (336, 336)];
+        let resized = resized_rgb(&image, targets);
+        let (_, _, rgb) = transforms::rgb_bytes(&image);
+        for (bytes, (out_w, out_h)) in resized.iter().zip(targets) {
+            let expected = if transforms::bilinear_torch_aa_trails_generic(&image) {
+                let generic = transforms::resize(&image, out_w, out_h, FilterType::Triangle);
+                transforms::rgb_bytes(&generic).2.into_owned()
+            } else {
+                transforms::resize_bilinear_torch_aa_rgb_bytes(&rgb, width, height, out_w, out_h)
+            };
+            assert_same_bytes(bytes, &expected, "a colour image above four megapixels");
+        }
     }
 
     /// A tile too large for any allocation, and a batch of them too large

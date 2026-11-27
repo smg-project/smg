@@ -51,6 +51,7 @@ use smg::{
         grpc::backend_client::BasicWorkerBuilder,
         RouterFactory, RouterTrait,
     },
+    wasm::module_manager::WasmModuleManager,
     workflow::Job,
 };
 use smg_data_connector::{
@@ -619,6 +620,14 @@ async fn build_test_app_context(
             .router_config(config.clone())
             .client(client)
             .rate_limiter(rate_limiter)
+            // The module manager where the configuration enables wasm, as
+            // the server's builder makes it: an app over a context without
+            // one attaches no wasm hook.
+            .wasm_manager(
+                config
+                    .enable_wasm
+                    .then(|| Arc::new(WasmModuleManager::with_default_config())),
+            )
             .rate_limit_manager(rate_limit_manager)
             .tokenizer_registry(tokenizer_registry)
             // `Default` builds each factory: naming its type would make this
