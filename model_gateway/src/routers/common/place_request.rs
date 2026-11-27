@@ -371,6 +371,7 @@ mod tests {
             connection: ConnectionMode::Grpc,
             requires_media_refs: true,
             pipeline: PipelinePin::Only,
+            hints: false,
         };
         let request = place_request(
             MODEL,
@@ -454,6 +455,7 @@ mod tests {
                 connection,
                 requires_media_refs: false,
                 pipeline: PipelinePin::Any,
+                hints: false,
             });
             for (other, worker) in workers.iter().enumerate() {
                 let (theirs, their_connection) = wires[other];

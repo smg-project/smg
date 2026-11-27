@@ -106,15 +106,15 @@ pub(crate) use plan::{
     validate_rendered_media_anchors, DeploymentFault, MediaPlan, PlaceholderTokens, RequestRefusal,
 };
 pub(crate) use process::process_multimodal_plan;
-#[cfg(test)]
-pub(crate) use refs::MM_PROCESSOR_LABEL;
 pub(crate) use refs::{
     assemble_media_refs, ensure_selection_supports_media_refs, media_refs_pipeline_pin,
-    models_without_media_processing, pool_processes_media_refs,
+    models_without_media_processing, pipeline_admits, plan_has_hints, pool_processes_media_refs,
     registration_lacks_media_processing, resolve_mm_processing, worker_accepts_media_refs,
-    worker_runs_gateway_pipeline, worker_supports_ec_transfer, MmProcessing, MmRefsError,
+    worker_applies_hints, worker_supports_ec_transfer, MmProcessing, MmRefsError,
     GATEWAY_PIPELINE_PROCESSOR,
 };
+#[cfg(test)]
+pub(crate) use refs::{MM_ITEM_HINTS_LABEL, MM_PROCESSOR_LABEL};
 pub(crate) use resolve::{resolve_media, MediaContext, ResolvedMedia};
 pub(crate) use serialize::WireMismatch;
 pub(crate) use settings::{init_mm_settings, mm_settings, MultimodalSettings};

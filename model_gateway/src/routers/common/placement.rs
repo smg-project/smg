@@ -81,6 +81,10 @@ pub(crate) struct WireConstraint {
     /// plan may use; the gRPC selection helpers derive their candidate
     /// predicate from it as from the flag above.
     pub pipeline: PipelinePin,
+    /// With `requires_media_refs`: the references carry per-item hints, so
+    /// only a worker that applies them may take the plan; the gRPC selection
+    /// helpers derive their candidate predicate from it as from the pin.
+    pub hints: bool,
 }
 
 /// Which of the workers that process media references a forwarded plan may
@@ -5076,6 +5080,7 @@ pub(crate) mod tests {
             connection: ConnectionMode::Grpc,
             requires_media_refs: false,
             pipeline: PipelinePin::Any,
+            hints: false,
         });
 
         assert_eq!(
@@ -5194,6 +5199,7 @@ pub(crate) mod tests {
                 connection: ConnectionMode::Grpc,
                 requires_media_refs: false,
                 pipeline: PipelinePin::Any,
+                hints: false,
             }),
             None,
             PlacementInputs::default(),
@@ -5330,6 +5336,7 @@ pub(crate) mod tests {
             connection: ConnectionMode::Grpc,
             requires_media_refs: false,
             pipeline: PipelinePin::Any,
+            hints: false,
         });
         let only_p1 = |w: &dyn Worker| w.url() == "grpc://p:1";
         let failure = select_pair(
@@ -8113,6 +8120,7 @@ pub(crate) mod tests {
             connection: ConnectionMode::Http,
             requires_media_refs: false,
             pipeline: PipelinePin::Any,
+            hints: false,
         };
         let mut on_wire = BTreeMap::new();
         let inputs = PlacementInputs::default();
@@ -8193,6 +8201,7 @@ pub(crate) mod tests {
             connection,
             requires_media_refs: false,
             pipeline: PipelinePin::Any,
+            hints: false,
         }
     }
 
@@ -9140,6 +9149,7 @@ pub(crate) mod tests {
             connection: ConnectionMode::Http,
             requires_media_refs: false,
             pipeline: PipelinePin::Any,
+            hints: false,
         };
 
         let (mut by_rule, mut on_wire) = (BTreeMap::new(), BTreeMap::new());
@@ -10787,6 +10797,7 @@ pub(crate) mod tests {
             connection: grpc,
             requires_media_refs: false,
             pipeline: PipelinePin::Any,
+            hints: false,
         };
         let refuses_one = |worker: &dyn Worker| worker.url() != "grpc://d:2";
         let placed_over = |wire: Option<WireConstraint>, rule: Option<CandidateFilter<'_>>| {
@@ -11033,6 +11044,7 @@ pub(crate) mod tests {
             connection: grpc,
             requires_media_refs: false,
             pipeline: PipelinePin::Any,
+            hints: false,
         };
         let taken = ["grpc://pv:0", "grpc://dv:0", "grpc://p:12", "grpc://d:12"];
         let takes = |worker: &dyn Worker| taken.contains(&worker.url());

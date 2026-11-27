@@ -334,6 +334,11 @@ pub(crate) struct ProcessingState {
     /// selection and the retry pin read it.
     pub media_refs_pipeline: PipelinePin,
 
+    /// With forwarded references: they carry per-item hints, so only a
+    /// worker that applies them may take the plan. Set in preparation with
+    /// `multimodal_refs`; worker selection and the retry pin read it.
+    pub media_refs_hints: bool,
+
     /// `Some` iff the request is multimodal EPD and worker selection produced
     /// encode assignments: the encode stage's plan, by handoff. Request building
     /// injects a rendezvous plan's bootstrap info and drops the prefill pixels;
@@ -416,13 +421,19 @@ pub(crate) struct RoutingSnapshot {
 pub(crate) use crate::routers::common::placement::{PipelinePin, WireConstraint};
 
 impl WireConstraint {
-    fn of(workers: &WorkerSelection, requires_media_refs: bool, pipeline: PipelinePin) -> Self {
+    fn of(
+        workers: &WorkerSelection,
+        requires_media_refs: bool,
+        pipeline: PipelinePin,
+        hints: bool,
+    ) -> Self {
         match workers {
             WorkerSelection::Single { worker } => Self {
                 runtime: worker.metadata().spec.runtime_type,
                 connection: *worker.connection_mode(),
                 requires_media_refs,
                 pipeline,
+                hints,
             },
             // The prefill side builds the request, so its transport is the
             // plan's (a gRPC servicer, or a TokenSpeed engine's ZMQ wire).
@@ -435,6 +446,7 @@ impl WireConstraint {
                 connection: *prefill.connection_mode(),
                 requires_media_refs,
                 pipeline,
+                hints,
             },
         }
     }
@@ -1449,6 +1461,7 @@ impl RequestContext {
             } else {
                 PipelinePin::Any
             },
+            self.state.media_refs_forwarded && self.state.media_refs_hints,
         );
         let request_id =
             super::common::stages::helpers::middleware_request_id(tenant_request_meta.as_ref())

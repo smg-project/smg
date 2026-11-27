@@ -36,7 +36,8 @@ use crate::{
             multimodal::{
                 ensure_model_accepts_media, media_refs_pipeline_pin, MediaContext, MediaPlan,
                 MultimodalComponents, MultimodalConfigRegistry, MultimodalSettings,
-                PlaceholderTokens, GATEWAY_PIPELINE_PROCESSOR, MM_PROCESSOR_LABEL,
+                PlaceholderTokens, GATEWAY_PIPELINE_PROCESSOR, MM_ITEM_HINTS_LABEL,
+                MM_PROCESSOR_LABEL,
             },
             regular::stages::testing::components_over,
             testing::unreadable_model_dir,
@@ -231,6 +232,55 @@ async fn media_a_worker_processes_itself_leaves_as_references_with_the_pin_set()
         Some(1)
     );
     assert_eq!(ctx.state.media_refs_pipeline, expected_pin);
+}
+
+/// A hinted image forwarded to a fleet whose workers apply the hints leaves
+/// with the hint demand set, the one worker selection and the dispatch's
+/// wire read for every attempt; the same image without hints leaves it
+/// unset.
+#[tokio::test]
+async fn hinted_media_forwarded_to_workers_that_apply_hints_sets_the_hint_demand() {
+    let image = |max_long_side_pixel| {
+        MediaPlan::new([MediaContentPart::ImageUrl {
+            url: "https://a/1.png".to_string().into(),
+            detail: None,
+            uuid: None,
+            max_long_side_pixel,
+        }])
+    };
+    let placeholders = PlaceholderTokens::worker_only();
+    for (name, plan, hinted) in [
+        ("a hinted image", image(Some(504)), true),
+        ("an image without hints", image(None), false),
+    ] {
+        let (mut ctx, tokenizer) = context_over(registry_with(vec![grpc_worker(
+            "grpc://127.0.0.1:9830",
+            "m",
+            RuntimeType::Vllm,
+            &[
+                (MM_PROCESSOR_LABEL, GATEWAY_PIPELINE_PROCESSOR),
+                (MM_ITEM_HINTS_LABEL, "true"),
+            ],
+        )]))
+        .await;
+        let media = media_for(plan, MmProcessingMode::Worker, placeholders.clone());
+        let rendered = match prepare_rendered_prompt(
+            &mut ctx,
+            &tokenizer,
+            "Hello world",
+            PromptEncoding::FromText,
+            Some(media),
+            &[],
+            "test",
+        )
+        .await
+        {
+            Ok(rendered) => rendered,
+            Err(response) => panic!("{name}: refused with {}", response.status()),
+        };
+        assert!(rendered.multimodal_refs.is_some(), "{name}");
+        assert_eq!(ctx.state.media_refs_hints, hinted, "{name}");
+    }
 }
 
 /// A prompt without media is the renderer's tokens and nothing else: no

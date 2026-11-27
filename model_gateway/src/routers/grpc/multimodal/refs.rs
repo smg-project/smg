@@ -14,7 +14,7 @@ use llm_multimodal::{
     media, MediaConnectorError, MediaContentPart, MediaErrorCode, Modality,
 };
 use openai_protocol::worker::MmProcessingMode;
-use smg_grpc_client::{common_proto as common, vllm_proto as vllm};
+use smg_grpc_client::{common_proto as common, vllm_proto as vllm, MediaItemHints};
 use smg_worker::{
     identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
     labels::SUPPORTS_VISION_LABEL,
@@ -44,6 +44,9 @@ use crate::{
 pub(crate) const MM_PROCESSOR_LABEL: &str = "mm_processor";
 /// Worker label carrying accepted URL schemes (`GetServerInfo.mm_media_ref_schemes`).
 pub(crate) const MM_MEDIA_REF_SCHEMES_LABEL: &str = "mm_media_ref_schemes";
+/// Worker label saying the worker applies a media reference's per-item hints
+/// (`max_long_side_pixel`, `fps`) itself (`GetServerInfo.mm_item_hints`).
+pub(crate) const MM_ITEM_HINTS_LABEL: &str = "mm_item_hints";
 /// The `mm_processor` value of a worker that runs the gateway's own media
 /// pipeline in place of the engine's processor. It expands a family's anchor
 /// exactly as the gateway would, so a spec's opt-in for the engine's prompt
@@ -71,10 +74,16 @@ impl MmProcessing {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MmRefsError {
     /// A part carries per-item processing hints (the long-side cap, the
-    /// sampling rate) no worker honors, and the router cannot apply them
-    /// itself: it has no spec for the model, or the request carries a
-    /// modality only the worker processes (audio).
+    /// sampling rate) that cannot ride to a worker (not every
+    /// media-processing worker of the model applies them, or none that does
+    /// may take the plan's media), and the router cannot apply them itself:
+    /// it has no spec for the model, or the request carries a modality only
+    /// the worker processes (audio).
     HintUnsupported,
+    /// The plan forwards per-item hints and the workers selection had for it
+    /// do not apply them (no candidate did, or the one picked does not): a
+    /// worker without the capability would serve the media unsized.
+    HintsNotAppliedBySelection,
     /// The model's placeholder anchor is not one the engine's own processor
     /// expands, and the model's workers do not all run the gateway's pipeline.
     ModelNotOptedIn(Modality),
@@ -123,7 +132,9 @@ impl MmRefsError {
     /// Stable error code for the HTTP response body.
     pub(crate) fn code(&self) -> &'static str {
         match self {
-            Self::HintUnsupported => "multimodal_hint_unsupported_in_worker_mode",
+            Self::HintUnsupported | Self::HintsNotAppliedBySelection => {
+                "multimodal_hint_unsupported_in_worker_mode"
+            }
             Self::ModelNotOptedIn(_) | Self::PipelineWorkerRequired => {
                 "multimodal_worker_processing_unsupported_model"
             }
@@ -162,6 +173,13 @@ impl std::fmt::Display for MmRefsError {
                 "per-item media hints (max_long_side_pixel, fps) cannot be forwarded to a worker, \
                  and the router cannot apply them itself: it has no media spec for this model, \
                  or an item is of a modality only the worker processes",
+            ),
+            Self::HintsNotAppliedBySelection => write!(
+                f,
+                "a worker selection had for this request does not apply per-item media \
+                 hints (max_long_side_pixel, fps); only a vLLM worker that advertises \
+                 {MM_ITEM_HINTS_LABEL} (--mm-processor {GATEWAY_PIPELINE_PROCESSOR} on the Rust \
+                 servicer) takes them"
             ),
             Self::ModelNotOptedIn(modality) => write!(
                 f,
@@ -303,6 +321,59 @@ fn fleet_runs_gateway_pipeline(registry: &WorkerRegistry, model_id: &str) -> boo
         .filter(|worker| worker_accepts_media_refs(worker.as_ref()))
         .peekable();
     capable.peek().is_some() && capable.all(|worker| worker_runs_gateway_pipeline(worker.as_ref()))
+}
+
+/// Whether `worker` is on the side of `pin`: running the gateway's own
+/// pipeline for [`PipelinePin::Only`], not running it for
+/// [`PipelinePin::Never`], anything for [`PipelinePin::Any`].
+pub(crate) fn pipeline_admits(pin: PipelinePin, worker: &dyn Worker) -> bool {
+    match pin {
+        PipelinePin::Any => true,
+        PipelinePin::Only => worker_runs_gateway_pipeline(worker),
+        PipelinePin::Never => !worker_runs_gateway_pipeline(worker),
+    }
+}
+
+/// Whether `worker` applies a media reference's per-item hints itself
+/// ([`MM_ITEM_HINTS_LABEL`] `"true"`). A vLLM worker alone: the SGLang wire
+/// carries a reference's URL and nothing else, so an SGLang worker never
+/// applies them, whatever it advertises. A hinted reference goes only to a
+/// worker that applies hints: by the fleet verdict in preparation
+/// ([`resolve_mm_processing`]), by the candidates of every selection and by
+/// the check after it ([`ensure_selection_supports_media_refs`]).
+pub(crate) fn worker_applies_hints(worker: &dyn Worker) -> bool {
+    let spec = &worker.metadata().spec;
+    spec.runtime_type == RuntimeType::Vllm
+        && spec
+            .labels
+            .get(MM_ITEM_HINTS_LABEL)
+            .is_some_and(|value| value == "true")
+}
+
+/// Whether the model's workers that process media references all apply a
+/// reference's per-item hints, and one of them is on the side of the plan's
+/// pipeline pin (`pin`, see [`media_refs_pipeline_pin`]): then a hinted
+/// request forwards with its hints instead of being preprocessed here. A plan
+/// no such worker may take (audio, which the gateway's own pipeline does not
+/// take) keeps the router's pipeline. A plan pinned to that pipeline
+/// ([`PipelinePin::Only`]) needs every one of them on it, as the forward
+/// branch does ([`fleet_runs_gateway_pipeline`]): a fleet with a worker off
+/// it would refuse the family the router serves. Every registered worker
+/// counts, healthy or not, so a health flap never flips a model between
+/// placements request to request.
+fn fleet_applies_hints(registry: &WorkerRegistry, model_id: &str, pin: PipelinePin) -> bool {
+    let mut admitted = false;
+    for worker in registry.get_by_model(model_id).iter() {
+        if !worker_accepts_media_refs(worker.as_ref()) {
+            continue;
+        }
+        let on_side = pipeline_admits(pin, worker.as_ref());
+        if !worker_applies_hints(worker.as_ref()) || (pin == PipelinePin::Only && !on_side) {
+            return false;
+        }
+        admitted |= on_side;
+    }
+    admitted
 }
 
 /// Whether `worker` runs an engine with a vision encoder (`supports_vision`
@@ -509,14 +580,25 @@ pub(crate) fn resolve_mm_processing(
 ) -> Result<MmProcessing, MmRefsError> {
     let (resolved, reason) = match components.processing {
         MmProcessingMode::Router => (MmProcessing::Router, "config"),
-        MmProcessingMode::Worker => match plan_carries_hints(plan)? {
-            // The hints are knobs of the router's own pipeline (the long-side
-            // cap, the sampling rate): a hinted request that pipeline can serve
-            // is preprocessed here, as under `auto`; every other request keeps
-            // forwarding references.
-            true if router_serves(plan, placeholders) => (MmProcessing::Router, "hint_fallback"),
-            true => return Err(MmRefsError::HintUnsupported),
-            false => {
+        MmProcessingMode::Worker => {
+            let hinted = plan_carries_hints(plan)?;
+            // The hints (the long-side cap, the sampling rate) ride the
+            // references to a fleet whose media-processing workers all apply
+            // them. Otherwise they are knobs of the router's own pipeline: a
+            // hinted request that pipeline can serve is preprocessed here, as
+            // under `auto`; every other request keeps forwarding references.
+            if hinted
+                && !fleet_applies_hints(
+                    registry,
+                    model_id,
+                    media_refs_pipeline_pin(plan, placeholders),
+                )
+            {
+                if !router_serves(plan, placeholders) {
+                    return Err(MmRefsError::HintUnsupported);
+                }
+                (MmProcessing::Router, "hint_fallback")
+            } else {
                 // A family the engine's processor does not expand still
                 // forwards when every media-processing worker of the model
                 // runs the gateway's own pipeline; selection then places the
@@ -527,14 +609,16 @@ pub(crate) fn resolve_mm_processing(
                 ensure_fleet_processes_media_refs(registry, model_id)?;
                 (
                     MmProcessing::Worker,
-                    if pipeline_fleet {
+                    if hinted {
+                        "hints_forwarded"
+                    } else if pipeline_fleet {
                         "pipeline_workers"
                     } else {
                         "config"
                     },
                 )
             }
-        },
+        }
         MmProcessingMode::Auto => {
             if plan.is_forwardable() {
                 // Every registered worker, healthy or not: a health flap must
@@ -621,7 +705,12 @@ pub(crate) fn resolve_mm_processing(
 /// identity relay does not apply, as with n>1). A plan pinned to the
 /// gateway's own pipeline (`pin`, see [`media_refs_pipeline_pin`]) needs
 /// every worker on that pipeline, and a worker on it takes no audio; selection
-/// draws its candidates by the same pin, so this is the backstop.
+/// draws its candidates by the same pin, so this is the backstop. A plan that
+/// forwards per-item hints needs every such worker to apply them
+/// ([`worker_applies_hints`]): selection draws its candidates by that too, and
+/// this is the backstop for a pool that changed after the fleet verdict of
+/// preparation, since a worker without the capability would serve the media
+/// unsized.
 pub(crate) fn ensure_selection_supports_media_refs(
     workers: &WorkerSelection,
     plan: &MediaPlan,
@@ -646,6 +735,9 @@ pub(crate) fn ensure_selection_supports_media_refs(
         .all(|worker| worker_accepts_media_refs(*worker))
     {
         return Err(MmRefsError::WorkerNotCapable);
+    }
+    if plan_has_hints(plan) && !workers.iter().all(|worker| worker_applies_hints(*worker)) {
+        return Err(MmRefsError::HintsNotAppliedBySelection);
     }
     let carries_audio = plan.modalities().contains(&Modality::Audio);
     for worker in &workers {
@@ -749,38 +841,23 @@ fn forwardable_ref(
     part: &MediaContentPart,
 ) -> Result<(common::Modality, WireUrl<'_>, usize), MmRefsError> {
     match part {
-        MediaContentPart::ImageUrl {
-            url,
-            max_long_side_pixel: None,
-            ..
-        } => Ok((
+        MediaContentPart::ImageUrl { url, .. } => Ok((
             common::Modality::Image,
             WireUrl::AsWritten(url.as_str()),
             media::image_max_input_bytes(),
         )),
         MediaContentPart::ImageBase64 {
-            media_type,
-            data,
-            max_long_side_pixel: None,
-            ..
+            media_type, data, ..
         } => Ok((
             common::Modality::Image,
             WireUrl::Base64 { media_type, data },
             media::image_max_input_bytes(),
         )),
-        MediaContentPart::VideoUrl {
-            url,
-            fps: None,
-            max_long_side_pixel: None,
-            ..
-        } => Ok((
+        MediaContentPart::VideoUrl { url, .. } => Ok((
             common::Modality::Video,
             WireUrl::AsWritten(url.as_str()),
             media::video_max_input_bytes(),
         )),
-        MediaContentPart::ImageUrl { .. }
-        | MediaContentPart::ImageBase64 { .. }
-        | MediaContentPart::VideoUrl { .. } => Err(MmRefsError::HintUnsupported),
         MediaContentPart::ImageData { .. } => {
             Err(MmRefsError::UnsupportedPart("inline image bytes"))
         }
@@ -809,20 +886,57 @@ fn forwardable_ref(
     }
 }
 
-/// Whether this plan is forwardable apart from per-item hints: `Ok(true)` when
-/// a part carries one, `Ok(false)` when none does; a part with no reference
-/// form at all is the error, whatever its position. Classification only: no
-/// part's URL is built here.
-fn plan_carries_hints(plan: &MediaPlan) -> Result<bool, MmRefsError> {
-    let mut hinted = false;
-    for part in plan.parts() {
-        match forwardable_ref(part) {
-            Ok(_) => {}
-            Err(MmRefsError::HintUnsupported) => hinted = true,
-            Err(blocker) => return Err(blocker),
+/// The per-item hints `part` carries, as the request sent them: the long-side
+/// cap of an image or of each video frame, and a video's sampling rate; none
+/// for a kind that takes none. Their bounds are the media pipeline's, applied
+/// where it runs (here under router placement, on a worker that applies hints
+/// otherwise), so a hint out of range meets one refusal either way.
+fn part_hints(part: &MediaContentPart) -> MediaItemHints {
+    match part {
+        MediaContentPart::ImageUrl {
+            max_long_side_pixel,
+            ..
         }
+        | MediaContentPart::ImageBase64 {
+            max_long_side_pixel,
+            ..
+        } => MediaItemHints {
+            max_long_side_pixel: *max_long_side_pixel,
+            fps: None,
+        },
+        MediaContentPart::VideoUrl {
+            fps,
+            max_long_side_pixel,
+            ..
+        } => MediaItemHints {
+            max_long_side_pixel: *max_long_side_pixel,
+            fps: *fps,
+        },
+        MediaContentPart::Text { .. }
+        | MediaContentPart::ImageData { .. }
+        | MediaContentPart::ImageEmbeds { .. }
+        | MediaContentPart::AudioUrl { .. }
+        | MediaContentPart::AudioBase64 { .. }
+        | MediaContentPart::AudioData { .. }
+        | MediaContentPart::VideoData { .. } => MediaItemHints::default(),
     }
-    Ok(hinted)
+}
+
+/// Whether a part of `plan` carries a per-item hint, which only a worker that
+/// applies hints may take ([`worker_applies_hints`]).
+pub(crate) fn plan_has_hints(plan: &MediaPlan) -> bool {
+    plan.parts().iter().any(|part| part_hints(part).is_set())
+}
+
+/// Whether this plan is forwardable, and hinted: `Ok(true)` when a part
+/// carries a per-item hint, `Ok(false)` when none does; a part with no
+/// reference form at all is the error, whatever its position. Classification
+/// only: no part's URL is built here.
+fn plan_carries_hints(plan: &MediaPlan) -> Result<bool, MmRefsError> {
+    for part in plan.parts() {
+        forwardable_ref(part)?;
+    }
+    Ok(plan_has_hints(plan))
 }
 
 /// The characters of a refused url its refusal echoes, at most: the sentence
@@ -943,8 +1057,17 @@ fn opens_a_data_url(text: &str) -> bool {
         .is_some_and(|scheme| scheme.eq_ignore_ascii_case("data:"))
 }
 
-/// Build the wire payload from the plan, in authored (prompt) order.
+/// Build the wire payload from the plan, in authored (prompt) order, each
+/// reference with the per-item hints its part carries. A hinted plan goes
+/// only to workers that apply hints, where the router's pipeline would have
+/// sampled its clips at the rate the request states
+/// (`MediaPlan::request_video_fps`) unless a clip states its own: that rate
+/// rides each clip without one, so the worker samples it alike. A plan
+/// without hints forwards as before.
 pub(crate) fn assemble_media_refs(plan: &MediaPlan) -> Result<vllm::MediaRefs, MmRefsError> {
+    let request_fps = plan_has_hints(plan)
+        .then(|| plan.request_video_fps())
+        .flatten();
     let mut items = Vec::with_capacity(plan.parts().len());
     for (index, part) in plan.parts().iter().enumerate() {
         let (modality, url, limit) = forwardable_ref(part)?;
@@ -958,11 +1081,17 @@ pub(crate) fn assemble_media_refs(plan: &MediaPlan) -> Result<vllm::MediaRefs, M
                 });
             }
         }
-        items.push(vllm::MediaRef {
+        let mut item = vllm::MediaRef {
             modality: modality as i32,
             url: url.into_owned(),
             ..Default::default()
-        });
+        };
+        let mut hints = part_hints(part);
+        if matches!(part, MediaContentPart::VideoUrl { .. }) {
+            hints.fps = hints.fps.or(request_fps);
+        }
+        item.set_item_hints(hints);
+        items.push(item);
     }
     Ok(vllm::MediaRefs { items })
 }

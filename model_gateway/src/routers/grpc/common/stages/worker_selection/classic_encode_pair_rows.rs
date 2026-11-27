@@ -341,6 +341,9 @@ fn refusal(failure: EpdSelectionFailure) -> Answer {
         EpdSelectionFailure::DecodeVisionUnsupported => named("decode_vision_unsupported"),
         EpdSelectionFailure::EncodeNotSupported => named("encode_not_supported"),
         EpdSelectionFailure::EncodeVisionUnsupported => named("encode_vision_unsupported"),
+        // No row of the recorder's sheet carries per-item hints, so none
+        // records this refusal. It has its name all the same.
+        EpdSelectionFailure::HintsNotApplied => named("hints_not_applied"),
         // The recorder does not start Grand Central, so no row of its sheet
         // records this refusal. It has its name all the same.
         EpdSelectionFailure::EncodeUnderGrandCentral => named("encode_under_grand_central"),
@@ -588,6 +591,7 @@ impl Bed {
                     media_refs: request.references,
                     vision: request.images,
                     pipeline: PipelinePin::Any,
+                    hints: false,
                 },
                 decode_vision: request.decode_images,
                 image_fanout: request.fanout,

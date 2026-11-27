@@ -14,6 +14,7 @@ use crate::routers::{
     common::snapshot::test_support::registry_with,
     grpc::{
         backend_client::BasicWorkerBuilder,
+        context::EncodeWorkerAssignment,
         multimodal::{config::MultimodalConfigRegistry, settings::MultimodalSettings},
     },
 };
@@ -969,6 +970,391 @@ fn worker_mode_preprocesses_hinted_items_itself() {
         )
         .expect("plain audio forwards"),
         MmProcessing::Worker
+    );
+}
+
+/// A worker that processes media references and applies their per-item
+/// hints: the Rust servicer on the gateway's own pipeline.
+fn applies_hints(url: &str) -> Arc<dyn Worker> {
+    worker(
+        url,
+        RuntimeType::Vllm,
+        ConnectionMode::Grpc,
+        &[
+            (MM_PROCESSOR_LABEL, GATEWAY_PIPELINE_PROCESSOR),
+            (MM_MEDIA_REF_SCHEMES_LABEL, "http,https,data"),
+            (MM_ITEM_HINTS_LABEL, "true"),
+        ],
+    )
+}
+
+/// A worker that processes media references and says it applies no hints,
+/// as the Python servicer's proto default does.
+fn applies_no_hints(url: &str) -> Arc<dyn Worker> {
+    worker(
+        url,
+        RuntimeType::Vllm,
+        ConnectionMode::Grpc,
+        &[
+            (MM_PROCESSOR_LABEL, "inprocess"),
+            (MM_MEDIA_REF_SCHEMES_LABEL, "http,https,data"),
+            (MM_ITEM_HINTS_LABEL, "false"),
+        ],
+    )
+}
+
+/// An SGLang worker on the gateway's own pipeline that claims the label: its
+/// wire carries a reference's URL alone, so it never applies hints.
+fn sglang_claiming_hints(url: &str) -> Arc<dyn Worker> {
+    worker(
+        url,
+        RuntimeType::Sglang,
+        ConnectionMode::Grpc,
+        &[
+            (MM_PROCESSOR_LABEL, GATEWAY_PIPELINE_PROCESSOR),
+            (MM_ITEM_HINTS_LABEL, "true"),
+        ],
+    )
+}
+
+/// An image and a video, each with its hints.
+fn hinted_plan() -> MediaPlan {
+    plan(vec![
+        hinted_image("https://a/1.png", 504),
+        hinted_video("https://a/1.mp4", Some(2.0), Some(1008)),
+    ])
+}
+
+/// Placeholders the engine's processor expands for images and videos.
+fn image_and_video_placeholders() -> PlaceholderTokens {
+    let mut placeholders = expandable_placeholders();
+    placeholders.insert(Modality::Video, "<|video_pad|>".to_string());
+    placeholders.set_worker_expandable(Modality::Video, true);
+    placeholders
+}
+
+/// Only a vLLM worker whose label reads `true` applies hints: one that says
+/// `false`, one without the label, and an SGLang worker whatever it claims
+/// do not.
+#[test]
+fn only_a_vllm_worker_that_advertises_the_label_applies_hints() {
+    assert!(worker_applies_hints(
+        applies_hints("grpc://127.0.0.1:9900").as_ref()
+    ));
+    for (name, other) in [
+        ("label false", applies_no_hints("grpc://127.0.0.1:9901")),
+        ("no label", capable("grpc://127.0.0.1:9902")),
+        ("SGLang", sglang_claiming_hints("grpc://127.0.0.1:9903")),
+    ] {
+        assert!(!worker_applies_hints(other.as_ref()), "{name}");
+    }
+    assert!(
+        worker_accepts_media_refs(sglang_claiming_hints("grpc://127.0.0.1:9904").as_ref()),
+        "the SGLang worker processes references, so it counts in the fleet verdict"
+    );
+}
+
+/// Under worker-side placement a hinted request forwards, its hints on the
+/// references and `hints_forwarded` on the placement metric, when every
+/// media-processing worker of the model applies them; a worker that
+/// processes no media takes no part in that verdict. A fleet with one
+/// media-processing worker that does not apply them (the Python servicer, a
+/// servicer older than the label, an SGLang worker), or a plan no worker
+/// that applies them may take, keeps the router's own pipeline, as before
+/// the label.
+#[test]
+fn worker_mode_forwards_hints_to_a_fleet_whose_media_workers_all_apply_them() {
+    let components = components(MmProcessingMode::Worker);
+    let placeholders = image_and_video_placeholders();
+    let resolve = |fleet: &WorkerRegistry, plan: &MediaPlan| {
+        resolve_mm_processing(&components, fleet, MODEL, plan, &placeholders).expect("resolves")
+    };
+    let applying = registry_with(vec![
+        applies_hints("grpc://127.0.0.1:9910"),
+        applies_hints("grpc://127.0.0.1:9911"),
+    ]);
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let resolved = metrics::with_local_recorder(&recorder, || resolve(&applying, &hinted_plan()));
+    assert_eq!(resolved, MmProcessing::Worker);
+    let rendered = handle.render();
+    assert!(
+        rendered
+            .lines()
+            .any(|line| line.starts_with("smg_mm_processing_total{")
+                && line.contains(r#"mode="worker""#)
+                && line.contains(r#"reason="hints_forwarded""#)),
+        "{rendered}"
+    );
+    let text_only = worker(
+        "grpc://127.0.0.1:9912",
+        RuntimeType::Vllm,
+        ConnectionMode::Grpc,
+        &[],
+    );
+    assert_eq!(
+        resolve(
+            &registry_with(vec![applies_hints("grpc://127.0.0.1:9913"), text_only]),
+            &hinted_plan()
+        ),
+        MmProcessing::Worker
+    );
+
+    let refs = assemble_media_refs(&hinted_plan()).expect("assembles");
+    assert_eq!(refs.items[0].max_long_side_pixel, Some(504));
+    assert_eq!(refs.items[0].fps, None);
+    assert_eq!(refs.items[1].max_long_side_pixel, Some(1008));
+    assert_eq!(refs.items[1].fps, Some(2.0));
+    let plain = assemble_media_refs(&plan(vec![image_url("https://a/1.png")])).expect("assembles");
+    assert!(!plain.items[0].has_item_hints());
+    // An image sent as a base64 source carries its cap on the data URL the
+    // wire takes.
+    let inline = MediaContentPart::ImageBase64 {
+        media_type: "image/png".to_string(),
+        data: Arc::new("AAAA".to_string()),
+        detail: None,
+        uuid: None,
+        max_long_side_pixel: Some(504),
+    };
+    let inline = assemble_media_refs(&plan(vec![inline])).expect("assembles");
+    assert_eq!(inline.items[0].url, "data:image/png;base64,AAAA");
+    assert_eq!(inline.items[0].max_long_side_pixel, Some(504));
+
+    for (name, fleet) in [
+        (
+            "a Python-servicer worker",
+            registry_with(vec![
+                applies_hints("grpc://127.0.0.1:9914"),
+                applies_no_hints("grpc://127.0.0.1:9915"),
+            ]),
+        ),
+        (
+            "a worker without the label",
+            registry_with(vec![
+                applies_hints("grpc://127.0.0.1:9916"),
+                capable("grpc://127.0.0.1:9917"),
+            ]),
+        ),
+        (
+            "an SGLang worker",
+            registry_with(vec![
+                applies_hints("grpc://127.0.0.1:9918"),
+                sglang_claiming_hints("grpc://127.0.0.1:9919"),
+            ]),
+        ),
+    ] {
+        assert_eq!(
+            resolve(&fleet, &hinted_plan()),
+            MmProcessing::Router,
+            "{name}"
+        );
+        assert_eq!(
+            resolve(&fleet, &plan(vec![image_url("https://a/1.png")])),
+            MmProcessing::Worker,
+            "{name}: a plain request forwards as before"
+        );
+    }
+
+    // Audio beside a hinted image pins the plan off the gateway's own
+    // pipeline, the one that applies the hints: no worker that applies them
+    // may take it, so the router applies them, as before the label.
+    let mut with_audio = image_and_video_placeholders();
+    with_audio.insert(Modality::Audio, "<|audio_pad|>".to_string());
+    with_audio.set_worker_expandable(Modality::Audio, true);
+    let hinted_with_audio = plan(vec![
+        hinted_image("https://a/1.png", 504),
+        MediaContentPart::AudioUrl {
+            url: "https://a/x.wav".to_string().into(),
+            uuid: None,
+        },
+    ]);
+    assert_eq!(
+        resolve_mm_processing(
+            &components,
+            &registry_with(vec![applies_hints("grpc://127.0.0.1:9924")]),
+            MODEL,
+            &hinted_with_audio,
+            &with_audio,
+        )
+        .expect("resolves"),
+        MmProcessing::Router
+    );
+}
+
+/// A hinted plan forwards to workers that apply hints, where the router's
+/// pipeline used to sample its clips at the rate the request states
+/// (`media_io_kwargs.video.fps`): that rate rides each clip that states none
+/// of its own, a clip's own rate wins, and an image carries none. A plan
+/// without hints forwards its clips as before, with no rate.
+#[test]
+fn a_hinted_plan_carries_the_requests_video_rate_on_each_clip_without_one() {
+    let hinted = plan(vec![
+        hinted_image("https://a/1.png", 504),
+        hinted_video("https://a/1.mp4", None, Some(1008)),
+        hinted_video("https://a/2.mp4", Some(1.0), None),
+        hinted_video("https://a/3.mp4", None, None),
+    ])
+    .with_request_video_fps(|| Some(2.0));
+    let refs = assemble_media_refs(&hinted).expect("assembles");
+    let rates: Vec<Option<f64>> = refs.items.iter().map(|item| item.fps).collect();
+    assert_eq!(rates, [None, Some(2.0), Some(1.0), Some(2.0)]);
+    assert_eq!(refs.items[1].max_long_side_pixel, Some(1008));
+
+    let unhinted = plan(vec![hinted_video("https://a/3.mp4", None, None)])
+        .with_request_video_fps(|| Some(2.0));
+    let refs = assemble_media_refs(&unhinted).expect("assembles");
+    assert!(
+        !refs.items[0].has_item_hints(),
+        "a plan without hints forwards as before"
+    );
+}
+
+/// A hinted image of a family the engine's processor does not expand is
+/// pinned to the gateway's own pipeline, whose forwarding needs every media
+/// worker on it. A fleet whose media workers all say they apply hints, one
+/// of them off that pipeline (a label set by hand), keeps the router's
+/// preprocessing instead of refusing the family.
+#[test]
+fn a_pipeline_pinned_hinted_request_forwards_only_to_a_fleet_on_the_pipeline() {
+    let components = components(MmProcessingMode::Worker);
+    let placeholders = unopted_placeholders();
+    let image = plan(vec![hinted_image("https://a/1.png", 504)]);
+    let resolve = |fleet: &WorkerRegistry| {
+        resolve_mm_processing(&components, fleet, MODEL, &image, &placeholders)
+    };
+    assert_eq!(
+        resolve(&registry_with(vec![
+            applies_hints("grpc://127.0.0.1:9930"),
+            applies_hints("grpc://127.0.0.1:9931"),
+        ]))
+        .ok(),
+        Some(MmProcessing::Worker),
+        "a fleet on the pipeline throughout is forwarded the hints"
+    );
+    let off_pipeline = worker(
+        "grpc://127.0.0.1:9933",
+        RuntimeType::Vllm,
+        ConnectionMode::Grpc,
+        &[
+            (MM_PROCESSOR_LABEL, "inprocess"),
+            (MM_MEDIA_REF_SCHEMES_LABEL, "http,https,data"),
+            (MM_ITEM_HINTS_LABEL, "true"),
+        ],
+    );
+    assert_eq!(
+        resolve(&registry_with(vec![
+            applies_hints("grpc://127.0.0.1:9932"),
+            off_pipeline,
+        ]))
+        .ok(),
+        Some(MmProcessing::Router),
+        "a fleet with a worker off the pipeline keeps the router's preprocessing"
+    );
+}
+
+/// `auto` keeps every hinted request in the router, a fleet that applies
+/// the hints included: only `worker` placement forwards them.
+#[test]
+fn auto_preprocesses_a_hinted_request_even_for_a_fleet_that_applies_hints() {
+    assert_eq!(
+        resolve_mm_processing(
+            &components(MmProcessingMode::Auto),
+            &registry_with(vec![
+                applies_hints("grpc://127.0.0.1:9920"),
+                applies_hints("grpc://127.0.0.1:9921"),
+            ]),
+            MODEL,
+            &hinted_plan(),
+            &image_and_video_placeholders(),
+        )
+        .expect("resolves"),
+        MmProcessing::Router
+    );
+}
+
+/// The hints a plan forwards need every worker the references reach to
+/// apply them: the fleet verdict of preparation has this backstop for a
+/// pool that changed in between. A plain plan asks nothing of the label; on
+/// a pair both sides take the references, on the encode-prefill-decode
+/// pipeline the encode workers the items are assigned to.
+#[test]
+fn selection_check_refuses_hints_on_a_worker_that_applies_none() {
+    let plain = plan(vec![image_url("https://a/1.png")]);
+    let single = |worker: Arc<dyn Worker>| WorkerSelection::Single {
+        worker: worker.into(),
+    };
+    let check = |workers: &WorkerSelection, plan: &MediaPlan| {
+        ensure_selection_supports_media_refs(workers, plan, PipelinePin::Any)
+    };
+    check(
+        &single(applies_hints("grpc://127.0.0.1:9930")),
+        &hinted_plan(),
+    )
+    .expect("the worker applies the hints");
+    let refused = check(
+        &single(applies_no_hints("grpc://127.0.0.1:9931")),
+        &hinted_plan(),
+    )
+    .expect_err("the worker applies no hints");
+    assert_eq!(refused, MmRefsError::HintsNotAppliedBySelection);
+    assert_eq!(refused.code(), "multimodal_hint_unsupported_in_worker_mode");
+    assert_eq!(
+        refused.into_response().status(),
+        http::StatusCode::BAD_REQUEST
+    );
+    check(&single(applies_no_hints("grpc://127.0.0.1:9932")), &plain)
+        .expect("a plain plan asks nothing of the label");
+
+    let pair = |decode: Arc<dyn Worker>| WorkerSelection::Disaggregated {
+        encode_assignments: None,
+        prefill: applies_hints("grpc://127.0.0.1:9933"),
+        decode: decode.into(),
+        runtime_type: RuntimeType::Vllm,
+    };
+    assert_eq!(
+        check(
+            &pair(applies_no_hints("grpc://127.0.0.1:9934")),
+            &hinted_plan()
+        ),
+        Err(MmRefsError::HintsNotAppliedBySelection),
+        "the decode worker takes the references too"
+    );
+    check(
+        &pair(applies_hints("grpc://127.0.0.1:9935")),
+        &hinted_plan(),
+    )
+    .expect("both sides apply the hints");
+
+    let encoders = |workers: Vec<Arc<dyn Worker>>| WorkerSelection::Disaggregated {
+        encode_assignments: Some(
+            workers
+                .into_iter()
+                .enumerate()
+                .map(|(item_index, worker)| EncodeWorkerAssignment { item_index, worker })
+                .collect(),
+        ),
+        prefill: capable("grpc://127.0.0.1:9936"),
+        decode: capable("grpc://127.0.0.1:9937").into(),
+        runtime_type: RuntimeType::Vllm,
+    };
+    check(
+        &encoders(vec![
+            applies_hints("grpc://127.0.0.1:9938"),
+            applies_hints("grpc://127.0.0.1:9939"),
+        ]),
+        &hinted_plan(),
+    )
+    .expect("every encode worker applies the hints");
+    assert_eq!(
+        check(
+            &encoders(vec![
+                applies_hints("grpc://127.0.0.1:9940"),
+                applies_no_hints("grpc://127.0.0.1:9941"),
+            ]),
+            &hinted_plan()
+        ),
+        Err(MmRefsError::HintsNotAppliedBySelection),
+        "an encode worker without the capability would encode its item unsized"
     );
 }
 
