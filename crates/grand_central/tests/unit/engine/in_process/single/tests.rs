@@ -1271,6 +1271,48 @@ fn only_a_retry_over_ranks_takes_the_threads_list_and_it_grows_once() {
     assert_eq!(kept(), grown, "the list is kept as it grew");
 }
 
+/// Over a list of workers that each stand alone the records hand no list
+/// of tried workers back ([`PoolRecords::tried_engines`]). A retry decided
+/// there by the function a retry over ranks runs ([`retried`]) reads the
+/// request's own list: the worker the retry names is passed over. The
+/// decision's own entry asks that function of no such list.
+#[test]
+fn a_retry_decided_over_workers_that_stand_alone_reads_the_requests_own_list() {
+    let engine = preset("round_robin");
+    let list = pool(3);
+    let members = engine.pool_members(&list);
+    let own = engine.loaded();
+    let spec = &own.document.spec;
+    let records = members.records(spec, &own.clock);
+    assert!(!records.has_ranks(), "each worker stands alone");
+    let tried = [worker_id(list[1].as_ref())];
+    for seed in 0..16 {
+        let mut retry = request();
+        retry.facts.seed = seed;
+        retry.facts.attempt = 1;
+        retry.facts.tried = &tried;
+        let live = records::Live::at(spec.engine(), &own.clock, Instant::now(), None, None)
+            .turning(&members.rotation.0);
+        let mut facts = retry.facts;
+        let cx = Constraints::default();
+        let decision = retried(
+            own,
+            &members,
+            records,
+            &live,
+            &mut facts,
+            &cx,
+            &retry,
+            None,
+            WithoutShadow,
+        );
+        let pick = decision.pick().expect("a pick");
+        let places: Vec<u32> = pick.targets.iter().map(|target| target.position).collect();
+        assert!(!places.is_empty(), "seed {seed}");
+        assert!(!places.contains(&1), "seed {seed}: {places:?}");
+    }
+}
+
 /// A whole pass's lease states the three sizes its request states: the
 /// count of its token ids and its text's two lengths. A reader that
 /// sizes a held decision of text reads the bytes over four off the
