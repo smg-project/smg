@@ -741,13 +741,22 @@ Classic reads exactly one record for a request:
 
 This is classic under its default, `--cache-index tree`. Under `--cache-index hash` classic reads
 none of the three: it keeps a table of placements with a time to live for requests with token
-ids, and balances a text request by load. This design covers the default.
-
-The engine builds no such table yet. A start under the engine whose routing settings state
-`cache_index = hash` runs, and `cache_aware` then remembers no request it placed. The start says
-so in one warning that names the setting. The warning is written for the settings alone: a
-supplied document whose index entry is of kind `hash` runs the same way and gets none, since it
-states its own entries and no setting names them.
+ids, and balances a text request by load. The engine follows it there by its record of sent
+prefixes: under an index of the kind `hash` the record is keyed at `view.boundaries` alone, and
+the settings translate to a `prefix-affinity` threshold of zero and a `warmup-slice` that names
+nobody. So a request of token ids goes back to the worker its head at a boundary was sent to,
+and a request with fewer whole blocks than the first boundary's, or one hashed by its text, is
+recorded nowhere. Five
+things differ from classic. The engine keeps no time to live: a placement stays until the
+record's size bound takes it. It keeps every worker sent a head as its holder, where classic
+keeps three. A key ends at the last whole block under its boundary and keys every request that
+holds those blocks, where classic asks for the boundary's every token. A boundary past the first
+`view.max_block_hashes` blocks of a request keys nothing, where classic keys every boundary the
+prompt reaches. And where the model's index of cache events holds a block, the engine reads
+record A for a request of token ids, which classic under `hash` does not read. The routing
+settings never raise `view.max_block_hashes`, so a gateway whose settings state a boundary past
+those blocks says so at its start in one warning that names the setting, `cache_boundaries`; a
+supplied document states its own view and gets none.
 
 Both trees are read and written in one walk: the walk finds the longest stored prefix, hands the
 match to the policy, and stores the request for the worker the policy chose. So no write is lost

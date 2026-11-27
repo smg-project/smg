@@ -346,6 +346,13 @@ impl AppliedSpec {
             .unwrap_or_default()
     }
 
+    /// The document's `view.boundaries`, in tokens and ascending: where a
+    /// hash index keys a request's head.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn boundaries(&self) -> &[u32] {
+        &self.built_from.view.boundaries
+    }
+
     /// The most prefix block hashes of one request a decision under this
     /// generation reads: the document's `view.max_block_hashes`. What a
     /// decision reads of a request is [`Self::block_hashes_read`], this
