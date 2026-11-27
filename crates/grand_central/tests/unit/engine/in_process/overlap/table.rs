@@ -1,6 +1,6 @@
-//! A list's table: a phase that reads no affinity, whose list keeps none, how
-//! long one stands, a number of the index that changes hands, and a model's
-//! first block and its last.
+//! A list's table: a request of a phase that reads no affinity, which reads
+//! no table, how long one stands, a number of the index that changes hands,
+//! and a model's first block and its last.
 
 use super::*;
 
@@ -273,9 +273,8 @@ fn a_host_that_hands_no_empty_index_learns_of_a_block_with_the_next_table() {
 /// Under a document where one model's profile reads affinity in the single
 /// phase and every other place reads none, each request is decided as under
 /// a document of its own. A request of a phase that reads none is named no
-/// row, and its list keeps no table. Another model's request of the
-/// reader's phase is named none behind its list's table. The reader is
-/// named its rows.
+/// row and reads no table. Another model's request of the reader's phase is
+/// named none behind its list's table. The reader is named its rows.
 #[test]
 fn a_profile_that_reads_affinity_is_named_its_rows_beside_one_that_reads_none() {
     let mut document = PolicySpec::preset("least_load").expect("the preset");
