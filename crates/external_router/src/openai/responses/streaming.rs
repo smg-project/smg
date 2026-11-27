@@ -936,6 +936,20 @@ struct RelayFlags {
     mcp_list_tools_sent: bool,
 }
 
+/// The cause an upstream terminal other than `response.completed` names, a
+/// short word: a failed response's error code, an incomplete response's
+/// reason, the `error` event's code. The upstream's free text stays out of
+/// the log.
+fn unfinished_turn_cause(event: &Value) -> Option<&str> {
+    [
+        "/response/error/code",
+        "/response/incomplete_details/reason",
+        "/code",
+    ]
+    .iter()
+    .find_map(|pointer| event.pointer(pointer).and_then(Value::as_str))
+}
+
 /// Relays one upstream event stream to the client: every block but the
 /// upstream's end sentinel (the loop ends the client's stream with its own)
 /// goes through the handler and is forwarded, buffered or dropped as it says;
@@ -1010,6 +1024,7 @@ async fn relay_upstream_stream(
                                 if let Some(terminal) = terminal {
                                     warn!(
                                         event = terminal,
+                                        cause = parsed.as_ref().and_then(unfinished_turn_cause),
                                         "An upstream turn ended unfinished behind a tool call of that turn: the turn ends there and the upstream is asked again"
                                     );
                                     return RelayEnd::Broke;
@@ -1409,6 +1424,16 @@ pub(super) fn handle_streaming_with_tool_interception(
                         &mut sequence_number,
                     )
                     .await
+                        // The stop ends the turn where it stands: an item
+                        // the upstream still holds open there is closed as
+                        // a cut turn's is.
+                        || !close_streaming_open_items(
+                            handler.take_open_items(),
+                            &tx,
+                            &mut state,
+                            &mut sequence_number,
+                        )
+                        .await
                     {
                         return;
                     }
@@ -1419,6 +1444,13 @@ pub(super) fn handle_streaming_with_tool_interception(
             // The model answered without asking for a tool: the loop's end.
             if !calls_ran {
                 break (handler, ToolLoopEnd::Answered);
+            }
+
+            // The next turn's handler replaces this one: the items the
+            // upstream closed behind a call of this turn stay for the final
+            // response, each at the output index the client read for it.
+            for (output_index, item) in handler.take_closed_items() {
+                state.retain_streamed_item(output_index, item);
             }
 
             // The next turn's payload: this one, the calls just executed

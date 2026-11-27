@@ -167,8 +167,10 @@ impl ToolLoopState {
             .resize(self.mcp_call_items.len(), output_index);
     }
 
-    /// Keeps an item the streamed loop closed itself (a call that did not
-    /// run, an item a cut turn left half-open) for the final response, at
+    /// Keeps an item of a streamed turn that the last turn's own output
+    /// does not carry (a call that did not run, an item a cut turn or the
+    /// tool-call limit left half-open, an item the upstream closed behind a
+    /// call of an earlier turn) for the final response, at
     /// the place of `output_index`, the index the client read for it: before
     /// the first kept item of a higher index. So the response lists a turn's
     /// items in the order the stream numbered them, whatever the order they
@@ -535,7 +537,8 @@ pub(crate) async fn skip_streaming_tool_calls(
 }
 
 /// The items other than function calls that an upstream turn left half-open
-/// when it was cut behind a call that ran, as
+/// when it was cut behind a call that ran or stopped there at the tool-call
+/// limit, as
 /// [`super::StreamingToolHandler::take_open_items`] hands them over: each gets the
 /// `response.output_item.done` the upstream did not write, with the item as
 /// closed there, and takes the place of its output index among the final
