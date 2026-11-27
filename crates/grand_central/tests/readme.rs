@@ -3,9 +3,10 @@
 //! `docs/policy-spec.md` is the policy spec's page, cut out of the reference
 //! and held to the README's bounds. `docs/stages.md` is the stages' page,
 //! `docs/service.md` the service's page, `docs/embedding.md` the page of a
-//! host that embeds the engine and `docs/worker-rows.md` the page of worker
-//! rows and worker jobs, each cut out and held the same way.
-//! `REFERENCE.md` holds the rest of the detail. Eleven things are read:
+//! host that embeds the engine, `docs/worker-rows.md` the page of worker
+//! rows and worker jobs and `docs/extending.md` the page of a host's own
+//! stages and plugins, each cut out and held the same way.
+//! `REFERENCE.md` holds the rest of the detail. Twelve things are read:
 //!
 //! - every fenced `yaml` block of a page is a whole policy document: it
 //!   parses, and the stock catalog validates it (a fragment is fenced as
@@ -33,7 +34,10 @@
 //!   names the default build's feature;
 //! - the worker rows' page states the bounds of its table, and the weights
 //!   a row is charged, as the crate's own constants hold them;
-//! - the README and the five pages cut out stay inside the bounds a person
+//! - the extending page's table of registration calls names each call the
+//!   case reads off the stage table's source, and no row the case reads
+//!   names another;
+//! - the README and the six pages cut out stay inside the bounds a person
 //!   reads with ease: no sentence over 30 words, no paragraph over five
 //!   sentences or 100 words, no list item over 50 words, no table cell over
 //!   30 words, no heading over 30 words, and none of the filler words in a
@@ -45,7 +49,7 @@
 //!   them and passes one that stands at a bound, and the reading of a
 //!   page's blocks, headings and links is held to short texts the same
 //!   way;
-//! - every link of the seven pages to a path of the checkout resolves, and
+//! - every link of the eight pages to a path of the checkout resolves, and
 //!   a link that names a heading names one its page holds;
 //! - each command the README shows names what the checkout holds: this
 //!   package, features and an example of its manifest, a unit test of the
@@ -95,6 +99,10 @@ const EMBEDDING_DOCUMENTS: usize = 0;
 /// reading.
 const WORKER_ROWS_DOCUMENTS: usize = 0;
 
+/// The documents the extending page shows running: none. Its fragments of
+/// a document are fenced as text.
+const EXTENDING_DOCUMENTS: usize = 0;
+
 /// The commands the README shows, counted as its documents are.
 const README_COMMANDS: usize = 4;
 
@@ -120,7 +128,7 @@ const SERIES: usize = 22;
 /// least: a walk that finds fewer has lost the shape of the manifest.
 const FEATURES: usize = 9;
 
-/// The most words a sentence of a short page holds: the README and the five
+/// The most words a sentence of a short page holds: the README and the six
 /// pages cut out of the reference are the short pages. Nothing but a
 /// sentence's end splits one, so a chain joined by semicolons is one
 /// sentence.
@@ -191,6 +199,12 @@ fn embedding() -> PathBuf {
 /// controller's probes and the worker jobs of a host with a local store.
 fn worker_rows() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/worker-rows.md")
+}
+
+/// The extending page: a Rust stage and its registration, a WebAssembly
+/// component and a gRPC plugin.
+fn extending() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/extending.md")
 }
 
 /// One fenced block of the page.
@@ -273,6 +287,7 @@ fn every_document_of_the_page_runs_over_the_stock_catalog() {
         ("service's page", service(), SERVICE_DOCUMENTS),
         ("embedding page", embedding(), EMBEDDING_DOCUMENTS),
         ("worker rows' page", worker_rows(), WORKER_ROWS_DOCUMENTS),
+        ("extending page", extending(), EXTENDING_DOCUMENTS),
         ("reference", reference(), DOCUMENTS),
     ] {
         let page = fs::read_to_string(path).expect("the page is readable");
@@ -826,6 +841,114 @@ fn the_worker_rows_page_states_the_bounds_of_its_table_as_the_crate_holds_them()
     );
 }
 
+/// The stage table's source.
+fn stage_table() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("src/stages/registry.rs")
+}
+
+/// The stage table's registration calls, read off its source: each `pub fn`
+/// whose line holds the text `(&mut self,` or `(&mut self)`, or ends at a
+/// parenthesis ahead of a line that begins `&mut self,` or `&mut self)`,
+/// in a block that the line `impl StageRegistry {` opens. The source is
+/// read by its lines as the formatter leaves them, by their text alone. So
+/// a call an attribute turns off, one a macro writes and one in a block
+/// opened by other words are not told apart, and a call that takes the
+/// table by value is no registration call here.
+fn registration_calls(source: &str) -> Vec<String> {
+    let mut calls = Vec::new();
+    let mut inside = false;
+    let mut lines = source.lines().peekable();
+    while let Some(line) = lines.next() {
+        match line {
+            "impl StageRegistry {" => inside = true,
+            "}" => inside = false,
+            _ => {}
+        }
+        let Some(signature) = line.strip_prefix("    pub fn ").filter(|_| inside) else {
+            continue;
+        };
+        // The receiver is the first parameter: behind the parenthesis that
+        // opens the parameters, or on the next line where the signature
+        // breaks there.
+        let own = signature.contains("(&mut self,") || signature.contains("(&mut self)");
+        let next = lines.peek().copied().unwrap_or("").trim_start();
+        let broken = signature.ends_with('(')
+            && (next.starts_with("&mut self,") || next.starts_with("&mut self)"));
+        if own || broken {
+            let name = signature.split(['<', '(']).next().unwrap_or(signature);
+            calls.push(name.to_owned());
+        }
+    }
+    calls
+}
+
+#[test]
+fn the_extending_page_names_each_registration_call_of_the_stage_table() {
+    let page = fs::read_to_string(extending()).expect("the extending page is readable");
+    let source = fs::read_to_string(stage_table()).expect("the stage table's source is readable");
+    let calls = registration_calls(&source);
+    assert!(
+        !calls.is_empty(),
+        "the stage table's source shows no registration call"
+    );
+    let mut faults = Vec::new();
+    // The table of calls, outside any fenced block: a row a call. Its
+    // first cell, as `row_cells` reads the row, holds the call's name alone
+    // in a code span, and each of its three cells holds something. A line
+    // is read less the blanks at its two ends, as the prose case reads one.
+    let mut fenced = false;
+    let mut lines = page
+        .lines()
+        .filter(|line| {
+            if fence(line).is_some() {
+                fenced = !fenced;
+                return false;
+            }
+            !fenced
+        })
+        .map(str::trim)
+        .skip_while(|line| *line != "| Call | It registers | Its entry in a spec |");
+    if lines.nth(1) != Some("|---|---|---|") {
+        faults.push("the table of calls has no header with its ruled line".to_owned());
+    }
+    let rows: Vec<Vec<String>> = lines
+        .take_while(|line| line.starts_with('|'))
+        .map(row_cells)
+        .collect();
+    for row in &rows {
+        let cell = row.first().map_or("", String::as_str);
+        let name = cell
+            .strip_prefix('`')
+            .and_then(|cell| cell.strip_suffix('`'));
+        match name {
+            Some(name) if calls.iter().any(|call| call == name) => {}
+            Some(name) => faults.push(format!(
+                "the page names `{name}`, a call the stage table does not hold"
+            )),
+            None => faults.push(format!(
+                "the row of {cell:?} names its call outside a code span"
+            )),
+        }
+        if row.len() != 3 || row.iter().any(String::is_empty) {
+            faults.push(format!("the row of {cell:?} does not fill its three cells"));
+        }
+    }
+    for call in &calls {
+        let span = format!("`{call}`");
+        let named = rows.iter().filter(|row| row.first() == Some(&span)).count();
+        if named != 1 {
+            faults.push(format!(
+                "the stage table's `{call}` has {named} rows on the page"
+            ));
+        }
+    }
+    assert!(
+        faults.is_empty(),
+        "the extending page's registration calls are not the stage table's:\n{}",
+        faults.join("\n")
+    );
+}
+
 #[test]
 fn the_page_names_every_series_the_controller_exports() {
     let page = fs::read_to_string(reference()).expect("the reference is readable");
@@ -1186,6 +1309,17 @@ fn the_worker_rows_pages_prose_stays_inside_the_same_bounds() {
     );
 }
 
+#[test]
+fn the_extending_pages_prose_stays_inside_the_same_bounds() {
+    let page = fs::read_to_string(extending()).expect("the extending page is readable");
+    let over = over_bounds(&page);
+    assert!(
+        over.is_empty(),
+        "the extending page is held to the README's bounds, and it is over them:\n{}",
+        over.join("\n")
+    );
+}
+
 /// A sentence of `words` words: a capital first and a full stop last.
 fn sentence(words: usize) -> String {
     let mut sentence = String::from("One");
@@ -1420,6 +1554,7 @@ fn every_link_of_a_page_resolves_heading_and_all() {
         ("service's page", service()),
         ("embedding page", embedding()),
         ("worker rows' page", worker_rows()),
+        ("extending page", extending()),
         ("reference", reference()),
     ] {
         let dead = dead_links(&path);
