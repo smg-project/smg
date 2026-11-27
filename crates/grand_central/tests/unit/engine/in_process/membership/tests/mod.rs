@@ -1064,6 +1064,152 @@ async fn a_record_leaves_once_no_worker_states_its_model() {
     task.abort();
 }
 
+/// A list keeps the record of a model its workers list behind their first
+/// under that model's own id. No worker states that id as its first model,
+/// and the record stays all the same while a worker that stands lists the
+/// model: the follow asks each standing worker for the id of every card it
+/// lists, where no list holds the record and another worker joins.
+#[tokio::test(start_paused = true)]
+async fn a_record_of_a_model_listed_behind_the_first_stays() {
+    const SHARED: &str = "model-s";
+    let mut document = PolicySpec::preset("cache_aware").expect("a built-in preset");
+    document.generation = 1;
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    let engine = Arc::new(InProcess::new(spec));
+    let registry = registry(2);
+    engine.set_registry(handed(&registry));
+    let task = running(&engine);
+    settle().await;
+    // Each worker lists the shared model behind a first model of its own.
+    let shared: Arc<[Arc<dyn Worker>]> = [MODEL, "model-b"]
+        .into_iter()
+        .enumerate()
+        .map(|(at, first)| {
+            let cards = vec![ModelCard::new(first), ModelCard::new(SHARED)];
+            let built = <BasicWorkerBuilder>::new(url(at)).models(cards);
+            Arc::new(built.health_config(no_health_check()).build()) as Arc<dyn Worker>
+        })
+        .collect();
+    for at in 0..2 {
+        assert!(registry.replace(&object(&registry, at), Arc::clone(&shared[at])));
+    }
+    let list = PublishedList::new(Arc::clone(&shared));
+    for prompt in 0..16u32 {
+        let tokens: Vec<u32> = (prompt * 100_000..prompt * 100_000 + 1_024).collect();
+        let hashes = engine.prompt_hashes(SHARED, Some(&tokens), None, HashSeeds::PLAIN);
+        let mut asked = request();
+        asked.facts.model = SHARED;
+        asked.facts.seed = u64::from(prompt);
+        hashes.write_to(&mut asked.facts);
+        let decided = decided(&engine, &Asks::of(asked, Some(&list)));
+        assert!(decided.decision.pick().is_some());
+    }
+    drop(list);
+    register(&registry, 2);
+    sleep(Duration::from_secs(1)).await;
+    let held = engine.affinity.held();
+    let models: Vec<Box<str>> = held.into_iter().map(|(model, _)| model).collect();
+    assert_eq!(
+        models,
+        [Box::from(SHARED)],
+        "a worker that stands lists the model"
+    );
+    task.abort();
+}
+
+/// While no list holds the record of a model listed behind the first, the
+/// upkeep asks the registry of it once: from then on it asks the worker
+/// found listing the model alone, and the registry again behind a word of
+/// membership. A card that worker drops in place is read at the next
+/// upkeep: the registry is asked once more, and the record leaves where no
+/// worker that stands lists the model.
+#[test]
+fn the_registry_is_asked_once_of_a_listed_model_no_list_holds() {
+    /// A host that counts how often its standing workers are asked for.
+    struct Counting {
+        registry: Arc<Registry>,
+        asks: AtomicUsize,
+    }
+    impl Members for Counting {
+        fn events(&self) -> Receiver<WorkerEvent> {
+            self.registry.subscribe_events()
+        }
+
+        fn standing(&self) -> Vec<(ObjectId, Arc<dyn Worker>)> {
+            self.asks.fetch_add(1, Ordering::Relaxed);
+            self.registry.get_all_with_ids()
+        }
+    }
+    const SHARED: &str = "model-s";
+    let mut document = PolicySpec::preset("cache_aware").expect("a built-in preset");
+    document.generation = 1;
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    let engine = InProcess::new(spec);
+    let registry = registry(2);
+    let host = Arc::new(Counting {
+        registry: Arc::clone(&registry),
+        asks: AtomicUsize::new(0),
+    });
+    engine.set_registry(handed(&host));
+    let mut members = started(&engine);
+    // Each worker lists the shared model behind a first model of its own.
+    let firsts = [MODEL, "model-b"];
+    let shared: Arc<[Arc<dyn Worker>]> = firsts
+        .into_iter()
+        .enumerate()
+        .map(|(at, first)| {
+            let cards = vec![ModelCard::new(first), ModelCard::new(SHARED)];
+            let built = <BasicWorkerBuilder>::new(url(at)).models(cards);
+            Arc::new(built.health_config(no_health_check()).build()) as Arc<dyn Worker>
+        })
+        .collect();
+    for at in 0..2 {
+        assert!(registry.replace(&object(&registry, at), Arc::clone(&shared[at])));
+    }
+    engine.follow_so_far(&mut members);
+    let list = PublishedList::new(Arc::clone(&shared));
+    for prompt in 0..16u32 {
+        let tokens: Vec<u32> = (prompt * 100_000..prompt * 100_000 + 1_024).collect();
+        let hashes = engine.prompt_hashes(SHARED, Some(&tokens), None, HashSeeds::PLAIN);
+        let mut asked = request();
+        asked.facts.model = SHARED;
+        asked.facts.seed = u64::from(prompt);
+        hashes.write_to(&mut asked.facts);
+        let decided = decided(&engine, &Asks::of(asked, Some(&list)));
+        assert!(decided.decision.pick().is_some());
+    }
+    drop(list);
+    let records = || engine.affinity.held().len();
+    let asked = || host.asks.load(Ordering::Relaxed);
+    let before = asked();
+    for _ in 0..3 {
+        engine.follow_registry(&mut members);
+    }
+    assert_eq!(
+        asked() - before,
+        1,
+        "the registry is asked once of the record"
+    );
+    assert_eq!(records(), 1, "a worker that stands lists the model");
+    register(&registry, 2);
+    engine.follow_so_far(&mut members);
+    for _ in 0..2 {
+        engine.follow_registry(&mut members);
+    }
+    assert_eq!(
+        asked() - before,
+        2,
+        "and once more behind a word of membership"
+    );
+    assert_eq!(records(), 1, "the worker asked anew lists the model");
+    for (at, first) in firsts.into_iter().enumerate() {
+        assert!(registry.refresh_models(&shared[at], vec![ModelCard::new(first)]));
+    }
+    engine.follow_registry(&mut members);
+    assert_eq!(asked() - before, 3, "a card dropped in place is read");
+    assert_eq!(records(), 0, "no worker that stands lists the model");
+}
+
 /// The engine's own task follows the registry its host handed: the workers
 /// that stand are told at its first upkeep, a removal and a registration
 /// behind it as they come, with no call of the host. A registry handed
