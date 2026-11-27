@@ -129,7 +129,10 @@ fn register_worker(
         WorkerRegistrationMode::CreateOnly => registry
             .register(worker.clone())
             .ok_or_else(|| step_failed(format!("Worker {} already exists", worker.redacted_url()))),
-        WorkerRegistrationMode::Upsert => Ok(registry.register_or_replace(worker)),
+        // A registration of the URL: over a worker its removal drains the
+        // new worker starts without that mark, and is admitted as any new
+        // worker is.
+        WorkerRegistrationMode::Upsert => Ok(registry.register_or_replace_clearing_drain(worker)),
         WorkerRegistrationMode::ReplaceById {
             worker_id,
             expected_revision,

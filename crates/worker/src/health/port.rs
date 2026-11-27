@@ -78,8 +78,9 @@ pub trait HealthSink: Send + Sync {
     /// whether the worker's probe decides instead, and then says nothing
     /// here. Answers the transition as `(old, new)`, or `None` for the
     /// three things that move nothing: the status stood (the worker serves
-    /// already), the revision moved (the signal is of a worker replaced
-    /// since), or no worker stands under the id.
+    /// already, or its removal is draining it), the revision moved (the
+    /// signal is of a worker replaced since), or no worker stands under
+    /// the id.
     fn connected(
         &self,
         worker_id: &WorkerId,
