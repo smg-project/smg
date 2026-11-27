@@ -152,6 +152,8 @@ impl Engine {
             placing,
             vetoed,
             sides_placed: _,
+            #[cfg(feature = "in-process")]
+                pair_drawn: _,
         } = entry;
         if binding.plan != Plan::Single {
             return None;

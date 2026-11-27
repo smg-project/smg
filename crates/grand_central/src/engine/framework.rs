@@ -3319,6 +3319,23 @@ const PICKS_BY_NO_COUNT: [&str; 2] = ["random", "round-robin"];
 #[cfg(feature = "in-process")]
 const DRAWS_TWO: [&str; 2] = ["power-of-two", "power-of-two-count-first"];
 
+/// One side of a pair asked by its draw: the
+/// fixed rows of its list, the buffer a record is written into, and the
+/// writer of one record.
+#[cfg(feature = "in-process")]
+pub(crate) type DrawnSide<'a> = (
+    &'a [Candidate],
+    &'a mut [Candidate],
+    &'a mut dyn FnMut(&Candidate, &mut Candidate),
+);
+
+/// What [`Engine::pair_drawn_for`] answers: the pair's two profiles.
+#[cfg(feature = "in-process")]
+#[derive(Clone, Copy)]
+pub(crate) struct PairDrawn {
+    profiles: [u16; 2],
+}
+
 /// The smallest pool over which a picker that draws two rows
 /// ([`DRAWS_TWO`]) is asked to draw before the pool's records are written
 /// ([`Engine::drawn_for`]), in a document whose every profile draws first
@@ -3552,6 +3569,95 @@ fn run_drawn_written(
         Decision::Queue(queue) => queue.trace.seed = facts.seed,
     }
     decision
+}
+
+/// One side of a pair by its draw ([`Engine::decide_pair_drawn`]): the two
+/// rows the seed's stream draws over `fixed`, each written at its place
+/// (`write`) and put to the profile's tests, then scored and ordered as
+/// [`run_drawn_written`] orders a single's.
+///
+/// The whole pass decides a pair's side at every pool size, so the draw
+/// keeps the pass's rule at every size, as a single's does under
+/// [`DRAW_FROM`] rows alone: the request's seed is read as it came, so two
+/// rows that tie are ordered by it, and the first row a test refuses ends
+/// the draw. `None` where the draw names no pick: the caller decides the
+/// pair whole, by a stream nothing was drawn from.
+#[cfg(feature = "in-process")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the draw's inputs and the host's two halves of a row: the fixed rows, the buffer and the write"
+)]
+#[inline(never)]
+fn run_side_drawn_written(
+    engine: &Engine,
+    index: u16,
+    facts: &RequestFacts<'_>,
+    pool: &PoolFacts<'_>,
+    fixed: &[Candidate],
+    rows: &mut [Candidate],
+    write: &mut dyn FnMut(&Candidate, &mut Candidate),
+    cx: &Constraints<'_>,
+    buf: &mut Buffers,
+) -> Option<Pick> {
+    let at = usize::from(index);
+    let (profile, tests) = (&engine.profiles[at], engine.row_tests[at]);
+    debug_assert_eq!(fixed.len(), rows.len(), "one buffer row a fixed row");
+    #[cfg(debug_assertions)]
+    for (row, fixed) in rows.iter_mut().zip(fixed) {
+        *row = unwritten(fixed);
+    }
+    // A request held to places is the whole pass's.
+    if places::stated(cx) {
+        return None;
+    }
+    buf.reserve(fixed.len());
+    buf.kept.clear();
+    let masked = tests.is_some_and(|tests| tests.masked(cx));
+    let mut refused = false;
+    // The row a draw lands on, written at its place: the written record
+    // is the one the tests are asked about.
+    let mut ask = |fixed: &Candidate| {
+        let kept = rows.get_mut(fixed.position as usize).is_some_and(|row| {
+            write(fixed, row);
+            let row = &*row;
+            match tests {
+                Some(tests) => tests.keeps(facts, row, cx) && !(masked && cx.masks(row.position)),
+                None => profile.filters.iter().all(|f| f.keep(facts, row, cx)),
+            }
+        });
+        refused |= !kept;
+        kept
+    };
+    // The stream is the draw's own: the order below reads the seed of
+    // `facts`, which no draw moved.
+    let mut draw = Draw::new(facts.seed);
+    let drew = profile
+        .picker
+        .draw_first(facts, pool, fixed, &mut ask, &mut buf.kept, &mut draw);
+    if !drew || refused {
+        return None;
+    }
+    let band = combine(
+        profile,
+        facts,
+        rows,
+        &buf.kept,
+        &mut buf.scores,
+        &mut buf.stage,
+    );
+    let mut targets = Targets::new();
+    profile
+        .picker
+        .order_drawn(facts, rows, &buf.kept, &buf.scores, band, &mut targets);
+    if targets.is_empty() {
+        return None;
+    }
+    let trace = trace_drawn(index, facts, pool, rows, &buf.kept, buf.traced());
+    Some(Pick {
+        targets,
+        trace,
+        session_verdict: SessionVerdict::None,
+    })
 }
 
 /// The whole pass of an encode item of the `epd` plan: the plan's rules
@@ -4224,6 +4330,11 @@ pub struct Engine {
     /// request's binding is resolved.
     #[cfg(feature = "in-process")]
     written_least: usize,
+    /// Whether some binding's pair may be asked by its draw
+    /// ([`Entry::pair_drawn`]): a document with no such binding is told so
+    /// at one load, before a pair's decision asks anything of its request.
+    #[cfg(feature = "in-process")]
+    pairs_drawn: bool,
     /// Whether no stage of any profile and no sessions rule's assignment
     /// reads a count a worker object alone holds ([`Self::rows_stand`]).
     #[cfg(feature = "in-process")]
@@ -4816,6 +4927,14 @@ struct Entry {
     /// pair's decision alone. A pair under no rule whose pickers pick
     /// tests this one byte a decision and runs its two profiles as it did.
     sides_placed: bool,
+    /// Whether each side of the binding's pair may be asked by its draw
+    /// ([`Engine::pair_drawn_for`]): the plan pairs, and each side's profile
+    /// is a pick of two that draws first, asks nothing ahead of its draw
+    /// and keeps a row by the engine's one folded test of it. Written once
+    /// when the engine is built: a pair's decision reads this one byte and
+    /// then asks of its request and its two lists alone.
+    #[cfg(feature = "in-process")]
+    pair_drawn: bool,
 }
 
 /// The sides of a pair that run under the pair's binding whatever binding
@@ -5827,6 +5946,8 @@ impl Engine {
         // delegate to: the assignment that places is written beside each
         // binding here, once, so no decision asks. The binding itself keeps
         // the rule as the spec declared it.
+        #[cfg(feature = "in-process")]
+        let mut pairs_drawn = false;
         let bindings = bindings
             .into_iter()
             .map(|binding| {
@@ -5858,11 +5979,39 @@ impl Engine {
                 let sides_placed = binding.sessions.is_some()
                     || assigned(binding.profile)
                     || binding.decode_profile.is_some_and(assigned);
+                // Each side of a pair may be asked by its draw where its
+                // profile is a pick of two that draws first, asks nothing
+                // ahead of the draw and folds its filters into one test.
+                #[cfg(feature = "in-process")]
+                let pair_drawn = matches!(binding.plan, Plan::PdPair | Plan::Epd { .. })
+                    && [
+                        binding.profile,
+                        binding.decode_profile.unwrap_or(binding.profile),
+                    ]
+                    .into_iter()
+                    .all(|index| {
+                        let at = usize::from(index);
+                        profiles
+                            .get(at)
+                            .is_some_and(|profile| DRAWS_TWO.contains(&profile.picker.name()))
+                            && row_tests.get(at).is_some_and(Option::is_some)
+                            && marks.get(at).is_some_and(|marks| {
+                                marks.asks_nothing_first()
+                                    && marks.ahead() == Marks::DRAWS_FIRST
+                                    && !marks.by_assignment()
+                            })
+                    });
+                #[cfg(feature = "in-process")]
+                {
+                    pairs_drawn |= pair_drawn;
+                }
                 Entry {
                     glob: binding.pattern().glob(),
                     placing: placed_by(declared, by_assignment),
                     vetoed: AllVetoed::default(),
                     sides_placed,
+                    #[cfg(feature = "in-process")]
+                    pair_drawn,
                     binding,
                 }
             })
@@ -5895,6 +6044,8 @@ impl Engine {
             written_from,
             #[cfg(feature = "in-process")]
             written_least,
+            #[cfg(feature = "in-process")]
+            pairs_drawn,
             #[cfg(feature = "in-process")]
             rows_stand,
             seat_flags: (u8::from(keeping) * KEEPS_SLOT_STATE) | (u8::from(shadows) * SHADOWS),
@@ -7417,6 +7568,8 @@ impl Engine {
             placing,
             vetoed,
             sides_placed: _,
+            #[cfg(feature = "in-process")]
+                pair_drawn: _,
         } = entry;
         // The single plan's rows, under the binding's word for a pool the
         // overload veto empties: every path below filters this set.
@@ -9323,6 +9476,148 @@ impl Engine {
             None => shed(ShedReason::NoEndpoints, PARTNERS, prefill_pick.trace),
         }
         .of_side(PairSide::Decode)
+    }
+
+    /// Whether some binding's pair may be asked by its draw: what a pair's
+    /// decision asks first, at one load ([`Self::pair_drawn_for`] asks the
+    /// rest of the request's own binding).
+    #[cfg(feature = "in-process")]
+    pub(crate) const fn pairs_drawn(&self) -> bool {
+        self.pairs_drawn
+    }
+
+    /// Whether each side of a pair may be
+    /// asked by its draw ([`run_side_drawn_written`]), which writes the records
+    /// it asks about and no other. Both profiles are a pick of two whose
+    /// filters fold into one test of a row, each list holds its profile's
+    /// floor of rows, and the request states nothing the pair's whole
+    /// decision reads beside its two picks. Asked before a record is
+    /// written; answers the two profiles.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn pair_drawn_for(
+        &self,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        rows: [usize; 2],
+        cx: &Constraints<'_>,
+    ) -> Option<PairDrawn> {
+        if carries_a_column(facts) || counts_no_place(cx) || !facts.session_key.is_none() {
+            return None;
+        }
+        let entry = self.pair_entry(facts.model)?;
+        if !entry.pair_drawn {
+            return None;
+        }
+        let binding = &entry.binding;
+        let decode_index = binding.decode_profile.unwrap_or(binding.profile);
+        for (index, rows) in [(binding.profile, rows[0]), (decode_index, rows[1])] {
+            let at = usize::from(index);
+            if rows < self.written_from.get(at).copied().unwrap_or(usize::MAX)
+                || (self.marks[at].first() & (Marks::ENGINES | Marks::OWNS) != 0
+                    && !pool.engines.is_empty())
+            {
+                return None;
+            }
+        }
+        if self
+            .weighing_lift(binding.profile, entry.vetoed, cx)
+            .is_some()
+        {
+            return None;
+        }
+        Some(PairDrawn {
+            profiles: [binding.profile, decode_index],
+        })
+    }
+
+    /// A pair's decision where each side is
+    /// asked by its draw: [`Self::pair_drawn_for`] said yes, both lists
+    /// stand, and every row of a side pairs with every row of the other.
+    /// The prefill by the draw of its profile, then the decode by the draw
+    /// of its own, joined as [`Self::decide_pair`] joins its two picks.
+    /// `None` where a side's draw answers no pick: the caller then decides
+    /// whole, over records it writes itself.
+    #[cfg(feature = "in-process")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the pair's facts, each side's rows with its writer, and the engine's scratch"
+    )]
+    pub(crate) fn decide_pair_drawn(
+        &self,
+        drawn: PairDrawn,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        prefills: DrawnSide<'_>,
+        decodes: DrawnSide<'_>,
+        cx: &Constraints<'_>,
+        scratch: &mut Scratch,
+    ) -> Option<Decision> {
+        let PairDrawn {
+            profiles: [prefill_index, decode_index],
+        } = drawn;
+        scratch.shed_over = None;
+        scratch.single.lifted = LiftedVeto::None;
+        let prefill_facts = RequestFacts {
+            phase: Phase::Prefill,
+            named: None,
+            signal_cells: None,
+            decode_ring_positions: None,
+            ..*facts
+        };
+        let decode_facts = RequestFacts {
+            phase: Phase::Decode,
+            seed: Draw::new(facts.seed).next_u64(),
+            named: None,
+            signal_cells: None,
+            ring_positions: facts.decode_ring_positions.unwrap_or(facts.ring_positions),
+            decode_ring_positions: None,
+            ..*facts
+        };
+        let (fixed, rows, write) = prefills;
+        let prefill_rows = fixed.len();
+        let prefill = run_side_drawn_written(
+            self,
+            prefill_index,
+            &prefill_facts,
+            pool,
+            fixed,
+            rows,
+            write,
+            cx,
+            &mut scratch.single,
+        );
+        let prefill_pick = prefill?;
+        let prefill_target = prefill_pick.targets.iter().next()?;
+        let (fixed, rows, write) = decodes;
+        let mut decision = Decision::Pick(run_side_drawn_written(
+            self,
+            decode_index,
+            &decode_facts,
+            pool,
+            fixed,
+            rows,
+            write,
+            cx,
+            &mut scratch.decode,
+        )?);
+        let Decision::Pick(paired) = &mut decision else {
+            return None;
+        };
+        let Pick {
+            targets,
+            trace,
+            session_verdict,
+        } = paired;
+        let placed = prefill_pick.targets.placing();
+        targets.pair_under(prefill_target, *session_verdict, placed);
+        let lifted = trace.lifted;
+        *trace = prefill_pick.trace;
+        // The whole pass counts the prefills it keeps, and a pair that
+        // draws is asked only where it keeps every one of them.
+        trace.survivors = Survivors::counted(prefill_rows as u32);
+        trace.lifted = lifted;
+        *session_verdict = prefill_pick.session_verdict;
+        Some(decision)
     }
 
     /// A pair's answer over two lists of which one holds no row: one side
