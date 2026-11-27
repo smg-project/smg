@@ -32,7 +32,6 @@ on:
       - crates/symphony/**
       - crates/response_template/**
       - model_gateway/src/routers/grpc/**
-      - model_gateway/tests/unit/routers/grpc/**
       - model_gateway/tests/bellwether_*.rs
       - model_gateway/Cargo.toml
       - Cargo.toml
@@ -57,7 +56,6 @@ on:
       - crates/symphony/**
       - crates/response_template/**
       - model_gateway/src/routers/grpc/**
-      - model_gateway/tests/unit/routers/grpc/**
       - model_gateway/tests/bellwether_*.rs
       - model_gateway/Cargo.toml
       - Cargo.toml
