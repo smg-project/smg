@@ -186,8 +186,8 @@ impl DecisionClock {
     }
 
     /// One more pool on this clock: counts it and answers its number, the
-    /// membership epoch from then on. The first pool is number one: an
-    /// epoch of zero says no membership.
+    /// membership epoch until the next pool is counted. The first pool is
+    /// number one: an epoch of zero says no membership.
     #[inline]
     fn next_pool(&self) -> u64 {
         self.pools.fetch_add(1, Ordering::Relaxed) + 1
@@ -490,7 +490,7 @@ pub(super) fn stated_report(
 /// of `cells` at `position`, and whether the report is the whole of its
 /// worker object. They are made by the crate's one conversion
 /// ([`signal_values`]) under `columns`, the document's, and written where
-/// a decision may read them ([`SignalCells::write`]): under the signal's
+/// a decision may read them ([`SignalColumn::write`]): under the signal's
 /// own unit and in range, each sample instant on `clock`. A report that
 /// is not the whole of its worker object states none ([`whole`]), and
 /// nothing is written of it: `ranks` says how many ranks the object stands
@@ -509,7 +509,7 @@ fn write_signals(
         return false;
     }
     signal_values(report, columns, sampled_at, |column, unit, value, at| {
-        cells.write(position, column, unit, value, clock.micros(at));
+        column.write(cells, position, unit, value, clock.micros(at));
     });
     true
 }
