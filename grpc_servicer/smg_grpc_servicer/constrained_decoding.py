@@ -22,7 +22,8 @@ refuses a tag that carries one at compile time; the Router spells such a
 worker's structural tags without ``optional``, ``plus`` and ``star``, the same
 language (a ``token`` node stays as derived, so a table that writes single-token
 markers still meets the older compiler's refusal). Read off the distribution's
-metadata once, at start-up, never by importing xgrammar.
+metadata, never by importing xgrammar: once at start-up by the Rust launchers,
+at each ``GetServerInfo`` by the Python servicers.
 
 Engine-free at import: the readers take the parsed server arguments. The vLLM
 servicers read the same facts off their engine's structured-outputs config

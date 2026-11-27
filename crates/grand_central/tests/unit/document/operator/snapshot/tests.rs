@@ -67,7 +67,7 @@ fn an_address_is_told_without_its_userinfo() {
 
 #[test]
 fn a_plain_page_stops_at_its_bytes_even_for_its_first_row() {
-    use crate::store::{MemoryStore, WorkerFacts, WorkersStore};
+    use crate::store::{MemoryStore, WorkerFacts};
 
     let store = MemoryStore::new();
     let asked = WorkerRowsQuery {

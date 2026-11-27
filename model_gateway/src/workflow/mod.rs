@@ -6,6 +6,7 @@ pub mod job_queue;
 pub mod mcp_registration;
 pub mod steps;
 pub mod tokenizer_registration;
+mod tokenizer_shares;
 pub mod wasm_module_registration;
 pub mod wasm_module_removal;
 pub(crate) mod worker_events;

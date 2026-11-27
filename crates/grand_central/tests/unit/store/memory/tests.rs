@@ -1,9 +1,192 @@
+use std::sync::mpsc;
+
 use super::*;
 use crate::{
     engine::{decision_slot::DecisionSlot, view::WorkerId},
-    store::leases::PickRecord,
+    store::{
+        leases::PickRecord,
+        workers::{Registrant, WorkerPatch},
+    },
     tracking::lease::Lease,
 };
+
+/// What the cases read of the store that no entry tells, and how they hold
+/// a lock, pause a snapshot and spend a term's ids.
+impl MemoryStore {
+    /// Holds the loads' lock: a case keeps an entry waiting where the
+    /// store's entry waits last.
+    #[cfg(feature = "controller")]
+    pub(crate) fn holding_loads(&self) -> impl Drop + '_ {
+        self.loads.lock()
+    }
+
+    /// How many vetoes the health table holds, over every gateway: a case
+    /// asks it to show that a row or a gateway that left took its vetoes
+    /// out of the table.
+    pub(in crate::store) fn health_entries(&self) -> usize {
+        self.health.lock().vetoes.len()
+    }
+
+    /// How many members' reads under the standing generation's lists the
+    /// store keeps: one a member under lists that name an engine family or
+    /// a zone, and none under any other.
+    #[cfg(feature = "operator")]
+    pub(crate) fn listed_members(&self) -> usize {
+        self.loads.lock().writer.listed()
+    }
+
+    /// How many members the table of the ones no world lists holds.
+    pub(in crate::store) fn filed_members(&self) -> usize {
+        self.joined.lock().len()
+    }
+
+    /// Whether no lock a journaled write takes is held at this instant:
+    /// the membership lock, the turn of the leases' file and the load lock,
+    /// each tried.
+    pub(crate) fn unlocked(&self) -> bool {
+        let free = |file: &turn::File| file.try_take().is_some();
+        self.workers.try_lock().is_some()
+            && self.files.iter().all(free)
+            && self.loads.try_lock().is_some()
+    }
+
+    pub(in crate::store) fn pause_snapshot_after_clone(&self) -> (Receiver<()>, SyncSender<()>) {
+        let (cloned_tx, cloned_rx) = mpsc::sync_channel(0);
+        let (resume_tx, resume_rx) = mpsc::sync_channel(0);
+        *self.snapshot_pause.lock() = Some((cloned_tx, resume_rx));
+        (cloned_rx, resume_tx)
+    }
+
+    pub(super) fn pause_snapshot(&self) {
+        let pause = self.snapshot_pause.lock().take();
+        if let Some((cloned, resume)) = pause {
+            cloned.send(()).expect("snapshot test receives clone point");
+            resume.recv().expect("snapshot test resumes sorting");
+        }
+    }
+
+    /// Spends the ids of the store's term but for the last `left`: no door
+    /// reaches a term's last ids in under 2^32 issues, and their cases
+    /// start here.
+    pub(crate) fn spend_ids(&self, left: u32) {
+        let mut leases = self.turn_of(0);
+        leases.minted = self.blocks.spend(leases.term, left, 0);
+    }
+
+    /// The terms whose tables the blocks keep, the newest first: no door
+    /// tells them.
+    pub(in crate::store) fn kept_terms(&self) -> Vec<u64> {
+        self.blocks.kept_terms()
+    }
+
+    /// The places of the deadline queue: no door tells its length.
+    pub(in crate::store) fn queued(&self) -> usize {
+        let files = 0..self.files.len();
+        files.map(|at| self.turn_of(at).due.len()).sum()
+    }
+
+    /// The length of the files' lists of places, summed: in each the most
+    /// pairs that stood at once.
+    pub(in crate::store) fn places(&self) -> usize {
+        let files = 0..self.files.len();
+        files.map(|at| self.turn_of(at).decodes.places.len()).sum()
+    }
+
+    /// The leases whose decode side stands in a place of the file's list,
+    /// and the leases whose record carries the mark of a pair's lease,
+    /// each in order: one list twice while the records and the places
+    /// stand together.
+    pub(in crate::store) fn paired(&self) -> [Vec<(GatewayId, u64)>; 2] {
+        let id = |key: &Key| (key.0, key.1 .0);
+        let marked = |(_, held): &(&Key, &Held)| held.record.decode.is_some();
+        let (mut sides, mut marks) = (Vec::new(), Vec::new());
+        for at in 0..self.files.len() {
+            let leases = self.turn_of(at);
+            let places = leases.decodes.places.iter().flatten();
+            sides.extend(places.map(|(key, _)| id(key)));
+            let records = leases.records.iter().filter(marked);
+            marks.extend(records.map(|(key, _)| id(key)));
+        }
+        sides.sort_unstable();
+        marks.sort_unstable();
+        [sides, marks]
+    }
+}
+
+/// The cases' road to the table of records: the five write entries the
+/// store's trait held, for a case that fills a store with no holder of
+/// worker objects. Each takes the write's hold, decides by the rule
+/// every writer decides by and hands the one body the change
+/// ([`MemoryStore::decided`]), as a holder's write call does. They
+/// leave with the table.
+impl MemoryStore {
+    /// The cases' road: a registration by a control call. It leaves with
+    /// the table.
+    pub(crate) fn upsert(&self, facts: WorkerFacts) -> MembershipChange {
+        self.upsert_by(facts, Registrant::Control)
+    }
+
+    /// The cases' road: a registration or its refresh by `maker`, decided
+    /// over the table's own row. It leaves with the table.
+    pub(crate) fn upsert_by(&self, facts: WorkerFacts, maker: Registrant) -> MembershipChange {
+        let workers = self.writing();
+        let standing = workers.by_key.get(&facts.key);
+        let standing = standing.and_then(|id| workers.rows.get(id));
+        let standing = standing.map(|held| &held.row);
+        let now = Instant::now();
+        let (change, row) = WorkerRow::laid_over(facts, standing, maker, now);
+        let fits = self.decided(workers, now, change, Some(row), None);
+        assert!(fits, "a change decided under the membership lock fits");
+        change
+    }
+
+    /// The cases' road: a patch of the row `id` where it stands at
+    /// `revision`. It leaves with the table.
+    pub(crate) fn patch(
+        &self,
+        id: WorkerId,
+        patch: WorkerPatch,
+        revision: u64,
+    ) -> Option<MembershipChange> {
+        let mut workers = self.writing();
+        let mut row = workers.guarded(id, revision)?.row.clone();
+        patch.laid_on(&mut row.facts);
+        row.revision += 1;
+        let change = MembershipChange::Relabelled { id };
+        self.decided(workers, Instant::now(), change, Some(row), None)
+            .then_some(change)
+    }
+
+    /// The cases' road: the removal of the row `id` where it stands at
+    /// `revision`. It leaves with the table.
+    pub(crate) fn remove(&self, id: WorkerId, revision: u64) -> Option<MembershipChange> {
+        let mut workers = self.writing();
+        workers.guarded(id, revision)?;
+        let change = MembershipChange::Removed { id };
+        self.decided(workers, Instant::now(), change, None, None)
+            .then_some(change)
+    }
+
+    /// The cases' road: a status of the row `id` where it stands at
+    /// `revision`, as a holder tells one. It leaves with the table.
+    pub(crate) fn set_status(
+        &self,
+        id: WorkerId,
+        status: WorkerStatus,
+        revision: u64,
+    ) -> Option<MembershipChange> {
+        let mut workers = self.writing();
+        let from = workers.guarded(id, revision)?.row.status;
+        match workers.set_status(id, status) {
+            StatusSet::Moved => Some(MembershipChange::StatusChanged {
+                id,
+                from,
+                to: status,
+            }),
+            StatusSet::Stood | StatusSet::Refused => None,
+        }
+    }
+}
 
 #[test]
 fn the_lease_sweep_takes_only_a_file_with_a_due_lease() {

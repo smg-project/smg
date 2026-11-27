@@ -51,7 +51,7 @@ pub trait Journal: Send + Sync {
     /// handed the row the write takes out, that row is told with the
     /// table's status. A status of the store's own tells its row with the
     /// status the write leaves, and the table then takes that status. A
-    /// status the store follows and the store's own patch tell the row as
+    /// status the store follows tells the row as
     /// the table holds it. `at` is the place of the
     /// leader's event the write applies, on a store that follows
     /// ([`crate::store::MemoryStore::follow`]), and none for a write of the

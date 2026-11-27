@@ -1004,6 +1004,73 @@ fn a_pick_only_ask_after_the_budget_is_spent_sends_no_frame() {
     assert_eq!(quick.frames(), 0);
 }
 
+/// A plugin opened under a budget that an earlier open spent is not asked,
+/// and its open says so ahead of anything else it would read. A WebAssembly
+/// plugin stands in front on a cold slot: its `init` takes 20 ms of its
+/// host's clock under a 10 ms decision, so the remote plugin's open finds
+/// no remainder. That open is the decision's budget spent and no failure,
+/// and no frame leaves. The view is one row too large for this plugin: it
+/// is not counted, since the open did not come to it.
+#[cfg(feature = "wasm")]
+#[test]
+fn a_plugin_opened_under_a_spent_budget_is_not_asked() {
+    use smg_grand_central::plugins::wasm;
+
+    use crate::{
+        guest_loaded,
+        support::wasm_guest::{mode, record_guest},
+    };
+
+    let open = OpenDecisions::new();
+    // The guests' clock naps where the case says so, and answers zero: an
+    // `init` that asks it goes on.
+    let naps = Arc::new(AtomicBool::new(false));
+    let steer = Arc::clone(&naps);
+    let guests = wasm::Runtime::with_clock(&open, move || {
+        if steer.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        0
+    })
+    .expect("a runtime");
+    let guests = Arc::new(guests);
+    let mut row = wasm::PluginSpec::new("init-asks", record_guest());
+    row.config = vec![mode::LEAST_IN_FLIGHT, mode::INIT_ASKS_THE_CLOCK];
+    row.budget_micros = 10_000;
+    let guest = guest_loaded(&guests, &row);
+    let served = TestPlugin::serve();
+    let runtime = Runtime::new(&open).expect("a runtime");
+    let mut small = spec(&served, "behind-the-init");
+    small.max_candidates = 3;
+    let remote = Plugin::load(&runtime, small).expect("the plugin loads");
+    let healthy: Option<Box<dyn Filter>> = Some(Box::new(Healthy));
+    let least: Option<Box<dyn Scorer>> = Some(Box::new(LeastRequests));
+    let mut profile = Profile::of("behind-an-init".into(), Box::new(Best));
+    profile.filters = vec![Box::new(wasm::WasmFilter::new(guest.bind(), healthy))];
+    profile.scorers = vec![WeightedScorer::of(
+        Box::new(GrpcScorer::new(remote.bind(), least)),
+        1.0,
+    )];
+    let engine = single_engine(profile);
+    guest.forget_instance();
+    naps.store(true, Ordering::Relaxed);
+    let mut short = facts(1);
+    short.budget_micros = 10_000;
+    let decision = decide_with(&engine, &short, &pool(4));
+    naps.store(false, Ordering::Relaxed);
+    assert!(
+        matches!(decision, Decision::Pick(_)),
+        "the fallbacks decide"
+    );
+    let stats = remote.stats();
+    assert_eq!(
+        (stats.budget_spent, stats.too_many, stats.breaker_opens),
+        (1, 0, 0),
+        "the open is the decision's budget spent, said ahead of the view's size: {stats:?}"
+    );
+    assert_eq!(served.frames(), 0, "no frame left");
+}
+
 #[test]
 fn an_answer_after_its_deadline_is_late() {
     let served = TestPlugin::serve();

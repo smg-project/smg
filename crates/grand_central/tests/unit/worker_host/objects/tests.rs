@@ -723,8 +723,8 @@ fn the_overload_switch_lays_no_row_the_holder_has_not_read() {
     let mut replica = Replica::new();
     let registry = Arc::clone(replica.objects.registry());
     replica.objects = Arc::new(Objects::new(registry).with_overload_thresholds(defaults));
-    // The first life stands at its second revision: a write decided
-    // over it is refused once another life stands at its first.
+    // The first life stands relabelled "iron": the second life's row
+    // states "gold".
     let first = replica.write(facts(A, 1));
     replica.patch(A, labels("iron"));
     let (old_id, before) = (replica.id(A), replica.at(A));
@@ -1939,27 +1939,6 @@ struct Late {
 type AfterGet = Box<dyn FnOnce(&MemoryStore) + Send>;
 
 impl WorkersStore for Late {
-    fn upsert_by(&self, facts: WorkerFacts, maker: Registrant) -> MembershipChange {
-        self.store.upsert_by(facts, maker)
-    }
-
-    fn patch(&self, id: WorkerId, patch: WorkerPatch, revision: u64) -> Option<MembershipChange> {
-        self.store.patch(id, patch, revision)
-    }
-
-    fn remove(&self, id: WorkerId, revision: u64) -> Option<MembershipChange> {
-        self.store.remove(id, revision)
-    }
-
-    fn set_status(
-        &self,
-        id: WorkerId,
-        status: WorkerStatus,
-        revision: u64,
-    ) -> Option<MembershipChange> {
-        self.store.set_status(id, status, revision)
-    }
-
     fn get(&self, id: WorkerId) -> Option<WorkerRow> {
         let row = self.store.get(id);
         if let Some(after_get) = self.after_get.lock().take() {
@@ -1992,6 +1971,7 @@ fn an_adapter_write_waits_for_the_holders_status_read() {
     let worker = registry.get(&id).expect("a registered worker");
     let revision = store.get(row).expect("the worker's row").revision;
     assert!(store
+        .store
         .set_status(row, WorkerStatus::Ready, revision)
         .is_some());
     objects.copy_status(&store, row);
@@ -2004,6 +1984,7 @@ fn an_adapter_write_waits_for_the_holders_status_read() {
         SoleLead::TERM,
     );
     assert!(store
+        .store
         .set_status(row, WorkerStatus::NotReady, revision)
         .is_some());
     let (reading, read) = mpsc::channel();

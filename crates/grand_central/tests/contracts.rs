@@ -1673,8 +1673,9 @@ fn the_demands_fields_are_pinned() {
 
 /// What a registration states and its answer tells, by name and number: the
 /// prober's settings (one message for the registration and the row), the
-/// row's rank and engine, the two thresholds a row is judged by, and what a
-/// worker states for a request's hard demands (one message for the two).
+/// row's rank and engine, the two thresholds a row is judged by, what a
+/// worker states for a request's hard demands (one message for the two),
+/// and whether it takes images.
 const MEMBERSHIP_FIELDS: &[(&str, &[ResumeField])] = &[
     (
         "HealthPolicy",
@@ -1701,6 +1702,7 @@ const MEMBERSHIP_FIELDS: &[(&str, &[ResumeField])] = &[
             ("health_policy", 25, Type::Message),
             ("maker", 27, Type::Message),
             ("demand_facts", 28, Type::Message),
+            ("vision", 29, Type::Bool),
         ],
     ),
     (
@@ -1722,6 +1724,7 @@ const MEMBERSHIP_FIELDS: &[(&str, &[ResumeField])] = &[
         &[
             ("health_policy", 14, Type::Message),
             ("demand_facts", 15, Type::Message),
+            ("vision", 16, Type::Bool),
         ],
     ),
 ];
@@ -1852,18 +1855,21 @@ fn the_principals_scopes_keep_the_ingestion_scopes_number_and_name_reserved() {
 }
 
 /// A pair's class left the pairing descriptor, and a snapshot's pair rows
-/// left with their message: no writer filled either. The two numbers and
-/// names stay reserved, so a later field takes neither, and no message
-/// takes the name of the one that left.
+/// left with their message: no writer filled either. Whether a worker takes
+/// images left the descriptor for a field of the registration and of the
+/// row: no build took or told it there. The numbers and names stay
+/// reserved, so a later field takes none of them, and no message takes the
+/// name of the one that left.
 #[test]
 fn the_pair_class_and_the_pair_rows_keep_their_numbers_and_names_reserved() {
     let set = compile_protocol().expect("protoc compiles the two protocol files");
     let controller =
         file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
-    for (message_name, number, name) in [
-        ("PairingDescriptor", 8, "pair_class"),
-        ("Snapshot", 9, "pairs"),
-    ] {
+    let left: [(&str, &[i32], &[&str]); 2] = [
+        ("PairingDescriptor", &[8, 11], &["pair_class", "vision"]),
+        ("Snapshot", &[9], &["pairs"]),
+    ];
+    for (message_name, numbers, names) in left {
         let compiled = message(controller, message_name)
             .unwrap_or_else(|| panic!("{message_name} is missing from {CONTROLLER_PROTO}"));
         let reserved: Vec<i32> = compiled
@@ -1871,11 +1877,11 @@ fn the_pair_class_and_the_pair_rows_keep_their_numbers_and_names_reserved() {
             .iter()
             .flat_map(|range| range.start()..range.end())
             .collect();
-        assert_eq!(reserved, [number], "{message_name}: the reserved number");
+        assert_eq!(reserved, numbers, "{message_name}: the reserved numbers");
         assert_eq!(
             compiled.reserved_name,
-            strings(&[name]),
-            "{message_name}: the reserved name"
+            strings(names),
+            "{message_name}: the reserved names"
         );
     }
     assert!(

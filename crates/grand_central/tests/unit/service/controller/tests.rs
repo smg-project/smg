@@ -963,6 +963,77 @@ async fn a_take_under_another_term_between_two_reads_is_another_word() {
     names(&mut role, second).await;
 }
 
+/// A take lands ahead of the serve's turn to serving: the election's
+/// thread stamps the fence, and the serve sets its phase at its next
+/// move. The fence admits a watch from the take, so the step under a
+/// serve still starting tells the term: a watch admitted in that moment
+/// hears its own term, and no second word that nobody leads here. The
+/// serve's turn to serving then tells nothing more.
+#[tokio::test]
+async fn a_take_under_a_serve_still_starting_is_told_as_its_term() {
+    let mut elector = Elector::alone("controller-0@127.0.0.1:1", ElectionSettings::default())
+        .expect("the default settings are in order");
+    let (steps, stepped) = watch::channel(ElectionObservation::default());
+    let (phase, readiness) = detached(elector.fence(), stepped, Arc::new(Lag::new(Duration::ZERO)));
+    let (_stop, stopped) = watch::channel(false);
+    let (told, mut role) = watch::channel(None);
+    let mut teller = JoinSet::new();
+    teller.spawn(tell_role(readiness, stopped, Vec::new(), told));
+    // The teller's first word, ahead of any take: nobody leads here.
+    let first = timeout(Duration::from_secs(5), role.changed()).await;
+    assert!(matches!(first, Ok(Ok(()))), "the teller told no first word");
+    assert_eq!(*role.borrow_and_update(), None);
+
+    // The take, with the phase as a serve's start leaves it. A watch
+    // admitted here sees the word as it stands, as an open does. The
+    // renewals stand ahead of the clock, each just short of the deadline
+    // the one before it stamped: the fence stays open seconds past the
+    // take, so a thread held on a loaded host reads the term.
+    let mut renewed = Instant::now();
+    assert!(matches!(
+        elector.tick(renewed),
+        Ok(TickOutcome::Acquired { .. })
+    ));
+    for _ in 0..10 {
+        renewed += ElectionSettings::default().renew_deadline - Duration::from_millis(10);
+        assert!(matches!(
+            elector.tick(renewed),
+            Ok(TickOutcome::Renewed { .. })
+        ));
+    }
+    let term = elector.fence().term();
+    let mut opened = role.clone();
+    opened.mark_unchanged();
+    steps.send_replace(ElectionObservation::default());
+    let heard = timeout(Duration::from_secs(5), opened.changed()).await;
+    assert!(
+        matches!(heard, Ok(Ok(()))),
+        "the step told the watch nothing"
+    );
+    assert_eq!(
+        *opened.borrow_and_update(),
+        Some(term),
+        "the step under a serve still starting tells the term its fence holds"
+    );
+
+    // The serve's turn to serving, taken by the teller: turns of the
+    // runtime and no clock. The term is told once.
+    phase.send_replace(Phase::Serving);
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !opened.has_changed().expect("the teller holds the word"),
+        "the turn to serving told the term again"
+    );
+    // The teller took that turn: the word behind the lead's loss is told.
+    assert!(elector.release().expect("a release"));
+    steps.send_replace(ElectionObservation::default());
+    let lost = timeout(Duration::from_secs(5), opened.changed()).await;
+    assert!(matches!(lost, Ok(Ok(()))), "the loss was not told");
+    assert_eq!(*opened.borrow_and_update(), None);
+}
+
 /// A serve whose lead opened with no step of the election since: the
 /// take of a lease with no holder to wait for leads one renew deadline
 /// after its write, between two steps. The fence admits a watch from

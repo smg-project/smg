@@ -14,7 +14,7 @@ use smg_worker::{
 use super::{
     super::{
         tests::stored_chain,
-        write::tests::{facts, refresh, Replica, A},
+        write::tests::{facts, on_let_go, refresh, Replica, A},
     },
     *,
 };
@@ -221,6 +221,73 @@ fn a_watch_snapshots_row_keeps_the_instant_its_object_holds() {
     assert_eq!(instants(), (stated, Some(stated)));
 }
 
+/// A watch's snapshot keeps the instant a row's object holds, and not
+/// the table's. The store is handed a snapshot around the holder that
+/// states a later instant, so the table's row and the object's entry
+/// differ. The holder's next snapshot states the entry's instant, on
+/// the table's row and on the row read back from the object.
+#[test]
+fn a_watch_snapshot_keeps_its_objects_instant_where_the_table_holds_another() {
+    let (told, watching) = (Replica::new(), Replica::new());
+    told.upsert(facts(1, "gold"));
+    let (store, objects) = (&watching.store, &watching.objects);
+    assert!(objects.watch_from(store, told.store.checkpoint()));
+    let admitted = store.by_key(A).expect("the snapshot's row").admitted_at;
+    let later = |by: u64| {
+        let mut cut = told.store.checkpoint();
+        cut.rows[0].admitted_at += Duration::from_secs(by);
+        cut
+    };
+    // The store's own door, around the holder.
+    assert!(store.watch_from(later(5)));
+    let around = store.by_key(A).expect("the row stands").admitted_at;
+    assert_ne!(around, admitted, "the table's row moved");
+    assert!(objects.watch_from(store, later(9)));
+    let object = watching.object(A).expect("the row's object");
+    let read = objects.row_of(&object).expect("its row");
+    let table = store.by_key(A).map(|row| row.admitted_at);
+    assert_eq!((read.admitted_at, table), (admitted, Some(admitted)));
+}
+
+/// A watch's snapshot reads the instant a row keeps inside the holder's
+/// turn. While another holds the turn the call waits, and the turn's
+/// holder states the row's entry at a later instant. Behind the turn
+/// the snapshot's row keeps that instant: the one the entry held when
+/// the call took the turn.
+#[test]
+fn a_watch_snapshot_reads_the_instant_it_keeps_inside_the_holders_turn() {
+    let (told, watching) = (Replica::new(), Replica::new());
+    told.upsert(facts(1, "gold"));
+    let (store, objects) = (&watching.store, &watching.objects);
+    assert!(objects.watch_from(store, told.store.checkpoint()));
+    let mut stated = store.by_key(A).expect("the snapshot's row");
+    stated.admitted_at += Duration::from_secs(5);
+    let mut cut = told.store.checkpoint();
+    cut.rows[0].admitted_at += Duration::from_secs(9);
+    let (laid, done) = mpsc::channel();
+    let turn = objects.turn.lock();
+    thread::scope(|scope| {
+        let call = scope.spawn(move || {
+            let took = objects.watch_from(store, cut);
+            let _ = laid.send(());
+            took
+        });
+        assert_eq!(
+            done.recv_timeout(Duration::from_millis(200)),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "the call waits for the turn"
+        );
+        objects.restate(&stated);
+        drop(turn);
+        assert!(call.join().expect("the call ends"));
+    });
+    let object = watching.object(A).expect("the row's object");
+    let read = objects.row_of(&object).expect("its row");
+    let table = store.by_key(A).map(|row| row.admitted_at);
+    let kept = stated.admitted_at;
+    assert_eq!((read.admitted_at, table), (kept, Some(kept)));
+}
+
 /// The wire tells a row's age, so each event's row comes with an
 /// instant of its own. A row told in place keeps the instant it was
 /// admitted at, by a relabel and by a resize: the table's row and the
@@ -282,6 +349,33 @@ fn a_removal_the_store_does_not_take_leaves_the_row_an_object() {
     follow(&standby, &leader);
     let row = standby.one_row(A);
     hand(&standby, 2, MembershipChange::Removed { id: row.id }, None);
+    let object = standby
+        .object(A)
+        .expect("the row that stands has an object");
+    assert_eq!(standby.objects.row_of(&object), Some(row));
+}
+
+/// A removal the store does not take lays the row read off its object,
+/// and not the one the store holds under the id. The standby's table is
+/// handed a patch of the row around the holder, as a decided change, so
+/// the two rows differ. A removal out of place takes the object out and
+/// lays it again from the row it stated.
+#[test]
+fn a_removal_the_store_does_not_take_lays_the_row_read_off_its_object() {
+    let (leader, standby) = (Replica::new(), Replica::new());
+    leader.upsert(facts(1, "gold"));
+    follow(&standby, &leader);
+    let row = standby.one_row(A);
+    let mut around = row.clone();
+    around.facts = facts(1, "iron");
+    around.revision += 1;
+    let epoch = standby.store.epoch() + 1;
+    let patch = MembershipChange::Relabelled { id: row.id };
+    standby.store.follow(at(epoch), epoch, patch, Some(around));
+    let table = standby.store.get(row.id).expect("the row stands");
+    assert_eq!(table.facts, facts(1, "iron"), "the table's row moved");
+    let removal = MembershipChange::Removed { id: row.id };
+    assert!(!hand(&standby, 2, removal, None), "out of place");
     let object = standby
         .object(A)
         .expect("the row that stands has an object");
@@ -502,6 +596,103 @@ fn a_restores_rows_have_their_objects_when_it_returns() {
     assert_eq!(standby.objects.row_of(&object), leader.store.by_key(A));
     assert_eq!(standby.object(B), None, "a row the cut drops");
     assert_eq!(standby.objects.len(), 1);
+}
+
+/// A row holds one object. A cut that names a standing row's id under
+/// another address ends the object at the first address, by a restore
+/// and by a watch's snapshot. The row's object stands at the new
+/// address, and the id's removal leaves the registry empty.
+#[test]
+fn a_cut_that_names_an_id_under_another_address_ends_its_first_object() {
+    for (name, lay) in LAYS {
+        let (leader, standby) = (Replica::new(), Replica::new());
+        leader.upsert(facts(1, "gold"));
+        let cut = leader.store.checkpoint();
+        assert!(lay(&standby.objects, &standby.store, cut), "{name}");
+        // The same id, under another address.
+        let mut cut = leader.store.checkpoint();
+        let id = cut.rows[0].id;
+        cut.rows[0].facts = WorkerFacts {
+            key: B.to_owned(),
+            engine: B.to_owned(),
+            ..facts(1, "gold")
+        };
+        let moved = cut.rows[0].clone();
+        assert!(lay(&standby.objects, &standby.store, cut), "{name}");
+        let registry = standby.objects.registry();
+        assert!(registry.get_by_url(A).is_none(), "{name}: the first one");
+        let object = standby.object(B).expect("the row's object");
+        assert_eq!(standby.objects.row_of(&object), Some(moved), "{name}");
+        assert_eq!(registry.len(), 1, "{name}: one object an id");
+        assert_eq!(standby.objects.object(id), Some(object), "{name}");
+        let left = MembershipChange::Removed { id };
+        assert!(hand(&standby, 1, left, None), "{name}: the removal");
+        assert!(registry.is_empty(), "{name}: no object with no row");
+    }
+}
+
+/// A cut names an id once. One that names it again, under another
+/// address, leaves one object, by a restore and by a watch's snapshot.
+/// The store keeps the id's last row. The lay lays both in the cut's
+/// order, and the second ends the first's object. No object stands at
+/// the first address, and the id's removal leaves the registry empty.
+#[test]
+fn a_cut_that_names_an_id_twice_lays_its_last_row_alone() {
+    for (name, lay) in LAYS {
+        let (leader, standby) = (Replica::new(), Replica::new());
+        leader.upsert(facts(1, "gold"));
+        let mut cut = leader.store.checkpoint();
+        let first = cut.rows.first().expect("the leader's row").clone();
+        let id = first.id;
+        // The same id again, under another address.
+        let again = WorkerRow {
+            facts: WorkerFacts {
+                key: B.to_owned(),
+                engine: B.to_owned(),
+                ..facts(1, "gold")
+            },
+            ..first
+        };
+        cut.rows.push(again.clone());
+        assert!(lay(&standby.objects, &standby.store, cut), "{name}");
+        let registry = standby.objects.registry();
+        assert!(registry.get_by_url(A).is_none(), "{name}: the first row");
+        let object = standby.object(B).expect("the last row's object");
+        assert_eq!(standby.objects.row_of(&object), Some(again), "{name}");
+        assert_eq!(registry.len(), 1, "{name}: one object an id");
+        assert_eq!(standby.objects.object(id), Some(object), "{name}");
+        let left = MembershipChange::Removed { id };
+        assert!(hand(&standby, 1, left, None), "{name}: the removal");
+        assert!(registry.is_empty(), "{name}: no object with no row");
+    }
+}
+
+/// A cut laid whole lays its own rows and reads none back to lay an
+/// object, by a restore and by a watch's snapshot. Where the store lets
+/// the cut's locks go, ahead of the lay, the table's row is changed
+/// around the holder. The object states the cut's row.
+#[test]
+fn a_cut_laid_whole_lays_its_own_row_where_the_table_moved_behind_its_write() {
+    for (name, lay) in LAYS {
+        let (leader, standby) = (Replica::new(), Rc::new(Replica::new()));
+        leader.upsert(facts(1, "gold"));
+        let cut = leader.store.checkpoint();
+        let row = cut.rows.first().expect("the leader's row").clone();
+        // A patch of the row, handed to the store itself.
+        let (within, mut moved) = (Rc::clone(&standby), row.clone());
+        on_let_go(move || {
+            moved.facts = facts(1, "iron");
+            moved.revision += 1;
+            let epoch = within.store.epoch() + 1;
+            let patch = MembershipChange::Relabelled { id: moved.id };
+            within.store.follow(at(epoch), epoch, patch, Some(moved));
+        });
+        assert!(lay(&standby.objects, &standby.store, cut), "{name}");
+        let table = standby.store.by_key(A).expect("the row stands");
+        assert_eq!(table.facts, facts(1, "iron"), "{name}: the table moved");
+        let object = standby.object(A).expect("the row's object");
+        assert_eq!(standby.objects.row_of(&object), Some(row), "{name}");
+    }
 }
 
 /// A cut's statuses are told ones. Each object states the status its

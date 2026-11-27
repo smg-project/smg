@@ -28,11 +28,6 @@ const PUBLISHED: &str = "every replica publishes its own world";
 
 /// The list: `(trait or type, entry, fate)`, each in its file's own order.
 pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
-    ("WorkersStore", "upsert", EntryReplication::Journaled),
-    ("WorkersStore", "upsert_by", EntryReplication::Journaled),
-    ("WorkersStore", "patch", EntryReplication::Journaled),
-    ("WorkersStore", "remove", EntryReplication::Journaled),
-    ("WorkersStore", "set_status", EntryReplication::Journaled),
     ("WorkersStore", "get", EntryReplication::Read),
     ("WorkersStore", "by_key", EntryReplication::Read),
     ("WorkersStore", "epoch", EntryReplication::Read),

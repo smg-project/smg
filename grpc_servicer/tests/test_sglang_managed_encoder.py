@@ -1302,19 +1302,18 @@ async def test_materialize_batch_produces_stable_item_identities_across_batch_si
     meta_wait = asyncio.Future()
     meta_wait.set_result({"embedding_size": 16, "token_count": 1, "embedding_dim": 8})
     server_mod = SimpleNamespace(meta_registry=SimpleNamespace(wait=lambda rid: meta_wait))
-    runtime_mod = SimpleNamespace(send_staged_embedding=None)
-    for name, mod in [
-        ("sglang", SimpleNamespace()),
-        ("sglang.srt", SimpleNamespace()),
-        ("sglang.srt.disaggregation", SimpleNamespace()),
-        (
-            "sglang.srt.disaggregation.encoder",
-            SimpleNamespace(server=server_mod, runtime=runtime_mod),
-        ),
-        ("sglang.srt.disaggregation.encoder.server", server_mod),
-        ("sglang.srt.disaggregation.encoder.runtime", runtime_mod),
-    ]:
-        monkeypatch.setitem(sys.modules, name, mod)
+    # facade() imports ``server`` from the package, so the package is stubbed as well.
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.disaggregation.encoder",
+        SimpleNamespace(server=server_mod),
+    )
+    monkeypatch.setitem(sys.modules, "sglang.srt.disaggregation.encoder.server", server_mod)
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.disaggregation.encoder.runtime",
+        SimpleNamespace(send_staged_embedding=None),
+    )
     fake_enc = _FakeEncoder()
     fake_enc._smg_req_item_identities = dict(sink_solo)
     owner = epd_encoder.NativeEncoder(

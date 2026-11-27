@@ -35,6 +35,7 @@ use crate::{
     multimodal,
     stream::{finish, poll_mapped, FinishParts, MappedGenerateStream, StreamState},
     structured_outputs::{ConstraintRef, StructuredOutputsBackendConfig, StructuredOutputsSupport},
+    vllm_cache_salt::engine_cache_salt,
 };
 
 /// Ranked candidates to emit per position for a requested logprob count:
@@ -521,18 +522,21 @@ pub fn structured_outputs_backend_from_config(name: &str) -> StructuredOutputsBa
 
 /// A request's media translated once, for every choice of the request: the
 /// per-item features (built here, or relayed from a worker-side processor
-/// with the aux frames its encoder split off), or the identity salt of a
+/// with the aux frames its encoder split off), or the media hashes of a
 /// tensor-less payload. Cloning shares the tensor bytes.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TranslatedMedia {
     pub(crate) mm_features: Option<MmFeaturesPayload>,
     pub(crate) aux_frames: Vec<Bytes>,
+    /// The salt a worker-side processor gave. The request salt replaces it.
     pub(crate) cache_salt: Option<String>,
     /// The prompt positions `mm_features` fill with their items' embeddings
     /// (sorted, merged runs), which the out-of-vocab prompt check holds to
     /// the outer bound only ([`validate_token_ids`]); empty without features.
     /// Read by that check, before the request fans out.
     pub(crate) embed_positions: Vec<Range<usize>>,
+    /// The media hashes of a tensor-less payload, for the engine's salt.
+    pub(crate) identity_hashes: Vec<String>,
 }
 
 /// Media processed worker-side (the servicer's `media_refs` path), in the
@@ -599,6 +603,7 @@ impl ProcessedMedia {
                     aux_frames,
                     cache_salt,
                     embed_positions,
+                    identity_hashes: Vec::new(),
                 })
             }
             Self::Batches(batches) => translate_batches_for(req, batches, model_dtype),
@@ -621,7 +626,7 @@ fn translate_batches_for(
     let has_remote_transfer =
         kv_transfer_params(req)?.is_some() || ec_transfer_params(req)?.is_some();
     let prompt = prompt_token_ids(req)?;
-    let (mm_features, cache_salt) =
+    let (mm_features, identity_hashes) =
         multimodal::translate_batches(batches, prompt, model_dtype, has_remote_transfer)?;
     // From the features the engine gets, not the batches: a tensor-less
     // identity batch is dropped into `cache_salt` (alone, or beside batches
@@ -633,8 +638,9 @@ fn translate_batches_for(
     Ok(TranslatedMedia {
         mm_features: mm_features.map(MmFeaturesPayload::Typed),
         aux_frames: Vec::new(),
-        cache_salt,
+        cache_salt: None,
         embed_positions,
+        identity_hashes,
     })
 }
 
@@ -881,7 +887,9 @@ pub(crate) fn translate_request_with_media(
         aux_frames: _,
         cache_salt,
         embed_positions: _,
+        identity_hashes,
     } = media;
+    let cache_salt = engine_cache_salt(req.cache_salt, &identity_hashes)?.or(cache_salt);
     let data_parallel_rank = req
         .data_parallel_rank
         .map(|rank| u32::try_from(rank).map_err(|_| format!("invalid data_parallel_rank: {rank}")))

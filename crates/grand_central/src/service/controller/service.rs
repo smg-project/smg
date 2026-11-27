@@ -91,8 +91,9 @@ use crate::{
 /// store's entry into the term.
 const NOT_IN_TERM: &str = "this replica leads a term its store has not entered yet";
 
-/// A leader's refusal for its whole lead, where its take started no term in
-/// its store's log: the log followed a term at or above the one taken.
+/// A leader's refusal where its take started no term in its store's log:
+/// the log followed a term at or above the one taken. The election leaves
+/// that lease in the take's step.
 const NO_TERM_LED: &str =
     "this replica holds the lease and its store leads no term: this call is not served until a later take";
 
@@ -669,7 +670,8 @@ impl Service {
     /// leader's control listener by the health service's word. The lease is
     /// taken before the store is told its term: in between the answer is
     /// `UNAVAILABLE`. A take at or below a term the log followed starts no
-    /// term: the answer is `UNAVAILABLE` for that whole lead. A call
+    /// term. The answer is `UNAVAILABLE` while that lead lasts: the election
+    /// leaves it in the take's own step. A call
     /// admitted under a take the store has since passed is told to retry.
     /// So a call that reads this guard is not served under a term the store
     /// does not lead: a membership write, a spec write, its dry run and a
@@ -1163,12 +1165,12 @@ impl GrandCentral for Service {
         let term = self.leading(Instant::now())?;
         self.shared
             .replication
-            .replicate(term, &standby, request.into_inner())
+            .replicate(&self.shared.floors, term, &standby, request.into_inner())
             .await
             .map(Response::new)
     }
 }
 
 #[cfg(test)]
-#[path = "../../../tests/unit/service/controller/service/tests.rs"]
+#[path = "../../../tests/unit/service/controller/service/tests/mod.rs"]
 mod tests;

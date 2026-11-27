@@ -354,9 +354,11 @@ class Router:
             larger values spread picks across candidates. Default: 0.0
         max_payload_size: Maximum payload size in bytes. Default: 512 MiB
         max_tree_size: Maximum total size of each model's approximation tree for
-            cache-aware routing, shared across all workers: for HTTP the chars
-            of its texts plus 1024 for each node a worker stands on, for gRPC
-            tokens; eviction keeps every tree at or under this bound.
+            cache-aware routing, shared across all workers: for requests routed
+            by text the chars of its texts plus 1024 for each node a worker
+            stands on, for requests routed by token ids (gRPC, and HTTP requests
+            that carry them) tokens; each eviction cycle trims every tree back
+            toward this bound, and writes take a tree past it until the next cycle.
             Default: 2^26
         dp_aware: Deprecated, accepted and ignored: every registration reads an
             engine's data-parallel size and registers one worker per rank (warned at

@@ -1509,6 +1509,146 @@ fn a_model_that_left_forgets_its_block_size() {
     assert_eq!(f.tables.block_size(MODEL), Some(16));
 }
 
+/// A model that left takes its own word alone: another model keeps the
+/// engine's word and the tables' size.
+#[test]
+fn a_model_that_left_takes_its_own_block_size_alone() {
+    const OTHER_MODEL: &str = "n";
+    let f = Fixture::single(None);
+    let (host, sink) = opened(&f);
+    let first = sink.admit(f.row, 0, facts(1), &wide(1, 32));
+    assert_eq!(first, BatchOutcome::Applied);
+    // What a feed of the other model learned.
+    sink.sizes.lock().insert(Arc::from(OTHER_MODEL), 64);
+    f.tables.set_block_size(OTHER_MODEL, 64);
+    host.model_left(MODEL);
+    assert_eq!(f.tables.block_size(MODEL), None);
+    assert_eq!(f.tables.block_size(OTHER_MODEL), Some(64));
+    let words = sink.sizes.lock();
+    assert_eq!(words.get(MODEL), None);
+    assert_eq!(words.get(OTHER_MODEL), Some(&64));
+}
+
+/// A model that left takes the engine's word with it: the first stored
+/// block behind its return names its size, a narrower one too.
+#[test]
+fn a_model_that_left_names_its_block_size_anew() {
+    let f = Fixture::single(None);
+    let (host, sink) = opened(&f);
+    let first = sink.admit(f.row, 0, facts(1), &wide(1, 32));
+    assert_eq!(first, BatchOutcome::Applied);
+    assert_eq!(f.tables.block_size(MODEL), Some(32));
+    // The model's one worker leaves, and the model with it.
+    sink.removed(f.row);
+    host.model_left(MODEL);
+    assert_eq!(f.tables.block_size(MODEL), None);
+    // It returns on the same host with a narrower block.
+    let worker = host
+        .objects
+        .registry()
+        .get_by_url(URL)
+        .expect("the worker's object");
+    let ticket = host.enroll(&worker, MODEL);
+    let (sink, _) = host.open(ticket, &worker, MODEL).expect("the row's feed");
+    let again = sink.admit(f.row, 0, facts(1), &wide(2, 16));
+    assert_eq!(again, BatchOutcome::Applied);
+    assert_eq!(f.tables.block_size(MODEL), Some(16));
+}
+
+/// A stream that left takes its feed's record with it: a batch for its
+/// row behind it names no size. What the batch itself is answered is no
+/// part of this case.
+#[test]
+fn a_stream_that_left_names_no_block_size() {
+    let f = Fixture::single(None);
+    let (_host, sink) = opened(&f);
+    sink.removed(f.row);
+    let _ = sink.admit(f.row, 0, facts(1), &wide(1, 32));
+    assert_eq!(f.tables.block_size(MODEL), None);
+    assert!(sink.sizes.lock().is_empty());
+}
+
+/// A batch reads its feed's record where it begins and learns at its
+/// end. One that began ahead of its stream's removal and learns behind it
+/// names no size: the feed is its row's no longer, and the model's
+/// departure cleared the size in between. A feed opened anew for the row
+/// is another feed, so the old batch's learning is not its either, and
+/// its own learning names the size.
+#[test]
+fn a_learning_behind_its_streams_removal_names_no_block_size() {
+    let f = Fixture::single(None);
+    let (host, sink) = opened(&f);
+    let of_row = |sink: &KvAdapter| sink.feeds.lock().get(&f.row).cloned();
+    let began = of_row(&sink).expect("the feed the batch found open");
+    sink.removed(f.row);
+    host.model_left(MODEL);
+    sink.learn(f.row, &began, 32);
+    assert_eq!(f.tables.block_size(MODEL), None);
+    assert!(sink.sizes.lock().is_empty());
+    // The model returns on the same host, under the same row.
+    let worker = host
+        .objects
+        .registry()
+        .get_by_url(URL)
+        .expect("the worker's object");
+    let ticket = host.enroll(&worker, MODEL);
+    let (sink, _) = host.open(ticket, &worker, MODEL).expect("the row's feed");
+    sink.learn(f.row, &began, 32);
+    assert_eq!(f.tables.block_size(MODEL), None);
+    let anew = of_row(&sink).expect("the feed opened anew");
+    sink.learn(f.row, &anew, 16);
+    assert_eq!(f.tables.block_size(MODEL), Some(16));
+}
+
+/// A model's departure takes the engine's word and the tables' size in
+/// one hold of the lock a learning holds, so no row of the model learns
+/// between the two. The table's own lock is the probe: the case holds
+/// it, and the departure cannot get past its call of the tables.
+#[test]
+fn a_models_departure_holds_the_learnings_lock_through_both_removals() {
+    let f = Fixture::single(None);
+    let (host, sink) = opened(&f);
+    let first = sink.admit(f.row, 0, facts(1), &wide(1, 32));
+    assert_eq!(first, BatchOutcome::Applied);
+    // The engine's words, looked at while the departure stands at the
+    // tables. Free, with the model's word gone: the departure let the
+    // lock go ahead of the tables. Free, with the word still there: the
+    // departure has not begun. Held at every look over a quarter second,
+    // which is long against a removal's own hold: the departure holds
+    // them, at the tables or still ahead of them.
+    let held_at_the_tables = || {
+        let window = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        loop {
+            if let Some(sizes) = sink.sizes.try_lock() {
+                return (!sizes.contains_key(MODEL)).then_some(false);
+            }
+            if std::time::Instant::now() >= window {
+                return Some(true);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    };
+    let held = std::thread::scope(|scope| {
+        f.tables.locked(|| {
+            // The collector's own call: the host's.
+            scope.spawn(|| host.model_left(MODEL));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Some(held) = held_at_the_tables() {
+                    break Some(held);
+                }
+                if std::time::Instant::now() >= deadline {
+                    break None;
+                }
+                std::thread::yield_now();
+            }
+        })
+    });
+    assert_eq!(held, Some(true), "let go ahead of the tables");
+    assert_eq!(f.tables.block_size(MODEL), None);
+    assert!(sink.sizes.lock().is_empty());
+}
+
 const UPPER: &str = "http://a:8000#1";
 
 const OTHER: &str = "http://b:8000";
@@ -1935,17 +2075,33 @@ impl Ranked {
 }
 
 /// A batch of rank 1 on the engine's one stream is indexed under rank
-/// 1's row, and a batch of rank 0 under the stream's own.
+/// 1's row, and a batch of rank 0 under the stream's own. A rank's store
+/// names the model's block size by its stream's feed, which is opened
+/// for the stream's own row.
 #[test]
 fn a_batch_of_rank_one_is_indexed_under_rank_ones_row() {
     let f = Ranked::new();
     let upper = f.upper();
     let store = |hash| Data::Stored(wide_store(hash, 16));
+    assert_eq!(f.tables.block_size(MODEL), None);
     assert_eq!(f.admit(1, 1, store(1)), BatchOutcome::Applied);
+    assert_eq!(f.tables.block_size(MODEL), Some(16));
     assert_eq!(f.blocks(upper), (0, 1));
     assert_eq!(f.admit(0, 1, store(2)), BatchOutcome::Applied);
     assert_eq!(f.admit(0, 2, store(3)), BatchOutcome::Applied);
     assert_eq!(f.blocks(upper), (2, 1));
+}
+
+/// A stream that left takes its own feed's record alone: another
+/// engine's stream still names the model's block size by its own.
+#[test]
+fn a_stream_that_left_takes_its_own_feed_alone() {
+    let f = Ranked::new();
+    let other = f.other(OTHER);
+    f.sink.removed(f.lower);
+    let first = f.sink.admit(other, 0, facts(1), &wide(1, 16));
+    assert_eq!(first, BatchOutcome::Applied);
+    assert_eq!(f.tables.block_size(MODEL), Some(16));
 }
 
 /// A batch of a rank whose row the holder has not laid is passed over,

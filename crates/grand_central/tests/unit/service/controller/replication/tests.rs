@@ -8,7 +8,15 @@ use super::*;
 use crate::{
     engine::view::WorkerId,
     service::{
-        controller::decision_slots::tests::holder,
+        controller::{
+            decision_slots::tests::holder,
+            election::{
+                self,
+                tests::{ended, until, Said},
+                ElectionObservation,
+            },
+            floor::FLOOR_BELIEVED,
+        },
         elector::{ElectionSettings, Elector, TickOutcome},
         proto::replication_event::Event as Sent,
         replication,
@@ -376,9 +384,11 @@ fn a_replica_deposed_while_it_awaited_the_hello_joins_no_feed() {
         max_backlog: 0,
         last_applied_term: place.term,
     };
+    // No election listens here: a term above the leader's is said nowhere.
+    let floors = Floors::default();
     let joins = |hello: &proto::ReplicaHello, now| {
         replication
-            .joins(leader.term, STANDBY, hello, now)
+            .joins(&floors, leader.term, STANDBY, hello, now)
             .map(|feed| feed.restore)
             .map_err(|status| status.code())
     };
@@ -413,6 +423,109 @@ fn a_replica_deposed_while_it_awaited_the_hello_joins_no_feed() {
             Err(Code::Unauthenticated)
         ));
     }
+}
+
+/// A hello that states a term above the leader's is refused in the words
+/// it always was, and its term is said to the election through the floors'
+/// one door: once a rising term, as a gateway's floor is. A term at or
+/// under the leader's says nothing. A term past the believed range is
+/// refused in the same words and says nothing.
+#[test]
+fn a_hello_above_the_leaders_term_says_its_term_to_the_election() {
+    let leader = Leader::leading();
+    leader.writes(2);
+    let replication = leader.replication();
+    let floors = Floors::default();
+    let (door, said) = Said::door();
+    floors.open(door);
+    let held = leader.log.head();
+    let term = leader.term;
+    let says = |place: Position, seen: u64| proto::ReplicaHello {
+        replica_id: STANDBY.to_owned(),
+        last_applied_seq: place.seq,
+        term_seen: seen,
+        max_backlog: 0,
+        last_applied_term: place.term,
+    };
+    let joins = |hello: &proto::ReplicaHello| {
+        replication
+            .joins(&floors, term, STANDBY, hello, leader.at)
+            .map(|_| ())
+            .map_err(|status| (status.code(), status.message().to_owned()))
+    };
+    let refusal = |seen: u64| {
+        Err((
+            Code::FailedPrecondition,
+            format!("the standby has seen term {seen}, above this replica's {term}"),
+        ))
+    };
+    // At the leader's term, and under it: a feed, and nothing said.
+    assert_eq!(joins(&says(held, term)), Ok(()));
+    assert_eq!(joins(&says(Position::default(), 0)), Ok(()));
+    assert!(said.terms().is_empty());
+
+    // Above it: the refusal stands as it was, and the term is said.
+    let above = term + 3;
+    assert_eq!(joins(&says(held, above)), refusal(above));
+    assert_eq!(said.terms(), [above]);
+    // Said once a rising term. A place applied under a later term was
+    // seen under it: that term is the one said.
+    assert_eq!(joins(&says(held, above)), refusal(above));
+    assert!(said.terms().is_empty());
+    let later = Position {
+        term: above + 1,
+        ..held
+    };
+    assert_eq!(joins(&says(later, term)), refusal(above + 1));
+    assert_eq!(said.terms(), [above + 1]);
+
+    // Past the believed range: the same refusal, and nothing said.
+    let far = term + FLOOR_BELIEVED + 1;
+    assert_eq!(joins(&says(held, far)), refusal(far));
+    assert!(said.terms().is_empty());
+}
+
+/// The word reaches the election's thread: a leader shown a hello above
+/// its term leaves its lease at that word, and the next take stands above
+/// the hello's term. Alone over its lease here, the replica takes again at
+/// once, and its log leads the new term.
+#[test]
+fn a_leader_shown_a_hello_above_its_term_leaves_for_a_take_above_it() {
+    let (store, feed) = journaled_from(&LeasePlace::File("shared".into()), 0);
+    let elector = Elector::alone(IDENTITY, ElectionSettings::default())
+        .expect("the default settings are in order");
+    let fence = elector.fence();
+    let (standing, _stood) = watch::channel(ElectionObservation::default());
+    let running = election::start(elector, Arc::clone(&store), standing).expect("a thread");
+    until("the first lead", || {
+        fence.leader_term(Instant::now()) == Some(1) && store.term() == 1
+    });
+    let floors = Floors::default();
+    floors.open(running.door());
+    let replication = Replication::new(
+        Arc::clone(&store),
+        Arc::clone(&feed.log),
+        Arc::clone(&fence),
+        holder(&store),
+    );
+    let hello = proto::ReplicaHello {
+        replica_id: STANDBY.to_owned(),
+        last_applied_seq: 0,
+        term_seen: 4,
+        max_backlog: 0,
+        last_applied_term: 0,
+    };
+    let refused = replication
+        .joins(&floors, 1, STANDBY, &hello, Instant::now())
+        .map(|_| ())
+        .map_err(|status| status.code());
+    assert_eq!(refused, Err(Code::FailedPrecondition));
+    until("the take above the hello's term", || {
+        fence.leader_term(Instant::now()) == Some(5) && store.term() == 5
+    });
+    assert_eq!(store.followed(), None);
+    running.stop();
+    ended(running);
 }
 
 #[test]

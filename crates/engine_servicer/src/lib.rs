@@ -55,6 +55,7 @@ pub mod sglang;
 mod stop_match;
 mod stream;
 #[cfg(test)]
+#[path = "../tests/unit/testing.rs"]
 mod testing;
 mod tokenizer_bundle;
 pub mod tokenspeed;

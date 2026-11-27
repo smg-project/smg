@@ -196,7 +196,10 @@ pub mod worker_host;
 /// - the seed's own stream: the profile's picker, and a plugin's draws. A
 ///   picker that draws first reads it too, and whatever follows that draw
 ///   (the order of the rows drawn, or the whole pass behind a draw that kept
-///   nobody) reads it past those values;
+///   nobody) reads it past those values. A pick of two drawn over fewer
+///   than sixteen rows reads a copy: what follows it reads the stream as it
+///   came, as the whole pass does whose pick of the seed that draw hands
+///   out;
 /// - the seed under a mask made of a stage's name ([`Draw::for_stage`]): the
 ///   draws of a filter or a scorer that opens it, the call for one its host
 ///   registers;

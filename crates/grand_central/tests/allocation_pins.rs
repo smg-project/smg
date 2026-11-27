@@ -38,8 +38,9 @@ use smg_grand_central::{
     },
     stages::Lifecycle,
     store::{
-        GatewayId, Hand, HealthSink, LeaseRecord, LeaseState, LeasesStore, MemoryStore, PickRecord,
-        WorkerFacts, WorkerStatus, WorkersStore,
+        identity, GatewayId, Hand, HealthSink, LeaseRecord, LeaseState, LeasesStore,
+        MembershipChange, MemoryStore, PickRecord, Position, Registrant, WorkerFacts, WorkerRow,
+        WorkerStatus, WorkersStore,
     },
     tracking::{Dispatch, Lease, LeaseId, Outcome, Said, Side, TransportClass},
 };
@@ -605,27 +606,48 @@ fn a_pair_decision_after_the_first_allocates_nothing() {
     assert_eq!(allocations, 0, "a pair decision allocated");
 }
 
+/// The row of `facts` as a registration by a control call leaves it. The
+/// stores here have no holder of worker objects: each takes a row as a
+/// decided change ([`MemoryStore::follow`]), and the test counts the
+/// epoch the write steps to.
+fn row_of(facts: WorkerFacts) -> WorkerRow {
+    WorkerRow {
+        id: identity(&facts.key, facts.incarnation),
+        facts,
+        status: WorkerStatus::Pending,
+        revision: 1,
+        admitted_at: Instant::now(),
+        maker: Registrant::Control,
+    }
+}
+
 /// A store of two pools: `n` ready members serving `m` and one member
 /// serving another model, each published. The store and the members of
 /// `m`.
 fn store_of(n: usize) -> (MemoryStore, Vec<WorkerId>) {
     let store = MemoryStore::new();
     let register = |key: String, model: &str| {
-        let id = store
-            .upsert(WorkerFacts {
-                key: key.clone(),
-                engine: key,
-                incarnation: 1,
-                models: vec![model.to_string()],
-                dp_size: 1,
-                ..WorkerFacts::default()
-            })
-            .id();
+        let row = row_of(WorkerFacts {
+            key: key.clone(),
+            engine: key,
+            incarnation: 1,
+            models: vec![model.to_string()],
+            dp_size: 1,
+            ..WorkerFacts::default()
+        });
+        let id = row.id;
+        let epoch = WorkersStore::epoch(&store) + 1;
+        let registered = MembershipChange::Registered { id };
+        store.follow(Position::default(), epoch, registered, Some(row));
         store.publish_now();
-        let revision = WorkersStore::get(&store, id).expect("the row").revision;
-        store
-            .set_status(id, WorkerStatus::Ready, revision)
-            .expect("ready");
+        let ready = MembershipChange::StatusChanged {
+            id,
+            from: WorkerStatus::Pending,
+            to: WorkerStatus::Ready,
+        };
+        store.follow(Position::default(), epoch + 1, ready, None);
+        let landed = WorkersStore::epoch(&store);
+        assert_eq!(landed, epoch + 1, "the member's two writes landed");
         id
     };
     let ids = (0..n)
@@ -728,11 +750,18 @@ fn a_registrations_allocations_do_not_follow_the_fleet() {
                 dp_size: 1,
                 ..WorkerFacts::default()
             };
-            allocations_during(|| {
-                store.upsert(facts);
+            // The row is stated ahead of the count: the count holds the
+            // store's write and the build it owes.
+            let row = row_of(facts);
+            let epoch = WorkersStore::epoch(&store) + 1;
+            let registered = MembershipChange::Registered { id: row.id };
+            let counted = allocations_during(|| {
+                store.follow(Position::default(), epoch, registered, Some(row));
                 store.publish_now();
-            })
-            .1
+            });
+            let landed = WorkersStore::epoch(&store);
+            assert_eq!(landed, epoch, "the registration landed");
+            counted.1
         };
         (0..8).map(one).min()
     };
@@ -766,12 +795,21 @@ fn a_decision_that_spans_a_write_frees_nothing_on_its_thread() {
         dp_size: 1,
         ..WorkerFacts::default()
     };
+    // Each membership write is a decided change the store takes
+    // ([`MemoryStore::follow`]), at the epoch it steps to.
+    let follow = |change: MembershipChange, row: Option<WorkerRow>| {
+        let epoch = WorkersStore::epoch(&store) + 1;
+        store.follow(Position::default(), epoch, change, row);
+        let landed = WorkersStore::epoch(&store);
+        assert_eq!(landed, epoch, "the store took {change:?}");
+    };
     let write = |kind: usize, turn: usize| match kind {
         // A veto of the asking gateway.
         0 => store.gateway_veto(gateway, ids[10 + turn], until),
         // A membership write, and the build it owes.
         1 => {
-            store.upsert(member(format!("http://new{turn}:8000"), 1));
+            let row = row_of(member(format!("http://new{turn}:8000"), 1));
+            follow(MembershipChange::Registered { id: row.id }, Some(row));
             store.publish_now();
         }
         // A generation applied.
@@ -779,14 +817,15 @@ fn a_decision_that_spans_a_write_frees_nothing_on_its_thread() {
             .apply(generation(turn as u64 + 1))
             .expect("above the standing one"),
         // A leave: it pays its build at its answer.
-        3 => {
-            let id = ids[40 + turn];
-            let revision = WorkersStore::get(&store, id).expect("the row").revision;
-            store.remove(id, revision).expect("removed");
-        }
+        3 => follow(MembershipChange::Removed { id: ids[40 + turn] }, None),
         // A new incarnation: the write pays its build at its answer.
         _ => {
-            store.upsert(member(format!("http://w{}:8000", 20 + turn), 2));
+            let row = row_of(member(format!("http://w{}:8000", 20 + turn), 2));
+            let replaced = MembershipChange::Replaced {
+                old: ids[20 + turn],
+                new: row.id,
+            };
+            follow(replaced, Some(row));
         }
     };
     for kind in 0..5 {

@@ -1416,8 +1416,8 @@ mod linked {
     /// its hard demands on its frame. The kinds are a single request,
     /// a request at a side's phase and one that names its worker, by a
     /// number or by a text that is none. Each part goes as the request
-    /// states it, the number beside it, and the ask is answered as any
-    /// ask is.
+    /// states it, a demand for vision among them, the number beside it,
+    /// and the ask is answered as any ask is.
     #[tokio::test(start_paused = true)]
     async fn a_requests_demands_go_out_on_its_frame_over_a_session_on_protocol_two() {
         let kinds = [
@@ -1435,11 +1435,11 @@ mod linked {
             ask.facts.phase = phase;
             ask.constraints.demands = Demands {
                 runtime: 7,
+                vision: true,
                 references: References::Caller,
                 input_window: 4_096,
                 output_window: 512,
                 decoding: 3,
-                ..Demands::default()
             };
             peer.read_hello().await;
             let link = peer.link.clone();
@@ -1465,7 +1465,7 @@ mod linked {
                 sent.demands,
                 Some(proto::Demands {
                     runtime: 7,
-                    vision: false,
+                    vision: true,
                     references: proto::demands::References::Caller.into(),
                     input_window: 4_096,
                     output_window: 512,
@@ -1478,15 +1478,13 @@ mod linked {
         }
     }
 
-    /// Over a session on protocol 2 the handle still refuses two
-    /// demands before anything is sent. One is an encode request's,
-    /// which a controller holds on no frame yet: by its own ask, and by
-    /// a request that states the encode phase. The other is the part
-    /// that demands vision, by its own name, on a request of any kind:
-    /// no registration states whether a worker takes images.
+    /// Over a session on protocol 2 the handle still refuses one demand
+    /// before anything is sent: an encode request's, which a controller
+    /// holds on no frame yet. It is refused by its own ask, and by a
+    /// request that states the encode phase. A demand for vision is
+    /// refused there as any other part is.
     #[tokio::test(start_paused = true)]
-    async fn an_encode_requests_demand_and_a_demand_for_vision_are_refused_before_anything_is_sent()
-    {
+    async fn an_encode_requests_demand_is_refused_before_anything_is_sent() {
         let mut peer = Peer::speaking(1, 2);
         let demand = Demands {
             runtime: 7,
@@ -1496,10 +1494,6 @@ mod linked {
             vision: true,
             ..Demands::default()
         };
-        let both = Demands {
-            vision: true,
-            ..demand
-        };
         let field = |answer: &Result<DecisionGuard<&InProcess>, DecisionUnavailable>| match answer {
             Err(DecisionUnavailable::Unsent(Error::OutOfRange(field))) => Some(*field),
             _ => None,
@@ -1508,16 +1502,7 @@ mod linked {
         let asks = [
             (Phase::Encode, None, demand, "constraints.demands"),
             (Phase::Encode, Some(Some(0)), demand, "constraints.demands"),
-            (Phase::Single, None, vision, "constraints.demands.vision"),
-            (Phase::Single, None, both, "constraints.demands.vision"),
-            (Phase::Prefill, None, vision, "constraints.demands.vision"),
-            (Phase::Decode, None, both, "constraints.demands.vision"),
-            (
-                Phase::Single,
-                Some(Some(0)),
-                vision,
-                "constraints.demands.vision",
-            ),
+            (Phase::Encode, None, vision, "constraints.demands"),
         ];
         for (phase, named, demands, refused) in asks {
             let mut ask = stated(&[1]);

@@ -342,6 +342,10 @@ enum SequentialPdDecodeForm {
 /// Worker selection keeps such a request off such workers while the model
 /// pairs a decode worker with the vision encoder (`decode_needs_vision`), so
 /// a refusal here means none is paired.
+// Always in line: the plan's decision ran this built in, on every sequential
+// request's path, before the check of its refusals called it too. With two
+// callers it stood alone, and a request read 32 instructions more.
+#[inline(always)]
 fn sequential_pd_decode_form(
     request: &ProtoGenerateRequest,
     decode_language_model_only: bool,
@@ -399,6 +403,15 @@ fn sequential_pd_decode_form(
         return Err(response);
     }
     Ok(SequentialPdDecodeForm::TextPlusHashes)
+}
+
+/// What refuses a pair on the MoRI-IO connector, for the plan's decision and
+/// for the check of its refusals alike.
+fn moriio_unsupported() -> Response {
+    error::not_implemented(
+        "moriio_grpc_pd_unsupported",
+        "MoRIIOConnector PD is supported by the HTTP PD router only",
+    )
 }
 
 /// What the sequential dispatch decides before either side is sent: the pair's
@@ -459,12 +472,7 @@ impl SequentialPlan {
             ),
             // Relaying nothing would let the decode engine compute over KV that
             // never arrives, so refuse until this pipeline speaks the protocol.
-            KvConnectorMode::MoriIo => {
-                return Err(error::not_implemented(
-                    "moriio_grpc_pd_unsupported",
-                    "MoRIIOConnector PD is supported by the HTTP PD router only",
-                ));
-            }
+            KvConnectorMode::MoriIo => return Err(moriio_unsupported()),
             KvConnectorMode::Store => debug!(
                 "vLLM PD (KV store): the prefill writes its blocks to the shared store and the \
                  decode reads them back by prefix hash; no connector params on either side"
@@ -515,6 +523,33 @@ impl SequentialPlan {
             stripped_mm_decode,
             streaming: proto_request.stream(),
         })
+    }
+
+    /// What [`Self::decide`] refuses of the pair and the request, asked
+    /// without the plan: no connector mode is read off the prefill, no line
+    /// is logged and no transfer id is minted. For a caller that asks ahead
+    /// of the dispatch that decides the plan. `decide` makes the same two
+    /// refusals in its own lines, which every sequential request runs.
+    pub(crate) fn refuses(
+        proto_request: &ProtoGenerateRequest,
+        workers: &WorkerSelection,
+    ) -> Result<(), Response> {
+        // The plan's mode is MoRI-IO for a MoRI-IO decode, and else what the
+        // prefill's connector says.
+        let moriio = [workers.decode_worker(), workers.prefill_worker()]
+            .into_iter()
+            .flatten()
+            .any(|worker| is_moriio_worker(worker.as_ref()));
+        if moriio {
+            return Err(moriio_unsupported());
+        }
+        let relay_kv_params = proto_request.sampling_n() <= 1;
+        let decode_language_model_only = proto_request.is_vllm()
+            && workers
+                .decode_worker()
+                .is_some_and(|worker| worker_language_model_only(worker.as_ref()));
+        sequential_pd_decode_form(proto_request, decode_language_model_only, relay_kv_params)
+            .map(drop)
     }
 
     /// The prefill request carried KV params, so the servicer was asked for
@@ -1666,6 +1701,124 @@ mod tests {
             prefill,
             decode: decode.into(),
             runtime_type: RuntimeType::Vllm,
+        }
+    }
+
+    /// The check of a plan's refusals answers as the plan's own decision
+    /// does: the same refusal, by its code, for every pairing and request
+    /// the decision refuses, and none where the decision makes a plan.
+    #[test]
+    fn the_check_of_a_plans_refusals_answers_as_the_plan_does() {
+        use smg_worker::{identity::basic::MORIIO_CONNECTOR, labels::SUPPORTS_VISION_LABEL};
+
+        let side = |url: &str, worker_type, connector: Option<&str>, vision: Option<&str>| {
+            let mut worker = BasicWorkerBuilder::new(url)
+                .worker_type(worker_type)
+                .runtime_type(RuntimeType::Vllm)
+                .connection_mode(ConnectionMode::Grpc);
+            if let Some(connector) = connector {
+                worker = worker.kv_connector(connector);
+            }
+            if let Some(vision) = vision {
+                worker = worker.label(SUPPORTS_VISION_LABEL, vision);
+            }
+            let worker: Arc<dyn Worker> = Arc::new(worker.build());
+            worker
+        };
+        let pair = |prefill: Option<&str>, decode: Option<&str>, vision: Option<&str>| {
+            WorkerSelection::Disaggregated {
+                encode_assignments: None,
+                prefill: side("grpc://prefill:30000", WorkerType::Prefill, prefill, None),
+                decode: side("grpc://decode:30000", WorkerType::Decode, decode, vision).into(),
+                runtime_type: RuntimeType::Vllm,
+            }
+        };
+        let code = |refused: Response| {
+            refused
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .and_then(|code| code.to_str().ok())
+                .map(str::to_owned)
+        };
+
+        // A multimodal request in the three forms a language-model-only
+        // decode is refused, as the decode form's own case builds them.
+        let gridded = vllm_pd_mm_request();
+        let mut refs_only = vllm_pd_mm_request();
+        let ProtoGenerateRequest::Vllm(req) = &mut refs_only else {
+            panic!("expected vLLM request");
+        };
+        req.mm_inputs = None;
+        req.extra_mm_inputs.clear();
+        let mut fanout = vllm_pd_mm_request();
+        let ProtoGenerateRequest::Vllm(req) = &mut fanout else {
+            panic!("expected vLLM request");
+        };
+        req.media_refs = None;
+        req.mm_inputs
+            .as_mut()
+            .unwrap()
+            .model_specific_tensors
+            .clear();
+        req.sampling_params.get_or_insert_with(Default::default).n = 2;
+        let text = recorded_request(1);
+
+        let nixl = Some(NIXL_CONNECTOR);
+        let moriio = Some(MORIIO_CONNECTOR);
+        let rows = [
+            ("a NIXL pair", pair(nixl, None, None), &text, None),
+            (
+                "a MoRI-IO decode",
+                pair(nixl, moriio, None),
+                &text,
+                Some("moriio_grpc_pd_unsupported"),
+            ),
+            (
+                "a MoRI-IO prefill",
+                pair(moriio, None, None),
+                &text,
+                Some("moriio_grpc_pd_unsupported"),
+            ),
+            (
+                "grids for a language-model-only decode",
+                pair(nixl, None, Some("false")),
+                &gridded,
+                Some("pd_decode_language_model_only_mrope"),
+            ),
+            (
+                "media references for a language-model-only decode",
+                pair(nixl, None, Some("false")),
+                &refs_only,
+                Some("pd_decode_language_model_only_media_refs"),
+            ),
+            (
+                "samples of a multimodal prompt for a language-model-only decode",
+                pair(nixl, None, Some("false")),
+                &fanout,
+                Some("pd_decode_language_model_only_n_samples"),
+            ),
+            (
+                "text for a language-model-only decode",
+                pair(nixl, None, Some("false")),
+                &text,
+                None,
+            ),
+            (
+                "grids for a decode with the vision encoder",
+                pair(nixl, None, Some("true")),
+                &gridded,
+                None,
+            ),
+        ];
+        for (name, workers, request, refused) in rows {
+            let checked = SequentialPlan::refuses(request, &workers)
+                .err()
+                .and_then(code);
+            let decided = SequentialPlan::decide(request, &workers)
+                .err()
+                .and_then(code);
+            assert_eq!(checked.as_deref(), refused, "{name}: the check");
+            assert_eq!(decided.as_deref(), refused, "{name}: the plan's decision");
         }
     }
 

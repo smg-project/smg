@@ -74,11 +74,14 @@ fn pair_row(position: u32, class: u32, over: bool, down: bool) -> Candidate {
 
 /// A pair's decision says the list it sheds its request over as
 /// saturated, under a binding that sheds a list wholly over its
-/// thresholds. The prefills, where no prefill stands but for the veto.
-/// The decodes, where the whole decode list is over its thresholds. No
-/// list where a decode that pairs with no prefill is under them: the
-/// shed is then made over the partners alone. Under a binding that
-/// steers the same sheds say no list.
+/// thresholds. The prefills, where no prefill that pairs stands. The
+/// decodes, where the whole decode list is over its thresholds. Where
+/// a decode that pairs with no prefill is under them, the decode list
+/// is not wholly over its thresholds: the request has no endpoint,
+/// and the shed names `partnered`, since that decode stands and pairs
+/// with nobody. Under a binding that steers no such shed is saturated,
+/// and none says a list: the prefill over its thresholds would be
+/// steered to, and pairs with no decode that stands.
 #[test]
 fn a_pairs_decision_says_the_list_it_sheds_over() {
     let steering = || {
@@ -95,14 +98,18 @@ fn a_pairs_decision_says_the_list_it_sheds_over() {
         engine
     };
     let saturated = Some((ShedReason::Saturated, "not-overloaded"));
+    let partnered = Some((ShedReason::NoEndpoints, PARTNERED));
     // The prefill is over its thresholds beside a decode that is down:
-    // no pair is left to steer to, and the shed is the prefills'.
+    // no pair is left to steer to, and the list judged is the prefills.
     let prefills = [pair_row(0, 7, true, false)];
     let decodes = [pair_row(0, 7, false, true)];
-    for (engine, over) in [(shedding(), Some(ShedOver::Prefills)), (steering(), None)] {
+    for (engine, shed, over) in [
+        (shedding(), saturated, Some(ShedOver::Prefills)),
+        (steering(), partnered, None),
+    ] {
         let mut scratch = Scratch::new();
         let decision = decide_pair_with(&engine, &prefills, &decodes, &mut scratch);
-        assert_eq!(shed_of(&decision), saturated);
+        assert_eq!(shed_of(&decision), shed, "the prefills");
         assert_eq!(scratch.shed_over(), over, "the prefills");
     }
     // Every decode is over its thresholds beside a prefill that stands.
@@ -119,22 +126,25 @@ fn a_pairs_decision_says_the_list_it_sheds_over() {
     for engine in [shedding(), steering()] {
         let mut scratch = Scratch::new();
         let decision = decide_pair_with(&engine, &prefills, &decodes, &mut scratch);
-        assert_eq!(shed_of(&decision), saturated);
-        assert_eq!(scratch.shed_over(), None, "the partners alone");
+        assert_eq!(shed_of(&decision), partnered, "an idle decode apart");
+        assert_eq!(scratch.shed_over(), None, "an idle decode apart");
     }
 }
 
-/// A pair's decision says a list where the gateway's own selection
-/// would read it as wholly over its thresholds, and no list where the
-/// two counts part ([`vetoed::wholly_over`]). A worker under its thresholds
-/// and under a liveness doubt keeps its list from being wholly over
-/// them, though no pass of the decision keeps it: a decode that pairs
-/// with no prefill for the decodes, a prefill for the prefills. Over
-/// its thresholds too, it does not. A prefill that pairs with no
+/// A pair's decision sheds as saturated, and says the list, exactly
+/// where the gateway's own selection would read that list as wholly
+/// over its thresholds (`vetoed::Half::count`). A worker under its
+/// thresholds and under a liveness doubt keeps its list from being
+/// wholly over them, though no pass of the decision keeps it: a
+/// decode that pairs with no prefill for the decodes, a prefill for
+/// the prefills. The request then has no endpoint, and the shed names
+/// the health stage, which refused that worker. Over its thresholds
+/// too, such a worker keeps nothing. A prefill that pairs with no
 /// decode is no part of the prefills' count: the one over its
 /// thresholds beside a partnered prefill that is down shows no
-/// overload of the list, and beside a partnered one over its
-/// thresholds it changes nothing.
+/// overload of the list, and the shed names the health stage for the
+/// one that is down. Beside a partnered prefill over its thresholds it
+/// changes nothing.
 ///
 /// That selection counts a worker that is healthy with a closed
 /// breaker, whatever doubt stands on it
@@ -143,7 +153,7 @@ fn a_pairs_decision_says_the_list_it_sheds_over() {
 /// (`model_gateway/src/routers/common/pair_index.rs:158-161`, on main
 /// `56773d28d`).
 #[test]
-fn a_pairs_decision_says_a_list_by_the_gateways_own_count() {
+fn a_pairs_decision_sheds_as_saturated_by_the_gateways_own_count() {
     let mut engine = Engine::new(
         vec![strict_profile()],
         vec![pair_binding()],
@@ -158,40 +168,41 @@ fn a_pairs_decision_says_a_list_by_the_gateways_own_count() {
     let said = |prefills: &[Candidate], decodes: &[Candidate]| {
         let mut scratch = Scratch::new();
         let decision = decide_pair_with(&engine, prefills, decodes, &mut scratch);
-        assert_eq!(
-            shed_of(&decision),
-            Some((ShedReason::Saturated, "not-overloaded")),
-            "{decision:?}"
-        );
-        scratch.shed_over()
+        (shed_of(&decision), scratch.shed_over())
     };
+    let saturated = |over| (Some((ShedReason::Saturated, "not-overloaded")), Some(over));
+    let doubt = (Some((ShedReason::NoEndpoints, "healthy")), None);
     let open = pair_row(0, 7, false, false);
     let over = pair_row(0, 7, true, false);
     let down = pair_row(0, 7, false, true);
     // The partner is over its thresholds beside a decode of a class no
     // prefill pairs with, which is under a doubt.
     let idle = doubted(pair_row(1, 9, false, false));
-    assert_eq!(said(&[open], &[over, idle]), None, "a decode under a doubt");
+    assert_eq!(
+        said(&[open], &[over, idle]),
+        doubt,
+        "a decode under a doubt"
+    );
     let busy = doubted(pair_row(1, 9, true, false));
-    assert_eq!(said(&[open], &[over, busy]), Some(ShedOver::Decodes));
+    assert_eq!(said(&[open], &[over, busy]), saturated(ShedOver::Decodes));
     // One prefill is over its thresholds beside one under a doubt, and
     // the decode is down.
     let idle = doubted(pair_row(1, 7, false, false));
     assert_eq!(
         said(&[over, idle], &[down]),
-        None,
+        doubt,
         "a prefill under a doubt"
     );
     let busy = doubted(pair_row(1, 7, true, false));
-    assert_eq!(said(&[over, busy], &[down]), Some(ShedOver::Prefills));
+    assert_eq!(said(&[over, busy], &[down]), saturated(ShedOver::Prefills));
     // The one prefill over its thresholds is of a class no decode is of.
     let alone = pair_row(1, 9, true, false);
     assert_eq!(
         said(&[down, alone], &[open]),
-        None,
+        doubt,
         "a prefill with no decode"
     );
-    assert_eq!(said(&[over, alone], &[open]), Some(ShedOver::Prefills));
+    assert_eq!(said(&[over, alone], &[open]), saturated(ShedOver::Prefills));
 }
 
 /// A pair's decision counts a list at the request's places alone. The
@@ -227,6 +238,114 @@ fn a_pairs_decision_counts_a_list_at_the_requests_places() {
     );
     assert_eq!(said(&[over, second], &[open], [None; 2]), (None, None));
     assert_eq!(said(&[open], &[over, second], [None; 2]), (None, None));
+}
+
+/// Behind a part a pair's decision asks no question of its shed
+/// (`PairPools::part`): the gateway's own selection judges another list
+/// there than the decision is handed (`admitted_pool` in
+/// `model_gateway/src/routers/common/placement.rs`). Two states, each
+/// answered by the question over whole lists and as before it behind a
+/// part.
+///
+/// The count makes no shed saturated. The prefill's one partner is down
+/// beside a decode over its thresholds that pairs with no prefill. Over
+/// whole lists every ready decode is over its thresholds, and the shed is
+/// saturated. Behind a part the health stage names it, which left the
+/// pass nobody.
+///
+/// A pass the overload veto ended keeps its word. The partner is over
+/// its thresholds beside a decode with room that pairs with no prefill
+/// and stands under a liveness doubt. Over whole lists the request has
+/// no endpoint, under the health stage. Behind a part the shed stays
+/// saturated.
+///
+/// Behind a part the decision says its list as it did before the question
+/// stood, where the overload veto ended the pass: the decode list whole
+/// beside a prefill that stands, and the prefills that pair where none
+/// stands, each where wholly over its thresholds. A prefill that pairs
+/// with no decode is no prefill of that list.
+///
+/// Under a binding that steers a decision says no list, behind a part as
+/// over whole lists. The one prefill is over its thresholds and its
+/// partner is down, so the binding has no pair to steer to. Behind a part
+/// the shed keeps the veto's name, and over whole lists it has no
+/// endpoint.
+#[test]
+fn a_pairs_decision_behind_a_part_asks_no_question_of_its_shed() {
+    let engine = |sheds: bool| {
+        let (profiles, bindings) = (vec![strict_profile()], vec![pair_binding()]);
+        let mut engine = Engine::new(profiles, bindings, 1, Needs::default());
+        if sheds {
+            engine.shed_when_all_vetoed(0);
+        }
+        engine
+    };
+    let (sheds, steers) = (engine(true), engine(false));
+    let said_by = |engine: &Engine, prefills: &[Candidate], decodes: &[Candidate], part: bool| {
+        let facts = RequestFacts {
+            model: "m",
+            ..RequestFacts::default()
+        };
+        let pools = PairPools {
+            prefills,
+            decodes,
+            part,
+            ..PairPools::default()
+        };
+        let (cx, pool) = (Constraints::default(), PoolFacts::default());
+        let mut scratch = Scratch::new();
+        let decision = engine.decide_pair(&facts, &pool, pools, &cx, &cx, &mut scratch);
+        (shed_of(&decision), scratch.shed_over())
+    };
+    let said = |prefills: &[Candidate], decodes: &[Candidate], part: bool| {
+        said_by(&sheds, prefills, decodes, part)
+    };
+    let saturated = Some((ShedReason::Saturated, "not-overloaded"));
+    let doubt = Some((ShedReason::NoEndpoints, "healthy"));
+    let open = pair_row(0, 7, false, false);
+    // The partner is down, and a decode apart is over its thresholds.
+    let decodes = [pair_row(0, 7, false, true), pair_row(1, 9, true, false)];
+    assert_eq!(
+        said(&[open], &decodes, false),
+        (saturated, Some(ShedOver::Decodes))
+    );
+    assert_eq!(said(&[open], &decodes, true), (doubt, None), "no question");
+    // The partner is over its thresholds, and a decode apart has room
+    // under a doubt.
+    let mut idle = pair_row(1, 9, false, false);
+    idle.health.stalled = true;
+    let decodes = [pair_row(0, 7, true, false), idle];
+    assert_eq!(said(&[open], &decodes, false), (doubt, None));
+    assert_eq!(
+        said(&[open], &decodes, true),
+        (saturated, None),
+        "the pass's word"
+    );
+    // The word behind a part. Every decode is over its thresholds beside
+    // a prefill that stands: the decodes.
+    let decodes = [pair_row(0, 7, true, false), pair_row(1, 9, true, false)];
+    assert_eq!(
+        said(&[open], &decodes, true),
+        (saturated, Some(ShedOver::Decodes))
+    );
+    // The one prefill is over its thresholds and pairs: the prefills.
+    let over = pair_row(0, 7, true, false);
+    assert_eq!(
+        said(&[over], &[open], true),
+        (saturated, Some(ShedOver::Prefills))
+    );
+    // One that pairs with no decode is no prefill of that list.
+    let alone = pair_row(0, 9, true, false);
+    assert_eq!(said(&[alone], &[open], true), (saturated, None));
+    // A binding that steers says no list. The partner is down.
+    let down = [pair_row(0, 7, false, true)];
+    let apart = Some((ShedReason::NoEndpoints, "partnered"));
+    assert_eq!(said_by(&steers, &[over], &down, true), (saturated, None));
+    assert_eq!(said_by(&steers, &[over], &down, false), (apart, None));
+    assert_eq!(
+        said(&[over], &down, true),
+        (saturated, Some(ShedOver::Prefills))
+    );
 }
 
 /// The word of the list a shed was made over is its decision's alone:
@@ -286,15 +405,16 @@ fn side_of(decision: &Decision) -> Option<PairSide> {
     }
 }
 
-/// A pair's refusal names the side that was left with nobody. The
-/// prefill side where no prefill of the request's stands: none is
-/// listed, each is down, or each is over its thresholds with nowhere to
-/// be steered. The decode side where a prefill stands and its partners
-/// are missing or refused: no decode is of its class, none is listed,
-/// each is down, or each is over its thresholds under a binding that
-/// sheds. The decode side too where the prefill was picked and the
-/// decode's picker declined. A pair declined ahead of every profile
-/// names no side: neither list was read.
+/// A pair's refusal names the side it is for, the role the gateway's
+/// own pair selection refuses for. The prefill side where no prefill
+/// of the request's stands: none is listed, each is down, or each is
+/// over its thresholds with nowhere to be steered. The decode side
+/// where a prefill stands and its partners are missing or refused: no
+/// decode is of its class, none is listed, each is down, or each is
+/// over its thresholds under a binding that sheds. The decode side too
+/// where the prefill was picked and the decode's picker declined. A
+/// pair declined ahead of every profile names no side: neither list
+/// was read.
 ///
 /// A decode decided again names the decode side for the partners it
 /// lacks, and the prefill side for a held prefill that left its list.
@@ -307,7 +427,7 @@ fn side_of(decision: &Decision) -> Option<PairSide> {
 /// decode policy's own decline (`:3090`), on main `d43c7b2a9`. It
 /// decides no decode again.
 #[test]
-fn a_pairs_refusal_names_the_side_left_with_nobody() {
+fn a_pairs_refusal_names_the_side_it_is_for() {
     let steering = strict_pair_engine();
     let mut shedding = strict_pair_engine();
     shedding.shed_when_all_vetoed(0);
@@ -329,8 +449,12 @@ fn a_pairs_refusal_names_the_side_left_with_nobody() {
         said(&steering, &[down], &[open]),
         (Some("healthy"), prefill)
     );
+    // One over its thresholds with nowhere to be steered has no
+    // endpoint under a binding that steers, and is saturation under one
+    // that sheds.
+    let unpartnered = Some("partnered");
+    assert_eq!(said(&steering, &[over], &[down]), (unpartnered, prefill));
     let vetoed = Some("not-overloaded");
-    assert_eq!(said(&steering, &[over], &[down]), (vetoed, prefill));
     assert_eq!(said(&shedding, &[over], &[open]), (vetoed, prefill));
     // Both lists are down: the prefills are read first.
     assert_eq!(
@@ -339,7 +463,6 @@ fn a_pairs_refusal_names_the_side_left_with_nobody() {
     );
     // A prefill stands, and its partners are missing or refused. The
     // last of these prefills is of no pair class: it pairs with nobody.
-    let unpartnered = Some("partnered");
     assert_eq!(said(&steering, &[open], &[apart]), (unpartnered, decode));
     assert_eq!(said(&steering, &[open], &[]), (unpartnered, decode));
     let classless = pair_row(0, 0, false, false);
@@ -369,6 +492,12 @@ fn a_pairs_refusal_names_the_side_left_with_nobody() {
     // No binding: the pair is declined ahead of either list.
     let unbound = Engine::new(vec![strict_profile()], vec![], 1, Needs::default());
     assert_eq!(said(&unbound, &[open], &[open]), (Some("binding"), None));
+    // So it is over a prefill list alone: the list that holds a row is not
+    // the side a pair declined ahead of both lists names.
+    let (pool, free) = (PoolFacts::default(), Constraints::default());
+    let alone =
+        unbound.decide_over_an_empty_list(&request(7), &pool, true, &free, &mut Scratch::new());
+    assert_eq!(names(&alone), (Some("binding"), None));
 
     // The decode decided again behind a held prefill.
     let again = |prefills: &[Candidate], decodes: &[Candidate], held: WorkerId| {
@@ -392,9 +521,8 @@ fn a_pairs_refusal_names_the_side_left_with_nobody() {
 /// Where a pair's decision says the list it shed over, its refusal
 /// names that list's side: the prefills are the prefill side, and the
 /// decodes the decode side. The refusal names its side where the
-/// decision says no list too: under a binding that steers, where the
-/// decision's count and the gateway's own part, and for a shed with no
-/// endpoint. So the side is not read from that word.
+/// decision says no list too: under a binding that steers, and for a
+/// shed with no endpoint. So the side is not read from that word.
 #[test]
 fn a_pairs_refusal_names_the_side_of_the_list_its_decision_says() {
     let steering = strict_pair_engine();
@@ -417,12 +545,71 @@ fn a_pairs_refusal_names_the_side_of_the_list_its_decision_says() {
     // Under a binding that steers the prefills' shed says no list.
     assert_eq!(said(&steering, &[over], &[down]), (prefill, None));
     // The partner is over its thresholds beside an idle decode that
-    // pairs with no prefill: the two counts part, and no list is said.
+    // pairs with no prefill: the decode list is not wholly over its
+    // thresholds, the request has no endpoint, and no list is said.
     let idle = pair_row(1, 9, false, false);
     assert_eq!(said(&shedding, &[open], &[over, idle]), (decode, None));
     // A shed with no endpoint says no list.
     assert_eq!(said(&shedding, &[down], &[open]), (prefill, None));
     assert_eq!(said(&shedding, &[open], &[down]), (decode, None));
+}
+
+/// Where a pair's prefill side places nobody, its refusal names the
+/// role the gateway's own pair selection refuses for (`pair_pass` in
+/// `model_gateway/src/routers/common/placement.rs`). That selection
+/// answers three tests of its lists whole ahead of any answer a
+/// worker's state decides, in this order: a
+/// prefill pool that holds no worker is refused for the prefill's
+/// role, a decode pool that holds none for the decode's, and a pool no
+/// prefill of which pairs with any decode for the decode's too, by its
+/// index's refusal (`PairingRefusal` in
+/// `model_gateway/src/routers/common/pair_index.rs`). So where nothing
+/// pairs the refusal is the decode side's, whatever the one prefill
+/// is: open, down, or over its thresholds.
+///
+/// Else the side is the list its one question judges: the prefills
+/// where no prefill that pairs with a decode stands as it is (the
+/// pass's branch where no prefill is eligible). A prefill that stands
+/// and pairs with nobody changes nothing there: that selection holds
+/// no such prefill.
+#[test]
+fn a_pairs_refusal_where_nothing_pairs_is_made_for_the_decode_side() {
+    let steering = strict_pair_engine();
+    let mut shedding = strict_pair_engine();
+    shedding.shed_when_all_vetoed(0);
+    let open = pair_row(0, 7, false, false);
+    let over = pair_row(0, 7, true, false);
+    let down = pair_row(0, 7, false, true);
+    let apart = pair_row(0, 9, false, false);
+    // A second prefill, of no pair class: it stands, and pairs with
+    // nobody.
+    let classless = pair_row(1, 0, false, false);
+    let said = |engine: &Engine, prefills: &[Candidate], decodes: &[Candidate]| {
+        let decision = decide_pair(engine, prefills, decodes);
+        let stage = shed_of(&decision).map(|(_, stage)| stage);
+        (stage, side_of(&decision))
+    };
+    let (prefill, decode) = (Some(PairSide::Prefill), Some(PairSide::Decode));
+    let (unpartnered, unhealthy) = (Some("partnered"), Some("healthy"));
+    for engine in [&steering, &shedding] {
+        // A pool that holds no worker: the prefills' is read first.
+        assert_eq!(said(engine, &[], &[]), (Some("none"), prefill));
+        assert_eq!(said(engine, &[], &[apart]), (Some("none"), prefill));
+        assert_eq!(said(engine, &[down], &[]), (unhealthy, decode));
+        // No prefill pairs with the one decode.
+        assert_eq!(said(engine, &[open], &[apart]), (unpartnered, decode));
+        assert_eq!(said(engine, &[down], &[apart]), (unhealthy, decode));
+        assert_eq!(said(engine, &[over], &[apart]), (unpartnered, decode));
+        // The one prefill that pairs is down, beside one that stands
+        // and pairs with nobody: the prefills are the list judged.
+        let beside = [down, classless];
+        assert_eq!(said(engine, &beside, &[open]), (unpartnered, prefill));
+    }
+    // So they are where the one prefill that pairs is over its
+    // thresholds, under a binding that sheds.
+    let vetoed = Some("not-overloaded");
+    let beside = [over, classless];
+    assert_eq!(said(&shedding, &beside, &[open]), (vetoed, prefill));
 }
 
 #[test]

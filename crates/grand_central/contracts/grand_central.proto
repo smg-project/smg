@@ -106,8 +106,9 @@
 // term, on a membership write, a spec write, its dry run and a rollback,
 // Replicate and the open of a WatchWorkers (the moment after
 // its take, until its store is told the term, and a call admitted under a
-// take its store has since passed: retry; or its whole lead, until a later
-// take, where its log followed a term at or above the one it took), or a
+// take its store has since passed: retry; or the one step of a lead whose
+// log followed a term at or above the one it took, which the election
+// leaves for a take above that term), or a
 // Decide stream open when the controller closes its listeners at its
 // shutdown (its gateway opens the next one on the leader);
 // ABORTED fenced mid-stream, reconnect through Leader, a Hello read
@@ -569,11 +570,10 @@ message DecideRequest {
 // are the asking party's own: the controller compares each with a worker's
 // and reads no more of it.
 //
-// Whether a worker takes images is its row's own bit. No registration
-// over this contract states it yet, so a request that demands vision is
-// shed unless the controller's host laid a worker that takes images. A
-// list the demands leave nobody is shed with no endpoint, under the stage
-// of the demand that took its last worker.
+// Whether a worker takes images is its row's own bit, which its
+// registration states (WorkerSpec.vision). A list the demands leave nobody
+// is shed with no endpoint, under the stage of the demand that took its
+// last worker.
 message Demands {
   // Where a request's media by reference may be processed.
   enum References {
@@ -858,6 +858,10 @@ message WorkerRow {
   // states none, and the row reads as it did before this field. A reader
   // that knows no such field reads every row as one that states none.
   DemandFacts demand_facts = 28;
+  // Whether the worker takes images. A reader that knows no such field
+  // reads every row as one that takes none, so it sends the worker no
+  // request that demands vision.
+  bool vision = 29;
 }
 
 // A provider that finds workers by itself, as a row's maker. Neither
@@ -900,7 +904,13 @@ message PairingDescriptor {
   reserved "pair_class";
   bool ec_producer = 9;
   bool ec_consumer = 10;
-  bool vision = 11;
+  // Whether the worker takes images, which no build took or told under
+  // this number: it is the registration's and the row's own field
+  // (WorkerSpec.vision, WorkerRow.vision). No later field takes the number
+  // or the name. A registration or a told row that still states it is read
+  // as one that states none.
+  reserved 11;
+  reserved "vision";
   // The worker's end of the encode handoff, with its two EC roles: the form
   // its registration states and, under a push, the connector the role is
   // stated on. Unspecified is no end, as a registration that names no form
@@ -965,8 +975,9 @@ message Signals {
 // and reads no more of them. A worker that states none meets no demand for
 // a runtime, for media by reference or for a way to decide a constraint,
 // and it takes a request of any size. Whether the worker takes images is
-// no field here. A frame states the demands these facts are held against
-// (DecideRequest.demands).
+// no field here: its registration states it beside this block
+// (WorkerSpec.vision). A frame states the demands these facts are held
+// against (DecideRequest.demands).
 message DemandFacts {
   // The worker's runtime, as a number. 0 states none.
   uint32 runtime = 1;
@@ -1001,15 +1012,16 @@ message RegisterWorkerRequest {
     // did not make the standing row is PERMISSION_DENIED (WorkerRow.maker).
     MODE_REPLACE = 2;
     // Registers an absent URL. Over a standing row: equal facts write no row
-    // and answer the row unmoved, a change of role, wire, models or demand
-    // facts is a new incarnation, any other change is made in place. Equal
-    // facts send a worker whose checks are off its connect signal again,
-    // where it is neither ready nor draining: its status alone moves. The
-    // models change when their set does: the same ids in another order are
-    // written in place, and the row tells the stated order. Over a draining
-    // row every registration is the URL's next incarnation, whatever its
-    // facts: a drain ends with the registration it named. A caller that did
-    // not make the standing row is PERMISSION_DENIED, whatever the facts.
+    // and answer the row unmoved, a change of role, wire, models, demand
+    // facts or whether the worker takes images is a new incarnation, any
+    // other change is made in place. Equal facts send a worker whose checks
+    // are off its connect signal again, where it is neither ready nor
+    // draining: its status alone moves. The models change when their set
+    // does: the same ids in another order are written in place, and the row
+    // tells the stated order. Over a draining row every registration is the
+    // URL's next incarnation, whatever its facts: a drain ends with the
+    // registration it named. A caller that did not make the standing row is
+    // PERMISSION_DENIED, whatever the facts.
     MODE_UPSERT = 3;
   }
   Mode mode = 2;
@@ -1102,6 +1114,9 @@ message WorkerSpec {
   // present is the row's, whole: an empty one states none. Unset keeps the
   // row's.
   DemandFacts demand_facts = 15;
+  // Whether the worker takes images. Unset keeps the row's, and a new row
+  // that states none takes no images.
+  optional bool vision = 16;
 }
 
 message PatchWorkerRequest {

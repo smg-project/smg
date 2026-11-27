@@ -656,9 +656,9 @@ impl RoutingSettings {
     /// binding with an encode side.
     ///
     /// The manual policy on both sides of a pair runs under the plan of
-    /// three sides, and under the encode mode's own plan: its rule places
+    /// three sides, and under the encode mode's own plan. Its rule places
     /// the pair's two sides, each by its own session, and the encode side
-    /// places an item by its content.
+    /// places an item by its own policy.
     ///
     /// A pure function of the settings. The document is not validated
     /// here, a plan with an encode side in a gateway of many routers

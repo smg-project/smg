@@ -184,6 +184,14 @@ impl DecisionClock {
     fn membership_epoch(&self) -> u64 {
         self.pools.load(Ordering::Relaxed)
     }
+
+    /// One more pool on this clock: counts it and answers its number, the
+    /// membership epoch from then on. The first pool is number one: an
+    /// epoch of zero says no membership.
+    #[inline]
+    fn next_pool(&self) -> u64 {
+        self.pools.fetch_add(1, Ordering::Relaxed) + 1
+    }
 }
 
 impl Default for DecisionClock {
@@ -775,9 +783,7 @@ impl PoolRecords {
             places.clear();
         }
         let (engine_rows, engine_ends) = engines_of(workers, &mut fixed);
-        // The first pool is number one: an epoch of zero says no
-        // membership.
-        let number = clock.pools.fetch_add(1, Ordering::Relaxed) + 1;
+        let number = clock.next_pool();
         Self {
             regular: fixed.iter().all(|row| row.role == Role::Single),
             fixed,
@@ -906,32 +912,52 @@ impl PoolRecords {
         !self.engine_ends.is_empty()
     }
 
-    /// The workers of the engines a retry tried, written into `whole`:
-    /// `tried` as its host named them, and behind them the id of every
-    /// other row of the engine that holds a tried worker's row
-    /// ([`Engines`]), each once. A retry that names one rank of a
-    /// data-parallel engine so names them all: its ranks share the engine a
-    /// failed attempt reached.
+    /// The workers of the engines a retry tried, over the lists of one
+    /// decision: `tried` as its host named them, and behind them the id of
+    /// every other row of an engine that holds a tried worker's row
+    /// ([`Engines`]), each once and each list read by its own engines. A
+    /// retry that names one rank of a data-parallel engine so names them
+    /// all: its ranks share the engine a failed attempt reached. A single
+    /// request hands its one list, a pair its two and an encode request
+    /// its three.
     ///
-    /// An id the list does not hold stays as it was named and adds nothing:
-    /// the list says nothing of its engine. Where two rows of the list
-    /// carry one id, no id has a place ([`Self::place_of`]) and nothing is
-    /// added.
+    /// Only a list where an engine holds several rows is read
+    /// ([`Self::has_ranks`]). `None` where `lists` holds no such list: the
+    /// request's own list stands, and `whole` is not asked. Else `whole`
+    /// hands the list that is written and returned. It is asked once, and
+    /// what its list held is not kept.
     ///
-    /// One binary search for each tried id, and nothing allocated once
-    /// `whole` has grown: what a retry pays, and only over a list with
-    /// such an engine ([`Self::has_ranks`]).
-    pub(crate) fn tried_engines(&self, tried: &[WorkerId], whole: &mut Vec<WorkerId>) {
+    /// An id a list does not hold stays as it was named and adds nothing
+    /// there: that list says nothing of its engine. Where two rows of a
+    /// list carry one id, no id has a place in it ([`Self::place_of`]) and
+    /// it adds nothing.
+    ///
+    /// One binary search for each tried id in each list read, and nothing
+    /// allocated once the list `whole` hands has grown: what a retry pays.
+    #[must_use]
+    pub(crate) fn tried_engines<'a>(
+        lists: impl IntoIterator<Item = &'a Self>,
+        tried: &[WorkerId],
+        whole: impl FnOnce() -> Vec<WorkerId>,
+    ) -> Option<Vec<WorkerId>> {
+        let mut ranked = lists.into_iter().filter(|list| list.has_ranks());
+        let first = ranked.next()?;
+        let mut whole = whole();
         whole.clear();
         whole.extend_from_slice(tried);
-        self.more_tried_engines(tried, whole);
+        first.add_engines_of(tried, &mut whole);
+        for list in ranked {
+            list.add_engines_of(tried, &mut whole);
+        }
+        Some(whole)
     }
 
-    /// [`Self::tried_engines`] for a further list of the same decision, as
-    /// a pair's second list is: adds to `whole` the id of every row of an
-    /// engine of this list that holds a row `tried` names, where `whole`
-    /// does not hold it yet, and takes nothing out of `whole`.
-    pub(crate) fn more_tried_engines(&self, tried: &[WorkerId], whole: &mut Vec<WorkerId>) {
+    /// One list's part of [`Self::tried_engines`]: adds to `whole` the id
+    /// of every row of an engine of this list that holds a row `tried`
+    /// names, where `whole` does not hold it yet, and takes nothing out of
+    /// `whole`. A further list of the same decision, as a pair's second
+    /// list is, so adds to what the lists before it wrote.
+    fn add_engines_of(&self, tried: &[WorkerId], whole: &mut Vec<WorkerId>) {
         for &id in tried {
             let Some(place) = self.place_of(id) else {
                 continue;
@@ -1764,7 +1790,37 @@ pub fn decide(
         // No record says yet whether it carries a report: a draw reads that
         // fact of no pool.
         let unsaid = pool.facts(live, false);
-        let drawn = engine.drawn_for(facts, &unsaid, pool.len());
+        // Under the draw's floor of every profile ([`DRAW_FROM`]) a draw is
+        // asked only where no filter refuses it a row: of a request that
+        // names no worker tried or excluded, is held to no places and
+        // stands under no veto of its host, over a list whose every worker
+        // publishes its routing state available ([`PoolRecords::stands`]):
+        // one load where no published state moved. The whole pass draws
+        // among the rows it keeps and a draw among all of them, so the two
+        // hand out one pick of a seed only where every row is kept. Every
+        // other decision under that floor is written whole and read by the
+        // pass: no refused row costs it a draw, and its pick is the pass's
+        // own. The request and the list are asked before the draw is: a
+        // decision the pass makes resolves its request's binding once.
+        // A request with a session key is written whole under that floor:
+        // under a sessions rule a profile that draws two is asked no draw
+        // of a key ([`Engine::drawn_for`]'s last test), and the question
+        // would resolve the request's binding a second time. So is a list
+        // that holds an engine's ranks ([`PoolRecords::has_ranks`]): a
+        // profile that decides over the engines is asked no draw of it.
+        let drawn = if engine.asks_standing(pool.len())
+            && !(facts.tried.is_empty()
+                && cx.excluded.is_empty()
+                && cx.places.is_none()
+                && cx.stalled.is_empty()
+                && facts.session_key.is_none()
+                && !pool.has_ranks()
+                && pool.stands(workers, published_word()))
+        {
+            None
+        } else {
+            engine.drawn_for(facts, &unsaid, pool.len())
+        };
         if let Some(drawn) = drawn.filter(|drawn| !drawn.claims()) {
             if rows.len() < pool.len() {
                 rows.resize(pool.len(), Candidate::default());

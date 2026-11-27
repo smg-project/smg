@@ -29,7 +29,7 @@ use crate::{
         proto::{self, snapshot_request::Slice},
     },
     stages::registry::StageRegistry,
-    store::{MemoryStore, Registrant, StoreCheckpoint, WorkerFacts, WorkerRow, WorkersStore},
+    store::{MemoryStore, Registrant, StoreCheckpoint, WorkerFacts, WorkerRow},
     worker_host::{Members, Objects},
 };
 

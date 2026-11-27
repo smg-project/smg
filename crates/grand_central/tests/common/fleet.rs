@@ -403,6 +403,9 @@ pub struct Harness {
     /// What the next one-rank engines' registrations state for a request's
     /// hard demands ([`Self::states`]).
     stating: Option<proto::DemandFacts>,
+    /// Whether the next one-rank engines' registrations state that their
+    /// workers take images ([`Self::sees`]).
+    seeing: Option<bool>,
     held: Vec<Box<dyn std::any::Any>>,
     /// The requests sent so far: the next one's lease id.
     sent: u64,
@@ -1187,6 +1190,7 @@ impl Harness {
             events: Arc::default(),
             feeding: false,
             stating: None,
+            seeing: None,
             held: Vec::new(),
             sent: 0,
             generation: 0,
@@ -1330,6 +1334,13 @@ impl Harness {
         self.stating = stated;
     }
 
+    /// Whether the one-rank engines registered from now on state that their
+    /// workers take images: the bit of their add on the control listener,
+    /// or none.
+    pub fn sees(&mut self, vision: Option<bool>) {
+        self.seeing = vision;
+    }
+
     /// Applies the preset named `preset` as the store's next generation,
     /// in the case's process: no call of the controller applies a spec yet.
     pub fn apply(&mut self, preset: &str) -> Result<(), String> {
@@ -1424,6 +1435,7 @@ impl Harness {
                     ..proto::Signals::default()
                 }),
                 demand_facts: self.stating,
+                vision: self.seeing,
                 ..proto::WorkerSpec::default()
             }),
             mode: Mode::Add.into(),

@@ -863,7 +863,7 @@ impl Picker for DecidesBeside {
         let mut beside = self.1.lock().expect("the staged request");
         if let Some((table, session, worker)) = beside.staged.take() {
             beside.read = Some(table.lookup(session, facts.now_micros, &SESSIONS));
-            table.respilled(session, worker);
+            table.respilled(session, worker, 0);
             table.dispatched(session, SessionVerdict::Respill, worker, 0);
         }
     }

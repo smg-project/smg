@@ -16,6 +16,11 @@
 //! This binary is built on the base branch with the pull request's bench
 //! sources, so a row here calls nothing the base's store lacks.
 //!
+//! The stores have no holder of worker objects. Each membership write is a
+//! decided change handed to the store ([`MemoryStore::follow`]): the bench
+//! states the row a registration leaves and counts the epoch. The
+//! registration rule is the holder's, and no cell here times it.
+//!
 //! `policy_store_labels/member_write/512` is the listed membership write
 //! under a generation that declares the label selectors and no family and
 //! no zone: no member stands outside such lists, and the write's build
@@ -63,7 +68,10 @@ use placed::page_start_buffer;
 use smg_grand_central::{
     document::{AppliedSpec, PolicySpec},
     engine::{Candidate, Role, WorkerId},
-    store::{GatewayId, HealthSink, MemoryStore, WorkerFacts, WorkerStatus, WorkersStore},
+    store::{
+        identity, GatewayId, HealthSink, MembershipChange, MemoryStore, Position, Registrant,
+        WorkerFacts, WorkerRow, WorkerStatus, WorkersStore,
+    },
 };
 
 const SIZES: [usize; 3] = [8, 64, 512];
@@ -78,6 +86,58 @@ struct Fixture {
     rows: Vec<Candidate>,
 }
 
+/// The row of `facts` as a registration by a control call leaves it, in
+/// `status` at `revision`. The stores here have no holder of worker
+/// objects: each takes a row as a decided change ([`MemoryStore::follow`]).
+/// The bench states the row and counts the epoch the write steps to.
+fn row_of(
+    facts: WorkerFacts,
+    status: WorkerStatus,
+    revision: u64,
+    admitted_at: Instant,
+) -> WorkerRow {
+    WorkerRow {
+        id: identity(&facts.key, facts.incarnation),
+        facts,
+        status,
+        revision,
+        admitted_at,
+        maker: Registrant::Control,
+    }
+}
+
+/// One member registered and ready in `store`, as its next two writes:
+/// its row, with the build the row owes paid, and its status.
+fn ready_member(store: &MemoryStore, facts: WorkerFacts) -> WorkerId {
+    let row = row_of(facts, WorkerStatus::Pending, 1, Instant::now());
+    let id = row.id;
+    let epoch = WorkersStore::epoch(store) + 1;
+    let registered = MembershipChange::Registered { id };
+    store.follow(Position::default(), epoch, registered, Some(row));
+    store.publish_now();
+    let ready = MembershipChange::StatusChanged {
+        id,
+        from: WorkerStatus::Pending,
+        to: WorkerStatus::Ready,
+    };
+    store.follow(Position::default(), epoch + 1, ready, None);
+    landed(store, epoch + 1);
+    id
+}
+
+/// The store stands at the epoch the bench counted: each write landed.
+fn landed(store: &MemoryStore, epoch: u64) {
+    assert_eq!(WorkersStore::epoch(store), epoch, "a write did not land");
+}
+
+/// One row written again in place as the store's write `epoch`, and the
+/// build it leaves owed.
+fn written_again(store: &MemoryStore, epoch: u64, row: WorkerRow) {
+    let refreshed = MembershipChange::Relabelled { id: row.id };
+    store.follow(Position::default(), epoch, refreshed, Some(row));
+    store.publish_now();
+}
+
 /// A store with one pool of `n` members, every one registered, ready and
 /// published: the store and its members by index.
 fn pool_of(n: usize) -> (Arc<MemoryStore>, Vec<WorkerId>) {
@@ -85,23 +145,16 @@ fn pool_of(n: usize) -> (Arc<MemoryStore>, Vec<WorkerId>) {
     let ids: Vec<WorkerId> = (0..n)
         .map(|index| {
             let key = format!("http://w{index}:8000");
-            let id = store
-                .upsert(WorkerFacts {
-                    key: key.clone(),
-                    engine: key,
-                    incarnation: 1,
-                    models: vec![MODEL.to_string()],
-                    dp_size: 1,
-                    max_running: Some(4),
-                    ..WorkerFacts::default()
-                })
-                .id();
-            store.publish_now();
-            let revision = WorkersStore::get(&*store, id).expect("the row").revision;
-            store
-                .set_status(id, WorkerStatus::Ready, revision)
-                .expect("ready");
-            id
+            let facts = WorkerFacts {
+                key: key.clone(),
+                engine: key,
+                incarnation: 1,
+                models: vec![MODEL.to_string()],
+                dp_size: 1,
+                max_running: Some(4),
+                ..WorkerFacts::default()
+            };
+            ready_member(&store, facts)
         })
         .collect();
     assert_eq!(store.publish_due(), None);
@@ -142,24 +195,38 @@ fn floor(c: &mut Criterion, fixtures: &mut [Fixture]) {
     group.finish();
 }
 
-/// One membership write in turn, and the build it leaves owed: the worker
-/// joins where it is out and leaves where it is in. `joined` holds its id
-/// and its row's revision between the two.
-fn join_or_leave(store: &MemoryStore, joining: &WorkerFacts, joined: &mut Option<(WorkerId, u64)>) {
-    match joined.take() {
-        Some((id, revision)) => {
-            store
-                .remove(id, revision)
-                .expect("the joined worker leaves");
-            store.publish_now();
-        }
-        None => {
-            let id = store.upsert(black_box(joining.clone())).id();
-            store.publish_now();
-            let revision = WorkersStore::get(store, id).expect("the row").revision;
-            *joined = Some((id, revision));
+/// A worker that joins a pool and leaves it in turn: whether it is in,
+/// and the store's epoch as the bench counts it.
+struct Turn {
+    joined: bool,
+    epoch: u64,
+}
+
+impl Turn {
+    fn of(store: &MemoryStore) -> Self {
+        Self {
+            joined: false,
+            epoch: WorkersStore::epoch(store),
         }
     }
+}
+
+/// One membership write in turn, and the build it leaves owed: the worker
+/// joins where it is out and leaves where it is in. `joining` is its row
+/// as a registration leaves it.
+fn join_or_leave(store: &MemoryStore, joining: &WorkerRow, turn: &mut Turn) {
+    let id = joining.id;
+    turn.epoch += 1;
+    if turn.joined {
+        let left = MembershipChange::Removed { id };
+        store.follow(Position::default(), turn.epoch, left, None);
+    } else {
+        let registered = MembershipChange::Registered { id };
+        let row = black_box(joining.clone());
+        store.follow(Position::default(), turn.epoch, registered, Some(row));
+    }
+    turn.joined = !turn.joined;
+    store.publish_now();
 }
 
 /// The store's rare writes beside standing vetoes, in the largest pool
@@ -204,17 +271,16 @@ fn writes_beside_vetoes(c: &mut Criterion, fixtures: &mut [Fixture]) {
         max_running: Some(4),
         ..WorkerFacts::default()
     };
-    let mut joined = None;
+    let joining = row_of(joining, WorkerStatus::Pending, 1, Instant::now());
+    let mut turn = Turn::of(store);
     group.bench_with_input(BenchmarkId::new("member_write", n), &n, |b, _| {
-        b.iter(|| join_or_leave(store, &joining, &mut joined));
+        b.iter(|| join_or_leave(store, &joining, &mut turn));
     });
     group.finish();
-    if let Some((id, revision)) = joined {
-        store
-            .remove(id, revision)
-            .expect("the joined worker leaves");
-        store.publish_now();
+    if turn.joined {
+        join_or_leave(store, &joining, &mut turn);
     }
+    landed(store, turn.epoch);
     for gateway in others {
         for nth in 0..64 {
             store.gateway_veto(gateway, vetoed(nth), None);
@@ -245,15 +311,8 @@ fn member_write_beside_spread_vetoes(c: &mut Criterion) {
     };
     let ids: Vec<WorkerId> = (0..MEMBERS)
         .map(|index| {
-            let id = store
-                .upsert(facts(format!("http://s{index}:8000"), index % POOLS))
-                .id();
-            store.publish_now();
-            let revision = WorkersStore::get(&store, id).expect("the row").revision;
-            store
-                .set_status(id, WorkerStatus::Ready, revision)
-                .expect("ready");
-            id
+            let facts = facts(format!("http://s{index}:8000"), index % POOLS);
+            ready_member(&store, facts)
         })
         .collect();
     assert_eq!(store.publish_due(), None);
@@ -266,14 +325,16 @@ fn member_write_beside_spread_vetoes(c: &mut Criterion) {
         }
     }
     let joining = facts("http://joining-spread:8000".to_string(), 0);
-    let mut joined = None;
+    let joining = row_of(joining, WorkerStatus::Pending, 1, Instant::now());
+    let mut turn = Turn::of(&store);
     let mut group = c.benchmark_group("policy_store");
     group.bench_with_input(
         BenchmarkId::new("member_write_spread", MEMBERS),
         &MEMBERS,
-        |b, _| b.iter(|| join_or_leave(&store, &joining, &mut joined)),
+        |b, _| b.iter(|| join_or_leave(&store, &joining, &mut turn)),
     );
     group.finish();
+    landed(&store, turn.epoch);
 }
 
 /// `policy_store/member_write_listed/<n>` is one membership write under a
@@ -329,14 +390,7 @@ fn member_write_under(c: &mut Criterion, group: &str, cell: &str, places: bool) 
         ..WorkerFacts::default()
     };
     for index in 0..MEMBERS {
-        let id = store
-            .upsert(facts(format!("http://l{index}:8000"), index))
-            .id();
-        store.publish_now();
-        let revision = WorkersStore::get(&store, id).expect("the row").revision;
-        store
-            .set_status(id, WorkerStatus::Ready, revision)
-            .expect("ready");
+        ready_member(&store, facts(format!("http://l{index}:8000"), index));
     }
     assert_eq!(store.publish_due(), None);
     filled::filled(&store, MODEL, Role::Single, MEMBERS);
@@ -345,12 +399,14 @@ fn member_write_under(c: &mut Criterion, group: &str, cell: &str, places: bool) 
     // outside, and under the selectors alone it counts none.
     assert_eq!(store.outside_lists().zones > 0, places);
     let joining = facts("http://joining-listed:8000".to_string(), MEMBERS);
-    let mut joined = None;
+    let joining = row_of(joining, WorkerStatus::Pending, 1, Instant::now());
+    let mut turn = Turn::of(&store);
     let mut group = c.benchmark_group(group);
     group.bench_with_input(BenchmarkId::new(cell, MEMBERS), &MEMBERS, |b, _| {
-        b.iter(|| join_or_leave(&store, &joining, &mut joined));
+        b.iter(|| join_or_leave(&store, &joining, &mut turn));
     });
     group.finish();
+    landed(&store, turn.epoch);
 }
 
 /// One membership write of a fleet of pairs: `n` prefills and `n` decodes
@@ -380,12 +436,7 @@ fn pair_writes(c: &mut Criterion) {
         };
         let store = MemoryStore::new();
         for index in 0..2 * n {
-            let id = store.upsert(facts_of(index)).id();
-            store.publish_now();
-            let revision = WorkersStore::get(&store, id).expect("the row").revision;
-            store
-                .set_status(id, WorkerStatus::Ready, revision)
-                .expect("ready");
+            ready_member(&store, facts_of(index));
         }
         assert_eq!(store.publish_due(), None);
         for role in [Role::Prefill, Role::Decode] {
@@ -396,14 +447,20 @@ fn pair_writes(c: &mut Criterion) {
             engine_kind: "rt-b".to_string(),
             ..written.clone()
         };
+        // Each write is the prefill's row as a refresh leaves it: ready,
+        // one revision on.
+        let now = Instant::now();
+        let (mut epoch, mut revision) = (WorkersStore::epoch(&store), 1);
         let mut group = c.benchmark_group("policy_store_pairs");
         group.bench_with_input(BenchmarkId::new("kept", n), &n, |b, _| {
             b.iter_batched(
-                || written.clone(),
-                |facts| {
-                    let change = store.upsert(black_box(facts));
-                    store.publish_now();
-                    change
+                || {
+                    revision += 1;
+                    row_of(written.clone(), WorkerStatus::Ready, revision, now)
+                },
+                |row| {
+                    epoch += 1;
+                    written_again(&store, epoch, black_box(row));
                 },
                 BatchSize::SmallInput,
             );
@@ -415,21 +472,19 @@ fn pair_writes(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     name = !name;
-                    if name {
-                        named.clone()
-                    } else {
-                        written.clone()
-                    }
+                    revision += 1;
+                    let facts = if name { &named } else { &written };
+                    row_of(facts.clone(), WorkerStatus::Ready, revision, now)
                 },
-                |facts| {
-                    let change = store.upsert(black_box(facts));
-                    store.publish_now();
-                    change
+                |row| {
+                    epoch += 1;
+                    written_again(&store, epoch, black_box(row));
                 },
                 BatchSize::SmallInput,
             );
         });
         group.finish();
+        landed(&store, epoch);
     }
 }
 
@@ -457,28 +512,28 @@ fn member_write_beside_many_models(c: &mut Criterion) {
         let wide = facts_of("http://wide:8000".to_string(), listed);
         let store = MemoryStore::new();
         for facts in (0..8).map(&small).chain([wide]) {
-            let id = store.upsert(facts).id();
-            store.publish_now();
-            let revision = WorkersStore::get(&store, id).expect("the row").revision;
-            store
-                .set_status(id, WorkerStatus::Ready, revision)
-                .expect("ready");
+            ready_member(&store, facts);
         }
         assert_eq!(store.publish_due(), None);
         filled::filled(&store, MODEL, Role::Single, 8);
         filled::filled(&store, "model-0", Role::Single, 1);
         let written = small(3);
+        let now = Instant::now();
+        let (mut epoch, mut revision) = (WorkersStore::epoch(&store), 1);
         group.bench_with_input(BenchmarkId::new("member_write", ids), &ids, |b, _| {
             b.iter_batched(
-                || written.clone(),
-                |facts| {
-                    let change = store.upsert(black_box(facts));
-                    store.publish_now();
-                    change
+                || {
+                    revision += 1;
+                    row_of(written.clone(), WorkerStatus::Ready, revision, now)
+                },
+                |row| {
+                    epoch += 1;
+                    written_again(&store, epoch, black_box(row));
                 },
                 BatchSize::SmallInput,
             );
         });
+        landed(&store, epoch);
     }
     group.finish();
 }

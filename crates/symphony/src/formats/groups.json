@@ -334,6 +334,7 @@
   {"model": "OpenGVLab/stage2-InternVideo2-1B-Qwen2_5-7B-tome16_mlp", "also": ["stage2-UMT-Qwen2_5_1.5B-tome16_mlp"], "table": "qwen2.5", "opener": null, "after": null},
   {"model": "stepfun-ai/Step-3.5-Flash", "also": [], "table": "qwen3_tagged", "opener": null, "after": "\n"},
   {"model": "stepfun-ai/Step-5-Preview", "also": [], "table": "qwen3_tagged", "opener": null, "after": ""},
+  {"model": "stepfun-ai/step3", "also": [], "table": "steptml", "opener": null, "after": null},
   {"model": "zai-org/SWE-Dev-32B", "also": [], "table": "qwen2.5", "opener": null, "after": null},
   {"model": "zai-org/SWE-Dev-7B", "also": [], "table": "qwen2.5", "opener": null, "after": null},
   {"model": "internlm/SWE-Fixer-Retriever-7B", "also": ["SWE-Fixer-Editor-72B"], "table": "qwen2.5", "opener": null, "after": null},

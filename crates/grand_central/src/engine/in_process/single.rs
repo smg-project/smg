@@ -518,18 +518,20 @@ fn handed_on(
 
 /// A retry's decision over a list where an engine holds several workers.
 /// The request is decided ([`by_facts`]) by a copy of its facts whose tried
-/// workers are its own and every other worker of their engines
-/// ([`PoolRecords::tried_engines`]). The key's rows, the whole pass and a
-/// binding's shadow profile so read one list, and the request's own list
-/// stays as its host made it. The decision's instant is written back into
-/// `facts`: the request's lease is dated by it. The request's maker goes
-/// with the copy, so a retry is decided inside a lent tree as a
-/// first attempt is.
+/// workers are its own and every other worker of their engines, which the
+/// list's records name in one operation ([`PoolRecords::tried_engines`]).
+/// The key's rows, the whole pass and a binding's shadow profile so read
+/// one list, and the request's own list stays as its host made it. The
+/// decision's instant is written back into `facts`: the request's lease
+/// is dated by it. The request's maker goes with the copy, so a retry is
+/// decided inside a lent tree as a first attempt is.
 ///
 /// The workers stand in the calling thread's own list ([`TRIED`]), so a
 /// retry allocates nothing once the list has grown. Out of line and cold:
 /// a first attempt's path, and a retry's over a list with no such engine,
-/// hold one test of this and nothing else.
+/// hold one test of this and nothing else. The records' own answer is read
+/// here all the same: over a list with no such engine they hand no list
+/// back, and the copy names the request's own.
 #[cold]
 #[inline(never)]
 #[expect(
@@ -547,10 +549,9 @@ fn retried(
     late: Option<&Made<'_, '_>>,
     whole: impl WholeDecision,
 ) -> Decision {
-    let mut tried = TRIED.take();
-    records.tried_engines(facts.tried, &mut tried);
+    let tried = PoolRecords::tried_engines([records], facts.tried, || TRIED.take());
     let mut widened = RequestFacts {
-        tried: &tried,
+        tried: tried.as_deref().unwrap_or(facts.tried),
         ..*facts
     };
     let decision = by_facts::<true>(
@@ -565,7 +566,9 @@ fn retried(
         whole,
     );
     facts.now_micros = widened.now_micros;
-    TRIED.set(tried);
+    if let Some(tried) = tried {
+        TRIED.set(tried);
+    }
     decision
 }
 

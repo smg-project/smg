@@ -24,9 +24,9 @@ No filter takes a parameter under its bare name. `has-room` alone can be written
 
 - No policy spec names an overload threshold. A worker's registration states the worker's thresholds.
 - Without them a worker takes its program's default: 8 queued requests and 0.8 active KV usage, unless the program sets others.
-- A worker of the `external` runtime takes no default. A standalone controller judges it by its registration's thresholds alone.
+- A worker of the `external` runtime takes no default when it registers. A standalone controller judges it by its registration's thresholds alone.
 - The binding's `overload` block switches that default on or off.
-- [Overload, shadows and reserved fields](../REFERENCE.md#overload-shadows-and-reserved-fields) has the rules for each host.
+- [Overload](policy-spec.md#overload) has the rules for each host.
 
 ### The host's two bits
 
@@ -84,7 +84,7 @@ Every scorer takes a `weight`: a finite number above zero, 1 by default. The wei
 | `session-affinity` | The request's pin from the host. | The pinned worker: it scores 1 and the others 0. |
 | `prefix-affinity` | The matched prefix depth and the request's size, with requests in flight and an optional gate on active KV usage. | The deepest holders that meet its spill and pressure rules. |
 | `kv-pressure` | Nothing of its own: its score is flat. | No worker. It sets the gate that `prefix-affinity` and `warmup-slice` read. |
-| `warmup-slice` | A worker's admission age, its cache's growth and size, the prefix depth and requests in flight. | Young or thin workers, for a share of the misses. |
+| `warmup-slice` | A worker's admission age, its cache's growth and size, the prefix depth and requests in flight. | Young or thin workers, for a share of the misses. A single request warms nobody while the model's index holds no block. |
 | `bucket` | The prefill prompt's size and the tokens booked on each worker. | The owner of the prompt's size range, or a usable owner near it. |
 | `consistent-hash` | The routing key, or a prefix key where the stage sets one. | The key's owner on a ring, then its successors. |
 | `resident-work` | Reported resident context, requests, the host's counts and the sends no report shows yet. | The lowest total work. |
@@ -139,6 +139,7 @@ Every scorer takes a `weight`: a finite number above zero, 1 by default. The wei
 ### `warmup-slice`
 
 - The slice gives young or thin workers a share of the misses.
+- A single request warms nobody while the model's index of cache events holds no block. A pair's side still warms a young worker there. So does a profile with a plugin's stage, or with warm-up stages that rule differently.
 - It can divert shallow hits to refill a thin cache.
 - It favors a warming worker on a miss only while that worker is under the profile's spill gate.
 - The gate is the `spill.rel` and `spill.abs` of the profile's `prefix-affinity` entries: the defaults for a bare name.
