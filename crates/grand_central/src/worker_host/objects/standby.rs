@@ -36,9 +36,10 @@
 //! So are the statuses of a cut laid whole, each on its row's object. A
 //! told row lays its status too: an object laid in another's place takes
 //! the standing object's, and a probe of a term that ended can have moved
-//! that one ahead of the row's event. This is one of the two ways from a
-//! table's status to an object's where the objects lead. The other is a
-//! tell the store refuses ([`mod@super::status`]).
+//! that one ahead of the row's event. This is one of the three ways from
+//! a table's status to an object's where the objects lead. The others
+//! are a tell the store refuses ([`mod@super::status`]) and a removal
+//! the store refuses for its term ([`mod@super::write`]).
 //!
 //! A restore is the store's restore and the lay of the cut's own rows in
 //! one turn of the holder. No row of the table is read back to lay an

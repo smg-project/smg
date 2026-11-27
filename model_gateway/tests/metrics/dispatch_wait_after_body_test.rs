@@ -6,6 +6,8 @@
 //! what the read of the body waited for the client. A wait for an admission
 //! permit is in both, whoever reads the body first: the route, behind that
 //! wait, or the WASM request hook, ahead of it, where a module is attached.
+//! A multipart upload to the transcription route, which stands under no body
+//! deadline, is measured as the chat body is.
 //!
 //! Each case answers chat requests, and the clean `200` row of that route in
 //! the response counter carries no label a test could own. The stream cut
@@ -20,6 +22,10 @@ use axum::{
 };
 use futures::{stream, StreamExt};
 use http_body_util::BodyExt;
+use llm_tokenizer::{
+    traits::{MediaHandling, RendererCapabilities},
+    MockTokenizer,
+};
 use metrics_exporter_prometheus::PrometheusHandle;
 use serde_json::json;
 use serial_test::serial;
@@ -27,12 +33,14 @@ use smg::{
     app_context::AppContext,
     wasm::module::{MiddlewareAttachPoint, WasmModule, WasmModuleAttachPoint, WasmModuleMeta},
 };
-use smg_test_harness::grpc_harness::grpc_router_config;
+use smg_test_harness::grpc_harness::{grpc_router_config, serve_canned_worker, Canned};
 use tower::ServiceExt;
 use uuid::Uuid;
 use wasm_encoder::{Component, Module, ModuleSection, TypeSection};
 
-use super::stream_cut_response_test::{gateway_app, gateway_app_over, MockEngine};
+use super::stream_cut_response_test::{
+    gateway_app, gateway_app_over, gateway_app_with, MockEngine,
+};
 use crate::metrics::recorder;
 
 /// A model of the slow upload's own: no other test of the binary records a
@@ -97,12 +105,18 @@ fn chat_of(model: &str) -> Bytes {
 
 /// `body` as one collected chat request through `app`, read to its end: the
 /// status.
-#[expect(clippy::expect_used, reason = "test helper")]
 async fn answered(app: axum::Router, body: Body) -> u16 {
+    sent(app, "/v1/chat/completions", "application/json", body).await
+}
+
+/// `body` of `content_type` posted to `path` through `app`, the answer read
+/// to its end: the status.
+#[expect(clippy::expect_used, reason = "test helper")]
+async fn sent(app: axum::Router, path: &str, content_type: &str, body: Body) -> u16 {
     let request = Request::builder()
         .method("POST")
-        .uri("/v1/chat/completions")
-        .header(CONTENT_TYPE, "application/json")
+        .uri(path)
+        .header(CONTENT_TYPE, content_type)
         .body(body)
         .expect("request");
     let response = app.oneshot(request).await.expect("response");
@@ -117,14 +131,19 @@ async fn answered(app: axum::Router, body: Body) -> u16 {
 /// One collected chat request through `app`, its body in two parts with
 /// `PAUSE` between them, read to its end: the status.
 async fn chat_with_a_slow_body(app: &axum::Router) -> u16 {
-    let mut head = chat_of(MODEL);
+    answered(app.clone(), in_two_parts(chat_of(MODEL))).await
+}
+
+/// `whole` as a body that comes in two parts with [`PAUSE`] between them.
+fn in_two_parts(whole: Bytes) -> Body {
+    let mut head = whole;
     let tail = head.split_off(head.len() / 2);
     let parts =
         stream::iter([(Duration::ZERO, head), (PAUSE, tail)]).then(|(pause, part)| async move {
             tokio::time::sleep(pause).await;
             Ok::<_, Infallible>(part)
         });
-    answered(app.clone(), Body::from_stream(parts)).await
+    Body::from_stream(parts)
 }
 
 /// Attaches to the module manager of `context` one module at the request
@@ -283,5 +302,98 @@ async fn a_wait_for_a_permit_is_in_both_waits_with_no_module_and_behind_a_reques
         "with a module the request hook reads the body ahead of admission, and the wait for \
          the permit is in the wait without the upload ({after_body} s) as it is in the \
          dispatch wait ({wait} s)"
+    );
+}
+
+/// The model of the multipart upload: the id of the transcription cases of
+/// the tenant rate limit test, a name the transcription family recognises.
+/// No other test of this binary records a wait under it.
+const UPLOAD_MODEL: &str = "qwen3-asr-tenant-rl-test-model";
+/// The boundary of the multipart upload.
+const BOUNDARY: &str = "dispatch-wait-after-body-upload";
+
+/// A transcription request under [`UPLOAD_MODEL`] as a multipart form: the
+/// model, a prompt and a few bytes of audio.
+fn upload_of() -> Bytes {
+    let field = |name: &str, value: &str| {
+        format!(
+            "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+        )
+    };
+    Bytes::from(
+        [
+            field("model", UPLOAD_MODEL),
+            field("prompt", "Hello world"),
+            format!(
+                "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"file\"; \
+                 filename=\"clip.wav\"\r\nContent-Type: audio/wav\r\n\r\nnot real audio\r\n\
+                 --{BOUNDARY}--\r\n"
+            ),
+        ]
+        .concat(),
+    )
+}
+
+/// A multipart upload is measured as a chat body is: the transcription route
+/// stands under no body deadline, and the pause of its upload is in the
+/// dispatch wait alone. The case answers no chat request, so it runs under
+/// no key of the chat row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_multipart_upload_is_in_the_dispatch_wait_and_not_in_the_wait_after_the_body() {
+    let handle = recorder();
+    let port = serve_canned_worker(Canned {
+        model: UPLOAD_MODEL,
+        gen_delay: Duration::ZERO,
+        output_tokens: 4,
+    })
+    .await;
+    // Media as template text: the audio turn needs no media processing. The
+    // ids of the canned answer (100 up) are given words, so the transcript
+    // is text.
+    let tokenizer = MockTokenizer::new()
+        .with_renderer_capabilities(RendererCapabilities {
+            media_handling: MediaHandling::TemplateText,
+            ..RendererCapabilities::default()
+        })
+        .with_tokens(&[
+            ("spoken", 100),
+            ("words", 101),
+            ("heard", 102),
+            ("here", 103),
+        ]);
+    let (app, _context) = gateway_app_with(
+        grpc_router_config(),
+        port,
+        UPLOAD_MODEL,
+        Arc::new(tokenizer),
+    )
+    .await;
+
+    let status = sent(
+        app,
+        "/v1/audio/transcriptions",
+        &format!("multipart/form-data; boundary={BOUNDARY}"),
+        in_two_parts(upload_of()),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let rendered = handle.render();
+    let (wait, waits) = waited(&rendered, DISPATCH_WAIT, UPLOAD_MODEL);
+    let (after_body, after_bodies) = waited(&rendered, DISPATCH_WAIT_AFTER_BODY, UPLOAD_MODEL);
+    assert_eq!(
+        (waits, after_bodies),
+        (1, 1),
+        "the one answer is observed once in each family"
+    );
+    let pause = PAUSE.as_secs_f64();
+    assert!(
+        wait >= pause,
+        "the dispatch wait ({wait} s) counts from the request's entry and holds the upload's pause"
+    );
+    assert!(
+        wait - after_body >= pause,
+        "the wait without the upload ({after_body} s) leaves the upload's pause to \
+         the dispatch wait ({wait} s)"
     );
 }

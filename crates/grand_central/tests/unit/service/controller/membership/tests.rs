@@ -11,6 +11,7 @@ use smg_worker::{
     identity::{basic::Worker, builder::BasicWorkerBuilder},
     model_card::ModelCard,
     settings::UnhealthyRemovalScope,
+    worker::WorkerStatus as ObjectStatus,
 };
 use tonic::{Code, Status};
 
@@ -1800,7 +1801,7 @@ fn a_caller_that_did_not_make_a_row_changes_nothing_of_it() {
     assert_eq!(store.epoch(), epoch);
     let held = store.get(WorkerId(made.id)).expect("the row");
     assert_eq!(held.revision, made.revision);
-    door.relabel(&operator(), &maker, &patch)
+    door.relabel(&operator(), &maker, TERM, &patch)
         .expect("the maker patches its row");
 
     // The other way round: a provider changes nothing of a control
@@ -1884,7 +1885,7 @@ fn a_row_holds_its_maker_inside_the_wires_bound() {
         revision: brim.revision,
     };
     let status = door
-        .relabel(&operator(), &maker, &more)
+        .relabel(&operator(), &maker, TERM, &more)
         .expect_err("past the bound");
     assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
     assert!(status.message().starts_with("labels:"), "{status:?}");
@@ -2868,16 +2869,15 @@ fn an_equal_registration_that_does_not_wait_answers_the_row_ahead_of_its_signal(
     );
 }
 
-/// A registration that changes its row in place asks no term ahead of
-/// its signal, so the signal's own word is all that stands between a
-/// call whose term ended and the status. The log leads a later term,
-/// and a call admitted under the one that ended relabels the waiting
-/// row: the row's write lands, which asks no term under the lock yet,
-/// and the signal asks the call's term and writes nothing. The
-/// same registration under the term the log leads finds the row
-/// unmoved and sends it.
+/// A registration that changes its row in place asks no term of its own
+/// ahead of its write: the write's telling asks it. The log leads a later
+/// term, and a call admitted under the one that ended would relabel the
+/// waiting row. Its write is refused as not leading, and the row stands
+/// as it stood: no label, pending, at its revision. The same registration
+/// under the term the log leads changes the row in place and sends its
+/// signal.
 #[test]
-fn a_change_in_place_sends_its_signal_under_the_term_of_its_call() {
+fn a_change_in_place_whose_call_lost_its_term_writes_nothing() {
     let (store, door, _) = lost_its_lead_at(0, &ask(unchecked(URL), Mode::Add));
     store::LeasesStore::set_term(store.as_ref(), TERM + 2);
     let stood = store.by_key(URL).expect("the row");
@@ -2888,19 +2888,20 @@ fn a_change_in_place_sends_its_signal_under_the_term_of_its_call() {
         };
         ask(labelled, Mode::Upsert)
     };
-    door.register(&operator(), under(TERM), &relabelled())
-        .expect("in place");
-    let row = store.get(stood.id).expect("the row");
+    let refused = door
+        .register(&operator(), under(TERM), &relabelled())
+        .expect_err("the term ended ahead of the write");
     assert_eq!(
-        (row.status, row.revision, row.facts.labels.len()),
-        (WorkerStatus::Pending, stood.revision + 1, 1)
+        (refused.code(), refused.message()),
+        (Code::Unavailable, super::LEADS_NO_TERM)
     );
+    assert_eq!(store.get(stood.id).as_ref(), Some(&stood));
     door.register(&operator(), under(TERM + 2), &relabelled())
-        .expect("unmoved");
+        .expect("in place");
     let ready = store.get(stood.id).expect("the row");
     assert_eq!(
-        (ready.status, ready.revision),
-        (WorkerStatus::Ready, row.revision)
+        (ready.status, ready.revision, ready.facts.labels.len()),
+        (WorkerStatus::Ready, stood.revision + 1, 1)
     );
 }
 
@@ -3103,14 +3104,51 @@ const BY_A_RISE: usize = 1;
 /// follows ([`LeavesAtATelling`]).
 const BY_A_FOLLOWED_TERM: usize = 2;
 
-/// The door's log as its store's journal, which leaves [`TERM`] in the
-/// telling of the next status once a case arms it: behind every ask of
-/// the writer's word, and ahead of the place the log gives the event.
+/// The door's log as its store's journal, which leaves [`TERM`] in a
+/// telling of the kind a case arms it for, a status's or a row's: the
+/// next one, or the one behind the rows' tellings a case lets by. It
+/// leaves behind every ask its writer makes ahead of the write, and
+/// ahead of the place the log gives the event.
 struct LeavesAtATelling {
     log: Arc<replication::Log>,
-    /// How the term ends at the next status told, [`BY_A_RISE`] or
+    /// How the term ends at that telling, [`BY_A_RISE`] or
     /// [`BY_A_FOLLOWED_TERM`], and zero once it has.
     armed: AtomicUsize,
+    /// Whether the telling it leaves at is a row's write and no status:
+    /// a registration's, a patch's, a removal's.
+    at_a_row: AtomicBool,
+    /// The tellings of a row it lets by ahead of that one: the ranks a
+    /// registration writes before the rank its term ends at.
+    lets_by: AtomicUsize,
+    /// The tellings of a row it was handed, whatever came of each.
+    rows: AtomicUsize,
+}
+
+impl LeavesAtATelling {
+    /// Whether this telling of a row is one a case lets by: one less is
+    /// left to let by then.
+    fn lets_one_by(&self) -> bool {
+        let one_less = |left: usize| left.checked_sub(1);
+        self.lets_by
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, one_less)
+            .is_ok()
+    }
+
+    /// Ends [`TERM`] the way a case armed, once.
+    fn leave(&self) {
+        match self.armed.swap(0, Ordering::Relaxed) {
+            BY_A_RISE => store::Journal::term_rose(self.log.as_ref(), TERM + 1),
+            BY_A_FOLLOWED_TERM => {
+                let next = Position {
+                    seq: self.log.head().seq + 1,
+                    term: TERM + 1,
+                };
+                let guard = self.log.adopt(next).expect("the next place");
+                guard.mark();
+            }
+            _ => {}
+        }
+    }
 }
 
 impl store::Journal for LeavesAtATelling {
@@ -3123,6 +3161,10 @@ impl store::Journal for LeavesAtATelling {
         row: Option<&WorkerRow>,
         left: Option<&WorkerRow>,
     ) -> bool {
+        self.rows.fetch_add(1, Ordering::Relaxed);
+        if self.at_a_row.load(Ordering::Relaxed) && !self.lets_one_by() {
+            self.leave();
+        }
         self.log.member(at, term, epoch, change, row, left)
     }
 
@@ -3136,17 +3178,8 @@ impl store::Journal for LeavesAtATelling {
         to: WorkerStatus,
         models: Arc<[String]>,
     ) -> bool {
-        match self.armed.swap(0, Ordering::Relaxed) {
-            BY_A_RISE => self.log.term_rose(TERM + 1),
-            BY_A_FOLLOWED_TERM => {
-                let next = Position {
-                    seq: self.log.head().seq + 1,
-                    term: TERM + 1,
-                };
-                let guard = self.log.adopt(next).expect("the next place");
-                guard.mark();
-            }
-            _ => {}
+        if !self.at_a_row.load(Ordering::Relaxed) {
+            self.leave();
         }
         self.log.status(at, term, epoch, id, from, to, models)
     }
@@ -3188,6 +3221,9 @@ fn leaving() -> (Arc<MemoryStore>, MembershipCalls, Arc<LeavesAtATelling>) {
     let journal = Arc::new(LeavesAtATelling {
         log: Arc::clone(&feed.log),
         armed: AtomicUsize::new(0),
+        at_a_row: AtomicBool::new(false),
+        lets_by: AtomicUsize::new(0),
+        rows: AtomicUsize::new(0),
     });
     let told: Arc<dyn store::Journal> = Arc::<LeavesAtATelling>::clone(&journal);
     let store = Arc::new(MemoryStore::journaled(told).with_decision_slots(1));
@@ -3307,6 +3343,562 @@ fn a_drain_whose_term_a_followed_term_ends_at_its_telling_is_refused_as_not_lead
     a_drain_whose_term_ends_at_its_telling(BY_A_FOLLOWED_TERM);
 }
 
+/// [`leaving`] with a journal that leaves the term in the telling of a
+/// row's write, once a case arms it.
+fn leaving_at_a_row() -> (Arc<MemoryStore>, MembershipCalls, Arc<LeavesAtATelling>) {
+    let made = leaving();
+    made.2.at_a_row.store(true, Ordering::Relaxed);
+    made
+}
+
+/// What a call whose term ended in its own telling leaves. The journal
+/// reached the telling, and the call answers that the store does not lead
+/// the term, never that the row moved. The epoch stands at `epoch`, and
+/// the log's head is the place behind `head` that ended the term: the log
+/// took no event of the call.
+fn left_at_its_telling(
+    (store, journal): (&MemoryStore, &LeavesAtATelling),
+    refused: &Status,
+    (epoch, head): (u64, Position),
+    said: &str,
+) {
+    let armed = journal.armed.load(Ordering::Relaxed);
+    assert_eq!(armed, 0, "the write reached its telling: {said}");
+    assert_eq!(
+        (refused.code(), refused.message()),
+        (Code::Unavailable, super::LEADS_NO_TERM),
+        "{said}"
+    );
+    assert_eq!(store.epoch(), epoch, "{said}");
+    let ended = Position {
+        seq: head.seq + 1,
+        term: TERM + 1,
+    };
+    assert_eq!(journal.log.head(), ended, "{said}");
+}
+
+/// What a registration under test makes of its URL.
+#[derive(Clone, Copy, Debug)]
+enum Lays {
+    /// The URL's first row.
+    First,
+    /// A change in place of the row that stands.
+    InPlace,
+    /// The URL's next life.
+    NextLife,
+}
+
+/// A registration's write whose term ends in its own telling writes
+/// nothing, whatever it would make of its URL. The door's asks of its
+/// term held: the term ended behind them, by a later take or by the start
+/// of a term the store follows, ahead of the place the log would give the
+/// row's event. Nothing moved: the row under the URL reads as it stood, in
+/// the table and off the objects. Nothing of the write is left behind
+/// either: under a term the store leads, the same registration is
+/// written.
+fn a_registration_whose_term_ends_at_its_telling(lays: Lays, ends: usize) {
+    let (store, door, journal) = leaving_at_a_row();
+    let said = format!("{lays:?}, {ends}");
+    let request = match lays {
+        Lays::First => ask(spec(URL), Mode::Add),
+        Lays::InPlace => {
+            let labelled = proto::WorkerSpec {
+                labels: [("tier".to_owned(), "gold".to_owned())].into(),
+                ..spec(URL)
+            };
+            ask(labelled, Mode::Upsert)
+        }
+        Lays::NextLife => ask(spec(URL), Mode::Replace),
+    };
+    if !matches!(lays, Lays::First) {
+        door.register(&operator(), under(TERM), &ask(spec(URL), Mode::Add))
+            .expect("registered");
+    }
+    let stood = store.by_key(URL);
+    let at = (store.epoch(), journal.log.head());
+    journal.armed.store(ends, Ordering::Relaxed);
+    let refused = door
+        .register(&operator(), under(TERM), &request)
+        .expect_err("the term ended at the telling");
+    left_at_its_telling((&store, &journal), &refused, at, &said);
+    assert_eq!(
+        (store.by_key(URL), door.row_under(URL)),
+        (stood.clone(), stood.clone()),
+        "{said}"
+    );
+    store::LeasesStore::set_term(store.as_ref(), TERM + 2);
+    let mark = journal.log.head();
+    let told = door
+        .register(&operator(), under(TERM + 2), &request)
+        .expect("written under the term the store leads");
+    let written = store.by_key(URL).expect("the row");
+    let told = row_of(&told);
+    assert_eq!(
+        (written.id.0, written.revision),
+        (told.id, told.revision),
+        "{said}"
+    );
+    assert_ne!(Some(written), stood, "{said}");
+    // The journal was told the epoch the write's step then gave.
+    let mut tail = Vec::new();
+    journal
+        .log
+        .read(mark, replication::Log::BATCH, &mut tail)
+        .expect("the log holds the mark");
+    let epochs: Vec<u64> = tail
+        .iter()
+        .filter_map(|entry| match &entry.event {
+            replication::Event::Member { epoch, .. } => Some(*epoch),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(epochs, [store.epoch()], "{said}");
+}
+
+/// A registration's write whose term a later take ends, in the write's
+/// own telling, moves nothing and is refused as not leading.
+#[test]
+fn a_registrations_write_whose_term_a_later_take_ends_at_its_telling_moves_nothing() {
+    for lays in [Lays::First, Lays::InPlace, Lays::NextLife] {
+        a_registration_whose_term_ends_at_its_telling(lays, BY_A_RISE);
+    }
+}
+
+/// A registration's write whose term the start of a followed term ends,
+/// in the write's own telling, moves nothing and is refused as not
+/// leading.
+#[test]
+fn a_registrations_write_whose_term_a_followed_term_ends_at_its_telling_moves_nothing() {
+    for lays in [Lays::First, Lays::InPlace, Lays::NextLife] {
+        a_registration_whose_term_ends_at_its_telling(lays, BY_A_FOLLOWED_TERM);
+    }
+}
+
+/// A registration of several ranks hands each rank's write the call's
+/// term. One whose term ends in its second rank's telling is refused at
+/// that rank: the log takes no event of it, and the rank behind it is not
+/// tried. The rank written before it stands, as behind a lead lost
+/// between two ranks.
+#[test]
+fn a_rank_whose_term_ends_at_its_telling_is_refused_and_the_rank_before_it_stands() {
+    let (store, door, journal) = leaving_at_a_row();
+    let mark = journal.log.head();
+    journal.lets_by.store(1, Ordering::Relaxed);
+    journal.armed.store(BY_A_RISE, Ordering::Relaxed);
+    let refused = door
+        .register(&operator(), under(TERM), &ask(wide(URL, 3), Mode::Add))
+        .expect_err("the term ended at the second rank's telling");
+    let armed = journal.armed.load(Ordering::Relaxed);
+    assert_eq!(armed, 0, "the second rank's write reached its telling");
+    assert_eq!(
+        (refused.code(), refused.message()),
+        (Code::Unavailable, super::LEADS_NO_TERM)
+    );
+    let written = |rank: u32| store.by_key(&format!("{URL}@{rank}"));
+    let first = written(0).expect("the first rank's row");
+    assert_eq!((written(1), written(2)), (None, None));
+    // The second rank's telling was the last: the third's never came.
+    assert_eq!(journal.rows.load(Ordering::Relaxed), 2);
+    // The whole tail, batch by batch: a batch ends where a term does.
+    let (mut from, mut batch, mut rows) = (mark, Vec::new(), Vec::new());
+    loop {
+        journal
+            .log
+            .read(from, replication::Log::BATCH, &mut batch)
+            .expect("the log holds the place");
+        let Some(last) = batch.last() else { break };
+        from = last.at;
+        rows.extend(batch.iter().filter_map(|entry| match &entry.event {
+            replication::Event::Member { change, .. } => Some(*change),
+            _ => None,
+        }));
+    }
+    let told = store::MembershipChange::Registered { id: first.id };
+    assert_eq!(rows, [told], "the first rank's event alone");
+    let ended = Position {
+        seq: mark.seq + 2,
+        term: TERM + 1,
+    };
+    assert_eq!(journal.log.head(), ended, "the term's end stands last");
+}
+
+/// A narrower registration takes out the rank it no longer states, and
+/// that removal goes under the call's term, as each rank's write does.
+/// One whose term ends in the removal's own telling is refused there:
+/// the rank stands, and the ranks written before it stay.
+#[test]
+fn a_surplus_ranks_removal_whose_term_ends_at_its_telling_takes_no_row_out() {
+    let (store, door, journal) = leaving_at_a_row();
+    door.register(&operator(), under(TERM), &ask(wide(URL, 3), Mode::Add))
+        .expect("registered");
+    // The two ranks that stay are written first, each in place.
+    journal.lets_by.store(2, Ordering::Relaxed);
+    journal.armed.store(BY_A_RISE, Ordering::Relaxed);
+    let refused = door
+        .register(&operator(), under(TERM), &ask(wide(URL, 2), Mode::Upsert))
+        .expect_err("the term ended at the removal's telling");
+    let armed = journal.armed.load(Ordering::Relaxed);
+    assert_eq!(armed, 0, "the removal reached its telling");
+    assert_eq!(
+        (refused.code(), refused.message()),
+        (Code::Unavailable, super::LEADS_NO_TERM)
+    );
+    let width = |rank: u32| {
+        store
+            .by_key(&format!("{URL}@{rank}"))
+            .map(|row| row.facts.dp_size)
+    };
+    assert_eq!((width(0), width(1), width(2)), (Some(2), Some(2), Some(3)));
+}
+
+/// A patch whose term ends in its own telling writes nothing, as a
+/// registration's write there writes nothing: the row reads as it stood,
+/// in the table and off its object. Under a term the store leads, the
+/// same patch is written.
+fn a_patch_whose_term_ends_at_its_telling(ends: usize) {
+    let (store, door, journal) = leaving_at_a_row();
+    let row = row_of(
+        &door
+            .register(&operator(), under(TERM), &ask(spec(URL), Mode::Add))
+            .expect("registered"),
+    );
+    let id = WorkerId(row.id);
+    let patch = proto::PatchWorkerRequest {
+        worker_id: row.id,
+        labels: [("tier".to_owned(), "gold".to_owned())].into(),
+        revision: row.revision,
+        ..Default::default()
+    };
+    let stood = store.get(id);
+    let at = (store.epoch(), journal.log.head());
+    journal.armed.store(ends, Ordering::Relaxed);
+    let refused = door
+        .patch(&operator(), under(TERM), &patch)
+        .expect_err("the term ended at the telling");
+    left_at_its_telling((&store, &journal), &refused, at, &ends.to_string());
+    assert_eq!(
+        (store.get(id), store.by_key(URL), door.row(id)),
+        (stood.clone(), stood.clone(), stood),
+        "{ends}"
+    );
+    store::LeasesStore::set_term(store.as_ref(), TERM + 2);
+    door.patch(&operator(), under(TERM + 2), &patch)
+        .expect("patched under the term the store leads");
+    let patched = store.get(id).expect("the row");
+    assert_eq!(
+        (patched.revision, patched.facts.labels.len()),
+        (row.revision + 1, 1),
+        "{ends}"
+    );
+}
+
+/// A patch whose term a later take ends, in the patch's own telling,
+/// moves nothing and is refused as not leading.
+#[test]
+fn a_patch_whose_term_a_later_take_ends_at_its_telling_moves_nothing() {
+    a_patch_whose_term_ends_at_its_telling(BY_A_RISE);
+}
+
+/// A patch whose term the start of a followed term ends, in the patch's
+/// own telling, moves nothing and is refused as not leading.
+#[test]
+fn a_patch_whose_term_a_followed_term_ends_at_its_telling_moves_nothing() {
+    a_patch_whose_term_ends_at_its_telling(BY_A_FOLLOWED_TERM);
+}
+
+/// A removal whose term ends in its own telling takes no row out. The
+/// table holds the row as it stood. Its object left the registry ahead of
+/// the store's word, and it is laid again from the row read off it: the
+/// row reads off the objects as it stood. Under a term the store leads,
+/// the same removal takes the row.
+fn a_removal_whose_term_ends_at_its_telling(ends: usize) {
+    let (store, door, journal) = leaving_at_a_row();
+    let row = row_of(
+        &door
+            .register(&operator(), under(TERM), &ask(spec(URL), Mode::Add))
+            .expect("registered"),
+    );
+    let id = WorkerId(row.id);
+    let removal = proto::DeregisterWorkerRequest {
+        worker_id: row.id,
+        revision: row.revision,
+        drain: false,
+    };
+    let stood = store.get(id);
+    let at = (store.epoch(), journal.log.head());
+    journal.armed.store(ends, Ordering::Relaxed);
+    let refused = door
+        .deregister(&operator(), under(TERM), &removal)
+        .expect_err("the term ended at the telling");
+    left_at_its_telling((&store, &journal), &refused, at, &ends.to_string());
+    assert_eq!(
+        (store.get(id), store.by_key(URL), door.row(id)),
+        (stood.clone(), stood.clone(), stood),
+        "{ends}"
+    );
+    store::LeasesStore::set_term(store.as_ref(), TERM + 2);
+    door.deregister(&operator(), under(TERM + 2), &removal)
+        .expect("removed under the term the store leads");
+    assert_eq!((store.get(id), door.row(id)), (None, None), "{ends}");
+}
+
+/// A removal whose term a later take ends, in the removal's own telling,
+/// takes no row out and is refused as not leading.
+#[test]
+fn a_removal_whose_term_a_later_take_ends_at_its_telling_takes_no_row_out() {
+    a_removal_whose_term_ends_at_its_telling(BY_A_RISE);
+}
+
+/// A removal whose term the start of a followed term ends, in the
+/// removal's own telling, takes no row out and is refused as not leading.
+#[test]
+fn a_removal_whose_term_a_followed_term_ends_at_its_telling_takes_no_row_out() {
+    a_removal_whose_term_ends_at_its_telling(BY_A_FOLLOWED_TERM);
+}
+
+/// The object of the row `id` moved alone to `to`, as a probe's verdict
+/// leaves it ahead of its telling: the table holds the row's status as it
+/// was still. What comes back is that telling, made when a case calls it:
+/// the store's answer to the move, told for the object the verdict moved.
+fn moved_alone(
+    door: &MembershipCalls,
+    id: WorkerId,
+    to: ObjectStatus,
+) -> impl Fn(&MemoryStore) -> store::HealthWrite + '_ {
+    let object = door.objects.object(id).expect("the row's object");
+    let registry = door.objects.registry();
+    let standing = registry.get(&object).expect("it stands");
+    let (built, left) = (standing.revision(), standing.status());
+    registry.apply_if_revision(&object, built, |_| ((), Some(to)));
+    move |store| {
+        door.objects
+            .tell_status(store, &object, built, (left, to), &|| true)
+    }
+}
+
+/// The status the holder tells behind a change in place goes under the
+/// term of its call. A probe's verdict readied this row's object, and the
+/// table was not told yet. A patch lays the row in place, and the holder
+/// then tells the object's status. The term ends in that status's
+/// telling, by a later take. The patch stands. No status is written
+/// under a term the call was not admitted under, and the object takes
+/// the status its row holds.
+#[test]
+fn a_status_told_behind_a_change_in_place_goes_under_its_calls_term() {
+    let (store, door, journal) = leaving();
+    let row = row_of(
+        &door
+            .register(&operator(), under(TERM), &ask(spec(URL), Mode::Add))
+            .expect("registered"),
+    );
+    let id = WorkerId(row.id);
+    // The verdict's own telling never comes in this case.
+    let _telling = moved_alone(&door, id, ObjectStatus::Ready);
+    let patch = proto::PatchWorkerRequest {
+        worker_id: row.id,
+        labels: [("tier".to_owned(), "gold".to_owned())].into(),
+        revision: row.revision,
+        ..Default::default()
+    };
+    let (epoch, head) = (store.epoch(), journal.log.head());
+    journal.armed.store(BY_A_RISE, Ordering::Relaxed);
+    let patched = row_of(
+        &door
+            .patch(&operator(), under(TERM), &patch)
+            .expect("patched"),
+    );
+    let armed = journal.armed.load(Ordering::Relaxed);
+    assert_eq!(armed, 0, "the status reached its telling");
+    assert_eq!(patched.revision, row.revision + 1);
+    let status = |row: Option<WorkerRow>| row.map(|row| row.status);
+    let pending = Some(WorkerStatus::Pending);
+    assert_eq!(
+        (status(store.get(id)), status(door.row(id))),
+        (pending, pending)
+    );
+    assert_eq!(store.epoch(), epoch + 1, "the patch alone");
+    // The patch's event, then the event that ended the term: no status
+    // stands behind it.
+    let ended = Position {
+        seq: head.seq + 2,
+        term: TERM + 1,
+    };
+    assert_eq!(journal.log.head(), ended);
+}
+
+/// The same status under a term that holds is written under it. A
+/// probe's verdict readied this row's object, and the table was not told
+/// yet. A patch lays the row in place, and the holder tells the object's
+/// status with the call's term, which the store leads still. The log
+/// takes both events in that term, and the table reads ready as the
+/// object does.
+#[test]
+fn a_status_told_behind_a_change_in_place_is_written_under_a_term_that_holds() {
+    let (store, door, journal) = leaving();
+    let row = row_of(
+        &door
+            .register(&operator(), under(TERM), &ask(spec(URL), Mode::Add))
+            .expect("registered"),
+    );
+    let id = WorkerId(row.id);
+    // The verdict's own telling never comes in this case.
+    let _telling = moved_alone(&door, id, ObjectStatus::Ready);
+    let patch = proto::PatchWorkerRequest {
+        worker_id: row.id,
+        labels: [("tier".to_owned(), "gold".to_owned())].into(),
+        revision: row.revision,
+        ..Default::default()
+    };
+    let (epoch, head) = (store.epoch(), journal.log.head());
+    door.patch(&operator(), under(TERM), &patch)
+        .expect("patched");
+    let status = |row: Option<WorkerRow>| row.map(|row| row.status);
+    let ready = Some(WorkerStatus::Ready);
+    assert_eq!(
+        (status(store.get(id)), status(door.row(id))),
+        (ready, ready)
+    );
+    assert_eq!(store.epoch(), epoch + 2, "the patch, then the status");
+    let told = Position {
+        seq: head.seq + 2,
+        term: TERM,
+    };
+    assert_eq!(journal.log.head(), told);
+}
+
+/// A removal the store refuses for its term lays the row's object again
+/// in the status the table holds, whatever that status is. A verdict
+/// readied this row, and the table was told. A later verdict took the
+/// row's object out of the ready ones, and the table holds the row ready
+/// still: that verdict's telling had not come. The removal's term ends in
+/// its own telling. The store laid its table's status over the handed row
+/// for the log's event, and the row comes back in it: the object laid
+/// again stands ready, as its row does. The late verdict's telling then
+/// comes, for the object that left, and writes nothing. The next verdict
+/// moves the object laid again, and the table is told.
+#[test]
+fn a_removal_refused_for_its_term_lays_its_object_again_in_the_tables_status() {
+    let (store, door, journal) = leaving_at_a_row();
+    let row = row_of(
+        &door
+            .register(&operator(), under(TERM), &ask(spec(URL), Mode::Add))
+            .expect("registered"),
+    );
+    let id = WorkerId(row.id);
+    let moved = |from, to| store::HealthWrite::Moved { from, to };
+    let readied = moved_alone(&door, id, ObjectStatus::Ready);
+    assert_eq!(
+        readied(&store),
+        moved(WorkerStatus::Pending, WorkerStatus::Ready)
+    );
+    let late = moved_alone(&door, id, ObjectStatus::NotReady);
+    let removal = proto::DeregisterWorkerRequest {
+        worker_id: row.id,
+        revision: row.revision,
+        drain: false,
+    };
+    journal.armed.store(BY_A_RISE, Ordering::Relaxed);
+    let refused = door
+        .deregister(&operator(), under(TERM), &removal)
+        .expect_err("the term ended at the telling");
+    assert_eq!(refused.code(), Code::Unavailable);
+    let status = |row: Option<WorkerRow>| row.map(|row| row.status);
+    let read = || (status(store.get(id)), status(door.row(id)));
+    let ready = Some(WorkerStatus::Ready);
+    assert_eq!(read(), (ready, ready));
+    // The late verdict's telling names the object that left the registry:
+    // no object stands under its id, and nothing is written.
+    assert_eq!(late(&store), store::HealthWrite::Stale);
+    assert_eq!(read(), (ready, ready));
+    // The next verdict moves the object laid again, and its telling lands
+    // under the term the log leads since.
+    let next = moved_alone(&door, id, ObjectStatus::NotReady);
+    assert_eq!(
+        next(&store),
+        moved(WorkerStatus::Ready, WorkerStatus::NotReady)
+    );
+    let out = Some(WorkerStatus::NotReady);
+    assert_eq!(read(), (out, out));
+}
+
+/// The replica's own writer asks its turn's term behind a write the
+/// store did not take, as a control call does. Its registration's term
+/// ends in the write's own telling: nothing is written, and the write is
+/// refused as a turn that does not lead, never as a row that moved.
+#[test]
+fn a_replicas_own_registration_whose_term_ends_at_its_telling_is_refused_as_not_leading() {
+    let (store, door, journal) = leaving_at_a_row();
+    let maker = found("pods/a");
+    let hosted = ReplicaMembershipWriter::new(Arc::new(door), operator(), under(TERM));
+    journal.armed.store(BY_A_RISE, Ordering::Relaxed);
+    assert_eq!(
+        hosted.found_one(&maker, URL, &|_| found_facts()),
+        Err(MembershipWriteRefused::NotLeading(
+            super::LEADS_NO_TERM.to_owned()
+        ))
+    );
+    let armed = journal.armed.load(Ordering::Relaxed);
+    assert_eq!(armed, 0, "the write reached its telling");
+    assert_eq!((store.by_key(URL), store.epoch()), (None, 0));
+}
+
+/// The replica's own removal asks its turn's term behind a write the
+/// store did not take, as its registration does. A removal whose term
+/// ends in its own telling takes no row out, and is refused as a turn
+/// that does not lead, never as a row that moved.
+#[test]
+fn a_replicas_own_removal_whose_term_ends_at_its_telling_is_refused_as_not_leading() {
+    let (store, door, journal) = leaving_at_a_row();
+    let maker = found("pods/a");
+    let hosted = ReplicaMembershipWriter::new(Arc::new(door), operator(), under(TERM));
+    hosted
+        .found_one(&maker, URL, &|_| found_facts())
+        .expect("registered");
+    let row = store.by_key(URL).expect("the registered row");
+    let (seen, epoch) = (standing(&row), store.epoch());
+    journal.armed.store(BY_A_RISE, Ordering::Relaxed);
+    assert_eq!(
+        hosted.gone(Remover::Registrant(&maker), URL, seen),
+        Err(MembershipWriteRefused::NotLeading(
+            super::LEADS_NO_TERM.to_owned()
+        ))
+    );
+    let armed = journal.armed.load(Ordering::Relaxed);
+    assert_eq!(armed, 0, "the write reached its telling");
+    assert_eq!((store.by_key(URL), store.epoch()), (Some(row), epoch));
+}
+
+/// The replica's own refresh of a worker's labels is a patch of its
+/// turn, under the turn's term. One whose term ends in the patch's own
+/// telling writes nothing, and is refused as a turn that does not lead,
+/// never as a row that moved.
+#[test]
+fn a_replicas_own_refresh_whose_term_ends_at_its_telling_is_refused_as_not_leading() {
+    const HTTP: &str = "http://10.0.0.7:8000";
+    let (store, door, journal) = leaving_at_a_row();
+    let hosted = ReplicaMembershipWriter::new(Arc::new(door), operator(), under(TERM));
+    let built = |tier: &str| -> Arc<dyn Worker> {
+        let worker = <BasicWorkerBuilder>::new(HTTP).model(ModelCard::new("m"));
+        Arc::new(worker.label("tier", tier).build())
+    };
+    let first = built("gold");
+    hosted
+        .found_built(&Registrant::Control, Precondition::Absent, &first, None)
+        .expect("registered");
+    let row = store.by_key(HTTP).expect("the registered row");
+    let epoch = store.epoch();
+    journal.armed.store(BY_A_RISE, Ordering::Relaxed);
+    assert_eq!(
+        hosted.refreshed(standing(&row), &built("silver"), &first),
+        Err(MembershipWriteRefused::NotLeading(
+            super::LEADS_NO_TERM.to_owned()
+        ))
+    );
+    let armed = journal.armed.load(Ordering::Relaxed);
+    assert_eq!(armed, 0, "the patch reached its telling");
+    assert_eq!((store.by_key(HTTP), store.epoch()), (Some(row), epoch));
+}
+
 #[test]
 fn a_registration_that_states_no_policy_is_checked_whatever_stood_under_its_url() {
     let (store, door) = door();
@@ -3380,7 +3972,7 @@ fn a_drain_ends_with_the_registration_it_named() {
         revision: row.revision,
     };
     let told = door
-        .relabel(&operator(), &Registrant::Control, &patch)
+        .relabel(&operator(), &Registrant::Control, TERM, &patch)
         .expect("patched");
     assert_eq!(row_of(&told).status, proto::WorkerStatus::Draining as i32);
     // A registration over a draining row is the URL's next incarnation,

@@ -230,14 +230,28 @@ pub(super) async fn gateway_app(port: u16, model: &str) -> axum::Router {
 /// here), with the context the app is built from. A configuration that
 /// bounds the requests in flight gets the admission queue it names, as the
 /// server builds it.
-#[expect(
-    clippy::expect_used,
-    reason = "test helper: an app that does not build fails the fixture"
-)]
 pub(super) async fn gateway_app_over(
     config: RouterConfigBuilder,
     port: u16,
     model: &str,
+) -> (axum::Router, Arc<AppContext>) {
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(ScriptedTokenizer::from_chunks(
+        (0..32).map(|i| format!("w{i} ")).collect(),
+    ));
+    gateway_app_with(config, port, model, tokenizer).await
+}
+
+/// [`gateway_app_over`] with `tokenizer` as the one the gateway reads
+/// `model` with.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper: an app that does not build fails the fixture"
+)]
+pub(super) async fn gateway_app_with(
+    config: RouterConfigBuilder,
+    port: u16,
+    model: &str,
+    tokenizer: Arc<dyn Tokenizer>,
 ) -> (axum::Router, Arc<AppContext>) {
     let config = config
         .regular_mode(vec![])
@@ -248,9 +262,6 @@ pub(super) async fn gateway_app_over(
         config.queue_size,
         Duration::from_secs(config.queue_timeout_secs),
     );
-    let tokenizer: Arc<dyn Tokenizer> = Arc::new(ScriptedTokenizer::from_chunks(
-        (0..32).map(|i| format!("w{i} ")).collect(),
-    ));
     let app_context = grpc_test_context_with_tokenizer(config, model, tokenizer).await;
     let admission_queue = (app_context.rate_limiter.is_some() && queue_size > 0)
         .then(|| Arc::new(AdmissionQueue::new(queue_size, queue_timeout)));

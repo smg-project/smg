@@ -510,6 +510,8 @@ The built-in stages:
 
 A program that embeds the crate can add stages of its own under new names
 (`StageRegistry::filter`, `scorer`, `picker`) and validate documents against that table.
+The engine keeps the names it refuses under. The registry takes a host's stage of such a name, and
+the check refuses a document that names it.
 
 **[built]** One default method is shown, `balances_load_against_affinity`: a scorer of a program's
 own that weighs load against affinity must answer it, because a pair's lift rests on it. A scorer
@@ -3495,7 +3497,7 @@ A fact leaves the remainder when the worker object gets a field that holds it as
    word: a drain and a connect signal write the object and tell the table, a key's next life
    starts in the status its worker object stood in, and a call's answer waits on no follow.
 
-   A change the store refuses lays nothing new: a refused write reads no record of the store, and a refused removal lays its record again as it was read. A
+   A change the store refuses lays nothing new: a refused write reads no record of the store, and a refused removal lays its record again. A
    record with no object waits for a cut laid whole, and its key's registration through the keeper is
    refused until then. It is one a store took as a decided change around the keeper, or one the store took and the registry did not get.
    A standby and a watcher also lay it at the next event that tells its record and that the store takes.
@@ -3597,11 +3599,12 @@ Three writes move the log's place outside the keeper's turn, and a
 copy stays whole beside each: a status tell changes no fact, and a generation's apply and a
 term's start change no record.
 
-The told status has six readers: the next status event, for
+The told status has seven readers: the next status event, for
 the status a record moved from, the event of a record changed in place, which carries it, the
 event of a record a write takes out, which is told in it where its writer handed the record, a
 first copy, a tell the store refused, whose object takes it back, and a standby's applier or
-a watcher, which lays it on the object. No decision reads it. An operator's read of a few
+a watcher, which lays it on the object. The seventh is a removal the store refused for its term:
+its record comes back in it, and its object is laid in it. No decision reads it. An operator's read of a few
 records is read as a first copy is cut, in the keeper's turn and with each record's told status,
 and the store's own read for it is deleted. The store's own
 cut of its table has no caller in the product and ends with step 4.
@@ -3628,9 +3631,15 @@ status. The store tells the journal first, with the call's term. The journal com
 term in the same turn of its lock that stamps the event. Where the log has left the term, it
 takes no event, and the store moves nothing.
 
-A probe's verdict names no term. Its writer's lead is asked last under the membership lock.
-The journal stamps the status behind that ask, with the term its store leads then or with
-none.
+A call's write of a record goes with the call's term too: a registration's write, a patch
+and a removal. The store tells the journal first and moves its tables behind the journal's
+yes. Where the log has left the term, nothing moves, and the call answers that the replica
+does not lead that term. A removal's object left the registry ahead of the store's word, so
+it is laid again from the record read off it, in the status the table holds.
+
+A probe's verdict, a health driver's connect signal and the settle behind an overload switch
+name no term. Each writer's lead is asked last under the membership lock. The journal stamps
+the status behind that ask, with the term its store leads then or with none.
 
 The log's term is as fresh as the election's last word to it. A call whose term ended while
 its write waited writes no status, and its drain answers that the replica does not lead that
@@ -3642,10 +3651,12 @@ The locks in their order: the object's own, then the store's membership lock. No
 holder of the store's lock takes an object's, and no decision takes one.
 
 From the table to an
-object there are two ways, both of a told status. A standby's applier and a gateway's watcher
+object there are three ways, each of a told status. A standby's applier and a gateway's watcher
 lay each status their leader tells, the status of each record it tells, and each status of a
-first copy. A tell the store refuses gives the object the status its record holds. The
-code that keeps a
+first copy. A tell the store refuses gives the object the status its record holds. A removal the
+store refuses for its term lays its object again in that status.
+
+The code that keeps a
 controller's objects follows no log of its own store: if it did, two moves in
 a row could end with the object at the older one. The store judges no health outcome: its
 own machine for one is deleted.

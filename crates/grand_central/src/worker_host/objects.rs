@@ -248,7 +248,9 @@ impl Held {
 ///
 /// [`Self::upsert`], [`Self::patch`], [`Self::remove`], [`Self::connect_row`]
 /// and [`Self::drain_row`] are the write side of a host that keeps worker
-/// objects: a controller's registration calls write a row through them. Each
+/// objects, and each names no term. A controller's registration calls write
+/// through the entries the five stand on, which are private to the crate
+/// and take the call's term. Each
 /// call decides over the object that stands and tells `store` what it
 /// decided. The object the call leaves stands when it returns, and a
 /// removed row's object is gone by then. The three calls that write a row

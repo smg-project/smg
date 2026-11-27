@@ -1520,7 +1520,9 @@ pub fn build_apps(
     // The WASM OnRequest phase buffers the full body into a `Vec<u8>` subject
     // to the WASM manager's `max_body_size` (10MB default). Audio uploads
     // routinely exceed that, so WASM middleware would reject them with 400
-    // before reaching the handler.
+    // before reaching the handler. No request-body deadline either: the
+    // innermost layer only measures how long the read of the upload waited
+    // for the client, for the dispatch wait counted without the upload.
     let multipart_upload_routes = Router::new()
         .route("/v1/audio/transcriptions", post(v1_audio_transcriptions))
         .route_layer(
@@ -1528,7 +1530,10 @@ pub fn build_apps(
                 .layer(InertLayer(serving_auth_layer.clone()))
                 .layer(tenant_resolution_state.layer())
                 .layer(InertLayer(priority_admission))
-                .layer(InertLayer(legacy_limit)),
+                .layer(InertLayer(legacy_limit))
+                .layer(tower::util::MapRequestLayer::new(|request: Request| {
+                    request.map(middleware::body_timeout::upload_measured)
+                })),
         );
 
     let public_routes = Router::new()

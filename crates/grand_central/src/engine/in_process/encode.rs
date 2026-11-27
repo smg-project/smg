@@ -41,7 +41,7 @@ use super::{
     signals, single, InProcess, Loaded, PoolMembers,
 };
 use crate::engine::{
-    decision::{shed, Decision, PairSide, ShedReason, Target, WIRES},
+    decision::{shed, Decision, PairSide, ShedReason, Target, DECODE_LATER, WIRES},
     decision_engine::{DecideOutcome, DecisionRefused, Request, RequestMaker, WorkerLists},
     demands::{Demands, UnmetDemand},
     framework::{EncodeItems, EncodePlaced, EncodePool, EncoderFacts, PairPools},
@@ -53,14 +53,6 @@ use crate::engine::{
 #[cfg(test)]
 #[path = "../../../tests/unit/engine/in_process/encode/tests/mod.rs"]
 mod tests;
-
-/// What a request that states the later decode is declined under where its
-/// decode is held to the ones that take images, by its demand or by
-/// references beside an image or a video: a decode asked again takes no
-/// items, so nothing there holds it to a decode that takes images. So is
-/// one that leaves a part of its hard demand to its encoders
-/// ([`splits`]): a decode asked again would hold the decode to the whole.
-const DECODE_LATER: &str = "decode-later";
 
 /// Whether an encode request leaves a part of its hard demand to its
 /// encoders: it carries items, and `demands` name its media, which the
