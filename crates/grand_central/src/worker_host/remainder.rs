@@ -35,7 +35,7 @@ use crate::{
 /// | `engine_kind` | the runtime the worker crate reads the name as | a name that crate does not know, and a known name as it was written |
 /// | `health` | its checks in whole seconds, off where its host cannot dial the worker | a part of a second, and the policy of a row built with its checks off |
 /// | `overload` | the thresholds its host's monitor judges by, the row's own over the host's defaults, its own alone for an external row or while the host's document switches the defaults off, or none | which of them the row stated |
-/// | `drain_settle_secs` | the window in force | a window stated equal to the object's default, which reads back as none |
+/// | `drain_settle_secs` | the window in force | a window stated equal to the object's default, which reads back as none with no word of the row |
 ///
 /// Ten are not carried to the object: the incarnation, and the facts a
 /// decision or a collector reads of the row alone. Three of them have a

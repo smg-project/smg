@@ -32,7 +32,9 @@ pub(super) fn engine_of(worker: &dyn Worker) -> &str {
 /// is stated over the standing row's. A threshold it leaves out stays the
 /// standing row's: this reading keeps it under every verb. A door that
 /// writes a replacement by id ([`Over::Replaced`]) clears it past this
-/// reading.
+/// reading. A drain window at the default goes the same way: this reading
+/// keeps the number where the standing row states it, and a replacement by
+/// id states none.
 ///
 /// The pairing descriptor is the standing row's here too. A host that
 /// states the worker's own reads it of the worker ([`pairing_descriptor`]).
@@ -90,11 +92,7 @@ pub fn facts(worker: &dyn Worker, standing: Option<&WorkerFacts>) -> WorkerFacts
                 waiting_requests: own.waiting_requests.or(standing.overload.waiting_requests),
             }
         },
-        // A window the object's registration left at the default is not a
-        // fact of the row: the object built from the row takes the default.
-        drain_settle_secs: (checks.drain_settle_secs
-            != HealthCheckConfig::default().drain_settle_secs)
-            .then(|| u32::try_from(checks.drain_settle_secs).unwrap_or(u32::MAX)),
+        drain_settle_secs: window(checks, standing.drain_settle_secs),
         demand_facts: standing.demand_facts,
     }
 }
@@ -143,11 +141,25 @@ fn thresholds(spec: &WorkerSpec) -> Overload {
     }
 }
 
+/// The drain window a row states of an object that waits `checks`' window.
+/// A window the object's registration left at the default is not a fact of
+/// the row: the object built from the row takes the default. A row that
+/// states the default's own number (`standing`) keeps it: its object waits
+/// that number and reads back as its row.
+fn window(checks: &HealthCheckConfig, standing: Option<u32>) -> Option<u32> {
+    let own = u32::try_from(checks.drain_settle_secs).unwrap_or(u32::MAX);
+    let default = HealthCheckConfig::default().drain_settle_secs;
+    (checks.drain_settle_secs != default || standing == Some(own)).then_some(own)
+}
+
 /// The facts `built` states at a write that names `over`: [`facts`], and at
-/// a replacement by id the thresholds as its own registration states them.
-/// A replacement is its maker's whole statement of what a registration can
-/// state, so a threshold it leaves out is cleared. An add finds no row to
-/// keep one from. An upsert and an update keep the standing row's.
+/// a replacement by id the thresholds and the drain window as its own
+/// registration states them. A replacement is its maker's whole statement
+/// of what a registration can state. So a threshold it leaves out is
+/// cleared, and a window it leaves at the default is read with no word of
+/// the standing row: the row states none. An add finds no row to keep
+/// either from. An upsert and an update keep the standing row's threshold,
+/// and its window where it states the default's number.
 #[cfg_attr(
     not(any(test, feature = "discovery")),
     expect(dead_code, reason = "the replica's own door reads a worker so")
@@ -159,10 +171,14 @@ pub(crate) fn stated(
 ) -> WorkerFacts {
     let facts = facts(built, standing);
     match over {
-        Some(Over::Replaced(_)) => WorkerFacts {
-            overload: thresholds(&built.metadata().spec),
-            ..facts
-        },
+        Some(Over::Replaced(_)) => {
+            let metadata = built.metadata();
+            WorkerFacts {
+                overload: thresholds(&metadata.spec),
+                drain_settle_secs: window(&metadata.health_config, None),
+                ..facts
+            }
+        }
         Some(Over::Updated(_)) | None => facts,
     }
 }

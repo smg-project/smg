@@ -1290,6 +1290,82 @@ async fn a_replacement_by_id_clears_a_threshold_it_leaves_out_and_the_other_verb
     assert_eq!(pair().waiting_requests, Some(3));
 }
 
+/// A row may state the drain window at the default's own number, as a
+/// control call's registration does, and a built worker that waits the
+/// default leaves the window out. An upsert and an update in place keep
+/// the row's number. A replacement by id is its maker's whole statement:
+/// the row states no window, or the one the replacement states.
+#[tokio::test]
+async fn a_replacement_by_id_clears_a_window_at_the_default_and_the_other_verbs_keep_it() {
+    let f = Fixture::new();
+    let default = HealthCheckConfig::default().drain_settle_secs;
+    let number = u32::try_from(default).expect("the default window in a row's width");
+    let waiting = |window: u64| -> Arc<dyn Worker> {
+        let spec = WorkerSpec {
+            models: vec![ModelCard::new("model")].into(),
+            ..WorkerSpec::new(URL.to_owned())
+        };
+        let checks = HealthCheckConfig {
+            drain_settle_secs: window,
+            ..HealthCheckConfig::default()
+        };
+        let built = <BasicWorkerBuilder>::from_spec(spec).health_config(checks);
+        Arc::new(built.build())
+    };
+    let row = || f.store.by_key(URL).expect("the row").facts;
+    let standing = || {
+        let id = f.host.registry.get_id_by_url(URL).expect("the worker's id");
+        let live = f.host.registry.get(&id).expect("the worker");
+        (id, live)
+    };
+    let write = f.write();
+
+    // The row states the default's own number.
+    f.laid(WorkerFacts {
+        drain_settle_secs: Some(number),
+        ..facts(waiting(default).as_ref(), None)
+    });
+    assert_eq!(row().drain_settle_secs, Some(number));
+
+    // An upsert of a worker that waits the default keeps the row's.
+    let mut cx = f.registration(WorkerJobAsker::Api, vec![waiting(default)]);
+    cx.data.registration_mode = WorkerRegistrationMode::Upsert;
+    write.execute(&mut cx).await.expect("upserted");
+    assert_eq!(row().drain_settle_secs, Some(number));
+
+    // So does an update in place.
+    let (id, live) = standing();
+    let seen = f.objects.standing_of(&id, &live).expect("its row");
+    let over = Some(Over::Updated(&live));
+    f.door
+        .found_built(
+            &Registrant::Control,
+            Precondition::AtRevision(seen),
+            &waiting(default),
+            over,
+        )
+        .expect("updated");
+    assert_eq!(row().drain_settle_secs, Some(number));
+
+    // A replacement by id that waits the default states no window.
+    let (id, live) = standing();
+    let by_id = |live: &Arc<dyn Worker>| WorkerRegistrationMode::ReplaceById {
+        worker_id: id.as_str().to_owned(),
+        expected_revision: live.revision(),
+    };
+    let mut cx = f.registration(WorkerJobAsker::Api, vec![waiting(default)]);
+    cx.data.registration_mode = by_id(&live);
+    write.execute(&mut cx).await.expect("replaced");
+    assert_eq!(row().drain_settle_secs, None);
+    let (_, live) = standing();
+
+    // One that states another window sets it.
+    let mut cx = f.registration(WorkerJobAsker::Api, vec![waiting(default + 40)]);
+    cx.data.registration_mode = by_id(&live);
+    write.execute(&mut cx).await.expect("replaced again");
+    assert_eq!(row().drain_settle_secs, Some(number + 40));
+}
+
 /// At a step's second read a worker registered anew under the URL is
 /// told from one that left.
 #[tokio::test]

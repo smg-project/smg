@@ -432,6 +432,35 @@ fn a_wildcard_names_no_model_and_an_unset_width_is_one() {
     );
 }
 
+/// A window at the default is no fact of the row. A standing row that
+/// states the default's own number keeps it: the object built from that
+/// row waits the number and reads back as its row.
+#[test]
+fn a_window_at_the_default_reads_back_as_the_standing_row_states_it() {
+    let default = HealthCheckConfig::default().drain_settle_secs;
+    let stated = u32::try_from(default).expect("the default window in a row's width");
+    let read = |window: u64, standing: Option<u32>| {
+        let worker = <BasicWorkerBuilder>::from_spec(WorkerSpec::new(URL.to_owned()))
+            .health_config(HealthCheckConfig {
+                drain_settle_secs: window,
+                ..HealthCheckConfig::default()
+            })
+            .build();
+        let standing = WorkerFacts {
+            drain_settle_secs: standing,
+            ..WorkerFacts::default()
+        };
+        facts(&worker, Some(&standing)).drain_settle_secs
+    };
+    // At the default: the row's word where it states that number, else none.
+    assert_eq!(read(default, Some(stated)), Some(stated));
+    assert_eq!(read(default, None), None);
+    assert_eq!(read(default, Some(stated + 40)), None);
+    // Away from the default the window is the object's own.
+    assert_eq!(read(default + 40, Some(stated)), Some(stated + 40));
+    assert_eq!(read(default + 40, None), Some(stated + 40));
+}
+
 #[test]
 fn seconds_are_told_in_milliseconds() {
     let checks = HealthCheckConfig {
