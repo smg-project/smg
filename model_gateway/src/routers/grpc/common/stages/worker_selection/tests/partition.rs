@@ -729,3 +729,42 @@ fn an_epd_pair_gap_counts_the_decode_vision_that_the_request_needs() {
         Err(EpdSelectionFailure::CachePartitionUnsupported(_))
     ));
 }
+
+/// With no encoder registered, as when service discovery drops a restarting
+/// encoder, a salted request that no pair takes still gets the 400. A request
+/// without a field gets the 503.
+#[test]
+fn an_epd_pair_gap_is_judged_with_no_encoder_registered() {
+    let model_id = "test-model";
+    let registry = ec_registry(
+        model_id,
+        &[
+            (9721, WorkerType::Prefill, "ECCPUConnector"),
+            (9722, WorkerType::Decode, "ECCPUConnector"),
+        ],
+    );
+    let stage = stage(&registry, WorkerSelectionMode::EncodePrefillDecode);
+    let pick = |partition| {
+        stage.select_encode_prefill_decode_workers(
+            model_id,
+            PlacementInputs::default(),
+            &[vec![1]],
+            EpdDemands {
+                wire: None,
+                encode: MediaDemands::NONE,
+                decode_vision: false,
+                image_fanout: false,
+                partition,
+            },
+            None,
+        )
+    };
+    assert!(matches!(
+        pick(CachePartitionDemand::default()),
+        Err(EpdSelectionFailure::Unavailable)
+    ));
+    assert!(matches!(
+        pick(salt()),
+        Err(EpdSelectionFailure::CachePartitionUnsupported(_))
+    ));
+}

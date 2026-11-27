@@ -2724,11 +2724,17 @@ impl WorkerSelectionStage {
         // vision demand. A pair that lacks the fields is a fact of membership.
         // An encoder that is down is not. So this check runs before encoder
         // health. It waits for a pair that the EC and vision checks below pass.
+        // With no encoder registered, no pair takes an encoder's output yet.
+        // The fields are still a fact of membership, so it judges every pair.
         let partition = demand.partition;
-        let applies = |worker: &dyn Worker| registered_ec(worker) && partition.met_by(worker);
+        let fed = |worker: &dyn Worker| registered_encode.is_empty() || registered_ec(worker);
+        let applies = |worker: &dyn Worker| fed(worker) && partition.met_by(worker);
         if partition.any()
-            && ec_pair_exists
-            && (!demand.decode_vision || vision_pair_exists)
+            && pair_admitted_by(&pairs, demand.wire, &fed)
+            && (!demand.decode_vision
+                || pair_admitted_by(&pairs, demand.wire, &|worker| {
+                    fed(worker) && decode_vision(worker)
+                }))
             && !pair_admitted_by(&pairs, demand.wire, &|worker| {
                 applies(worker) && (!demand.decode_vision || decode_vision(worker))
             })
