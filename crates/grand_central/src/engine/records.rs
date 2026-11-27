@@ -38,8 +38,8 @@
 //!   worker's report. [`PoolRecords::write`] writes every worker's record
 //!   into a buffer of its caller, and [`PoolRecords::read`] one worker's.
 //!   Neither waits for a lock. A write allocates nothing once the buffer has
-//!   grown to the pool, but for the one decision a snapshot that converts
-//!   the list's reports.
+//!   grown to the pool, but for a decision that converts the list's
+//!   reports (the doc of [`PoolRecords::write`] says when one does).
 //!
 //! [`decide`] is one single decision over such records, in the calling
 //! thread's own buffer. It writes the records the decision reads: every
@@ -563,8 +563,9 @@ struct Reported {
     /// so the rows are never taken for another snapshot's.
     snapshot: Weak<LoadSnapshot>,
     /// The instant of the decision that converted the rows, on the
-    /// engine's clock. A decision that began no later holds a snapshot no
-    /// newer than theirs, and leaves them in place.
+    /// engine's clock. A decision that began no later is taken to hold a
+    /// snapshot no newer than theirs, and leaves them in place
+    /// ([`PoolRecords::convert`]).
     since_micros: u64,
     /// Each worker's record by position: its fixed half, and where the
     /// snapshot holds a report of the worker, the report with its sample's
@@ -592,7 +593,8 @@ impl Reported {
 
     /// Whether a decision that began at `now_micros` leaves the rows in
     /// place: it began no later than the decision that converted them, so
-    /// it holds a snapshot no newer than theirs.
+    /// it is taken to hold a snapshot no newer than theirs
+    /// ([`PoolRecords::convert`]).
     #[inline]
     fn outlasts(&self, now_micros: u64) -> bool {
         now_micros <= self.since_micros
@@ -615,10 +617,13 @@ type Held = Guard<Option<Arc<Reported>>>;
 /// pair's or an encode request's decision that the list's one kept answer
 /// serves: that every worker of it has published that it is available. A
 /// worker's load report is read from the load snapshot the decision holds:
-/// converted once for the list, by the first decision that writes every
+/// converted for the list, by the first decision that writes every
 /// record under that snapshot or by the draw that pays the last of the
 /// list's length in look-ups, and read by the decisions behind it that
-/// hold the same snapshot.
+/// hold the same snapshot. A snapshot is converted once, save across a
+/// publication: a decision that still holds the snapshot before it can
+/// convert that one over the newer rows, and the next decision under the
+/// newer snapshot then converts its own again.
 ///
 /// Made from one list and good for that list alone: the list a gateway's
 /// registry publishes at a membership change is a new list, and takes new
@@ -672,7 +677,10 @@ pub struct PoolRecords {
     /// records from its own snapshot.
     converting: Mutex<LookUps>,
     /// How many times the list's reports were converted: once a snapshot
-    /// a decision wrote every record under, or the list's draws paid for.
+    /// a decision wrote every record under, or the list's draws paid for,
+    /// and once more each time a decision that still holds the snapshot
+    /// before it, or the next decision under the newer one, converts its
+    /// own over the other's rows.
     conversions: AtomicU64,
     /// The number the list's fixed rows are known by ([`serial`]).
     serial: NonZeroU64,
@@ -1060,8 +1068,11 @@ impl PoolRecords {
 
     /// How many times the list's reports were converted so far: once for
     /// each load snapshot a decision wrote every record under
-    /// ([`Self::write`]) or the list's draws paid for. What a bench and a
-    /// case count against the snapshots published.
+    /// ([`Self::write`]) or the list's draws paid for, and once more each
+    /// time a decision that still holds the snapshot before a publication
+    /// converts it over the newer rows, and each time the next decision
+    /// under the newer snapshot converts its own again. What a bench and
+    /// a case count against the snapshots published.
     #[must_use]
     pub fn conversions(&self) -> u64 {
         self.conversions.load(Ordering::Relaxed)
@@ -1126,8 +1137,12 @@ impl PoolRecords {
     ///
     /// No lock is waited for here beyond what a read of a worker object takes.
     /// Nothing is allocated once `rows` has grown to the list. The one
-    /// exception is the conversion: one allocation, by one decision, at
-    /// most once a published snapshot a list.
+    /// exception is the conversion, by one decision at a time, once a
+    /// published snapshot a list: it allocates the boxed rows and the
+    /// shared value that holds them (and the signal cells, under a document
+    /// a stage of which reads one). A decision that still holds the
+    /// snapshot before it can convert that one over its rows, and the next
+    /// decision under the newer snapshot then converts its own again.
     ///
     /// The facts borrow the records and what `live` borrows, the list's own
     /// word among it. The rows borrow their buffer alone.
@@ -1274,7 +1289,7 @@ impl PoolRecords {
     /// a draw. They are counted under the claim, and the decision converts
     /// where the count has reached the list's length ([`LookUps`]).
     ///
-    /// **One decision converts a snapshot.** The decision takes the
+    /// **One decision at a time converts.** The decision takes the
     /// list's claim first, by one compare and exchange. Another decision
     /// that meets the same snapshot meanwhile finds the claim taken,
     /// converts nothing, allocates nothing and waits for nothing. The
@@ -1284,17 +1299,28 @@ impl PoolRecords {
     /// they are.
     ///
     /// A decision that began no later than the decision that converted
-    /// the list's rows holds a snapshot no newer than theirs, and does not
-    /// replace them. That holds for the rows it read as `held` and for the
-    /// rows it finds under the claim, where another decision left them
-    /// since: it converts nothing and counts nothing.
+    /// the list's rows is taken to hold a snapshot no newer than theirs,
+    /// and does not replace them. That holds for the rows it read as
+    /// `held` and for the rows it finds under the claim, where another
+    /// decision left them since: it converts nothing and counts nothing.
+    /// The instant stands for an order the engine does not have: a
+    /// snapshot does not say when it was published. So a decision that
+    /// began later and still holds the snapshot before theirs converts it
+    /// over them, and the next decision under the newer snapshot converts
+    /// that one again: at most one such pair of conversions more each
+    /// time a decision that holds the older snapshot across one
+    /// publication comes to the list, and no new pair once the last of
+    /// them has ended. Each of them reads the reports of its own snapshot
+    /// throughout.
     ///
     /// The conversion is one look-up of each worker's address in the
-    /// snapshot, one conversion of each report, and one allocation of the
-    /// rows, left in the slot by one atomic store of the whole value. It
-    /// is the one allocation a decision over records makes once its
-    /// thread's buffer has grown: at most once a published snapshot a
-    /// list, by one decision.
+    /// snapshot, one conversion of each report, and the allocation of the
+    /// boxed rows and of the shared value that holds them (and of the
+    /// signal cells, under a document a stage of which reads one), left
+    /// in the slot by one atomic store of the whole value. A decision over
+    /// records allocates nothing else once its thread's buffer has grown:
+    /// once a published snapshot a list, by one decision, and again only
+    /// for such pairs.
     #[inline(never)]
     fn convert(
         &self,

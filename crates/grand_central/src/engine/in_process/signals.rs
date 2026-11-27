@@ -10,9 +10,12 @@
 //! The engine makes those cells itself. A worker's report stands in the load
 //! snapshot a decision holds, the one its request gives or the one the
 //! engine's own task keeps, and the named values are part of that report.
-//! So a list's cells are made where its load reports are converted: once a
-//! snapshot a list ([`PoolRecords::cells`]). A host hands its load channel
-//! and nothing more, and cells a caller put on a request are not read.
+//! So a list's cells are made where its load reports are converted, by the
+//! same conversion ([`PoolRecords::cells`]): once a published snapshot a
+//! list, and again wherever that conversion runs again. A decision that is
+//! not the one to convert writes the cells of its own snapshot. A host hands
+//! its load channel and nothing more, and cells a caller put on a request
+//! are not read.
 //!
 //! **Who is lent them.** A single request whose profile reads a signal
 //! ([`decide`]), and each side of a pair whose profile reads one: the
