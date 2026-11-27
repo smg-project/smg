@@ -1271,6 +1271,48 @@ fn only_a_retry_over_ranks_takes_the_threads_list_and_it_grows_once() {
     assert_eq!(kept(), grown, "the list is kept as it grew");
 }
 
+/// Over a list of workers that each stand alone the records hand no list
+/// of tried workers back ([`PoolRecords::tried_engines`]). A retry decided
+/// there by the function a retry over ranks runs ([`retried`]) reads the
+/// request's own list: the worker the retry names is passed over. The
+/// decision's own entry asks that function of no such list.
+#[test]
+fn a_retry_decided_over_workers_that_stand_alone_reads_the_requests_own_list() {
+    let engine = preset("round_robin");
+    let list = pool(3);
+    let members = engine.pool_members(&list);
+    let own = engine.loaded();
+    let spec = &own.document.spec;
+    let records = members.records(spec, &own.clock);
+    assert!(!records.has_ranks(), "each worker stands alone");
+    let tried = [worker_id(list[1].as_ref())];
+    for seed in 0..16 {
+        let mut retry = request();
+        retry.facts.seed = seed;
+        retry.facts.attempt = 1;
+        retry.facts.tried = &tried;
+        let live = records::Live::at(spec.engine(), &own.clock, Instant::now(), None, None)
+            .turning(&members.rotation.0);
+        let mut facts = retry.facts;
+        let cx = Constraints::default();
+        let decision = retried(
+            own,
+            &members,
+            records,
+            &live,
+            &mut facts,
+            &cx,
+            &retry,
+            None,
+            WithoutShadow,
+        );
+        let pick = decision.pick().expect("a pick");
+        let places: Vec<u32> = pick.targets.iter().map(|target| target.position).collect();
+        assert!(!places.is_empty(), "seed {seed}");
+        assert!(!places.contains(&1), "seed {seed}: {places:?}");
+    }
+}
+
 /// A whole pass's lease states the three sizes its request states: the
 /// count of its token ids and its text's two lengths. A reader that
 /// sizes a held decision of text reads the bytes over four off the
@@ -2721,6 +2763,56 @@ fn a_long_conversation_of_text_goes_back_to_its_worker_by_the_string_tree() {
         sent(&said, seed) != first
     });
     assert!(moved, "a worker out of the tree holds no prompt");
+}
+
+/// A worker admitted beside older ones takes no turn of a conversation
+/// where its model's workers send no cache events: the warm-up catches a
+/// worker up to what the index of cache events holds, so under an index
+/// that holds no block a single request warms nobody, whatever warm-up
+/// window the settings name, and a turn is placed where the turn before it
+/// was sent.
+#[test]
+fn a_conversation_stays_with_its_worker_beside_a_new_one_where_no_cache_event_came() {
+    use crate::document::routing_settings::{PolicySettings, RoutingSettings};
+    // A window of one second, so that seven workers are older than it
+    // within the case's own time.
+    let settings = RoutingSettings {
+        policy: PolicySettings::of_label("cache_aware").expect("a policy of that name"),
+        worker_warmup_secs: 1,
+        ..RoutingSettings::default()
+    };
+    let mut document = settings.policy_document().expect("the settings translate");
+    document.generation = 1;
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    let engine = InProcess::new(spec);
+    let sent = |members: &PublishedList, tokens: &[u32], seed: u64| {
+        let hashes = engine.prompt_hashes(MODEL, Some(tokens), None, HashSeeds::PLAIN);
+        let mut asked = request();
+        asked.facts.seed = seed;
+        hashes.write_to(&mut asked.facts);
+        let decision = decided(&engine, &Asks::of(asked, Some(members))).decision;
+        let pick = decision.pick().expect("a pick");
+        pick.targets.first().expect("a target").position
+    };
+    let mut list: Vec<Arc<dyn Worker>> = (0..7)
+        .map(|at| ready_worker(&format!("http://worker-{at}:8000"), MODEL))
+        .collect();
+    std::thread::sleep(Duration::from_millis(1_100));
+    let older = PublishedList::new(Arc::from(list.clone()));
+    let mut said: Vec<u32> = (0..4_096).collect();
+    let first = sent(&older, &said, 0);
+    // The eighth worker is admitted now, beside seven older than the window.
+    list.push(ready_worker("http://worker-7:8000", MODEL));
+    let members = PublishedList::new(Arc::from(list));
+    let mut back = 0;
+    for turn in 1..32 {
+        said.extend(turn * 1_000_000..turn * 1_000_000 + 16);
+        back += u32::from(sent(&members, &said, u64::from(turn)) == first);
+    }
+    assert_eq!(
+        back, 31,
+        "the turns that went back beside a worker admitted now"
+    );
 }
 
 /// A pin followed under a host that lends its string tree. The

@@ -160,6 +160,20 @@ pub(crate) struct ModelLabels {
     pub(crate) vocabulary: TagVocabulary,
 }
 
+/// What the regular HTTP workers of a generation say together to the
+/// decision of a request's body path, before the body arrives
+/// ([`ModelWorkerSnapshot::body_facts`]). The HTTP router holds the rule
+/// that reads each from the workers; a snapshot keeps the answers.
+///
+/// The answers depend on the membership, never on a request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BodyFacts {
+    /// A card of a worker names an alias.
+    pub(crate) aliased: bool,
+    /// A worker rewrites the body it is sent.
+    pub(crate) mutates: bool,
+}
+
 /// Immutable membership snapshot. Route-specific projections are populated
 /// lazily once and then shared by every request until membership changes
 /// publish a replacement snapshot.
@@ -203,6 +217,9 @@ pub struct ModelWorkerSnapshot {
     /// The consistent-hash ring over the URLs of this generation's members
     /// (see [`Self::hash_ring`]).
     hash_ring: OnceLock<Arc<HashRing>>,
+    /// What the regular HTTP workers of this generation say together to
+    /// the decision of a request's body path (see [`Self::body_facts`]).
+    body_facts: OnceLock<Option<BodyFacts>>,
 }
 
 impl ModelWorkerSnapshot {
@@ -217,6 +234,7 @@ impl ModelWorkerSnapshot {
             labels: OnceLock::new(),
             media: OnceLock::new(),
             hash_ring: OnceLock::new(),
+            body_facts: OnceLock::new(),
         }
     }
 
@@ -300,6 +318,27 @@ impl ModelWorkerSnapshot {
     /// the media gates.
     pub(crate) fn media(&self, read: impl FnOnce(&[Arc<dyn Worker>]) -> MediaFacts) -> &MediaFacts {
         self.media.get_or_init(|| read(&self.all))
+    }
+
+    /// What the regular HTTP workers of this generation say together to
+    /// the decision of a request's body path: `read` reads them at the first
+    /// such decision after the membership change, every decision after it
+    /// reads what `read` said, so it walks no worker here, however many
+    /// there are. The HTTP router asks the snapshot of the whole membership
+    /// alone. A built-in worker holds what the answers hang on from its
+    /// construction (the cards and the rank of its spec), so whatever
+    /// changes one publishes a new snapshot (see [`Self::harmony`]). A
+    /// worker of another type may change an answer on the handle this
+    /// snapshot holds: `read` says `None` for a pool with one, and a caller
+    /// that is told `None` reads that pool itself at every decision. The
+    /// rule stays with the HTTP router.
+    pub(crate) fn body_facts(
+        &self,
+        read: impl FnOnce(&[Arc<dyn Worker>]) -> Option<BodyFacts>,
+    ) -> Option<BodyFacts> {
+        *self
+            .body_facts
+            .get_or_init(|| read(self.pool(RoutingPool::HttpRegular)))
     }
 
     /// The consistent-hash ring over the URLs of this generation's members,

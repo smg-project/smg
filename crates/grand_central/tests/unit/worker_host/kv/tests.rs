@@ -32,7 +32,9 @@ impl KvAdapter {
 
 /// A store's rows, the tables beside them and an adapter with no
 /// holder: the cases state a row to the tables themselves
-/// ([`Fixture::state`]), as a holder does where it lays the row.
+/// ([`Fixture::state`]), as a holder does where it lays the row. The
+/// row's feed is open on the adapter ([`open_feed`]): a stream writes
+/// only while its feed stands open.
 struct Fixture {
     store: Arc<MemoryStore>,
     tables: Arc<KvTables>,
@@ -79,6 +81,7 @@ impl Fixture {
             row,
         };
         fixture.state(row);
+        open_feed(&fixture.sink, row);
         fixture
     }
 
@@ -110,6 +113,13 @@ impl Fixture {
         lay_standing(&objects, &self.store);
         KvHost::new(objects)
     }
+}
+
+/// Open `row`'s feed on `sink`, as a host's opening does: the row
+/// begins, and the feed's record is kept.
+fn open_feed(sink: &KvAdapter, row: WorkerId) {
+    assert_eq!(sink.begin(row, || true), Ok(()), "the row begins");
+    sink.opened(row, MODEL, URL);
 }
 
 fn facts(sequence: u64) -> BatchFacts {
@@ -763,8 +773,9 @@ fn a_worker_that_left_takes_what_its_stream_showed_with_it() {
         ]),
     );
     f.sink.removed(f.row);
-    // Nothing is shown of group 1 now: its kind-less store is the main
-    // group's.
+    // The worker's next feed opens on the same row. Nothing is shown of
+    // group 1 now: its kind-less store is the main group's.
+    open_feed(&f.sink, f.row);
     let event = KvBlocksStored {
         group_idx: Some(1),
         ..stored(2)
@@ -1509,6 +1520,190 @@ fn a_model_that_left_forgets_its_block_size() {
     assert_eq!(f.tables.block_size(MODEL), Some(16));
 }
 
+/// A model that left takes its own word alone: another model keeps the
+/// engine's word and the tables' size.
+#[test]
+fn a_model_that_left_takes_its_own_block_size_alone() {
+    const OTHER_MODEL: &str = "n";
+    let f = Fixture::single(None);
+    let (host, sink) = opened(&f);
+    let first = sink.admit(f.row, 0, facts(1), &wide(1, 32));
+    assert_eq!(first, BatchOutcome::Applied);
+    // What a feed of the other model learned.
+    sink.sizes.lock().insert(Arc::from(OTHER_MODEL), 64);
+    f.tables.set_block_size(OTHER_MODEL, 64);
+    host.model_left(MODEL);
+    assert_eq!(f.tables.block_size(MODEL), None);
+    assert_eq!(f.tables.block_size(OTHER_MODEL), Some(64));
+    let words = sink.sizes.lock();
+    assert_eq!(words.get(MODEL), None);
+    assert_eq!(words.get(OTHER_MODEL), Some(&64));
+}
+
+/// A model that left takes the engine's word with it: the first stored
+/// block behind its return names its size, a narrower one too.
+#[test]
+fn a_model_that_left_names_its_block_size_anew() {
+    let f = Fixture::single(None);
+    let (host, sink) = opened(&f);
+    let first = sink.admit(f.row, 0, facts(1), &wide(1, 32));
+    assert_eq!(first, BatchOutcome::Applied);
+    assert_eq!(f.tables.block_size(MODEL), Some(32));
+    // The model's one worker leaves, and the model with it.
+    sink.removed(f.row);
+    host.model_left(MODEL);
+    assert_eq!(f.tables.block_size(MODEL), None);
+    // It returns on the same host with a narrower block.
+    let worker = host
+        .objects
+        .registry()
+        .get_by_url(URL)
+        .expect("the worker's object");
+    let ticket = host.enroll(&worker, MODEL);
+    let (sink, _) = host.open(ticket, &worker, MODEL).expect("the row's feed");
+    let again = sink.admit(f.row, 0, facts(1), &wide(2, 16));
+    assert_eq!(again, BatchOutcome::Applied);
+    assert_eq!(f.tables.block_size(MODEL), Some(16));
+}
+
+/// A stream no feed was opened for writes nothing: its batch is passed
+/// over, and the adapter keeps no row for it.
+#[test]
+fn a_batch_on_a_stream_no_feed_was_opened_for_is_passed_over() {
+    let f = Fixture::single(None);
+    // Another adapter over the same tables, which opened no feed.
+    let unopened = KvAdapter::new(Arc::clone(&f.tables));
+    assert_eq!(
+        unopened.admit(f.row, 0, facts(1), &wide(1, 32)),
+        BatchOutcome::Skipped
+    );
+    assert_eq!(f.tables.indexed_blocks(f.row, 0), 0);
+    assert_eq!(f.tables.cursor(f.row, 0), None);
+    assert!(unopened.rows.lock().written.is_empty());
+}
+
+/// A stream that left takes its feed's record with it, and a batch said
+/// behind its removal is passed over. It writes nothing: no block, no
+/// cursor and no entry of the adapter, and it names no size. The
+/// worker's next feed opens on the same row and begins it again: its
+/// first batch is taken below the cursor the row held.
+#[test]
+fn a_batch_behind_its_streams_removal_is_passed_over() {
+    let f = Fixture::single(None);
+    let (host, sink) = opened(&f);
+    assert_eq!(
+        sink.admit(f.row, 0, facts(7), &wide(1, 16)),
+        BatchOutcome::Applied
+    );
+    sink.removed(f.row);
+    assert_eq!(
+        sink.admit(f.row, 0, facts(8), &wide(2, 32)),
+        BatchOutcome::Skipped
+    );
+    assert_eq!(f.tables.indexed_blocks(f.row, 0), 0);
+    assert_eq!(sink.cursor(f.row, 0), None);
+    assert_eq!(f.tables.block_size(MODEL), Some(16), "the wider late store");
+    {
+        let rows = sink.rows.lock();
+        assert!(rows.written.is_empty() && rows.fed.is_empty());
+    }
+
+    let worker = host
+        .objects
+        .registry()
+        .get_by_url(URL)
+        .expect("the worker's object");
+    let ticket = host.enroll(&worker, MODEL);
+    let (sink, row) = host.open(ticket, &worker, MODEL).expect("the row's feed");
+    assert!(begun(&sink, row));
+    assert_eq!(
+        sink.admit(row, 0, facts(1), &wide(3, 16)),
+        BatchOutcome::Applied
+    );
+    assert_eq!(f.tables.indexed_blocks(row, 0), 1);
+}
+
+/// A batch reads its feed's record where it begins and learns at its
+/// end. One that began ahead of its stream's removal and learns behind it
+/// names no size: the feed is its row's no longer, and the model's
+/// departure cleared the size in between. A feed opened anew for the row
+/// is another feed, so the old batch's learning is not its either, and
+/// its own learning names the size.
+#[test]
+fn a_learning_behind_its_streams_removal_names_no_block_size() {
+    let f = Fixture::single(None);
+    let (host, sink) = opened(&f);
+    let of_row = |sink: &KvAdapter| sink.feeds.lock().get(&f.row).cloned();
+    let began = of_row(&sink).expect("the feed the batch found open");
+    sink.removed(f.row);
+    host.model_left(MODEL);
+    sink.learn(f.row, &began, 32);
+    assert_eq!(f.tables.block_size(MODEL), None);
+    assert!(sink.sizes.lock().is_empty());
+    // The model returns on the same host, under the same row.
+    let worker = host
+        .objects
+        .registry()
+        .get_by_url(URL)
+        .expect("the worker's object");
+    let ticket = host.enroll(&worker, MODEL);
+    let (sink, _) = host.open(ticket, &worker, MODEL).expect("the row's feed");
+    sink.learn(f.row, &began, 32);
+    assert_eq!(f.tables.block_size(MODEL), None);
+    let anew = of_row(&sink).expect("the feed opened anew");
+    sink.learn(f.row, &anew, 16);
+    assert_eq!(f.tables.block_size(MODEL), Some(16));
+}
+
+/// A model's departure takes the engine's word and the tables' size in
+/// one hold of the lock a learning holds, so no row of the model learns
+/// between the two. The table's own lock is the probe: the case holds
+/// it, and the departure cannot get past its call of the tables.
+#[test]
+fn a_models_departure_holds_the_learnings_lock_through_both_removals() {
+    let f = Fixture::single(None);
+    let (host, sink) = opened(&f);
+    let first = sink.admit(f.row, 0, facts(1), &wide(1, 32));
+    assert_eq!(first, BatchOutcome::Applied);
+    // The engine's words, looked at while the departure stands at the
+    // tables. Free, with the model's word gone: the departure let the
+    // lock go ahead of the tables. Free, with the word still there: the
+    // departure has not begun. Held at every look over a quarter second,
+    // which is long against a removal's own hold: the departure holds
+    // them, at the tables or still ahead of them.
+    let held_at_the_tables = || {
+        let window = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        loop {
+            if let Some(sizes) = sink.sizes.try_lock() {
+                return (!sizes.contains_key(MODEL)).then_some(false);
+            }
+            if std::time::Instant::now() >= window {
+                return Some(true);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    };
+    let held = std::thread::scope(|scope| {
+        f.tables.locked(|| {
+            // The collector's own call: the host's.
+            scope.spawn(|| host.model_left(MODEL));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Some(held) = held_at_the_tables() {
+                    break Some(held);
+                }
+                if std::time::Instant::now() >= deadline {
+                    break None;
+                }
+                std::thread::yield_now();
+            }
+        })
+    });
+    assert_eq!(held, Some(true), "let go ahead of the tables");
+    assert_eq!(f.tables.block_size(MODEL), None);
+    assert!(sink.sizes.lock().is_empty());
+}
+
 const UPPER: &str = "http://a:8000#1";
 
 const OTHER: &str = "http://b:8000";
@@ -1827,22 +2022,19 @@ mod series {
         });
     }
 
-    /// A row no feed was opened for names no series: its batch is
-    /// applied by the rules alone. A feed that left names none either.
+    /// A stream that left names no series: its batch is passed over and
+    /// counted nowhere, and its reset counts under no worker.
     #[test]
-    fn a_row_with_no_open_feed_names_no_series() {
+    fn a_stream_that_left_names_no_series() {
         let series = Series::new();
         metrics::with_local_recorder(&series.recorder, || {
             let f = Fixture::single(Some(BLOCK_SIZE));
-            assert_eq!(
-                f.sink.admit(f.row, 0, facts(1), &wide(1, 32)),
-                BatchOutcome::Applied
-            );
-            assert_eq!(f.tables.indexed_blocks(f.row, 0), 1);
-            assert!(!series.names_the_worker());
-
             let (_host, sink) = opened(&f);
             sink.removed(f.row);
+            assert_eq!(
+                sink.admit(f.row, 0, facts(1), &wide(1, 32)),
+                BatchOutcome::Skipped
+            );
             sink.resync(f.row, None, ResyncReason::DataLoss);
             assert!(!series.names_the_worker());
         });
@@ -1935,17 +2127,33 @@ impl Ranked {
 }
 
 /// A batch of rank 1 on the engine's one stream is indexed under rank
-/// 1's row, and a batch of rank 0 under the stream's own.
+/// 1's row, and a batch of rank 0 under the stream's own. A rank's store
+/// names the model's block size by its stream's feed, which is opened
+/// for the stream's own row.
 #[test]
 fn a_batch_of_rank_one_is_indexed_under_rank_ones_row() {
     let f = Ranked::new();
     let upper = f.upper();
     let store = |hash| Data::Stored(wide_store(hash, 16));
+    assert_eq!(f.tables.block_size(MODEL), None);
     assert_eq!(f.admit(1, 1, store(1)), BatchOutcome::Applied);
+    assert_eq!(f.tables.block_size(MODEL), Some(16));
     assert_eq!(f.blocks(upper), (0, 1));
     assert_eq!(f.admit(0, 1, store(2)), BatchOutcome::Applied);
     assert_eq!(f.admit(0, 2, store(3)), BatchOutcome::Applied);
     assert_eq!(f.blocks(upper), (2, 1));
+}
+
+/// A stream that left takes its own feed's record alone: another
+/// engine's stream still names the model's block size by its own.
+#[test]
+fn a_stream_that_left_takes_its_own_feed_alone() {
+    let f = Ranked::new();
+    let other = f.other(OTHER);
+    f.sink.removed(f.lower);
+    let first = f.sink.admit(other, 0, facts(1), &wide(1, 16));
+    assert_eq!(first, BatchOutcome::Applied);
+    assert_eq!(f.tables.block_size(MODEL), Some(16));
 }
 
 /// A batch of a rank whose row the holder has not laid is passed over,
@@ -2006,6 +2214,27 @@ fn a_removed_engine_clears_every_rank() {
     assert!(rows.written.is_empty() && rows.fed.is_empty());
 }
 
+/// Behind its engine's removal a batch is passed over at every rank,
+/// another rank's first and then the stream's own. Neither writes: no
+/// block, no cursor, and no row taken for the stream.
+#[test]
+fn a_batch_behind_its_engines_removal_is_passed_over_at_every_rank() {
+    let f = Ranked::new();
+    let upper = f.upper();
+    let store = |hash| Data::Stored(wide_store(hash, 16));
+    assert_eq!(f.admit(0, 1, store(1)), BatchOutcome::Applied);
+    assert_eq!(f.admit(1, 1, store(2)), BatchOutcome::Applied);
+    f.sink.removed(f.lower);
+    for rank in [1, 0] {
+        assert_eq!(f.admit(rank, 2, store(3)), BatchOutcome::Skipped);
+        assert_eq!(f.blocks(upper), (0, 0), "rank {rank}");
+        assert_eq!(f.sink.cursor(f.lower, rank), None, "rank {rank}");
+        let rows = f.sink.rows.lock();
+        let nothing = rows.written.is_empty() && rows.fed.is_empty();
+        assert!(nothing, "rank {rank}: a row is kept for the stream");
+    }
+}
+
 /// A new connection of the engine's stream is every fed rank's: a
 /// rank's first batch below its cursor then reads as a publisher that
 /// started over.
@@ -2060,8 +2289,10 @@ fn the_admission_state_is_the_routed_rows() {
 fn a_ranks_row_the_stream_feeds_first_begins_from_nothing() {
     let f = Ranked::new();
     let upper = f.upper();
-    // Another adapter over the same store wrote the row before.
+    // Another adapter over the same store wrote the row before, as a
+    // feed of the row's own.
     let other = KvAdapter::new(Arc::clone(&f.tables));
+    open_feed(&other, upper);
     let before = batch([Data::Stored(wide_store(1, 16))]);
     assert_eq!(
         other.admit(upper, 1, facts(7), &before),
@@ -2230,6 +2461,92 @@ fn a_row_its_leaving_stream_still_clears_is_passed_over() {
     assert_eq!(stream, Some(other));
     assert_eq!(rows.fed.get(&other), Some(&vec![upper]));
     assert_eq!(rows.fed.get(&f.lower), None);
+}
+
+/// A feed can open for a row its leaving stream still clears: the row
+/// was a rank of that stream's engine and is laid again as rank 0 of its
+/// own. The opening leaves the row to the removal, and the feed's batch
+/// is passed over. Its first batch behind the removal's end begins the
+/// row.
+#[test]
+fn a_feed_opened_under_a_leaving_stream_begins_its_row_behind_the_clear() {
+    let f = Ranked::new();
+    let upper = f.upper();
+    let store = |hash| Data::Stored(wide_store(hash, 16));
+    assert_eq!(f.admit(1, 5, store(1)), BatchOutcome::Applied);
+    // The row is laid again in place as rank 0 of its own engine.
+    assert_eq!(f.write(rank_facts(UPPER, UPPER, 0)), upper);
+    // The first engine's stream is leaving: its removal marked the row
+    // and has not cleared it yet. The row's own feed opens there.
+    f.sink
+        .rows
+        .lock()
+        .written
+        .get_mut(&upper)
+        .expect("the row's entry")
+        .leaving = true;
+    let worker = f
+        .host
+        .objects
+        .registry()
+        .get_by_url(UPPER)
+        .expect("the row's object");
+    let ticket = f.host.enroll(&worker, MODEL);
+    let (sink, row) = f.host.open(ticket, &worker, MODEL).expect("the row's feed");
+    assert_eq!(row, upper);
+    // One batch on the row's own stream.
+    let own = |sequence, hash| {
+        let one = batch([store(hash)]);
+        sink.admit(upper, 0, facts(sequence), &one)
+    };
+    assert_eq!(own(1, 2), BatchOutcome::Skipped);
+
+    // The removal ends: the row is cleared and forgotten, and the
+    // feed's next batch begins it.
+    f.sink.removed(f.lower);
+    assert_eq!(f.tables.indexed_blocks(upper, 0), 0);
+    assert_eq!(own(2, 3), BatchOutcome::Applied);
+    assert_eq!(f.tables.indexed_blocks(upper, 0), 1);
+    let rows = f.sink.rows.lock();
+    let stream = rows.written.get(&upper).map(|written| written.stream);
+    assert_eq!(stream, Some(upper));
+    assert!(rows.fed.is_empty());
+}
+
+/// A row named under another address has two feeds open for a time: a
+/// cut ends its object at the first address and lays one at the second,
+/// whose feed opens while the first's removal is not told. That removal
+/// leaves a feed open and takes nothing: the second feed's block stands,
+/// and its next batch is taken. The second's own removal is the row's
+/// last, and clears it.
+#[test]
+fn a_removal_that_leaves_a_feed_open_takes_nothing() {
+    let f = Ranked::new();
+    let store = |hash| Data::Stored(wide_store(hash, 16));
+    // A cut names the row's id under another address.
+    let mut cut = f.store.checkpoint();
+    let moved = cut.rows.iter_mut().find(|row| row.id == f.lower);
+    moved.expect("the row").facts = rank_facts(OTHER, OTHER, 0);
+    assert!(f.host.objects.watch_from(&f.store, cut));
+    let registry = f.host.objects.registry();
+    assert!(registry.get_by_url(URL).is_none(), "the first address");
+    let second = registry.get_by_url(OTHER).expect("the second's object");
+    let ticket = f.host.enroll(&second, MODEL);
+    assert_eq!(ticket, Ok(f.lower));
+    assert!(f.host.open(ticket, &second, MODEL).is_some());
+    assert_eq!(f.admit(0, 1, store(1)), BatchOutcome::Applied);
+
+    // The first address's removal, told behind the second feed's opening.
+    f.sink.removed(f.lower);
+    assert_eq!(f.tables.indexed_blocks(f.lower, 0), 1);
+    assert_eq!(f.admit(0, 2, store(2)), BatchOutcome::Applied);
+    assert_eq!(f.tables.indexed_blocks(f.lower, 0), 2);
+
+    f.sink.removed(f.lower);
+    assert_eq!(f.tables.indexed_blocks(f.lower, 0), 0);
+    assert_eq!(f.admit(0, 3, store(3)), BatchOutcome::Skipped);
+    let rows = f.sink.rows.lock();
+    assert!(rows.written.is_empty() && rows.fed.is_empty());
 }
 
 /// A route read before a row was laid again takes no open feed's own

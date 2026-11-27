@@ -275,10 +275,15 @@ fn a_respill_fronts_its_worker_where_it_is_decided() {
 
 /// A lease's word takes back the claim its own decision made, and no later
 /// decision's claim on the same worker. A key's claim idles out, and a
-/// later decision claims the same worker. The older lease's refusal and
-/// its dispatch elsewhere, both told late, leave that claim. The later
-/// lease's own refusal takes it back. Each lease is dated by its
+/// later decision claims the same worker. The older lease's refusal, told
+/// late, leaves that claim. Its dispatch elsewhere, told late, comes from
+/// the key's older life: it leaves the claim and pins nothing. The later
+/// lease's own refusal takes its claim back. Each lease is dated by its
 /// decision's instant, as a host dates it.
+///
+/// A gateway's sticky map pins where it selects a worker and writes
+/// nothing at a send (`model_gateway/src/policies/manual.rs:322-368`). A
+/// send that comes late leaves a key's new entry as it stands.
 #[test]
 fn a_leases_word_takes_back_the_claim_of_its_own_decision_alone() {
     let engine = session_engine(SessionRule {
@@ -312,9 +317,9 @@ fn a_leases_word_takes_back_the_claim_of_its_own_decision_alone() {
         ..Target::default()
     };
     engine.on_dispatched(&older, &elsewhere, Side::Single, 0);
-    assert_eq!(pins(), Some([other, claimed]), "the later claim stands");
+    assert_eq!(pins(), Some([claimed, WorkerId(0)]), "the later claim");
     engine.on_released(&later, ReleaseReason::CommitFailed);
-    assert_eq!(pins(), Some([other, WorkerId(0)]), "its own refusal");
+    assert_eq!(pins(), Some([WorkerId(0); 2]), "its own refusal");
     // A lease that states no instant reaches a claim by its worker.
     let undated = Lease {
         issued_micros: 0,

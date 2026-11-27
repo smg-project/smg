@@ -552,7 +552,8 @@ pub struct AffinityRows<'a> {
     pub holders: &'a [AffinityHolder],
     /// The pool's warming rows, ascending, by the warm-up stage's rule as
     /// the host applied it: the thin whatever the fleet's age, else the
-    /// young unless every row is young.
+    /// young unless every row is young. The in-process engine names none
+    /// while the model's index of cache events holds no block.
     pub warming: &'a [u32],
     /// The warming rows are the thin.
     pub thin: bool,
@@ -1718,9 +1719,10 @@ pub struct Constraints<'a> {
     /// each encoder to what its encode side's constraints state, against
     /// what the encoder states beside its row
     /// ([`EncodePool::demands`](crate::engine::EncodePool::demands)).
-    /// Over a link a request states them on its frame where its controller
-    /// holds them (`DecideRequest.demands`). A handle refuses any other
-    /// request that states one before it sends it (`DecisionGuard::asked`).
+    /// Over a link a request states them on its frame where its session's
+    /// protocol carries them (`DecideRequest.demands`). Over any other
+    /// session a handle refuses a request that states one before it sends
+    /// it (`DecisionGuard::asked`).
     pub demands: crate::engine::Demands,
     /// The rows a standing veto of this host masks, by position, in order,
     /// where the host did not write them into the rows: a view of a

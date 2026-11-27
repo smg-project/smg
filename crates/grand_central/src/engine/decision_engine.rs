@@ -90,7 +90,11 @@ pub trait RequestMaker {
     /// reads none and a worker stands to be placed. Under a pair's binding
     /// it asks this for a side's shadow profile, inside that side's run,
     /// where neither side's profile reads a ring and the shadow's filters
-    /// kept a worker. A panic here is the shadow's fault, and the time it
+    /// kept a worker: one decision may ask a maker for its two sides' shadow
+    /// profiles, which may read the ring by two words (a key's text and
+    /// heads, or the heads of two rules): a maker answers each by the
+    /// profile it names, and what it keeps of one answer is no answer for
+    /// the other. A panic here is the shadow's fault, and the time it
     /// takes is the shadow's: spent, like the rest of a shadow's run,
     /// ahead of a later ask of the same call.
     fn shadow_ring<'w>(

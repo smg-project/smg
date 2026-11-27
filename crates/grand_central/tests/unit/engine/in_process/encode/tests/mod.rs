@@ -360,7 +360,7 @@ impl Host {
                     placed,
                     |_| true,
                     noted,
-                    Some(SessionCountedUnder::default),
+                    SessionCountedUnder::default,
                 )
             }
         };
@@ -2477,17 +2477,20 @@ impl Filter for ReadsCounts {
 }
 
 /// Under a capped sessions rule each side of an encode request's pair reads
-/// the count of its key's requests on a worker's object under the name the
-/// request's maker states for that side's session, as a pair's own decision
-/// does. A maker that says nothing is of a host whose own guard counts: the
-/// key's text names both sides. A maker of a host that counts by the
-/// decisions it holds says the session's number, and each side keeps a
-/// session of its own. An encoder's row carries no count under any of those
-/// names: an item goes by its content, whatever the request's key.
+/// the count of its key's requests on a worker's object, as a pair's own
+/// decision does. It reads it under the name the request's maker states for
+/// that side's session. A maker that says nothing is of a host whose own
+/// guard counts: the key's text names both sides. A maker of a host that
+/// counts by the decisions it holds says the session's number, and each
+/// side keeps a session of its own.
 ///
-/// The entry of a host that files a pick's lease itself names no count
-/// ([`Loaded::decide_encode_without_lease`]): a controller refuses a rule
-/// under `epd`, and each row of its encode request carries none, as it did.
+/// An encoder's row carries no count under any of those names: an item goes
+/// by its side's policy, whatever the request's key.
+///
+/// The entry of a host that files a pick's lease itself hands its maker's
+/// word too ([`Loaded::decide_encode_without_lease`]). Each side reads its
+/// count under the name that maker states, and an encoder's row carries
+/// none.
 ///
 /// The classic gateway's sticky map reads the count for the role it pins,
 /// under the key's own text, and never for an encoder
@@ -2603,13 +2606,18 @@ fn an_encode_requests_sides_read_their_keys_count_and_its_encoders_none() {
     // Each side under its own session's number: the other side's is no
     // count of its key.
     assert_eq!(read(number, [decode, prefill], true), neither, "crossed");
-    // The entry of a host that files a pick's lease itself names no count:
-    // its rows carry none under either word, whatever is counted there.
-    assert_eq!(read(text, [TALK; 2], false), neither, "unleased, a guard's");
+    // The entry of a host that files a pick's lease itself reads the same
+    // counts, under the name its maker states and under no other.
+    assert_eq!(read(text, [TALK; 2], false), both, "unleased, a guard's");
     assert_eq!(
         read(number, [prefill, decode], false),
-        neither,
+        both,
         "unleased, the held decisions'"
+    );
+    assert_eq!(
+        read(number, [TALK; 2], false),
+        neither,
+        "unleased, no held decision's count"
     );
 }
 

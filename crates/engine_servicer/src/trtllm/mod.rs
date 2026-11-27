@@ -12,6 +12,7 @@ mod generate;
 mod info;
 mod service;
 #[cfg(test)]
+#[path = "../../tests/unit/trtllm/tests.rs"]
 mod tests;
 
 use std::{sync::Arc, time::Duration};

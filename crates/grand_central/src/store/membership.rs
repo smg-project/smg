@@ -8,11 +8,13 @@
     reason = "the store's table of worker records leaves the crate, and its types with it"
 )]
 
-use std::{collections::hash_map::RandomState, fmt, hash::BuildHasher, sync::Arc, time::Instant};
+use std::{collections::hash_map::RandomState, fmt, hash::BuildHasher};
+#[cfg(any(test, feature = "worker-host"))]
+use std::{sync::Arc, time::Instant};
 
-use super::workers::{
-    identity, MembershipChange, Registrant, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus,
-};
+#[cfg(any(test, feature = "worker-host"))]
+use super::workers::{identity, MembershipChange, WorkerPatch};
+use super::workers::{Registrant, WorkerFacts, WorkerRow, WorkerStatus};
 
 /// A write of a row by a caller that did not register it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,6 +133,10 @@ pub(super) fn same_worker(old: &WorkerFacts, new: &WorkerFacts) -> bool {
     old.role == new.role && old.same_models(new) && old.wire_modes == new.wire_modes
 }
 
+// The rule's three items are built where a holder of worker objects is:
+// the holder is the rule's one writer. A test build has one more caller,
+// the cases' road to a store's table.
+#[cfg(any(test, feature = "worker-host"))]
 impl WorkerRow {
     /// What a registration of `facts` by `maker` makes of `standing`, the
     /// row that stands under their key, at `now`: the change, and the
@@ -224,6 +230,7 @@ impl WorkerRow {
     }
 }
 
+#[cfg(any(test, feature = "worker-host"))]
 impl WorkerPatch {
     /// Writes the patch over `facts`: each fact it names, and no other.
     /// Every field is named: one more stops the build here until it says
@@ -259,6 +266,19 @@ impl WorkerFacts {
     /// What a row is charged beside its numbers where its worker states a
     /// fact for a request's hard demands: the wire's block at its widest.
     pub const DEMAND_FACTS: usize = 22;
+    /// What a row is charged beside its numbers where its worker takes
+    /// images: the wire's bit.
+    pub const VISION: usize = 3;
+    /// What a row is charged beside its numbers where its worker's encode
+    /// offer states anything: the wire's block with every role stated and
+    /// no connector. A connector is charged as any text is.
+    pub const ENCODE: usize = 11;
+    /// What a row is charged beside its numbers where its worker states a
+    /// priority other than zero: the wire's number at its widest.
+    pub const PRIORITY: usize = 7;
+    /// What a row is charged beside its numbers where its worker states a
+    /// drain window: the wire's number at its widest.
+    pub const DRAIN_WINDOW: usize = 7;
     /// What a text is charged beside its own bytes.
     pub const FRAME: usize = 5;
     /// The most a row weighs.
@@ -275,6 +295,21 @@ impl WorkerFacts {
         }
         if self.demand_facts != crate::engine::DemandFacts::default() {
             bytes += Self::DEMAND_FACTS;
+        }
+        if self.vision {
+            bytes += Self::VISION;
+        }
+        if self.encode != super::EncodeOffer::default() {
+            bytes += Self::ENCODE;
+            if let Some(connector) = &self.encode.connector {
+                bytes += text(connector);
+            }
+        }
+        if self.priority != 0 {
+            bytes += Self::PRIORITY;
+        }
+        if self.drain_settle_secs.is_some() {
+            bytes += Self::DRAIN_WINDOW;
         }
         if let Some(zone) = &self.zone {
             bytes += text(zone);

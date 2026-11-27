@@ -14,7 +14,7 @@ use std::{
 use smg_grand_central::{
     document::{AppliedSpec, PolicySpec, ShadowSpec},
     engine::Role,
-    service::controller::{Config, Controller, ElectionConfig, Listener, Scope, State},
+    service::controller::{Config, Controller, Listener, Scope, State},
     store::{MemoryStore, Registrant, WorkerFacts, WorkersStore},
     worker_host::{Members, Objects},
 };
@@ -76,32 +76,24 @@ fn loopback() -> SocketAddr {
 }
 
 fn listener(name: &str, scopes: &[Scope]) -> Listener {
-    Listener {
-        name: name.to_owned(),
-        addr: loopback(),
-        scopes: scopes.to_vec(),
-        tls: None,
-    }
+    Listener::of(name.to_owned(), loopback(), scopes.to_vec(), None)
 }
 
 /// The binary's default shape on ephemeral loopback ports.
 fn config(deciders: usize) -> Config {
-    Config {
-        controller_id: "bench-controller".to_owned(),
-        listeners: vec![
+    let mut config = Config::of(
+        "bench-controller".to_owned(),
+        vec![
             listener("gateway", &[Scope::Gateway]),
             listener("control", &[Scope::Control]),
             listener("replication", &[Scope::Replication]),
         ],
-        admin: loopback(),
-        shutdown_settle: Duration::from_millis(10),
-        shutdown_grace: Duration::from_secs(5),
-        load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
-        worker_overload: Config::DEFAULT_WORKER_OVERLOAD,
-        decide_shards: deciders,
-        election: ElectionConfig::default(),
-        discovery: None,
-    }
+        loopback(),
+    );
+    config.shutdown_settle = Duration::from_millis(10);
+    config.shutdown_grace = Duration::from_secs(5);
+    config.decide_shards = deciders;
+    config
 }
 
 /// The band of each of `members` rows, a band a request above the one

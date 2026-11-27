@@ -9,7 +9,7 @@ use std::{
     rc::Rc,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
     thread,
     time::Instant,
@@ -17,7 +17,7 @@ use std::{
 
 use parking_lot::Mutex;
 
-use super::{Loaded, SpecHandle};
+use super::{InForce, Loaded, SpecHandle};
 use crate::{
     document::spec::{AppliedSpec, BindingSpec, Match, PolicySpec},
     engine::{
@@ -34,7 +34,7 @@ use crate::{
         },
         list_cell::PublishedList,
         prompt_hashes::HashSeeds,
-        shadow::Shadowed,
+        shadow::{ShadowCounts, Shadowed},
         view::{Candidate, RequestFacts, WorkerId},
     },
     policies::random::Random,
@@ -101,6 +101,14 @@ impl InProcess {
     pub(crate) fn count_shadow(&self, said: Option<Shadowed>) {
         let document = self.in_force();
         self.under(&document).count_shadow(said);
+    }
+}
+
+impl InForce {
+    /// The tables of the shadow decisions counted so far, for a case that
+    /// reads whether they were allocated or writes a count of its own.
+    pub(in crate::engine::in_process) fn shadow_tables(&self) -> &OnceLock<Box<ShadowCounts>> {
+        &self.shadow_tables
     }
 }
 
@@ -467,6 +475,37 @@ fn a_document_put_in_force_inside_a_decision_decides_the_next_one() {
     assert_eq!(engine.spec().generation(), 2);
     let after = decided(&engine, &maker.asks).decision;
     assert_eq!(after.trace().generation, 2, "the next decision");
+}
+
+/// A decision kept as a sample is kept by the document it began under. A
+/// document put in force while the decision makes its request takes no
+/// record of it. The record stands in the first document's ring, where a
+/// handle of that document reads it. The engine reads the ring of the
+/// document in force, and finds none there.
+#[test]
+fn a_decision_is_kept_by_the_document_it_began_under() {
+    let keeping_each = |number: u64| {
+        let mut document = PolicySpec::preset("least_load").expect("a built-in preset");
+        document.generation = number;
+        document.explain.sample = 1;
+        AppliedSpec::validate(&document).expect("the document validates")
+    };
+    let engine = InProcess::new(keeping_each(1));
+    let first = engine.spec();
+    let members = PublishedList::new(pool(4));
+    let maker = AppliesInside {
+        asks: Asks::of(request(), Some(&members)),
+        engine: &engine,
+        next: Cell::new(Some(keeping_each(2))),
+    };
+    let answer = engine.decide_under(GatewayId::LOCAL, &maker, Instant::now());
+    let (began, _) = answer.expect("an answer").whole().expect("no place");
+    assert_eq!(engine.spec().generation(), 2, "the next is in force");
+    let kept = first.0.kept_sample(b"request");
+    let record = kept.expect("kept by the document the decision began under");
+    assert_eq!(record.decision, began.decision);
+    assert_eq!(record.decision.trace().generation, 1);
+    assert_eq!(engine.explained(b"request"), None, "the ring in force");
 }
 
 /// The record of sent prompts is the engine's and stands across a new

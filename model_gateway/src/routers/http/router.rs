@@ -42,7 +42,7 @@ use openai_protocol::{
 use reqwest::multipart::{Form, Part};
 use smg_worker::{
     identity::{
-        basic::{ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerType},
+        basic::{BasicWorker, ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerType},
         endpoint::Endpoint,
     },
     metrics::writers::Metrics as WorkerMetrics,
@@ -61,6 +61,7 @@ use crate::{
             request_body_stalled_response, REQUEST_BODY_STALLED, REQUEST_BODY_TOO_LARGE,
         },
         scheduler::PreemptionGuard,
+        sse_keepalive::names_event_stream,
         TenantRequestMeta,
     },
     observability::{
@@ -94,7 +95,7 @@ use crate::{
             retry::{
                 is_request_timeout, is_retryable_response, request_timeout_response, RetryExecutor,
             },
-            snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt},
+            snapshot::{BodyFacts, RoutingPool, WorkerRegistry, WorkerRegistryExt},
             sse_rechunk::{NoopObserver, RechunkPolicy, SseRechunker},
             stream::GuardedStream,
             worker_selection::{SelectWorkerRequest, WorkerSelector},
@@ -751,9 +752,10 @@ impl Router {
             .dispatch_attempt(attempt, &placed, &mut decision_adapter)
             .await;
 
-        // A streamed head's success was recorded before its relay task was
-        // spawned (see `forward_worker_response`); the adapter's verdict
-        // below may still turn the answer into a failure, which is recorded.
+        // A streamed head's breaker sample is its relay's to take, at the
+        // head or at the stream's end (see `forward_worker_response`); the
+        // adapter's verdict below may still turn the answer into a failure,
+        // which is recorded.
         let head_success_recorded = head_success_recorded(&response);
 
         // Judge the converted result so malformed successes become backend
@@ -995,8 +997,8 @@ impl Router {
     }
 
     /// The attempt's answer on the request's ledger: the worker's breaker
-    /// outcome, unless a streamed head already recorded a success that the
-    /// verdict kept; the retry window settled on a definitive answer; the
+    /// outcome, unless a streamed head left its sample to its relay and the
+    /// verdict kept it; the retry window settled on a definitive answer; the
     /// engine on the tried list after a replayable failure; the worker error
     /// metric on a server error. Where the breaker's outcome is recorded,
     /// the same status is reported through `placed`, the answer the
@@ -1557,7 +1559,7 @@ impl Router {
                 .get(CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
             {
-                Some(ct) => ct.starts_with("text/event-stream"),
+                Some(ct) => names_event_stream(ct),
                 None => status.is_success(),
             };
             let rechunker = rechunk
@@ -1703,7 +1705,7 @@ impl Router {
             .headers()
             .get(CONTENT_TYPE)
             .and_then(|ct| ct.to_str().ok())
-            .is_some_and(|ct| ct.starts_with("text/event-stream"));
+            .is_some_and(names_event_stream);
         self.forward_worker_response(
             res,
             StreamRelayMode {
@@ -2375,13 +2377,47 @@ pub(super) fn convert_reqwest_error(e: reqwest::Error) -> Response {
 
 use async_trait::async_trait;
 
+/// Whether a card of `worker` names an alias.
+fn names_an_alias(worker: &Arc<dyn Worker>) -> bool {
+    let models = &worker.metadata().spec.models;
+    models.iter().any(|card| !card.aliases.is_empty())
+}
+
+/// What `workers` say together to the decision of a request's body path,
+/// for their generation to keep; `None` at the first one that is not the
+/// built-in type, as nothing a worker of another type says is kept.
+fn kept_body_facts(workers: &[Arc<dyn Worker>]) -> Option<BodyFacts> {
+    let mut facts = BodyFacts {
+        aliased: false,
+        mutates: false,
+    };
+    for worker in workers {
+        // The type of the object itself: `Worker::as_any` is a worker's own
+        // answer, and one that wraps a built-in worker may give that one.
+        let object: &dyn std::any::Any = &**worker;
+        if !object.is::<BasicWorker>() {
+            return None;
+        }
+        facts.aliased |= names_an_alias(worker);
+        facts.mutates |= worker.mutates_request();
+    }
+    Some(facts)
+}
+
 impl Router {
     /// Gather this router's per-request state for the shared decision matrix
     /// in [`crate::routers::common::body_policy`].
     fn request_body_path(&self, headers: &HeaderMap, wasm_request_hooks: bool) -> BodyPath {
-        let candidates = self
-            .worker_registry
-            .get_routing_pool(UNKNOWN_MODEL_ID, RoutingPool::HttpRegular);
+        // What built-in workers say together is kept by their membership
+        // generation: the first decision behind a membership change reads
+        // them, every later one reads the kept answers and walks no worker.
+        // A worker of another type may change an answer on the handle the
+        // generation holds, so with one among them nothing is kept, and
+        // each question below walks the generation's pool to its first yes
+        // at every decision.
+        let generation = self.worker_registry.global_generation();
+        let kept = generation.body_facts(kept_body_facts);
+        let live = || generation.pool(RoutingPool::HttpRegular);
         decide_body_path(&BodyPathInputs {
             routing_key_override: self.policy_registry.routing_key_override_enabled(),
             // The body question: a document keyed by a request's own id
@@ -2392,11 +2428,14 @@ impl Router {
             // A worker knows a model's canonical id alone, and only a body
             // read here has an alias in it rewritten to that id.
             model_ambiguous: self.worker_registry.model_count() > 1
-                || candidates.iter().any(|w| {
-                    let models = &w.metadata().spec.models;
-                    models.iter().any(|card| !card.aliases.is_empty())
-                }),
-            worker_mutates_body: candidates.iter().any(|w| w.mutates_request()),
+                || match kept {
+                    Some(facts) => facts.aliased,
+                    None => live().iter().any(names_an_alias),
+                },
+            worker_mutates_body: match kept {
+                Some(facts) => facts.mutates,
+                None => live().iter().any(|worker| worker.mutates_request()),
+            },
             wasm_request_hooks,
             content_length: header_utils::content_length(Some(headers)).map(|len| len as u64),
             // The model sits inside the unread body, so any per-model retry
@@ -2526,9 +2565,9 @@ impl Router {
             REQUEST_BODY_STALLED | REQUEST_BODY_TOO_LARGE | STREAMED_BODY_ABORTED
         );
         if !client_body_fault {
-            // A streamed head's success was recorded before its relay task
-            // was spawned (see `forward_worker_response`), and its end is
-            // that relay's to report.
+            // A streamed head's breaker sample is its relay's to take (see
+            // `forward_worker_response`), and its end is that relay's to
+            // report.
             if !head_success_recorded(&response) {
                 worker.record_outcome(status.as_u16());
                 placed.ended(status.as_u16(), || worker_answered(&response));
@@ -3105,15 +3144,19 @@ impl RouterTrait for Router {
 mod tests {
     use std::{
         net::SocketAddr,
-        sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering},
     };
 
     use axum::http::header::{CONTENT_LENGTH, RETRY_AFTER};
     use openai_protocol::{model_card::ModelCard, profile::ProviderProfile, rerank::RerankResult};
     use serde_json::{json, Value};
     use smg_worker::{
-        health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
-        identity::basic::BasicWorker,
+        connection::engine::EngineConnection,
+        health::{
+            circuit_breaker::{CircuitBreakerConfig, CircuitState},
+            resilience::ResolvedResilience,
+        },
+        identity::{basic::WorkerMetadata, error::WorkerResult},
         test_support::{no_health_check, RefusedAddress},
     };
 
@@ -4836,6 +4879,218 @@ mod tests {
         );
     }
 
+    /// The body decision reads the regular workers once in a membership
+    /// generation: the first decision keeps their answers, a later one
+    /// reads the kept answers, and the decision behind a membership change
+    /// reads the members of its own generation.
+    #[test]
+    fn the_body_decision_asks_the_workers_once_a_generation() {
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![]);
+        router
+            .worker_registry
+            .register_or_replace(Arc::new(plain_worker("http://worker1:8080")));
+        let headers = headers_with_content_length(Some("64"));
+        let streamed = BodyPath::Stream(REASON_RETRY_FORFEITED);
+        // The answers the generation of the moment holds; one that holds
+        // none would read its workers here.
+        let kept = || {
+            let generation = router.worker_registry.global_generation();
+            generation.body_facts(|_| panic!("no decision kept the answers"))
+        };
+        let plain = BodyFacts {
+            aliased: false,
+            mutates: false,
+        };
+
+        assert_eq!(router.request_body_path(&headers, false), streamed);
+        assert_eq!(kept(), Some(plain), "the first decision keeps the answers");
+        assert_eq!(router.request_body_path(&headers, false), streamed);
+
+        // A worker that rewrites its body joins, then leaves: each change
+        // publishes a generation, and the request behind it decides by the
+        // members of that generation.
+        let mutating = BasicWorkerBuilder::new("http://worker2:8080")
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .dp_config(3, 8)
+            .build();
+        let joined = router
+            .worker_registry
+            .register_or_replace(Arc::new(mutating));
+        assert_eq!(
+            router.request_body_path(&headers, false),
+            BodyPath::Buffer(REASON_WORKER_MUTATES_BODY)
+        );
+        assert_eq!(
+            kept(),
+            Some(BodyFacts {
+                mutates: true,
+                ..plain
+            })
+        );
+        router.worker_registry.remove(&joined).unwrap();
+        assert_eq!(router.request_body_path(&headers, false), streamed);
+        assert_eq!(kept(), Some(plain));
+    }
+
+    /// A regular worker of another type around a built-in one. It answers
+    /// [`Worker::as_any`] with the worker it wraps, says whether it
+    /// rewrites its body from a flag that changes on the handle, and counts
+    /// how often it is asked.
+    #[derive(Debug)]
+    struct Wrapper {
+        inner: BasicWorker,
+        mutates: AtomicBool,
+        asked: AtomicUsize,
+    }
+
+    impl Wrapper {
+        fn around(url: &str) -> Self {
+            Self {
+                inner: plain_worker(url),
+                mutates: AtomicBool::new(false),
+                asked: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Worker for Wrapper {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self.inner.as_any()
+        }
+        fn url(&self) -> &str {
+            self.inner.url()
+        }
+        fn api_key(&self) -> Option<&String> {
+            self.inner.api_key()
+        }
+        fn worker_type(&self) -> &WorkerType {
+            self.inner.worker_type()
+        }
+        fn connection_mode(&self) -> &ConnectionMode {
+            self.inner.connection_mode()
+        }
+        fn status(&self) -> openai_protocol::worker::WorkerStatus {
+            self.inner.status()
+        }
+        fn set_status(&self, status: openai_protocol::worker::WorkerStatus) {
+            self.inner.set_status(status);
+        }
+        fn load(&self) -> usize {
+            self.inner.load()
+        }
+        fn increment_load(&self) {
+            self.inner.increment_load();
+        }
+        fn decrement_load(&self) {
+            self.inner.decrement_load();
+        }
+        fn routing_key_load(&self) -> usize {
+            self.inner.routing_key_load()
+        }
+        fn routing_key_inflight(&self, routing_key: &str) -> usize {
+            self.inner.routing_key_inflight(routing_key)
+        }
+        fn increment_routing_key_load(&self, routing_key: &str) {
+            self.inner.increment_routing_key_load(routing_key);
+        }
+        fn decrement_routing_key_load(&self, routing_key: &str) {
+            self.inner.decrement_routing_key_load(routing_key);
+        }
+        fn processed_requests(&self) -> usize {
+            self.inner.processed_requests()
+        }
+        fn increment_processed(&self) {
+            self.inner.increment_processed();
+        }
+        fn metadata(&self) -> &WorkerMetadata {
+            self.inner.metadata()
+        }
+        fn circuit_breaker_state(&self) -> CircuitState {
+            self.inner.circuit_breaker_state()
+        }
+        fn circuit_breaker_can_execute(&self) -> bool {
+            self.inner.circuit_breaker_can_execute()
+        }
+        fn record_circuit_breaker_outcome(&self, success: bool) {
+            self.inner.record_circuit_breaker_outcome(success);
+        }
+        fn resilience(&self) -> &ResolvedResilience {
+            self.inner.resilience()
+        }
+        fn http_client(&self) -> &reqwest::Client {
+            self.inner.http_client()
+        }
+        fn http_client_handle_if_initialized(&self) -> Option<Arc<reqwest::Client>> {
+            self.inner.http_client_handle_if_initialized()
+        }
+        async fn check_health_async(&self) -> WorkerResult<()> {
+            self.inner.check_health_async().await
+        }
+        async fn engine_connection(&self) -> WorkerResult<Option<Arc<dyn EngineConnection>>> {
+            self.inner.engine_connection().await
+        }
+        fn mutates_request(&self) -> bool {
+            self.asked.fetch_add(1, AtomicOrdering::SeqCst);
+            self.mutates.load(AtomicOrdering::SeqCst)
+        }
+    }
+
+    /// A worker of another type is asked at every decision, also one that
+    /// answers [`Worker::as_any`] with the built-in worker it wraps: what
+    /// it says changes on the handle a generation holds, behind no
+    /// membership change.
+    #[test]
+    fn the_body_decision_asks_a_worker_of_another_type_every_time() {
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![]);
+        let wrapper = Arc::new(Wrapper::around("http://worker1:8080"));
+        router
+            .worker_registry
+            .register_or_replace(Arc::clone(&wrapper) as Arc<dyn Worker>);
+        let headers = headers_with_content_length(Some("64"));
+
+        wrapper.mutates.store(true, AtomicOrdering::SeqCst);
+        assert_eq!(
+            router.request_body_path(&headers, false),
+            BodyPath::Buffer(REASON_WORKER_MUTATES_BODY)
+        );
+        wrapper.mutates.store(false, AtomicOrdering::SeqCst);
+        assert_eq!(
+            router.request_body_path(&headers, false),
+            BodyPath::Stream(REASON_RETRY_FORFEITED)
+        );
+        assert_eq!(wrapper.asked.load(AtomicOrdering::SeqCst), 2);
+    }
+
+    /// A decision that finds answers kept reads those and asks no worker.
+    /// The worker here counts how often it is asked; the test keeps the
+    /// answers itself, as the first decision does for built-in workers,
+    /// and keeps one this worker does not give.
+    #[test]
+    fn the_body_decision_asks_no_worker_behind_kept_answers() {
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![]);
+        let counted = Arc::new(Wrapper::around("http://worker1:8080"));
+        router
+            .worker_registry
+            .register_or_replace(Arc::clone(&counted) as Arc<dyn Worker>);
+        let headers = headers_with_content_length(Some("64"));
+        let kept = BodyFacts {
+            aliased: false,
+            mutates: true,
+        };
+        let generation = router.worker_registry.global_generation();
+        assert_eq!(generation.body_facts(|_| Some(kept)), Some(kept));
+
+        for _ in 0..2 {
+            assert_eq!(
+                router.request_body_path(&headers, false),
+                BodyPath::Buffer(REASON_WORKER_MUTATES_BODY)
+            );
+        }
+        assert_eq!(counted.asked.load(AtomicOrdering::SeqCst), 0);
+    }
+
     #[test]
     fn per_model_retry_override_keeps_small_bodies_buffered() {
         let mut router = streaming_router(
@@ -6399,8 +6654,8 @@ mod tests {
         );
     }
 
-    /// The successful head of a streamed response is recorded on the worker's
-    /// breaker before the relay task is spawned, so a body the worker cuts
+    /// On a breaker that is not closed, a streamed response's successful head
+    /// is recorded before the relay task is spawned, so a body the worker cuts
     /// right behind the head is sampled after the head's success and stands,
     /// instead of being erased by a success recorded after it. Read on a
     /// current-thread runtime, where the relay cannot run before the body is
@@ -6720,6 +6975,84 @@ mod tests {
             "the event names the timeout as the 504 does: {body}"
         );
         assert_eq!(events[3], "data: [DONE]");
+    }
+
+    /// A stream the gateway's request timeout ends is its worker's failure,
+    /// as the timeout of a request that is not streamed is
+    /// (`a_request_timeout_is_answered_once_and_not_replayed`), and a closed
+    /// breaker's one sample of that stream: two such streams in a row open a
+    /// breaker with a threshold of two, the next request finds no worker, and
+    /// the outcome series counts the two failures alone. The head's success
+    /// used to set the failure streak back between the two, and was counted.
+    /// The timeout also covers the connect and the head, which run on the
+    /// wall clock, so it is wide; the clock is paused once a head is in, and
+    /// the body's read runs the timeout out with no wait.
+    #[tokio::test]
+    async fn streams_the_request_timeout_ends_open_the_breaker_at_its_threshold() {
+        let url =
+            spawn_stalled_stream_stub("/v1/chat/completions", "text/event-stream", CHAT_SSE_CHUNKS)
+                .await;
+        let worker = BasicWorkerBuilder::new(&url)
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .circuit_breaker_config(CircuitBreakerConfig {
+                failure_threshold: 2,
+                ..Default::default()
+            })
+            .http_client(client_with_timeout(Duration::from_secs(30)))
+            .build();
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![worker]);
+        let worker = Arc::clone(&router.worker_registry.get_all()[0]);
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let chat = || {
+            router.route_typed_request(
+                None,
+                None,
+                streaming_chat_request(),
+                "/v1/chat/completions",
+                UNKNOWN_MODEL_ID,
+            )
+        };
+
+        for (stream, behind_it) in [(1, CircuitState::Closed), (2, CircuitState::Open)] {
+            let response = chat().await;
+            assert_eq!(response.status(), StatusCode::OK, "stream {stream}");
+            tokio::time::pause();
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("the body ends cleanly after the error event");
+            tokio::time::resume();
+            let body = std::str::from_utf8(&body).unwrap();
+            assert!(
+                body.contains("call_upstream_timeout"),
+                "stream {stream}: {body}"
+            );
+            assert_eq!(
+                worker.circuit_breaker_state(),
+                behind_it,
+                "behind stream {stream} of the two the timeout ended"
+            );
+        }
+
+        let response = chat().await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            "no_available_workers"
+        );
+        // One sample a stream: the two failures, and no head's success.
+        let rendered = handle.render();
+        let outcomes: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("smg_worker_cb_outcomes_total{"))
+            .collect();
+        assert_eq!(outcomes.len(), 1, "{rendered}");
+        assert!(
+            outcomes[0].contains(r#"outcome="failure""#) && outcomes[0].ends_with(" 2"),
+            "{rendered}"
+        );
     }
 
     /// On the Messages API the same cut ends the stream with the API's own
@@ -7603,6 +7936,71 @@ mod tests {
                             \"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\
                             \"finish_reason\":null}]}\n\n\
                             data: [DONE]\n\n";
+
+    /// A media type's name is case-insensitive (RFC 9110, section 8.3.1):
+    /// a typed route relays a worker's event stream as one however the
+    /// worker spells the type. Matched by its lowercase spelling alone, a
+    /// `Text/Event-Stream` answer kept the upstream's `Content-Length`, as
+    /// a body that is no event stream does.
+    #[tokio::test]
+    async fn a_typed_routes_event_stream_is_one_however_the_worker_spells_its_type() {
+        use openai_protocol::validated::Normalizable;
+
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let mut answers = Vec::new();
+        for content_type in ["text/event-stream", "Text/Event-Stream"] {
+            let url = spawn_sized_worker(SIZED_DELTA_BODY, content_type).await;
+            let router =
+                streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
+            let mut request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "served-plain-relay-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 16,
+                "stream": true,
+            }))
+            .unwrap();
+            request.normalize();
+            let response = router
+                .route_chat(None, &tenant, Arc::new(request), UNKNOWN_MODEL_ID)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK, "{content_type}");
+            let sized = response.headers().contains_key(CONTENT_LENGTH);
+            let bytes = http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .unwrap()
+                .to_bytes();
+            answers.push((sized, bytes));
+        }
+        assert!(!answers[0].0, "an event stream carries no upstream length");
+        assert_eq!(
+            answers[1], answers[0],
+            "the answer under `Text/Event-Stream` is the one under `text/event-stream`"
+        );
+    }
+
+    /// The pass-through reads the type the same way: a worker's event
+    /// stream under another spelling is relayed, where it was buffered
+    /// whole and refused above the payload limit.
+    #[tokio::test]
+    async fn a_passed_through_event_stream_is_relayed_however_the_worker_spells_its_type() {
+        for content_type in ["text/event-stream", "Text/Event-Stream"] {
+            let (url, _captured) = spawn_capture_stub(content_type, SIZED_DELTA_BODY).await;
+            // A payload limit under the answer's length: a relayed stream
+            // passes it, a buffered answer does not.
+            let router = streaming_router(PolicyConfig::RoundRobin, 64, vec![plain_worker(&url)]);
+
+            let response = router
+                .route_streaming_request(streamed_request(&[b"{}"]), "/generate", false)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{content_type}");
+            let bytes = http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .unwrap()
+                .to_bytes();
+            assert_eq!(bytes, SIZED_DELTA_BODY.as_bytes(), "{content_type}");
+        }
+    }
 
     /// A streamed SSE relay may change the body's length, by re-slicing it
     /// or by ending a cut stream with its error event, so a sized upstream

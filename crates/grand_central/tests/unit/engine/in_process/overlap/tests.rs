@@ -987,47 +987,328 @@ fn a_request_under_another_name_leaves_the_records_bound() {
     assert_eq!(bed.holders(&asked, NOW), [(1, 0, 4)]);
 }
 
-/// A model its workers registered after their first shares the record of
-/// the id they registered first, and that id's index settings bound it: a
-/// request for the later model reads them, before a request for the first
-/// model and after one.
+/// A model its workers list behind their first reads its own record, and
+/// its own index settings bound it, whichever worker stands first in its
+/// list: the workers of a shared model registered under different first
+/// models. Another name of the model's card reads the same record, and a
+/// card that lists the model's id as an alias takes none of its requests.
 #[test]
-fn a_later_model_of_its_workers_shares_the_first_models_record() {
+fn a_shared_model_of_its_workers_reads_its_own_record() {
     use smg_worker::{
         identity::builder::BasicWorkerBuilder, model_card::ModelCard, test_support::no_health_check,
     };
 
     use crate::document::spec::IndexSpec;
-    const LATER: &str = "model-b";
+    const SHARED: &str = "model-s";
+    const ALIAS: &str = "alias-s";
     let (affinity, _, _) = hosted(false);
     let mut document = PolicySpec::preset("cache_aware").expect("the preset");
     document.generation = 1;
-    // One placement under the later model's name, the default under the first's.
-    let one = IndexSpec {
-        max_size: u64::from(BLOCK),
-        ..IndexSpec::default()
-    };
-    document.index.insert(LATER.into(), one);
-    document.index.insert(MODEL.into(), IndexSpec::default());
+    // One placement under each first model's name, the default under the
+    // shared model's.
+    for first in [MODEL, "model-b"] {
+        let one = IndexSpec {
+            max_size: u64::from(BLOCK),
+            ..IndexSpec::default()
+        };
+        document.index.insert(first.into(), one);
+    }
+    document.index.insert(SHARED.into(), IndexSpec::default());
     let spec = AppliedSpec::validate(&document).expect("the document validates");
-    let mut bed = Bed::new(affinity, spec, 4);
-    for (at, worker) in bed.workers.iter_mut().enumerate() {
-        let models = vec![ModelCard::new(MODEL), ModelCard::new(LATER)];
-        let built = <BasicWorkerBuilder>::new(address(at)).models(models);
-        *worker = Arc::new(built.health_config(no_health_check()).build());
+    let mut bed = Bed::new(affinity, spec, 2);
+    for (at, first) in [MODEL, "model-b"].into_iter().enumerate() {
+        // The first model's card lists the shared model's id as an alias,
+        // ahead of the shared model's own card: the id answers.
+        let other = ModelCard::new(first).with_alias(SHARED);
+        let shared = ModelCard::new(SHARED).with_alias(ALIAS);
+        let built = <BasicWorkerBuilder>::new(address(at)).models(vec![other, shared]);
+        bed.workers[at] = Arc::new(built.health_config(no_health_check()).build());
     }
     let asked = prompt(1_000, 4);
-    let later = RequestFacts {
-        model: LATER,
+    let shared = RequestFacts {
+        model: SHARED,
         ..request(&asked, 7, NOW)
     };
-    bed.decide(&later, Some(1));
+    bed.decide(&shared, Some(1));
     bed.affinity.sweep();
-    // The holders are asked under the first model's name.
-    assert_eq!(bed.holders(&asked, NOW), [(1, 0, 4)]);
-    bed.decide(&later, None);
+    let named = bed.decide(&shared, None).expect("rows named");
+    assert_eq!(named.holders, [(1, 0, 4)], "the shared model's own bound");
+    // The list is published again headed by the other worker.
+    bed.workers.swap(0, 1);
+    bed.ids.swap(0, 1);
+    bed.pool = PoolAffinity::default();
+    let alias = RequestFacts {
+        model: ALIAS,
+        ..request(&asked, 7, NOW)
+    };
+    let named = bed.decide(&alias, None).expect("rows named");
+    assert_eq!(named.holders, [(0, 0, 4)], "one record a card");
+}
+
+/// A host that keeps the trees of a model its workers list behind their
+/// first lends them to a request for that model: the token tree and the
+/// string tree are asked for under the id the record is kept under, the
+/// shared model's own, though the first worker of the list states another
+/// model first. This host lends no tree under either first model.
+#[test]
+fn a_shared_model_of_its_workers_reads_the_trees_lent_for_it() {
+    use smg_worker::{
+        identity::builder::BasicWorkerBuilder, model_card::ModelCard, test_support::no_health_check,
+    };
+
+    const SHARED: &str = "model-s";
+    /// A host that lends its two trees for the shared model alone.
+    struct Lender {
+        tree: Arc<TokenTree>,
+        text: Arc<StringTree>,
+    }
+    impl CacheIndexes for Lender {
+        fn index(&self, _: &str) -> Option<Arc<dyn CacheIndex>> {
+            None
+        }
+
+        fn block_size(&self, _: &str) -> Option<u32> {
+            Some(BLOCK)
+        }
+
+        fn token_tree(&self, model: &str, phase: Phase) -> Option<Arc<TokenTree>> {
+            (model == SHARED && phase == Phase::Single).then(|| Arc::clone(&self.tree))
+        }
+
+        fn string_tree(&self, model: &str, phase: Phase) -> Option<Arc<StringTree>> {
+            (model == SHARED && phase == Phase::Single).then(|| Arc::clone(&self.text))
+        }
+    }
+    let tree = Arc::new(TokenTree::with_config(BLOCK as usize, Default::default()));
+    let text_tree = Arc::new(StringTree::new());
+    let host = Lender {
+        tree: Arc::clone(&tree),
+        text: Arc::clone(&text_tree),
+    };
+    let affinity = Affinity::default();
+    affinity.set_indexes(Arc::new(host) as Arc<dyn CacheIndexes>);
+    let mut bed = Bed::new(affinity, preset("cache_aware"), 2);
+    for (at, first) in [MODEL, "model-b"].into_iter().enumerate() {
+        let cards = vec![ModelCard::new(first), ModelCard::new(SHARED)];
+        let built = <BasicWorkerBuilder>::new(address(at)).models(cards);
+        bed.workers[at] = Arc::new(built.health_config(no_health_check()).build());
+    }
+    // A request of token ids for the shared model, sent to the worker at 1:
+    // the host's token tree holds it for that worker.
+    let ids = tokens(1_000, 4);
+    let hashes = hashed(&ids);
+    let asked = RequestFacts {
+        model: SHARED,
+        ..request(&hashes, 7, NOW)
+    };
+    let key = || TokenKey {
+        tokens: Cow::Borrowed(&ids[..]),
+        marker: 0,
+    };
+    bed.decide_keyed(&asked, Some(key()), Some(1));
+    let named = bed.decide_keyed(&asked, Some(key()), None);
+    assert_eq!(named.expect("rows named").holders, [(1, 0, 4)]);
+    let held = tree.get_tenant_token_counts();
+    assert_eq!(held.get(&address(1)), Some(&ids.len()), "the token tree");
+    // A request of text for it, sent to the worker at 0: the host's string
+    // tree holds it for that worker.
+    let words = text(1_000, 4);
+    let hashes = worded(&words);
+    let asked = RequestFacts {
+        model: SHARED,
+        ..request(&hashes, 7, NOW)
+    };
+    let entry = || TextKey {
+        text: Cow::Borrowed(words.as_str()),
+        marker: 0,
+    };
+    bed.decide_entered(&asked, None, (None, Some(entry())), Some(0));
+    let named = bed.decide_entered(&asked, None, (None, Some(entry())), None);
+    assert_eq!(named.expect("rows named").holders, [(0, 0, 4)]);
+    let found = text_tree.match_prefix_with_counts(&words);
+    let sent = [TenantId::from(address(0))];
+    assert_eq!(found.matched_tenants, sent, "the string tree");
+}
+
+/// A record its lists read from behind their first models is held by the
+/// smallest block size they ask with, whichever worker heads the list. The
+/// host knows 16 tokens a block under one first model and 32 under every
+/// other; the shared model's record of 128 tokens keeps its eight blocks
+/// under both heads and behind a sweep, and under the head that states the
+/// shared model first, of 32 tokens a block, too.
+#[test]
+fn a_shared_models_record_is_held_by_the_smallest_block_size_of_its_heads() {
+    use smg_worker::{
+        identity::builder::BasicWorkerBuilder, model_card::ModelCard, test_support::no_health_check,
+    };
+
+    use crate::document::spec::IndexSpec;
+
+    const SHARED: &str = "model-s";
+    /// A host that knows a block size a model and lends no index.
+    struct Widths;
+    impl CacheIndexes for Widths {
+        fn index(&self, _: &str) -> Option<Arc<dyn CacheIndex>> {
+            None
+        }
+
+        fn block_size(&self, model: &str) -> Option<u32> {
+            Some(if model == MODEL { 16 } else { 32 })
+        }
+    }
+    let affinity = Affinity::default();
+    affinity.set_indexes(Arc::new(Widths) as Arc<dyn CacheIndexes>);
+    let mut document = PolicySpec::preset("cache_aware").expect("the preset");
+    document.generation = 1;
+    let small = IndexSpec {
+        max_size: 128,
+        ..IndexSpec::default()
+    };
+    document.index.insert("*".into(), small);
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    let mut bed = Bed::new(affinity, spec, 3);
+    for (at, first) in [Some(MODEL), Some("model-b"), None].into_iter().enumerate() {
+        let mut cards: Vec<_> = first.into_iter().map(ModelCard::new).collect();
+        cards.push(ModelCard::new(SHARED));
+        let built = <BasicWorkerBuilder>::new(address(at)).models(cards);
+        bed.workers[at] = Arc::new(built.health_config(no_health_check()).build());
+    }
+    let hashes = prompt(1_000, 8);
+    let asked = RequestFacts {
+        model: SHARED,
+        ..request(&hashes, 7, NOW)
+    };
+    // Eight blocks go to the worker at 1, under the head of 16 tokens a
+    // block.
+    bed.decide(&asked, Some(1));
+    let named = bed.decide(&asked, None).expect("rows named");
+    assert_eq!(named.holders, [(1, 0, 8)], "headed by 16 tokens a block");
+    // The worker of 32 tokens a block heads the list: the holder stands at 0.
+    bed.workers.swap(0, 1);
+    bed.ids.swap(0, 1);
+    bed.pool = PoolAffinity::default();
+    let named = bed.decide(&asked, None).expect("rows named");
+    assert_eq!(named.holders, [(0, 0, 8)], "headed by 32 tokens a block");
     bed.affinity.sweep();
-    assert_eq!(bed.holders(&asked, NOW), [(1, 0, 4)]);
+    let named = bed.decide(&asked, None).expect("rows named");
+    assert_eq!(named.holders, [(0, 0, 8)], "behind a sweep");
+    // The worker that states the shared model first heads the list: the
+    // holder stands at 2.
+    bed.workers.swap(0, 2);
+    bed.ids.swap(0, 2);
+    bed.pool = PoolAffinity::default();
+    bed.decide(&asked, None);
+    bed.affinity.sweep();
+    let named = bed.decide(&asked, None).expect("rows named");
+    assert_eq!(
+        named.holders,
+        [(2, 0, 8)],
+        "headed by the shared model first"
+    );
+}
+
+/// A shared record keeps the block size its own first model asked with. The
+/// host knows 16 tokens a block under the shared model and 32 under every
+/// other. The worker that states the shared model first heads the list and
+/// the record of 128 tokens takes eight blocks; a worker that states it
+/// behind another model then heads the list, and the eight blocks stand
+/// behind a sweep.
+#[test]
+fn a_shared_models_record_keeps_the_block_size_its_own_head_asked_with() {
+    use smg_worker::{
+        identity::builder::BasicWorkerBuilder, model_card::ModelCard, test_support::no_health_check,
+    };
+
+    use crate::document::spec::IndexSpec;
+
+    const SHARED: &str = "model-s";
+    /// A host that knows a block size a model and lends no index.
+    struct Widths;
+    impl CacheIndexes for Widths {
+        fn index(&self, _: &str) -> Option<Arc<dyn CacheIndex>> {
+            None
+        }
+
+        fn block_size(&self, model: &str) -> Option<u32> {
+            Some(if model == SHARED { 16 } else { 32 })
+        }
+    }
+    let affinity = Affinity::default();
+    affinity.set_indexes(Arc::new(Widths) as Arc<dyn CacheIndexes>);
+    let mut document = PolicySpec::preset("cache_aware").expect("the preset");
+    document.generation = 1;
+    let small = IndexSpec {
+        max_size: 128,
+        ..IndexSpec::default()
+    };
+    document.index.insert("*".into(), small);
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    let mut bed = Bed::new(affinity, spec, 2);
+    for (at, first) in [None, Some("model-b")].into_iter().enumerate() {
+        let mut cards: Vec<_> = first.into_iter().map(ModelCard::new).collect();
+        cards.push(ModelCard::new(SHARED));
+        let built = <BasicWorkerBuilder>::new(address(at)).models(cards);
+        bed.workers[at] = Arc::new(built.health_config(no_health_check()).build());
+    }
+    let hashes = prompt(1_000, 8);
+    let asked = RequestFacts {
+        model: SHARED,
+        ..request(&hashes, 7, NOW)
+    };
+    // Eight blocks go to the worker at 1, under the head of 16 tokens a
+    // block, which states the shared model first.
+    bed.decide(&asked, Some(1));
+    let named = bed.decide(&asked, None).expect("rows named");
+    assert_eq!(named.holders, [(1, 0, 8)], "headed by 16 tokens a block");
+    // The worker of 32 tokens a block heads the list, the shared model
+    // behind its first: the holder stands at 0.
+    bed.workers.swap(0, 1);
+    bed.ids.swap(0, 1);
+    bed.pool = PoolAffinity::default();
+    let named = bed.decide(&asked, None).expect("rows named");
+    assert_eq!(named.holders, [(0, 0, 8)], "headed by 32 tokens a block");
+    bed.affinity.sweep();
+    let named = bed.decide(&asked, None).expect("rows named");
+    assert_eq!(named.holders, [(0, 0, 8)], "behind a sweep");
+}
+
+/// Two lists that size one shared record at the same time leave it held by
+/// the smaller of their block sizes, whichever of them picked its size
+/// first. A record of 128 tokens that stands at 64 tokens a block is read
+/// from behind at 32 and at 16 by two threads let go together: it is held
+/// to eight placements behind every round.
+#[test]
+fn two_lists_that_size_a_shared_record_at_once_leave_it_at_the_smallest_size() {
+    for round in 0..10_000 {
+        let affinity = Affinity::default();
+        drop(affinity.record_of(MODEL, 128, 64, false));
+        let (ready, go) = (AtomicUsize::new(0), AtomicBool::new(false));
+        thread::scope(|scope| {
+            for size in [32, 16] {
+                let (affinity, ready, go) = (&affinity, &ready, &go);
+                scope.spawn(move || {
+                    ready.fetch_add(1, Ordering::Relaxed);
+                    while !go.load(Ordering::Relaxed) {
+                        std::hint::spin_loop();
+                    }
+                    drop(affinity.record_of(MODEL, 128, size, true));
+                });
+            }
+            while ready.load(Ordering::Relaxed) < 2 {
+                thread::yield_now();
+            }
+            go.store(true, Ordering::Relaxed);
+        });
+        let record = {
+            let records = affinity.records.lock();
+            Arc::clone(records.get(MODEL).expect("the model's record"))
+        };
+        let held = (
+            record.bound.load(Ordering::Relaxed),
+            record.predictor.read().bound(),
+        );
+        assert_eq!(held, (8, 8), "round {round}");
+    }
 }
 
 /// A pick the binding's sessions rule placed alone is recorded by the
@@ -2323,15 +2604,18 @@ fn a_record_made_anew_begins_past_the_greatest_count_that_left() {
     for (many, one) in [(MODEL, "model-b"), ("model-b", MODEL)] {
         let (affinity, _, _) = hosted(false);
         // Each record is the map's alone and holds no place.
-        drop(affinity.record_of(many, 8));
+        drop(affinity.record_of(many, 8, 1, false));
         for worker in 1..=3 {
             affinity.forget(WorkerId(worker));
         }
-        drop(affinity.record_of(one, 8));
+        drop(affinity.record_of(one, 8, 1, false));
         affinity.forget(WorkerId(4));
         affinity.sweep();
         assert!(affinity.records.lock().is_empty(), "the two left");
-        let anew = affinity.record_of(one, 8).left.load(Ordering::Relaxed);
+        let anew = affinity
+            .record_of(one, 8, 1, false)
+            .left
+            .load(Ordering::Relaxed);
         assert_eq!(anew, 5, "{many} left with four");
     }
 }
@@ -3073,6 +3357,38 @@ fn a_models_first_block_decides_the_next_request_by_the_index() {
     let by_index = bed.keyed_whole(&asked, 0, None);
     assert_eq!(by_index.holders, [(2, 4, 0)]);
     assert_eq!(by_index.tree, None, "no tree's match under the index");
+}
+
+/// A model's first block names a single request its young worker. The
+/// host lends its index while it holds no block, as a gateway lends its
+/// own from a model's first enrolment, and a worker admitted beside older
+/// ones is named no warming row: the warm-up catches a worker up to what
+/// the index of cache events holds. Once another worker's events store a
+/// block, the next decision finds the index's word moved, reads the table
+/// again inside its second and names the young worker by its age. The
+/// classic policy calls its warm-up slice on its road of cache events
+/// alone, which it takes once the index holds a block
+/// (`model_gateway/src/policies/cache_aware.rs:1802-1808`).
+#[test]
+fn a_models_first_block_names_a_single_request_its_young_worker() {
+    let (affinity, index, _tree) = lending_whenever();
+    let mut bed = Bed::new(affinity, warming_by(1), 7);
+    // Seven workers are older than the window of one second, and the
+    // eighth is admitted now.
+    thread::sleep(Duration::from_millis(1_100));
+    bed.workers.push(ready_worker(&address(7), MODEL));
+    bed.ids.push(WorkerId(8));
+    let asked = prompt(50_000, 2);
+    let warming = || {
+        let named = bed.decide(&request(&asked, 7, NOW), None);
+        named.map_or_else(Vec::new, |rows| rows.warming)
+    };
+    assert!(warming().is_empty(), "under an index that holds no block");
+    // The events of a worker outside the list store a prompt: the model's
+    // index holds a block and no worker of the list holds one. The next
+    // decision, at the same instant, names the young worker.
+    store(&index, 9, &hashes_of(&prompt(1_000, 8)));
+    assert_eq!(warming(), [7], "from the model's first block");
 }
 
 /// The last block's leaving returns the next request to the tree. While
@@ -4787,7 +5103,7 @@ fn a_request_sent_a_moment_ago_writes_nothing() {
         }
 
         // The older of the two ends loses one block.
-        let record = bed.affinity.record_of(MODEL, 8);
+        let record = bed.affinity.record_of(MODEL, 8, 1, false);
         record.predictor.write().sweep(1);
         assert_eq!(
             bed.holders(&asked, last),
@@ -4851,7 +5167,7 @@ fn a_long_request_is_written_in_slices_of_sixteen() {
     }
 
     // A write at any repeated end puts it after the marker.
-    let record = bed.affinity.record_of(MODEL, 1);
+    let record = bed.affinity.record_of(MODEL, 1, 1, false);
     record.predictor.write().sweep(usize::MAX);
     assert_eq!(
         bed.holders(&marker, NOW),

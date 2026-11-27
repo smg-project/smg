@@ -8,7 +8,12 @@
 //! follow, and a store without one (a gateway deciding in its own process)
 //! pays one branch a write.
 
-use crate::store::workers::{MembershipChange, WorkerRow};
+use std::sync::Arc;
+
+use crate::{
+    engine::view::WorkerId,
+    store::workers::{MembershipChange, WorkerRow, WorkerStatus},
+};
 
 /// A place in a store's history: the number of a replicated write, and the
 /// term the store wrote it under. The default is the place before every
@@ -43,22 +48,20 @@ pub struct Position {
 /// hold for long, it never waits on a standby and it calls nothing of the
 /// store.
 pub trait Journal: Send + Sync {
-    /// A membership or status write: the epoch it makes, the change, the
-    /// row it is about as the write leaves it (`None` for a removal) and
-    /// the row the write took out (a removal's row, a replacement's old
-    /// incarnation). Where a write's writer handed the store the row it
-    /// leaves, that row is told and the table then takes it. Where it
-    /// handed the row the write takes out, that row is told with the
-    /// table's status. A status of the store's own tells its row with the
-    /// status the write leaves, and the table then takes that status. A
-    /// status the store follows and the store's own patch tell the row as
-    /// the table holds it. `at` is the place of the
-    /// leader's event the write applies, on a store that follows
-    /// ([`crate::store::MemoryStore::follow`]), and none for a write of the
-    /// store's own: a journal keeps that place for the applier's write
-    /// alone. A write whose place was given up before it came is the
-    /// store's own where the store took a term since, and is journaled
-    /// nowhere otherwise.
+    /// A membership write: the epoch it makes, the change, the row it is
+    /// about as the write leaves it (`None` for a removal) and the row the
+    /// write took out (a removal's row, a replacement's old incarnation).
+    /// Where a write's writer handed the store the row it leaves, that row
+    /// is told and the table then takes it. Where it handed the row the
+    /// write takes out, that row is told with the table's status. A write
+    /// that hands none tells that row as the table held it. A status is
+    /// not told here: it has its own call ([`Journal::status`]). `at` is
+    /// the place of the leader's event the write applies, on a store that
+    /// follows ([`crate::store::MemoryStore::follow`]), and none for a
+    /// write of the store's own: a journal keeps that place for the
+    /// applier's write alone. A write whose place was given up before it
+    /// came is the store's own where the store took a term since, and is
+    /// journaled nowhere otherwise.
     ///
     /// `term` is the term the write is made under, where its writer names
     /// one. The answer is whether the write goes on. A journal says no in
@@ -77,6 +80,32 @@ pub trait Journal: Send + Sync {
         change: MembershipChange,
         row: Option<&WorkerRow>,
         left: Option<&WorkerRow>,
+    ) -> bool;
+
+    /// A status write: the epoch it makes, the row's id, the status the
+    /// row leaves and the one it takes. No row is told. `models` are the
+    /// models the row serves at the write, the one fact of its row a
+    /// reader of a status reads: a watch that asked for some. They are the
+    /// writer's where it handed them, as a holder of worker objects does
+    /// on a leader and on a standby, and the table's row's otherwise.
+    /// `at`, `term` and the answer are as [`Journal::member`] has
+    /// them. A status of the store's own is told ahead of the table's
+    /// move, and the table takes the status behind a yes alone. A status
+    /// the store follows names no term.
+    #[must_use = "a write the journal refuses moves nothing in the store"]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a status entry's fields, with the write's place and term"
+    )]
+    fn status(
+        &self,
+        at: Option<Position>,
+        term: Option<u64>,
+        epoch: u64,
+        id: WorkerId,
+        from: WorkerStatus,
+        to: WorkerStatus,
+        models: Arc<[String]>,
     ) -> bool;
 
     /// A generation applied, by its number: told under the membership lock

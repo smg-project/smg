@@ -20,7 +20,7 @@ use crate::{
         list_cell::PublishedList,
         prompt_hashes::{HashSeeds, PromptHashes},
         records::worker_id,
-        sticky_sessions::{DecodeVerdict, SessionVerdict},
+        sticky_sessions::{Claim, DecodeVerdict, SessionRule, SessionVerdict},
         view::{FixedFacts, Identity, WireModes},
     },
     policies::consistent_hashing::tests::InOrder,
@@ -3939,7 +3939,8 @@ fn ranked(
 /// the gateway's classic answer for a pair: each side steps aside from
 /// the engines the request tried
 /// (`model_gateway/src/routers/common/placement.rs:1486-1493` and
-/// `:1562-1569` at main `75d279287`).
+/// `:1562-1569` at main `75d279287`). The list such a retry is decided by
+/// adds each side's ranks in the order of the pair's lists.
 #[test]
 fn a_pairs_retry_leaves_every_rank_of_the_engines_it_tried() {
     use std::collections::BTreeSet;
@@ -3985,6 +3986,23 @@ fn a_pairs_retry_leaves_every_rank_of_the_engines_it_tried() {
         landed(&[tried_prefill, tried_decode]),
         (second.clone(), second),
         "a tried pair moves on both sides"
+    );
+
+    // The list such a retry is decided by, in the order a stage reads it:
+    // the tried workers as the host named them, the prefills' other ranks
+    // behind them, and the decodes' behind those.
+    let prefill = host.engine.pool_members(&host.prefills);
+    let decode = host.engine.pool_members(&host.decodes);
+    let tried = [tried_prefill, tried_decode];
+    let whole = tried_engines(host.engine.loaded(), &tried, &[&prefill, &decode]);
+    assert_eq!(
+        whole.expect("each list holds ranks"),
+        [
+            tried_prefill,
+            tried_decode,
+            worker_id(host.prefills[0].as_ref()),
+            worker_id(host.decodes[1].as_ref()),
+        ]
     );
 }
 
@@ -4921,6 +4939,159 @@ fn a_guards_decode_call_claims_under_its_pairs_lease() {
     drop(guard);
     let (next, _, _) = served(&host, 7, Sent::Together);
     assert_eq!(next.1, first.1, "the call's claim left with its release");
+}
+
+/// A decode call that follows a pin hands the session table its pair's
+/// lease date through each of its two entries. One is a guard's call,
+/// and the other issues no lease. The pair's first decision is older than
+/// the key's idle time by the call. Another request began the key's new
+/// life and was served, and the call follows that pin.
+///
+/// A word under the pair's lease is then of that life, and a word one
+/// microsecond older is not.
+///
+/// A gateway's sticky map pins a decode where that role's selection
+/// picks it (`model_gateway/src/policies/manual.rs:322-368`).
+#[test]
+fn a_decode_call_that_follows_a_pin_dates_its_keys_life_through_each_entry() {
+    for leased in [true, false] {
+        let mut document = kept_document("round_robin", Assignment::Delegate, RulePlaced::Told);
+        let rule = document.bindings[0].sessions.as_mut();
+        let rule = rule.expect("the pair's rule");
+        (rule.ttl_s, rule.sweep_s, rule.recovery) = (1, 1, Recovery::Latest);
+        let host = host_of(document, 2, 2);
+        let classes = every(2, 2);
+        let mut asks = host.asks(&classes, true);
+        asks.0.facts.session_key = Identity::hashed(7);
+        // The pair's first decision, and its prefill's dispatch.
+        let now = Instant::now() + Duration::from_secs(1);
+        let guard = DecisionGuard::decide_under(&host.engine, GatewayId::LOCAL, &asks, now);
+        let mut guard = guard.expect("a decision");
+        guard.dispatched(now);
+        let issued = guard.lease().expect("the pair's lease").lease.issued_micros;
+        assert_ne!(issued, 0, "the lease states its instant");
+        // The key idles out. Another request of the key begins its new
+        // life and is served.
+        let later = now + Duration::from_secs(10);
+        let other = DecisionGuard::decide_under(&host.engine, GatewayId::LOCAL, &asks, later);
+        let mut other = other.expect("a decision");
+        other.dispatched(later);
+        other.dispatched_decode(later);
+        let served = first_target(other.decision())
+            .pair
+            .expect("a pair")
+            .decode_id;
+        // The first request's decode call follows that pin.
+        let call = later + Duration::from_secs(1);
+        let again = if leased {
+            *guard.decide_decode_under(&asks, call).expect("a decision")
+        } else {
+            let held = first_target(guard.decision());
+            let own = host.engine.loaded();
+            let again = own.decide_decode_without_lease(&asks, &held, issued, call);
+            again.expect("a decision")
+        };
+        let pair = first_target(&again).pair.expect("a pair");
+        assert_eq!(pair.decode_id, served, "the new life's pin");
+        let verdict = pair.decode_verdict.on(served);
+        assert_eq!(verdict, SessionVerdict::Pinned, "{leased}");
+        let own = host.engine.loaded();
+        let table = own.document.spec.engine().sessions();
+        let (key, elsewhere) = (decode_session(&asks.0.facts), WorkerId(9_000));
+        table.dispatched(key, SessionVerdict::Pinned, elsewhere, issued - 1);
+        let front = || table.pins(key).map(|pins| pins[0]);
+        assert_eq!(front(), Some(served), "{leased}: one before");
+        table.dispatched(key, SessionVerdict::Pinned, elsewhere, issued);
+        assert_eq!(front(), Some(elsewhere), "{leased}: the lease's date");
+    }
+}
+
+/// A decode call that states a verdict of its key hands the session
+/// table its pair's lease date, with a claim and with none. The side's
+/// dispatch is told under that lease, and it is then written into the
+/// life the call read. A decode that states no verdict hands the table
+/// nothing, and neither does a lease that states no instant.
+///
+/// A gateway's sticky map pins a decode where that role's selection
+/// picks it (`model_gateway/src/policies/manual.rs:322-368`).
+#[test]
+fn a_decode_calls_verdict_hands_the_table_its_pairs_lease_date() {
+    let (id, pinned) = (WorkerId, SessionVerdict::Pinned);
+    let host = kept_host(Assignment::Delegate, RulePlaced::Told);
+    let own = host.engine.loaded();
+    let table = own.document.spec.engine().sessions();
+    let rule = SessionRule {
+        assignment: Assignment::Delegate,
+        inflight_cap: 0,
+        ttl_micros: Some(1_000),
+        sweep_micros: 100,
+        recovery: Recovery::Latest,
+        rule_placed: RulePlaced::Told,
+    };
+    // The call's pick: the held prefill (worker 1) with decode 102.
+    let call = |verdict: SessionVerdict| {
+        let mut prefill = Targets::new();
+        prefill.push(Target {
+            id: id(1),
+            ..Target::default()
+        });
+        let mut targets = Targets::new();
+        targets.push(Target {
+            id: id(102),
+            ..Target::default()
+        });
+        let first = *prefill.first().expect("a prefill");
+        targets.pair_under(&first, verdict, prefill.placing());
+        Decision::Pick(Pick {
+            targets,
+            ..Pick::default()
+        })
+    };
+    // The call decides at 5,000. Its pair's lease is of 10, or states no
+    // instant. Another request began the key's life at 4,000 and was
+    // served on decode 102. The call follows that pin, and its send
+    // lands on decode 101.
+    let rows = [
+        (pinned, 10, [id(101), id(102)]),
+        (SessionVerdict::Respill, 10, [id(101), id(102)]),
+        (SessionVerdict::None, 10, [id(102), id(0)]),
+        (pinned, 0, [id(102), id(0)]),
+    ];
+    for (hash, (verdict, lease, pins)) in (70..).zip(rows) {
+        let facts = RequestFacts {
+            now_micros: 5_000,
+            session_key: Identity { hash, plain: None },
+            ..facts()
+        };
+        let key = decode_session(&facts);
+        table.lookup(key, 4_000, &rule);
+        table.dispatched(key, pinned, id(102), 4_000);
+        // A decode that states no verdict never asks for its key.
+        let asked = Cell::new(false);
+        let made = || {
+            asked.set(true);
+            key
+        };
+        date_decode_claim(own, &call(verdict), made, 5_000, lease);
+        let stated = verdict != SessionVerdict::None;
+        assert_eq!(asked.get(), stated, "{verdict:?} under {lease}");
+        table.dispatched(key, pinned, id(101), 10);
+        assert_eq!(table.pins(key), Some(pins), "{verdict:?} under {lease}");
+    }
+    // The call begins a key's life at 5,000 and claims decode 102. Its
+    // send lands on decode 101 under the lease's date: the claim goes.
+    let facts = RequestFacts {
+        now_micros: 5_000,
+        ..keyed()
+    };
+    let key = decode_session(&facts);
+    let seen = table.lookup(key, 5_000, &rule);
+    let made = table.claim(key, seen, id(102), 5_000);
+    assert_eq!(made, Claim::Made(id(102)));
+    let claimed = SessionVerdict::Claimed(id(102));
+    date_decode_claim(own, &call(claimed), || key, 5_000, 10);
+    table.dispatched(key, claimed, id(101), 10);
+    assert_eq!(table.pins(key), Some([id(101), id(0)]), "with a claim");
 }
 
 /// A pair's pick of one prefill (worker 1) with two decodes (workers

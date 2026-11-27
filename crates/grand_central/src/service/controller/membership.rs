@@ -137,9 +137,9 @@ use crate::{
         WorkerRow, WorkerStatus, WorkersStore,
     },
     worker_host::{
-        awaits_connect, dial_address, drain, lay, lay_one, lay_ready, refresh, stated, stating,
-        take, Members, MembershipWriteOutcome, MembershipWriteRefused, MembershipWriter, Objects,
-        Over, Precondition, Ready, Remover, RowRevision, Stated, Turn,
+        asks_events_under, awaits_connect, dial_address, drain, lay, lay_one, lay_ready, refresh,
+        stated, stating, take, Members, MembershipWriteOutcome, MembershipWriteRefused,
+        MembershipWriter, Objects, Over, Precondition, Ready, Remover, RowRevision, Stated, Turn,
     },
 };
 
@@ -303,10 +303,36 @@ impl MembershipCalls {
         self.objects.records_of(engine)
     }
 
+    /// Whether a found row of `facts` asks for its engine's cache events,
+    /// under the generation in force at the door's store
+    /// ([`asks_events_under`]).
+    #[cfg_attr(
+        not(any(test, feature = "discovery")),
+        expect(dead_code, reason = "a row is found at the replica's own writer")
+    )]
+    fn asks_events(&self, facts: &WorkerFacts) -> bool {
+        asks_events_under(facts, &self.store)
+    }
+
     /// The log's place: read after a call's write, that write's own or one
     /// past it.
     fn place(&self) -> Position {
         self.log.head()
+    }
+
+    /// The audit line of what `call`, from `by`, made of a row: `wrote`
+    /// names the row and what was made of it. The line carries the store's
+    /// epoch and the log's place ([`Self::place`]), both read here.
+    fn audit(
+        &self,
+        call: &'static str,
+        by: &Principal,
+        wrote: MembershipWriteOutcome,
+        asker: Option<&str>,
+    ) {
+        let (made, worker) = made(wrote);
+        let (epoch, at) = (self.store.epoch(), self.place());
+        audit_write(call, by, worker.0, made, epoch, at, asker);
     }
 
     /// The number of the life a registration makes now, under `admitted`,
@@ -335,6 +361,13 @@ impl MembershipCalls {
         life(term, self.base, self.store.epoch())
     }
 
+    /// Run `call` in the door's turn: one call at a time, from its read to
+    /// its read back. The turn is let go when `call` returns.
+    fn in_turn<T>(&self, call: impl FnOnce() -> T) -> T {
+        let _turn = self.turn.lock();
+        call()
+    }
+
     /// One call of the door, admitted from `by`: its turn, the term
     /// `leading` (the service's read of the fence) tells once the turn is
     /// held, its write under that term, and the audit line of a refusal.
@@ -354,9 +387,7 @@ impl MembershipCalls {
         leading: impl FnOnce() -> Result<u64, Status>,
         write: impl FnOnce(u64) -> Result<proto::WorkerEvent, Status>,
     ) -> Result<proto::WorkerEvent, Status> {
-        let turn = self.turn.lock();
-        let answer = leading().and_then(write);
-        drop(turn);
+        let answer = self.in_turn(|| leading().and_then(write));
         if let Err(refusal) = &answer {
             audit_refusal(call, by, refusal.code(), refusal.message(), None);
         }
@@ -368,10 +399,10 @@ impl MembershipCalls {
     /// `ADD` (and no mode) wants the URL absent; `REPLACE` wants it standing
     /// and makes its next incarnation; `UPSERT` registers an absent URL and
     /// lays the registration over a standing row: equal facts write no row
-    /// and answer the row unmoved, a change of role, wire, models or demand
-    /// facts is a new incarnation, any other change is made in place. Over a
-    /// draining row an `UPSERT` is the URL's next incarnation, whatever its
-    /// facts.
+    /// and answer the row unmoved, a change of role, wire, models, demand
+    /// facts or whether the worker takes images is a new incarnation, any
+    /// other change is made in place. Over a draining row an `UPSERT` is the
+    /// URL's next incarnation, whatever its facts.
     ///
     /// A registration whose checks are off ends with its row's connect
     /// signal, and so does an `UPSERT` of equal facts where the row waits
@@ -703,8 +734,8 @@ struct CallTurn<'a> {
 }
 
 impl Turn for CallTurn<'_> {
-    fn store(&self) -> &MemoryStore {
-        &self.door.store
+    fn asks_events(&self, facts: &WorkerFacts) -> bool {
+        self.door.asks_events(facts)
     }
 
     fn row(&self, id: WorkerId) -> Option<WorkerRow> {
@@ -761,9 +792,7 @@ impl Turn for CallTurn<'_> {
     }
 
     fn told(&self, wrote: MembershipWriteOutcome) {
-        let (made, worker) = made(wrote);
-        let (epoch, at) = (self.door.store.epoch(), self.door.place());
-        audit_write(REGISTER, self.by, worker.0, made, epoch, at, None);
+        self.door.audit(REGISTER, self.by, wrote, None);
     }
 }
 
@@ -943,29 +972,22 @@ impl ReplicaMembershipWriter {
         asker: Option<&str>,
         write: impl FnOnce(u64) -> Result<T, MembershipWriteRefused>,
     ) -> Result<T, MembershipWriteRefused> {
-        let turn = self.door.turn.lock();
-        let term = match (self.leading)() {
-            Ok(term) => term,
-            Err(status) => {
-                drop(turn);
-                audit_refusal(call, &self.by, status.code(), status.message(), asker);
-                return Err(MembershipWriteRefused::NotLeading(
-                    status.message().to_owned(),
-                ));
-            }
-        };
-        match write(term) {
-            Ok(answer) => {
-                // The worker objects hold the write when the call answers,
-                // as behind a control call's ([`MembershipCalls::call`]).
-                drop(turn);
-                Ok(answer)
-            }
-            Err(refusal) => {
-                drop(turn);
+        // The term is read and the write is made in the door's turn. A
+        // refusal's audit line is written once the turn is let go.
+        match self.door.in_turn(|| (self.leading)().map(write)) {
+            // The worker objects hold the write when the call answers, as
+            // behind a control call's ([`MembershipCalls::call`]).
+            Ok(Ok(answer)) => Ok(answer),
+            Ok(Err(refusal)) => {
                 let status = refused(&refusal);
                 audit_refusal(call, &self.by, status.code(), status.message(), asker);
                 Err(refusal)
+            }
+            Err(status) => {
+                audit_refusal(call, &self.by, status.code(), status.message(), asker);
+                Err(MembershipWriteRefused::NotLeading(
+                    status.message().to_owned(),
+                ))
             }
         }
     }
@@ -984,16 +1006,7 @@ impl ReplicaMembershipWriter {
     }
 
     fn audit(&self, call: &'static str, wrote: MembershipWriteOutcome, asker: Option<&str>) {
-        let (made, worker) = made(wrote);
-        audit_write(
-            call,
-            &self.by,
-            worker.0,
-            made,
-            self.door.store.epoch(),
-            self.door.place(),
-            asker,
-        );
+        self.door.audit(call, &self.by, wrote, asker);
     }
 
     fn removal(
@@ -1024,8 +1037,8 @@ struct ReplicaTurn<'a> {
 }
 
 impl Turn for ReplicaTurn<'_> {
-    fn store(&self) -> &MemoryStore {
-        &self.host.door.store
+    fn asks_events(&self, facts: &WorkerFacts) -> bool {
+        self.host.door.asks_events(facts)
     }
 
     fn row(&self, id: WorkerId) -> Option<WorkerRow> {

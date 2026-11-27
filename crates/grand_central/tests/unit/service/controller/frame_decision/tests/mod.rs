@@ -916,6 +916,30 @@ fn stating_member(
     written_ready(store, objects, facts)
 }
 
+/// [`side_member`] for a worker whose row says whether it takes images.
+fn seeing_member(
+    store: &MemoryStore,
+    objects: &Objects<Members>,
+    name: &str,
+    role: Role,
+    vision: bool,
+) -> WorkerId {
+    let key = format!("http://{name}:8000");
+    let facts = WorkerFacts {
+        key: key.clone(),
+        engine: key,
+        incarnation: 1,
+        role,
+        wire_modes: WireModes::HTTP,
+        models: vec![PAIRED.to_owned()],
+        dp_size: 1,
+        max_running: Some(4),
+        vision,
+        ..WorkerFacts::default()
+    };
+    written_ready(store, objects, facts)
+}
+
 /// The `n`th frame for [`PAIRED`] at its prefill, with what its gateway
 /// states of itself: its wires as the wire carries them, and its hint.
 fn at_prefill(n: u8, wires: WireModes, hint: Option<u32>) -> proto::DecideRequest {
@@ -993,12 +1017,38 @@ fn pairs_of(decision: &Decision) -> Vec<(WorkerId, WorkerId)> {
     pairs.collect()
 }
 
+/// A shed's reason beside the stage it names, as [`shed_of`] reads it.
+type Shed = Option<(ShedReason, &'static str)>;
+
 /// A shed's reason beside the stage it names; `None` for any other answer.
-fn shed_of(decision: &Decision) -> Option<(ShedReason, &'static str)> {
+fn shed_of(decision: &Decision) -> Shed {
     match decision {
         Decision::Shed(shed) => Some((shed.reason, shed.emptied_by)),
         Decision::Pick(_) | Decision::Queue(_) => None,
     }
+}
+
+/// What each answer of a run named, or the one shed each of them was. An
+/// answer that names a worker beside one that is shed fails the case, and
+/// so do two sheds that differ in their reason or their stage: a demand
+/// holds every answer. The side a shed names is not compared.
+fn together<A>(answers: impl Iterator<Item = Result<A, Shed>>) -> Result<Vec<A>, Shed> {
+    let (mut picked, mut shed) = (Vec::new(), None);
+    for (n, answer) in answers.enumerate() {
+        match answer {
+            Ok(pick) => picked.push(pick),
+            Err(stage) => {
+                let same = shed.is_none_or(|before| before == stage);
+                assert!(same, "answer {n}: another shed");
+                shed = Some(stage);
+            }
+        }
+    }
+    let Some(stage) = shed else {
+        return Ok(picked);
+    };
+    assert!(picked.is_empty(), "a pick beside a shed");
+    Err(stage)
 }
 
 /// A pair at its prefill is decided over its model's two lists, and each

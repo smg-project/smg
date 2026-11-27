@@ -135,10 +135,8 @@ fn a_refused_socket_under_a_cool_down_of_zero_is_asked_once_a_pause() {
     let mut served = TestPlugin::serve();
     let runtime = runtime();
     let mut spec = spec(&served, "refused");
-    spec.breaker = BreakerSpec {
-        cooldown_micros: 0,
-        ..BreakerSpec::default()
-    };
+    spec.breaker = BreakerSpec::default();
+    spec.breaker.cooldown_micros = 0;
     let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
     let engine = single_engine(profile(&plugin, ALL));
     let candidates = pool(4);
@@ -174,11 +172,10 @@ fn a_stream_that_ends_counts_on_the_breaker() {
     served.behave(Behaviour::EndStream);
     let runtime = runtime();
     let mut spec = spec(&served, "leaving-once");
-    spec.breaker = BreakerSpec {
-        failures: 1,
-        window_micros: 60_000_000,
-        cooldown_micros: 60_000_000,
-    };
+    spec.breaker = BreakerSpec::default();
+    spec.breaker.failures = 1;
+    spec.breaker.window_micros = 60_000_000;
+    spec.breaker.cooldown_micros = 60_000_000;
     let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
     let engine = single_engine(profile(&plugin, ALL));
     let candidates = pool(4);
@@ -203,11 +200,10 @@ fn streams_that_end_together_are_one_failure_on_the_breaker() {
     let mut served = TestPlugin::serve();
     let runtime = runtime();
     let mut spec = spec(&served, "gone-once");
-    spec.breaker = BreakerSpec {
-        failures: 2,
-        window_micros: 60_000_000,
-        cooldown_micros: 60_000_000,
-    };
+    spec.breaker = BreakerSpec::default();
+    spec.breaker.failures = 2;
+    spec.breaker.window_micros = 60_000_000;
+    spec.breaker.cooldown_micros = 60_000_000;
     let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
     // A second deciding thread, with a stream of its own.
     std::thread::scope(|scope| {

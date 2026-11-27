@@ -209,6 +209,19 @@ fn an_item_is_placed_on_an_encoder_at_one_of_its_requests_places() {
         assert_eq!(placed(&holding(&[1])), ((1, 0), vec![1]));
         assert_eq!(placed(&holding(&[0, 1])), ((0, 0), vec![0]));
     }
+
+    // Two far classes whose encoders stand in descending order, under
+    // places that name both. The open classes are read again from the
+    // encoders kept and sorted behind that, so the greater one is found.
+    let mut far = Bed::new();
+    far.prefill_classes = vec![65];
+    far.encoders = vec![row(0, Role::Encode, 0, 0), row(1, Role::Encode, 0, 0)];
+    far.facts = vec![pushing(65), pushing(64)];
+    let both = holding(&[0, 1]);
+    let sides = [&open, &open, &both];
+    let (decision, placed) = decide_under(&far, &engine, &facts, far.pools(), sides);
+    let encoders: Vec<u32> = placed.encoders().iter().map(|t| t.position).collect();
+    assert_eq!((pair_of(&decision), encoders), ((0, 0), vec![0]));
 }
 
 /// A request whose places on a list name workers and none that takes it,

@@ -500,15 +500,16 @@ async fn a_handle_over_a_link_is_answered_the_worker_its_request_names() {
 /// Three engines register over the control listener. One states a runtime
 /// and a window, and processes media by reference by its registering
 /// party's pipeline. One states another runtime and a pipeline of its own.
-/// One states nothing.
+/// One states none of those, and that it takes images.
 ///
 /// The link's session is welcomed on protocol 2, so the handle states each
 /// demand on its frame. Every ask of a demand a worker meets is a pick, and
 /// the picks name the workers that meet it and no other. A runtime no
 /// worker states is shed at every ask, and so is an input past the window
 /// of its runtime's one worker: each with no endpoint, under its demand's
-/// stage as the handle reads it. The part that demands vision is refused at
-/// the handle's door, by its name, with nothing sent.
+/// stage as the handle reads it. A demand for vision crosses too: every
+/// pick of it names the engine whose registration says that it takes
+/// images. Beside a runtime that engine does not state, it is shed too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_handle_over_a_link_is_held_to_the_workers_that_meet_its_requests_demands() {
     use std::collections::BTreeSet;
@@ -551,6 +552,8 @@ async fn a_handle_over_a_link_is_held_to_the_workers_that_meet_its_requests_dema
         ];
         for (engine, block) in stated.into_iter().enumerate() {
             harness.states(block);
+            // The last engine's registration says that it takes images.
+            harness.sees((engine == 2).then_some(true));
             harness
                 .register(&FLEET[engine..=engine])
                 .await
@@ -586,6 +589,10 @@ async fn a_handle_over_a_link_is_held_to_the_workers_that_meet_its_requests_dema
             input_window: 4_097,
             ..none
         };
+        let vision = Demands {
+            vision: true,
+            ..none
+        };
         // What a demand's asks are answered: the engines their picks name, or
         // the reason and the stage of a shed.
         let demands = [
@@ -606,6 +613,15 @@ async fn a_handle_over_a_link_is_held_to_the_workers_that_meet_its_requests_dema
                 "an input past the window of its runtime's one worker",
                 past_its_one,
                 Err((Why::NoEndpoints, "context-window")),
+            ),
+            ("vision", vision, Ok(BTreeSet::from([2]))),
+            (
+                "vision and a runtime its engine does not state",
+                Demands {
+                    runtime: 7,
+                    ..vision
+                },
+                Err((Why::NoEndpoints, "vision")),
             ),
         ];
         let asked = |id: &'static [u8], seed: u64, demands: Demands| Request {
@@ -659,29 +675,6 @@ async fn a_handle_over_a_link_is_held_to_the_workers_that_meet_its_requests_dema
             assert!(answered, "{what}: picks {named:?}, sheds {shed:?}");
         }
 
-        // The part that demands vision never leaves the handle.
-        let vision = Demands {
-            vision: true,
-            ..none
-        };
-        let request = asked(b"vision", 0, vision);
-        let held = Box::pin(DecisionGuard::<&InProcess>::asked(
-            &link,
-            &request,
-            Instant::now(),
-            ROOM,
-        ))
-        .await;
-        assert!(
-            matches!(
-                held,
-                Err(DecisionUnavailable::Unsent(client::Error::OutOfRange(
-                    "constraints.demands.vision"
-                )))
-            ),
-            "{:?}",
-            held.err()
-        );
         assert!(link.stands());
         drop(link);
         harness.stop().await.expect("a clean stop");

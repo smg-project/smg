@@ -1187,8 +1187,10 @@ impl WarmupSlice {
     /// A thin worker is one whatever the fleet's age; workers warming only
     /// because they are young are ones only when the fleet is not all
     /// young. A host that named the rows ruled the same where it derived
-    /// them: the pass walks its list beside the kept rows of a pool read
-    /// whole, and searches it a row behind a draw (`DRAWN`).
+    /// them, or named none (the in-process engine, for a single request
+    /// under an index that holds no block): the pass walks its list beside
+    /// the kept rows of a pool read whole, and searches it a row behind a
+    /// draw (`DRAWN`).
     fn warming<'a, const DRAWN: bool>(
         &'a self,
         warm: Warm<'a>,
@@ -1447,5 +1449,5 @@ impl ReadsLoad for WarmupSlice {
 }
 
 #[cfg(test)]
-#[path = "../../tests/unit/policies/cache_aware/tests.rs"]
+#[path = "../../tests/unit/policies/cache_aware/tests/mod.rs"]
 mod tests;

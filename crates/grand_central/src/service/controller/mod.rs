@@ -129,8 +129,9 @@ pub const PROTOCOL_PACKAGE: &str = "smg.policy.v1";
 /// `Hello` offers and its `Leader` answers, and the newest its `Welcome`
 /// picks (design 5.2). A change a peer must know its controller reads
 /// raises it, and every other additive change within the package keeps
-/// it. Version 2 is the first whose frames state a request's hard demands
-/// (`DecideRequest.demands`).
+/// it. The rule binds from the first shipped release that carries the
+/// contract, as the contract's header says. Version 2 is the first whose
+/// frames state a request's hard demands (`DecideRequest.demands`).
 pub const PROTOCOL_VERSION: u32 = 2;
 
 /// The oldest protocol version this build speaks, the bottom of the same
@@ -813,7 +814,8 @@ impl Controller {
     /// the holder's doc says what a write on a replica that follows comes
     /// to ("A host's write calls"). A row written through the entries of
     /// [`Self::store`] itself has no worker object, and no first copy holds
-    /// it, until a cut is laid whole.
+    /// it, until a cut is laid whole. A standby's applier also lays it at
+    /// the next event that tells the row and that the store takes.
     pub fn workers(&self) -> Arc<Objects<Members>> {
         self.workers.holder()
     }
@@ -1232,6 +1234,11 @@ impl Controller {
 /// word that nobody leads here. The word told again ends it, the drain's
 /// included; told at the change alone, the drain would leave that watch
 /// open to the end of the grace period.
+///
+/// The word is the fence's from the first take on ([`Readiness::led`]). A
+/// take lands ahead of the serve's turn to serving, and a move in between
+/// tells the term: told once more that nobody leads here, a watch the
+/// fence admitted in that moment would end under a lead that stands.
 ///
 /// The word names the term led, and a term is told once. A release and the
 /// take behind it can both fall between two reads of this loop: the replica

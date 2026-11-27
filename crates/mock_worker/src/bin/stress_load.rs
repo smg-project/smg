@@ -1,6 +1,6 @@
-//! `stress_load`: an open-loop load client for the gateway's gRPC request
-//! path on a CPU-only bed (the release gateway in front of `mock-worker
-//! --engine realistic` gRPC engines; `scripts/bench/grpc_stress/`).
+//! `stress_load`: a load client, open loop or closed loop, for the gateway's
+//! gRPC request path on a CPU-only bed (the release gateway in front of
+//! `mock-worker --engine realistic` gRPC engines; `scripts/bench/grpc_stress/`).
 //!
 //! It sends requests at a fixed rate whatever the answer time, so what it
 //! measures is the gateway's cost under a given offered load: the time to the
@@ -14,6 +14,18 @@
 //! its next request the moment its last one ended, so the answers set the
 //! rate and no request is skipped. `achieved_rps` counts, as in the open
 //! loop, the requests that started inside the window and ended well.
+//!
+//! `--conversation-turns T` makes each caller of a closed loop of `--mode
+//! chat` hold a conversation: its first turn is the next of the `--distinct`
+//! prompts, and each turn behind it sends the conversation so far (every turn
+//! answered by an assistant message the client makes, of `--max-tokens`
+//! words: the worker's own answer is not carried) with one more user message
+//! of `--turn-tokens` words, `--think-ms` after the answer before. After T
+//! turns, or a turn that failed, the caller starts a new conversation. The
+//! summary's `conversations` says how many sampled turns went to the worker
+//! of the turn before, by the answers' `x-smg-routed-worker-id` header (a
+//! turn that failed behind its headers counts where they name one), and at
+//! which turn a conversation moved.
 //!
 //! Modes (`--mode`): `chat` (chat completions; `--stream` for SSE), `tools`
 //! (a tool-heavy conversation: `--turns` tool-call rounds over `--tools`
@@ -113,6 +125,10 @@ enum Mode {
     Completion,
 }
 
+/// The flags a conversation's flags are refused beside. Each names them
+/// itself: a flag's `requires` is waived when one of these is given.
+const NO_CONVERSATION: [&str; 4] = ["tenants", "new_tenants", "rate", "max_inflight"];
+
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "stress_load",
@@ -138,6 +154,31 @@ struct Args {
     /// failed), so none is skipped.
     #[arg(long, conflicts_with_all = ["rate", "max_inflight"])]
     closed_loop: Option<NonZeroUsize>,
+    /// Conversations in a closed loop of `--mode chat`: a caller sends this
+    /// many turns, each carrying the turns before it, every one answered by
+    /// an assistant message the client makes (`--max-tokens` words, not the
+    /// worker's answer), then starts a new conversation. Not with
+    /// `--tenants` or `--new-tenants`: a turn's tenant would not be its
+    /// conversation's.
+    #[arg(long, requires = "closed_loop", conflicts_with_all = NO_CONVERSATION)]
+    conversation_turns: Option<NonZeroUsize>,
+    /// Words of each user message behind a conversation's first, which is
+    /// one of the `--distinct` prompts.
+    #[arg(
+        long,
+        default_value_t = 64,
+        requires = "conversation_turns",
+        conflicts_with_all = NO_CONVERSATION
+    )]
+    turn_tokens: usize,
+    /// Milliseconds a conversation waits between an answer and its next turn.
+    #[arg(
+        long,
+        default_value_t = 0,
+        requires = "conversation_turns",
+        conflicts_with_all = NO_CONVERSATION
+    )]
+    think_ms: u64,
     /// Sampled seconds after the warm-up.
     #[arg(long, default_value_t = 60)]
     duration: u64,
@@ -448,6 +489,27 @@ fn data_url(path: &Path) -> Result<String> {
     Ok(format!("data:{mime};base64,{}", base64(&bytes)))
 }
 
+/// A chat completions request over `messages`, with the options the flags ask.
+fn chat_body(args: &Args, messages: Vec<Value>) -> Value {
+    let mut body = json!({
+        "model": args.model,
+        "messages": [],
+        "max_tokens": args.max_tokens,
+        "stream": args.stream,
+        "stream_options": if args.stream { json!({"include_usage": true}) } else { Value::Null },
+    });
+    // Moved in, not copied: a conversation's messages grow by its turns.
+    body["messages"] = Value::Array(messages);
+    if args.json_schema {
+        body["response_format"] = answer_schema();
+    }
+    if let Some(top_logprobs) = args.logprobs {
+        body["logprobs"] = json!(true);
+        body["top_logprobs"] = json!(top_logprobs);
+    }
+    body
+}
+
 /// The request bodies the run cycles through (built once; `responses`
 /// bodies carry a session link and are built per request instead).
 fn build_bodies(args: &Args) -> Result<Vec<Bytes>> {
@@ -472,26 +534,13 @@ fn build_bodies(args: &Args) -> Result<Vec<Bytes>> {
     if args.logprobs.is_some() && args.mode != Mode::Chat {
         anyhow::bail!("--logprobs applies to --mode chat only");
     }
+    if args.conversation_turns.is_some() && args.mode != Mode::Chat {
+        anyhow::bail!("--conversation-turns applies to --mode chat only");
+    }
     let mut bodies = Vec::with_capacity(distinct);
     for i in 0..distinct {
         let body = match args.mode {
-            Mode::Chat => {
-                let mut body = json!({
-                    "model": args.model,
-                    "messages": [chat_user(prompt(args, i), args.text_parts)],
-                    "max_tokens": args.max_tokens,
-                    "stream": args.stream,
-                    "stream_options": if args.stream { json!({"include_usage": true}) } else { Value::Null },
-                });
-                if args.json_schema {
-                    body["response_format"] = answer_schema();
-                }
-                if let Some(top_logprobs) = args.logprobs {
-                    body["logprobs"] = json!(true);
-                    body["top_logprobs"] = json!(top_logprobs);
-                }
-                body
-            }
+            Mode::Chat => chat_body(args, vec![chat_user(prompt(args, i), args.text_parts)]),
             Mode::Messages => json!({
                 "model": args.model,
                 "max_tokens": args.max_tokens,
@@ -624,10 +673,43 @@ struct Stats {
     chunks: AtomicU64,
     bytes_rx: AtomicU64,
     session_overflow: AtomicU64,
+    /// Conversations opened: the next one's place in the `--distinct` prompts.
+    opened: AtomicU64,
     samples: Mutex<Vec<Sample>>,
     statuses: Mutex<BTreeMap<u16, u64>>,
     errors: Mutex<BTreeMap<String, u64>>,
+    conversations: Mutex<Conversations>,
     gaps: Option<LogHist>,
+}
+
+/// What `--conversation-turns` adds to the summary, over the sampled turns.
+#[derive(Serialize, Default, Clone)]
+struct Conversations {
+    /// The turns of a conversation, as asked.
+    turns: usize,
+    /// Conversations whose last turn ended well.
+    finished: u64,
+    /// Turns whose answer names a worker, as the answer of the turn before
+    /// in their conversation did.
+    followed: u64,
+    /// The followed turns that went to the worker of the turn before.
+    returned: u64,
+    /// `returned` over `followed`.
+    return_share: f64,
+    /// The turn (2 is a conversation's second) at which conversations left
+    /// the worker of the turn before, and how many did.
+    moves_by_turn: BTreeMap<usize, u64>,
+}
+
+/// A conversation's turn as `one` sends it: the body, and what `one` reads
+/// from the answer.
+struct Turn {
+    body: Bytes,
+    /// The answer ended well.
+    ok: bool,
+    /// The worker the answer names in `x-smg-routed-worker-id`, also where
+    /// the answer failed behind its headers: the turn went there.
+    worker: Option<String>,
 }
 
 impl Stats {
@@ -806,7 +888,7 @@ fn response_id(bytes: &[u8]) -> Option<String> {
     None
 }
 
-async fn one(shared: Arc<Shared>, i: u64, sampled: bool) {
+async fn one(shared: Arc<Shared>, i: u64, sampled: bool, turn: Option<&mut Turn>) {
     let args = &shared.args;
     let stats = &shared.stats;
     let session = if args.mode == Mode::Responses {
@@ -820,7 +902,9 @@ async fn one(shared: Arc<Shared>, i: u64, sampled: bool) {
     } else {
         None
     };
-    let body = if args.mode == Mode::Responses {
+    let body = if let Some(turn) = turn.as_deref() {
+        turn.body.clone()
+    } else if args.mode == Mode::Responses {
         responses_body(
             args,
             i as usize,
@@ -842,11 +926,16 @@ async fn one(shared: Arc<Shared>, i: u64, sampled: bool) {
     let mut sample = Sample::default();
     let mut body_head: Vec<u8> = Vec::new();
     let mut outcome: Result<Option<String>, String> = Ok(None);
+    let mut worker: Option<String> = None;
     match request.send().await {
         Err(e) => outcome = Err(classify(&e)),
         Ok(response) => {
             sample.ttfb_us = started.elapsed().as_micros() as u32;
             let status = response.status().as_u16();
+            if turn.is_some() {
+                let named = response.headers().get("x-smg-routed-worker-id");
+                worker = named.and_then(|v| v.to_str().ok()).map(str::to_owned);
+            }
             *stats
                 .statuses
                 .lock()
@@ -938,6 +1027,10 @@ async fn one(shared: Arc<Shared>, i: u64, sampled: bool) {
     }
     stats.done.fetch_add(1, Ordering::Relaxed);
     stats.inflight.fetch_sub(1, Ordering::Relaxed);
+    if let Some(turn) = turn {
+        turn.ok = outcome.is_ok();
+        turn.worker = worker;
+    }
     match outcome {
         Ok(_) => {
             stats.ok.fetch_add(1, Ordering::Relaxed);
@@ -1026,6 +1119,9 @@ struct Summary {
     gap_us: Quantiles,
     gaps_recorded: u64,
     session_overflow: u64,
+    /// A summary without `--conversation-turns` has no such key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    conversations: Option<Conversations>,
 }
 
 fn summarize(shared: &Shared, wall: Duration, unfinished: u64) -> Summary {
@@ -1084,6 +1180,17 @@ fn summarize(shared: &Shared, wall: Duration, unfinished: u64) -> Summary {
         },
         gaps_recorded: gaps.map_or(0, LogHist::count),
         session_overflow: stats.session_overflow.load(Ordering::Relaxed),
+        conversations: shared.args.conversation_turns.map(|turns| {
+            let counts = stats
+                .conversations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            Conversations {
+                turns: turns.get(),
+                return_share: counts.returned as f64 / counts.followed.max(1) as f64,
+                ..counts.clone()
+            }
+        }),
     }
 }
 
@@ -1157,6 +1264,10 @@ async fn run(args: Args) -> Result<Summary> {
         for _ in 0..callers.get() {
             let shared = Arc::clone(&shared);
             tasks.spawn(async move {
+                // This caller's conversation: its messages so far, and the
+                // worker of its last answer.
+                let mut messages: Vec<Value> = Vec::new();
+                let mut worker: Option<String> = None;
                 loop {
                     // A send that fails without a wait must not hold its
                     // thread to the end of the window.
@@ -1167,7 +1278,67 @@ async fn run(args: Args) -> Result<Summary> {
                     }
                     let i = shared.stats.sent.fetch_add(1, Ordering::Relaxed) + 1;
                     shared.stats.note_inflight();
-                    one(Arc::clone(&shared), i, elapsed >= warm).await;
+                    let sampled = elapsed >= warm;
+                    let args = &shared.args;
+                    let Some(turns) = args.conversation_turns else {
+                        one(Arc::clone(&shared), i, sampled, None).await;
+                        continue;
+                    };
+                    let text = if messages.is_empty() {
+                        // An opening is the next of the `--distinct` prompts,
+                        // as a request outside a conversation is.
+                        let opened = shared.stats.opened.fetch_add(1, Ordering::Relaxed);
+                        prompt(args, opened as usize % args.distinct.max(1))
+                    } else {
+                        let seed = args.seed ^ (i << 20);
+                        let said = words(seed ^ 0xA55E_0000, args.max_tokens as usize);
+                        messages.push(json!({"role": "assistant", "content": said}));
+                        words(seed ^ 0x7012_0000, args.turn_tokens)
+                    };
+                    messages.push(chat_user(text, args.text_parts));
+                    let nth = messages.len() / 2 + 1;
+                    let mut body = chat_body(args, std::mem::take(&mut messages));
+                    let mut turn = Turn {
+                        body: Bytes::from(body.to_string()),
+                        ok: false,
+                        worker: None,
+                    };
+                    if let Value::Array(sent) = body["messages"].take() {
+                        messages = sent;
+                    }
+                    one(Arc::clone(&shared), i, sampled, Some(&mut turn)).await;
+                    if sampled {
+                        let mut counts = shared
+                            .stats
+                            .conversations
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        if let (Some(before), Some(now)) = (&worker, &turn.worker) {
+                            counts.followed += 1;
+                            if before == now {
+                                counts.returned += 1;
+                            } else {
+                                *counts.moves_by_turn.entry(nth).or_insert(0) += 1;
+                            }
+                        }
+                        counts.finished += u64::from(turn.ok && nth == turns.get());
+                    }
+                    if turn.ok && nth < turns.get() {
+                        worker = turn.worker;
+                        // A caller whose next turn would start behind the
+                        // window leaves: asleep at the end of the drain it
+                        // would count as a request that did not finish.
+                        let think = Duration::from_millis(args.think_ms);
+                        if start.elapsed() + think >= total {
+                            break;
+                        }
+                        if !think.is_zero() {
+                            tokio::time::sleep(think).await;
+                        }
+                    } else {
+                        messages.clear();
+                        worker = None;
+                    }
                 }
             });
         }
@@ -1190,7 +1361,7 @@ async fn run(args: Args) -> Result<Summary> {
                 }
                 shared.stats.sent.fetch_add(1, Ordering::Relaxed);
                 shared.stats.note_inflight();
-                tasks.spawn(one(Arc::clone(&shared), launched, sampled));
+                tasks.spawn(one(Arc::clone(&shared), launched, sampled, None));
             }
         }
     }
@@ -1729,5 +1900,110 @@ mod tests {
             (&read["closed_loop"], &read["rate_target"]),
             (&json!(3), &json!(0.0))
         );
+    }
+
+    /// Two callers hold conversations of four turns against a server that
+    /// names worker `a` for a conversation's first two turns and `b` behind
+    /// them, and `lost` for a turn that does not carry the turn before it;
+    /// it fails the last turn of the conversation that opens with the first
+    /// of the `--distinct` prompts, behind a header that names worker `c`.
+    #[tokio::test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the server ends with the test's runtime"
+    )]
+    async fn a_conversation_carries_its_turns_and_counts_where_they_went() {
+        use axum::http::StatusCode;
+
+        for refused in [
+            &["--conversation-turns=4"][..],
+            &["--closed-loop=2", "--conversation-turns=0"],
+            &["--closed-loop=2", "--conversation-turns=4", "--tenants=2"],
+            &[
+                "--closed-loop=2",
+                "--conversation-turns=4",
+                "--new-tenants=0.5",
+            ],
+            &["--closed-loop=2", "--think-ms=2"],
+            &["--conversation-turns=4", "--rate=10"],
+            &["--closed-loop=2", "--think-ms=2", "--tenants=2"],
+        ] {
+            let words = ["stress_load"].iter().chain(refused);
+            assert!(Args::try_parse_from(words).is_err(), "{refused:?}");
+        }
+
+        // Each conversation's messages at its last turn, by its first message.
+        let seen: Arc<Mutex<BTreeMap<String, Vec<Value>>>> = Arc::default();
+        let answer = move |axum::Json(body): axum::Json<Value>| async move {
+            let messages = body["messages"].as_array().cloned().unwrap_or_default();
+            let first = messages[0]["content"].to_string();
+            let opens_the_prompts = first.contains("[session 0]");
+            let before = seen.lock().unwrap().insert(first, messages.clone());
+            let carried = before.is_none_or(|before| {
+                messages.len() == before.len() + 2
+                    && messages.starts_with(&before)
+                    && messages[before.len()]["role"] == "assistant"
+            });
+            let (status, worker) = match messages.len() {
+                _ if !carried => (StatusCode::OK, "lost"),
+                7 if opens_the_prompts => (StatusCode::INTERNAL_SERVER_ERROR, "c"),
+                1 | 3 => (StatusCode::OK, "a"),
+                _ => (StatusCode::OK, "b"),
+            };
+            (status, [("x-smg-routed-worker-id", worker)], "{}")
+        };
+        let app = axum::Router::new().route("/v1/chat/completions", axum::routing::post(answer));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let args = Args::try_parse_from([
+            "stress_load",
+            "--gateway",
+            &gateway,
+            "--closed-loop",
+            "2",
+            "--conversation-turns",
+            "4",
+            "--think-ms",
+            "2",
+            "--warmup",
+            "0",
+            "--duration",
+            "1",
+            "--interim",
+            "0",
+        ]);
+        let args = args.expect("a conversation is a flag of a closed loop");
+        let summary = run(args.clone()).await.unwrap();
+
+        let read = serde_json::to_value(&summary).unwrap();
+        let counts = summary.conversations.expect("the summary counts the turns");
+        assert!(counts.finished > 0, "a conversation ends at its last turn");
+        // The one failure is the turn the server fails.
+        assert_eq!((summary.failed, summary.unfinished), (1, 0));
+        // A whole conversation returns at its turns 2 and 4 and moves at 3;
+        // the window's end may cut each caller's last one short. The failed
+        // turn moved to the worker its header names.
+        let moved = counts.moves_by_turn.get(&3).copied().unwrap_or(0);
+        assert_eq!(counts.moves_by_turn.get(&4), Some(&1));
+        assert_eq!(counts.moves_by_turn.len(), 2, "moves at turns 3 and 4");
+        assert!((counts.finished + 1..=counts.finished + 3).contains(&moved));
+        assert_eq!(counts.returned + moved + 1, counts.followed);
+        assert_eq!(
+            read["conversations"]["return_share"],
+            json!(counts.returned as f64 / counts.followed as f64)
+        );
+        assert_eq!(read["conversations"]["turns"], json!(4));
+
+        // A caller whose think time ends behind the window leaves at its
+        // answer: it is not a request that did not finish.
+        let thinker = Args {
+            closed_loop: NonZeroUsize::new(1),
+            think_ms: 60_000,
+            drain: 0,
+            ..args
+        };
+        let summary = run(thinker).await.unwrap();
+        assert_eq!((summary.sent, summary.ok, summary.unfinished), (1, 1, 0));
     }
 }

@@ -150,8 +150,8 @@ pub struct WorkerFacts {
     /// shared pointer: a worker that reports none holds one word for it,
     /// and every copy of a row shares the one its worker reported.
     pub pairing: Option<Arc<PairingDescriptor>>,
-    /// The worker's end of the encode handoff, as the handshake learned it;
-    /// the default states none. A worker host derives its encode classes
+    /// The worker's end of the encode handoff, as its registration states
+    /// it; the default states none. A worker host derives its encode classes
     /// from it by the engine's rule, with the engine kind as the runtime
     /// ([`EncodeClasses`](crate::engine::EncodeClasses)). The door drops a
     /// blank connector and reads its name past its blanks.
@@ -172,9 +172,11 @@ pub struct WorkerFacts {
     pub signals: Signals,
     pub health: HealthPolicy,
     pub overload: Overload,
-    /// The seconds a removal waits behind a drain, where the worker's
-    /// registration states another window than the default. A host that
-    /// builds the worker's object from the row gives the object this window.
+    /// The seconds a removal waits behind a drain, where the row states a
+    /// window: a control call's registration states any, and a found
+    /// worker's is a fact of its row where it is not the default. A host
+    /// that builds the worker's object from the row gives the object this
+    /// window.
     pub drain_settle_secs: Option<u32>,
     /// What the worker states for a request's hard demands beside its
     /// vision ([`DemandFacts`]), in its registering host's own numbers. A
@@ -416,12 +418,17 @@ impl MembershipChange {
     }
 }
 
-/// The membership store's write side.
+/// The membership store's rows, as a host reads them.
+///
+/// The trait holds no write. A host writes a row through the holder of its
+/// worker objects. A store with no holder takes a decided change
+/// ([`crate::store::MemoryStore::follow`]).
 ///
 /// Every write moves the store's epoch; a write of a row's facts moves the
 /// row's revision, a status change does not. The store keeps no log of
 /// its changes. A journaled store tells each write to its journal
-/// ([`Journal::member`](super::Journal::member)), and a watcher reads
+/// ([`Journal::member`](super::Journal::member), and a status write
+/// [`Journal::status`](super::Journal::status)), and a watcher reads
 /// the journal's log. A
 /// snapshot carries the
 /// facts the gateways' pools derive from (role, wire modes, engine kind,
@@ -443,43 +450,6 @@ impl MembershipChange {
 /// decision reads a worker's status on its worker object, which the holder
 /// of the objects moves with the row's.
 pub trait WorkersStore: Send + Sync {
-    /// A registration or its refresh. A new key is `Registered`; the same key
-    /// with another incarnation is `Replaced` (the old id leaves with its
-    /// state); the same key and incarnation refresh the facts in place
-    /// (`Resized` when the data-parallel width moved, else `Relabelled`).
-    /// A new key's row is a control call's ([`Registrant::Control`]).
-    fn upsert(&self, facts: WorkerFacts) -> MembershipChange {
-        self.upsert_by(facts, Registrant::Control)
-    }
-
-    /// [`Self::upsert`] from `maker`: a new key's row is made by it. A row
-    /// that stands under the key keeps the maker it has, through a refresh
-    /// and through a new incarnation, whoever calls. Who may write a row is
-    /// the membership door's test, not the store's.
-    ///
-    /// The store takes the incarnation as stated. A caller numbers a new
-    /// life of a key with a number no life of the key had: the membership
-    /// doors do ([`life`](super::membership::life)), and a row they made
-    /// never comes back under its id.
-    fn upsert_by(&self, facts: WorkerFacts, maker: Registrant) -> MembershipChange;
-
-    /// Change a row's mutable facts; `None` when the row is gone or
-    /// `revision` moved.
-    fn patch(&self, id: WorkerId, patch: WorkerPatch, revision: u64) -> Option<MembershipChange>;
-
-    /// Remove a row; `None` when it is gone already or `revision` moved (a
-    /// removal never takes a newer incarnation of the same key).
-    fn remove(&self, id: WorkerId, revision: u64) -> Option<MembershipChange>;
-
-    /// Move a row's status; `None` when the row is gone, `revision` moved or
-    /// the status already stood (nothing is emitted then, as today).
-    fn set_status(
-        &self,
-        id: WorkerId,
-        status: WorkerStatus,
-        revision: u64,
-    ) -> Option<MembershipChange>;
-
     fn get(&self, id: WorkerId) -> Option<WorkerRow>;
 
     /// The row under a registration key, whatever its incarnation.

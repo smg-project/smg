@@ -544,3 +544,70 @@ fn each_fact_changed_alone_reads_back_as_it_was_changed() {
     assert_eq!(read_back(&store, &objects, "incarnation"), 2);
     assert_eq!(objects.object(id), None);
 }
+
+/// A cut laid whole holds each row against the row read back off its
+/// object. A row that did not read back as stated would be laid again at
+/// every cut. So a second cut keeps the very object of each row of a
+/// varied fleet. The fleet is [`fleet`], the row that states every fact
+/// and a row for each fact moved alone. It also holds a key that ends in
+/// a slash, and blank labels under the two names a worker's pairing
+/// facts are read from.
+///
+/// Each holds under a plain holder, under one that builds a host-local
+/// row with its checks off, and under one whose objects state thresholds.
+#[test]
+fn a_second_cut_keeps_the_very_object_of_each_row_of_a_varied_fleet() {
+    let defaults = OverloadThresholds {
+        waiting_requests: Some(8),
+        token_usage: Some(0.8),
+    };
+    let holders = [
+        ("a plain holder", holder()),
+        ("checks off", holder().with_host_local_unchecked()),
+        ("thresholds", holder().with_overload_thresholds(defaults)),
+    ];
+    for (case, objects) in holders {
+        let store = MemoryStore::new();
+        let mut fleet = fleet();
+        fleet.push(WorkerFacts {
+            key: "grpc://engine:9000@whole".to_owned(),
+            ..stated()
+        });
+        for (n, (_, change)) in moves().into_iter().enumerate() {
+            let mut facts = WorkerFacts {
+                key: format!("grpc://engine:9000@moved{n}"),
+                ..stated()
+            };
+            change(&mut facts);
+            fleet.push(facts);
+        }
+        fleet.push(at("http://slash:8000/"));
+        fleet.push(WorkerFacts {
+            labels: BTreeMap::from([
+                ("pairing_protocol".to_owned(), " ".to_owned()),
+                ("kv_connector".to_owned(), String::new()),
+            ]),
+            ..at("http://blank:8000")
+        });
+        let rows = fleet.len();
+        for facts in fleet {
+            laid(&objects, &store, facts);
+        }
+        let registry = objects.registry();
+        let object = |row: &WorkerRow| {
+            let id = objects.object(row.id).expect("the row's object");
+            registry.get(&id).expect("the object")
+        };
+        let (_, table) = store.all_rows();
+        assert_eq!(table.len(), rows, "{case}: one row a key");
+        let built: Vec<_> = table.iter().map(object).collect();
+        for cut in ["a first cut", "a second cut"] {
+            assert!(objects.restore_from(&store, store.checkpoint()), "{case}");
+            for (row, built) in table.iter().zip(&built) {
+                let key = &row.facts.key;
+                assert!(Arc::ptr_eq(built, &object(row)), "{case}, {cut}: {key}");
+            }
+            assert_eq!(read_back(&store, &objects, case), rows);
+        }
+    }
+}

@@ -163,10 +163,10 @@ pub(super) fn presets(config: &RoutingSettings) -> Result<Planned<'_>, RoutingSe
 pub(super) fn both_families(
     config: &RoutingSettings,
 ) -> Result<Option<Planned<'_>>, RoutingSettingsError> {
-    let mode = &config.mode;
+    let (mode, main) = (&config.mode, &config.policy);
     let (both, encode) = match mode {
         ModeSettings::Regular | ModeSettings::Provider(_) => {
-            (config.enable_igw && !manual_alone(config), None)
+            (config.enable_igw && !manual_alone(mode, main), None)
         }
         ModeSettings::PrefillDecode {
             prefill_policy: _,
@@ -184,7 +184,7 @@ pub(super) fn both_families(
     if !both {
         return Ok(None);
     }
-    families(config, encode).map(Some)
+    families(mode, main, encode).map(Some)
 }
 
 /// The document of a gateway of many routers outside the encode mode, with
@@ -202,40 +202,44 @@ pub(super) fn both_families(
 /// A setting with no document under three sides leaves the plan where it
 /// is written, as one manual side of the pair's two does.
 ///
-/// The manual policy on both sides of the pair is planned: its rule places
+/// The manual policy on both sides of the pair is planned. Its rule places
 /// the pair's two sides, each by its own session, and the encode side
-/// places an item by its content.
-pub(super) fn three_sided(
-    config: &RoutingSettings,
-) -> Result<Option<Planned<'_>>, RoutingSettingsError> {
-    let encode_mode = matches!(config.mode, ModeSettings::EncodePrefillDecode { .. });
-    if !config.enable_igw || encode_mode || manual_alone(config) {
+/// places an item by its own policy.
+///
+/// The plan reads three of the settings and takes them as they are: the
+/// mode, the main policy, and whether the gateway is one of many routers.
+pub(super) fn three_sided<'a>(
+    mode: &'a ModeSettings,
+    main: &'a PolicySettings,
+    many_routers: bool,
+) -> Result<Option<Planned<'a>>, RoutingSettingsError> {
+    let encode_mode = matches!(mode, ModeSettings::EncodePrefillDecode { .. });
+    if !many_routers || encode_mode || manual_alone(mode, main) {
         return Ok(None);
     }
-    families(config, Some(&ENCODE_DEFAULT)).map(Some)
+    families(mode, main, Some(&ENCODE_DEFAULT)).map(Some)
 }
 
 /// Whether the settings are a regular configuration under the manual
-/// policy. Its picker leaves the placement to the binding's session rule,
-/// and this module does not plan its pairs beside its single requests yet:
-/// such a gateway of many routers plans its single requests alone, under
-/// the plan of two families as under the plan of three sides.
-fn manual_alone(config: &RoutingSettings) -> bool {
-    let regular = matches!(
-        config.mode,
-        ModeSettings::Regular | ModeSettings::Provider(_)
-    );
-    regular && matches!(config.policy, PolicySettings::Manual { .. })
+/// policy, by their mode and their main policy. Its picker leaves the
+/// placement to the binding's session rule, and this module does not plan
+/// its pairs beside its single requests yet: such a gateway of many
+/// routers plans its single requests alone, under the plan of two families
+/// as under the plan of three sides.
+fn manual_alone(mode: &ModeSettings, main: &PolicySettings) -> bool {
+    let regular = matches!(mode, ModeSettings::Regular | ModeSettings::Provider(_));
+    regular && matches!(main, PolicySettings::Manual { .. })
 }
 
 /// The plan of two families: the pair's sides under one binding over their
 /// phases, with `encode` as a third side ahead of them where one is named,
-/// and the main policy's single binding behind it.
+/// and the main policy's single binding behind it. The sides' policies are
+/// the mode's own, or `main` where the mode names none.
 fn families<'a>(
-    config: &'a RoutingSettings,
+    mode: &'a ModeSettings,
+    main: &'a PolicySettings,
     encode: Option<&'a PolicySettings>,
 ) -> Result<Planned<'a>, RoutingSettingsError> {
-    let (mode, main) = (&config.mode, &config.policy);
     let (prefill, decode) = (mode.prefill_policy(main), mode.decode_policy(main));
     let mut sides = vec![("prefill", prefill), ("decode", decode)];
     let mut phases = vec![Phase::Prefill, Phase::Decode];
@@ -416,17 +420,17 @@ pub(super) fn written_with<'a>(
                         policy: policy.name(),
                         part: "profile",
                     })?;
-            // The encode side places an item by the item's content: it reads
-            // no key, the override never places it and no session rule does.
-            // So the manual policy is no encode side's, as the gateway's own
-            // check holds (`validate_encode_policy`,
-            // `model_gateway/src/config/validation.rs:319-328`).
+            // The encode side places an item by its own policy: it reads no
+            // key of the request's, the override never places it and no
+            // session rule does. So the manual policy is no encode side's, as
+            // the gateway's own check holds: `validate_encode_policy`
+            // (`model_gateway/src/config/validation.rs`).
             if side == ENCODE_SIDE {
                 if matches!(policy, PolicySettings::Manual { .. }) {
                     return Err(unsupported(
                         "encode_policy",
                         policy.name(),
-                        "a session rule places no item: an item goes to its encoder by its content",
+                        "a session rule places no item: an item goes to its encoder by its side's policy",
                     ));
                 }
                 shared.bound.encode_side = true;
@@ -1018,7 +1022,7 @@ impl Bound {
             return Err(unsupported(
                 "policy",
                 "manual",
-                "the manual policy places by the binding's one session rule, so every side of a plan is manual or none is",
+                "the manual policy places by the binding's one session rule, so both sides of a pair are manual or neither is",
             ));
         }
         let key = one_list(self.keys)?.ok_or(RoutingSettingsError::NoPart {

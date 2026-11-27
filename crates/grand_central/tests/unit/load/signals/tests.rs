@@ -82,7 +82,7 @@ fn a_stated_value_is_written_under_its_columns_unit_in_range_inside_the_cells() 
     let mut cells = SignalCells::default();
     cells.blank(3, 2);
     assert!(cells.fits(3) && valued(&cells) == 0, "every cell is blank");
-    assert!(cells.write(2, &held, "tokens", 7.0, 9));
+    assert!(held.write(&mut cells, 2, "tokens", 7.0, 9));
     let written = cells.cell(2, 1).expect("the cell");
     assert_eq!((written.value, written.sampled_at_micros), (7.0, 9));
     assert_eq!(valued(&cells), 1, "one cell was written");
@@ -95,16 +95,16 @@ fn a_stated_value_is_written_under_its_columns_unit_in_range_inside_the_cells() 
         (0, "tokens", -1e15 - 1.0),
         (3, "tokens", 1.0),
     ] {
-        let taken = cells.write(position, &held, unit, value, 9);
+        let taken = held.write(&mut cells, position, unit, value, 9);
         assert!(!taken, "{value} {unit} at row {position}");
     }
     // A column past the cells' count of signals names no cell.
     let past = SignalColumn::new("past", "tokens", 2, None);
-    assert!(!cells.write(0, &past, "tokens", 1.0, 9));
+    assert!(!past.write(&mut cells, 0, "tokens", 1.0, 9));
     assert_eq!(valued(&cells), 1, "none of them was written");
     // The bound itself is in range, at either sign.
-    assert!(cells.write(0, &held, "tokens", 1e15, 9));
-    assert!(cells.write(1, &held, "tokens", -1e15, 9));
+    assert!(held.write(&mut cells, 0, "tokens", 1e15, 9));
+    assert!(held.write(&mut cells, 1, "tokens", -1e15, 9));
     // Blank again, over fewer rows: no value stays, and the room does.
     let room = cells.cells_mut().capacity();
     cells.blank(2, 2);
@@ -180,4 +180,51 @@ fn the_default_cells_hold_no_signal() {
     let cells = SignalCells::default();
     assert!(cells.fits(0) && cells.fits(64));
     assert!(cells.cell(0, 0).is_none());
+}
+
+/// A sum reads each term under that term's own maximum age, whatever its
+/// count of terms: none, one, the most of a short sum, one more, and as
+/// many as a document may declare. A value sampled at exactly its term's
+/// maximum age is read. One sampled a microsecond earlier adds nothing,
+/// and the sum is not whole.
+#[test]
+fn a_sum_of_any_length_reads_each_term_under_its_own_maximum_age() {
+    const NOW: u64 = 1_000_000;
+    fn facts_over(cells: &SignalCells) -> RequestFacts<'_> {
+        RequestFacts {
+            now_micros: NOW,
+            signal_cells: Some(cells),
+            ..RequestFacts::default()
+        }
+    }
+    let row = Candidate::default();
+    for count in [0, 1, SHORT_SUM, SHORT_SUM + 1, MAX_SIGNALS] {
+        // The term at `at` ends past `at + 1` milliseconds and prices its
+        // value at `at + 1`.
+        let terms: Vec<SignalTerm> = (0..count)
+            .map(|at| {
+                let ends = Some(at as u32 + 1);
+                let column = SignalColumn::new("held", "tokens", at as u16, ends);
+                (column, (at + 1) as f64)
+            })
+            .collect();
+        let every: f64 = terms.iter().map(|(_, coefficient)| coefficient).sum();
+        let at_its_age = |at: usize| SignalCell::of(1.0, NOW - (at as u64 + 1) * 1_000);
+        let read: Vec<SignalCell> = (0..count).map(at_its_age).collect();
+        let cells = SignalCells::new(read.clone(), count);
+        let facts = facts_over(&cells);
+        let sums = SignalSums::new(&facts, &terms);
+        let summed = sums.add(0.5, sums.row(&row));
+        assert_eq!(summed, (0.5 + every, true), "{count} terms");
+        for late in 0..count {
+            let mut aged = read.clone();
+            aged[late].sampled_at_micros -= 1;
+            let cells = SignalCells::new(aged, count);
+            let facts = facts_over(&cells);
+            let sums = SignalSums::new(&facts, &terms);
+            let summed = sums.add(0.5, sums.row(&row));
+            let others = 0.5 + every - terms[late].1;
+            assert_eq!(summed, (others, false), "term {late} of {count}");
+        }
+    }
 }

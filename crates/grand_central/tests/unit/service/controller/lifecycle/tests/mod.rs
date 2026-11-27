@@ -89,7 +89,7 @@ fn stated(key: &str) -> WorkerFacts {
 /// A worker the store holds a row for, in a store no holder of worker
 /// objects stands over.
 pub(crate) fn worker(store: &MemoryStore, key: &str) -> WorkerId {
-    WorkersStore::upsert(store, stated(key)).id()
+    store.upsert(stated(key)).id()
 }
 
 pub(crate) fn a_dispatched(lease: u64) -> proto::Dispatched {

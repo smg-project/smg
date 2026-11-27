@@ -2,20 +2,23 @@
 //! its string tree for the prompts sent as text.
 //!
 //! Where Grand Central places every request no classic policy object is
-//! made, so no policy keeps the trees of the prompts this process sent. The
-//! engine's start makes an owner of them in a policy's place
-//! ([`LentTrees`]), and only where the document in force reads the prefixes
-//! sent to each worker. The owner keeps the trees in the store type the
-//! classic policy keeps its own in, under the document's own numbers: its
-//! block size is a token tree's page, and a model's `index` entry states
-//! the size its trees are held to and how often. The one size holds a token
-//! tree in tokens and a string tree in its own unit, its chars and a weight
-//! for each node a worker stands on, as the classic policy's one setting
-//! does, and the classic policy's own pass holds a tree to it. A
-//! worker the registry lost is taken out of the trees
-//! by the owner's own task, which follows the registry's events
-//! ([`LentTrees::follow_removals`]): the registry sends one for every
-//! removal, so a worker a mesh peer's word took away leaves the trees as
+//! made, so no policy keeps the trees of the prompts this process sent. An
+//! owner of them stands in a policy's place ([`LentTrees`]). It is made
+//! where a document put in force first reads the prefixes sent to each
+//! worker: at the engine's start, or behind a worker's `policy` label.
+//!
+//! The owner keeps the trees in the store type the classic policy keeps its
+//! own in, under the numbers of the document in force. Its block size is a
+//! token tree's page, and a model's `index` entry states the size its trees
+//! are held to and how often. The one size holds a token tree in tokens and
+//! a string tree in its own unit: its chars and a weight for each node a
+//! worker stands on. The classic policy's one setting does the same, and
+//! the classic policy's own pass holds a tree to it.
+//!
+//! A worker the registry lost is taken out of the trees by the owner's own
+//! task, which follows the registry's events
+//! ([`LentTrees::follow_removals`]). The registry sends one for every
+//! removal. So a worker a mesh peer's word took away leaves the trees as
 //! one this process removed does. The engine calls a tree's match and
 //! nothing else.
 //!
@@ -23,7 +26,7 @@
 //! workers' caches ([`EngineCaches`]): the cache-event monitor's indexes and
 //! these trees, each to a single request's decision alone.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use kv_index::{ModelTrees, TenantId, TokenTree, Tree as StringTree};
 use parking_lot::Mutex;
@@ -36,7 +39,7 @@ use tokio::{
     runtime::Handle,
     sync::broadcast::error::{RecvError, TryRecvError},
 };
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 use super::{
     cache_aware::evict_trees, kv_index::event_monitor::KvEventMonitor, normalize_model_key,
@@ -49,9 +52,14 @@ use crate::routers::common::snapshot::WorkerRegistry;
 #[derive(Debug)]
 pub(crate) struct LentTrees {
     /// The document the engine runs: a model's `index` entry sizes its
-    /// trees ([`PolicySpec::index_for`]).
-    document: PolicySpec,
-    /// A token tree's page in tokens: the document's block size.
+    /// trees ([`PolicySpec::index_for`]). A document a worker's label puts
+    /// in force takes its place ([`Self::follow`]).
+    document: Mutex<PolicySpec>,
+    /// A token tree's page in tokens: the block size of the document the
+    /// owner was made under. Every later document that reads the trees
+    /// states the same size, so the page never moves. The settings'
+    /// builder holds one block size for the sides of a document, a
+    /// label's among them, and refuses a label that names another.
     page: usize,
     /// One store for each size and cadence the models asked so far take.
     stores: Mutex<Vec<SizedTrees>>,
@@ -101,16 +109,85 @@ impl LentTrees {
     /// them as the classic policy's do. A supplied document states its own.
     pub(crate) fn of_document(document: PolicySpec, page: u32) -> Self {
         Self {
-            document,
+            document: Mutex::new(document),
             page: usize::try_from(page).unwrap_or(usize::MAX),
             stores: Mutex::new(Vec::new()),
         }
     }
 
-    /// The token tree of `model`, made at its first ask: every later ask is
-    /// handed the same tree. It stands with the trees of its size and its
-    /// cadence ([`Self::store_of`]). The engine asks when it builds a
-    /// model's table, not for a request.
+    /// The owner in `cell`. The first call makes it under the numbers of
+    /// `document`, whose block size is `page` tokens. Every later call is
+    /// handed that owner, whatever it names.
+    ///
+    /// The owner is made with the task that takes a worker `workers` lost
+    /// out of the trees ([`Self::follow_removals`]), on the runtime the
+    /// call is made on. The engine's start runs on one, and so does a
+    /// registration. Where none is entered no task is started, nothing
+    /// takes a worker out of the trees, and a debug line says so.
+    pub(crate) fn lend(
+        cell: &OnceLock<Arc<Self>>,
+        document: &PolicySpec,
+        page: u32,
+        workers: &WorkerRegistry,
+    ) -> Arc<Self> {
+        let made = || {
+            let trees = Arc::new(Self::of_document(document.clone(), page));
+            match Handle::try_current() {
+                Ok(runtime) => trees.follow_removals(workers, &runtime),
+                Err(_) => debug!("No runtime is entered: no task takes a worker that leaves out of the lent trees"),
+            }
+            trees
+        };
+        Arc::clone(cell.get_or_init(made))
+    }
+
+    /// Puts the trees of `cell` under `document`, a document a worker's
+    /// label is about to put in force. An owner that stands follows it
+    /// ([`Self::follow`]), and the document it followed before is answered
+    /// for a caller whose apply is refused. Where none stands and the
+    /// document reads the prefixes sent to each worker (`reads`), the owner
+    /// is made under it ([`Self::lend`]). The first document in force to
+    /// read them is then a label's. A document that reads none makes no
+    /// owner.
+    pub(crate) fn under(
+        cell: &OnceLock<Arc<Self>>,
+        document: PolicySpec,
+        reads: bool,
+        page: u32,
+        workers: &WorkerRegistry,
+    ) -> Option<PolicySpec> {
+        match cell.get() {
+            Some(trees) => Some(trees.follow(document)),
+            None => {
+                if reads {
+                    Self::lend(cell, &document, page, workers);
+                }
+                None
+            }
+        }
+    }
+
+    /// Sizes the trees asked from here on by `document`, the document in
+    /// force, and answers the one they were sized by. A model whose `index`
+    /// entry stands as it stood is handed the tree it had. A model whose
+    /// entry states another size or cadence under `document` is handed the
+    /// tree of that entry's store at its next ask. The engine asks where it
+    /// builds the model's table again.
+    pub(crate) fn follow(&self, document: PolicySpec) -> PolicySpec {
+        std::mem::replace(&mut *self.document.lock(), document)
+    }
+
+    /// The number of the document the trees are sized by: for a case that
+    /// reads which spec they follow.
+    #[cfg(test)]
+    pub(crate) fn follows(&self) -> u64 {
+        self.document.lock().generation
+    }
+
+    /// The token tree of `model`, made at its first ask: every later ask
+    /// under the same `index` entry is handed the same tree. It stands with
+    /// the trees of its size and its cadence ([`Self::store_of`]). The
+    /// engine asks when it builds a model's table, not for a request.
     pub(crate) fn token_tree(&self, model: &str) -> Arc<TokenTree> {
         self.store_of(model)
             .token_tree_or_new(normalize_model_key(model))
@@ -126,18 +203,21 @@ impl LentTrees {
     }
 
     /// The store of the trees of `model`'s size and cadence, made at the
-    /// first ask for a tree of that size and cadence: the model's `index`
-    /// entry of the document, or the entry's defaults where the document
+    /// first ask for a tree of that size and cadence. The two are the
+    /// model's `index` entry of the document in force at the ask
+    /// ([`Self::follow`]), or the entry's defaults where that document
     /// writes none for it.
     fn store_of(&self, model: &str) -> Arc<ModelTrees> {
-        let entry = self.document.index_for(model);
-        let (max_size, sweep_s) = entry.map_or_else(
+        let document = self.document.lock();
+        let (max_size, sweep_s) = document.index_for(model).map_or_else(
             || {
                 let unwritten = IndexSpec::default();
                 (unwritten.max_size, unwritten.sweep_s)
             },
             |(_, entry)| (entry.max_size, entry.sweep_s),
         );
+        // Let go ahead of the stores' lock: no caller holds the two.
+        drop(document);
         let mut stores = self.stores.lock();
         let found = stores
             .iter()
@@ -307,18 +387,25 @@ impl Left {
 pub(crate) struct EngineCaches {
     /// The cache-event monitor, where the process keeps one.
     events: Option<Arc<KvEventMonitor>>,
-    /// The lent trees, where the document in force reads sent prefixes.
-    trees: Option<Arc<LentTrees>>,
+    /// The cell of the lent trees. It is filled where a document put in
+    /// force first reads sent prefixes: at the start, or behind a worker's
+    /// label. The engine asks where it builds a model's table, so trees
+    /// lent behind a label are read at the table's next build.
+    trees: Arc<OnceLock<Arc<LentTrees>>>,
 }
 
 impl EngineCaches {
-    /// The one object over `events` and `trees`: `None` where the process
-    /// keeps neither, so the engine is handed nothing.
+    /// The one object over `events` and the cell `trees`. `later` says
+    /// that a later document can fill the cell: the registry holds a maker
+    /// of later specs. `None` where the process keeps no monitor, the cell
+    /// holds no trees and no later document can fill it: the engine is then
+    /// handed nothing.
     pub(crate) fn of(
         events: Option<Arc<KvEventMonitor>>,
-        trees: Option<Arc<LentTrees>>,
+        trees: Arc<OnceLock<Arc<LentTrees>>>,
+        later: bool,
     ) -> Option<Self> {
-        (events.is_some() || trees.is_some()).then_some(Self { events, trees })
+        (events.is_some() || trees.get().is_some() || later).then_some(Self { events, trees })
     }
 }
 
@@ -335,7 +422,7 @@ impl CacheIndexes for EngineCaches {
     /// the engine reads no tree for a prefill or a decode side yet.
     fn token_tree(&self, model: &str, phase: Phase) -> Option<Arc<TokenTree>> {
         match phase {
-            Phase::Single => Some(self.trees.as_ref()?.token_tree(model)),
+            Phase::Single => Some(self.trees.get()?.token_tree(model)),
             Phase::Prefill | Phase::Decode | Phase::Encode => None,
         }
     }
@@ -345,7 +432,7 @@ impl CacheIndexes for EngineCaches {
     /// lent no token tree.
     fn string_tree(&self, model: &str, phase: Phase) -> Option<Arc<StringTree>> {
         match phase {
-            Phase::Single => Some(self.trees.as_ref()?.string_tree(model)),
+            Phase::Single => Some(self.trees.get()?.string_tree(model)),
             Phase::Prefill | Phase::Decode | Phase::Encode => None,
         }
     }
@@ -386,6 +473,11 @@ mod tests {
     /// The owner under `document`, at pages of 16 tokens.
     fn owner(document: PolicySpec) -> LentTrees {
         LentTrees::of_document(document, 16)
+    }
+
+    /// A cell of lent trees that holds `trees`, or nothing.
+    fn cell(trees: Option<Arc<LentTrees>>) -> Arc<OnceLock<Arc<LentTrees>>> {
+        Arc::new(trees.map_or_else(OnceLock::new, OnceLock::from))
     }
 
     /// An `index` entry of `max_size` tokens trimmed every `sweep_s`
@@ -886,7 +978,8 @@ mod tests {
     #[test]
     fn the_engine_is_lent_a_single_requests_tree_and_no_sides() {
         let trees = Arc::new(owner(document(1_000, 0)));
-        let caches = EngineCaches::of(None, Some(Arc::clone(&trees))).expect("the trees");
+        let lent = cell(Some(Arc::clone(&trees)));
+        let caches = EngineCaches::of(None, lent, false).expect("the trees");
         let lent = caches.token_tree(MODEL, Phase::Single).expect("a tree");
         assert!(Arc::ptr_eq(&lent, &trees.token_tree(MODEL)));
         let lent = caches.string_tree(MODEL, Phase::Single).expect("a tree");
@@ -899,10 +992,72 @@ mod tests {
         assert!(caches.index(MODEL).is_none() && caches.block_size(MODEL).is_none());
 
         let monitor = Arc::new(KvEventMonitor::new());
-        let caches = EngineCaches::of(Some(monitor), None).expect("the monitor");
+        let caches = EngineCaches::of(Some(monitor), cell(None), false).expect("the monitor");
         assert!(caches.token_tree(MODEL, Phase::Single).is_none());
         assert!(caches.string_tree(MODEL, Phase::Single).is_none());
-        assert!(EngineCaches::of(None, None).is_none());
+        assert!(EngineCaches::of(None, cell(None), false).is_none());
+    }
+
+    /// The engine's object reads the trees through their cell: none while
+    /// the cell is empty, and the owner's once a document put in force
+    /// filled it. Over an empty cell the object is made only where a later
+    /// document can fill it. A document that reads no sent prefix makes no
+    /// owner, and the first that reads them makes it. An owner that stands
+    /// follows the next document and answers the one before.
+    #[test]
+    fn the_engines_object_reads_the_trees_a_later_document_lends() {
+        let lent = cell(None);
+        assert!(EngineCaches::of(None, Arc::clone(&lent), false).is_none());
+        let caches = EngineCaches::of(None, Arc::clone(&lent), true).expect("a later document");
+        assert!(caches.token_tree(MODEL, Phase::Single).is_none());
+        assert!(caches.string_tree(MODEL, Phase::Single).is_none());
+
+        let workers = WorkerRegistry::new();
+        let first = document(1_000, 0);
+        assert!(LentTrees::under(&lent, first.clone(), false, 16, &workers).is_none());
+        assert!(lent.get().is_none(), "a document that reads none");
+        assert!(LentTrees::under(&lent, first.clone(), true, 16, &workers).is_none());
+        let trees = Arc::clone(lent.get().expect("the first document that reads them"));
+        let asked = caches.token_tree(MODEL, Phase::Single).expect("a tree");
+        assert!(Arc::ptr_eq(&asked, &trees.token_tree(MODEL)));
+        let asked = caches.string_tree(MODEL, Phase::Single).expect("a tree");
+        assert!(Arc::ptr_eq(&asked, &trees.string_tree(MODEL)));
+
+        let mut second = first.clone();
+        second.generation = first.generation + 1;
+        let before = LentTrees::under(&lent, second.clone(), false, 16, &workers);
+        assert_eq!(before, Some(first), "the document followed before");
+        assert!(Arc::ptr_eq(lent.get().expect("one owner"), &trees));
+        assert_eq!(trees.follows(), second.generation);
+    }
+
+    /// The owner sizes a model's trees by the model's `index` entry of the
+    /// document in force at the ask. Behind a document that follows, a model
+    /// whose entry stands as it stood is handed the tree it had. A model
+    /// the new document writes an entry of its own for is handed the tree
+    /// of that entry's store.
+    #[test]
+    fn a_models_trees_are_sized_by_the_document_in_force_at_the_ask() {
+        let start = document(128, 1);
+        let trees = owner(start.clone());
+        let (plain, labelled) = (trees.token_tree("plain"), trees.token_tree(MODEL));
+        let mut later = start.clone();
+        later.index.insert(MODEL.to_owned(), entry(64, 2));
+        assert_eq!(trees.follow(later), start, "the document followed before");
+        assert!(
+            Arc::ptr_eq(&trees.token_tree("plain"), &plain),
+            "its entry stands"
+        );
+        assert!(
+            !Arc::ptr_eq(&trees.token_tree(MODEL), &labelled),
+            "another store"
+        );
+        let stores = trees.stores.lock();
+        let numbers: Vec<(u64, u32)> = stores
+            .iter()
+            .map(|store| (store.max_size, store.sweep_s))
+            .collect();
+        assert_eq!(numbers, [(128, 1), (64, 2)]);
     }
 
     /// The object answers a model's index and its block size as the
@@ -915,7 +1070,7 @@ mod tests {
         monitor.set_index(MODEL, Arc::clone(&index));
         monitor.set_block_size(MODEL, 4);
         let trees = Arc::new(owner(document(1_000, 0)));
-        let caches = EngineCaches::of(Some(monitor), Some(trees)).expect("both");
+        let caches = EngineCaches::of(Some(monitor), cell(Some(trees)), false).expect("both");
         assert_eq!(caches.block_size(MODEL), Some(4));
         let empty = caches.index(MODEL).expect("the model's index");
         assert!(!empty.holds_a_block(), "no block yet");

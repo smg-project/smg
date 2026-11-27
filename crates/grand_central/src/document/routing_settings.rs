@@ -656,9 +656,9 @@ impl RoutingSettings {
     /// binding with an encode side.
     ///
     /// The manual policy on both sides of a pair runs under the plan of
-    /// three sides, and under the encode mode's own plan: its rule places
+    /// three sides, and under the encode mode's own plan. Its rule places
     /// the pair's two sides, each by its own session, and the encode side
-    /// places an item by its content.
+    /// places an item by its own policy.
     ///
     /// A pure function of the settings. The document is not validated
     /// here, a plan with an encode side in a gateway of many routers
@@ -666,7 +666,7 @@ impl RoutingSettings {
     /// names there a stage its build does not run yet.
     pub fn policy_document(&self) -> Result<PolicySpec, RoutingSettingsError> {
         refuse_unsupported(self)?;
-        if let Some(three) = three_sided(self)? {
+        if let Some(three) = three_sided(&self.mode, &self.policy, self.enable_igw)? {
             if let Some(said) = taken(written(self, three), true) {
                 return said;
             }
@@ -768,7 +768,7 @@ impl RoutingSettings {
         }
         // The plan that document was written from ([`written_from`]),
         // written again with the labels' sides.
-        let plan = match three_sided(self)? {
+        let plan = match three_sided(&self.mode, &self.policy, self.enable_igw)? {
             Some(three) if written_from(&three, &document) => three,
             _ => match both_families(self)? {
                 Some(both) if written_from(&both, &document) => both,

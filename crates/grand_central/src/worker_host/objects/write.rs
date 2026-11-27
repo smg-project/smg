@@ -32,15 +32,17 @@
 //! standby's applier and a watcher's. So the store refuses a change where
 //! its table was written around the holder, through an entry of the
 //! store's own ([`MemoryStore::follow`]). The row and the object then
-//! stand apart until a cut is laid whole ([`mod@super::standby`]).
+//! stand apart until a cut is laid whole ([`mod@super::standby`]). A
+//! standby's applier and a watcher also lay the row at the next event
+//! that tells it and that the store takes.
 //!
 //! A writer's thread that ends between its two writes, the store's and
 //! the registry's, leaves a row and its object apart too. No line of the
 //! holder between the two returns early or unwraps a result.
 //!
-//! A patch tells the store the whole row read back from the object, where
-//! the store's own patch wrote the patched facts alone. The two are one
-//! row while an object states what its row stated: what an object does not
+//! A patch tells the store the whole row read back from the object, and
+//! the store writes it whole. It is the table's row with the patch laid
+//! on it while an object states what its row stated: what an object does not
 //! hold as stated is kept beside it, and nothing in a controller sets a
 //! fact of an object behind its build, as a gateway's refresh of a
 //! worker's models does in a gateway. A change that sets one writes the

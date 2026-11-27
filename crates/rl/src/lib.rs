@@ -15,6 +15,7 @@ pub mod proxy;
 pub mod selector;
 pub mod state;
 #[cfg(test)]
+#[path = "../tests/unit/testing.rs"]
 pub(crate) mod testing;
 pub mod view;
 

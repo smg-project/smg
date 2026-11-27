@@ -35,14 +35,15 @@ pub trait LentRing: fmt::Debug + Send + Sync {
     /// No part of a recipe is held here, and nothing is hashed for one.
     ///
     /// What makes a request under the prefix form asks once for each head
-    /// of the prompt, or once for the routing value, and states the
-    /// answers as the request's places, the deepest head's first
-    /// ([`RequestFacts::ring_positions`]). The order of the asks is its
-    /// own. Under `None` the request is lent no ring and states no place,
-    /// so the stage's own ring places it. The lender is then asked about
-    /// no further head, and [`Self::position`] is asked nothing for a
-    /// head: one recipe's place is never read under the other form. A ring
-    /// that holds no worker answers too, as [`Self::position`] does.
+    /// of the prompt, or once for the routing value, under each rule a
+    /// request is cut by, and states the answers as the request's places,
+    /// the deepest head's first ([`RequestFacts::ring_positions`]). The
+    /// order of the asks is its own. Under `None` the request is lent no
+    /// ring and states no place, so the stage's own ring places it. The
+    /// lender is then asked about no further head, and [`Self::position`]
+    /// is asked nothing for a head: one recipe's place is never read under
+    /// the other form. A ring that holds no worker answers too, as
+    /// [`Self::position`] does.
     ///
     /// A pair whose two sides read the ring by two forms is asked both
     /// questions, each for the side of its form

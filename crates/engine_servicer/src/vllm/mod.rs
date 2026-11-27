@@ -41,6 +41,7 @@ mod info;
 mod media;
 mod service;
 #[cfg(test)]
+#[path = "../../tests/unit/vllm/tests.rs"]
 mod tests;
 
 use std::{sync::Arc, time::Duration};

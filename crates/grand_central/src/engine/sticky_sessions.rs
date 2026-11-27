@@ -225,8 +225,9 @@ struct Entry {
     touched_at_micros: u64,
     recovery: Recovery,
     /// The pin a decision's claim wrote before its commit; `WorkerId(0)`
-    /// when none stands. Any dispatch to it confirms it (the key was served
-    /// there), the claiming decision's dispatch elsewhere withdraws it while
+    /// when none stands. Any dispatch of the key's current life to it
+    /// confirms it (the key was served there), the claiming decision's
+    /// dispatch elsewhere withdraws it while
     /// it stands unconfirmed, and no other dispatch elsewhere touches it; a
     /// claim whose commit never comes stands until the TTL sweeps the key.
     /// A pair's decision moves its own claim to the prefill its pair formed
@@ -248,11 +249,32 @@ struct Entry {
     /// is dated later. Two claims of one key on one worker a whole 2^32
     /// microseconds apart read as one, the answer by the worker alone.
     claimed_at: u32,
+    /// The least date under which a decision that read this life of the
+    /// key tells its words, on the decision clock. It never rises inside
+    /// a life.
+    ///
+    /// Four calls write it. The read that begins the life writes its
+    /// instant ([`SessionTable::lookup`]). A reader with an older instant
+    /// lowers it ([`Entry::touch`]). So does a claim call, which reads
+    /// the pins as they stand ([`SessionTable::claim`]). So does a decode
+    /// call that read this life, by the date of its pair's lease
+    /// (`SessionTable::told_under`, with the in-process engine).
+    ///
+    /// Three doors read it, by one test ([`Entry::outlived`]). A call
+    /// dated before it comes from a decision that read no pin of this
+    /// life, and writes nothing. The three are a dispatch
+    /// ([`SessionTable::dispatched`]), a move at the cap
+    /// ([`SessionTable::respilled`]) and a decode call's date. `0` in an
+    /// entry no decision has read: every word is written there.
+    oldest_reader_micros: u64,
 }
 
 impl Entry {
     fn touch(&mut self, now_micros: u64, rule: &SessionRule) {
         if now_micros < self.touched_at_micros {
+            // A decision that read its clock ahead of another reads this
+            // life behind it, and tells its words under its own instant.
+            self.read_under(now_micros);
             return;
         }
         match rule.ttl_micros {
@@ -309,13 +331,38 @@ impl Entry {
 
     /// Dates the claim of record by `issued`, the instant of the lease its
     /// words are told under, where that claim is the one `leased` and `at`
-    /// name ([`Self::reached_by`]). A lease that states no instant (`0`)
-    /// dates nothing: the claim keeps its own date.
+    /// name ([`Self::reached_by`]). Its caller hands the date of a lease
+    /// that states one ([`SessionTable::told_under`]).
     #[cfg(any(test, feature = "in-process"))]
     fn dated(&mut self, leased: WorkerId, at: u64, issued: u64) {
-        if issued != 0 && self.reached_by(leased, at) {
+        if self.reached_by(leased, at) {
             self.claimed_at = issued as u32;
         }
+    }
+
+    /// A key's life as the decision at `now_micros` begins it: no pin, and
+    /// that decision its oldest reader.
+    fn begun(now_micros: u64) -> Self {
+        Self {
+            oldest_reader_micros: now_micros,
+            ..Self::default()
+        }
+    }
+
+    /// A decision that tells its words under `date` read this life of the
+    /// key: the oldest reader's date falls to it where it is older.
+    fn read_under(&mut self, date: u64) {
+        if date < self.oldest_reader_micros {
+            self.oldest_reader_micros = date;
+        }
+    }
+
+    /// Whether a word dated `at` comes from an older life of the key: it
+    /// is dated before every decision that read this one. A word that
+    /// states no instant (`0`) does not. Neither does any word in an entry
+    /// no decision has read.
+    fn outlived(&self, at: u64) -> bool {
+        at != 0 && at < self.oldest_reader_micros
     }
 
     /// Withdraws `claim` from the pins (the pin behind it moves up): its
@@ -643,7 +690,8 @@ impl SessionTable {
         if entry.expires_at_micros <= now_micros {
             // Expired and not yet swept: the key starts over here, under the
             // lock the sweep takes; the walk only reclaims what expired.
-            *entry = Entry::default();
+            // This decision is the new life's first reader.
+            *entry = Entry::begun(now_micros);
         }
         entry.touch(now_micros, rule);
         entry.pins
@@ -657,8 +705,9 @@ impl SessionTable {
     /// among this decision's survivors; the pin that stands is returned with
     /// the pins the key held ([`Claim::standing`] is the rule). The
     /// claim is a pin made before a commit, and it is marked as such:
-    /// any dispatch to it confirms it, the claiming decision's own dispatch
-    /// elsewhere withdraws it (`dispatched`), the TTL sweeps it otherwise.
+    /// any dispatch of the key's current life to it confirms it, the
+    /// claiming decision's own dispatch elsewhere withdraws it
+    /// (`dispatched`), the TTL sweeps it otherwise.
     /// A pair's decision moves its own claim before its dispatch, and a
     /// commit that refused every target withdraws its decision's
     /// ([`Self::move_claim`]).
@@ -668,7 +717,14 @@ impl SessionTable {
     /// lease moves or withdraws the claim where the lease names the
     /// claim's id and that instant ([`Entry::reached_by`]). A decode call
     /// claims at its own instant, and its claim is dated again by its
-    /// pair's lease (`Self::date_claim`, with the in-process engine).
+    /// pair's lease (`Self::told_under`, with the in-process engine).
+    ///
+    /// The call reads the key's pins as they stand and answers by them:
+    /// it is a read of the key's life. Where the key started over between
+    /// the decision's first read and this call, the new life takes `at`
+    /// as a reader's date ([`Entry::read_under`]). The decision's
+    /// dispatch is then written into the life its call read. A call that
+    /// states no instant (`0`) lowers nothing.
     ///
     /// The pin and the claim of record take the id that stands for the
     /// worker ([`Self::stands`]): the decision read its rows ahead of this
@@ -711,6 +767,12 @@ impl SessionTable {
         let Some(entry) = self.slot(&mut shard, key) else {
             return Claim::NoRoom;
         };
+        // A read of the key's life as it stands, whatever the answer. A
+        // call that states no instant lowers nothing: a zero date would
+        // open the life to every older word.
+        if at != 0 {
+            entry.read_under(at);
+        }
         // The pins as written, read ahead of the ask. Where they are
         // the ones the decision read, the ask is a write's
         // (`stands`). Where they moved, the answer names their
@@ -764,12 +826,22 @@ impl SessionTable {
     /// forms, to the prefill the pair formed on. A prefill its side placed
     /// first and passed over is fronted at no instant, and a decision
     /// that forms no pair moves no pin.
-    pub(crate) fn respilled(&self, key: Session, target: WorkerId) {
+    ///
+    /// `at` is the moving decision's instant. A move dated before every
+    /// decision that read the key's current life writes nothing
+    /// ([`Entry::outlived`]). The key started over since the moving
+    /// decision read its pin, and the move would front a worker over
+    /// pins that decision never read. A caller that states no instant
+    /// (`0`) moves the pin in any life.
+    pub(crate) fn respilled(&self, key: Session, target: WorkerId, at: u64) {
         let key = key.get();
         if target == WorkerId(0) {
             return;
         }
         if let Some(entry) = self.shard(key).lock().get_mut(&key) {
+            if entry.outlived(at) {
+                return;
+            }
             // The decision read its rows ahead of this write. In neither
             // pin, its worker may have been registered again between the
             // two: the dispatch behind this move finds the worker pinned
@@ -803,7 +875,9 @@ impl SessionTable {
     /// issued at `at` ([`Entry::reached_by`]). A later decision's claim on
     /// the same worker is dated later, so a refusal told late leaves it.
     /// The claim written for `target` keeps `at`. A caller that states no
-    /// instant (`0`) is known by its worker alone.
+    /// instant (`0`) is known by its worker alone. The call reads no date
+    /// of the key's life and writes none: it reaches its caller's own
+    /// claim alone.
     pub(crate) fn move_claim(
         &self,
         key: Session,
@@ -843,17 +917,34 @@ impl SessionTable {
         SessionVerdict::Claimed(target)
     }
 
-    /// A decode call claimed `leased` for `key` at `at`, its own instant,
-    /// under the lease its pair's first decision issued at `issued`. Every
-    /// word of the side that call issues is told under that lease, so the
-    /// claim takes the lease's date here. Nothing is written where the
-    /// claim of record is no longer that call's, or where the lease states
-    /// no instant (`issued` is 0).
+    /// A decode call read `key` at `at`, its own instant, under the lease
+    /// its pair's first decision issued at `issued`. Every word of the side
+    /// that call issues is told under that lease. The key's life takes the
+    /// lease's date as a reader's, so the call's dispatch is of this life
+    /// ([`Entry::outlived`]). Where the call claimed `claimed`, the claim
+    /// takes the lease's date too, unless the claim of record is no longer
+    /// that call's.
+    ///
+    /// A life whose every reader is dated after `at` began behind the
+    /// call's read. The call read no pin of it, and nothing is written:
+    /// the call's dispatch is an older life's there.
+    ///
+    /// A lease that states no instant (`issued` is 0) writes nothing, and
+    /// neither does a call with no key: no lock is taken for either.
     #[cfg(any(test, feature = "in-process"))]
-    pub(crate) fn date_claim(&self, key: Session, leased: WorkerId, at: u64, issued: u64) {
+    pub(crate) fn told_under(&self, key: Session, claimed: Option<WorkerId>, at: u64, issued: u64) {
         let key = key.get();
+        if key == 0 || issued == 0 {
+            return;
+        }
         if let Some(entry) = self.shard(key).lock().get_mut(&key) {
-            entry.dated(leased, at, issued);
+            if entry.outlived(at) {
+                return;
+            }
+            entry.read_under(issued);
+            if let Some(leased) = claimed {
+                entry.dated(leased, at, issued);
+            }
         }
     }
 
@@ -873,6 +964,11 @@ impl SessionTable {
     /// that instant ([`Entry::reached_by`]): the commit elsewhere of an
     /// older decision that claimed the same worker withdraws nothing. A
     /// lease that states no instant (`0`) is known by its worker alone.
+    ///
+    /// A dispatch dated before every decision that read the key's current
+    /// life writes nothing ([`Entry::outlived`]): the key started over
+    /// between that dispatch's decision and its send. One that states no
+    /// instant is written.
     pub(crate) fn dispatched(
         &self,
         key: Session,
@@ -888,6 +984,13 @@ impl SessionTable {
         let Some(entry) = self.slot(&mut shard, key) else {
             return;
         };
+        // A dispatch dated before every decision that read the key's
+        // current life comes from an older one. The new life keeps its
+        // own pins: a gateway's sticky map pins where it selects, and a
+        // send that comes late writes nothing there.
+        if entry.outlived(at) {
+            return;
+        }
         // A dispatch to the claimed worker confirms the claim, whichever
         // decision commits there: the key was served on it, so a pin another
         // request already used is never withdrawn. Only the claiming

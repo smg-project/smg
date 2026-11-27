@@ -36,6 +36,9 @@
 //! CLASSIC_ROWS_OUT=<dir> CLASSIC_ROWS_COMMIT=<commit> \
 //!   cargo test -p smg --lib worker_selection::classic_encode_pair_rows -- --ignored --nocapture
 //! ```
+//!
+//! A second test, which every run of the crate's tests includes, records the
+//! rows the same way and holds the checked-in sheet to them byte for byte.
 
 use std::{
     fs,
@@ -380,7 +383,11 @@ struct Call {
 }
 
 /// The encode policy behind a wrapper that writes down each call and passes
-/// it on unchanged.
+/// it on unchanged. The selection reads a policy's type to choose what it
+/// hands it, the model's hash ring among it. So the wrapper answers with the
+/// type of the policy inside: under a type of its own the ring's policy is
+/// handed no ring, and places an item by its fallback and not as the gateway
+/// does.
 #[derive(Debug)]
 struct Watched {
     inner: Arc<dyn LoadBalancingPolicy>,
@@ -413,7 +420,7 @@ impl LoadBalancingPolicy for Watched {
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
-        self
+        self.inner.as_any()
     }
 }
 
@@ -1183,6 +1190,55 @@ fn rows() -> Vec<Row> {
     rows
 }
 
+/// The sheet as this recorder writes it under `commit`: its rows, recorded
+/// now, and the text of its file to the end of the last line.
+fn sheet_under(commit: String) -> (Sheet, String) {
+    let sheet = Sheet {
+        recorded_from: commit,
+        policy: "encode_pair",
+        rows: rows(),
+    };
+    let text = serde_json::to_string_pretty(&sheet).expect("the sheet serializes");
+    (sheet, text + "\n")
+}
+
+/// The sheet the Grand Central crate replays is the one this recorder
+/// writes: recorded now under the sheet's own commit, the rows are the
+/// file's text byte for byte. A change of the gateway's answer to a row, or
+/// of the bed the rows are recorded on, turns this red until the sheet is
+/// recorded again. The crate's replay cannot tell which encoder the ring
+/// gives a key: it holds the key to the encoders it was offered, and the
+/// ring it lends is built from the row's own answer.
+#[test]
+fn the_recorder_writes_the_sheet_the_crate_replays() {
+    let kept = fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../crates/grand_central/tests/classic/sheets/encode_pair.json"
+    ))
+    .expect("the checked-in sheet");
+    let rows_of = |text: &str| {
+        let sheet: serde_json::Value = serde_json::from_str(text).expect("a sheet");
+        let rows = sheet["rows"].as_array().cloned().unwrap_or_default();
+        (sheet["recorded_from"].as_str().map(str::to_string), rows)
+    };
+    let (commit, was) = rows_of(&kept);
+    let (_, text) = sheet_under(commit.expect("the commit the sheet was recorded from"));
+    if text != kept {
+        let (_, now) = rows_of(&text);
+        let differing: Vec<_> = now
+            .iter()
+            .zip(&was)
+            .filter(|(now, was)| now != was)
+            .map(|(now, _)| now["name"].clone())
+            .collect();
+        panic!(
+            "the recorder writes {} rows and the sheet holds {}; the rows that differ: {differing:?}",
+            now.len(),
+            was.len()
+        );
+    }
+}
+
 #[test]
 #[ignore = "records the classic rows into CLASSIC_ROWS_OUT"]
 fn record_the_classic_encode_pair_rows() {
@@ -1191,15 +1247,10 @@ fn record_the_classic_encode_pair_rows() {
     );
     let commit =
         std::env::var("CLASSIC_ROWS_COMMIT").expect("CLASSIC_ROWS_COMMIT names the commit");
-    let sheet = Sheet {
-        recorded_from: commit,
-        policy: "encode_pair",
-        rows: rows(),
-    };
+    let (sheet, text) = sheet_under(commit);
     fs::create_dir_all(&out).expect("the output directory");
     let path = out.join("encode_pair.json");
-    let text = serde_json::to_string_pretty(&sheet).expect("the sheet serializes");
-    fs::write(&path, text + "\n").expect("the sheet is written");
+    fs::write(&path, text).expect("the sheet is written");
     for row in &sheet.rows {
         println!(
             "ROW {}: {}",

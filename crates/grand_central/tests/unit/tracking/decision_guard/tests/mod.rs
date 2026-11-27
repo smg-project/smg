@@ -1414,16 +1414,17 @@ mod linked {
 
     /// Over a session whose welcome chose protocol 2, a request states
     /// its hard demands on its frame. The kinds are a single request,
-    /// a request at a side's phase and one that names its worker, by a
-    /// number or by a text that is none. Each part goes as the request
-    /// states it, the number beside it, and the ask is answered as any
-    /// ask is.
+    /// a request at a side's phase or at the encode phase, and one that
+    /// names its worker. Its name is a number or a text that is none.
+    /// Each part goes as the request states it, a demand for vision among
+    /// them, the number beside it, and the ask is answered as any ask is.
     #[tokio::test(start_paused = true)]
     async fn a_requests_demands_go_out_on_its_frame_over_a_session_on_protocol_two() {
         let kinds = [
             (Phase::Single, None),
             (Phase::Prefill, None),
             (Phase::Decode, None),
+            (Phase::Encode, None),
             (Phase::Single, Some(Some(3))),
             (Phase::Single, Some(None)),
             (Phase::Prefill, Some(Some(3))),
@@ -1435,11 +1436,11 @@ mod linked {
             ask.facts.phase = phase;
             ask.constraints.demands = Demands {
                 runtime: 7,
+                vision: true,
                 references: References::Caller,
                 input_window: 4_096,
                 output_window: 512,
                 decoding: 3,
-                ..Demands::default()
             };
             peer.read_hello().await;
             let link = peer.link.clone();
@@ -1465,7 +1466,7 @@ mod linked {
                 sent.demands,
                 Some(proto::Demands {
                     runtime: 7,
-                    vision: false,
+                    vision: true,
                     references: proto::demands::References::Caller.into(),
                     input_window: 4_096,
                     output_window: 512,
@@ -1478,93 +1479,63 @@ mod linked {
         }
     }
 
-    /// Over a session on protocol 2 the handle still refuses two
-    /// demands before anything is sent. One is an encode request's,
-    /// which a controller holds on no frame yet: by its own ask, and by
-    /// a request that states the encode phase. The other is the part
-    /// that demands vision, by its own name, on a request of any kind:
-    /// no registration states whether a worker takes images.
+    /// Over a session on protocol 2 an encode request states its hard
+    /// demands on its frame, beside its items. Each part goes as the
+    /// request states it, a demand for vision among them, and the ask is
+    /// answered as any encode ask is.
     #[tokio::test(start_paused = true)]
-    async fn an_encode_requests_demand_and_a_demand_for_vision_are_refused_before_anything_is_sent()
-    {
+    async fn a_linked_encode_requests_demands_go_out_on_its_frame() {
         let mut peer = Peer::speaking(1, 2);
-        let demand = Demands {
-            runtime: 7,
-            ..Demands::default()
+        let keys = [Identity::hashed(11), Identity::NONE];
+        let items = EncodeItems {
+            keys: &keys,
+            references: true,
+            ..EncodeItems::default()
         };
-        let vision = Demands {
-            vision: true,
-            ..Demands::default()
-        };
-        let both = Demands {
-            vision: true,
-            ..demand
-        };
-        let field = |answer: &Result<DecisionGuard<&InProcess>, DecisionUnavailable>| match answer {
-            Err(DecisionUnavailable::Unsent(Error::OutOfRange(field))) => Some(*field),
-            _ => None,
-        };
-        let before = tokio::time::Instant::now();
-        let asks = [
-            (Phase::Encode, None, demand, "constraints.demands"),
-            (Phase::Encode, Some(Some(0)), demand, "constraints.demands"),
-            (Phase::Single, None, vision, "constraints.demands.vision"),
-            (Phase::Single, None, both, "constraints.demands.vision"),
-            (Phase::Prefill, None, vision, "constraints.demands.vision"),
-            (Phase::Decode, None, both, "constraints.demands.vision"),
-            (
-                Phase::Single,
-                Some(Some(0)),
-                vision,
-                "constraints.demands.vision",
-            ),
-        ];
-        for (phase, named, demands, refused) in asks {
-            let mut ask = stated(&[1]);
-            ask.facts.budget_micros = 200_000;
-            ask.facts.phase = phase;
-            ask.constraints.demands = demands;
-            let answer = timeout(
-                PATIENCE,
-                pin!(DecisionGuard::<&InProcess>::asked_naming(
-                    &peer.link,
-                    &ask,
-                    named,
-                    Instant::now(),
-                    PATIENCE
-                )),
-            )
-            .await
-            .expect("the ask returns");
-            assert_eq!(field(&answer), Some(refused), "{phase:?} {named:?}");
-        }
+        let mut placed = EncodePlaced::new();
         let mut ask = stated(&[1]);
         ask.facts.budget_micros = 200_000;
         ask.facts.phase = Phase::Prefill;
-        ask.constraints.demands = demand;
-        let mut placed = EncodePlaced::new();
-        let answer = timeout(
-            PATIENCE,
-            pin!(DecisionGuard::<&InProcess>::asked_encode(
-                &peer.link,
+        ask.constraints.demands = Demands {
+            runtime: 7,
+            vision: true,
+            references: References::Caller,
+            input_window: 4_096,
+            ..Demands::default()
+        };
+        peer.read_hello().await;
+        let link = peer.link.clone();
+        let exchange = async {
+            let sent = peer.requests.next().await.expect("an ask went out");
+            let beside = Some(two_encoders());
+            peer.answer_beside(1, link.term_floor(), Answer::Decision(paired()), beside);
+            sent
+        };
+        let both = async {
+            let now = Instant::now();
+            let held = pin!(DecisionGuard::<&InProcess>::asked_encode(
+                &link,
                 &ask,
-                EncodeItems::default(),
+                items,
                 &mut placed,
-                Instant::now(),
+                now,
                 PATIENCE
-            )),
-        )
-        .await
-        .expect("the ask returns");
+            ));
+            tokio::join!(exchange, held)
+        };
+        let (sent, handle) = timeout(PATIENCE, both).await.expect("an answer came back");
+        assert!(handle.is_ok(), "the ask is answered: {:?}", handle.err());
+        assert!(sent.encode.is_some(), "the frame states its items");
         assert_eq!(
-            field(&answer),
-            Some("constraints.demands"),
-            "an encode request"
-        );
-        assert_eq!(tokio::time::Instant::now(), before);
-        assert!(
-            poll(pin!(peer.requests.next())).is_pending(),
-            "nothing went out"
+            sent.demands,
+            Some(proto::Demands {
+                runtime: 7,
+                vision: true,
+                references: proto::demands::References::Caller.into(),
+                input_window: 4_096,
+                output_window: 0,
+                decoding: 0,
+            })
         );
     }
 }

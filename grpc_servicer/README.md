@@ -163,14 +163,12 @@ documented setting and logs nothing. The startup
 line `VllmEngineServicer initialized (mm_processor=inprocess, source=flag)` and
 the `mm_processor_source` label name where the value came from.
 
-A model family whose reference image processor raises a short side below a
-floor before its own resize (MiniMax-M3: 112 px) gets the same raise on the
-worker: `inprocess` and the sidecar raise such an image to the floor, bicubic,
-before the engine's processor sizes it, as the router's own pipeline does, so
-a tiny image costs the same visual tokens whichever component preprocessed it
-(video frames are not raised, as there). An engine started with
-`--mm-processor-kwargs '{"do_resize": false}'` raises nothing, as the pipeline
-raises nothing then.
+A worker that prepares media itself (`inprocess` or the sidecar) hands a
+fetched image to the engine's processor unchanged, so the image costs the
+visual tokens the installed engine release counts. The router's own pipeline
+sizes an image by the rule of the newest release it follows; a worker on an
+older release whose processor sizes a small image by another rule counts that
+image differently.
 
 The worker then advertises `mm_processor=inprocess` and `mm_media_ref_schemes`
 through `GetServerInfo`; a router with media-reference support forwards

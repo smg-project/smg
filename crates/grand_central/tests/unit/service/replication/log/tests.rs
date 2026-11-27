@@ -5,7 +5,7 @@ use std::{
 };
 
 use super::*;
-use crate::{engine::view::WorkerId, service::replication::tests::ascends, store::WorkerStatus};
+use crate::service::replication::tests::ascends;
 
 impl Log {
     /// The log's lock, held: for a case that shows what waits for it.
@@ -23,21 +23,20 @@ const GENERATION: u32 = 2_000_000;
 
 /// A status write of the store's own, marked by its epoch.
 fn status(log: &Log, epoch: u32) {
-    assert!(log.member(None, None, u64::from(epoch), drained(epoch), None, None));
+    assert!(drains(log, None, None, epoch));
 }
 
 /// A leader's status write applied at `at`, the place a guard holds.
 fn status_at(log: &Log, at: Position, epoch: u32) {
-    let change = drained(epoch);
-    assert!(log.member(Some(at), None, u64::from(epoch), change, None, None));
+    assert!(drains(log, Some(at), None, epoch));
 }
 
-fn drained(epoch: u32) -> MembershipChange {
-    MembershipChange::StatusChanged {
-        id: WorkerId(u64::from(epoch)),
-        from: WorkerStatus::Ready,
-        to: WorkerStatus::Draining,
-    }
+/// A ready row's drain told at `at` under `term`: the row serves no
+/// model. Whether the log took it.
+fn drains(log: &Log, at: Option<Position>, term: Option<u64>, epoch: u32) -> bool {
+    let id = WorkerId(u64::from(epoch));
+    let (from, to) = (WorkerStatus::Ready, WorkerStatus::Draining);
+    log.status(at, term, u64::from(epoch), id, from, to, Arc::default())
 }
 
 /// A membership write of the store's own, marked by its epoch above
@@ -66,14 +65,8 @@ fn marks(entries: &[Entry]) -> Vec<u32> {
     entries
         .iter()
         .map(|entry| match &entry.event {
-            Event::Member { epoch, change, .. } => {
-                let epoch = u32::try_from(*epoch).expect("a test's epoch");
-                if matches!(change, MembershipChange::StatusChanged { .. }) {
-                    epoch
-                } else {
-                    MEMBER + epoch
-                }
-            }
+            Event::Status { epoch, .. } => u32::try_from(*epoch).expect("a test's epoch"),
+            Event::Member { epoch, .. } => MEMBER + u32::try_from(*epoch).expect("a test's epoch"),
             Event::Term => TERM,
             Event::Generation { generation } => {
                 GENERATION + u32::try_from(*generation).expect("a test's generation")
@@ -147,6 +140,16 @@ fn applies(follower: &Log, led: &[Entry]) {
                 row.as_deref(),
                 left.as_deref(),
             )),
+            Event::Status {
+                epoch,
+                id,
+                from,
+                to,
+                models,
+            } => {
+                let models = Arc::clone(models);
+                assert!(follower.status(Some(entry.at), None, *epoch, *id, *from, *to, models));
+            }
         }
         assert!(adopting.landed());
     }
@@ -1496,37 +1499,44 @@ fn a_term_told_while_its_start_is_applied_is_the_leaders_and_no_take() {
 }
 
 /// A write made under a term meets the log's test where its event would
-/// take its place. Under the term the log leads it lands, stamped with
+/// take its place, by each door that takes a term: a status and a
+/// membership write. Under the term the log leads it lands, stamped with
 /// that term. Under a term the log has not been told, under one a later
 /// take left, and under any term while the store follows, it appends
 /// nothing and answers no. A write that names no term lands as before.
 #[test]
 fn a_write_under_a_term_lands_only_while_the_log_leads_that_term() {
-    let under = |log: &Log, term: u64, epoch: u32| {
-        let change = drained(epoch);
+    /// A door's write under a term, by its epoch: whether the log took it.
+    type Door = fn(&Log, u64, u32) -> bool;
+    let drain: Door = |log, term, epoch| drains(log, None, Some(term), epoch);
+    let relabels: Door = |log, term, epoch| {
+        let change = relabel(epoch);
         log.member(None, Some(term), u64::from(epoch), change, None, None)
     };
-    let log = Log::new(16);
-    assert!(!under(&log, 3, 1), "a term the log has not been told");
-    assert_eq!(log.head(), Position::default());
-    log.term_rose(3);
-    assert!(under(&log, 3, 1));
-    assert_eq!(log.head(), at(2, 3));
-    assert!(!under(&log, 4, 2), "a term the log has not been told");
-    // A later take: the term the write was made under is past.
-    log.term_rose(4);
-    assert!(!under(&log, 3, 2), "a term a later take left");
-    assert_eq!(log.head(), at(3, 4), "the take's own place alone");
-    // The store follows a later term: it leads none.
-    apply(&log, at(4, 5), 3);
-    for term in [3, 4, 5] {
-        assert!(!under(&log, term, 4), "term {term} while the store follows");
+    // Each door with the mark its event reads as, above its epoch.
+    for (under, mark) in [(drain, 0), (relabels, MEMBER)] {
+        let log = Log::new(16);
+        assert!(!under(&log, 3, 1), "a term the log has not been told");
+        assert_eq!(log.head(), Position::default());
+        log.term_rose(3);
+        assert!(under(&log, 3, 1));
+        assert_eq!(log.head(), at(2, 3));
+        assert!(!under(&log, 4, 2), "a term the log has not been told");
+        // A later take: the term the write was made under is past.
+        log.term_rose(4);
+        assert!(!under(&log, 3, 2), "a term a later take left");
+        assert_eq!(log.head(), at(3, 4), "the take's own place alone");
+        // The store follows a later term: it leads none.
+        apply(&log, at(4, 5), 3);
+        for term in [3, 4, 5] {
+            assert!(!under(&log, term, 4), "term {term} while the store follows");
+        }
+        assert_eq!(log.head(), at(4, 5));
+        // A write that names no term is the store's own, under no term.
+        status(&log, 4);
+        assert_eq!(log.head(), at(5, 0));
+        assert_eq!(marks(&all(&log)), [TERM, mark + 1, TERM, 3, 4]);
     }
-    assert_eq!(log.head(), at(4, 5));
-    // A write that names no term is the store's own, under no term.
-    status(&log, 4);
-    assert_eq!(log.head(), at(5, 0));
-    assert_eq!(marks(&all(&log)), [TERM, 1, TERM, 3, 4]);
 }
 
 /// A write refused for its term ends no applier's hold: the leader's
@@ -1541,7 +1551,7 @@ fn a_write_refused_for_its_term_ends_no_hold_of_an_applier() {
     let adopting = log.adopt(at(3, 4)).expect("the next position");
     // A status of a call admitted under the term the store led comes
     // late.
-    assert!(!log.member(None, Some(3), 9, drained(9), None, None));
+    assert!(!drains(&log, None, Some(3), 9));
     status_at(&log, at(3, 4), 2);
     assert!(
         adopting.landed(),
@@ -1549,4 +1559,23 @@ fn a_write_refused_for_its_term_ends_no_hold_of_an_applier() {
     );
     assert_eq!(places(&all(&log)), [at(1, 3), at(2, 4), at(3, 4)]);
     assert_eq!(marks(&all(&log)), [TERM, 1, 2]);
+}
+
+/// A status entry holds the very list of models the log was handed: the
+/// log copies no model, and a reader's copy of the entry shares the list.
+#[test]
+fn a_status_entry_shares_the_list_of_models_it_was_handed() {
+    let log = Log::new(4);
+    let handed: Arc<[String]> = ["m".to_owned(), "n".to_owned()].into();
+    let (from, to) = (WorkerStatus::Ready, WorkerStatus::Draining);
+    assert!(log.status(None, None, 1, WorkerId(1), from, to, Arc::clone(&handed)));
+    let told = all(&log);
+    let [Entry {
+        event: Event::Status { models, .. },
+        ..
+    }] = told.as_slice()
+    else {
+        panic!("one status entry: {told:?}");
+    };
+    assert!(Arc::ptr_eq(models, &handed), "the handed list itself");
 }

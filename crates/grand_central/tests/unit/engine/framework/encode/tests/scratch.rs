@@ -203,6 +203,60 @@ fn each_admitted_row_and_each_encoder_reads_its_own_cells() {
     }
 }
 
+/// A pool that hands cells is lent cells, whatever they hold. An encode
+/// pool whose cells state no signal hands cells all the same: a key's run
+/// over the encoders offered carries cells, as a run over the whole pool
+/// would. Beside a pool that hands none the run carries none.
+#[test]
+fn cells_of_no_signal_are_lent_to_the_encoders_offered_as_cells() {
+    let mut engine = engine();
+    let notes = noting(&mut engine);
+    let mut bed = Bed::new();
+    // The first encoder is of another class than the prefill's: the
+    // encoders offered are a part of the pool.
+    bed.encoders = vec![row(0, Role::Encode, 0, 0), row(1, Role::Encode, 0, 0)];
+    bed.facts = vec![pushing(2), pushing(1)];
+    let (facts, pool) = bed.asked();
+    let items = EncodeItems {
+        keys: &bed.keys,
+        one: bed.one,
+        references: bed.references,
+        decode_images: bed.decode_images,
+        ring: None,
+    };
+    let open = Constraints::default();
+    let no_signal = SignalCells::default();
+    for handed in [Some(&no_signal), None] {
+        notes.lock().clear();
+        let encode = EncodePool {
+            encoders: &bed.encoders,
+            facts: &bed.facts,
+            prefill_classes: &bed.prefill_classes,
+            affinity: &bed.encode_affinity,
+            signal_cells: handed,
+            ..EncodePool::default()
+        };
+        let mut placed = EncodePlaced::new();
+        let decision = engine.decide_encode_pair(
+            &facts,
+            &pool,
+            bed.pools(),
+            encode,
+            items,
+            &open,
+            &open,
+            &open,
+            &mut Scratch::new(),
+            &mut placed,
+        );
+        assert!(decision.pick().is_some(), "a pick, not {decision:?}");
+        let read = noted_under(&notes, Phase::Encode);
+        assert!(!read.is_empty(), "no stage was asked");
+        let lent = handed.is_some();
+        assert!(read.iter().all(|note| note.cells == lent), "{read:?}");
+    }
+}
+
 /// The decision of a bed whose admission narrows both sides, as the case
 /// above lays it, with `prefill` and `decode` cells handed for two rows a
 /// side.
@@ -418,6 +472,80 @@ fn an_encode_class_above_the_rows_handed_is_a_class_still() {
     assert_eq!(targets.first().map(|target| target.position), Some(1));
 }
 
+/// The classes above the bits are read anew by every decision. An encoder
+/// whose class moved between two decisions of one scratch leaves its old
+/// class to nobody: no encoder of the prefill's class is registered.
+#[test]
+fn a_far_encode_class_is_forgotten_by_the_next_decision() {
+    let engine = engine();
+    let mut scratch = Scratch::new();
+    let mut bed = Bed::new();
+    bed.facts = vec![pushing(64)];
+    bed.prefill_classes = vec![64];
+    let first = bed.decide_in(&engine, &mut scratch);
+    assert!(first.pick().is_some(), "{first:?}");
+    bed.facts = vec![pushing(65)];
+    match bed.decide_in(&engine, &mut scratch) {
+        Decision::Shed(shed) => assert_eq!(shed.emptied_by, "ec-compatible"),
+        other => panic!("a shed, not {other:?}"),
+    }
+}
+
+/// A gap of the pair is named by the classes with a registered encoder,
+/// whatever their numbers. A far class whose one encoder is not ready is
+/// served still, so the gap is the decode's.
+#[test]
+fn a_far_encode_class_with_an_unready_encoder_is_served_still() {
+    let mut bed = Bed::new();
+    bed.encoders = vec![
+        unready(row(0, Role::Encode, 0, 0)),
+        row(1, Role::Encode, 0, 0),
+    ];
+    bed.facts = vec![pushing(64), pushing(65)];
+    bed.prefill_classes = vec![64];
+    bed.decodes = vec![Candidate {
+        vision: false,
+        ..row(0, Role::Decode, 1, 0)
+    }];
+    bed.decode_images = true;
+    assert_eq!(bed.stage(), "decode-vision");
+}
+
+/// A class as high as the count of the encoders stands in the sets' bits:
+/// the two lists take the classes above it alone.
+#[test]
+fn an_encode_class_equal_to_the_count_of_the_encoders_stands_in_the_bits() {
+    let mut bed = Bed::new();
+    bed.encoders = (0..64).map(|at| row(at, Role::Encode, 0, 0)).collect();
+    bed.facts = (1..=64).map(pushing).collect();
+    bed.prefill_classes = vec![64];
+    let mut scratch = Scratch::new();
+    let decision = bed.decide_in(&engine(), &mut scratch);
+    assert!(decision.pick().is_some(), "{decision:?}");
+    let side = scratch
+        .encode
+        .as_deref()
+        .expect("the entry leaves its side in the scratch");
+    let encoders = &side.encoders;
+    assert_eq!(
+        (
+            encoders.open.words.len(),
+            encoders.far_open.len(),
+            encoders.far_member.len()
+        ),
+        (2, 0, 0)
+    );
+    // The class is a member in the bits' second word, and is read there.
+    // Beside a decode that takes no image, a request that asks one of its
+    // decode is left the decode's gap: an encoder serves its prefill.
+    bed.decodes = vec![Candidate {
+        vision: false,
+        ..row(0, Role::Decode, 1, 0)
+    }];
+    bed.decode_images = true;
+    assert_eq!(bed.stage(), "decode-vision");
+}
+
 /// The index of `decodes`, of a fleet of as many, under `table`.
 fn index_of(decodes: &[Candidate], table: PairTable<'_>) -> DecodeClasses {
     let mut classes = DecodeClasses::default();
@@ -485,4 +613,27 @@ fn a_request_without_items_reads_no_membership() {
     let (decision, words) = decided_widths(&bed, PairTable::default());
     assert_eq!(decision, bed.pair(&engine()));
     assert_eq!(words, [0, 0, 0, 0]);
+}
+
+/// A request with items whose decode is not held to the ones that take
+/// images reads the pair's passes for one thing, a pair no encoder serves:
+/// with every prefill's class open the pass over the decodes walks no row,
+/// and the decision's index of the decodes' classes holds none. The pass
+/// over the prefills leaves nothing a test can read.
+#[test]
+fn a_request_with_items_and_every_class_open_walks_no_row_of_the_pair() {
+    let mut bed = Bed::new();
+    // The second turn is the control of the witness: a decode held to the
+    // ones that take images is walked, and the index holds its class.
+    for decode_images in [false, true] {
+        bed.decode_images = decode_images;
+        let mut scratch = Scratch::new();
+        let decision = bed.decide_in(&engine(), &mut scratch);
+        if !decode_images {
+            assert!(matches!(decision, Decision::Pick(_)), "{decision:?}");
+        }
+        let side = scratch.encode.as_deref().expect("the encode side");
+        let walked = side.decode_classes.holds(1);
+        assert_eq!(walked, decode_images, "decode images {decode_images}");
+    }
 }

@@ -2,8 +2,9 @@
 //! in the case's own process, a fleet of mock engines beside it, and one
 //! handle, [`Harness`], through which a case registers the fleet, feeds the
 //! store and asks the service through the crate's reference client.
-//! Included by path beside `common/engines.rs` and `common/net.rs` (the
-//! including binary names them `engines` and `net`).
+//! Included by path beside `common/engines.rs`, `common/net.rs` and
+//! `common/pair.rs` (the including binary names them `engines`, `net` and
+//! `pair`).
 //!
 //! Every fact the store holds of an engine came from that engine, through a
 //! sink. Loads are the controller's own load monitor's: the harness writes
@@ -12,7 +13,7 @@
 //! each engine its wire's health check once an interval and keeps how the
 //! dial ended, for a case to read. KV events are the controller's own too:
 //! its feed is the one writer of its worker host's KV tables, and a
-//! listener ([`subscribe`]) holds one event stream an engine and keeps what
+//! listener ([`kv_events`]) holds one event stream an engine and keeps what
 //! the stream said, for a case to read beside the tables. A dial is
 //! bounded, so an engine that stops answering costs a turn that bound and
 //! no more.
@@ -32,8 +33,13 @@
 //! newest report of it. A case calls the handle alone, so a move of either
 //! rewrites no case.
 
+// The harness is itself included by path, so a plain `mod` line would look for
+// this file in `tests/common/`.
+#[path = "fleet/kv_events.rs"]
+mod kv_events;
+
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     io::ErrorKind,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::Path,
@@ -45,7 +51,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use kv_index::{compute_content_hash, SequenceHash, StoredBlock};
 use mock_worker::{
     config::{Config as EngineConfig, SchedulerWire},
     engine::{EngineParams, LoadsLike, TimingModel},
@@ -58,10 +63,7 @@ use smg_grand_central::{
     load::load_row,
     service::{
         client::Client,
-        controller::{
-            Config, Controller, ElectionConfig, Error, LeasePlace, Listener, Readiness, Scope,
-            State,
-        },
+        controller::{Config, Controller, Error, LeasePlace, Listener, Readiness, Scope, State},
         proto::{
             self, completed::Class, grand_central_client::GrandCentralClient,
             register_worker_request::Mode, worker_event::Event, Completed, Dispatched, LeaderInfo,
@@ -71,20 +73,14 @@ use smg_grand_central::{
     },
     stages::StageRegistry,
     store::{
-        GatewayId, HealthPolicy, LeaseState, MembershipChange, MemoryStore, Position, Registrant,
-        Signals, WorkerFacts, WorkerStatus, WorkersStore,
+        GatewayId, HealthPolicy, LeaseState, MemoryStore, Position, Registrant, Signals,
+        WorkerFacts, WorkerStatus, WorkersStore,
     },
     tracking::LeaseId,
     worker_host::{KvTables, Members, Objects},
 };
-use smg_grpc_client::{
-    common_proto::{kv_cache_event::Data, KvEventBatch},
-    tokenspeed_proto, vllm_proto, TokenSpeedSchedulerClient, VllmEngineClient,
-};
-use smg_worker::{
-    kv_events::port::{KvCursor, ResyncReason},
-    load::state::LoadReceiver,
-};
+use smg_grpc_client::{tokenspeed_proto, vllm_proto, TokenSpeedSchedulerClient, VllmEngineClient};
+use smg_worker::load::state::LoadReceiver;
 use tokio::{
     io::{copy, sink},
     net::{TcpListener, TcpStream},
@@ -96,6 +92,7 @@ use tonic::{
     codegen::tokio_stream::StreamExt, metadata::AsciiMetadataValue, transport::Channel, Request,
 };
 
+use self::kv_events::Events;
 use crate::{
     engines::{engine_config, eventually},
     net::loopback,
@@ -122,41 +119,6 @@ pub const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Room for a loaded host on top of a wait's own timing.
 pub const ROOM: Duration = Duration::from_secs(30);
-
-/// Every reason the KV tables count a resync under.
-const RESYNCS: [ResyncReason; 6] = [
-    ResyncReason::OutOfRange,
-    ResyncReason::DataLoss,
-    ResyncReason::SnapshotAbandoned,
-    ResyncReason::PublisherRestart,
-    ResyncReason::GapCleared,
-    ResyncReason::Snapshot,
-];
-
-/// A reason's place in [`RESYNCS`]. The match names every reason, so a new
-/// one fails to build here, beside the list that must name it.
-const fn place(reason: ResyncReason) -> usize {
-    match reason {
-        ResyncReason::OutOfRange => 0,
-        ResyncReason::DataLoss => 1,
-        ResyncReason::SnapshotAbandoned => 2,
-        ResyncReason::PublisherRestart => 3,
-        ResyncReason::GapCleared => 4,
-        ResyncReason::Snapshot => 5,
-    }
-}
-
-// Every place of the list holds its reason, read at the build.
-const _: () = {
-    let mut at = 0;
-    while at < RESYNCS.len() {
-        assert!(
-            place(RESYNCS[at]) == at,
-            "a resync reason is out of its place"
-        );
-        at += 1;
-    }
-};
 
 /// The metadata entry a caller states its name in.
 const PRINCIPAL: &str = "x-smg-principal";
@@ -204,25 +166,6 @@ pub struct Moved {
     pub engine: usize,
     pub from: WorkerStatus,
     pub to: WorkerStatus,
-}
-
-/// One rank's KV events: what the listener's stream delivered beside what
-/// the controller's KV tables hold of it, read at one instant. The two come
-/// by streams of their own, so they agree only at rest.
-#[derive(Clone, Copy, Debug)]
-pub struct Heard {
-    /// The engine's data-parallel rank the row stands for.
-    pub rank: u16,
-    /// The last sequence the engine's stream delivered for the rank; `0`
-    /// when none came.
-    pub last: u64,
-    /// The blocks the stream's events left the engine holding.
-    pub held: usize,
-    /// The blocks the controller's index holds for the row.
-    pub indexed: usize,
-    /// The rank's cursor in the KV tables, when the rank has been heard
-    /// from.
-    pub cursor: Option<KvCursor>,
 }
 
 /// An engine's death.
@@ -319,39 +262,6 @@ struct Dialed {
     end: DialEnd,
 }
 
-/// What the listeners heard, a row at a time. The controller's KV tables
-/// have a writer of their own, its feed, so a read sees the two in step
-/// only at rest.
-#[derive(Default)]
-struct Events {
-    rows: Mutex<HashMap<WorkerId, Stream>>,
-    /// What refuses each engine's stream, by the engine's index: a dial or
-    /// a subscription that failed or outlasted its bound, a stream that
-    /// broke. An engine whose stream stands open has none.
-    refused: Mutex<HashMap<usize, String>>,
-    /// The snapshot chunks that came: an engine's own stream carries none.
-    snapshots: AtomicU64,
-}
-
-/// One row's stream as its listener heard it.
-#[derive(Default)]
-struct Stream {
-    /// The last sequence the stream delivered.
-    last: u64,
-    /// The blocks the stream's events left the engine holding, by its
-    /// hashes. An engine's own stream carries no snapshot chunk (a relay's
-    /// does), so stores, removals and clears are the whole of it. A stream
-    /// opened again past the engine's replay buffer would part it from the
-    /// index: the replay starts this set over with what the buffer still
-    /// holds, and the index keeps what its own stream brought. No engine of
-    /// the fleet opens one.
-    held: HashSet<SequenceHash>,
-    /// The first chain the stream stored, in the chain's order: the blocks of
-    /// the first store under no parent, then of each store whose parent is
-    /// the chain's last block. A prompt's head as the engine holds it.
-    head: Vec<StoredBlock>,
-}
-
 /// An engine as the harness's dialer dials it: its address and the rows its
 /// one answer speaks for.
 #[derive(Clone)]
@@ -403,6 +313,9 @@ pub struct Harness {
     /// What the next one-rank engines' registrations state for a request's
     /// hard demands ([`Self::states`]).
     stating: Option<proto::DemandFacts>,
+    /// Whether the next one-rank engines' registrations state that their
+    /// workers take images ([`Self::sees`]).
+    seeing: Option<bool>,
     held: Vec<Box<dyn std::any::Any>>,
     /// The requests sent so far: the next one's lease id.
     sent: u64,
@@ -780,150 +693,6 @@ async fn probe(
     }
 }
 
-/// One event of an engine's batch as the listener keeps it.
-enum KvEvent {
-    /// Blocks stored in order after `parent`; `None` starts a chain.
-    Stored {
-        parent: Option<SequenceHash>,
-        blocks: Vec<StoredBlock>,
-    },
-    /// Blocks evicted, by the engine's hashes.
-    Removed(Vec<SequenceHash>),
-    /// The engine emptied its cache.
-    Cleared,
-}
-
-/// One engine batch as the events an index applies: every block under the
-/// engine's own hash, its content hash made of its token ids. The harness's
-/// engines publish one cache group in one tier, so this decode chooses
-/// nothing: which blocks reach an index is a collector's decision.
-fn decode(batch: &KvEventBatch) -> Vec<KvEvent> {
-    batch
-        .events
-        .iter()
-        .filter_map(|event| {
-            Some(match event.data.as_ref()? {
-                Data::Stored(stored) => KvEvent::Stored {
-                    parent: stored.parent_block_hash.map(SequenceHash::from),
-                    blocks: stored
-                        .blocks
-                        .iter()
-                        .map(|block| StoredBlock {
-                            seq_hash: SequenceHash::from(block.block_hash),
-                            content_hash: compute_content_hash(&block.token_ids),
-                        })
-                        .collect(),
-                },
-                Data::Removed(removed) => KvEvent::Removed(
-                    removed
-                        .block_hashes
-                        .iter()
-                        .copied()
-                        .map(SequenceHash::from)
-                        .collect(),
-                ),
-                Data::Cleared(_) => KvEvent::Cleared,
-            })
-        })
-        .collect()
-}
-
-/// One batch as its rank's row keeps it: the last sequence, and the blocks
-/// its events leave the engine holding. The controller is handed nothing
-/// here: its KV tables have its own feed. A batch that carries a load
-/// record alone is passed by, and its record is not written here: loads
-/// are the monitor's. A snapshot chunk is a relay's: its start is a
-/// collector's word to every row of the engine, which this listener does
-/// not say, so a chunk is counted and passed by.
-fn keep(engine: &Probed, events: &Events, batch: &KvEventBatch) {
-    if batch.load.as_ref().is_some_and(|load| load.load_only) {
-        return;
-    }
-    if batch.snapshot.is_some() {
-        events.snapshots.fetch_add(1, Ordering::SeqCst);
-        return;
-    }
-    let rank = u16::try_from(batch.dp_rank.unwrap_or(0)).unwrap_or(u16::MAX);
-    let Some(&id) = engine.ids.get(usize::from(rank)) else {
-        return;
-    };
-    let decoded = decode(batch);
-    let mut rows = events.rows.lock();
-    let row = rows.entry(id).or_default();
-    row.last = batch.sequence_number;
-    for event in decoded {
-        match event {
-            KvEvent::Stored { parent, blocks } => {
-                if parent == row.head.last().map(|block| block.seq_hash) {
-                    row.head.extend(&blocks);
-                }
-                row.held.extend(blocks.iter().map(|block| block.seq_hash));
-            }
-            KvEvent::Removed(hashes) => {
-                for hash in hashes {
-                    row.held.remove(&hash);
-                }
-            }
-            KvEvent::Cleared => row.held.clear(),
-        }
-    }
-}
-
-/// The case's listener on the KV events: one stream an engine, every rank's
-/// batches on it, each kept as it arrives ([`keep`]). The stream is asked
-/// from zero each time it opens, and the engine's rows start over: an
-/// engine asked from zero replays what its buffer still holds. A stream
-/// that ends is opened again after one probe interval. What refuses a dial
-/// or a stream is kept until a stream opens, so a wait that runs out can
-/// say why.
-async fn subscribe(engine: Probed, events: Arc<Events>, mut stop: watch::Receiver<bool>) {
-    loop {
-        let opened = tokio::time::timeout(DIAL_TIMEOUT, async {
-            let client = VllmEngineClient::connect(&engine.endpoint)
-                .await
-                .map_err(|error| format!("the dial: {error}"))?;
-            client
-                .subscribe_kv_events(0)
-                .await
-                .map_err(|status| format!("the subscription: {status}"))
-        })
-        .await
-        .unwrap_or_else(|_| Err(format!("no stream within {DIAL_TIMEOUT:?}")));
-        let refusal = match opened {
-            Ok(mut stream) => {
-                events.refused.lock().remove(&engine.engine);
-                {
-                    // The engine replays from zero: its rows start over,
-                    // and the controller is told nothing.
-                    let mut rows = events.rows.lock();
-                    for id in &engine.ids {
-                        rows.remove(id);
-                    }
-                }
-                loop {
-                    let batch = tokio::select! {
-                        batch = stream.message() => batch,
-                        _ = stop.wait_for(|stop| *stop) => return,
-                    };
-                    match batch {
-                        Ok(Some(batch)) => keep(&engine, &events, &batch),
-                        Ok(None) => break None,
-                        Err(status) => break Some(format!("the stream: {status}")),
-                    }
-                }
-            }
-            Err(refusal) => Some(refusal),
-        };
-        if let Some(refusal) = refusal {
-            events.refused.lock().insert(engine.engine, refusal);
-        }
-        tokio::select! {
-            () = tokio::time::sleep(PROBE_INTERVAL) => {}
-            _ = stop.wait_for(|stop| *stop) => return,
-        }
-    }
-}
-
 impl Replica {
     /// Binds and serves a controller named `id`. Replicas given one `lease`
     /// file elect over it; with none the controller leads itself.
@@ -975,32 +744,31 @@ impl Replica {
         standbys: bool,
         (catalog, spec): (Option<StageRegistry>, Option<&Path>),
     ) -> Result<Self, String> {
-        let listener = |name: &str, scopes: &[Scope], port: u16| Listener {
-            name: name.to_owned(),
-            addr: SocketAddr::new(ip, port),
-            scopes: scopes.to_vec(),
-            tls: None,
+        let listener = |name: &str, scopes: &[Scope], port: u16| {
+            Listener::of(
+                name.to_owned(),
+                SocketAddr::new(ip, port),
+                scopes.to_vec(),
+                None,
+            )
         };
-        let config = |port: u16| Config {
-            controller_id: id.to_owned(),
-            listeners: vec![
-                listener("gateway", &[Scope::Gateway], 0),
-                listener("control", &[Scope::Control], 0),
-                listener("replication", &[Scope::Replication], port),
-            ],
-            admin: SocketAddr::new(ip, 0),
-            decide_shards: Config::default_decide_shards(),
-            shutdown_settle: Duration::ZERO,
-            shutdown_grace: Duration::from_secs(5),
-            load_poll_interval: POLL_INTERVAL,
-            worker_overload: Config::DEFAULT_WORKER_OVERLOAD,
-            discovery: None,
-            election: ElectionConfig {
-                lease: lease.map_or(LeasePlace::Process, |file| {
-                    LeasePlace::File(file.to_owned())
-                }),
-                ..ElectionConfig::default()
-            },
+        let config = |port: u16| {
+            let mut configuration = Config::of(
+                id.to_owned(),
+                vec![
+                    listener("gateway", &[Scope::Gateway], 0),
+                    listener("control", &[Scope::Control], 0),
+                    listener("replication", &[Scope::Replication], port),
+                ],
+                SocketAddr::new(ip, 0),
+            );
+            configuration.shutdown_settle = Duration::ZERO;
+            configuration.shutdown_grace = Duration::from_secs(5);
+            configuration.load_poll_interval = POLL_INTERVAL;
+            configuration.election.lease = lease.map_or(LeasePlace::Process, |file| {
+                LeasePlace::File(file.to_owned())
+            });
+            configuration
         };
         // A pair's first replica draws its replication port from the pairs'
         // own numbers and takes the next one free on its address. A bind
@@ -1187,6 +955,7 @@ impl Harness {
             events: Arc::default(),
             feeding: false,
             stating: None,
+            seeing: None,
             held: Vec::new(),
             sent: 0,
             generation: 0,
@@ -1330,6 +1099,13 @@ impl Harness {
         self.stating = stated;
     }
 
+    /// Whether the one-rank engines registered from now on state that their
+    /// workers take images: the bit of their add on the control listener,
+    /// or none.
+    pub fn sees(&mut self, vision: Option<bool>) {
+        self.seeing = vision;
+    }
+
     /// Applies the preset named `preset` as the store's next generation,
     /// in the case's process: no call of the controller applies a spec yet.
     pub fn apply(&mut self, preset: &str) -> Result<(), String> {
@@ -1424,6 +1200,7 @@ impl Harness {
                     ..proto::Signals::default()
                 }),
                 demand_facts: self.stating,
+                vision: self.seeing,
                 ..proto::WorkerSpec::default()
             }),
             mode: Mode::Add.into(),
@@ -1474,77 +1251,6 @@ impl Harness {
             }
         }
         self.feeding = true;
-    }
-
-    /// Starts the listener of one engine.
-    fn subscriber(&mut self, engine: Probed) {
-        self.feeds.spawn(subscribe(
-            engine,
-            Arc::clone(&self.events),
-            self.stop_feeds.subscribe(),
-        ));
-    }
-
-    /// The first chain the first rank of the engine at `engine` stored, in
-    /// the chain's order, each block by the hash of its tokens: what a
-    /// request that brings the same prompt states of its head.
-    pub fn head(&self, engine: usize) -> Vec<u64> {
-        let streams = self.events.rows.lock();
-        self.members
-            .iter()
-            .find(|(_, (of, rank))| *of == engine && *rank == 0)
-            .and_then(|(id, _)| streams.get(id))
-            .map(|stream| {
-                stream
-                    .head
-                    .iter()
-                    .map(|block| block.content_hash.0)
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    /// The KV events of the engine at `engine`, a rank a row: what each
-    /// stream delivered beside what the controller's KV tables hold of it.
-    pub fn heard(&self, engine: usize) -> Vec<Heard> {
-        let streams = self.events.rows.lock();
-        let mut rows: Vec<Heard> = self
-            .members
-            .iter()
-            .filter(|(_, (of, _))| *of == engine)
-            .map(|(id, (_, rank))| {
-                let stream = streams.get(id);
-                Heard {
-                    rank: *rank,
-                    last: stream.map_or(0, |stream| stream.last),
-                    held: stream.map_or(0, |stream| stream.held.len()),
-                    indexed: self.tables.indexed_blocks(*id, *rank),
-                    cursor: self.tables.cursor(*id, *rank),
-                }
-            })
-            .collect();
-        rows.sort_unstable_by_key(|row| row.rank);
-        rows
-    }
-
-    /// What refuses the event stream of the engine at `engine`, in the
-    /// subscriber's words; `None` when nothing refuses it.
-    pub fn refused(&self, engine: usize) -> Option<String> {
-        self.events.refused.lock().get(&engine).cloned()
-    }
-
-    /// The gaps on any engine's stream: the resyncs the controller's KV
-    /// tables count, under every reason.
-    pub fn gaps(&self) -> u64 {
-        RESYNCS
-            .iter()
-            .map(|reason| self.tables.resyncs(*reason))
-            .sum()
-    }
-
-    /// The snapshot chunks any engine's stream carried.
-    pub fn snapshot_chunks(&self) -> u64 {
-        self.events.snapshots.load(Ordering::SeqCst)
     }
 
     /// Patches the overload thresholds of every rank of the engine at
@@ -1964,11 +1670,7 @@ impl Harness {
                 break;
             }
             for entry in &batch {
-                if let Logged::Member {
-                    change: MembershipChange::StatusChanged { id, from, to },
-                    ..
-                } = entry.event
-                {
+                if let Logged::Status { id, from, to, .. } = entry.event {
                     if let Some(&(engine, _)) = self.members.get(&id) {
                         moved.push(Moved { engine, from, to });
                     }

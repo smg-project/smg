@@ -25,7 +25,7 @@ use std::{net::SocketAddr, time::Duration};
 use net::loopback;
 use smg_grand_central::{
     engine::WorkerId,
-    service::controller::{Config, ElectionConfig, Listener, Scope},
+    service::controller::{Config, Listener, Scope},
     store::{MemoryStore, Registrant, WorkerFacts, WorkersStore},
     worker_host::{Members, Objects},
 };
@@ -48,33 +48,25 @@ mod readiness;
 mod sessions;
 
 fn listener(name: &str, scopes: &[Scope]) -> Listener {
-    Listener {
-        name: name.to_owned(),
-        addr: loopback(),
-        scopes: scopes.to_vec(),
-        tls: None,
-    }
+    Listener::of(name.to_owned(), loopback(), scopes.to_vec(), None)
 }
 
 /// The binary's default shape on ephemeral loopback ports, with short
 /// shutdown bounds.
 fn config() -> Config {
-    Config {
-        controller_id: "test-controller".to_owned(),
-        listeners: vec![
+    let mut config = Config::of(
+        "test-controller".to_owned(),
+        vec![
             listener("gateway", &[Scope::Gateway]),
             listener("control", &[Scope::Control]),
             listener("replication", &[Scope::Replication]),
         ],
-        admin: loopback(),
-        shutdown_settle: Duration::from_millis(100),
-        shutdown_grace: Duration::from_secs(5),
-        load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
-        worker_overload: Config::DEFAULT_WORKER_OVERLOAD,
-        decide_shards: 2,
-        election: ElectionConfig::default(),
-        discovery: None,
-    }
+        loopback(),
+    );
+    config.shutdown_settle = Duration::from_millis(100);
+    config.shutdown_grace = Duration::from_secs(5);
+    config.decide_shards = 2;
+    config
 }
 
 /// A plaintext health check of `service` on the listener at `addr`.

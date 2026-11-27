@@ -1,13 +1,12 @@
 use std::{
+    collections::BTreeSet,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use tokio::{sync::watch, task::JoinSet, time::timeout};
 
-use super::{
-    over_kinds, DropPause, Gateways, Refused, SessionPlace, Vetoed, KINDS_MAX, VETOES_MAX,
-};
+use super::{over_kinds, Gateways, Refused, SessionPlace, Vetoed, KINDS_MAX, VETOES_MAX};
 use crate::{
     document::spec::{AppliedSpec, Assignment, PolicySpec, Recovery, RulePlaced},
     engine::{
@@ -48,9 +47,9 @@ impl Gateways {
             .map_or(0, |row| row.replaced.len())
     }
 
-    /// How many rows the sweep has visited.
-    fn take_sweep_visits(&self) -> usize {
-        std::mem::take(&mut self.table.lock().sweep_visits)
+    /// How many rows have an entry among the deadlines the sweep takes.
+    fn deadlines(&self) -> usize {
+        self.table.lock().deadlines.len()
     }
 
     /// How many ends the table keeps for the gateway: the row's count,
@@ -178,8 +177,33 @@ fn a_hello_inside_the_grace_period_changes_nothing() {
     drop(seat);
 }
 
+/// The sweep is handed the deadlines that are due, the earliest first,
+/// each taken out of the set. One due at the sweep's own instant is due.
+/// A later one stays, and the set is left as it stood.
 #[test]
-fn the_sweep_visits_only_rows_with_a_due_deadline() {
+fn a_due_deadline_is_handed_earliest_first_and_a_later_one_stays() {
+    let t0 = Instant::now();
+    let at = |seconds| t0 + Duration::from_secs(seconds);
+    let mut deadlines = BTreeSet::from([(at(2), B), (at(1), C), (at(3), A)]);
+
+    assert_eq!(Gateways::pop_due(&mut deadlines, t0), None, "none is due");
+    assert_eq!(deadlines.len(), 3, "the set as it stood");
+    assert_eq!(Gateways::pop_due(&mut deadlines, at(2)), Some((at(1), C)));
+    assert_eq!(Gateways::pop_due(&mut deadlines, at(2)), Some((at(2), B)));
+    assert_eq!(
+        Gateways::pop_due(&mut deadlines, at(2)),
+        None,
+        "a later one"
+    );
+    assert_eq!(Vec::from_iter(deadlines), [(at(3), A)]);
+    assert_eq!(Gateways::pop_due(&mut BTreeSet::new(), at(3)), None);
+}
+
+/// The deadlines are the sweep's work, and a row that stands and never
+/// held a veto has none: among thousands of rows the set holds the ended
+/// row and the row with a note, and a pass takes the entry that is due.
+#[test]
+fn the_sweep_takes_the_due_deadlines_and_a_standing_row_has_none() {
     const ROWS: u64 = 4_096;
 
     let (_elector, store, gateways, t0) = ceiled(GRACE, ROWS as usize);
@@ -188,8 +212,8 @@ fn the_sweep_visits_only_rows_with_a_due_deadline() {
         .map(|id| welcomed(&gateways, GatewayId(id), &format!("gateway-{id}"), TERM, t0))
         .collect();
 
+    assert_eq!(gateways.deadlines(), 0, "no row has work due");
     assert_eq!(gateways.sweep(t0 + Duration::from_secs(1)), 0);
-    assert_eq!(gateways.take_sweep_visits(), 0, "no row has work due");
 
     let noted = worker(&store, "http://noted:8000");
     assert_eq!(
@@ -197,16 +221,13 @@ fn the_sweep_visits_only_rows_with_a_due_deadline() {
         Vetoed::Shown
     );
     gone.end(t0);
+    assert_eq!(gateways.deadlines(), 2, "the ended row and the note");
     assert_eq!(gateways.sweep(t0 + GRACE), 1);
-    assert_eq!(
-        gateways.take_sweep_visits(),
-        1,
-        "only the expired row is visited"
-    );
+    assert_eq!(gateways.deadlines(), 1, "the note's is later and stays");
 
     assert_eq!(gateways.sweep(t0 + 2 * GRACE), 0);
-    assert_eq!(gateways.take_sweep_visits(), 1, "the due note is visited");
-    assert_eq!(gateways.kept(GatewayId(2)), 0);
+    assert_eq!(gateways.kept(GatewayId(2)), 0, "the due note is pruned");
+    assert_eq!(gateways.deadlines(), 0);
 }
 
 #[tokio::test]
@@ -275,24 +296,22 @@ fn a_gateway_is_not_let_go_while_a_session_it_replaced_still_runs() {
     assert_eq!(gateways.sweep(t0 + GRACE), 1);
 }
 
+/// A replaced session's end takes its note out of the row in the end's
+/// own locked step, and waits for no release of the seat: with the seat
+/// still held behind its end, the next due sweep lets the gateway go.
 #[test]
 fn a_replaced_sessions_end_and_due_sweep_cleanup_atomically() {
     let (_elector, store, gateways, t0) = leading(GRACE);
     store.issue(lease(A, 1, t0)).expect("a lease");
-    let mut replaced = welcomed(&gateways, A, "gateway-a", TERM, t0);
+    let replaced = welcomed(&gateways, A, "gateway-a", TERM, t0);
     welcomed(&gateways, A, "gateway-a", TERM, t0).end(t0);
     assert!(replaced.replaced());
 
-    let pause = Arc::new(DropPause {
-        gone: std::sync::Barrier::new(2),
-        swept: std::sync::Barrier::new(2),
-    });
-    replaced.drop_pause = Some(Arc::clone(&pause));
-    let ending = std::thread::spawn(move || drop(replaced));
-    pause.gone.wait();
+    // The seat's end as its drop makes it, with the seat held still: what
+    // a sweep finds between the drop's call and the seat's release.
+    gateways.gone(replaced.gateway, replaced.session, &replaced.superseded, t0);
     let let_go = gateways.sweep(t0 + GRACE);
-    pause.swept.wait();
-    ending.join().expect("the session ends");
+    drop(replaced);
 
     assert_eq!(let_go, 1, "the next due sweep lets the gateway go");
     assert_eq!(store.live(A), 0, "the gateway's lease is released");
@@ -751,7 +770,7 @@ async fn the_sweeps_task_ends_the_absence_of_a_key_that_stays_away() {
     };
     let left = Instant::now();
     let revision = WorkersStore::get(&*store, w).expect("the row").revision;
-    WorkersStore::remove(&*store, w, revision).expect("removed");
+    store.remove(w, revision).expect("removed");
     let never = SessionRule {
         assignment: Assignment::default(),
         inflight_cap: 0,
@@ -945,7 +964,7 @@ fn a_worker_registered_again_starts_clean_and_an_end_past_its_instant_is_not_kep
     let seat = welcomed(&gateways, A, "gateway-a", TERM, t0);
     assert_eq!(seat.veto(w, BREAKER, Some(t0 + 60 * S), t0), Vetoed::Shown);
     let revision = WorkersStore::get(&*store, w).expect("the row").revision;
-    WorkersStore::remove(&*store, w, revision).expect("removed");
+    store.remove(w, revision).expect("removed");
     assert_eq!(worker(&store, "http://a:8000"), w, "the same id");
     assert!(!store.vetoed(A, w, t0), "the veto left with the row");
 
@@ -1133,7 +1152,7 @@ fn a_workers_ceiling_of_kinds_leaves_with_its_row() {
     }
     assert_eq!(seat.veto(w, kinds + 1, Some(t0 + 60 * S), t0), Vetoed::Full);
     let revision = WorkersStore::get(&*store, w).expect("the row").revision;
-    WorkersStore::remove(&*store, w, revision).expect("removed");
+    store.remove(w, revision).expect("removed");
     assert_eq!(worker(&store, "http://a:8000"), w, "the same id");
     assert_eq!(seat.veto(w, kinds + 1, Some(t0 + 5 * S), t0), Vetoed::Shown);
     assert!(
@@ -1228,7 +1247,7 @@ fn a_gateways_ceiling_counts_no_end_of_a_row_that_left() {
     // still holds their ends.
     for &w in &workers[1..] {
         let revision = WorkersStore::get(&*store, w).expect("the row").revision;
-        WorkersStore::remove(&*store, w, revision).expect("removed");
+        store.remove(w, revision).expect("removed");
     }
     assert_eq!(gateways.kept(A), VETOES_MAX);
 
@@ -1298,7 +1317,7 @@ fn a_noted_worker_removed_under_a_kept_epoch_has_the_store_asked_again() {
     let revision = WorkersStore::get(&*store, workers[1])
         .expect("the row")
         .revision;
-    WorkersStore::remove(&*store, workers[1], revision).expect("removed");
+    store.remove(workers[1], revision).expect("removed");
     assert_eq!(frame(), Vetoed::Shown);
     assert!(store.vetoed(A, one_more, t0 + S));
     assert_eq!(gateways.kept(A), VETOES_MAX - KINDS_MAX + 1);

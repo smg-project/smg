@@ -156,7 +156,9 @@ fn a_pair_is_placed_on_the_rules_prefill_though_an_earlier_attempt_tried_it() {
 /// A pair whose rule takes no worker of one list is shed with no endpoint
 /// under the rule's name, behind one decision that picked. The rule is
 /// asked of that decision's picks, then of every prefill, then of every
-/// decode, ready or not, and no second decision is made. Behind a first
+/// decode, ready or not, and of nobody more. One decision more is held
+/// to the rule's prefills, with no decode lent: it picks nobody, and its
+/// shed leaves that answer. Behind a first
 /// decision that sheds the request as saturated, that shed stands in two
 /// cases ([`rows`](super::rows)).
 ///
@@ -199,8 +201,60 @@ fn a_pair_whose_rule_takes_no_worker_of_a_list_is_shed_under_its_name() {
         "the picks, the prefills, the decodes"
     );
     let given_up = both_given_up(first, decodes[0]);
-    assert_eq!(said(&heard), given_up, "one decision");
+    assert_eq!(said(&heard), given_up, "one decision that picked");
     assert_eq!((engine.faults(), engine.unheard()), (0, 0));
+}
+
+/// A caller's admission that answers a count of reads of a prefill's limit
+/// and panics at the next: a decision reads each prefill's limit once.
+#[derive(Debug)]
+struct FailsBehind(Cell<usize>);
+
+impl PairAdmission for FailsBehind {
+    fn has_capacity(&self, _: usize) -> bool {
+        let left = self.0.get();
+        assert!(left > 0, "the caller's admission failed");
+        self.0.set(left - 1);
+        true
+    }
+
+    fn has_room(&self, _: usize) -> bool {
+        true
+    }
+}
+
+/// The one decision more that panics is refused as any decision is, and
+/// that refusal is the call's answer: not the shed under the rule's name
+/// that stood ahead of it. The first decision picked the one pair, and
+/// the rule takes the prefill alone: it was asked of both lists behind
+/// that decision, so the fault is the next decision's. It is counted once.
+#[test]
+fn a_decision_more_that_panics_is_the_calls_refusal() {
+    let (engine, _) = paired(false);
+    let lists = Lists::of(1, 1);
+    let classes = lists.every();
+    // The first decision reads the one prefill's limit, and the decision
+    // held to the rule's prefills reads it again.
+    let failing = FailsBehind(Cell::new(1));
+    let pair = lists.under(&classes, &failing);
+    let (prefill, decode) = (lists.prefill_id(0), lists.decode_id(0));
+    let asked = RefCell::new(Vec::new());
+    let admits = |worker: &dyn Worker| {
+        let id = worker_id(worker);
+        asked.borrow_mut().push(id);
+        id == prefill
+    };
+    let request = PlaceRequest {
+        admits: Some(&admits),
+        ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair))
+    };
+    assert_eq!(
+        engine.place(&request).err(),
+        Some(Unplaced::Refused(DecisionRefused::Faulted))
+    );
+    let asked = asked.borrow();
+    assert!(asked.ends_with(&[prefill, decode]), "both lists: {asked:?}");
+    assert_eq!(engine.faults(), 1);
 }
 
 /// A rule that takes a worker of each list is the decision's to answer
@@ -567,20 +621,21 @@ fn a_pairs_rule_that_panics_at_a_list_leaves_no_lease_behind() {
     assert_eq!((engine.faults(), engine.unheard()), (0, 0));
 }
 
-/// A pair whose first decision sheds the request as saturated has its rule
-/// asked of the two lists too. The decode the rule takes is over its
-/// thresholds, and an idle decode stands that the rule refuses and that no
-/// prefill pairs with: no decision names it, and it keeps the decode list
-/// from being wholly over its thresholds, so the first decision sheds the
-/// request. Held to the rule's workers, the second decision judges the
-/// overload over that decode alone, and the binding falls back to it.
+/// A pair whose first decision sheds the request has its rule asked of the
+/// two lists too. The decode the rule takes is over its thresholds, and an
+/// idle decode stands that the rule refuses and that no prefill pairs
+/// with: no decision names it, and it keeps the decode list from being
+/// wholly over its thresholds, so the first decision sheds the request
+/// with no endpoint. Held to the rule's workers, the second decision
+/// judges the overload over that decode alone, and the binding falls back
+/// to it.
 ///
 /// The classic router lifts the thresholds of a pool where no worker the
 /// rule takes is under them
 /// (`model_gateway/src/routers/common/placement.rs:2663-2677` on main
 /// `cf6f0c15e`).
 #[test]
-fn a_pair_shed_as_saturated_is_decided_again_among_the_rules_workers() {
+fn a_pair_shed_by_its_first_decision_is_decided_again_among_the_rules_workers() {
     let (engine, heard) = paired(false);
     let lists = Lists::of(1, 2);
     // The prefill pairs with the first decode alone.
@@ -601,11 +656,13 @@ fn a_pair_shed_as_saturated_is_decided_again_among_the_rules_workers() {
     assert_eq!((engine.faults(), engine.unheard()), (0, 0));
 }
 
-/// A pair that states no rule keeps the saturated shed of its first
-/// decision: no rule narrows the lists that decision judged, and the call
-/// decides no more.
+/// A pair that states no rule keeps the shed of its first decision: no
+/// rule narrows the lists that decision judged, and the call decides no
+/// more. The idle decode no prefill pairs with keeps the decode list from
+/// being wholly over its thresholds: the request has no endpoint, and the
+/// shed names `partnered` for that decode.
 #[test]
-fn a_pair_shed_as_saturated_under_no_rule_keeps_its_shed() {
+fn a_pair_shed_under_no_rule_keeps_its_shed() {
     let (engine, heard) = paired(false);
     let lists = Lists::of(1, 2);
     // The prefill pairs with the first decode alone.
@@ -619,20 +676,17 @@ fn a_pair_shed_as_saturated_under_no_rule_keeps_its_shed() {
     else {
         panic!("a shed");
     };
-    assert_eq!(
-        (reason, emptied_by),
-        (ShedReason::Saturated, "not-overloaded")
-    );
+    assert_eq!((reason, emptied_by), (ShedReason::NoEndpoints, "partnered"));
     assert!(said(&heard).is_empty(), "no decision issued");
     assert_eq!((engine.faults(), engine.unheard()), (0, 0));
 }
 
-/// A saturated shed stands where the decision among the rule's workers
-/// sheds the request too. The rule takes the idle decode no prefill pairs
-/// with, so its decodes are not wholly over their thresholds, and it
-/// refuses the one prefill under its limit. The request is shed as
-/// saturated, and does not wait for the prefill at its limit: no decode
-/// would pair with that prefill.
+/// A shed stands where the decision among the rule's workers sheds the
+/// request too. The rule takes the idle decode no prefill pairs with, so
+/// its decodes are not wholly over their thresholds, and it refuses the
+/// one prefill under its limit. The request is shed with no endpoint,
+/// under `partnered`, and does not wait for the prefill at its limit: no
+/// decode would pair with that prefill.
 ///
 /// The classic router counts a prefill only while one of its partners is
 /// open, and judges such a miss from the decode side, ahead of the
@@ -640,7 +694,7 @@ fn a_pair_shed_as_saturated_under_no_rule_keeps_its_shed() {
 /// (`model_gateway/src/routers/common/placement.rs:2778-2822` on main
 /// `cf6f0c15e`).
 #[test]
-fn a_pair_shed_as_saturated_twice_does_not_wait_for_its_prefills_limit() {
+fn a_pair_shed_twice_does_not_wait_for_its_prefills_limit() {
     let (engine, heard) = paired(false);
     let lists = Lists::of(2, 2);
     // Both prefills pair with the first decode alone, and the first
@@ -665,23 +719,24 @@ fn a_pair_shed_as_saturated_twice_does_not_wait_for_its_prefills_limit() {
     else {
         panic!("a shed");
     };
-    assert_eq!(
-        (reason, emptied_by),
-        (ShedReason::Saturated, "not-overloaded")
-    );
+    assert_eq!((reason, emptied_by), (ShedReason::NoEndpoints, "partnered"));
     assert_eq!(asked.get(), 4, "the two lists, once");
     assert!(said(&heard).is_empty(), "no decision issued");
     assert_eq!((engine.faults(), engine.unheard()), (0, 0));
 }
 
-/// A pair shed as saturated by its first decision, whose rule takes no
-/// worker of one list, is shed with no endpoint under the rule's name. The
-/// rule is asked of the prefill and then of the two decodes, it takes
-/// neither decode, and no second decision is made. The saturated shed does
-/// not stand here. The binding steers, and an idle decode that pairs with
-/// no prefill keeps the decode list from being wholly over its thresholds:
-/// the decision says no list of its shed. Where it says one, the shed
-/// stands where the rule's prefills let it ([`rows`](super::rows)).
+/// A pair shed with no endpoint by its first decision, whose rule takes no
+/// worker of one list, keeps that decision's shed. The rule is asked of
+/// the prefill and then of the two decodes, and it takes neither decode.
+/// One decision more is held to the rule's prefill, with no decode lent:
+/// it picks nobody, and its shed leaves that answer. An idle decode that
+/// pairs with no prefill
+/// keeps the decode list from being wholly over its thresholds: the first
+/// decision sheds the request with no endpoint under `partnered`, and
+/// that shed is the call's answer, with no side: the rule narrowed the
+/// lists that decision judged. Where a first decision sheds as saturated,
+/// its shed stands where the rule's prefills let it
+/// ([`rows`](super::rows)).
 ///
 /// The classic router's pair pass judges the decode list whole where the
 /// rule takes none of it, and answers that it has no worker where a decode
@@ -689,7 +744,7 @@ fn a_pair_shed_as_saturated_twice_does_not_wait_for_its_prefills_limit() {
 /// (`model_gateway/src/routers/common/placement.rs:2909-2936`,
 /// `:1831-1852` on main `56773d28d`).
 #[test]
-fn a_pair_shed_as_saturated_whose_rule_takes_no_worker_of_a_list_is_shed_under_its_name() {
+fn a_pair_shed_with_no_endpoint_whose_rule_takes_no_worker_of_a_list_keeps_its_shed() {
     let (engine, heard) = paired(false);
     let lists = Lists::of(1, 2);
     // The prefill pairs with the first decode alone.
@@ -709,7 +764,7 @@ fn a_pair_shed_as_saturated_whose_rule_takes_no_worker_of_a_list_is_shed_under_i
     };
     let shed = Unplaced::Shed {
         reason: ShedReason::NoEndpoints,
-        emptied_by: "admits",
+        emptied_by: "partnered",
         retry_after_secs: 1,
         side: None,
     };
@@ -724,18 +779,18 @@ fn a_pair_shed_as_saturated_whose_rule_takes_no_worker_of_a_list_is_shed_under_i
     assert_eq!((engine.faults(), engine.unheard()), (0, 0));
 }
 
-/// A pair shed as saturated by its first decision, whose rule takes a
-/// worker of each list that do not pair, is the held decision's to answer.
-/// The rule refuses the overloaded decode and takes the idle one no prefill
-/// pairs with: the decision among the rule's workers finds no prefill with
-/// a partner, and its shed names what left nobody. The saturated shed does
-/// not stand: the rule was asked here.
+/// A pair shed by its first decision, whose rule takes a worker of each
+/// list that do not pair, is the held decision's to answer. The rule
+/// refuses the overloaded decode and takes the idle one no prefill pairs
+/// with: the decision among the rule's workers finds no prefill with a
+/// partner, and its shed names what left nobody. The first shed does not
+/// stand: the rule takes a worker of each list.
 ///
 /// The classic router counts a prefill only while one of its partners is
 /// open (`model_gateway/src/routers/common/placement.rs:2778-2822` on main
 /// `cf6f0c15e`).
 #[test]
-fn a_pair_shed_as_saturated_whose_rules_workers_do_not_pair_is_answered_by_the_decision() {
+fn a_pair_shed_whose_rules_workers_do_not_pair_is_answered_by_the_decision() {
     let (engine, _) = paired(false);
     let lists = Lists::of(1, 2);
     // The prefill pairs with the first decode alone.
@@ -743,7 +798,11 @@ fn a_pair_shed_as_saturated_whose_rules_workers_do_not_pair_is_answered_by_the_d
     let pair = lists.under(&classes, &Open);
     lists.decodes[0].set_overloaded(true);
     let refused = lists.decode_id(0);
-    let admits = |worker: &dyn Worker| worker_id(worker) != refused;
+    let asked = Cell::new(0);
+    let admits = |worker: &dyn Worker| {
+        asked.set(asked.get() + 1);
+        worker_id(worker) != refused
+    };
     let request = PlaceRequest {
         admits: Some(&admits),
         ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair))
@@ -755,6 +814,11 @@ fn a_pair_shed_as_saturated_whose_rules_workers_do_not_pair_is_answered_by_the_d
         panic!("a shed");
     };
     assert_eq!((reason, emptied_by), (ShedReason::NoEndpoints, "partnered"));
+    // The first decision's shed has that reason and stage too, so the
+    // answer alone does not tell the two apart here: the rule was asked
+    // of both lists behind it. The pair's rows hold states where the two
+    // differ.
+    assert_eq!(asked.get(), 3, "the two lists, once");
     assert_eq!((engine.faults(), engine.unheard()), (0, 0));
 }
 

@@ -117,25 +117,30 @@ pub(super) fn thresholds(overload: &Overload) -> OverloadUpdate {
     }
 }
 
-/// Whether `facts` state the external runtime: an endpoint of another
+/// Whether `engine_kind` names the external runtime: an endpoint of another
 /// party's API. A host's default thresholds are no such row's
 /// ([`Objects::with_overload_thresholds`](super::Objects::with_overload_thresholds)).
-pub(super) fn external(facts: &WorkerFacts) -> bool {
-    facts.engine_kind.parse() == Ok(smg_worker::worker::RuntimeType::External)
+pub(super) fn external(engine_kind: &str) -> bool {
+    engine_kind.parse() == Ok(smg_worker::worker::RuntimeType::External)
 }
 
-/// Whether an object built from `facts` states a threshold of `defaults`:
+/// Whether an object built from a row that states `overload` and
+/// `engine_kind` states a threshold of `defaults`:
 /// an engine's row that names none for a signal `defaults` state. The rows
 /// a host's overload switch changes
 /// ([`Objects::state_overload_switch`](super::Objects::state_overload_switch)).
-pub(super) fn takes_default(facts: &WorkerFacts, defaults: OverloadThresholds) -> bool {
+pub(super) fn takes_default(
+    overload: Overload,
+    engine_kind: &str,
+    defaults: OverloadThresholds,
+) -> bool {
     let Overload {
         kv_usage_permille,
         waiting_requests,
-    } = facts.overload;
+    } = overload;
     let waiting = waiting_requests.is_none() && defaults.waiting_requests.is_some();
     let usage = kv_usage_permille.is_none() && defaults.token_usage.is_some();
-    !external(facts) && (waiting || usage)
+    !external(engine_kind) && (waiting || usage)
 }
 
 /// The store's role for a worker object.

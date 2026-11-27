@@ -5593,7 +5593,8 @@ mod tests {
         };
 
         /// The encode policy behind a count of the items it is asked to
-        /// place.
+        /// place. The stage reads a policy's type to choose what it hands
+        /// it, so the wrapper answers with the type of the policy inside.
         #[derive(Debug)]
         struct Counted {
             inner: Arc<dyn LoadBalancingPolicy>,
@@ -5615,7 +5616,7 @@ mod tests {
             }
 
             fn as_any(&self) -> &dyn std::any::Any {
-                self
+                self.inner.as_any()
             }
         }
 
@@ -9352,6 +9353,210 @@ mod tests {
             &stage,
         ));
         assert!(future <= 2048, "the dispatch future is {future} bytes");
+    }
+
+    /// A pair Grand Central placed, held as a pair route holds it ahead of
+    /// its prefill's send: one prefill and one decode on the KV transport
+    /// `connector`, what the hearing stage heard, the selection under the
+    /// runtime `runtime_type`, which the dispatch reads its shape from, and
+    /// the prefill's load not yet sent.
+    fn a_pair_ahead_of_its_send(
+        connector: &str,
+        runtime_type: RuntimeType,
+    ) -> (placement::tests::Heard, WorkerSelection, PrefillAhead) {
+        use crate::routers::common::{
+            placement::{
+                select_pair,
+                tests::{hearing_pairs_on, pairs_of, MODEL},
+                PlacedPair, PlacementInputs, Stated,
+            },
+            prefill_admission::hold_unbounded,
+        };
+
+        let registry = WorkerRegistry::new();
+        for (url, worker_type) in [
+            ("grpc://p:1", WorkerType::Prefill),
+            ("grpc://d:1", WorkerType::Decode),
+        ] {
+            let worker = BasicWorkerBuilder::new(url)
+                .model(ModelCard::new(MODEL))
+                .worker_type(worker_type)
+                .connection_mode(ConnectionMode::Grpc)
+                .runtime_type(RuntimeType::Vllm)
+                .health_config(no_health_check())
+                .kv_connector(connector)
+                .build();
+            registry
+                .register(Arc::new(worker))
+                .expect("worker registers");
+        }
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let heard = hearing_pairs_on(&policies, false);
+        let pairs = pairs_of(&registry, &policies);
+        let inputs = PlacementInputs::default();
+        let pair = select_pair(
+            &registry,
+            &policies,
+            MODEL,
+            &pairs,
+            None,
+            None,
+            inputs,
+            Stated::nothing,
+        );
+        let Ok(pair) = pair else {
+            panic!("the engine places the pair");
+        };
+        let ((prefill, decode), ahead) = hold_unbounded(
+            pair,
+            Some("key"),
+            |pair: &PlacedPair| &pair.prefill,
+            |pair: PlacedPair| {
+                let (prefill, unsent) = pair.prefill.unsent();
+                ((prefill, pair.decode), unsent)
+            },
+        );
+        let workers = WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill,
+            decode,
+            runtime_type,
+        };
+        (heard, workers, ahead)
+    }
+
+    /// The dispatch context of one attempt over `workers`, a pair held with
+    /// its prefill's load `ahead` of its send, with `client` for both sides.
+    fn an_attempt_over(
+        workers: WorkerSelection,
+        ahead: PrefillAhead,
+        client: &BackendClient,
+        runtime_type: RuntimeType,
+    ) -> DispatchContext {
+        use crate::routers::grpc::context::{ClientSelection, DispatchMetadata};
+
+        let mut ctx = dispatch_ctx("m", grpc_wire(runtime_type));
+        ctx.workers = Some(workers);
+        ctx.pd_prefill_guard = Some(ahead);
+        ctx.clients = Some(ClientSelection::Disaggregated {
+            prefill: client.clone(),
+            decode: client.clone(),
+        });
+        ctx.dispatch = Some(DispatchMetadata {
+            request_id: "r".to_string(),
+            model: "m".to_string(),
+            created: 0,
+            weight_version: None,
+        });
+        ctx
+    }
+
+    /// A pair's request that is refused ahead of any send is heard as a
+    /// release of both sides, with no dispatch and no end: the runtime's
+    /// refusal and the sequential plan's, for one request and for a batch.
+    /// Grand Central placed the pair, so the plan makes the decode's guards
+    /// ahead of its send, one for each sub-request, and the dispatch that
+    /// refuses the request has said neither side's send.
+    #[tokio::test]
+    async fn a_pair_refused_ahead_of_its_send_is_heard_as_a_release() {
+        use smg_worker::identity::basic::MORIIO_CONNECTOR;
+
+        use crate::routers::grpc::regular::stages::testing::mock_backend_client;
+
+        let (client, engine) = mock_backend_client("m").await;
+        let stage = regular_stage(Arc::new(WorkerRegistry::new()));
+        // Each refusal by a pair that meets it: a runtime with no pair
+        // protocol, and a decode whose connector the sequential plan refuses.
+        let refusals = [
+            (
+                RuntimeType::Mlx,
+                "NixlConnector",
+                "runtime_pd_not_supported",
+            ),
+            (
+                RuntimeType::Vllm,
+                MORIIO_CONNECTOR,
+                "moriio_grpc_pd_unsupported",
+            ),
+        ];
+        for (runtime_type, connector, code) in refusals {
+            for batched in [false, true] {
+                let (heard, workers, ahead) = a_pair_ahead_of_its_send(connector, runtime_type);
+                let said = || heard.lock().expect("the stage heard").clone();
+                assert_eq!(said(), ["issued", "issued"]);
+                let decode = Arc::clone(workers.decode_worker().expect("a pair's decode"));
+                let mut ctx = an_attempt_over(workers, ahead, &client, runtime_type);
+                let request = || ProtoGenerateRequest::Vllm(Box::default());
+                let plan = if batched {
+                    ExecutionPlan::Batch {
+                        kind: ExecutionPlanKind::PrefillDecode,
+                        shared_request_id: "r".to_string(),
+                        requests: vec![request(), request()],
+                    }
+                } else {
+                    ExecutionPlan::PrefillDecode(request())
+                };
+                let refused =
+                    execute_plan(&mut ctx, plan, true, None, GroupedDpSticky::Off, &stage).await;
+                let Err(refused) = refused else {
+                    panic!("{code}, batched {batched}: the plan is refused");
+                };
+                assert_eq!(
+                    refused
+                        .headers()
+                        .get(error::HEADER_X_SMG_ERROR_CODE)
+                        .unwrap(),
+                    code
+                );
+                assert_eq!(
+                    decode.load(),
+                    if batched { 2 } else { 1 },
+                    "{code}, batched {batched}: each sub-request counts on the decode"
+                );
+                drop(ctx);
+                assert_eq!(decode.load(), 0);
+                assert_eq!(
+                    said()[2..],
+                    ["released Abandoned", "released Abandoned"],
+                    "{code}, batched {batched}: both sides, with no dispatch and no end"
+                );
+            }
+        }
+        engine.abort();
+    }
+
+    /// A batch of a pair Grand Central placed that goes out says each side's
+    /// send once, behind its refusals: the decode's first, on the first of
+    /// its guards, which the plan made ahead of that send, and then the
+    /// prefill's. What the mock engine answers the sub-requests is no part
+    /// of this: both words are said ahead of them.
+    #[tokio::test]
+    async fn a_pairs_batch_that_goes_out_says_each_send_once() {
+        use crate::routers::grpc::regular::stages::testing::mock_backend_client;
+
+        let (client, engine) = mock_backend_client("m").await;
+        let stage = regular_stage(Arc::new(WorkerRegistry::new()));
+        let (heard, workers, ahead) = a_pair_ahead_of_its_send("NixlConnector", RuntimeType::Vllm);
+        let mut ctx = an_attempt_over(workers, ahead, &client, RuntimeType::Vllm);
+        let request = || ProtoGenerateRequest::Vllm(Box::default());
+        let plan = ExecutionPlan::Batch {
+            kind: ExecutionPlanKind::PrefillDecode,
+            shared_request_id: "r".to_string(),
+            requests: vec![request(), request()],
+        };
+        let bound = Some(Duration::from_secs(5));
+        let _answered =
+            execute_plan(&mut ctx, plan, true, bound, GroupedDpSticky::Off, &stage).await;
+        let sends: Vec<String> = heard
+            .lock()
+            .expect("the stage heard")
+            .iter()
+            .filter(|word| word.starts_with("dispatched"))
+            .cloned()
+            .collect();
+        assert_eq!(sends, ["dispatched Decode", "dispatched Prefill"]);
+        drop(ctx);
+        engine.abort();
     }
 
     /// A decode request is built for the decode the first decision named.

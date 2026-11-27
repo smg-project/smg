@@ -260,8 +260,8 @@ fn a_call_builds_a_rows_object_at_its_write_and_its_status_follows() {
 }
 
 /// A door's patch and removal are decided over the worker objects, as
-/// its registration is: each runs the store's one body, which the
-/// store's own patch and removal never run, and a removal's object has
+/// its registration is: each runs the store's one body,
+/// and a removal's object has
 /// left the registry when the store hears of it. So it is for a control
 /// call and for a removal by the replica's own writer.
 #[test]
@@ -706,8 +706,8 @@ fn an_upsert_changes_a_standing_row_in_place_or_makes_a_new_incarnation() {
     assert_eq!(store.get(first), None);
 
     // The models alone, then the wire alone, then what the worker
-    // states for a request's hard demands alone: each is another
-    // worker under the URL too.
+    // states for a request's hard demands alone, then whether it takes
+    // images alone: each is another worker under the URL too.
     let remodelled = proto::WorkerSpec {
         models: vec!["model-b".to_owned()],
         ..decode
@@ -723,10 +723,15 @@ fn an_upsert_changes_a_standing_row_in_place_or_makes_a_new_incarnation() {
         }),
         ..rewired.clone()
     };
+    let seeing = proto::WorkerSpec {
+        vision: Some(true),
+        ..stating.clone()
+    };
     let changes = [
         ("models", remodelled),
         ("wire", rewired),
         ("demand facts", stating.clone()),
+        ("whether it takes images", seeing.clone()),
     ];
     for (what, changed) in changes {
         let stood = store.by_key(URL).expect("the row");
@@ -740,15 +745,20 @@ fn an_upsert_changes_a_standing_row_in_place_or_makes_a_new_incarnation() {
         assert_eq!(store.get(stood.id), None, "{what}");
     }
 
-    // The row holds the block, and the same registration again finds
-    // equal facts: it writes nothing.
+    // The row holds the block and the bit, and the same registration
+    // again finds equal facts: it writes nothing. Neither does one that
+    // states the block and leaves the bit out, since a bit left out
+    // keeps the row's.
     let stood = store.by_key(URL).expect("the row");
     assert_eq!(stood.facts.demand_facts.runtime, 7);
-    let told = door
-        .register(&operator(), under(TERM), &ask(stating, Mode::Upsert))
-        .expect("answered");
-    assert!(matches!(told.event, Some(Event::Relabelled(_))));
-    assert_eq!(store.by_key(URL), Some(stood));
+    assert!(stood.facts.vision);
+    for again in [seeing, stating] {
+        let told = door
+            .register(&operator(), under(TERM), &ask(again, Mode::Upsert))
+            .expect("answered");
+        assert!(matches!(told.event, Some(Event::Relabelled(_))));
+        assert_eq!(store.by_key(URL).as_ref(), Some(&stood));
+    }
 }
 
 #[test]
@@ -1110,9 +1120,27 @@ fn a_registration_of_one_rank_over_another_makers_ranks_is_told_the_maker_first(
 /// membership write lands: a lead lost inside one call.
 struct LosesTheLead {
     log: Arc<replication::Log>,
-    /// The membership writes the lead still holds for. The write that
-    /// finds none left loses it, once.
+    /// The membership writes the lead still holds for, a status write
+    /// among them. The write that finds none left loses it, once.
     holds: AtomicUsize,
+}
+
+impl LosesTheLead {
+    /// One write was told: the lead holds for one write fewer, and the
+    /// write that finds none left loses it.
+    fn told(&self) {
+        match self.holds.load(Ordering::Relaxed) {
+            0 => {
+                let next = Position {
+                    seq: 40,
+                    term: TERM + 1,
+                };
+                assert!(self.log.restart(next).is_ok(), "a place the log takes");
+                self.holds.store(usize::MAX, Ordering::Relaxed);
+            }
+            more => self.holds.store(more - 1, Ordering::Relaxed),
+        }
+    }
 }
 
 impl store::Journal for LosesTheLead {
@@ -1126,17 +1154,22 @@ impl store::Journal for LosesTheLead {
         left: Option<&WorkerRow>,
     ) -> bool {
         let goes_on = self.log.member(at, term, epoch, change, row, left);
-        match self.holds.load(Ordering::Relaxed) {
-            0 => {
-                let next = Position {
-                    seq: 40,
-                    term: TERM + 1,
-                };
-                assert!(self.log.restart(next).is_ok(), "a place the log takes");
-                self.holds.store(usize::MAX, Ordering::Relaxed);
-            }
-            more => self.holds.store(more - 1, Ordering::Relaxed),
-        }
+        self.told();
+        goes_on
+    }
+
+    fn status(
+        &self,
+        at: Option<Position>,
+        term: Option<u64>,
+        epoch: u64,
+        id: WorkerId,
+        from: WorkerStatus,
+        to: WorkerStatus,
+        models: Arc<[String]>,
+    ) -> bool {
+        let goes_on = self.log.status(at, term, epoch, id, from, to, models);
+        self.told();
         goes_on
     }
 
@@ -1772,29 +1805,35 @@ fn a_fact_the_log_does_not_carry_is_refused_by_its_name_and_nothing_is_written()
     let hosted = ReplicaMembershipWriter::new(Arc::new(door), operator(), under(TERM));
     let maker = found("pods/a");
     let epoch = store.epoch();
-    let lost: [(&str, State); 9] = [
+    let lost: [(&str, State); 7] = [
         ("row.pairing", |facts| {
             facts.pairing = Some(Arc::new(PairingDescriptor {
                 protocol: Some("pd".to_owned()),
                 ..PairingDescriptor::default()
             }));
         }),
+        // An empty connector, which the wire's row reads as none.
         ("row.encode", |facts| {
             facts.encode = EncodeOffer {
                 handoff: EncodeHandoff::Push,
                 producer: true,
+                connector: Some(String::new()),
                 ..EncodeOffer::default()
             };
         }),
-        ("row.vision", |facts| facts.vision = true),
-        ("row.priority", |facts| facts.priority = 5),
+        // A connector's one bound is the row's.
+        ("row", |facts| {
+            facts.encode = EncodeOffer {
+                handoff: EncodeHandoff::Push,
+                producer: true,
+                connector: Some("a".repeat(WorkerFacts::ROW_BYTES)),
+                ..EncodeOffer::default()
+            };
+        }),
         ("row.zone", |facts| facts.zone = Some(String::new())),
         ("row.max_running", |facts| facts.max_running = Some(0)),
         ("row.kv_block_size", |facts| facts.kv_block_size = Some(0)),
         ("row.bootstrap_port", |facts| facts.bootstrap_port = Some(0)),
-        ("row.drain_settle_secs", |facts| {
-            facts.drain_settle_secs = Some(30);
-        }),
     ];
     for (fact, state) in lost {
         let answer = hosted.found_one(&maker, URL, &|_| {
@@ -1810,7 +1849,11 @@ fn a_fact_the_log_does_not_carry_is_refused_by_its_name_and_nothing_is_written()
     assert_eq!((store.by_key(URL), store.epoch()), (None, epoch));
 
     // What the log carries is taken, and a standby reads it back whole:
-    // what the worker states for a request's hard demands among it.
+    // what the worker states for a request's hard demands among it,
+    // whether it takes images, its end of the encode handoff, its priority
+    // and a drain window of its own. The offer's connector is the store's
+    // text, held to no rule of its words: one that holds a blank and a
+    // control character, past a name's bound.
     let stated = DemandFacts {
         runtime: 7,
         references: true,
@@ -1818,13 +1861,27 @@ fn a_fact_the_log_does_not_carry_is_refused_by_its_name_and_nothing_is_written()
         window: 32_768,
         decoding: 3,
     };
+    let offered = EncodeOffer {
+        handoff: EncodeHandoff::Push,
+        producer: true,
+        connector: Some(format!("connector a\u{7}{}", "b".repeat(256))),
+        ..EncodeOffer::default()
+    };
     let stating = |_: Option<&WorkerFacts>| WorkerFacts {
         demand_facts: stated,
+        vision: true,
+        encode: offered.clone(),
+        priority: 5,
+        drain_settle_secs: Some(30),
         ..found_facts()
     };
     hosted.found_one(&maker, URL, &stating).expect("found");
     let row = store.by_key(URL).expect("the found row");
     assert_eq!(row.facts.demand_facts, stated);
+    assert!(row.facts.vision);
+    assert_eq!(row.facts.encode, offered);
+    let stated = (row.facts.priority, row.facts.drain_settle_secs);
+    assert_eq!(stated, (5, Some(30)));
     let back = worker_wire::told_row(&worker_wire::row(&row), std::time::Instant::now());
     assert_eq!(back.map(|back| back.facts), Ok(row.facts));
 }
@@ -2923,21 +2980,32 @@ impl store::Journal for LeavesAtATelling {
         row: Option<&WorkerRow>,
         left: Option<&WorkerRow>,
     ) -> bool {
-        if matches!(change, store::MembershipChange::StatusChanged { .. }) {
-            match self.armed.swap(0, Ordering::Relaxed) {
-                BY_A_RISE => self.log.term_rose(TERM + 1),
-                BY_A_FOLLOWED_TERM => {
-                    let next = Position {
-                        seq: self.log.head().seq + 1,
-                        term: TERM + 1,
-                    };
-                    let guard = self.log.adopt(next).expect("the next place");
-                    guard.mark();
-                }
-                _ => {}
-            }
-        }
         self.log.member(at, term, epoch, change, row, left)
+    }
+
+    fn status(
+        &self,
+        at: Option<Position>,
+        term: Option<u64>,
+        epoch: u64,
+        id: WorkerId,
+        from: WorkerStatus,
+        to: WorkerStatus,
+        models: Arc<[String]>,
+    ) -> bool {
+        match self.armed.swap(0, Ordering::Relaxed) {
+            BY_A_RISE => self.log.term_rose(TERM + 1),
+            BY_A_FOLLOWED_TERM => {
+                let next = Position {
+                    seq: self.log.head().seq + 1,
+                    term: TERM + 1,
+                };
+                let guard = self.log.adopt(next).expect("the next place");
+                guard.mark();
+            }
+            _ => {}
+        }
+        self.log.status(at, term, epoch, id, from, to, models)
     }
 
     fn generation(&self, at: Option<Position>, generation: u64) {
@@ -3647,6 +3715,59 @@ fn every_write_of_a_provider_leaves_its_audit_line() {
         }
     }
     for private in [URL, key, "another/key"] {
+        assert!(!logged.contains(private), "{logged}");
+    }
+}
+
+/// A provider's write on a replica that does not lead leaves a refusal's
+/// audit line under the call's own name: the code and the words the fence
+/// answered, and a removal's asker. No line holds the URL or the
+/// provider's key.
+#[test]
+fn a_write_refused_where_the_replica_does_not_lead_leaves_its_audit_line() {
+    let lines = Logged::default();
+    let writer = lines.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _beside = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+    let _kept = tracing::subscriber::set_default(subscriber);
+
+    let (_store, door) = door();
+    let follower = ReplicaMembershipWriter::new(Arc::new(door), operator(), || {
+        Err(Status::failed_precondition("this replica does not lead"))
+    });
+    let key = "private/provider-key";
+    let maker = found(key);
+    let refused = Err(MembershipWriteRefused::NotLeading(
+        "this replica does not lead".to_owned(),
+    ));
+    assert_eq!(follower.found_one(&maker, URL, &|_| found_facts()), refused);
+    let seen = RowRevision {
+        row: WorkerId(1),
+        revision: 1,
+    };
+    assert_eq!(
+        follower.drained(Remover::Provider("cluster"), URL, seen),
+        refused
+    );
+
+    let logged = String::from_utf8(lines.0.lock().clone()).expect("the lines are text");
+    let lines: Vec<&str> = logged.lines().collect();
+    let want = [("worker registration", false), ("worker drain", true)];
+    assert_eq!(lines.len(), want.len(), "{logged}");
+    for (line, (call, asked)) in lines.iter().zip(want) {
+        let refusal = format!(
+            "call=\"{call}\" by=operator-a code=FailedPrecondition why=\"this replica does not lead\""
+        );
+        assert!(
+            line.contains("membership call refused") && line.contains(&refusal),
+            "{line}"
+        );
+        assert_eq!(line.contains("asker=\"cluster\""), asked, "{line}");
+    }
+    for private in [URL, key] {
         assert!(!logged.contains(private), "{logged}");
     }
 }

@@ -86,7 +86,7 @@ fn lease(gateway: GatewayId, id: u64, term: u64, now: Instant) -> LeaseRecord {
 #[test]
 fn a_registration_is_keyed_and_a_new_incarnation_replaces_it_under_a_new_id() {
     let store = MemoryStore::new();
-    let workers: &dyn WorkersStore = &store;
+    let workers = &store;
     let first = workers.upsert(facts("http://w:8000", 1));
     let MembershipChange::Registered { id } = first else {
         panic!("a new key registers: {first:?}");
@@ -111,7 +111,7 @@ fn a_registration_is_keyed_and_a_new_incarnation_replaces_it_under_a_new_id() {
     assert_eq!(old, id);
     assert_eq!(new, identity("http://w:8000", 2));
     assert_ne!(old, new);
-    assert!(workers.get(old).is_none(), "the old id left");
+    assert!(WorkersStore::get(workers, old).is_none(), "the old id left");
     assert_eq!(workers.by_key("http://w:8000").map(|row| row.id), Some(new));
     assert_eq!(
         replaced.as_lifecycle(),
@@ -153,9 +153,9 @@ fn a_replacement_carries_a_matching_registrations_status_and_a_changed_one_start
 #[test]
 fn a_write_under_a_moved_revision_is_refused_and_never_reaches_a_successor() {
     let store = MemoryStore::new();
-    let workers: &dyn WorkersStore = &store;
+    let workers = &store;
     let id = workers.upsert(facts("http://w:8000", 1)).id();
-    let stale = workers.get(id).expect("the row").revision;
+    let stale = WorkersStore::get(workers, id).expect("the row").revision;
     assert!(workers
         .patch(id, WorkerPatch::default(), stale)
         .is_some_and(|change| change == MembershipChange::Relabelled { id }));
@@ -164,8 +164,8 @@ fn a_write_under_a_moved_revision_is_refused_and_never_reaches_a_successor() {
         "the patch moved the revision"
     );
     assert!(workers.set_status(id, WorkerStatus::Ready, stale).is_none());
-    assert!(workers.get(id).is_some(), "the row stands");
-    let current = workers.get(id).expect("the row").revision;
+    assert!(WorkersStore::get(workers, id).is_some(), "the row stands");
+    let current = WorkersStore::get(workers, id).expect("the row").revision;
     let status = workers.set_status(id, WorkerStatus::Ready, current);
     assert_eq!(
         status,
@@ -179,7 +179,7 @@ fn a_write_under_a_moved_revision_is_refused_and_never_reaches_a_successor() {
         status.and_then(|change| change.as_lifecycle()).is_none(),
         "a status change is a health signal, not a membership event"
     );
-    let current = workers.get(id).expect("the row").revision;
+    let current = WorkersStore::get(workers, id).expect("the row").revision;
     assert!(
         workers
             .set_status(id, WorkerStatus::Ready, current)
@@ -190,13 +190,13 @@ fn a_write_under_a_moved_revision_is_refused_and_never_reaches_a_successor() {
         workers.remove(id, current),
         Some(MembershipChange::Removed { id })
     );
-    assert!(workers.get(id).is_none());
+    assert!(WorkersStore::get(workers, id).is_none());
 }
 
 #[test]
 fn a_snapshot_holds_every_row_at_its_epoch_ordered_by_key() {
     let store = MemoryStore::new();
-    let workers: &dyn WorkersStore = &store;
+    let workers = &store;
     let (epoch, rows) = workers.all_rows();
     assert_eq!((epoch, rows.len()), (0, 0));
     let a = workers.upsert(facts("http://a:8000", 1)).id();
@@ -279,8 +279,9 @@ fn a_told_status_says_what_happened_and_the_status_that_stands() {
     let store = MemoryStore::new();
     let id = store.upsert(facts("http://w:8000", 1)).id();
     let revision = || WorkersStore::get(&store, id).expect("the row").revision;
+    // The store has no journal: its holder hands it no models.
     let told = |status, revision, leads: bool| {
-        store.status_told(id, status, revision, LeadWord::of(&|| leads))
+        store.status_told(id, status, revision, LeadWord::of(&|| leads), None)
     };
     // A status the row holds already stands, and nothing is written.
     let epoch = store.epoch();
@@ -301,7 +302,9 @@ fn a_told_status_says_what_happened_and_the_status_that_stands() {
     // A status told under a revision the row left is stale: it says no
     // status, and the row stands as it stood.
     let left = revision();
-    WorkersStore::patch(&store, id, WorkerPatch::default(), left).expect("the patch");
+    store
+        .patch(id, WorkerPatch::default(), left)
+        .expect("the patch");
     assert_eq!(told(WorkerStatus::NotReady, left, true), Stale);
     let stands = WorkersStore::get(&store, id).expect("the row").status;
     assert_eq!((stands, store.epoch()), (WorkerStatus::Ready, epoch + 2));
@@ -313,7 +316,7 @@ fn a_told_status_says_what_happened_and_the_status_that_stands() {
 
 /// A status told under a term goes to the journal ahead of the table's
 /// move. Under the term the log leads, the event tells the epoch the
-/// table then takes, and the row with its new status. Under a term the
+/// table then takes, and the status the row takes. Under a term the
 /// log left, the journal takes no event and nothing moved: the status,
 /// the table's epoch and the log's head stand. A word that names no term
 /// writes there, as before.
@@ -337,7 +340,8 @@ fn a_status_under_a_term_is_journaled_under_it_or_moves_nothing() {
             leads: &|| true,
             term: Some(term),
         };
-        store.status_told(id, status, revision, word)
+        // This writer hands no models: the event names the table's row's.
+        store.status_told(id, status, revision, word, None)
     };
     let stands = || WorkersStore::get(&store, id).expect("the row").status;
     // Under the term the log leads.
@@ -351,20 +355,21 @@ fn a_status_under_a_term_is_journaled_under_it_or_moves_nothing() {
     log.read(before, 2, &mut told).expect("the place stands");
     let [Entry {
         at,
-        event:
-            Event::Member {
-                epoch,
-                row: Some(row),
-                ..
-            },
+        event: Event::Status {
+            epoch, from, to, ..
+        },
     }] = told.as_slice()
     else {
         panic!("one status event: {told:?}");
     };
     assert_eq!((at.term, *epoch), (3, store.epoch()));
     assert_eq!(
-        (row.status, stands()),
-        (WorkerStatus::Ready, WorkerStatus::Ready)
+        (*from, *to, stands()),
+        (
+            WorkerStatus::Pending,
+            WorkerStatus::Ready,
+            WorkerStatus::Ready
+        )
     );
     // The log leaves the term by a later take.
     store.set_term(4);
@@ -375,7 +380,7 @@ fn a_status_under_a_term_is_journaled_under_it_or_moves_nothing() {
         (WorkerStatus::Ready, epoch, head)
     );
     // A word that names no term is journaled as the store's own.
-    let told = store.status_told(id, WorkerStatus::NotReady, revision, LeadWord::FREE);
+    let told = store.status_told(id, WorkerStatus::NotReady, revision, LeadWord::FREE, None);
     assert!(told.moved().is_some());
     assert_eq!(
         (stands(), store.epoch()),
@@ -2061,7 +2066,7 @@ fn a_noted_veto_is_written_only_while_its_note_stands() {
     // with it. A write that says its note stands writes nothing: the row
     // registered again takes no end of the row before it.
     let revision = WorkersStore::get(&store, w).expect("the row").revision;
-    WorkersStore::remove(&store, w, revision).expect("removed");
+    store.remove(w, revision).expect("removed");
     assert_eq!(ready(&store, "http://a:8000"), w, "the same id");
     for until in [Some(second), None] {
         let written = store.gateway_veto_noted(g, w, until, None, true, now);
@@ -2667,6 +2672,19 @@ impl Journal for WaitsAtRestart {
         _: MembershipChange,
         _: Option<&WorkerRow>,
         _: Option<&WorkerRow>,
+    ) -> bool {
+        true
+    }
+
+    fn status(
+        &self,
+        _: Option<Position>,
+        _: Option<u64>,
+        _: u64,
+        _: WorkerId,
+        _: WorkerStatus,
+        _: WorkerStatus,
+        _: Arc<[String]>,
     ) -> bool {
         true
     }
@@ -6079,6 +6097,19 @@ fn an_applys_time_under_the_stores_locks_measured() {
             _: MembershipChange,
             _: Option<&WorkerRow>,
             _: Option<&WorkerRow>,
+        ) -> bool {
+            true
+        }
+
+        fn status(
+            &self,
+            _: Option<Position>,
+            _: Option<u64>,
+            _: u64,
+            _: WorkerId,
+            _: WorkerStatus,
+            _: WorkerStatus,
+            _: Arc<[String]>,
         ) -> bool {
             true
         }

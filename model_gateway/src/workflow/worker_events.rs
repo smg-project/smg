@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use smg_grpc_client::tokenspeed_encoder::TokenSpeedEncoderClient;
 use smg_worker::{
     identity::basic::Worker,
     registry::{event::WorkerEvent, WorkerId, WorkerOrigin},
@@ -15,10 +16,9 @@ use crate::app_context::AppContext;
 /// Spawns the task that follows the registry's events. It walks the registry
 /// at its start and after a lag, when an event had no reader.
 pub(crate) fn spawn_worker_event_reactions(app_context: &Arc<AppContext>) {
-    // With autoload off the gateway manages no tokenizer: nothing to follow.
-    if app_context.router_config.disable_tokenizer_autoload {
-        return;
-    }
+    // With autoload off the gateway manages no tokenizer: the task then
+    // follows the removals alone.
+    let manages_tokenizers = !app_context.router_config.disable_tokenizer_autoload;
     let mut events = app_context.worker_registry.subscribe_events();
     let app_context = Arc::downgrade(app_context);
     #[expect(
@@ -31,7 +31,15 @@ pub(crate) fn spawn_worker_event_reactions(app_context: &Arc<AppContext>) {
             let Some(context) = app_context.upgrade() else {
                 break;
             };
+            // The removal workflow's step drops the encode connections pooled
+            // to its worker's URL; a worker a peer's tombstone took ran none.
+            // A removal lost in a lag keeps its pool: the walk below cannot
+            // name the URLs that left.
+            if let Some(WorkerEvent::Removed { worker, .. }) = &event {
+                TokenSpeedEncoderClient::forget_cached(worker.url());
+            }
             match event {
+                _ if !manages_tokenizers => {}
                 None => {
                     for (worker_id, worker) in context.worker_registry.get_all_with_ids() {
                         load_tokenizer_of_import(&context, &worker_id, &worker).await;

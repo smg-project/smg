@@ -185,6 +185,45 @@ async fn the_text_questions_follow_each_spec_a_label_puts_in_force() {
     assert!(!policies.any_policy_needs_request_text(None));
 }
 
+/// Under the sticky override each binding of the settings' spec takes a
+/// routing key from the request's own id. The id stands in the body, so a
+/// route reads the body of a request that carries no token ids. That
+/// answer stands behind each spec a label puts in force, also where the
+/// label's policy reads no text.
+///
+/// With the override off the question follows the spec's text alone. The
+/// body is read while a label's policy reads the prompt, and neither
+/// before the label nor behind the model's last worker.
+#[tokio::test]
+async fn the_body_question_follows_each_spec_a_label_puts_in_force() {
+    use crate::config::RoutingKeyOverrideConfig;
+
+    let mut keyed = round_robin();
+    keyed.routing_key_override = RoutingKeyOverrideConfig {
+        enabled: true,
+        ..Default::default()
+    };
+    // The settings, the label, and the answer before the label, behind its
+    // apply and behind the model's last leave.
+    for (config, label, body) in [
+        (keyed, "random", [true, true, true]),
+        (round_robin(), "cache_aware", [false, true, false]),
+    ] {
+        let policies = started(&config);
+        let start = generation(&policies);
+        let asked = || policies.any_policy_needs_request_body(None);
+        assert_eq!(asked(), body[0], "{label}: before the label");
+
+        policies.on_worker_added(MODEL, Some(label));
+        assert_eq!(generation(&policies), start + 1, "{label}");
+        assert_eq!(asked(), body[1], "{label}: behind its apply");
+
+        policies.on_model_unserved(MODEL);
+        assert_eq!(generation(&policies), start + 2, "{label}");
+        assert_eq!(asked(), body[2], "{label}: behind the last leave");
+    }
+}
+
 /// Registrations of one model that arrive at once decide in turn: one of
 /// them decides, and one spec is put in force.
 #[tokio::test]
@@ -388,4 +427,145 @@ async fn a_model_no_worker_serves_is_not_found_before_and_behind_a_labels_spec()
     let unserved = workers.get_routing_snapshot(UNSERVED);
     let kept = format!("{:?}", unserved.lent(RoutingPool::HttpRegular).cell);
     assert!(kept.contains("values: 0,"), "{kept}");
+}
+
+/// The start's spec reads no sent prefix under `round_robin`, so the start
+/// lends the engine no tree. Neither does a label whose policy reads none.
+/// A worker's label that makes its model `cache_aware` puts the first spec
+/// in force that reads them, and the trees are lent there. A classic
+/// registry builds that model's trees at its registration.
+///
+/// The engine reads the trees through the object the start handed it. A
+/// conversation's next turns go back to the worker its first turn was sent
+/// to, and the model's lent tree holds the conversation for that worker
+/// alone. The trees are sized by the spec the label put in force.
+#[tokio::test]
+async fn a_label_whose_spec_first_reads_sent_prefixes_lends_the_trees() {
+    use openai_protocol::worker::RuntimeType;
+
+    use crate::routers::common::{
+        placement::{select_single, PlacementInputs, Stated},
+        snapshot::{test_support::grpc_worker, RoutingPool},
+    };
+
+    let (policies, workers) = started_over(&round_robin());
+    assert!(policies.lent_trees().is_none(), "the start's spec");
+    policies.on_worker_added("qwen", Some("random"));
+    assert!(policies.lent_trees().is_none(), "a label that reads none");
+
+    for at in 0..4 {
+        let url = format!("grpc://w{at}:9000");
+        let worker = grpc_worker(&url, MODEL, RuntimeType::Vllm, &[]);
+        workers.register(worker).expect("a worker");
+    }
+    policies.on_worker_added(MODEL, Some("cache_aware"));
+    let trees = policies.lent_trees().expect("the label's spec lent them");
+    assert_eq!(trees.follows(), generation(&policies));
+    let turn = |said: &[u32]| {
+        let inputs = PlacementInputs {
+            tokens: Some(said),
+            ..PlacementInputs::default()
+        };
+        let pool = RoutingPool::GrpcPipelineRegular;
+        let placed = select_single(
+            &workers,
+            &policies,
+            MODEL,
+            pool,
+            None,
+            inputs,
+            Stated::nothing,
+        );
+        placed.expect("a worker").into_worker().url().to_owned()
+    };
+    let mut said: Vec<u32> = (0..256).collect();
+    let first = turn(&said);
+    for next in 1..8_u32 {
+        said.extend(next * 1_000_000..next * 1_000_000 + 16);
+        assert_eq!(turn(&said), first, "turn {next}");
+    }
+    let tree = trees.token_tree(MODEL);
+    let held: Vec<String> = tree.get_tenant_token_counts().into_keys().collect();
+    assert_eq!(held, [first.as_str()]);
+}
+
+/// A start whose spec reads sent prefixes lends the trees itself, and a
+/// label's spec makes no second owner. The trees follow each spec a label
+/// puts in force, at its arrival and at its leave. A model whose `index`
+/// entry stands as it stood keeps the tree it had.
+#[tokio::test]
+async fn trees_the_start_lent_follow_each_spec_a_label_puts_in_force() {
+    use crate::config::types::PolicyConfig;
+
+    let mut config = RouterConfig {
+        policy: PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096),
+        ..RouterConfig::default()
+    };
+    config.grand_central = true;
+    let policies = started(&config);
+    let start = generation(&policies);
+    let trees = policies.lent_trees().expect("the start lent them");
+    assert_eq!(trees.follows(), start);
+    let tree = trees.token_tree(MODEL);
+
+    policies.on_worker_added("qwen", Some("random"));
+    assert_eq!(generation(&policies), start + 1);
+    let lent = policies.lent_trees().expect("the trees stand");
+    assert!(Arc::ptr_eq(&lent, &trees), "one owner");
+    assert_eq!(trees.follows(), start + 1, "the label's spec");
+    assert!(
+        Arc::ptr_eq(&trees.token_tree(MODEL), &tree),
+        "its entry stands"
+    );
+
+    policies.on_model_unserved("qwen");
+    assert_eq!(generation(&policies), start + 2);
+    assert_eq!(trees.follows(), start + 2, "the spec without the label");
+    assert!(Arc::ptr_eq(&trees.token_tree(MODEL), &tree));
+}
+
+/// The trees are put under a label's document ahead of its apply. Where the
+/// engine refuses that apply, they are put back under the document they
+/// followed: the spec in force still sizes them. The engine refuses a spec
+/// whose number is not above the standing one, and behind a standing spec
+/// of the largest number no next number is.
+#[tokio::test]
+async fn a_refused_apply_puts_the_trees_back_under_the_document_they_followed() {
+    use std::collections::BTreeMap;
+
+    use smg_grand_central::stages::StageRegistry;
+
+    use crate::config::types::PolicyConfig;
+
+    let mut config = RouterConfig {
+        policy: PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096),
+        ..RouterConfig::default()
+    };
+    config.grand_central = true;
+    let policies = started(&config);
+    let start = generation(&policies);
+    let trees = policies.lent_trees().expect("the start lent them");
+    assert_eq!(trees.follows(), start);
+
+    // The start's own spec again, under the largest number: applied by hand,
+    // so the trees still follow the start's document.
+    let (_, last) = config
+        .hosted_policy_with_labels(&BTreeMap::new(), u64::MAX, &StageRegistry::builtin())
+        .expect("the settings' own spec");
+    let engine = policies.engine().expect("an engine");
+    assert!(engine.apply(last).is_ok(), "a higher number");
+    assert_eq!(generation(&policies), u64::MAX);
+
+    policies.on_worker_added("qwen", Some("random"));
+    assert_eq!(
+        generation(&policies),
+        u64::MAX,
+        "the label's spec is refused"
+    );
+    assert_eq!(placing(&policies, "qwen").as_deref(), Some("cache_aware"));
+    assert_eq!(
+        trees.follows(),
+        start,
+        "back under the document they followed"
+    );
 }

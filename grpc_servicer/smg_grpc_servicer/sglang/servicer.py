@@ -81,6 +81,7 @@ from ..constrained_decoding import (
     sglang_constrained_decoding_start,
     sglang_grammar_backend,
     sglang_supports_thinking_budget,
+    structural_tag_vocabulary_entry,
 )
 from ..mm_item_limits import MM_ITEM_LIMITS_KEY, sglang_item_limits
 from ..pd_pairing import pairing_protocol_from_env
@@ -759,12 +760,17 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         )
         # The grammar backend the scheduler runs, resolved (the raw argument
         # is None unless set), under the same key the Rust servicer reads.
+        grammar_backend = sglang_grammar_backend(self.server_args)
+        grammar_backend_entry(serializable_args, grammar_backend)
+        # The vocabulary of structural-tag nodes that backend takes, as the
+        # Rust launcher reports it: the Router spells an older xgrammar's
+        # structural tags in the older vocabulary.
+        structural_tag_vocabulary_entry(serializable_args, grammar_backend)
         if (
             "thinking_token_budget" in sglang_scheduler_pb2.SamplingParams.DESCRIPTOR.fields_by_name
             and self._supports_thinking_token_budget
         ):
             serializable_args["supports_thinking_token_budget"] = True
-        grammar_backend_entry(serializable_args, sglang_grammar_backend(self.server_args))
         # The gateway reads this worker's running window (its PD admission
         # bound, its share of the fleet's capacity) from `max_running_requests`
         # here, which is None unless the operator set the flag: the scheduler

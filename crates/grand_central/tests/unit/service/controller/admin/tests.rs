@@ -20,7 +20,7 @@ use crate::{
         metrics::{LoadTotals, Metrics},
         readiness::{tests::fenced, Phase},
     },
-    store::{MemoryStore, WorkerFacts, WorkersStore},
+    store::{MemoryStore, WorkerFacts},
 };
 
 async fn get(app: axum::Router, path: &str) -> (StatusCode, String, String) {

@@ -8,7 +8,15 @@ use super::*;
 use crate::{
     engine::view::WorkerId,
     service::{
-        controller::decision_slots::tests::holder,
+        controller::{
+            decision_slots::tests::holder,
+            election::{
+                self,
+                tests::{ended, until, Said},
+                ElectionObservation,
+            },
+            floor::FLOOR_BELIEVED,
+        },
         elector::{ElectionSettings, Elector, TickOutcome},
         proto::replication_event::Event as Sent,
         replication,
@@ -18,6 +26,7 @@ use crate::{
         LeadWord, LeasesStore, MembershipChange, Registrant, WorkerFacts, WorkerRow, WorkerStatus,
         WorkersStore,
     },
+    worker_host::tests::stand,
 };
 
 /// The same over one file of leases with the log's places starting after
@@ -376,9 +385,11 @@ fn a_replica_deposed_while_it_awaited_the_hello_joins_no_feed() {
         max_backlog: 0,
         last_applied_term: place.term,
     };
+    // No election listens here: a term above the leader's is said nowhere.
+    let floors = Floors::default();
     let joins = |hello: &proto::ReplicaHello, now| {
         replication
-            .joins(leader.term, STANDBY, hello, now)
+            .joins(&floors, leader.term, STANDBY, hello, now)
             .map(|feed| feed.restore)
             .map_err(|status| status.code())
     };
@@ -413,6 +424,109 @@ fn a_replica_deposed_while_it_awaited_the_hello_joins_no_feed() {
             Err(Code::Unauthenticated)
         ));
     }
+}
+
+/// A hello that states a term above the leader's is refused in the words
+/// it always was, and its term is said to the election through the floors'
+/// one door: once a rising term, as a gateway's floor is. A term at or
+/// under the leader's says nothing. A term past the believed range is
+/// refused in the same words and says nothing.
+#[test]
+fn a_hello_above_the_leaders_term_says_its_term_to_the_election() {
+    let leader = Leader::leading();
+    leader.writes(2);
+    let replication = leader.replication();
+    let floors = Floors::default();
+    let (door, said) = Said::door();
+    floors.open(door);
+    let held = leader.log.head();
+    let term = leader.term;
+    let says = |place: Position, seen: u64| proto::ReplicaHello {
+        replica_id: STANDBY.to_owned(),
+        last_applied_seq: place.seq,
+        term_seen: seen,
+        max_backlog: 0,
+        last_applied_term: place.term,
+    };
+    let joins = |hello: &proto::ReplicaHello| {
+        replication
+            .joins(&floors, term, STANDBY, hello, leader.at)
+            .map(|_| ())
+            .map_err(|status| (status.code(), status.message().to_owned()))
+    };
+    let refusal = |seen: u64| {
+        Err((
+            Code::FailedPrecondition,
+            format!("the standby has seen term {seen}, above this replica's {term}"),
+        ))
+    };
+    // At the leader's term, and under it: a feed, and nothing said.
+    assert_eq!(joins(&says(held, term)), Ok(()));
+    assert_eq!(joins(&says(Position::default(), 0)), Ok(()));
+    assert!(said.terms().is_empty());
+
+    // Above it: the refusal stands as it was, and the term is said.
+    let above = term + 3;
+    assert_eq!(joins(&says(held, above)), refusal(above));
+    assert_eq!(said.terms(), [above]);
+    // Said once a rising term. A place applied under a later term was
+    // seen under it: that term is the one said.
+    assert_eq!(joins(&says(held, above)), refusal(above));
+    assert!(said.terms().is_empty());
+    let later = Position {
+        term: above + 1,
+        ..held
+    };
+    assert_eq!(joins(&says(later, term)), refusal(above + 1));
+    assert_eq!(said.terms(), [above + 1]);
+
+    // Past the believed range: the same refusal, and nothing said.
+    let far = term + FLOOR_BELIEVED + 1;
+    assert_eq!(joins(&says(held, far)), refusal(far));
+    assert!(said.terms().is_empty());
+}
+
+/// The word reaches the election's thread: a leader shown a hello above
+/// its term leaves its lease at that word, and the next take stands above
+/// the hello's term. Alone over its lease here, the replica takes again at
+/// once, and its log leads the new term.
+#[test]
+fn a_leader_shown_a_hello_above_its_term_leaves_for_a_take_above_it() {
+    let (store, feed) = journaled_from(&LeasePlace::File("shared".into()), 0);
+    let elector = Elector::alone(IDENTITY, ElectionSettings::default())
+        .expect("the default settings are in order");
+    let fence = elector.fence();
+    let (standing, _stood) = watch::channel(ElectionObservation::default());
+    let running = election::start(elector, Arc::clone(&store), standing).expect("a thread");
+    until("the first lead", || {
+        fence.leader_term(Instant::now()) == Some(1) && store.term() == 1
+    });
+    let floors = Floors::default();
+    floors.open(running.door());
+    let replication = Replication::new(
+        Arc::clone(&store),
+        Arc::clone(&feed.log),
+        Arc::clone(&fence),
+        holder(&store),
+    );
+    let hello = proto::ReplicaHello {
+        replica_id: STANDBY.to_owned(),
+        last_applied_seq: 0,
+        term_seen: 4,
+        max_backlog: 0,
+        last_applied_term: 0,
+    };
+    let refused = replication
+        .joins(&floors, 1, STANDBY, &hello, Instant::now())
+        .map(|_| ())
+        .map_err(|status| status.code());
+    assert_eq!(refused, Err(Code::FailedPrecondition));
+    until("the take above the hello's term", || {
+        fence.leader_term(Instant::now()) == Some(5) && store.term() == 5
+    });
+    assert_eq!(store.followed(), None);
+    running.stop();
+    ended(running);
 }
 
 #[test]
@@ -1270,6 +1384,19 @@ impl Journal for AtTheCut {
         self.log.member(at, term, epoch, change, row, left)
     }
 
+    fn status(
+        &self,
+        at: Option<Position>,
+        term: Option<u64>,
+        epoch: u64,
+        id: WorkerId,
+        from: WorkerStatus,
+        to: WorkerStatus,
+        models: Arc<[String]>,
+    ) -> bool {
+        self.log.status(at, term, epoch, id, from, to, models)
+    }
+
     fn term_rose(&self, term: u64) {
         self.log.term_rose(term);
     }
@@ -1648,10 +1775,14 @@ fn a_copy_behind_a_status_tell_holds_the_told_status_at_its_place() {
         panic!("one row was written");
     };
     assert_eq!(row.status, WorkerStatus::Pending);
-    // The store's entry a holder's tell ends in, with no turn here.
-    let ready = WorkerStatus::Ready;
+    // The store's entry a holder's tell ends in, with no turn here: the
+    // models are the row's, as a holder reads them off its object.
+    let (ready, models) = (WorkerStatus::Ready, row.facts.models.as_slice().into());
     let word = LeadWord::FREE;
-    leader.store.status_told(id, ready, row.revision, word);
+    let told = leader
+        .store
+        .status_told(id, ready, row.revision, word, Some(models));
+    assert!(told.moved().is_some(), "the store took the status");
     let (behind, held) = first_copy(&leader, &objects);
     assert!(behind.seq > before.seq, "the tell moved the place");
     let told = WorkerRow {
@@ -1659,4 +1790,37 @@ fn a_copy_behind_a_status_tell_holds_the_told_status_at_its_place() {
         ..row.clone()
     };
     assert_eq!(held, [told]);
+}
+
+/// A status entry names the models its worker object served at the
+/// write, and no row: the holder reads them under the object's lock
+/// and hands them ahead of the store's. A row whose models change in
+/// place behind a told status leaves that entry as it was told, and
+/// the row's next status names the new ones.
+#[test]
+fn a_status_entry_names_the_models_its_row_served_at_the_write() {
+    let leader = Leader::leading();
+    let id = leader.writes(0);
+    stand(&leader.objects, &leader.store, id, WorkerStatus::Ready);
+    // The row's models change in place, and its object moves again.
+    let stood = WorkersStore::get(leader.store.as_ref(), id).expect("the row");
+    let mut wider = stood.facts;
+    wider.models.push("n".to_owned());
+    assert_eq!(leader.registers(wider), id, "a change in place");
+    stand(&leader.objects, &leader.store, id, WorkerStatus::NotReady);
+    let mut entries = Vec::new();
+    leader
+        .log
+        .read(START, Log::BATCH, &mut entries)
+        .expect("the log holds its start");
+    let statuses = entries.iter().filter_map(|entry| match &entry.event {
+        Written::Status { to, models, .. } => Some((*to, models.to_vec())),
+        Written::Member { .. } | Written::Term | Written::Generation { .. } => None,
+    });
+    let (m, n) = ("m".to_owned(), "n".to_owned());
+    let told = [
+        (WorkerStatus::Ready, vec![m.clone()]),
+        (WorkerStatus::NotReady, vec![m, n]),
+    ];
+    assert_eq!(statuses.collect::<Vec<_>>(), told);
 }

@@ -8,7 +8,10 @@ use smg_grand_central::{
         ApplyOutcome, DocumentManager, EnforceRefused, Format, SpecRejected, MAX_DOCUMENT_BYTES,
     },
     stages::StageRegistry,
-    store::{MemoryStore, StaleGeneration, WorkerFacts, WorkersStore},
+    store::{
+        identity, MembershipChange, MemoryStore, Position, Registrant, StaleGeneration,
+        WorkerFacts, WorkerRow, WorkerStatus,
+    },
 };
 
 const START: &[u8] = br#"{"apiVersion":"smg.policy/v1","profiles":{"default":{"pick":"random"}}}"#;
@@ -65,20 +68,35 @@ fn a_host_applies_its_start_document_and_serves_a_read_only_source() {
         (1, 2)
     );
 
-    for (key, model) in [
+    // The store has no holder of worker objects: it takes each row as a
+    // decided change, stated as a registration leaves it.
+    let rows = [
         ("grpc://b:8000", "served"),
         ("grpc://a:8000", "other"),
         ("grpc://operator:secret@c:8000", "served"),
-    ] {
-        store.upsert(WorkerFacts {
+    ];
+    for (epoch, (key, model)) in (1..).zip(rows) {
+        let id = identity(key, 1);
+        let facts = WorkerFacts {
             key: key.to_owned(),
             engine: key.to_owned(),
             incarnation: 1,
             models: vec![model.to_owned()],
             dp_size: 1,
             ..WorkerFacts::default()
-        });
+        };
+        let row = WorkerRow {
+            id,
+            facts,
+            status: WorkerStatus::Pending,
+            revision: 1,
+            admitted_at: Instant::now(),
+            maker: Registrant::Control,
+        };
+        let registered = MembershipChange::Registered { id };
+        store.follow(Position::default(), epoch, registered, Some(row));
     }
+    assert_eq!(store.checkpoint().rows.len(), 3, "each row landed");
     let asked = WorkerRowsQuery {
         models: vec!["served".to_owned()],
         limit: 1,

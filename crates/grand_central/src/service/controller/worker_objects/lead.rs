@@ -10,11 +10,11 @@ use crate::{service::elector::Fence, worker_host::Lead};
 /// its fence admits that term now.
 ///
 /// The word is the one the serve tells its watches: the term this replica
-/// leads, if it leads one. It names none until the replica serves and from
-/// its stop on, where the fence may still stand. The fence is read by the
-/// clock, as before every write a leader makes: past its renew deadline it
-/// admits nothing, told or not. A term the fence took and the word has not
-/// told yet is no lead's: the task of that term starts at its word.
+/// leads, if it leads one. It names none from the replica's stop on, where
+/// the fence may still stand. The fence is read by the clock, as before
+/// every write a leader makes: past its renew deadline it admits nothing,
+/// told or not. A term the fence took and the word has not told yet is no
+/// lead's: the task of that term starts at its word.
 pub(crate) struct ElectedLead {
     fence: Arc<Fence>,
     led: watch::Receiver<Option<u64>>,

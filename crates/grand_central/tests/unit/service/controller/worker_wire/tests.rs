@@ -7,9 +7,9 @@ use std::{
 use prost::Message as _;
 
 use super::{
-    event, member, page, patch, refused, registration, removed, replaced, replication, row,
-    start_again, status, status_changed, told_change, told_part, told_row, Refused, KEY_BYTES,
-    LABELS, NAME_BYTES, ROW_BYTES, URL_BYTES, VALUE_BYTES,
+    bootstrap_port, event, member, page, patch, refused, registration, removed, replaced,
+    replication, row, start_again, status, status_changed, told_change, told_part, told_row,
+    Refused, KEY_BYTES, LABELS, NAME_BYTES, ROW_BYTES, URL_BYTES, VALUE_BYTES,
 };
 use crate::{
     engine::{
@@ -21,8 +21,8 @@ use crate::{
         replication::{Entry, Event as Written},
     },
     store::{
-        identity, GatewayId, HealthPolicy, MembershipChange, Overload, Position, Reachability,
-        Registrant, Signals, WorkerFacts, WorkerRow, WorkerStatus,
+        identity, EncodeHandoff, EncodeOffer, GatewayId, HealthPolicy, MembershipChange, Overload,
+        Position, Reachability, Registrant, Signals, WorkerFacts, WorkerRow, WorkerStatus,
     },
 };
 
@@ -119,6 +119,16 @@ fn full() -> WorkerRow {
             window: 32_768,
             decoding: 3,
         },
+        vision: true,
+        encode: EncodeOffer {
+            handoff: EncodeHandoff::Push,
+            producer: true,
+            consumer: false,
+            connector: Some("connector-a".to_owned()),
+            references: true,
+        },
+        priority: -5,
+        drain_settle_secs: Some(45),
         ..WorkerFacts::default()
     };
     WorkerRow {
@@ -195,6 +205,16 @@ fn the_wires_row_tells_every_fact_of_the_stores_row() {
             window: 32_768,
             decoding: 3,
         }),
+        vision: true,
+        encode: Some(proto::EncodeOffer {
+            handoff: proto::EncodeHandoff::Push as i32,
+            producer: true,
+            consumer: false,
+            connector: "connector-a".to_owned(),
+            references: true,
+        }),
+        priority: -5,
+        drain_settle_secs: Some(45),
     };
     assert_eq!(told, expected);
 }
@@ -240,6 +260,8 @@ fn a_row_of_defaults_reads_any_gateway_and_no_scrape() {
     // A worker that states nothing for a request's hard demands tells
     // no block: its row is the row a build before the block told.
     assert_eq!(told.demand_facts, None);
+    // Neither does one whose encode offer states nothing.
+    assert_eq!(told.encode, None);
 }
 
 #[test]
@@ -344,22 +366,46 @@ fn a_log_entry_of_each_membership_write_has_its_case_at_the_entrys_place() {
         )),
         removed(&old)
     );
-    // A status change is told with the revision its write left the row
-    // at, the row's own.
+    // A status entry is read by its kind. It holds no row, and its
+    // event is the one a status write was always sent as, field by
+    // field: the models it holds are for a watch's filter alone.
     let (from, to) = (WorkerStatus::Pending, WorkerStatus::Ready);
-    let moved = MembershipChange::StatusChanged {
+    let moved = Entry {
+        at,
+        event: Written::Status {
+            epoch: 6,
+            id: new.id,
+            from,
+            to,
+            models: new.facts.models.as_slice().into(),
+        },
+    };
+    assert_eq!(told(&moved), status_changed(new.id, from, to));
+    assert_eq!(
+        member(&moved),
+        Some(proto::WorkerEvent {
+            seq: 9,
+            membership_epoch: 6,
+            event: Some(Event::Status(proto::StatusChanged {
+                worker_id: new.id.0,
+                old: proto::WorkerStatus::Pending as i32,
+                new: proto::WorkerStatus::Ready as i32,
+                health: proto::HealthFlag::Healthy as u32,
+            })),
+            term: 4,
+        })
+    );
+    // A shape the store never tells, and an entry that is no worker's
+    // event. A status is none of a membership entry's shapes, with a
+    // row or with none.
+    assert_eq!(member(&entry(registered, None, None)), None);
+    let status = MembershipChange::StatusChanged {
         id: new.id,
         from,
         to,
     };
-    assert_eq!(
-        told(&entry(moved, Some(&new), None)),
-        status_changed(new.id, from, to)
-    );
-    // A shape the store never tells, and an entry that is no worker's
-    // event.
-    assert_eq!(member(&entry(registered, None, None)), None);
-    assert_eq!(member(&entry(moved, None, Some(&old))), None);
+    assert_eq!(member(&entry(status, Some(&new), None)), None);
+    assert_eq!(member(&entry(status, None, Some(&old))), None);
     assert_eq!(
         member(&Entry {
             at,
@@ -674,6 +720,397 @@ fn a_block_of_demand_facts_is_the_rows_whole_and_one_left_out_keeps_the_rows() {
     );
 }
 
+/// Whether a worker takes images is its registration's where it states
+/// it. A registration that states none keeps the row's, and a new row
+/// takes no images.
+#[test]
+fn a_registration_states_whether_its_worker_takes_images_and_one_that_states_none_keeps_the_rows() {
+    let with = |vision: bool| proto::WorkerSpec {
+        vision: Some(vision),
+        ..spec()
+    };
+    let stated = |stated: &proto::WorkerSpec, standing: Option<&WorkerFacts>| {
+        facts(stated, standing).map(|made| made.vision)
+    };
+    assert_eq!(stated(&spec(), None), Ok(false));
+    assert_eq!(stated(&with(true), None), Ok(true));
+    assert_eq!(stated(&with(false), None), Ok(false));
+
+    // Over a standing row: a registration that states none keeps the
+    // row's, and one that states it is the row's, either way.
+    let seeing = facts(&with(true), None).expect("a registration");
+    assert_eq!(stated(&spec(), Some(&seeing)), Ok(true));
+    assert_eq!(stated(&with(false), Some(&seeing)), Ok(false));
+    let blind = facts(&spec(), None).expect("a registration");
+    assert_eq!(stated(&with(true), Some(&blind)), Ok(true));
+}
+
+/// The wire's row tells whether its worker takes images, and its reader
+/// holds it. A row of a worker that takes none tells no byte of the
+/// field, so it is the row a build before the field told. Such a row
+/// reads as taking none.
+#[test]
+fn a_row_tells_whether_its_worker_takes_images_and_one_that_tells_none_reads_as_taking_none() {
+    let seeing = full();
+    let blind = WorkerRow {
+        facts: WorkerFacts {
+            vision: false,
+            ..full().facts
+        },
+        ..full()
+    };
+    let (told_seeing, told_blind) = (row(&seeing), row(&blind));
+    assert!(told_seeing.vision);
+    assert!(!told_blind.vision);
+    let read = |told: &proto::WorkerRow| told_row(told, Instant::now()).map(|row| row.facts.vision);
+    assert_eq!(read(&told_seeing), Ok(true));
+    assert_eq!(read(&told_blind), Ok(false));
+    // The bit is three bytes of the row that tells it, and none of the
+    // row that does not.
+    assert_eq!(told_seeing.encoded_len() - told_blind.encoded_len(), 3);
+    let bytes = told_blind.encode_to_vec();
+    let again = proto::WorkerRow::decode(bytes.as_slice()).expect("a row");
+    assert_eq!(read(&again), Ok(false));
+}
+
+/// The descriptor's number 11 left the contract: whether a worker takes
+/// images is the registration's own field. A registration that still
+/// states the number is read as one that states none, where a build
+/// before this one refused it by its path.
+#[test]
+fn a_descriptor_that_still_states_number_eleven_reads_as_one_that_states_none() {
+    let port_alone = proto::PairingDescriptor {
+        bootstrap_port: 7_000,
+        ..Default::default()
+    };
+    let mut bytes = port_alone.encode_to_vec();
+    // Field 11 as a varint: its key, then one.
+    bytes.extend_from_slice(&[11 << 3, 1]);
+    let read = proto::PairingDescriptor::decode(bytes.as_slice()).expect("a descriptor");
+    assert_eq!(read, port_alone);
+    assert_eq!(bootstrap_port(&read), Ok(Some(7_000)));
+}
+
+/// A worker's end of the encode handoff is its registration's block,
+/// whole. A block left out keeps what the row states, and an empty one
+/// states no end. Its connector is the store's text: no rule holds its
+/// words, and the row's bound is its one bound.
+#[test]
+fn a_block_of_an_encode_offer_is_the_rows_whole_and_one_left_out_keeps_the_rows() {
+    let with = |block: proto::EncodeOffer| proto::WorkerSpec {
+        encode: Some(block),
+        ..spec()
+    };
+    let stated = |stated: &proto::WorkerSpec, standing: Option<&WorkerFacts>| {
+        facts(stated, standing).map(|made| made.encode)
+    };
+    let every = proto::EncodeOffer {
+        handoff: proto::EncodeHandoff::Push as i32,
+        producer: true,
+        consumer: true,
+        connector: "connector-a".to_owned(),
+        references: true,
+    };
+    let held = EncodeOffer {
+        handoff: EncodeHandoff::Push,
+        producer: true,
+        consumer: true,
+        connector: Some("connector-a".to_owned()),
+        references: true,
+    };
+    assert_eq!(stated(&spec(), None), Ok(EncodeOffer::default()));
+    assert_eq!(stated(&with(every.clone()), None), Ok(held.clone()));
+
+    // Over a standing row: no block keeps its offer, a block replaces it
+    // whole, and an empty block states no end.
+    let standing = facts(&with(every.clone()), None).expect("a registration");
+    assert_eq!(stated(&spec(), Some(&standing)), Ok(held));
+    let meeting = proto::EncodeOffer {
+        handoff: proto::EncodeHandoff::Rendezvous as i32,
+        ..Default::default()
+    };
+    assert_eq!(
+        stated(&with(meeting), Some(&standing)),
+        Ok(EncodeOffer {
+            handoff: EncodeHandoff::Rendezvous,
+            ..EncodeOffer::default()
+        })
+    );
+    assert_eq!(
+        stated(&with(proto::EncodeOffer::default()), Some(&standing)),
+        Ok(EncodeOffer::default())
+    );
+
+    // A registration's connector is the store's text, and no rule holds its
+    // words. One past a name's bound, one that holds a blank and one that
+    // holds a control character are each taken as stated.
+    let named = |connector: &str| proto::EncodeOffer {
+        connector: connector.to_owned(),
+        ..every.clone()
+    };
+    let read = |connector: &str| stated(&with(named(connector)), None).map(|offer| offer.connector);
+    for taken in [
+        text(NAME_BYTES + 1),
+        "connector a".to_owned(),
+        "connector\u{7}".to_owned(),
+    ] {
+        assert_eq!(read(&taken), Ok(Some(taken.clone())));
+    }
+    // It is read as the store holds it: past the blanks around it, and a
+    // blank one states none. So a registration that states the row's offer
+    // with blanks around its connector states the row's own offer.
+    assert_eq!(read("  connector a\t"), Ok(Some("connector a".to_owned())));
+    assert_eq!(read(" \t "), Ok(None));
+    assert_eq!(
+        stated(&with(named(" connector-a ")), Some(&standing)),
+        Ok(standing.encode.clone())
+    );
+    // The row's bound is the connector's one bound: one that carries the
+    // row past it is refused by the row's path.
+    assert_eq!(
+        read(&text(ROW_BYTES)).map_err(|refused| refused.path),
+        Err("spec")
+    );
+    // A form this build does not know is refused by its path.
+    let unknown = proto::EncodeOffer {
+        handoff: 3,
+        ..every.clone()
+    };
+    let Refused { path, why } = stated(&with(unknown), None).expect_err("the form is refused");
+    assert_eq!(path, "spec.encode.handoff");
+    assert!(!why.is_empty());
+}
+
+/// The wire's row tells its worker's end of the encode handoff, and its
+/// reader holds it. A row of a worker whose offer states nothing tells no
+/// byte of the block, so it is the row a build before the block told. Such
+/// a row reads as one that states no end. An offer that names no form and
+/// states something tells its block. A told row's connector is read as
+/// told.
+#[test]
+fn a_row_tells_its_workers_encode_offer_and_one_that_tells_none_reads_as_stating_no_end() {
+    let offering = full();
+    let silent = WorkerRow {
+        facts: WorkerFacts {
+            encode: EncodeOffer::default(),
+            ..full().facts
+        },
+        ..full()
+    };
+    let (told_offering, told_silent) = (row(&offering), row(&silent));
+    assert_eq!(told_silent.encode, None);
+    let read = |told: &proto::WorkerRow| told_row(told, Instant::now()).map(|row| row.facts.encode);
+    assert_eq!(read(&told_offering), Ok(offering.facts.encode.clone()));
+    assert_eq!(read(&told_silent), Ok(EncodeOffer::default()));
+    let bytes = told_silent.encode_to_vec();
+    let again = proto::WorkerRow::decode(bytes.as_slice()).expect("a row");
+    assert_eq!(read(&again), Ok(EncodeOffer::default()));
+
+    // The wire's weight counts the block as the wire frames it: with no
+    // connector, and at each side of the second byte of the block's own
+    // length and of the connector's.
+    let told = |facts: &WorkerFacts| {
+        let stored = WorkerRow {
+            facts: facts.clone(),
+            ..full()
+        };
+        row(&stored).encoded_len()
+    };
+    for connector in [0, 1, 119, 120, 127, 128, NAME_BYTES] {
+        let with = WorkerFacts {
+            encode: EncodeOffer {
+                connector: (connector > 0).then(|| text(connector)),
+                ..offering.facts.encode.clone()
+            },
+            ..offering.facts.clone()
+        };
+        assert_eq!(
+            weight(&with) - weight(&silent.facts),
+            told(&with) - told(&silent.facts),
+            "a connector of {connector} bytes"
+        );
+    }
+
+    // The writer tells each form by its own number, and the reader holds it:
+    // a rendezvous comes back a rendezvous. An offer that names no form and
+    // states references is no default one, so its block is told too.
+    let offers = [
+        EncodeOffer {
+            handoff: EncodeHandoff::Rendezvous,
+            ..EncodeOffer::default()
+        },
+        EncodeOffer {
+            references: true,
+            ..EncodeOffer::default()
+        },
+    ];
+    for (offer, form) in offers.into_iter().zip([
+        proto::EncodeHandoff::Rendezvous,
+        proto::EncodeHandoff::Unspecified,
+    ]) {
+        let stored = WorkerRow {
+            facts: WorkerFacts {
+                encode: offer.clone(),
+                ..full().facts
+            },
+            ..full()
+        };
+        let told = row(&stored);
+        let block = told.encode.as_ref().expect("the block is told");
+        assert_eq!(block.handoff, form as i32);
+        assert_eq!(read(&told), Ok(offer));
+    }
+
+    // A told row's connector is read as told. One that holds a blank and
+    // one past a registration's bound are texts a host's own write may
+    // state, and a standby holds the row its leader took. A form this build
+    // does not know is refused by the row's path.
+    let told_as = |change: fn(&mut proto::EncodeOffer)| {
+        let mut told = row(&offering);
+        change(told.encode.as_mut().expect("the block"));
+        told_row(&told, Instant::now())
+            .map(|row| row.facts.encode.connector)
+            .map_err(|refused| refused.path)
+    };
+    assert_eq!(
+        told_as(|block| block.connector = "a b".to_owned()),
+        Ok(Some("a b".to_owned()))
+    );
+    assert_eq!(
+        told_as(|block| block.connector = text(NAME_BYTES + 1)),
+        Ok(Some(text(NAME_BYTES + 1)))
+    );
+    assert_eq!(
+        told_as(|block| block.handoff = 3),
+        Err("row.encode.handoff")
+    );
+}
+
+/// The descriptor's five numbers of an encode offer left the contract: the
+/// offer is the registration's own block. A registration that still states
+/// one of them is read as one that states none, where a build before this
+/// one refused it by its path.
+#[test]
+fn a_descriptor_that_still_states_a_number_of_the_encode_offer_reads_as_one_that_states_none() {
+    let port_alone = proto::PairingDescriptor {
+        bootstrap_port: 7_000,
+        ..Default::default()
+    };
+    let mut bytes = port_alone.encode_to_vec();
+    // Four of the five as a varint of one, then the connector as a text of
+    // one letter: each field's key, then its value.
+    for number in [9_u8, 10, 12, 14] {
+        bytes.extend_from_slice(&[number << 3, 1]);
+    }
+    bytes.extend_from_slice(&[(13 << 3) | 2, 1, b'a']);
+    let read = proto::PairingDescriptor::decode(bytes.as_slice()).expect("a descriptor");
+    assert_eq!(read, port_alone);
+    let registered = proto::WorkerSpec {
+        pairing: Some(read),
+        ..spec()
+    };
+    let made = facts(&registered, None).expect("a registration");
+    assert_eq!(made.bootstrap_port, Some(7_000));
+    assert_eq!(made.encode, EncodeOffer::default());
+}
+
+/// A worker's priority and its drain window are its registration's where
+/// it states them. A registration that states neither keeps the row's, and
+/// a new row stands at priority zero and waits the default window.
+#[test]
+fn a_registration_states_a_priority_and_a_drain_window_and_one_that_states_none_keeps_the_rows() {
+    let with = |priority: Option<i32>, window: Option<u32>| proto::WorkerSpec {
+        priority,
+        drain_settle_secs: window,
+        ..spec()
+    };
+    let stated = |stated: &proto::WorkerSpec, standing: Option<&WorkerFacts>| {
+        facts(stated, standing).map(|made| (made.priority, made.drain_settle_secs))
+    };
+    assert_eq!(stated(&spec(), None), Ok((0, None)));
+    assert_eq!(stated(&with(Some(-5), None), None), Ok((-5, None)));
+    // A window of no wait is a window, and not the default one.
+    assert_eq!(stated(&with(None, Some(0)), None), Ok((0, Some(0))));
+    assert_eq!(stated(&with(Some(7), Some(45)), None), Ok((7, Some(45))));
+
+    // Over a standing row: a registration that states neither keeps the
+    // row's, and one that states either is the row's for that fact alone.
+    let standing = facts(&with(Some(7), Some(45)), None).expect("a registration");
+    assert_eq!(stated(&spec(), Some(&standing)), Ok((7, Some(45))));
+    let zero = with(Some(0), None);
+    assert_eq!(stated(&zero, Some(&standing)), Ok((0, Some(45))));
+    let no_wait = with(None, Some(0));
+    assert_eq!(stated(&no_wait, Some(&standing)), Ok((7, Some(0))));
+}
+
+/// The wire's row tells its worker's priority and drain window, and its
+/// reader holds them. A row of a worker that states neither tells no byte
+/// of the two fields, so it is the row a build before the fields told.
+/// Such a row reads at priority zero and the default window.
+#[test]
+fn a_row_tells_its_workers_priority_and_drain_window_and_one_that_tells_none_reads_the_defaults() {
+    let stating = full();
+    let plain = WorkerRow {
+        facts: WorkerFacts {
+            priority: 0,
+            drain_settle_secs: None,
+            ..full().facts
+        },
+        ..full()
+    };
+    let (told_stating, told_plain) = (row(&stating), row(&plain));
+    let told = |told: &proto::WorkerRow| (told.priority, told.drain_settle_secs);
+    assert_eq!(told(&told_stating), (-5, Some(45)));
+    assert_eq!(told(&told_plain), (0, None));
+    let read = |told: &proto::WorkerRow| {
+        let read = told_row(told, Instant::now());
+        read.map(|row| (row.facts.priority, row.facts.drain_settle_secs))
+    };
+    assert_eq!(read(&told_stating), Ok((-5, Some(45))));
+    assert_eq!(read(&told_plain), Ok((0, None)));
+    // Each number is three bytes of the row that tells it, and none of the
+    // row that does not.
+    assert_eq!(told_stating.encoded_len() - told_plain.encoded_len(), 6);
+    let bytes = told_plain.encode_to_vec();
+    let again = proto::WorkerRow::decode(bytes.as_slice()).expect("a row");
+    assert_eq!(read(&again), Ok((0, None)));
+    // A window of no wait crosses as a window.
+    let no_wait = WorkerRow {
+        facts: WorkerFacts {
+            drain_settle_secs: Some(0),
+            ..full().facts
+        },
+        ..full()
+    };
+    assert_eq!(read(&row(&no_wait)), Ok((-5, Some(0))));
+}
+
+/// A watcher builds its worker's object from the row it was told, and the
+/// object waits the window that row tells. A row that tells none builds an
+/// object of the default window.
+#[test]
+fn an_object_built_from_a_told_row_waits_the_window_the_row_tells() {
+    use smg_worker::worker::HealthCheckConfig;
+
+    let window = |stored: &WorkerRow| {
+        let told = told_row(&row(stored), Instant::now()).expect("a row");
+        let object = crate::worker_host::object(&told);
+        object.metadata().health_config.drain_settle_secs
+    };
+    assert_eq!(window(&full()), 45);
+    let plain = WorkerRow {
+        facts: WorkerFacts {
+            drain_settle_secs: None,
+            ..full().facts
+        },
+        ..full()
+    };
+    assert_eq!(
+        window(&plain),
+        HealthCheckConfig::default().drain_settle_secs
+    );
+}
+
 #[test]
 fn a_registration_over_a_standing_row_keeps_what_it_leaves_unsaid_save_its_labels_and_its_policy() {
     let standing = full().facts;
@@ -850,7 +1287,7 @@ fn a_field_the_store_cannot_hold_is_refused_by_its_path() {
     // Of a pairing descriptor the store holds the bootstrap port alone:
     // every other field a caller states is refused by its own path.
     let named = |name: &str| name.to_owned();
-    let descriptors: [(proto::PairingDescriptor, &str); 13] = [
+    let descriptors: [(proto::PairingDescriptor, &str); 7] = [
         (
             proto::PairingDescriptor {
                 protocol: named("protocol-a"),
@@ -885,48 +1322,6 @@ fn a_field_the_store_cannot_hold_is_refused_by_its_path() {
                 ..Default::default()
             },
             "spec.pairing.kv_layout",
-        ),
-        (
-            proto::PairingDescriptor {
-                ec_producer: true,
-                ..Default::default()
-            },
-            "spec.pairing.ec_producer",
-        ),
-        (
-            proto::PairingDescriptor {
-                ec_consumer: true,
-                ..Default::default()
-            },
-            "spec.pairing.ec_consumer",
-        ),
-        (
-            proto::PairingDescriptor {
-                vision: true,
-                ..Default::default()
-            },
-            "spec.pairing.vision",
-        ),
-        (
-            proto::PairingDescriptor {
-                encode_handoff: proto::EncodeHandoff::Push as i32,
-                ..Default::default()
-            },
-            "spec.pairing.encode_handoff",
-        ),
-        (
-            proto::PairingDescriptor {
-                ec_connector: named("connector-b"),
-                ..Default::default()
-            },
-            "spec.pairing.ec_connector",
-        ),
-        (
-            proto::PairingDescriptor {
-                encode_references: true,
-                ..Default::default()
-            },
-            "spec.pairing.encode_references",
         ),
         (
             proto::PairingDescriptor {
@@ -1465,7 +1860,6 @@ fn the_stores_measure_is_never_under_the_wires_weight() {
         kv_block_size: Some(u32::MAX),
         max_running: Some(u32::MAX),
         bootstrap_port: Some(u16::MAX),
-        priority: i32::MAX,
         reachable_from: Reachability::Gateway(GatewayId(u64::MAX)),
         overload: Overload {
             kv_usage_permille: Some(u16::MAX),
@@ -1508,10 +1902,70 @@ fn the_stores_measure_is_never_under_the_wires_weight() {
         numbers.admitted_age_ms = u64::MAX;
         numbers.encoded_len()
     };
+    // The same row again where its worker takes images too: the store
+    // charges the wire's bit beside the block.
+    let seeing = WorkerFacts {
+        vision: true,
+        ..stating.clone()
+    };
+    // The same row again where its worker states every role of an encode
+    // offer and no connector: the store charges the wire's block.
+    let offering = WorkerFacts {
+        encode: EncodeOffer {
+            handoff: EncodeHandoff::Rendezvous,
+            producer: true,
+            consumer: true,
+            connector: None,
+            references: true,
+        },
+        ..seeing.clone()
+    };
     let (plain, block) = (numeric(&widest), numeric(&stating));
     assert!(plain <= WorkerFacts::NUMBERS, "{plain} numeric bytes");
     // What the store charges for the block is the block at its widest.
     assert_eq!(block - plain, WorkerFacts::DEMAND_FACTS);
+    // What it charges for the bit is the bit.
+    assert_eq!(numeric(&seeing) - block, WorkerFacts::VISION);
+    // The measure adds that charge for a row that takes images. A row's
+    // texts leave more room than the bit takes, so no row below needs
+    // the charge to fit its measure, and it is read here.
+    let charged = |facts: &WorkerFacts| facts.weight(&Registrant::Control);
+    assert_eq!(charged(&seeing) - charged(&stating), WorkerFacts::VISION);
+    // What it charges for an offer is the offer's block with no connector,
+    // and the measure adds it for a row whose offer states anything.
+    assert_eq!(numeric(&offering) - numeric(&seeing), WorkerFacts::ENCODE);
+    assert_eq!(charged(&offering) - charged(&seeing), WorkerFacts::ENCODE);
+    // A connector is charged as any text is, beside the block: its bytes
+    // and a text's frame, and no byte more.
+    let on = WorkerFacts {
+        encode: EncodeOffer {
+            connector: Some(text(300)),
+            ..offering.encode.clone()
+        },
+        ..offering.clone()
+    };
+    assert_eq!(charged(&on) - charged(&offering), 300 + WorkerFacts::FRAME);
+    // The same row again where its worker states a priority, and then a
+    // drain window too, each at its widest. The store charges the wire's
+    // number for each, and the measure adds each where the row states it.
+    let ranked = WorkerFacts {
+        priority: i32::MIN,
+        ..offering.clone()
+    };
+    let waiting = WorkerFacts {
+        drain_settle_secs: Some(u32::MAX),
+        ..ranked.clone()
+    };
+    assert_eq!(numeric(&ranked) - numeric(&offering), WorkerFacts::PRIORITY);
+    assert_eq!(charged(&ranked) - charged(&offering), WorkerFacts::PRIORITY);
+    assert_eq!(
+        numeric(&waiting) - numeric(&ranked),
+        WorkerFacts::DRAIN_WINDOW
+    );
+    assert_eq!(
+        charged(&waiting) - charged(&ranked),
+        WorkerFacts::DRAIN_WINDOW
+    );
 
     let makers = [
         Registrant::Control,
@@ -1520,12 +1974,20 @@ fn the_stores_measure_is_never_under_the_wires_weight() {
     ];
     for long in [false, true] {
         let sized = |least, most| text(if long { most } else { least });
-        // With a scrape and with none, the block stated and not.
+        // With a scrape and with none: the block stated and not, the bit
+        // beside the block, and an offer beside both, whose connector is
+        // a text of the row.
         let cells = [
             (false, &widest),
             (true, &widest),
             (false, &stating),
             (true, &stating),
+            (false, &seeing),
+            (true, &seeing),
+            (false, &offering),
+            (true, &offering),
+            (false, &waiting),
+            (true, &waiting),
         ];
         for (scrape, numbers) in cells {
             let facts = WorkerFacts {
@@ -1542,6 +2004,10 @@ fn the_stores_measure_is_never_under_the_wires_weight() {
                 signals: Signals {
                     scrape_interval_ms: if scrape { u32::MAX } else { 0 },
                     ..numbers.signals
+                },
+                encode: EncodeOffer {
+                    connector: (numbers.encode != EncodeOffer::default()).then(|| sized(1, 256)),
+                    ..numbers.encode.clone()
                 },
                 ..numbers.clone()
             };
@@ -1565,7 +2031,11 @@ fn the_stores_measure_is_never_under_the_wires_weight() {
         key: text(2_048),
         engine: text(2_048),
         engine_kind: text(256),
-        ..stating
+        encode: EncodeOffer {
+            connector: Some(text(256)),
+            ..offering.encode.clone()
+        },
+        ..offering
     };
     let mut told = row(&WorkerRow {
         facts: lean.clone(),
@@ -1614,6 +2084,13 @@ fn every_kind_of_log_entry_is_sent_under_a_case_of_its_own() {
             row: Some(Arc::new(stored.clone())),
             left: None,
         },
+        Written::Status {
+            epoch: 1,
+            id: stored.id,
+            from: WorkerStatus::Pending,
+            to: WorkerStatus::Ready,
+            models: stored.facts.models.as_slice().into(),
+        },
     ]
     .map(|event| replication(&Entry { at, event }).event);
     assert_eq!(entries[0], Some(Sent::TermStart(proto::TermStart {})));
@@ -1626,6 +2103,10 @@ fn every_kind_of_log_entry_is_sent_under_a_case_of_its_own() {
             2
         )))
     );
+    // A status entry is sent as the status event of its change: the
+    // models it holds are not sent.
+    let moved = status_changed(stored.id, WorkerStatus::Pending, WorkerStatus::Ready);
+    assert_eq!(entries[2], Some(Sent::Membership(event(moved, 3, 1, 2))));
     // A membership entry in a shape the store never tells is sent with
     // no case set: the standby reads an event it does not know.
     let untold = Written::Member {
@@ -1908,7 +2389,19 @@ fn every_membership_event_comes_back_as_the_change_the_store_follows() {
         Ok((6, replacement, row))
     );
     assert_eq!(sent(removal, None, Some(&old)), Ok((6, removal, None)));
-    assert_eq!(sent(status, Some(&old), None), Ok((6, status, None)));
+    // A status entry comes back as the status change, with no row.
+    let moved = Entry {
+        at: Position { seq: 9, term: 4 },
+        event: Written::Status {
+            epoch: 6,
+            id: old.id,
+            from: WorkerStatus::Ready,
+            to: WorkerStatus::Draining,
+            models: old.facts.models.as_slice().into(),
+        },
+    };
+    let back = told_change(&member(&moved).expect("a status event"), now);
+    assert_eq!(back, Ok((6, status, None)));
     // A watch's own cases and an event of no case are not a change.
     for event in [
         None,
