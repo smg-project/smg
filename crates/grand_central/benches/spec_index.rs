@@ -9,6 +9,14 @@
 //! A bench target of its own: no pull-request gate reads it, and a row
 //! added to the gated `decision` binary would move that binary
 //! (`.github/bench-gates/grand-central-engine.toml`).
+//!
+//! Under the feature `in-process`, one apply on a running engine whose
+//! document gained one profile at each of its generations, as a host's does
+//! that registers one model at a time. Ids:
+//! `engine/spec/apply_grown/<profiles>` at ten, a hundred and a thousand
+//! profiles. A row is the check of the document and its apply: the engine
+//! keeps every profile, each made under a generation of its own, and holds
+//! nothing for an earlier generation.
 #![expect(
     clippy::expect_used,
     reason = "a bench's setup has no caller to answer; a document that fails to parse is a bug the unit tests catch"
@@ -62,5 +70,65 @@ fn spec_validate_index(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, spec_validate_index);
+/// The `round_robin` preset's document under `generation`, with `profiles`
+/// profiles in all: the preset's own and a copy of it for each further one,
+/// bound to a model of its own.
+#[cfg(feature = "in-process")]
+fn grown(profiles: usize, generation: u64) -> PolicySpec {
+    let mut document = PolicySpec::preset("round_robin").expect("a preset's name");
+    document.generation = generation;
+    let own = document.profiles["round_robin"].clone();
+    let binding = document.bindings[0].clone();
+    for at in 1..profiles {
+        let name = format!("model-{at:04}");
+        document.profiles.insert(name.clone(), own.clone());
+        let mut bound = binding.clone();
+        bound.matcher.model.clone_from(&name);
+        bound.profile = Some(name);
+        document.bindings.insert(0, bound);
+    }
+    document
+}
+
+/// One apply on an engine whose document gained one profile at each of
+/// its generations. The apply keeps every profile, each made under a
+/// generation of its own.
+#[cfg(feature = "in-process")]
+fn spec_apply_grown(c: &mut Criterion) {
+    use smg_grand_central::{document::AppliedSpec, engine::InProcess};
+    let mut group = c.benchmark_group("engine/spec");
+    group.sample_size(20);
+    for profiles in [10, 100, 1_000] {
+        let first = AppliedSpec::validate(&grown(1, 1)).expect("the document validates");
+        let engine = InProcess::new(first);
+        let mut generation = 1;
+        for count in 2..=profiles {
+            generation += 1;
+            let next = AppliedSpec::validate(&grown(count, generation));
+            engine
+                .apply(next.expect("the document validates"))
+                .expect("a later generation");
+        }
+        let mut document = grown(profiles, generation);
+        group.bench_with_input(
+            BenchmarkId::new("apply_grown", profiles),
+            &profiles,
+            |b, _| {
+                b.iter(|| {
+                    document.generation += 1;
+                    let next = AppliedSpec::validate(black_box(&document));
+                    engine
+                        .apply(next.expect("the document validates"))
+                        .expect("a later generation");
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+#[cfg(not(feature = "in-process"))]
+fn spec_apply_grown(_: &mut Criterion) {}
+
+criterion_group!(benches, spec_validate_index, spec_apply_grown);
 criterion_main!(benches);

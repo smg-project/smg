@@ -23,7 +23,7 @@ use crate::{
     engine::{
         decision::{Decision, Target, Targets},
         decision_engine::{DecisionEngine, DecisionRefused, Request, RequestMaker, WorkerLists},
-        framework::{EncodeItems, EncodePlaced, Picker, TieBand},
+        framework::{EncodeItems, EncodePlaced, Issuing, Picker, TieBand},
         in_process::{
             membership::tests::{handed, id, registry, remove},
             single::tests::{
@@ -712,13 +712,100 @@ fn a_stage_built_since_a_leases_generation_and_kept_later_did_not_stand_at_it() 
         let stood = held.under(&engine).hearing(generation);
         let stood = stood.expect("a generation under the standing one");
         let side = crate::tracking::Side::Single;
-        stood.on_dispatched(&lease, &Target::default(), side, 0);
+        stood.dispatched_stages(&lease, &Target::default(), side, 0);
     }
     // The pickers by the place the table built them at: `random` of the
     // first document, kept by both later ones, and the second document's
     // `second`, kept by the third.
     assert_eq!(words(&built, 0), ["dispatched", "dispatched"]);
     assert_eq!(words(&built, 3), ["dispatched"], "born under the second");
+    // A lease of the document's own generation is heard by the document's
+    // whole engine, and one of a generation above it by nobody.
+    let held = engine.spec();
+    let own = held.under(&engine).hearing(3);
+    let own = own.expect("the standing generation");
+    let lease = crate::tracking::Lease {
+        generation: 3,
+        ..Default::default()
+    };
+    own.dispatched_stages(&lease, &Target::default(), crate::tracking::Side::Single, 0);
+    assert_eq!(words(&built, 0).len(), 3, "kept since the first");
+    assert_eq!(words(&built, 3).len(), 2, "kept since the second");
+    assert!(
+        held.under(&engine).hearing(4).is_none(),
+        "no stage booked it"
+    );
+}
+
+/// A document holds each of its profiles once, whatever the number of
+/// generations they were made under, and nothing for an earlier
+/// generation: a word of an older lease is told by the generations the
+/// document's own profiles were made under ([`InForce::stood_at`]). Twelve
+/// documents each add one profile and keep the ones that stand, as a host
+/// does that registers one model at a time. Under the last, a dispatch of
+/// a lease of each earlier generation reaches the profiles made by then,
+/// one more a generation, and a lease of the document's own generation or
+/// of one above it reaches the eleven it kept. Each profile's object is
+/// held by the document in force alone.
+#[test]
+fn a_document_holds_each_profile_once_whatever_generations_made_them() {
+    const DOCUMENTS: u64 = 12;
+    let (stages, built) = hearing_stages();
+    // `random` and a profile `more-<n>` for each generation from the
+    // second to `count`, each bound to a model no case asks for.
+    let grown = |count: u64| {
+        move |document: &mut PolicySpec| {
+            for at in 2..=count {
+                let name = format!("more-{at:02}");
+                let profile = document.profiles["random"].clone();
+                document.profiles.insert(name.clone(), profile);
+                let elsewhere = BindingSpec {
+                    matcher: Match {
+                        model: name.clone(),
+                        ..Match::default()
+                    },
+                    profile: Some(name),
+                    ..BindingSpec::default()
+                };
+                document.bindings.insert(0, elsewhere);
+            }
+        }
+    };
+    let engine = InProcess::new(hearing_over(&stages, 1, grown(1)));
+    for number in 2..=DOCUMENTS {
+        let applied = engine.apply(hearing_over(&stages, number, grown(number)));
+        applied.expect("a number above the standing one");
+    }
+    // The dispatches every picker the table built has heard so far.
+    let dispatches = || -> u64 {
+        let heard = |picker: &Heard| {
+            let words = picker.lock();
+            words.iter().filter(|word| word.0 == "dispatched").count() as u64
+        };
+        built.lock().iter().map(heard).sum()
+    };
+    let held = engine.spec();
+    let document = &held.0;
+    let side = crate::tracking::Side::Single;
+    for (generation, stood) in (1..DOCUMENTS)
+        .map(|at| (at, at))
+        .chain([(DOCUMENTS, DOCUMENTS - 1), (DOCUMENTS + 5, DOCUMENTS - 1)])
+    {
+        let lease = crate::tracking::Lease {
+            generation,
+            ..Default::default()
+        };
+        let before = dispatches();
+        let hears = document.stood_at(generation);
+        hears.dispatched_stages(&lease, &Target::default(), side, 0);
+        assert_eq!(dispatches() - before, stood, "a lease of {generation}");
+    }
+    let profiles = document.spec.engine().profiles();
+    assert_eq!(profiles.len() as u64, DOCUMENTS);
+    for profile in profiles {
+        let holders = Arc::strong_count(profile);
+        assert_eq!(holders, 1, "{} is held {holders} times", profile.name);
+    }
 }
 
 /// A send said behind a later document, for a decision the document before
