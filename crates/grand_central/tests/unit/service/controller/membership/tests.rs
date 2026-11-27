@@ -1805,7 +1805,7 @@ fn a_fact_the_log_does_not_carry_is_refused_by_its_name_and_nothing_is_written()
     let hosted = ReplicaMembershipWriter::new(Arc::new(door), operator(), under(TERM));
     let maker = found("pods/a");
     let epoch = store.epoch();
-    let lost: [(&str, State); 9] = [
+    let lost: [(&str, State); 7] = [
         ("row.pairing", |facts| {
             facts.pairing = Some(Arc::new(PairingDescriptor {
                 protocol: Some("pd".to_owned()),
@@ -1830,14 +1830,10 @@ fn a_fact_the_log_does_not_carry_is_refused_by_its_name_and_nothing_is_written()
                 ..EncodeOffer::default()
             };
         }),
-        ("row.priority", |facts| facts.priority = 5),
         ("row.zone", |facts| facts.zone = Some(String::new())),
         ("row.max_running", |facts| facts.max_running = Some(0)),
         ("row.kv_block_size", |facts| facts.kv_block_size = Some(0)),
         ("row.bootstrap_port", |facts| facts.bootstrap_port = Some(0)),
-        ("row.drain_settle_secs", |facts| {
-            facts.drain_settle_secs = Some(30);
-        }),
     ];
     for (fact, state) in lost {
         let answer = hosted.found_one(&maker, URL, &|_| {
@@ -1854,9 +1850,10 @@ fn a_fact_the_log_does_not_carry_is_refused_by_its_name_and_nothing_is_written()
 
     // What the log carries is taken, and a standby reads it back whole:
     // what the worker states for a request's hard demands among it,
-    // whether it takes images, and its end of the encode handoff. The
-    // offer's connector is the store's text, held to no rule of its words:
-    // one that holds a blank and a control character, past a name's bound.
+    // whether it takes images, its end of the encode handoff, its priority
+    // and a drain window of its own. The offer's connector is the store's
+    // text, held to no rule of its words: one that holds a blank and a
+    // control character, past a name's bound.
     let stated = DemandFacts {
         runtime: 7,
         references: true,
@@ -1874,6 +1871,8 @@ fn a_fact_the_log_does_not_carry_is_refused_by_its_name_and_nothing_is_written()
         demand_facts: stated,
         vision: true,
         encode: offered.clone(),
+        priority: 5,
+        drain_settle_secs: Some(30),
         ..found_facts()
     };
     hosted.found_one(&maker, URL, &stating).expect("found");
@@ -1881,6 +1880,8 @@ fn a_fact_the_log_does_not_carry_is_refused_by_its_name_and_nothing_is_written()
     assert_eq!(row.facts.demand_facts, stated);
     assert!(row.facts.vision);
     assert_eq!(row.facts.encode, offered);
+    let stated = (row.facts.priority, row.facts.drain_settle_secs);
+    assert_eq!(stated, (5, Some(30)));
     let back = worker_wire::told_row(&worker_wire::row(&row), std::time::Instant::now());
     assert_eq!(back.map(|back| back.facts), Ok(row.facts));
 }
