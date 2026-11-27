@@ -2047,13 +2047,17 @@ jobs:
       engine: vllm
       gpu_tier: "2"
       runner: ${{ vars.SMG_RUNNER_AMD_GPU_2 }}
+      # Inherited CUDA-row budgets; no AMD timing measurement yet.
+      # Re-derive from actual AMD startup, runtime, and cleanup before enabling.
       timeout: 50
       test_timeout: 34
       test_dirs: e2e_test/router
       vllm_kv_backend: nixl
       # Rank-pin and placement cases inspect the per-request servicer log.
       worker_log_filter: info,engine_servicer::request=debug
-      min_selected: 15 # Selection floor; the full applicable router suite is required
+      # Inherited CUDA-row floor; re-derive from the measured AMD selection.
+      # This minimum alone does not establish full applicable router coverage.
+      min_selected: 15
       gpu_vendor: amd
       container_image: vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
       container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
