@@ -346,12 +346,12 @@ The lists below take the rows in that order.
 
 ### The record of sent prefixes
 
-- A standalone controller's engine keeps a record of the prefixes sent to its workers. It keeps one for a pool whose prefix stage reads sent prefixes, under an index of the kind `tree`.
+- A standalone controller's engine keeps a record of the prefixes sent to its workers. It keeps the records by model, for a pool whose prefix stage reads sent prefixes, under an index of the kind `tree`.
 - A stage that says `source: index` reads cache events alone, and no such record.
 - A decision can write a placement there: a single request's, and each side of a pair's.
 - It writes for the first target its maker says the caller sends to. On the stock controller that is the pick's first. Under an encode request it writes none where the maker says the caller sends to a placed encoder no more.
 - It writes none for a pick the sessions rule keeps from the profile.
-- The record has room for `max_size` over the block size placements, and for one at least.
+- A model's record takes its room from the index's `max_size`, and has room for one placement at least. [Index](policy-spec.md#index) has the rule.
 - A placement is a prediction made at the decision.
 - A decision turned back after its lease's issue keeps the placement it wrote. A later request with that prefix can read it as a predicted hit, which must exceed the stage's `threshold`.
 - A decision does not wait to write its placement: a write that meets the record's lock held is kept by its thread and written behind the thread's next picks. A write that eight newer ones push out, or that its thread ends with, is left out.
