@@ -7,12 +7,14 @@ caller must prepare the owned SDK and interpreter before invoking this API.
 import argparse
 import csv
 import hashlib
+import importlib.metadata as metadata
 import json
 import os
 import re
 import subprocess
 from email.parser import Parser
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 from ci_verify_sglang_rocm_cohort import CONSTRAINT, CONSTRAINT_SHA, IMAGE
 
@@ -216,6 +218,112 @@ def installed_records(manifest_path):
     return found
 
 
+def owned_metadata_records(manifest_path):
+    """Read the complete declared owned metadata view without importing it.
+
+    Other roots need not use the target's RECORD scheme. In particular, source
+    projects may expose egg-info while the target contains their PEP660 metadata.
+    Borrowed provider sites are not added to this owned inventory.
+    """
+    spec = json.loads(Path(manifest_path).read_bytes())
+    roots = {directory(p) for p in spec["import_roots"]}
+    borrowed = [directory(p) for p in spec.get("borrowed_sites", [])]
+    for package in spec.get("packages", []):
+        path = Path(package["metadata_path"]).absolute()
+        if any(path.is_relative_to(root) for root in borrowed) and not any(
+            path.is_relative_to(root) for root in roots
+        ):
+            continue
+        if path.name in ("METADATA", "PKG-INFO"):
+            roots.add(directory(path.parent.parent))
+        elif path.name.endswith(".egg-info"):
+            roots.add(directory(path.parent))
+        else:
+            raise ValueError("Unsupported declared owned metadata layout")
+    target = directory(spec["install_prefix"])
+    major, minor = spec["python_version"]
+    site = directory(target / f"lib/python{major}.{minor}/site-packages")
+    roots.add(site)
+    found = {}
+    for root in sorted(roots):
+        query = metadata.DistributionFinder.Context(path=[str(root)])
+        for dist in metadata.MetadataPathFinder.find_distributions(query):
+            if not isinstance(dist, metadata.PathDistribution):
+                raise ValueError("Owned filesystem metadata origin required")
+            origin = Path(dist._path).absolute()
+            if origin.is_symlink() or origin != origin.resolve() or not origin.is_relative_to(root):
+                raise ValueError("Owned metadata origin is aliased or escapes its root")
+            if origin.is_dir():
+                candidates = [origin / "METADATA", origin / "PKG-INFO"]
+                if any(p.is_symlink() for p in candidates):
+                    raise ValueError("Owned metadata body cannot be a symlink")
+                body = next((p for p in candidates if p.is_file()), None)
+            else:
+                body = origin if origin.is_file() else None
+            if body is None:
+                raise ValueError("Owned metadata body is missing")
+            fields = Parser().parsestr(body.read_text())
+            if len(fields.get_all("Name", [])) != 1 or len(fields.get_all("Version", [])) != 1:
+                raise ValueError("Owned distribution needs one name and version")
+            name = re.sub(r"[-_.]+", "-", fields["Name"]).lower()
+            version = fields["Version"].strip()
+            if not name or not version:
+                raise ValueError("Owned distribution name or version is empty")
+            found[str(body)] = {
+                "name": name,
+                "version": version,
+                "origin": str(origin),
+                "metadata": str(body),
+                "sha256": digest(body),
+            }
+
+    groups = {}
+    for entry in found.values():
+        groups.setdefault(entry["name"], []).append(entry)
+    for entries in groups.values():
+        if len(entries) == 1:
+            continue
+        targets = [
+            e
+            for e in entries
+            if Path(e["origin"]).parent == site and Path(e["origin"]).name.endswith(".dist-info")
+        ]
+        if len(targets) != 1:
+            raise ValueError("Ambiguous distributions across owned metadata roots")
+        primary = targets[0]
+        direct = Path(primary["origin"]) / "direct_url.json"
+        if direct.is_symlink() or not direct.is_file():
+            raise ValueError("Cross-root replacement needs a proven editable origin")
+        declared = json.loads(direct.read_text())
+        url = urlsplit(declared.get("url", ""))
+        if (
+            declared.get("dir_info", {}).get("editable") is not True
+            or url.scheme != "file"
+            or url.netloc not in ("", "localhost")
+            or url.query
+            or url.fragment
+            or not Path(unquote(url.path)).is_absolute()
+        ):
+            raise ValueError("Cross-root replacement has no declared editable origin")
+        project = directory(unquote(url.path))
+        mapped = spec.get("editable_projects", {}).get(str(project), [])
+        mapped = [directory(p) for p in mapped]
+        if not mapped or any(p not in roots for p in mapped):
+            raise ValueError("Editable metadata project has no explicit import mapping")
+        for entry in entries:
+            if entry is primary:
+                continue
+            origin = Path(entry["origin"])
+            if (
+                entry["version"] != primary["version"]
+                or not origin.name.endswith(".egg-info")
+                or not origin.is_relative_to(project)
+                or not (origin.parent == project or any(origin.is_relative_to(p) for p in mapped))
+            ):
+                raise ValueError("Conflicting providers across owned metadata roots")
+    return found
+
+
 def install(manifest_path, arguments, *, cwd, timeout=600):
     """Install with full arguments; refuse ambiguous or stale owned replacements.
 
@@ -243,8 +351,16 @@ def install(manifest_path, arguments, *, cwd, timeout=600):
     finally:
         os.close(parent_fd)
     before = installed_records(manifest_path)
+    before_metadata = owned_metadata_records(manifest_path)
     subprocess.run(command, env=environment, cwd=cwd, check=True, timeout=timeout)
     after = installed_records(manifest_path)
+    after_metadata = owned_metadata_records(manifest_path)
+    target = directory(spec["install_prefix"])
+    if any(
+        not Path(path).is_relative_to(target) and path not in after_metadata
+        for path in before_metadata
+    ):
+        raise ValueError("Owned metadata outside the target disappeared during install")
     claimed = set().union(*after.values()) if after else set()
     if any(name not in after for name in before):
         raise ValueError("Owned distribution disappeared during install")
