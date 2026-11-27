@@ -15,7 +15,7 @@ pub(super) enum BudgetWire {
 pub(super) fn wire(runtime: RuntimeType) -> BudgetWire {
     match runtime {
         RuntimeType::Sglang => BudgetWire::Sglang,
-        RuntimeType::Vllm => BudgetWire::Canonical,
+        RuntimeType::Vllm | RuntimeType::Trtllm => BudgetWire::Canonical,
         _ => BudgetWire::Passthrough,
     }
 }
@@ -115,6 +115,7 @@ mod tests {
                 for (runtime, expected) in [
                     (RuntimeType::Sglang, &nested),
                     (RuntimeType::Vllm, &canonical),
+                    (RuntimeType::Trtllm, &canonical),
                     (RuntimeType::Generic, passthrough),
                     (RuntimeType::Unspecified, passthrough),
                 ] {
@@ -137,5 +138,26 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn thinking_token_budget_removes_only_the_alias_for_strict_http_servers() {
+        let trt = BasicWorkerBuilder::new("http://worker")
+            .runtime_type(RuntimeType::Trtllm)
+            .build();
+        let input = json!({"custom_params":{"thinking_budget":0}});
+        let bytes = super::super::request_body::serialize_request_body_with_edits(
+            &input,
+            None,
+            &trt,
+            None,
+            true,
+            Some(0),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).unwrap(),
+            json!({"thinking_token_budget":0})
+        );
     }
 }

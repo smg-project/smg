@@ -3874,6 +3874,31 @@ mod tests {
         tenant::TenantKey,
     };
 
+    #[test]
+    fn a_moved_http_decode_reuses_the_serialized_thinking_budget_spelling() {
+        let decode = |url, runtime| {
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Decode)
+                .runtime_type(runtime)
+                .build()
+        };
+        let vllm = decode("http://vllm", RuntimeType::Vllm);
+        let trtllm = decode("http://trtllm", RuntimeType::Trtllm);
+        let sglang = decode("http://sglang", RuntimeType::Sglang);
+        let other_sglang = decode("http://other-sglang", RuntimeType::Sglang);
+        let mlx = decode("http://mlx", RuntimeType::Mlx);
+        let tokenspeed = decode("http://tokenspeed", RuntimeType::TokenSpeed);
+
+        assert!(takes_sequential_decode_body(&vllm, &trtllm, true));
+        assert!(takes_sequential_decode_body(&sglang, &other_sglang, true));
+        assert!(takes_sequential_decode_body(&mlx, &tokenspeed, true));
+        assert!(!takes_sequential_decode_body(&vllm, &sglang, true));
+        assert!(!takes_sequential_decode_body(&sglang, &vllm, true));
+        assert!(!takes_sequential_decode_body(&mlx, &vllm, true));
+        assert!(!takes_sequential_decode_body(&sglang, &mlx, true));
+        assert!(takes_sequential_decode_body(&sglang, &mlx, false));
+    }
+
     /// A call that never reached its worker, with the worker's URL on the
     /// error as reqwest attaches it.
     async fn call_refused_by(addr: std::net::SocketAddr) -> reqwest::Error {
