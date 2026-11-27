@@ -325,6 +325,8 @@ def _start_local_grpc_gateway_with_mcp(
                 "memory",
             ],
         )
+        if any(getattr(w, "external", False) and getattr(w, "flush_cache", False) for w in workers):
+            gateway.flush_cache()
         client = openai.OpenAI(base_url=f"{gateway.base_url}/v1", api_key="not-used")
     except Exception:
         gateway.shutdown()

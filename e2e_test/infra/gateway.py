@@ -621,6 +621,34 @@ class Gateway:
         except (httpx.RequestError, httpx.TimeoutException):
             return False
 
+    def flush_cache(self, timeout: float = 30.0) -> bool:
+        """Best-effort KV cache flush across workers connected to this gateway.
+
+        Issues ``POST /flush_cache`` and returns ``True`` when the gateway
+        confirms HTTP 200. Engines or gateway modes that do not support cache
+        flushing (or transient transport errors) log and return ``False``
+        without raising.
+        """
+        try:
+            resp = httpx.post(f"{self.base_url}/flush_cache", timeout=timeout)
+            if resp.status_code == 200:
+                logger.info("Flushed worker KV cache via gateway %s", self.base_url)
+                return True
+            logger.debug(
+                "Gateway %s /flush_cache returned %d (%s); skipping cache flush",
+                self.base_url,
+                resp.status_code,
+                resp.text[:200],
+            )
+            return False
+        except (httpx.RequestError, httpx.TimeoutException) as exc:
+            logger.warning(
+                "Gateway %s /flush_cache failed (%s); skipping cache flush",
+                self.base_url,
+                exc,
+            )
+            return False
+
     def _worker_from_api_response(self, w: dict) -> WorkerInfo:
         """Convert API response dict to WorkerInfo."""
         status = "healthy" if w.get("is_healthy", False) else "unhealthy"
