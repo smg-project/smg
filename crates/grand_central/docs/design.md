@@ -941,7 +941,9 @@ A controller keeps one engine object too, built at its store's start. The store 
 it applies in force on it, by `InProcess::apply`, the call of a host that keeps one engine (section
 8.1, step 6, and section 10.2).
 
-The session table and the record of sent prompts stand across the call. So do the stages of a
+The session table stands across the call. So does the record of sent prompts, as a rule: a
+document that keys a model's record another way can start that record anew, by another kind of
+the model's index or by other boundaries under a hash index (section 4.5). So do the stages of a
 profile whose name and text did not change, with what they remember, under the rules that follow.
 Nothing is kept unless both documents were validated over one stage table: the stock one, or one
 table of the host's own that took no stage between the two validations.
@@ -3319,7 +3321,8 @@ The store keeps one engine object for its life and puts each document it applies
 on it, by `InProcess::apply`, the call of a host that keeps one engine (section 8.1, step 6). The
 session pins, the record of sent
 prompts and the stages of a profile whose name and text did not change stand, with what they hold,
-and the members that stand are told to the stages built new alone. A decision runs under the
+under the rules of section 5.1, and the members that stand are told to the stages built new alone.
+A decision runs under the
 document of the world it read: the list's value it asks, its lease, the stages told that issue and
 its shadow's count are that document's, whatever document is applied meanwhile. A word of a lease on
 file is told by the document in force at the word, which on a controller is the one its store's
