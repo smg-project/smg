@@ -208,6 +208,87 @@ impl Shape {
     }
 }
 
+/// The replacement decode needs a prefill in its pairing island with a vision
+/// encoder to process the image references.
+#[tokio::test]
+async fn thinking_token_budget_retries_only_on_a_pair_that_accepts_the_built_request() {
+    use llm_tokenizer::chat_template::ChatTemplateContentFormat;
+    use smg_worker::labels::SUPPORTS_THINKING_TOKEN_BUDGET_LABEL;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.json"), r#"{"model_type":"test"}"#).unwrap();
+    let tokenizers = Arc::new(TokenizerRegistry::new());
+    let tokenizer = MockTokenizer::new()
+        .with_content_format(ChatTemplateContentFormat::OpenAI)
+        .with_deferred_chat_ids(vec![1, 2]);
+    tokenizers
+        .load("test", MODEL, dir.path().to_str().unwrap(), || async {
+            Ok(Arc::new(tokenizer) as Arc<dyn Tokenizer>)
+        })
+        .await
+        .unwrap();
+
+    for (alternative_vision, expected_status, expected_sends) in [
+        ("false", http::StatusCode::INTERNAL_SERVER_ERROR, 1),
+        ("true", http::StatusCode::OK, 2),
+    ] {
+        let registry = Arc::new(WorkerRegistry::new());
+        let prefill = GatedScheduler::default();
+        let decode = GatedScheduler {
+            fail_first_internal: true,
+            ..Default::default()
+        };
+        for (island, prefill_vision) in [("a", "true"), ("b", alternative_vision)] {
+            for (role, vision, scheduler) in [
+                (WorkerType::Prefill, prefill_vision, &prefill),
+                (WorkerType::Decode, "true", &decode),
+            ] {
+                let port = Shape::Sequential.serve(scheduler.clone()).await;
+                register_worker_of_runtime(
+                    &registry,
+                    port,
+                    role,
+                    RuntimeType::Vllm,
+                    &[
+                        (SUPPORTS_THINKING_TOKEN_BUDGET_LABEL, "true"),
+                        ("pairing_protocol", island),
+                        ("mm_processor", "inprocess"),
+                        (SUPPORTS_VISION_LABEL, vision),
+                    ],
+                );
+            }
+        }
+        let deps = PipelineDeps::pair(
+            registry.clone(),
+            Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            None,
+            None,
+            NO_DEADLINE,
+        );
+        let pipeline = RequestPipeline::build(Endpoint::Chat, Mode::PrefillDecode, &deps).unwrap();
+        let mut request = one_pixel_image_chat();
+        request["thinking_token_budget"] = 0.into();
+        let response = chat_response_with_retries(
+            &pipeline,
+            shared_components(tokenizers.clone(), registry, true),
+            request,
+            Some(&fast_retry_config(3)),
+        )
+        .await;
+        let (status, body) = chat_body(response).await;
+        assert_eq!(status, expected_status, "{body}");
+        if status.is_server_error() {
+            let message = body["error"]["message"].as_str().unwrap();
+            assert!(
+                message.contains("release-test induced engine failure"),
+                "{body}"
+            );
+        }
+        assert_eq!(prefill.started.load(Ordering::SeqCst), expected_sends);
+        assert_eq!(decode.started.load(Ordering::SeqCst), expected_sends);
+    }
+}
+
 /// The pair pipeline of `shape` over one prefill stub and the decode stubs,
 /// whose requests `policies` place, with the stubs' workers: the prefill's
 /// first.

@@ -30,6 +30,7 @@ use openai_protocol::{
 };
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use smg_external_router::header_utils::insert_routed_worker_id;
+use smg_worker::identity::basic::Worker;
 use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{debug, error};
 
@@ -84,10 +85,11 @@ use crate::{
     rate_limit::{RateLimitManager, UsageSettlement},
     routers::{
         common::{
-            json_response, placement,
+            attempt_ledger::closes_retry_window,
+            json_response, overload, placement,
             placement::{Candidates, WireConstraint},
             prefill_admission::PrefillAdmission,
-            retry::{is_retryable_response, BackoffCalculator},
+            retry::{is_retryable_response, mark_non_retryable, BackoffCalculator},
             snapshot::{RoutingPool, WorkerRegistry},
         },
         error,
@@ -595,15 +597,14 @@ impl RequestPipeline {
         plan: &mut Option<ExecutionPlan>,
         spec: &mut Option<ResponseSpec>,
         stamp: &AttemptStamp,
-        attempt: u32,
+        previous_failure: &mut Option<Box<Response>>,
         last_attempt: bool,
     ) -> Result<Option<Response>, Response> {
-        dctx.attempt = attempt;
         let consumed = || {
             error!(function = "run_attempt", "Execution plan already consumed");
             error::internal_error("execution_plan_consumed", "Execution plan already consumed")
         };
-        if attempt > 0 {
+        if dctx.attempt > 0 {
             // Fresh worker selection per attempt; the retained plan is
             // re-stamped (engine ids, sampling defaults, the forced tool
             // call's shape, PD rooms) for the new workers. Buffered decode
@@ -612,6 +613,8 @@ impl RequestPipeline {
                 .worker_selection
                 .reselect(dctx, plan.as_ref().ok_or_else(consumed)?)
                 .await?;
+            // Errors after placement belong to the newly selected worker.
+            *previous_failure = None;
             let workers = stage_output(dctx.workers.as_ref(), "run_attempt")?;
             dctx.clients = Some(
                 acquire_clients(
@@ -759,7 +762,9 @@ impl RequestPipeline {
             let mut plan = Some(plan);
             let mut spec = Some(spec);
             let mut attempt: u32 = 0;
+            let mut previous_failure = None;
             loop {
+                dctx.attempt = attempt;
                 let last_attempt = attempt + 1 >= max_attempts;
                 let mut failure = match self
                     .run_attempt(
@@ -767,7 +772,7 @@ impl RequestPipeline {
                         &mut plan,
                         &mut spec,
                         &stamp,
-                        attempt,
+                        &mut previous_failure,
                         last_attempt,
                     )
                     .await
@@ -779,7 +784,23 @@ impl RequestPipeline {
                         return Ok(RunOutcome::Early(Self::routed_response(&dctx, response)));
                     }
                     Ok(None) => return Ok(RunOutcome::Final(dctx, start)),
-                    Err(response) => response,
+                    Err(response) => {
+                        if let Some(mut original) = previous_failure.take() {
+                            // The worker already answered. Preserve its error when the
+                            // retained request has no eligible replacement.
+                            if matches!(
+                                response.status(),
+                                http::StatusCode::BAD_REQUEST
+                                    | http::StatusCode::NOT_FOUND
+                                    | http::StatusCode::SERVICE_UNAVAILABLE
+                            ) {
+                                mark_non_retryable(&mut original);
+                                self.record_error(metrics_endpoint, &dctx.model_id, &original);
+                                return Err(*original);
+                            }
+                        }
+                        response
+                    }
                 };
 
                 if failure.extensions().get::<ReportedRefusal>().is_some() {
@@ -809,27 +830,7 @@ impl RequestPipeline {
                 // A worker's definitive answer closes the retry window on that
                 // worker: the next attempt goes to another available worker, or
                 // the answer stands as the client's response.
-                if let Some(workers) = dctx.workers.as_ref() {
-                    // The alternative is sought where the retry would re-select,
-                    // among the workers that decide the constraint alike too.
-                    let pools = self.retry_pools(&dctx.model_id, dctx.wire);
-                    let decided_on = dctx.constraint_decided_on;
-                    dctx.ledger.settle(
-                        &mut failure,
-                        workers.workers(),
-                        pools
-                            .iter()
-                            .flat_map(|pool| pool.as_slice().iter())
-                            .filter(|worker| {
-                                decided_on
-                                    .is_none_or(|decoding| decoding.decides_alike(worker.as_ref()))
-                                    && dctx
-                                        .routing
-                                        .context_requirements
-                                        .admits(worker.as_ref(), &dctx.model_id)
-                            }),
-                    );
-                }
+                self.settle_attempt(&dctx, &mut failure);
 
                 // The attempt's failure is the request's answer unless a retry
                 // follows: counted once, here, under its class and reason, as
@@ -860,6 +861,9 @@ impl RequestPipeline {
                     }
                 }
 
+                if dctx.routing.needs_thinking_budget && closes_retry_window(&failure) {
+                    previous_failure = Some(Box::new(failure));
+                }
                 let next_attempt = attempt + 1;
                 let delay = BackoffCalculator::calculate_delay(config, attempt);
                 if let Some(endpoint) = metrics_endpoint {
@@ -870,6 +874,44 @@ impl RequestPipeline {
                 attempt = next_attempt;
             }
         }
+    }
+
+    /// Return the worker's own failure when no eligible replacement can take the request.
+    fn settle_attempt(&self, ctx: &DispatchContext, failure: &mut Response) {
+        if !closes_retry_window(failure) {
+            return;
+        }
+        let Some(workers) = ctx.workers.as_ref() else {
+            return;
+        };
+        let eligible = |worker: &dyn Worker| {
+            (!ctx.routing.needs_thinking_budget || supports_thinking_budget(worker))
+                && ctx
+                    .constraint_decided_on
+                    .is_none_or(|decoding| decoding.decides_alike(worker))
+                && ctx
+                    .routing
+                    .context_requirements
+                    .admits(worker, &ctx.model_id)
+        };
+        let pools = self.retry_pools(&ctx.model_id, ctx.wire);
+        ctx.ledger.settle_with(
+            failure,
+            workers.workers(),
+            pools
+                .iter()
+                .flat_map(|pool| pool.as_slice().iter())
+                .filter(|worker| eligible(worker.as_ref())),
+            // Placement can lift an overload or liveness veto on retry. Let it
+            // decide whether this worker can take the retained request.
+            |worker| {
+                if ctx.routing.needs_thinking_budget {
+                    overload::routable_but_for_veto(worker)
+                } else {
+                    worker.is_available()
+                }
+            },
+        );
     }
 
     /// The pools a retry of `model_id` re-selects from, narrowed to the
