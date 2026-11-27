@@ -4313,9 +4313,9 @@ impl HashDepth {
 }
 
 /// A profile as [`check_profile`] built it: the profile, whether it keeps a
-/// session key on its worker, and the place in the list of counts of the
-/// one its stages read.
-type BuiltProfile = (Profile, bool, Option<usize>);
+/// session key on its worker, and the count of sends its stages read, where
+/// one of them asked for it.
+type BuiltProfile = (Profile, bool, Option<Arc<DispatchCredit>>);
 
 /// The two depths of one generation: how deep its stages read a request's
 /// block hashes, and how deep a stage reads them itself. The
@@ -4357,7 +4357,8 @@ impl HashDepths {
 /// The build reads four values of `view` and no header: the block size, the
 /// boundaries, the bound of block hashes and the age limit of load reports.
 /// The keep of a profile across a new header list rests on that
-/// (`AppliedSpec::keep_from`).
+/// (`AppliedSpec::keep_from`). `shared` answers the count of sends that an
+/// earlier profile's stages asked for under the same two send settings.
 fn check_profile(
     name: &str,
     p: &ProfileSpec,
@@ -4365,7 +4366,7 @@ fn check_profile(
     from: StageInputs<'_>,
     deferred: &mut Deferred,
     depth: &mut HashDepths,
-    sent_credits: &mut Vec<Arc<DispatchCredit>>,
+    shared: impl FnOnce(SentSettings) -> Option<Arc<DispatchCredit>>,
 ) -> Result<Option<BuiltProfile>, SpecError> {
     // The empty label is the engine's word for no profile.
     if name.is_empty() {
@@ -4389,10 +4390,7 @@ fn check_profile(
     // profile's count under the same two settings is the one handed.
     let mut sent = SentSlot {
         asked: None,
-        shared: sent_credits
-            .iter()
-            .find(|count| count.settings == settings)
-            .cloned(),
+        shared: shared(settings),
     };
     let mut filters = Vec::with_capacity(p.filter.len());
     for (index, entry) in p.filter.iter().enumerate() {
@@ -4568,15 +4566,6 @@ fn check_profile(
     }
     Ok(match picker {
         Some(picker) if complete => {
-            // A shared count stands in the list under the profile that
-            // made it.
-            let read = sent.asked.as_ref().map(|asked| {
-                let shared = sent_credits.iter().position(|c| Arc::ptr_eq(c, asked));
-                shared.unwrap_or(sent_credits.len())
-            });
-            if sent.shared.is_none() {
-                sent_credits.extend(sent.asked);
-            }
             // A filter and a picker name no depth of their own.
             let unkeyed = filters.iter().map(|filter| filter.needs());
             depth.deepen(HashDepth::of(unkeyed.fold(picker.needs(), Needs::or)), true);
@@ -4588,7 +4577,7 @@ fn check_profile(
                     picker,
                 },
                 by_key,
-                read,
+                sent.asked,
             ))
         }
         _ => None,
@@ -5438,23 +5427,24 @@ impl PolicySpec {
         // What no stage declares: the sessions rules' counts and the view's
         // headers. The engine folds every profile's stages in.
         let mut needs = Needs::default();
-        let mut profiles = Vec::with_capacity(self.profiles.len());
+        // The build's age limit of load reports and its stage table's
+        // number, stated once: the engine takes both where it is made.
+        let mut build = Engine::builder(self.view.max_report_age_ms, catalog.own);
         let has_shadows = self.bindings.iter().any(|binding| binding.shadow.is_some());
         let mut scoped_stages = BTreeMap::new();
-        let mut sent_credits = Vec::new();
-        let mut sent_of = Vec::new();
         // Noted by name: the built vector lines up with the document's
         // positions only once nothing is deferred.
         let mut by_assignment = Vec::new();
         // The built profiles the plain ring alone places by a request's
-        // session key, by their place in `profiles`.
+        // session key, by their place among the built ones.
         let mut keyed = Vec::new();
         // A registered stage reads a report through the view's reading:
-        // the limit the built-in scorers are wrapped with. It resolves a
+        // the limit the built-in scorers are wrapped with, and the one
+        // the build's engine checks a report's age by. It resolves a
         // signal's column from the document's, resolved once.
         let from = StageInputs {
             catalog,
-            reports: LoadReportReader::new(self.view.max_report_age_ms),
+            reports: LoadReportReader::new(build.max_report_age_ms()),
             signals: &signal_columns,
         };
         for (name, profile) in &self.profiles {
@@ -5465,10 +5455,9 @@ impl PolicySpec {
                 from,
                 &mut deferred,
                 &mut depth,
-                &mut sent_credits,
+                |settings| build.sent_under(settings),
             )?;
-            if let Some((built, by_key, read)) = built {
-                sent_of.push(read);
+            if let Some((built, by_key, asked)) = built {
                 if has_shadows {
                     if let Some(stage) = scoped_stage(&built) {
                         scoped_stages.insert(name.as_str(), stage);
@@ -5478,9 +5467,9 @@ impl PolicySpec {
                     by_assignment.push(name.as_str());
                 }
                 if by_key {
-                    keyed.push(profiles.len());
+                    keyed.push(build.len());
                 }
-                profiles.push(built);
+                build.push(built, asked);
             }
         }
         // A binding addresses its profile by position in the built vector,
@@ -5535,7 +5524,7 @@ impl PolicySpec {
             return Err(missing);
         }
         debug_assert_eq!(
-            profiles.len(),
+            build.len(),
             self.profiles.len(),
             "every profile is built once the deferred check has passed"
         );
@@ -5561,15 +5550,8 @@ impl PolicySpec {
             });
         }
         needs.headers |= !self.view.headers.is_empty();
-        let mut engine = Engine::new(profiles, bindings, self.generation, needs);
-        engine.sent_credits = sent_credits;
-        #[cfg(feature = "in-process")]
-        {
-            engine.sent_of = sent_of;
-            engine.stage_table = Some(catalog.own);
-        }
+        let mut engine = Engine::built(build, bindings, self.generation, needs);
         engine.set_explain_sample(self.explain.sample);
-        engine.limit_report_age(self.view.max_report_age_ms);
         for at in sheds {
             engine.shed_when_all_vetoed(at);
         }
