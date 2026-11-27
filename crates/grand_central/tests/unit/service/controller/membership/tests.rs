@@ -1120,9 +1120,27 @@ fn a_registration_of_one_rank_over_another_makers_ranks_is_told_the_maker_first(
 /// membership write lands: a lead lost inside one call.
 struct LosesTheLead {
     log: Arc<replication::Log>,
-    /// The membership writes the lead still holds for. The write that
-    /// finds none left loses it, once.
+    /// The membership writes the lead still holds for, a status write
+    /// among them. The write that finds none left loses it, once.
     holds: AtomicUsize,
+}
+
+impl LosesTheLead {
+    /// One write was told: the lead holds for one write fewer, and the
+    /// write that finds none left loses it.
+    fn told(&self) {
+        match self.holds.load(Ordering::Relaxed) {
+            0 => {
+                let next = Position {
+                    seq: 40,
+                    term: TERM + 1,
+                };
+                assert!(self.log.restart(next).is_ok(), "a place the log takes");
+                self.holds.store(usize::MAX, Ordering::Relaxed);
+            }
+            more => self.holds.store(more - 1, Ordering::Relaxed),
+        }
+    }
 }
 
 impl store::Journal for LosesTheLead {
@@ -1136,17 +1154,22 @@ impl store::Journal for LosesTheLead {
         left: Option<&WorkerRow>,
     ) -> bool {
         let goes_on = self.log.member(at, term, epoch, change, row, left);
-        match self.holds.load(Ordering::Relaxed) {
-            0 => {
-                let next = Position {
-                    seq: 40,
-                    term: TERM + 1,
-                };
-                assert!(self.log.restart(next).is_ok(), "a place the log takes");
-                self.holds.store(usize::MAX, Ordering::Relaxed);
-            }
-            more => self.holds.store(more - 1, Ordering::Relaxed),
-        }
+        self.told();
+        goes_on
+    }
+
+    fn status(
+        &self,
+        at: Option<Position>,
+        term: Option<u64>,
+        epoch: u64,
+        id: WorkerId,
+        from: WorkerStatus,
+        to: WorkerStatus,
+        models: Arc<[String]>,
+    ) -> bool {
+        let goes_on = self.log.status(at, term, epoch, id, from, to, models);
+        self.told();
         goes_on
     }
 
@@ -2935,21 +2958,32 @@ impl store::Journal for LeavesAtATelling {
         row: Option<&WorkerRow>,
         left: Option<&WorkerRow>,
     ) -> bool {
-        if matches!(change, store::MembershipChange::StatusChanged { .. }) {
-            match self.armed.swap(0, Ordering::Relaxed) {
-                BY_A_RISE => self.log.term_rose(TERM + 1),
-                BY_A_FOLLOWED_TERM => {
-                    let next = Position {
-                        seq: self.log.head().seq + 1,
-                        term: TERM + 1,
-                    };
-                    let guard = self.log.adopt(next).expect("the next place");
-                    guard.mark();
-                }
-                _ => {}
-            }
-        }
         self.log.member(at, term, epoch, change, row, left)
+    }
+
+    fn status(
+        &self,
+        at: Option<Position>,
+        term: Option<u64>,
+        epoch: u64,
+        id: WorkerId,
+        from: WorkerStatus,
+        to: WorkerStatus,
+        models: Arc<[String]>,
+    ) -> bool {
+        match self.armed.swap(0, Ordering::Relaxed) {
+            BY_A_RISE => self.log.term_rose(TERM + 1),
+            BY_A_FOLLOWED_TERM => {
+                let next = Position {
+                    seq: self.log.head().seq + 1,
+                    term: TERM + 1,
+                };
+                let guard = self.log.adopt(next).expect("the next place");
+                guard.mark();
+            }
+            _ => {}
+        }
+        self.log.status(at, term, epoch, id, from, to, models)
     }
 
     fn generation(&self, at: Option<Position>, generation: u64) {

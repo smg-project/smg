@@ -396,7 +396,7 @@ fn a_handle_reads_the_logs_head_and_the_writes_behind_a_mark() {
     let mut out = Vec::new();
     assert_eq!(readiness.log_after(mark, Log::BATCH, &mut out), Ok(()));
     let epochs = out.iter().filter_map(|entry| match entry.event {
-        Event::Member { epoch, .. } => Some(epoch),
+        Event::Member { epoch, .. } | Event::Status { epoch, .. } => Some(epoch),
         Event::Term | Event::Generation { .. } => None,
     });
     assert_eq!(epochs.collect::<Vec<_>>(), [2, 3]);

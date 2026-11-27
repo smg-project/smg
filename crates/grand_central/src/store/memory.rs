@@ -24,8 +24,6 @@ use rustc_hash::FxHashMap;
 
 #[cfg(feature = "controller")]
 use crate::engine::CacheIndexes;
-#[cfg(any(test, feature = "worker-host"))]
-use crate::store::workers::WorkerStatus;
 use crate::{
     document::spec::AppliedSpec,
     engine::{
@@ -45,7 +43,7 @@ use crate::{
             left_models, micros, OutsideLists, StaleGeneration, StoreSnapshot, Writer,
             PUBLISH_WINDOW,
         },
-        workers::{MembershipChange, WorkerFacts, WorkerRow, WorkersStore},
+        workers::{MembershipChange, WorkerFacts, WorkerRow, WorkerStatus, WorkersStore},
         GatewayId,
     },
     tracking::lease::{
@@ -438,9 +436,9 @@ impl MemoryStore {
     /// the leader's steps: they stand through the key's absence, follow
     /// the worker it was to its next id and leave with another worker. A
     /// row that stays keeps its admission instant. `at` is the event's
-    /// place in that log, which the applier holds ([`Journal::member`]):
-    /// the journal takes the write there, and no write of the store's own
-    /// does.
+    /// place in that log, which the applier holds ([`Journal::member`],
+    /// [`Journal::status`]): the journal takes the write there, and no
+    /// write of the store's own does.
     ///
     /// It is the call of a store with no holder of worker objects, and of a
     /// fixture. A holder is told nothing of a change written here. The row
@@ -520,7 +518,11 @@ impl MemoryStore {
     /// table's in its own entry (`MemoryStore::follow_objects`). A writer
     /// that hands none tells the row the table held: [`Self::follow`], and
     /// a holder with no object under the row's id. A status
-    /// change comes with no row, and its event tells the table's.
+    /// change comes with no row, and its event holds none: it names the
+    /// models the row serves, which no writer hands this body. They are
+    /// the table's row's here, for a standby's applied status
+    /// (`Writing::record_status`). A leader's holder hands its object's
+    /// in its own entry (`MemoryStore::status_told`).
     fn decided(
         &self,
         mut workers: Writing<'_>,
@@ -608,10 +610,10 @@ impl MemoryStore {
             }
             _ => return false,
         };
-        if matches!(change, MembershipChange::StatusChanged { .. }) {
-            // A status comes with no row of its writer's: its event tells
-            // the row as the table holds it.
-            workers.record(change);
+        if let MembershipChange::StatusChanged { id, from, to } = change {
+            // A status comes with no row, and its event holds none. This
+            // writer hands no models: the event names the table's row's.
+            workers.record_status(id, from, to);
         } else {
             // The row the write took out is told as its writer handed it,
             // in the status the table held, and as the table held it where
@@ -1358,9 +1360,10 @@ struct Workers {
     /// follows and at the rows a snapshot drops ([`Self::lay_gone`]).
     gone: HashMap<String, Gone>,
     epoch: u64,
-    /// The store's journal: every membership and status write passes
-    /// [`Writing::record`], [`Writing::record_over`] or
-    /// [`Writing::set_status`], which tell it.
+    /// The store's journal: every membership write passes
+    /// [`Writing::record_over`], and every status write
+    /// [`Writing::record_status`] or [`Writing::set_status`], which tell
+    /// it.
     journal: Option<Arc<dyn Journal>>,
 }
 
@@ -1555,7 +1558,8 @@ impl DerefMut for Writing<'_> {
 /// the membership lock bare has no way to journal a write, so none is
 /// journaled whose release the journal does not hear.
 impl Writing<'_> {
-    /// The epoch's step for a change the journal took ([`Self::tell`]).
+    /// The epoch's step for a change the journal took ([`Self::tell`],
+    /// [`Self::record_status`]).
     fn step(&mut self) {
         self.workers.epoch += 1;
     }
@@ -1576,16 +1580,22 @@ impl Writing<'_> {
         journal.is_none_or(|journal| journal.member(self.at, self.term, epoch, change, row, left))
     }
 
-    /// Record a change that comes with no row of its writer's: a status
-    /// the store follows. The journal is told
-    /// the row as the table holds it, and the epoch steps behind the
-    /// telling. Its writers name no term, so the journal takes it.
-    fn record(&mut self, change: MembershipChange) -> MembershipChange {
-        let row = self.workers.rows.get(&change.id()).map(|row| &row.row);
-        let goes_on = self.tell(change, row, None);
-        debug_assert!(goes_on, "a write that names no term goes on");
+    /// Record a status the store follows: the row `id` left `from` and
+    /// took `to`. The journal is told the change and the models the
+    /// table's row serves, copied here where a journal stands, and no row
+    /// ([`Journal::status`]). It is told with the epoch the step gives,
+    /// and the epoch steps behind the telling. Its writer names no term,
+    /// so the journal takes it.
+    fn record_status(&mut self, id: WorkerId, from: WorkerStatus, to: WorkerStatus) {
+        if let Some(journal) = &self.workers.journal {
+            let held = self.workers.rows.get(&id);
+            let models =
+                held.map_or_else(Arc::default, |held| held.row.facts.models.as_slice().into());
+            let epoch = self.workers.epoch + 1;
+            let goes_on = journal.status(self.at, self.term, epoch, id, from, to, models);
+            debug_assert!(goes_on, "a write that names no term goes on");
+        }
         self.step();
-        change
     }
 
     /// Record a change whose writer handed the row it leaves. The journal
@@ -1608,15 +1618,21 @@ impl Writing<'_> {
     }
 
     /// Write `status` on the row under `id`, under the hold's term. The
-    /// journal is told first: the row with the status the write leaves,
-    /// built by a copy ahead of the telling, and the epoch the step
-    /// gives. Where the journal refuses the hold's term, nothing has
-    /// moved. Behind a yes stand two moves alone, and neither refuses:
-    /// the field's write and the epoch's step. The row is looked up once,
-    /// and a store with no journal copies nothing. A status a holder of
-    /// worker objects tells is its one caller.
+    /// journal is told first ([`Journal::status`]): the change, the models
+    /// the row serves and the epoch the step gives, and no row. `models`
+    /// is the list its writer handed. A writer that hands none tells the
+    /// table's row's, copied here where a journal stands. Where the
+    /// journal refuses the hold's term, nothing has moved. Behind a yes
+    /// stand two moves alone, and neither refuses: the field's write and
+    /// the epoch's step. The row is looked up once, and no row is copied.
+    /// A status a holder of worker objects tells is its one caller.
     #[cfg(any(test, feature = "worker-host"))]
-    fn set_status(&mut self, id: WorkerId, status: WorkerStatus) -> StatusSet {
+    fn set_status(
+        &mut self,
+        id: WorkerId,
+        status: WorkerStatus,
+        models: Option<Arc<[String]>>,
+    ) -> StatusSet {
         let (at, term) = (self.at, self.term);
         let workers = &mut *self.workers;
         let Some(held) = workers.rows.get_mut(&id) else {
@@ -1626,18 +1642,10 @@ impl Writing<'_> {
         if from == status {
             return StatusSet::Stood;
         }
-        let change = MembershipChange::StatusChanged {
-            id,
-            from,
-            to: status,
-        };
         if let Some(journal) = &workers.journal {
-            let told = WorkerRow {
-                status,
-                ..held.row.clone()
-            };
+            let models = models.unwrap_or_else(|| held.row.facts.models.as_slice().into());
             let epoch = workers.epoch + 1;
-            if !journal.member(at, term, epoch, change, Some(&told), None) {
+            if !journal.status(at, term, epoch, id, from, status, models) {
                 return StatusSet::Refused;
             }
         }
@@ -1747,6 +1755,14 @@ impl Told {
 
 #[cfg(feature = "worker-host")]
 impl MemoryStore {
+    /// Whether the store tells a journal its writes. It is fixed where the
+    /// store is built, and read under no lock: a holder of worker objects
+    /// builds what a status entry names only for a store that tells one
+    /// ([`Self::status_told`]).
+    pub(crate) fn journals(&self) -> bool {
+        self.journal.is_some()
+    }
+
     /// The told status of every row: what the journal last told of its
     /// id, with the journal's place and the membership epoch,
     /// all read in one hold of the membership lock.
@@ -1756,12 +1772,14 @@ impl MemoryStore {
     ///
     /// The told status is the log's own word, kept beside the epoch:
     /// no copy of what a decision reads. A decision reads a
-    /// worker's status on its object. The told status has five readers:
+    /// worker's status on its object. The told status has six readers:
     ///
     /// - the next status event, which says the status its row moved from
     ///   ([`Self::status_told`]);
     /// - the event of a row changed in place, which carries it: a status
     ///   moves by its own event alone ([`Self::follow_objects`]);
+    /// - the event of a row a write takes out, which is told in it where
+    ///   its writer handed the row ([`Self::decided`]);
     /// - a first copy, which the holder of the worker objects cuts with
     ///   each row's told status (`Objects::checkpoint`,
     ///   `Objects::rows_serving`), by this read;
@@ -1873,10 +1891,19 @@ impl MemoryStore {
     /// to end hands a word that always holds.
     ///
     /// The word's term goes to the journal with the event, ahead of the
-    /// table's move ([`Journal::member`]). The journal compares it in the
+    /// table's move ([`Journal::status`]). The journal compares it in the
     /// take of its lock that gives the event its place. Where the store
     /// has left the term, the journal takes no event, the store moves
     /// nothing, and the status is stale.
+    ///
+    /// `models` are the models the object serves, read by its holder under
+    /// the hold that read the status and handed ahead of this lock. The
+    /// journal is told them with the status, and no row: of the table's
+    /// row a leader's status entry holds the status it left alone. A
+    /// holder hands a list only where the store tells a journal
+    /// ([`Self::journals`]), so a host that tells none builds none. A
+    /// writer that hands none to a store that tells one has the table's
+    /// row's told.
     ///
     /// What the write found: the status moved; it stood, because the row
     /// holds it already; the row left `revision`; or no row stands.
@@ -1886,6 +1913,7 @@ impl MemoryStore {
         status: WorkerStatus,
         revision: u64,
         word: LeadWord<'_>,
+        models: Option<Arc<[String]>>,
     ) -> HealthWrite {
         let mut workers = self.writing_under(word.term);
         let Some(row) = workers.guarded(id, revision) else {
@@ -1901,7 +1929,18 @@ impl MemoryStore {
             return HealthWrite::Stale;
         }
         let from = row.row.status;
-        match workers.set_status(id, status) {
+        // While the table stands, a debug build holds the handed models to
+        // the ones the table's row serves: the object was laid from that
+        // row. A host with no journal is handed none and held to nothing
+        // here: a gateway's refresh of a worker's models sets them on its
+        // object behind the build.
+        debug_assert!(
+            models
+                .as_deref()
+                .is_none_or(|models| row.row.facts.models[..] == *models),
+            "the models a holder read off its object are the ones the table's row serves"
+        );
+        match workers.set_status(id, status, models) {
             StatusSet::Moved => HealthWrite::Moved { from, to: status },
             StatusSet::Stood => HealthWrite::Stood(from),
             StatusSet::Refused => HealthWrite::Stale,

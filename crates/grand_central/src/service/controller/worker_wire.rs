@@ -547,34 +547,43 @@ pub(crate) fn start_again(floor: Position) -> proto::WorkerEvent {
 
 /// A log entry of a membership or status write in its envelope, at the
 /// entry's position and term. `None` for any other entry, and for a shape
-/// the store never tells.
+/// the store never tells. An entry's kind says which it is: a status
+/// entry holds no row, and its event tells none.
 pub(crate) fn member(entry: &Entry) -> Option<proto::WorkerEvent> {
-    let Written::Member {
-        epoch,
-        change,
-        row,
-        left,
-    } = &entry.event
-    else {
-        return None;
+    let (epoch, told) = match &entry.event {
+        Written::Member {
+            epoch,
+            change,
+            row,
+            left,
+        } => {
+            let told = match (*change, row.as_deref(), left.as_deref()) {
+                (MembershipChange::Registered { .. }, Some(new), _) => registered(new),
+                (
+                    MembershipChange::Relabelled { .. } | MembershipChange::Resized { .. },
+                    Some(now),
+                    _,
+                ) => relabelled(now),
+                // A fresh row is pending: any other status the write left
+                // came over from the old incarnation.
+                (MembershipChange::Replaced { .. }, Some(new), Some(old)) => {
+                    replaced(old, new, new.status != WorkerStatus::Pending)
+                }
+                (MembershipChange::Removed { .. }, _, Some(last)) => removed(last),
+                _ => return None,
+            };
+            (*epoch, told)
+        }
+        Written::Status {
+            epoch,
+            id,
+            from,
+            to,
+            ..
+        } => (*epoch, status_changed(*id, *from, *to)),
+        Written::Term | Written::Generation { .. } => return None,
     };
-    let told = match (*change, row.as_deref(), left.as_deref()) {
-        (MembershipChange::Registered { .. }, Some(new), _) => registered(new),
-        (MembershipChange::Relabelled { .. } | MembershipChange::Resized { .. }, Some(now), _) => {
-            relabelled(now)
-        }
-        // A fresh row is pending: any other status the write left came
-        // over from the old incarnation.
-        (MembershipChange::Replaced { .. }, Some(new), Some(old)) => {
-            replaced(old, new, new.status != WorkerStatus::Pending)
-        }
-        (MembershipChange::Removed { .. }, _, Some(last)) => removed(last),
-        (MembershipChange::StatusChanged { id, from, to }, Some(_), _) => {
-            status_changed(id, from, to)
-        }
-        _ => return None,
-    };
-    Some(event(told, entry.at.seq, *epoch, entry.at.term))
+    Some(event(told, entry.at.seq, epoch, entry.at.term))
 }
 
 /// A log entry as a standby is sent it. An entry this build
@@ -583,7 +592,7 @@ pub(crate) fn member(entry: &Entry) -> Option<proto::WorkerEvent> {
 pub(crate) fn replication(entry: &Entry) -> proto::ReplicationEvent {
     use proto::replication_event::Event as Sent;
     let event = match &entry.event {
-        Written::Member { .. } => member(entry).map(Sent::Membership),
+        Written::Member { .. } | Written::Status { .. } => member(entry).map(Sent::Membership),
         Written::Term => Some(Sent::TermStart(proto::TermStart {})),
         Written::Generation { generation } => Some(Sent::Generation(generation_told(*generation))),
     };

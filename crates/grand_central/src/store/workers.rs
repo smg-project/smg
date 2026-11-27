@@ -425,7 +425,8 @@ impl MembershipChange {
 /// Every write moves the store's epoch; a write of a row's facts moves the
 /// row's revision, a status change does not. The store keeps no log of
 /// its changes. A journaled store tells each write to its journal
-/// ([`Journal::member`](super::Journal::member)), and a watcher reads
+/// ([`Journal::member`](super::Journal::member), and a status write
+/// [`Journal::status`](super::Journal::status)), and a watcher reads
 /// the journal's log. A
 /// snapshot carries the
 /// facts the gateways' pools derive from (role, wire modes, engine kind,

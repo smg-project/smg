@@ -346,22 +346,46 @@ fn a_log_entry_of_each_membership_write_has_its_case_at_the_entrys_place() {
         )),
         removed(&old)
     );
-    // A status change is told with the revision its write left the row
-    // at, the row's own.
+    // A status entry is read by its kind. It holds no row, and its
+    // event is the one a status write was always sent as, field by
+    // field: the models it holds are for a watch's filter alone.
     let (from, to) = (WorkerStatus::Pending, WorkerStatus::Ready);
-    let moved = MembershipChange::StatusChanged {
+    let moved = Entry {
+        at,
+        event: Written::Status {
+            epoch: 6,
+            id: new.id,
+            from,
+            to,
+            models: new.facts.models.as_slice().into(),
+        },
+    };
+    assert_eq!(told(&moved), status_changed(new.id, from, to));
+    assert_eq!(
+        member(&moved),
+        Some(proto::WorkerEvent {
+            seq: 9,
+            membership_epoch: 6,
+            event: Some(Event::Status(proto::StatusChanged {
+                worker_id: new.id.0,
+                old: proto::WorkerStatus::Pending as i32,
+                new: proto::WorkerStatus::Ready as i32,
+                health: proto::HealthFlag::Healthy as u32,
+            })),
+            term: 4,
+        })
+    );
+    // A shape the store never tells, and an entry that is no worker's
+    // event. A status is none of a membership entry's shapes, with a
+    // row or with none.
+    assert_eq!(member(&entry(registered, None, None)), None);
+    let status = MembershipChange::StatusChanged {
         id: new.id,
         from,
         to,
     };
-    assert_eq!(
-        told(&entry(moved, Some(&new), None)),
-        status_changed(new.id, from, to)
-    );
-    // A shape the store never tells, and an entry that is no worker's
-    // event.
-    assert_eq!(member(&entry(registered, None, None)), None);
-    assert_eq!(member(&entry(moved, None, Some(&old))), None);
+    assert_eq!(member(&entry(status, Some(&new), None)), None);
+    assert_eq!(member(&entry(status, None, Some(&old))), None);
     assert_eq!(
         member(&Entry {
             at,
@@ -1696,6 +1720,13 @@ fn every_kind_of_log_entry_is_sent_under_a_case_of_its_own() {
             row: Some(Arc::new(stored.clone())),
             left: None,
         },
+        Written::Status {
+            epoch: 1,
+            id: stored.id,
+            from: WorkerStatus::Pending,
+            to: WorkerStatus::Ready,
+            models: stored.facts.models.as_slice().into(),
+        },
     ]
     .map(|event| replication(&Entry { at, event }).event);
     assert_eq!(entries[0], Some(Sent::TermStart(proto::TermStart {})));
@@ -1708,6 +1739,10 @@ fn every_kind_of_log_entry_is_sent_under_a_case_of_its_own() {
             2
         )))
     );
+    // A status entry is sent as the status event of its change: the
+    // models it holds are not sent.
+    let moved = status_changed(stored.id, WorkerStatus::Pending, WorkerStatus::Ready);
+    assert_eq!(entries[2], Some(Sent::Membership(event(moved, 3, 1, 2))));
     // A membership entry in a shape the store never tells is sent with
     // no case set: the standby reads an event it does not know.
     let untold = Written::Member {
@@ -1990,7 +2025,19 @@ fn every_membership_event_comes_back_as_the_change_the_store_follows() {
         Ok((6, replacement, row))
     );
     assert_eq!(sent(removal, None, Some(&old)), Ok((6, removal, None)));
-    assert_eq!(sent(status, Some(&old), None), Ok((6, status, None)));
+    // A status entry comes back as the status change, with no row.
+    let moved = Entry {
+        at: Position { seq: 9, term: 4 },
+        event: Written::Status {
+            epoch: 6,
+            id: old.id,
+            from: WorkerStatus::Ready,
+            to: WorkerStatus::Draining,
+            models: old.facts.models.as_slice().into(),
+        },
+    };
+    let back = told_change(&member(&moved).expect("a status event"), now);
+    assert_eq!(back, Ok((6, status, None)));
     // A watch's own cases and an event of no case are not a change.
     for event in [
         None,

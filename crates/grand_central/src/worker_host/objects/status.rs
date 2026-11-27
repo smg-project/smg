@@ -20,6 +20,13 @@
 //! store's lock. A holder's write of a row holds that turn, then an
 //! object's lock, then the store's: one order for the three.
 //!
+//! A tell hands a store that tells a journal the models its object serves,
+//! read in that same critical section and ahead of the store's lock: the
+//! log's entry of a status names them and no row. Of the table's row a
+//! leader's status entry holds one thing alone, the status the row left,
+//! which is the log's own word. A store with no journal is handed none,
+//! and no list is built for it.
+//!
 //! A tell the store refuses writes nothing, and the call does not try it
 //! again: the row left the revision the object was built from, no row
 //! stands, or the writer's term ended. A writer that names its term hands
@@ -52,6 +59,17 @@ use crate::{
 
 /// An object's move: the status it left, then the one that stands.
 type Moved = Option<(ObjectStatus, ObjectStatus)>;
+
+/// The ids of the models `object` serves, in its cards' order, as the one
+/// shared list a status entry holds. Each id is copied, and no card.
+fn served(object: &dyn Worker) -> Arc<[String]> {
+    let mut ids = Vec::new();
+    object.any_model(&mut |card| {
+        ids.push(card.id.clone());
+        false
+    });
+    ids.into()
+}
 
 /// What a status write does to its object, read under the object's lock.
 #[derive(Clone, Copy)]
@@ -269,7 +287,12 @@ impl<G: Generation> Objects<G> {
             // A call can wait here for the object's lock through the end of
             // its term: it tells nothing.
             let told = if (word.leads)() {
-                store.status_told(standing.row, status, standing.revision, word)
+                // The models the object serves at this instant, read under
+                // its lock and handed ahead of the store's: the log's entry
+                // of a status names them, and no row of the table. A store
+                // that tells no entry is handed none, and no list is built.
+                let models = store.journals().then(|| served(object.as_ref()));
+                store.status_told(standing.row, status, standing.revision, word, models)
             } else {
                 HealthWrite::Stale
             };

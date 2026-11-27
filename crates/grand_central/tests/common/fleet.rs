@@ -71,8 +71,8 @@ use smg_grand_central::{
     },
     stages::StageRegistry,
     store::{
-        GatewayId, HealthPolicy, LeaseState, MembershipChange, MemoryStore, Position, Registrant,
-        Signals, WorkerFacts, WorkerStatus, WorkersStore,
+        GatewayId, HealthPolicy, LeaseState, MemoryStore, Position, Registrant, Signals,
+        WorkerFacts, WorkerStatus, WorkersStore,
     },
     tracking::LeaseId,
     worker_host::{KvTables, Members, Objects},
@@ -1976,11 +1976,7 @@ impl Harness {
                 break;
             }
             for entry in &batch {
-                if let Logged::Member {
-                    change: MembershipChange::StatusChanged { id, from, to },
-                    ..
-                } = entry.event
-                {
+                if let Logged::Status { id, from, to, .. } = entry.event {
                     if let Some(&(engine, _)) = self.members.get(&id) {
                         moved.push(Moved { engine, from, to });
                     }

@@ -13,7 +13,10 @@
 //! and the sweep's pass. A host in process is pinned
 //! too, in a build
 //! with the `in-process` feature: a request held from its decision to its
-//! completion allocates nothing after the first ones. A separate
+//! completion allocates nothing after the first ones. A keeper of worker
+//! objects is pinned in a build with the `worker-host` feature: a status
+//! tell copies each id of its worker's models once, and only for a store
+//! that tells a journal. A separate
 //! executable, so it can declare the counting allocator the pins need.
 //!
 //! One pin reads frees: a decision that spans a write frees nothing on its
@@ -1176,6 +1179,78 @@ mod in_process {
             }
             let allocations: usize = (0..256).map(|_| serve()).sum();
             assert_eq!(allocations, 256 * (1 + 2 * a_side), "a pair's two sides");
+        }
+    }
+}
+
+/// What a status tell copies of its worker's models, through a host's
+/// write call on the keeper of its worker objects.
+#[cfg(feature = "worker-host")]
+mod status_tells {
+    use std::sync::Arc;
+
+    use smg_grand_central::{
+        service::replication::Log,
+        store::{MemoryStore, Registrant, WorkerFacts, WorkerStatus, WorkersStore},
+        worker_host::{Members, Objects},
+    };
+    use smg_worker::registry::WorkerRegistry;
+
+    use super::allocations_during;
+
+    /// The fewest allocation calls of one connect signal among a few rows
+    /// that each serve `models` models, over a store that tells a log or
+    /// tells none. The fewest, as the pin of a registration keeps it: a
+    /// tell that paid for a table's growth would not move the count. No
+    /// tell here pays for one: the log's ring is reserved whole where the
+    /// log is built, and the registry makes a worker's lock at its
+    /// registration.
+    fn a_connect_signal(journaled: bool, models: usize) -> usize {
+        let store = if journaled {
+            MemoryStore::journaled(Arc::new(Log::new(64)))
+        } else {
+            MemoryStore::new()
+        };
+        let objects: Objects<Members> = Objects::new(Arc::new(WorkerRegistry::new()));
+        let one = |turn: usize| {
+            let key = format!("http://w{turn}:8000");
+            let facts = WorkerFacts {
+                key: key.clone(),
+                engine: key,
+                incarnation: 1,
+                models: (0..models).map(|at| format!("m{at}")).collect(),
+                dp_size: 1,
+                ..WorkerFacts::default()
+            };
+            let laid = objects.upsert(&store, facts, Registrant::Control);
+            let id = laid.expect("a registration").id();
+            let row = WorkersStore::get(&store, id).expect("the row");
+            let signal = || objects.connect_row(&store, id, row.revision);
+            let ((), allocations) = allocations_during(signal);
+            let stands = WorkersStore::get(&store, id).expect("the row").status;
+            assert_eq!(stands, WorkerStatus::Ready, "the signal readied the row");
+            allocations
+        };
+        (0..8).map(one).min().expect("eight rows")
+    }
+
+    /// A status tell copies each id of its worker's models once where its
+    /// store tells a journal: the list its entry holds, built by the
+    /// keeper. Neither the store nor the log copies an id again. A store
+    /// that tells no journal is handed no list and none is built: its tell
+    /// allocates the same whatever its worker serves.
+    #[test]
+    fn a_status_tell_copies_its_models_once_and_for_a_journal_alone() {
+        const MODELS: usize = 4;
+        for journaled in [false, true] {
+            let one = a_connect_signal(journaled, 1);
+            let many = a_connect_signal(journaled, MODELS);
+            let more = if journaled { MODELS - 1 } else { 0 };
+            assert_eq!(
+                many,
+                one + more,
+                "a journal {journaled}: {one} for one model, {many} for {MODELS}"
+            );
         }
     }
 }
