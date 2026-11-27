@@ -82,7 +82,7 @@ fn a_stated_value_is_written_under_its_columns_unit_in_range_inside_the_cells() 
     let mut cells = SignalCells::default();
     cells.blank(3, 2);
     assert!(cells.fits(3) && valued(&cells) == 0, "every cell is blank");
-    assert!(cells.write(2, &held, "tokens", 7.0, 9));
+    assert!(held.write(&mut cells, 2, "tokens", 7.0, 9));
     let written = cells.cell(2, 1).expect("the cell");
     assert_eq!((written.value, written.sampled_at_micros), (7.0, 9));
     assert_eq!(valued(&cells), 1, "one cell was written");
@@ -95,16 +95,16 @@ fn a_stated_value_is_written_under_its_columns_unit_in_range_inside_the_cells() 
         (0, "tokens", -1e15 - 1.0),
         (3, "tokens", 1.0),
     ] {
-        let taken = cells.write(position, &held, unit, value, 9);
+        let taken = held.write(&mut cells, position, unit, value, 9);
         assert!(!taken, "{value} {unit} at row {position}");
     }
     // A column past the cells' count of signals names no cell.
     let past = SignalColumn::new("past", "tokens", 2, None);
-    assert!(!cells.write(0, &past, "tokens", 1.0, 9));
+    assert!(!past.write(&mut cells, 0, "tokens", 1.0, 9));
     assert_eq!(valued(&cells), 1, "none of them was written");
     // The bound itself is in range, at either sign.
-    assert!(cells.write(0, &held, "tokens", 1e15, 9));
-    assert!(cells.write(1, &held, "tokens", -1e15, 9));
+    assert!(held.write(&mut cells, 0, "tokens", 1e15, 9));
+    assert!(held.write(&mut cells, 1, "tokens", -1e15, 9));
     // Blank again, over fewer rows: no value stays, and the room does.
     let room = cells.cells_mut().capacity();
     cells.blank(2, 2);

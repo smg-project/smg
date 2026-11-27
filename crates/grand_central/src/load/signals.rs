@@ -42,7 +42,7 @@ const VALUE_MAGNITUDE_LIMIT: f64 = {
 
 /// Whether `value` is one a decision may read: a finite number of
 /// magnitude at most 1e15. The crate's one write of a cell holds a
-/// report's value to it ([`SignalCells::write`]).
+/// report's value to it ([`SignalColumn::write`]).
 #[cfg(feature = "in-process")]
 pub(crate) fn in_range(value: f64) -> bool {
     value.is_finite() && value.abs() <= VALUE_MAGNITUDE_LIMIT
@@ -153,7 +153,7 @@ impl SignalCells {
 
     /// The cells of `rows` rows of `signals` cells each, every one with no
     /// value: what a reader of the rows' reports writes the stated values
-    /// into ([`Self::write`]). The room the cells held is kept.
+    /// into ([`SignalColumn::write`]). The room the cells held is kept.
     #[cfg(feature = "in-process")]
     pub(crate) fn blank(&mut self, rows: usize, signals: usize) {
         let signals = counted(signals) as usize;
@@ -161,35 +161,22 @@ impl SignalCells {
             .resize(rows.saturating_mul(signals), SignalCell::NONE);
     }
 
-    /// One value a report states for the row at `position` under `column`,
-    /// in `unit`, sampled at `sampled_at_micros`, and whether it was
-    /// written. It is written where a decision may read it: the unit is
-    /// the column's, byte for byte, and the value is in range
-    /// ([`in_range`]). A place outside the cells takes nothing.
+    /// `cell` put for the row at `position` under `column`, and whether it
+    /// was put: a place outside the cells takes nothing. A column past a
+    /// row's cells is outside them too: it would land on the next row's
+    /// cell. It tests no value: its one caller does
+    /// ([`SignalColumn::write`]).
     #[cfg(feature = "in-process")]
-    pub(crate) fn write(
-        &mut self,
-        position: u32,
-        column: &SignalColumn,
-        unit: &str,
-        value: f64,
-        sampled_at_micros: u64,
-    ) -> bool {
-        if column.unit() != unit || !in_range(value) {
-            return false;
-        }
-        let place = u64::from(position) * u64::from(self.signals) + u64::from(column.column);
+    fn set(&mut self, position: u32, column: u16, cell: SignalCell) -> bool {
+        let place = u64::from(position) * u64::from(self.signals) + u64::from(column);
         let held = usize::try_from(place)
             .ok()
-            .filter(|_| u32::from(column.column) < self.signals)
+            .filter(|_| u32::from(column) < self.signals)
             .and_then(|place| self.cells.get_mut(place));
         let Some(held) = held else {
             return false;
         };
-        *held = SignalCell {
-            value,
-            sampled_at_micros,
-        };
+        *held = cell;
         true
     }
 
@@ -355,6 +342,30 @@ impl SignalColumn {
     pub fn told(&self, signals: ReportSignals<'_>) -> Option<SignalCell> {
         // The first instant of all: no value was sampled before it.
         self.held(signals.0, 0).copied()
+    }
+
+    /// One value a report states for the row of `cells` at `position`
+    /// under this column, in `unit`, sampled at `sampled_at_micros`, and
+    /// whether it was written. It is written where a decision may read it:
+    /// the unit is the column's, byte for byte, and the value is in range
+    /// ([`in_range`]). A place outside the cells takes nothing.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn write(
+        &self,
+        cells: &mut SignalCells,
+        position: u32,
+        unit: &str,
+        value: f64,
+        sampled_at_micros: u64,
+    ) -> bool {
+        if self.unit() != unit || !in_range(value) {
+            return false;
+        }
+        let cell = SignalCell {
+            value,
+            sampled_at_micros,
+        };
+        cells.set(position, self.column, cell)
     }
 
     /// The oldest sample instant a decision still reads of the signal: one
