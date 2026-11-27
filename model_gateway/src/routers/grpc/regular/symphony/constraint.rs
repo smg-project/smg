@@ -16,6 +16,7 @@ use smg_worker::identity::basic::{Worker, WorkerType};
 use symphony::{
     grammar::{GrammarStart, Options},
     Format, Grammar, GrammarBackend, OutputAnswer, OutputChoice, Spelling, Turn, Unspelled,
+    Whitespace,
 };
 
 #[cfg(test)]
@@ -276,8 +277,11 @@ fn references_in(schema: &Value) -> Vec<&str> {
 /// the thought), nor for a table that admits a thought before its answer. A registry table whose
 /// tag is the schema alone, the engine's own constraint, leaves it to the engine as before, and
 /// so does one with no tag, or a prompt that `continues` the assistant's message, since the tag
-/// writes a turn from its start; the template's table takes its tag either way and refuses what
-/// it cannot constrain ([`tagged`]). `vocabulary` is the one the worker's grammar compiler takes.
+/// writes a turn from its start; one that bounds the answer's whitespace
+/// ([`Format::bounds_answer_whitespace`]) takes the tag for the schema alone as well, since the
+/// bound is written on the schema's node of a tag and the engine's own constraint carries none.
+/// The template's table takes its tag either way and refuses what it cannot constrain
+/// ([`tagged`]). `vocabulary` is the one the worker's grammar compiler takes.
 #[expect(
     clippy::too_many_arguments,
     reason = "the table, the request's ask, where the prompt and the engine leave the model, \
@@ -294,7 +298,16 @@ fn answer_tag(
     continues: bool,
 ) -> Result<Option<ToolConstraint>, SymphonyError> {
     let grammar = format.answer_grammar_for(schema, reasoning_open, start);
-    if !compiled && (continues || matches!(grammar, Some(Grammar::JsonSchema { .. }))) {
+    // The schema alone is the engine's own constraint only with its whitespace free: a bound is
+    // written on the schema's node of a tag, and the engine's schema constraint carries none.
+    let engines_own = matches!(
+        grammar,
+        Some(Grammar::JsonSchema {
+            whitespace: Whitespace::Free,
+            ..
+        })
+    );
+    if !compiled && (continues || engines_own) {
         return Ok(None);
     }
     tagged(
@@ -2498,6 +2511,57 @@ mod tests {
         }
     }
 
+    /// A table that bounds the whitespace of its JSON answer hands the answer's tag wherever the
+    /// workers start the grammar and wherever the prompt leaves the thought, the schema alone
+    /// included: the bound is written on the schema's node of a tag, and the engine's own schema
+    /// constraint carries none. A table without a bound leaves the schema alone to the engine.
+    #[test]
+    fn a_table_that_bounds_the_answers_whitespace_hands_the_tag_for_the_schema_alone() {
+        let schema =
+            Arc::new(json!({"type": "object", "properties": {"city": {"type": "string"}}}));
+        let (mut bounded, mut free) = (0, 0);
+        for table in symphony::formats::Table::ALL {
+            let format = table.format();
+            for start in STARTS {
+                for reasoning_open in [false, true] {
+                    let Some(grammar) = format.answer_grammar_for(&schema, reasoning_open, start)
+                    else {
+                        continue;
+                    };
+                    let alone = matches!(grammar, Grammar::JsonSchema { .. });
+                    let written = grammar.payload_text();
+                    let tag = answer_tag(
+                        &format,
+                        false,
+                        "m",
+                        &schema,
+                        reasoning_open,
+                        start,
+                        TagVocabulary::Current,
+                        false,
+                    );
+                    let at = format!(
+                        "{}, {start:?}, reasoning_open={reasoning_open}",
+                        table.name()
+                    );
+                    if written.contains("\"max_whitespace_cnt\"") {
+                        bounded += usize::from(alone);
+                        let handed = match &tag {
+                            Ok(Some(ToolConstraint::StructuralTag(text))) => Some(text.as_str()),
+                            _ => None,
+                        };
+                        assert_eq!(handed, Some(written.as_str()), "{at}");
+                    } else if alone {
+                        free += 1;
+                        assert!(matches!(tag, Ok(None)), "{at}: {tag:?}");
+                    }
+                }
+            }
+        }
+        assert!(bounded > 0, "no table's bounded answer is the schema alone");
+        assert!(free > 0, "no table's unbounded answer is the schema alone");
+    }
+
     /// A JSON answer on a prompt that closed the thought: the thought is over before the answer
     /// starts, so the answer's tag (a chat request's `json_object` and `json_schema`, a Messages
     /// request's `output_config.format`) owes the schema alone,
@@ -2520,14 +2584,24 @@ mod tests {
                     .filter(|ask| !ask["response_format"].is_null())
                     .chain([&of_messages])
                 {
-                    // The schema alone is the engine's own constraint: the table sends no tag.
+                    // The schema alone, in a tag of its node alone: the table of these cases
+                    // bounds the answer's whitespace, and the node carries the bound.
                     let found = found_where_the_thought_is_the_models(
                         ask,
                         TURN_THAT_CLOSED_THE_THOUGHT,
                         switch,
                         start,
                     );
-                    if !matches!(found, Ok(None)) {
+                    let alone = match &found {
+                        Ok(Some(ToolConstraint::StructuralTag(tag))) => {
+                            serde_json::from_str::<Value>(tag).is_ok_and(|tag| {
+                                tag["format"]["type"] == "json_schema"
+                                    && tag["format"]["max_whitespace_cnt"] == 32
+                            })
+                        }
+                        _ => false,
+                    };
+                    if !alone {
                         kept.push(format!("{start:?}, the switch {switch}, {ask}: {found:?}"));
                     }
                 }
@@ -2535,7 +2609,7 @@ mod tests {
         }
         assert!(
             kept.is_empty(),
-            "JSON answers that take a tag on a prompt that closed the thought:\n{}",
+            "JSON answers that are not the schema alone on a prompt that closed the thought:\n{}",
             kept.join("\n")
         );
     }
@@ -2836,7 +2910,8 @@ mod tests {
             .expect("read")
             .is_none());
         // A table that admits a thought before its answer (MiniMax M3's) keeps that tag with the
-        // thought closed: the thought the model may write first, then the schema.
+        // thought closed: the thought the model may write first, then the schema, under the bound
+        // the table sets on the answer's whitespace.
         let thought_first = tag_of(answer(
             &ModelNames::default(),
             json!({"model": "MiniMaxAI/MiniMax-M3", "response_format": {"type": "json_object"}}),
@@ -2852,7 +2927,11 @@ mod tests {
         );
         assert_eq!(
             thought_first["format"]["elements"][1],
-            json!({"type": "json_schema", "json_schema": {"type": "object"}}),
+            json!({
+                "type": "json_schema",
+                "json_schema": {"type": "object"},
+                "max_whitespace_cnt": 32
+            }),
             "{thought_first}"
         );
         // No answer state (xLAM's list), a continued assistant message, or no JSON asked: the

@@ -128,9 +128,9 @@ loosely, as before, though the gateway no longer asks for one). A table may boun
 its tokens (`Format::bounds_answer_whitespace`, written as xgrammar's `max_whitespace_cnt` on the
 answer's schema node; an xgrammar before 0.2.7 ignores the key): a model held to its answer's JSON
 after a long thought, by an engine that starts the grammar at the first token, may drift into tabs
-and newlines the schema's grammar otherwise admits without end. LFM2.5's table bounds them to
-thirty-two, which leaves four-space indentation seven levels deep; the calls' values are never
-bounded.
+and newlines the schema's grammar otherwise admits without end. LFM2.5's table and MiniMax M3's
+bound them to thirty-two, which leaves four-space indentation seven levels deep; the calls'
+values are never bounded.
 
 Where the thought is a message of its own before an answer that is another (Inkling's: the
 thought's close ends every message alike, and the next message's opener says what it is), and the
