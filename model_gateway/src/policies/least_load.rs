@@ -25,7 +25,8 @@ use crate::{observability::cache_trace, policies::expected_wait::ExpectedWait};
 
 /// Dispatches kept per worker between reports. A worker that never reports
 /// (a dark fleet is scored by its live in-flight count instead) would
-/// otherwise accumulate them without end; past this the oldest are dropped.
+/// otherwise accumulate them without end; past this the oldest entry is
+/// folded into the one behind it.
 const SINCE_POLL_DISPATCHES_KEPT: usize = 8_192;
 
 /// Expected waits within this of the minimum are one tie and are drawn from
@@ -52,61 +53,94 @@ const HELD_GUARD_CANDIDATES: usize = 7;
 
 /// Since-report dispatch tally for one worker: the token-work and request
 /// count of the dispatches no report has reflected yet, with each dispatch's
-/// instant, so a report that says when the engine was sampled releases
-/// exactly the dispatches it saw and keeps the later ones as credit.
+/// instant, so a report that says when the engine was sampled releases the
+/// dispatches it saw and keeps the later ones as credit. A full history
+/// folds its oldest entry into the one behind it, which keeps its own
+/// instant: the newest dispatches, the ones a report is least likely to
+/// reflect yet, keep an entry each. A report sampled at or after a folded
+/// entry's instant releases it whole. One sampled before it seals it: the
+/// history then folds behind it, so the next report can release it, and
+/// the tally exceeds the dispatches no report reflects by at most what one
+/// sealed entry holds.
 #[derive(Clone, Debug, Default)]
 struct SincePollDispatch {
     tokens: u64,
     requests: u64,
-    /// `(dispatched_at, tokens)` per dispatch, oldest first: the instant is
-    /// read under the tally's write guard, so the pushes keep the clock's order.
-    dispatches: VecDeque<(Instant, u64)>,
+    /// `(dispatched_at, tokens, dispatches)` per entry, oldest first: the
+    /// instant is read under the tally's write guard, so the entries keep
+    /// the clock's order. An entry of several dispatches holds the last one's.
+    dispatches: VecDeque<(Instant, u64, u64)>,
+    /// The oldest entry is a fold that a report's sample did not reach.
+    sealed: bool,
 }
 
 impl SincePollDispatch {
     fn record(&mut self, at: Instant, tokens: u64) {
         debug_assert!(
-            self.dispatches.back().is_none_or(|&(last, _)| last <= at),
+            self.dispatches.back().is_none_or(|&(last, ..)| last <= at),
             "a dispatch recorded out of clock order"
         );
+        // The totals stop at their type's bound and an entry takes what the
+        // totals took, so the totals stay the sum of the entries.
+        let tokens = tokens.min(u64::MAX - self.tokens);
+        let requests = u64::from(self.requests < u64::MAX);
         self.tokens += tokens;
-        self.requests += 1;
-        self.dispatches.push_back((at, tokens));
-        if self.dispatches.len() > SINCE_POLL_DISPATCHES_KEPT {
-            self.pop_oldest();
+        self.requests += requests;
+        if self.dispatches.len() >= SINCE_POLL_DISPATCHES_KEPT {
+            // A sealed fold stays first and takes no more: the entry behind
+            // it is the oldest one that folds.
+            if self.sealed {
+                self.dispatches.swap(0, 1);
+            }
+            let oldest = self.dispatches.pop_front();
+            if let (Some((_, held, count)), Some((_, next_held, next_count))) =
+                (oldest, self.dispatches.get_mut(usize::from(self.sealed)))
+            {
+                *next_held += held;
+                *next_count += count;
+            }
         }
+        self.dispatches.push_back((at, tokens, requests));
     }
 
     /// Release the dispatches a report sampled at `sampled_at` already
-    /// reflects: those made at or before it. Idempotent: the dispatches are
+    /// reflects: the entries at or before it. Idempotent: the entries are
     /// kept oldest first, so the same report read again, or an older sample
-    /// read after a newer one, releases nothing more.
+    /// read after a newer one, releases nothing more. A fold the sample did
+    /// not reach is sealed.
     fn release_through(&mut self, sampled_at: Instant) {
-        while self
-            .dispatches
-            .front()
-            .is_some_and(|&(at, _)| at <= sampled_at)
-        {
+        while let Some(&(at, _, count)) = self.dispatches.front() {
+            if at > sampled_at {
+                // Stored once for a fold, not on every read: each decision
+                // passes here, and a store would dirty the record for the
+                // other callers.
+                if count > 1 && !self.sealed {
+                    self.sealed = true;
+                }
+                break;
+            }
             self.pop_oldest();
         }
     }
 
     /// The credit a decision reads, `(tokens, requests, release)`: the tally
-    /// less the dispatches made at or before `sampled_at`, which a report
+    /// less the entries at or before `sampled_at`, which a report
     /// sampled then already reflects, read without releasing them.
-    /// `release` says whether any such dispatch is held, so the decision's
-    /// write phase can pop them ([`Self::release_through`]) once it holds
-    /// the guard. No sample instant (no report) reads the whole tally.
+    /// `release` says whether any such entry is held, or a fold to seal,
+    /// so the decision's write phase can pop and seal
+    /// ([`Self::release_through`]) once it holds the guard. No sample
+    /// instant (no report) reads the whole tally.
     fn credit_after(&self, sampled_at: Option<Instant>) -> (u64, u64, bool) {
         let (mut tokens, mut requests) = (self.tokens, self.requests);
         let mut release = false;
         if let Some(sampled_at) = sampled_at {
-            for &(at, dispatched) in &self.dispatches {
+            for &(at, dispatched, count) in &self.dispatches {
                 if at > sampled_at {
+                    release |= count > 1 && !self.sealed;
                     break;
                 }
                 tokens -= dispatched;
-                requests -= 1;
+                requests -= count;
                 release = true;
             }
         }
@@ -114,9 +148,10 @@ impl SincePollDispatch {
     }
 
     fn pop_oldest(&mut self) {
-        if let Some((_, tokens)) = self.dispatches.pop_front() {
+        if let Some((_, tokens, count)) = self.dispatches.pop_front() {
             self.tokens -= tokens;
-            self.requests -= 1;
+            self.requests -= count;
+            self.sealed = false;
         }
     }
 }
@@ -250,9 +285,10 @@ struct Candidate {
     since_poll_tokens: u64,
     since_poll_requests: u64,
     /// The report's sample instant, and whether the tally still holds
-    /// dispatches made at or before it for the decision's write phase to
-    /// release (a read under the held guard released them as it read). A
-    /// report without a reading keeps its instant.
+    /// dispatches made at or before it, or a fold to seal, for the
+    /// decision's write phase to release (a read under the held guard
+    /// released them as it read). A report without a reading keeps its
+    /// instant.
     sampled_at: Option<Instant>,
     release: bool,
 }
@@ -513,12 +549,12 @@ impl LeastLoadPolicy {
     /// as the scorer resolves them against the feed's current snapshot.
     #[cfg(test)]
     fn resolve_for_test(&self, workers: &[Arc<dyn Worker>], indices: &[usize]) -> Vec<Candidate> {
-        let snapshot = self.snapshot();
-        let snapshot = snapshot.as_deref();
         let tally = self
             .tally
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let snapshot = self.snapshot();
+        let snapshot = snapshot.as_deref();
         let mut read_credit = |url: &str, sampled_at| credit_read(&tally, url, sampled_at);
         indices
             .iter()
@@ -530,14 +566,14 @@ impl LeastLoadPolicy {
     /// the next decision reads them: `(has_load, tokens, requests)`.
     #[cfg(test)]
     pub(super) fn load_state_for_test(&self, url: &str) -> (bool, u64, u64) {
-        let snapshot = self.snapshot();
-        let report = snapshot
-            .as_deref()
-            .and_then(|snapshot| snapshot.report(url));
         let tally = self
             .tally
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let snapshot = self.snapshot();
+        let report = snapshot
+            .as_deref()
+            .and_then(|snapshot| snapshot.report(url));
         let (tokens, requests, _) =
             credit_read(&tally, url, report.map(|(_, sampled_at)| sampled_at));
         (report.is_some(), tokens, requests)
@@ -830,7 +866,8 @@ impl LeastLoadPolicy {
     /// Up to [`HELD_GUARD_CANDIDATES`] candidates one write guard is held
     /// across the decision. Above it the decision reads under the tally's
     /// read guard, scores with no guard held and writes under the write
-    /// guard: each candidate's credit is
+    /// guard: the reports are read under the guard the credits are read
+    /// under, each candidate's credit is
     /// read as it stands after its current report's sample, the veto and
     /// the scores read the result, then the dispatches those reports
     /// reflect are released and the winner is credited. No decision pairs a
@@ -915,8 +952,13 @@ impl LeastLoadPolicy {
         credit: Option<&dyn Fn(usize) -> u64>,
         resolved: &mut Vec<Candidate>,
     ) -> Option<usize> {
-        let snapshot = self.snapshot();
-        let snapshot = snapshot.as_deref();
+        // The feed is read once the tally's guard is held. A release reaches
+        // the tally under the write guard through a report read before it:
+        // under that guard, or by a split decision under its read guard. So
+        // no report read here is older than a release the credits read with
+        // it already show. Declared first, the snapshot is dropped after the
+        // guard.
+        let snapshot;
 
         // Up to `HELD_GUARD_CANDIDATES` candidates one write guard is held
         // across the decision: each candidate is read under it with the
@@ -938,6 +980,8 @@ impl LeastLoadPolicy {
         resolved.clear();
         match held.as_deref_mut() {
             Some(tally) => {
+                snapshot = self.snapshot();
+                let snapshot = snapshot.as_deref();
                 let mut read_credit =
                     |url: &str, sampled_at| credit_released(tally, url, sampled_at);
                 resolved.extend(candidates.iter().map(|&idx| {
@@ -955,6 +999,8 @@ impl LeastLoadPolicy {
                     .tally
                     .read()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
+                snapshot = self.snapshot();
+                let snapshot = snapshot.as_deref();
                 let mut read_credit = |url: &str, sampled_at| credit_read(&tally, url, sampled_at);
                 resolved.extend(candidates.iter().map(|&idx| {
                     self.resolve(
@@ -1795,14 +1841,49 @@ mod tests {
     fn the_tally_keeps_a_bounded_history_for_a_worker_that_never_reports() {
         let mut dispatch = SincePollDispatch::default();
         let at = Instant::now();
-        for _ in 0..(SINCE_POLL_DISPATCHES_KEPT + 100) {
+        let later = at + std::time::Duration::from_millis(1);
+        let kept = SINCE_POLL_DISPATCHES_KEPT as u64;
+        for _ in 0..kept {
             dispatch.record(at, 7);
         }
+        for _ in 0..100 {
+            dispatch.record(later, 7);
+        }
+        // Past the bound the oldest entry is folded into the one behind it:
+        // the tally counts every dispatch, and a report sampled at the first
+        // instant releases the folded entry and leaves the 100 later ones.
         assert_eq!(dispatch.dispatches.len(), SINCE_POLL_DISPATCHES_KEPT);
-        assert_eq!(dispatch.requests as usize, SINCE_POLL_DISPATCHES_KEPT);
-        assert_eq!(dispatch.tokens as usize, 7 * SINCE_POLL_DISPATCHES_KEPT);
+        assert_eq!(
+            (dispatch.tokens, dispatch.requests),
+            (7 * (kept + 100), kept + 100)
+        );
+        assert_eq!(dispatch.credit_after(Some(at)), (7 * 100, 100, true));
         dispatch.release_through(at);
-        assert_eq!((dispatch.tokens, dispatch.requests), (0, 0));
+        assert_eq!((dispatch.tokens, dispatch.requests), (7 * 100, 100));
+
+        // A worker that takes 10,000 dispatches a report, each report sampled
+        // 9,000 dispatches back: the fold a sample does not reach is sealed
+        // and the next report releases it. The tally settles at 18,190 where
+        // 9,000 dispatches are unreported, and each read asks for the write
+        // phase, the first one for the seal alone.
+        let mut steady = SincePollDispatch::default();
+        let (mut now, mut asked) = (later, Vec::new());
+        for charged in [10_000, 18_191, 18_190, 18_190] {
+            let mut sampled_at = now;
+            for dispatched in 1..=10_000 {
+                now += std::time::Duration::from_nanos(1);
+                steady.record(now, 1);
+                if dispatched == 1_000 {
+                    sampled_at = now;
+                }
+            }
+            asked.push(steady.credit_after(Some(sampled_at)).2);
+            steady.release_through(sampled_at);
+            assert_eq!((steady.tokens, steady.requests), (charged, charged));
+            // Sealed once: a further read of the same report asks for nothing.
+            assert!(!steady.credit_after(Some(sampled_at)).2);
+        }
+        assert_eq!(asked, [true; 4]);
     }
 
     #[test]
@@ -2501,6 +2582,109 @@ mod tests {
             policy.select_worker(&workers, &SelectWorkerInfo::default()),
             Some(0)
         );
+    }
+
+    /// A decision reads its reports once it holds the tally's guard: one that
+    /// waits for the guard while a worker's newer report is published and
+    /// that worker's dispatches are released under it prices the worker by
+    /// the newer report. The waiting decision runs on a second thread: one
+    /// that starts late can pass the old order of the two reads and can
+    /// never fail this one.
+    #[test]
+    fn a_decision_reads_its_reports_under_the_tallys_guard() {
+        // Step one: the dispatches are released as a decision that read the
+        // newer report releases them. Step two: a decision that scored under
+        // the old report books `a`'s full history after the newer report is
+        // published. `b` is the lighter worker both times.
+        for older_report_books in [false, true] {
+            let b_queue = if older_report_books { 18_000 } else { 12_000 };
+            let (policy, feed, workers) = fed_pair(LeastLoadPolicy::with_params(0.0, 1, 100.0));
+            let mut loads = HashMap::new();
+            loads.insert("http://a:8000".to_string(), one_rank_load(0, 0.0, 100.0));
+            loads.insert(
+                "http://b:8000".to_string(),
+                one_rank_load(b_queue, 0.0, 100.0),
+            );
+            feed.publish(&loads);
+            // `a` holds a full history of live two-token dispatches that its
+            // report does not show yet.
+            let info = SelectWorkerInfo::default();
+            let two = |_: usize| 2u64;
+            for _ in 0..SINCE_POLL_DISPATCHES_KEPT {
+                let pick = policy.select_min_expected_wait_credited(
+                    &workers,
+                    &[0],
+                    &info,
+                    "test",
+                    Some(&two),
+                );
+                assert_eq!(pick, Some(0));
+                workers[0].increment_load();
+            }
+            // `a`'s newer report shows them queued.
+            let mut reported = one_rank_load(16_384, 0.0, 100.0);
+            reported.loads[0].num_waiting_reqs = 8_192;
+            loads.insert("http://a:8000".to_string(), reported);
+
+            let old = policy.snapshot().expect("a feed");
+            let waiting_pick = Mutex::new(None);
+            let (policy_ref, workers_ref, pick_ref) = (&policy, &workers, &waiting_pick);
+            std::thread::scope(|scope| {
+                // Called with the tally's write guard held: the waiting
+                // decision starts, then the newer report is published.
+                let start_waiting = || {
+                    let clones = Arc::strong_count(&old);
+                    scope.spawn(move || {
+                        let info = SelectWorkerInfo::default();
+                        let pick = policy_ref.select_min_expected_wait(
+                            workers_ref,
+                            &[0, 1],
+                            &info,
+                            "test",
+                        );
+                        *pick_ref.lock().expect("the waiting pick") = pick;
+                    });
+                    // Bounded: the old order clones the old snapshot here,
+                    // this one stands at the guard.
+                    let until = Instant::now() + std::time::Duration::from_millis(200);
+                    while Arc::strong_count(&old) == clones && Instant::now() < until {
+                        std::thread::yield_now();
+                    }
+                    feed.publish(&loads);
+                };
+                if older_report_books {
+                    let credit = |_: usize| {
+                        start_waiting();
+                        workers_ref[0].increment_load();
+                        4_096u64
+                    };
+                    let booked = policy.select_min_expected_wait_credited(
+                        &workers,
+                        &[0, 1],
+                        &info,
+                        "test",
+                        Some(&credit),
+                    );
+                    assert_eq!(booked, Some(0), "the old report prices `a` under `b`");
+                } else {
+                    let mut tally = policy.tally.write().expect("the tally");
+                    start_waiting();
+                    let sampled_at = policy
+                        .snapshot()
+                        .and_then(|feed| feed.report("http://a:8000").map(|(_, at)| at))
+                        .expect("a's newer report");
+                    tally
+                        .get_mut("http://a:8000")
+                        .expect("a's history")
+                        .release_through(sampled_at);
+                }
+            });
+            assert_eq!(
+                *waiting_pick.lock().expect("the waiting pick"),
+                Some(1),
+                "older_report_books {older_report_books}"
+            );
+        }
     }
 
     #[test]
