@@ -934,7 +934,7 @@ fn churn(leader: &impl Hands, stop: &AtomicBool) -> u32 {
         rounds += 1;
         let index = draw(4) as usize;
         let name = format!("http://w{index}:8000");
-        match (store.by_key(&name), draw(8)) {
+        match (workers.read_row_under(&name), draw(8)) {
             (None, _) | (Some(_), 0) => {
                 lives[index] += 1;
                 lays(leader, facts(&name, lives[index], 0));
@@ -947,7 +947,11 @@ fn churn(leader: &impl Hands, stop: &AtomicBool) -> u32 {
                 lays(leader, facts(&name, lives[index], more));
             }
             (Some(row), 3) => {
-                probed(leader, row.id, row.status != WorkerStatus::Ready);
+                // By the table's status: the object's own leads it. This
+                // thread is the one writer of the leader's rows, so the
+                // table holds the row the holder read a line above.
+                let told = store.get(row.id).expect("the table's row").status;
+                probed(leader, row.id, told != WorkerStatus::Ready);
             }
             // The other half of the draws writes nothing.
             (Some(_), _) => {}
@@ -957,10 +961,10 @@ fn churn(leader: &impl Hands, stop: &AtomicBool) -> u32 {
     rounds
 }
 
-/// Waits, within 20 s, until `store` wrote past position `seq`.
-async fn written_past(store: &MemoryStore, seq: u64) {
+/// Waits, within 20 s, until `replica`'s store wrote past position `seq`.
+async fn written_past(replica: &impl Hands, seq: u64) {
     let deadline = Instant::now() + Duration::from_secs(20);
-    while store.checkpoint().at.seq <= seq {
+    while replica.workers().checkpoint(replica.store()).at.seq <= seq {
         assert!(Instant::now() < deadline, "no write past {seq} in 20 s");
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
@@ -987,12 +991,12 @@ async fn a_snapshot_and_the_batches_after_it_are_the_next_snapshot_under_a_write
             let taken = standby.restored().await.expect("a snapshot");
             // The next snapshot parts from this one by a write: the writer
             // is waited for, never taken to have run meanwhile.
-            written_past(&leader.store, taken.replication_seq).await;
+            written_past(&leader, taken.replication_seq).await;
             streams.push((standby, taken));
         }
         // The events the case counts are waited for, never timed.
         let first = streams[0].1.replication_seq;
-        written_past(&leader.store, first + 100).await;
+        written_past(&leader, first + 100).await;
         stop.store(true, Ordering::Relaxed);
         let rounds = writer.join().expect("the writer");
         let last = snapshot(leader.replication).await.expect("a snapshot");
@@ -1134,13 +1138,19 @@ async fn a_store_past_one_message_restores_a_standby_whole_on_its_stream() {
         let page = 2 * 1024 * 1024 + 64;
         assert!(standby.parts.iter().all(|part| *part <= page));
         // Every row the leader holds, at its head, and no load row.
-        let held = leader.store.checkpoint();
+        let held = leader.workers.checkpoint(&leader.store);
+        // The cut is whole by the case's own count: the wide rows and the
+        // one row of `writes`.
+        assert_eq!(held.rows.len(), 1_501, "every row the case laid");
         let at = (restored.replication_seq, restored.replication_term);
         assert_eq!(at, (held.at.seq, held.at.term));
         assert_eq!(restored.membership_epoch, held.epoch);
         let told: Vec<u64> = restored.workers.iter().map(|row| row.id).collect();
         let rows: Vec<u64> = held.rows.iter().map(|row| row.id.0).collect();
         assert_eq!(told, rows);
+        // The order is held here: the snapshot was sent from such a cut.
+        let keys: Vec<&str> = held.rows.iter().map(|row| &*row.facts.key).collect();
+        assert!(keys.windows(2).all(|pair| pair[0] < pair[1]), "by key");
         assert!(restored.loads.is_empty());
         // The log follows from the snapshot's place, on the same stream.
         turn(&leader, id, 3);
@@ -1241,15 +1251,18 @@ async fn snapshots_numbers(workers: u32) {
 /// 53-byte address, one 36-byte model, four labels, a zone), asked whole
 /// and under a limit of one row. Each line: the rows told and whether a
 /// bound cut them, the answer's bytes, how long the call takes over the
-/// wire (the store's cut, the rows' build, the client's read), and how long
-/// the store's cut takes alone: what a membership write waits behind a
+/// wire (the holder's cut, the rows' build, the client's read), and how long
+/// the holder's cut takes alone: more than a membership write waits behind a
 /// snapshot that copies every row, as a call with no limit and no models
 /// does, and a call let in beside another. A lone call under a limit
 /// copies its limit's worth alone, and a third line asks one row of the
 /// widest list of models a call may state: each row's model is searched
-/// in that list under the membership lock. A last line, with a watch
+/// in that list in the holder's turn. A last line, with a watch
 /// open: one row asked eleven times, where each call shares the cut the
 /// feed keeps and copies nothing.
+///
+/// The cut's own figure holds its sort, which runs behind the holder's
+/// turn: a write waits for the copy of the rows, and not for the sort.
 async fn operators_snapshot_numbers(workers: u32) {
     let dir = tempfile::tempdir().expect("a temp dir");
     with_leader(shared(&dir), |leader| async move {
@@ -1259,7 +1272,7 @@ async fn operators_snapshot_numbers(workers: u32) {
         let mut cuts = Vec::new();
         for _ in 0..11 {
             let began = Instant::now();
-            let cut = leader.store.checkpoint();
+            let cut = leader.workers.checkpoint(&leader.store);
             cuts.push(began.elapsed().as_micros());
             assert_eq!(cut.rows.len(), workers as usize);
         }
@@ -1299,7 +1312,7 @@ async fn operators_snapshot_numbers(workers: u32) {
             micros.sort_unstable();
             writeln!(
                 out,
-                "OPERATORS_SNAPSHOT workers={workers} limit={limit} models={asked} rows={} truncated={} bytes={} median_us={} store_cut_median_us={}",
+                "OPERATORS_SNAPSHOT workers={workers} limit={limit} models={asked} rows={} truncated={} bytes={} median_us={} holder_cut_median_us={}",
                 told.0, told.1, told.2, micros[5], cuts[5]
             )
             .expect("stdout");
@@ -1746,7 +1759,7 @@ impl Replica {
     /// What the replica holds, without its instants: its place, then its
     /// epoch and its rows.
     fn held(&self) -> ((u64, u64), impl PartialEq + std::fmt::Debug) {
-        let cut = self.store.checkpoint();
+        let cut = self.workers.checkpoint(&self.store);
         let rows: Vec<_> = cut
             .rows
             .into_iter()
@@ -1871,7 +1884,7 @@ async fn a_promoted_standby_holds_every_row_of_its_leader() {
         thread::spawn(move || churn(&hands, &stop))
     };
     // The events the case counts are waited for, never timed.
-    written_past(&leader.store, began.0 + 100).await;
+    written_past(&leader, began.0 + 100).await;
     stop.store(true, Ordering::Relaxed);
     let rounds = writer.join().expect("the writer");
     let (head, wrote) = leader.held();
@@ -2123,7 +2136,9 @@ async fn a_followed_row_reaches_the_published_world_of_a_standby() {
     let mut standby = Replica::serve("replication-1", FOLLOWER, port, shared(&dir)).await;
     standby.reads(State::Follower).await;
     let published = |replica: &Replica| {
-        let on_file = replica.store.by_key("http://a:8000").is_some();
+        // The table's row, by the id the holder reads under the key.
+        let row = replica.workers.read_row_under("http://a:8000");
+        let on_file = row.is_some_and(|row| replica.store.get(row.id).is_some());
         on_file && replica.store.publish_due().is_none()
     };
     assert!(!published(&standby), "no row is written yet");

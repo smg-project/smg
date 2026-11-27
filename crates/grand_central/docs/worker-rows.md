@@ -52,6 +52,16 @@ A host's registration and removal steps write rows at a membership door, `worker
 - A worker of the host-local ZMQ wire whose row names no gateway, as it refuses a control call's registration of that wire.
 - One gateway holds that socket, and such a row would stand in every gateway's pool.
 
+**What a host reads back.**
+
+- A host that keeps worker objects reads a row off their holder, `worker_host::Objects`: each call builds the row again, a copy of its facts.
+- `Objects::read_row` reads a row by its id, and `Objects::read_row_under` by its exact registration key.
+- `Objects::checkpoint` cuts the rows that the holder and the store both hold, in one turn of the holder. It states the log's place, or the default place for a store that keeps no log. It takes the store that the holder's write calls tell.
+- Each read takes the holder's turn, so a writer of a row waits for it and no decision does.
+- A row read so carries the models its worker object serves now. A row read alone carries the status that object states, and a row of the cut carries the status the store holds.
+- The cut reads the place with the store's word in one hold of the store's lock: the rows that stand, their statuses and the epoch.
+- Models that a host sets on worker objects through the registry are read row by row. A cut may hold one object's new list beside another's old one, and a list the log holds no word of yet.
+
 ## Probes
 
 The controller probes its workers while it leads.

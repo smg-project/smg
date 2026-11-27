@@ -195,11 +195,11 @@ impl Turn for HolderDoor {
     }
 
     fn row(&self, id: WorkerId) -> Option<WorkerRow> {
-        self.objects.record(id)
+        self.objects.read_row(id)
     }
 
     fn row_under(&self, url: &str) -> Option<WorkerRow> {
-        self.objects.record_under(url)
+        self.objects.read_row_under(url)
     }
 
     fn rows_of(&self, engine: &str) -> Vec<WorkerRow> {
