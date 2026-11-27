@@ -5,6 +5,10 @@
 
 use super::*;
 
+mod asked_again;
+mod give_up;
+mod marks;
+
 /// A decision waits in its stream's queue as it was made, with the
 /// lease issued for its pick and what is left of that lease's span: its
 /// frame is its stream's to build. A `Busy` is handed over as its

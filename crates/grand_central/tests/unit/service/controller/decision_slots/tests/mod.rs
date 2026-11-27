@@ -69,16 +69,12 @@ impl DecisionSlots {
     }
 }
 
-mod asked_again;
 mod busy;
-mod decode;
 pub(crate) mod encode;
 mod faults;
 mod fence;
 mod gateway;
-mod give_up;
 mod leases;
-mod marks;
 mod measured;
 mod named;
 mod pair;
