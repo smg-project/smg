@@ -486,6 +486,43 @@ fn a_hello_above_the_leaders_term_says_its_term_to_the_election() {
     assert!(said.terms().is_empty());
 }
 
+/// A hello at the last believed term, the leader's term and the whole
+/// believed range above it, is refused in the same words and says its term
+/// to the election: the range holds its last term. It is the first hello to
+/// say that term here: a floor as high as one said already is not said
+/// again.
+#[test]
+fn a_hello_at_the_last_believed_term_says_its_term_to_the_election() {
+    let leader = Leader::leading();
+    leader.writes(2);
+    let replication = leader.replication();
+    let floors = Floors::default();
+    let (door, said) = Said::door();
+    floors.open(door);
+    let held = leader.log.head();
+    let term = leader.term;
+    let last = term + FLOOR_BELIEVED;
+    let hello = proto::ReplicaHello {
+        replica_id: STANDBY.to_owned(),
+        last_applied_seq: held.seq,
+        term_seen: last,
+        max_backlog: 0,
+        last_applied_term: held.term,
+    };
+    let refused = replication
+        .joins(&floors, term, STANDBY, &hello, leader.at)
+        .map(|_| ())
+        .map_err(|status| (status.code(), status.message().to_owned()));
+    assert_eq!(
+        refused,
+        Err((
+            Code::FailedPrecondition,
+            format!("the standby has seen term {last}, above this replica's {term}"),
+        ))
+    );
+    assert_eq!(said.terms(), [last]);
+}
+
 /// The word reaches the election's thread: a leader shown a hello above
 /// its term leaves its lease at that word, and the next take stands above
 /// the hello's term. Alone over its lease here, the replica takes again at

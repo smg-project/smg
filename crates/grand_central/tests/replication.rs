@@ -40,7 +40,7 @@ use smg_grand_central::{
     engine::{DemandFacts, WireModes, WorkerId},
     service::{
         controller::{Config, Controller, Error, LeasePlace, Listener, Readiness, Scope, State},
-        elector::{ElectionSettings, Elector, FileLease, TickOutcome},
+        elector::{ElectionSettings, Elector, FileLease, LeaseBackend, LeaseRecord, TickOutcome},
         proto::{
             self, grand_central_client::GrandCentralClient, replica_frame::Frame,
             replication_event::Event as Sent, worker_event::Event,
@@ -227,6 +227,14 @@ fn shared(dir: &tempfile::TempDir) -> LeasePlace {
         assert!(before.release().expect("the release's write"));
     }
     LeasePlace::File(path)
+}
+
+/// The record in the lease file now.
+fn stored(lease: &Path) -> LeaseRecord {
+    FileLease::new(lease)
+        .read()
+        .expect("the lease file reads")
+        .expect("the lease file holds a record")
 }
 
 async fn client(addr: SocketAddr) -> GrandCentralClient<Channel> {
@@ -579,6 +587,7 @@ async fn get_snapshot(addr: SocketAddr) -> Result<proto::Snapshot, Status> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_standby_is_sent_the_log_from_its_place_and_restored_from_any_other() {
     let dir = tempfile::tempdir().expect("a temp dir");
+    let lease = dir.path().join("lease");
     with_leader(shared(&dir), |leader| async move {
         let id = writes(&leader, 3);
         let base = snapshot(leader.replication).await.expect("a snapshot");
@@ -686,18 +695,36 @@ async fn a_standby_is_sent_the_log_from_its_place_and_restored_from_any_other() 
         // lease: a stream that stood open under its term ends at its next
         // look.
         assert_eq!(fresh.ended().await, Some(Code::Aborted));
+        // The leave wrote its release: the lease's record names no holder,
+        // under the term the hello stated. The fence closes ahead of that
+        // write, so the record is read until it shows, under a timeout of
+        // thirty seconds. A fence that ran out would end the stream too,
+        // and would leave the holder's record as it stood: the record
+        // tells the leave, and not which of the two ended the stream.
+        let released = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let record = stored(&lease);
+                if record.is_released() {
+                    break record;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the leave's release within 30 s");
+        assert_eq!(released.term, term + 1);
 
-        // So is one whose place stands under a later term, whatever floor
-        // it states. A replica that left its lease holds its takes back for
-        // the lease's duration (`settings`), and restores no standby.
-        let ahead = proto::ReplicaHello {
-            term_seen: term,
-            ..place(nth(5), term + 1)
+        // A replica that left its lease serves no standby: the hello it
+        // served before the leave is refused now. The case counts on the
+        // hold of `settings`: the replica takes no lease again for the
+        // lease's duration, long against this case's run, and a call
+        // inside that hold meets a closed fence. Such a call is refused
+        // ahead of its hello's fields: a place under a later term is
+        // judged in the library's cases.
+        let Err(left) = replicate(leader.replication, place(nth(5), term)).await else {
+            panic!("a replica that left its lease serves no standby");
         };
-        let Err(deposed) = replicate(leader.replication, ahead).await else {
-            panic!("a standby ahead of this replica's term is not served");
-        };
-        assert_eq!(deposed.code(), Code::FailedPrecondition);
+        assert_eq!(left.code(), Code::FailedPrecondition);
     })
     .await;
 }
