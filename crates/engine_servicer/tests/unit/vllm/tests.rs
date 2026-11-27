@@ -2099,6 +2099,73 @@ async fn structured_output_backend_follows_the_launcher_config() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// `outlines` and `lm-format-enforcer` compile no structural tag: one is
+/// refused before the engine, which would admit the request and fail it at
+/// grammar compile. A choice, which both compile, still goes to the engine
+/// as a choice under the configured backend.
+#[tokio::test]
+async fn a_structural_tag_is_refused_under_a_backend_that_compiles_none() {
+    use vllm::sampling_params::Constraint;
+
+    for (configured, expected) in [
+        ("outlines", StructuredOutputBackend::Outlines),
+        (
+            "lm-format-enforcer",
+            StructuredOutputBackend::LmFormatEnforcer,
+        ),
+    ] {
+        let mut model = model_info();
+        model.structured_outputs_backend = configured.to_string();
+        let mut h = harness(model, None).await;
+        let mut request = generate_request("tag1", true, Vec::new());
+        request.sampling_params.as_mut().unwrap().constraint = Some(Constraint::StructuralTag(
+            serde_json::json!({"format": {"type": "triggered_tags", "triggers": ["<tool_call>"],
+                "tags": [{"begin": "<tool_call>",
+                          "content": {"type": "json_schema", "json_schema": {"type": "object"}},
+                          "end": "</tool_call>"}],
+                "at_least_one": true}})
+            .to_string(),
+        ));
+        let status = h.client.generate(request).await.expect_err("refused");
+        assert_eq!(status.code(), Code::InvalidArgument, "{configured}");
+        assert!(
+            smg_grpc_client::is_constraint_refusal(&status),
+            "{configured}"
+        );
+        assert!(
+            status.message().contains(&format!("`{configured}`")),
+            "{}",
+            status.message()
+        );
+        // Nothing refused reached the engine: its next request is the choice.
+        let choices = vec!["a".to_string(), "b".to_string()];
+        let mut request = generate_request("choice1", true, Vec::new());
+        request.sampling_params.as_mut().unwrap().constraint =
+            Some(Constraint::Choice(vllm::ChoiceConstraint {
+                choices: choices.clone(),
+            }));
+        let _stream = h
+            .client
+            .generate(request)
+            .await
+            .expect("generate")
+            .into_inner();
+        let engine_request = recv_add(&mut h.engine_in).await;
+        assert_eq!(engine_request.request_id, "choice1", "{configured}");
+        let structured = engine_request
+            .sampling_params
+            .and_then(|sp| sp.structured_outputs)
+            .expect("structured outputs");
+        assert_eq!(structured.backend, expected, "{configured}");
+        assert_eq!(
+            structured.constraint,
+            StructuredOutputConstraint::Choice(choices),
+            "{configured}"
+        );
+        h.server.stop(Duration::from_secs(5)).expect("clean stop");
+    }
+}
+
 /// The request id is the Router's cancellation handle, so a live duplicate
 /// is refused; dropping the first stream aborts its engine request.
 #[tokio::test]
