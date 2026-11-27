@@ -224,20 +224,17 @@ pub(crate) fn stated_items(
 
 /// The hard demands a frame states (`DecideRequest.demands`), or the field
 /// that puts them out of range. A message with no part demands nothing, on
-/// any frame. A stated demand is read on every frame but an encode
-/// request's. That frame is out of range by `demands`: its decision holds
-/// no demand yet, so it drops none in silence.
+/// any frame. A stated demand is read on every frame: a part out of its
+/// own range is refused by its name, and no demand is refused for the kind
+/// of its frame.
 ///
-/// `phase` is the phase the frame's facts state, or the decode phase for a
-/// decode call. An encode request's frame states the encode phase there,
-/// with its items or with none. The check of a frame received hands that
-/// phase ([`Checked::new`]). A sender whose callers share one stream reads
-/// the field here too, and hands the same phase.
+/// The check of a frame received reads the field here ([`Checked::new`]).
+/// A sender whose callers share one stream reads it here too.
 ///
 /// Out of line: a frame that states no message reads none of it.
 #[cold]
 #[inline(never)]
-pub(crate) fn stated_demands(stated: &proto::Demands, phase: Phase) -> Result<Demands, Refusal> {
+pub(crate) fn stated_demands(stated: &proto::Demands) -> Result<Demands, Refusal> {
     // Every field by its name: one the contract gains stops the build here,
     // so no demand passes unread.
     let proto::Demands {
@@ -258,18 +255,14 @@ pub(crate) fn stated_demands(stated: &proto::Demands, phase: Phase) -> Result<De
     let Ok(decoding) = u8::try_from(decoding) else {
         return Err(Refusal::OutOfRange("demands.decoding"));
     };
-    let demands = Demands {
+    Ok(Demands {
         runtime,
         vision,
         references,
         input_window,
         output_window,
         decoding,
-    };
-    if !demands.is_none() && phase == Phase::Encode {
-        return Err(Refusal::OutOfRange("demands"));
-    }
-    Ok(demands)
+    })
 }
 
 /// A `DecideRequest` the engine's record holds whole.
@@ -351,11 +344,9 @@ impl Checked {
             };
             Box::new(Items { stated, placed })
         });
-        // A stated demand is read at the phase the frame states, ahead of
-        // the phase its items are read at.
         let demands = match &request.demands {
             None => Demands::default(),
-            Some(stated) => stated_demands(stated, phase)?,
+            Some(stated) => stated_demands(stated)?,
         };
         let phase = if items.is_some() {
             Phase::Prefill

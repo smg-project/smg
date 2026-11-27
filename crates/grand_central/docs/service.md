@@ -341,10 +341,17 @@ let mut handle = DecisionGuard::<&InProcess>::asked(&link, &request, now, budget
 - Give the controller time to decide in `request.facts.budget_micros`. On the wire, zero means that time is spent.
 - A request built for the door states no budget with 0, so set one before you ask. The handle answers a zero budget `DecisionUnavailable::Late` before anything is sent.
 - A request that states a hard demand (`Constraints::demands`) states it on its frame, over a session on protocol 2.
-- Behind the budget's test, an encode request that states one is answered `DecisionUnavailable::Unsent` before it is sent.
-- So is every request that states one over a session on protocol 1.
+- Behind the budget's test, a request that states one over a session on protocol 1 is answered `DecisionUnavailable::Unsent` before it is sent.
 - The separate `budget` is how long the link waits for the answer.
 - The handle counts the time to dispatch and the lease's dispatch span from `now`.
+
+**Demands.**
+
+- A request states its hard demands in `Constraints::demands`, and a worker's registration states what it offers (`WorkerFacts::demand_facts`).
+- The door keeps the workers that meet them before any stage runs.
+- A registration that changes what a worker states starts another life of the worker, as a change of its wires does.
+- The stock controller's `Decide` request states a request's demands on every frame (`DecideRequest.demands`).
+- A registration states whether its worker takes images (`WorkerSpec.vision`), so a demand for vision crosses too.
 
 **Reports.**
 
