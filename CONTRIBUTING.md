@@ -151,7 +151,8 @@ runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
 
 With these variables unset, callers with fallbacks keep their default labels.
 Callers documented as requiring an explicit runner also need that variable set.
-A fork that runs CI on its own runners only has to set the variables it needs (**Settings → Secrets and variables → Actions → Variables**) — no workflow
+A fork that runs CI on its own runners only has to set the variables it needs
+(**Settings → Secrets and variables → Actions → Variables**) — no workflow
 edits, so upstream syncs stay conflict-free.
 
 | Variable | Upstream fallback | Used for |
@@ -163,9 +164,9 @@ edits, so upstream syncs stay conflict-free.
 | `SMG_RUNNER_AMD_GPU_1` | `1-gpu-mi300x` | AMD row of the 1-GPU chat e2e job (off unless `SMG_RUN_AMD_LEGS` is `true`) |
 | `SMG_RUNNER_GPU_2` | `2-gpu-h100` | 2-GPU e2e jobs |
 | `SMG_RUNNER_GPU_4` | `4-gpu-h100` | 4-GPU e2e and benchmark jobs |
-| `SMG_RUNNER_AMD_GPU_4` | `4-gpu-mi300x` for weekly/benchmarks; none for SG4 chat | AMD weekly/PR benchmarks and SGLang 4-GPU chat; SG4 chat requires this runner variable explicitly |
+| `SMG_RUNNER_AMD_GPU_4` | `4-gpu-mi300x` (none for AMD SGLang 4-GPU chat) | AMD weekly and opt-in PR benchmarks; AMD SGLang 4-GPU chat |
 | `SMG_RUNNER_AMD_GPU_8` | `8-gpu-mi300x` | AMD BFCL and nightly PD runner; automatic AMD selection requires `SMG_RUN_AMD_LEGS=true` |
-| `SMG_RUN_AMD_SGLANG_4GPU_CHAT` | `false` | Full SGLang TP4 chat; also needs `SMG_RUN_AMD_LEGS=true`, a nonempty `SMG_RUNNER_AMD_GPU_4`, and `SMG_RUN_AMD_ON_PRS=true` on PRs. Keep off until original GPT-OSS-120B MXFP4 and Scout attention on gfx942, the pinned runtime and shared-host admission are qualified |
+| `SMG_RUN_AMD_SGLANG_4GPU_CHAT` | `false` | AMD SGLang 4-GPU chat; also needs `SMG_RUN_AMD_LEGS=true`, a nonempty `SMG_RUNNER_AMD_GPU_4`, and `SMG_RUN_AMD_ON_PRS=true` on PRs. Keep off until original GPT-OSS-120B MXFP4 and Scout attention on gfx942, the pinned runtime, and shared-host admission are qualified |
 | `SMG_RUN_AMD_BFCL` | `false` | Required for every AMD BFCL selection, including explicit dispatch; keep off until shared-host admission and owned teardown are qualified |
 | `SMG_RUN_AMD_PR_BENCHMARK` | `false` | Advisory AMD PR performance measurements; also requires `SMG_RUN_AMD_LEGS=true` and `SMG_RUN_AMD_ON_PRS=true`. Keep off until the native environment, performance budget and shared-host admission are qualified |
 

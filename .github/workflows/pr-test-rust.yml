@@ -2035,7 +2035,8 @@ jobs:
   # each use one TP4 worker, sequentially, through the original frontdoors.
   # Keep this opt-in separate from the existing one-GPU AMD chat lane.
   # Keep this gate OFF until original GPT-OSS-120B MXFP4 and Scout attention
-  # are qualified on gfx942; this full suite propagates failures to finish.
+  # on gfx942, the pinned runtime, and shared-host admission are qualified.
+  # This full suite propagates failures to finish.
   e2e-4gpu-chat-sglang-amd:
     name: e2e-4gpu-chat-sglang-amd
     needs: [build-wheel, detect-changes]
