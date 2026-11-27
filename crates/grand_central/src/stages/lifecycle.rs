@@ -179,7 +179,10 @@ pub trait Lifecycle: Send + Sync {
     ///
     /// A change of membership and a signal are told to every stage,
     /// whatever it answers: no host reads those two kinds of the answer
-    /// yet. A plugin's stage answers every kind its plugin observes.
+    /// yet. A plugin's stage answers every kind its plugin observes, and
+    /// with them the kinds its fallback stage names. It hands each word it
+    /// is told on to that fallback, whatever the fallback names: a
+    /// plugin's fallback may hear a word it does not name.
     ///
     /// The two answers part for a stage that takes a word only to drop
     /// state early: it decides the same without the call and declares no

@@ -1196,9 +1196,9 @@ fn a_decode_asked_again_behind_a_new_document_tells_no_stage_its_issue() {
 
 /// A pair's decode asked again behind a later document that kept the
 /// first one's stages tells them the side's issue: they heard the
-/// pair's lease issued, and they hear the side's dispatch. A stage
-/// hears a lease's issue where it hears that lease's later words, and
-/// nowhere else.
+/// pair's lease issued, and they hear the side's dispatch. A lease's
+/// issue is told where that lease's later words are told, and nowhere
+/// else: each of them to the stages that name it.
 #[test]
 fn a_decode_asked_again_behind_a_document_that_kept_its_stages_tells_them_its_issue() {
     let ([first, next], heard) = hearing_and_its_next();
