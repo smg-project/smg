@@ -971,8 +971,7 @@ The leader's load monitor takes the load records on a worker's stream, and a sta
 - A binding that matches on a tenant, a priority, a header, a prompt size or labels. The fields are in the schema. A document that writes one is refused as not in this build.
 - A pair's shadows at an encode request's first decision, beside a side its sessions rule or its picker's assignment places and through a served controller, and plugin stages in a shadow profile.
 - `canary`, `override: allowed` and `admission` on a binding, and `issue_session_id` in a sessions rule.
-- A sessions rule under `epd` through the stock controller, with a cap or with none. The rule is not in that build at all, and an encode frame's rows name no count of a key's requests.
-- A sessions rule under `pd-pair` that states `rule_placed: untold`, through the stock controller. Its file of leases keeps no word of a pair's side. In a host's own process a rule runs on both sides of a pair under either plan.
+- A sessions rule under `pd-pair` or `epd` that states `rule_placed: untold`, through the stock controller. Its file of leases keeps no word of a pair's side. In a host's own process a rule runs on both sides of a pair under either plan.
 - The `best-with-temperature` picker, and three settings of `prefix-affinity`: `decay`, `accounting_ttl_ms` and `spill.uncached_credit`.
 - The `bucket` scorer in the stock controller. The library runs it. The stock controller refuses a document that names it, because it does not yet report every request's end to a stage.
 - The record of sent prefixes on a standby. A standby starts with an empty record.

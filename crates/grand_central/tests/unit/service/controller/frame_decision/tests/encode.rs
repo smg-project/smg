@@ -43,6 +43,8 @@ use crate::{
     worker_host::{Members, Objects},
 };
 
+mod sessions;
+
 /// [`member_of`] for [`ENCODED`].
 fn member(
     store: &MemoryStore,
@@ -459,8 +461,8 @@ fn a_frame_with_items_under_a_plan_with_no_encode_side_is_declined_by_its_bindin
 /// It does so in a controller whose catalog holds no stage that needs the
 /// lifecycle's calls. Each side then takes the worker that holds the fewest
 /// requests, by the leases on file, and an item goes to its encoder beside
-/// the pair. A sessions rule under that plan stays refused in such a build,
-/// by the document's check.
+/// the pair. A sessions rule that tells its stages runs under that plan in
+/// such a build too, each side by its own session.
 ///
 /// The gateway's manual policy always keeps its table, so it has no twin of
 /// a binding with no rule. Its nearest answer is for a request that states

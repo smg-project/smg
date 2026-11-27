@@ -266,7 +266,7 @@ A binding with no block says the defaults.
 - The rule runs under `single`. It also runs on the two sides of `pd-pair` and of the pair in `epd`, each side by its own session.
 - Under `epd` it places no encode item.
 - A picker that places by session assignment runs on the pair's two sides of `epd`, and is refused on its encode side.
-- The stock controller refuses a rule under `epd`. Under `pd-pair` it refuses one that states `rule_placed: untold`.
+- The stock controller refuses a rule that states `rule_placed: untold` under `pd-pair` and under `epd`.
 
 | `sessions` field | Default | Meaning |
 |---|---|---|

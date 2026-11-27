@@ -1808,9 +1808,11 @@ field's name.
 Under the `epd` plan a rule runs on the pair's two sides the same way and places no item. An item
 is placed by its side's policy, and the encode phase takes none of the rule's needs. A host
 that decides in its own process names each side's count of the key's requests for an encode
-request as for a pair. A controller refuses every rule under `epd` by the plan's name, with a cap
-or with none. The rule is not in that build at all, and an encode frame's rows name no count of a
-key's requests.
+request as for a pair.
+
+A controller takes a rule under `epd` that tells its stages, with a cap or with none. Under a cap
+its encode request's rows name each side's count by the leases it holds. It refuses a document
+whose rule states `untold` under `epd`, by that field's name, as under `pd-pair`.
 
 An encode request's pick states each side's word as a pair's does, also where the encode pass
 numbered a side's rows anew. An item that is shed, queued or finds no encoder turns the request away

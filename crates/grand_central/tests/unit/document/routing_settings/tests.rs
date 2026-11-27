@@ -10,6 +10,7 @@ use crate::{
         view::Phase,
     },
     policies::cache_aware::Gates,
+    stages::StageRegistry,
 };
 
 /// The settings of a gateway that sets none, as its configuration
@@ -2063,6 +2064,11 @@ fn the_manual_policy_on_both_sides_of_a_pair_runs_under_three_sides() {
             decode_policy: decode,
         }
     };
+    // The stock controller checks a document in a catalog with no stage
+    // that needs the lifecycle's calls. It takes each plan of three sides
+    // below: the manual policy's rule tells its stages.
+    let served = StageRegistry::builtin().without_lifecycle();
+    let on_file = |document: &PolicySpec| document.validate_in(&served, &[]).err();
 
     // A pair mode of many routers: the document it said under two
     // families, with the encode side ahead of the pair's two.
@@ -2076,6 +2082,7 @@ fn the_manual_policy_on_both_sides_of_a_pair_runs_under_three_sides() {
     assert_eq!(three, with_encode_side(two_families));
     assert_eq!(three.bindings[0].sessions, rule);
     assert_eq!(validated(&three).err(), None);
+    assert_eq!(on_file(&three), None);
     // A label is written into that plan, between its two bindings.
     let labelled = with_labels(&pairs, &[("m", "random")]).expect("a labelled one");
     assert_eq!(labelled.bindings.len(), 3);
@@ -2097,6 +2104,7 @@ fn the_manual_policy_on_both_sides_of_a_pair_runs_under_three_sides() {
     assert_eq!(three.bindings[0].sessions, rule);
     assert_eq!(three.bindings[1].sessions, rule);
     assert_eq!(validated(&three).err(), None);
+    assert_eq!(on_file(&three), None);
 
     // The encode mode of one router: the mode's three presets, with the
     // manual preset's rule on their one binding.
@@ -2109,6 +2117,7 @@ fn the_manual_policy_on_both_sides_of_a_pair_runs_under_three_sides() {
     own.bindings[0].sessions.clone_from(&rule);
     assert_eq!(one_router.policy_document().as_ref(), Ok(&own));
     assert_eq!(validated(&own).err(), None);
+    assert_eq!(on_file(&own), None);
     // Of many routers the main policy's single binding stands behind it.
     let many = many_routers(one_router.clone())
         .policy_document()
@@ -2118,6 +2127,7 @@ fn the_manual_policy_on_both_sides_of_a_pair_runs_under_three_sides() {
     assert_eq!(many.bindings[0].sessions, rule);
     assert_eq!(many.bindings[1].sessions, None);
     assert_eq!(validated(&many).err(), None);
+    assert_eq!(on_file(&many), None);
 
     // One manual side of the two, in each mode that plans three sides.
     let one_side = [
