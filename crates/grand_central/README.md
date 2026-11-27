@@ -136,7 +136,7 @@ target/release/smg-grand-central --controller-id controller-0 --spec-file policy
 - Ask for a worker with `Session` and `Decide` on the gateway listener.
 - The service checks a changed policy spec before it replaces the running one.
 
-[The controller's wire test](tests/controller.rs) shows registration and the decision stream end to end. The reference lists every [flag](REFERENCE.md#standalone-service) and every [call](REFERENCE.md#remote-calls-from-a-gateway).
+[The controller's wire test](tests/controller.rs) shows registration and the decision stream end to end. The service page lists every [flag](docs/service.md#start-the-service) and every [call](docs/service.md#a-gateway-that-calls-the-service).
 
 ## Presets
 
@@ -175,7 +175,7 @@ A host can add stages of its own in three ways:
 - [Signals a decision can read](REFERENCE.md#signals-a-decision-can-read)
 - [Decisions and refusals](REFERENCE.md#decisions-and-refusals) and [updating a policy spec](REFERENCE.md#updating-a-document)
 - [Explain and metrics](REFERENCE.md#explain-and-metrics)
-- [Worker discovery](REFERENCE.md#worker-discovery) for the standalone service
+- [Worker discovery](docs/service.md#worker-discovery) for the standalone service
 - [Cost and regression gates](REFERENCE.md#cost-and-regression-gates)
 - [The design document](docs/design.md)
 
