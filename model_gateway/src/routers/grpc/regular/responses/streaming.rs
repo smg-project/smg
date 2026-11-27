@@ -714,10 +714,11 @@ pub(super) async fn execute_tool_loop_streaming(
     mcp_servers: Vec<McpServerBinding>,
     background: Option<BackgroundStream>,
 ) -> Response {
-    // The request's entry stamp, read here in the request's task: the loop
-    // runs in a task of its own, where the stamp's scope is gone, and
-    // dispatches its first generation under this stamp again.
-    let entered = RequestStarted::current().map(RequestStarted::at);
+    // The request's stamp (its entry and its body's upload wait), read
+    // here in the request's task: the loop runs in a task of its own, where
+    // the stamp's scope is gone, and dispatches its first generation under
+    // this stamp again.
+    let entered = RequestStarted::carried();
 
     // Create SSE channel for client
     let (tx, rx) = sse_channel();
