@@ -318,6 +318,24 @@ fn a_shadow_that_picks_another_worker_is_counted_and_the_live_answer_served() {
     assert_eq!(seen.shadows(), 0);
 }
 
+/// A kept decision's record holds what its shadow said and the worker the
+/// shadow picked first. The document keeps every pick of a request that an
+/// id names. The live profile takes the first worker of the list and the
+/// shadow the second. The record names the second as the shadow's target.
+#[test]
+fn a_kept_decisions_record_names_the_worker_its_shadow_picked() {
+    let list = pool(3);
+    let keep_each = |document: &mut PolicySpec| document.explain.sample = 1;
+    let (engine, _) = bed_of("random", Rule::Place(0), Some(Rule::Place(1)), keep_each);
+    let live = placed(&engine, &list, request(7));
+    assert_eq!(first(&live), 0, "the live pick");
+    let record = engine.explained(b"request").expect("the pick is kept");
+    assert_eq!(record.decision, live);
+    let said = (record.shadow, record.shadow_target);
+    let second = worker_id(list[1].as_ref());
+    assert_eq!(said, (Some(ShadowKind::OtherTarget), Some(second)));
+}
+
 /// The shadow decisions are counted under the document that made them: a
 /// document put in force on the running engine starts its count at zero,
 /// and counts its own.
@@ -1239,4 +1257,31 @@ fn the_bindings_from_the_sixteenth_on_are_told_as_one_row() {
         counts_of(15, ShadowSide::Single, [0, 2, 0, 0]),
     ];
     assert_eq!(told(&engine), rows.concat());
+}
+
+/// A binding behind the sixteenth is told in the last row where it alone
+/// names a shadow. The scan of the bindings does not end with the rows.
+/// Here the seventeenth binding alone names one, the eighteenth names none,
+/// and the requests are the seventeenth's.
+#[test]
+fn a_binding_behind_the_sixteenth_that_alone_names_a_shadow_is_told() {
+    let list = pool(3);
+    let eighteen = |document: &mut PolicySpec| {
+        let shadowed = document.bindings.pop().expect("the preset's binding");
+        for at in 0..18 {
+            let mut binding = shadowed.clone();
+            if at != 16 {
+                binding.matcher.model = format!("model-{at}");
+                binding.shadow = None;
+            }
+            document.bindings.push(binding);
+        }
+    };
+    let (engine, _) = bed_of("random", Rule::Place(0), Some(Rule::Place(1)), eighteen);
+    let last_row = |counts| counts_of(15, ShadowSide::Single, counts);
+    assert_eq!(told(&engine), last_row([0; 4]), "zeros ahead of a decision");
+    for seed in 0..2 {
+        let _ = placed(&engine, &list, request(seed));
+    }
+    assert_eq!(told(&engine), last_row([0, 2, 0, 0]));
 }
