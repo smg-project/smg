@@ -181,6 +181,96 @@ fn a_page_counts_the_demand_facts_its_rows_tell() {
     }
 }
 
+/// A page's bytes count a text by what its JSON writes for it: two bytes
+/// for a quote, for a backslash and for a control character JSON names by
+/// a letter, six for any other control character, and every other byte as
+/// it stands. A row's measure grows by what its JSON grows where its texts
+/// hold such characters, and a page of rows with such a zone and such a
+/// label keeps its JSON inside the page's bytes.
+#[test]
+fn a_page_counts_a_text_by_what_its_json_writes() {
+    use crate::{
+        engine::view::WorkerId,
+        store::{EncodeOffer, WorkerFacts, WorkerStatus},
+    };
+
+    // Every character of one byte, and one each of two, three and four.
+    let one_byte = (0..=0x7F_u8).map(|byte| char::from(byte).to_string());
+    for text in one_byte.chain(["\u{e9}", "\u{2028}", "\u{1f600}"].map(str::to_owned)) {
+        let json = serde_json::to_string(&text).expect("a text's JSON");
+        assert_eq!(escaped_len(&text), json.len() - 2, "{text:?}");
+    }
+
+    let now = Instant::now();
+    let row = |n: u64, zone: String, tier: String, connector: Option<String>| {
+        let address = format!("http://10.0.{}.{}:8000", n / 256, n % 256);
+        WorkerRow {
+            id: WorkerId(n),
+            facts: WorkerFacts {
+                key: address.clone(),
+                engine: address,
+                incarnation: 1,
+                dp_size: 1,
+                models: vec!["m".to_owned()],
+                labels: [("tier".to_owned(), tier)].into(),
+                zone: Some(zone),
+                encode: EncodeOffer {
+                    connector,
+                    ..EncodeOffer::default()
+                },
+                ..WorkerFacts::default()
+            },
+            status: WorkerStatus::Ready,
+            revision: 1,
+            admitted_at: now,
+            maker: Registrant::Control,
+        }
+    };
+    // Three texts a registration states as it likes: a zone and a label's
+    // value, each as long as a row lets it be, and a connector. The plain
+    // row holds a letter in every place. The other holds a zone of bells,
+    // a value of quotes and backslashes, and a connector with a line feed
+    // in every fourth place.
+    let (zone, value) = (WorkerFacts::NAME_BYTES, WorkerFacts::LABEL_VALUE_BYTES);
+    let (bells, quotes) = ("\u{7}".repeat(zone), r#""\"#.repeat(value / 2));
+    let plain = row(
+        1,
+        "z".repeat(zone),
+        "t".repeat(value),
+        Some("c".repeat(1_024)),
+    );
+    let escaped = row(1, bells.clone(), quotes.clone(), Some("nfs\n".repeat(256)));
+    let json =
+        |row: &WorkerRow| serde_json::to_string(&RowJson::of(row, now)).expect("a row's JSON");
+    let (told_plain, told) = (json(&plain), json(&escaped));
+    // Five more bytes a bell, and one more a quote, a backslash and a
+    // line feed.
+    assert_eq!(told.len() - told_plain.len(), 5 * zone + value + 256);
+    assert_eq!(
+        measure(&escaped) - measure(&plain),
+        told.len() - told_plain.len()
+    );
+
+    // A page of rows with that zone and that value. They state no pair and
+    // no encode offer: what that block's own fields take in a row's JSON
+    // is no part of a text's count.
+    let asked = WorkerRowsQuery {
+        models: Vec::new(),
+        limit: usize::MAX,
+    };
+    let rows: Vec<WorkerRow> = (0..2_000)
+        .map(|n| row(n, bells.clone(), quotes.clone(), None))
+        .collect();
+    let serving = rows.len();
+    let page = worker_rows_page(&asked, Rows::Told(rows, serving), now);
+    let bytes = serde_json::to_vec(&page).expect("a page's JSON").len();
+    assert!(
+        page.truncated && bytes <= PAGE_BYTES,
+        "{bytes} bytes in {} rows",
+        page.rows.len()
+    );
+}
+
 /// A page's JSON, literally: a row that states every fact, a
 /// provider's among them with a credential in its key and in its own,
 /// and a row that states the least, admitted after the take. The first
