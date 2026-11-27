@@ -18,6 +18,7 @@ use serde::{
 use serde_json::value::{to_raw_value, RawValue};
 use smg_worker::identity::{basic::Worker, error::WorkerError};
 
+use super::thinking_budget::{self, BudgetWire};
 use crate::routers::common::{
     request_to_value, serialize_json_sized,
     sglang_fields::{
@@ -28,6 +29,7 @@ use crate::routers::common::{
 
 #[derive(Debug)]
 pub(crate) enum RequestBodyError {
+    ThinkingBudget(String),
     Serialize(serde_json::Error),
     Prepare(WorkerError),
 }
@@ -45,77 +47,79 @@ pub(crate) fn serialize_request_body<T: Serialize>(
     worker: &dyn Worker,
     raw_len: Option<usize>,
 ) -> Result<Vec<u8>, RequestBodyError> {
-    serialize_request_body_impl(typed_req, canonical_model, worker, raw_len, true)
+    serialize_request_body_with_edits(typed_req, canonical_model, worker, raw_len, true, None)
 }
 
-/// Preserve explicitly supplied backend fields while applying model aliases
-/// and worker preparation. Decisions and SystemOne extensions have no shared defaults.
-pub(crate) fn serialize_request_body_preserving_fields<T: Serialize>(
-    typed_req: &T,
-    canonical_model: Option<&str>,
-    worker: &dyn Worker,
-    raw_len: Option<usize>,
-) -> Result<Vec<u8>, RequestBodyError> {
-    serialize_request_body_impl(typed_req, canonical_model, worker, raw_len, false)
-}
-
-fn serialize_request_body_impl<T: Serialize>(
+/// Apply the selected worker's wire edits to the same raw body used for model
+/// aliases and DP rank. Decisions and SystemOne preserve their backend fields.
+pub(super) fn serialize_request_body_with_edits<T: Serialize>(
     typed_req: &T,
     canonical_model: Option<&str>,
     worker: &dyn Worker,
     raw_len: Option<usize>,
     strip_defaults: bool,
+    budget: Option<i64>,
 ) -> Result<Vec<u8>, RequestBodyError> {
-    let bytes = serialize_json_sized(typed_req, raw_len).map_err(RequestBodyError::Serialize)?;
-
-    // With no alias and no worker edit only the strip can change an object:
-    // a body it would leave alone goes out unparsed.
-    if canonical_model.is_none()
-        && !worker.mutates_request()
+    let edit = budget
+        .map(|budget| {
+            (
+                thinking_budget::wire(worker.metadata().spec.runtime_type),
+                budget,
+            )
+        })
+        .filter(|(wire, _)| *wire != BudgetWire::Passthrough);
+    let value_fallback =
+        || value_request_body(typed_req, canonical_model, worker, raw_len, strip_defaults);
+    let mutates = worker.mutates_request();
+    let rank = if mutates && worker.uses_builtin_prepare_request() {
+        worker.dp_rank()
+    } else {
+        None
+    };
+    // A custom hook owns the model rewrite and default stripping in the Value
+    // path. Apply the budget to its output, in the same order as for built-ins.
+    let (bytes, canonical_model, strip_defaults) = if mutates && rank.is_none() {
+        let bytes = value_fallback()?;
+        if edit.is_none() {
+            return Ok(bytes);
+        }
+        (bytes, None, false)
+    } else {
+        let bytes =
+            serialize_json_sized(typed_req, raw_len).map_err(RequestBodyError::Serialize)?;
+        (bytes, canonical_model, strip_defaults)
+    };
+    if edit.is_none()
+        && canonical_model.is_none()
+        && rank.is_none()
         && bytes.first() == Some(&b'{')
         && !(strip_defaults && may_carry_stripped_sglang_default(&bytes))
     {
         return Ok(bytes);
     }
 
-    // A body the raw editor cannot parse (in practice: non-objects) takes
-    // the Value pipeline rather than skipping the hooks.
-    let Ok(mut body) = RawBody::parse(&bytes) else {
-        return value_request_body(typed_req, canonical_model, worker, raw_len, strip_defaults);
+    let mut body = match RawBody::parse(&bytes) {
+        Ok(body) => body,
+        Err(e) if edit.is_some() => return Err(RequestBodyError::Serialize(e)),
+        Err(_) => return value_fallback(),
     };
-    // Edits only swap the model id, append the DP rank, or strip fields, so
-    // the first pass plus the two inserted values bounds the reserialization.
     let mut extra = 0;
     if let Some(model) = canonical_model {
         let model = to_raw_value(model).map_err(RequestBodyError::Serialize)?;
         extra += model.get().len();
         body.set_model(model);
     }
-    // `Worker::prepare_request` on the raw slices, for the built-in edit
-    // (`Worker::uses_builtin_prepare_request`): the DP rank goes in after
-    // the model rewrite and before the strip, the order the Value pipeline
-    // runs, so the wire bytes are the same. A worker with its own
-    // `prepare_request` keeps the Value pipeline so its edits and errors
-    // still apply.
-    if worker.mutates_request() {
-        let rank = match worker.dp_rank() {
-            Some(rank) if worker.uses_builtin_prepare_request() => rank,
-            _ => {
-                return value_request_body(
-                    typed_req,
-                    canonical_model,
-                    worker,
-                    raw_len,
-                    strip_defaults,
-                )
-            }
-        };
+    if let Some(rank) = rank {
         let rank = to_raw_value(&rank).map_err(RequestBodyError::Serialize)?;
         extra += DATA_PARALLEL_RANK.len() + rank.get().len() + 4;
         body.insert(DATA_PARALLEL_RANK, rank);
     }
     if strip_defaults {
         body.strip_default_sglang_fields();
+    }
+    if let Some((wire, budget)) = edit {
+        thinking_budget::translate(&mut body, wire, budget)
+            .map_err(RequestBodyError::ThinkingBudget)?;
     }
     if body.mutated() {
         let mut out = Vec::with_capacity(bytes.len() + extra);
