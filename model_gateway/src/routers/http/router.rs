@@ -42,7 +42,7 @@ use openai_protocol::{
 use reqwest::multipart::{Form, Part};
 use smg_worker::{
     identity::{
-        basic::{ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerType},
+        basic::{BasicWorker, ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerType},
         endpoint::Endpoint,
     },
     metrics::writers::Metrics as WorkerMetrics,
@@ -94,7 +94,7 @@ use crate::{
             retry::{
                 is_request_timeout, is_retryable_response, request_timeout_response, RetryExecutor,
             },
-            snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt},
+            snapshot::{BodyFacts, RoutingPool, WorkerRegistry, WorkerRegistryExt},
             sse_rechunk::{NoopObserver, RechunkPolicy, SseRechunker},
             stream::GuardedStream,
             worker_selection::{SelectWorkerRequest, WorkerSelector},
@@ -2364,13 +2364,47 @@ pub(super) fn convert_reqwest_error(e: reqwest::Error) -> Response {
 
 use async_trait::async_trait;
 
+/// Whether a card of `worker` names an alias.
+fn names_an_alias(worker: &Arc<dyn Worker>) -> bool {
+    let models = &worker.metadata().spec.models;
+    models.iter().any(|card| !card.aliases.is_empty())
+}
+
+/// What `workers` say together to the decision of a request's body path,
+/// for their generation to keep; `None` at the first one that is not the
+/// built-in type, as nothing a worker of another type says is kept.
+fn kept_body_facts(workers: &[Arc<dyn Worker>]) -> Option<BodyFacts> {
+    let mut facts = BodyFacts {
+        aliased: false,
+        mutates: false,
+    };
+    for worker in workers {
+        // The type of the object itself: `Worker::as_any` is a worker's own
+        // answer, and one that wraps a built-in worker may give that one.
+        let object: &dyn std::any::Any = &**worker;
+        if !object.is::<BasicWorker>() {
+            return None;
+        }
+        facts.aliased |= names_an_alias(worker);
+        facts.mutates |= worker.mutates_request();
+    }
+    Some(facts)
+}
+
 impl Router {
     /// Gather this router's per-request state for the shared decision matrix
     /// in [`crate::routers::common::body_policy`].
     fn request_body_path(&self, headers: &HeaderMap, wasm_request_hooks: bool) -> BodyPath {
-        let candidates = self
-            .worker_registry
-            .get_routing_pool(UNKNOWN_MODEL_ID, RoutingPool::HttpRegular);
+        // What built-in workers say together is kept by their membership
+        // generation: the first decision behind a membership change reads
+        // them, every later one reads the kept answers and walks no worker.
+        // A worker of another type may change an answer on the handle the
+        // generation holds, so with one among them nothing is kept, and
+        // each question below walks the generation's pool to its first yes
+        // at every decision.
+        let generation = self.worker_registry.global_generation();
+        let kept = generation.body_facts(kept_body_facts);
+        let live = || generation.pool(RoutingPool::HttpRegular);
         decide_body_path(&BodyPathInputs {
             routing_key_override: self.policy_registry.routing_key_override_enabled(),
             // The body question: a document keyed by a request's own id
@@ -2381,11 +2415,14 @@ impl Router {
             // A worker knows a model's canonical id alone, and only a body
             // read here has an alias in it rewritten to that id.
             model_ambiguous: self.worker_registry.model_count() > 1
-                || candidates.iter().any(|w| {
-                    let models = &w.metadata().spec.models;
-                    models.iter().any(|card| !card.aliases.is_empty())
-                }),
-            worker_mutates_body: candidates.iter().any(|w| w.mutates_request()),
+                || match kept {
+                    Some(facts) => facts.aliased,
+                    None => live().iter().any(names_an_alias),
+                },
+            worker_mutates_body: match kept {
+                Some(facts) => facts.mutates,
+                None => live().iter().any(|worker| worker.mutates_request()),
+            },
             wasm_request_hooks,
             content_length: header_utils::content_length(Some(headers)).map(|len| len as u64),
             // The model sits inside the unread body, so any per-model retry
@@ -3089,15 +3126,19 @@ impl RouterTrait for Router {
 mod tests {
     use std::{
         net::SocketAddr,
-        sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering},
     };
 
     use axum::http::header::{CONTENT_LENGTH, RETRY_AFTER};
     use openai_protocol::{model_card::ModelCard, profile::ProviderProfile, rerank::RerankResult};
     use serde_json::{json, Value};
     use smg_worker::{
-        health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
-        identity::basic::BasicWorker,
+        connection::engine::EngineConnection,
+        health::{
+            circuit_breaker::{CircuitBreakerConfig, CircuitState},
+            resilience::ResolvedResilience,
+        },
+        identity::{basic::WorkerMetadata, error::WorkerResult},
         test_support::{no_health_check, RefusedAddress},
     };
 
@@ -4818,6 +4859,218 @@ mod tests {
             BodyPath::Buffer(REASON_MODEL_AMBIGUOUS),
             "a body that may name an alias is read first"
         );
+    }
+
+    /// The body decision reads the regular workers once in a membership
+    /// generation: the first decision keeps their answers, a later one
+    /// reads the kept answers, and the decision behind a membership change
+    /// reads the members of its own generation.
+    #[test]
+    fn the_body_decision_asks_the_workers_once_a_generation() {
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![]);
+        router
+            .worker_registry
+            .register_or_replace(Arc::new(plain_worker("http://worker1:8080")));
+        let headers = headers_with_content_length(Some("64"));
+        let streamed = BodyPath::Stream(REASON_RETRY_FORFEITED);
+        // The answers the generation of the moment holds; one that holds
+        // none would read its workers here.
+        let kept = || {
+            let generation = router.worker_registry.global_generation();
+            generation.body_facts(|_| panic!("no decision kept the answers"))
+        };
+        let plain = BodyFacts {
+            aliased: false,
+            mutates: false,
+        };
+
+        assert_eq!(router.request_body_path(&headers, false), streamed);
+        assert_eq!(kept(), Some(plain), "the first decision keeps the answers");
+        assert_eq!(router.request_body_path(&headers, false), streamed);
+
+        // A worker that rewrites its body joins, then leaves: each change
+        // publishes a generation, and the request behind it decides by the
+        // members of that generation.
+        let mutating = BasicWorkerBuilder::new("http://worker2:8080")
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .dp_config(3, 8)
+            .build();
+        let joined = router
+            .worker_registry
+            .register_or_replace(Arc::new(mutating));
+        assert_eq!(
+            router.request_body_path(&headers, false),
+            BodyPath::Buffer(REASON_WORKER_MUTATES_BODY)
+        );
+        assert_eq!(
+            kept(),
+            Some(BodyFacts {
+                mutates: true,
+                ..plain
+            })
+        );
+        router.worker_registry.remove(&joined).unwrap();
+        assert_eq!(router.request_body_path(&headers, false), streamed);
+        assert_eq!(kept(), Some(plain));
+    }
+
+    /// A regular worker of another type around a built-in one. It answers
+    /// [`Worker::as_any`] with the worker it wraps, says whether it
+    /// rewrites its body from a flag that changes on the handle, and counts
+    /// how often it is asked.
+    #[derive(Debug)]
+    struct Wrapper {
+        inner: BasicWorker,
+        mutates: AtomicBool,
+        asked: AtomicUsize,
+    }
+
+    impl Wrapper {
+        fn around(url: &str) -> Self {
+            Self {
+                inner: plain_worker(url),
+                mutates: AtomicBool::new(false),
+                asked: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Worker for Wrapper {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self.inner.as_any()
+        }
+        fn url(&self) -> &str {
+            self.inner.url()
+        }
+        fn api_key(&self) -> Option<&String> {
+            self.inner.api_key()
+        }
+        fn worker_type(&self) -> &WorkerType {
+            self.inner.worker_type()
+        }
+        fn connection_mode(&self) -> &ConnectionMode {
+            self.inner.connection_mode()
+        }
+        fn status(&self) -> openai_protocol::worker::WorkerStatus {
+            self.inner.status()
+        }
+        fn set_status(&self, status: openai_protocol::worker::WorkerStatus) {
+            self.inner.set_status(status);
+        }
+        fn load(&self) -> usize {
+            self.inner.load()
+        }
+        fn increment_load(&self) {
+            self.inner.increment_load();
+        }
+        fn decrement_load(&self) {
+            self.inner.decrement_load();
+        }
+        fn routing_key_load(&self) -> usize {
+            self.inner.routing_key_load()
+        }
+        fn routing_key_inflight(&self, routing_key: &str) -> usize {
+            self.inner.routing_key_inflight(routing_key)
+        }
+        fn increment_routing_key_load(&self, routing_key: &str) {
+            self.inner.increment_routing_key_load(routing_key);
+        }
+        fn decrement_routing_key_load(&self, routing_key: &str) {
+            self.inner.decrement_routing_key_load(routing_key);
+        }
+        fn processed_requests(&self) -> usize {
+            self.inner.processed_requests()
+        }
+        fn increment_processed(&self) {
+            self.inner.increment_processed();
+        }
+        fn metadata(&self) -> &WorkerMetadata {
+            self.inner.metadata()
+        }
+        fn circuit_breaker_state(&self) -> CircuitState {
+            self.inner.circuit_breaker_state()
+        }
+        fn circuit_breaker_can_execute(&self) -> bool {
+            self.inner.circuit_breaker_can_execute()
+        }
+        fn record_circuit_breaker_outcome(&self, success: bool) {
+            self.inner.record_circuit_breaker_outcome(success);
+        }
+        fn resilience(&self) -> &ResolvedResilience {
+            self.inner.resilience()
+        }
+        fn http_client(&self) -> &reqwest::Client {
+            self.inner.http_client()
+        }
+        fn http_client_handle_if_initialized(&self) -> Option<Arc<reqwest::Client>> {
+            self.inner.http_client_handle_if_initialized()
+        }
+        async fn check_health_async(&self) -> WorkerResult<()> {
+            self.inner.check_health_async().await
+        }
+        async fn engine_connection(&self) -> WorkerResult<Option<Arc<dyn EngineConnection>>> {
+            self.inner.engine_connection().await
+        }
+        fn mutates_request(&self) -> bool {
+            self.asked.fetch_add(1, AtomicOrdering::SeqCst);
+            self.mutates.load(AtomicOrdering::SeqCst)
+        }
+    }
+
+    /// A worker of another type is asked at every decision, also one that
+    /// answers [`Worker::as_any`] with the built-in worker it wraps: what
+    /// it says changes on the handle a generation holds, behind no
+    /// membership change.
+    #[test]
+    fn the_body_decision_asks_a_worker_of_another_type_every_time() {
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![]);
+        let wrapper = Arc::new(Wrapper::around("http://worker1:8080"));
+        router
+            .worker_registry
+            .register_or_replace(Arc::clone(&wrapper) as Arc<dyn Worker>);
+        let headers = headers_with_content_length(Some("64"));
+
+        wrapper.mutates.store(true, AtomicOrdering::SeqCst);
+        assert_eq!(
+            router.request_body_path(&headers, false),
+            BodyPath::Buffer(REASON_WORKER_MUTATES_BODY)
+        );
+        wrapper.mutates.store(false, AtomicOrdering::SeqCst);
+        assert_eq!(
+            router.request_body_path(&headers, false),
+            BodyPath::Stream(REASON_RETRY_FORFEITED)
+        );
+        assert_eq!(wrapper.asked.load(AtomicOrdering::SeqCst), 2);
+    }
+
+    /// A decision that finds answers kept reads those and asks no worker.
+    /// The worker here counts how often it is asked; the test keeps the
+    /// answers itself, as the first decision does for built-in workers,
+    /// and keeps one this worker does not give.
+    #[test]
+    fn the_body_decision_asks_no_worker_behind_kept_answers() {
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![]);
+        let counted = Arc::new(Wrapper::around("http://worker1:8080"));
+        router
+            .worker_registry
+            .register_or_replace(Arc::clone(&counted) as Arc<dyn Worker>);
+        let headers = headers_with_content_length(Some("64"));
+        let kept = BodyFacts {
+            aliased: false,
+            mutates: true,
+        };
+        let generation = router.worker_registry.global_generation();
+        assert_eq!(generation.body_facts(|_| Some(kept)), Some(kept));
+
+        for _ in 0..2 {
+            assert_eq!(
+                router.request_body_path(&headers, false),
+                BodyPath::Buffer(REASON_WORKER_MUTATES_BODY)
+            );
+        }
+        assert_eq!(counted.asked.load(AtomicOrdering::SeqCst), 0);
     }
 
     #[test]

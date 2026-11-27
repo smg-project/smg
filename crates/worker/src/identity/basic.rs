@@ -157,8 +157,13 @@ pub fn merge_labels(
 }
 
 /// Core worker abstraction that represents a backend service
+///
+/// [`Any`] is a supertrait: a caller that must know the concrete type of a
+/// worker asks the object itself (`let object: &dyn Any = worker;`), where
+/// [`Worker::as_any`] is each implementation's own answer. Every `'static`
+/// type is [`Any`], so an implementation writes nothing for it.
 #[async_trait]
-pub trait Worker: Send + Sync + fmt::Debug + 'static {
+pub trait Worker: Any + Send + Sync + fmt::Debug + 'static {
     /// Downcast support for same-URL replace state sharing.
     fn as_any(&self) -> &dyn Any;
 
