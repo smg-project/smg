@@ -36,7 +36,7 @@ use crate::{
     engine::{
         decision::{Decision, PairSide, ShadowKind},
         explain::{DecisionRecord, Samples},
-        framework::{Engine, ShadowRows, SHADOWS},
+        framework::{ShadowRows, Stood, SHADOWS},
         shadow::{ShadowCount, ShadowCounts, ShadowSide, Shadowed, SHADOW_ROWS},
         view::{fingerprint, Phase},
     },
@@ -59,15 +59,6 @@ pub(in crate::engine) struct InForce {
     /// process has ([`InProcess::applied`]). A list's value is made
     /// under it and read under it alone ([`Loaded::members_of`]).
     pub(in crate::engine) applied: u64,
-    /// What an older request's word is told to ([`Self::stood_at`]): for
-    /// each generation below the document's own under which a profile it
-    /// kept was built, in their order, the profiles and counts of sends
-    /// that stood by then ([`Engine::hearing`]). Empty where every profile
-    /// was built new.
-    older: Box<[(u64, Engine)]>,
-    /// No stage and no count, over the engine's session table: what hears
-    /// a word older than every stage the document kept.
-    table: Engine,
     /// The kinds of event the document takes ([`Lifecycle::hears`]), read
     /// once, here. A document that takes no word on a lease
     /// ([`EventSet::LEASE`]) costs a request no lease, no id and no word,
@@ -111,6 +102,8 @@ pub(in crate::engine) struct InForce {
     /// named values ([`InProcess::tell_loads`]). Under any other none is
     /// converted for a telling: a column held by a stage that keeps no
     /// report is read at decisions alone.
+    ///
+    /// [`Engine::keepers_read_signals`]: crate::engine::Engine::keepers_read_signals
     pub(super) keepers_read_signals: bool,
     /// Whether a decision under the document reads the load snapshot the
     /// engine's task keeps at hand: a stage of it reads a load report
@@ -153,10 +146,7 @@ impl InForce {
         let needs = spec.needs();
         let any_shadow = spec.engine().seat_flags() & SHADOWS != 0;
         let engine = spec.engine();
-        let kept = |since| (since, engine.hearing(|made| made <= since));
         Self {
-            older: engine.kept_since().into_iter().map(kept).collect(),
-            table: engine.hearing(|_| false),
             hears,
             hears_beside_table,
             leases_or_samples: hears.intersects(EventSet::LEASE) || samples,
@@ -180,14 +170,20 @@ impl InForce {
     /// dispatch is counted apart, by every count of sends in force
     /// ([`lease_events::of_host`](crate::engine::lease_events::of_host)).
     ///
+    /// The document holds nothing for it: the answer reads the document's
+    /// own profiles by the generations they were made under
+    /// ([`Engine::stood_by`]). So a document whose profiles were made under
+    /// many generations holds each of them once.
+    ///
     /// It is written for an earlier generation alone. Asked the document's
     /// own generation or one above it, it answers every stage the document
     /// kept and no stage it built: a caller that may hold such a lease
     /// tests the number first (`InForce::hearing`).
-    pub(super) fn stood_at(&self, generation: u64) -> &Engine {
-        let stood = |kept: &&(u64, Engine)| kept.0 <= generation;
-        let kept = self.older.iter().rev().find(stood);
-        kept.map_or(&self.table, |kept| &kept.1)
+    ///
+    /// [`Engine::stood_by`]: crate::engine::Engine::stood_by
+    #[inline]
+    pub(super) fn stood_at(&self, generation: u64) -> Stood<'_> {
+        self.spec.engine().stood_by(generation)
     }
 
     /// What hears a word of a lease issued under `generation`, for a host
@@ -198,9 +194,9 @@ impl InForce {
     /// ([`Self::stood_at`]). One of a generation above the document's is
     /// heard by no stage and no table: no stage of this engine booked it.
     #[cfg(feature = "controller")]
-    fn hearing(&self, generation: u64) -> Option<&Engine> {
+    fn hearing(&self, generation: u64) -> Option<Stood<'_>> {
         match generation.cmp(&self.spec.generation()) {
-            std::cmp::Ordering::Equal => Some(self.spec.engine()),
+            std::cmp::Ordering::Equal => Some(self.spec.engine().stands()),
             std::cmp::Ordering::Less => Some(self.stood_at(generation)),
             std::cmp::Ordering::Greater => None,
         }
@@ -412,7 +408,7 @@ impl<'d> Loaded<'_, 'd> {
     /// lease of a generation above that document's.
     #[cfg(feature = "controller")]
     #[inline]
-    pub(crate) fn hearing(self, generation: u64) -> Option<&'d Engine> {
+    pub(crate) fn hearing(self, generation: u64) -> Option<Stood<'d>> {
         self.document.hearing(generation)
     }
 

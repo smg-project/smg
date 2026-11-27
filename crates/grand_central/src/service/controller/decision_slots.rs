@@ -218,7 +218,7 @@ use crate::{
         decision_engine::{DecisionRefused, DecodeRefused},
         decision_slot::DecisionSlot,
         explain::{DecisionRecord, SampleCount, Samples},
-        framework::{release, Engine},
+        framework::{release, Engine, Issuing},
         view::{fingerprint, Phase},
     },
     service::{
@@ -1560,7 +1560,7 @@ fn take_back(
 ) {
     if store.unissue_decode(gateway, lease.id, issue) {
         if let Some(engine) = issuing(world, lease) {
-            engine.on_released(lease, reason);
+            engine.released(lease, reason);
         }
     }
 }
