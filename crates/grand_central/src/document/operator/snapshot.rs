@@ -189,8 +189,11 @@ enum ReachableJson {
     GatewayId(String),
 }
 
-/// What a row states of a pair and of an encode handoff, under the names
-/// of the contract's pairing descriptor.
+/// What a row states of a pair and of an encode handoff, in one object. A
+/// pair's fields stand under the names of the contract's pairing
+/// descriptor. `vision` and the encode offer's five fields keep the names
+/// the descriptor reserves: the contract states them on the registration
+/// and on the row themselves.
 #[derive(Serialize)]
 struct PairingJson<'a> {
     protocol: Option<&'a str>,

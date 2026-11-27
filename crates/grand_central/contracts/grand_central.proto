@@ -864,8 +864,8 @@ message WorkerRow {
   bool vision = 29;
   // The worker's end of the encode handoff. Absent: it states none, and the
   // row reads as it did before this field. A reader that knows no such
-  // field reads every row as one that states no end, so it hands the
-  // worker no item.
+  // field reads every row as one that states no end, so a decision it
+  // makes from its own rows hands the worker no item.
   EncodeOffer encode = 30;
 }
 
@@ -937,8 +937,10 @@ message EncodeOffer {
   bool producer = 2;
   // The worker states the consumer role: a prefill's, under a push.
   bool consumer = 3;
-  // The connector the role is stated on: at most 256 bytes, with no blank
-  // and no control character. Empty states none.
+  // The connector the role is stated on: any text, compared whole and never
+  // parsed. No rule holds its words, and the row's size is its one bound. A
+  // registration's is read past the blanks around it. Empty, or blank in a
+  // registration, states none.
   string connector = 4;
   // The worker, an encoder, processes an item's references itself.
   bool references = 5;

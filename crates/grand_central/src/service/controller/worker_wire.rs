@@ -315,14 +315,11 @@ const fn offer_numbers(offer: &EncodeOffer) -> proto::EncodeOffer {
 
 /// The store's offer of the contract's block, in a registration and in a
 /// told row alike. A form this build does not know is refused by the path
-/// `handoff`. The connector is a name: one past its bound, or that holds a
-/// blank or a control character, is refused by the path `connector`, never
-/// mended. An empty one states none.
-fn offer(
-    block: &proto::EncodeOffer,
-    handoff: &'static str,
-    connector: &'static str,
-) -> Result<EncodeOffer, Refused> {
+/// `handoff`: no reader can hold it. The connector is read as told, with no
+/// rule of its words: it is the store's text, compared whole and never
+/// parsed, and its one bound is the row's. So a row a leader's store took
+/// is a row its standby reads. An empty one states none.
+fn offer(block: &proto::EncodeOffer, handoff: &'static str) -> Result<EncodeOffer, Refused> {
     // Every field by its name: one the contract gains stops the build here,
     // so none passes unread.
     let proto::EncodeOffer {
@@ -343,15 +340,6 @@ fn offer(
             ))
         }
     };
-    if name.len() > NAME_BYTES {
-        return Err(refused(connector, "a connector is at most 256 bytes"));
-    }
-    if blank(name) {
-        return Err(refused(
-            connector,
-            "a connector holds no blank and no control character",
-        ));
-    }
     Ok(EncodeOffer {
         handoff: form,
         producer: *producer,
@@ -537,7 +525,9 @@ fn maker_weight(maker: &Registrant) -> usize {
 /// or drain window. It reads an empty zone, an empty connector of an encode
 /// offer and a zero admission window, block size or port as none. The facts
 /// are written as the log writes them and read back as a standby reads
-/// them, so a fact the wire gains is taken here with no second list.
+/// them, so a fact the wire gains is taken here with no second list. A text
+/// the log tells comes back as it was told, so the door holds an encode
+/// offer's connector to no rule of its words.
 #[cfg_attr(
     not(any(test, feature = "discovery")),
     expect(dead_code, reason = "the host's door asks it of each registration")
@@ -742,9 +732,12 @@ fn told_status(status: i32) -> Option<WorkerStatus> {
 /// descriptor, the priority) stand at the store's defaults: no call states
 /// them in this build.
 ///
-/// A value this build cannot hold (a status, a role or a scope it does not
-/// know, a count past the store's width) is refused by its path: a standby
-/// that guessed would hold another row than its leader's.
+/// A value this build cannot hold (a status, a role, a scope or an encode
+/// handoff it does not know, a count past the store's width) is refused by
+/// its path: a standby that guessed would hold another row than its
+/// leader's. A fact's text is read as told, an encode offer's connector as
+/// a URL, a model id, a zone and a label are: the leader's store took it,
+/// and the reader asks no second rule of it.
 pub(crate) fn told_row(told: &proto::WorkerRow, now: Instant) -> Result<WorkerRow, Refused> {
     use proto::reachability::Scope;
     let status = told_status(told.status).ok_or_else(|| unknown("row.status"))?;
@@ -849,7 +842,7 @@ pub(crate) fn told_row(told: &proto::WorkerRow, now: Instant) -> Result<WorkerRo
         encode: told
             .encode
             .as_ref()
-            .map(|block| offer(block, "row.encode.handoff", "row.encode.connector"))
+            .map(|block| offer(block, "row.encode.handoff"))
             .transpose()?
             .unwrap_or_default(),
         ..WorkerFacts::default()
@@ -1186,9 +1179,11 @@ fn over(
         facts.vision = vision;
     }
     // The worker's end of the encode handoff is the block's, whole: an
-    // empty one states no end, and one left out keeps the row's.
+    // empty one states nothing, and one left out keeps the row's. Its
+    // connector is read as the store holds it, past the blanks around it,
+    // so a registration that states the row's offer again finds it unmoved.
     if let Some(block) = &spec.encode {
-        facts.encode = offer(block, "spec.encode.handoff", "spec.encode.connector")?;
+        facts.encode = offer(block, "spec.encode.handoff")?.normalized();
     }
     // The health policy of record is the registration's, whole: one that
     // states none is checked under the defaults.

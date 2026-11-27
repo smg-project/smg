@@ -150,8 +150,8 @@ pub struct WorkerFacts {
     /// shared pointer: a worker that reports none holds one word for it,
     /// and every copy of a row shares the one its worker reported.
     pub pairing: Option<Arc<PairingDescriptor>>,
-    /// The worker's end of the encode handoff, as the handshake learned it;
-    /// the default states none. A worker host derives its encode classes
+    /// The worker's end of the encode handoff, as its registration states
+    /// it; the default states none. A worker host derives its encode classes
     /// from it by the engine's rule, with the engine kind as the runtime
     /// ([`EncodeClasses`](crate::engine::EncodeClasses)). The door drops a
     /// blank connector and reads its name past its blanks.

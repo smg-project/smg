@@ -1821,11 +1821,12 @@ fn a_fact_the_log_does_not_carry_is_refused_by_its_name_and_nothing_is_written()
                 ..EncodeOffer::default()
             };
         }),
-        ("row.encode.connector", |facts| {
+        // A connector's one bound is the row's.
+        ("row", |facts| {
             facts.encode = EncodeOffer {
                 handoff: EncodeHandoff::Push,
                 producer: true,
-                connector: Some("connector a".to_owned()),
+                connector: Some("a".repeat(WorkerFacts::ROW_BYTES)),
                 ..EncodeOffer::default()
             };
         }),
@@ -1853,7 +1854,9 @@ fn a_fact_the_log_does_not_carry_is_refused_by_its_name_and_nothing_is_written()
 
     // What the log carries is taken, and a standby reads it back whole:
     // what the worker states for a request's hard demands among it,
-    // whether it takes images, and its end of the encode handoff.
+    // whether it takes images, and its end of the encode handoff. The
+    // offer's connector is the store's text, held to no rule of its words:
+    // one that holds a blank and a control character, past a name's bound.
     let stated = DemandFacts {
         runtime: 7,
         references: true,
@@ -1864,7 +1867,7 @@ fn a_fact_the_log_does_not_carry_is_refused_by_its_name_and_nothing_is_written()
     let offered = EncodeOffer {
         handoff: EncodeHandoff::Push,
         producer: true,
-        connector: Some("connector-a".to_owned()),
+        connector: Some(format!("connector a\u{7}{}", "b".repeat(256))),
         ..EncodeOffer::default()
     };
     let stating = |_: Option<&WorkerFacts>| WorkerFacts {
