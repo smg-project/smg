@@ -302,7 +302,7 @@ pub(crate) trait Turn {
 
     /// The row that stands under the id `id`, as the door reads a record:
     /// a door with a holder reads it off its worker objects
-    /// ([`Objects::record`](super::Objects::record)).
+    /// ([`Objects::read_row`](super::Objects::read_row)).
     fn row(&self, id: WorkerId) -> Option<WorkerRow>;
 
     /// The row that stands under `url`, as [`Self::row`] reads one.

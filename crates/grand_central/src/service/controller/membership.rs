@@ -26,7 +26,7 @@
 //! **A call reads the record that stands off the worker objects.** The row
 //! under a URL, the row under an id and an engine's rows are read back from
 //! the objects in their holder's turn
-//! ([`Objects::record`]). A worker object's status leads its row's, so
+//! ([`Objects::read_row`]). A worker object's status leads its row's, so
 //! a record read carries the status its object states.
 //!
 //! **A call writes under the term it reads once it holds the door's turn.**
@@ -287,14 +287,14 @@ impl MembershipCalls {
 
     /// The door's read of the row under `id`, in its turn: the record read
     /// back from the worker object that stands, with the status that
-    /// object states ([`Objects::record`]).
+    /// object states ([`Objects::read_row`]).
     fn row(&self, id: WorkerId) -> Option<WorkerRow> {
-        self.objects.record(id)
+        self.objects.read_row(id)
     }
 
     /// The door's read of the row under `url`, as [`Self::row`] reads one.
     fn row_under(&self, url: &str) -> Option<WorkerRow> {
-        self.objects.record_under(url)
+        self.objects.read_row_under(url)
     }
 
     /// The door's read of the rows that name `engine`, as [`Self::row`]

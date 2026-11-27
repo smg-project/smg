@@ -198,8 +198,10 @@ impl<G: Generation> Objects<G> {
     /// One body for a cut the store takes whole, under the holder's turn
     /// its caller holds: `door` is the store's own entry for it. The
     /// holder lays the cut's own rows, copied ahead of that entry, which
-    /// takes the cut whole: a cut the store refuses is copied too. The one
-    /// read of the table left is each row's status. Each row is held
+    /// takes the cut whole: a cut the store refuses is copied too. The
+    /// pass uses one thing of the table, a row's status where the row
+    /// stands at its object's revision, and hands the store each row's
+    /// count. Each row is held
     /// against the object that stands for it ([`Self::reconcile`]), and
     /// the registry takes new objects in the rows' order. The keeper
     /// forgets the rows that left behind the store's write.

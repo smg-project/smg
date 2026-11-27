@@ -25,6 +25,20 @@ pub(super) fn engine_of(worker: &dyn Worker) -> &str {
     spec.dp_base_url.as_deref().unwrap_or(&spec.url)
 }
 
+/// The ids of the models `worker` serves now, in the order
+/// [`Worker::any_model`] hands its cards. The worker crate's object and
+/// the trait's own body hand them in the order of [`Worker::models`].
+/// Each id is copied, and no card: a card holds its chat template, and
+/// [`Worker::models`] copies every card whole.
+fn model_ids(worker: &dyn Worker) -> Vec<String> {
+    let mut ids = Vec::new();
+    worker.any_model(&mut |card| {
+        ids.push(card.id.clone());
+        false
+    });
+    ids
+}
+
 /// The facts a provider states of a worker it found, from the object to the
 /// row as the module's table describes. Facts the object does not carry
 /// come from the standing row, or from the store's defaults. The models are
@@ -59,7 +73,7 @@ pub fn facts(worker: &dyn Worker, standing: Option<&WorkerFacts>) -> WorkerFacts
         } else {
             String::new()
         },
-        models: worker.models().into_iter().map(|card| card.id).collect(),
+        models: model_ids(worker),
         // Values wider than a row's fields take the largest value they hold.
         dp_rank: u16::try_from(spec.dp_rank.unwrap_or(0)).unwrap_or(u16::MAX),
         dp_size: u16::try_from(spec.dp_size.unwrap_or(1)).unwrap_or(u16::MAX),

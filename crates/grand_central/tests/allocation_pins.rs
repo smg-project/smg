@@ -16,7 +16,7 @@
 //! completion allocates nothing after the first ones. A keeper of worker
 //! objects is pinned in a build with the `worker-host` feature: a status
 //! tell copies each id of its worker's models once, and only for a store
-//! that tells a journal. A separate
+//! that tells a journal. A read of a row copies no model card. A separate
 //! executable, so it can declare the counting allocator the pins need.
 //!
 //! One pin reads frees: a decision that spans a write frees nothing on its
@@ -1269,5 +1269,75 @@ mod status_tells {
                 "a journal {journaled}: {one} for one model, {many} for {MODELS}"
             );
         }
+    }
+}
+
+/// What a read of a row copies of its worker's models, through a host's
+/// read call on the keeper of its worker objects.
+#[cfg(feature = "worker-host")]
+mod row_reads {
+    use std::sync::Arc;
+
+    use smg_grand_central::{
+        store::{MemoryStore, Registrant, WorkerFacts},
+        worker_host::{Members, Objects},
+    };
+    use smg_worker::{model_card::ModelCard, registry::WorkerRegistry};
+
+    use super::allocations_during;
+
+    /// The fewest allocation calls of one read of a row among a few reads.
+    /// The row's worker serves two models. Each card is as the keeper
+    /// builds it from the row, an id alone. Where `filled`, the test sets
+    /// cards that hold more beside their ids. Each holds a display name,
+    /// two aliases, a family, an architecture, a tokenizer path, a chat
+    /// template of 4 KiB and two parsers' names.
+    fn a_row_read(filled: bool) -> usize {
+        let store = MemoryStore::new();
+        let objects: Objects<Members> = Objects::new(Arc::new(WorkerRegistry::new()));
+        let key = "http://w:8000".to_owned();
+        let facts = WorkerFacts {
+            key: key.clone(),
+            engine: key,
+            incarnation: 1,
+            models: vec!["m0".to_owned(), "m1".to_owned()],
+            dp_size: 1,
+            ..WorkerFacts::default()
+        };
+        let laid = objects.upsert(&store, facts, Registrant::Control);
+        let id = laid.expect("a registration").id();
+        if filled {
+            let object = objects.object(id).expect("the row's object");
+            let worker = objects.registry().get(&object).expect("the object");
+            let card = |model: &str| {
+                ModelCard::new(model)
+                    .with_display_name("M")
+                    .with_aliases(["m-a", "m-b"])
+                    .with_hf_model_type("llama")
+                    .with_architectures(vec!["LlamaForCausalLM".to_owned()])
+                    .with_tokenizer_path(model)
+                    .with_chat_template("x".repeat(4096))
+                    .with_reasoning_parser("r")
+                    .with_tool_parser("t")
+            };
+            let cards = vec![card("m0"), card("m1")];
+            let changed = objects.registry().refresh_models(&worker, cards);
+            assert!(changed, "the object took the filled cards");
+        }
+        let one = |_| {
+            let (row, allocations) = allocations_during(|| objects.read_row(id));
+            assert_eq!(row.expect("the row").facts.models, ["m0", "m1"]);
+            allocations
+        };
+        (0..4).map(one).min().expect("four reads")
+    }
+
+    /// A read of a row copies each id of its worker's models and no card.
+    /// It allocates the same for cards that hold their ids alone and for
+    /// cards that hold what this case fills beside them.
+    #[test]
+    fn a_row_read_copies_a_models_id_and_no_card() {
+        let (built, filled) = (a_row_read(false), a_row_read(true));
+        assert_eq!(filled, built, "ids alone against filled cards");
     }
 }
