@@ -270,7 +270,7 @@ async fn the_serialized_request_is_not_copied_a_second_time_for_the_attempts() {
 }
 
 #[tokio::test]
-async fn external_chat_forwards_thinking_token_budget_fields_as_supplied() {
+async fn external_chat_uses_the_same_thinking_token_budget_for_both_spellings() {
     use axum::{routing::post, Json, Router};
     use serde_json::{json, Value};
 
@@ -292,13 +292,39 @@ async fn external_chat_forwards_thinking_token_budget_fields_as_supplied() {
     );
     let requests = async {
         let tenant = TenantRequestMeta::new(TenantKey::new("t"));
-        for fields in [
-            json!({"thinking_token_budget": 0}),
-            json!({"custom_params": {"thinking_budget": 8, "other": true}}),
-            json!({"thinking_token_budget": 0, "custom_params": {"thinking_budget": 8}}),
-            json!({"thinking_token_budget": -1}),
-            json!({"custom_params": {"thinking_budget": -1}}),
-            json!({}),
+        for (fields, expected_params) in [
+            (json!({"thinking_token_budget": 0}), None),
+            (json!({"thinking_token_budget": -1}), None),
+            (
+                json!({"custom_params": {"thinking_budget": -1}}),
+                Some(json!({"thinking_budget": -1})),
+            ),
+            (
+                json!({"thinking_token_budget": 7, "custom_params": {"thinking_budget": null}}),
+                Some(json!({"thinking_budget": 7})),
+            ),
+            (
+                json!({"custom_params": {"thinking_budget": 8, "other": true}}),
+                Some(json!({"thinking_budget": 8, "other": true})),
+            ),
+            (
+                json!({"thinking_token_budget": 0, "custom_params": {"thinking_budget": 8, "other": true}}),
+                Some(json!({"thinking_budget": 0, "other": true})),
+            ),
+            (
+                json!({"thinking_token_budget": -1, "custom_params": {"thinking_budget": "ignored"}}),
+                Some(json!({"thinking_budget": -1})),
+            ),
+            (
+                json!({"thinking_token_budget": null, "custom_params": {"thinking_budget": 4}}),
+                Some(json!({"thinking_budget": 4})),
+            ),
+            (
+                json!({"thinking_token_budget": null, "custom_params": {"thinking_budget": null, "other": true}}),
+                Some(json!({"other": true})),
+            ),
+            (json!({"custom_params": {"thinking_budget": null}}), None),
+            (json!({}), None),
         ] {
             let mut body = json!({"model":"m","messages":[{"role":"user","content":"hi"}]});
             body.as_object_mut()
@@ -314,13 +340,18 @@ async fn external_chat_forwards_thinking_token_budget_fields_as_supplied() {
             .await;
             assert_eq!(response.status(), StatusCode::OK);
             let received: Value = serde_json::from_slice(&bytes_of(response).await).unwrap();
-            for key in ["thinking_token_budget", "custom_params"] {
-                assert_eq!(
-                    received.get(key),
-                    fields.get(key),
-                    "external request {fields}"
-                );
-            }
+            assert_eq!(
+                received.get("thinking_token_budget"),
+                fields
+                    .get("thinking_token_budget")
+                    .filter(|value| !value.is_null()),
+                "external request {fields}"
+            );
+            assert_eq!(
+                received.get("custom_params"),
+                expected_params.as_ref(),
+                "external request {fields}"
+            );
         }
     };
     tokio::select! {

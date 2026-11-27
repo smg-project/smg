@@ -11557,7 +11557,7 @@ mod tests {
         assert_eq!(body["thinking_token_budget"], -1);
         assert_eq!(
             body["custom_params"],
-            json!({"thinking_budget": 64, "other": 42})
+            json!({"thinking_budget": -1, "other": 42})
         );
     }
 

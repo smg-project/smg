@@ -15,9 +15,8 @@ use super::{
         deserialize_null_as_true, empty_tool_name, invalid, invalid_at, is_false, is_true,
         json_type_name, on_field, validate_json_schema_shape, validate_logit_bias, validate_stop,
         CachePartition, ChatLogProbs, ContentPart, Function, FunctionCall, FunctionCallResponse,
-        FunctionChoice, GenerationRequest, ResponseFormat, StreamOptions, StringOrArray,
-        ThinkingTokenBudget, Tool, ToolCall, ToolCallDelta, ToolChoice, ToolChoiceValue,
-        ToolReference, Usage,
+        FunctionChoice, GenerationRequest, ResponseFormat, StreamOptions, StringOrArray, Tool,
+        ToolCall, ToolCallDelta, ToolChoice, ToolChoiceValue, ToolReference, Usage,
     },
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
@@ -687,16 +686,36 @@ impl ChatCompletionRequest {
     pub fn resolved_thinking_token_budget(
         &self,
     ) -> Result<Option<u32>, validator::ValidationError> {
-        Ok(match self.checked_thinking_token_budget()? {
-            Some(ThinkingTokenBudget::Tokens(budget)) => u32::try_from(budget).ok(),
-            Some(ThinkingTokenBudget::NullAlias) | None => None,
-        })
+        Ok(self
+            .checked_thinking_token_budget()?
+            .and_then(|budget| u32::try_from(budget).ok()))
+    }
+
+    /// An upstream may read either spelling. Preserve the client's keys while giving
+    /// both the top-level value, and omit a null alias when no budget was set.
+    pub(crate) fn normalize_upstream_thinking_budget(&mut self) {
+        let Some(params) = self
+            .other
+            .get_mut("custom_params")
+            .and_then(Value::as_object_mut)
+        else {
+            return;
+        };
+        let Some(alias) = params.get_mut("thinking_budget") else {
+            return;
+        };
+        if let Some(budget) = self.thinking_token_budget {
+            *alias = budget.into();
+        } else if alias.is_null() {
+            params.remove("thinking_budget");
+            if params.is_empty() {
+                self.other.remove("custom_params");
+            }
+        }
     }
 
     /// Resolve the aliases without losing the HTTP engine's explicit -1 sentinel.
-    fn checked_thinking_token_budget(
-        &self,
-    ) -> Result<Option<ThinkingTokenBudget>, validator::ValidationError> {
+    fn checked_thinking_token_budget(&self) -> Result<Option<i64>, validator::ValidationError> {
         const CANONICAL: &str = "thinking_token_budget";
         const ALIAS: &str = "custom_params.thinking_budget";
         let invalid_budget = |field| {
@@ -713,18 +732,16 @@ impl ChatCompletionRequest {
                 .other
                 .get("custom_params")
                 .and_then(|params| params.get("thinking_budget"))
+                .filter(|value| !value.is_null())
             else {
                 return Ok(None);
             };
-            if value.is_null() {
-                return Ok(Some(ThinkingTokenBudget::NullAlias));
-            }
             (ALIAS, value.as_i64().ok_or_else(|| invalid_budget(ALIAS))?)
         };
         if !(-1..=i64::from(u32::MAX)).contains(&budget) {
             return Err(invalid_budget(field));
         }
-        Ok(Some(ThinkingTokenBudget::Tokens(budget)))
+        Ok(Some(budget))
     }
 
     /// The cap the client put on the completion: `max_completion_tokens`,
@@ -1318,7 +1335,7 @@ impl Normalizable for ChatCompletionRequest {
 // ============================================================================
 
 impl GenerationRequest for ChatCompletionRequest {
-    fn thinking_token_budget(&self) -> Option<ThinkingTokenBudget> {
+    fn thinking_token_budget(&self) -> Option<i64> {
         self.checked_thinking_token_budget().ok().flatten()
     }
 

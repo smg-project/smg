@@ -43,10 +43,9 @@ SGLang with `pyzmq>=25.0.0` and `msgspec>=0.18.0`).
 Use `thinking_token_budget` or `custom_params.thinking_budget` on
 `POST /v1/chat/completions` to limit reasoning within a generated answer.
 Zero is an explicit budget. Reasoning mode and the total output token limit
-are controlled separately. For SGLang, vLLM and TensorRT-LLM HTTP workers and
-supported gRPC workers, SMG reads `thinking_token_budget` first, in either
-JSON key order. It reads the nested field only when the top-level value
-is missing or null. An invalid effective budget returns HTTP 400.
+are controlled separately. For every backend, SMG reads `thinking_token_budget`
+first, in either JSON key order. It reads the nested field only when the
+top-level value is missing or null. An invalid effective budget returns HTTP 400.
 
 ```json
 {
@@ -61,9 +60,10 @@ TensorRT-LLM read `thinking_token_budget`. SMG uses its typed chat request
 path to send the selected worker its native field and preserve other
 `custom_params` entries. It buffers the full chat request body before
 contacting the worker. Clients can still stream the response with
-`stream: true`. For unknown runtimes and external providers, SMG passes
-through both spellings when both have values. A top-level JSON null
-is treated as an omitted field.
+`stream: true`. For unknown runtimes and external providers, SMG keeps
+a single budget under the name the client used. If the client sends both
+names with a non-null top-level value, SMG sends that value under both
+names. A request with only null budget values uses the worker default.
 
 HTTP forwarding is independent of the worker's version, capability labels
 and strict-thinking setting. Enforcement depends on the upstream model and
