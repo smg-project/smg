@@ -2512,7 +2512,7 @@ pub async fn startup_with(
     // resolved router config; per-worker specs still override at request time.
     use crate::routers::grpc::multimodal::{
         enforce_jpeg_decoder_policy, init_mm_settings, init_mm_transport_defaults,
-        report_jpeg_decoder, MultimodalSettings,
+        report_jpeg_decoder, spawn_buffer_pool_trim, MultimodalSettings,
     };
     init_mm_transport_defaults(
         config.router_config.multimodal_tensor_transport,
@@ -2591,6 +2591,8 @@ pub async fn startup_with(
     if config.prometheus_config.is_some() {
         history_metrics::spawn_sampler(Arc::clone(&app_context));
     }
+    // The media crate's buffer pool gives its idle buffers back at rest.
+    spawn_buffer_pool_trim();
 
     // Register the CRDT namespaces and start the inbound sync adapters now;
     // gossip starts further down, after the metrics and probe listeners are
