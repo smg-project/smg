@@ -427,6 +427,7 @@ impl ZmqEngineClient {
                 "native scheduler lacks matching managed plugin capability",
             ));
         }
+        self.check_sglang_thinking_budget(&req)?;
         if let Some(input) = manifest {
             req.tokenized
                 .as_mut()
@@ -947,6 +948,33 @@ impl ZmqEngineClient {
                 Err(only_on(operation, "a vLLM ZMQ backend"))
             }
         }
+    }
+
+    /// Any connected SGLang rank can receive a generation request.
+    pub fn sglang_supports_thinking_budget(&self) -> bool {
+        let ranks = self.engines();
+        !ranks.is_empty()
+            && ranks
+                .iter()
+                .all(|rank| rank.ready_response.supports_thinking_token_budget)
+    }
+
+    /// Check an explicit budget against the capabilities from the scheduler handshakes.
+    pub fn check_sglang_thinking_budget(
+        &self,
+        req: &sglang_proto::GenerateRequest,
+    ) -> Result<(), tonic::Status> {
+        if req
+            .sampling_params
+            .as_ref()
+            .is_some_and(|params| params.thinking_token_budget.is_some())
+            && !self.sglang_supports_thinking_budget()
+        {
+            return Err(tonic::Status::invalid_argument(
+                "thinking_token_budget requires an active SGLang reasoning token filter",
+            ));
+        }
+        Ok(())
     }
 
     /// The SGLang scheduler client behind this connection, for what only the
@@ -1489,6 +1517,7 @@ impl ZmqEngineClient {
                 "this ZMQ backend is not an SGLang scheduler",
             ));
         };
+        self.check_sglang_thinking_budget(&req)?;
         // A constraint the engine's grammar backend cannot enforce is refused
         // here, before anything reaches the engine, as on every wire.
         if let Some(sp) = req.sampling_params.as_ref() {
@@ -2562,17 +2591,15 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn sglang_managed_prefill_sets_disagg_prefill_dp_rank_on_replica_dp() {
-        use engine_zmq_client::{
-            codec::decode_msgpack,
-            mock_engine::connect_to_frontend,
-            protocol::{
-                handshake::ManagedSglangHandshake,
-                sglang::request::{SglangRequestType, TokenizedGenerateReqInput},
-            },
-            EngineId,
-        };
+    async fn managed_prefill_ranks(
+        budget_support: [bool; 2],
+    ) -> (
+        ZmqEngineClient,
+        [MockEngine; 2],
+        tempfile::TempDir,
+        managed::InputBinding,
+    ) {
+        use engine_zmq_client::protocol::handshake::ManagedSglangHandshake;
 
         let dir = tempfile::tempdir().unwrap();
         let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
@@ -2583,6 +2610,10 @@ mod tests {
             role: "prefill".into(),
             layout: smg_grpc_client::sglang_managed::LAYOUT.into(),
         });
+        let ready_for = |supports_thinking_token_budget| EngineCoreReadyResponse {
+            supports_thinking_token_budget,
+            ..ready.clone()
+        };
         let (client, rank0, rank1) = tokio::join!(
             ZmqEngineClient::connect(
                 &handshake,
@@ -2594,12 +2625,18 @@ mod tests {
                 RuntimeType::Sglang,
                 Duration::from_secs(10),
             ),
-            connect_to_frontend(&handshake, EngineId::from_engine_index(0), ready.clone()),
-            connect_to_frontend(&handshake, EngineId::from_engine_index(1), ready),
+            connect_to_frontend(
+                &handshake,
+                EngineId::from_engine_index(0),
+                ready_for(budget_support[0])
+            ),
+            connect_to_frontend(
+                &handshake,
+                EngineId::from_engine_index(1),
+                ready_for(budget_support[1])
+            ),
         );
         let client = client.unwrap();
-        let _rank0 = rank0.unwrap();
-        let mut rank1 = rank1.unwrap();
         client.note_engine_ranks_are_replicas();
 
         let binding = managed::InputBinding {
@@ -2614,6 +2651,71 @@ mod tests {
             processor_contract: "qwen3".into(),
             model_revision: "weights".into(),
         };
+        (client, [rank0.unwrap(), rank1.unwrap()], dir, binding)
+    }
+
+    #[tokio::test]
+    async fn sglang_direct_and_managed_budgets_require_every_rank() {
+        use engine_zmq_client::protocol::sglang::request::TokenizedGenerateReqInput;
+
+        for supported in [false, true] {
+            let (client, [mut rank0, mut rank1], _dir, binding) =
+                managed_prefill_ranks([true, supported]).await;
+            let mut req = managed_decode_request();
+            req.tokenized.as_mut().unwrap().original_text = "test prompt".into();
+            req.data_parallel_rank = Some(1);
+            req.sampling_params.as_mut().unwrap().thinking_token_budget = Some(0);
+            let direct = client.generate_sglang(req.clone()).await;
+            req.request_id.clone_from(&binding.prefill_rid);
+            let managed = client
+                .generate_sglang_managed(req, &binding, Some(("http://enc:30000", 1, 0)), None)
+                .await;
+            if supported {
+                let _direct = direct.expect("all ranks support the budget");
+                let _managed = managed.expect("all ranks support the budget");
+                for rid in ["managed-decode", binding.prefill_rid.as_str()] {
+                    let frames = tokio::time::timeout(Duration::from_secs(2), rank1.recv_request())
+                        .await
+                        .expect("budgeted request must reach rank 1")
+                        .unwrap();
+                    let wire: TokenizedGenerateReqInput =
+                        engine_zmq_client::codec::decode_msgpack(&frames[1]).unwrap();
+                    assert_eq!(wire.rid, rid);
+                    let custom = wire
+                        .sampling_params
+                        .custom_params
+                        .expect("custom parameters");
+                    assert!(custom
+                        .as_map()
+                        .unwrap()
+                        .contains(&("thinking_budget".into(), 0_u32.into())));
+                }
+            } else {
+                for error in [direct.err(), managed.err()] {
+                    let status = error.expect("one rank did not declare support");
+                    assert_eq!(status.code(), Code::InvalidArgument);
+                    assert!(status.message().contains("thinking_token_budget"));
+                }
+                let received = tokio::time::timeout(Duration::from_millis(50), async {
+                    tokio::select! {
+                        frame = rank0.recv_request() => frame,
+                        frame = rank1.recv_request() => frame,
+                    }
+                })
+                .await;
+                assert!(received.is_err(), "a refused request reached the scheduler");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sglang_managed_prefill_sets_disagg_prefill_dp_rank_on_replica_dp() {
+        use engine_zmq_client::{
+            codec::decode_msgpack,
+            protocol::sglang::request::{SglangRequestType, TokenizedGenerateReqInput},
+        };
+
+        let (client, [_rank0, mut rank1], _dir, binding) = managed_prefill_ranks([false; 2]).await;
         let mut req = managed_decode_request();
         req.request_id = "prefill-dp-rid".into();
         // Disagreeing/out-of-range caller pin must yield to binding.bootstrap.room (7 % 2 == 1).
