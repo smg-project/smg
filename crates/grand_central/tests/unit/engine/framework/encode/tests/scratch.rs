@@ -551,3 +551,26 @@ fn a_request_without_items_reads_no_membership() {
     assert_eq!(decision, bed.pair(&engine()));
     assert_eq!(words, [0, 0, 0, 0]);
 }
+
+/// A request with items whose decode is not held to the ones that take
+/// images reads the pair's passes for one thing, a pair no encoder serves:
+/// with every prefill's class open the pass over the decodes walks no row,
+/// and the decision's index of the decodes' classes holds none. The pass
+/// over the prefills leaves nothing a test can read.
+#[test]
+fn a_request_with_items_and_every_class_open_walks_no_row_of_the_pair() {
+    let mut bed = Bed::new();
+    // The second turn is the control of the witness: a decode held to the
+    // ones that take images is walked, and the index holds its class.
+    for decode_images in [false, true] {
+        bed.decode_images = decode_images;
+        let mut scratch = Scratch::new();
+        let decision = bed.decide_in(&engine(), &mut scratch);
+        if !decode_images {
+            assert!(matches!(decision, Decision::Pick(_)), "{decision:?}");
+        }
+        let side = scratch.encode.as_deref().expect("the encode side");
+        let walked = side.decode_classes.holds(1);
+        assert_eq!(walked, decode_images, "decode images {decode_images}");
+    }
+}
