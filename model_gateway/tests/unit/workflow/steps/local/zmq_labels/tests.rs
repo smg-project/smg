@@ -85,10 +85,9 @@ async fn zmq_labels_say_the_links_grammar_start() {
     );
 }
 
-/// A ZMQ worker that declared no runtime takes the default in this step,
-/// and one whose runtime is settled keeps it.
-#[tokio::test]
-async fn a_zmq_worker_with_no_runtime_takes_the_default_here() {
+/// The data of a local ZMQ worker after this step, from the runtime that
+/// the detection settled.
+async fn after_the_step(settled: Option<&str>) -> WorkerWorkflowData {
     use openai_protocol::worker::WorkerSpec;
     use smg_worker::jobs::WorkerRegistrationMode;
     use wfaas::WorkflowInstanceId;
@@ -97,19 +96,26 @@ async fn a_zmq_worker_with_no_runtime_takes_the_default_here() {
         app_context::testing::create_test_app_context, workflow::steps::create_worker_workflow_data,
     };
 
+    let mut data = create_worker_workflow_data(
+        WorkerSpec::new("ipc:///tmp/engine-a.sock"),
+        WorkerRegistrationMode::Upsert,
+        create_test_app_context(),
+        WorkerJobAsker::Api,
+    );
+    data.worker_kind = Some(WorkerKind::Local);
+    data.connection_mode = Some(ConnectionMode::Zmq);
+    data.detected_runtime_type = settled.map(str::to_string);
+    let mut context = WorkflowContext::new(WorkflowInstanceId::new(), data);
+    DiscoverZmqLabelsStep.execute(&mut context).await.unwrap();
+    context.data
+}
+
+/// A ZMQ worker that declared no runtime takes the default in this step,
+/// and one whose runtime is settled keeps it.
+#[tokio::test]
+async fn a_zmq_worker_with_no_runtime_takes_the_default_here() {
     async fn runtime_after(settled: Option<&str>) -> Option<String> {
-        let mut data = create_worker_workflow_data(
-            WorkerSpec::new("ipc:///tmp/engine-a.sock"),
-            WorkerRegistrationMode::Upsert,
-            create_test_app_context(),
-            WorkerJobAsker::Api,
-        );
-        data.worker_kind = Some(WorkerKind::Local);
-        data.connection_mode = Some(ConnectionMode::Zmq);
-        data.detected_runtime_type = settled.map(str::to_string);
-        let mut context = WorkflowContext::new(WorkflowInstanceId::new(), data);
-        DiscoverZmqLabelsStep.execute(&mut context).await.unwrap();
-        context.data.detected_runtime_type
+        after_the_step(settled).await.detected_runtime_type
     }
 
     assert_eq!(runtime_after(None).await.as_deref(), Some("vllm"));
@@ -117,4 +123,25 @@ async fn a_zmq_worker_with_no_runtime_takes_the_default_here() {
         runtime_after(Some("tokenspeed")).await.as_deref(),
         Some("tokenspeed")
     );
+}
+
+/// A ZMQ worker's labels name the cache partition fields that its dialect
+/// gives to the engine. A worker with no runtime takes the vLLM fields.
+/// A TokenSpeed worker gets no label.
+#[tokio::test]
+async fn a_zmq_worker_names_the_cache_partition_fields_of_its_dialect() {
+    for (settled, fields) in [
+        (Some("vllm"), Some("cache_salt")),
+        (None, Some("cache_salt")),
+        (Some("sglang"), Some("cache_salt,extra_key")),
+        (Some("tokenspeed"), None),
+    ] {
+        let labels = after_the_step(settled).await.discovered_labels;
+        assert_eq!(
+            labels.get(CACHE_PARTITION_FIELDS_LABEL).map(String::as_str),
+            fields,
+            "{settled:?}"
+        );
+        assert!(labels.contains_key(GrammarStart::LABEL), "{settled:?}");
+    }
 }

@@ -55,6 +55,7 @@ async fn a_zmq_worker_without_its_link_is_skipped() {
 
 /// A ZMQ worker's refresh reads the window its link learned at the
 /// handshake and keeps what registration read from the model's files.
+/// It also keeps the cache partition fields that registration wrote.
 #[tokio::test]
 async fn a_zmq_worker_reads_its_handshake_window() {
     use std::time::Duration;
@@ -65,6 +66,7 @@ async fn a_zmq_worker_reads_its_handshake_window() {
         EngineId,
     };
     use openai_protocol::worker::RuntimeType;
+    use smg_worker::labels::CACHE_PARTITION_FIELDS_LABEL;
 
     use crate::routers::grpc::zmq_client::{EosTokenIds, ZmqEngineClient};
 
@@ -94,10 +96,16 @@ async fn a_zmq_worker_reads_its_handshake_window() {
             .connection_mode(ConnectionMode::Zmq)
             .runtime_type(RuntimeType::Vllm)
             .engine_connection(BackendClient::Zmq(client.expect("adapter connect")))
-            .discovered_labels(HashMap::from([(
-                "constrained_decoding_start".to_string(),
-                "first_token".to_string(),
-            )]))
+            .discovered_labels(HashMap::from([
+                (
+                    "constrained_decoding_start".to_string(),
+                    "first_token".to_string(),
+                ),
+                (
+                    CACHE_PARTITION_FIELDS_LABEL.to_string(),
+                    "cache_salt".to_string(),
+                ),
+            ]))
             .status(WorkerStatus::Ready)
             .build(),
     );
@@ -118,8 +126,13 @@ async fn a_zmq_worker_reads_its_handshake_window() {
         "what registration read stays"
     );
     assert_eq!(
+        fresh.get(CACHE_PARTITION_FIELDS_LABEL).map(String::as_str),
+        Some("cache_salt"),
+        "the fields that registration wrote stay"
+    );
+    assert_eq!(
         fresh.len(),
-        2,
+        3,
         "nothing else of the handshake's report: {fresh:?}"
     );
 }

@@ -32,6 +32,7 @@ use super::{
     common::{
         response_formatting::TokenCounts,
         stages::{
+            cache_partition::CachePartitionDemand,
             encode::EncodeDispatchPlan,
             helpers::{IdStamp, SamplingBaseline, SamplingDefaultsMask, ToolConstraintStamp},
             pd_protocol::{EncodeHandoff, PdProtocol},
@@ -411,6 +412,10 @@ pub(crate) struct RoutingSnapshot {
     /// refusal. The snapshot has no default: worker selection writes every
     /// field.
     pub language_model_reads_grids: bool,
+    /// The cache partition fields the request carries. The first selection
+    /// writes it. A retry and `decode_again` use it to keep the workers that
+    /// apply the fields.
+    pub cache_partition: CachePartitionDemand,
 }
 
 pub(crate) use crate::routers::common::placement::{PipelinePin, WireConstraint};

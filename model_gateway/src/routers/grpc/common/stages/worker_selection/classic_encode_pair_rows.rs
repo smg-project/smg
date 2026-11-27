@@ -344,6 +344,8 @@ fn refusal(failure: EpdSelectionFailure) -> Answer {
         // The recorder does not start Grand Central, so no row of its sheet
         // records this refusal. It has its name all the same.
         EpdSelectionFailure::EncodeUnderGrandCentral => named("encode_under_grand_central"),
+        // No row of the sheet carries a cache partition field.
+        EpdSelectionFailure::CachePartitionUnsupported(_) => named("cache_partition_not_supported"),
         EpdSelectionFailure::Placement(failure) => Answer::Refused {
             name: "placement",
             role: Some(format!("{:?}", failure.role).to_lowercase()),
@@ -591,6 +593,7 @@ impl Bed {
                 },
                 decode_vision: request.decode_images,
                 image_fanout: request.fanout,
+                partition: CachePartitionDemand::default(),
             },
             None,
         );

@@ -4,6 +4,7 @@
 
 use std::{sync::Arc, time::Duration};
 
+use engine_zmq_adapter::ZmqDialect;
 use openai_protocol::worker::SchedulerLoadSnapshot;
 use smg_grpc_client::vllm_proto as vllm;
 use tonic::Status;
@@ -174,7 +175,10 @@ fn server_facts(state: &State) -> vllm::GetServerInfoResponse {
         constrained_decoding_start: model.constrained_decoding_start.clone(),
         structural_tag_vocabulary: model.structural_tag_vocabulary.clone(),
         // The cache partition fields the adapter's translation reads.
-        cache_partition_fields: "cache_salt".to_string(),
+        cache_partition_fields: ZmqDialect::Vllm
+            .cache_partition_fields()
+            .unwrap_or_default()
+            .to_string(),
         ..Default::default()
     }
 }

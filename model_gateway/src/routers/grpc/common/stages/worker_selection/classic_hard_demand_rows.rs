@@ -558,9 +558,13 @@ impl Bed {
                 &[],
             ) else {
                 assert!(placed.is_empty(), "a request placed once is placed again");
-                let refusal = self
-                    .stage
-                    .context_selection_failure(MODEL, wire, media, context);
+                let refusal = self.stage.context_selection_failure(
+                    MODEL,
+                    wire,
+                    media,
+                    CachePartitionDemand::default(),
+                    context,
+                );
                 return refused(refusal).await;
             };
             let at = self

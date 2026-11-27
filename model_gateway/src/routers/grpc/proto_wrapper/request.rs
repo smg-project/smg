@@ -5,6 +5,7 @@
 //! the four names the code takes from sibling modules come through the
 //! parent's imports.
 
+use openai_protocol::common::CachePartition;
 use smg_grpc_client::{
     mlx_proto as mlx, sglang_proto as sglang, tokenspeed_proto as tokenspeed,
     trtllm_proto as trtllm, vllm_proto as vllm,
@@ -355,6 +356,22 @@ impl ProtoGenerateRequest {
             Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => {
                 tracing::warn!("set_kv_transfer_params called on non-vLLM request, ignoring");
             }
+        }
+    }
+
+    /// Set the request's cache salt and extra key. A wire without a field
+    /// leaves it out. Worker selection sends a request with a field only to a
+    /// worker whose label lists it. The LoRA adapter does not change here.
+    pub fn set_cache_partition(&mut self, partition: CachePartition<'_>) {
+        match self {
+            Self::Vllm(req) => req.cache_salt = partition.cache_salt.map(str::to_owned),
+            Self::Sglang(req) => {
+                req.cache_partition = Some(Box::new(sglang::CachePartition {
+                    cache_salt: partition.cache_salt.map(str::to_owned),
+                    extra_key: partition.extra_key.map(str::to_owned),
+                }));
+            }
+            Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => {}
         }
     }
 

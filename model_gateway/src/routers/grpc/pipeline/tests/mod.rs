@@ -7,6 +7,7 @@ mod glm53;
 mod model_label;
 mod outcome;
 mod pair_outcome;
+mod partition;
 mod pretokenized;
 mod rate_limit_reserve;
 mod refusal_lines;

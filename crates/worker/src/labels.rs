@@ -23,6 +23,11 @@ pub const DISCOVERY_PROVIDER_LABEL: &str = "smg.ai/discovery-provider";
 /// kept. An absent label reads as unknown, never as a refusal.
 pub const SUPPORTS_VISION_LABEL: &str = "supports_vision";
 
+/// The prefix-cache partition fields that the worker's servicer gives to the
+/// engine. The value is comma-separated, for example `cache_salt,extra_key`.
+/// An absent label means none.
+pub const CACHE_PARTITION_FIELDS_LABEL: &str = "cache_partition_fields";
+
 /// Whether text contains a Unicode control character.
 pub fn has_control_character(text: &str) -> bool {
     text.chars().any(char::is_control)
