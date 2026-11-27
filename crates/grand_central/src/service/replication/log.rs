@@ -12,13 +12,16 @@ use std::{
 
 use parking_lot::Mutex;
 
-use crate::store::{Journal, MembershipChange, Position, WorkerRow};
+use crate::{
+    engine::view::WorkerId,
+    store::{Journal, MembershipChange, Position, WorkerRow, WorkerStatus},
+};
 
 /// One replicated write, as the store told it.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum Event {
-    /// A membership or status write.
+    /// A membership write.
     Member {
         /// The membership epoch the write made.
         epoch: u64,
@@ -29,6 +32,18 @@ pub enum Event {
         /// The row the write took out: a removal's row, a replacement's old
         /// incarnation.
         left: Option<Arc<WorkerRow>>,
+    },
+    /// A status write: the row `id` left `from` and took `to`. It holds no
+    /// row.
+    Status {
+        /// The membership epoch the write made.
+        epoch: u64,
+        id: WorkerId,
+        from: WorkerStatus,
+        to: WorkerStatus,
+        /// The models the row serves at the write: the one fact of its row
+        /// a reader of a status reads, a watch that asked for some.
+        models: Arc<[String]>,
     },
     /// The store's term rose: the first position of a term, one of the
     /// watched kinds. It changes nothing a standby holds; it is why the
@@ -463,7 +478,8 @@ impl Log {
     /// the store's membership lock: this read takes the log's lock alone,
     /// and no holder of the log's lock takes one of those two. A write
     /// that names its term meets the same test once more, in the take of
-    /// the log's lock that gives its event a place ([`Journal::member`]).
+    /// the log's lock that gives its event a place ([`Journal::member`],
+    /// [`Journal::status`]).
     pub fn leads(&self, term: u64) -> Result<(), NotLeading> {
         let ring = self.ring.lock();
         self.leads_in(&ring, term)
@@ -716,7 +732,8 @@ impl Log {
     /// there under that term, the leader's own, so a position and its term
     /// name one history on every replica that holds them. The applier's
     /// write names it, through the store's door for a followed write
-    /// ([`Journal::member`]), and no other write does. Refused
+    /// ([`Journal::member`], [`Journal::status`]), and no other write
+    /// does. Refused
     /// unless `at` is the position after the head, under a named term not
     /// below any the log has seen, and the head is a leader's write or the
     /// start: a gap, a replay, a falling term and a write of the store's
@@ -898,6 +915,30 @@ impl Journal for Log {
                 change,
                 row: row.map(copy),
                 left: left.map(copy),
+            },
+        )
+    }
+
+    fn status(
+        &self,
+        at: Option<Position>,
+        term: Option<u64>,
+        epoch: u64,
+        id: WorkerId,
+        from: WorkerStatus,
+        to: WorkerStatus,
+        models: Arc<[String]>,
+    ) -> bool {
+        // The list is shared as it was handed: no row is copied here.
+        self.push(
+            at,
+            term,
+            Event::Status {
+                epoch,
+                id,
+                from,
+                to,
+                models,
             },
         )
     }

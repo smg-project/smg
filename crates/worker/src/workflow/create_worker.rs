@@ -382,7 +382,10 @@ pub fn validate_constrained_decoding_label(
 /// engine has named nothing yet. The label refresh of the worker's first
 /// transition into service reads it again, and a label set by hand on this
 /// line's advice would stand over the start the engine names then.
-fn unnamed_grammar_start_warning(
+///
+/// A label refresh says the same of a worker it leaves without a start: its
+/// step calls this with the report it read and the labels it wrote.
+pub fn unnamed_grammar_start_warning(
     url: &str,
     connection_mode: ConnectionMode,
     runtime_type: RuntimeType,

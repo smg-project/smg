@@ -53,7 +53,7 @@ use super::{
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
-    middleware::TenantRequestMeta,
+    middleware::{sse_keepalive::names_event_stream, TenantRequestMeta},
     observability::{
         events::{self, Event},
         metrics::{bool_to_static_str, metrics_labels, Metrics},
@@ -2939,7 +2939,7 @@ impl PDRouter {
             .and_then(|headers| headers.get(CONTENT_TYPE))
             .and_then(|value| value.to_str().ok())
         {
-            Some(content_type) => content_type.starts_with("text/event-stream"),
+            Some(content_type) => names_event_stream(content_type),
             None => status.is_success(),
         };
         let mut response_headers = headers.unwrap_or_default();
@@ -9118,6 +9118,42 @@ mod tests {
         assert_eq!(events[2], "data: [DONE]");
     }
 
+    /// The decode side's answer is an event stream however the worker spells
+    /// the type (a media type's name is case-insensitive, RFC 9110, section
+    /// 8.3.1): the relay may change its length, so a sized
+    /// `Text/Event-Stream` answer reaches the client without the decode
+    /// worker's `Content-Length` too.
+    #[tokio::test]
+    async fn a_decode_stream_is_an_event_stream_however_the_worker_spells_its_type() {
+        const BODY: &str =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\ndata: [DONE]\n\n";
+        for content_type in ["text/event-stream", "Text/Event-Stream"] {
+            let prefill = axum::Router::new().route(
+                "/v1/chat/completions",
+                axum::routing::post(|| async { axum::Json(json!({})) }),
+            );
+            let decode = axum::Router::new().route(
+                "/v1/chat/completions",
+                axum::routing::post(move || async move { ([(CONTENT_TYPE, content_type)], BODY) }),
+            );
+            let router = create_test_pd_router();
+            register_pd_pair(&router, spawn_stub(prefill).await, spawn_stub(decode).await);
+            let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+            let response = tokio::time::timeout(
+                ROUND_TRIP_GUARD,
+                router.route_chat(None, &tenant, Arc::new(streaming_chat()), UNKNOWN_MODEL_ID),
+            )
+            .await
+            .expect("the client stream starts once the prefill answered");
+            assert_eq!(response.status(), StatusCode::OK, "{content_type}");
+            assert!(
+                !response.headers().contains_key(CONTENT_LENGTH),
+                "{content_type}: the decode worker's length is not the relay's"
+            );
+        }
+    }
+
     /// With logprobs asked for, the relay re-encodes each frame with the
     /// prefill's logprobs merged in, so a sized decode answer grows past its
     /// declared length: the client gets the merged frame and no length.
@@ -10261,6 +10297,43 @@ mod tests {
         );
     }
 
+    /// The drain's twin of the case above: a streamed pair's prefill body
+    /// that breaks off under its drain is told as a failed connection, no
+    /// answer of the worker's. The decode's stream is the client's and ends
+    /// well.
+    #[tokio::test]
+    async fn the_engine_hears_a_prefill_body_cut_under_its_drain_as_a_failed_connection() {
+        let (prefill_url, _refusing) = faulty_stub(Fault::CutAfterHead).await;
+        let decode_url = spawn_cut_stub(
+            "/v1/chat/completions",
+            "text/event-stream",
+            CHAT_SSE_CHUNKS,
+            false,
+        )
+        .await;
+        let router = single_attempt_router();
+        let heard = hearing_pair_sides_on(&router.policy_registry);
+        register_fleet(
+            &router,
+            Shape::Parallel,
+            &prefill_url,
+            &[decode_url.as_str()],
+        );
+
+        let response = stream_chat_through(&router).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            ends_heard_at(&heard, 2).await,
+            [
+                "completed Decode Ok 200",
+                "completed Prefill ConnectFailed 502"
+            ]
+        );
+    }
+
     /// A fan-out of more than one answer sends no prefill. The route lets
     /// the prefill's guard go unsent and tells its end nothing, and the
     /// decode is told its own answer.
@@ -10305,7 +10378,7 @@ mod tests {
     /// A MoRI-IO pair written concurrently tells the side that answered and
     /// leaves the side it dropped to nobody. The rows: a decode that
     /// refuses, or whose call fails, while its prefill is in flight, and a
-    /// prefill that refuses while its decode is.
+    /// prefill that does either while its decode is.
     #[tokio::test]
     async fn the_engine_hears_the_side_that_answered_of_a_pair_written_concurrently() {
         use Fault::{Refuses, Unreachable};
@@ -10330,6 +10403,14 @@ mod tests {
                 UNAVAILABLE,
                 "completed Decode Cancelled",
                 "completed Prefill ServerError 503",
+            ),
+            // The route's own answer for a call that failed is no answer
+            // of the worker's.
+            (
+                PdSide::Prefill,
+                Unreachable,
+                "completed Decode Cancelled",
+                "completed Prefill ConnectFailed 502",
             ),
         ];
         for (fails, fault, decode_end, prefill_end) in rows {

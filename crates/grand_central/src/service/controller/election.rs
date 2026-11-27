@@ -32,12 +32,8 @@
 //! the store's log. The log followed a term at or above the take's, so
 //! another replica led that term. The thread leaves in the take's own step,
 //! ahead of the standing, as at a word of a term seen. The next take stands
-//! above the followed term, and the log leads it.
-
-#![expect(
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
+//! above the followed term, and the log leads it. Where no term is left to
+//! take above the followed term, the thread keeps the lease.
 
 use std::{
     fmt, io,
@@ -106,8 +102,13 @@ impl fmt::Display for LeasePlace {
     }
 }
 
-/// The election's configuration (design 5.3).
+/// The election's configuration (design 5.3). The default is one replica
+/// that leads itself over a lease in its own process.
+///
+/// The record gains fields: code outside this crate starts from the default
+/// and assigns what it states otherwise, and a pattern of it ends with `..`.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct ElectionConfig {
     /// Where the lease lives.
     pub lease: LeasePlace,
@@ -650,8 +651,8 @@ enum Streak {
 
 /// One line a change of role, a gone streak or a waiting one; a take's term
 /// to the store. Where that take started no term in the store's log: one
-/// warning, and the term the log followed, which the loop leaves the lease
-/// for.
+/// warning, and the term the log followed. The loop leaves the lease for
+/// that term, or keeps it where no term is left to take above it.
 fn report(
     elector: &Elector,
     tick: &TickOutcome,
@@ -678,7 +679,7 @@ fn report(
                     identity = elector.identity(),
                     term,
                     followed,
-                    "the take started no term in the log: the log followed a term at or above it, so another replica led that term and this one leaves the lease"
+                    "the take started no term in the log: the log followed a term at or above it, so another replica led that term"
                 );
             }
         }
@@ -733,8 +734,9 @@ fn report(
     // take it made: after a slow step the fence reads closed here as well,
     // with no wait to name, and the next renewal leads.
     match tick {
-        // A take the loop leaves in this step says no line of a lead. Where
-        // the elector refuses that leave, the next renewal says it.
+        // A take that started no term says no line of a lead: the loop
+        // leaves it in this step. Where the loop keeps the lease, the next
+        // renewal says it.
         TickOutcome::Acquired { .. } if followed.is_some() => {}
         TickOutcome::Acquired { term } | TickOutcome::Renewed { term } => {
             if !*leading {

@@ -4686,6 +4686,22 @@ mod native_loads_tests {
         assert_eq!(own.map(|own| own.loads.capacity()), Some(1));
     }
 
+    /// The last member takes the engine's answer itself: the report of an
+    /// engine of one worker is the answer, moved, and its text and its rows
+    /// are the answer's own.
+    #[test]
+    fn the_last_member_takes_its_engines_answer_itself() {
+        let mut answer = host_answer(1);
+        answer.version = "engine-7".to_owned();
+        let (text, rows) = (answer.version.as_ptr(), answer.loads.as_ptr());
+        let mut reports = Vec::new();
+        let members = [gauge_worker("http://engine-a")];
+        WorkerMonitor::scope_to_members(&mut reports, &members, answer);
+        let report = reports.pop().flatten().expect("the member's report");
+        assert_eq!(report.version.as_ptr(), text, "the answer, not a copy");
+        assert_eq!(report.loads.as_ptr(), rows, "the rows, not a copy");
+    }
+
     /// A connector that keeps no source is asked once, and its worker is
     /// then polled over HTTP as a worker with no connector is: one request
     /// a poll, the engine's own answer, the same memo.

@@ -9,8 +9,8 @@ use std::{collections::BTreeSet, sync::Arc, time::Instant};
 use smg_worker::load::state::LoadSnapshot;
 
 use super::{
-    alone_at, at_call, at_prefill, demanding, first, holder, pairs_of, preset, served_alone,
-    served_call, served_pair, shed_of, stating_member, stock_pair_plan, GATEWAY,
+    alone_at, at_call, at_prefill, demanding, first, holder, pairs_of, preset, seeing_member,
+    served_alone, served_call, served_pair, shed_of, stating_member, stock_pair_plan, GATEWAY,
 };
 use crate::{
     engine::{
@@ -103,6 +103,67 @@ fn a_pairs_frame_that_states_a_demand_is_answered_workers_that_meet_it_on_each_s
         ..none
     };
     assert_eq!(answered(other), Err(Some(unmet("decoding"))));
+}
+
+/// A pair's frame that demands vision is answered workers that take
+/// images, on each side. A fleet holds two prefills and two decodes, and
+/// at most one worker a side takes images.
+///
+/// Where one prefill and one decode take images, a frame that demands
+/// vision is answered that prefill beside that decode. Where a side holds
+/// none that does, the frame is shed with no endpoint, under `vision`. A
+/// frame that demands none is answered every pair of each fleet.
+#[test]
+fn a_pairs_frame_that_demands_vision_is_answered_workers_that_take_images_on_each_side() {
+    let (prefill, decode) = (Role::Prefill, Role::Decode);
+    let now = Instant::now();
+    let none = proto::Demands::default();
+    let vision = proto::Demands {
+        vision: true,
+        ..none
+    };
+    // Whether a fleet's second prefill takes images, and its second decode.
+    for (ahead, behind) in [(true, true), (true, false), (false, true)] {
+        let store = Arc::new(MemoryStore::new());
+        let objects = holder(&store);
+        store
+            .apply(stock_pair_plan())
+            .expect("above the unbound start");
+        let seeing = |name: &str, role, takes| seeing_member(&store, &objects, name, role, takes);
+        let prefills = [seeing("p0", prefill, false), seeing("p1", prefill, ahead)];
+        let decodes = [seeing("d0", decode, false), seeing("d1", decode, behind)];
+        // Every frame is answered the same way: a pair, or the one shed. A
+        // pair named ahead of a shed is not dropped: frames that part fail
+        // the case.
+        let answered = |demands: proto::Demands| -> Named<(WorkerId, WorkerId)> {
+            let (mut named, mut sheds) = (BTreeSet::new(), Vec::new());
+            for n in 1..=64 {
+                let frame = demanding(at_prefill(n, WireModes::NONE, None), demands);
+                let answer = served_pair(&store, &objects, frame, GATEWAY, now);
+                if answer.pick().is_none() {
+                    sheds.push(shed_of(&answer));
+                }
+                named.extend(pairs_of(&answer));
+            }
+            sheds.dedup();
+            match (named.is_empty(), sheds.as_slice()) {
+                (false, []) => Ok(named),
+                (true, [shed]) => Err(*shed),
+                _ => panic!("the frames part: pairs {named:?}, sheds {sheds:?}"),
+            }
+        };
+        assert_eq!(answered(none), Ok(every(&prefills, &decodes)));
+        let meeting = if ahead && behind {
+            Ok(every(&prefills[1..], &decodes[1..]))
+        } else {
+            Err(Some(unmet("vision")))
+        };
+        assert_eq!(
+            answered(vision),
+            meeting,
+            "prefill {ahead}, decode {behind}"
+        );
+    }
 }
 
 /// A decode call that states a hard demand is answered a decode that meets

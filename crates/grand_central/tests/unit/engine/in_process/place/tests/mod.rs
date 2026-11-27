@@ -1214,11 +1214,15 @@ fn a_placement_names_the_profile_that_picked_by_its_label() {
 /// Placing a request asks the process's table of names for nothing: the
 /// label a placement holds is read from the engine's own list, which the
 /// engine made at its start. A place's placement, and a whole decision's.
+/// The control: a call of `intern` on this thread raises the count by one.
 #[test]
 fn placing_a_request_asks_the_table_of_names_for_nothing() {
-    use crate::names::tests::ASKED;
+    use crate::names::{intern, tests::ASKED};
 
     let asked = || ASKED.with(Cell::get);
+    let before = asked();
+    assert_eq!(intern("round_robin"), "round_robin");
+    assert_eq!(asked(), before + 1, "a call is counted");
     for name in ["round_robin", "power_of_two"] {
         let engine = hosted(preset(name));
         let list = pool(4);

@@ -269,6 +269,10 @@ impl WorkerFacts {
     /// What a row is charged beside its numbers where its worker takes
     /// images: the wire's bit.
     pub const VISION: usize = 3;
+    /// What a row is charged beside its numbers where its worker's encode
+    /// offer states anything: the wire's block with every role stated and
+    /// no connector. A connector is charged as any text is.
+    pub const ENCODE: usize = 11;
     /// What a text is charged beside its own bytes.
     pub const FRAME: usize = 5;
     /// The most a row weighs.
@@ -288,6 +292,12 @@ impl WorkerFacts {
         }
         if self.vision {
             bytes += Self::VISION;
+        }
+        if self.encode != super::EncodeOffer::default() {
+            bytes += Self::ENCODE;
+            if let Some(connector) = &self.encode.connector {
+                bytes += text(connector);
+            }
         }
         if let Some(zone) = &self.zone {
             bytes += text(zone);

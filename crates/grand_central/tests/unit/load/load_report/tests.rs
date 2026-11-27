@@ -62,6 +62,7 @@ fn resident_tokens_are_counted_only_when_every_rank_sends_them() {
     let one_silent = report(vec![rank(1, 0, 0.1, 40.0, None), silent]);
     let row = load_row(&one_silent, Role::Single, now, now, SignalSource::Poll);
     assert_eq!((row.resident_tokens, row.resident_counted), (0, false));
+    assert_eq!(one_silent.total_resident_tokens(), None);
     let mut one_missing = report(vec![rank(1, 0, 0.1, 40.0, None)]);
     one_missing.dp_rank_count = 2;
     let row = load_row(&one_missing, Role::Single, now, now, SignalSource::Poll);
@@ -92,8 +93,15 @@ fn resident_tokens_past_what_one_sum_holds_saturate() {
         let row = load_row(&stated, Role::Single, now, now, SignalSource::Poll);
         (row.resident_tokens, row.resident_counted)
     };
+    // The gateway's own total of the same reports is the same whole sum,
+    // held at the ends of its count.
+    let total_of = |counts: &[i64]| {
+        report(counts.iter().copied().map(stating).collect()).total_resident_tokens()
+    };
     assert_eq!(row_of(&[i64::MAX, i64::MAX]), (u32::MAX, true));
+    assert_eq!(total_of(&[i64::MAX, i64::MAX]), Some(i64::MAX));
     assert_eq!(row_of(&[i64::MIN, i64::MIN]), (0, true));
+    assert_eq!(total_of(&[i64::MIN, i64::MIN]), Some(i64::MIN));
     // Mixed signs: a whole sum that one count of the ranks' width holds,
     // past steps that one such count does not.
     for counts in [
@@ -102,11 +110,18 @@ fn resident_tokens_past_what_one_sum_holds_saturate() {
         [i64::MIN, i64::MAX, i64::MAX],
     ] {
         assert_eq!(row_of(&counts), (u32::MAX, true), "{counts:?}");
+        assert_eq!(total_of(&counts), Some(i64::MAX - 1), "{counts:?}");
     }
     assert_eq!(
         row_of(&[i64::MIN, i64::MIN, i64::MAX, i64::MAX, 7]),
         (5, true)
     );
+    // A rank that sends no count leaves the report without a total, also
+    // behind ranks whose sum already left one count's width.
+    let mut silent = stating(0);
+    silent.num_resident_tokens = None;
+    let silent_last = report(vec![stating(i64::MAX), stating(i64::MAX), silent]);
+    assert_eq!(silent_last.total_resident_tokens(), None);
 }
 
 #[test]

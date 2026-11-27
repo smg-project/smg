@@ -58,10 +58,7 @@ use smg_grand_central::{
     load::load_row,
     service::{
         client::Client,
-        controller::{
-            Config, Controller, ElectionConfig, Error, LeasePlace, Listener, Readiness, Scope,
-            State,
-        },
+        controller::{Config, Controller, Error, LeasePlace, Listener, Readiness, Scope, State},
         proto::{
             self, completed::Class, grand_central_client::GrandCentralClient,
             register_worker_request::Mode, worker_event::Event, Completed, Dispatched, LeaderInfo,
@@ -71,8 +68,8 @@ use smg_grand_central::{
     },
     stages::StageRegistry,
     store::{
-        GatewayId, HealthPolicy, LeaseState, MembershipChange, MemoryStore, Position, Registrant,
-        Signals, WorkerFacts, WorkerStatus, WorkersStore,
+        GatewayId, HealthPolicy, LeaseState, MemoryStore, Position, Registrant, Signals,
+        WorkerFacts, WorkerStatus, WorkersStore,
     },
     tracking::LeaseId,
     worker_host::{KvTables, Members, Objects},
@@ -978,32 +975,31 @@ impl Replica {
         standbys: bool,
         (catalog, spec): (Option<StageRegistry>, Option<&Path>),
     ) -> Result<Self, String> {
-        let listener = |name: &str, scopes: &[Scope], port: u16| Listener {
-            name: name.to_owned(),
-            addr: SocketAddr::new(ip, port),
-            scopes: scopes.to_vec(),
-            tls: None,
+        let listener = |name: &str, scopes: &[Scope], port: u16| {
+            Listener::of(
+                name.to_owned(),
+                SocketAddr::new(ip, port),
+                scopes.to_vec(),
+                None,
+            )
         };
-        let config = |port: u16| Config {
-            controller_id: id.to_owned(),
-            listeners: vec![
-                listener("gateway", &[Scope::Gateway], 0),
-                listener("control", &[Scope::Control], 0),
-                listener("replication", &[Scope::Replication], port),
-            ],
-            admin: SocketAddr::new(ip, 0),
-            decide_shards: Config::default_decide_shards(),
-            shutdown_settle: Duration::ZERO,
-            shutdown_grace: Duration::from_secs(5),
-            load_poll_interval: POLL_INTERVAL,
-            worker_overload: Config::DEFAULT_WORKER_OVERLOAD,
-            discovery: None,
-            election: ElectionConfig {
-                lease: lease.map_or(LeasePlace::Process, |file| {
-                    LeasePlace::File(file.to_owned())
-                }),
-                ..ElectionConfig::default()
-            },
+        let config = |port: u16| {
+            let mut configuration = Config::of(
+                id.to_owned(),
+                vec![
+                    listener("gateway", &[Scope::Gateway], 0),
+                    listener("control", &[Scope::Control], 0),
+                    listener("replication", &[Scope::Replication], port),
+                ],
+                SocketAddr::new(ip, 0),
+            );
+            configuration.shutdown_settle = Duration::ZERO;
+            configuration.shutdown_grace = Duration::from_secs(5);
+            configuration.load_poll_interval = POLL_INTERVAL;
+            configuration.election.lease = lease.map_or(LeasePlace::Process, |file| {
+                LeasePlace::File(file.to_owned())
+            });
+            configuration
         };
         // A pair's first replica draws its replication port from the pairs'
         // own numbers and takes the next one free on its address. A bind
@@ -1976,11 +1972,7 @@ impl Harness {
                 break;
             }
             for entry in &batch {
-                if let Logged::Member {
-                    change: MembershipChange::StatusChanged { id, from, to },
-                    ..
-                } = entry.event
-                {
+                if let Logged::Status { id, from, to, .. } = entry.event {
                     if let Some(&(engine, _)) = self.members.get(&id) {
                         moved.push(Moved { engine, from, to });
                     }

@@ -538,9 +538,10 @@ whether it is marked non-exhaustive and how code writes it:
 | the view a stage only reads | `RequestFacts`, `Candidate`, `Constraints`, `PoolFacts`, `LoadRow`, `AffinityFacts`, `AffinityRows`, `AffinityHolder`, `Health`, `MediaCounts`, `Header`, `ZoneCapacity`, and its enums `HashKind`, `SignalSource`, `OverloadRegime` | yes | code outside the crate starts a record from its `Default`, or a `Candidate` from `Candidate::ready`, and assigns the fields it knows. It never matches one whole, and a `match` on one of the enums keeps an arm for the rest |
 | the parts of a decision, of a lease and of a profile | `Target`, `Pair`, `Trace`, `Shed`, `Queue`, `LiftedVeto`, `DemandFacts`, `Lease`, `LeaseKind`, `Dispatch`, `WeightedScorer`, `Profile`, `Binding`, `PairPools`, `EncoderFacts`, `EncodePool`, `EncodeItems` | yes | code outside the crate starts a record from its `Default` or from its call (`Target::of`, `Pair::of`, `PairPools::of`, `WeightedScorer::of`, `Profile::of`, `Binding::of`) and assigns the fields it knows. A `Trace`, a `Shed` and a `Queue` are answers: a caller reads one and builds none. It never matches one whole, and a `match` on `LiftedVeto` or `LeaseKind` keeps an arm for the rest |
 | what a host states of a worker, of a store's history and of a signal | `EncodeOffer`, `PairingDescriptor`, `Position`, `SignalCell` | yes | code outside the crate starts an offer, a descriptor or a position from its `Default` and assigns the fields it knows. It makes a cell by `SignalCell::of`, which takes both of its fields, or starts from `SignalCell::NONE`. A pattern on one ends with `..` |
+| what a host starts a service or a plugin with | `Config`, `Listener`, `ElectionConfig`, `ElectionSettings`, `WorkerFollowerSettings`, `PemFile`, `ClientIdentity`, `Exposure`, `BreakerSpec`, `Abi`, the three records named `Tls`, and the elector's `LeaseRecord` | yes | code outside the crate starts an exposure, a breaker, an election's configuration, its timing or the elector's lease record from its `Default` and assigns the fields it knows. It makes each of the others by its call. `Config::of` takes the three fields a host must state. Each other call takes every field the record has: none has a neutral value, and a TLS left out by silence would be a plaintext listener or a plain dial. A pattern on one ends with `..` |
 | what no caller builds or matches whole | `Pick`, `Overlap`, `HeldDecision`, `HeldDecode`, `SessionRule`, and every other public enum or record that no program outside the crate builds or matches whole | yes | a caller reads one by its fields, and starts one from its `Default` or its call where it has one. A `match` on one keeps an arm for the rest, and a pattern on one ends with `..` |
-| what a caller builds or matches whole | the lists a request lends and its `Demands`, the settings, a store's checkpoint | not yet | each takes its mark with a call to start from, and its module or its own declaration says so |
-| the enums closed by design | `Decision`, `ShedReason`, `Side`, `Phase`, `Role`, `Said`, `Pairing`, `Head`, and the client's `Answer` | no | a caller answers every case of them, and a new case must stop its build |
+| what a caller builds or matches whole | the lists a request lends and its `Demands`, the routing settings, a store's checkpoint | not yet | each takes its mark with a call to start from, and its module or its own declaration says so |
+| the enums closed by design | `Decision`, `ShedReason`, `Side`, `Phase`, `Role`, `Said`, `Pairing`, `Head`, the elector's `TickOutcome`, and the client's `Answer` | no | a caller answers every case of them, and a new case must stop its build |
 | the records closed by their shape | a record of one value: `WorkerId`, `LeaseId`, `GatewayId`, `TieBand`. A record with no field, as the stage `Best` | no | its one value, or its name, is the whole record |
 | the records closed by their own doc | `DispatchCounts`, and a lease as a store holds it: `LeaseRecord`, `DecodeSide`, `Sides` | no | a further number goes on `CreditedDispatches`. A store's door takes a lease's record or its decode side whole, and a store answers both parts: a field that joins stops each writer's build until the writer states it |
 | an enum with no case | `DiscoverySettings` in a build without discovery | no | it has no value, and a caller may match it with no arm |
@@ -2717,6 +2718,9 @@ impl PlacementSide {
 }
 impl SideEnd {
     pub fn reported(&self, outcome: Outcome); // the side ended with this outcome
+    // the same for a side several readers tell: a failure reported before stands against a
+    // good outcome
+    pub fn reported_unless_failed(&self, outcome: Outcome);
     pub fn is_empty(&self) -> bool;           // a report through it reaches nobody
 }
 ```
@@ -2731,6 +2735,9 @@ outcome last reported or, where none was, in the words of a dropped side: a rele
 class cancelled. Into a reported outcome the side writes its own name, the worker that served
 and the span from its dispatch to the report. A host that asks no handle, and a handle dropped
 with no report, change nothing.
+
+A side whose answer several readers tell is reported through `reported_unless_failed`. A failure
+then stands against a good outcome reported behind it.
 
 Under a document none of whose stages takes an end, a handle is empty and costs nothing: no
 allocation and no lock. Under one that does, a side shares its placement with its handles: one
@@ -2916,19 +2923,28 @@ request ──> route (HTTP or gRPC, any family)
 
   The route tells a side through that side's own guard, where the guard stands, and keeps no
   handle on a prefill's end, which waits for no reader. The streamed decode's relay holds the
-  route's one handle, asked of the decode's guard. A side the gateway dropped is told by
-  nobody: the partner of a side that failed first, a prefill a fan-out never sends, a decode
-  never sent. The route's count request, placed on one worker, is told as a single request is.
+  route's one handle, asked of the decode's guard.
 
-  Two events of a pair sent both sides at once, its prefill read whole, are told otherwise than
-  the circuit breaker records them. In the first, the decode fails behind a prefill that had
-  answered. The engine hears the prefill's own good answer and the decode's failure. The
-  breaker records that failure on the decode alone and nothing on the prefill.
+  A side the gateway dropped is told by nobody: the partner of a side that failed first, a
+  prefill a fan-out never sends, a decode never sent. So is a decode already sent on the
+  concurrent write, where the route refuses its prefill's handoff: the prefill was told its
+  good answer. The route's count request, placed on one worker, is told as a single request is.
+
+  Three events are told otherwise than the circuit breaker records them. The first two are of
+  a pair sent both sides at once, its prefill read whole. In the first, the decode fails behind
+  a prefill that had answered. The engine hears the prefill's own good answer and the decode's
+  failure. The breaker records that failure on the decode alone and nothing on the prefill.
 
   In the second, the request's own timeout ends the pair. The breaker records the timeout on
-  both workers. The engine hears it on the decode and on a prefill whose own call met it. A
-  prefill that had answered is told its own answer. A prefill still in flight is told no
+  both workers, but for a prefill whose body was cut while it was only consumed: the cut's 502
+  stands on it. The engine hears the timeout on the decode and on a prefill whose own call met
+  it. A prefill that had answered is told its own answer. A prefill still in flight is told no
   outcome: that side ends as a cancelled completion, as any end nobody reported does.
+
+  The third is of the two other shapes. There a prefill's refusal is recorded on its worker at
+  its head, and told behind the read of its body. A request that ends otherwise during that
+  read tells the prefill nothing: a client that leaves then, or a decode that refuses then on
+  the concurrent write.
 
   A single request on the gRPC wire tells its end through its stream, an answer read whole too:
   every answer of that wire is read through one stream. The execution stage asks the attempt's
@@ -2944,11 +2960,52 @@ request ──> route (HTTP or gRPC, any family)
   media, a constraint the engine could not continue under, a constraint the worker refused. This
   wire states no time to first token and no tokens yet.
 
-  A route tells every answer of its workers or none. The other routes tell no outcome yet
-  **[planned]**: the transcription route and the gRPC pair route. There, and for an end
-  nobody reported, a stage hears the end of a request that was sent as a cancelled completion,
-  with the time since its dispatch and no other measure. So a plugin stage that learns from
-  outcomes reads those requests as cancelled.
+  A pair on the gRPC wire tells each side its own end, however its two sides are sent. The
+  decode is told as a single request is: by its stream, or by the stage where its dispatch
+  opened none. A failed dispatch's answer bears the decode's end only where the breaker charges
+  the decode. A decode sent behind its prefill is told once it was sent, on the worker the
+  request went to.
+
+  A decode counts as sent once its send is said, and a deadline that passes then is the
+  decode's timeout, as the breaker charges it. One request sent one side behind the other says
+  the send once its prefill answered. A batch of prompts on that shape says it with the
+  dispatch, as before, and so does a pair sent at once whose decode waits on its prefill's
+  media identity. Their deadline is told as the decode's timeout though its call was held back.
+
+  The prefill is told through its load. Its dispatch tells a failure where it records one, and
+  its good answer once. That is at its drain where it goes out first, and at its first response
+  where both sides go out at once. With the prefill's silence bound off the route reads nothing
+  there: the good answer is told where the call returned, as the breaker samples it.
+
+  A reader that meets a failure on the prefill's stream tells it as that reader charges the
+  breaker. A streamed answer tells the engine's own report of a failed request, and a collected
+  answer does not. A collected answer reads the prefill's stream first: a deadline that passes
+  under that reader is the prefill's timeout, and the unread decode is told nothing.
+
+  A request of several samples and a batch of prompts place each side once. Every child tells
+  the pair's one prefill side: a replica of the prefill's load keeps the handle of the load it
+  was made of. A child's failure stands against a sibling's good answer, whichever is told
+  last. Their decode streams tell one end between them, and each takes its share of that end
+  before any of them is read. A side the gateway dropped is told by nobody: the partner of a
+  side that failed first, a decode never sent.
+
+  Three ends of such a pair are told otherwise than the breaker records them. A partner retired
+  off the request path is told nothing, while the breaker still takes its late failure. A
+  prefill told its good answer keeps it where its reader is dropped: a client that left, a
+  decode that failed. A collected answer's failed prefill stream is one charge of its request
+  on the breaker, and one end of each attempt for the engine.
+
+  Three more follow from where an end is told. A fan-out's prefill stream that fails behind
+  every sample's last message is told to no load, and the prefill keeps its good answer. Each
+  sample let its load go at that message. A request of over thirty children hands on the answer
+  of its first failed child in their order, so a decode's end another child's answer bore is
+  told by nobody. A decode that ends clean with no message is told the worker's 200, as a
+  single request's stream is.
+
+  A route tells every answer of its workers or none. One route tells no outcome yet
+  **[planned]**: the transcription route. A stage hears a request sent there, like an end
+  nobody reported, as a cancelled completion. It carries the time since its dispatch and no
+  other measure. So a plugin stage that learns from outcomes reads those requests as cancelled.
 
 - **Membership.** The gateway's value for a model's workers gets one cell for each list, which
   the engine fills.
@@ -2980,7 +3037,9 @@ The bar for that change:
 
    With the engine off, neither pair route makes the one call of the second point. Each route asks the pair's first answer once, where it decides how the pair is sent, and builds no ask for a decode the classic policies picked. A classic pair sent prefill first still pays that test, the holder of its decode ahead of the send, and on the HTTP route the cell a moved decode is written to. The decision bench runs no route's attempt, so it does not count that cost. It was counted once by a program built for the count, under Callgrind, on the lines the second point added.
 
-   With the engine off, an outcome's report through the answer returns at its first test, of the answer's engine side. A streamed answer pays the route's ask of its guard and its reader's test of an empty handle. A report on a side of a pair through its guard returns at its first test, of what that guard keeps. A pair's streamed decode pays what a streamed answer pays. On the gRPC wire the stage's ask returns at the answer's first test, and the request's stream is left as it is. The decision bench's `--end` flag counts each against a cell that reports nothing.
+   With the engine off, an outcome's report through the answer returns at its first test, of the answer's engine side. The HTTP pair route's count request pays that test. A streamed answer pays the route's ask of its guard and its reader's test of an empty handle. A report on a side of a pair through its guard returns at its first test, of what that guard keeps. A pair's streamed decode pays what a streamed answer pays.
+
+   On the gRPC wire the stage's ask returns at the answer's first test, a pair's at its decode's answer, and the request's stream is left as it is. A pair's prefill load returns at its first test of what it keeps, where its dispatch tells its good answer. A replica of a classic load keeps nothing, and allocates nothing it did not before. The decision bench's `--end` flag counts a report against a cell that reports nothing. A pair of release builds counts what no cell runs: the gRPC pair and the count request.
 4. With the engine on, every classic test of the gateway passes under the settings' own document.
 
 ### 9.3 The options
@@ -3268,7 +3327,6 @@ tells the data once more:
 | Copy | Where | Read by |
 |---|---|---|
 | the worker record | the store's table of records (`store/memory.rs`) | the code that keeps the objects, among its reads: a record's status where a leader's log tells it, and a first copy, for the status the log told of each record; and the store itself, for its published copy and the membership log's event |
-| a copy of the record's facts | beside the worker objects (`worker_host/objects.rs`) | the code that keeps the objects, to tell a record that changed under its object |
 | the worker object | the worker-crate registry | the health checker, the follower of cache events, a decision, and a watcher's, a standby's and an operator's first copy |
 | the remainder: 17 of the 24 facts and one bit of an eighteenth, with the record's id and revision | beside each worker object (`worker_host/remainder.rs`) | a decision, for the record's id, whether the worker takes images, its wire modes and from where it is reached. A pair's classes read the worker's engine kind and its pairing descriptor too, and for a record that states no descriptor the pairing facts its worker object derives of its labels. What the worker states for a request's hard demands is lent with the list, and a frame that states a demand is held to it, every frame but an encode request's. The follower of cache events asks here whether a worker's events are indexed: its signals stand here and its models on the object (`worker_host/kv_feed.rs:191`, through `Objects::row_of`) |
 | the published copy: of a record its id alone, beside its slot in the counts and in a gateway's vetoes by pool; with them each pool's index by model and role, the generation and the clock | the store | a pick's booking and a gateway's vetoes; every other loader reads the generation; no row of a record stands in it and no request is decided over it |
@@ -3278,8 +3336,10 @@ A leader's write of a record is decided over the worker object since step 1 belo
 table follows it. The object leads a status too since step 3, and the table is told it. The
 object leads a first copy's facts since the last part of step 2, and the log its statuses. After the switch the object leads: a worker's data
 stands once, as its worker object with its remainder beside it, and the log still tells it. The
-remainder is the copy that stays. Step 4 below takes the table of records apart and ends the
-second copy of the facts. The records themselves end later, with the published copy, whose
+remainder is the copy that stays.
+
+Step 4 below takes the table of records apart. It has ended the
+second copy of the facts **[built]**. The records themselves end later, with the published copy, whose
 membership build reads them.
 The published copy holds no row of a record, and a status change makes no
 publication. It ends when the two readers of what it holds of a worker, a pick's booking and
@@ -3345,15 +3405,28 @@ A fact leaves the remainder when the worker object gets a field that holds it as
    log last told of the record. A standby's applier hands its own log the record its applied
    change takes out the same way, read back from the object.
 
-   The table still gives an event five things until step 4. The status told with a handed
-   record is the first: it is the log's own word, which the table holds for the log. The
+   The table still gives an event six things until step 4. The status the log last told of a
+   record is the first: a handed record is told in it, and a status event names it as the
+   status its record left. It is the log's own word, which the table holds for the log. The
    second is the instant a record changed in place was admitted at: the one body lays the
    table's over every writer's record, and a keeper and a standby's applier hand that same
-   instant. The third is the record of a status event, on a leader and on a standby, until a
-   status entry holds what its readers read **[planned]**. The fourth is the record taken out
-   by a decided change that a host hands the store itself (`MemoryStore::follow`): no product code hands one so.
+   instant. The third is the models of a status a standby applies. A status event holds no
+   record: it names the models its record served at the write, the one fact a reader of a
+   status reads, for a watch that asked for some. A leader's keeper hands them off the worker
+   object, under the hold that reads the status **[built]**. A standby's applier hands none,
+   and its log is told the models of the table's record until the applier hands its object's
+   **[planned]**. No watch reads a standby's log: a watch of the leader it becomes reads those
+   entries. The fourth is the record taken out
+   by a decided change that a host hands the store itself (`MemoryStore::follow`), and the models of a status it hands so: no product code hands one so.
+   A keeper's status that hands no models is told the table's too: a keeper hands them wherever a log is told.
    The fifth is the record a standby's applied change takes out where that record has no
-   object.
+   object. The sixth is the kind of a change in place: the one body tells a resize where the
+   width of the table's record differs from the handed record's, whatever kind its writer
+   handed.
+
+   Two more reads of the table in that body reach no event, and they end with the table too:
+   the test whether a key's next life is the same worker, for its session pins, and the models
+   a registration takes its worker off, which the stages are told.
 
    In a controller the
    code that keeps the objects alone writes a worker object's own facts, so the record a change
@@ -3376,7 +3449,10 @@ A fact leaves the remainder when the worker object gets a field that holds it as
 
    A change the store refuses lays nothing new: a refused write reads no record of the store, and a refused removal lays its record again as it was read. A
    record with no object waits for a cut laid whole, and its key's registration through the keeper is
-   refused until then. It is one a store took as a decided change around the keeper, or one the store took and the registry did not get. A change that moves a fact the object holds builds the object again: the
+   refused until then. It is one a store took as a decided change around the keeper, or one the store took and the registry did not get.
+   A standby and a watcher also lay it at the next event that tells its record and that the store takes.
+
+   A change that moves a fact the object holds builds the object again: the
    new object takes the standing one's place under its id, with its running state, as the code
    that keeps the objects does today for a record that changed.
 2. A standby applies the leader's events to its own worker objects **[built]**. A call reads the
@@ -3391,22 +3467,32 @@ A fact leaves the remainder when the worker object gets a field that holds it as
    request's does on main.
 4. The table of records is taken apart in removals. The second copy of the facts, the two
    conversions between a record and an object, and the task that follows the table are
-   deleted. The removals come in this order. First the store's log of its changes
+   deleted. The removals come in this order.
+
+   First the store's log of its changes
    **[built]**, then a cut's read back **[built]** and the store's own write entries **[built]**. Then its read
    entries with its own cut, and last the store's reads of the record before a write. The
    records themselves stay for the published copy's membership build, and go with that copy.
+
    The task is deleted
    **[built]**: the calls a record is written by are public, a host of the worker objects
    writes through them, and a served controller hands the code that keeps its objects. A
-   record a store took as a decided change around the keeper gets its object in one place: where a cut
-   is laid whole.
-   No task lays it. No turn that takes the controller's own store starts with
+   record a store took as a decided change around the keeper gets its object where a cut
+   is laid whole. A standby and a watcher also lay it at the next event that tells it.
+   No task lays it.
+
+   No turn that takes the controller's own store starts with
    a read of its table **[built]**: a write call decides over the object that stands, a call's read
    and a first copy read the objects, and a standby's applier lays its leader's event. A
    turn of the keeper's own reads no log of the store's changes **[built]**: a refused write
    reads no record, a cut laid whole lays the cut's own records, then reads the status the
    table holds for each, and the call that lays a kept credential again reads the objects. No
    host follows the store **[built]**.
+
+   The second copy of the facts is deleted **[built]**. The code that keeps the objects holds a
+   cut's record against the record read back off its object and its remainder. Models set on
+   an object since its build read back as set, so a cut whose record states others builds the
+   object again.
 
 **One rule for a registration's write [built].** What a registration makes of the record under
 its address is one function beside the other membership rules (`WorkerRow::laid_over`,
@@ -3423,7 +3509,7 @@ hands the store the event at its place in the log, and puts the object in the re
 the store took the event. A removal's object leaves the registry first. A record changed in
 place keeps the instant it was admitted at. A status the leader tells is written to the table and
 laid on the object in the same turn. A restore is the store's restore and the lay of the cut's own
-records in one turn of that code. No record is read back to lay an object: each record's status is read off the table. A record of a watch's snapshot whose
+records in one turn of that code. No record of the table is read back to lay an object: each record's status alone is read off it. A record of a watch's snapshot whose
 object stands keeps the instant it was admitted at: that code states it before the store takes
 the snapshot. A first copy is cut from the objects, by the last
 part of step 2.
@@ -3450,7 +3536,9 @@ hold, and no record of the table. So a copy holds
 each record the log told at the copy's place, and none it did not, beside every writer that holds the turn. A
 record the store took and the registry did not get is in no copy until it is laid (step 1).
 One a store took as a decided change around that code is laid
-where a cut is laid whole. A copy's statuses are the
+where a cut is laid whole. A standby and a watcher also lay it at the next event that tells it.
+
+A copy's statuses are the
 ones the log last told at its place, and not the objects': an object can stand one tell
 ahead of the log. The store keeps what the log last told of each record's status, beside its
 epoch. A copy reads the log's place, the epoch and those statuses in one hold
@@ -3461,8 +3549,9 @@ Three writes move the log's place outside the keeper's turn, and a
 copy stays whole beside each: a status tell changes no fact, and a generation's apply and a
 term's start change no record.
 
-The told status has five readers: the next status event, for
-the status a record moved from, the event of a record changed in place, which carries it, a
+The told status has six readers: the next status event, for
+the status a record moved from, the event of a record changed in place, which carries it, the
+event of a record a write takes out, which is told in it where its writer handed the record, a
 first copy, a tell the store refused, whose object takes it back, and a standby's applier or
 a watcher, which lays it on the object. No decision reads it. An operator's read of a few
 records is read as a first copy is cut, in the keeper's turn and with each record's told status,
@@ -3572,8 +3661,8 @@ gateway                                           controller (leader)
   flight: its dispatch names no worker (decision 6). Its completion names the worker that served
   it. Nothing counts it toward that worker's health yet **[planned]**. In process these tell the
   gateway's own engine the outcome: the regular HTTP router's typed and pass-through routes, the
-  HTTP pair route and a single request on the gRPC wire. The other routes do not yet (section
-  9.2).
+  HTTP pair route, and a single request and a pair on the gRPC wire. The transcription route
+  does not yet (section 9.2).
 - When no answer comes in time (no credit on the stream, a change of leader, the controller
   gone), the gateway decides by itself with the same engine, under the document the controller
   pushed, over the worker list it follows (decision 6). That list stops changing while the

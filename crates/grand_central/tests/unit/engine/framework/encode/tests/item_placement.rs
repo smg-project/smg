@@ -139,6 +139,8 @@ fn the_admitted_rows_answer_by_their_place_in_the_hosts_pools() {
         },
         row(1, Role::Decode, 1, 9),
     ];
+    // Each of the three lists is handed its column, by the pool's places.
+    bed.decode_affinity = vec![AffinityFacts::default(); 2];
     bed.encoders = vec![
         unready(row(0, Role::Encode, 0, 0)),
         row(1, Role::Encode, 0, 3),

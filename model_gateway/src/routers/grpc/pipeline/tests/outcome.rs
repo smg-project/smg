@@ -61,7 +61,7 @@ async fn placed_by(
 }
 
 /// One completion through `pipeline`.
-async fn complete(
+pub(super) async fn complete(
     pipeline: &RequestPipeline,
     components: &Arc<SharedComponents>,
     request: Arc<CompletionRequest>,

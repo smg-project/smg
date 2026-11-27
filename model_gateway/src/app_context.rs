@@ -1146,14 +1146,7 @@ impl AppContextBuilder {
         let config = config.clone();
         let stages = stages.unwrap_or_else(StageRegistry::builtin);
         Box::new(move |labels, generation| {
-            let spec = config.hosted_policy_with_labels(labels, generation, &stages)?;
-            // The document the spec was checked from, built once more: the
-            // builder is a pure function of the settings and the labels.
-            let mut document = config
-                .policy_document_with_labels(labels)
-                .map_err(|refused| refused.to_string())?;
-            document.generation = generation;
-            Ok((document, spec))
+            config.hosted_policy_with_labels(labels, generation, &stages)
         })
     }
 

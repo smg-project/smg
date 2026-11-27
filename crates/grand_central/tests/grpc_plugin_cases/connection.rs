@@ -28,11 +28,10 @@ fn the_hello_names_the_plugin_and_the_window_and_the_load_settles_the_stream() {
     let mut spec = spec(&served, "greeter");
     spec.config = b"mode=1".to_vec();
     spec.metrics = vec!["hits".to_owned(), "skips".to_owned()];
-    spec.view = Exposure {
-        tenant: Reveal::Hash,
-        session_key: Reveal::None,
-        headers: HeaderSet::of([2, 5]),
-    };
+    spec.view = Exposure::default();
+    spec.view.tenant = Reveal::Hash;
+    spec.view.session_key = Reveal::None;
+    spec.view.headers = HeaderSet::of([2, 5]);
     let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
     assert!(plugin.is_warm(), "the load opened this thread's stream");
     assert_eq!(plugin.name(), "greeter");
@@ -175,10 +174,8 @@ fn an_ack_under_another_version_is_cancelled_on_every_racing_thread_naming_both(
     let runtime = runtime();
     let mut spec = spec(&served, "one-version");
     // The refused streams count on the breaker: far from its threshold.
-    spec.breaker = BreakerSpec {
-        failures: 100,
-        ..BreakerSpec::default()
-    };
+    spec.breaker = BreakerSpec::default();
+    spec.breaker.failures = 100;
     let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
     // Every later ack names another version, late enough that the threads'
     // hellos are all out before the first of them is answered.
@@ -247,10 +244,8 @@ fn an_ack_that_settles_second_under_another_version_is_cancelled_naming_both() {
     let mut spec = spec(&served, "second-to-settle");
     // The ended and the refused stream count on the breaker: far from its
     // threshold.
-    spec.breaker = BreakerSpec {
-        failures: 100,
-        ..BreakerSpec::default()
-    };
+    spec.breaker = BreakerSpec::default();
+    spec.breaker.failures = 100;
     let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
     let engine = single_engine(profile(&plugin, ALL));
     // The plugin ends the load's stream at its first frame.
@@ -360,12 +355,12 @@ fn a_row_the_host_cannot_connect_to_is_refused_before_any_connect() {
         "p",
         Transport::Tls {
             address: "127.0.0.1:1".to_owned(),
-            tls: Tls {
-                server_name: "plugin.test".to_owned(),
-                ca_pem: Vec::new(),
-                cert_pem: b"x".to_vec(),
-                key_pem: b"x".to_vec(),
-            },
+            tls: Tls::of(
+                "plugin.test".to_owned(),
+                Vec::new(),
+                b"x".to_vec(),
+                b"x".to_vec(),
+            ),
         },
     );
     for (row, why) in [
@@ -454,12 +449,12 @@ fn mutual_tls_with_the_pinned_server_name() {
         .to_string();
     let tls = |server_name: &str, cert: &str, key: &str| Transport::Tls {
         address: address.clone(),
-        tls: Tls {
-            server_name: server_name.to_owned(),
-            ca_pem: authority.pem.clone().into_bytes(),
-            cert_pem: cert.as_bytes().to_vec(),
-            key_pem: key.as_bytes().to_vec(),
-        },
+        tls: Tls::of(
+            server_name.to_owned(),
+            authority.pem.clone().into_bytes(),
+            cert.as_bytes().to_vec(),
+            key.as_bytes().to_vec(),
+        ),
     };
     let runtime = runtime();
     let mut spec = GrpcPluginSpec::new("remote", tls("plugin.test", &client_cert, &client_key));

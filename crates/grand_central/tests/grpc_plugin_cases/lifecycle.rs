@@ -180,10 +180,8 @@ fn a_left_word_that_waited_for_a_stream_is_not_written_on_protocol_1() {
     let runtime = runtime();
     let mut spec = spec(&served, "waited");
     // The ended stream counts on the breaker: far from its threshold.
-    spec.breaker = BreakerSpec {
-        failures: 100,
-        ..BreakerSpec::default()
-    };
+    spec.breaker = BreakerSpec::default();
+    spec.breaker.failures = 100;
     let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
     let engine = single_engine(profile(&plugin, ALL));
     // The plugin ends the load's stream at its first frame.

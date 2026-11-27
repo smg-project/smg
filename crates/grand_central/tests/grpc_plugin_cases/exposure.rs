@@ -22,11 +22,10 @@ fn the_exposure_withholds_what_the_row_does_not_reveal() {
     let served = TestPlugin::serve();
     let runtime = runtime();
     let mut spec = spec(&served, "narrow-view");
-    spec.view = Exposure {
-        tenant: Reveal::None,
-        session_key: Reveal::Plain,
-        headers: HeaderSet::of([2]),
-    };
+    spec.view = Exposure::default();
+    spec.view.tenant = Reveal::None;
+    spec.view.session_key = Reveal::Plain;
+    spec.view.headers = HeaderSet::of([2]);
     let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
     let engine = single_engine(profile(&plugin, ALL));
     let headers = [
@@ -88,11 +87,10 @@ fn a_picker_kept_across_a_new_header_list_is_shown_its_rows_place() {
     let served = TestPlugin::serve();
     let runtime = runtime();
     let mut row = spec(&served, "first-place");
-    row.view = Exposure {
-        tenant: Reveal::None,
-        session_key: Reveal::None,
-        headers: HeaderSet::of([0]),
-    };
+    row.view = Exposure::default();
+    row.view.tenant = Reveal::None;
+    row.view.session_key = Reveal::None;
+    row.view.headers = HeaderSet::of([0]);
     let plugin = Plugin::load(&runtime, row).expect("the plugin loads");
     let mut stages = StageRegistry::builtin();
     let make = move || -> Box<dyn Picker> {
@@ -205,10 +203,8 @@ fn a_lease_and_its_request_show_one_session_value_or_none() {
     let shown_under = |name: &str, session_key: Reveal| {
         let served = TestPlugin::serve();
         let mut spec = spec(&served, name);
-        spec.view = Exposure {
-            session_key,
-            ..Exposure::default()
-        };
+        spec.view = Exposure::default();
+        spec.view.session_key = session_key;
         let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
         let engine = single_engine(profile(&plugin, ALL));
         let decision = decide_with(&engine, &keyed, &pool(4));
@@ -246,12 +242,12 @@ fn a_printed_row_withholds_its_pems() {
         "printed",
         Transport::Tls {
             address: "plugin.example:9000".to_owned(),
-            tls: Tls {
-                server_name: "plugin.example".to_owned(),
-                ca_pem: pems[0].to_vec(),
-                cert_pem: pems[1].to_vec(),
-                key_pem: pems[2].to_vec(),
-            },
+            tls: Tls::of(
+                "plugin.example".to_owned(),
+                pems[0].to_vec(),
+                pems[1].to_vec(),
+                pems[2].to_vec(),
+            ),
         },
     );
     let printed = format!("{row:?}");

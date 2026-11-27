@@ -324,15 +324,16 @@ pub(crate) fn execute_plan<'a>(
         let ledger = &ctx.ledger;
 
         // A pair's decode goes out with the dispatch, and its guard says so
-        // where it is made. One request of a sequential dispatch is the
-        // exception, where its decode is owed anything behind its prefill: the
-        // guard is made ahead of the decode's send, and the dispatch asks the
-        // decode again and says the send once the prefill has answered. A
-        // classic pair is owed neither and takes the rule.
-        let behind_prefill = decode_is_owed_behind_its_prefill(&execution_plan, workers);
+        // where it is made. A decode Grand Central placed is the exception
+        // where its dispatch may refuse the request, or wait for the
+        // prefill, ahead of the decode's send
+        // ([`decode_guard_is_made_ahead`]): the guard is made ahead of that
+        // send, and the dispatch says the send where the decode goes out. A
+        // classic pair is owed nothing there and takes the rule.
+        let ahead = decode_guard_is_made_ahead(&execution_plan, workers);
         let sticky_key = ctx.sticky_key.as_deref();
-        let guards = if behind_prefill {
-            LoadGuards::behind_prefill(workers, sticky_key)
+        let guards = if ahead {
+            LoadGuards::behind_prefill(workers, sticky_key, sub_requests)
         } else {
             LoadGuards::scaled(workers, sticky_key, sub_requests)
         };
@@ -344,7 +345,9 @@ pub(crate) fn execute_plan<'a>(
         let mut moved = None;
         // The dispatch below borrows this slot and a pair arm takes the hold out
         // of it: moved in, the hold would sit in every request's dispatch future.
-        let mut behind = behind_prefill.then(|| DecodeBehindPrefill {
+        // A batch's dispatch is handed the slot, and says its decode's send
+        // from the hold.
+        let mut behind = ahead.then(|| DecodeBehindPrefill {
             stage: selection,
             model_id: ctx.model_id.as_str(),
             routing: &ctx.routing,
@@ -481,6 +484,7 @@ pub(crate) fn execute_plan<'a>(
                         prefill_guard,
                         ledger,
                         dispatched_at.into_std(),
+                        &mut behind,
                     )
                     .await
                 }
@@ -502,15 +506,31 @@ pub(crate) fn execute_plan<'a>(
             },
             None => dispatch.await,
         };
-        // Grand Central hears the attempt's end from here, and from no
-        // dispatch: the plan holds the guards the handle is asked of. No await
-        // lies between the dispatch's return and this, so a stream takes its
+        // Grand Central hears a single request's end and a pair's decode from
+        // here: the plan holds the guards their handle is asked of. A pair's
+        // prefill is told inside its dispatch, through its load. No await
+        // lies between the dispatch's return and this. So a stream takes its
         // layer ahead of any reader's watch for its client (see
-        // `ProtoStream::put_report_layer`) and a failed call is told ahead of
-        // its retry's backoff. The selection's test stands here in line: a
+        // `ProtoStream::put_report_layer`), and a failed call is told ahead
+        // of its retry's backoff. The selection's test stands here in line: a
         // request the classic policies placed pays it and no more.
-        if workers.tells_end() {
-            tell_end(&mut result, workers.end(ctx.load_guards.as_ref()));
+        match workers {
+            WorkerSelection::Single { worker } => {
+                if worker.tells_end() {
+                    tell_end(&mut result, workers.end(ctx.load_guards.as_ref()));
+                }
+            }
+            // A pair's decode is told through its own handle, by a test and a
+            // teller of its own. A single request reads one worker's word here
+            // and nothing of a pair. The hint lays the pair's arm out of the
+            // single request's line, which then runs no jump past it. A pair
+            // pays the jump to its arm and nothing else for the hint.
+            WorkerSelection::Disaggregated { decode, .. } => {
+                std::hint::cold_path();
+                if decode.tells_end() {
+                    tell_decode_end(&mut result, workers, ctx.load_guards.as_ref());
+                }
+            }
         }
         // A pair's decode that moved behind its prefill: the attempt's selection
         // names the decode that was sent, for the response's stages and for a
@@ -557,7 +577,8 @@ pub(crate) fn execute_plan<'a>(
 /// ([`WorkerSelection::end`]). The plan calls it once, behind the dispatch's
 /// return, for a request that tells its end
 /// ([`WorkerSelection::tells_end`]): a classic request never comes here, so
-/// it stands out of line.
+/// it stands out of line. A pair comes here with its decode's handle
+/// ([`tell_decode_end`]).
 ///
 /// A dispatch that answered hands the handle to its result, which tells its
 /// own end from here on ([`ExecutionResult::report_through`]). A dispatch
@@ -575,6 +596,19 @@ fn tell_end(result: &mut Result<ExecutionResult, Response>, end: RequestEnd) {
             }
         }
     }
+}
+
+/// [`tell_end`] for a pair: its decode's end, through the decode's handle
+/// ([`WorkerSelection::decode_end`]). The plan calls it for a pair whose
+/// decode tells its end. It is a teller of its own, out of line: the plan's
+/// code for a single request holds nothing of a pair's.
+#[inline(never)]
+fn tell_decode_end(
+    result: &mut Result<ExecutionResult, Response>,
+    workers: &WorkerSelection,
+    guards: Option<&LoadGuards>,
+) {
+    tell_end(result, workers.decode_end(guards));
 }
 
 /// A request's end that its dispatch owes Grand Central and cannot
@@ -620,6 +654,73 @@ impl UntoldEnd {
     }
 }
 
+/// Mark `response`, the client's answer for a pair's decode that failed,
+/// with the end that decode owes Grand Central ([`UntoldEnd`]). `read`
+/// answers it as the circuit breaker samples the failure on the decode.
+/// The mark follows the side the breaker charges, not the name the failure
+/// arrives under. A pair's answers are made in this file and in the
+/// sequential dispatch's: this is the one maker of their mark. `read` is
+/// asked only for a pair whose decode tells its end
+/// ([`WorkerSelection::decode_tells_end`]): a single request's answer takes
+/// no mark here.
+pub(in crate::routers::grpc) fn owe_decode_end(
+    response: &mut Response,
+    workers: &WorkerSelection,
+    read: impl FnOnce() -> Option<(u16, bool)>,
+) {
+    if !workers.decode_tells_end() {
+        return;
+    }
+    if let Some((status, answered)) = read() {
+        UntoldEnd { status, answered }.mark(response);
+    }
+}
+
+/// Tell Grand Central a pair's prefill that failed, through its load where the
+/// dispatch holds it. It is told the status the circuit breaker samples for the
+/// failure, and whether the worker answered it. A failure the breaker takes no
+/// sample of is told by nobody. A load the classic policies placed keeps no
+/// side, and the failure is not read for it.
+pub(in crate::routers::grpc) fn tell_prefill_failure(guard: &PrefillLoadGuard, e: &tonic::Status) {
+    let end = guard.end();
+    if !end.is_empty() {
+        if let Some((status, answered)) = e.end_status() {
+            end.report(status, || answered);
+        }
+    }
+}
+
+/// [`tell_prefill_failure`] for a prefill sent beside its decode, where the
+/// circuit breaker sampled the failure on the prefill. A dispatch that ended
+/// with its request's failed encode dispatch, or with the verdict on its
+/// stalled decode, is no sample of the prefill: nobody is told through its
+/// load. Answers whether the failure was the prefill's own sample. Cold and
+/// out of line: a dispatch whose prefill answers well never comes here.
+#[cold]
+#[inline(never)]
+fn tell_sampled_prefill_failure(guard: &PrefillLoadGuard, e: &tonic::Status) -> bool {
+    let sampled = !is_encode_dispatch_failure(e) && !is_decode_silence(e);
+    if sampled {
+        tell_prefill_failure(guard, e);
+    }
+    sampled
+}
+
+/// The client's answer where both dispatches of a pair failed: the prefill's.
+/// It takes the end the decode's answer owed where the prefill's failure was
+/// its own sample (`sampled_apart`). Beside a prefill dispatch that was no
+/// sample of the prefill, the decode's failure is none either: the answer
+/// keeps what it bears. Cold and out of line: a pair with a side that
+/// answers never comes here.
+#[cold]
+#[inline(never)]
+fn both_sides_failed(mut prefill: Response, mut decode: Response, sampled_apart: bool) -> Response {
+    if let Some(untold) = UntoldEnd::take(&mut decode).filter(|_| sampled_apart) {
+        untold.mark(&mut prefill);
+    }
+    prefill
+}
+
 /// The client's answer for an attempt whose deadline passed before the
 /// worker answered the call that opens the stream (a worker that took the
 /// request and never spoke; on a disaggregated pair, a side the pair's own
@@ -633,9 +734,11 @@ impl UntoldEnd {
 /// prefill side's first response waits for the decode side; a prefill side
 /// that is itself silent is the prefill silence bound's to charge, which
 /// fires before this deadline when it is on. The dropped call is what
-/// cancels the request on the worker(s). The answer bears the end a single
+/// cancels the request on the worker(s). The answer bears the end the
 /// request owes Grand Central, the timeout as the breaker samples it
-/// ([`UntoldEnd`]): the plan takes it off the answer and tells it.
+/// ([`UntoldEnd`]): the plan takes it off the answer and tells it. A
+/// pair's is its decode's, told through the decode's guard once its send
+/// was said: a decode still behind its prefill is told nothing.
 fn dispatch_timed_out(
     deadline: RequestDeadline,
     workers: &WorkerSelection,
@@ -670,6 +773,8 @@ fn dispatch_timed_out(
     if let Some(untold) = UntoldEnd::owed(workers, || status.end_status()) {
         untold.mark(&mut response);
     }
+    // A pair's timeout is its decode's.
+    owe_decode_end(&mut response, workers, || status.end_status());
     response
 }
 
@@ -715,24 +820,36 @@ impl PrefillSend for PrefillLoadGuard {
     }
 }
 
-/// Whether the dispatch owes the plan's decode anything behind its prefill
-/// ([`DecodeBehindPrefill`]): one disaggregated request under a runtime
-/// whose protocol sends its two sides one behind the other, with a decode
-/// that is owed its ask and its send there
-/// ([`Placed::owed_behind_prefill`]). A batch's sub-requests, and both sides
-/// of the parallel shape, go out with the dispatch. A decode the classic
-/// policies picked goes out behind its prefill and is owed nothing there:
-/// its answer's test is made ahead of the runtime's, and the dispatch holds
+/// Whether the plan's decode guards are made ahead of the decode's send
+/// ([`LoadGuards::behind_prefill`]), which the dispatch then says from what
+/// the plan holds for it ([`DecodeBehindPrefill`]): a pair Grand Central
+/// placed ([`Placed::owed_behind_prefill`]) whose dispatch may refuse the
+/// request, or wait for the prefill, ahead of that send. That is a pair's
+/// request or batch under a runtime whose protocol sends the two sides one
+/// behind the other, and under a runtime with no pair protocol. One request
+/// of the first is asked its decode again once the prefill has answered and
+/// says the send there, and a batch says it once, behind what refuses a
+/// sub-request ahead of its send ([`pd_batch_refusal`]). The second's
+/// dispatch refuses the request and says nothing. Both sides of the
+/// parallel shape go out with the dispatch, which refuses nothing ahead of
+/// them: that guard says its send where it is made. A decode the classic
+/// policies picked, and a request with no decode, leave at the answer's
+/// test: the guard is whole where it is made, and the dispatch holds
 /// nothing for it.
-fn decode_is_owed_behind_its_prefill(plan: &ExecutionPlan, workers: &WorkerSelection) -> bool {
-    matches!(
-        plan,
-        ExecutionPlan::PrefillDecode(_) | ExecutionPlan::EncodePrefillDecode { .. }
-    ) && workers.decode().is_some_and(Placed::owed_behind_prefill)
+fn decode_guard_is_made_ahead(plan: &ExecutionPlan, workers: &WorkerSelection) -> bool {
+    workers.decode().is_some_and(Placed::owed_behind_prefill)
+        && match plan {
+            ExecutionPlan::PrefillDecode(_) | ExecutionPlan::EncodePrefillDecode { .. } => true,
+            ExecutionPlan::Batch { kind, .. } => matches!(
+                kind,
+                ExecutionPlanKind::PrefillDecode | ExecutionPlanKind::EncodePrefillDecode
+            ),
+            ExecutionPlan::Single(_) | ExecutionPlan::EmbedBatch { .. } => false,
+        }
         && workers
             .disaggregated_runtime_type()
             .and_then(|runtime| PdProtocol::for_runtime(*runtime))
-            .is_some_and(|protocol| protocol.dispatch == PdDispatch::Sequential)
+            .is_none_or(|protocol| protocol.dispatch == PdDispatch::Sequential)
 }
 
 /// What answers a pair's request whose selection is no pair's, which is
@@ -772,9 +889,9 @@ fn pd_runtime_unsupported(runtime_type: &RuntimeType) -> Response {
 /// send ([`execute_pd_dispatch`]), asked of every sub-request of a batch:
 /// the runtime's refusals and, where the two sides go out one behind the
 /// other, the sequential plan's, by the check that builds no plan
-/// ([`SequentialPlan::refuses`]). A batch asks this ahead of its one word of
-/// the send, where that word says anything
-/// ([`PrefillAhead::says_its_send`]).
+/// ([`SequentialPlan::refuses`]). A batch asks this ahead of its words of
+/// its two sends, where those words say anything
+/// ([`PrefillAhead::ahead_of_its_send`]).
 // Out of line: a batch of a classic answer never comes here, and its
 // dispatch keeps the body it had.
 #[inline(never)]
@@ -796,16 +913,34 @@ fn pd_batch_refusal(
     }
 }
 
+/// A batch that goes out says its decode's send, once, where its decode
+/// guards were made ahead of that send: `behind` is the plan's slot for
+/// what it holds of them, empty where the guards said the send as they were
+/// made. The first decode guard takes the answer's side
+/// ([`LoadGuards::map_decode`]), as the first guard made of an answer does.
+/// A batch asks this behind its refusals ([`pd_batch_refusal`]): a batch
+/// refused there leaves the slot as it is, and its guards are dropped
+/// unsent.
+// Out of line: a batch of a classic answer never comes here.
+#[inline(never)]
+fn batch_decode_sent(behind: &mut Option<DecodeBehindPrefill<'_>>, workers: &WorkerSelection) {
+    if let (Some(behind), Some(decode)) = (behind.take(), workers.decode()) {
+        behind.guards.map_decode(|ahead| decode.sent(ahead));
+    }
+}
+
 /// Dispatch one disaggregated request in its runtime's shape.
 /// `room_residue` is the prefill rank the request's sticky key pinned its
 /// room to ([`pin_grouped_dp_prefill_room`]), which the rooms of an n>1
 /// request's samples take too.
 /// `encode` is the watch on an EPD request's encode dispatch (see
 /// [`launch_encode_dispatch`]), `None` for every other request.
-/// `behind` is what one request of the sequential shape holds for its
-/// decode, which goes out behind its prefill (see [`DecodeBehindPrefill`]);
-/// `None` for every dispatch whose decode guard said its send where it was
-/// made.
+/// `behind` is what one request holds for its decode where the decode's
+/// guard was made ahead of its send (see [`DecodeBehindPrefill`]): the
+/// sequential shape asks the decode again and says the send behind its
+/// prefill, and a request refused here drops what it holds unsent. `None`
+/// for every dispatch whose decode's send is said already: by the guard
+/// where it was made, or by the batch for its sub-requests.
 /// `prefill` is the prefill's load as the dispatch was handed it
 /// ([`PrefillSend`]): one request's send is said here, where the shape is
 /// dispatched.
@@ -1329,6 +1464,10 @@ async fn encode_dispatch_failed(watch: Option<&mut EncodeWatch>) -> String {
 /// Dispatch one backend request per batched prompt concurrently, preserving
 /// prompt order. Fail-fast: the first failed dispatch fails the batch and
 /// drops the remaining streams (abort-on-drop reclaims them backend-side).
+/// `behind` is the plan's slot for what it holds of a pair's decode guards
+/// made ahead of their send (see [`DecodeBehindPrefill`]): a batch that
+/// goes out says that send from it. The slot is empty for every other
+/// batch.
 #[expect(clippy::too_many_arguments)]
 async fn execute_batch_dispatch(
     kind: ExecutionPlanKind,
@@ -1339,6 +1478,7 @@ async fn execute_batch_dispatch(
     prefill_guard: Option<PrefillAhead>,
     ledger: &AttemptLedger,
     dispatched_at: Instant,
+    behind: &mut Option<DecodeBehindPrefill<'_>>,
 ) -> Result<ExecutionResult, Response> {
     // One Prefill handle per PD sub-request, all on the one admission slot.
     // The batch's prefills go out with the dispatches below: the send is
@@ -1346,21 +1486,32 @@ async fn execute_batch_dispatch(
     // word says anything, for an answer of Grand Central, what a
     // sub-request's dispatch refuses ahead of its send is asked first
     // ([`pd_batch_refusal`]): a batch refused there sent nothing, and its
-    // load is dropped as it was acquired. A classic answer's send says
-    // nothing and asks nothing here: its sub-requests make their refusals
-    // as before.
+    // load and its decode guards are dropped as they were acquired. Behind
+    // the refusals the decode's send is said too, where its guards were
+    // made ahead of it ([`batch_decode_sent`]). A classic answer's send
+    // says nothing and asks nothing here: its sub-requests make their
+    // refusals as before.
     let prefill_guards: Vec<Option<PrefillLoadGuard>> = match kind {
         ExecutionPlanKind::Single => requests.iter().map(|_| None).collect(),
         ExecutionPlanKind::PrefillDecode | ExecutionPlanKind::EncodePrefillDecode => {
-            // The look is at the load where it lies. A load that is named,
-            // or handed through an answer, ahead of its send is carried to
-            // another place on a classic answer's path too.
-            if prefill_guard
-                .as_ref()
-                .is_some_and(PrefillAhead::says_its_send)
-            {
-                pd_batch_refusal(&requests, workers)?;
+            // The load is asked where it lies: one that is moved into a
+            // name, or handed through an answer, ahead of its send is
+            // carried to another place on a classic answer's path too.
+            if let Some(load) = prefill_guard.as_ref() {
+                load.ahead_of_its_send(|| -> Result<(), Response> {
+                    pd_batch_refusal(&requests, workers)?;
+                    batch_decode_sent(behind, workers);
+                    Ok(())
+                })?;
             }
+            // Both answers of a pair are one placement's ([`PlacedPair`]):
+            // decode guards made ahead of their send lie beside a prefill's
+            // load that asks here, and the ask takes what the plan holds of
+            // them.
+            debug_assert!(
+                prefill_guard.is_none() || behind.is_none(),
+                "a prefill's load whose send says nothing lies beside decode guards made ahead of their send"
+            );
             require_prefill_guard(prefill_guard)?
                 .sent()
                 .replicate_to(requests.len())
@@ -1393,7 +1544,7 @@ async fn execute_batch_dispatch(
                             None, // the room as minted: no sticky prefill rank
                             None, // no encode dispatch on this path
                             None, // no prepared-input handoff on batch completion path
-                            None, // the decode's guard said its send where it was made
+                            None, // the decode's send is said: by its guard, or by the batch above
                         )
                         .await
                     }
@@ -2096,7 +2247,15 @@ async fn execute_parallel_pd(
             side,
             error,
             partner,
-        } => Err(parallel_side_failed_first(&sides, side, &error, partner)),
+        } => {
+            // The side that answered is told, as it is recorded: a prefill
+            // through its load here, a decode by the end its answer owes.
+            // The partner is dropped or retired, and nobody tells it.
+            if side == PdSide::Prefill {
+                tell_sampled_prefill_failure(&prefill_guard, &error);
+            }
+            Err(parallel_side_failed_first(&sides, side, &error, partner))
+        }
     }
 }
 
@@ -2170,6 +2329,14 @@ async fn parallel_sides_answered(
     let prefill_silence = prefill_result.as_ref().is_err_and(|e| {
         is_prefill_silence(e) || is_decode_silence(e) || is_encode_dispatch_failure(e)
     });
+    // Grand Central hears each side as the breaker sampled it above. A
+    // prefill dispatch that ended with the encode's failure or with the
+    // decode's verdict is no sample of the prefill, and the decode's own
+    // failure beside it is none either.
+    let sampled_apart = match &prefill_result {
+        Err(e) => tell_sampled_prefill_failure(&prefill_guard, e),
+        Ok(_) => true,
+    };
     let prefill = prefill_result
         .map_err(|e| pd_side_error(PdSide::Prefill, sides.prefill_label, &e, workers));
     let decode =
@@ -2186,9 +2353,16 @@ async fn parallel_sides_answered(
             drop(decode.defer_abort_until_first_item());
             return Err(response);
         }
+        // Both sides failed: the client sees the prefill's answer, which
+        // takes the end the decode's answer owed. The dispatch hands on its
+        // first failure alone today, so no request reaches this arm: it
+        // keeps the rule for a join that hands on both.
+        (Err(response), Err(decode)) => {
+            return Err(both_sides_failed(response, decode, sampled_apart));
+        }
         // Any other failure: the surviving side's stream drops here,
         // which aborts its room on the worker.
-        (Err(response), _) | (Ok(_), Err(response)) => return Err(response),
+        (Err(response), Ok(_)) | (Ok(_), Err(response)) => return Err(response),
     };
 
     // The prefill side's prompt has been pending prefill on its worker
@@ -2226,6 +2400,9 @@ async fn parallel_sides_answered(
             drop(prefill_stream);
             drop(decode_stream.defer_abort_until_first_item());
             record_silence_outcome(workers, sides.ledger, &e);
+            // A verdict on the prefill is told through its load. One that
+            // charges the decode is owed on the answer (`pd_side_error`).
+            tell_sampled_prefill_failure(&prefill_guard, &e);
             return Err(pd_side_error(
                 PdSide::Prefill,
                 sides.prefill_label,
@@ -2238,7 +2415,14 @@ async fn parallel_sides_answered(
         // where its reader meets it (the streaming layer's
         // accounting); a stream that ended with nothing on it is no
         // success of the side either.
-        Ok(FirstItem::Response) => workers.record_outcome_prefill(sides.ledger, 200),
+        Ok(FirstItem::Response) => {
+            workers.record_outcome_prefill(sides.ledger, 200);
+            // The one place a prefill sent beside its decode is told its
+            // good answer. Its reader tells a failure it meets later. With
+            // the silence bound off nothing is read here: the side counts
+            // as answered where its call returned, and is told there.
+            prefill_guard.end().report(200, || true);
+        }
         Ok(FirstItem::Failure | FirstItem::End) => {}
     }
 
@@ -2528,7 +2712,11 @@ fn pd_side_error(
     }
     if side == PdSide::Prefill && is_decode_silence(error) {
         if let Some(decode) = workers.decode_worker() {
-            return decode_silence_response(error, decode);
+            // The verdict arrives under the prefill's name and charges the
+            // decode: the answer bears the decode's end.
+            let mut response = decode_silence_response(error, decode);
+            owe_decode_end(&mut response, workers, || error.end_status());
+            return response;
         }
     }
     UpstreamClass::account_dispatch_failure(side.name(), connection, error);
@@ -2537,7 +2725,13 @@ fn pd_side_error(
         PdSide::Prefill => workers.prefill_worker(),
         PdSide::Decode => workers.decode_worker(),
     };
-    pd_start_failure_response(side, worker, error, "execute_parallel_pd")
+    let mut response = pd_start_failure_response(side, worker, error, "execute_parallel_pd");
+    // A prefill's own failure is told through the prefill's load, where the
+    // dispatch holds it. The decode's is owed to the plan.
+    if side == PdSide::Decode {
+        owe_decode_end(&mut response, workers, || error.end_status());
+    }
+    response
 }
 
 /// The client answer for a disaggregated side that failed to start, under the
@@ -3317,7 +3511,7 @@ pub(crate) mod tests {
     use crate::routers::{
         common::{
             attempt_ledger::FailedSide,
-            placement::tests::{heard_request, Heard},
+            placement::tests::{heard_pair, heard_request, Heard},
             retry::is_retryable_response,
         },
         grpc::{
@@ -5950,13 +6144,13 @@ pub(crate) mod tests {
         assert_eq!(plan_sub_requests(&batch, None), 4);
     }
 
-    /// One request of a sequential dispatch holds something for its decode
-    /// where Grand Central placed the pair: the decode is owed its ask
-    /// and its send behind the prefill. A pair the classic policies picked
-    /// is owed neither, so its dispatch holds nothing and makes the guard
-    /// it made with no engine. The parallel shape holds nothing for either,
-    /// and neither does a batch, whose sub-requests go out with the dispatch
-    /// whatever placed the pair.
+    /// A pair's dispatch holds something for its decode where Grand Central
+    /// placed the pair and the dispatch may refuse the request, or wait for
+    /// the prefill, ahead of the decode's send: one request and a batch of
+    /// the sequential shape, and of a runtime with no pair protocol. A pair
+    /// the classic policies picked is owed nothing there, so its dispatch
+    /// holds nothing and makes the guard it made with no engine. The
+    /// parallel shape holds nothing for either.
     #[test]
     fn a_sequential_dispatch_holds_nothing_for_a_classic_pairs_decode() {
         use crate::{
@@ -5994,20 +6188,24 @@ pub(crate) mod tests {
         };
 
         let classic = PolicyRegistry::new(PolicyConfig::RoundRobin);
-        assert!(!decode_is_owed_behind_its_prefill(
+        assert!(!decode_guard_is_made_ahead(
             &plan,
             &selected(&classic, RuntimeType::Vllm)
         ));
 
         let by_engine = PolicyRegistry::new(PolicyConfig::RoundRobin);
         let _heard = hearing_pairs_on(&by_engine, true);
-        assert!(decode_is_owed_behind_its_prefill(
+        assert!(decode_guard_is_made_ahead(
             &plan,
             &selected(&by_engine, RuntimeType::Vllm)
         ));
         assert!(
-            !decode_is_owed_behind_its_prefill(&plan, &selected(&by_engine, RuntimeType::Sglang)),
+            !decode_guard_is_made_ahead(&plan, &selected(&by_engine, RuntimeType::Sglang)),
             "both sides of the parallel shape go out with the dispatch"
+        );
+        assert!(
+            decode_guard_is_made_ahead(&plan, &selected(&by_engine, RuntimeType::Mlx)),
+            "a runtime with no pair protocol refuses the request ahead of its sends"
         );
 
         // A batch over the engine's pair, under the runtime that sends one
@@ -6018,8 +6216,81 @@ pub(crate) mod tests {
             requests: vec![ProtoGenerateRequest::Vllm(Box::default())],
         };
         assert!(
-            !decode_is_owed_behind_its_prefill(&batch, &selected(&by_engine, RuntimeType::Vllm)),
-            "a batch's sub-requests go out with the dispatch"
+            decode_guard_is_made_ahead(&batch, &selected(&by_engine, RuntimeType::Vllm)),
+            "a batch says its decode's send behind its sub-requests' refusals"
+        );
+        assert!(decode_guard_is_made_ahead(
+            &batch,
+            &selected(&by_engine, RuntimeType::Mlx)
+        ));
+        assert!(
+            !decode_guard_is_made_ahead(&batch, &selected(&by_engine, RuntimeType::Sglang)),
+            "a batch of the parallel shape refuses nothing ahead of its sends"
+        );
+        assert!(!decode_guard_is_made_ahead(
+            &batch,
+            &selected(&classic, RuntimeType::Vllm)
+        ));
+    }
+
+    /// A batch's ask reads the selection and every sub-request: a batch
+    /// whose second sub-request alone the sequential plan refuses is
+    /// refused by that sub-request's code, and a selection that is no
+    /// pair's is the pipeline's own fault.
+    #[test]
+    fn a_batchs_ask_reads_the_selection_and_every_sub_request() {
+        use smg_worker::labels::SUPPORTS_VISION_LABEL;
+
+        let side = |url: &str, worker_type, vision: Option<&str>| {
+            let mut worker = BasicWorkerBuilder::new(url)
+                .worker_type(worker_type)
+                .runtime_type(RuntimeType::Vllm)
+                .connection_mode(ConnectionMode::Grpc)
+                .kv_connector("NixlConnector");
+            if let Some(vision) = vision {
+                worker = worker.label(SUPPORTS_VISION_LABEL, vision);
+            }
+            let worker: Arc<dyn Worker> = Arc::new(worker.build());
+            worker
+        };
+        let code = |asked: Result<(), Response>| {
+            asked.err().and_then(|refused| {
+                refused
+                    .headers()
+                    .get(error::HEADER_X_SMG_ERROR_CODE)
+                    .and_then(|code| code.to_str().ok())
+                    .map(str::to_owned)
+            })
+        };
+        let text = || ProtoGenerateRequest::Vllm(Box::default());
+        // Media references, which a decode that takes text alone cannot
+        // expand: the sequential plan refuses such a request for the pair.
+        let references = || {
+            ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
+                media_refs: Some(vllm::MediaRefs::default()),
+                ..Default::default()
+            }))
+        };
+
+        let pair = WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill: side("grpc://prefill:30000", WorkerType::Prefill, None),
+            decode: side("grpc://decode:30000", WorkerType::Decode, Some("false")).into(),
+            runtime_type: RuntimeType::Vllm,
+        };
+        assert_eq!(code(pd_batch_refusal(&[text(), text()], &pair)), None);
+        assert_eq!(
+            code(pd_batch_refusal(&[text(), references()], &pair)).as_deref(),
+            Some("pd_decode_language_model_only_media_refs"),
+            "the second sub-request alone is refused"
+        );
+
+        let single = WorkerSelection::Single {
+            worker: side("grpc://single:30000", WorkerType::Regular, None).into(),
+        };
+        assert_eq!(
+            code(pd_batch_refusal(&[text()], &single)).as_deref(),
+            Some("pd_mode_requires_disaggregated_workers")
         );
     }
 
@@ -7076,7 +7347,8 @@ pub(crate) mod tests {
     /// the end its dispatch owes: the plan takes it off the answer and tells
     /// it, with the status and with who answered as the mark says them. An
     /// answer that bears none tells nothing. A request the classic policies
-    /// placed and a pair owe no end, and their failure is not read for one.
+    /// placed owes no end, single or pair, and its failure is not read for
+    /// one.
     #[test]
     fn the_plan_takes_the_end_a_failed_dispatch_owes_off_its_answer_and_tells_it() {
         let failed = || error::internal_error("stub_failed", "the stub's answer");
@@ -7111,9 +7383,139 @@ pub(crate) mod tests {
             worker: worker.into(),
         };
         for selection in [classic, tokenspeed_pair()] {
-            assert!(!selection.tells_end());
+            assert!(!selection.tells_end() && !selection.decode_tells_end());
             let owed = UntoldEnd::owed(&selection, || panic!("no end is owed"));
             assert!(owed.is_none());
+            let mut answer = failed();
+            owe_decode_end(&mut answer, &selection, || panic!("no end is owed"));
+            assert!(!bears_untold_end(&answer));
+        }
+    }
+
+    /// A pair a hearing engine placed, as its dispatch holds it. Answers what
+    /// the stage hears, the selection, the prefill's load with its send said,
+    /// and the attempt's guards, which hold the decode's.
+    fn heard_pair_dispatch() -> (Heard, WorkerSelection, PrefillLoadGuard, LoadGuards) {
+        let (heard, pair) = heard_pair();
+        let prefill = PrefillLoadGuard::Unbounded {
+            _guard: pair.prefill.guard(None),
+        };
+        let workers = WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill: Arc::clone(pair.prefill.worker()),
+            decode: pair.decode,
+            runtime_type: RuntimeType::TokenSpeed,
+        };
+        let guards = LoadGuards::new(&workers, None);
+        (heard, workers, prefill, guards)
+    }
+
+    /// What a stage that names sides heard of each side's end, sorted.
+    fn ends_of(heard: &Heard) -> Vec<String> {
+        let mut ends = heard_of(heard);
+        ends.retain(|word| word.starts_with("completed") || word.starts_with("released"));
+        ends.sort();
+        ends
+    }
+
+    /// A silence verdict is told to the side the circuit breaker charges with
+    /// it, whichever name it arrives under. The prefill's own silence is told
+    /// through the prefill's load, and its answer bears no end for the decode.
+    /// A prefill given up on for its decode's stall arrives under the prefill's
+    /// name and charges the decode. Its answer bears the decode's end, the plan
+    /// tells it, and the prefill is told nothing.
+    #[test]
+    fn a_silence_verdict_is_told_to_the_side_the_breaker_charges() {
+        let verdict =
+            |words: &str| tonic::Status::deadline_exceeded(format!("{words} 3s of its dispatch"));
+        let rows = [
+            (
+                verdict(PREFILL_SILENCE_MESSAGE),
+                [
+                    "completed Decode Cancelled",
+                    "completed Prefill Timeout 504",
+                ],
+            ),
+            (
+                verdict(DECODE_SILENCE_MESSAGE),
+                [
+                    "completed Decode Timeout 504",
+                    "completed Prefill Cancelled",
+                ],
+            ),
+        ];
+        for (silence, ends) in rows {
+            let (heard, workers, prefill, guards) = heard_pair_dispatch();
+            assert!(workers.decode_tells_end() && !workers.tells_end());
+            let on_the_prefill = tell_sampled_prefill_failure(&prefill, &silence);
+            let answer = pd_side_error(
+                PdSide::Prefill,
+                metrics_labels::CONNECTION_GRPC,
+                &silence,
+                &workers,
+            );
+            assert_eq!(bears_untold_end(&answer), !on_the_prefill, "{silence:?}");
+            let mut result = Err(answer);
+            tell_end(&mut result, workers.decode_end(Some(&guards)));
+            assert!(result.is_err_and(|answer| !bears_untold_end(&answer)));
+            drop((prefill, guards));
+            assert_eq!(ends_of(&heard), ends, "{silence:?}");
+        }
+    }
+
+    /// Two dispatches that both answered with a failure tell each side its own,
+    /// as the circuit breaker samples each. The prefill is told through its
+    /// load. The decode is told by the end the client's answer bears, which is
+    /// the prefill's answer here. A prefill dispatch that ended with its
+    /// request's failed encode dispatch is no sample of either side, and nobody
+    /// is told. One that ended with the verdict on its decode charges the
+    /// decode once, with the verdict. The case takes the steps the dispatch
+    /// takes with two failures in hand.
+    #[test]
+    fn two_failed_dispatches_tell_each_side_as_the_breaker_samples_it() {
+        let encode_failed = tonic::Status::failed_precondition(format!(
+            "{ENCODE_DISPATCH_FAILED_MESSAGE} (dispatch): refused"
+        ));
+        let stalled = tonic::Status::deadline_exceeded(format!(
+            "{DECODE_SILENCE_MESSAGE} 3s of the prefill side's dispatch"
+        ));
+        let rows = [
+            (
+                tonic::Status::unavailable("the prefill refused"),
+                [
+                    "completed Decode ServerError 500",
+                    "completed Prefill ServerError 503",
+                ],
+            ),
+            (
+                encode_failed,
+                ["completed Decode Cancelled", "completed Prefill Cancelled"],
+            ),
+            (
+                stalled,
+                [
+                    "completed Decode Timeout 504",
+                    "completed Prefill Cancelled",
+                ],
+            ),
+        ];
+        for (prefill_failure, ends) in rows {
+            let (heard, workers, prefill, guards) = heard_pair_dispatch();
+            let row = format!("{prefill_failure:?}");
+            let grpc = metrics_labels::CONNECTION_GRPC;
+            let decode_failure = tonic::Status::internal("the decode failed");
+            let sampled_apart = tell_sampled_prefill_failure(&prefill, &prefill_failure);
+            let prefill_answer = pd_side_error(PdSide::Prefill, grpc, &prefill_failure, &workers);
+            let decode_answer = pd_side_error(PdSide::Decode, grpc, &decode_failure, &workers);
+            let answer = both_sides_failed(prefill_answer, decode_answer, sampled_apart);
+            let mut result = Err(answer);
+            tell_end(&mut result, workers.decode_end(Some(&guards)));
+            assert!(
+                result.is_err_and(|answer| !bears_untold_end(&answer)),
+                "{row}"
+            );
+            drop((prefill, guards));
+            assert_eq!(ends_of(&heard), ends, "{row}");
         }
     }
 
@@ -7193,6 +7595,43 @@ pub(crate) mod tests {
         }
     }
 
+    /// A batch's stream may hold its end before its layer is put: a decode
+    /// sent behind its prefill is waited for, and may end with nothing on
+    /// it. The layer meets that end where it is put. Every reader has its
+    /// share by then, so that end is no good end of the batch, and a
+    /// sibling that fails behind it is told.
+    #[tokio::test]
+    async fn a_batchs_stream_that_ended_ahead_of_its_layer_waits_for_its_siblings() {
+        let (heard, guard, end) = heard_request();
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("grpc://d:30000").build());
+        let (ended, _first) = scripted_stream(Vec::new(), "0").await;
+        let mut ended = ended.tracked_decode_side(worker);
+        assert_eq!(ended.first_response().await, FirstItem::End);
+        let (failing, _second) = scripted_stream(vec![complete(0, "stop")], "13").await;
+        let unit = |stream| ExecutionResult::Single {
+            stream,
+            dispatch_start: Instant::now(),
+        };
+        let mut batch = ExecutionResult::Batch {
+            results: vec![unit(ended), unit(failing)],
+        };
+        batch.report_through(end);
+        let ExecutionResult::Batch { results } = &mut batch else {
+            panic!("a batch");
+        };
+        for result in results {
+            let ExecutionResult::Single { stream, .. } = result else {
+                panic!("a single request's result");
+            };
+            while stream.next().await.is_some() {}
+        }
+        drop((batch, guard));
+        assert_eq!(
+            heard_of(&heard),
+            ["issued", "dispatched Single", "completed ServerError 500"]
+        );
+    }
+
     /// A failed embedding owes Grand Central the breaker's one sample,
     /// and for who answered the word of its first failure, the one the
     /// client's answer is made of. Where a request's inputs fail in
@@ -7232,7 +7671,6 @@ pub(crate) mod tests {
             assert_eq!(heard_of(&heard), ["issued", "dispatched Single", end_heard]);
         }
     }
-
     /// A pair Grand Central placed, held as a pair route holds it ahead of
     /// its prefill's send: one prefill and one decode on the KV transport
     /// `connector`, what the hearing stage heard, the selection under the
@@ -7308,91 +7746,6 @@ pub(crate) mod tests {
             runtime_type,
         };
         (heard, workers, ahead)
-    }
-
-    /// A pair's dispatch says its prefill's send behind the request's
-    /// refusals, the runtime's and the sequential plan's: one request
-    /// refused there drops its load as it was acquired, and Grand Central
-    /// hears the prefill's side released. A batch refused at the same
-    /// refusals sent nothing either and is heard alike: a release, with no
-    /// dispatch and no end.
-    #[tokio::test]
-    async fn a_batch_refused_ahead_of_its_send_is_heard_as_a_release() {
-        use smg_worker::identity::basic::MORIIO_CONNECTOR;
-
-        use crate::routers::grpc::regular::stages::testing::mock_backend_client;
-
-        let (client, engine) = mock_backend_client("m").await;
-        let clients = ClientSelection::Disaggregated {
-            prefill: client.clone(),
-            decode: client,
-        };
-        // Each refusal by a pair that meets it: a runtime with no pair
-        // protocol, and a decode whose connector the sequential plan refuses.
-        let refusals = [
-            (
-                RuntimeType::Mlx,
-                "NixlConnector",
-                "runtime_pd_not_supported",
-            ),
-            (
-                RuntimeType::Vllm,
-                MORIIO_CONNECTOR,
-                "moriio_grpc_pd_unsupported",
-            ),
-        ];
-        for (runtime_type, connector, code) in refusals {
-            for batched in [false, true] {
-                let (heard, workers, ahead) = a_pair_ahead_of_its_send(connector, runtime_type);
-                assert_eq!(heard_of(&heard), ["issued", "issued"]);
-                let ledger = AttemptLedger::default();
-                let request = || ProtoGenerateRequest::Vllm(Box::default());
-                let refused = if batched {
-                    execute_batch_dispatch(
-                        ExecutionPlanKind::PrefillDecode,
-                        vec![request(), request()],
-                        &clients,
-                        &workers,
-                        "m",
-                        Some(ahead),
-                        &ledger,
-                        Instant::now(),
-                    )
-                    .await
-                } else {
-                    let mut clients = clients.clone();
-                    execute_pd_dispatch(
-                        request(),
-                        &mut clients,
-                        &workers,
-                        "m",
-                        ahead,
-                        &ledger,
-                        None,
-                        None,
-                        None,
-                        None,
-                    )
-                    .await
-                };
-                let Err(refused) = refused else {
-                    panic!("{code}, batched {batched}: the dispatch is refused");
-                };
-                assert_eq!(
-                    refused
-                        .headers()
-                        .get(error::HEADER_X_SMG_ERROR_CODE)
-                        .unwrap(),
-                    code
-                );
-                assert_eq!(
-                    heard_of(&heard)[2..],
-                    ["released Abandoned"],
-                    "{code}, batched {batched}: the prefill's side, with no dispatch and no end"
-                );
-            }
-        }
-        engine.abort();
     }
 
     #[tokio::test]

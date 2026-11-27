@@ -416,6 +416,14 @@ async fn demanded(
         })
         .await
         .map_err(|_| "the stream takes no request".to_owned())?;
+    named(answers).await.map(|(named, _)| named)
+}
+
+/// What the stream's next answer names, past its credits, and where it
+/// says an encode request's items go.
+async fn named(
+    answers: &mut tonic::Streaming<proto::DecideAnswer>,
+) -> Result<(Named, Option<proto::EncodePlaced>), String> {
     loop {
         let answer = timeout(Duration::from_secs(20), answers.message())
             .await
@@ -427,12 +435,15 @@ async fn demanded(
             Some(decide_answer::Answer::Decision(Decision {
                 outcome: Some(decision::Outcome::Pick(pick)),
                 ..
-            })) => return Ok(Ok(pick.targets.iter().map(|target| target.id).collect())),
+            })) => {
+                let targets = pick.targets.iter().map(|target| target.id).collect();
+                return Ok((Ok(targets), answer.encode));
+            }
             Some(decide_answer::Answer::Decision(Decision {
                 outcome: Some(decision::Outcome::Shed(shed)),
                 ..
             })) if shed.reason() == proto::ShedReason::NoEndpoints => {
-                return Ok(Err(shed.emptied_by));
+                return Ok((Err(shed.emptied_by), answer.encode));
             }
             other => {
                 return Err(format!(
@@ -441,6 +452,43 @@ async fn demanded(
             }
         }
     }
+}
+
+/// One encode request's frame for `model`, numbered `n`, with one item,
+/// and what its answer names: the encoder of the item, or the stage that
+/// shed the request with no endpoint.
+async fn encoded(
+    requests: &mpsc::Sender<DecideRequest>,
+    answers: &mut tonic::Streaming<proto::DecideAnswer>,
+    n: u32,
+    model: &str,
+) -> Result<Named, String> {
+    use smg_grand_central::service::proto::{identity::Form, EncodeItems, Identity, Phase};
+    requests
+        .send(DecideRequest {
+            request_id: n.to_be_bytes().to_vec(),
+            facts: Some(RequestFacts {
+                model: model.to_owned(),
+                seed: u64::from(n),
+                budget_micros: 5_000_000,
+                phase: Phase::Encode as i32,
+                ..RequestFacts::default()
+            }),
+            encode: Some(EncodeItems {
+                keys: vec![Identity {
+                    form: Some(Form::Hash(u64::from(n))),
+                }],
+                ..EncodeItems::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .map_err(|_| "the stream takes no request".to_owned())?;
+    let (named, placed) = named(answers).await?;
+    Ok(named.map(|_| {
+        let encoders = placed.into_iter().flat_map(|placed| placed.encoders);
+        encoders.map(|encoder| encoder.id).collect()
+    }))
 }
 
 /// A frame states its request's hard demands, and a controller holds the
@@ -851,6 +899,215 @@ async fn a_frame_that_states_a_demand_is_held_to_the_workers_whose_registrations
             ended.message(),
             "demands is out of its range in this protocol version"
         );
+
+        stop.send(()).expect("the serve is listening for the stop");
+    };
+    let (served, ()) = tokio::join!(serve, probe);
+    served.expect("a clean stop");
+}
+
+/// A worker's end of the encode handoff crosses its registration, and a
+/// controller hands an encode request's item to the encoder that states it.
+///
+/// A prefill, a decode and an encoder are added through the control
+/// listener under the `epd` plan. The prefill states that it consumes a
+/// push over a connector, and the encoder states no end: an encode
+/// request's frame is shed with no endpoint. The encoder then registers
+/// again and states that it produces the push over that connector. Its row
+/// changes in place, the answer tells the block, and every frame's answer
+/// names that encoder for its item.
+#[tokio::test]
+async fn an_encode_frames_item_goes_to_the_encoder_whose_registration_states_its_end() {
+    use smg_grand_central::service::proto::{
+        register_worker_request::Mode, worker_event::Event, EncodeHandoff, EncodeOffer,
+        RegisterWorkerRequest, WireMode, WorkerSpec,
+    };
+    const GATEWAY: &str = "gateway-e";
+    const MODEL: &str = "model-e";
+    const CONNECTOR: &str = "connector-e";
+    let mut controller = Controller::bind(config()).await.expect("bind");
+    for name in ["gateway", "control"] {
+        controller
+            .identity_as_told(name)
+            .expect("a listener of the configuration");
+    }
+    let addresses = controller.addresses();
+    let mut readiness = controller.readiness();
+    let store = controller.store();
+    let mut document =
+        PolicySpec::epd_presets("random", "random", "random").expect("three presets of this build");
+    document.generation = 1;
+    let spec = AppliedSpec::validate(&document).expect("the plan validates");
+    store.apply(spec).expect("above the unbound start");
+
+    let (stop, stopped) = oneshot::channel::<()>();
+    let serve = controller.serve(async {
+        let _ = stopped.await;
+    });
+    let probe = async {
+        assert_eq!(readiness.wait_for(State::Leader).await, Some(State::Leader));
+        let gateway = addresses
+            .of(Scope::Gateway)
+            .expect("every scope is mounted");
+        let control = addresses
+            .of(Scope::Control)
+            .expect("every scope is mounted");
+        let mut client = GrandCentralClient::connect(format!("http://{gateway}"))
+            .await
+            .expect("the listener accepts");
+        let operator = GrandCentralClient::connect(format!("http://{control}"))
+            .await
+            .expect("the listener accepts");
+        let (frames, sent) = mpsc::channel(4);
+        let mut session = client
+            .session(stating(Some(GATEWAY), ReceiverStream::new(sent)))
+            .await
+            .expect("the stream opens")
+            .into_inner();
+        let hello = Hello {
+            gateway_id: GATEWAY.to_owned(),
+            protocol_min: 1,
+            protocol_max: 2,
+            ..Hello::default()
+        };
+        frames
+            .send(GatewayFrame {
+                seq: 0,
+                term_floor: 0,
+                frame: Some(gateway_frame::Frame::Hello(hello)),
+            })
+            .await
+            .expect("the stream takes the Hello");
+        let answer = timeout(Duration::from_secs(20), session.message())
+            .await
+            .expect("a Welcome within the case's patience")
+            .expect("a frame, not a status")
+            .expect("a frame, not the stream's end");
+        assert!(
+            matches!(answer.frame, Some(controller_frame::Frame::Welcome(_))),
+            "{answer:?}"
+        );
+        let (requests, sent) = mpsc::channel(4);
+        let mut answers = client
+            .decide(stating(Some(GATEWAY), ReceiverStream::new(sent)))
+            .await
+            .expect("a present gateway's stream opens")
+            .into_inner();
+
+        // Three workers of one runtime whose policy turns their probes off:
+        // each call's connect signal readies its worker.
+        let worker = |name: &str, role: proto::Role, encode: Option<EncodeOffer>| WorkerSpec {
+            url: format!("http://{name}.fleet:8000"),
+            wire: WireMode::Http as i32,
+            role: role as i32,
+            runtime: "one".to_owned(),
+            models: vec![MODEL.to_owned()],
+            health_policy: Some(proto::HealthPolicy {
+                disabled: true,
+                ..Default::default()
+            }),
+            encode,
+            ..WorkerSpec::default()
+        };
+        let pushing = |producer: bool| EncodeOffer {
+            handoff: EncodeHandoff::Push as i32,
+            producer,
+            consumer: !producer,
+            connector: CONNECTOR.to_owned(),
+            references: false,
+        };
+        let register = |spec: WorkerSpec, mode: Mode| {
+            let mut operator = operator.clone();
+            let request = RegisterWorkerRequest {
+                spec: Some(spec),
+                mode: mode as i32,
+                wait_ready: false,
+            };
+            async move {
+                operator
+                    .register_worker(stating(Some("operator-e"), request))
+                    .await
+            }
+        };
+        let consuming = Some(pushing(false));
+        let added = register(
+            worker("p0", proto::Role::Prefill, consuming.clone()),
+            Mode::Add,
+        )
+        .await
+        .expect("the add is taken")
+        .into_inner();
+        let Some(Event::Registered(prefill)) = added.event else {
+            panic!("a registration's answer: {:?}", added.event);
+        };
+        assert_eq!(prefill.encode, consuming, "the answer tells the block");
+        for (name, role) in [("d0", proto::Role::Decode), ("e0", proto::Role::Encode)] {
+            let added = register(worker(name, role, None), Mode::Add)
+                .await
+                .expect("the add is taken")
+                .into_inner();
+            let Some(Event::Registered(row)) = added.event else {
+                panic!("a registration's answer: {:?}", added.event);
+            };
+            assert_eq!(row.encode, None, "{name} states no end and is told none");
+        }
+
+        // The encoder states no end: no frame's item has an encoder. Frames
+        // are asked until the served loop has paid the builds the three
+        // registrations owe. From the first frame the encode stage sheds,
+        // every frame is shed there with no endpoint, and by no other stage.
+        const ENCODERS: &str = "encoders";
+        let mut asked = 0u32;
+        let mut sheds = Vec::new();
+        while sheds.len() < 8 {
+            asked += 1;
+            assert!(
+                asked < 4_096,
+                "no frame is shed at the encode stage: {sheds:?}"
+            );
+            match encoded(&requests, &mut answers, asked, MODEL).await {
+                Ok(Err(stage)) if stage == ENCODERS => sheds.push(stage),
+                Ok(Err(stage)) => assert!(
+                    sheds.is_empty(),
+                    "frame {asked} is shed by {stage} behind {sheds:?}"
+                ),
+                Ok(Ok(encoders)) => panic!("an encoder with no end is named: {encoders:?}"),
+                Err(why) => panic!("{why}"),
+            }
+        }
+
+        // The encoder registers again and states its end. The row changes
+        // in place, and the answer tells the block.
+        let producing = Some(pushing(true));
+        let again = register(
+            worker("e0", proto::Role::Encode, producing.clone()),
+            Mode::Upsert,
+        )
+        .await
+        .expect("the upsert is taken")
+        .into_inner();
+        let Some(Event::Relabelled(encoder)) = again.event else {
+            panic!("a change in place: {:?}", again.event);
+        };
+        assert_eq!(encoder.encode, producing, "the answer tells the block");
+        // A change in place keeps the row's status: the encoder was ready
+        // while its frames were shed, so its missing end shed them.
+        assert_eq!(
+            encoder.status,
+            proto::WorkerStatus::Ready as i32,
+            "{encoder:?}"
+        );
+
+        // The change is acknowledged, so each frame behind it reads the
+        // fleet it left: its item goes to that encoder.
+        for _ in 0..8 {
+            asked += 1;
+            match encoded(&requests, &mut answers, asked, MODEL).await {
+                Ok(Ok(encoders)) => assert_eq!(encoders, [encoder.id], "frame {asked}"),
+                Ok(Err(stage)) => panic!("frame {asked} is shed by {stage}"),
+                Err(why) => panic!("{why}"),
+            }
+        }
 
         stop.send(()).expect("the serve is listening for the stop");
     };

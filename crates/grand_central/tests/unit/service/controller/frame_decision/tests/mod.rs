@@ -916,6 +916,30 @@ fn stating_member(
     written_ready(store, objects, facts)
 }
 
+/// [`side_member`] for a worker whose row says whether it takes images.
+fn seeing_member(
+    store: &MemoryStore,
+    objects: &Objects<Members>,
+    name: &str,
+    role: Role,
+    vision: bool,
+) -> WorkerId {
+    let key = format!("http://{name}:8000");
+    let facts = WorkerFacts {
+        key: key.clone(),
+        engine: key,
+        incarnation: 1,
+        role,
+        wire_modes: WireModes::HTTP,
+        models: vec![PAIRED.to_owned()],
+        dp_size: 1,
+        max_running: Some(4),
+        vision,
+        ..WorkerFacts::default()
+    };
+    written_ready(store, objects, facts)
+}
+
 /// The `n`th frame for [`PAIRED`] at its prefill, with what its gateway
 /// states of itself: its wires as the wire carries them, and its hint.
 fn at_prefill(n: u8, wires: WireModes, hint: Option<u32>) -> proto::DecideRequest {

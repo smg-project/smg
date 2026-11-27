@@ -82,9 +82,10 @@
                              prompt (default off; decode picks keep the whole prompt)
     balance_rel_threshold:   Relative margin of the spill gate (multiple of the fleet mean)
     eviction_interval_secs:  Interval between LRU eviction / TTL sweep cycles
-    max_tree_size:           Max total size of each model's approximate tree (chars plus
-                             1024 for each node a worker stands on, or tokens), shared
-                             across all workers; enforced by eviction
+    max_tree_size:           Max total size of each model's approximate tree, summed over
+                             all workers (for each worker the chars of the nodes it stands
+                             on plus 1024 for each such node, or its tokens); enforced by
+                             eviction
     block_size:              Backend KV cache block size for event-driven routing
     cache_index:             Under-layer: tree (radix trees) or hash (placement map)
     cache_ttl_secs:          Seconds a hash-index placement stays routable
