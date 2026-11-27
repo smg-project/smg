@@ -156,14 +156,19 @@ pub struct Placement<'a> {
     /// writes it, under the document it decided with.
     pub decode_profile: Option<&'static str>,
     /// What the pick states of the worker the request goes to
-    /// ([`Overlap`]): how many leading blocks of the request that worker
-    /// holds, of how many. A host observes its cache series from it, once
-    /// a placement that states one. A pick states it of its first target
-    /// alone ([`Pick::overlap`](crate::engine::Pick::overlap)), so it
-    /// stands here where the request goes to that target.
-    /// [`Overlap::NONE`], which states nothing, where the pick states none,
-    /// as a pair's does. So too for a place of which nothing is owed, and
-    /// for a request that goes to a later target of its pick.
+    /// ([`Overlap`]): how much of the request that worker holds, of how
+    /// much. The two counts are leading blocks, or inside a lent tree the
+    /// match's tokens or chars. A host observes its cache series from it,
+    /// once a placement that states one. A pick states it of its first target's
+    /// worker alone ([`Pick::overlap`](crate::engine::Pick::overlap)), so
+    /// it stands here where the request goes to that worker. A single
+    /// request's first target is the one such. A pair's pick states what
+    /// its prefill holds and nothing of its decode, and every target of a
+    /// pair names that prefill: a pair sent to a later one is stated the
+    /// same, and a decode decided again leaves it as it stood.
+    /// [`Overlap::NONE`], which states nothing, where the pick states none.
+    /// So too for a place of which nothing is owed, and for a single request
+    /// that goes to a later target of its pick.
     pub overlap: Overlap,
     /// The pick's lease: a pair's always, a single request's where a stage
     /// of the document takes a word of a request. `None` for an answer of
@@ -228,10 +233,13 @@ impl Placement<'_> {
         // position in the document that decided.
         let profile = pick.map(|pick| engine.label_at(pick.trace.profile));
         let target = pick.and_then(|pick| pick.targets.as_slice().get(index).copied());
-        // A pick states what its first target holds, and nothing of the
-        // others: a request that goes to a later one is stated nothing.
-        let overlap = match pick {
-            Some(pick) if index == 0 => pick.overlap(),
+        // A pick states what its first target's worker holds: the request
+        // is stated it where it goes to that worker. A single request's
+        // later target is another worker and is stated nothing. A pair's
+        // targets share their prefill, so each is stated what the first is.
+        let first = pick.and_then(|pick| pick.targets.first());
+        let overlap = match (pick, first, target) {
+            (Some(pick), Some(first), Some(target)) if target.id == first.id => pick.overlap(),
             _ => Overlap::NONE,
         };
         // Held ahead of every refusal below: a lease ends at this guard's
@@ -308,6 +316,20 @@ impl Placement<'_> {
     #[must_use]
     pub fn owes_events(&self) -> bool {
         self.held.as_ref().is_some_and(DecisionGuard::owes)
+    }
+
+    /// Whether the pair's decode stands chosen, as the lease's guard says
+    /// it ([`DecisionGuard::decode_chosen`]): the document picks the decode
+    /// after the prefill, the first decision named a decode and booked
+    /// nothing for it, and [`Self::decode_again`] may decide it again.
+    /// `false` for a decode booked with its prefill and for a single
+    /// request, and from that call's pick, from the decode's send and from
+    /// the prefill's end. A host asks it ahead of [`Self::decode_again`]:
+    /// where it answers `false` that call is refused by name with no
+    /// decision made, so the host states no request again.
+    #[must_use]
+    pub fn decode_chosen(&self) -> bool {
+        self.held.as_ref().is_some_and(DecisionGuard::decode_chosen)
     }
 
     /// Decides a pair's decode again, behind its prefill's answer, for a
@@ -485,14 +507,5 @@ impl Placement<'_> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::Placement;
-
-    /// A kept placement travels with its request: to the task that streams
-    /// the response, and behind a pointer several threads share.
-    #[test]
-    fn a_kept_placement_crosses_threads_and_borrows_nothing() {
-        fn travels<T: Send + Sync + 'static>() {}
-        travels::<Placement<'static>>();
-    }
-}
+#[path = "../../tests/unit/tracking/placement/tests.rs"]
+mod tests;

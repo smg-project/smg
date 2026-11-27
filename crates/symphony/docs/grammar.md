@@ -55,7 +55,10 @@ its generation prompt adds no opener), the tag admits first what the model would
 or the bare close the turn's start also has a row for, which the model writes for an empty
 thought; or nothing. Then the calls. A forced call is written at once, so without this the tag
 would take the thought away, and the model, held to the call from its first token, answers worse
-than it reasons.
+than it reasons. Where the generation prompt itself ends with that close (a request with thinking
+switched off: the template closed the thought in the model's place, `Format::thought_closed`), a
+forced call starts at once: its tag holds no thought and no second close. The `auto` tag and a
+JSON answer's tag still admit them.
 
 Inkling's named JSON takes the tag the gateway's old Inkling parser writes, the call marker its
 trigger inside whatever message the model is writing. Mistral's named arguments take a tag per tool

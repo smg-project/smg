@@ -5,12 +5,14 @@
 //! shutdown bounds, and worker discovery settings when built with discovery.
 //! The configuration is validated before anything binds.
 
-#![expect(
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
-
-use std::{collections::BTreeMap, fmt, net::SocketAddr, path::PathBuf, thread, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+    thread,
+    time::Duration,
+};
 
 use smg_worker::health::overload::{
     OverloadThresholds, DEFAULT_TOKEN_USAGE_CEILING, DEFAULT_WAITING_REQUESTS,
@@ -18,7 +20,8 @@ use smg_worker::health::overload::{
 
 #[cfg(feature = "discovery")]
 pub use super::discovery::DiscoverySettings;
-use super::election::ElectionConfig;
+use super::election::{ElectionConfig, LeasePlace};
+use crate::service::elector::ElectError;
 
 /// Worker discovery's settings in a build without the `discovery` feature:
 /// a type with no value. Such a build runs no provider, so its
@@ -39,10 +42,6 @@ pub enum Scope {
     /// TLS, or a per-gateway bearer whose verified subject is the gateway id
     /// that keys its leases.
     Gateway,
-    /// `PushLoad` and `PushKvEvents`: the relays' calls, a per-relay
-    /// credential. Mounted beside the gateway scope by default: a relay is a
-    /// gateway in front of a host-local worker.
-    Ingestion,
     /// The unary operator calls and `WatchRegime`: the control-plane keys and
     /// roles, `user` reads and `admin` writes, every call audited.
     Control,
@@ -52,18 +51,12 @@ pub enum Scope {
 
 impl Scope {
     /// Every scope, in the order the design lists them.
-    pub const ALL: [Scope; 4] = [
-        Scope::Gateway,
-        Scope::Ingestion,
-        Scope::Control,
-        Scope::Replication,
-    ];
+    pub const ALL: [Scope; 3] = [Scope::Gateway, Scope::Control, Scope::Replication];
 
     /// The scope's name on the command line, in log lines and in refusals.
     pub const fn as_str(self) -> &'static str {
         match self {
             Scope::Gateway => "gateway",
-            Scope::Ingestion => "ingestion",
             Scope::Control => "control",
             Scope::Replication => "replication",
         }
@@ -77,7 +70,11 @@ impl fmt::Display for Scope {
 }
 
 /// The TLS material of a listener, as paths read once at bind.
+///
+/// The record gains fields: code outside this crate makes one by
+/// [`Tls::of`], and a pattern of it ends with `..`.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct Tls {
     /// The server certificate chain, PEM.
     pub cert: PathBuf,
@@ -91,11 +88,33 @@ pub struct Tls {
     pub client_ca: Option<PathBuf>,
 }
 
+impl Tls {
+    /// A listener's TLS under the server's `cert` and `key`, with the
+    /// clients' authority `client_ca` where the listener is mutual TLS. It
+    /// takes all three fields: the authority is a guard, and one left out
+    /// by silence would be a listener that verifies no client's
+    /// certificate. It checks nothing: the files are read at bind. Code
+    /// outside this crate starts here: the record gains fields, so no
+    /// literal of it builds there.
+    #[must_use]
+    pub fn of(cert: PathBuf, key: PathBuf, client_ca: Option<PathBuf>) -> Self {
+        Self {
+            cert,
+            key,
+            client_ca,
+        }
+    }
+}
+
 /// One gRPC listener: an address, the scopes mounted on it and its TLS.
+///
+/// The record gains fields: code outside this crate makes one by
+/// [`Listener::of`], and a pattern of it ends with `..`.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct Listener {
     /// The listener's name in log lines and refusals; the binary names each
-    /// after its flag (`gateway`, `control`, `replication`, `ingestion`).
+    /// after its flag (`gateway`, `control`, `replication`).
     pub name: String,
     /// The address it binds. Port `0` takes an ephemeral port, reported by
     /// [`Controller::addresses`](super::Controller::addresses). A replica
@@ -110,16 +129,39 @@ pub struct Listener {
     pub tls: Option<Tls>,
 }
 
+impl Listener {
+    /// A listener of `name` on `addr` that serves `scopes` under `tls`. It
+    /// takes all four fields: a name, an address and the scopes have no
+    /// neutral value, and a TLS left out by silence would be a plaintext
+    /// listener. It checks nothing: [`Config::validate`] refuses a wrong
+    /// one. Code outside this crate starts here: the record gains fields,
+    /// so no literal of it builds there.
+    #[must_use]
+    pub fn of(name: String, addr: SocketAddr, scopes: Vec<Scope>, tls: Option<Tls>) -> Self {
+        Self {
+            name,
+            addr,
+            scopes,
+            tls,
+        }
+    }
+}
+
 /// The controller's start-up configuration. It is compared by `PartialEq`
 /// alone: its overload usage is a ratio.
+///
+/// The record gains fields: code outside this crate starts from
+/// [`Config::of`] and assigns what it states otherwise, and a pattern of it
+/// ends with `..`.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Config {
     /// This controller's identity: the holder of the leases it takes
     /// (design 10, `controller-id@host:port`) and the name on its log lines.
     /// One token of letters, digits, `.`, `_` and `-`.
     pub controller_id: String,
-    /// The gRPC listeners. The binary mounts the gateway and ingestion
-    /// scopes on one and the control and replication scopes on one each.
+    /// The gRPC listeners. The binary mounts each scope on a listener of
+    /// its own.
     pub listeners: Vec<Listener>,
     /// The HTTP admin listener: the probes, the version and the metrics.
     pub admin: SocketAddr,
@@ -178,6 +220,11 @@ fn addresses_overlap(first: SocketAddr, second: SocketAddr) -> bool {
         || (a.is_ipv4() && b.is_ipv4() && (a == b || a.is_unspecified() || b.is_unspecified()))
 }
 
+/// The number of [`Config::MAX_DECIDE_SHARDS`], named by the refusal too:
+/// the refusal reads it here, not through `Config`, so `ConfigError` does
+/// not know the record whose check returns it.
+const DECIDE_SHARDS_CEILING: usize = 256;
+
 impl Config {
     /// The default settle window, the gateway's.
     pub const DEFAULT_SHUTDOWN_SETTLE: Duration = Duration::from_secs(5);
@@ -201,14 +248,47 @@ impl Config {
         waiting_requests: Some(DEFAULT_WAITING_REQUESTS),
         token_usage: Some(DEFAULT_TOKEN_USAGE_CEILING),
     };
-    /// The most deciding threads a controller starts.
-    pub const MAX_DECIDE_SHARDS: usize = 256;
+    /// The most deciding threads a controller starts: 256.
+    pub const MAX_DECIDE_SHARDS: usize = DECIDE_SHARDS_CEILING;
 
     /// The deciding threads a controller starts when its operator names no
     /// count: one a CPU available to the process, eight at most, the
     /// design's count for its busiest fleet.
     pub fn default_decide_shards() -> usize {
         thread::available_parallelism().map_or(1, |cpus| cpus.get().min(8))
+    }
+
+    /// A configuration of `controller_id`, `listeners` and `admin`: the
+    /// three fields a host must state. Each of the seven
+    /// others takes the value the crate states once, which the command
+    /// line's flag takes too:
+    ///
+    /// - `shutdown_settle`: [`Self::DEFAULT_SHUTDOWN_SETTLE`]
+    /// - `shutdown_grace`: [`Self::DEFAULT_SHUTDOWN_GRACE`]
+    /// - `load_poll_interval`: [`Self::DEFAULT_LOAD_POLL_INTERVAL`]
+    /// - `worker_overload`: [`Self::DEFAULT_WORKER_OVERLOAD`]
+    /// - `decide_shards`: [`Self::default_decide_shards`]
+    /// - `election`: its own default, one replica that leads itself
+    /// - `discovery`: `None`, no provider
+    ///
+    /// The deciding threads are the machine's number, so this is no
+    /// constant function. It checks nothing: [`Self::validate`] is the
+    /// check. Code outside this crate starts here: the record gains
+    /// fields, so no literal of it builds there.
+    #[must_use]
+    pub fn of(controller_id: String, listeners: Vec<Listener>, admin: SocketAddr) -> Self {
+        Self {
+            controller_id,
+            listeners,
+            admin,
+            shutdown_settle: Self::DEFAULT_SHUTDOWN_SETTLE,
+            shutdown_grace: Self::DEFAULT_SHUTDOWN_GRACE,
+            load_poll_interval: Self::DEFAULT_LOAD_POLL_INTERVAL,
+            worker_overload: Self::DEFAULT_WORKER_OVERLOAD,
+            decide_shards: Self::default_decide_shards(),
+            election: ElectionConfig::default(),
+            discovery: None,
+        }
     }
 
     /// Holds default overload thresholds to their bounds, each signal that
@@ -326,6 +406,152 @@ impl Config {
     }
 }
 
+impl ElectionConfig {
+    /// Refuses what no bind could cure: settings out of order, a lease with
+    /// no name or an empty namespace, and an advertised address that is
+    /// malformed, that is the wildcard in any spelling (a client that dials
+    /// it reaches its own host), or that ends in a number and is no address
+    /// in its standard form (a resolver reads such a host as an address).
+    ///
+    /// A multicast or broadcast address, like a name nobody holds, is left
+    /// to the dial; a loopback address is taken as written, right where a
+    /// client shares the host.
+    pub(crate) fn validate(&self, gateway: SocketAddr) -> Result<(), ConfigError> {
+        if let Err(ElectError::Settings(why)) = self.settings.validate() {
+            return Err(ConfigError::ElectionSettings(why));
+        }
+        match &self.advertise {
+            // The port is a stand-in: the form alone is judged before the
+            // bind names the real one.
+            Some(advertise) => {
+                dialable(advertise, 1)?;
+            }
+            None if self.lease.is_shared() && is_wildcard(gateway.ip()) => {
+                return Err(ConfigError::AdvertiseAddressRequired);
+            }
+            None => {}
+        }
+        match &self.lease {
+            LeasePlace::Process => {}
+            LeasePlace::File(path) => {
+                if path.as_os_str().is_empty() {
+                    return Err(ConfigError::EmptyLeaseName);
+                }
+            }
+            #[cfg(feature = "kubernetes")]
+            LeasePlace::Kubernetes { namespace, name } => {
+                if name.is_empty() {
+                    return Err(ConfigError::EmptyLeaseName);
+                }
+                if namespace.as_ref().is_some_and(String::is_empty) {
+                    return Err(ConfigError::EmptyLeaseNamespace);
+                }
+                // The object stores whole seconds: a fraction would be
+                // refused at the first write, after the listeners serve.
+                if self.settings.duration.subsec_nanos() != 0 {
+                    return Err(ConfigError::LeaseDurationNotWholeSeconds(
+                        self.settings.duration,
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// This replica's dialable address once the gateway listener is bound
+    /// at `gateway`; `None` when no client could be told one (a lone
+    /// controller behind a wildcard listener).
+    pub(crate) fn address(&self, gateway: SocketAddr) -> Result<Option<String>, ConfigError> {
+        match &self.advertise {
+            Some(advertise) => dialable(advertise, gateway.port()).map(Some),
+            None if is_wildcard(gateway.ip()) => Ok(None),
+            None => Ok(Some(gateway.to_string())),
+        }
+    }
+}
+
+/// The dialable `host:port` of an advertised address: an address or a name,
+/// alone (it takes `port`) or with its own port. An IPv6 address alone is
+/// bracketed here, so a deployment passes a pod's address as it reads it.
+/// An address has one spelling here, the standard one: the wildcard is
+/// refused by name, and so is any other host that ends in a number, which a
+/// resolver would read as an address of its own making. Every other name is
+/// taken as given.
+fn dialable(advertise: &str, port: u16) -> Result<String, ConfigError> {
+    let malformed = || ConfigError::MalformedAdvertiseAddress(advertise.to_owned());
+    let dialed = |ip: IpAddr| {
+        if is_wildcard(ip) {
+            Err(ConfigError::WildcardAdvertiseAddress(advertise.to_owned()))
+        } else {
+            Ok(ip)
+        }
+    };
+    let bare = advertise
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(advertise);
+    if let Ok(ip) = bare.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(dialed(ip)?, port).to_string());
+    }
+    if let Ok(addr) = advertise.parse::<SocketAddr>() {
+        dialed(addr.ip())?;
+        return if addr.port() == 0 {
+            Err(malformed())
+        } else {
+            Ok(addr.to_string())
+        };
+    }
+    let (host, port) = match advertise.rsplit_once(':') {
+        Some((host, given)) => (
+            host,
+            given
+                .parse::<u16>()
+                .ok()
+                .filter(|port| *port != 0)
+                .ok_or_else(malformed)?,
+        ),
+        None => (advertise, port),
+    };
+    let named = !host.is_empty()
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+    if !named {
+        return Err(malformed());
+    }
+    if ends_in_a_number(host) {
+        return Err(ConfigError::NumericAdvertiseHost(advertise.to_owned()));
+    }
+    Ok(format!("{host}:{port}"))
+}
+
+/// Whether `ip` is the wildcard: the unspecified address of either family,
+/// or the IPv4 one written mapped into IPv6, which a listener binds as the
+/// wildcard too. A client that dials it reaches its own host.
+fn is_wildcard(ip: IpAddr) -> bool {
+    ip.to_canonical().is_unspecified()
+}
+
+/// Whether a host's last label is a number: digits alone, or `0x` in either
+/// case and then hexadecimal digits, none included; one closing dot is
+/// dropped first. This is the URL standard's check of a host that ends in a
+/// number. A resolver reads such a host as an address, whatever the labels
+/// before it, and not always the one that was meant: `0` is the wildcard,
+/// `010.0.0.1` is `8.0.0.1`, `8080` is `0.0.31.144`.
+fn ends_in_a_number(host: &str) -> bool {
+    let last = host
+        .strip_suffix('.')
+        .unwrap_or(host)
+        .rsplit('.')
+        .next()
+        .unwrap_or_default();
+    let hexadecimal = last
+        .strip_prefix("0x")
+        .or_else(|| last.strip_prefix("0X"))
+        .is_some_and(|digits| digits.bytes().all(|b| b.is_ascii_hexdigit()));
+    hexadecimal || (!last.is_empty() && last.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// A controller setting refused by name.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
@@ -404,7 +630,7 @@ pub enum ConfigError {
     #[error("the default overload threshold of usage is not above 0 and at most 1: a worker at or above it is vetoed")]
     OverloadTokenUsageOutOfRange,
     /// A count of deciding threads outside its range.
-    #[error("{0} deciding threads: the count is from 1 to {max}", max = Config::MAX_DECIDE_SHARDS)]
+    #[error("{0} deciding threads: the count is from 1 to {max}", max = DECIDE_SHARDS_CEILING)]
     DecideShards(usize),
     /// A settle window the grace period cannot hold twice.
     #[error("the shutdown settle window of {settle:?} is over half the grace period of {grace:?}")]
@@ -459,29 +685,6 @@ pub enum ConfigError {
     /// A client authority for a scope while no server certificate is set.
     #[error("a client CA for the {0} scope without a server certificate: mutual TLS needs TLS")]
     ClientCaWithoutTls(Scope),
-    /// Two scopes on one listener, one with a client authority and one
-    /// without: a listener has one credential rule.
-    #[error("listener {listener} mounts {with} with a client CA and {without} without one: give the two their own listeners")]
-    ScopesDisagreeOnClientCa {
-        /// The listener.
-        listener: String,
-        /// The scope with a client authority.
-        with: Scope,
-        /// The scope without one.
-        without: Scope,
-    },
-    /// Two scopes on one listener naming different client authorities: a
-    /// listener verifies against one, and taking the first would admit the
-    /// second scope's clients on neither.
-    #[error("listener {listener} mounts {first} and {second} with different client CAs: give the two their own listeners")]
-    ScopesNameDifferentClientCas {
-        /// The listener.
-        listener: String,
-        /// The scope whose authority was read first.
-        first: Scope,
-        /// The scope naming another.
-        second: Scope,
-    },
     /// A discovery flag was refused.
     #[error("{flag}: {reason}")]
     DiscoveryFlag {
@@ -493,542 +696,5 @@ pub enum ConfigError {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
-    use std::{
-        net::{Ipv4Addr, Ipv6Addr, SocketAddr},
-        path::PathBuf,
-        time::Duration,
-    };
-
-    use super::{Config, ConfigError, Listener, OverloadThresholds, Scope, Tls};
-    use crate::service::{
-        controller::election::{ElectionConfig, LeasePlace},
-        elector::ElectionSettings,
-    };
-
-    fn loopback(port: u16) -> SocketAddr {
-        SocketAddr::from((Ipv4Addr::LOCALHOST, port))
-    }
-
-    fn listener(name: &str, port: u16, scopes: &[Scope]) -> Listener {
-        Listener {
-            name: name.to_owned(),
-            addr: loopback(port),
-            scopes: scopes.to_vec(),
-            tls: None,
-        }
-    }
-
-    /// The binary's default shape on ephemeral ports.
-    pub(crate) fn valid() -> Config {
-        Config {
-            controller_id: "controller-0".to_owned(),
-            listeners: vec![
-                listener("gateway", 0, &[Scope::Gateway, Scope::Ingestion]),
-                listener("control", 0, &[Scope::Control]),
-                listener("replication", 0, &[Scope::Replication]),
-            ],
-            admin: loopback(0),
-            shutdown_settle: Duration::from_millis(100),
-            shutdown_grace: Duration::from_secs(2),
-            load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
-            worker_overload: Config::DEFAULT_WORKER_OVERLOAD,
-            decide_shards: 2,
-            election: ElectionConfig::default(),
-            discovery: None,
-        }
-    }
-
-    /// A setting names a listener by its name, so no two share one.
-    #[test]
-    fn two_listeners_of_one_name_are_refused() {
-        let mut config = valid();
-        if let Some(second) = config.listeners.get_mut(1) {
-            second.name = "gateway".to_owned();
-        }
-        assert_eq!(
-            config.validate(),
-            Err(ConfigError::ListenerNameShared("gateway".to_owned()))
-        );
-    }
-
-    /// A default overload threshold is held to its bounds, by name. A
-    /// worker at or above a threshold is vetoed: a count of zero would veto
-    /// a worker with nothing queued, and so would a count over the most a
-    /// load report states, which is read as a negative one. A usage of zero
-    /// would veto a worker with nothing in use. A usage is a fraction, at
-    /// most one, and one that is no number compares with none.
-    /// The ends are taken: a count of 1 and the most a report states, and a
-    /// usage of 1 and the least above 0. A signal that states none has no
-    /// default and is no refusal, one signal or both.
-    #[test]
-    fn a_default_overload_threshold_is_one_a_worker_can_stay_under() {
-        let stating = |waiting_requests, token_usage| OverloadThresholds {
-            waiting_requests,
-            token_usage,
-        };
-        // The most queued requests a load report states, and the least
-        // usage above zero.
-        let most = usize::try_from(i64::MAX).unwrap_or(usize::MAX);
-        let least = f64::from_bits(1);
-        let mut config = valid();
-        assert_eq!(config.worker_overload, stating(Some(8), Some(0.8)));
-        for taken in [
-            stating(Some(1), Some(1.0)),
-            stating(Some(most), Some(least)),
-            stating(None, Some(0.5)),
-            stating(Some(3), None),
-            stating(None, None),
-        ] {
-            config.worker_overload = taken;
-            assert_eq!(config.validate(), Ok(()), "{taken:?}");
-        }
-        for count in [Some(0), most.checked_add(1)].into_iter().flatten() {
-            for usage in [None, Some(0.5)] {
-                config.worker_overload = stating(Some(count), usage);
-                assert_eq!(
-                    config.validate(),
-                    Err(ConfigError::OverloadWaitingRequests(count)),
-                    "{count} beside {usage:?}"
-                );
-            }
-        }
-        for usage in [0.0, -0.5, 1.0 + f64::EPSILON, 1.5, f64::INFINITY, f64::NAN] {
-            for waiting in [None, Some(1)] {
-                config.worker_overload = stating(waiting, Some(usage));
-                assert_eq!(
-                    config.validate(),
-                    Err(ConfigError::OverloadTokenUsageOutOfRange),
-                    "{usage} beside {waiting:?}"
-                );
-            }
-        }
-        assert_eq!(
-            ConfigError::OverloadWaitingRequests(0).to_string(),
-            "a default overload threshold of 0 queued requests: the count is from 1 to 9223372036854775807, the most a load report states"
-        );
-        assert_eq!(
-            ConfigError::OverloadTokenUsageOutOfRange.to_string(),
-            "the default overload threshold of usage is not above 0 and at most 1: a worker at or above it is vetoed"
-        );
-    }
-
-    #[test]
-    fn the_deciding_threads_are_counted_from_one_to_their_ceiling() {
-        let mut config = valid();
-        for count in [1, Config::MAX_DECIDE_SHARDS] {
-            config.decide_shards = count;
-            assert_eq!(config.validate(), Ok(()), "{count}");
-        }
-        for count in [0, Config::MAX_DECIDE_SHARDS + 1] {
-            config.decide_shards = count;
-            assert_eq!(
-                config.validate(),
-                Err(ConfigError::DecideShards(count)),
-                "{count}"
-            );
-        }
-        assert_eq!(
-            ConfigError::DecideShards(0).to_string(),
-            "0 deciding threads: the count is from 1 to 256"
-        );
-        assert!((1..=8).contains(&Config::default_decide_shards()));
-    }
-
-    #[test]
-    fn the_default_shape_is_accepted_with_or_without_tls() {
-        let mut config = valid();
-        assert_eq!(config.validate(), Ok(()));
-        config.listeners[0].tls = Some(Tls {
-            cert: PathBuf::from("server.pem"),
-            key: PathBuf::from("server.key"),
-            client_ca: Some(PathBuf::from("gateways-ca.pem")),
-        });
-        assert_eq!(config.validate(), Ok(()));
-    }
-
-    #[test]
-    fn the_controller_id_is_one_plain_token() {
-        let mut config = valid();
-        config.controller_id = String::new();
-        assert_eq!(config.validate(), Err(ConfigError::EmptyControllerId));
-        for bad in ["a b", "a@b", "a/b", "a:b"] {
-            config.controller_id = bad.to_owned();
-            assert_eq!(
-                config.validate(),
-                Err(ConfigError::MalformedControllerId(bad.to_owned())),
-                "{bad}"
-            );
-        }
-        for good in ["controller-0", "pod.ns_1", "A-Z.0-9"] {
-            config.controller_id = good.to_owned();
-            assert_eq!(config.validate(), Ok(()), "{good}");
-        }
-    }
-
-    #[test]
-    fn every_scope_is_mounted_exactly_once() {
-        let mut config = valid();
-        config.listeners.clear();
-        assert_eq!(config.validate(), Err(ConfigError::NoListeners));
-
-        let mut config = valid();
-        config.listeners[1].scopes.clear();
-        assert_eq!(
-            config.validate(),
-            Err(ConfigError::ListenerWithoutScope("control".to_owned()))
-        );
-
-        let mut config = valid();
-        config.listeners[2].scopes.push(Scope::Control);
-        assert_eq!(
-            config.validate(),
-            Err(ConfigError::ScopeMountedTwice {
-                scope: Scope::Control,
-                first: "control".to_owned(),
-                second: "replication".to_owned(),
-            })
-        );
-
-        let mut config = valid();
-        config.listeners[0].scopes = vec![Scope::Gateway];
-        assert_eq!(
-            config.validate(),
-            Err(ConfigError::ScopeUnmounted(Scope::Ingestion))
-        );
-
-        let mut config = valid();
-        config
-            .listeners
-            .push(listener("relays", 0, &[Scope::Ingestion]));
-        config.listeners[0].scopes = vec![Scope::Gateway];
-        assert_eq!(config.validate(), Ok(()), "the relays split onto a fourth");
-    }
-
-    #[test]
-    fn two_listeners_never_share_a_real_address() {
-        let mut config = valid();
-        config.listeners[0].addr = loopback(30100);
-        config.listeners[2].addr = loopback(30100);
-        assert_eq!(
-            config.validate(),
-            Err(ConfigError::AddressShared {
-                addr: loopback(30100),
-                first: "gateway".to_owned(),
-                second: "replication".to_owned(),
-            })
-        );
-
-        let mut config = valid();
-        config.listeners[1].addr = loopback(30103);
-        config.admin = loopback(30103);
-        assert_eq!(
-            config.validate(),
-            Err(ConfigError::AddressShared {
-                addr: loopback(30103),
-                first: "control".to_owned(),
-                second: "admin".to_owned(),
-            })
-        );
-
-        let config = valid();
-        assert!(
-            config.listeners.iter().all(|l| l.addr.port() == 0),
-            "ephemeral ports are not shared addresses"
-        );
-        assert_eq!(config.validate(), Ok(()));
-    }
-
-    #[test]
-    fn a_wildcard_and_a_specific_listener_never_share_a_real_port() {
-        let wildcard = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 30100));
-        let specific = loopback(30100);
-
-        let mut config = valid();
-        config.listeners[0].addr = wildcard;
-        config.listeners[1].addr = specific;
-        assert_eq!(
-            config.validate(),
-            Err(ConfigError::AddressShared {
-                addr: specific,
-                first: "gateway".to_owned(),
-                second: "control".to_owned(),
-            })
-        );
-
-        let mut config = valid();
-        config.listeners[0].addr = specific;
-        config.listeners[1].addr = wildcard;
-        assert_eq!(
-            config.validate(),
-            Err(ConfigError::AddressShared {
-                addr: wildcard,
-                first: "gateway".to_owned(),
-                second: "control".to_owned(),
-            })
-        );
-
-        let mut config = valid();
-        config.listeners[1].addr = wildcard;
-        config.admin = specific;
-        assert_eq!(
-            config.validate(),
-            Err(ConfigError::AddressShared {
-                addr: specific,
-                first: "control".to_owned(),
-                second: "admin".to_owned(),
-            })
-        );
-
-        let mut config = valid();
-        config.listeners[1].addr = specific;
-        config.admin = wildcard;
-        assert_eq!(
-            config.validate(),
-            Err(ConfigError::AddressShared {
-                addr: wildcard,
-                first: "control".to_owned(),
-                second: "admin".to_owned(),
-            })
-        );
-
-        let v6_wildcard = SocketAddr::from((Ipv6Addr::UNSPECIFIED, 30100));
-        let v6_specific = SocketAddr::from((Ipv6Addr::LOCALHOST, 30100));
-        let mut config = valid();
-        config.listeners[0].addr = v6_wildcard;
-        config.listeners[1].addr = v6_specific;
-        assert_eq!(
-            config.validate(),
-            Err(ConfigError::AddressShared {
-                addr: v6_specific,
-                first: "gateway".to_owned(),
-                second: "control".to_owned(),
-            })
-        );
-    }
-
-    #[test]
-    fn wildcard_listeners_overlap_every_address_they_cover() {
-        let specific = loopback(30100);
-
-        let mapped_wildcard = SocketAddr::from((Ipv4Addr::UNSPECIFIED.to_ipv6_mapped(), 30100));
-        let mut config = valid();
-        config.listeners[0].addr = mapped_wildcard;
-        config.listeners[1].addr = specific;
-        assert_eq!(
-            config.validate(),
-            Err(ConfigError::AddressShared {
-                addr: specific,
-                first: "gateway".to_owned(),
-                second: "control".to_owned(),
-            })
-        );
-
-        let mapped_specific = SocketAddr::from((Ipv4Addr::LOCALHOST.to_ipv6_mapped(), 30100));
-        let mut config = valid();
-        config.listeners[0].addr = mapped_wildcard;
-        config.listeners[1].addr = mapped_specific;
-        assert_eq!(
-            config.validate(),
-            Err(ConfigError::AddressShared {
-                addr: mapped_specific,
-                first: "gateway".to_owned(),
-                second: "control".to_owned(),
-            })
-        );
-    }
-
-    #[test]
-    fn listener_addresses_that_do_not_overlap_are_accepted() {
-        let mut config = valid();
-        config.listeners[0].addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0));
-        config.listeners[1].addr = SocketAddr::from((Ipv4Addr::new(10, 0, 0, 1), 30100));
-        config.listeners[2].addr = loopback(30100);
-        config.admin = SocketAddr::from((Ipv6Addr::LOCALHOST, 30100));
-        assert_eq!(
-            config.validate(),
-            Ok(()),
-            "port 0, two specific addresses and two families share no address"
-        );
-
-        let mut config = valid();
-        config.listeners[1].addr = SocketAddr::from((Ipv6Addr::UNSPECIFIED, 30100));
-        config.listeners[2].addr = loopback(30100);
-        assert_eq!(
-            config.validate(),
-            Ok(()),
-            "an IPv6 wildcard is not known to cover the IPv4 family"
-        );
-    }
-
-    #[test]
-    fn the_shutdown_bounds_hold_each_other() {
-        let mut config = valid();
-        config.shutdown_grace = Duration::ZERO;
-        assert_eq!(config.validate(), Err(ConfigError::ZeroShutdownGrace));
-
-        let mut config = valid();
-        config.shutdown_grace = Duration::from_secs(8);
-        config.shutdown_settle = Duration::from_secs(5);
-        assert_eq!(
-            config.validate(),
-            Err(ConfigError::SettleOverHalfTheGrace {
-                settle: Duration::from_secs(5),
-                grace: Duration::from_secs(8),
-            })
-        );
-        config.shutdown_settle = Duration::from_secs(4);
-        assert_eq!(config.validate(), Ok(()), "half the grace is the bound");
-    }
-
-    #[test]
-    fn the_elections_settings_keep_their_order() {
-        let mut config = valid();
-        assert_eq!(config.election.settings, ElectionSettings::default());
-        config.election.settings.renew_period = Duration::ZERO;
-        assert_eq!(
-            config.validate(),
-            Err(ConfigError::ElectionSettings("the renew period is zero"))
-        );
-        let mut config = valid();
-        config.election.settings.renew_deadline = Duration::from_secs(1);
-        assert_eq!(
-            config.validate(),
-            Err(ConfigError::ElectionSettings(
-                "the renew deadline is not longer than the renew period"
-            ))
-        );
-        let mut config = valid();
-        config.election.settings.duration = Duration::from_secs(2);
-        assert_eq!(
-            config.validate(),
-            Err(ConfigError::ElectionSettings(
-                "the duration is not longer than the renew deadline"
-            ))
-        );
-    }
-
-    #[test]
-    fn a_shared_lease_needs_an_address_a_client_can_dial() {
-        // A lone controller needs none, on any listener.
-        let mut config = valid();
-        config.listeners[0].addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 30100));
-        assert_eq!(config.validate(), Ok(()));
-
-        // A shared lease behind the wildcard address is refused by name.
-        config.election.lease = LeasePlace::File(PathBuf::from("/run/smg/lease"));
-        assert_eq!(
-            config.validate(),
-            Err(ConfigError::AdvertiseAddressRequired)
-        );
-        // The IPv4 wildcard mapped into IPv6 is a wildcard listener too.
-        config.listeners[0].addr =
-            SocketAddr::from((Ipv4Addr::UNSPECIFIED.to_ipv6_mapped(), 30100));
-        assert_eq!(
-            config.validate(),
-            Err(ConfigError::AdvertiseAddressRequired)
-        );
-        // ... until an address is advertised, or the listener binds one.
-        config.election.advertise = Some("10.0.0.7".to_owned());
-        assert_eq!(config.validate(), Ok(()));
-        config.election.advertise = None;
-        config.listeners[0].addr = loopback(30100);
-        assert_eq!(config.validate(), Ok(()));
-
-        for bad in [
-            "",
-            "a b",
-            "controller@host",
-            "host:0",
-            "host:port",
-            ":30100",
-            "a/b",
-        ] {
-            config.election.advertise = Some(bad.to_owned());
-            assert_eq!(
-                config.validate(),
-                Err(ConfigError::MalformedAdvertiseAddress(bad.to_owned())),
-                "{bad:?}"
-            );
-        }
-        // The wildcard is a listener's address, never a client's, and a
-        // host that ends in a number is an address to a resolver.
-        for wildcard in ["0.0.0.0", "[::]:30100"] {
-            config.election.advertise = Some(wildcard.to_owned());
-            assert_eq!(
-                config.validate(),
-                Err(ConfigError::WildcardAdvertiseAddress(wildcard.to_owned())),
-                "{wildcard:?}"
-            );
-        }
-        config.election.advertise = Some("0:30100".to_owned());
-        assert_eq!(
-            config.validate(),
-            Err(ConfigError::NumericAdvertiseHost("0:30100".to_owned()))
-        );
-        for good in [
-            "10.0.0.7",
-            "10.0.0.7:30100",
-            "fd00::7",
-            "[fd00::7]",
-            "[fd00::7]:30100",
-            "controller-0.policy.svc",
-            "controller-0.policy.svc:30100",
-        ] {
-            config.election.advertise = Some(good.to_owned());
-            assert_eq!(config.validate(), Ok(()), "{good}");
-        }
-
-        config.election.advertise = None;
-        config.election.lease = LeasePlace::File(PathBuf::new());
-        assert_eq!(config.validate(), Err(ConfigError::EmptyLeaseName));
-    }
-
-    #[cfg(feature = "kubernetes")]
-    #[test]
-    fn a_lease_object_takes_a_name_and_whole_seconds() {
-        let object = |namespace: Option<&str>, name: &str| LeasePlace::Kubernetes {
-            namespace: namespace.map(str::to_owned),
-            name: name.to_owned(),
-        };
-        let mut config = valid();
-        config.election.lease = object(None, "smg-policy");
-        assert_eq!(config.validate(), Ok(()));
-        config.election.lease = object(Some("policy"), "smg-policy");
-        assert_eq!(config.validate(), Ok(()));
-
-        config.election.lease = object(None, "");
-        assert_eq!(config.validate(), Err(ConfigError::EmptyLeaseName));
-        config.election.lease = object(Some(""), "smg-policy");
-        assert_eq!(config.validate(), Err(ConfigError::EmptyLeaseNamespace));
-
-        // The object stores whole seconds: a fraction is refused here, not
-        // at the first write.
-        config.election.lease = object(None, "smg-policy");
-        config.election.settings = ElectionSettings {
-            duration: Duration::from_millis(2500),
-            renew_period: Duration::from_millis(500),
-            renew_deadline: Duration::from_millis(1500),
-        };
-        assert_eq!(
-            config.validate(),
-            Err(ConfigError::LeaseDurationNotWholeSeconds(
-                Duration::from_millis(2500)
-            ))
-        );
-        // A file takes the same settings.
-        config.election.lease = LeasePlace::File(PathBuf::from("/run/smg/lease"));
-        assert_eq!(config.validate(), Ok(()));
-    }
-
-    #[test]
-    fn a_scope_names_itself_everywhere() {
-        for scope in Scope::ALL {
-            assert_eq!(scope.to_string(), scope.as_str());
-        }
-        assert_eq!(
-            ConfigError::ScopeUnmounted(Scope::Replication).to_string(),
-            "scope replication is mounted on no listener"
-        );
-    }
-}
+#[path = "../../../tests/unit/service/controller/config/tests.rs"]
+pub(crate) mod tests;

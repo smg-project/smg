@@ -32,12 +32,17 @@
 //!   cargo test -p smg --lib routers::common::classic_pair_select_rows -- --ignored --nocapture
 //! ```
 //!
-//! That filter also runs this module's two child recorders
-//! ([`classic_pair_bound_rows`], [`classic_pair_runtime_rows`]), each of
-//! which writes a sheet of its own beside this one: their rows draw
-//! nothing. A row of the second is placed on the wire that carries one
-//! runtime's request, and names the runtime of a worker that is not on the
-//! sheet's own.
+//! That filter also runs this module's four child recorders
+//! ([`classic_pair_bound_rows`], [`classic_pair_runtime_rows`],
+//! [`classic_pair_named_rows`], [`classic_pair_sticky_rows`]), each of
+//! which writes a sheet of its own beside this one: the rows of the first
+//! three draw nothing. A row of the second is placed
+//! on the wire that carries one runtime's request, and names the runtime of
+//! a worker that is not on the sheet's own. A row of the third states the
+//! text its requests carry under `x-smg-target-worker`, and the pair a
+//! failed attempt was sent to where its requests are retries. A row of the
+//! fourth is a list of steps under the sticky routing-key override, in a
+//! shape of its own.
 //!
 //! A sequence row is recorded twenty times from fresh pools and fresh
 //! policies and must come out the same each time; a drawn row records how
@@ -46,6 +51,7 @@
 
 use std::{collections::HashMap, fs, path::PathBuf, sync::Arc, time::Duration};
 
+use axum::http::HeaderMap;
 use openai_protocol::{
     model_card::ModelCard,
     worker::{WorkerSpec, WorkerStatus},
@@ -174,6 +180,14 @@ struct Row {
     /// one: `grpc`, which carries one runtime's request.
     #[serde(skip_serializing_if = "Option::is_none")]
     wire: Option<&'static str>,
+    /// The text the row's requests carry under `x-smg-target-worker`: the
+    /// worker they name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<&'static str>,
+    /// The pair a failed attempt of each request was sent to, where the
+    /// row's requests are retries: the prefill's place, then the decode's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tried: Option<(usize, usize)>,
     prefills: Vec<Member>,
     decodes: Vec<Member>,
     /// How many requests the row places, one after another.
@@ -182,10 +196,10 @@ struct Row {
 }
 
 #[derive(Serialize)]
-struct Sheet {
+struct Sheet<R> {
     recorded_from: String,
     policy: &'static str,
-    rows: Vec<Row>,
+    rows: Vec<R>,
 }
 
 /// The policy's configuration, as the gateway's own configuration file
@@ -349,6 +363,10 @@ impl Bed {
                     PlacementFailure::PrefillAtCapacity => "at_capacity",
                     PlacementFailure::PolicyDeclined(_) => "declined",
                     PlacementFailure::NoCompatiblePair { .. } => "other",
+                    // The recorder starts no Grand Central, so no row of
+                    // its sheet records this refusal. It has its name all
+                    // the same, as in the encode pairs' recorder.
+                    PlacementFailure::NoPlanBound(_) => "no_plan_bound",
                 },
             },
         }
@@ -357,6 +375,17 @@ impl Bed {
     /// One request through the gateway's pair placement, behind the prefill
     /// admission when the row names its bound.
     fn pick(&self) -> Answer {
+        self.pick_with(None, &[])
+    }
+
+    /// [`Self::pick`] for a request that carries `headers` and that a failed
+    /// attempt already sent to the engines `tried`, each by its base URL.
+    fn pick_with(&self, headers: Option<&HeaderMap>, tried: &[String]) -> Answer {
+        let inputs = PlacementInputs {
+            headers,
+            tried,
+            ..PlacementInputs::default()
+        };
         let Some(admission) = &self.admission else {
             return self.answer(&select_pair(
                 &self.registry,
@@ -365,7 +394,7 @@ impl Bed {
                 &self.pairs,
                 None,
                 None,
-                PlacementInputs::default(),
+                inputs,
                 Stated::nothing,
             ));
         };
@@ -384,7 +413,7 @@ impl Bed {
                     &self.pairs,
                     None,
                     Some(capacity),
-                    PlacementInputs::default(),
+                    inputs,
                     Stated::nothing,
                 );
                 answer = Some(self.answer(&placed));
@@ -450,6 +479,8 @@ impl Cell {
             shed: self.shed,
             prefill_bound: self.prefill_bound,
             wire: self.wire,
+            target: None,
+            tried: None,
             prefills: self.prefills,
             decodes: self.decodes,
             requests,
@@ -980,8 +1011,9 @@ fn rows() -> Vec<Row> {
 }
 
 /// Writes `rows` as the sheet `file` of `policy` under `CLASSIC_ROWS_OUT`,
-/// naming `CLASSIC_ROWS_COMMIT` as the commit they were recorded from.
-fn write(file: &str, policy: &'static str, rows: Vec<Row>) {
+/// naming `CLASSIC_ROWS_COMMIT` as the commit they were recorded from. A
+/// child recorder's rows may be of a shape of its own.
+fn write<R: Serialize>(file: &str, policy: &'static str, rows: Vec<R>) {
     let out = PathBuf::from(
         std::env::var_os("CLASSIC_ROWS_OUT").expect("CLASSIC_ROWS_OUT names the output directory"),
     );
@@ -1013,3 +1045,11 @@ mod classic_pair_bound_rows;
 /// none, on the wire that carries one runtime's request and on a sheet of
 /// their own.
 mod classic_pair_runtime_rows;
+
+/// The rows of a pair whose request names its worker, on a sheet of their
+/// own.
+mod classic_pair_named_rows;
+
+/// The rows of a pair under the sticky routing-key override, request after
+/// request, on a sheet of their own.
+mod classic_pair_sticky_rows;

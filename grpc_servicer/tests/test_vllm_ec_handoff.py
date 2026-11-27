@@ -2,6 +2,7 @@
 
 import ast
 import asyncio
+import inspect
 import json
 import logging
 import time
@@ -13,7 +14,7 @@ import grpc
 import pytest
 from smg_grpc_proto import vllm_engine_pb2 as pb
 from smg_grpc_servicer.vllm.mm_keys import batches_missing_pixels, mm_batches
-from smg_grpc_servicer.vllm.mm_salt import has_preprocessed_mm_payload
+from smg_grpc_servicer.vllm.mm_salt import has_preprocessed_mm_payload, request_cache_salt
 
 
 class _Aborted(Exception):
@@ -24,11 +25,12 @@ def _generate(**overrides):
     """Compile the actual handler with engine-independent dependencies."""
     path = Path(__file__).parents[1] / "smg_grpc_servicer/vllm/servicer.py"
     module = ast.parse(path.read_text())
-    helper = next(
+    helpers = [
         n
         for n in module.body
-        if isinstance(n, ast.FunctionDef) and n.name == "_valid_cpu_ec_handle"
-    )
+        if isinstance(n, ast.FunctionDef)
+        and n.name in ("_valid_cpu_ec_handle", "_takes_reasoning_ended")
+    ]
     cls = next(
         n for n in module.body if isinstance(n, ast.ClassDef) and n.name == "VllmEngineServicer"
     )
@@ -39,6 +41,7 @@ def _generate(**overrides):
     for arg in method.args.args:
         arg.annotation = None
     namespace = {
+        "inspect": inspect,
         "json": json,
         "asyncio": asyncio,
         "build_media_identity": Mock(),
@@ -47,6 +50,7 @@ def _generate(**overrides):
         "grpc": grpc,
         "mm_batches": mm_batches,
         "has_preprocessed_mm_payload": has_preprocessed_mm_payload,
+        "request_cache_salt": request_cache_salt,
         "batches_missing_pixels": batches_missing_pixels,
         "params_from_request": lambda req: (
             json.loads(req.kv_transfer_params_json)
@@ -65,7 +69,9 @@ def _generate(**overrides):
         "GracefulHTTPError": type("GracefulHTTPError", (Exception,), {}),
     }
     namespace.update(overrides)
-    exec(compile(ast.Module(body=[helper, method], type_ignores=[]), str(path), "exec"), namespace)
+    exec(
+        compile(ast.Module(body=[*helpers, method], type_ignores=[]), str(path), "exec"), namespace
+    )
     return namespace["Generate"]
 
 
@@ -271,3 +277,65 @@ async def test_reasoning_template_kwargs_reach_engine_or_fail_before_submission(
         assert len(seen) == 1
         expected = {"chat_template_kwargs": {"thinking_mode": mode}} if mode else None
         assert seen[0].get("reasoning_parser_kwargs") == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("first_token", "constrained", "engine_takes", "handed"),
+    [
+        (True, True, True, True),
+        (True, False, True, False),
+        (False, True, True, False),
+        (True, True, False, False),
+    ],
+)
+async def test_grammar_from_first_token_reaches_engine_as_reasoning_ended(
+    first_token, constrained, engine_takes, handed
+):
+    """A shaped grammar's start reaches an engine whose generate() takes it."""
+    params = pb.SamplingParams(grammar_from_first_token=first_token)
+    if constrained:
+        params.json_schema = "{}"
+    request = pb.GenerateRequest(
+        request_id="start-test",
+        tokenized=pb.TokenizedInput(input_ids=[1, 2]),
+        sampling_params=params,
+    )
+    seen = []
+
+    async def generate(*, reasoning_ended="unsaid", **kwargs):
+        """Record the switch an engine that names the keyword is handed."""
+        seen.append(reasoning_ended)
+        if False:
+            yield
+
+    async def older_generate(**kwargs):
+        """Record the switch an engine that does not name the keyword is handed."""
+        seen.append(kwargs.get("reasoning_ended", "unsaid"))
+        if False:
+            yield
+
+    async def abort(code, message):
+        """Make gRPC validation failures observable to the test."""
+        raise _Aborted(code, message)
+
+    handler = _generate()
+    engine = SimpleNamespace(
+        generate=generate if engine_takes else older_generate,
+        renderer=SimpleNamespace(process_for_engine=lambda prompt, **kwargs: prompt),
+        vllm_config=SimpleNamespace(ec_transfer_config=None),
+    )
+    servicer = SimpleNamespace(
+        engine=engine,
+        # The servicer's own read, the one its constructor makes once.
+        _takes_reasoning_ended=handler.__globals__["_takes_reasoning_ended"](engine),
+        _sampling_params_from_proto=lambda *args, **kwargs: SimpleNamespace(
+            extra_args=None, logprobs=None, prompt_logprobs=None
+        ),
+        _tokenization_kwargs_from_proto=lambda _: {},
+        _loads=Mock(),
+        _notify_kv_transfer_rejected=AsyncMock(),
+    )
+    context = SimpleNamespace(abort=abort, invocation_metadata=lambda: ())
+    assert [reply async for reply in handler(servicer, request, context)] == []
+    assert seen == [True if handed else "unsaid"]

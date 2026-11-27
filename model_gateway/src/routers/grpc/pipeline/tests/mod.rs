@@ -5,6 +5,8 @@ mod embeddings;
 mod generate_body;
 mod glm53;
 mod model_label;
+mod outcome;
+mod pair_outcome;
 mod pretokenized;
 mod rate_limit_reserve;
 mod refusal_lines;
@@ -140,6 +142,27 @@ struct GatedScheduler {
     fail_always: bool,
     fail_internal: bool,
     fail_mid_stream: bool,
+    /// The call of this place, counted from zero, ends its stream with the
+    /// engine's own error a pace behind its first frame: the calls beside
+    /// it have ended by then.
+    fail_late: Option<usize>,
+    /// The call of this place, counted from zero, is refused as
+    /// `fail_first` refuses the first: UNAVAILABLE, and no stream.
+    fail_call: Option<usize>,
+    /// The call of the fan-out's sample of this index is refused the same
+    /// way, whenever it arrives: its request's id ends with the index.
+    fail_sample: Option<u32>,
+    /// The call of the fan-out's sample of this index ends its stream with
+    /// UNAVAILABLE a pace behind its last message: every sample's last
+    /// message has been read by then.
+    fail_behind_last: Option<u32>,
+    /// Every call is refused as `fail_always` refuses it, behind this wait:
+    /// a refusal that lands behind the answer of a call sent beside it.
+    fail_after: Option<Duration>,
+    /// Every call waits where it arrived until the flag is set, then
+    /// answers: a call whose answer the test times itself.
+    call_gate: Option<Arc<AtomicBool>>,
+    started: Arc<AtomicUsize>,
     fail_constraint: bool,
     fail_engine_report: bool,
     /// Send the first frame, then hold the stream open with nothing on
@@ -285,7 +308,27 @@ impl TokenSpeedScheduler for GatedScheduler {
                     })
                     .unwrap_or_default(),
             );
-        if self.fail_always || (self.fail_first && self.calls.fetch_add(1, Ordering::SeqCst) == 0) {
+        let place = self.started.fetch_add(1, Ordering::SeqCst);
+        // A fan-out names each sample's request by the sample's index.
+        let of_sample = |index: Option<u32>| {
+            index.is_some_and(|index| request.request_id.ends_with(&format!("-{index}")))
+        };
+        let fail_sample = of_sample(self.fail_sample);
+        let fail_behind_last = of_sample(self.fail_behind_last);
+        if let Some(wait) = self.fail_after {
+            tokio::time::sleep(wait).await;
+            return Err(Status::unavailable("release-test induced late failure"));
+        }
+        if let Some(gate) = &self.call_gate {
+            while !gate.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        if self.fail_always
+            || self.fail_call == Some(place)
+            || fail_sample
+            || (self.fail_first && self.calls.fetch_add(1, Ordering::SeqCst) == 0)
+        {
             return Err(Status::unavailable("release-test induced failure"));
         }
         if self.fail_internal {
@@ -321,7 +364,8 @@ impl TokenSpeedScheduler for GatedScheduler {
         let probe = (!self.gate_rpc).then(|| self.probe.clone()).flatten();
         let released = Arc::clone(&self.released);
         let frame_gap = self.frame_gap;
-        let fail_mid_stream = self.fail_mid_stream;
+        let fail_late = self.fail_late == Some(place);
+        let fail_mid_stream = self.fail_mid_stream || fail_late;
         let hold_after_first = self.hold_after_first;
         let gate_after_first = self.gate_after_first.clone();
         tokio::spawn(async move {
@@ -334,6 +378,9 @@ impl TokenSpeedScheduler for GatedScheduler {
             {
                 if let Some(gap) = frame_gap {
                     tokio::time::sleep(gap).await;
+                }
+                if fail_late && index == 1 {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
                 }
                 let frame = if fail_mid_stream && index == 1 {
                     Err(Status::internal(ENGINE_ERROR_MESSAGE))
@@ -354,6 +401,11 @@ impl TokenSpeedScheduler for GatedScheduler {
                         tokio::time::sleep(Duration::from_millis(5)).await;
                     }
                 }
+            }
+            if fail_behind_last {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                let failure = Status::unavailable("release-test induced failure behind the end");
+                let _ = tx.send(Err(failure)).await;
             }
         });
         Ok(TonicResponse::new(Box::pin(ReceiverStream::new(rx))))

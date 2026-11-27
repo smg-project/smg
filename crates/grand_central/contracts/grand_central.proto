@@ -1,22 +1,24 @@
-// smg.policy.v1: Grand Central's gateway, ingestion, control and
+// smg.policy.v1: Grand Central's gateway, control and
 // replication protocol (design 5.2 and appendix A). The view and decision
-// vocabulary is in policy_plugin.proto; the relay frames carry the engine
-// wire's own messages (smg.grpc.common) unchanged.
+// vocabulary is in policy_plugin.proto.
 //
 // Versioning: design appendix A (additive within v1). The package is
 // pre-release until the first shipped release that carries it; the rule
-// binds from then on. Hello carries the range of protocol versions the
-// gateway speaks and Welcome the one the controller picked; a range that
-// holds no version the controller speaks is refused with
-// FAILED_PRECONDITION, the status message naming the range and the
-// controller's version.
+// binds from then on.
 //
-// Scopes and principals: design 5.2. Four credentialed scopes, each
+// Hello carries the range of protocol versions the gateway speaks, and
+// Welcome the one the controller picked. The controller speaks two
+// versions, its own and the one before it, and picks the newest that the
+// range holds. A range that holds neither is refused with
+// FAILED_PRECONDITION, and the status message names the range and the
+// controller's own. Version 2 is the first whose frames state a request's
+// hard demands (DecideRequest.demands).
+//
+// Scopes and principals: design 5.2. Three credentialed scopes, each
 // mountable on its own listener; the verified principal is transport
 // metadata, never a field a peer fills in. Gateway: Session, Decide,
 // WatchWorkers and Leader; a Hello whose gateway_id is not the verified
-// subject is refused with UNAUTHENTICATED and the stream closes. Ingestion:
-// PushLoad and PushKvEvents; the relay's subject is the RELAY origin.
+// subject is refused with UNAUTHENTICATED and the stream closes.
 // Control: `user` reads (GetSnapshot, Explain, GetPolicySpec, Leader,
 // WatchRegime), `admin` writes the rest; every call writes an audit event.
 // Replication: Replicate, whose stream carries a re-sync's snapshot in parts;
@@ -85,7 +87,7 @@
 // same), a veto of no kind, a Hello whose veto_count is not its list's
 // length, or a DecideRequest field out of its range in this protocol version
 // (the status message names the field, and the stream closes);
-// RESOURCE_EXHAUSTED a relay over its per-subscriber budget, a WatchWorkers
+// RESOURCE_EXHAUSTED a WatchWorkers
 // past its principal's ceiling of 4 open watches or past the replica's
 // ceiling of watching principals, a
 // Decide stream past its gateway's Welcome.max_decide_streams, a Session
@@ -104,8 +106,9 @@
 // term, on a membership write, a spec write, its dry run and a rollback,
 // Replicate and the open of a WatchWorkers (the moment after
 // its take, until its store is told the term, and a call admitted under a
-// take its store has since passed: retry; or its whole lead, until a later
-// take, where its log followed a term at or above the one it took), or a
+// take its store has since passed: retry; or the one step of a lead whose
+// log followed a term at or above the one it took, which the election
+// leaves for a take above that term), or a
 // Decide stream open when the controller closes its listeners at its
 // shutdown (its gateway opens the next one on the leader);
 // ABORTED fenced mid-stream, reconnect through Leader, a Hello read
@@ -115,7 +118,7 @@
 // call, a frame kind or a mode this build does not serve, or a spec call
 // of a controller given no spec source, by its name;
 // OUT_OF_RANGE and
-// DATA_LOSS raised by no handler, forwarded as RelayResync. The
+// DATA_LOSS raised by no handler. The
 // transport answers OUT_OF_RANGE itself to a request over its limit of
 // 4 MiB on a call of one request message; on a Session or Decide stream
 // the reader answers that finding RESOURCE_EXHAUSTED. Any other read of
@@ -128,7 +131,6 @@ syntax = "proto3";
 package smg.policy.v1;
 
 import "policy_plugin.proto";
-import "common.proto";
 
 service GrandCentral {
   // Gateway scope, one bidirectional stream per gateway: identity, leases,
@@ -142,9 +144,6 @@ service GrandCentral {
   // resumes after the last event it took. A principal holds at most 4
   // watches open at a replica: one more is refused RESOURCE_EXHAUSTED.
   rpc WatchWorkers(WatchWorkersRequest) returns (stream WorkerEvent);
-  // Ingestion scope (relays only), client streams answered once at the end.
-  rpc PushLoad(stream LoadReport) returns (Ack);
-  rpc PushKvEvents(stream RelayKvFrame) returns (Ack);
   // Control scope, unary. An answer says the row as written. A registration,
   // its refresh and a patch owe a build of the pools: it starts within one
   // publication window (20 ms) of their answer, and they are in force for
@@ -353,7 +352,10 @@ message Principal {
   enum Scope {
     SCOPE_UNSPECIFIED = 0;
     SCOPE_GATEWAY = 1;
-    SCOPE_INGESTION = 2;
+    // The ingestion scope's, which held two relay calls: no later scope
+    // takes its number or its name.
+    reserved 2;
+    reserved "SCOPE_INGESTION";
     SCOPE_CONTROL = 3;
     SCOPE_REPLICATION = 4;
   }
@@ -483,7 +485,11 @@ message DecideRequest {
   // the same lease id. A refusal is a Busy with a reason of its own, and a
   // decision that sheds is no refusal of the request, whose prefill runs:
   // behind either the gateway sends the decode the first pick named, and
-  // that Dispatched books the side. An id of 0 is out of range.
+  // that Dispatched books the side. A call whose frame names its worker
+  // (named_worker), under a spec whose binding holds the pair's decode side
+  // to that number, is refused so, as one whose decode side was never
+  // chosen: the decode stays the one the first pick named. An id of 0 is
+  // out of range.
   optional fixed64 decode_of = 6;
   // The items of an encode request. Its presence says that the request is
   // one, with a key or with none. Read on a frame of the encode phase, and
@@ -513,11 +519,91 @@ message DecideRequest {
   // worker, and neither its session key nor its client key is read. A text
   // that is no number is stated as 4294967295: it reaches no worker of any
   // list, as that text does. Absent, the request names no worker, so the
-  // frame of a host older than the field is decided as it was. Read on a
-  // frame that is decided over one list, a single request's and one that
-  // stands alone at a side's phase, under a spec whose binding for the
-  // frame names a target source, and on no other.
+  // frame of a host older than the field is decided as it was. Read under a
+  // spec whose binding for the frame names a target source: on a frame that
+  // is decided over one list, a single request's and one that stands alone
+  // at a side's phase, and on a pair's frame at its prefill. Not read on an
+  // encode request's frame.
+  //
+  // A pair's frame states the one number for its two sides, and each side
+  // whose profile is the plain hash ring reads it. The prefill's side counts
+  // the prefills the gateway can be sent to that pair with a decode it can
+  // be sent to, and those with such a decode among their first partners
+  // alone where there is one. The decode's side counts the partners so
+  // counted of the prefill reached. The decision is held to the two
+  // workers, or to the prefill alone where the decode's side does not read
+  // the number. Where the decode's side alone reads it, the decision counts
+  // it among the partners of the prefill it picks. A number that reaches no
+  // worker on a side sheds the pair with no endpoint, under
+  // `target-worker`, and so does a named worker that cannot take the
+  // request after all. Where no prefill can be counted, or none opens the
+  // pair, the pair is decided as one that names no worker, and its keys are
+  // read. Where every decode is over its thresholds and the spec steers
+  // such a pool, the decode goes by load and its number is not read. The
+  // pair's decode_later stands as it is stated.
   optional uint32 named_worker = 8;
+  // The request's hard demands of the worker that takes it. Absent, or with
+  // no part stated, the request demands nothing and the frame is decided as
+  // it was.
+  //
+  // A stated demand is read on every frame but an encode request's. On
+  // that frame it is out of range, by this field, in this protocol version.
+  // A worker is held by its role:
+  // - a single worker, a decode and a decode call's decode: to every part
+  // - a prefill, in a pair or alone: to every part but output_window and
+  //   decoding
+  //
+  // A decode call states its request's demands again: the lease keeps
+  // none. A frame that states named_worker counts its number among the
+  // workers that meet the demand.
+  //
+  // A host states a demand only on a session whose Welcome chose protocol 2
+  // or later. A controller of protocol 1 reads no such field, and would
+  // place the request among the workers its demand rules out. A controller
+  // that speaks protocol 2 reads a stated demand on a session of either
+  // version.
+  Demands demands = 9;
+}
+
+// What a request demands of the worker that takes it. A worker meets a
+// demand by what its registration states (DemandFacts). The two numbers
+// are the asking party's own: the controller compares each with a worker's
+// and reads no more of it.
+//
+// Whether a worker takes images is its row's own bit, which its
+// registration states (WorkerSpec.vision). A list the demands leave nobody
+// is shed with no endpoint, under the stage of the demand that took its
+// last worker.
+message Demands {
+  // Where a request's media by reference may be processed.
+  enum References {
+    // The request carries no media by reference.
+    REFERENCES_NONE = 0;
+    // By a worker that processes media by reference, whichever pipeline it
+    // runs.
+    REFERENCES_ANY = 1;
+    // By a worker that processes it by its registering party's pipeline.
+    REFERENCES_CALLER = 2;
+    // By a worker that processes it by a pipeline of its own.
+    REFERENCES_WORKER = 3;
+  }
+  // The runtime the request stays on, as a number: only a worker that
+  // states the same number takes it. 0 demands none.
+  uint32 runtime = 1;
+  // The request needs a worker that takes images.
+  bool vision = 2;
+  // A value this contract does not name is out of range, by this field.
+  References references = 3;
+  // The context window the request's input needs, in tokens: only a worker
+  // whose window is as wide, or that states none, takes it. 0 demands none.
+  uint32 input_window = 4;
+  // The context window the request's completion needs, in tokens, held
+  // against a worker's window alone as the input is. 0 demands none.
+  uint32 output_window = 5;
+  // How the request's constraint was decided, as a number of at most 255:
+  // out of range above, by this field. Only a worker that states the same
+  // number takes it. 0 demands none.
+  uint32 decoding = 6;
 }
 
 // The encode items of a request and what it asks for them.
@@ -768,6 +854,19 @@ message WorkerRow {
   // ALREADY_EXISTS whoever made it. A reader that knows no such field
   // reads every row as a control call's.
   Maker maker = 27;
+  // What the worker states for a request's hard demands. Absent: it
+  // states none, and the row reads as it did before this field. A reader
+  // that knows no such field reads every row as one that states none.
+  DemandFacts demand_facts = 28;
+  // Whether the worker takes images. A reader that knows no such field
+  // reads every row as one that takes none, so it sends the worker no
+  // request that demands vision.
+  bool vision = 29;
+  // The worker's end of the encode handoff. Absent: it states none, and the
+  // row reads as it did before this field. A reader that knows no such
+  // field reads every row as one that states no end, so a decision it
+  // makes from its own rows hands the worker no item.
+  EncodeOffer encode = 30;
 }
 
 // A provider that finds workers by itself, as a row's maker. Neither
@@ -792,13 +891,9 @@ message Reachability {
   }
 }
 
-// What one PD worker offers a rendezvous partner, and the store's class.
-// The store derives the class where the membership moves a member or an
-// offer, and again when a generation moves the pairing mode: the classes
-// then move at the same membership epoch and no watch event says so. A
-// registration hands none in. pair_class is the worker's one class on its
-// side, 0 outside any pairing: the decodes a prefill pairs with are the
-// snapshot's PairRow.decodes.
+// What one PD worker offers a rendezvous partner. A pair's classes are no
+// part of it: the holder of the worker objects derives them under the
+// pairing mode in force.
 message PairingDescriptor {
   string protocol = 1;
   string connector = 2;
@@ -807,19 +902,48 @@ message PairingDescriptor {
   uint32 bootstrap_port = 5;
   string bootstrap_host = 6;
   map<string, string> kv_layout = 7;
-  uint32 pair_class = 8;
-  bool ec_producer = 9;
-  bool ec_consumer = 10;
-  bool vision = 11;
-  // The worker's end of the encode handoff, with its two EC roles: the form
-  // its registration states and, under a push, the connector the role is
-  // stated on. Unspecified is no end, as a registration that names no form
-  // reads; the connector above is the pair's. A host derives from them
-  // which encoders hand an item to which prefills.
-  EncodeHandoff encode_handoff = 12;
-  string ec_connector = 13;
+  // The pair class, which no writer filled: no later field takes its
+  // number or its name. A registration or a told row that still states it
+  // is read as one that states none.
+  reserved 8;
+  reserved "pair_class";
+  // Whether the worker takes images, which no build took or told under
+  // this number: it is the registration's and the row's own field
+  // (WorkerSpec.vision, WorkerRow.vision). No later field takes the number
+  // or the name. A registration or a told row that still states it is read
+  // as one that states none.
+  reserved 11;
+  reserved "vision";
+  // The worker's end of the encode handoff, which no build took or told
+  // under these five numbers: it is a message of its own on the
+  // registration and on the row (EncodeOffer: WorkerSpec.encode,
+  // WorkerRow.encode). No later field takes a number or a name of the
+  // five. A registration or a told row that still states one is read as
+  // one that states none.
+  reserved 9, 10, 12, 13, 14;
+  reserved "ec_producer", "ec_consumer", "encode_handoff";
+  reserved "ec_connector", "encode_references";
+}
+
+// A worker's end of the encode handoff, with its two EC roles: the form its
+// registration states and, under a push, the connector the role is stated
+// on. A pairing descriptor's connector is the pair's, and no part of this.
+// A host derives from the offers of its workers which encoders hand an item
+// to which prefills.
+message EncodeOffer {
+  // Unspecified is no end, as a registration that names no form reads.
+  EncodeHandoff handoff = 1;
+  // The worker states the producer role: an encoder's, under a push.
+  bool producer = 2;
+  // The worker states the consumer role: a prefill's, under a push.
+  bool consumer = 3;
+  // The connector the role is stated on: any text, compared whole and never
+  // parsed. No rule holds its words, and the row's size is its one bound. A
+  // registration's is read past the blanks around it. Empty, or blank in a
+  // registration, states none.
+  string connector = 4;
   // The worker, an encoder, processes an item's references itself.
-  bool encode_references = 14;
+  bool references = 5;
 }
 
 // How an encoder hands an encoded item to a prefill.
@@ -851,7 +975,9 @@ message HealthPolicy {
   uint32 success_threshold = 2;
   uint32 check_interval_ms = 3;
   uint32 timeout_ms = 4;
-  // The checks are off: the worker is ready from its registration and the
+  // The checks are off: the worker is ready from its registration, where
+  // the call's term holds through its connect signal, and from a
+  // MODE_UPSERT of that registration where it did not. The
   // prober never judges it. The registrant says "do not check", never
   // "healthy".
   bool disabled = 5;
@@ -867,61 +993,31 @@ message Signals {
   string scrape_family = 5;
 }
 
-// --- Ingestion scope: relays only -------------------------------------------
-
-// One load record of one rank: the engine wire's EngineLoad unchanged, with
-// the worker, the rank and the relay's receipt; a gateway in front of a
-// host-local wire forwards what it received, its verified subject the origin.
-message LoadReport {
-  fixed64 worker_id = 1;
-  // When the relay has no id yet (a worker it registered itself).
-  string registration_key = 2;
-  uint32 dp_rank = 3;
-  smg.grpc.common.EngineLoad record = 4;
-  // EVENTS, POLL or SCRAPE at the relay; the controller records the RELAY hop.
-  SignalSource source = 5;
-  // The relay's receipt, microseconds since its stream opened.
-  uint64 received_offset_micros = 6;
-  uint64 relay_seq = 7;
-}
-
-// The engine wire's event batch unchanged, or the stream status the relay saw.
-message RelayKvFrame {
-  fixed64 worker_id = 1;
-  string registration_key = 2;
-  oneof frame {
-    smg.grpc.common.KvEventBatch batch = 3;
-    RelaySubscribed subscribed = 4;
-    RelayResync resync = 5;
-    RelayEnded ended = 6;
-  }
-  uint64 received_offset_micros = 7;
-}
-
-message RelaySubscribed {
-  uint64 start_sequence_number = 1;
-  bool loads_only = 2;
-  uint32 dp_size = 3;
-}
-
-// The engine wire's status codes and stream ends as frames.
-message RelayResync {
-  enum Reason {
-    REASON_UNSPECIFIED = 0;
-    REASON_OUT_OF_RANGE = 1;
-    REASON_DATA_LOSS = 2;
-    REASON_STREAM_ENDED = 3;
-    REASON_SNAPSHOT_ABANDONED = 4;
-    REASON_RELAY_RESTART = 5;
-    REASON_ENGINE_REPLACED = 6;
-  }
-  Reason reason = 1;
-  uint32 dp_rank = 2;
-  uint64 resume_from = 3;
-}
-
-message RelayEnded {
-  string reason = 1;
+// What a worker states for a request's hard demands, by its registration.
+// The two numbers are the registering party's own: equal numbers are one
+// runtime, or one way to decide a constraint. The controller compares them
+// and reads no more of them. A worker that states none meets no demand for
+// a runtime, for media by reference or for a way to decide a constraint,
+// and it takes a request of any size. Whether the worker takes images is
+// no field here: its registration states it beside this block
+// (WorkerSpec.vision). A frame states the demands these facts are held
+// against (DecideRequest.demands).
+message DemandFacts {
+  // The worker's runtime, as a number. 0 states none.
+  uint32 runtime = 1;
+  // The worker processes media by reference.
+  bool references = 2;
+  // It processes that media by its registering party's pipeline, and not
+  // by one of its own. Read only beside `references`. The bit is carried
+  // and compared as stated. No decision reads it where the party states no
+  // references. A change of it alone changes the row, as a change of any
+  // other stated fact does.
+  bool host_pipeline = 3;
+  // The worker's context window, in tokens. 0 states none.
+  uint32 window = 4;
+  // How the worker decides a request's constraint, as a number of at most
+  // 255: INVALID_ARGUMENT above, by this field. 0 states none.
+  uint32 decoding = 5;
 }
 
 // --- Control scope: membership ----------------------------------------------
@@ -939,22 +1035,30 @@ message RegisterWorkerRequest {
     // INVALID_ARGUMENT first, whether the URL stands or not. A caller that
     // did not make the standing row is PERMISSION_DENIED (WorkerRow.maker).
     MODE_REPLACE = 2;
-    // Registers an absent URL. Over a standing row: equal facts write nothing
-    // and answer the row unmoved, a change of role, wire or models is a new
-    // incarnation, any other change is made in place. The models change
-    // when their set does: the same ids in another order are written in
-    // place, and the row tells the stated order. Over a draining row every
-    // registration is the URL's next incarnation, whatever its facts: a
-    // drain ends with the registration it named. A caller that did not make
-    // the standing row is PERMISSION_DENIED, whatever the facts.
+    // Registers an absent URL. Over a standing row: equal facts write no row
+    // and answer the row unmoved, a change of role, wire, models, demand
+    // facts or whether the worker takes images is a new incarnation, any
+    // other change is made in place. Equal facts send a worker whose checks
+    // are off its connect signal again, where it is neither ready nor
+    // draining: its status alone moves. The models change when their set
+    // does: the same ids in another order are written in place, and the row
+    // tells the stated order. Over a draining row every registration is the
+    // URL's next incarnation, whatever its facts: a drain ends with the
+    // registration it named. A caller that did not make the standing row is
+    // PERMISSION_DENIED, whatever the facts.
     MODE_UPSERT = 3;
   }
   Mode mode = 2;
   // Wait for the handshake; otherwise the row is answered PENDING and the
   // handshake's result is a StatusChanged on WatchWorkers. A worker whose
   // checks are off is ready from its registration: its wait ends in the call
-  // and the answer is the row after it. INVALID_ARGUMENT, by this field's
-  // name, where the controller runs no handshake that ends the wait.
+  // and the answer is the row after it. A call whose term ended between its
+  // write and its connect signal answers that row as it stands, PENDING for
+  // a new worker: read the status the answer holds, and send the
+  // registration again as MODE_UPSERT, which sends the signal again. As
+  // MODE_ADD it is ALREADY_EXISTS and sends none. INVALID_ARGUMENT, by this
+  // field's name, where the controller runs no handshake that ends the
+  // wait.
   bool wait_ready = 3;
 }
 
@@ -963,10 +1067,12 @@ message RegisterWorkerRequest {
 // character is INVALID_ARGUMENT. Over a standing row (MODE_REPLACE,
 // MODE_UPSERT) the labels and the health policy are the registration's,
 // whole; any other field left unset or empty keeps the row's value, and an
-// overload or a signals block that is present replaces the row's. A URL's
-// first registration names its wire and its role: INVALID_ARGUMENT by the
-// field it leaves unset. A wire or a role that states a number this
-// contract does not name is INVALID_ARGUMENT at every registration.
+// overload, a signals, a demand facts or an encode offer block that is
+// present replaces the row's. A URL's first registration names its wire and
+// its role:
+// INVALID_ARGUMENT by the field it leaves unset. A wire or a role that
+// states a number this contract does not name is INVALID_ARGUMENT at every
+// registration.
 //
 // Bounds, each INVALID_ARGUMENT by its field: a URL at most 2,048 bytes; a
 // runtime, a zone and a model id at most 256 bytes each; at most 128 labels,
@@ -1029,6 +1135,16 @@ message WorkerSpec {
   // Unset: checked, under the controller's defaults, whatever stood under
   // the URL: every registration that wants its checks off says so.
   HealthPolicy health_policy = 14;
+  // What the worker states for a request's hard demands. A block that is
+  // present is the row's, whole: an empty one states none. Unset keeps the
+  // row's.
+  DemandFacts demand_facts = 15;
+  // Whether the worker takes images. Unset keeps the row's, and a new row
+  // that states none takes no images.
+  optional bool vision = 16;
+  // The worker's end of the encode handoff. A block that is present is the
+  // row's, whole: an empty one states no end. Unset keeps the row's.
+  EncodeOffer encode = 17;
 }
 
 message PatchWorkerRequest {
@@ -1074,7 +1190,11 @@ message SnapshotRequest {
     SLICE_LOADS = 3;
     SLICE_SESSIONS = 4;
     SLICE_LEASES = 5;
-    SLICE_PAIRS = 6;
+    // The pair rows' slice, which no build served: no later slice takes its
+    // number or its name. A request that still names it is refused as one
+    // that names no slice: INVALID_ARGUMENT by `slices`.
+    reserved 6;
+    reserved "SLICE_PAIRS";
     SLICE_SPEC = 7;
     SLICE_PLUGINS = 8;
     SLICE_KV_INDEX = 9;
@@ -1102,7 +1222,10 @@ message Snapshot {
   repeated LoadSample loads = 6;
   repeated SessionRow sessions = 7;
   repeated LeaseRow leases = 8;
-  repeated PairRow pairs = 9;
+  // The pair rows, which no writer filled: no later field takes their
+  // number or their name.
+  reserved 9;
+  reserved "pairs";
   SpecStatus spec = 10;
   repeated PluginState plugins = 11;
   KvIndexSummary kv_index = 12;
@@ -1165,12 +1288,8 @@ message LeaseRow {
   bool dispatched = 7;
 }
 
-message PairRow {
-  fixed64 prefill_id = 1;
-  repeated fixed64 decodes = 2 [packed = true];
-  uint32 pair_class = 3;
-  uint32 slots_free = 4;
-}
+// PairRow, the row of a snapshot's pairs, which no writer filled, left
+// with them: no later message takes its name.
 
 enum ApplyMode {
   APPLY_MODE_UNSPECIFIED = 0;
@@ -1350,6 +1469,8 @@ message LeaderInfo {
   bool synced = 5;
   SyncState sync = 6;
   repeated GroupLeader groups = 7;
+  // The oldest and the newest protocol version the answering controller
+  // speaks.
   uint32 protocol_min = 8;
   uint32 protocol_max = 9;
 }

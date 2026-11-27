@@ -26,9 +26,10 @@
 //! indexed under its first model name, and only when its signals ask for
 //! events.
 //!
-//! An index id is free for the next row once its row leaves. A lane says by
-//! one bit of its model's index (`Index`) that it applied an event, since a
-//! worker that asks for cache events may never publish one.
+//! An index id is free for the next row once its row leaves. A row holds
+//! its id from its lane's making, ahead of its first event: a worker that
+//! asks for cache events may never publish one, and the index then holds no
+//! block under its id.
 //!
 //! Locks, in one order: the holder's, then the table's, then a lane's. The
 //! table's is taken under the holder's lock where a row is stated or
@@ -43,7 +44,6 @@
 //! order no path inverts.
 
 use std::{
-    cell::Cell,
     collections::HashMap,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -61,6 +61,7 @@ use super::kv_cursor::{BatchAdmission, RankCursor};
 use crate::{engine::view::WorkerId, store::workers::WorkerRow};
 
 #[cfg(test)]
+#[path = "../../tests/unit/worker_host/kv_tables/tests.rs"]
 mod tests;
 
 /// Workers one model's index holds at once: the chain index's own ceiling.
@@ -130,9 +131,6 @@ fn emptying() -> u64 {
 /// lane starts over before the unwind goes on.
 pub struct LaneWriter<'a> {
     held: &'a mut Held,
-    /// Whether the body wrote: the lane says its row heard behind a body
-    /// that did.
-    wrote: Cell<bool>,
 }
 
 impl LaneWriter<'_> {
@@ -166,7 +164,6 @@ impl LaneWriter<'_> {
         parent: Option<SequenceHash>,
         map: &mut ChainBlockMap,
     ) -> Result<(), ApplyError> {
-        self.wrote.set(true);
         self.held
             .index
             .chain
@@ -175,7 +172,6 @@ impl LaneWriter<'_> {
 
     /// Forget the named blocks of the row.
     pub(crate) fn removed(&self, hashes: &[SequenceHash], map: &mut ChainBlockMap) {
-        self.wrote.set(true);
         self.held
             .index
             .chain
@@ -184,7 +180,6 @@ impl LaneWriter<'_> {
 
     /// Forget every block of the row.
     pub(crate) fn cleared(&self, map: &mut ChainBlockMap) {
-        self.wrote.set(true);
         self.held.index.chain.apply_cleared(self.held.worker, map);
     }
 
@@ -208,17 +203,10 @@ struct Lent<'a> {
 }
 
 impl Lent<'_> {
-    /// Lend the lane's place to `body`, once, and say the row heard where
-    /// the body wrote.
+    /// Lend the lane's place to `body`, once.
     fn lend(mut self, body: &mut dyn FnMut(&mut LaneWriter<'_>)) {
         if let Some(held) = &mut self.lane.held {
-            let mut writer = LaneWriter {
-                held: &mut *held,
-                wrote: Cell::new(false),
-            };
-            body(&mut writer);
-            let wrote = writer.wrote.get();
-            hear_written(held, wrote);
+            body(&mut LaneWriter { held });
         }
         self.whole = true;
     }
@@ -229,14 +217,6 @@ impl Drop for Lent<'_> {
         if !self.whole {
             self.lane.start_over();
         }
-    }
-}
-
-/// The index speaks for a row from the first admitted batch whose lent
-/// body wrote. A batch the cursor refuses writes no block.
-fn hear_written(held: &Held, wrote: bool) {
-    if wrote && !held.index.heard(held.worker) {
-        held.index.hear(held.worker, true);
     }
 }
 
@@ -276,9 +256,9 @@ fn admitted<B: Blocks>(
 struct Lane {
     cursor: RankCursor,
     /// A batch ran through the cursor since the lane was made or its worker
-    /// was reported gone. The index keeps a bit beside it
-    /// ([`Index::hear`]), set at the first such batch whose body writes,
-    /// and cleared with this word.
+    /// was reported gone: what a subscriber's read of the cursor answers by
+    /// ([`KvTables::cursor`]). The row's id in its index does not wait for
+    /// it.
     heard: bool,
     /// `None` once the row left: a batch that found the lane before the
     /// removal writes nothing.
@@ -293,7 +273,6 @@ impl Lane {
         self.cursor.reset();
         self.heard = false;
         if let Some(held) = &mut self.held {
-            held.index.hear(held.worker, false);
             held.cleared();
         }
     }
@@ -303,27 +282,24 @@ impl Lane {
 struct Entry {
     rank: u16,
     model: Box<str>,
+    /// The index the lane writes and the row's id in it, as the lane holds
+    /// them ([`Held`]): set once at the lane's making and never changed, so
+    /// a reader of the id asks the table alone and waits for no batch. The
+    /// entry leaves the table before the lane lets them go.
+    #[cfg(feature = "controller")]
+    index: Arc<Index>,
+    #[cfg(feature = "controller")]
+    worker: u32,
     lane: Arc<Mutex<Lane>>,
 }
 
-/// The words of a read's mask at most: a bit an index id.
-const MASK_WORDS: usize = INDEX_WORKERS / 64;
-
-/// One model's index: the chain index, each row's view of its cache groups,
-/// and whether each id's lane was heard.
+/// One model's index: the chain index and each row's view of its cache
+/// groups.
 struct Index {
     chain: ChainIndex,
     /// Each row's view of its cache groups other than main attention,
     /// under the row's id: written by a lent body ([`LaneWriter::groups`]).
     groups: GroupViews,
-    /// A bit an index id: the body of an admitted batch wrote through the
-    /// lane of the row that holds the id. A body that writes nothing sets
-    /// nothing, and neither does a batch the lane's cursor refuses:
-    /// the index holds nothing of the row yet. The lane's own word says
-    /// less, that any batch ran through it
-    /// ([`Lane::heard`]). The lane writes its own bit under its lock.
-    /// The bit is a hint of the instant it was read at and orders nothing.
-    heard: [AtomicU64; MASK_WORDS],
 }
 
 impl Index {
@@ -331,40 +307,71 @@ impl Index {
         Self {
             chain: ChainIndex::with_max_workers(INDEX_WORKERS),
             groups: GroupViews::new(),
-            heard: std::array::from_fn(|_| AtomicU64::new(0)),
         }
-    }
-
-    /// The lane that holds `id` says whether an admitted batch's body
-    /// wrote through it.
-    fn hear(&self, id: u32, heard: bool) {
-        let Some(word) = self.heard.get((id / 64) as usize) else {
-            return;
-        };
-        let bit = 1u64 << (id % 64);
-        if heard {
-            word.fetch_or(bit, Ordering::Relaxed);
-        } else {
-            word.fetch_and(!bit, Ordering::Relaxed);
-        }
-    }
-
-    /// Whether an admitted batch's body wrote through the lane
-    /// that holds `id`.
-    fn heard(&self, id: u32) -> bool {
-        let word = self.heard.get((id / 64) as usize);
-        word.is_some_and(|word| word.load(Ordering::Relaxed) & (1 << (id % 64)) != 0)
     }
 
     /// A row takes `id`, which the chain just handed out. Said under the
     /// table's lock, before the row's lane exists.
     fn take(&self, id: u32) {
-        // The row that held the id before may have been heard: the row
-        // that takes it is not.
-        self.hear(id, false);
-        // Nor does it find the view of the row before it, whatever path
-        // that row left by.
+        // The row does not find the view of the row before it, whatever
+        // path that row left by.
         self.groups.remove(id);
+    }
+}
+
+/// One model's index, lent to the engine over worker lists through the
+/// worker host's reader ([`super::kv_read`]): the chain the lanes write and
+/// its group views, with no copy of a block.
+///
+/// A row's id here is its lane's place: held from the lane's making, ahead
+/// of its first event, and free for the next row once its row leaves. The
+/// chain counts each freed id it hands to the next row, and the lending
+/// answers that count ([`Self::ids_reused`]). A reader that maps ids to
+/// rows once a table reads the count ahead of the ids and again behind a
+/// lookup: once it moved, an id of the table may be another row's.
+#[cfg(feature = "controller")]
+pub(super) struct LentIndex {
+    tables: Arc<KvTables>,
+    index: Arc<Index>,
+}
+
+#[cfg(feature = "controller")]
+impl LentIndex {
+    /// Whether no row holds a block in the index.
+    pub(super) fn is_empty(&self) -> bool {
+        self.index.chain.is_empty()
+    }
+
+    /// The id of `row` in this index: its lane's place, whether or not a
+    /// batch ran through the lane. `None` for a row with no lane, and for
+    /// one whose lane writes another index: another model's, or this
+    /// model's made again behind its last lane. Read from the table's entry
+    /// under the table's lock alone: no lane's lock is taken, so the read
+    /// waits for no batch.
+    pub(super) fn number_of(&self, row: WorkerId) -> Option<u32> {
+        let table = self.tables.table.lock();
+        let entry = table.lanes.get(&row)?;
+        Arc::ptr_eq(&entry.index, &self.index).then_some(entry.worker)
+    }
+
+    /// How many times the index handed an id one row freed to the next row
+    /// that asked for one: the chain's own count, which a removal alone
+    /// does not move. A row takes its id before its lane is made
+    /// ([`KvTables::member`]), so the count moves ahead of the row's first
+    /// block. One load, and no lock.
+    pub(super) fn ids_reused(&self) -> u64 {
+        self.index.chain.ids_reused()
+    }
+
+    /// How many blocks the index holds under `id`.
+    pub(super) fn blocks(&self, id: u32) -> usize {
+        self.index.chain.worker_block_count(id)
+    }
+
+    /// The chain index and the group views beside it, for the engine's one
+    /// lookup.
+    pub(super) fn chain(&self) -> (&ChainIndex, &GroupViews) {
+        (&self.index.chain, &self.index.groups)
     }
 }
 
@@ -462,6 +469,8 @@ impl KvTables {
         held.index.take(worker);
         held.lanes += 1;
         let index = Arc::clone(&held.index);
+        #[cfg(feature = "controller")]
+        let lent = Arc::clone(&index);
         let lane = Lane {
             cursor: RankCursor::default(),
             heard: false,
@@ -477,6 +486,10 @@ impl KvTables {
             Entry {
                 rank: facts.dp_rank,
                 model: model.as_str().into(),
+                #[cfg(feature = "controller")]
+                index: lent,
+                #[cfg(feature = "controller")]
+                worker,
                 lane: Arc::new(Mutex::new(lane)),
             },
         );
@@ -520,11 +533,23 @@ impl KvTables {
             .then(|| Arc::clone(&entry.lane))
     }
 
+    /// The index of `model`, lent to the engine over worker lists
+    /// ([`LentIndex`]). `None` where the tables hold no index of the model:
+    /// one is made with a model's first lane and goes with its last.
+    #[cfg(feature = "controller")]
+    pub(super) fn lend(self: &Arc<Self>, model: &str) -> Option<LentIndex> {
+        let table = self.table.lock();
+        let index = Arc::clone(&table.indexes.get(model)?.index);
+        Some(LentIndex {
+            tables: Arc::clone(self),
+            index,
+        })
+    }
+
     /// Run one batch through its row's lane, for its host's own rules to
     /// apply: the cursor reads the header alone, and an admitted batch
-    /// lends the lane to `body`, once, inside the lane's turn. The lane
-    /// says its row heard behind a body that wrote. A body that unwinds
-    /// has the lane start over ([`Lent`]).
+    /// lends the lane to `body`, once, inside the lane's turn. A body that
+    /// unwinds has the lane start over ([`Lent`]).
     ///
     /// A batch the cursor skips or answers with a gap runs no body. The
     /// cursor reads `facts` alone, since it holds no batch to look into: a
@@ -645,13 +670,6 @@ impl KvTables {
         self.resyncs[slot(reason)].load(Ordering::Relaxed)
     }
 
-    /// How many rows hold a lane, for the cases: the rows that ask for
-    /// events less these are the rows an index had no place for.
-    #[cfg(test)]
-    pub(super) fn lanes(&self) -> usize {
-        self.table.lock().lanes.len()
-    }
-
     /// Blocks the index holds for the row of `id` at `rank`; `0` for a row
     /// that holds no lane there.
     pub fn indexed_blocks(&self, id: WorkerId, rank: u16) -> usize {
@@ -662,61 +680,5 @@ impl KvTables {
         lane.held
             .as_ref()
             .map_or(0, |held| held.index.chain.worker_block_count(held.worker))
-    }
-
-    /// Whether the row of `id` holds a lane at `rank`, for the cases.
-    #[cfg(test)]
-    pub(crate) fn holds_lane(&self, id: WorkerId, rank: u16) -> bool {
-        self.lane(id, Some(rank)).is_some()
-    }
-
-    /// The rows holding a prefix of the request's blocks in `model`'s
-    /// index, each with the leading blocks it holds, by id: every holder
-    /// listed, for the cases.
-    #[cfg(test)]
-    pub(crate) fn overlaps(&self, model: &str, hashes: &[u64]) -> Vec<(WorkerId, u32)> {
-        let (index, rows) = {
-            let table = self.table.lock();
-            let Some(ModelIndex { index, .. }) = table.indexes.get(model) else {
-                return Vec::new();
-            };
-            let rows: FxHashMap<u32, WorkerId> = table
-                .lanes
-                .iter()
-                .filter(|(_, entry)| &*entry.model == model)
-                .filter_map(|(id, entry)| Some((entry.lane.lock().held.as_ref()?.worker, *id)))
-                .collect();
-            (Arc::clone(index), rows)
-        };
-        let mut held = Vec::new();
-        index.chain.score_into(
-            hashes,
-            |hash| *hash,
-            false,
-            |worker, blocks| {
-                if let Some(id) = rows.get(&worker) {
-                    held.push((*id, blocks));
-                }
-            },
-        );
-        held.sort_unstable();
-        held
-    }
-
-    /// How many models hold an index.
-    #[cfg(test)]
-    pub(super) fn indexes(&self) -> usize {
-        self.table.lock().indexes.len()
-    }
-
-    /// Blocks `model`'s index holds across its workers (a block two hold
-    /// counts twice).
-    #[cfg(test)]
-    pub(super) fn held_blocks(&self, model: &str) -> usize {
-        let table = self.table.lock();
-        table
-            .indexes
-            .get(model)
-            .map_or(0, |held| held.index.chain.current_size())
     }
 }

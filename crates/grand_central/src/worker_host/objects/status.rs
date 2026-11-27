@@ -20,10 +20,20 @@
 //! store's lock. A holder's write of a row holds that turn, then an
 //! object's lock, then the store's: one order for the three.
 //!
+//! A tell hands a store that tells a journal the models its object serves,
+//! read in that same critical section and ahead of the store's lock: the
+//! log's entry of a status names them and no row. Of the table's row a
+//! leader's status entry holds one thing alone, the status the row left,
+//! which is the log's own word. A store with no journal is handed none,
+//! and no list is built for it.
+//!
 //! A tell the store refuses writes nothing, and the call does not try it
 //! again: the row left the revision the object was built from, no row
-//! stands, or the writer's term ended. The row's next lay or the object's
-//! next move settles it. A status the object took ahead of a tell the
+//! stands, or the writer's term ended. A writer that names its term hands
+//! it on with its word ([`LeadWord`]): the store's journal compares it
+//! where the status's event takes its place, so a term that ended by then
+//! writes nothing either. The row's next lay or the object's next move
+//! settles it. A status the object took ahead of a tell the
 //! store takes no word of is taken back in the tell's own turn: the
 //! object takes the status its row holds, and where no row stands for it
 //! the status it left.
@@ -44,11 +54,22 @@ use smg_worker::{
 use super::{super::object::row_status, Objects};
 use crate::{
     engine::view::WorkerId,
-    store::{HealthWrite, MemoryStore},
+    store::{HealthWrite, LeadWord, MemoryStore},
 };
 
 /// An object's move: the status it left, then the one that stands.
 type Moved = Option<(ObjectStatus, ObjectStatus)>;
+
+/// The ids of the models `object` serves, in its cards' order, as the one
+/// shared list a status entry holds. Each id is copied, and no card.
+fn served(object: &dyn Worker) -> Arc<[String]> {
+    let mut ids = Vec::new();
+    object.any_model(&mut |card| {
+        ids.push(card.id.clone());
+        false
+    });
+    ids.into()
+}
 
 /// What a status write does to its object, read under the object's lock.
 #[derive(Clone, Copy)]
@@ -84,9 +105,9 @@ impl<G: Generation> Objects<G> {
     /// behind a move the registry's state machine made, `moved`: the
     /// status the object left, then the one it took. `leads` is the
     /// driver's last word, asked under the object's lock and again under
-    /// the store's. Where the store takes no word, the move is taken back
-    /// in this turn ([`Self::status_under`]). What the store made of the
-    /// status.
+    /// the store's. A driver's word names no term to the store's journal.
+    /// Where the store takes no word, the move is taken back in this turn
+    /// ([`Self::status_under`]). What the store made of the status.
     pub(crate) fn tell_status(
         &self,
         store: &MemoryStore,
@@ -96,7 +117,8 @@ impl<G: Generation> Objects<G> {
         leads: &dyn Fn() -> bool,
     ) -> HealthWrite {
         let write = Write::Tell(Some(moved));
-        self.status_under(store, id, revision, None, leads, write).0
+        let word = LeadWord::of(leads);
+        self.status_under(store, id, revision, None, word, write).0
     }
 
     /// The connect signal of the object under `id`, as
@@ -110,7 +132,8 @@ impl<G: Generation> Objects<G> {
         revision: u64,
         leads: &dyn Fn() -> bool,
     ) -> Moved {
-        self.status_under(store, id, revision, None, leads, Write::Connect)
+        let word = LeadWord::of(leads);
+        self.status_under(store, id, revision, None, word, Write::Connect)
             .1
     }
 
@@ -119,9 +142,25 @@ impl<G: Generation> Objects<G> {
     /// A ready or a draining object stands, and its counters with it. A row
     /// that left the revision, or left, moves nothing. One of a host's
     /// write calls ([`Objects`]): its caller asks its term itself, so the
-    /// call hands the store no last word.
+    /// call hands the store no last word and no term.
     pub fn connect_row(&self, store: &MemoryStore, row: WorkerId, revision: u64) {
-        self.row_status(store, row, revision, Write::Connect);
+        self.connect_row_under(store, row, revision, LeadWord::FREE);
+    }
+
+    /// [`Self::connect_row`] under its writer's word of its lead, `word`,
+    /// for a caller whose term can end while the write waits. Its read is
+    /// asked under the object's lock and again under the store's, as
+    /// [`Self::tell_status`] asks a driver's, and its term goes to the
+    /// store's journal with the status. Where any of the three says no,
+    /// no status is written and the object stands.
+    pub(crate) fn connect_row_under(
+        &self,
+        store: &MemoryStore,
+        row: WorkerId,
+        revision: u64,
+        word: LeadWord<'_>,
+    ) {
+        self.row_status(store, row, revision, word, Write::Connect);
     }
 
     /// The drain of the row `row`, read at `revision`, as
@@ -129,7 +168,21 @@ impl<G: Generation> Objects<G> {
     /// `store` is told. Whether the row's object moved: a row that left
     /// the revision, or left, moves nothing, and a draining object stands.
     pub fn drain_row(&self, store: &MemoryStore, row: WorkerId, revision: u64) -> bool {
-        self.row_status(store, row, revision, Write::Drain)
+        self.drain_row_under(store, row, revision, LeadWord::FREE)
+    }
+
+    /// [`Self::drain_row`] under its writer's word of its lead, as
+    /// [`Self::connect_row_under`] takes one. A drain whose word says no
+    /// moves nothing, as one whose row left the revision: its caller asks
+    /// its term to tell the two apart.
+    pub(crate) fn drain_row_under(
+        &self,
+        store: &MemoryStore,
+        row: WorkerId,
+        revision: u64,
+        word: LeadWord<'_>,
+    ) -> bool {
+        self.row_status(store, row, revision, word, Write::Drain)
             .is_some()
     }
 
@@ -137,23 +190,44 @@ impl<G: Generation> Objects<G> {
     /// a write that laid the object in another's place: it took the
     /// standing object's status there, and the table holds its own.
     pub(super) fn tell_row(&self, store: &MemoryStore, row: WorkerId, revision: u64) {
-        self.row_status(store, row, revision, Write::Tell(None));
+        self.row_status(store, row, revision, LeadWord::FREE, Write::Tell(None));
+    }
+
+    /// Settle the status of the object that stands for `row` with the
+    /// table's, behind a lay outside a write call that put the object in
+    /// another's place: it took the standing object's status there, and a
+    /// move a health driver made on that one ahead of its telling tells
+    /// nothing ([`Self::status_under`]). `leads` is the caller's own word
+    /// of its lead, and it names no term. Where it holds, the table is
+    /// told the object's status, as [`Self::tell_row`] tells it. Where it
+    /// does not, the table is not written, and the object takes the status
+    /// its row holds.
+    pub(super) fn settle_row(
+        &self,
+        store: &MemoryStore,
+        row: WorkerId,
+        revision: u64,
+        leads: &dyn Fn() -> bool,
+    ) {
+        let word = LeadWord::of(leads);
+        self.row_status(store, row, revision, word, Write::Tell(None));
     }
 
     /// A status write that names its row: on the object that stands for
-    /// `row`, where it was built from `revision`.
-    fn row_status(&self, store: &MemoryStore, row: WorkerId, revision: u64, write: Write) -> Moved {
+    /// `row`, where it was built from `revision`, under its writer's word
+    /// of its lead.
+    fn row_status(
+        &self,
+        store: &MemoryStore,
+        row: WorkerId,
+        revision: u64,
+        word: LeadWord<'_>,
+        write: Write,
+    ) -> Moved {
         let id = self.object(row)?;
         let object = self.registry.get(&id)?;
-        self.status_under(
-            store,
-            &id,
-            object.revision(),
-            Some(revision),
-            &|| true,
-            write,
-        )
-        .1
+        self.status_under(store, &id, object.revision(), Some(revision), word, write)
+            .1
     }
 
     /// One status write, under the object's mutation lock: the writer's
@@ -184,16 +258,14 @@ impl<G: Generation> Objects<G> {
     /// stood in, the move with it. What laid it settles the two. A door
     /// tells the store its object's status behind the put
     /// ([`Self::tell_row`]). A told row's put and a cut are followed by
-    /// the table's status ([`mod@super::standby`]). The holder's own
-    /// follow, which lays a row written around the holder, settles it
-    /// only where it follows statuses ([`Self::with_status_followed`]).
+    /// the table's status ([`mod@super::standby`]).
     fn status_under(
         &self,
         store: &MemoryStore,
         id: &ObjectId,
         revision: u64,
         seen: Option<u64>,
-        leads: &dyn Fn() -> bool,
+        word: LeadWord<'_>,
         write: Write,
     ) -> (HealthWrite, Moved) {
         let under = |object: &Arc<dyn Worker>| {
@@ -214,8 +286,13 @@ impl<G: Generation> Objects<G> {
             let status = row_status(next.unwrap_or(from));
             // A call can wait here for the object's lock through the end of
             // its term: it tells nothing.
-            let told = if leads() {
-                store.status_told(standing.row, status, standing.revision, leads)
+            let told = if (word.leads)() {
+                // The models the object serves at this instant, read under
+                // its lock and handed ahead of the store's: the log's entry
+                // of a status names them, and no row of the table. A store
+                // that tells no entry is handed none, and no list is built.
+                let models = store.journals().then(|| served(object.as_ref()));
+                store.status_told(standing.row, status, standing.revision, word, models)
             } else {
                 HealthWrite::Stale
             };
@@ -245,288 +322,5 @@ impl<G: Generation> Objects<G> {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
-    use smg_worker::{
-        health::port::{HealthSink, ProbeAnswer},
-        registry::WorkerRegistry,
-    };
-
-    use super::{
-        super::{
-            super::object::status,
-            write::tests::{facts, A},
-        },
-        *,
-    };
-    use crate::{
-        store::{
-            identity, HealthPolicy, MembershipChange, MembershipTail, Registrant, WorkerFacts,
-            WorkerStatus, WorkersStore,
-        },
-        worker_host::Members,
-    };
-
-    /// A leader's holder over a store: its objects lead their rows' status,
-    /// so it follows none. One row, registered through the holder.
-    struct Leader {
-        store: MemoryStore,
-        objects: Objects<Members>,
-        row: WorkerId,
-        id: ObjectId,
-        revision: u64,
-    }
-
-    /// The registration of [`Leader`]'s row under `tier`, with the two
-    /// thresholds of its checks.
-    fn stated(incarnation: u64, tier: &str, failure: u32, success: u32) -> WorkerFacts {
-        WorkerFacts {
-            health: HealthPolicy {
-                failure_threshold: failure,
-                success_threshold: success,
-                ..HealthPolicy::default()
-            },
-            ..facts(incarnation, tier)
-        }
-    }
-
-    impl Leader {
-        /// A row each probe moves.
-        fn new() -> Self {
-            Self::with(1, 1)
-        }
-
-        fn with(failure: u32, success: u32) -> Self {
-            let store = MemoryStore::default();
-            let objects: Objects<Members> = Objects::new(Arc::new(WorkerRegistry::new()));
-            let facts = stated(1, "gold", failure, success);
-            let change = objects.upsert(&store, facts, Registrant::Control);
-            let row = change.expect("registered").id();
-            let id = objects.object(row).expect("the object");
-            let revision = objects.registry().get(&id).expect("it stands").revision();
-            Self {
-                store,
-                objects,
-                row,
-                id,
-                revision,
-            }
-        }
-
-        /// One probe, judged by the registry's own state machine as the
-        /// health adapter hands it on: the object alone moves.
-        fn probe(&self, passed: bool) -> ProbeAnswer {
-            let registry = self.objects.registry().as_ref();
-            let launched = registry.get(&self.id).expect("it stands").status();
-            HealthSink::probe_outcome(registry, &self.id, passed, self.revision, launched)
-        }
-
-        /// The tell behind a probe that moved the object: the table still
-        /// holds the status the object left.
-        fn tell(&self, leads: bool) -> HealthWrite {
-            let table = self.store.by_key(A).expect("the row stands");
-            let object = self.objects.registry().get(&self.id).expect("it stands");
-            let moved = (status(table.status), object.status());
-            self.objects
-                .tell_status(&self.store, &self.id, self.revision, moved, &|| leads)
-        }
-
-        /// The status the table holds under the key, then its object's.
-        fn statuses(&self) -> (Option<WorkerStatus>, Option<ObjectStatus>) {
-            let table = self.store.by_key(A).map(|row| row.status);
-            let object = self.objects.registry().get_by_url(A);
-            (table, object.map(|object| object.status()))
-        }
-    }
-
-    /// Stand the worker object of `row` in `to` and tell `store`, as a
-    /// probe's verdict leaves the two: a case's own hand on a worker's
-    /// health where it runs no probe. The holder reads the store to its
-    /// end first.
-    #[cfg(feature = "controller")]
-    pub(crate) fn stand<G: Generation>(
-        objects: &Objects<G>,
-        store: &MemoryStore,
-        row: WorkerId,
-        to: WorkerStatus,
-    ) {
-        objects.follow(store);
-        let id = objects.object(row).expect("the row's object");
-        let registry = objects.registry();
-        let revision = registry.get(&id).expect("it stands").revision();
-        let moved = registry.apply_if_revision(&id, revision, |_| ((), Some(status(to))));
-        let moved = moved.and_then(|((), moved)| moved);
-        let moved = moved.unwrap_or_else(|| (status(to), status(to)));
-        let told = objects.tell_status(store, &id, revision, moved, &|| true);
-        assert!(told.stands().is_some(), "the store took the status");
-    }
-
-    /// The table and the object in one status.
-    fn both(stands: WorkerStatus) -> (Option<WorkerStatus>, Option<ObjectStatus>) {
-        (Some(stands), Some(status(stands)))
-    }
-
-    /// A tell under a word that says no writes nothing to the table, and
-    /// the object takes the status its row holds again. One that finds the
-    /// table at the object's status tells nothing.
-    #[test]
-    fn a_tell_writes_where_the_writer_leads_and_the_table_differs() {
-        let leader = Leader::new();
-        assert!(matches!(leader.probe(true), ProbeAnswer::Moved { .. }));
-        let epoch = leader.store.epoch();
-        assert_eq!(leader.tell(false), HealthWrite::Stale);
-        let back = both(WorkerStatus::Pending);
-        assert_eq!((leader.statuses(), leader.store.epoch()), (back, epoch));
-        assert!(matches!(leader.probe(true), ProbeAnswer::Moved { .. }));
-        assert!(leader.tell(true).moved().is_some());
-        assert_eq!(leader.store.epoch(), epoch + 1);
-        assert_eq!(leader.tell(true), HealthWrite::Stood(WorkerStatus::Ready));
-        assert_eq!(leader.store.epoch(), epoch + 1, "a status that stands");
-    }
-
-    /// A door's connect signal and its drain are written on the object,
-    /// and the store is told in the same turn of the object's lock: the
-    /// two say one status when the write returns, with no follow. A ready
-    /// object stands at a connect signal, and so does a draining one. A
-    /// drain moves any other.
-    #[test]
-    fn a_doors_connect_signal_and_its_drain_write_the_object_and_tell_the_store() {
-        let leader = Leader::new();
-        let (store, objects, row) = (&leader.store, &leader.objects, leader.row);
-        objects.connect_row(store, row, 1);
-        assert_eq!(leader.statuses(), both(WorkerStatus::Ready));
-        let epoch = store.epoch();
-        objects.connect_row(store, row, 1);
-        assert_eq!(store.epoch(), epoch, "a ready object stands");
-        assert!(objects.drain_row(store, row, 1));
-        assert_eq!(leader.statuses(), both(WorkerStatus::Draining));
-        let epoch = store.epoch();
-        objects.connect_row(store, row, 1);
-        assert!(
-            !objects.drain_row(store, row, 1),
-            "a draining object stands"
-        );
-        assert_eq!(leader.statuses(), both(WorkerStatus::Draining));
-        assert_eq!(store.epoch(), epoch);
-    }
-
-    /// A door's status write names the revision it read the row at. Where
-    /// the row left it, or no object stands for the row, nothing moves and
-    /// the store is told nothing.
-    #[test]
-    fn a_status_write_at_a_revision_the_row_left_moves_nothing() {
-        let leader = Leader::new();
-        let (store, objects, row) = (&leader.store, &leader.objects, leader.row);
-        let epoch = store.epoch();
-        objects.connect_row(store, row, 2);
-        assert!(!objects.drain_row(store, row, 2));
-        let absent = identity(A, 9);
-        objects.connect_row(store, absent, 1);
-        assert!(!objects.drain_row(store, absent, 1));
-        assert_eq!(leader.statuses(), both(WorkerStatus::Pending));
-        assert_eq!(store.epoch(), epoch);
-    }
-
-    /// A connect signal counts the object's probes anew as it readies it:
-    /// a failure counted before the signal is not counted behind it.
-    #[test]
-    fn a_connect_signal_counts_the_objects_probes_anew() {
-        let leader = Leader::with(2, 2);
-        let pending = ProbeAnswer::Stood(ObjectStatus::Pending);
-        assert_eq!(leader.probe(false), pending);
-        leader.objects.connect_row(&leader.store, leader.row, 1);
-        let ready = ProbeAnswer::Stood(ObjectStatus::Ready);
-        assert_eq!(leader.probe(false), ready, "one failure of two");
-        assert!(matches!(leader.probe(false), ProbeAnswer::Moved { .. }));
-    }
-
-    /// A connect signal on an object that stands leaves its counters with
-    /// it: a failure counted before the signal still counts behind it.
-    #[test]
-    fn a_connect_signal_on_an_object_that_stands_keeps_its_count() {
-        let leader = Leader::with(2, 2);
-        let (store, objects, row) = (&leader.store, &leader.objects, leader.row);
-        objects.connect_row(store, row, 1);
-        let ready = ProbeAnswer::Stood(ObjectStatus::Ready);
-        assert_eq!(leader.probe(false), ready, "one failure of two");
-        // The object stands ready: the signal moves nothing and counts on.
-        objects.connect_row(store, row, 1);
-        let second = leader.probe(false);
-        assert!(matches!(second, ProbeAnswer::Moved { .. }), "{second:?}");
-    }
-
-    /// Where no row stands for it, a tell the store takes no word of takes
-    /// its driver's move back only where the object stands in the moved
-    /// status still. Here the object moved again ahead of the tell, and its
-    /// row left: nothing is taken back, and the later move stands.
-    #[test]
-    fn a_refused_tell_behind_a_second_move_takes_nothing_back() {
-        let leader = Leader::new();
-        assert!(matches!(leader.probe(true), ProbeAnswer::Moved { .. }));
-        let first = (ObjectStatus::Pending, ObjectStatus::Ready);
-        assert!(matches!(leader.probe(false), ProbeAnswer::Moved { .. }));
-        // The store's own removal: the holder's object stands a while yet.
-        WorkersStore::remove(&leader.store, leader.row, 1).expect("removed");
-        let (store, objects) = (&leader.store, &leader.objects);
-        let told = objects.tell_status(store, &leader.id, leader.revision, first, &|| true);
-        assert_eq!(told, HealthWrite::NoRow);
-        let stands = objects
-            .registry()
-            .get(&leader.id)
-            .map(|object| object.status());
-        assert_eq!(stands, Some(ObjectStatus::NotReady), "the later move");
-    }
-
-    /// A row changed in place keeps its object's status. The registry lays
-    /// the new object in the standing one's place with its running state,
-    /// and the holder tells the store that status behind the write, by an
-    /// event of its own: here a move the table was not told.
-    #[test]
-    fn a_row_laid_in_place_tells_the_status_its_object_took() {
-        let leader = Leader::new();
-        assert!(matches!(leader.probe(true), ProbeAnswer::Moved { .. }));
-        let epoch = leader.store.epoch();
-        let relabelled = stated(1, "iron", 1, 1);
-        let change = leader
-            .objects
-            .upsert(&leader.store, relabelled, Registrant::Control);
-        assert_eq!(
-            change,
-            Some(MembershipChange::Relabelled { id: leader.row })
-        );
-        assert_eq!(leader.statuses(), both(WorkerStatus::Ready));
-        let MembershipTail::Changes(tail) = leader.store.changes_since(epoch) else {
-            panic!("the store's tail reaches back to the write");
-        };
-        let told = MembershipChange::StatusChanged {
-            id: leader.row,
-            from: WorkerStatus::Pending,
-            to: WorkerStatus::Ready,
-        };
-        let tail: Vec<_> = tail.into_iter().map(|(_, change)| change).collect();
-        assert_eq!(
-            tail,
-            [MembershipChange::Relabelled { id: leader.row }, told]
-        );
-    }
-
-    /// A key's next life starts in the status its worker object stood in,
-    /// by the rule every writer decides by, and the new object takes it:
-    /// here a move the table was not told.
-    #[test]
-    fn a_keys_next_life_starts_in_the_status_its_object_stood_in() {
-        let leader = Leader::new();
-        assert!(matches!(leader.probe(true), ProbeAnswer::Moved { .. }));
-        let trails = (Some(WorkerStatus::Pending), Some(ObjectStatus::Ready));
-        assert_eq!(leader.statuses(), trails);
-        let next = stated(2, "gold", 1, 1);
-        let change = leader
-            .objects
-            .upsert(&leader.store, next, Registrant::Control);
-        let replaced = MembershipChange::Replaced {
-            old: leader.row,
-            new: identity(A, 2),
-        };
-        assert_eq!(change, Some(replaced));
-        assert_eq!(leader.statuses(), both(WorkerStatus::Ready));
-    }
-}
+#[path = "../../../tests/unit/worker_host/objects/status/tests.rs"]
+pub(crate) mod tests;

@@ -41,6 +41,7 @@ mod info;
 mod media;
 mod service;
 #[cfg(test)]
+#[path = "../../tests/unit/vllm/tests.rs"]
 mod tests;
 
 use std::{sync::Arc, time::Duration};
@@ -101,6 +102,13 @@ pub struct VllmModelInfo {
     pub kv_connector: String,
     pub kv_role: String,
     pub kv_engine_id: String,
+    /// How many trailing prompt tokens a PD decode side still computes
+    /// itself after its KV pull, as the launcher reads it off the engine's
+    /// config: the last token, recomputed to sample the next, or the
+    /// speculative drafter's prefill lookahead where it is longer (vLLM's
+    /// `num_prefill_lookahead_tokens`, which NIXL pulls short of). 0 when
+    /// unknown, and then a request's handoff claim loosens no prompt bound.
+    pub pd_local_tail: u32,
     /// Whether a Mooncake connector runs in the engine at all, as the
     /// launcher reads it off the raw `kv_transfer_config` (the top-level
     /// connector or any child a wrapper lists, whatever `kv_connector`

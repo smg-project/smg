@@ -27,7 +27,10 @@ use ts::{
     token_speed_scheduler_server::{TokenSpeedScheduler, TokenSpeedSchedulerServer},
 };
 
-use super::{Frame, GenerateInput, LogProbs, MockScheduler, Rendezvous, TokenizerStream};
+use super::{
+    media_identity, Frame, GenerateInput, LogProbs, MediaSpan, MockScheduler, Rendezvous,
+    TokenizerStream,
+};
 use crate::{config::Role, drain::InFlight, engine::KvEventStream, script::MatchedStop};
 
 pub(super) type Server = TokenSpeedSchedulerServer<MockScheduler>;
@@ -63,6 +66,23 @@ impl TokenSpeedScheduler for MockScheduler {
         }
         check_encode_bootstrap(&req)?;
         check_mm_inputs(&req, self.cfg.role)?;
+        // An item's content hash, with its modality, keys each of the item's
+        // placeholder spans.
+        let media: Vec<MediaSpan> = req
+            .mm_inputs
+            .iter()
+            .flat_map(|mm| &mm.items)
+            .flat_map(|item| {
+                let identity = media_identity(&item.content_hash)
+                    .wrapping_add(u64::from(item.modality.unsigned_abs()));
+                item.placeholders.iter().map(move |span| MediaSpan {
+                    identity,
+                    offset: span.offset,
+                    length: span.length,
+                    slot: item.placeholder_token_id,
+                })
+            })
+            .collect();
         let tokenized = req.tokenized.unwrap_or_default();
         let params = req.sampling_params.unwrap_or_default();
         let rendezvous = req
@@ -88,6 +108,7 @@ impl TokenSpeedScheduler for MockScheduler {
                 score_ids: Vec::new(),
                 pin: req.data_parallel_rank,
                 rendezvous,
+                media: Box::new(move || media),
             })
             .await?;
         let request_id = req.request_id;
@@ -1085,5 +1106,105 @@ mod tests {
                 && status.message().contains("remote payload"),
             "{status:?}"
         );
+    }
+
+    /// The realistic engine keys a media item's tokens by the item's content
+    /// hash: the same item is served from the cache, another item under the
+    /// same placeholder id parts the prompt at the item's first token.
+    #[tokio::test]
+    async fn a_media_items_tokens_are_cached_by_the_item() {
+        let (service, _stop) = MockScheduler::for_tests(
+            Config {
+                realistic: true,
+                engine: crate::engine::EngineParams {
+                    timing: crate::engine::TimingModel::linear(),
+                    ..Default::default()
+                },
+                ..Config::default()
+            },
+            65_262,
+        );
+        // A block of text, two blocks under the placeholder id, text again.
+        let ids: Vec<u32> = (100..116).chain([9; 32]).chain(200..219).collect();
+        let mut cached = Vec::new();
+        // The last request carries the hash of the one before it under
+        // another modality: another item.
+        for (id, hash, modality) in [
+            ("tw-media-a1", 1, common::Modality::Image),
+            ("tw-media-a2", 1, common::Modality::Image),
+            ("tw-media-b", 2, common::Modality::Image),
+            ("tw-media-video", 2, common::Modality::Video),
+        ] {
+            let mut item = image_item(16, 32);
+            item.content_hash = vec![hash; 8];
+            item.modality = modality as i32;
+            let mut frames = service
+                .generate(Request::new(with_items(request(id, &ids), vec![item])))
+                .await
+                .expect("accepted")
+                .into_inner();
+            while frames.next().await.is_some() {}
+            cached.push(
+                crate::engine::records_since(0, usize::MAX)
+                    .into_iter()
+                    .find(|record| record.request_id == id)
+                    .map(|record| record.cached_tokens),
+            );
+        }
+        assert_eq!(cached, [Some(0), Some(64), Some(16), Some(16)]);
+    }
+
+    /// A prefill worker under `--prefill-engine true` keys a media item's
+    /// tokens by the item as a regular worker does: the same item is served
+    /// from the cache, another item parts the prompt at its first token.
+    #[tokio::test]
+    async fn a_prefill_worker_on_its_engine_caches_a_media_items_tokens_by_the_item() {
+        let (service, _stop) = MockScheduler::for_tests(
+            Config {
+                realistic: true,
+                role: Some(Role::Prefill),
+                prefill_engine: true,
+                engine: crate::engine::EngineParams {
+                    timing: crate::engine::TimingModel::linear(),
+                    ..Default::default()
+                },
+                ..Config::default()
+            },
+            65_264,
+        );
+        // A block of text, two blocks under the placeholder id, text again.
+        let ids: Vec<u32> = (100..116).chain([9; 32]).chain(200..219).collect();
+        let mut cached = Vec::new();
+        // The last request carries the hash of the one before it under
+        // another modality: another item.
+        for (id, hash, modality) in [
+            ("tw-prefill-media-a1", 1, common::Modality::Image),
+            ("tw-prefill-media-a2", 1, common::Modality::Image),
+            ("tw-prefill-media-b", 2, common::Modality::Image),
+            ("tw-prefill-media-video", 2, common::Modality::Video),
+        ] {
+            let mut item = image_item(16, 32);
+            item.content_hash = vec![hash; 8];
+            item.modality = modality as i32;
+            let mut req = with_items(request(id, &ids), vec![item]);
+            req.kv_bootstrap_info = Some(ts::KvBootstrapInfo {
+                bootstrap_host: "127.0.0.1".to_string(),
+                bootstrap_port: 8998,
+                bootstrap_room: 7,
+            });
+            let mut frames = service
+                .generate(Request::new(req))
+                .await
+                .expect("accepted")
+                .into_inner();
+            while frames.next().await.is_some() {}
+            cached.push(
+                crate::engine::records_since(0, usize::MAX)
+                    .into_iter()
+                    .find(|record| record.request_id == id)
+                    .map(|record| record.cached_tokens),
+            );
+        }
+        assert_eq!(cached, [Some(0), Some(64), Some(16), Some(16)]);
     }
 }

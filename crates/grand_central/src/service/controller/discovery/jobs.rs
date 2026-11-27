@@ -72,8 +72,10 @@ type Registration = WorkerRegistrationWorkflowData<Jobs>;
 type Removal = WorkerRemovalWorkflowData<Jobs>;
 
 /// What a controller fixes for every registration it runs, beside
-/// `overload`: the default overload thresholds its start states, which the
-/// object a registration builds states as the row's standing object will.
+/// `overload`: the default overload thresholds its start states. The
+/// object a registration builds states them, as the row's standing object
+/// does while the document's overload switch is on. That object is
+/// dropped, and no row reads them.
 /// No flag sets another yet. A worker is polled for
 /// [`STARTUP_TIMEOUT_SECS`] every [`STARTUP_CHECK_INTERVAL_SECS`] from the
 /// job's start, over HTTP/1.1 where it speaks HTTP. Its row states the
@@ -285,4 +287,5 @@ impl JobHost for Jobs {
 }
 
 #[cfg(test)]
+#[path = "../../../../tests/unit/service/controller/discovery/jobs/tests.rs"]
 mod tests;

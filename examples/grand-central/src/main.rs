@@ -17,9 +17,7 @@ use smg_grand_central::{
 /// The process's allocator, the one the stock controller's binary registers,
 /// on the targets where the settings below hold. An Apple target is left out:
 /// the allocator compiles no background thread there. The library registers
-/// none: a controller built on it chooses its own. A burst of registrations
-/// builds the store's world again at every write, and the system allocator
-/// keeps resident what those builds free.
+/// none: a controller built on it chooses its own.
 #[cfg(all(
     not(target_env = "msvc"),
     not(target_env = "musl"),
@@ -137,7 +135,7 @@ mod tests {
             Candidate, InProcess, LentList, ListCell, LoadRow, PlaceRequest, RequestFacts, Scorer,
             TieBand, Unplaced, WorkerLists, WorkerRule,
         },
-        service::controller::{Config, Controller, ElectionConfig, Error, Listener, Scope},
+        service::controller::{Config, Controller, Error, Listener, Scope},
         stages::StageRegistry,
     };
     use smg_worker::{
@@ -459,28 +457,18 @@ mod tests {
     /// host picks. The command line builds the same value from its flags.
     fn config() -> Config {
         let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
-        let listener = |name: &str, scopes: &[Scope]| Listener {
-            name: name.to_owned(),
-            addr: loopback,
-            scopes: scopes.to_vec(),
-            tls: None,
+        let listener = |name: &str, scopes: &[Scope]| {
+            Listener::of(name.to_owned(), loopback, scopes.to_vec(), None)
         };
-        Config {
-            controller_id: "example-0".to_owned(),
-            listeners: vec![
-                listener("gateway", &[Scope::Gateway, Scope::Ingestion]),
+        Config::of(
+            "example-0".to_owned(),
+            vec![
+                listener("gateway", &[Scope::Gateway]),
                 listener("control", &[Scope::Control]),
                 listener("replication", &[Scope::Replication]),
             ],
-            admin: loopback,
-            decide_shards: Config::default_decide_shards(),
-            shutdown_settle: Config::DEFAULT_SHUTDOWN_SETTLE,
-            shutdown_grace: Config::DEFAULT_SHUTDOWN_GRACE,
-            load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
-            worker_overload: Config::DEFAULT_WORKER_OVERLOAD,
-            election: ElectionConfig::default(),
-            discovery: None,
-        }
+            loopback,
+        )
     }
 
     #[tokio::test]

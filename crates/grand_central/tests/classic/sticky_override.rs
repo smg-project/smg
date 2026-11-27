@@ -238,12 +238,10 @@ impl Bed {
         );
         let pick = decision.pick().expect("a pick");
         let target = *pick.targets.first().expect("a target");
-        let lease = Lease {
-            issued_micros: self.clock,
-            session: facts.session(),
-            session_verdict: pick.session_verdict,
-            ..Lease::default()
-        };
+        let mut lease = Lease::default();
+        lease.issued_micros = self.clock;
+        lease.session = facts.session();
+        lease.session_verdict = pick.session_verdict;
         self.engine.on_dispatched(&lease, &target, Side::Single, 0);
         target.position as usize
     }
@@ -438,9 +436,9 @@ fn a_key_goes_where_its_policy_sends_it_and_then_follows_its_pin() {
     }
 }
 
-/// `bucket` under the override, where the rule plans single requests alone.
+/// `bucket` under the override, for a single request.
 /// The gateway's policy holds a bucket of sizes for the prefill workers of
-/// a pair alone (`model_gateway/src/policies/registry.rs:1564-1575`), and
+/// a pair alone (`model_gateway/src/policies/registry.rs:1716-1727`), and
 /// draws a healthy worker among single ones
 /// (`model_gateway/src/policies/bucket.rs:186-191`). This crate's stage
 /// places a prefill decision alone and draws for every other. So a single

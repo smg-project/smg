@@ -110,22 +110,6 @@ pub(crate) struct Discovery {
 }
 
 impl Discovery {
-    /// A discovery over a host its case built, which hands that host a
-    /// queue of its own.
-    #[cfg(test)]
-    pub(crate) fn new(
-        settings: RuntimeDiscoveryConfig,
-        host: Arc<Host>,
-        fence: Arc<Fence>,
-    ) -> Self {
-        Self {
-            settings,
-            host,
-            fence,
-            _jobs: None,
-        }
-    }
-
     /// The discovery of a replica that registers what its passes find. The
     /// host reads the registry of `objects`, and its queue runs each job
     /// with the store's write at `door` ([`Jobs`]): the door reads the term
@@ -359,4 +343,5 @@ impl Drop for ProviderTask {
 }
 
 #[cfg(test)]
+#[path = "../../../tests/unit/service/controller/discovery/tests.rs"]
 mod tests;

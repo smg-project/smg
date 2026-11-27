@@ -7,7 +7,7 @@ use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 use engine_zmq_adapter::{
     fold_tokenizer_eos_backstop, kv_transfer_rejection_params, stops::take_vllm_string_stops,
-    VllmGenerateStream, ZmqEngineClient,
+    validate_cache_salt, VllmGenerateStream, ZmqEngineClient,
 };
 use smg_grpc_client::vllm_proto as vllm;
 use tonic::Status;
@@ -117,6 +117,32 @@ fn python_bool(value: bool) -> &'static str {
         "True"
     } else {
         "False"
+    }
+}
+
+/// Drop the stop ids this servicer derived (single-token string stops, the
+/// tokenizer's EOS backstop) that lie past the model's vocabulary. The model
+/// can never sample them, so they could never stop anything (a string stop is
+/// still matched on the decoded text), and keeping them would make the
+/// engine client's vocabulary check refuse the request over ids the caller
+/// never sent. The derivations only append, so the first `caller_stop_count`
+/// ids are the caller's own, kept for that check to judge. A `vocab_size` of
+/// 0 (unknown) keeps everything.
+fn drop_unsampleable_derived_stops(
+    req: &mut vllm::GenerateRequest,
+    caller_stop_count: usize,
+    vocab_size: u32,
+) {
+    if vocab_size == 0 {
+        return;
+    }
+    if let Some(params) = req.sampling_params.as_mut() {
+        let mut position = 0;
+        params.stop_token_ids.retain(|id| {
+            let callers = position < caller_stop_count;
+            position += 1;
+            callers || *id < vocab_size
+        });
     }
 }
 
@@ -295,6 +321,12 @@ async fn submit(
                     notice.disarm();
                 }
             })?;
+    // Refuse a bad salt before the media stage fetches anything, and after
+    // the registry, which keeps a live id from getting a notice. The adapter
+    // checks the salt again for its direct-ZMQ lane.
+    if let Some(salt) = req.cache_salt.as_deref() {
+        validate_cache_salt(salt).map_err(Status::invalid_argument)?;
+    }
     // Worker-side media: the request's references become engine features
     // and its prompt the expanded one, before the frontend duties below.
     let (processed_media, media_identity) = match process_media_refs(state, &mut req).await? {
@@ -320,6 +352,10 @@ async fn submit(
     // stop ids) and come back as this servicer's own obligation; the
     // tokenizer's EOS set backstops a config without ids.
     let tokenizer = state.tokenizer();
+    let caller_stop_count = req
+        .sampling_params
+        .as_ref()
+        .map_or(0, |params| params.stop_token_ids.len());
     let stops = req
         .sampling_params
         .as_mut()
@@ -327,6 +363,7 @@ async fn submit(
         .unwrap_or_default();
     client.adopt_tokenizer_eos(tokenizer);
     fold_tokenizer_eos_backstop(&mut req, tokenizer);
+    drop_unsampleable_derived_stops(&mut req, caller_stop_count, state.model.vocab_size);
     let decoder = stop_decoder(state.tokenizer(), &stops, skip_special_tokens)?;
 
     // Admission ends here: the add is on the wire before `submit_with_aux`
@@ -459,3 +496,7 @@ impl Shape for VllmShape {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/vllm/generate/tests.rs"]
+mod tests;

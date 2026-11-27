@@ -48,25 +48,35 @@
 //! caller's word), this rule judges: whether a worker states an end, and
 //! which ends are one ([`hands_to`]).
 
-#![expect(
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
-
 use rustc_hash::FxHashMap;
 
 use super::framework::EncoderFacts;
 use crate::store::{pairing::known, EncodeHandoff, EncodeOffer};
 
 #[cfg(test)]
+#[path = "../../tests/unit/engine/encode_classes/tests.rs"]
 mod tests;
 
 /// One encoder or prefill as the derivation reads it.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct EncodeMember<'a> {
     /// The worker's runtime; empty when it is unknown.
     pub runtime: &'a str,
     pub offer: &'a EncodeOffer,
+}
+
+impl<'a> EncodeMember<'a> {
+    /// A member's runtime and its offer. It takes every field whose silence
+    /// would change an answer with no word, as a runtime left out would read
+    /// as unknown, and a later field with a true neutral value joins by
+    /// assignment. A caller that knows no runtime states it empty. It checks
+    /// nothing. Code outside this crate starts here: the record gains fields,
+    /// so no literal of it builds there.
+    #[must_use]
+    pub const fn of(runtime: &'a str, offer: &'a EncodeOffer) -> Self {
+        Self { runtime, offer }
+    }
 }
 
 /// The side of the handoff a worker stands on.

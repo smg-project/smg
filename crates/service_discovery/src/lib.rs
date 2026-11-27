@@ -90,11 +90,11 @@ pub use consul::ConsulProviderConfig;
 pub use file::{export_manifest, FileProviderConfig, Manifest};
 pub use host::DiscoveryHost;
 #[cfg(all(feature = "kubernetes", feature = "test-util"))]
-pub use kubernetes::start_service_discovery_with_client;
+pub use kubernetes::start_service_discovery_on;
 #[cfg(feature = "kubernetes")]
 pub use kubernetes::{
-    build_watcher_config, matches_selector, pod_ip, pod_is_ready, selector_string, ModelIdSource,
-    PodInfo, PodType, ServiceDiscoveryConfig, POD_NAME_LABEL, POD_UID_LABEL,
+    build_watcher_config, matches_selector, pod_ip, pod_is_ready, selector_string, watch_client,
+    ModelIdSource, PodInfo, PodType, ServiceDiscoveryConfig, POD_NAME_LABEL, POD_UID_LABEL,
 };
 pub use provider::Roles;
 pub use reconciler::{

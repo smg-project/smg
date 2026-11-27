@@ -626,9 +626,10 @@ What the syntax says, and what the assembler does with it:
   no bytes and the call's bytes stay the call's, since a client reads the prefix as written
   under `length` and never the call's bytes as the answer's prose: the member the cut found
   inside its value leaves as the call's own fragment, its key and the JSON the assembler would
-  have written for the value as far as that is known (an open string in either quote as an open
-  JSON string holding its text so far, decoded as the dialect reads it, `{"city": "Par`, an
-  escape the cut left unfinished left out; a value whole before the separator that never came
+  have written for the value as far as that is known (an open string in either quote, and so a
+  quoted dialect's value that went on behind a quote that closed its string, as an open JSON
+  string holding its text so far, decoded as the dialect reads it, `{"city": "Par`, an escape
+  the cut left unfinished left out; a value whole before the separator that never came
   written whole, `"days": 3`; a number's digits, the start of a literal word (`Tr` as `tr`)
   and a list or a dict still open as the JSON they stand for so far, which is the text as
   written where that is a prefix of a JSON value and a string holding the text where it is not,

@@ -14,7 +14,7 @@ use smg_data_connector::{
 };
 use smg_external_router::realtime::webrtc::default_bind_addr;
 use smg_grand_central::{
-    document::{AppliedSpec, PolicySpec},
+    document::{AppliedSpec, IndexKind, PolicySpec},
     engine::{CacheIndexes, InProcess, Members, WorkerData},
     stages::StageRegistry,
 };
@@ -57,7 +57,7 @@ use crate::{
         grpc::{
             backend_client::{BackendConnector, Fronting},
             multimodal::MultimodalConfigRegistry,
-            regular::symphony::{check_names, named_table},
+            regular::symphony::{check_names, named_table, names_template},
             utils::{Names, ALIASES},
         },
     },
@@ -577,17 +577,19 @@ impl AppContextBuilder {
             );
             return Err(AppContextBuildError::InvalidConfig(why.into()));
         }
+        // `hf` names no table either, but selects the response template's, so it is not warned
+        // of here.
         if router_config.parser == ParserChoice::Symphony
             && names.tool.is_some()
             && named_table(&names).is_none()
+            && !names_template(&names)
         {
             tracing::warn!(
                 tool_call_parser = ?names.tool,
                 reasoning_parser = ?names.reasoning,
                 "The configured tool-call parser name selects no Symphony table, so under \
-                 --parser symphony every model the registry does not know is read by the legacy \
-                 parsers (the registry's table reads the models it knows, a worker's own labels \
-                 aside); a table's name, a legacy name that reads a table's format (qwen, \
+                 --parser symphony every model, the registry's included, is read by the legacy \
+                 parsers (a worker's own labels aside); a table's name, a legacy name that reads a table's format (qwen, \
                  qwen_xml, ...), a launcher's name for a family whose table has no older \
                  parser (muse), or an engine's exact name for a table (llama4_pythonic), reads \
                  those models with that table"
@@ -732,6 +734,11 @@ impl AppContextBuilder {
         // words. The engine is started last, from the document that was
         // checked here.
         let policy = Self::policy_in_force(&router_config, policy_stages.as_ref())?;
+        // The maker of every later spec takes the very table that check
+        // read: a spec a worker's `policy` label builds is validated over it.
+        let respec = policy
+            .is_some()
+            .then(|| Self::respec(&router_config, policy_stages));
         // The overload veto's two words are read once below, where the
         // registration settings are made and the registry's shed word is set.
         // A supplied document this gateway refuses for them ends the start
@@ -769,7 +776,7 @@ impl AppContextBuilder {
             .await?
             .with_wasm_manager(&router_config)
             .with_kv_event_monitor()
-            .with_engine(policy)?
+            .with_engine(policy, respec)?
             .webrtc_bind_addr(
                 webrtc_bind_addr.or_else(|| Some(default_bind_addr(&router_config.host))),
             )
@@ -1042,10 +1049,11 @@ impl AppContextBuilder {
     /// requests by no routing policy, so the option moves nothing there,
     /// and this start says so in one log line.
     ///
-    /// A document whose `explain.sample` is not zero is named in one warn
-    /// line, ahead of its check: the engine this process hosts keeps the
-    /// sample, and no route of this gateway reads a kept record yet. The
-    /// document is not refused for it.
+    /// The engine builds no hash index yet. Where the document the routing
+    /// settings mean holds an index entry of the hash kind, the start runs
+    /// and `cache_aware` remembers no request, which this start says in one
+    /// warning that names the setting, `cache_index`. A supplied document
+    /// states its own index entries, which the warning does not read.
     fn policy_in_force(
         config: &RouterConfig,
         stages: Option<&StageRegistry>,
@@ -1063,22 +1071,21 @@ impl AppContextBuilder {
         let document = config
             .policy_document_in_force()
             .map_err(|refused| format!("Grand Central: {refused}"))?;
-        // The engine keeps the sample and this gateway has no route that
-        // reads one yet, so the field is named here and not refused.
-        if document.explain.sample != 0 {
-            tracing::warn!(
-                sample = document.explain.sample,
-                "The policy document sets explain.sample: the Grand Central this gateway hosts \
-                 keeps the sample, and no route of this gateway reads a kept record yet"
-            );
-        }
         let checked = match stages {
             Some(stages) => config.hosted_policy(&document, stages),
             None => config.hosted_policy(&document, &StageRegistry::builtin()),
         };
-        checked
-            .map(|spec| Some((document, spec)))
-            .map_err(|refused| format!("Grand Central: {refused}"))
+        let spec = checked.map_err(|refused| format!("Grand Central: {refused}"))?;
+        // The engine keeps its record of sent prefixes under the tree index
+        // alone: a hash entry runs and remembers no request. The line stands
+        // behind the check, so a refused start says its refusal alone.
+        let mut entries = document.index.values();
+        if config.policy_spec.is_none() && entries.any(|entry| entry.kind == IndexKind::Hash) {
+            tracing::warn!(
+                "Grand Central: cache_index = hash: the engine builds no hash index yet, so cache_aware remembers no request: use the tree index"
+            );
+        }
+        Ok(Some((document, spec)))
     }
 
     /// Starts Grand Central over `policy`, where the configuration runs
@@ -1086,9 +1093,13 @@ impl AppContextBuilder {
     /// answered, with its checked form. It is the last step of the start,
     /// so the engine is handed where this process keeps its workers' data,
     /// each once: the worker registry, the load monitor's channel, and the
-    /// cache-event monitor with the token trees the engine is lent
+    /// cache-event monitor with the trees the engine is lent
     /// ([`Self::engine_caches`]).
-    fn with_engine(self, policy: Option<(PolicySpec, AppliedSpec)>) -> Result<Self, String> {
+    fn with_engine(
+        self,
+        policy: Option<(PolicySpec, AppliedSpec)>,
+        respec: Option<crate::policies::Respec>,
+    ) -> Result<Self, String> {
         let Some((document, spec)) = policy else {
             return Ok(self);
         };
@@ -1110,41 +1121,71 @@ impl AppContextBuilder {
             .as_ref()
             .ok_or_else(|| unset("kv_event_monitor"))?;
         let events = Some(cache_events);
+        let later = respec.is_some();
         let data = WorkerData {
             registry: Arc::clone(registry) as Arc<dyn Members>,
             loads: Some(monitor.subscribe()),
-            cache_indexes: Self::engine_caches(&document, &spec, events, policies, registry),
+            cache_indexes: Self::engine_caches(&document, &spec, events, policies, registry, later),
         };
-        Self::start_engine(spec, data, policies)?;
+        Self::start_engine(spec, data, policies, registry, respec)?;
         Ok(self)
+    }
+
+    /// The maker of every later spec of this process. A spec it makes is
+    /// the one the routing settings mean with a model's own policy for each
+    /// worker's `policy` label. It is checked as the start checks its own
+    /// (`RouterConfig::hosted_policy_with_labels`). The maker owns a copy of
+    /// the settings and `stages`, the table the start was handed, or the
+    /// stock one where it was handed none.
+    ///
+    /// The registry is handed it with the engine and puts each spec it makes
+    /// in force on that engine. It hands the spec's document with the
+    /// checked spec: the trees the engine is lent are sized by that
+    /// document.
+    fn respec(config: &RouterConfig, stages: Option<StageRegistry>) -> crate::policies::Respec {
+        let config = config.clone();
+        let stages = stages.unwrap_or_else(StageRegistry::builtin);
+        Box::new(move |labels, generation| {
+            config.hosted_policy_with_labels(labels, generation, &stages)
+        })
     }
 
     /// What the engine is handed of this process's caches, as one object
     /// ([`EngineCaches`]): `events`, the cache-event monitor where the
-    /// process keeps one, and the token trees the engine is lent.
+    /// process keeps one, and the trees the engine is lent.
     ///
     /// With the engine on no classic policy object is built, so no policy
     /// keeps the trees of the prompts this process sent. The start asks the
     /// registry for them in a policy's place
-    /// ([`PolicyRegistry::lend_token_trees`]), and only where `spec`, the
-    /// checked form of `document`, reads the prefixes sent to each worker:
-    /// the document's own word, whatever the settings name the policy. The
-    /// trees take the document's numbers too: its block size, and each
+    /// ([`PolicyRegistry::lend_trees`]). It asks only where `spec`, the
+    /// checked form of `document`, reads the prefixes sent to each worker.
+    /// That is the document's own word, whatever the settings name the
+    /// policy.
+    ///
+    /// The trees take the document's numbers too: its block size, and each
     /// model's `index` entry. They follow `workers`, the registry the engine
-    /// is handed: a worker it lost is taken out of them. `None` where the
-    /// process keeps neither a monitor nor trees.
+    /// is handed: a worker it lost is taken out of them.
+    ///
+    /// The object reads the trees through their cell, which a later spec
+    /// can fill. Where the start's spec reads no sent prefix, the first
+    /// spec a worker's `policy` label puts in force that reads them lends
+    /// the trees. A classic registry builds that model's trees at its
+    /// registration. So the engine is handed the object wherever the
+    /// registry holds a maker of later specs (`later`). `None` where the
+    /// process keeps neither a monitor nor trees and no later spec can
+    /// bring them.
     fn engine_caches(
         document: &PolicySpec,
         spec: &AppliedSpec,
         events: Option<&Arc<KvEventMonitor>>,
         policies: &PolicyRegistry,
         workers: &WorkerRegistry,
+        later: bool,
     ) -> Option<Arc<dyn CacheIndexes>> {
-        let trees = spec
-            .needs()
-            .sent_prefixes
-            .then(|| policies.lend_token_trees(document, spec.block_size(), workers));
-        let caches = EngineCaches::of(events.cloned(), trees)?;
+        if spec.needs().sent_prefixes {
+            policies.lend_trees(document, spec.block_size(), workers);
+        }
+        let caches = EngineCaches::of(events.cloned(), policies.lent_cell(), later)?;
         Some(Arc::new(caches) as Arc<dyn CacheIndexes>)
     }
 
@@ -1155,11 +1196,16 @@ impl AppContextBuilder {
     /// events and tells the document's stages a worker that joined or was
     /// removed, and it keeps the newest load snapshot at hand. It is
     /// spawned on the runtime this context is built on, and the placement
-    /// functions find the engine through `policies`.
+    /// functions find the engine through `policies`. `workers` is the
+    /// registry `data` holds, by its own type: `policies` keeps it with
+    /// the maker of later specs and publishes its lists again behind each
+    /// spec a worker's label puts in force.
     fn start_engine(
         spec: AppliedSpec,
         data: WorkerData,
         policies: &PolicyRegistry,
+        workers: &Arc<WorkerRegistry>,
+        respec: Option<crate::policies::Respec>,
     ) -> Result<(), String> {
         let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
             format!("Grand Central: the engine's task needs a Tokio runtime: {error}")
@@ -1170,6 +1216,11 @@ impl AppContextBuilder {
         // its load snapshot and its follow of the registry end with the
         // runtime.
         runtime.spawn(task);
+        // The maker stands before the engine does: a registration finds
+        // both, or no engine and decides nothing.
+        if let Some(respec) = respec {
+            policies.set_respec(respec, Arc::clone(workers));
+        }
         policies.set_engine(engine);
         Ok(())
     }
@@ -1182,8 +1233,14 @@ impl AppContextBuilder {
     /// configuration that leaves Grand Central off starts nothing.
     /// The engine is handed the test's worker registry and its load
     /// monitor's channel. Such a context keeps no cache-event monitor, so
-    /// the engine is handed none, and the token trees it is lent where its
+    /// the engine is handed none, and the trees it is lent where its
     /// document reads them (`engine_caches`).
+    ///
+    /// The registry is handed the maker of later specs where the test
+    /// brings no table (`respec` over the stock one). A table a
+    /// test lends for this call cannot be kept behind it, so a start over
+    /// one hands no maker, and a worker's `policy` label is not applied
+    /// there.
     #[cfg(any(test, feature = "test-util"))]
     pub fn start_engine_by_hand(
         config: &RouterConfig,
@@ -1193,12 +1250,16 @@ impl AppContextBuilder {
         monitor: &WorkerMonitor,
     ) -> Result<(), String> {
         if let Some((document, spec)) = Self::policy_in_force(config, stages)? {
+            let respec = stages.is_none().then(|| Self::respec(config, None));
+            let later = respec.is_some();
             let data = WorkerData {
                 registry: Arc::clone(registry) as Arc<dyn Members>,
                 loads: Some(monitor.subscribe()),
-                cache_indexes: Self::engine_caches(&document, &spec, None, policies, registry),
+                cache_indexes: Self::engine_caches(
+                    &document, &spec, None, policies, registry, later,
+                ),
             };
-            Self::start_engine(spec, data, policies)?;
+            Self::start_engine(spec, data, policies, registry, respec)?;
         }
         Ok(())
     }
@@ -1210,7 +1271,7 @@ impl AppContextBuilder {
     /// them for a test. The engine is handed the bench's worker registry and
     /// `loads`, the channel of the load feed the bench publishes where a
     /// monitor would. A bench keeps no cache-event monitor, so the engine is
-    /// handed none, and the token trees it is lent where its document reads
+    /// handed none, and the trees it is lent where its document reads
     /// them (`engine_caches`). A configuration that leaves Grand
     /// Central off starts nothing.
     #[cfg(any(test, feature = "test-util"))]
@@ -1224,9 +1285,12 @@ impl AppContextBuilder {
             let data = WorkerData {
                 registry: Arc::clone(registry) as Arc<dyn Members>,
                 loads,
-                cache_indexes: Self::engine_caches(&document, &spec, None, policies, registry),
+                cache_indexes: Self::engine_caches(
+                    &document, &spec, None, policies, registry, true,
+                ),
             };
-            Self::start_engine(spec, data, policies)?;
+            let respec = Some(Self::respec(config, None));
+            Self::start_engine(spec, data, policies, registry, respec)?;
         }
         Ok(())
     }
@@ -1908,6 +1972,84 @@ mod tests {
         }
     }
 
+    /// The start lends Grand Central the gateway's own string trees
+    /// beside its token trees. Under `cache_aware` a conversation whose
+    /// requests hold their prompt as text goes back, turn after turn, to
+    /// the worker its first turn was sent to, and the model's string tree
+    /// holds the whole conversation for that worker alone. No token tree
+    /// takes a prompt of text, and the worker that leaves the registry is
+    /// taken out of the string tree too.
+    ///
+    /// The classic policy keeps such a tree itself and reads it the same
+    /// way (`model_gateway/src/policies/cache_aware.rs`,
+    /// `select_worker_with_text`).
+    #[tokio::test]
+    async fn the_start_lends_the_engine_the_string_trees_a_request_of_text_reads() {
+        use std::{fmt::Write as _, time::Instant};
+
+        use kv_index::TenantId;
+        use openai_protocol::worker::RuntimeType;
+
+        use crate::routers::common::{
+            placement::{select_single, PlacementInputs, Stated},
+            snapshot::{test_support::grpc_worker, RoutingPool},
+        };
+
+        let mut config = config_with_policy(PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096));
+        config.grand_central = true;
+        config.health_check.disable_health_check = true;
+        let context = AppContext::from_config(config, 30, None, None).await;
+        let context = context.expect("a context");
+        let trees = context.policy_registry.lent_trees();
+        let trees = trees.expect("the start made the trees");
+        for at in 0..4 {
+            let url = format!("grpc://w{at}:9000");
+            let worker = grpc_worker(&url, "m", RuntimeType::Vllm, &[]);
+            context.worker_registry.register(worker).expect("a worker");
+        }
+        let turn = |said: &str| {
+            let inputs = PlacementInputs {
+                text: Some(said),
+                ..PlacementInputs::default()
+            };
+            let placed = select_single(
+                &context.worker_registry,
+                &context.policy_registry,
+                "m",
+                RoutingPool::GrpcPipelineRegular,
+                None,
+                inputs,
+                Stated::nothing,
+            );
+            placed.expect("a worker").into_worker().url().to_owned()
+        };
+        // A first turn of sixteen windows of text, 64 bytes a window by the
+        // settings' block size, and each next turn one window more.
+        let mut said: String = (0..16).map(|window| format!("{window:<64}")).collect();
+        let first = turn(&said);
+        for next in 1..8 {
+            let words = format!("turn {next}");
+            write!(said, "{words:<64}").expect("a string takes its words");
+            assert_eq!(turn(&said), first, "turn {next}");
+        }
+        let tree = trees.string_tree("m");
+        let found = tree.match_prefix_with_counts(&said);
+        assert_eq!(found.matched_char_count, said.chars().count());
+        assert_eq!(found.matched_tenants, [TenantId::from(first.as_str())]);
+        let tokens = trees.token_tree("m").get_tenant_token_counts();
+        assert!(tokens.is_empty(), "no token tree takes a prompt of text");
+
+        // The trees' task takes the worker that leaves out of the string
+        // tree, as out of the token tree.
+        let registry = &context.worker_registry;
+        registry.remove_by_url(&first).expect("the removal");
+        let bound = Instant::now() + Duration::from_secs(60);
+        while !tree.get_tenant_char_count().is_empty() {
+            assert!(Instant::now() < bound, "the trees' task never purged");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
     /// A context built on a runtime starts the task that fills the hash
     /// rings: the ring of a generation is filled with no request to read it.
     #[tokio::test]
@@ -2053,6 +2195,94 @@ mod tests {
             match lines.iter().filter(|line| line.contains(LINE)).count() {
                 1 => Ok(()),
                 said => Err(format!("the start said the line {said} times")),
+            }
+        });
+    }
+
+    /// The engine builds no hash index yet, so under Grand Central a
+    /// `cache_aware` policy over the hash kind of the cache index remembers
+    /// no request. The start runs its engine and says so once, by the
+    /// setting's name. The settings' other readers say nothing, and neither
+    /// does the start's step with Grand Central off, under the tree kind,
+    /// or over a supplied document, which states its own index entries. A
+    /// start the check refuses says its refusal alone.
+    #[traced_test]
+    #[tokio::test]
+    async fn the_start_alone_says_once_that_the_hash_index_remembers_no_request() {
+        use crate::config::{validation::ConfigValidator, CacheIndexKind, PolicyConfig};
+
+        const LINE: &str = "Grand Central: cache_index = hash: the engine builds no hash index yet";
+        let of_kind = |kind: CacheIndexKind| {
+            let boundaries = vec![512, 2048];
+            let mut config = RouterConfig {
+                policy: PolicyConfig::cache_aware(0.5, 32, 1.1, 60, 1_000),
+                cache_boundaries: boundaries.clone(),
+                grand_central: true,
+                ..RouterConfig::default()
+            };
+            if let PolicyConfig::CacheAware {
+                cache_index,
+                cache_boundaries,
+                ..
+            } = &mut config.policy
+            {
+                *cache_index = kind;
+                *cache_boundaries = boundaries;
+            }
+            config.health_check.disable_health_check = true;
+            config
+        };
+        let hashed = of_kind(CacheIndexKind::Hash);
+        let document = hashed
+            .policy_document_in_force()
+            .expect("the settings' document");
+        let mut entries = document.index.values();
+        assert!(entries.any(|entry| entry.kind == IndexKind::Hash));
+        ConfigValidator::validate_policy_document(&hashed).expect("the start's check takes it");
+        let step = |config: &RouterConfig| AppContextBuilder::policy_in_force(config, None);
+        let off = RouterConfig {
+            grand_central: false,
+            ..hashed.clone()
+        };
+        assert!(matches!(step(&off), Ok(None)));
+        assert!(matches!(step(&of_kind(CacheIndexKind::Tree)), Ok(Some(_))));
+        let supplied = RouterConfig {
+            policy_spec: Some(document),
+            ..hashed.clone()
+        };
+        assert!(matches!(step(&supplied), Ok(Some(_))));
+        assert!(!logs_contain(LINE), "a reader other than the start said it");
+        // A setting the check refuses: the settings translate, and the start
+        // ends by the refusal alone.
+        let mut refused = hashed.clone();
+        if let PolicyConfig::CacheAware {
+            selection_temperature,
+            ..
+        } = &mut refused.policy
+        {
+            *selection_temperature = 0.05;
+        }
+        assert!(
+            refused.policy_document_in_force().is_ok(),
+            "the settings translate"
+        );
+        assert!(
+            matches!(step(&refused), Err(refusal) if refusal.starts_with("Grand Central: ")),
+            "the check refuses a selection temperature"
+        );
+        assert!(!logs_contain(LINE), "a refused start said it");
+
+        let context = AppContext::from_config(hashed, 30, None, None)
+            .await
+            .expect("the gateway starts");
+        let registry = &context.policy_registry;
+        assert!(registry.engine().is_some(), "the engine runs");
+        logs_assert(|lines: &[&str]| {
+            let said: Vec<_> = lines.iter().filter(|line| line.contains(LINE)).collect();
+            match said.as_slice() {
+                [line] if line.contains("WARN") && line.contains("use the tree index") => Ok(()),
+                [line] => Err(format!("the start said it otherwise: {line}")),
+                said => Err(format!("the start said the line {} times", said.len())),
             }
         });
     }
@@ -2300,56 +2530,6 @@ policy:
             .await;
         assert!(logs_contain("Starting KV event subscription"));
         monitor.stop().await;
-    }
-
-    /// The engine this process hosts keeps the sample, and no route of this
-    /// gateway reads a kept record yet. A supplied document that leaves
-    /// `explain.sample` at zero is taken without a word, and one that sets
-    /// it is taken with one warn line that says so. One the check refuses
-    /// is named too, ahead of its refusal.
-    #[traced_test]
-    #[test]
-    fn a_documents_explain_sample_is_named_at_the_start() {
-        let mut config = RouterConfig {
-            grand_central: true,
-            ..Default::default()
-        };
-        let mut document = config.policy_document().expect("the settings' document");
-        config.policy_spec = Some(document.clone());
-        let taken = AppContextBuilder::policy_in_force(&config, None);
-        assert!(matches!(taken, Ok(Some(_))));
-        assert!(!logs_contain("explain.sample"));
-
-        document.explain.sample = 10;
-        config.policy_spec = Some(document.clone());
-        let taken = AppContextBuilder::policy_in_force(&config, None);
-        assert!(matches!(taken, Ok(Some(_))));
-        logs_assert(|lines: &[&str]| {
-            let named: Vec<_> = lines
-                .iter()
-                .filter(|line| line.contains("explain.sample"))
-                .collect();
-            let said = "keeps the sample, and no route of this gateway reads a kept record yet";
-            let warns = |line: &&&str| line.contains("WARN") && line.contains("sample=10");
-            match named.as_slice() {
-                [line] if warns(line) && line.contains(said) => Ok(()),
-                _ => Err(format!("the lines that name explain.sample: {named:?}")),
-            }
-        });
-
-        // Its binding's profile gone, the document is refused by the check.
-        document.explain.sample = 11;
-        document.profiles.clear();
-        config.policy_spec = Some(document);
-        let taken = AppContextBuilder::policy_in_force(&config, None);
-        assert!(taken.is_err());
-        logs_assert(|lines: &[&str]| {
-            let named = lines.iter().filter(|line| line.contains("sample=11"));
-            match named.count() {
-                1 => Ok(()),
-                named => Err(format!("the lines of the refused document: {named}")),
-            }
-        });
     }
 }
 

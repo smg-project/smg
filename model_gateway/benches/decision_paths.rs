@@ -15,7 +15,7 @@
 //! cache-event monitor, so the engine is handed no index of cache events.
 //! Where the document reads the prefixes sent to each worker, as
 //! `cache_aware`'s does, the start lends the engine the gateway's token
-//! trees.
+//! trees and string trees.
 //! The paths `object` and `records` are refused by name: they are no
 //! longer part of this bench.
 //!
@@ -46,6 +46,14 @@
 //! its two side policies, or by the engine, whose document plans the pair
 //! alone. `--not-ready` and `--ready` then hold for each side.
 //!
+//! `--encode-side true` makes a pair cell's gateway a three-sided one: its
+//! settings name the encode mode, so the engine's document plans an encode
+//! side beside the pair's two, under that side's default policy, which
+//! places by the model's ring. The cell's requests carry no item: each is
+//! placed as a pair, and the encode side places nothing. The cell counts
+//! what a pair pays for a side it does not use. Only a pair cell on the
+//! engine's path takes it.
+//!
 //! `--keys N` gives each request one of `N` routing keys in turn, in the
 //! header `x-smg-routing-key`: a policy that places by a key places by it.
 //! `0`, the default, sends no key.
@@ -66,6 +74,16 @@
 //! by chance, one turn in the fleet's size, and by its load reports where
 //! the cell publishes them: a cell read for this column also runs with
 //! `--reports false`.
+//!
+//! `--text true` makes each request hold its prompt as text and no token
+//! ids, as a request the HTTP router did not tokenize does: the same
+//! prompts and conversations, each token written as four letters. A policy
+//! that keeps its prompts by text then places by it, as `cache_aware` does
+//! by its string tree. The cell's line is as it was, and a line
+//! `prompt=text` stands ahead of it. `false`, the default, sends token ids
+//! on either route. A pair cell sends token ids alone, and a cell of text
+//! takes no `--end`: the bench has no route that tells the end of a
+//! request of text.
 //!
 //! `--publish-ms N` publishes the fleet's reports again, as a new load
 //! snapshot, every `N` milliseconds while the callers run: the load monitor
@@ -91,9 +109,31 @@
 //! shows the guard to an opaque reader and reports nothing. `answer` is an
 //! answer read whole: the route reports through the answer it keeps past
 //! its guard. It is counted against `kept`, which keeps that answer and
-//! reports nothing. A pair route tells no end yet: under `streamed` its
-//! decode's reader tests the empty handle it is handed, and a pair cell
-//! takes neither `kept` nor `answer`.
+//! reports nothing. A pair route tells each side through that side's own
+//! guard. `answer` is a pair read whole. Under `streamed` the prefill is
+//! told through its guard, and the decode's reader reports through the
+//! handle asked of the decode's guard. Both are counted against `passed`. A
+//! pair route keeps no answer, so a pair cell takes no `kept`, and none of
+//! the forms below, which are a single request's.
+//!
+//! `told` is a single request of the gRPC execution stage, behind a
+//! dispatch that answered: the stage asks its selection whether the request
+//! tells its end, the answer's word, and behind a yes asks its guards the
+//! handle and hands it to the request's stream. It is counted against
+//! `dispatched`, which makes the same selection, guards and stream and asks
+//! nothing. `walked` asks the guards whatever the answer's word says: what
+//! a request Grand Central placed pays there, counted on a classic
+//! guard against `dispatched`. `read` reads the stream once, to its end,
+//! counted against `dispatched` too. `watched` watches the stream for a
+//! client as a streaming reader does, and `stopped` lets that stream go as
+//! a reader lets it go at its own stop, counted against `watched`. A
+//! classic request's stream holds no layer of Grand Central's, so a
+//! read walks the layers it walked before and a stop finds nothing to tell.
+//!
+//! `layered` puts on the stream the layer that tells its end under a policy
+//! document one of whose stages takes an end, with an empty handle in it.
+//! `layered-read` reads that stream once through the layer. They count what
+//! the layer costs a request and a read, the report itself apart.
 //!
 //! No Criterion harness: a cell runs a fixed count of decisions, so the same
 //! binary counts instructions under callgrind (two counts, one difference).
@@ -110,6 +150,7 @@
 )]
 
 use std::{
+    cell::RefCell,
     collections::HashMap,
     hint::black_box,
     sync::{
@@ -189,10 +230,15 @@ struct Cell {
     /// A pair gateway: `workers` prefill workers and as many decode
     /// workers a model, and a request placed as a pair.
     pair: bool,
+    /// A pair cell's settings name the encode mode: the engine's document
+    /// plans an encode side beside the pair's two.
+    encode_side: bool,
     /// The routing keys the requests carry in turn; `0` for none.
     keys: usize,
     /// The prompts the requests carry in turn.
     prompts: usize,
+    /// The requests hold their prompt as text and no token ids.
+    text: bool,
     /// Milliseconds between two publications of the fleet's reports while
     /// the callers run; `0` for the one publication before the first
     /// request.
@@ -219,8 +265,10 @@ fn cell() -> Cell {
         overloaded: false,
         models: 1,
         pair: false,
+        encode_side: false,
         keys: 0,
         prompts: 1,
+        text: false,
         publish_ms: 0,
         grow: 0,
         end: None,
@@ -253,8 +301,10 @@ fn cell() -> Cell {
             "--overloaded" => cell.overloaded = value.parse().unwrap(),
             "--models" => cell.models = value.parse().unwrap(),
             "--pair" => cell.pair = value.parse().unwrap(),
+            "--encode-side" => cell.encode_side = value.parse().unwrap(),
             "--keys" => cell.keys = value.parse().unwrap(),
             "--prompts" => cell.prompts = value.parse().unwrap(),
+            "--text" => cell.text = value.parse().unwrap(),
             "--publish-ms" => cell.publish_ms = value.parse().unwrap(),
             "--grow" => cell.grow = value.parse().unwrap(),
             "--end" => {
@@ -263,6 +313,14 @@ fn cell() -> Cell {
                     "streamed" => Ended::Streamed,
                     "kept" => Ended::Kept,
                     "answer" => Ended::Answer,
+                    "dispatched" => Ended::Dispatched,
+                    "told" => Ended::Told,
+                    "walked" => Ended::Walked,
+                    "read" => Ended::Read,
+                    "watched" => Ended::Watched,
+                    "stopped" => Ended::Stopped,
+                    "layered" => Ended::Layered,
+                    "layered-read" => Ended::LayeredRead,
                     other => panic!("no end {other}"),
                 });
             }
@@ -504,6 +562,75 @@ impl Conversation {
     }
 }
 
+/// The letters a token is written as under `--text`: the engine reads a
+/// text's size in tokens as its bytes over four.
+const TOKEN_BYTES: usize = 4;
+
+/// A caller's requests as text, under `--text`: the tokens of its last
+/// request and their text. A request that carries the last one on has the
+/// tokens it adds written behind that text, as a conversation's next turn
+/// is its last one and more. Any other request is written whole.
+struct AsText {
+    tokens: Vec<u32>,
+    text: String,
+}
+
+impl AsText {
+    /// The text of `tokens`: each token as four letters of its mix (`mix`),
+    /// so two prompts' texts part where their tokens do, but for one pair
+    /// of tokens in some 450,000.
+    fn of(&mut self, tokens: &[u32]) -> &str {
+        if !tokens.starts_with(&self.tokens) {
+            self.tokens.clear();
+            self.text.clear();
+        }
+        let kept = self.tokens.len();
+        for &token in &tokens[kept..] {
+            let mut bits = mix(u64::from(token));
+            for _ in 0..TOKEN_BYTES {
+                self.text.push(char::from(b'a' + (bits % 26) as u8));
+                bits /= 26;
+            }
+        }
+        self.tokens.extend_from_slice(&tokens[kept..]);
+        &self.text
+    }
+}
+
+thread_local! {
+    /// The calling thread's requests as text: each caller is a thread.
+    static AS_TEXT: RefCell<AsText> = const {
+        RefCell::new(AsText {
+            tokens: Vec::new(),
+            text: String::new(),
+        })
+    };
+}
+
+/// A text cell's routing call: the same call for a request that holds its
+/// prompt as text. A closure of its own over a route of its own: a cell
+/// without `--text` runs the code it ran before this flag.
+fn text_routing(
+    registry: Arc<WorkerRegistry>,
+    policies: Arc<PolicyRegistry>,
+    models: Vec<String>,
+    keys: Vec<HeaderMap>,
+    route: Route,
+) -> Routing {
+    use smg::routers::common::bench_support::route_text;
+    Box::new(move |tokens, turn| {
+        let model = &models[(turn % models.len() as u64) as usize];
+        let headers = match keys.len() {
+            0 => None,
+            count => keys.get((turn % count as u64) as usize),
+        };
+        AS_TEXT.with_borrow_mut(|as_text| {
+            let text = as_text.of(tokens);
+            route_text(&registry, &policies, model, route, text, headers)
+        })
+    })
+}
+
 /// The load feed of a cell and the reports it publishes: one a worker.
 struct Feed {
     feed: TestFeed,
@@ -532,12 +659,27 @@ fn build(cell: &Cell) -> Built {
         policy: policy_config(&cell.policy),
         ..RouterConfig::default()
     };
+    assert!(
+        !cell.encode_side || (cell.pair && cell.path == "engine"),
+        "an encode side is planned for a pair cell on the engine's path"
+    );
     if cell.pair {
-        config.mode = RoutingMode::PrefillDecode {
-            prefill_urls: vec![],
-            decode_urls: vec![],
-            prefill_policy: None,
-            decode_policy: None,
+        config.mode = if cell.encode_side {
+            RoutingMode::EncodePrefillDecode {
+                encode_urls: vec![],
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                encode_policy: None,
+                prefill_policy: None,
+                decode_policy: None,
+            }
+        } else {
+            RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: None,
+            }
         };
         // The cell's workers are on the gRPC wire, and its settings say so:
         // a pair gateway of one router over gRPC plans the pair alone, where
@@ -633,13 +775,27 @@ fn build(cell: &Cell) -> Built {
         "a pair cell sends no routing key"
     );
     assert!(
-        !(pair && matches!(end, Some(Ended::Kept | Ended::Answer))),
-        "a pair cell reports through no answer"
+        !pair
+            || matches!(
+                end,
+                None | Some(Ended::Passed | Ended::Streamed | Ended::Answer)
+            ),
+        "a pair cell keeps no answer and runs no single request's stage"
     );
     assert!(
         !(cell.grow > 0 && cell.models > 1),
         "a growing conversation is one model's"
     );
+    if cell.text {
+        assert!(!pair, "a pair cell sends token ids");
+        assert!(end.is_none(), "a cell of text takes no --end");
+        let keys = keyed_headers(cell.keys);
+        return Built {
+            routing: text_routing(registry, policies, models, keys, route),
+            feed,
+            runtime,
+        };
+    }
     let keys = keyed_headers(cell.keys);
     let routing: Routing = match end {
         None => Box::new(move |tokens, turn| {
@@ -816,8 +972,13 @@ fn main() {
     } else {
         returned as f64 / turns as f64
     };
+    if cell.text {
+        // A line of its own, ahead of the cell's: the cell's line stands as
+        // it was before this flag.
+        println!("prompt=text");
+    }
     println!(
-        "path={} route={:?} policy={} workers={} callers={} reports={} not_ready={} ready={} overloaded={} models={} pair={} end={} keys={} prompts={} grow={} turns={} returned={} return_rate={:.4} publish_ms={} publications={} alloc_bytes_per_decision={:.2} decisions={} wall_s={:.3} decisions_per_s={:.0} ns_per_decision={:.1}",
+        "path={} route={:?} policy={} workers={} callers={} reports={} not_ready={} ready={} overloaded={} models={} pair={} encode_side={} end={} keys={} prompts={} grow={} turns={} returned={} return_rate={:.4} publish_ms={} publications={} alloc_bytes_per_decision={:.2} decisions={} wall_s={:.3} decisions_per_s={:.0} ns_per_decision={:.1}",
         cell.path,
         cell.route,
         cell.policy,
@@ -829,6 +990,7 @@ fn main() {
         cell.overloaded,
         cell.models,
         cell.pair,
+        cell.encode_side,
         cell
             .end
             .map_or_else(|| "dropped".to_owned(), |end| format!("{end:?}").to_lowercase()),

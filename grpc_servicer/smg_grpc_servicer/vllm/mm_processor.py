@@ -62,7 +62,6 @@ from smg_grpc_servicer.vllm.media_refs import (
     advertised_schemes,
     parse_scheme_list,
 )
-from smg_grpc_servicer.vllm.short_side_floor import FloorRule, floor_rule, raise_to_floor_off_loop
 
 logger = logging.getLogger(__name__)
 
@@ -427,9 +426,6 @@ class InProcessMediaProcessor:
     """Fetch with vLLM's MediaConnector and process with the engine's own renderer."""
 
     name = MODE_INPROCESS
-    # The served family's short-side floor (`floor_rule`), applied to a
-    # fetched image before the engine's processor sees it; None raises nothing.
-    _short_side_floor: FloorRule | None = None
     # vLLM's download size caps, the releases that have them.
     _download_too_large: tuple[type[BaseException], ...] = ()
     # The media-fault kind of a fetch failure (`fetch_fault_classifier`),
@@ -501,13 +497,6 @@ class InProcessMediaProcessor:
         self._video_processor = get_video_processor_cls_name(model_config)
         self.schemes = advertised_schemes(model_config.allowed_local_media_path)
         self.accepted_schemes = parse_scheme_list(self.schemes)
-        self._short_side_floor = floor_rule(model_config)
-        if self._short_side_floor is not None:
-            logger.info(
-                "images below a %d px short side are raised to it before the engine's "
-                "processor, as the router's own pipeline does for this model family",
-                self._short_side_floor.floor,
-            )
         if not connector_kwargs["allowed_media_domains"]:
             logger.warning(
                 "%s=inprocess with no --allowed-media-domains: this worker will fetch media "
@@ -568,8 +557,7 @@ class InProcessMediaProcessor:
         """
         try:
             if item.modality == "image":
-                image = await self._connector.fetch_image_async(item.url)
-                return await raise_to_floor_off_loop(image, self._short_side_floor)
+                return await self._connector.fetch_image_async(item.url)
             if item.modality == "audio":
                 return await self._connector.fetch_audio_async(item.url)
             if item.modality == "video":

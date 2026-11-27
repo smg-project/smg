@@ -143,7 +143,7 @@ type ModelIndex<G> = Arc<DashMap<String, Arc<G>, FxBuildHasher>>;
 
 /// Shards of the maps that hold one entry a model and are iterated on
 /// request paths, on any host: the model index
-/// ([`WorkerRegistry::model_count`]) and the per-model retry overrides
+/// ([`WorkerRegistry::get_models`]) and the per-model retry overrides
 /// ([`WorkerRegistry::any_model_retry_override_enables_retries`]). Iterating
 /// a map costs one lock and one allocation a shard, whether the shard holds
 /// an entry or not: the count must not follow the CPUs the process sees, as
@@ -176,6 +176,14 @@ pub struct WorkerRegistry<G> {
     /// Model index for O(1) lookups using immutable snapshots.
     /// Uses `Arc<[T]>` instead of `Arc<RwLock<Vec<T>>>` for lock-free reads.
     model_index: ModelIndex<G>,
+
+    /// The models of `model_index` that hold a worker
+    /// ([`Self::model_count`]). The two writers of an entry's members keep
+    /// it under the entry's shard lock: one more ahead of an entry's first
+    /// worker, one less behind its last, so a read never falls under the
+    /// models the index holds. Nothing that can fail stands between a move
+    /// of the count and the write it belongs to.
+    served_models: AtomicUsize,
 
     /// Immutable snapshot spanning every registered worker, tagged with the
     /// `global_epoch` it was built at. Model-less routes use its lazy route
@@ -329,6 +337,7 @@ impl<G: Generation> WorkerRegistry<G> {
                 FxBuildHasher,
                 MODEL_MAP_SHARDS,
             )),
+            served_models: AtomicUsize::new(0),
             global_routing_snapshot: ArcSwap::from_pointee(GlobalRoutingSnapshot {
                 epoch: 0,
                 snapshot: Arc::clone(&empty_generation),
@@ -991,11 +1000,14 @@ impl<G: Generation> WorkerRegistry<G> {
 
     /// Distinct canonical models with at least one worker serving them.
     /// Wildcard workers carry no model and contribute nothing.
+    ///
+    /// A kept count: the registry moves it where a model takes its first
+    /// worker and where it loses its last, so a request reads one word and
+    /// no shard of the model index. It goes up ahead of a model's first
+    /// worker and down behind its last: a read never falls under the models
+    /// the index holds.
     pub fn model_count(&self) -> usize {
-        self.model_index
-            .iter()
-            .filter(|entry| !entry.value().members().is_empty())
-            .count()
+        self.served_models.load(Ordering::Relaxed)
     }
 
     /// Whether at least one worker serves this name, as a canonical model ID
@@ -1054,12 +1066,7 @@ impl<G: Generation> WorkerRegistry<G> {
     /// `/v1/stats` and monitoring dashboards.
     pub fn stats(&self) -> WorkerRegistryStats {
         let total_workers = self.workers.len();
-        // Count models directly instead of allocating Vec via get_models() (lock-free)
-        let total_models = self
-            .model_index
-            .iter()
-            .filter(|entry| !entry.value().members().is_empty())
-            .count();
+        let total_models = self.model_count();
 
         let mut healthy_count = 0;
         let mut total_load = 0;
@@ -1793,14 +1800,45 @@ impl<G: Generation> WorkerRegistry<G> {
         let mut previous = Vec::with_capacity(holding.len());
         for model_id in &holding {
             if let Some(mut entry) = self.model_index.get_mut(model_id) {
-                let members = Arc::clone(entry.members());
-                previous.push(std::mem::replace(&mut *entry, Arc::new(G::of(members))));
+                previous.push(Self::published_again(&mut entry));
             }
         }
         drop(previous);
         let _order = self.global_membership_order.read();
         self.bump_global_routing_epoch();
         true
+    }
+
+    /// Publishes every model's snapshot again over the same list, with the
+    /// global one: what a host's value of a generation keeps beside its
+    /// lists starts anew, and the next request reads it again. No worker is
+    /// written and no list changes.
+    ///
+    /// For a host that changes what its values keep, with no membership
+    /// change at hand. The cost is the host's value built again for every
+    /// model a worker serves, so a host calls it at such a change of its
+    /// own and at no request. The generation without a member is built once
+    /// with the registry and is not published again.
+    ///
+    /// Emits no events.
+    pub fn publish_again(&self) {
+        // As in add_worker_to_model_index: a replaced snapshot drops after
+        // its shard guard, not under it.
+        let mut previous = Vec::with_capacity(self.model_index.len());
+        for mut entry in self.model_index.iter_mut() {
+            previous.push(Self::published_again(&mut entry));
+        }
+        drop(previous);
+        let _order = self.global_membership_order.read();
+        self.bump_global_routing_epoch();
+    }
+
+    /// One model's snapshot published again over the list it holds. Answers
+    /// the snapshot it replaced, for its caller to drop behind the shard
+    /// guard.
+    fn published_again(entry: &mut Arc<G>) -> Arc<G> {
+        let members = Arc::clone(entry.members());
+        std::mem::replace(entry, Arc::new(G::of(members)))
     }
 
     /// The models whose index entry holds `worker`, by its handle.
@@ -2330,12 +2368,19 @@ impl<G: Generation> WorkerRegistry<G> {
                     .cloned()
                     .collect();
                 new_workers.push(worker.clone());
-                previous = Some(std::mem::replace(
-                    existing,
-                    Arc::new(G::of(Arc::from(new_workers.into_boxed_slice()))),
-                ));
+                let next = Arc::new(G::of(Arc::from(new_workers.into_boxed_slice())));
+                // An entry a removal emptied and has not evicted yet takes
+                // its first worker again.
+                if existing.members().is_empty() {
+                    self.served_models.fetch_add(1, Ordering::Relaxed);
+                }
+                previous = Some(std::mem::replace(existing, next));
             })
-            .or_insert_with(|| Arc::new(G::of(Arc::from(vec![worker].into_boxed_slice()))));
+            .or_insert_with(|| {
+                let first = Arc::new(G::of(Arc::from(vec![worker].into_boxed_slice())));
+                self.served_models.fetch_add(1, Ordering::Relaxed);
+                first
+            });
         drop(previous);
     }
 
@@ -2437,12 +2482,18 @@ impl<G: Generation> WorkerRegistry<G> {
                 .collect();
 
             if new_workers.is_empty() {
-                previous = Some(std::mem::replace(
+                let emptied = std::mem::replace(
                     &mut *entry,
                     Arc::new(G::of(Arc::from(
                         Vec::<Arc<dyn Worker>>::new().into_boxed_slice(),
                     ))),
-                ));
+                );
+                // The entry lost its last worker here, unless another
+                // removal emptied it already.
+                if !emptied.members().is_empty() {
+                    self.served_models.fetch_sub(1, Ordering::Relaxed);
+                }
+                previous = Some(emptied);
                 should_remove_entry = true;
             } else {
                 previous = Some(std::mem::replace(

@@ -444,7 +444,9 @@ message Lease {
   uint64 term = 8;
   // Bounds decision to Dispatched; then Completed or the stream rule ends it.
   // A controller's lease tells what is left of the span as its answer is
-  // sent; the span counts from the request's take.
+  // sent; the span counts from the request's take. A pair's decode side
+  // issued with its prefill is bound from that prefill's end: a controller
+  // holds it while the prefill is dispatched.
   uint32 dispatch_ttl_ms = 9;
   LeaseOrigin origin = 10;
 }
@@ -541,7 +543,9 @@ message Busy {
     // The decode call names no lease of this gateway.
     REASON_DECODE_NO_LEASE = 5;
     // The lease's decode side was never chosen: its first request did not say
-    // that the decode comes later, or the lease is no pair's.
+    // that the decode comes later, or the lease is no pair's. A call that
+    // names its worker where the pair's decode side reads that number leaves
+    // under this reason too: the decode the first pick named stands.
     REASON_DECODE_NOT_CHOSEN = 6;
     // The lease's prefill is not held: not dispatched yet, or ended.
     REASON_DECODE_PREFILL_NOT_HELD = 7;

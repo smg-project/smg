@@ -491,9 +491,12 @@ async fn removed_event_evicts_cached_loads() {
         vec![(Arc::clone(&worker), Arc::new(WorkerLoadResponse::default()))],
     );
     assert!(monitor.load_state.snapshot().contains(&url));
-    monitor
-        .native_loads_memo
-        .insert(url.clone(), NativeLoadsMemo::default());
+    let file = NativeLoadsFile {
+        memo: NativeLoadsMemo::default(),
+        prober: Arc::downgrade(&worker),
+        number: 0,
+    };
+    monitor.native_loads_memo.insert(url.clone(), file);
     let mut dp_loads: HashMap<String, HashMap<isize, isize>> = HashMap::new();
     let mut inner = HashMap::new();
     inner.insert(0, 5);
@@ -528,9 +531,15 @@ async fn stop_all_groups_clears_native_probe_memo() {
     // A worker removed during a `RecvError::Lagged` window never
     // fires an eviction, so the reset path must drop the memo too.
     let (_registry, monitor) = build_monitor();
+    let worker = ready_worker("http://w1:8080", "llama-3");
+    let file = NativeLoadsFile {
+        memo: NativeLoadsMemo::default(),
+        prober: Arc::downgrade(&worker),
+        number: 0,
+    };
     monitor
         .native_loads_memo
-        .insert("http://w1:8080".to_string(), NativeLoadsMemo::default());
+        .insert(worker.url().to_string(), file);
 
     monitor.stop_all_groups();
 
@@ -2563,6 +2572,98 @@ async fn an_engines_answer_crosses_whole_and_the_file_is_laid_by_the_sinks_ranks
         vec![false],
         "an answer with no token capacity lists no ranks for a cache"
     );
+}
+
+/// A worker can leave, and another take its URL, while its engine's answer
+/// is open. An answer that comes then is not told to the sink, as an answer
+/// or as a failed fetch. A fetch that fails then is said as a failed fetch
+/// for the worker it was asked for, as where no worker took the URL. The
+/// batch holds no report either way.
+#[tokio::test]
+async fn a_late_answer_is_not_said_and_a_late_failed_fetch_is_said_as_one() {
+    for late in [StatusCode::OK, StatusCode::SERVICE_UNAVAILABLE] {
+        // The engine says when it is asked and holds its answer until it is
+        // let go.
+        let (asked, let_go) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        let app = axum::Router::new().route(
+            "/v1/loads",
+            axum::routing::get({
+                let (asked, let_go) = (Arc::clone(&asked), Arc::clone(&let_go));
+                move || {
+                    let (asked, let_go) = (Arc::clone(&asked), Arc::clone(&let_go));
+                    async move {
+                        asked.notify_one();
+                        let_go.notified().await;
+                        (late, r#"{"loads":[{"dp_rank":0,"num_running_reqs":3}]}"#)
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("stub serve");
+        });
+
+        let (registry, monitor, sink) =
+            build_recording(PollMode::Poll, PolledRanks::default(), true, false);
+        let engine_worker = |model: &str| -> Arc<dyn Worker> {
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(&url)
+                    .worker_type(WorkerType::Regular)
+                    .connection_mode(ConnectionMode::Http)
+                    .runtime_type(RuntimeType::Vllm)
+                    .model(ModelCard::new(model))
+                    .health_config(HealthCheckConfig {
+                        disable_health_check: true,
+                        ..Default::default()
+                    })
+                    .build(),
+            );
+            worker.set_status(WorkerStatus::Ready);
+            worker
+        };
+        let left = registry.register(engine_worker("a")).unwrap();
+        let group = WorkerGroupKey {
+            model_id: "a".to_string(),
+            worker_type: WorkerType::Regular,
+            connection_mode: ConnectionMode::Http,
+        };
+        let tick = poll_group_once(&monitor, &group, Duration::from_secs(10), Instant::now());
+        tokio::pin!(tick);
+        tokio::select! {
+            () = &mut tick => panic!("the tick ended ahead of its engine's answer"),
+            () = asked.notified() => {}
+        }
+        assert!(registry.remove(&left).is_some());
+        registry.register(engine_worker("b")).unwrap();
+        sink.said.lock().clear();
+
+        let_go.notify_one();
+        tick.await;
+        let said = sink.said.lock();
+        let (batches, told): (Vec<&Said>, Vec<&Said>) =
+            said.iter().partition(|said| matches!(said, Said::Tick(..)));
+        assert!(
+            batches
+                .iter()
+                .all(|batch| matches!(batch, Said::Tick(_, reports) if reports.is_empty())),
+            "{late}: the batch holds no report: {batches:?}"
+        );
+        if late == StatusCode::OK {
+            assert!(told.is_empty(), "an answer that came is not told: {told:?}");
+        } else {
+            assert_eq!(
+                told,
+                [&Said::FetchFailed(vec![url.clone()], false)],
+                "a fetch that failed is said as one, for the worker it was asked for"
+            );
+        }
+    }
 }
 
 /// An answer that brought no row and a fetch that failed are said apart: the

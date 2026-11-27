@@ -18,7 +18,7 @@ use std::sync::atomic::AtomicU64;
 
 use crate::{
     engine::{
-        decision::{Pair, Target},
+        decision::{DecodePlacing, Pair, Target},
         sticky_sessions::{DecodeVerdict, SessionVerdict},
         view::{
             AffinityFacts, AffinityRows, Candidate, Engines, HashKind, Header, Health, Identity,
@@ -77,10 +77,11 @@ wit! {
     // A session crosses as its value.
     Session => "u64",
     // Host-only: a lease's session verdict and a pair's decode side's never
-    // reach a guest, and a request's model crosses as its name, never as
-    // the host's fingerprint.
+    // reach a guest, nor does who placed that side, and a request's model
+    // crosses as its name, never as the host's fingerprint.
     SessionVerdict => "host-only",
     DecodeVerdict => "host-only",
+    DecodePlacing => "host-only",
     ModelFingerprint => "host-only",
     // Host-only: a guest reads the request's affinity column as five fields
     // of each candidate.
@@ -100,6 +101,9 @@ wit! {
     // Host-only: the ring a caller lends names its workers by address,
     // and a guest is shown rows.
     Option<&dyn LentRing> => "host-only",
+    // Host-only: a pair's decode side's own places on that ring stay
+    // with the ring, in process.
+    Option<&[u64]> => "host-only",
 }
 
 // The spellings above that look inside a type, tied to it: an inner width that
@@ -215,12 +219,12 @@ pub(crate) fn all() -> Vec<Probe> {
             budget_micros, headers, media, seed, block_size, prompt_chars, prompt_bytes, now_micros,
             session_counted, affinity, named,
             model_fingerprint, signal_cells, client_key, ring, ring_positions,
-            session_key_from_rid,
+            decode_ring_positions, session_key_from_rid,
         } host [
             prompt_chars, prompt_bytes, now_micros,
             session_counted,
             affinity, named, model_fingerprint, signal_cells, client_key, ring, ring_positions,
-            session_key_from_rid
+            decode_ring_positions, session_key_from_rid
         ],
         &request),
         probe!("zone-capacity", before [], ZoneCapacity { zone, healthy, total } host [], &zone),
@@ -237,8 +241,8 @@ pub(crate) fn all() -> Vec<Probe> {
             session_verdict, issued_micros, tokens, chars, bytes,
         } host [booked, session_verdict, issued_micros, chars, bytes], &lease),
         probe!("pair", before [], Pair {
-            decode_position, decode_id, decode_dp_rank, decode_verdict,
-        } host [decode_position, decode_verdict], &pair),
+            decode_position, decode_id, decode_dp_rank, decode_verdict, decode_placing,
+        } host [decode_position, decode_verdict, decode_placing], &pair),
         probe!("target", before [], Target { position, id, dp_rank, pair } host [position], &target),
         probe!("completed", before ["lease": "lease"], Outcome {
             side, served, status, class, ttft_micros, tokens_in, tokens_out, duration_micros,
@@ -278,61 +282,5 @@ pub fn drift() -> Vec<String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn every_record_probe_matches_its_descriptor() {
-        let drift = drift();
-        assert!(drift.is_empty(), "{}", drift.join("\n"));
-    }
-
-    /// The probe of a record tied to two structs reads the record's order
-    /// from its `order` list, and a field of either struct that the list and
-    /// `host` both leave out follows the list instead of vanishing: the
-    /// descriptor's test then names the record.
-    #[test]
-    fn a_field_the_order_leaves_out_follows_it() {
-        struct Row {
-            a: u32,
-            b: u64,
-            c: bool,
-        }
-        struct Column {
-            x: u32,
-            y: u16,
-        }
-        let row = Row {
-            a: 0,
-            b: 0,
-            c: false,
-        };
-        let column = Column { x: 0, y: 0 };
-        let probe = probe!("toy", before [],
-            Row { a, b, c } = &row,
-            Column { x, y } = &column,
-            order [b, x, a] host [c]);
-        assert_eq!(
-            probe.fields,
-            [("b", "u64"), ("x", "u32"), ("a", "u32"), ("y", "u16")]
-        );
-    }
-
-    #[test]
-    fn the_probes_cover_every_record_that_mirrors_a_struct() {
-        let probed: Vec<&str> = all().into_iter().map(|p| p.record).collect();
-        let records: Vec<&str> = super::super::types::TYPES
-            .iter()
-            .filter(|i| matches!(i, super::super::Item::Record { .. }))
-            .map(|i| i.name())
-            .collect();
-        for record in records {
-            // The host composes `dispatched` and the guest `score-answer`:
-            // neither mirrors a struct of the crate.
-            assert!(
-                matches!(record, "dispatched" | "score-answer") || probed.contains(&record),
-                "{record} has no probe"
-            );
-        }
-    }
-}
+#[path = "../../../tests/unit/plugins/wit/probes/tests.rs"]
+mod tests;

@@ -43,14 +43,14 @@ use openai_protocol::worker::RuntimeType;
 use replicas::{Lease, Record, Replica};
 use smg_grand_central::{
     service::{
-        controller::{Config, Controller, ElectionConfig, Listener, Scope, State, SERVICE_NAME},
+        controller::{Config, Controller, Listener, Scope, State, SERVICE_NAME},
         elector::ElectionSettings,
         proto::{
             self, grand_central_client::GrandCentralClient, register_worker_request::Mode,
             worker_event::Event,
         },
     },
-    store::{WorkerStatus, WorkersStore},
+    store::{WorkerRow, WorkerStatus, WorkersStore},
 };
 use tokio::{net::TcpListener, sync::oneshot, task::JoinSet};
 use tonic::{metadata::AsciiMetadataValue, transport::Channel, Code, Request};
@@ -62,11 +62,11 @@ use tonic_health::pb::{
 /// end. The renew deadline stays well under the kit's room for an agreement,
 /// so a leader whose lead opens one deadline after its take is seen in time.
 fn settings() -> ElectionSettings {
-    ElectionSettings {
-        duration: Duration::from_secs(60),
-        renew_period: Duration::from_millis(500),
-        renew_deadline: Duration::from_secs(10),
-    }
+    let mut settings = ElectionSettings::default();
+    settings.duration = Duration::from_secs(60);
+    settings.renew_period = Duration::from_millis(500);
+    settings.renew_deadline = Duration::from_secs(10);
+    settings
 }
 
 async fn client(addr: SocketAddr) -> GrandCentralClient<Channel> {
@@ -541,31 +541,23 @@ async fn the_leader_takes_a_fleet_through_the_door_and_reads_the_load_of_the_eng
 }
 
 fn listener(name: &str, scopes: &[Scope]) -> Listener {
-    Listener {
-        name: name.to_owned(),
-        addr: loopback(),
-        scopes: scopes.to_vec(),
-        tls: None,
-    }
+    Listener::of(name.to_owned(), loopback(), scopes.to_vec(), None)
 }
 
 fn config() -> Config {
-    Config {
-        controller_id: "door-0".to_owned(),
-        listeners: vec![
-            listener("gateway", &[Scope::Gateway, Scope::Ingestion]),
+    let mut config = Config::of(
+        "door-0".to_owned(),
+        vec![
+            listener("gateway", &[Scope::Gateway]),
             listener("control", &[Scope::Control]),
             listener("replication", &[Scope::Replication]),
         ],
-        admin: loopback(),
-        shutdown_settle: Duration::from_millis(50),
-        shutdown_grace: Duration::from_secs(5),
-        load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
-        worker_overload: Config::DEFAULT_WORKER_OVERLOAD,
-        decide_shards: 2,
-        election: ElectionConfig::default(),
-        discovery: None,
-    }
+        loopback(),
+    );
+    config.shutdown_settle = Duration::from_millis(50);
+    config.shutdown_grace = Duration::from_secs(5);
+    config.decide_shards = 2;
+    config
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -615,9 +607,33 @@ async fn the_store_holds_the_rows_the_door_answered() {
             .await
             .expect("registered")
             .into_inner();
+        // The second registration states what its worker states for a
+        // request's hard demands.
+        let stating = proto::WorkerSpec {
+            demand_facts: Some(proto::DemandFacts {
+                runtime: 7,
+                references: true,
+                host_pipeline: false,
+                window: 32_768,
+                decoding: 3,
+            }),
+            // It states that its worker takes images too.
+            vision: Some(true),
+            // And its worker's end of the encode handoff.
+            encode: Some(proto::EncodeOffer {
+                handoff: proto::EncodeHandoff::Push as i32,
+                producer: true,
+                consumer: false,
+                connector: "connector-a".to_owned(),
+                references: false,
+            }),
+            ..unchecked("http://127.0.0.1:9/b")
+        };
+        let block = stating.demand_facts;
+        let offer = stating.encode.clone();
         let waited = proto::RegisterWorkerRequest {
             wait_ready: true,
-            ..ask(unchecked("http://127.0.0.1:9/b"), Mode::Add)
+            ..ask(stating, Mode::Add)
         };
         let unchecked = operator
             .register_worker(stated(waited))
@@ -653,6 +669,33 @@ async fn the_store_holds_the_rows_the_door_answered() {
             rows.iter().map(|row| row.status).collect::<Vec<_>>(),
             [WorkerStatus::Pending, WorkerStatus::Ready]
         );
+        // What a registration states for a request's hard demands crosses
+        // the call: the answer's row tells the block, and the store's row
+        // holds it. A registration that states none is told no block.
+        assert_eq!(told.each_ref().map(|told| told.demand_facts), [None, block]);
+        let held = |row: &WorkerRow| {
+            let held = row.facts.demand_facts;
+            let media = (held.references, held.host_pipeline);
+            (held.runtime, media, held.window, held.decoding)
+        };
+        assert_eq!(held(&rows[0]), (0, (false, false), 0, 0));
+        assert_eq!(held(&rows[1]), (7, (true, false), 32_768, 3));
+        // So does whether the worker takes images. A registration that
+        // states none is told as taking none.
+        assert_eq!(told.each_ref().map(|told| told.vision), [false, true]);
+        assert_eq!([rows[0].facts.vision, rows[1].facts.vision], [false, true]);
+        // So does the worker's end of the encode handoff. A new worker's
+        // registration that states no block is told none.
+        assert_eq!(
+            told.each_ref().map(|told| told.encode.clone()),
+            [None, offer]
+        );
+        let end = |row: &WorkerRow| {
+            let offer = &row.facts.encode;
+            (offer.producer, offer.connector.clone())
+        };
+        assert_eq!(end(&rows[0]), (false, None));
+        assert_eq!(end(&rows[1]), (true, Some("connector-a".to_owned())));
 
         // A registration that states two ranks is answered a row a rank.
         let ranked = proto::WorkerSpec {

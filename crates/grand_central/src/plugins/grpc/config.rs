@@ -4,11 +4,6 @@
 //! directly. The parts a row has whatever its kind are the shared ones of
 //! [`crate::plugins::shared`], re-exported here.
 
-#![expect(
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
-
 use std::{fmt, path::PathBuf};
 
 use crate::document::spec::Needs;
@@ -19,7 +14,11 @@ pub(crate) use crate::plugins::shared::config::{
 /// The client side of mutual TLS: the authority that signed the plugin's
 /// certificate, the identity the plugin verifies, and the name pinned on the
 /// plugin's certificate.
+///
+/// The record gains fields: code outside this crate makes one by
+/// [`Tls::of`], and a pattern of it ends with `..`.
 #[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Tls {
     /// The server name the plugin's certificate must carry.
     pub server_name: String,
@@ -28,6 +27,24 @@ pub struct Tls {
     /// This host's certificate chain and private key, PEM.
     pub cert_pem: Vec<u8>,
     pub key_pem: Vec<u8>,
+}
+
+impl Tls {
+    /// The TLS of a dial to a plugin whose certificate carries
+    /// `server_name` and chains to `ca_pem`, under this host's own
+    /// `cert_pem` and `key_pem`. It takes all four fields: each is a part
+    /// of the guard, and none has a neutral value. It checks nothing: the
+    /// connect reads the PEMs. Code outside this crate starts here: the
+    /// record gains fields, so no literal of it builds there.
+    #[must_use]
+    pub fn of(server_name: String, ca_pem: Vec<u8>, cert_pem: Vec<u8>, key_pem: Vec<u8>) -> Self {
+        Self {
+            server_name,
+            ca_pem,
+            cert_pem,
+            key_pem,
+        }
+    }
 }
 
 /// The PEMs are withheld: the private key is one of them, and a host that

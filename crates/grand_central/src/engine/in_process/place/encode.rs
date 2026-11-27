@@ -5,10 +5,18 @@
 //! the first of them, and behind a first decision that sheds the request
 //! as saturated over a list of its pair, a rule the request states is
 //! asked of the pair's two lists once, and the call's later decisions are
-//! held to the workers it takes on each, as a pair's are and by the pair's
-//! own routine ([`pair::again`]). The rule is asked of no encoder there
-//! either, and no item is held to places of the rule's. So a shed made
-//! over the encoders stands, and no rule is asked behind it ([`asks`]).
+//! held to the workers it takes on each, as a pair's are and by the
+//! pair's own routine ([`pair::again`]). A request the encode pass is not
+//! laid for states no item and holds its decode to no images. Its rule is
+//! asked behind a shed with no endpoint for a side of its pair too, where
+//! it states no hard demand and a prefill of the lists pairs with a
+//! decode. The rule is asked of no encoder there either, and no item is
+//! held to places of the rule's. So a shed made for the encoders stands,
+//! and no rule is asked behind it.
+//! One as saturated is told by the decision's word of the list it shed
+//! over, which the routine reads. One with no endpoint names no side of
+//! the pair, and such a shed goes to no rule
+//! ([`pair::goes_to_the_rule`]).
 //!
 //! The engine's entry for an encode request decides the pair and each
 //! item's encoder in one call ([`Loaded::decide_encode_at`]). The
@@ -48,7 +56,6 @@ use super::{
 };
 use crate::{
     engine::{
-        decision::ShedReason,
         framework::{EncodeItems, EncodePlaced},
         in_process::Loaded,
         prefills_full, EncodeLists, WorkerLists,
@@ -176,9 +183,6 @@ fn asked<'a>(
         }
     });
     let Ok(walked) = &mut taken else {
-        // The decision's word of a shed it made over its encoders: such a
-        // shed stands ([`asks`]).
-        call.over_encoders = placed.shed_over_encoders();
         return taken;
     };
     let (workers, down) = read.into_inner().unwrap_or_default();
@@ -209,7 +213,8 @@ fn asked<'a>(
 /// What an ask answers, and [`Unplaced::NoWorkers`] where the call's last
 /// ask takes no placement. A rule that takes no worker of one of the
 /// pair's two lists sheds the request with no endpoint, under `admits`
-/// ([`super::hold_to_rule`]).
+/// ([`super::hold_to_rule`]), or leaves it its first decision's shed
+/// ([`pair::again`]).
 pub(super) fn place<'a>(
     engine: Loaded<'static, '_>,
     request: &PlaceRequest<'a>,
@@ -228,14 +233,21 @@ pub(super) fn place<'a>(
 /// lent the three lists with each side's places of the pair beside it: the
 /// pair's own routine does both ([`pair::again`]), whatever kept the ask
 /// from a placement, a side of the pair or an encoder. An ask that sheds
-/// the request as saturated over a list of its pair goes there too: it
-/// judged the overload over the lists it was lent, which a rule may
-/// narrow. A shed made over the encoders stands, and no rule is asked
-/// behind it: the rule is asked of no encoder, so it narrows nothing that
-/// decision judged, and a decision among its workers could only shed
-/// again. The decision says which shed it made
-/// ([`EncodePlaced::shed_over_encoders`]), whatever profiles its sides are
-/// decided under.
+/// the request goes there too, by the pair's own test
+/// ([`pair::goes_to_the_rule`]). A shed as saturated made over a list of
+/// its pair judged the overload over the lists it was lent, which a rule
+/// may narrow. One made over the encoders stands there, and no rule is
+/// asked behind it. The routine tells the two by the decision's own word
+/// of the list it shed over
+/// ([`ShedOver`](crate::engine::framework::ShedOver)), whatever profiles
+/// the request's sides are decided under. A first ask's shed with no
+/// endpoint goes there under a rule where it names a side of the pair
+/// and a prefill of the pair's lists pairs with a decode, for a request
+/// that states no hard demand and that the pass is not laid for: one
+/// with no item whose decode is held to no images, which is its pair's
+/// alone. One the pass is laid for keeps such a shed, as it did before a
+/// pair's decision asked its one question, and so does one that states a
+/// hard demand. One made for the encoders names no side.
 fn asks<'a>(
     engine: Loaded<'static, '_>,
     request: &PlaceRequest<'a>,
@@ -247,12 +259,7 @@ fn asks<'a>(
     let shed = match ask(engine, request, lists, items, lent, call) {
         Ok(Some(placement)) => return Ok(placement),
         Ok(None) => None,
-        Err(
-            shed @ Unplaced::Shed {
-                reason: ShedReason::Saturated,
-                ..
-            },
-        ) if !call.over_encoders => Some(shed),
+        Err(shed) if pair::goes_to_the_rule(request, &lists.pair, call, &shed) => Some(shed),
         Err(unplaced) => return Err(unplaced),
     };
     let next =

@@ -1823,7 +1823,10 @@ impl TokenTree {
     /// and a split hands the tenant's prefix to a new node: a count dropped
     /// whole left such a node standing uncounted, so the total read short
     /// by it and the tenant's next purge returned at a count of zero. A
-    /// node a split makes between the walk and its child's removal stays
+    /// node a split makes between a walk and its child's removal names the
+    /// tenant, counted, behind that walk: while the count reads above zero
+    /// the purge walks the whole tree again, `PURGE_PASSES` passes at most,
+    /// until a walk finds no node. What the last walk leaves stays
     /// the tenant's, counted, until its next purge. What can still drift is
     /// a count with no node behind it: a node attached ahead of the walk
     /// whose insert counts behind the debit. Such a count stays with the
@@ -1848,13 +1851,34 @@ impl TokenTree {
             nodes.clear();
             self.collect_tenant_nodes(&self.root, tenant_id, &mut nodes);
         }
-        let mut removed = 0;
-        for node in &nodes {
-            removed += self.remove_tenant_and_cleanup(node, tenant_id).0;
+        let mut passes = 1;
+        loop {
+            let mut removed = 0;
+            for node in &nodes {
+                removed += self.remove_tenant_and_cleanup(node, tenant_id).0;
+            }
+            self.sub_tenant_tokens(tenant_id, removed);
+            // Another tenant's insert that split a node between the walk and
+            // that node's removal left the tenant's prefix on a node the walk
+            // never saw, under ancestors this pass cleared: the count still
+            // holds it, and only the complete walk reaches it.
+            if passes == Self::PURGE_PASSES || self.tenant_token_size(tenant_id) == 0 {
+                break;
+            }
+            passes += 1;
+            nodes.clear();
+            self.collect_tenant_nodes(&self.root, tenant_id, &mut nodes);
+            if nodes.is_empty() {
+                break;
+            }
         }
-        self.sub_tenant_tokens(tenant_id, removed);
         self.drop_count_at_zero(tenant_id);
     }
+
+    /// The passes one purge makes at most: its first, and one more for each
+    /// pass that ends with the tenant's count above zero. The first pass
+    /// walks the tree twice where its pruned walk and the count disagree.
+    const PURGE_PASSES: usize = 3;
 
     /// Drops a tenant's count entry where it reads zero, and only there: an
     /// insert may have counted since the entry was last read.
@@ -1987,24 +2011,51 @@ impl TokenTree {
         node: &NodeRef,
         result: &mut Vec<(NodeRef, TenantId, u64)>,
     ) {
-        for child_entry in &node.children {
-            self.collect_all_tenant_leaves(child_entry.value(), result);
+        // The children are named under the guards of the child map and walked
+        // behind them: the walk below a child holds no shard of its parent.
+        let children: Vec<NodeRef> = node
+            .children
+            .iter()
+            .map(|child| Arc::clone(child.value()))
+            .collect();
+        for child in &children {
+            self.collect_all_tenant_leaves(child, result);
         }
 
         // Root is never eligible for eviction
         if Arc::ptr_eq(node, &self.root) {
             return;
         }
-        for entry in &node.tenant_last_access_time {
-            let tenant = entry.key();
-            let any_child_has_tenant = node.children.iter().any(|child| {
-                child
-                    .value()
-                    .tenant_last_access_time
-                    .contains_key(tenant.as_ref())
-            });
-            if !any_child_has_tenant {
-                result.push((Arc::clone(node), Arc::clone(tenant), *entry.value()));
+        // No child was listed: each of the node's tenants is queued straight
+        // from the stamp map, as no child is asked under its guard. A child
+        // attached since is met by the leaf check where the entry is popped.
+        if children.is_empty() {
+            for entry in &node.tenant_last_access_time {
+                result.push((Arc::clone(node), Arc::clone(entry.key()), *entry.value()));
+            }
+            return;
+        }
+        // The tenants are named first, and the guard of the stamp map ends
+        // with the list: no child is probed under it, so a match that stamps
+        // this node does not wait behind a probe.
+        let tenants: Vec<TenantId> = node
+            .tenant_last_access_time
+            .iter()
+            .map(|entry| Arc::clone(entry.key()))
+            .collect();
+        for tenant in tenants {
+            let any_child_has_tenant = children
+                .iter()
+                .any(|child| child.tenant_last_access_time.contains_key(tenant.as_ref()));
+            if any_child_has_tenant {
+                continue;
+            }
+            let stamp = node
+                .tenant_last_access_time
+                .get(tenant.as_ref())
+                .map(|ts| *ts);
+            if let Some(ts) = stamp {
+                result.push((Arc::clone(node), tenant, ts));
             }
         }
     }

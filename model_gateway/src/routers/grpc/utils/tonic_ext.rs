@@ -56,7 +56,10 @@ pub(crate) trait TonicStatusExt {
     /// reset below gRPC, a protocol fault), whatever code tonic picked from
     /// the frame's reason, and one made of the socket under the call
     /// failing (the connection reset or closed with the call in flight),
-    /// which tonic has no code for.
+    /// which tonic has no code for. A worker's answer above the receive
+    /// bound ([`is_receive_bound_refusal`]) is a bad gateway too: an answer
+    /// the gateway could not read, where any other `OUT_OF_RANGE` is the
+    /// request's fault.
     fn http_status(&self) -> StatusCode;
 
     /// Convert this gRPC error into an HTTP error response with the appropriate
@@ -83,10 +86,11 @@ pub(crate) trait TonicStatusExt {
     /// predicates, in the same order: a constraint the engine could not
     /// continue under, a fault of the request's media, the worker's
     /// connection failing under the call (an HTTP/2 or socket fault, or the
-    /// worker's side cancelling), then the code the worker answered: its
-    /// deadline, its capacity pushback, its unavailability, the request's
-    /// own fault, the engine's own report that the request failed, or a
-    /// failure inside the worker.
+    /// worker's side cancelling), a worker's answer above the receive bound
+    /// ([`is_receive_bound_refusal`], a bad response), then the code the
+    /// worker answered: its deadline, its capacity pushback, its
+    /// unavailability, the request's own fault, the engine's own report
+    /// that the request failed, or a failure inside the worker.
     fn error_reason(&self) -> &'static str;
 
     /// The worker's report that the request's media failed, when the status
@@ -127,8 +131,17 @@ pub(crate) trait TonicStatusExt {
     /// worker that fetched it, and for a constraint the engine could not
     /// continue the request under, or one the worker refused as
     /// unenforceable, which say nothing about the worker
-    /// either.
+    /// either, and for a worker's answer above the receive bound, which the
+    /// worker gave rightly ([`is_receive_bound_refusal`]).
     fn breaker_status(&self) -> Option<u16>;
+
+    /// What Grand Central is told where this failure ends a request
+    /// (`RequestEnd::report_with`): the status the circuit breaker samples
+    /// for it ([`TonicStatusExt::breaker_status`]), and whether the worker
+    /// itself answered it ([`TonicStatusExt::is_no_answer`]). `None` where
+    /// the breaker takes no sample: the failure says nothing about the
+    /// worker, and nobody reports it.
+    fn end_status(&self) -> Option<(u16, bool)>;
 
     /// The client's answer when the status is a worker's report that the
     /// engine could not continue the request under the request's own
@@ -196,6 +209,19 @@ fn is_frame_cap_refusal(status: &tonic::Status) -> bool {
     }
 }
 
+/// Whether `status` is a decoder's refusal of a message above its receive
+/// bound (`max_decoding_message_size`, tonic's default where none is set):
+/// `OUT_OF_RANGE` in the words of tonic 0.14's `codec::decode`, private
+/// wording a tonic bump re-checks here. The gateway's own client answers so
+/// for a worker's message it cannot read: the request was valid, the worker
+/// did nothing wrong, and another worker's answer would be as large.
+pub(crate) fn is_receive_bound_refusal(status: &tonic::Status) -> bool {
+    status.code() == Code::OutOfRange
+        && status
+            .message()
+            .contains("decoded message length too large")
+}
+
 impl TonicStatusExt for tonic::Status {
     fn http_status(&self) -> StatusCode {
         if is_constraint_failure(self) {
@@ -222,6 +248,11 @@ impl TonicStatusExt for tonic::Status {
         // all. The worker's connection failed under the call: a 502 the
         // breaker samples and the retry layer replays elsewhere.
         if is_transport_failure(self) {
+            return StatusCode::BAD_GATEWAY;
+        }
+        // The worker's answer was above the receive bound: an answer the
+        // gateway could not read, not a fault of the request.
+        if is_receive_bound_refusal(self) {
             return StatusCode::BAD_GATEWAY;
         }
         match self.code() {
@@ -257,6 +288,11 @@ impl TonicStatusExt for tonic::Status {
         } else {
             error::create_error(self.http_status(), code, msg)
         };
+        // An answer above the receive bound is as large from any worker:
+        // final for the retry layer.
+        if is_receive_bound_refusal(self) {
+            mark_non_retryable(&mut response);
+        }
         mark_error_reason(&mut response, self.error_reason());
         response
     }
@@ -282,6 +318,9 @@ impl TonicStatusExt for tonic::Status {
         }
         if is_transport_failure(self) {
             return REASON_TRANSPORT_DISCONNECT;
+        }
+        if is_receive_bound_refusal(self) {
+            return REASON_BAD_RESPONSE;
         }
         match self.code() {
             Code::Cancelled => REASON_TRANSPORT_DISCONNECT,
@@ -339,10 +378,16 @@ impl TonicStatusExt for tonic::Status {
         if is_constraint_failure(self)
             || is_constraint_refusal(self)
             || self.media_fault().is_some()
+            || is_receive_bound_refusal(self)
         {
             return None;
         }
         Some(self.http_status().as_u16())
+    }
+
+    fn end_status(&self) -> Option<(u16, bool)> {
+        self.breaker_status()
+            .map(|status| (status, !self.is_no_answer()))
     }
 
     fn constraint_failure_response(&self) -> Option<Response> {
@@ -620,6 +665,28 @@ mod tests {
         }
     }
 
+    /// What a failure tells Grand Central where it ends a request: the
+    /// status the breaker samples for it and whether the worker answered
+    /// it. A failure the breaker takes no sample of tells nothing.
+    #[test]
+    fn a_failure_tells_the_engine_what_the_breaker_samples_and_who_answered() {
+        assert_eq!(
+            tonic::Status::internal("the engine failed").end_status(),
+            Some((500, true))
+        );
+        assert_eq!(
+            tonic::Status::invalid_argument("a bad request").end_status(),
+            Some((400, true))
+        );
+        assert_eq!(
+            tonic::Status::cancelled("the worker's side ended the call").end_status(),
+            Some((502, false))
+        );
+        let constraint = smg_grpc_client::constraint_failed_status("no token fits the grammar");
+        assert_eq!(constraint.breaker_status(), None);
+        assert_eq!(constraint.end_status(), None);
+    }
+
     #[test]
     fn invalid_argument_maps_to_400_and_is_not_a_circuit_breaker_failure() {
         for status in [
@@ -801,6 +868,34 @@ mod tests {
         // A code this router does not know names no fetch: the worker's words
         // reach the client under the fallback code.
         assert_eq!(unknown.media_message(WorkerMediaFault::Client), "new words");
+    }
+
+    /// A worker's message above the receive bound is refused by the gateway's
+    /// own decoder, `OUT_OF_RANGE` in the words of tonic 0.14's
+    /// `codec::decode`. The request was valid and the answer could not be
+    /// read: an upstream fault, as an HTTP router answers for its size bound.
+    #[test]
+    fn a_worker_message_above_the_receive_bound_is_an_upstream_fault() {
+        use crate::routers::common::retry::is_retryable_response;
+
+        let refused = tonic::Status::out_of_range(
+            "Error, decoded message length too large: found 9886731 bytes, the limit is: 4194304 bytes",
+        );
+        assert_eq!(refused.http_status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(refused.error_reason(), metrics_labels::REASON_BAD_RESPONSE);
+        // The worker did nothing wrong, and another worker's answer would
+        // be as large: no breaker sample, no report, no replay; the code a
+        // client knows stays.
+        assert_eq!(refused.breaker_status(), None);
+        assert_eq!(refused.end_status(), None);
+        let answer = refused.to_http_error("worker_stream_failed", "too large".to_string());
+        assert_eq!(answer.status(), StatusCode::BAD_GATEWAY);
+        assert!(!is_retryable_response(&answer));
+        // Any other `OUT_OF_RANGE` stays the 400 it was, sampled and final.
+        let plain = tonic::Status::out_of_range("position 9 is past the end");
+        assert_eq!(plain.http_status(), StatusCode::BAD_REQUEST);
+        assert_eq!(plain.error_reason(), metrics_labels::REASON_INVALID_REQUEST);
+        assert_eq!(plain.breaker_status(), Some(400));
     }
 
     /// The gateway's sentence stands only for a status that names a fetch. A

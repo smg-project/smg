@@ -45,10 +45,9 @@
 //! them: the workers the request may be placed on, or its refusal. Each
 //! must replay answer for answer, a refusal by its status and its code.
 //! A pair-select row holds the gateway's answers to the requests of a
-//! prefill pool and a decode pool: the pair, or no pair and why. It must
-//! replay answer for answer, and a drawn row pair for pair and share for
-//! share. The pair-select module holds five recorded rows the pair's
-//! decision answers apart to the answer each entry gives.
+//! prefill pool and a decode pool: the pair, or no pair, for which role
+//! and why. It must replay answer for answer, a refusal by its reason and
+//! its role, and a drawn row pair for pair and share for share.
 //! A pair-bound row is a pair-select row behind the prefill admission,
 //! where a prefill that holds the admission's bound has an open partner or
 //! has none. Its sheet is its own and its replay the pair-select module's,
@@ -57,6 +56,17 @@
 //! runtime's request, where the workers of one known runtime stand beside
 //! workers of another or of none. Its sheet is its own too, and its replay
 //! the pair-select module's, answer for answer.
+//! A pair-named row is a pair-select row whose requests name their worker
+//! under `x-smg-target-worker`. Its sheet is its own, and so is its
+//! replay: through the engine's one call for a host in process, answer
+//! for answer.
+//! A pair-sticky row holds the gateway's answers to the requests of a
+//! prefill pool and a decode pool under the sticky routing-key override,
+//! between steps that write what the router holds of a worker. Its replay
+//! is its own too: through that one call, under the document the routing
+//! settings give for the row, answer for answer, and a drawn row pair for
+//! pair and share for share. Its module names the recorded rows the
+//! settings write no document for.
 //! No row is decided differently but where its module names it. The prefix
 //! hash module holds a recorded row that a key of whole blocks cannot
 //! decide as recorded to the outcome its entry gives. The sticky rank
@@ -97,8 +107,10 @@ mod classic {
     pub mod overload;
     pub mod pair_bound;
     pub mod pair_index;
+    pub mod pair_named;
     pub mod pair_runtime;
     pub mod pair_select;
+    pub mod pair_sticky;
     pub mod power_of_two;
     pub mod prefix_hash;
     pub mod retry_wire;
@@ -297,7 +309,13 @@ const fn module<R: Recorded>(inline: &'static str) -> Module {
 /// A pair-bound row and a pair-runtime row have the pair-select row's
 /// shape: each module names its own sheet and replays it by the pair-select
 /// module's replay, and holds a copied row whole.
-const MODULES: [Module; 18] = [
+/// A pair-named row has that shape and two words more: its module brings
+/// its own replay, through the engine's one call, and holds a copied row
+/// whole.
+/// A pair-sticky row is a list of steps: its module brings its own replay,
+/// through that call under the settings' own document, and holds a copied
+/// row whole.
+const MODULES: [Module; 20] = [
     module::<classic::all_vetoed::Row>(classic::all_vetoed::INLINE),
     module::<classic::bucket::Row>(classic::bucket::INLINE),
     module::<classic::cache_aware::Row>(classic::cache_aware::INLINE),
@@ -345,6 +363,12 @@ const MODULES: [Module; 18] = [
         copied: classic::pair_index::copied_row_defects,
     },
     Module {
+        policy: classic::pair_named::POLICY,
+        inline: classic::pair_named::INLINE,
+        replay: classic::pair_named::replay_rows,
+        copied: whole_row_defects,
+    },
+    Module {
         policy: classic::pair_runtime::POLICY,
         inline: classic::pair_runtime::INLINE,
         replay: classic::pair_runtime::replay_rows,
@@ -354,6 +378,12 @@ const MODULES: [Module; 18] = [
         policy: classic::pair_select::POLICY,
         inline: classic::pair_select::INLINE,
         replay: classic::pair_select::replay_rows,
+        copied: whole_row_defects,
+    },
+    Module {
+        policy: classic::pair_sticky::POLICY,
+        inline: classic::pair_sticky::INLINE,
+        replay: classic::pair_sticky::replay_rows,
         copied: whole_row_defects,
     },
     module::<classic::power_of_two::Row>(classic::power_of_two::INLINE),
@@ -1301,8 +1331,10 @@ fn every_json_file_of_the_directory_is_a_sheet_to_answer_for() {
             "overload.json",
             "pair-bound.json",
             "pair-index.json",
+            "pair-named.json",
             "pair-runtime.json",
             "pair-select.json",
+            "pair-sticky.json",
             "power_of_two.json",
             "prefix_hash.json",
             "retry-wire.json",

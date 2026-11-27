@@ -69,6 +69,44 @@ impl HealthWrite {
     }
 }
 
+/// A status writer's word of its lead (`MemoryStore::status_told`): its own
+/// read of whether it leads still, and the term that read speaks of where
+/// the writer names one.
+#[cfg(feature = "worker-host")]
+#[derive(Clone, Copy)]
+pub(crate) struct LeadWord<'a> {
+    /// Whether the writer leads still, by its own read. The holder of the
+    /// worker objects asks it under an object's lock, and the store asks
+    /// it behind its membership lock.
+    pub(crate) leads: &'a dyn Fn() -> bool,
+    /// The term the write is made under. The journal compares it in the
+    /// take of its lock that gives the event its place. A writer with no
+    /// term names none, and its write is journaled as the store's own.
+    pub(crate) term: Option<u64>,
+}
+
+#[cfg(feature = "worker-host")]
+impl<'a> LeadWord<'a> {
+    /// The word of a writer that names no term: `leads`, its own read.
+    pub(crate) fn of(leads: &'a dyn Fn() -> bool) -> Self {
+        Self { leads, term: None }
+    }
+}
+
+#[cfg(feature = "worker-host")]
+impl LeadWord<'static> {
+    /// The word of a writer with no term to end: it always holds.
+    pub(crate) const FREE: Self = Self {
+        leads: &always,
+        term: None,
+    };
+}
+
+#[cfg(feature = "worker-host")]
+fn always() -> bool {
+    true
+}
+
 /// Where a gateway's own health words are written. The pool's view is the
 /// prober's, on the worker objects; a gateway's breaker and liveness
 /// vetoes are its own and mask the worker for that gateway alone.

@@ -48,7 +48,7 @@ pub(crate) async fn grpc_ctx(mode: RoutingMode) -> Arc<AppContext> {
 
 /// [`grpc_ctx`] with the gateway's `--parser` choice and its
 /// `--tool-call-parser` name, which under Symphony pins the table that
-/// answers to it for every model the registry does not know.
+/// answers to it for every model whose workers label no parser.
 pub(crate) async fn grpc_ctx_with_parsers(
     mode: RoutingMode,
     parser: ParserChoice,

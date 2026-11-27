@@ -3,18 +3,14 @@
 //! one binary:
 //!
 //! - `policy_store_journal/status_write/<plain|journaled|told>/<n>`: one
-//!   status flip of a member, published at once; `told` is the journaled
+//!   status flip of a member, which publishes nothing; `told` is the journaled
 //!   write on a log with a listener of the watched kinds, as a controller
-//!   with a watch open has: the write's telling is in the cell. Under the
-//!   `worker-host` feature `followed` is that write with the worker
-//!   objects following the store: the listener wakes their follower, which
-//!   reads the store's tail on a thread of its own and waits again. The
-//!   wake is in the cell. For a run pinned to two cores; no gate reads it;
+//!   with a watch open has: the write's telling is in the cell;
 //! - `policy_store_journal/member_write/<plain|journaled>/<n>`: one refresh
 //!   of a member's facts, the pool derived again;
 //! - `policy_store_journal/read/<events>`: one reader's copy of a batch of
-//!   status events out of the log, each with its row, the longest the log's
-//!   lock is held;
+//!   status events out of the log, each with the models its row serves, the
+//!   longest the log's lock is held;
 //! - `policy_store_journal/read/watched_at_head`: a watch's read at the
 //!   log's head: nothing to copy, the lock and the look at the log alone.
 //!   The log of the three read cells holds a full ring;
@@ -23,6 +19,11 @@
 //!
 //! Every member is ready, in a store that leads a term as a serving
 //! controller's does. The journaled store's log retains 4,096 events.
+//!
+//! The stores have no holder of worker objects. Each write is a decided
+//! change handed to the store ([`MemoryStore::follow`]): the bench states
+//! the row and counts the epoch. A store that leads its term journals such
+//! a write as its own.
 #![expect(
     clippy::expect_used,
     reason = "a bench's setup has no caller to answer"
@@ -31,22 +32,19 @@
 #[path = "common/filled.rs"]
 mod filled;
 
-use std::{hint::black_box, sync::Arc};
+use std::{hint::black_box, sync::Arc, time::Instant};
 
 use criterion::{
     criterion_group, criterion_main, measurement::WallTime, BenchmarkGroup, BenchmarkId, Criterion,
 };
-#[cfg(feature = "worker-host")]
-use smg_grand_central::worker_host::{Members, Objects};
 use smg_grand_central::{
     engine::{Role, WorkerId},
     service::replication::Log,
-    store::{LeasesStore, MemoryStore, Position, WorkerFacts, WorkerStatus, WorkersStore},
+    store::{
+        identity, LeasesStore, MembershipChange, MemoryStore, Position, Registrant, WorkerFacts,
+        WorkerRow, WorkerStatus, WorkersStore,
+    },
 };
-#[cfg(feature = "worker-host")]
-use smg_worker::registry::WorkerRegistry;
-#[cfg(feature = "worker-host")]
-use tokio::{runtime::Builder, sync::Notify, task::JoinSet};
 
 const SIZES: [usize; 3] = [8, 64, 512];
 const MODEL: &str = "m";
@@ -65,6 +63,38 @@ fn facts(index: usize, priority: i32) -> WorkerFacts {
         priority,
         ..WorkerFacts::default()
     }
+}
+
+/// The row of `facts` as a registration by a control call leaves it, in
+/// `status` at `revision`. The stores here have no holder of worker
+/// objects: each takes a row as a decided change ([`MemoryStore::follow`]).
+/// The bench states the row and counts the epoch the write steps to.
+fn row_of(
+    facts: WorkerFacts,
+    status: WorkerStatus,
+    revision: u64,
+    admitted_at: Instant,
+) -> WorkerRow {
+    WorkerRow {
+        id: identity(&facts.key, facts.incarnation),
+        facts,
+        status,
+        revision,
+        admitted_at,
+        maker: Registrant::Control,
+    }
+}
+
+/// The status of the row `id` moved from `from` to `to`, as the store's
+/// write `epoch`.
+fn moved(store: &MemoryStore, epoch: u64, id: WorkerId, from: WorkerStatus, to: WorkerStatus) {
+    let change = MembershipChange::StatusChanged { id, from, to };
+    store.follow(Position::default(), epoch, change, None);
+}
+
+/// The store stands at the epoch the bench counted: each write landed.
+fn landed(store: &MemoryStore, epoch: u64) {
+    assert_eq!(WorkersStore::epoch(store), epoch, "a write did not land");
 }
 
 /// One pool of `n` members, each ready and published, in a store with no
@@ -91,17 +121,27 @@ fn pool_on(n: usize, log: Option<Log>) -> Pool {
     };
     // The store leads: its writes are journaled under its term.
     store.set_term(1);
+    let now = Instant::now();
+    let mut epoch = WorkersStore::epoch(&store);
     let ids: Vec<WorkerId> = (0..n)
         .map(|index| {
-            let id = store.upsert(facts(index, 0)).id();
+            let row = row_of(facts(index, 0), WorkerStatus::Pending, 1, now);
+            let id = row.id;
+            let registered = MembershipChange::Registered { id };
+            store.follow(Position::default(), epoch + 1, registered, Some(row));
             store.publish_now();
-            let revision = WorkersStore::get(&store, id).expect("the row").revision;
-            store
-                .set_status(id, WorkerStatus::Ready, revision)
-                .expect("ready");
+            epoch += 2;
+            moved(
+                &store,
+                epoch,
+                id,
+                WorkerStatus::Pending,
+                WorkerStatus::Ready,
+            );
             id
         })
         .collect();
+    landed(&store, epoch);
     filled::filled(&store, MODEL, Role::Single, n);
     Pool { store, log, ids }
 }
@@ -124,64 +164,22 @@ fn status_write(c: &mut Criterion) {
             flips(&mut group, kind, n, &build(n));
         }
     }
-    #[cfg(feature = "worker-host")]
-    followed(&mut group);
     group.finish();
 }
 
-/// One status flip of the pool's middle member, published at once.
+/// One status flip of the pool's middle member: no world is published.
 fn flips(group: &mut BenchmarkGroup<'_, WallTime>, kind: &str, n: usize, pool: &Pool) {
     let id = pool.ids[n / 2];
-    let mut ready = true;
+    let (mut from, mut to) = (WorkerStatus::Ready, WorkerStatus::NotReady);
+    let mut epoch = WorkersStore::epoch(&pool.store);
     group.bench_with_input(BenchmarkId::new(kind, n), &n, |b, _| {
         b.iter(|| {
-            ready = !ready;
-            let status = if ready {
-                WorkerStatus::Ready
-            } else {
-                WorkerStatus::NotReady
-            };
-            let revision = WorkersStore::get(&pool.store, id)
-                .expect("the row")
-                .revision;
-            black_box(pool.store.set_status(id, status, revision));
+            epoch += 1;
+            moved(&pool.store, epoch, black_box(id), from, to);
+            (from, to) = (to, from);
         });
     });
-}
-
-/// The `told` write with the worker objects following the store, as a
-/// controller that hosts them has: the log's listener wakes their follower
-/// on a runtime thread of its own, and each wake reads the store's tail to
-/// its end. A status change builds nothing there, so the cell holds the
-/// wake and what the follower's read takes of the store's lock.
-#[cfg(feature = "worker-host")]
-fn followed(group: &mut BenchmarkGroup<'_, WallTime>) {
-    let runtime = Builder::new_multi_thread()
-        .worker_threads(1)
-        .build()
-        .expect("a runtime");
-    for n in SIZES {
-        let moved = Arc::new(Notify::new());
-        let told = Arc::clone(&moved);
-        let log = Log::new(WATCHED).on_watched(move || told.notify_one());
-        let pool = Arc::new(pool_on(n, Some(log)));
-        let objects = Objects::new(Arc::new(WorkerRegistry::<Members>::new()));
-        // Ended with the set, at the end of this size.
-        let mut follower = JoinSet::new();
-        follower.spawn_on(
-            {
-                let pool = Arc::clone(&pool);
-                async move {
-                    loop {
-                        objects.follow(&pool.store);
-                        moved.notified().await;
-                    }
-                }
-            },
-            runtime.handle(),
-        );
-        flips(group, "followed", n, &pool);
-    }
+    landed(&pool.store, epoch);
 }
 
 fn member_write(c: &mut Criterion) {
@@ -190,14 +188,25 @@ fn member_write(c: &mut Criterion) {
     for (kind, journaled) in KINDS {
         for n in SIZES {
             let pool = pool_of(n, journaled);
+            let id = pool.ids[n / 2];
+            let now = Instant::now();
             let mut turn = 0i32;
+            let mut epoch = WorkersStore::epoch(&pool.store);
+            let mut revision = 1;
             group.bench_with_input(BenchmarkId::new(kind, n), &n, |b, _| {
                 b.iter(|| {
                     turn = turn.wrapping_add(1);
-                    black_box(pool.store.upsert(facts(n / 2, turn)));
-                    pool.store.publish_now();
+                    epoch += 1;
+                    revision += 1;
+                    // The member's row as its refresh leaves it.
+                    let row = row_of(facts(n / 2, turn), WorkerStatus::Ready, revision, now);
+                    let refreshed = MembershipChange::Relabelled { id };
+                    let store = &pool.store;
+                    store.follow(Position::default(), epoch, refreshed, Some(black_box(row)));
+                    store.publish_now();
                 });
             });
+            landed(&pool.store, epoch);
         }
     }
     group.finish();
@@ -210,25 +219,22 @@ fn read(c: &mut Criterion) {
     // The ring full and written half over again, as a controller
     // that ran a while holds it: the ring's buffer is wrapped at its
     // middle, and a reader's search of it is the search of a full ring.
+    let mut epoch = WorkersStore::epoch(&pool.store);
     for turn in 0..WATCHED + WATCHED / 2 {
-        let status = if turn % 2 == 0 {
-            WorkerStatus::NotReady
+        let (from, to) = if turn % 2 == 0 {
+            (WorkerStatus::Ready, WorkerStatus::NotReady)
         } else {
-            WorkerStatus::Ready
+            (WorkerStatus::NotReady, WorkerStatus::Ready)
         };
-        let revision = WorkersStore::get(&pool.store, pool.ids[0])
-            .expect("the row")
-            .revision;
-        pool.store
-            .set_status(pool.ids[0], status, revision)
-            .expect("a flip");
+        epoch += 1;
+        moved(&pool.store, epoch, pool.ids[0], from, to);
     }
+    landed(&pool.store, epoch);
     // The store took term 1 before its first write: every position stands
     // under it.
-    let after = Position {
-        seq: log.head().seq - 2_048,
-        term: 1,
-    };
+    let mut after = Position::default();
+    after.seq = log.head().seq - 2_048;
+    after.term = 1;
     for events in [16usize, 256] {
         let mut out = Vec::with_capacity(events);
         // Checked ahead of the timed id: a filtered run skips its routine.

@@ -49,10 +49,10 @@ pub struct WorkerData {
     /// hands a channel ([`InProcess::set_loads`]).
     pub loads: Option<LoadReceiver>,
     /// The program's indexes of cache events, by model, and with them its
-    /// token tree, where it keeps one ([`CacheIndexes::token_tree`]). `None`
-    /// from a program that keeps neither: every worker reads as publishing
-    /// no cache events, and no request is decided inside a tree of the
-    /// program's.
+    /// two trees, where it keeps them ([`CacheIndexes::token_tree`],
+    /// [`CacheIndexes::string_tree`]). `None` from a program that keeps
+    /// none of them: every worker reads as publishing no cache events, and
+    /// no request is decided inside a tree of the program's.
     pub cache_indexes: Option<Arc<dyn CacheIndexes>>,
 }
 
@@ -123,4 +123,5 @@ impl InProcess {
 }
 
 #[cfg(test)]
+#[path = "../../../tests/unit/engine/in_process/start/tests.rs"]
 mod tests;

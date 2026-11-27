@@ -4,8 +4,9 @@
 //! The store is the truth of who the workers are. What reads a worker's
 //! signals (its loads, its cache events, its health) is the worker crate's
 //! and works over that crate's object and registry. This module is the
-//! projection between the two. [`Objects`] follows the store's membership
-//! and writes the registry: a row arrives and its object is built, a row's
+//! projection between the two. Every writer of a row writes through
+//! [`Objects`], which writes the registry:
+//! a row arrives and its object is built, a row's
 //! facts change and its object is replaced under the same id, a row goes and
 //! its object is dropped. A leader and a standby run the same path over the
 //! same rows.
@@ -35,16 +36,15 @@
 //! | `zone`, `encode`, `max_running`, `priority` | not carried: a decision's facts, read of the store's rows and never of an object |
 //! | `vision`, `demand_facts` | not carried to the object: a decision's facts, which the holder keeps beside the object and lends with each list (`Objects::lent`) |
 //! | `pairing` | not carried to the object: a decision's fact, read of the store's rows. The object derives its own at its build ([`pairing_descriptor`] reads it). [`facts()`] keeps the standing row's, and so does the controller's door, whose log carries none. A row that states none pairs by its object's own, so [`facts()`] lays the pairing facts a worker's spec holds among the row's labels |
-//! | `overload` | not carried to the object by a holder built with no thresholds: nothing judges its workers. Under a host whose own load monitor judges it ([`Objects::with_overload_thresholds`]), the object's thresholds: the row's own, each over the host's default for its signal, the usage as a ratio. A row of the external runtime takes no default. [`facts()`] states the thresholds of the object's own registration over the standing row's. A replacement by id states them whole: one it leaves out is cleared ([`Over::Replaced`]) |
+//! | `overload` | not carried to the object by a holder built with no thresholds: nothing judges its workers. Under a host whose own load monitor judges it ([`Objects::with_overload_thresholds`]), the object's thresholds: the row's own, each over the host's default for its signal, the usage as a ratio. A row of the external runtime takes no default, and no row takes one while the host's document switches it off ([`Objects::state_overload_switch`]). [`facts()`] states the thresholds of the object's own registration over the standing row's. A replacement by id states them whole: one it leaves out is cleared ([`Over::Replaced`]) |
 //!
 //! A new object starts at its row's status. A replacement takes the
-//! standing object's running state, including its status. A host that gets
-//! health from the rows can use [`Objects::with_status_followed`] to copy
-//! their status on tail changes and snapshots, for objects kept or laid
-//! again. The holder checks the row's revision under the object's
-//! mutation lock and hands the registry the status: the registry's
-//! subscribers hear the change, and a
-//! promotion comes back as any promotion does. The host's vetoes stand.
+//! standing object's running state, including its status. From there an
+//! object's status leads its row's: a host writes a status on the object,
+//! by its connect signal and its drain ([`Objects::connect_row`],
+//! [`Objects::drain_row`]) and by its health driver ([`HealthAdapter`]),
+//! and the store is told. A status written into the store's table alone
+//! does not move the object.
 //! The id and the revision stand beside the object in the
 //! holder ([`RowRevision`]), with every fact of the row the object does not
 //! hold as stated: inside the crate the two together state the row
@@ -55,8 +55,8 @@
 //! the rows its registrations wrote: a row no registration of this host
 //! stated takes none. Where a registration's answer says so, the host has
 //! the holder lay the address's objects again ([`Objects::lay_again`]).
-//! [`registration_into_store_keeping_credentials`] makes these calls with the
-//! keeper the host's holder was built with.
+//! [`registration_into_store_keeping_credentials`] has the holder make these
+//! calls, with the keeper the holder was built with.
 //!
 //! # The adapters
 //!
@@ -83,6 +83,12 @@
 //! above rank 0 of a data-parallel worker gets no feed yet ([`SkipReason`]).
 //! The module `kv` names the decode's limits.
 //!
+//! The stock controller lends its engine the tables' indexes through the
+//! engine's own traits: the index the streams write, with no second copy
+//! (the module `kv_read`). A worker's number there is its row's place in
+//! its model's index, found from the worker's address through the registry
+//! and the holder's record beside the object.
+//!
 //! # The door
 //!
 //! The host hands out a [`MembershipWriter`] door. The crate holds one: the
@@ -102,7 +108,7 @@
 //! # What the module does not hold
 //!
 //! It builds no registry and no engine. The host builds the registry and
-//! hands it in, and calls [`Objects::follow`] where the store moved.
+//! hands it in, and writes its rows through [`Objects`].
 //! [`KvFeed::run`], its follow of the cache events, is a future the host
 //! drives. The collector under it starts a task for each worker it streams
 //! and ends them at the stop. It names nothing of the controller.
@@ -113,6 +119,8 @@ mod health;
 mod kv;
 mod kv_cursor;
 mod kv_feed;
+#[cfg(feature = "controller")]
+mod kv_read;
 mod kv_tables;
 mod lead;
 mod loads;
@@ -132,20 +140,18 @@ pub use found::{facts, pairing_descriptor};
 pub use health::HealthAdapter;
 pub use kv::{KvAdapter, KvHost, SkipReason, SkippedSubscriptions};
 pub use kv_feed::KvFeed;
+#[cfg(feature = "controller")]
+pub(crate) use kv_read::EventIndexes;
 pub use kv_tables::KvTables;
 pub use lead::{Lead, SoleLead};
 pub use loads::load_monitor;
 pub use members::Members;
 #[cfg(feature = "in-process")]
 pub use members::{EncodeColumns, OpenAdmission};
-#[cfg(all(test, feature = "controller"))]
-pub(crate) use membership_writer::tests::{
-    check_event_signal, check_expectations, check_guard, check_health_scope, check_maker,
-    check_one_row, check_provider, check_rank_rows, check_refresh, FindOne, Rows, StoreDoor,
-};
 #[cfg(feature = "controller")]
 pub(crate) use membership_writer::{
-    drain, lay, lay_one, lay_ready, refresh, stating, take, Ready, Stated, Turn,
+    asks_events_under, awaits_connect, drain, lay, lay_one, lay_ready, refresh, stating, take,
+    Ready, Stated, Turn,
 };
 pub use membership_writer::{
     MembershipWriteOutcome, MembershipWriteRefused, MembershipWriter, Over, Precondition, Remover,
@@ -153,8 +159,6 @@ pub use membership_writer::{
 #[cfg(feature = "controller")]
 pub(crate) use object::dial_address;
 pub use object::object;
-#[cfg(all(test, feature = "controller"))]
-pub(crate) use objects::stand;
 pub use objects::{Objects, RowRevision};
 pub use steps::{
     registrant_of, registration_into_store, registration_into_store_keeping_credentials,
@@ -162,3 +166,7 @@ pub use steps::{
     RemoveWorkersFromStore, WriteWorkersToStore, DISCOVERY, DRAIN_WORKERS_IN_STORE_STEP,
     REMOVE_WORKERS_FROM_STORE_STEP, WRITE_WORKERS_TO_STORE_STEP,
 };
+
+#[cfg(all(test, feature = "controller"))]
+#[path = "../tests/unit/worker_host/tests.rs"]
+pub(crate) mod tests;

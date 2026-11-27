@@ -101,47 +101,29 @@ fn plugin_engine(plugin: &Arc<Plugin>, stages: u32) -> Engine {
     } else {
         Box::new(Best)
     };
-    engine_of(Profile {
-        name: "plugin".into(),
-        filters: vec![filter],
-        scorers: vec![WeightedScorer {
-            scorer,
-            weight: 1.0,
-        }],
-        picker,
-    })
+    let mut profile = Profile::of("plugin".into(), picker);
+    profile.filters = vec![filter];
+    profile.scorers = vec![WeightedScorer::of(scorer, 1.0)];
+    engine_of(profile)
 }
 
 /// The same shape out of built-in stages.
 fn native_engine() -> Engine {
-    engine_of(Profile {
-        name: "native".into(),
-        filters: vec![Box::new(Healthy)],
-        scorers: vec![WeightedScorer {
-            scorer: Box::new(LeastRequests),
-            weight: 1.0,
-        }],
-        picker: Box::new(Best),
-    })
+    let mut profile = Profile::of("native".into(), Box::new(Best));
+    profile.filters = vec![Box::new(Healthy)];
+    profile.scorers = vec![WeightedScorer::of(Box::new(LeastRequests), 1.0)];
+    engine_of(profile)
 }
 
 fn engine_of(profile: Profile) -> Engine {
-    Engine::new(
-        vec![profile],
-        vec![Binding {
-            model: "*".into(),
-            phases: vec![],
-            plan: Plan::Single,
-            profile: 0,
-            decode_profile: None,
-            shadow: None,
-            decode_shadow: None,
-            sessions: None,
-            overload: None,
-        }],
-        1,
-        Needs::default(),
-    )
+    let mut binding = Binding::of("*".into(), 0);
+    binding.phases = vec![];
+    binding.plan = Plan::Single;
+    binding.decode_profile = None;
+    binding.shadow = None;
+    binding.decode_shadow = None;
+    binding.sessions = None;
+    Engine::new(vec![profile], vec![binding], 1, Needs::default())
 }
 
 fn facts(seed: u64) -> RequestFacts<'static> {
@@ -264,28 +246,30 @@ fn bypassed(c: &mut Criterion) {
     let served = serve();
     served.behave(Behaviour::ScoreNan);
     let mut spec = spec(&served, "bypassed");
-    spec.breaker = BreakerSpec {
-        failures: 1,
-        window_micros: 3_600_000_000,
-        cooldown_micros: 3_600_000_000,
-    };
+    spec.breaker = BreakerSpec::default();
+    spec.breaker.failures = 1;
+    spec.breaker.window_micros = 3_600_000_000;
+    spec.breaker.cooldown_micros = 3_600_000_000;
     let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
     let bound = plugin.bind();
-    let engine = engine_of(Profile {
-        name: "plugin".into(),
-        filters: vec![Box::new(GrpcFilter::new(
+    let filters: Vec<Box<dyn Filter>> = vec![Box::new(GrpcFilter::new(
+        Arc::clone(&bound),
+        Some(Box::new(Healthy)),
+    ))];
+    let scorers = vec![WeightedScorer::of(
+        Box::new(GrpcScorer::new(
             Arc::clone(&bound),
-            Some(Box::new(Healthy)),
-        ))],
-        scorers: vec![WeightedScorer {
-            scorer: Box::new(GrpcScorer::new(
-                Arc::clone(&bound),
-                Some(Box::new(LeastRequests)),
-            )),
-            weight: 1.0,
-        }],
-        picker: Box::new(GrpcPicker::new(bound, Some(Box::new(Best)))),
-    });
+            Some(Box::new(LeastRequests)),
+        )),
+        1.0,
+    )];
+    let mut profile = Profile::of(
+        "plugin".into(),
+        Box::new(GrpcPicker::new(bound, Some(Box::new(Best)))),
+    );
+    profile.filters = filters;
+    profile.scorers = scorers;
+    let engine = engine_of(profile);
     let mut group = c.benchmark_group("policy_grpc/bypassed");
     for &n in &SIZES {
         let fleet = fleet(n);

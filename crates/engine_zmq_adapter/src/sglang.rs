@@ -70,6 +70,8 @@ pub struct SglangGenerateStream {
     /// the tick's rows, the completion the whole list with absolute positions.
     hidden_states: Vec<Vec<f32>>,
     hidden_states_sent: usize,
+    /// A transport error is not an acknowledgement that native resources exited.
+    native_terminal_received: bool,
 }
 
 impl SglangGenerateStream {
@@ -85,6 +87,7 @@ impl SglangGenerateStream {
             selected_logprobs_delta: Vec::new(),
             hidden_states: Vec::new(),
             hidden_states_sent: 0,
+            native_terminal_received: false,
         }
     }
 
@@ -107,6 +110,11 @@ impl SglangGenerateStream {
     /// engine whose identity names no index.
     pub fn engine_index(&self) -> Option<u32> {
         self.inner.engine_index()
+    }
+
+    /// True only after a terminal scheduler output, including an acknowledged abort.
+    pub fn native_terminal_received(&self) -> bool {
+        self.native_terminal_received
     }
 
     /// Convert a stream item without discarding the SGLang-only rows: the
@@ -302,6 +310,7 @@ impl MappedGenerateStream for SglangGenerateStream {
         &mut self,
         mut output: SglangOutput,
     ) -> Result<vllm::GenerateResponse, tonic::Status> {
+        self.native_terminal_received |= output.finish_reason.is_some();
         if let Some(error) = &output.selected_logprobs_error {
             return Err(tonic::Status::internal(error.clone()));
         }
@@ -426,6 +435,20 @@ pub(crate) struct SglangConnection<'a> {
     pub(crate) per_image: PerImageItems,
 }
 
+/// The `server_args` entry that names the cache partition fields that
+/// `translate_request_sglang` gives to the scheduler. The gateway reads it as
+/// a worker label.
+pub fn cache_partition_fields_arg() -> (String, prost_types::Value) {
+    (
+        "cache_partition_fields".to_string(),
+        prost_types::Value {
+            kind: Some(prost_types::value::Kind::StringValue(
+                "cache_salt,extra_key".to_string(),
+            )),
+        },
+    )
+}
+
 /// Translate an SGLang proto `GenerateRequest` into the scheduler's
 /// `TokenizedGenerateReqInput`, as its `connection` takes it. ZMQ mode
 /// requires pre-tokenized input (SMG tokenizes upstream). The slim output
@@ -510,6 +533,13 @@ pub(crate) fn translate_request_sglang(
         }
         _ => (routed_dp_rank(req.data_parallel_rank, ranks)?, None),
     };
+    let sglang_proto::CachePartition {
+        cache_salt,
+        extra_key,
+    } = req
+        .cache_partition
+        .map(|partition| *partition)
+        .unwrap_or_default();
     Ok(TokenizedGenerateReqInput {
         rid: req.request_id,
         input_text,
@@ -538,6 +568,10 @@ pub(crate) fn translate_request_sglang(
         routed_dp_rank,
         disagg_prefill_dp_rank,
         require_reasoning: req.require_reasoning,
+        // An empty string is unset. SGLang's tokenizer manager applies that
+        // rule, and a request on this wire does not pass through it.
+        extra_key: extra_key.filter(|value| !value.is_empty()),
+        cache_salt: cache_salt.filter(|value| !value.is_empty()),
         ..TokenizedGenerateReqInput::default()
     })
 }
@@ -741,7 +775,7 @@ pub(crate) enum RankPlacement {
 /// connection, at DEBUG after), never refused, since placing by the pin
 /// would fail the request at the engine's KV sender. A single rank takes
 /// everything.
-fn room_residue_rank(
+pub(crate) fn room_residue_rank(
     room: i64,
     pin: Option<i32>,
     ranks: usize,
@@ -1707,6 +1741,58 @@ mod tests {
                 plain.bootstrap_room
             ),
             (None, None, None)
+        );
+    }
+
+    /// The cache partition reaches the scheduler as its two separate fields. An
+    /// empty string is unset.
+    #[test]
+    fn sglang_translation_forwards_the_cache_partition() {
+        let forwarded = |cache_partition| {
+            let wire = translate(sglang_proto::GenerateRequest {
+                request_id: "r".into(),
+                tokenized: Some(sglang_proto::TokenizedInput {
+                    input_ids: vec![1, 2],
+                    original_text: String::new(),
+                }),
+                cache_partition,
+                ..Default::default()
+            })
+            .unwrap();
+            (wire.cache_salt, wire.extra_key)
+        };
+        assert_eq!(forwarded(None), (None, None));
+        for (sent, expected) in [
+            ((None, None), (None, None)),
+            ((Some(""), Some("")), (None, None)),
+            ((Some("salt"), None), (Some("salt"), None)),
+            ((Some(""), Some("key")), (None, Some("key"))),
+            ((Some("salt"), Some("key")), (Some("salt"), Some("key"))),
+        ] {
+            let (cache_salt, extra_key) = forwarded(Some(Box::new(sglang_proto::CachePartition {
+                cache_salt: sent.0.map(String::from),
+                extra_key: sent.1.map(String::from),
+            })));
+            assert_eq!((cache_salt.as_deref(), extra_key.as_deref()), expected);
+        }
+    }
+
+    /// The direct-ZMQ lane gives both fields to the scheduler, so its worker
+    /// gets the `cache_partition_fields` label.
+    #[tokio::test]
+    async fn a_direct_zmq_worker_advertises_the_cache_partition_fields() {
+        use smg_grpc_client::engine_labels::ServerInfo;
+
+        use crate::client::ZmqServerInfo;
+
+        let (client, _engine, _dir) = connected_pair(RuntimeType::Sglang).await;
+        let ZmqServerInfo::Sglang(info) = client.server_info() else {
+            panic!("expected SGLang server info");
+        };
+        let labels = ServerInfo::Sglang(info).to_labels();
+        assert_eq!(
+            labels.get("cache_partition_fields").map(String::as_str),
+            Some("cache_salt,extra_key")
         );
     }
 

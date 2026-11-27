@@ -134,20 +134,40 @@ fn chunk_frames_write_the_bytes_of_the_whole_structs() {
                 created: 1_700_000_000,
                 model: "model-x".to_string(),
                 system_fingerprint: fingerprint.map(str::to_string),
+                prompt_text: None,
                 choices: vec![choice.clone()],
                 usage: usage.clone(),
             };
-            let mut expected = serde_json::to_vec(&whole).unwrap();
-            if emit_usage_null {
-                expected.pop();
-                expected.extend_from_slice(b",\"usage\":null}");
-            }
-            assert_eq!(
-                event(&buffer),
-                expected,
-                "chat, fingerprint {fingerprint:?}, usage {}, placeholder {emit_usage_null}",
-                usage.is_some()
+            // The chunk that carries the rendered prompt is the same struct
+            // with the prompt, its quotes and line end escaped as serde's.
+            let prompt = "user: say \"hi\"\nassistant: ";
+            let mut with_prompt = BytesMut::new();
+            frame.write_chunk_with_prompt(
+                &mut with_prompt,
+                prompt,
+                &choice,
+                usage.as_ref(),
+                emit_usage_null,
             );
+            let whole_with_prompt = ChatCompletionStreamResponse {
+                prompt_text: Some(prompt.to_string()),
+                ..whole.clone()
+            };
+            for (written, whole) in [(&buffer, &whole), (&with_prompt, &whole_with_prompt)] {
+                let mut expected = serde_json::to_vec(whole).unwrap();
+                if emit_usage_null {
+                    expected.pop();
+                    expected.extend_from_slice(b",\"usage\":null}");
+                }
+                assert_eq!(
+                    event(written),
+                    expected,
+                    "chat, fingerprint {fingerprint:?}, usage {}, placeholder {emit_usage_null}, \
+                     prompt {}",
+                    usage.is_some(),
+                    whole.prompt_text.is_some()
+                );
+            }
         }
 
         let usage = Usage::from_counts(3, 2);
@@ -159,6 +179,7 @@ fn chunk_frames_write_the_bytes_of_the_whole_structs() {
             created: 1_700_000_000,
             model: "model-x".to_string(),
             system_fingerprint: fingerprint.map(str::to_string),
+            prompt_text: None,
             choices: Vec::new(),
             usage: Some(usage),
         };

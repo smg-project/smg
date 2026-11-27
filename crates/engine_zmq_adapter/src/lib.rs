@@ -43,6 +43,7 @@ mod test_support;
 mod tokenspeed;
 mod trtllm;
 mod vllm;
+mod vllm_cache_salt;
 
 pub use client::{
     connect_for_worker, connect_with_eos, kv_transfer_rejection_params, ZmqDialect,
@@ -57,7 +58,9 @@ pub use engine_zmq_client::{
     EngineCount,
 };
 pub use eos::{fold_tokenizer_eos_backstop, EosTokenIds};
-pub use sglang::{to_sglang_response, SglangGenerateStream, SglangProfileStart};
+pub use sglang::{
+    cache_partition_fields_arg, to_sglang_response, SglangGenerateStream, SglangProfileStart,
+};
 pub use sglang_encode::{
     EncodeDispatchErrorSink, EncodeDispatchOutcome, EncodeDispatchRequest, EncodeFuture,
     EncodeMediaRefs, EncodeRelease, EncodeTransport, EncoderDispatchErrorReq,
@@ -79,3 +82,4 @@ pub use tokenspeed::{
 };
 pub use trtllm::{to_trtllm_response, TrtllmGenerateStream};
 pub use vllm::{structured_outputs_backend_from_config, ProcessedMedia, VllmGenerateStream};
+pub use vllm_cache_salt::validate_cache_salt;

@@ -1473,10 +1473,13 @@ class RouterArgs:
             type=int,
             default=RouterArgs.max_tree_size,
             help="Maximum total size of each model's approximation tree for "
-            "cache-aware routing, shared across all workers: for HTTP the "
-            "chars of its texts plus 1024 for each node a worker stands on, "
-            "for gRPC tokens; eviction keeps every tree at or under this "
-            "bound",
+            "cache-aware routing, summed over all workers: for requests "
+            "routed by text the chars of the nodes each worker stands on plus "
+            "1024 for each such node, for requests routed by token ids (gRPC, "
+            "and HTTP requests that carry them) the tokens each worker holds, "
+            "so a prefix that several workers hold counts once for each of "
+            "them; each eviction cycle trims every tree back toward this "
+            "bound, and writes take a tree past it until the next cycle",
         )
         routing_group.add_argument(
             f"--{prefix}block-size",
@@ -1800,7 +1803,8 @@ class RouterArgs:
             type=str,
             choices=["inline", "shm", "auto", "rdma"],
             default=RouterArgs.multimodal_tensor_transport,
-            help="Multimodal tensor transport: inline (default), shm, auto, or rdma (NIXL lane; needs mm-rdma build)",
+            help="Multimodal tensor transport: inline (default), shm, auto, or rdma "
+            "(NIXL lane; needs mm-rdma build and --rdma-listen-ip)",
         )
         parser.add_argument(
             f"--{prefix}multimodal-shm-min-bytes",
@@ -2596,7 +2600,10 @@ class RouterArgs:
             f"--{prefix}decode-expected-workers",
             type=_positive_int,
             default=None,
-            help="Desired decode fleet size, used only as the fixed percentage denominator",
+            help=(
+                "Desired decode fleet size: the fixed percentage denominator."
+                " The minimum of healthy decode workers may not exceed it."
+            ),
         )
         health_group.add_argument(
             f"--{prefix}decode-min-ready-percent",
@@ -2616,7 +2623,10 @@ class RouterArgs:
             f"--{prefix}prefill-expected-workers",
             type=_positive_int,
             default=None,
-            help="Desired prefill fleet size, used only as the fixed percentage denominator",
+            help=(
+                "Desired prefill fleet size: the fixed percentage denominator."
+                " The minimum of healthy prefill workers may not exceed it."
+            ),
         )
         health_group.add_argument(
             f"--{prefix}prefill-min-ready-percent",
@@ -2749,7 +2759,8 @@ class RouterArgs:
             help="Which parser reads a chat completion's reasoning and tool calls: Symphony "
             "(symphony, the default) or the per-model parsers (legacy). With Symphony, a model's "
             "worker labels decide, "
-            "else Symphony's registry for a model it knows, else --tool-call-parser and --reasoning-parser: "
+            "else --tool-call-parser and --reasoning-parser, else Symphony's registry for a model it knows "
+            "(a reasoning name alone that a table answers to comes after the registry): "
             "a Symphony table's name reads with that table, and so does a legacy parser's name whose format "
             "a table reads (qwen for qwen3, qwen_xml for qwen3_tagged: the table's aliases, so existing flags "
             "keep a working parser); any other legacy parser's name keeps the legacy parsers (the Symphony "
@@ -2795,8 +2806,10 @@ class RouterArgs:
             default=None,
             choices=reasoning_parser_choices,
             help="Specify the parser for reasoning models (e.g., deepseek_r1, qwen3). Under --parser symphony, "
-            "a worker's labels decide for its model, else Symphony's registry for a model it knows, and this "
-            "flag for the models the registry does not know: a Symphony table's name here (and in "
+            "a worker's labels decide for its model, else this flag and --tool-call-parser, before Symphony's "
+            "registry, for every model; a name here alone that a table answers to leaves a model the registry "
+            "knows to the registry and reads only the models it does not know: a Symphony table's name here "
+            "(and in "
             "--tool-call-parser, or here alone) reads them with that table, and so does a legacy parser's "
             "name whose format a table reads (the table's aliases); any other legacy parser's name keeps "
             "the legacy parsers for them",
@@ -2808,8 +2821,9 @@ class RouterArgs:
             default=None,
             choices=tool_call_parser_choices,
             help="Specify the parser for tool-call interactions (e.g., json, qwen). Under --parser symphony, "
-            "a worker's labels decide for its model, else Symphony's registry for a model it knows, and this "
-            "flag for the models the registry does not know: a Symphony table's name here (and in "
+            "a worker's labels decide for its model, else this flag, for every model, before Symphony's "
+            "registry, which reads a model it knows only where the flags select nothing: a Symphony table's "
+            "name here (and in "
             "--reasoning-parser, or here alone) reads them with that table, and so does a legacy parser's "
             "name whose format a table reads (the table's aliases); any other legacy parser's name keeps "
             "the legacy parsers for them",

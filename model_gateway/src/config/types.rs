@@ -49,9 +49,11 @@ pub enum ParserChoice {
     Legacy,
     /// Symphony's tables, the default, by one precedence per model
     /// (`routers::grpc::regular::symphony::names::reads`):
-    /// the table its worker labels select, when they select anything; else the registry's table
-    /// for a model it knows; else the one the `--tool-call-parser` and `--reasoning-parser` flags
-    /// select, for a model the registry does not know. Names select a table when it answers to
+    /// the table its worker labels select, when they select anything; else the one the
+    /// `--tool-call-parser` and `--reasoning-parser` flags select, when they select anything; else
+    /// the registry's table for a model it knows. A reasoning name alone in the flags that a table
+    /// answers to comes after the registry: its table reads only the models the registry does not
+    /// know. Names select a table when it answers to
     /// them: its own name, a legacy parser's that reads its format (`qwen` for `qwen3`, `qwen_xml`
     /// for `qwen3_tagged`), or a launcher's for a family whose table has no older parser (`muse`
     /// for `muse_spark`); `hf` selects the model's response template's table; a reasoning name
@@ -688,8 +690,9 @@ pub struct RouterConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ReadinessRoleConfig {
-    /// Desired fleet size used as the stable percentage denominator. Has no
-    /// effect unless `min_healthy_percent` is also set.
+    /// Desired fleet size used as the stable percentage denominator. It
+    /// enables no percentage gate unless `min_healthy_percent` is also set.
+    /// `min_healthy_workers` may not exceed it.
     pub expected_workers: Option<usize>,
     /// Absolute safety floor, independent of the percentage threshold.
     pub min_healthy_workers: usize,

@@ -88,36 +88,24 @@ impl UpdatePoliciesStep {
 
     /// Check for conflicts between prefill and decode worker configurations for a model.
     fn check_worker_conflicts(model_id: &str, workers: &[Arc<dyn Worker>]) {
-        let prefill_workers: Vec<_> = workers
-            .iter()
-            .filter(|w| {
-                w.metadata()
-                    .spec
-                    .labels
-                    .get("disaggregation_mode")
-                    .map(|s| s.as_str())
-                    == Some("prefill")
-            })
-            .collect();
-
-        let decode_workers: Vec<_> = workers
-            .iter()
-            .filter(|w| {
-                w.metadata()
-                    .spec
-                    .labels
-                    .get("disaggregation_mode")
-                    .map(|s| s.as_str())
-                    == Some("decode")
-            })
-            .collect();
-
-        if prefill_workers.is_empty() || decode_workers.is_empty() {
-            return;
+        // The first worker of each side is the pair compared: one walk of
+        // the model's workers, which ends where both are found.
+        let mut prefill = None;
+        let mut decode = None;
+        for worker in workers {
+            let mode = worker.metadata().spec.labels.get("disaggregation_mode");
+            match mode.map(String::as_str) {
+                Some("prefill") if prefill.is_none() => prefill = Some(worker),
+                Some("decode") if decode.is_none() => decode = Some(worker),
+                _ => continue,
+            }
+            if prefill.is_some() && decode.is_some() {
+                break;
+            }
         }
 
         // Compare configurations of prefill vs decode workers
-        if let (Some(pw), Some(dw)) = (prefill_workers.first(), decode_workers.first()) {
+        if let (Some(pw), Some(dw)) = (prefill, decode) {
             let pl = &pw.metadata().spec.labels;
             let dl = &dw.metadata().spec.labels;
 
@@ -219,33 +207,45 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
             }
         }
 
-        // Under Grand Central a `policy` label names no policy. Each
-        // registration that carries one says so, behind the step's last
-        // wait, so a step tried again writes no second line. The label's
-        // value is free text and is not written.
-        if policy_hint.is_some() && !app_context.policy_registry.keeps_classic_policies() {
+        // Under Grand Central a `policy` label names the policy that
+        // places its model's single requests in the policy spec in force.
+        // The model's first registration decides it, and the registry's
+        // call above put that spec in force. A registration whose label is
+        // not what places its model says so here, behind the step's last
+        // wait, so a step tried again writes no second line: a later worker
+        // of a model another label decided, a name that is no policy's, a
+        // label the spec refused, a label beside a supplied spec that gives
+        // the model another profile, and a label of a model whose single
+        // requests no profile places. The label's value is free text and is
+        // not written.
+        if let Some(hint) = policy_hint {
+            let policies = &app_context.policy_registry;
             for model_id in &updated_models {
-                let long = model_id.chars().nth(64).is_some();
-                let cut = if long { "..." } else { "" };
-                warn!(
-                    "Worker label policy of model {model_id:.64}{cut} names no policy: the \
-                     policy document in force places the model"
-                );
+                if policies.label_places(model_id, hint) == Some(false) {
+                    let cut = crate::policies::cut_mark(model_id);
+                    warn!(
+                        "Worker label policy of model {model_id:.64}{cut} is not what places \
+                         the model under the policy spec in force"
+                    );
+                }
             }
         }
 
-        // Initialize PD policies for prefill/decode workers (local workers only)
-        let prefill_workers = app_context.worker_registry.get_prefill_workers();
-        let decode_workers = app_context.worker_registry.get_decode_workers();
-        app_context
-            .policy_registry
-            .init_pd_cache_aware_policies(&prefill_workers, &decode_workers);
+        // Initialize PD policies for prefill/decode workers (local workers only).
+        // A side's list is a walk of every worker of that role: it is made
+        // only where the registry says that side's policy reads it.
+        let policies = &app_context.policy_registry;
+        let registry = &app_context.worker_registry;
+        let (prefill_read, decode_read) = policies.pd_lists_read();
+        let prefill_workers = prefill_read.then(|| registry.get_prefill_workers());
+        let prefill_workers = prefill_workers.as_deref().unwrap_or_default();
+        let decode_workers = decode_read.then(|| registry.get_decode_workers());
+        let decode_workers = decode_workers.as_deref().unwrap_or_default();
+        policies.init_pd_cache_aware_policies(prefill_workers, decode_workers);
         if !prefill_workers.is_empty() {
-            let policy = app_context.policy_registry.get_prefill_policy();
+            let policy = policies.get_prefill_policy();
             if policy.name() == "bucket" {
-                app_context
-                    .policy_registry
-                    .init_pd_bucket_policies(&prefill_workers);
+                policies.init_pd_bucket_policies(prefill_workers);
             }
         }
 
@@ -269,6 +269,7 @@ mod tests {
         model_card::ModelCard,
         worker::{HealthCheckConfig, RuntimeType, WorkerSpec, WorkerType},
     };
+    use parking_lot::Mutex;
     use smg_grand_central::{
         document::{AppliedSpec, PolicySpec},
         engine::InProcess,
@@ -282,7 +283,8 @@ mod tests {
         app_context::{testing::app_context_for_tests, AppContext},
         config::{PolicyConfig, RouterConfig},
         policies::{
-            as_cache_aware, kv_index::event_monitor::KvEventMonitor, PolicyFactory, PolicyRegistry,
+            as_cache_aware, kv_index::event_monitor::KvEventMonitor, BucketPolicy,
+            LoadBalancingPolicy, PolicyFactory, PolicyRegistry, SelectWorkerInfo,
         },
         routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder},
         workflow::{data::WorkerRegistrationMode, steps::create_worker_workflow_data},
@@ -374,18 +376,39 @@ mod tests {
     /// worker of any role, whatever policy its label names, and gives the
     /// worker no completion sink. Under the classic policies the same
     /// workers make the labelled model's policy beside the default, and
-    /// each is given the registry's sink. The engine's step names the
-    /// label at each registration that carries it, whichever worker heads
-    /// the model's list, and the classic step, which follows it, at none.
+    /// each is given the registry's sink.
+    ///
+    /// Under the engine the label of the model's first registration names
+    /// the profile that places the model, whatever that worker's role, and
+    /// a registration that carries that label writes no line. A later one
+    /// whose label names another policy says so once, and so does one whose
+    /// label names no policy. The classic step, which follows the engine's
+    /// here, writes none of these lines.
     #[traced_test]
     #[tokio::test]
     async fn under_the_engine_a_worker_of_any_role_gets_no_classic_policy() {
+        use crate::{app_context::AppContextBuilder, routers::common::snapshot::WorkerMonitor};
+
         let roles = [
             ("grpc://127.0.0.1:1", WorkerType::Regular),
             ("grpc://127.0.0.1:2", WorkerType::Prefill),
             ("grpc://127.0.0.1:3", WorkerType::Decode),
             ("grpc://127.0.0.1:4", WorkerType::Encode),
         ];
+        let others = [
+            ("grpc://127.0.0.1:5", "random"),
+            ("grpc://127.0.0.1:6", "no-such-policy"),
+        ];
+        let wanted = format!("Worker label policy of model {MODEL} is not what places");
+        let written = |count: usize| {
+            logs_assert(|lines: &[&str]| {
+                let named = lines.iter().filter(|line| line.contains(&wanted));
+                match named.filter(|line| line.contains("WARN")).count() {
+                    found if found == count => Ok(()),
+                    found => Err(format!("the lines that name the label: {found}")),
+                }
+            });
+        };
         for (grand_central, made) in [(true, 0), (false, 2)] {
             let mut config = RouterConfig::builder()
                 .policy(PolicyConfig::RoundRobin)
@@ -397,8 +420,13 @@ mod tests {
                 None,
             ));
             context.policy_registry = Arc::new(PolicyRegistry::of_config(&config));
+            let (policies, workers) = (&context.policy_registry, &context.worker_registry);
+            let monitor =
+                WorkerMonitor::new(Arc::clone(workers), Arc::clone(policies), 1, false, true);
+            AppContextBuilder::start_engine_by_hand(&config, None, policies, workers, &monitor)
+                .expect("the settings' own spec");
             let app_context = Arc::new(context);
-            for (nth, (url, role)) in roles.into_iter().enumerate() {
+            for (url, role) in roles {
                 let worker = grpc_worker_at(url, role);
                 register(
                     &app_context,
@@ -407,19 +435,22 @@ mod tests {
                 )
                 .await;
                 assert_eq!(worker.completion_sink().is_some(), !grand_central);
-                // Each of the engine's registrations writes the line once,
-                // and the classic ones behind them add none.
-                let written = if grand_central { nth + 1 } else { roles.len() };
-                let wanted = format!("Worker label policy of model {MODEL} names no policy");
-                logs_assert(|lines: &[&str]| {
-                    let named = lines.iter().filter(|line| line.contains(&wanted));
-                    match named.filter(|line| line.contains("WARN")).count() {
-                        count if count == written => Ok(()),
-                        count => Err(format!("the lines that name the label: {count}")),
-                    }
-                });
             }
-            assert_eq!(app_context.policy_registry.classic_made_or_asked(), made);
+            let policies = &app_context.policy_registry;
+            assert_eq!(policies.classic_made_or_asked(), made);
+            // The first registration's label places the model, and none of
+            // the four that carried it wrote the line: the engine's two
+            // lines below stand alone behind the classic pass too.
+            let placing = policies.placing_profile(MODEL);
+            let named = grand_central.then_some("power_of_two");
+            assert_eq!(placing.as_deref(), named);
+            written(if grand_central { 0 } else { others.len() });
+            for (nth, (url, label)) in others.into_iter().enumerate() {
+                let worker = grpc_worker_at(url, WorkerType::Regular);
+                register(&app_context, worker, &[("policy", label)]).await;
+                written(if grand_central { nth + 1 } else { others.len() });
+            }
+            assert_eq!(policies.placing_profile(MODEL).as_deref(), named);
         }
     }
 
@@ -541,6 +572,97 @@ mod tests {
             .expect("a cache-aware policy")
             .tree_tenants_for_test(MODEL);
         assert_eq!(tenants, ["grpc://127.0.0.1:1"]);
+        monitor.stop().await;
+    }
+
+    /// A cache-aware policy on one side of a pair is handed that side's
+    /// workers, and no worker of the other side, whose policy reads no list.
+    #[tokio::test]
+    async fn a_cache_aware_side_of_a_pair_is_handed_its_own_workers() {
+        for (side, own) in [
+            (WorkerType::Prefill, "grpc://127.0.0.1:1"),
+            (WorkerType::Decode, "grpc://127.0.0.1:2"),
+        ] {
+            let (app_context, monitor) = context_over(PolicyConfig::RoundRobin);
+            let policy = PolicyFactory::create_from_config(&cache_aware());
+            let other = PolicyFactory::create_from_config(&PolicyConfig::RoundRobin);
+            let registry = &app_context.policy_registry;
+            if side == WorkerType::Prefill {
+                registry.set_prefill_policy(Arc::clone(&policy));
+                registry.set_decode_policy(other);
+            } else {
+                registry.set_prefill_policy(other);
+                registry.set_decode_policy(Arc::clone(&policy));
+            }
+
+            let prefill = grpc_worker_at("grpc://127.0.0.1:1", WorkerType::Prefill);
+            register(&app_context, prefill, &[]).await;
+            let decode = grpc_worker_at("grpc://127.0.0.1:2", WorkerType::Decode);
+            register(&app_context, decode, &[]).await;
+
+            let tenants = as_cache_aware(policy.as_ref())
+                .expect("a cache-aware policy")
+                .tree_tenants_for_test(MODEL);
+            assert_eq!(tenants, [own], "{side:?}");
+            monitor.stop().await;
+        }
+    }
+
+    /// A router made while a registration runs sets the prefill side to a
+    /// bucket policy: the registration under way hands it the prefill workers.
+    #[traced_test]
+    #[tokio::test]
+    async fn a_prefill_policy_set_during_a_registration_is_handed_its_workers() {
+        /// The decode side's policy. Once it is armed, the first test of its
+        /// type sets the prefill policy, as the making of a router does.
+        #[derive(Debug, Default)]
+        struct SetsPrefill(Mutex<Option<Arc<PolicyRegistry>>>);
+        impl LoadBalancingPolicy for SetsPrefill {
+            fn select_worker(&self, _: &[Arc<dyn Worker>], _: &SelectWorkerInfo) -> Option<usize> {
+                None
+            }
+            fn name(&self) -> &'static str {
+                "sets_prefill"
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                let armed = self.0.lock().take();
+                if let Some(registry) = armed {
+                    registry.set_prefill_policy(Arc::new(BucketPolicy::new()));
+                }
+                self
+            }
+        }
+
+        let (app_context, monitor) = context_over(PolicyConfig::RoundRobin);
+        let registry = &app_context.policy_registry;
+        let decode = Arc::new(SetsPrefill::default());
+        registry.set_decode_policy(Arc::<SetsPrefill>::clone(&decode));
+        *decode.0.lock() = Some(Arc::clone(registry));
+
+        register(&app_context, grpc_worker(WorkerType::Prefill), &[]).await;
+
+        assert!(logs_contain(
+            "Initializing prefill bucket policy with 1 workers"
+        ));
+        monitor.stop().await;
+    }
+
+    /// A bucket policy that stands on the prefill side before a prefill
+    /// worker registers, as a pair router made at start-up sets it, is handed
+    /// that worker by the registration.
+    #[traced_test]
+    #[tokio::test]
+    async fn a_bucket_prefill_policy_set_before_a_registration_is_handed_its_workers() {
+        let (app_context, monitor) = context_over(PolicyConfig::RoundRobin);
+        let registry = &app_context.policy_registry;
+        registry.set_prefill_policy(Arc::new(BucketPolicy::new()));
+        registry.set_decode_policy(PolicyFactory::create_from_config(&PolicyConfig::RoundRobin));
+
+        register(&app_context, grpc_worker(WorkerType::Prefill), &[]).await;
+
+        assert!(logs_contain(
+            "Initializing prefill bucket policy with 1 workers"
+        ));
         monitor.stop().await;
     }
 

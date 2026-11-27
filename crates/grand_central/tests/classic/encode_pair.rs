@@ -210,25 +210,27 @@ fn offers(row: &Row) -> Option<(Vec<EncodeOffer>, Vec<EncodeOffer>)> {
     let encoders = row
         .encoders
         .iter()
-        .map(|encoder| EncodeOffer {
-            handoff: handoff(encoder.handoff),
-            producer: encoder.ec_producer,
-            consumer: false,
-            connector: encoder.connector.clone(),
-            references: encoder.references,
+        .map(|encoder| {
+            let mut offer = EncodeOffer::default();
+            offer.handoff = handoff(encoder.handoff);
+            offer.producer = encoder.ec_producer;
+            offer.consumer = false;
+            offer.connector.clone_from(&encoder.connector);
+            offer.references = encoder.references;
+            offer
         })
         .collect();
     let prefills = row
         .prefills
         .iter()
         .map(|prefill| {
-            Some(EncodeOffer {
-                handoff: handoff(form_of(&prefill.runtime)?),
-                producer: false,
-                consumer: prefill.ec_consumer,
-                connector: prefill.connector.clone(),
-                references: false,
-            })
+            let mut offer = EncodeOffer::default();
+            offer.handoff = handoff(form_of(&prefill.runtime)?);
+            offer.producer = false;
+            offer.consumer = prefill.ec_consumer;
+            offer.connector.clone_from(&prefill.connector);
+            offer.references = false;
+            Some(offer)
         })
         .collect::<Option<Vec<_>>>()?;
     Some((encoders, prefills))
@@ -244,17 +246,11 @@ fn replay(row: &Row) -> Vec<String> {
         row.encoders
             .iter()
             .zip(&of_encoders)
-            .map(|(worker, offer)| EncodeMember {
-                runtime: &worker.runtime,
-                offer,
-            }),
+            .map(|(worker, offer)| EncodeMember::of(&worker.runtime, offer)),
         row.prefills
             .iter()
             .zip(&of_prefills)
-            .map(|(worker, offer)| EncodeMember {
-                runtime: &worker.runtime,
-                offer,
-            }),
+            .map(|(worker, offer)| EncodeMember::of(&worker.runtime, offer)),
     );
     let mut found = Vec::new();
     if row.requests.len() != row.outcome.sequence.len() {
@@ -606,13 +602,12 @@ fn decided(row: &Row, classes: &EncodeClasses, offers: &[EncodeOffer], lent: boo
             Some(text) => Some(Identity::plain(text)),
             None => (!request.fanout && !keys.is_empty()).then_some(digest),
         };
-        let items = EncodeItems {
-            keys: &keys,
-            one,
-            references: request.references,
-            decode_images: request.decode_images,
-            ring: of_answer.as_ref().map(|ring| ring as &dyn LentRing),
-        };
+        let mut items = EncodeItems::default();
+        items.keys = &keys;
+        items.one = one;
+        items.references = request.references;
+        items.decode_images = request.decode_images;
+        items.ring = of_answer.as_ref().map(|ring| ring as &dyn LentRing);
         let seed = at as u64 + 1;
         let id = seed.to_le_bytes();
         // The request as its host makes it for the prefill phase: held to

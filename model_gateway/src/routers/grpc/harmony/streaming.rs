@@ -41,7 +41,7 @@ use crate::{
         },
         grpc::{
             common::{
-                response_collection::drain_prefill,
+                response_collection::{drain_prefill, StreamedAnswer},
                 response_formatting::{known_spec_drafted, CompletionTokenTracker, TokenCounts},
                 responses::{
                     body_guards, build_sse_response_driven, driven_channel,
@@ -347,10 +347,16 @@ impl HarmonyStreamingProcessor {
         let mut prompt_tokens: HashMap<u32, u32> = HashMap::new();
         let mut cached_tokens: HashMap<u32, u32> = HashMap::new();
 
-        drain_prefill(&mut prefill_stream, prefill_guards, false, |complete| {
-            prompt_tokens.insert(complete.index(), complete.prompt_tokens());
-            cached_tokens.insert(complete.index(), complete.cached_tokens());
-        })
+        drain_prefill(
+            &mut prefill_stream,
+            prefill_guards,
+            false,
+            StreamedAnswer,
+            |complete| {
+                prompt_tokens.insert(complete.index(), complete.prompt_tokens());
+                cached_tokens.insert(complete.index(), complete.cached_tokens());
+            },
+        )
         .await
         .map_err(utils::StreamFailure::prefill)?;
 
@@ -669,7 +675,13 @@ impl HarmonyStreamingProcessor {
         let drained = tokio::select! {
             biased;
             () = tx.closed() => None,
-            drained = drain_prefill(&mut prefill_stream, prefill_guards, false, |_| {}) => {
+            drained = drain_prefill(
+                &mut prefill_stream,
+                prefill_guards,
+                false,
+                StreamedAnswer,
+                |_| {},
+            ) => {
                 Some(drained)
             }
         };
@@ -774,7 +786,7 @@ impl HarmonyStreamingProcessor {
                 endpoint: metrics_labels::ENDPOINT_RESPONSES,
                 tail_tokens: decode.tail_tokens,
             });
-            drop(decode_stream);
+            decode_stream.abort_past_stop();
         } else {
             decode_stream.mark_completed();
         }
@@ -1739,7 +1751,7 @@ impl ChatDecode {
             endpoint: metrics_labels::ENDPOINT_CHAT,
             tail_tokens: self.tail_tokens,
         });
-        drop(decode_stream);
+        decode_stream.abort_past_stop();
     }
 
     /// The stream's first engine output, for the TTFT; in PD mode the PD first-token pair is

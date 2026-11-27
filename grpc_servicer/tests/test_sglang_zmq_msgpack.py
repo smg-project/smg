@@ -171,6 +171,25 @@ def test_request_decodes_the_encode_dispatch_slots_as_the_frontend_sets_them():
     assert req.mm_inputs is None and req.require_reasoning is False
 
 
+def test_the_rust_servicers_cache_partition_decodes_into_the_schedulers_two_fields():
+    """The ``ADD`` payload the Rust servicer sends for a request with both
+    values; the same constant is pinned in ``protocol/sglang/request.rs``
+    (``the_cache_partition_payload_the_plugins_test_decodes_is_pinned``), so a
+    change there is a change here."""
+    rust_pinned = bytes.fromhex(
+        "dc002eb9546f6b656e697a656447656e6572617465526571496e707574a673616c746564c0c093010203c0c0c0dc001a"
+        "cc80c0c0c0cb3ff0000000000000cb3ff0000000000000ffcb0000000000000000cb0000000000000000cb0000000000"
+        "000000cb3ff00000000000000001c0c0c0c0c0c2c3c3c2c0c0c0c0c2ff00c0c2c2c2c2c200c2c0c0c0c0c0c0c0c0c0c0"
+        "c0c0c0c2c0a56b65792d61c2c2c2c0c0c0c0c0c0a673616c742d61"
+    )
+    (req,) = wire.decode_request_frames([wire.REQ_TYPE_ADD, rust_pinned])
+    assert (req.extra_key, req.cache_salt) == ("key-a", "salt-a")
+    assert req.rid == "salted" and list(req.input_ids) == [1, 2, 3]
+    assert (req.priority, req.no_logs, req.return_bytes) == (None, False, False)
+    assert (req.need_wait_for_mm_inputs, req.num_items_assigned) == (None, None)
+    assert (req.encoder_urls, req.time_stats, req.kv_hints) == (None, None, None)
+
+
 def test_the_encode_dispatch_failure_notice_decodes_as_the_schedulers_own_request():
     """The notice the Rust servicer sends after a request whose dispatch
     failed (the bytes its wire test pins) is the scheduler's own

@@ -402,6 +402,50 @@ async fn an_http_worker_whose_host_keeps_a_load_source_keeps_its_ranks_unasked()
     assert_eq!(reads.load(Ordering::SeqCst), 0);
 }
 
+/// A worker registered with a key is asked its load route with that key.
+/// An engine that answers its loads to the key alone keeps the worker's
+/// ranks where the registration holds the key, and leaves one plain worker
+/// where it holds none or another. Each registration reads the route once.
+#[tokio::test]
+async fn an_http_worker_registered_with_a_key_reads_its_load_route_with_it() {
+    use http::{header::AUTHORIZATION, HeaderMap};
+
+    let reads = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&reads);
+    let route = axum::routing::get(move |headers: HeaderMap| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        let keyed = headers
+            .get(AUTHORIZATION)
+            .is_some_and(|value| value == "Bearer secret");
+        async move {
+            if keyed {
+                (StatusCode::OK, axum::Json(loads_of(&[0, 1])))
+            } else {
+                (StatusCode::UNAUTHORIZED, axum::Json(json!({})))
+            }
+        }
+    });
+    let router = axum::Router::new().route(ENGINE_LOADS_ROUTE, route);
+    let base = serve_router(router).await;
+
+    let registrations = [
+        (Some("secret"), Some(2)),
+        (None, None),
+        (Some("other"), None),
+    ];
+    for (asked, (key, ranks)) in registrations.into_iter().enumerate() {
+        let mut ctx = http_context(&base, 2);
+        ctx.data.config.api_key = key.map(str::to_string);
+
+        let result = DiscoverDpInfoStep.execute(&mut ctx).await.unwrap();
+
+        assert_eq!(result, StepResult::Success, "{key:?}");
+        let shape = ctx.data.dp_info.as_ref().map(|info| info.dp_size);
+        assert_eq!(shape, ranks, "{key:?}");
+        assert_eq!(reads.load(Ordering::SeqCst), asked + 1, "{key:?}");
+    }
+}
+
 /// Each outcome of the one read that leaves no shape has its own words, and
 /// an answer with a row for every rank lacks nothing. The warning names the
 /// engine with its credentials masked, the route, what was read and how the
@@ -419,7 +463,7 @@ fn the_plain_worker_warning_names_the_engine_the_route_and_what_was_read() {
             "answered what is no load report",
         ),
         (
-            NativeLoads::Unreadable(FetchFailure::Deadline),
+            NativeLoads::Inconclusive(FetchFailure::Deadline),
             "gave no answer",
         ),
         (
@@ -428,7 +472,7 @@ fn the_plain_worker_warning_names_the_engine_the_route_and_what_was_read() {
         ),
         (
             NativeLoads::Inconclusive(FetchFailure::Answer),
-            "gave no answer",
+            "answered with an error status or a body too large to read",
         ),
     ] {
         assert_eq!(missing_rank_loads(&loads, 2), Some(read));

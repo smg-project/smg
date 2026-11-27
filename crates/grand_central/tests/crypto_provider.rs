@@ -11,19 +11,14 @@ use std::{
 };
 
 use rustls::crypto::CryptoProvider;
-use smg_grand_central::service::controller::{Config, Controller, ElectionConfig, Listener, Scope};
+use smg_grand_central::service::controller::{Config, Controller, Listener, Scope};
 
 fn loopback() -> SocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, 0))
 }
 
 fn listener(name: &str, scopes: &[Scope]) -> Listener {
-    Listener {
-        name: name.to_owned(),
-        addr: loopback(),
-        scopes: scopes.to_vec(),
-        tls: None,
-    }
+    Listener::of(name.to_owned(), loopback(), scopes.to_vec(), None)
 }
 
 /// A bind that names no TLS material installs the provider all the same:
@@ -34,22 +29,18 @@ async fn a_bind_installs_the_process_crypto_provider() {
         CryptoProvider::get_default().is_none(),
         "the process starts with no provider installed"
     );
-    let config = Config {
-        controller_id: "test-controller".to_owned(),
-        listeners: vec![
-            listener("gateway", &[Scope::Gateway, Scope::Ingestion]),
+    let mut config = Config::of(
+        "test-controller".to_owned(),
+        vec![
+            listener("gateway", &[Scope::Gateway]),
             listener("control", &[Scope::Control]),
             listener("replication", &[Scope::Replication]),
         ],
-        admin: loopback(),
-        shutdown_settle: Duration::from_millis(100),
-        shutdown_grace: Duration::from_secs(5),
-        load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
-        worker_overload: Config::DEFAULT_WORKER_OVERLOAD,
-        decide_shards: 2,
-        election: ElectionConfig::default(),
-        discovery: None,
-    };
+        loopback(),
+    );
+    config.shutdown_settle = Duration::from_millis(100);
+    config.shutdown_grace = Duration::from_secs(5);
+    config.decide_shards = 2;
     let _controller = Controller::bind(config)
         .await
         .expect("the controller binds");

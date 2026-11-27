@@ -45,7 +45,7 @@ use super::{
     },
 };
 use crate::routers::{
-    common::sse::sse_channel,
+    common::{placement::tests::heard_request, sse::sse_channel},
     grpc::zmq_client::{EosTokenIds, ZmqEngineClient},
 };
 
@@ -164,6 +164,125 @@ async fn a_local_stop_ends_the_chat_read_and_the_engine_request() {
     let usage = usage(&events);
     assert_eq!(usage["prompt_tokens"], 7);
     assert_eq!(usage["completion_tokens"], 8, "{usage}");
+}
+
+/// A stop the gateway hits with the engine streaming on leaves a whole
+/// answer. The reader lets the engine go there, and Grand Central hears
+/// one good end, the worker's 200, though the stream is dropped before its
+/// own end.
+#[tokio::test]
+async fn a_local_stop_is_heard_as_the_workers_good_end() {
+    let (heard, guard, end) = heard_request();
+    let (gate_tx, mut stream, server) = stream_past_a_local_stop().await;
+    stream.report_through(end);
+    let (tx, rx) = sse_channel();
+    let result = timeout(
+        Duration::from_secs(5),
+        processor(false).process_streaming_chunks(
+            stream,
+            dispatch(),
+            Arc::new(CharacterTokenizer::default()),
+            stop_string("STOP"),
+            single_choice_spec(),
+            &tx,
+            None,
+        ),
+    )
+    .await
+    .expect("the stream ends at the stop, without the engine's tail");
+    drop(tx);
+    let events = collect_events(rx).await;
+    server.abort();
+    drop(gate_tx);
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(finish_reasons(&events), [(0, "stop".to_string())]);
+
+    drop(guard);
+    assert_eq!(
+        *heard.lock().expect("the stage heard"),
+        ["issued", "dispatched Single", "completed Ok 200"]
+    );
+}
+
+/// The completion read lets the engine go at the gateway's stop as the chat
+/// read does, and Grand Central hears the same good end.
+#[tokio::test]
+async fn a_completions_local_stop_is_heard_as_the_workers_good_end() {
+    let request: openai_protocol::completion::CompletionRequest = serde_json::from_value(json!({
+        "model": "eof-test", "prompt": "test", "stream": true, "ignore_eos": true,
+        "max_tokens": 4096, "stop": "STOP"
+    }))
+    .unwrap();
+    let spec = CompletionResponseSpec::new(&request, Vec::new());
+    let (heard, guard, end) = heard_request();
+    let (gate_tx, mut stream, server) = stream_past_a_local_stop().await;
+    stream.report_through(end);
+    let (tx, rx) = sse_channel();
+    let outcome = timeout(
+        Duration::from_secs(5),
+        processor(false).process_completion_streaming_chunks(
+            stream,
+            dispatch(),
+            Arc::new(CharacterTokenizer::default()),
+            stop_string("STOP"),
+            &spec,
+            "",
+            0,
+            &tx,
+            None,
+        ),
+    )
+    .await
+    .expect("the unit ends at the stop, without the engine's tail")
+    .expect("the unit's outcome");
+    drop(tx);
+    collect_events(rx).await;
+    server.abort();
+    drop(gate_tx);
+    assert!(outcome.saw_complete);
+
+    drop(guard);
+    assert_eq!(
+        *heard.lock().expect("the stage heard"),
+        ["issued", "dispatched Single", "completed Ok 200"]
+    );
+}
+
+/// The messages read lets the engine go at the gateway's stop too, and
+/// Grand Central hears the same good end.
+#[tokio::test]
+async fn a_messages_local_stop_is_heard_as_the_workers_good_end() {
+    let (heard, guard, end) = heard_request();
+    let (gate_tx, mut stream, server) = stream_past_a_local_stop().await;
+    stream.report_through(end);
+    let (tx, rx) = sse_channel();
+    let mut spec = messages_spec(false);
+    spec.prompt_tokens = 7;
+    let result = timeout(
+        Duration::from_secs(5),
+        processor(false).process_messages_streaming_chunks(
+            stream,
+            dispatch(),
+            Arc::new(CharacterTokenizer::default()),
+            stop_string("STOP"),
+            spec,
+            &tx,
+            None,
+        ),
+    )
+    .await
+    .expect("the message ends at the stop, without the engine's tail");
+    drop(tx);
+    collect_events(rx).await;
+    server.abort();
+    drop(gate_tx);
+    assert!(result.is_ok(), "{result:?}");
+
+    drop(guard);
+    assert_eq!(
+        *heard.lock().expect("the stage heard"),
+        ["issued", "dispatched Single", "completed Ok 200"]
+    );
 }
 
 #[tokio::test]

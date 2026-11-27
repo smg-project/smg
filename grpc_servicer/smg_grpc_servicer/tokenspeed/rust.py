@@ -405,6 +405,17 @@ def server_facts(server_args: Any) -> dict[str, Any]:
     # servicer refuses a constraint that backend cannot enforce before the
     # scheduler, and judges nothing when the backend is not known.
     grammar_backend = tokenspeed_grammar_backend(server_args)
+    if not grammar_backend and callable(getattr(server_args, "resolve_model_defaults", None)):
+        # An unset flag on a checkpoint the engine had not read when it parsed
+        # its arguments (a hub id its cache did not hold). The launcher's model
+        # config step has fetched the checkpoint's config since, so the engine's
+        # own method finds it in the cache now. Ask it on a deep copy: the
+        # launch still finds its arguments unread and settles them itself, and
+        # raises again whatever the method refuses here.
+        with contextlib.suppress(Exception):
+            settled = copy.deepcopy(server_args)
+            settled.resolve_model_defaults()
+            grammar_backend = tokenspeed_grammar_backend(settled)
     grammar_backend_entry(args_dict, grammar_backend)
     # The vocabulary of structural-tag nodes that backend takes, when the
     # xgrammar installed beside the engine predates the current one: the

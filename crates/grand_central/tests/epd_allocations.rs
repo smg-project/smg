@@ -255,25 +255,23 @@ fn an_encode_pair_decision_allocates_nothing_after_its_first_32() {
                     }
                 }
                 let of_encoders: Vec<EncoderFacts> = (0..n)
-                    .map(|i| EncoderFacts {
-                        class: 1 + i % 2,
-                        pushes: true,
-                        references: false,
+                    .map(|i| {
+                        let mut encoder = EncoderFacts::default();
+                        encoder.class = 1 + i % 2;
+                        encoder.pushes = true;
+                        encoder.references = false;
+                        encoder
                     })
                     .collect();
                 let prefill_classes: Vec<u32> = (0..n).map(|i| 1 + i % 2).collect();
-                let pools = PairPools {
-                    prefills: &prefills,
-                    decodes: &decodes,
-                    ..PairPools::default()
-                };
-                let encode = EncodePool {
-                    encoders: &pool,
-                    facts: &of_encoders,
-                    prefill_classes: &prefill_classes,
-                    affinity: &[],
-                    ..EncodePool::default()
-                };
+                let mut pools = PairPools::default();
+                pools.prefills = &prefills;
+                pools.decodes = &decodes;
+                let mut encode = EncodePool::default();
+                encode.encoders = &pool;
+                encode.facts = &of_encoders;
+                encode.prefill_classes = &prefill_classes;
+                encode.affinity = &[];
                 let mut pool_facts = PoolFacts::default();
                 pool_facts.pool_size = n;
                 pool_facts.generation = 1;
@@ -298,13 +296,12 @@ fn an_encode_pair_decision_allocates_nothing_after_its_first_32() {
                     facts.media.images = 1;
                     facts.seed = seed;
                     facts.now_micros = 1_000_000;
-                    let items = EncodeItems {
-                        keys: &keys,
-                        one: None,
-                        references: false,
-                        decode_images: left_out,
-                        ring: lent.then_some(&ring as &dyn LentRing),
-                    };
+                    let mut items = EncodeItems::default();
+                    items.keys = &keys;
+                    items.one = None;
+                    items.references = false;
+                    items.decode_images = left_out;
+                    items.ring = lent.then_some(&ring as &dyn LentRing);
                     let decision = engine.decide_encode_pair(
                         &facts,
                         &pool_facts,

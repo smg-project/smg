@@ -17,7 +17,10 @@ pub use smg_external_router::metrics::{
     bool_to_static_str, error_reason_from_status, intern_model_label, intern_tool_label,
     metrics_labels, STREAMING_FALSE, STREAMING_TRUE,
 };
-use smg_grand_central::engine::{DecisionEngine, InProcess, ShadowKind, ShadowSide};
+use smg_grand_central::engine::{
+    DecisionEngine, InProcess, ShadowKind, ShadowSide, POLICY_FAULTS_HELP, POLICY_FAULTS_TOTAL,
+    POLICY_FAULT_KINDS,
+};
 use smg_worker::metrics::{
     series as worker_series,
     series::{WorkerSeries, WorkerSeriesRecorder},
@@ -889,13 +892,7 @@ pub(crate) fn init_metrics() {
          the shadow is asked beside (single, prefill, decode, decode-again) and by kind \
          (agreed, other-target, other-outcome, skipped); a shadow that panicked is not counted"
     );
-    describe_counter!(
-        "smg_policy_faults_total",
-        "Panics Grand Central held and counted, by kind: decision (a decision that \
-         panicked, a shadow's beside a live decision among them), event (a stage at a lease \
-         event or a change of membership), upkeep (a step of the engine's upkeep: its sweep, \
-         the registry's follow, a load report, a fill of worker lists)"
-    );
+    describe_counter!(POLICY_FAULTS_TOTAL, POLICY_FAULTS_HELP);
     describe_histogram!(
         "smg_cache_aware_match_ratio",
         "The predicted overlap of a cache-aware routing decision as a ratio (0..1), one observation per decision: in tree mode the best prefix match in the tree (matched/input units, whatever branch the decision took); in event mode the chosen worker's overlap in blocks over the request's blocks (0 where the chosen worker holds none: a miss, a spill, a warm-up placement). \
@@ -1190,12 +1187,9 @@ pub(super) fn record_policy_shadow_activity(engine: &InProcess, published: &Shad
 /// each series is set to its count as read, with no record of the scrapes
 /// before, and of two scrapes at once the larger read stands.
 pub(super) fn record_policy_fault_activity(engine: &InProcess) {
-    for (kind, held) in [
-        ("decision", engine.faults()),
-        ("event", engine.unheard()),
-        ("upkeep", engine.upkeep_faults()),
-    ] {
-        counter!("smg_policy_faults_total", "kind" => kind).absolute(held);
+    let held = [engine.faults(), engine.unheard(), engine.upkeep_faults()];
+    for (kind, held) in POLICY_FAULT_KINDS.into_iter().zip(held) {
+        counter!(POLICY_FAULTS_TOTAL, "kind" => kind).absolute(held);
     }
 }
 
@@ -1373,88 +1367,7 @@ fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Mat
     not(target_env = "msvc"),
     not(target_env = "musl")
 ))]
-pub(crate) mod allocator_stats {
-    use metrics::{describe_gauge, gauge};
-
-    use super::jemalloc_is_global;
-
-    pub(crate) fn describe() {
-        if !jemalloc_is_global() {
-            return;
-        }
-        describe_gauge!(
-            "smg_allocator_allocated_bytes",
-            "Bytes in live Rust allocations managed by SMG's jemalloc instance"
-        );
-        describe_gauge!(
-            "smg_allocator_active_bytes",
-            "Bytes in active pages for SMG's Rust jemalloc heap"
-        );
-        describe_gauge!(
-            "smg_allocator_resident_bytes",
-            "Upper bound on resident bytes for SMG's Rust jemalloc heap"
-        );
-        describe_gauge!(
-            "smg_allocator_metadata_bytes",
-            "Metadata bytes for SMG's Rust jemalloc instance"
-        );
-    }
-
-    fn record() {
-        use tikv_jemalloc_ctl::{epoch, stats};
-        if epoch::advance().is_err() {
-            return;
-        }
-        if let Ok(v) = stats::allocated::read() {
-            gauge!("smg_allocator_allocated_bytes").set(v as f64);
-        }
-        if let Ok(v) = stats::active::read() {
-            gauge!("smg_allocator_active_bytes").set(v as f64);
-        }
-        if let Ok(v) = stats::resident::read() {
-            gauge!("smg_allocator_resident_bytes").set(v as f64);
-        }
-        if let Ok(v) = stats::metadata::read() {
-            gauge!("smg_allocator_metadata_bytes").set(v as f64);
-        }
-    }
-
-    /// The gauges are published where this jemalloc serves the process's Rust
-    /// allocations, and nowhere else.
-    pub(crate) fn start_reporting() {
-        if !jemalloc_is_global() {
-            return;
-        }
-        record();
-        // Plain thread: metrics must not depend on a runtime being alive.
-        let _ = std::thread::Builder::new()
-            .name("smg-allocator-stats".into())
-            .spawn(|| loop {
-                std::thread::sleep(std::time::Duration::from_secs(60));
-                record();
-            });
-    }
-
-    #[cfg(test)]
-    mod tests {
-        #[test]
-        fn the_allocator_of_the_lib_tests_is_found() {
-            // The lib's tests declare jemalloc as their allocator (lib.rs),
-            // so the one allocation moves its count.
-            assert!(super::jemalloc_is_global());
-        }
-
-        #[test]
-        fn jemalloc_stats_interface_readable() {
-            use tikv_jemalloc_ctl::{epoch, stats};
-            epoch::advance().expect("epoch advance");
-            stats::allocated::read().expect("stats.allocated readable");
-            stats::active::read().expect("stats.active readable");
-            stats::resident::read().expect("stats.resident readable");
-            stats::metadata::read().expect("stats.metadata readable");
-        }
-    }
-}
+pub(crate) mod allocator_stats;
 
 /// SMG Metrics helper struct for the new layered metrics architecture.
 ///
@@ -2586,81 +2499,9 @@ impl Metrics {
 
 /// Metrics helpers for tests elsewhere in the crate.
 #[cfg(test)]
-pub(crate) mod test_support {
-    use std::sync::OnceLock;
-
-    use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
-    use smg_grand_central::document::{AppliedSpec, PolicySpec, ShadowSpec};
-
-    /// The lib test binary's one process-wide recorder, for records made on
-    /// threads no local recorder covers (the blocking pool). Installed once;
-    /// every other test keeps its own local recorder, which takes precedence
-    /// on its thread.
-    pub(crate) fn global_recorder() -> &'static PrometheusHandle {
-        static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
-        HANDLE.get_or_init(|| {
-            PrometheusBuilder::new()
-                .install_recorder()
-                .expect("the lib test binary's one global recorder")
-        })
-    }
-
-    /// The scrape a test renders under its own recorder, with the two
-    /// readers of it: the worker's test support owns them.
-    pub(crate) use smg_worker::test_support::assert_metric;
-    pub(crate) use smg_worker::test_support::{render_with_recorder, sorted_series};
-
-    /// A policy document of two bindings. The first is of another model
-    /// and names no shadow. The second is the `round_robin` preset's, of
-    /// every model, with the `random` preset's profile as its shadow.
-    pub(crate) fn shadowing_document() -> PolicySpec {
-        let preset = |name| PolicySpec::preset(name).expect("a stock preset");
-        let mut document = preset("round_robin");
-        document.profiles.extend(preset("random").profiles);
-        let mut ahead = document.bindings[0].clone();
-        ahead.matcher.model = "another-model".to_owned();
-        document.bindings[0].shadow = Some(ShadowSpec::Profile("random".to_owned()));
-        document.bindings.insert(0, ahead);
-        document
-    }
-
-    /// [`shadowing_document`], as an engine is built from it.
-    pub(crate) fn shadowing_spec() -> AppliedSpec {
-        AppliedSpec::validate(&shadowing_document()).expect("a valid policy document")
-    }
-
-    /// The shadow series of the second binding's single requests in a
-    /// scrape, by kind: agreed, other target, other outcome, skipped.
-    /// `None` where the scrape holds no such series.
-    pub(crate) fn shadow_kinds(rendered: &str) -> [Option<u64>; 4] {
-        ["agreed", "other-target", "other-outcome", "skipped"].map(|kind| {
-            let labels = [
-                r#"binding="1""#,
-                r#"side="single""#,
-                &format!(r#"kind="{kind}""#),
-            ];
-            let of_kind = |line: &&str| {
-                line.starts_with("smg_policy_shadow_decisions_total{")
-                    && labels.iter().all(|label| line.contains(label))
-            };
-            let line = rendered.lines().find(of_kind)?;
-            line.rsplit(' ').next()?.parse().ok()
-        })
-    }
-
-    /// The series of the panics Grand Central held and counted in a
-    /// scrape, by kind: decision, event, upkeep. `None` where the scrape
-    /// holds no such series.
-    pub(crate) fn fault_kinds(rendered: &str) -> [Option<u64>; 3] {
-        ["decision", "event", "upkeep"].map(|kind| {
-            let label = format!(r#"kind="{kind}""#);
-            let of_kind =
-                |line: &&str| line.starts_with("smg_policy_faults_total{") && line.contains(&label);
-            let line = rendered.lines().find(of_kind)?;
-            line.rsplit(' ').next()?.parse().ok()
-        })
-    }
-}
+#[path = "../../tests/unit/observability/metrics/test_support.rs"]
+pub(crate) mod test_support;
 
 #[cfg(test)]
+#[path = "../../tests/unit/observability/metrics/tests.rs"]
 mod tests;

@@ -63,11 +63,9 @@ fn decode_later(c: &mut Criterion) {
     for &n in &SIZES {
         let prefills = side_view(n / 4, Role::Prefill, 10_000);
         let decodes = side_view(n - n / 4, Role::Decode, 20_000);
-        let pools = PairPools {
-            prefills: &prefills,
-            decodes: &decodes,
-            ..PairPools::default()
-        };
+        let mut pools = PairPools::default();
+        pools.prefills = &prefills;
+        pools.decodes = &decodes;
         // The facts of the decode pool: the entry's profile places there.
         let mut pool = PoolFacts::default();
         pool.pool_size = decodes.len() as u32;
@@ -124,11 +122,9 @@ fn decode_later_handed(c: &mut Criterion, decode: &str, handed: &str) {
     for &n in &SIZES {
         let prefills = side_view(n / 4, Role::Prefill, 10_000);
         let decodes = side_view(n - n / 4, Role::Decode, 20_000);
-        let pools = PairPools {
-            prefills: &prefills,
-            decodes: &decodes,
-            ..PairPools::default()
-        };
+        let mut pools = PairPools::default();
+        pools.prefills = &prefills;
+        pools.decodes = &decodes;
         let mut pool = PoolFacts::default();
         pool.pool_size = decodes.len() as u32;
         pool.generation = 1;

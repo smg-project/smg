@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 
 use super::DecisionRecord;
 use crate::engine::{
-    decision::{Decision, LiftedVeto, ShedReason, Target},
+    decision::{Decision, LiftedVeto, PairSide, ShedReason, Target},
     framework::Engine,
     view::WorkerId,
 };
@@ -52,25 +52,33 @@ impl DecisionRecord {
     /// and that profile's stages stand where `engine` holds the record's
     /// generation ([`Self::names`]).
     ///
-    /// The JSON holds what the record holds. It states neither `request_id`
-    /// nor `gateway_id`: the record holds neither, and a caller holds the
-    /// id it asked by. A field of the contract that no kept record holds is
-    /// left out as well.
+    /// The JSON holds what the record holds but for the decode side's
+    /// shadow (`decode_shadow`, `decode_shadow_target`), which no kept
+    /// record holds yet. The worker the binding's shadow picked
+    /// (`shadow_target`) stands under the contract's own name for it,
+    /// `shadow_pick` in the trace, where the record holds one. The JSON
+    /// states neither `request_id` nor `gateway_id`: the record holds
+    /// neither, and a caller holds the id it asked by. A field of the
+    /// contract that no kept record holds is left out as well.
     ///
     /// A number is written by the width the contract carries it in. One of
     /// 64 bits is a decimal string, since it does not fit a JSON number: a
     /// worker's id, a seed, a ticket, a generation and the instant. A
-    /// narrower one and a score are JSON numbers. An enum is the contract's
-    /// word. An option that holds no value is left out, and a zero, a
-    /// `false` and an empty list are written. The instant is the wall
-    /// clock's, in microseconds since the epoch.
+    /// narrower one and a score are JSON numbers. A score that is no number
+    /// has no JSON form: its row is written without it. An enum is the
+    /// contract's word. An option that holds no value is left out, and a
+    /// zero, a `false` and an empty list are written. The instant is the
+    /// wall clock's, in microseconds since the epoch.
     ///
-    /// Three names stand beside the contract's, which has no field for
+    /// Four names stand beside the contract's, which has no field for
     /// them. `shadow` at the record is what the binding's shadow said
     /// beside the decision. `url` beside a target's `id` and a top row's
     /// `worker_id`, and `decode_url` beside a pair's `decode_id`, are what
     /// `url` answers for the worker of that id: its host's address for it,
-    /// where the host still holds one.
+    /// where the host still holds one. `side` in a shed is the side of a
+    /// pair its refusal names, `prefill` or `decode`
+    /// ([`Shed::side`](crate::engine::decision::Shed::side)): left out
+    /// where the refusal names none.
     ///
     /// A record holds no fact of its request: no id, no routing value, no
     /// session key, no header, no prompt and no credential stand in it.
@@ -107,6 +115,7 @@ impl DecisionRecord {
                     "emptied_by": shed.emptied_by,
                     "retry_after_secs": shed.retry_after_secs,
                     "wait_allowed": shed.wait_allowed,
+                    "side": shed.side.map(PairSide::as_str),
                 }),
             ),
             Decision::Queue(queue) => (
@@ -137,6 +146,7 @@ impl DecisionRecord {
                     "seed": trace.seed.to_string(),
                     "generation": trace.generation.to_string(),
                     "lifted": lifted(trace.lifted),
+                    "shadow_pick": self.shadow_target.map(|picked| picked.0.to_string()),
                 },
             },
             "at_unix_micros": micros.map(|micros| micros.to_string()),
@@ -151,4 +161,5 @@ impl DecisionRecord {
 }
 
 #[cfg(test)]
+#[path = "../../../tests/unit/engine/explain/json/tests.rs"]
 mod tests;

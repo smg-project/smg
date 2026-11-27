@@ -35,9 +35,13 @@ use smg_worker::{health::liveness, identity::basic::Worker, runtime::WorkerRunti
 use tokio::time::error::Elapsed;
 
 use crate::routers::{
-    common::sse::SseSender,
+    common::{
+        placement::{RequestEnd, SharedEnd},
+        sse::SseSender,
+    },
     grpc::{
         multimodal::{log_mm_timing_enabled, mm_rdma_exporter},
+        utils::tonic_ext::TonicStatusExt,
         zmq_client::ZmqGenerateStream,
     },
 };
@@ -723,6 +727,53 @@ pub enum ProtoStream {
     /// abort-on-drop reaches the engine, its tickets go back to the worker)
     /// and the reader meets the end (see [`WatchedStream`]).
     Watched(Box<WatchedStream>),
+    /// A stream that tells Grand Central how it ended (see
+    /// [`ReportedStream`]). No stream of a request the classic policies
+    /// placed is one.
+    Reported(Box<ReportedStream>),
+}
+
+/// A worker's stream that tells Grand Central its end, through the
+/// handle the execution plan asked for it once its call had answered
+/// ([`ProtoStream::report_through`]). It lies
+/// under the stream's tracked layer, and it is the one reader that tells a
+/// worker's end from a client's leaving: the watch above drops it unread.
+///
+/// A clean end is the worker's 200. A failure is told by the status the
+/// circuit breaker samples for it, and one the breaker takes no sample of
+/// is not told ([`TonicStatusExt::end_status`]). The end is told once, and
+/// the handle goes with it. A reader whose own stop ended the generation
+/// tells the same good end where it lets the engine go
+/// ([`ProtoStream::abort_past_stop`]). A stream dropped before its end
+/// tells nothing: a client that left, a reading the gateway gave up. The
+/// engine then hears that end as it did before. A stream that is one of a
+/// batch's tells through the end the batch shares ([`SharedEnd`]).
+pub struct ReportedStream {
+    inner: ProtoStream,
+    end: RequestEnd,
+    /// The end a batch's streams share, where this is one of them: its own
+    /// handle is empty then.
+    among: Option<Arc<SharedEnd>>,
+}
+
+impl ReportedStream {
+    /// The stream met `item`: an end is told, a response is not looked at.
+    #[inline]
+    fn met(&mut self, item: Option<&Result<ProtoGenerateResponse, tonic::Status>>) {
+        let failure = match item {
+            Some(Ok(_)) => return,
+            Some(Err(status)) => Some(status),
+            None => None,
+        };
+        let mut end = std::mem::take(&mut self.end);
+        if let Some(shared) = self.among.take() {
+            end = shared.take(failure.is_some());
+        }
+        match failure {
+            Some(status) => end.report_with(|| status.end_status()),
+            None => end.report(200, || true),
+        }
+    }
 }
 
 /// A stream with its first item (`None`: its end) pulled ahead of its reader
@@ -1994,6 +2045,141 @@ impl ProtoStream {
         }))
     }
 
+    /// From here on this stream tells Grand Central its end through
+    /// `end` (see [`ReportedStream`]). An empty handle leaves the stream as
+    /// it is: a request the classic policies placed, or one under a policy
+    /// document no stage of which takes an end. Such a request pays the
+    /// handle's test, and its stream is not moved.
+    #[inline]
+    pub(crate) fn report_through(&mut self, end: RequestEnd) {
+        if !end.is_empty() {
+            self.put_report_layer(end, None);
+        }
+    }
+
+    /// [`Self::report_through`] behind its test of the handle: the layer is
+    /// made whatever `end` holds. It goes under the stream's tracked layer,
+    /// where it has one. A pair's decode side may come stamped
+    /// ([`Self::decode_side`]): the layer goes under the stamp too, so it
+    /// lies in one place whichever shape sent the pair. The decision bench
+    /// counts the layer through this, on an empty handle. One of a batch's
+    /// streams takes `among`, the end the batch shares, and tells through
+    /// it.
+    ///
+    /// The stage puts the layer before a reader watches the stream for its
+    /// client: over a watch the layer would read a client's leaving as the
+    /// worker's end. A debug build stops at a stream watched already.
+    ///
+    /// The tracked layer may hold the stream's first item already, read
+    /// ahead of the layer: a decode sent behind its prefill is waited for
+    /// within its bound. No read hands that item down, so the layer meets
+    /// it here.
+    #[inline(never)]
+    pub(crate) fn put_report_layer(&mut self, end: RequestEnd, among: Option<Arc<SharedEnd>>) {
+        debug_assert!(
+            !matches!(self, Self::Watched(_)),
+            "the layer is put before the stream is watched"
+        );
+        let over = match self {
+            Self::DecodeSide(side) => &mut side.inner,
+            stream => stream,
+        };
+        let (over, held) = match over {
+            Self::Tracked(tracked) => {
+                let TrackedStream { inner, replay, .. } = &mut **tracked;
+                (inner, replay.as_ref())
+            }
+            stream => (stream, None),
+        };
+        // Nothing unwinds between the take and the write that follows it.
+        let empty = Self::Fanout(FanoutStream::new(Vec::new()));
+        let inner = std::mem::replace(over, empty);
+        let mut layer = ReportedStream { inner, end, among };
+        if let Some(held) = held {
+            layer.met(held.as_ref());
+        }
+        *over = Self::Reported(Box::new(layer));
+    }
+
+    /// The reader's own stop ended the generation while the engine streamed
+    /// on. The answer is whole, so the stream tells Grand Central the
+    /// worker's 200 as at a clean end ([`ReportedStream`]). It is then
+    /// dropped un-marked, which aborts the engine's tail.
+    ///
+    /// A streaming reader's stream over a classic request is the watch for
+    /// its client over the tracked layer over its worker's own stream, and
+    /// a decode side lays its stamp over that. Such a stream holds no layer
+    /// to tell through: it is tested for that shape in line and dropped as
+    /// before. A stream of any other shape walks its layers out of line.
+    #[inline]
+    pub(crate) fn abort_past_stop(mut self) {
+        let plain = self.has_only_watch_and_tracking()
+            || matches!(
+                &self,
+                Self::DecodeSide(side) if side.inner.has_only_watch_and_tracking()
+            );
+        if !plain {
+            self.tell_stop();
+        }
+    }
+
+    /// Whether this is the watch for a client over the tracked layer over
+    /// a stream with no layer ([`Self::has_no_layer`]), and nothing else.
+    #[inline]
+    fn has_only_watch_and_tracking(&self) -> bool {
+        let Self::Watched(watched) = self else {
+            return false;
+        };
+        matches!(&watched.inner, Some(Self::Tracked(tracked)) if tracked.inner.has_no_layer())
+    }
+
+    /// [`Self::abort_past_stop`] for a stream that may hold the layer, out
+    /// of line: the layers are walked, and the layer tells the good end.
+    #[inline(never)]
+    fn tell_stop(&mut self) {
+        if let Some(reported) = self.reported() {
+            reported.met(None);
+        }
+    }
+
+    /// Whether this stream holds no layer the walk to the layer enters
+    /// ([`Self::reported`]): a worker's own stream, or a fan-out. A fan-out's
+    /// children are streams of their own, and the walk does not enter one
+    /// either, so naming it here changes no answer. A form added to the
+    /// stream counts as layered until it is named here: it walks its layers
+    /// at a reader's stop.
+    #[inline]
+    fn has_no_layer(&self) -> bool {
+        matches!(
+            self,
+            Self::Sglang(_)
+                | Self::Vllm(_)
+                | Self::Trtllm(_)
+                | Self::Mlx(_)
+                | Self::TokenSpeed(_)
+                | Self::Zmq(_)
+                | Self::Fanout(_)
+        )
+    }
+
+    /// The layer that tells this stream's end, under whatever lies over it.
+    fn reported(&mut self) -> Option<&mut ReportedStream> {
+        match self {
+            Self::Reported(reported) => Some(reported),
+            Self::Tracked(tracked) => tracked.inner.reported(),
+            Self::DecodeSide(side) => side.inner.reported(),
+            Self::Ahead(ahead) => ahead.inner.reported(),
+            Self::Watched(watched) => watched.inner.as_mut()?.reported(),
+            Self::Sglang(_)
+            | Self::Vllm(_)
+            | Self::Trtllm(_)
+            | Self::Mlx(_)
+            | Self::TokenSpeed(_)
+            | Self::Zmq(_)
+            | Self::Fanout(_) => None,
+        }
+    }
+
     /// Whether the end this stream's reader met was the client's leaving
     /// (see [`Self::until_client_gone`]), not the engine's end: the
     /// generation did not complete, and nothing accounts it as one. Read
@@ -2178,6 +2364,13 @@ impl ProtoStream {
                 *self = std::mem::replace(&mut ahead.inner, empty);
                 return first;
             }
+            // Read behind a boxed future, as any layer under the tracked
+            // one is: the stream under it mapped the item.
+            Self::Reported(reported) => {
+                let item = Box::pin(reported.inner.next_untracked()).await;
+                reported.met(item.as_ref());
+                return item;
+            }
         };
         item.map(reject_engine_error)
     }
@@ -2200,6 +2393,7 @@ impl ProtoStream {
                     inner.mark_completed();
                 }
             }
+            Self::Reported(reported) => reported.inner.mark_completed(),
         }
     }
 
@@ -2235,6 +2429,7 @@ impl ProtoStream {
                     inner.apply_deadline(deadline);
                 }
             }
+            Self::Reported(reported) => reported.inner.apply_deadline(deadline),
         }
     }
 
@@ -2315,6 +2510,11 @@ impl ProtoStream {
                     client_gone,
                     request_id,
                 }))
+            }
+            Self::Reported(reported) => {
+                let ReportedStream { inner, end, among } = *reported;
+                let inner = inner.defer_abort_within(bound);
+                Self::Reported(Box::new(ReportedStream { inner, end, among }))
             }
         }
     }
@@ -2509,7 +2709,10 @@ mod fanout_tests {
         common::prefill_admission::{
             test_support::select_worker, PrefillAdmission, PrefillLoadGuard,
         },
-        grpc::{backend_client::BasicWorkerBuilder, common::response_collection::drain_prefill},
+        grpc::{
+            backend_client::BasicWorkerBuilder,
+            common::response_collection::{drain_prefill, StreamedAnswer},
+        },
     };
 
     /// A child that yields a script, then ends.
@@ -2650,10 +2853,16 @@ mod fanout_tests {
                 let (second, _) = child(vec![complete()]);
                 let mut stream = FanoutStream::new(vec![first, second]);
                 let mut indices = Vec::new();
-                drain_prefill(&mut stream, guards, finish_at_complete, |complete| {
-                    indices.push(complete.index());
-                    assert_eq!(worker.load(), if complete.index() == 0 { 1 } else { 0 });
-                })
+                drain_prefill(
+                    &mut stream,
+                    guards,
+                    finish_at_complete,
+                    StreamedAnswer,
+                    |complete| {
+                        indices.push(complete.index());
+                        assert_eq!(worker.load(), if complete.index() == 0 { 1 } else { 0 });
+                    },
+                )
                 .await
                 .unwrap();
                 assert_eq!(indices, vec![0, 1]);
@@ -3367,7 +3576,9 @@ mod watched_tests {
         common::sse::{sse_channel, SseReceiver},
         grpc::{
             backend_client::BasicWorkerBuilder,
-            regular::streaming::tests::eof::{chunk, complete, gated_stream, staged_stream},
+            regular::streaming::tests::eof::{
+                chunk, complete, gated_stream, scripted_stream, staged_stream,
+            },
         },
     };
 
@@ -3613,6 +3824,185 @@ mod watched_tests {
         drop(rx);
         assert!(stream.next().await.is_none());
         assert!(stream.next().await.is_none());
+    }
+
+    /// A reader's own stop finds the layer that tells a stream's end under
+    /// each layer a reader's stream has: the tracked layer, the watch for
+    /// its client and a decode side's stamp, in a reader's order and in
+    /// another, and an item pulled ahead of its reader. Grand Central
+    /// hears the worker's 200 each time.
+    #[test]
+    fn a_readers_stop_tells_the_end_under_each_layer_of_its_stream() {
+        use super::{AheadStream, FanoutStream};
+        use crate::routers::common::placement::{tests::heard_request, RequestEnd};
+
+        let (client, _body) = sse_channel();
+        let stamp = || {
+            let mut prefill = PrefillCachedTokens::default();
+            prefill.note(&ProtoGenerateComplete::Vllm(Box::new(
+                vllm::GenerateComplete {
+                    cached_tokens: 2,
+                    ..Default::default()
+                },
+            )));
+            prefill
+        };
+        let layered = |end: RequestEnd| {
+            let mut stream = ProtoStream::Fanout(FanoutStream::new(Vec::new()));
+            stream.report_through(end);
+            stream
+        };
+        let tracked = |end: RequestEnd| {
+            let worker: Arc<dyn Worker> =
+                Arc::new(BasicWorkerBuilder::new("grpc://e:30000").build());
+            let mut stream =
+                ProtoStream::Fanout(FanoutStream::new(Vec::new())).tracked(worker, 0, false);
+            stream.report_through(end);
+            stream
+        };
+        let watched = |end: RequestEnd| tracked(end).until_client_gone(&client, "req-stopped");
+        let shapes: [(&str, &dyn Fn(RequestEnd) -> ProtoStream); 6] = [
+            ("the layer alone", &layered),
+            ("under an item pulled ahead", &|end| {
+                ProtoStream::Ahead(Box::new(AheadStream {
+                    inner: layered(end),
+                    first: None,
+                }))
+            }),
+            ("under the tracked layer", &tracked),
+            ("under the watch", &watched),
+            ("under a decode side's stamp", &|end| {
+                watched(end).decode_side(stamp())
+            }),
+            ("under a stamp that is watched", &|end| {
+                tracked(end)
+                    .decode_side(stamp())
+                    .until_client_gone(&client, "req-stopped")
+            }),
+        ];
+        for (shape, stream) in shapes {
+            let (heard, guard, end) = heard_request();
+            stream(end).abort_past_stop();
+            drop(guard);
+            assert_eq!(
+                *heard.lock().expect("the stage heard"),
+                ["issued", "dispatched Single", "completed Ok 200"],
+                "{shape}"
+            );
+        }
+    }
+
+    /// The layer goes under a stream's tracked layer, so its readers still
+    /// meet a tracked stream: it names its worker, and its first item is
+    /// read ahead and held back for its reader.
+    #[tokio::test]
+    async fn the_layer_goes_under_the_tracked_layer() {
+        use super::{FanoutStream, FirstItem};
+        use crate::routers::common::placement::tests::heard_request;
+
+        let (heard, guard, end) = heard_request();
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("grpc://e:30000").build());
+        let mut stream =
+            ProtoStream::Fanout(FanoutStream::new(Vec::new())).tracked(worker, 0, false);
+        stream.report_through(end);
+        assert!(stream.worker().is_some(), "the stream names its worker");
+        assert_eq!(stream.first_response().await, FirstItem::End);
+        assert!(stream.next().await.is_none(), "the end was held back");
+
+        drop((stream, guard));
+        assert_eq!(
+            *heard.lock().expect("the stage heard"),
+            ["issued", "dispatched Single", "completed Ok 200"]
+        );
+    }
+
+    /// A pair's decode stream comes to the stage stamped where its prefill
+    /// reported a prefix-cache hit, and with no stamp where the readers
+    /// stamp it behind the stage. The layer lies in one place for both:
+    /// under the stamp, and under the tracked layer.
+    #[tokio::test]
+    async fn the_layer_goes_under_a_decode_sides_stamp_too() {
+        use super::FanoutStream;
+        use crate::routers::common::placement::tests::heard_request;
+
+        let mut prefill = PrefillCachedTokens::default();
+        prefill.note(&ProtoGenerateComplete::Vllm(Box::new(
+            vllm::GenerateComplete {
+                cached_tokens: 2,
+                ..Default::default()
+            },
+        )));
+        let (heard, guard, end) = heard_request();
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("grpc://d:30000").build());
+        let mut stream = ProtoStream::Fanout(FanoutStream::new(Vec::new()))
+            .tracked_decode_side(worker)
+            .decode_side(prefill);
+        stream.report_through(end);
+        let ProtoStream::DecodeSide(side) = &stream else {
+            panic!("the stamp stays the outermost layer");
+        };
+        let ProtoStream::Tracked(tracked) = &side.inner else {
+            panic!("the tracked layer stays under the stamp");
+        };
+        assert!(
+            matches!(tracked.inner, ProtoStream::Reported(_)),
+            "the layer lies under the tracked layer"
+        );
+        assert!(stream.next().await.is_none());
+
+        drop((stream, guard));
+        assert_eq!(
+            *heard.lock().expect("the stage heard"),
+            ["issued", "dispatched Single", "completed Ok 200"]
+        );
+    }
+
+    /// A tracked stream may hold its first item before the layer is put: a
+    /// decode sent behind its prefill is waited for within its bound. The layer
+    /// meets that item where it is put. A failure is told by its status, and an
+    /// end with nothing on the stream as a clean end, each once. The item is
+    /// still handed to the stream's reader.
+    #[tokio::test]
+    async fn the_layer_meets_a_first_item_the_tracked_layer_read_ahead_of_it() {
+        use super::FirstItem;
+        use crate::routers::common::placement::tests::heard_request;
+
+        for (status, first, end_heard) in [
+            ("13", FirstItem::Failure, "completed ServerError 500"),
+            ("0", FirstItem::End, "completed Ok 200"),
+        ] {
+            let (heard, guard, end) = heard_request();
+            let (stream, _server) = scripted_stream(Vec::new(), status).await;
+            let worker: Arc<dyn Worker> =
+                Arc::new(BasicWorkerBuilder::new("grpc://d:30000").build());
+            let mut stream = stream.tracked_decode_side(worker);
+            assert_eq!(stream.first_response().await, first, "{status}");
+
+            stream.report_through(end);
+            let read = stream.next().await;
+            assert_eq!(read.is_some(), status == "13", "{status}");
+            drop((stream, guard));
+            assert_eq!(
+                *heard.lock().expect("the stage heard"),
+                ["issued", "dispatched Single", end_heard],
+                "{status}"
+            );
+        }
+    }
+
+    /// The stage puts the layer before a reader watches the stream: a debug
+    /// build stops at a stream watched already.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "the layer is put before the stream is watched")]
+    fn the_layer_is_not_put_over_a_watch() {
+        use super::FanoutStream;
+        use crate::routers::common::placement::RequestEnd;
+
+        let (client, _body) = sse_channel();
+        let mut stream = ProtoStream::Fanout(FanoutStream::new(Vec::new()))
+            .until_client_gone(&client, "req-watched");
+        stream.put_report_layer(RequestEnd::default(), None);
     }
 
     /// A client that stays reads the stream as it is: every response, a gap

@@ -467,10 +467,29 @@ const _: () = assert!(CHAIN_INDEX_SHARDS == 1);
 
 /// Grand Central's reads of the index, where it decides in the
 /// gateway's own process: a worker's id and its block count once a list of
-/// workers is read, and one lookup a request.
+/// workers is read, and one lookup a request. The count of ids handed out
+/// again is read beside both: ahead of a list's ids, and by a request
+/// where it takes the list's table and behind its lookup.
 impl CacheIndex for KvIndex {
     fn worker_number(&self, address: &str) -> Option<u32> {
         self.worker_id(address)
+    }
+
+    /// The chain index's one shard counts them; the reference index of the
+    /// tests hands no id out twice.
+    fn numbers_reused(&self) -> u64 {
+        match self {
+            Self::Chain(chain) => chain.index.shard(0).ids_reused(),
+            #[cfg(test)]
+            Self::Reference(_) => 0,
+        }
+    }
+
+    /// The index's own test, the one the classic policy asks before every
+    /// request ([`Self::is_empty`]): the engine asks it where a decision
+    /// takes its list's table.
+    fn holds_a_block(&self) -> bool {
+        !self.is_empty()
     }
 
     fn worker_blocks(&self, number: u32) -> usize {

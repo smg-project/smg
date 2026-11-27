@@ -64,7 +64,7 @@ the scanner and the token ledger are the engine's own.
 | `ValueRead`, `Inferred`, `Format::reads_values_with` | How a shaped call's values read: a tagged value's text by the template's parser (`shape::ValueParser`), typed by its parameter's schema; a member of JSON arguments held and typed where the reader says; a key written twice. A table names its reader; `Inferred`, the default, reads as the tagged tables do, and a crate that implements a template library's semantics gives its own. |
 | `shape::Layout`, `Format::with_layout` | How the model's chat template writes a turn where a response template's patterns leave the text open: the whitespace a `\s*` stands for, the text outside every field, each part of a call, the values, a thought and an answer, and which close the template writes for a region it closes more than one way. Whoever compiles the table learns it from a rendering, reading the call's shape through `Format::call_syntax` and the markers through `Format::terminal_texts`, and gives it to the table; `Layout::check` says whether it fits. Parsing does not read it; the structural tags of a shaped call are written from it. |
 | `Declared` | What the request's tools declare: the parameter types, which type a tagged call's values and the quoted pythonic dialect's (`Declared::kind`), and whether a tool declares a function (`Declared::declares`), which decides whether a list after content is held and read as calls. |
-| `formats::*` | One function per family, each returning its table: `qwen3(syntax)`, `qwen2_5()`, `deepseek_v3()`, `deepseek_v3_1()`, `deepseek_v3_2()`, `deepseek_v4()`, `deepseek_v4_1()`, `seed_oss()`, `hy4()`, `ling()`, `iquest()`, `glm()`, `glm4()`, `k2_horizon()`, `longcat()`, `olmo3()`, `lfm2_5()`, `llama4()`, `xlam()`, `json()`, `minimax_m2()`, `minimax_m3()`, `kimi_k3()`, `kimi_k2()`, `kimi()`, `inkling()`, `inkling2()`, `minicpm5()`, `dots3()`, `gemma4()`, `function_gemma()`, `mistral()`, `mistral_v13()`, `llama_nemotron()`, `command()`, `gpt_oss()`, `forced()`, `plain()`. |
+| `formats::*` | One function per family, each returning its table: `qwen3(syntax)`, `qwen2_5()`, `deepseek_v3()`, `deepseek_v3_1()`, `deepseek_v3_2()`, `deepseek_v4()`, `deepseek_v4_1()`, `seed_oss()`, `hy4()`, `ling()`, `iquest()`, `glm()`, `glm4()`, `k2_horizon()`, `longcat()`, `olmo3()`, `lfm2_5()`, `llama4()`, `xlam()`, `json()`, `minimax_m2()`, `minimax_m3()`, `steptml()`, `kimi_k3()`, `kimi_k2()`, `kimi()`, `inkling()`, `inkling2()`, `minicpm5()`, `dots3()`, `gemma4()`, `function_gemma()`, `mistral()`, `mistral_v13()`, `llama_nemotron()`, `command()`, `gpt_oss()`, `forced()`, `plain()`. |
 | `adapt::chat`, `adapt::responses`, `adapt::messages` | Pure functions from events to Chat Completions, Responses and Messages API shapes, streamed (`delta`, `Stream`) and whole (`message`, `output`); the driver adds only the envelope. |
 | `Grammar`, `Tag`, `Format::grammar`, `Format::grammar_for`, `grammar::Options` | The structural tag an engine takes for a forced or required call, derived from the same table and the request's tools, or `None` for a table without calls: `to_json()` as the engine reads it, `payload()` as a request carries it. `grammar_for` takes the request's `Options`, one call among them (a named function, `parallel_tool_calls: false`); `Format::answer_grammar` is the tag for an answer that is JSON a schema accepts (`response_format`). A table given its vocabulary's added tokens (`Format::marker_tokens`) writes each marker that is one token as that token (`Grammar::Token`) inside its tags; `CallSyntax::tag_texts` lists each syntax's own tags. A call given as data gets its tag from the table's layout (`Format::with_layout`): what the model's chat template writes, and no tag without one. |
 | `Format::turn_grammar`, `Turn`, `Format::output_spelling`, `OutputSpelling`, `Output`, `Format::output_position` | The output grammar for a whole assistant turn, for a table whose calls are addressed to a tool (a call given as data whose header names the tool and whose parameters are tags around raw text): the thought, then an answer (free, JSON, a regex or an EBNF grammar) or calls to the tools the request lets the model call, each held to its schema, from the first token. `output_spelling` reads the turn's texts from the table's rows and the call's shape; `OutputSpelling::grammar` builds the grammar for one request (`Output`: where `output_position` says the prompt leaves the model, the tools, the choice, the answer's format). `turn_grammar` is the one call a gateway makes: it builds that grammar for a request (`Turn`) or refuses what it cannot hold. A tag may end at any of several texts (`Bound`), and JSON may keep words out of its strings. |
@@ -218,8 +218,10 @@ difference. **Pending** means no table yet.
 `--tool-call-parser` and `--reasoning-parser` names its registries resolve from the model id, as
 in `smg serve --model-path Qwen/Qwen3-8B --tool-call-parser qwen --reasoning-parser qwen3`; none
 means passthrough, the output read as content. Under `--parser symphony` (the gateway's default), a worker's parser labels
-decide for its model, else the registry's table for a model it knows, else the two flags, for the
-models the registry does not know: a table's name in them reads those models with that table, and
+decide for its model, else the two flags, else the registry's table for a model it knows (a
+reasoning name alone that a table answers to comes after the registry, so the family's usual
+engine flag leaves a model the registry knows to its table): a table's name in them reads the
+models with that table, and
 the name `hf` reads each with the table its tokenizer's `response_template` compiles into
 (`smg-response-template`). Symphony's tables carry one name each, the **Table** column, and the
 Qwen3 table takes its call syntax as a second selector (JSON calls, or the tagged calls of Qwen 3.5
@@ -229,12 +231,17 @@ listed here with a table needs neither flag once the gateway reads it with Symph
 or renamed checkpoint is not listed: the flags, or its workers' labels, name its table until its
 group names it, else it keeps the older parsers). The flags stay: under `--parser symphony` the gateway maps a legacy tool-call or reasoning parser's
 name whose format a table reads to that table (`qwen` for `qwen3`, `qwen_xml` for `qwen3_tagged`, a
-launcher's `muse` for `muse_spark`; the map is the gateway's `routers::grpc::utils::ALIASES`, beside
+launcher's `muse` for `muse_spark`; a family's name reads with the table of the family's current
+line, `minimax` for `minimax_m3`, and the M2 line names `minimax_m2`; the map is the gateway's `routers::grpc::utils::ALIASES`, beside
 its parser resolution), so a deployment's existing flags keep a working parser under Symphony, the
 gateway's default parser; a legacy name no table answers to keeps the legacy parsers as a tool-call
 name and selects nothing as a reasoning name alone, and the gateway lists each such name with the
 reason (`utils::UNANSWERED`); its test over both legacy registries holds every legacy name to one of
-three: a table's own name (`qwen3`, `gemma4`), a row of `ALIASES`, or a row of `UNANSWERED`. The crate knows a table by its own name only (`Table::named`). The Harmony family (gpt-oss) has a
+three: a table's own name (`qwen3`, `gemma4`), a row of `ALIASES`, or a row of `UNANSWERED`. A name
+that selects a table and that no legacy parser of its own kind has binds the other flag, or a
+worker's other label, to the same table, by any name the table answers to, or to nothing
+(`--tool-call-parser qwen_xml --reasoning-parser qwen3_tagged` names one table twice), else the
+gateway refuses to start, or refuses the worker's registration or label update. The crate knows a table by its own name only (`Table::named`). The Harmony family (gpt-oss) has a
 table, `gpt_oss`, that the registry does not list yet: no name and no model id selects it, and its requests stay on the gateway's Harmony pipeline.
 
 <!-- models: begin -->
@@ -549,7 +556,7 @@ Newest first; the status column reads ready, replaying the set, awaiting fixture
 | 2025-07-29 | [afm-4.5b](https://github.com/smg-project/bellwether/tree/main/fixtures/afm-4.5b) | arcee-ai/AFM-4.5B |  | — | 328,662 | pending | none |
 | 2025-07-29 | [qwen3-30b-a3b-thinking-2507](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-30b-a3b-thinking-2507) | Qwen/Qwen3-30B-A3B-Thinking-2507 | NousResearch/nomos-1, Qwen3-235B-A22B-Thinking-2507 | `qwen3` | 54,418 | ready | `qwen`, `qwen3` |
 | 2025-07-28 | [qwen3-30b-a3b-instruct-2507](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-30b-a3b-instruct-2507) | Qwen/Qwen3-30B-A3B-Instruct-2507 | Qwen3-235B-A22B-Instruct-2507 | `qwen3` | 41,533 | ready | `qwen`, `qwen3` |
-| 2025-07-28 | [step3](https://github.com/smg-project/bellwether/tree/main/fixtures/step3) | stepfun-ai/step3 |  | — | — | pending | `step3`, `step3` |
+| 2025-07-28 | [step3](https://github.com/smg-project/bellwether/tree/main/fixtures/step3) | stepfun-ai/step3 |  | `steptml` | — | awaiting fixtures | `step3`, `step3` |
 | 2025-07-25 | [llama-3-3-nemotron-super-49b-v1-5](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3-3-nemotron-super-49b-v1-5) | nvidia/Llama-3_3-Nemotron-Super-49B-v1_5 |  | `llama_nemotron` | 576,772 | replaying the set | `json`, `nano_v3` |
 | 2025-07-15 | [openreasoning-nemotron-1.5b](https://github.com/smg-project/bellwether/tree/main/fixtures/openreasoning-nemotron-1.5b) | nvidia/OpenReasoning-Nemotron-1.5B | OpenReasoning-Nemotron-32B, OpenReasoning-Nemotron-7B | — | 328,662 | pending | none |
 | 2025-07-15 | [openreasoning-nemotron-14b](https://github.com/smg-project/bellwether/tree/main/fixtures/openreasoning-nemotron-14b) | nvidia/OpenReasoning-Nemotron-14B |  | — | 328,662 | pending | none |

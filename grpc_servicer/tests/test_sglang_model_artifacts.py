@@ -250,3 +250,43 @@ def test_native_downloader_keeps_metadata_after_close_and_excludes_weights(monke
     with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
         assert bundle.read("config.json") == b"{}"
         assert bundle.read("tokenizer.json") == b"{}"
+
+
+def test_managed_encoder_resolves_separate_hub_metadata_at_native_revision(tmp_path, monkeypatch):
+    calls = []
+
+    def snapshot(repo, *, revision, allow_patterns, local_files_only):
+        calls.append((repo, revision, allow_patterns, local_files_only))
+        directory = tmp_path / repo.replace("/", "-")
+        directory.mkdir(exist_ok=True)
+        (directory / "config.json").write_text("{}")
+        if repo == "org/tokenizer":
+            (directory / "tokenizer.json").write_text("{}")
+        return str(directory)
+
+    monkeypatch.setitem(sys.modules, "huggingface_hub", SimpleNamespace(snapshot_download=snapshot))
+    args = _args("org/model", "org/tokenizer")
+    model, tokenizer = model_artifacts.encoder_artifact_dirs(args)
+    assert model != tokenizer
+    assert [(repo, revision) for repo, revision, _, _ in calls] == [
+        ("org/model", "pinned"),
+        ("org/tokenizer", "pinned"),
+    ]
+    assert all(
+        "*.py" in patterns and "*.json" in patterns and "*.safetensors" not in patterns
+        for _, _, patterns, _ in calls
+    )
+
+
+def test_managed_encoder_local_and_object_storage_and_fail_closed(tmp_path, monkeypatch, storage):
+    (tmp_path / "tokenizer.json").write_text("{}")
+    assert model_artifacts.encoder_artifact_dirs(_args(str(tmp_path))) == (
+        str(tmp_path),
+        str(tmp_path),
+    )
+    args = _args("s3://bucket/model")
+    directory = storage.model.get_path(args.model_path)
+    assert model_artifacts.encoder_artifact_dirs(args) == (directory, directory)
+    monkeypatch.setattr(model_artifacts, "resolve_model_metadata_dir", lambda *a, **kw: None)
+    with pytest.raises(ServicerConfigError, match="native revision"):
+        model_artifacts.encoder_artifact_dirs(_args("org/unavailable"))

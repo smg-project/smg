@@ -53,18 +53,43 @@ fn the_print_is_the_document_alone_on_stdout_and_a_zero_exit() {
         document,
         PolicySpec::preset("cache_aware").expect("a preset")
     );
-}
 
-#[test]
-fn a_setting_no_document_says_is_one_sentence_on_stderr_and_a_failing_exit() {
-    // The sticky override's rule places single requests alone, and this
-    // line plans a pair.
+    // A pair mode under the sticky override has its document too: the
+    // override's rule stands on the pair's binding and on the binding of
+    // single requests behind it.
     let answer = print(&[
         "--pd-disaggregation",
         "--prefill",
         "http://prefill-a:8000",
         "--decode",
         "http://decode-a:8000",
+        "--routing-key-override",
+    ])
+    .expect("the binary runs");
+    assert_eq!(answer.status.code(), Some(0), "{}", text(&answer.stderr));
+    assert_eq!(text(&answer.stderr), "");
+    let document: PolicySpec =
+        serde_yaml::from_slice(&answer.stdout).expect("stdout is a document and nothing else");
+    let rules: Vec<bool> = document
+        .bindings
+        .iter()
+        .map(|binding| binding.sessions.is_some())
+        .collect();
+    assert_eq!(rules, [true, true]);
+}
+
+#[test]
+fn a_setting_no_document_says_is_one_sentence_on_stderr_and_a_failing_exit() {
+    // The sticky override's rule places both sides of a pair, and this
+    // line's prefill policy reads the routing key itself.
+    let answer = print(&[
+        "--pd-disaggregation",
+        "--prefill",
+        "http://prefill-a:8000",
+        "--decode",
+        "http://decode-a:8000",
+        "--prefill-policy",
+        "consistent_hashing",
         "--routing-key-override",
     ])
     .expect("the binary runs");

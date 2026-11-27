@@ -13,7 +13,7 @@ use openai_protocol::UNKNOWN_MODEL_ID;
 use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxBuildHasher;
 use smg_grand_central::{
-    document::{Needs, PolicySpec},
+    document::{AppliedSpec, Needs, PolicySpec},
     engine::{Engine, InProcess, Phase},
 };
 use smg_worker::{
@@ -147,9 +147,11 @@ impl LoadBalancingPolicy for NoClassicPolicy {
 /// per-model map.
 ///
 /// Where Grand Central places every request the bits are its
-/// document's answers ([`Self::of_document`]), written where the engine is
-/// set, and no policy is asked. A second value there holds what a pair's
-/// two decisions read ([`Self::of_pairs`]).
+/// document's answers ([`Self::of_spec`]), written where the engine is
+/// set, and no policy is asked. A fifth bit then says whether a binding of
+/// the document keys by the request's own id ([`Self::REQUEST_ID`]). A
+/// second value there holds what a pair's two decisions read
+/// ([`Self::of_pairs`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct TextNeeds(u8);
 
@@ -158,6 +160,13 @@ impl TextNeeds {
     const TEXT_UNDER_KEY: u8 = 1 << 1;
     const TEXT_WITH_TOKENS: u8 = 1 << 2;
     const TEXT_WITH_TOKENS_UNDER_KEY: u8 = 1 << 3;
+    /// A binding of the engine's document takes a routing key from the
+    /// request's own id. The id stands in the body, so the question a route
+    /// asks before it sends a body on unread reads this bit beside the
+    /// text's ([`Self::reads_body`]). No text question reads it
+    /// ([`Self::answer`]): a route that holds a request's body reads the id
+    /// off the request, and renders no text for it.
+    const REQUEST_ID: u8 = 1 << 4;
 
     /// What `policy` answers.
     fn of(policy: &dyn LoadBalancingPolicy) -> Self {
@@ -205,6 +214,22 @@ impl TextNeeds {
         Self::from_answers(without_tokens, with_tokens, true)
     }
 
+    /// What the document `spec` answers of a single request's body: its
+    /// text answers ([`Self::of_document`]), and [`Self::REQUEST_ID`] where
+    /// a binding of it takes a routing key from the request's own id
+    /// ([`AppliedSpec::reads_request_id`]). A route asks before it knows
+    /// the request's binding, so any binding that reads the id keeps every
+    /// body. A pair's answer holds no such bit ([`Self::of_pairs`]): the
+    /// pair routers hold a request's body already.
+    fn of_spec(spec: &AppliedSpec) -> Self {
+        let text = Self::of_document(spec.needs());
+        if spec.reads_request_id() {
+            Self(text.0 | Self::REQUEST_ID)
+        } else {
+            text
+        }
+    }
+
     /// What a pair's two decisions read of a request's text under the
     /// document `engine` runs: what some decision of the prefill phase and
     /// some decision of the decode phase may read
@@ -231,6 +256,20 @@ impl TextNeeds {
             (true, true) => Self::TEXT_WITH_TOKENS_UNDER_KEY,
         };
         self.0 & bit != 0
+    }
+
+    /// Whether a request's body is read before the request is sent on:
+    /// where a policy wants the text of a request that carries no token
+    /// ids ([`Self::answer`]), or a binding keys by the request's own id
+    /// ([`Self::REQUEST_ID`]). A valid routing key (`keyed_override`) lifts
+    /// the text's need alone: the id is read whatever the headers say.
+    fn reads_body(self, keyed_override: bool) -> bool {
+        let text = if keyed_override {
+            Self::TEXT_UNDER_KEY
+        } else {
+            Self::TEXT
+        };
+        self.0 & (text | Self::REQUEST_ID) != 0
     }
 }
 
@@ -299,10 +338,11 @@ pub struct PolicyRegistry {
     /// every request.
     engine: Arc<OnceLock<&'static InProcess>>,
 
-    /// The token trees Grand Central is lent, where its start asked
-    /// for them ([`Self::lend_token_trees`]). A worker the registry lost is
-    /// taken out of them by their own task
-    /// ([`LentTrees::follow_removals`]).
+    /// The trees Grand Central is lent, in their cell: filled where a
+    /// document put in force first reads sent prefixes, at the start
+    /// ([`Self::lend_trees`]) or behind a worker's label
+    /// ([`LentTrees::under`]). A worker the registry lost is taken out of
+    /// them by their own task ([`LentTrees::follow_removals`]).
     lent_trees: Arc<OnceLock<Arc<LentTrees>>>,
 
     /// Shared sticky selector for the routing-key override. `Some` when the
@@ -346,6 +386,11 @@ pub struct PolicyRegistry {
     supplied_document: bool,
     /// The hash rings kept between membership generations ([`KeptRings`]).
     rings: Arc<KeptRings>,
+    /// Under Grand Central, the models a registration decided by its
+    /// `policy` label, with the maker of the specs those labels put in
+    /// force ([`Labels`](super::labels::Labels)). A classic registry leaves
+    /// it empty: it keeps a policy object for such a model.
+    labels: Arc<super::labels::Labels>,
 }
 
 /// A sticky key with this many of its own requests already in flight on its
@@ -536,6 +581,7 @@ impl PolicyRegistry {
             pd_pairing_mode: PdPairingMode::default(),
             supplied_document: false,
             rings: Arc::new(KeptRings::default()),
+            labels: Arc::default(),
         }
     }
 
@@ -890,18 +936,64 @@ impl PolicyRegistry {
 
     /// Hands the registry the engine the gateway started, once: a second
     /// engine is not taken. From here on the engine's document answers the
-    /// text questions ([`TextNeeds::of_document`]): the stored answer is
+    /// text questions ([`TextNeeds::of_spec`]): the stored answer is
     /// written here, and a request reads it as before. What a pair's two
-    /// decisions read is settled here once, of the engine that is taken
-    /// ([`TextNeeds::of_pairs`]): an engine keeps one document for its life.
+    /// decisions read is stored here too, of the engine that is taken
+    /// ([`TextNeeds::of_pairs`]). Both are stored again behind each spec a
+    /// worker's `policy` label puts in force ([`Self::read_spec_again`]).
     pub(crate) fn set_engine(&self, engine: &'static InProcess) {
         if self.engine.set(engine).is_err() {
             warn!("Grand Central is already set: the second one is not taken");
+            self.refresh_text_needs();
         } else {
-            let pairs = TextNeeds::of_pairs(engine.spec().engine());
-            self.pair_text_needs.store(pairs.0, Ordering::Release);
+            self.read_spec_again(engine);
         }
+    }
+
+    /// Stores again the two answers the registry keeps of the spec in force
+    /// on `engine`, behind the start and behind each later spec: what a
+    /// pair's two decisions read, and the text questions' answer. Nothing
+    /// else of the spec is kept here: every other read asks the engine at
+    /// its call.
+    fn read_spec_again(&self, engine: &InProcess) {
+        let pairs = TextNeeds::of_pairs(engine.spec().engine());
+        self.pair_text_needs.store(pairs.0, Ordering::Release);
         self.refresh_text_needs();
+    }
+
+    /// Hands the registry the maker of every later spec of this process,
+    /// once, with the engine at the start
+    /// ([`Respec`](super::labels::Respec)). A worker's `policy` label is
+    /// built into a spec by it. A registry that was handed none applies no
+    /// label. `workers` is the registry of the worker lists the engine is
+    /// lent: they are published again behind each spec a label puts in
+    /// force. The maker is handed with the cell of the lent trees, which
+    /// follow each of those specs.
+    pub(crate) fn set_respec(&self, respec: super::labels::Respec, workers: Arc<WorkerRegistry>) {
+        self.labels
+            .set_respec(respec, workers, Arc::clone(&self.lent_trees));
+    }
+
+    /// Whether the spec in force places `model_id`'s single requests by the
+    /// policy `hint` names, a worker's `policy` label
+    /// ([`Labels::places`](super::labels::Labels::places)). False for a
+    /// name that is no policy's, and where the spec binds no single request
+    /// of the model. `None` under the classic policies, where the label
+    /// builds a policy object.
+    pub(crate) fn label_places(&self, model_id: &str, hint: &str) -> Option<bool> {
+        let engine = self.engine()?;
+        let own = self.default_policy_config.name();
+        let supplied = self.supplied_document;
+        Some(self.labels.places(engine, model_id, hint, own, supplied))
+    }
+
+    /// The name of the profile that places `model_id`'s single requests
+    /// under the spec in force: what a case reads of a label's effect.
+    /// `None` under the classic policies, and where the spec binds no
+    /// single request of the model.
+    #[cfg(test)]
+    pub(crate) fn placing_profile(&self, model_id: &str) -> Option<String> {
+        super::labels::placing_profile(self.engine()?, model_id)
     }
 
     /// Whether Grand Central decides under a document the gateway was
@@ -916,37 +1008,33 @@ impl PolicyRegistry {
         self.supplied_document
     }
 
-    /// The token trees Grand Central is lent, made at the first call
+    /// The trees Grand Central is lent, made at the first call
     /// under the numbers of `document`, the document the engine runs, whose
-    /// block size is `page` tokens ([`LentTrees::of_document`]), and kept
-    /// here. The engine's start calls it, and only where its document reads
-    /// the prefixes sent to each worker: with the engine on no classic
-    /// policy is made that would keep such trees.
-    ///
-    /// The trees are made with the task that takes a worker `workers` lost
-    /// out of them ([`LentTrees::follow_removals`]), on the runtime the
-    /// call is made on. The start runs on one, the engine's own task needs
-    /// it. Where none is entered no task is started, nothing takes a worker
-    /// out of the trees, and a debug line says so.
-    pub(crate) fn lend_token_trees(
+    /// block size is `page` tokens ([`LentTrees::lend`]). They are kept
+    /// here in their cell. The engine's start calls it, and only where its
+    /// document reads the prefixes sent to each worker. With the engine on
+    /// no classic policy is made that would keep such trees. Where the
+    /// start's document reads none, the first document a worker's label
+    /// puts in force that reads them fills the same cell
+    /// ([`LentTrees::under`]).
+    pub(crate) fn lend_trees(
         &self,
         document: &PolicySpec,
         page: u32,
         workers: &WorkerRegistry,
     ) -> Arc<LentTrees> {
-        let made = || {
-            let trees = Arc::new(LentTrees::of_document(document.clone(), page));
-            match tokio::runtime::Handle::try_current() {
-                Ok(runtime) => trees.follow_removals(workers, &runtime),
-                Err(_) => debug!("No runtime is entered: no task takes a worker that leaves out of the lent token trees"),
-            }
-            trees
-        };
-        Arc::clone(self.lent_trees.get_or_init(made))
+        LentTrees::lend(&self.lent_trees, document, page, workers)
     }
 
-    /// The token trees Grand Central is lent, where its start asked
-    /// for them: for a case that reads what the start made.
+    /// The cell of the lent trees, for the object the engine reads its
+    /// host's caches through. Trees lent behind a worker's label are read
+    /// through the cell the start handed.
+    pub(crate) fn lent_cell(&self) -> Arc<OnceLock<Arc<LentTrees>>> {
+        Arc::clone(&self.lent_trees)
+    }
+
+    /// The trees Grand Central is lent, where a document put in force
+    /// asked for them: for a case that reads what was made.
     #[cfg(test)]
     pub(crate) fn lent_trees(&self) -> Option<Arc<LentTrees>> {
         self.lent_trees.get().cloned()
@@ -1141,7 +1229,9 @@ impl PolicyRegistry {
     /// router's live in-flight count there (see
     /// [`LoadBalancingPolicy::reconcile_in_flight`]). The worker monitor
     /// calls this at every batch of a group's load answers, for every
-    /// worker of the group.
+    /// worker of the group but a handle that left an address where another
+    /// worker counts on its own now (a handle a replacement swapped out
+    /// shares the replacement's count and is still reconciled).
     pub fn reconcile_in_flight(&self, worker: &dyn Worker) {
         if !self.classic {
             return;
@@ -1161,8 +1251,10 @@ impl PolicyRegistry {
         policy_hint: Option<&str>,
     ) -> Arc<dyn LoadBalancingPolicy> {
         if !self.classic {
-            // No model has a policy of its own under the engine: the
-            // stand-in is answered and nothing is kept.
+            // No model has a policy object of its own under the engine: the
+            // stand-in is answered. The label names the model's policy in
+            // the spec in force instead.
+            self.label_decides(model_id, policy_hint);
             return Arc::clone(&self.default_policy);
         }
         // Check if model already has a policy (lock-free read via DashMap)
@@ -1193,6 +1285,32 @@ impl PolicyRegistry {
         policy
     }
 
+    /// The engine a worker's `policy` label is applied on: the one this
+    /// gateway started, where it decides under the spec its routing
+    /// settings mean. `None` under the classic policies, ahead of the
+    /// engine's start, and beside a supplied spec, where no label is read.
+    fn label_engine(&self) -> Option<&'static InProcess> {
+        if self.classic || self.supplied_document {
+            return None;
+        }
+        self.engine()
+    }
+
+    /// Under Grand Central, a registration of `model_id` with `hint` as
+    /// its `policy` label: the registration that finds the model undecided
+    /// decides its policy, and the spec that names it is put in force
+    /// ([`Labels::registered`](super::labels::Labels::registered)). The
+    /// registry's stored answers of the spec are read again behind it.
+    fn label_decides(&self, model_id: &str, hint: Option<&str>) {
+        let Some(engine) = self.label_engine() else {
+            return;
+        };
+        let own = self.default_policy_config.name();
+        if self.labels.registered(engine, model_id, hint, own) {
+            self.read_spec_again(engine);
+        }
+    }
+
     /// Hand `policy` the shared state a cache-aware policy consumes (the KV
     /// event monitor, the backend load feed, the mesh tree bridge), then run
     /// `publish` while the three guards are still held. Holding them across
@@ -1217,7 +1335,18 @@ impl PolicyRegistry {
     /// `WorkerRegistry::serves_model_locally`): the model's policy goes with
     /// its last worker, so a later registration builds the policy its own
     /// labels name.
+    ///
+    /// Under Grand Central no policy object stands for the model. What
+    /// its deciding registration said goes with its last worker instead,
+    /// and where its label stood in the spec in force, the spec without it
+    /// is put in force (`Labels::unserved`, `policies/labels.rs`).
     pub fn on_model_unserved(&self, model_id: &str) {
+        if let Some(engine) = self.label_engine() {
+            if self.labels.unserved(engine, model_id) {
+                self.read_spec_again(engine);
+            }
+            return;
+        }
         if let Some((_, policy)) = self.model_policies.remove(model_id) {
             info!(
                 "Removed policy {} for model {} (no worker of this node serves it)",
@@ -1476,6 +1605,21 @@ impl PolicyRegistry {
         self.any_policy_wants_text(headers, false)
     }
 
+    /// Whether a route reads this request's body before it sends the
+    /// request on. It does where a policy routes on the request's text
+    /// ([`Self::any_policy_needs_request_text`]). Where Grand Central
+    /// places every request it also does while a binding of its document
+    /// keys by the request's own id: the id stands in the unread body too.
+    /// A valid routing-tokens hint lifts that need with the text's: such a
+    /// request is sent on unread, and the engine is handed no id for it. A
+    /// routing key lifts the text's need alone.
+    ///
+    /// A route that holds the body asks the text question instead: it
+    /// reads the id off the request, and renders no text for it.
+    pub fn any_policy_needs_request_body(&self, headers: Option<&HeaderMap>) -> bool {
+        self.read_text_needs(headers, TextNeeds::reads_body)
+    }
+
     /// [`Self::any_policy_needs_request_text`] for a request whose token ids
     /// are available: a policy that routes on the ids and reads text only
     /// without them ([`LoadBalancingPolicy::needs_request_text_with_tokens`])
@@ -1484,18 +1628,35 @@ impl PolicyRegistry {
         self.any_policy_wants_text(headers, true)
     }
 
-    /// The two text questions' shared rules: a valid routing-tokens hint
-    /// lifts the requirement, and a valid routing key under the sticky
-    /// override lifts it for the policies the override supersedes; what the
-    /// policies answer is read from [`Self::text_needs`], kept current where
-    /// a policy is added or removed, so a request walks nothing.
+    /// The two text questions, read of the stored answers under the shared
+    /// rules ([`Self::read_text_needs`]).
     fn any_policy_wants_text(&self, headers: Option<&HeaderMap>, with_tokens: bool) -> bool {
+        self.read_text_needs(headers, |needs, keyed_override| {
+            needs.answer(with_tokens, keyed_override)
+        })
+    }
+
+    /// The text questions' and the body question's shared rules: a valid
+    /// routing-tokens hint lifts the requirement, and a valid routing key
+    /// under the sticky override lifts it for the policies the override
+    /// supersedes; what the policies answer is read from
+    /// [`Self::text_needs`], kept current where a policy is added or
+    /// removed, so a request walks nothing. `read` is the asker's reading
+    /// of those answers, under such a key (its second word) or without one.
+    fn read_text_needs(
+        &self,
+        headers: Option<&HeaderMap>,
+        read: impl FnOnce(TextNeeds, bool) -> bool,
+    ) -> bool {
         if parse_routing_tokens_hint(headers).is_some() {
             return false;
         }
         let keyed_override =
             self.routing_key_override && self.resolve_routing_key(headers).is_some();
-        TextNeeds(self.text_needs.load(Ordering::Acquire)).answer(with_tokens, keyed_override)
+        read(
+            TextNeeds(self.text_needs.load(Ordering::Acquire)),
+            keyed_override,
+        )
     }
 
     /// Recompute [`Self::text_needs`] over the policies the text questions
@@ -1506,8 +1667,8 @@ impl PolicyRegistry {
     /// instead, and no policy is walked: called where the engine is set too.
     fn refresh_text_needs(&self) {
         let _one_at_a_time = self.text_needs_refresh.lock();
-        let needs = match self.document_needs() {
-            Some(needs) => TextNeeds::of_document(needs),
+        let needs = match self.engine() {
+            Some(engine) => TextNeeds::of_spec(&engine.spec()),
             None => self.policies_text_needs(),
         };
         self.text_needs.store(needs.0, Ordering::Release);
@@ -1660,6 +1821,24 @@ impl PolicyRegistry {
     /// on worker removal alongside the cache-aware cleanup above.
     pub fn remove_worker_from_policies(&self, worker_url: &str) {
         self.each_policy(|policy| policy.remove_worker(worker_url));
+    }
+
+    /// Whether the prefill and the decode side's policy read their side's
+    /// workers at [`Self::init_pd_cache_aware_policies`] and
+    /// [`Self::init_pd_bucket_policies`]. A side's policy is set once, so
+    /// the answer of two set sides stands. While a side has none, both
+    /// read as `true`: one can still be set, and those calls test it
+    /// after their caller has listed the workers.
+    pub(crate) fn pd_lists_read(&self) -> (bool, bool) {
+        let (Some(prefill), Some(decode)) = (self.prefill_policy.get(), self.decode_policy.get())
+        else {
+            return (true, true);
+        };
+        let prefill = prefill.as_ref();
+        (
+            as_cache_aware(prefill).is_some() || as_bucket(prefill).is_some(),
+            as_cache_aware(decode.as_ref()).is_some(),
+        )
     }
 
     /// Initialize cache-aware policies for PD mode (prefill and decode) - lock-free
@@ -3718,10 +3897,10 @@ mod tests {
             workers.register(ready_worker(url, "llama-3"));
         }
         assert!(registry.lent_trees().is_none());
-        let trees = registry.lend_token_trees(&document, 8, &workers);
+        let trees = registry.lend_trees(&document, 8, &workers);
         assert!(Arc::ptr_eq(
             &trees,
-            &registry.lend_token_trees(&document, 8, &workers)
+            &registry.lend_trees(&document, 8, &workers)
         ));
         let tokens: Vec<u32> = (0..64).collect();
         let tree = trees.token_tree("llama-3");
@@ -3982,6 +4161,71 @@ mod tests {
         assert!(!logs_contain("No bucket found for model"));
     }
 
+    /// Every kind the factory builds by name, set on both sides of a pair:
+    /// the sides [`PolicyRegistry::pd_lists_read`] names are the sides the
+    /// two init calls hand their workers, so a registration lists a side's
+    /// workers for every kind that reads them. A kind the factory learns is
+    /// added to the list here.
+    #[traced_test]
+    #[test]
+    fn pd_lists_read_names_the_sides_the_init_calls_hand_their_workers() {
+        const KINDS: [&str; 10] = [
+            "random",
+            "round_robin",
+            "passthrough",
+            "power_of_two",
+            "least_load",
+            "cache_aware",
+            "bucket",
+            "manual",
+            "consistent_hashing",
+            "prefix_hash",
+        ];
+        for (at, kind) in KINDS.into_iter().enumerate() {
+            let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+            for set in [
+                PolicyRegistry::set_prefill_policy,
+                PolicyRegistry::set_decode_policy,
+            ] {
+                let policy = PolicyFactory::create_by_name(kind)
+                    .unwrap_or_else(|| panic!("the factory builds no {kind} policy"));
+                set(&registry, policy);
+            }
+            // A list length of the kind's own tells its debug lines from the
+            // lines of the kinds before it.
+            let count = at + 2;
+            let side = |role: &str, worker_type: WorkerType| -> Vec<Arc<dyn Worker>> {
+                (0..count)
+                    .map(|i| worker_of(&format!("http://{role}-{i}:8000"), worker_type))
+                    .collect()
+            };
+            let prefill = side("prefill", WorkerType::Prefill);
+            let decode = side("decode", WorkerType::Decode);
+
+            registry.init_pd_cache_aware_policies(&prefill, &decode);
+            registry.init_pd_bucket_policies(&prefill);
+
+            let read = registry.pd_lists_read();
+            logs_assert(|lines: &[&str]| {
+                let handed = |role: &str| {
+                    let start = format!("Initializing {role} ");
+                    let end = format!("policy with {count} workers");
+                    lines
+                        .iter()
+                        .any(|line| line.contains(&start) && line.contains(&end))
+                };
+                let handed = (handed("prefill"), handed("decode"));
+                if handed == read {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "{kind}: the init calls hand the sides {handed:?} and pd_lists_read says {read:?}"
+                    ))
+                }
+            });
+        }
+    }
+
     /// A prefill worker's removal reaches the bucket policy, which keeps the
     /// prefill workers' size partition without consuming load reports: every
     /// request size still selects one of the workers left.
@@ -4149,6 +4393,82 @@ mod tests {
                     assert_eq!(reg.classic_made_or_asked(), 0, "{preset}");
                 }
             }
+        }
+    }
+
+    /// A document that takes a routing key from a request's own id asks for
+    /// the body of a request that carries no token ids: the id stands
+    /// there, and a route that sent the body on unread would hand the
+    /// engine no id. The answer stands under a routing key of the sticky
+    /// override, and a valid routing-tokens hint lifts the need as it
+    /// lifts a classic policy's. The stock document reads its key from
+    /// headers and asks for no body. The id is found in whichever binding
+    /// reads it: in the third row one model's, behind another model's and
+    /// ahead of the rest's, which read headers. A document whose stage
+    /// reads the text asks for the body as it asks for the text.
+    ///
+    /// No text question reads the id: the registry's, the main policy's
+    /// and the pair routers' answer for the text alone under each
+    /// document, so a route that holds a request's body renders no text
+    /// for an id.
+    #[test]
+    fn a_document_keyed_by_the_request_id_asks_for_the_body() {
+        use smg_grand_central::document::{AppliedSpec, KeySourceSpec, PolicySpec, RoutingKeySpec};
+
+        use crate::routers::common::placement::tests::engine_on;
+
+        let stock = PolicySpec::preset("consistent_hashing").expect("a stock preset");
+        let binding = |model: &str, by_request_id: bool| {
+            let mut binding = stock.bindings[0].clone();
+            binding.matcher.model = model.to_string();
+            if by_request_id {
+                binding.routing_key = Some(RoutingKeySpec {
+                    sources: vec![KeySourceSpec {
+                        rid: true,
+                        ..KeySourceSpec::default()
+                    }],
+                    strip_lineage: false,
+                });
+            }
+            binding
+        };
+        let of = |bindings| {
+            let mut document = stock.clone();
+            document.bindings = bindings;
+            document
+        };
+        let some_model = vec![
+            binding("m", false),
+            binding("chat-*", true),
+            binding("*", false),
+        ];
+        let reads_text = PolicySpec::preset("cache_aware").expect("a stock preset");
+        let keyed = headers_with_routing_key("session-A");
+        let hinted = headers_with_tokens("1,2,3");
+        let asked = [None, Some(&keyed), Some(&hinted)];
+        for (name, document, id, text) in [
+            ("headers", of(vec![binding("*", false)]), false, false),
+            ("the id", of(vec![binding("*", true)]), true, false),
+            ("one model's id", of(some_model), true, false),
+            ("the text", reads_text, false, true),
+        ] {
+            let reg = PolicyRegistry::for_engine(PolicyConfig::RoundRobin, enabled_override());
+            let spec = AppliedSpec::validate(&document).expect("a valid document");
+            engine_on(&reg, spec);
+            let body = asked.map(|headers| reg.any_policy_needs_request_body(headers));
+            assert_eq!(body, [id || text, id || text, false], "{name}");
+            let texts = asked.map(|headers| reg.any_policy_needs_request_text(headers));
+            assert_eq!(texts, [text, text, false], "{name}");
+            assert!(
+                !reg.any_policy_needs_request_text_with_tokens(None),
+                "{name}"
+            );
+            // The object a getter hands out answers the text question from
+            // the stored bits, and the pair routes ask the two side slots'.
+            let main = reg.get_policy_or_default("m");
+            assert_eq!(main.needs_request_text(), text, "{name}");
+            assert_eq!(reg.pair_needs_request_text(), text, "{name}");
+            assert_eq!(reg.classic_made_or_asked(), 0, "{name}");
         }
     }
 

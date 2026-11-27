@@ -123,10 +123,7 @@ fn rows(ids: &[u64]) -> Vec<Candidate> {
 }
 
 fn cell(value: f64, age_micros: u64) -> SignalCell {
-    SignalCell {
-        value,
-        sampled_at_micros: NOW - age_micros,
-    }
+    SignalCell::of(value, NOW - age_micros)
 }
 
 /// One decision over `rows` with `cells` on the request's facts; what the
@@ -277,10 +274,7 @@ fn a_stage_reads_each_rows_value_by_its_position_and_none_past_its_age() {
     let rows = rows(&[31, 32, 33, 34]);
     // Sampled a microsecond after the decision's instant: a source's
     // clock may run ahead of the host's.
-    let ahead = |value| SignalCell {
-        value,
-        sampled_at_micros: NOW + 1,
-    };
+    let ahead = |value| SignalCell::of(value, NOW + 1);
     // A row's cells in the order of the names: `free`, then `pending`,
     // whose maximum age is 4 s.
     let cells = [
@@ -360,16 +354,15 @@ fn each_side_of_a_pair_reads_its_own_pools_cells() {
     facts.now_micros = NOW;
     facts.signal_cells = Some(&request);
     let cx = Constraints::default();
+    let mut pools = PairPools::default();
+    pools.prefills = &prefills;
+    pools.decodes = &decodes;
+    pools.prefill_signal_cells = Some(&prefill);
+    pools.decode_signal_cells = Some(&decode);
     let decision = engine.decide_pair(
         &facts,
         &PoolFacts::default(),
-        PairPools {
-            prefills: &prefills,
-            decodes: &decodes,
-            prefill_signal_cells: Some(&prefill),
-            decode_signal_cells: Some(&decode),
-            ..PairPools::default()
-        },
+        pools,
         &cx,
         &cx,
         &mut Scratch::new(),

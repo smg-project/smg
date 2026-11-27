@@ -119,6 +119,12 @@ pub struct Config {
     /// a few megabytes; tonic's own default (4 MiB) refuses that, while the
     /// engine servicers run without a limit, so none is the default.
     pub grpc_max_message_bytes: usize,
+    /// Whether the gRPC wires serve the subscription to KV-cache events
+    /// (`--grpc-kv-events`). With false it is refused as by an engine
+    /// without the call, so a gateway hears no KV event from this process
+    /// over gRPC, while the engines keep their prefix cache and the load
+    /// records alone stay served. The ZMQ publishers are not touched.
+    pub grpc_kv_events: bool,
     /// vLLM-wire ZMQ KV-event publishers (realistic engines only): the first
     /// PUB port; worker `i` publishes on `base + 2i` and answers replay on
     /// `base + 2i + 1`. Off when `None`.
@@ -138,6 +144,11 @@ pub struct Config {
     /// batches), `false` (the default) a wire that carries token batches
     /// only, whose silence the gateway judges against its prefill bound.
     pub step_reports: bool,
+    /// What the gRPC workers' model info says of vision input from their
+    /// start (`--supports-vision`): the `supports_vision` entry of the info
+    /// the admin API patches, seeded. Unset, each wire answers as it does
+    /// with no entry.
+    pub supports_vision: Option<bool>,
     /// The role of a process's HTTP workers alone, or of its gRPC workers
     /// and ZMQ ranks together, in a disaggregated fleet
     /// (`--worker-type`): a prefill worker answers every request with the
@@ -161,6 +172,13 @@ pub struct Config {
     /// and advertises nothing, and is refused for a ZMQ prefill rank: its
     /// handshake is the only place the port reaches the gateway.
     pub bootstrap_base_port: Option<u16>,
+    /// Whether a gRPC worker in the prefill role runs each prompt on its
+    /// realistic engine (`--prefill-engine`): the prompt is admitted as a
+    /// request of no output, so the engine's prefix cache, its request
+    /// records, its KV events and its load record see it, and the prompt
+    /// side's completion carries the engine's cached count once the engine
+    /// has prefilled the prompt. False answers without the engine.
+    pub prefill_engine: bool,
     /// The pairing protocol the process environment names
     /// (`SMG_PAIRING_PROTOCOL`), advertised in the gRPC workers' server args
     /// as the engine servicers advertise theirs (`pairing_protocol`): the
@@ -402,6 +420,7 @@ impl Default for Config {
             drain_timeout: Duration::from_secs(5),
             context_length: 32768,
             grpc_max_message_bytes: usize::MAX,
+            grpc_kv_events: true,
             kv_events_zmq_base_port: None,
             kv_events_replay: true,
             kv_events_topic: String::new(),
@@ -409,8 +428,10 @@ impl Default for Config {
             kv_events_wire: Wire::Vllm,
             loads_like: LoadsLike::Mock,
             step_reports: false,
+            supports_vision: None,
             role: None,
             bootstrap_base_port: None,
+            prefill_engine: false,
             pairing_protocol: None,
             replay: ReplayConfig::default(),
         }
@@ -546,6 +567,9 @@ impl Config {
                 "--grpc-max-message-bytes" => {
                     cfg.grpc_max_message_bytes = parse(value(&mut args, &flag)?, &flag)?;
                 }
+                "--grpc-kv-events" => {
+                    cfg.grpc_kv_events = parse(value(&mut args, &flag)?, &flag)?;
+                }
                 "--kv-events-zmq-base-port" => {
                     cfg.kv_events_zmq_base_port = Some(parse(value(&mut args, &flag)?, &flag)?);
                 }
@@ -563,6 +587,9 @@ impl Config {
                 }
                 "--loads-like" => cfg.loads_like = value(&mut args, &flag)?.parse()?,
                 "--step-reports" => cfg.step_reports = parse(value(&mut args, &flag)?, &flag)?,
+                "--supports-vision" => {
+                    cfg.supports_vision = Some(parse(value(&mut args, &flag)?, &flag)?);
+                }
                 "--block-size" => {
                     cfg.engine.block_size = parse(value(&mut args, &flag)?, &flag)?;
                     block_size_given = true;
@@ -571,6 +598,9 @@ impl Config {
                 "--worker-type" => cfg.role = Some(value(&mut args, &flag)?.parse()?),
                 "--bootstrap-base-port" => {
                     cfg.bootstrap_base_port = Some(parse(value(&mut args, &flag)?, &flag)?);
+                }
+                "--prefill-engine" => {
+                    cfg.prefill_engine = parse(value(&mut args, &flag)?, &flag)?;
                 }
                 "--drain-timeout-secs" => {
                     let secs: f64 = parse(value(&mut args, &flag)?, &flag)?;
@@ -704,6 +734,19 @@ impl Config {
                     .to_string(),
             );
         }
+        if cfg.prefill_engine
+            && !(cfg.realistic
+                && cfg.role == Some(Role::Prefill)
+                && cfg.grpc_count > 0
+                && cfg.zmq_count == 0)
+        {
+            return Err(
+                "--prefill-engine true needs --engine realistic and --worker-type prefill on \
+                 gRPC workers, with no ZMQ rank: an HTTP worker and a ZMQ rank in the prefill \
+                 role answer the prompt side without the engine"
+                    .to_string(),
+            );
+        }
         if cfg.role == Some(Role::Prefill) && cfg.zmq_count > 0 && cfg.bootstrap_base_port.is_none()
         {
             return Err(
@@ -723,7 +766,10 @@ impl Config {
     /// the worker's own KV pool (`--worker-kv-tokens`) and pass-time scale
     /// (`--worker-pass-time-scale`). Its own pool changes how much it holds,
     /// not how long its steps take: its decode cost keeps the fleet's pool as
-    /// its reference, unless a calibration gave the reference.
+    /// its reference, unless a calibration gave the reference. Its synthetic
+    /// output keeps to the ids the worker's tokenizer decodes, where
+    /// `--tokenizer` names local files; an HTTP worker sends text and no id,
+    /// so its engine keeps the ids drawn and loads no tokenizer for them.
     pub fn engine_for(&self, worker: &str) -> EngineParams {
         let mut params = self.engine.clone();
         if let Some(&tokens) = self.worker_kv_tokens.get(worker) {
@@ -734,6 +780,9 @@ impl Config {
         }
         if let Some(&scale) = self.worker_pass_time_scale.get(worker) {
             params.pass_time_scale = scale;
+        }
+        if !worker.starts_with("http:") {
+            params.output_table = crate::script::output_table(self);
         }
         params
     }
@@ -772,9 +821,16 @@ impl Config {
         Ok(())
     }
 
+    /// Whether the gRPC workers of `role` run their engine's passes: the
+    /// decode role, and the prefill role under `--prefill-engine true`.
+    fn runs_passes(&self, role: Role) -> bool {
+        role == Role::Decode || (role == Role::Prefill && self.prefill_engine)
+    }
+
     /// Refuse a per-worker override that would not take: one on a canned
     /// engine or on a prefill or encode worker (neither runs its engine's
-    /// passes), one naming no worker of this process (a data-parallel rank's
+    /// passes; a gRPC prefill worker under `--prefill-engine true` does and
+    /// takes one), one naming no worker of this process (a data-parallel rank's
     /// name included: an override names the whole worker), a pool under one
     /// block or, where decode reads utilisation, over the largest pool its
     /// cost is measured against, and a scale outside 0.001 to 1000.
@@ -793,7 +849,13 @@ impl Config {
                     "{flag} sets a realistic engine's parameters: it needs --engine realistic"
                 ));
             }
-            if let Some(role) = self.role.filter(|role| *role != Role::Decode) {
+            // Under `--prefill-engine true` the prefill role's gRPC workers
+            // run their engine; its HTTP workers answer without it.
+            let on_engine = self.role == Some(Role::Decode) || worker.starts_with("grpc:");
+            if let Some(role) = self
+                .role
+                .filter(|role| !(self.runs_passes(*role) && on_engine))
+            {
                 return Err(format!(
                     "{flag} sets an engine's parameters, but --worker-type {} workers answer \
                      without running their engine's passes",
@@ -891,7 +953,8 @@ impl Config {
 
     /// Refuse the shared KV tier's flags where the tier would not take: on a
     /// canned engine, on prefill or encode workers (neither runs its engine's
-    /// passes, which write and restore the tier), with prefix caching off (a
+    /// passes, which write and restore the tier; gRPC prefill workers under
+    /// `--prefill-engine true` do and take it), with prefix caching off (a
     /// restore continues a prefix hit), on an engine whose cache groups are
     /// not one main-attention group (the tier holds whole blocks of one
     /// group), and a restore price with no tier or one that is not a finite
@@ -907,7 +970,10 @@ impl Config {
                     .to_string(),
             );
         }
-        if let Some(role) = self.role.filter(|role| blocks > 0 && *role != Role::Decode) {
+        if let Some(role) = self
+            .role
+            .filter(|role| blocks > 0 && !self.runs_passes(*role))
+        {
             return Err(format!(
                 "--global-l3-blocks is a tier the engines' passes write and restore from, but \
                  --worker-type {} workers answer without running their engine's passes",
@@ -1145,6 +1211,9 @@ pub fn usage() -> String {
                                 the gateway detects the runtime from it (--capture: tokenspeed only)\n\
        --grpc-max-message-bytes <n>  largest gRPC message a worker decodes or encodes, in bytes\n\
                                 (default none, as the engine servicers; tonic's own default is 4 MiB)\n\
+       --grpc-kv-events <bool>  serve the gRPC subscription to KV-cache events (default true);\n\
+                                false refuses it as an engine without the call does, while the\n\
+                                engines keep their prefix cache and the load records stay served\n\
        --zmq-handshake <addr>   frontend ipc:// handshake addr (required if --zmq-count > 0)\n\
        --zmq-count <n>          number of ZMQ mock EngineCore ranks (default 0)\n\
        --zmq-start-index <n>    engine index of the first ZMQ rank (default 0)\n\
@@ -1191,7 +1260,8 @@ pub fn usage() -> String {
        --kv-blocks <n>          KV cache capacity in blocks (overrides --kv-tokens)\n\
        --worker-kv-tokens <worker=n,..>  the named workers' KV capacity in tokens instead, at\n\
                                 most the fleet's or a calibration's pool (grpc:<port>,\n\
-                                http:<port> or zmq:<index>; a generating worker); their decode\n\
+                                http:<port> or zmq:<index>; a generating worker, or a gRPC\n\
+                                prefill worker under --prefill-engine true); their decode\n\
                                 keeps the fleet's step time: a pool's size is room, not speed\n\
        --worker-pass-time-scale <worker=f,..>  the named workers' passes take f times the\n\
                                 timing model's duration (0.001 to 1000; above 1 a slower engine)\n\
@@ -1201,7 +1271,8 @@ pub fn usage() -> String {
                                 more, and grpc:<port>:r<k> names one rank's own list\n\
        --global-l3-blocks <n>   process-wide shared KV tier every engine writes to and restores\n\
                                 prefixes from, in blocks (default 0: off; a generating worker's\n\
-                                realistic engine, --prefix-cache true and one main-attention\n\
+                                realistic engine or a gRPC prefill worker's under\n\
+                                --prefill-engine true, --prefix-cache true and one main-attention\n\
                                 cache group only)\n\
        --global-l3-ms-per-token <f>  pass time per token restored from the shared tier (default 0;\n\
                                 needs --global-l3-blocks)\n\
@@ -1231,6 +1302,11 @@ pub fn usage() -> String {
                                 vLLM's stats-only step batches do) instead of token batches only\n\
                                 (default false): decides which bound the gateway judges the\n\
                                 engine's silence against\n\
+       --supports-vision <bool> what the gRPC workers' model info says of vision input from\n\
+                                their start (default: no entry, so an encode worker on the vLLM\n\
+                                wire says true and every other worker false); the gateway\n\
+                                refuses an image request to vLLM-wire workers that all say\n\
+                                false; the admin API's info patch sets the same entry later\n\
        --admin-port <port>      process-wide admin API: fleet, request records with the\n\
                                 arrival-time oracle, cache dumps, resets (default off)\n\
        --worker-type <prefill|decode|encode>  the role of the HTTP workers alone, or of the gRPC\n\
@@ -1247,6 +1323,12 @@ pub fn usage() -> String {
                                 gRPC workers), accepts and closes each connection (the gateway's\n\
                                 probe) and advertises it (disaggregation_bootstrap_port)\n\
                                 (default none; a ZMQ prefill rank needs one)\n\
+       --prefill-engine <bool>  a gRPC prefill worker runs each prompt on its realistic engine as\n\
+                                a request of no output, so its prefix cache, its request records,\n\
+                                its KV events and its load record see the prompt, and answers the\n\
+                                prompt side with the engine's cached count once the prompt is\n\
+                                prefilled (default false: answered without the engine); needs\n\
+                                --engine realistic and gRPC workers with no ZMQ rank\n\
        --drain-timeout-secs <s> on SIGTERM or SIGINT, how long the requests in flight may\n\
                                 finish before the process exits regardless (default 5)\n\
      \n\
@@ -2105,6 +2187,86 @@ mod tests {
             refused.contains("pass --grpc-wire vllm or tokenspeed") && refused.contains("sglang"),
             "{refused}"
         );
+    }
+
+    /// `--prefill-engine true` is taken only where the process serves
+    /// realistic gRPC workers in the prefill role and no ZMQ rank; such a
+    /// worker then takes the overrides of a worker's engine and the shared
+    /// tier, which the prefill role refuses without the flag.
+    #[test]
+    fn prefill_engine_is_a_realistic_grpc_prefill_workers_flag() {
+        let grpc: &[&str] = &["--grpc-base-port", "19000", "--grpc-count", "1"];
+        let http: &[&str] = &["--http-base-port", "18000", "--http-count", "1"];
+        let realistic: &[&str] = &["--engine", "realistic"];
+        let prefill: &[&str] = &["--worker-type", "prefill"];
+        let on: &[&str] = &["--prefill-engine", "true"];
+        let refused = |flags: &[&[&str]], why: &str| {
+            let error = parse(&flags.concat()).expect_err(why);
+            assert!(
+                error.contains("--prefill-engine true needs"),
+                "{why}: {error}"
+            );
+        };
+        refused(&[grpc, prefill, on], "the canned engine");
+        refused(&[grpc, realistic, on], "no worker type");
+        refused(
+            &[grpc, realistic, &["--worker-type", "decode"], on],
+            "a decode worker",
+        );
+        refused(
+            &[http, realistic, prefill, on],
+            "HTTP workers alone in the prefill role",
+        );
+        refused(
+            &[
+                grpc,
+                realistic,
+                prefill,
+                on,
+                &["--zmq-count", "1", "--zmq-handshake", "ipc://unused"],
+                &["--bootstrap-base-port", "8998"],
+            ],
+            "a ZMQ prefill rank",
+        );
+        let off = parse(&[grpc, &["--prefill-engine", "false"]].concat())
+            .expect("false on a regular worker");
+        assert!(!off.prefill_engine);
+        let start = [grpc, realistic, prefill, on].concat();
+        assert!(
+            parse(&start)
+                .expect("a realistic gRPC prefill worker")
+                .prefill_engine
+        );
+
+        // A prefill worker on its engine runs passes: it takes the overrides
+        // of a worker's engine and the shared tier, which the role refuses
+        // without the flag.
+        let scale: &[&str] = &["--worker-pass-time-scale", "grpc:19000=2"];
+        let pool: &[&str] = &["--worker-kv-tokens", "grpc:19000=4096"];
+        let tier: &[&str] = &["--global-l3-blocks", "64"];
+        let cfg = parse(&[&start[..], scale, pool, tier].concat())
+            .expect("the overrides and the tier beside --prefill-engine true");
+        assert_eq!(cfg.worker_pass_time_scale.get("grpc:19000"), Some(&2.0));
+        assert_eq!(cfg.worker_kv_tokens.get("grpc:19000"), Some(&4096));
+        assert_eq!(cfg.engine.global_l3_blocks, 64);
+        let without = [grpc, realistic, prefill].concat();
+        for flag in [scale, pool, tier] {
+            let error = parse(&[&without[..], flag].concat())
+                .expect_err("a prefill worker without its engine runs no passes");
+            assert!(error.contains("workers answer without running"), "{error}");
+        }
+        // The flag puts the gRPC workers on their engine, not an HTTP worker
+        // of the same process.
+        let error = parse(
+            &[
+                &start[..],
+                http,
+                &["--worker-pass-time-scale", "http:18000=2"],
+            ]
+            .concat(),
+        )
+        .expect_err("an HTTP prefill worker answers without its engine");
+        assert!(error.contains("workers answer without running"), "{error}");
     }
 
     /// The prefill and decode roles are a process's HTTP workers' alone or

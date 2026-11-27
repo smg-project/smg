@@ -157,8 +157,13 @@ pub fn merge_labels(
 }
 
 /// Core worker abstraction that represents a backend service
+///
+/// [`Any`] is a supertrait: a caller that must know the concrete type of a
+/// worker asks the object itself (`let object: &dyn Any = worker;`), where
+/// [`Worker::as_any`] is each implementation's own answer. Every `'static`
+/// type is [`Any`], so an implementation writes nothing for it.
 #[async_trait]
-pub trait Worker: Send + Sync + fmt::Debug + 'static {
+pub trait Worker: Any + Send + Sync + fmt::Debug + 'static {
     /// Downcast support for same-URL replace state sharing.
     fn as_any(&self) -> &dyn Any;
 
@@ -614,6 +619,23 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
             overloaded: self.is_overloaded(),
             stalled: self.stall_reason().is_some(),
         }
+    }
+
+    /// Whether the routing state this worker published last says that no
+    /// routing veto holds: the one case [`Self::routing_state`] answers
+    /// without a read of the worker's facts. Every write that changes a
+    /// published state moves the process's word
+    /// ([`published_word`](crate::runtime::published_word)), so a caller
+    /// that read the word before it asked, and reads the same value later,
+    /// knows the answer still stands.
+    ///
+    /// `false` for a worker that publishes no routing state, the default:
+    /// what such a worker says is read from its facts at every decision.
+    /// A worker type that answers `true` moves the process's word at every
+    /// change of this answer, behind the change: a caller keeps a `true`
+    /// for as long as the word stands.
+    fn published_available(&self) -> bool {
+        false
     }
 
     /// Record the outcome of a request based on the HTTP status code.
@@ -1851,6 +1873,10 @@ impl Worker for BasicWorker {
             overloaded: rt.is_overloaded(),
             stalled: rt.stall_reason().is_some(),
         }
+    }
+
+    fn published_available(&self) -> bool {
+        self.runtime.load().published_state() == AVAILABLE_CODE
     }
 
     fn record_circuit_breaker_outcome(&self, success: bool) {

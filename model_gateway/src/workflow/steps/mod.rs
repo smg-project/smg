@@ -489,8 +489,11 @@ mod tests {
             )
             .await
             .unwrap();
+        // The registration ends in a fraction of a second alone and takes
+        // seconds beside the crate's other tests: the wait is long enough
+        // for that, and ends where the workflow does.
         let state = engine
-            .wait_for_terminal_state(id, url, Duration::from_secs(5))
+            .wait_for_terminal_state(id, url, Duration::from_secs(60))
             .await
             .unwrap();
 

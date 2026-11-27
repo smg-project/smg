@@ -750,11 +750,16 @@ fn the_print_option_says_a_refusal_in_one_sentence() {
     // A setting no document says: no document, and one sentence with the
     // setting by its name at the head. The words behind the head are the
     // Grand Central crate's, and no case of the gateway holds them. The sticky
-    // override's rule places single requests alone, and this line plans a
-    // pair.
+    // override's rule places both sides of a pair, and this line's prefill
+    // policy reads the routing key itself.
     let mut line = vec!["smg"];
     line.extend_from_slice(PAIR);
-    line.extend_from_slice(&["--routing-key-override", "--print-policy-spec"]);
+    line.extend_from_slice(&[
+        "--prefill-policy",
+        "consistent_hashing",
+        "--routing-key-override",
+        "--print-policy-spec",
+    ]);
     let sticky = printed(&line);
     assert_eq!(sticky.document(), None);
     assert!(
@@ -870,5 +875,41 @@ fn the_print_refuses_its_part_of_a_line_as_a_start_refuses_it() {
         let mut asked = line.to_vec();
         asked.push("--print-policy-spec");
         assert_eq!(printed(&asked), PolicySpecPrint::Refused(start), "{line:?}");
+    }
+}
+
+/// The connection mode is no flag: a start reads it off the worker
+/// addresses, and a pair's document follows it. Over HTTP the document
+/// binds a single request behind the pair, and over gRPC and over ZMQ it
+/// plans the pair alone. The routing part reads the mode off the same
+/// addresses, so the print answers with the document a start hosts.
+#[test]
+fn the_print_reads_the_connection_mode_off_the_addresses_as_a_start_does() {
+    for (prefill, decode, bindings) in [
+        ("http://prefill-a:8000", "http://decode-a:8000", 2),
+        ("grpc://prefill-a:8000", "grpc://decode-a:8000", 1),
+        ("ipc:///tmp/smg-zmq/p0", "ipc:///tmp/smg-zmq/d0", 1),
+    ] {
+        let line = [
+            "smg",
+            "--pd-disaggregation",
+            "--prefill",
+            prefill,
+            "--decode",
+            decode,
+        ];
+        let argv: Vec<String> = line.iter().map(|word| (*word).to_string()).collect();
+        let start = router_config(&argv)
+            .expect("a start takes the line")
+            .policy_document();
+        assert_eq!(one_routing_part(&argv, &start), Ok(()), "{prefill}");
+
+        let mut asked = line.to_vec();
+        asked.push("--print-policy-spec");
+        let answer = printed(&asked);
+        assert_eq!(answer.refusal(), None, "{prefill}");
+        let document = read_back(&answer);
+        assert_eq!(document.bindings.len(), bindings, "{prefill}");
+        assert_eq!(Ok(document), start, "{prefill}");
     }
 }

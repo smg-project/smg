@@ -1507,4 +1507,5 @@ fn vllm_keys(keys: Option<&[ExtraKey]>, index: usize) -> Result<Option<Vec<VllmE
 }
 
 #[cfg(test)]
+#[path = "../tests/unit/kv_wire/tests/mod.rs"]
 mod tests;

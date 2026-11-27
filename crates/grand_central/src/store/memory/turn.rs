@@ -128,8 +128,8 @@
 //! waits, and at each other file that shows a watch. A stage that says
 //! nothing is taken as one: a plugin's, whose rule is its own, and a
 //! host's own stage. Each stage of this crate says it is none. The day
-//! the reservations' `try_reserve` gets a caller, or a stage of this
-//! crate sheds on a count or on its book, it takes the same entry.
+//! a stage of this crate sheds on a count or on its book, it takes the
+//! same entry.
 //!
 //! The lock order, written here once: a file's turn is taken first or not
 //! at all, and one turn at a time. The term's rise holds every turn, in
@@ -160,7 +160,7 @@ use std::{
         Arc, OnceLock,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use arc_swap::Guard;
@@ -180,10 +180,11 @@ use crate::{
 };
 
 /// What tells the engine of a frame applied to a lease on file: the world
-/// the frame is told under, the lease as it stood before the frame, both
-/// its parts, what the frame said, and the decider whose file the lease is
-/// on, where the store's host named its deciders. It holds what its host
-/// gave it: a served controller's holds the replica's worker objects.
+/// the frame's run loaded ([`OneLoad`]), the lease as it stood before the
+/// frame, both its parts, what the frame said, and the decider whose file
+/// the lease is on, where the store's host named its deciders. It holds
+/// what its host gave it: a served controller's holds the replica's worker
+/// objects.
 type Teller =
     Arc<dyn Fn(&MemoryStore, &StoreSnapshot, &Sides, Said, Option<DecisionSlot>) + Send + Sync>;
 
@@ -191,13 +192,13 @@ type Teller =
 /// world, loaded at the run's first word and held to its last. A run is
 /// one loop's words: the frames an apply finds in the ring, the leases an
 /// issue ends, the leases a sweep ends in a file. So a run that tells
-/// nothing loads no world, and one that tells many loads one: each word
-/// of a run is told under the generation that stood at the run's first.
-/// Each run builds its own where it tells, so one hold of a turn may load
-/// twice: the leases an issue ends may be told under a later world than
-/// the frames its apply found. Where a generation starts between the two,
-/// the engine that issued those leases does not hear their ends. That is
-/// a limit of this form, not its aim: one load for both runs undoes it.
+/// nothing loads no world, and one that tells many loads one. Each run
+/// builds its own where it tells, so one hold of a turn may load twice.
+/// The load is the world a teller is handed, and it does not say who
+/// hears a word: a served controller's teller tells each word by the
+/// generation that stands at that word, and loads the standing world
+/// itself where a generation started behind the run's load
+/// (`lease_words::told`).
 /// None is passed in by a caller: that cost every take a holder's
 /// building and its drop, whatever the take found.
 #[derive(Default)]
@@ -312,7 +313,9 @@ struct Working {
     /// The mark of the thread at work at the file ([`me`]); 0 for none.
     /// One thread at most works at a file: its decider, with a job at
     /// hand. It applies what is handed while it works, and once more as
-    /// it leaves.
+    /// it leaves. The file's methods alone read and write it
+    /// ([`File::begin_work`], [`File::leave_work`], [`File::may_act`],
+    /// [`File::has_worker`]).
     at_work: AtomicUsize,
 }
 
@@ -369,14 +372,17 @@ impl File {
         }
     }
 
-    /// Whether this file may hold work for a sweep.
-    pub(super) fn sweep_needed(&self, now: std::time::Instant) -> bool {
+    /// Whether this file may hold work for a sweep at `now`: its deadline
+    /// hint is reached, or its ring holds a frame. Read with no turn held
+    /// ([`MemoryStore::sweep_turn`]).
+    fn sweep_needed(&self, now: Instant) -> bool {
         self.next_due.reached(now) || self.shown.hands.waits()
     }
 
     /// Takes the turn and applies nothing: for the term's read, which no
     /// handed frame changes.
     pub(super) fn take(&self) -> Turn<'_> {
+        // A case's count of takes, made ahead of the wait for the turn.
         #[cfg(test)]
         self.takes.fetch_add(1, SeqCst);
         #[cfg(debug_assertions)]
@@ -395,24 +401,6 @@ impl File {
         }
     }
 
-    /// Whether the turn is free at this instant, tried.
-    #[cfg(test)]
-    pub(super) fn free(&self) -> bool {
-        self.turn.try_lock().is_some()
-    }
-
-    /// Takes of this file's turn since the test last cleared them.
-    #[cfg(test)]
-    pub(super) fn takes(&self) -> usize {
-        self.takes.load(SeqCst)
-    }
-
-    /// Starts this test's count of turn takes again.
-    #[cfg(test)]
-    pub(super) fn clear_takes(&self) {
-        self.takes.store(0, SeqCst);
-    }
-
     /// The turn where it is free, with nothing applied. `None` where a
     /// thread holds it: what is handed behind that holder's take waits
     /// for the next take that applies.
@@ -425,6 +413,38 @@ impl File {
             #[cfg(debug_assertions)]
             file: self,
         })
+    }
+
+    /// The calling thread says it works at this file: it writes its mark
+    /// ([`me`]). One thread at most works at a file.
+    #[inline(always)]
+    fn begin_work(&self) {
+        let was = self.working.at_work.swap(me(), SeqCst);
+        debug_assert_eq!(was, 0, "one thread works at a file");
+    }
+
+    /// The thread at work at this file takes its mark back.
+    #[inline(always)]
+    fn leave_work(&self) {
+        self.working.at_work.store(0, SeqCst);
+    }
+
+    /// Whether the calling thread may act at this file: no thread is at
+    /// work there, or the caller is that thread. Asked with no turn held
+    /// it lets a caller pass a file whose decider works without a wait
+    /// for that file's turn. What an apply goes by is read under the turn
+    /// ([`MemoryStore::applied`]).
+    #[inline(always)]
+    fn may_act(&self) -> bool {
+        let worker = self.working.at_work.load(SeqCst);
+        worker == 0 || worker == me()
+    }
+
+    /// Whether a thread is at work at this file: what a hand reads where
+    /// no watch stands.
+    #[inline(always)]
+    fn has_worker(&self) -> bool {
+        self.working.at_work.load(SeqCst) != 0
     }
 }
 
@@ -864,24 +884,6 @@ impl MemoryStore {
         }
     }
 
-    /// How many files show a watch, for the cases: no door of the store
-    /// tells it.
-    #[cfg(test)]
-    pub(crate) fn watches(&self) -> usize {
-        let files = self.files.iter();
-        files.filter(|file| file.shown.watched.load(SeqCst)).count()
-    }
-
-    /// How many files show a thread at work, for the deciders' cases: no
-    /// door of the store tells it.
-    #[cfg(all(test, feature = "controller"))]
-    pub(crate) fn working(&self) -> usize {
-        let files = self.files.iter();
-        files
-            .filter(|file| file.working.at_work.load(SeqCst) != 0)
-            .count()
-    }
-
     /// The calling thread's place at its file, at work: a decider's, from
     /// a job at hand to an empty queue. The file is the one of the
     /// decider the thread acts as ([`DecisionSlot::acting`]), and one thread
@@ -906,8 +908,7 @@ impl MemoryStore {
     /// A thread that keeps its watch over the file begins by
     /// [`Self::begin_watched`].
     fn begin(&self, at: usize) {
-        let was = self.files[at].working.at_work.swap(me(), SeqCst);
-        debug_assert_eq!(was, 0, "one thread works at a file");
+        self.files[at].begin_work();
         fence(SeqCst);
         drop(self.turn_of(at));
     }
@@ -926,8 +927,7 @@ impl MemoryStore {
     fn begin_watched(&self, at: usize) {
         let file = &self.files[at];
         let mut turn = file.take();
-        let was = file.working.at_work.swap(me(), SeqCst);
-        debug_assert_eq!(was, 0, "one thread works at a file");
+        file.begin_work();
         fence(SeqCst);
         self.applied(at, &mut turn);
     }
@@ -937,7 +937,7 @@ impl MemoryStore {
     /// follows, its look ([`Self::looked`]) or its last apply, is the
     /// leaver's half of the hand-over ([`Self::settle`]).
     fn leave(&self, at: usize) {
-        self.files[at].working.at_work.store(0, SeqCst);
+        self.files[at].leave_work();
         fence(SeqCst);
     }
 
@@ -952,7 +952,7 @@ impl MemoryStore {
     /// [`LookOutcome::Ended`] too where another thread is at work there: what
     /// waits is that thread's.
     fn looked(&self, at: usize) -> LookOutcome {
-        if !self.may_act(at) {
+        if !self.files[at].may_act() {
             return LookOutcome::Ended;
         }
         let mut turn = self.files[at].take();
@@ -977,14 +977,25 @@ impl MemoryStore {
         turn
     }
 
-    /// Whether the calling thread may act at the file at `at`: no thread
-    /// is at work there, or the caller is that thread. Asked with no turn
-    /// held it lets a caller pass a file whose decider works without a
-    /// wait for that file's turn; what an apply goes by is read under the
-    /// turn ([`Self::applied`]).
-    pub(super) fn may_act(&self, at: usize) -> bool {
-        let worker = self.files[at].working.at_work.load(SeqCst);
-        worker == 0 || worker == me()
+    /// The turn of the file at `at` for a sweep at `now`, with everything
+    /// handed applied: the sweep's whole admission to a file. `None` where
+    /// the sweep passes the file.
+    ///
+    /// It passes a file that holds no work for it ([`File::sweep_needed`]),
+    /// and one whose decider works ([`File::may_act`]). That is read first
+    /// with no turn held, so the sweep waits for no turn of a thread at
+    /// work, and again under the turn ([`Self::applied`]). The file's
+    /// deadline is shown under the turn ahead of that second read
+    /// ([`Leases::show_due`]): a file passed there is asked again at its
+    /// deadline, not at every pass.
+    pub(super) fn sweep_turn(&self, at: usize, now: Instant) -> Option<Turn<'_>> {
+        let file = &self.files[at];
+        if !file.sweep_needed(now) || !file.may_act() {
+            return None;
+        }
+        let mut turn = file.take();
+        turn.show_due();
+        self.applied(at, &mut turn).then_some(turn)
     }
 
     /// Applies what waits at the file at `at`, under its turn, where the
@@ -994,7 +1005,7 @@ impl MemoryStore {
     /// so no thread acts as a decider beside it. The frames it finds are
     /// told under one load of the world, the apply's own ([`OneLoad`]).
     pub(super) fn applied(&self, at: usize, turn: &mut Turn<'_>) -> bool {
-        if !self.may_act(at) {
+        if !self.files[at].may_act() {
             return false;
         }
         let Behind { leases, ring } = &mut *turn.behind;
@@ -1030,7 +1041,7 @@ impl MemoryStore {
     /// instructions, by count.
     #[inline(never)]
     fn settle(&self, at: usize) -> bool {
-        if !self.may_act(at) {
+        if !self.files[at].may_act() {
             return false;
         }
         let mut turn = self.files[at].take();
@@ -1145,7 +1156,7 @@ impl MemoryStore {
         }
         // The hand's half of the hand-over ([`Self::settle`]).
         fence(SeqCst);
-        if file.working.at_work.load(SeqCst) == 0 {
+        if !file.has_worker() {
             self.settle(at);
         }
         true
@@ -1160,7 +1171,21 @@ impl MemoryStore {
     /// is of the sides the record held as the frame found it. A dispatch
     /// at an index a chosen side's pick holds no target at moves nothing
     /// and is handed on all the same.
+    ///
+    /// A side a decode call issued stands in the place of the chosen side
+    /// the pair's first decision filed. A release that ends the issued
+    /// side ends that chosen side too, and the engine hears it as the
+    /// release of a decode still chosen that is named alone: the session
+    /// table does, under the verdict the first decision stated, and no
+    /// stage.
     fn apply_frame(&self, at: usize, leases: &mut Leases, key: Key, said: Said, one: &mut OneLoad) {
+        // Read ahead of the door's change, for a release that can end the
+        // decode: one that names it, or no side.
+        #[cfg(feature = "controller")]
+        let first = match said {
+            Said::Released(None | Some(lease::Side::Decode), _) => leases.replaced_decode(&key),
+            _ => None,
+        };
         let found = match said {
             Said::Dispatched(dispatch, when) => leases
                 .dispatched(self.slots(), &key, dispatch, when)
@@ -1170,6 +1195,19 @@ impl MemoryStore {
         };
         if let Some(found) = found {
             self.tell(at, one.world(self), &found, said);
+            #[cfg(feature = "controller")]
+            if let (Some(first), Said::Released(_, reason)) = (first, said) {
+                let chosen = Sides {
+                    decode: Some(first),
+                    ..found
+                };
+                let alone = Said::Released(Some(lease::Side::Decode), reason);
+                self.tell(at, one.world(self), &chosen, alone);
+            }
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../../tests/unit/store/memory/turn/tests.rs"]
+mod tests;

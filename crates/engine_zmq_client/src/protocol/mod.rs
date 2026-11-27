@@ -158,10 +158,13 @@ pub trait EngineProtocol: Send + Sync + 'static {
     /// What this protocol reads off an engine's handshake and needs when it
     /// frames that engine's requests or decodes its outputs: where the engine
     /// declared the optional output columns this client knows, whether its
-    /// request decoder resolves tensors sent as auxiliary frames (`()` for a
-    /// protocol that needs neither). Read once per connection
-    /// ([`EngineProtocol::read_layout`]) and handed to every
-    /// [`EngineProtocol::encode_add`] and [`EngineProtocol::decode_batch`].
+    /// request decoder resolves tensors sent as auxiliary frames, which form
+    /// of a request its release reads (`()` for a protocol that needs none).
+    /// Read once for each engine as it connects
+    /// ([`EngineProtocol::read_layout`]): an engine's own is handed to every
+    /// [`EngineProtocol::encode_add`] of a request it is sent, and the one
+    /// the engines of its connection agree on (the default where they
+    /// differ) to every [`EngineProtocol::decode_batch`].
     type Layout: Clone + Default + PartialEq + std::fmt::Debug + Send + Sync + 'static;
 
     /// The single-byte request-type frame prepended to an add-request.
@@ -218,8 +221,8 @@ pub trait EngineProtocol: Send + Sync + 'static {
     fn check_layouts(_ready: &EngineCoreReadyResponse) -> Result<()> {
         Ok(())
     }
-    /// The connection's [`EngineProtocol::Layout`], read off the engine's
-    /// ready response: the positions the engine declares for the optional
+    /// An engine's [`EngineProtocol::Layout`], read off its ready
+    /// response: the positions the engine declares for the optional
     /// output columns this protocol knows, unset (the default) for a column
     /// it does not declare, and what it declares its request decoder
     /// resolves. Never an error: an engine that declares nothing is an older

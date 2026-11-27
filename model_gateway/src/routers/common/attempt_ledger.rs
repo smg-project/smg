@@ -50,6 +50,11 @@ pub(crate) fn is_upstream_answer(response: &Response) -> bool {
     response.extensions().get::<UpstreamAnswer>().is_some()
 }
 
+/// Error code of the 502 a route answers for a worker's body over the
+/// limit. The worker answered, and the route refused what it gave: the
+/// refusal bears no mark ([`UpstreamAnswer`]) and is known by this code.
+pub(crate) const WORKER_BODY_TOO_LARGE: &str = "upstream_response_too_large";
+
 /// Response extension: the attempt failed on one side of a disaggregated pair,
 /// named by its engine, and that side alone is what the request must not be
 /// replayed on (see [`AttemptLedger::settle`]).
@@ -102,6 +107,14 @@ pub(crate) fn failed_side_type(response: &Response) -> Option<WorkerType> {
 /// (502, 503, 504) stay replayable.
 pub(crate) fn is_definitive_failure(response: &Response) -> bool {
     response.status() == StatusCode::INTERNAL_SERVER_ERROR && is_upstream_answer(response)
+}
+
+/// Whether `response` closes the retry window: it names a failed side
+/// ([`FailedSide`]) or is a definitive failure. [`AttemptLedger::settle`]
+/// passes any other response untouched, so a caller that asks this first
+/// takes its pool only for a response `settle` reads it for.
+pub(crate) fn closes_retry_window(response: &Response) -> bool {
+    failed_side_type(response).is_some() || is_definitive_failure(response)
 }
 
 /// What one request's attempts have told the worker pool so far.
@@ -212,10 +225,10 @@ impl AttemptLedger {
         answered_by: impl IntoIterator<Item = &'a Arc<dyn Worker>>,
         pool: impl IntoIterator<Item = &'a Arc<dyn Worker>>,
     ) {
-        let side = response.extensions().get::<FailedSide>().cloned();
-        if side.is_none() && !is_definitive_failure(response) {
+        if !closes_retry_window(response) {
             return;
         }
+        let side = response.extensions().get::<FailedSide>().cloned();
         {
             let mut ledger = self.inner.lock();
             for worker in answered_by {

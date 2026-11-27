@@ -199,8 +199,9 @@ pub enum EncoderInput {
         norm: PixelNorm,
     },
     /// The encoder input already in a wire dtype: `shape`'s elements as
-    /// little-endian `dtype` values, written from pixel bytes with `norm` in
-    /// one pass (the patch layout and the normalization together, for a
+    /// little-endian `dtype` values, written from pixel bytes with `norm`,
+    /// or by a processor's own arithmetic that `norm` approximates, in one
+    /// pass (the patch layout and the normalization together, for a
     /// destination whose dtype was known before preprocessing). A
     /// destination of that dtype reads it as it is; a narrower float dtype
     /// is derived exactly from a `float32` wire; nothing else is.

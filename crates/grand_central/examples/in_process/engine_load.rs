@@ -1,12 +1,13 @@
 //! A stage of the program's own, added in code: a scorer that weighs a
 //! data-parallel engine as a whole.
 //!
-//! A stage is handed one record for each rank of such an engine, and each
-//! record states which engine of its list it is a rank of
-//! ([`Candidate::engine`]). [`EngineLoad`] adds up the requests in flight
-//! over the ranks of each engine and scores highest the ranks of the engine
-//! that holds the fewest. A request then goes to an idle engine before it
-//! goes to an idle rank of a busy one.
+//! A stage is handed one record for each rank of such an engine. Each record
+//! states which engine of its list it is a rank of ([`Candidate::engine`]).
+//!
+//! [`EngineLoad`] adds up the requests in flight over the ranks of each
+//! engine, and scores highest the ranks of the engine that holds the fewest. A
+//! request then goes to an idle engine before it goes to an idle rank of a
+//! busy one.
 //!
 //! The sums count every rank the stage is handed, the ones a filter dropped
 //! too: a rank that is refused for its load still loads its engine.
@@ -26,9 +27,9 @@ use smg_grand_central::{
 /// The name a document's `score` list names the scorer by.
 pub const ENGINE_LOAD: &str = "engine-load";
 
-/// Scores each record by the requests in flight on its whole engine: `1`
-/// where the engine holds none, `0` for the engine that holds the most
-/// among the engines of the records it scores.
+/// Scores each record by the requests in flight on its whole engine. The score
+/// is `1` where the engine holds none. It is `0` for the engine that holds the
+/// most among the engines of the records scored.
 #[derive(Debug)]
 pub struct EngineLoad;
 

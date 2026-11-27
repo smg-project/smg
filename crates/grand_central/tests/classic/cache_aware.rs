@@ -8,17 +8,18 @@
 //! four characters an id. Every prompt and every shared prefix of the rows
 //! is whole blocks.
 //!
-//! What a worker holds of a request reaches the decision as the affinity
-//! column a host lends beside its rows. The matchers read apart, and the
-//! row's matcher says which reading the replay hands the engine:
+//! What a worker holds of a request reaches the decision as a host lends
+//! it. The matchers read apart, and the row's matcher says which reading
+//! the replay hands the engine:
 //!
-//! - the index: every worker holds its own depth, by the blocks the row's
-//!   `stored` and `removed` steps wrote for it;
+//! - the index: the affinity column, every worker holding its own depth,
+//!   by the blocks the row's `stored` and `removed` steps wrote for it;
 //! - a tree: the classic's tree names the holders of the deepest match over
-//!   the whole pool and nobody else. The replay gives those holders their
-//!   depth as a predicted placement and every other worker nothing, from
-//!   the row's own history: each request wrote its prompt for the worker it
-//!   was placed on.
+//!   the whole pool and nobody else, and reads the match by two numbers,
+//!   its size and the prompt's in the tree's own unit. The replay names
+//!   those holders as the rows of a tree's match, with the two numbers,
+//!   from the row's own history: each request wrote its prompt for the
+//!   worker it was placed on.
 //!
 //! A row under the index is handed that column by the replay's own count
 //! of the blocks each worker stored.
@@ -34,8 +35,9 @@ use serde::Deserialize;
 use smg_grand_central::{
     document::PolicySpec,
     engine::{
-        AffinityFacts, Candidate, Constraints, Decision, Engine, HashKind, Health, LoadRow,
-        PoolFacts, RequestFacts, Role, Scratch, ShedReason, SignalSource, Target, WorkerId,
+        AffinityFacts, AffinityHolder, AffinityRows, Candidate, Constraints, Decision, Engine,
+        HashKind, Health, LoadRow, PoolFacts, RequestFacts, Role, Scratch, ShedReason,
+        SignalSource, Target, TreeMatch, WorkerId,
     },
     stages::Lifecycle,
     tracking::{Lease, Side, TransportClass},
@@ -349,52 +351,66 @@ impl Bed {
         })
     }
 
-    /// The affinity column of a request for `prompt`: the replay's own
-    /// count, under the row's matcher.
+    /// The affinity column of a request for `prompt` under the index: the
+    /// replay's own count. Every worker by its own depth: the leading
+    /// blocks of the prompt it holds, each as the prefix that ends at it.
     fn column(&self, prompt: &[u32]) -> Vec<AffinityFacts> {
         let per = self.ids_per_block;
-        match self.matcher {
-            // Every worker by its own depth: the leading blocks of the
-            // prompt it holds, each as the prefix that ends at it.
-            Matcher::Events => self
-                .held
-                .iter()
-                .map(|held| {
-                    let overlap = (1..=prompt.len() / per)
-                        .take_while(|&blocks| held.iter().any(|h| h[..] == prompt[..blocks * per]))
-                        .count();
-                    let mut affinity = AffinityFacts::default();
-                    affinity.overlap_blocks = overlap as u32;
-                    affinity.indexed_growth = held.len() as u32;
-                    affinity.indexed_blocks = held.len() as u32;
-                    affinity
-                })
-                .collect(),
-            // The holders of the deepest match alone, by the prompts
-            // placed on each worker.
-            Matcher::Text | Matcher::Tokens => {
-                let depths: Vec<u32> = self
-                    .held
-                    .iter()
-                    .map(|placed| {
-                        placed
-                            .iter()
-                            .map(|other| shared_blocks(prompt, other, per))
-                            .max()
-                            .unwrap_or(0)
-                    })
-                    .collect();
-                let deepest = depths.iter().copied().max().unwrap_or(0);
-                depths
-                    .iter()
-                    .map(|&depth| {
-                        let mut affinity = AffinityFacts::default();
-                        affinity.predicted_blocks = if depth == deepest { depth } else { 0 };
-                        affinity
-                    })
-                    .collect()
+        let depth = |held: &Vec<Vec<u32>>| {
+            let overlap = (1..=prompt.len() / per)
+                .take_while(|&blocks| held.iter().any(|h| h[..] == prompt[..blocks * per]))
+                .count();
+            let mut affinity = AffinityFacts::default();
+            affinity.overlap_blocks = overlap as u32;
+            affinity.indexed_growth = held.len() as u32;
+            affinity.indexed_blocks = held.len() as u32;
+            affinity
+        };
+        self.held.iter().map(depth).collect()
+    }
+
+    /// What a tree's match of a request for `prompt` names: the holders of
+    /// the deepest match alone, by the prompts placed on each worker, and
+    /// the match's two numbers in the tree's own unit. The tree of token
+    /// ids walks whole pages, a page a block. The tree of text matches
+    /// character by character, each id spelled as the recorder spells it.
+    /// A holder's row counts the whole blocks of its match.
+    fn tree_rows(&self, prompt: &[u32]) -> (Vec<AffinityHolder>, TreeMatch) {
+        let text = self.matcher == Matcher::Text;
+        let asked = spelled(prompt);
+        let shared = |other: &Vec<u32>| {
+            if text {
+                let other = spelled(other);
+                let alike = asked.bytes().zip(other.bytes());
+                alike.take_while(|(a, b)| a == b).count() as u32
+            } else {
+                shared_blocks(prompt, other, self.ids_per_block) * self.block_size
             }
-        }
+        };
+        let depths: Vec<u32> = self
+            .held
+            .iter()
+            .map(|placed| placed.iter().map(shared).max().unwrap_or(0))
+            .collect();
+        let deepest = depths.iter().copied().max().unwrap_or(0);
+        let holders = (0u32..)
+            .zip(&depths)
+            .filter(|&(_, &depth)| deepest > 0 && depth == deepest)
+            .map(|(row, _)| {
+                let mut holder = AffinityHolder::default();
+                holder.row = row;
+                holder.predicted_blocks = deepest / self.block_size;
+                holder
+            })
+            .collect();
+        let mut tree = TreeMatch::default();
+        tree.matched = deepest;
+        tree.of = if text {
+            asked.len() as u32
+        } else {
+            prompt.len() as u32
+        };
+        (holders, tree)
     }
 
     /// One request decided and, when it is placed, dispatched as a host
@@ -404,7 +420,16 @@ impl Bed {
     fn pick(&mut self, prompt: &[[u32; 2]], tried: &[usize], seed: u64) -> usize {
         self.clock += 1_000;
         let prompt = ids(prompt);
-        let column = self.column(&prompt);
+        // The index's column, or the rows a tree's match names.
+        let (column, (holders, tree)) = if self.matcher == Matcher::Events {
+            (self.column(&prompt), (Vec::new(), None))
+        } else {
+            let (holders, tree) = self.tree_rows(&prompt);
+            (Vec::new(), (holders, Some(tree)))
+        };
+        let mut named = AffinityRows::default();
+        named.holders = &holders;
+        named.tree = tree;
         let tried: Vec<WorkerId> = tried.iter().map(|&i| id(i)).collect();
         let text = self.matcher == Matcher::Text;
         let mut facts = RequestFacts::default();
@@ -423,6 +448,7 @@ impl Bed {
         facts.seed = seed;
         facts.now_micros = self.clock;
         facts.affinity = &column;
+        facts.named = tree.map(|_| named);
         let mut pool_facts = PoolFacts::default();
         pool_facts.pool_size = self.pool.len() as u32;
         pool_facts.generation = 1;
@@ -442,13 +468,11 @@ impl Bed {
             }
         };
         let target = *pick.targets.first().expect("a target");
-        let lease = Lease {
-            issued_micros: self.clock,
-            // A request carried as text states no size: the load stage
-            // credits its dispatch at its own mean.
-            tokens: if text { 0 } else { prompt.len() as u32 },
-            ..Lease::default()
-        };
+        let mut lease = Lease::default();
+        lease.issued_micros = self.clock;
+        // A request carried as text states no size: the load stage
+        // credits its dispatch at its own mean.
+        lease.tokens = if text { 0 } else { prompt.len() as u32 };
         self.engine.on_dispatched(&lease, &target, Side::Single, 0);
         let place = target.position as usize;
         self.pool[place].in_flight += 1;
@@ -525,6 +549,12 @@ impl Bed {
         }
         None
     }
+}
+
+/// A prompt carried as text, as the recorder spells it: four hex digits an
+/// id.
+fn spelled(prompt: &[u32]) -> String {
+    prompt.iter().map(|id| format!("{id:04x}")).collect()
 }
 
 /// The leading whole blocks two prompts share.

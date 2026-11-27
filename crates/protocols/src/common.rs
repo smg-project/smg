@@ -203,6 +203,18 @@ pub trait GenerationRequest: Send + Sync {
     /// Extract text content for routing decisions
     fn extract_text_for_routing(&self) -> String;
 
+    /// The text the routing policies key on: by default the text of
+    /// [`Self::extract_text_for_routing`]. A protocol whose content holds
+    /// parts that are no text (an image, a clip, a file) writes a marker at
+    /// the place of each, so two requests part where a backend's prefix
+    /// cache parts them. Every reader of the routing text sees the markers:
+    /// a reader of the prompt's size counts each as one word of 256
+    /// characters. A reader that must count the words of the text alone
+    /// reads `extract_text_for_routing`.
+    fn routing_text(&self) -> String {
+        self.extract_text_for_routing()
+    }
+
     /// Token IDs for routing when the request is already tokenized.
     /// Some(_) routes on the token radix tree instead of the decimal-string
     /// rendering of the same IDs.
@@ -612,7 +624,13 @@ pub struct ImageUrl {
     /// MiniMax-M3 extension: cap the image's long side before preprocessing.
     ///
     /// For M3 router preprocessing, any positive cap is accepted (default 2016).
-    /// Branch on the source size: shrink if its long side exceeds the cap;
+    /// The image takes the model processor's aligned size: a source under
+    /// 168 x 168 in area, or under 168 on its short side, is enlarged; both
+    /// sides are rounded up to a multiple of 28; and a side over the cap,
+    /// which is first rounded down to a multiple of 28, scales both sides
+    /// back, each keeping 28 at least. Where the source or that size passes
+    /// an aspect ratio of 200:1, or that size 12,845,056 pixels, branch on
+    /// the source size instead: shrink if its long side exceeds the cap;
     /// otherwise raise a short side below 112. Then round both sides to the
     /// nearest multiple of 28, so the aligned long side can exceed the cap.
     /// Outputs above 12,845,056 pixels are rejected; the legacy `max_pixels`

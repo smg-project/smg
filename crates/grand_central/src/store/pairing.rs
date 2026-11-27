@@ -1,7 +1,7 @@
 //! The pair classes (design 4.1 and 5.1): which decodes a prefill may hand
-//! its KV blocks to, decided where a membership write moves a member or an
-//! offer and where a generation moves the pairing mode, and read by every
-//! pair decision as a class on its rows and a table of classes.
+//! its KV blocks to, derived by whoever holds the worker objects of a
+//! model's two lists, and read by every pair decision as a class on its
+//! rows and a table of classes.
 //!
 //! One invariant: **a worker has one class, and which classes pair is a
 //! table of classes.** Two prefills that may pair with the same decodes
@@ -32,27 +32,15 @@
 //!
 //! The derivation ([`PairClasses::derive`]) is a function of the membership
 //! and the mode and of nothing else. It numbers each side's classes in the
-//! order that side's workers are given, which the store makes the workers'
-//! id order, so two stores that hold one membership number its classes
-//! alike.
-//!
-//! A membership build of one worker's writes derives for that worker
-//! alone: the store's writer keeps each model's offers and the rule's
-//! verdicts on them from one build to the next, moves the written worker in
-//! them and runs the rule again only on an offer no worker of its pool
-//! held. The classes it hands back are the whole derivation's.
+//! order that side's workers are given, so two holders that give one
+//! membership in one order number its classes alike. The store derives
+//! none.
 //!
 //! Every value here is opaque text: a runtime, a transport and a layout
 //! fact are compared for equality and never interpreted. Deriving a
 //! descriptor from what an engine reports is the registration handshake's.
 
-#![expect(
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
-
 use std::{
-    cmp::Ordering,
     collections::hash_map::Entry,
     fmt,
     hash::{BuildHasher, Hash},
@@ -70,6 +58,7 @@ use crate::{
 };
 
 #[cfg(test)]
+#[path = "../../tests/unit/store/pairing/tests.rs"]
 mod tests;
 
 /// The KV layout facts a descriptor may report, in the order they are
@@ -88,7 +77,11 @@ pub const LAYOUT_FACTS: [(&str, &str); 4] = [
 /// never meets one: the store's door hands it a normalized descriptor
 /// ([`PairingDescriptor::normalize`]), as the gateway's own derive drops a
 /// blank label where it makes a worker's descriptor.
+///
+/// The record gains fields: code outside this crate starts from the default
+/// and assigns what it knows, and a pattern of it ends with `..`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct PairingDescriptor {
     /// The protocol an operator set. Two workers that both set one are
     /// compared on it whole.
@@ -552,17 +545,6 @@ impl PairClasses {
         PairTable::new(&self.ends, &self.listed)
     }
 
-    /// The table and, behind it, the first partners, as a derivation
-    /// compares and carries them.
-    fn tables(&self) -> Tables<'_> {
-        [
-            &self.ends,
-            &self.listed,
-            &self.first_ends,
-            &self.first_listed,
-        ]
-    }
-
     /// The partner list of prefill class `class`: the decodes of the
     /// classes it pairs with, as indexes into the decodes given, in that
     /// order; empty for class `0` and for a class past the last. Built on
@@ -594,45 +576,6 @@ impl PairClasses {
     }
 }
 
-/// A pool as a derivation reads it: its workers in id order, each by its
-/// place.
-pub(super) trait Pool<'a> {
-    /// How many workers the pool holds.
-    fn count(&self) -> usize;
-    /// The id of the worker at `at`.
-    fn id(&self, at: usize) -> WorkerId;
-    /// The worker at `at` as the rule reads it.
-    fn member(&self, at: usize) -> Member<'a>;
-}
-
-impl<'a> Pool<'a> for [Member<'a>] {
-    fn count(&self) -> usize {
-        self.len()
-    }
-
-    fn id(&self, at: usize) -> WorkerId {
-        self[at].id
-    }
-
-    fn member(&self, at: usize) -> Member<'a> {
-        self[at]
-    }
-}
-
-/// Where the worker `id` stands in `pool`.
-fn place<'a, P: Pool<'a> + ?Sized>(pool: &P, id: WorkerId) -> Option<usize> {
-    let (mut low, mut high) = (0, pool.count());
-    while low < high {
-        let middle = low + (high - low) / 2;
-        match pool.id(middle).cmp(&id) {
-            Ordering::Less => low = middle + 1,
-            Ordering::Greater => high = middle,
-            Ordering::Equal => return Some(middle),
-        }
-    }
-    None
-}
-
 /// The hash a [`Numbering`] is asked with.
 fn hash(thing: impl Hash) -> u64 {
     FxBuildHasher.hash_one(thing)
@@ -643,8 +586,8 @@ const STEP: u64 = 0x9e37_79b9_7f4a_7c15;
 
 /// Numbers distinct things as each first comes, by a hash the caller takes
 /// and a compare the caller makes. It borrows nothing of what it numbers,
-/// so a derivation keeps one and clears it: a map keyed by the things
-/// themselves is built at every derivation.
+/// so one serves every numbering of a derivation, cleared before each: a
+/// map keyed by the things themselves is built at every numbering.
 #[derive(Default)]
 struct Numbering {
     /// A hash, or a hash some steps on where things share one, and the
@@ -701,20 +644,6 @@ fn numbered(
     }
 }
 
-/// The first `count` of the kept `lists`, each cleared: a list keeps its
-/// room from one derivation to the next.
-fn cleared(lists: &mut Vec<Vec<u32>>, count: usize) -> &mut [Vec<u32>] {
-    if lists.len() < count {
-        lists.resize_with(count, Vec::new);
-    }
-    let lists = &mut lists[..count];
-    lists.iter_mut().for_each(Vec::clear);
-    lists
-}
-
-/// The class of a slot no derivation has classed yet.
-const UNCLASSED: u32 = u32::MAX;
-
 /// One distinct offer of a pool as a derivation keeps it.
 #[derive(Clone, Copy)]
 struct Slot {
@@ -724,54 +653,33 @@ struct Slot {
     first: usize,
     /// The offer's side of the wire's fact ([`runtime_specific`]).
     specific: bool,
-    /// The class of the offer's workers as the last derivation left it.
-    class: u32,
-}
-
-impl Slot {
-    /// Write the offer's class. Whether that moved a class it had.
-    fn classed(&mut self, class: u32) -> bool {
-        let moved = self.class != UNCLASSED && self.class != class;
-        self.class = class;
-        moved
-    }
 }
 
 /// One pool's offers as a derivation keeps them.
 #[derive(Default)]
 struct Offered {
-    /// Each worker's offer, by slot, the workers in id order.
+    /// Each worker's offer, by slot, the workers in the order given.
     of: Vec<u32>,
-    /// A slot a distinct offer, and the slots that wait for one.
+    /// A slot a distinct offer, in the order their first workers come.
     slots: Vec<Slot>,
-    /// The slots that hold an offer. A derivation that classes the offers
-    /// puts them in the order their first workers come.
-    order: Vec<u32>,
-    /// The slots no worker holds. The next new offer takes one, so the
-    /// slots never outnumber the most offers the pool held at once.
-    free: Vec<u32>,
 }
 
 impl Offered {
     /// The worker of `pool` whose facts spell the offer of `slot`.
-    fn first<'a, P: Pool<'a> + ?Sized>(&self, pool: &P, slot: u32) -> Member<'a> {
-        pool.member(self.slots[slot as usize].first)
+    fn first<'a>(&self, pool: &[Member<'a>], slot: u32) -> Member<'a> {
+        pool[self.slots[slot as usize].first]
     }
 
     /// Number the offers of `pool` from nothing: a slot a distinct offer,
     /// as its first worker comes.
-    fn number<'a, P: Pool<'a> + ?Sized>(&mut self, pool: &P, numbering: &mut Numbering) {
-        self.of.clear();
-        self.slots.clear();
-        self.order.clear();
-        self.free.clear();
+    fn number<'a>(&mut self, pool: &[Member<'a>], numbering: &mut Numbering) {
         numbering.clear();
         // Neighbours in a pool mostly share an offer: a worker whose offer
         // is the one before it takes that slot by one compare, and the
         // numbering is asked where the two differ.
         let mut before: Option<(Offer<'a>, u32)> = None;
-        for at in 0..pool.count() {
-            let offer = pool.member(at).offer();
+        for (at, member) in pool.iter().enumerate() {
+            let offer = member.offer();
             let slot = match before {
                 Some((same, slot)) if same == offer => slot,
                 _ => {
@@ -782,9 +690,7 @@ impl Offered {
                         self.slots.push(Slot {
                             first: at,
                             specific: offer.0,
-                            class: UNCLASSED,
                         });
-                        self.order.push(slot);
                     }
                     before = Some((offer, slot));
                     slot
@@ -793,79 +699,10 @@ impl Offered {
             self.of.push(slot);
         }
     }
-
-    /// The worker at `at` leaves the pool: its place closes. Whether an
-    /// offer went or an offer's first worker changed.
-    fn leave(&mut self, at: usize) -> bool {
-        let slot = self.of.remove(at);
-        for &held in &self.order {
-            let first = &mut self.slots[held as usize].first;
-            if *first > at {
-                *first -= 1;
-            }
-        }
-        if self.slots[slot as usize].first != at {
-            return false;
-        }
-        // It was its offer's first worker: the next of them is, and with
-        // none left the slot is free.
-        match self.of[at..].iter().position(|&of| of == slot) {
-            Some(next) => self.slots[slot as usize].first = at + next,
-            None => {
-                self.order.retain(|&held| held != slot);
-                self.free.push(slot);
-            }
-        }
-        true
-    }
-
-    /// The worker at `at` of `pool` joins it: a place opens under the slot
-    /// of its offer, a new slot where no worker of the pool holds that
-    /// offer. The slot, whether it is new, and whether an offer came or an
-    /// offer's first worker changed.
-    fn join<'a, P: Pool<'a> + ?Sized>(&mut self, pool: &P, at: usize) -> (u32, bool, bool) {
-        for &held in &self.order {
-            let first = &mut self.slots[held as usize].first;
-            if *first >= at {
-                *first += 1;
-            }
-        }
-        let offer = pool.member(at).offer();
-        let holds = |&slot: &u32| self.first(pool, slot).offer() == offer;
-        let held = self.order.iter().copied().find(holds);
-        let (slot, new, moved) = if let Some(slot) = held {
-            let first = &mut self.slots[slot as usize].first;
-            let earlier = at < *first;
-            if earlier {
-                *first = at;
-            }
-            (slot, false, earlier)
-        } else {
-            let fresh = Slot {
-                first: at,
-                specific: offer.0,
-                class: UNCLASSED,
-            };
-            let slot = if let Some(slot) = self.free.pop() {
-                self.slots[slot as usize] = fresh;
-                slot
-            } else {
-                self.slots.push(fresh);
-                self.slots.len() as u32 - 1
-            };
-            self.order.push(slot);
-            (slot, true, true)
-        };
-        self.of.insert(at, slot);
-        (slot, new, moved)
-    }
 }
 
-/// The working lists of one classing of the offers, kept from one to the
-/// next: after the first of a size a derivation allocates the classes it
-/// hands back and, where a side stands refused, that side's refusal,
-/// written out to be compared with the last one. A whole derivation
-/// allocates a list of the decode offers beside them.
+/// The working lists of a derivation's one classing of the offers: new at
+/// the derivation and dropped with it.
 #[derive(Default)]
 struct Work {
     numbering: Numbering,
@@ -893,22 +730,6 @@ struct Work {
     refused: Vec<Mismatch>,
 }
 
-/// A derivation's table and, behind it, its first partners: the ends and
-/// the lists of each.
-type Tables<'t> = [&'t [u32]; 4];
-
-impl Work {
-    /// The tables of the last classing.
-    fn tables(&self) -> Tables<'_> {
-        [
-            &self.ends,
-            &self.listed,
-            &self.first_ends,
-            &self.first_listed,
-        ]
-    }
-}
-
 /// What a row names: the thing at `at` (a decode offer, or a prefill class
 /// in a column), and whether its pair goes first. Two rows are then one
 /// class only where they pair first alike.
@@ -916,15 +737,11 @@ fn named(at: u32, first: bool) -> u32 {
     at << 1 | u32::from(first)
 }
 
-/// One model's derivation as the store's writer keeps it from one
-/// membership build to the next: each pool's distinct offers, which worker
-/// holds which, and the rule's verdict on every pair of offers. A write of
-/// one worker moves that worker alone in it ([`Derivation::written`]), and
-/// the rule runs again only on an offer no worker of its pool held. What is
-/// kept grows with the workers and with the offers that differ, and a
-/// model that loses a side takes its derivation with it.
+/// One derivation's working state: each pool's distinct offers, which
+/// worker holds which, and the rule's verdict on every pair of offers. It
+/// grows with the workers and with the offers that differ.
 #[derive(Default)]
-pub(super) struct Derivation {
+struct Derivation {
     /// The prefill pool's offers, then the decode pool's.
     sides: [Offered; 2],
     /// The rule's verdict on each prefill slot beside each decode slot.
@@ -933,27 +750,24 @@ pub(super) struct Derivation {
 }
 
 impl Derivation {
-    /// Derive the classes of `prefills` and `decodes` under `mode` whole,
-    /// as [`PairClasses::derive`] does: what is kept is made again from
-    /// the two pools.
-    pub(super) fn whole<'a, P: Pool<'a> + ?Sized>(
-        &mut self,
-        prefills: &P,
-        decodes: &P,
+    /// Derive the classes of `prefills` and `decodes` under `mode`, as
+    /// [`PairClasses::derive`] states them. A derivation serves one call
+    /// and is spent by it: every list it holds is new here.
+    fn whole<'a>(
+        mut self,
+        prefills: &[Member<'a>],
+        decodes: &[Member<'a>],
         mode: Pairing,
     ) -> PairClasses {
         let Self {
             sides: [prefill, decode],
             verdicts,
             work,
-            ..
-        } = self;
+        } = &mut self;
         prefill.number(prefills, &mut work.numbering);
         decode.number(decodes, &mut work.numbering);
         let (rows, columns) = (prefill.slots.len(), decode.slots.len());
-        if verdicts.len() < rows {
-            verdicts.resize_with(rows, Vec::new);
-        }
+        verdicts.resize_with(rows, Vec::new);
         // Each decode offer's first worker, read from its pool once: every
         // prefill offer is judged beside every one of them.
         let firsts: Vec<Member<'a>> = (0..columns as u32)
@@ -961,45 +775,34 @@ impl Derivation {
             .collect();
         for (row, slot) in verdicts.iter_mut().zip(0..rows as u32) {
             let offer = prefill.first(prefills, slot);
-            row.clear();
             let judged = |beside: &Member<'a>| Verdict::of(&offer, beside, mode);
             row.extend(firsts.iter().map(judged));
         }
-        let (refusals, _) = self.class(prefills, decodes);
-        self.classes(prefills, decodes, self.work.tables(), refusals)
+        let refusals = self.class(prefills, decodes);
+        self.classes(prefills, decodes, refusals)
     }
 
     /// Class the offers as they stand: each slot's class, the table and
     /// the first partners into the working lists, and each side's refusal.
-    /// Whether a class moved that a slot had.
-    fn class<'a, P: Pool<'a> + ?Sized>(
-        &mut self,
-        prefills: &P,
-        decodes: &P,
-    ) -> ([Option<Refusal>; 2], bool) {
+    fn class(&mut self, prefills: &[Member<'_>], decodes: &[Member<'_>]) -> [Option<Refusal>; 2] {
         let Self {
             sides: [prefill, decode],
             verdicts,
             work,
-            ..
         } = self;
-        // The offers in the order their first workers come: the classes
-        // are numbered in it.
-        for Offered { order, slots, .. } in [&mut *prefill, &mut *decode] {
-            order.sort_unstable_by_key(|&slot| slots[slot as usize].first);
-        }
-        // One row a prefill offer: the decode offers it pairs with, by
-        // their place in that order, each beside whether the pair goes
-        // first. One prefill class a distinct row.
-        let rows = cleared(&mut work.rows, prefill.order.len());
-        for (row, &slot) in rows.iter_mut().zip(&prefill.order) {
-            let verdicts = &verdicts[slot as usize];
-            let paired = |(at, &beside): (u32, &u32)| match verdicts[beside as usize] {
+        // One row a prefill offer: the decode offers it pairs with, each
+        // beside whether the pair goes first. A side's offers stand in the
+        // order their first workers come, and the classes are numbered in
+        // it. One prefill class a distinct row.
+        let rows = &mut work.rows;
+        rows.resize_with(prefill.slots.len(), Vec::new);
+        for (row, verdicts) in rows.iter_mut().zip(&*verdicts) {
+            let paired = |(at, verdict): (u32, &Verdict)| match verdict {
                 Verdict::Pairs => Some(named(at, true)),
                 Verdict::Behind => Some(named(at, false)),
                 Verdict::Apart | Verdict::Refused(_) => None,
             };
-            row.extend((0u32..).zip(&decode.order).filter_map(paired));
+            row.extend((0u32..).zip(verdicts).filter_map(paired));
         }
         let numbering = &mut work.numbering;
         numbered(rows, numbering, &mut work.row_class, &mut work.row_firsts);
@@ -1007,7 +810,8 @@ impl Derivation {
         // ascending as the classes are walked, each beside whether it
         // pairs with the offer first. One decode class a distinct column:
         // the offers a class takes first stand apart from its others.
-        let columns = cleared(&mut work.columns, decode.order.len());
+        let columns = &mut work.columns;
+        columns.resize_with(decode.slots.len(), Vec::new);
         for (class, &first) in (1u32..).zip(&work.row_firsts) {
             for &offer in &rows[first] {
                 columns[(offer >> 1) as usize].push(named(class, offer & 1 != 0));
@@ -1025,8 +829,6 @@ impl Derivation {
             (&mut work.first_ends, &mut work.first_listed, true),
         ];
         for (ends, listed, first_alone) in tables {
-            ends.clear();
-            listed.clear();
             for &first in &work.row_firsts {
                 let offers = rows[first].iter();
                 let offers = offers.filter(|&&offer| !first_alone || offer & 1 != 0);
@@ -1050,212 +852,33 @@ impl Derivation {
         debug_assert_eq!(table.validate(), Ok(()));
         let partners = FirstPartners::new(&work.first_ends, &work.first_listed);
         debug_assert_eq!(partners.within(&table), Ok(()));
-        let mut moved = false;
-        let classed = [
-            (&mut *prefill, &work.row_class),
-            (&mut *decode, &work.column_class),
-        ];
-        for (Offered { order, slots, .. }, classes) in classed {
-            for (&slot, &class) in order.iter().zip(classes) {
-                moved |= slots[slot as usize].classed(class);
-            }
-        }
         let (pools, offered) = ([prefills, decodes], [&*prefill, &*decode]);
         let mut on = |side| refusal(side, pools, offered, verdicts, &mut work.refused);
-        ([on(false), on(true)], moved)
-    }
-
-    /// Derive the classes for one written worker alone: `left` is the
-    /// worker as the last write held it and `joined` the worker as it
-    /// stands now, each where there is one, and `last` is the classes the
-    /// last write left, which stand beside what is kept. `None` when those
-    /// classes stand as they are.
-    ///
-    /// The worker's place closes in the pool it left and opens in the pool
-    /// it joined, and no other worker's facts are read but those of an
-    /// offer's first worker, which spell the offer. Where its offer is one
-    /// its pool holds, it takes that offer's class. Where an offer came or
-    /// went, or an offer's first worker changed, the rule runs on a new
-    /// offer beside the other pool's and the offers are classed again from
-    /// the verdicts kept. The answer is the whole derivation's.
-    pub(super) fn written<'a, P: Pool<'a> + ?Sized>(
-        &mut self,
-        last: &PairClasses,
-        prefills: &P,
-        decodes: &P,
-        mode: Pairing,
-        (left, joined): (Option<WorkerId>, Option<WorkerId>),
-    ) -> Option<PairClasses> {
-        let pools = [prefills, decodes];
-        let lasts = [&*last.prefills, &*last.decodes];
-        let going = left.and_then(|id| {
-            let at = |side: usize| lasts[side].binary_search_by_key(&id, |&(id, _)| id);
-            (0..2).find_map(|side| Some((side, at(side).ok()?)))
-        });
-        let coming =
-            joined.and_then(|id| (0..2).find_map(|side| Some((side, place(pools[side], id)?))));
-        // What is kept stands beside the last classes, and the pools are
-        // the last ones but for the written worker. Where a count says
-        // otherwise the caller named the wrong worker, and the whole
-        // derivation answers.
-        let fits = (0..2).all(|side| {
-            let kept = self.sides[side].of.len();
-            let went = usize::from(going.is_some_and(|(from, _)| from == side));
-            let came = usize::from(coming.is_some_and(|(to, _)| to == side));
-            kept == lasts[side].len() && kept + came == pools[side].count() + went
-        });
-        if !fits {
-            return Some(self.whole(prefills, decodes, mode));
-        }
-        let mut moved = false;
-        let mut was = None;
-        if let Some((side, at)) = going {
-            moved |= self.sides[side].leave(at);
-            was = Some((side, lasts[side][at].1));
-        }
-        let mut is = None;
-        if let Some((side, at)) = coming {
-            let (slot, new, came) = self.sides[side].join(pools[side], at);
-            if new {
-                self.judge(side, slot, prefills, decodes, mode);
-            }
-            moved |= came;
-            is = Some((side, slot));
-        }
-        debug_assert!(
-            self.sound(prefills, decodes, mode),
-            "what is kept is the two pools'"
-        );
-        // Whether the worker stands where it stood, in the class it had.
-        let stands = |kept: &Self| match (was, is) {
-            (None, None) => true,
-            (Some((from, class)), Some((to, slot))) => {
-                left == joined && from == to && class == kept.sides[to].slots[slot as usize].class
-            }
-            _ => false,
-        };
-        if !moved {
-            // No offer came or went: the tables and the refusals stand,
-            // and the worker took the class of an offer its pool held.
-            if stands(self) {
-                return None;
-            }
-            let refusals = last.refusals.clone();
-            return Some(self.classes(prefills, decodes, last.tables(), refusals));
-        }
-        let (refusals, reclassed) = self.class(prefills, decodes);
-        let tables = self.work.tables();
-        let same = !reclassed && tables == last.tables() && refusals == last.refusals;
-        if same && stands(self) {
-            return None;
-        }
-        Some(self.classes(prefills, decodes, tables, refusals))
-    }
-
-    /// Ask the rule about the new offer of `slot` on `side` (`0` the
-    /// prefills') beside each offer the other pool holds.
-    fn judge<'a, P: Pool<'a> + ?Sized>(
-        &mut self,
-        side: usize,
-        slot: u32,
-        prefills: &P,
-        decodes: &P,
-        mode: Pairing,
-    ) {
-        let Self {
-            sides: [prefill, decode],
-            verdicts,
-            ..
-        } = self;
-        let at = slot as usize;
-        if side == 0 {
-            if verdicts.len() <= at {
-                verdicts.resize_with(at + 1, Vec::new);
-            }
-            let (row, offer) = (&mut verdicts[at], prefill.first(prefills, slot));
-            // Every held decode offer's verdict is written below, and no
-            // other is read.
-            row.resize(decode.slots.len(), Verdict::Apart);
-            for &beside in &decode.order {
-                let verdict = Verdict::of(&offer, &decode.first(decodes, beside), mode);
-                row[beside as usize] = verdict;
-            }
-        } else {
-            let offer = decode.first(decodes, slot);
-            for &beside in &prefill.order {
-                let row = &mut verdicts[beside as usize];
-                if row.len() <= at {
-                    row.resize(at + 1, Verdict::Apart);
-                }
-                row[at] = Verdict::of(&prefill.first(prefills, beside), &offer, mode);
-            }
-        }
+        [on(false), on(true)]
     }
 
     /// The classes as they stand: each worker of the two pools with its
-    /// offer's class, beside `tables` and `refusals`.
-    fn classes<'a, P: Pool<'a> + ?Sized>(
+    /// offer's class, beside the table, the first partners and `refusals`.
+    fn classes(
         &self,
-        prefills: &P,
-        decodes: &P,
-        [ends, listed, first_ends, first_listed]: Tables<'_>,
+        prefills: &[Member<'_>],
+        decodes: &[Member<'_>],
         refusals: [Option<Refusal>; 2],
     ) -> PairClasses {
-        let classed = |offered: &Offered, pool: &P| {
-            let of = |(at, &slot): (usize, &u32)| (pool.id(at), offered.slots[slot as usize].class);
+        let work = &self.work;
+        let classed = |offered: &Offered, classes: &[u32], pool: &[Member<'_>]| {
+            let of = |(at, &slot): (usize, &u32)| (pool[at].id, classes[slot as usize]);
             offered.of.iter().enumerate().map(of).collect()
         };
         PairClasses {
-            prefills: classed(&self.sides[0], prefills),
-            decodes: classed(&self.sides[1], decodes),
-            ends: ends.into(),
-            listed: listed.into(),
-            first_ends: first_ends.into(),
-            first_listed: first_listed.into(),
+            prefills: classed(&self.sides[0], &work.row_class, prefills),
+            decodes: classed(&self.sides[1], &work.column_class, decodes),
+            ends: work.ends.as_slice().into(),
+            listed: work.listed.as_slice().into(),
+            first_ends: work.first_ends.as_slice().into(),
+            first_listed: work.first_listed.as_slice().into(),
             refusals,
         }
-    }
-
-    /// Whether what is kept is the two pools': every worker under the slot
-    /// of its offer, a slot a distinct offer with its first worker and its
-    /// side, a slot held or free, and the rule's verdict on every pair of
-    /// held slots. Asked in a debug build after a written worker's derive.
-    fn sound<'a, P: Pool<'a> + ?Sized>(&self, prefills: &P, decodes: &P, mode: Pairing) -> bool {
-        let pools = [prefills, decodes];
-        let offers = (0..2).all(|side| {
-            let (kept, pool) = (&self.sides[side], pools[side]);
-            let offer = |at: usize| pool.member(at).offer();
-            let held = |(at, &slot): (usize, &u32)| {
-                let first = kept.slots[slot as usize].first;
-                first <= at && offer(first) == offer(at) && kept.order.contains(&slot)
-            };
-            let distinct = |(nth, &slot): (usize, &u32)| {
-                let Slot {
-                    first, specific, ..
-                } = kept.slots[slot as usize];
-                let others = &kept.order[..nth];
-                kept.of.get(first) == Some(&slot)
-                    && specific == offer(first).0
-                    && !kept.free.contains(&slot)
-                    && others
-                        .iter()
-                        .all(|&other| kept.first(pool, other).offer() != offer(first))
-            };
-            kept.of.len() == pool.count()
-                && kept.order.len() + kept.free.len() == kept.slots.len()
-                && kept.of.iter().enumerate().all(held)
-                && kept.order.iter().enumerate().all(distinct)
-        });
-        let [prefill, decode] = &self.sides;
-        let judged = |&slot: &u32| {
-            let offer = prefill.first(prefills, slot);
-            let verdict = |&beside: &u32| {
-                let asked = Verdict::of(&offer, &decode.first(decodes, beside), mode);
-                self.verdicts[slot as usize].get(beside as usize) == Some(&asked)
-            };
-            decode.order.iter().all(verdict)
-        };
-        offers && prefill.order.iter().all(judged)
     }
 }
 
@@ -1300,10 +923,10 @@ impl Verdict {
     }
 }
 
-/// The held slots of `offered` on one `side` of the wire's fact.
+/// The slots of `offered` on one `side` of the wire's fact.
 fn on_side(offered: &Offered, side: bool) -> impl Iterator<Item = u32> + '_ {
-    let there = move |&slot: &u32| offered.slots[slot as usize].specific == side;
-    offered.order.iter().copied().filter(there)
+    let there = move |&(_, slot): &(u32, &Slot)| slot.specific == side;
+    (0u32..).zip(&offered.slots).filter(there).map(|(at, _)| at)
 }
 
 /// Why the offers on one `side` of the wire's fact make no pair, each pool
@@ -1311,9 +934,9 @@ fn on_side(offered: &Offered, side: bool) -> impl Iterator<Item = u32> + '_ {
 /// pool's distinct pairing keys there and the components the two pools
 /// disagree on, each list sorted. `None` when a pair is made there, and
 /// when a pool holds nobody on that side.
-fn refusal<'a, P: Pool<'a> + ?Sized>(
+fn refusal(
     side: bool,
-    pools: [&P; 2],
+    pools: [&[Member<'_>]; 2],
     offered: [&Offered; 2],
     verdicts: &[Vec<Verdict>],
     refused: &mut Vec<Mismatch>,
@@ -1324,8 +947,8 @@ fn refusal<'a, P: Pool<'a> + ?Sized>(
     }
     refused.clear();
     for slot in on_side(prefill, side) {
-        for &beside in &decode.order {
-            match verdicts[slot as usize][beside as usize] {
+        for &verdict in &verdicts[slot as usize] {
+            match verdict {
                 Verdict::Pairs | Verdict::Behind => return None,
                 Verdict::Refused(mismatch) => refused.push(mismatch),
                 Verdict::Apart => {}
@@ -1336,7 +959,7 @@ fn refusal<'a, P: Pool<'a> + ?Sized>(
     refused.dedup();
     let mut mismatches: Vec<String> = refused.iter().map(Mismatch::to_string).collect();
     mismatches.sort_unstable();
-    let keys_of = |offered: &Offered, pool: &P| {
+    let keys_of = |offered: &Offered, pool: &[Member<'_>]| {
         keys(on_side(offered, side).map(|slot| offered.first(pool, slot)))
     };
     Some(Refusal {

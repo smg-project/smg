@@ -74,11 +74,9 @@ fn a_forced_color_reaches_a_pipe() {
 }
 
 /// The binary runs on the allocator the gateway's binary registers, with a
-/// copy of its settings. A burst of registrations builds the store's world
-/// again at every write, and the system allocator keeps resident what those
-/// builds free. The allocator is asked for its statistics at the process's
-/// end, an ask the system allocator does not hear, and the statistics name
-/// the settings it runs on.
+/// copy of its settings. The allocator is asked for its statistics at the
+/// process's end, an ask the system allocator does not hear, and the
+/// statistics name the settings it runs on.
 #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
 #[test]
 fn the_binary_runs_on_the_gateways_allocator() {
@@ -159,7 +157,7 @@ fn the_served_benchs_settings_are_the_binarys() {
     ));
     let bench = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/benches/decide_stream.rs"
+        "/benches/decide_stream/shipped.rs"
     ));
     let ours = settings_after(binary, "const SETTINGS").expect("the binary's settings");
     let theirs = settings_after(bench, "pub static MALLOC_CONF").expect("the bench's copy");

@@ -6,26 +6,19 @@
 //!   and the prefills;
 //! - `policy_encodes/membership_write/<fleet>/<n>`: one membership write of
 //!   a store that holds the fleet: a registration refreshed with the facts
-//!   it had, every pool derived again, the pair classes carried, and
-//!   published;
-//! - `policy_encodes/moved_write/<fleet>/<n>`: the same write where the
-//!   registration states another runtime each time: the pair classes are
-//!   derived for that worker;
-//! - `policy_encodes/decode_write/<fleet>/<n>`: the same write where the
-//!   first decode states another runtime each time: the pair classes are
-//!   derived for that decode;
-//! - `policy_encodes/models_write/apart/<models>`: the moved write over
-//!   that many models, each of the fleet `apart` at 64: the pair classes
-//!   are derived for that worker in its model and carried in every other.
+//!   it had, every pool derived again, and published;
+//! - `policy_encodes/models_write/apart/<models>`: one membership write
+//!   over that many models, each of the fleet `apart` at 64: the first
+//!   prefill of the first model registers with another runtime each time.
 //!
-//! A store derives no encode class: the four write cells say what a
-//! membership write costs over a fleet that holds encoders.
+//! A store derives no encode class and no pair class: the two write cells
+//! say what a membership write costs over a fleet that holds encoders.
 //!
 //! The fleets, each of one runtime and one wire:
 //!
 //! - `none`: no encoder at all, what a model with no encode stage pays;
 //! - `silent`: nobody states an end of the encode handoff, as a store holds
-//!   its workers until a handshake fills one: no class;
+//!   its workers until a registration or a handshake states one: no class;
 //! - `meeting`: every encoder and prefill meets at a rendezvous: one class;
 //! - `connectors`: every encoder and prefill pushes on one of eight
 //!   connectors: a class a connector that has an encoder;
@@ -42,12 +35,15 @@
 #[path = "common/filled.rs"]
 mod filled;
 
-use std::hint::black_box;
+use std::{hint::black_box, time::Instant};
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 use smg_grand_central::{
     engine::{EncodeClasses, EncodeMember, Role, WireModes},
-    store::{EncodeHandoff, EncodeOffer, MemoryStore, WorkerFacts, WorkersStore},
+    store::{
+        identity, EncodeHandoff, EncodeOffer, MembershipChange, MemoryStore, Position, Registrant,
+        WorkerFacts, WorkerRow, WorkerStatus, WorkersStore,
+    },
 };
 
 const SIZES: [usize; 3] = [8, 64, 512];
@@ -57,19 +53,21 @@ const FLEETS: [&str; 5] = ["none", "silent", "meeting", "connectors", "apart"];
 /// What worker `index` of `role` states in `fleet`, a fleet of `stage`
 /// encoders.
 fn offer(fleet: &str, role: Role, index: usize, stage: usize) -> EncodeOffer {
-    let push = |connector: usize| EncodeOffer {
-        handoff: EncodeHandoff::Push,
-        producer: role == Role::Encode,
-        consumer: role == Role::Prefill,
-        connector: Some(format!("c{connector}")),
-        ..EncodeOffer::default()
+    let push = |connector: usize| {
+        let mut offer = EncodeOffer::default();
+        offer.handoff = EncodeHandoff::Push;
+        offer.producer = role == Role::Encode;
+        offer.consumer = role == Role::Prefill;
+        offer.connector = Some(format!("c{connector}"));
+        offer
     };
     match (fleet, role) {
         ("none" | "silent", _) | (_, Role::Decode | Role::Single) => EncodeOffer::default(),
-        ("meeting", _) => EncodeOffer {
-            handoff: EncodeHandoff::Rendezvous,
-            ..EncodeOffer::default()
-        },
+        ("meeting", _) => {
+            let mut offer = EncodeOffer::default();
+            offer.handoff = EncodeHandoff::Rendezvous;
+            offer
+        }
         ("connectors", _) => push(index % 8),
         _ => push(index % stage),
     }
@@ -104,19 +102,49 @@ fn fleet(fleet: &str, n: usize) -> Vec<WorkerFacts> {
 fn members(fleet: &[WorkerFacts], role: Role) -> Vec<EncodeMember<'_>> {
     let of_role = fleet.iter().filter(|facts| facts.role == role);
     of_role
-        .map(|facts| EncodeMember {
-            runtime: &facts.engine_kind,
-            offer: &facts.encode,
-        })
+        .map(|facts| EncodeMember::of(&facts.engine_kind, &facts.encode))
         .collect()
+}
+
+/// The row of `facts` as a registration by a control call leaves it, at
+/// `revision`. The stores here have no holder of worker objects: each
+/// takes a row as a decided change ([`MemoryStore::follow`]). The bench
+/// states the row and counts the epoch the write steps to. Every offer
+/// here is stated whole, as a registration's rule would leave it.
+fn row_of(facts: WorkerFacts, revision: u64, admitted_at: Instant) -> WorkerRow {
+    WorkerRow {
+        id: identity(&facts.key, facts.incarnation),
+        facts,
+        status: WorkerStatus::Pending,
+        revision,
+        admitted_at,
+        maker: Registrant::Control,
+    }
+}
+
+/// One row written again in place as the store's write `epoch`, and the
+/// build it leaves owed.
+fn written_again(store: &MemoryStore, epoch: u64, row: WorkerRow) {
+    let refreshed = MembershipChange::Relabelled { id: row.id };
+    store.follow(Position::default(), epoch, refreshed, Some(row));
+    store.publish_now();
+}
+
+/// The store stands at the epoch the bench counted: each write landed.
+fn landed(store: &MemoryStore, epoch: u64) {
+    assert_eq!(WorkersStore::epoch(store), epoch, "a write did not land");
 }
 
 /// A store that holds `fleet`.
 fn store_of(fleet: &[WorkerFacts]) -> MemoryStore {
     let store = MemoryStore::new();
-    for facts in fleet {
-        store.upsert(facts.clone());
+    let now = Instant::now();
+    for (epoch, facts) in (1..).zip(fleet) {
+        let row = row_of(facts.clone(), 1, now);
+        let registered = MembershipChange::Registered { id: row.id };
+        store.follow(Position::default(), epoch, registered, Some(row));
     }
+    landed(&store, fleet.len() as u64);
     store.publish_now();
     // The first row's pool: its own model's, where a fleet holds several.
     if let Some(first) = fleet.first() {
@@ -167,7 +195,7 @@ fn derivation(c: &mut Criterion) {
     group.finish();
 }
 
-/// A membership write that moves no offer: the pair classes are carried.
+/// A membership write that moves no offer.
 fn membership_write(c: &mut Criterion) {
     let mut group = c.benchmark_group("policy_encodes/membership_write");
     for name in FLEETS {
@@ -175,94 +203,22 @@ fn membership_write(c: &mut Criterion) {
             let fleet = fleet(name, n);
             let store = store_of(&fleet);
             let refreshed = fleet.first().expect("a prefill").clone();
-            group.bench_function(BenchmarkId::new(name, n), |b| {
-                b.iter_batched(
-                    || refreshed.clone(),
-                    |facts| {
-                        let change = store.upsert(black_box(facts));
-                        store.publish_now();
-                        change
-                    },
-                    BatchSize::SmallInput,
-                );
-            });
-        }
-    }
-    group.finish();
-}
-
-/// A membership write that moves an offer: the first prefill registers with
-/// another runtime each time, so every write derives that prefill's pair
-/// classes.
-fn moved_write(c: &mut Criterion) {
-    let mut group = c.benchmark_group("policy_encodes/moved_write");
-    for name in FLEETS {
-        for n in SIZES {
-            let fleet = fleet(name, n);
-            let store = store_of(&fleet);
-            let first = fleet.first().expect("a prefill").clone();
-            let other = WorkerFacts {
-                engine_kind: "rt-b".to_string(),
-                ..first.clone()
-            };
-            let mut turn = false;
+            let now = Instant::now();
+            let (mut epoch, mut revision) = (WorkersStore::epoch(&store), 1);
             group.bench_function(BenchmarkId::new(name, n), |b| {
                 b.iter_batched(
                     || {
-                        turn = !turn;
-                        if turn {
-                            other.clone()
-                        } else {
-                            first.clone()
-                        }
+                        revision += 1;
+                        row_of(refreshed.clone(), revision, now)
                     },
-                    |facts| {
-                        let change = store.upsert(black_box(facts));
-                        store.publish_now();
-                        change
+                    |row| {
+                        epoch += 1;
+                        written_again(&store, epoch, black_box(row));
                     },
                     BatchSize::SmallInput,
                 );
             });
-        }
-    }
-    group.finish();
-}
-
-/// A membership write that moves an offer the encode handoff does not read:
-/// the first decode registers with another runtime each time, so every
-/// write derives that decode's pair classes.
-fn decode_write(c: &mut Criterion) {
-    let mut group = c.benchmark_group("policy_encodes/decode_write");
-    for name in FLEETS {
-        for n in SIZES {
-            let fleet = fleet(name, n);
-            let store = store_of(&fleet);
-            let mut decodes = fleet.iter().filter(|facts| facts.role == Role::Decode);
-            let first = decodes.next().expect("a decode").clone();
-            let other = WorkerFacts {
-                engine_kind: "rt-b".to_string(),
-                ..first.clone()
-            };
-            let mut turn = false;
-            group.bench_function(BenchmarkId::new(name, n), |b| {
-                b.iter_batched(
-                    || {
-                        turn = !turn;
-                        if turn {
-                            other.clone()
-                        } else {
-                            first.clone()
-                        }
-                    },
-                    |facts| {
-                        let change = store.upsert(black_box(facts));
-                        store.publish_now();
-                        change
-                    },
-                    BatchSize::SmallInput,
-                );
-            });
+            landed(&store, epoch);
         }
     }
     group.finish();
@@ -270,8 +226,7 @@ fn decode_write(c: &mut Criterion) {
 
 /// A membership write that moves an offer in one model of several: the
 /// first prefill of the first model registers with another runtime each
-/// time. Every model holds the fleet `apart` at 64, so the write derives
-/// that prefill's pair classes in its model and carries the others'.
+/// time. Every model holds the fleet `apart` at 64.
 fn models_write(c: &mut Criterion) {
     let mut group = c.benchmark_group("policy_encodes/models_write");
     for models in [1, 8] {
@@ -294,34 +249,27 @@ fn models_write(c: &mut Criterion) {
             ..first.clone()
         };
         let mut turn = false;
+        let now = Instant::now();
+        let (mut epoch, mut revision) = (WorkersStore::epoch(&store), 1);
         group.bench_function(BenchmarkId::new("apart", models), |b| {
             b.iter_batched(
                 || {
                     turn = !turn;
-                    if turn {
-                        other.clone()
-                    } else {
-                        first.clone()
-                    }
+                    revision += 1;
+                    let facts = if turn { &other } else { &first };
+                    row_of(facts.clone(), revision, now)
                 },
-                |facts| {
-                    let change = store.upsert(black_box(facts));
-                    store.publish_now();
-                    change
+                |row| {
+                    epoch += 1;
+                    written_again(&store, epoch, black_box(row));
                 },
                 BatchSize::SmallInput,
             );
         });
+        landed(&store, epoch);
     }
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    derivation,
-    membership_write,
-    moved_write,
-    decode_write,
-    models_write
-);
+criterion_group!(benches, derivation, membership_write, models_write);
 criterion_main!(benches);

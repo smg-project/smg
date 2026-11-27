@@ -51,7 +51,6 @@ from smg_grpc_servicer.vllm.mm_processor import (
     fingerprint_from_model_config,
     vllm_default_video_frames,
 )
-from smg_grpc_servicer.vllm.short_side_floor import FloorRule, floor_rule, raise_to_floor_off_loop
 
 logger = logging.getLogger("smg_grpc_servicer.vllm.mm_sidecar")
 
@@ -115,10 +114,6 @@ def classify_process_error(exc: BaseException) -> str:
 
 
 class Sidecar:
-    # The served family's short-side floor (`floor_rule`), applied to a
-    # fetched image before the engine's processor sees it; None raises nothing.
-    _short_side_floor: FloorRule | None = None
-
     def __init__(
         self,
         vllm_config,
@@ -170,13 +165,6 @@ class Sidecar:
         self._video_processor = get_video_processor_cls_name(model_config)
         self._schemes = advertised_schemes(model_config.allowed_local_media_path)
         self._accepted = parse_scheme_list(self._schemes)
-        self._short_side_floor = floor_rule(model_config)
-        if self._short_side_floor is not None:
-            logger.info(
-                "images below a %d px short side are raised to it before the engine's "
-                "processor, as the router's own pipeline does for this model family",
-                self._short_side_floor.floor,
-            )
         self._started_at = time.time()
         if not connector_kwargs["allowed_media_domains"]:
             logger.warning(
@@ -423,8 +411,7 @@ class Sidecar:
 
     async def _fetch(self, modality: str, url: str):
         if modality == "image":
-            image = await self._connector.fetch_image_async(url)
-            return await raise_to_floor_off_loop(image, self._short_side_floor)
+            return await self._connector.fetch_image_async(url)
         if modality == "audio":
             return await self._connector.fetch_audio_async(url)
         if modality == "video":

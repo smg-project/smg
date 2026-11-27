@@ -943,9 +943,10 @@ impl WorkerSelectionStage {
     /// prefill's answer could fail a request the first decode would have
     /// served; and its admission gate takes the request now, by one try
     /// with no wait ([`pd_admission::try_admit_decode`]). The first decode
-    /// holds with no try: its client and its claim stand. A claim tried for
-    /// a decode the engine then passes over is given back at the next try,
-    /// and at the call's end.
+    /// holds with no try: its client and its claim stand, and the engine
+    /// reads it with the room that claim holds ([`RequestAgain::claimed`]).
+    /// A claim tried for a decode the engine then passes over is given back
+    /// at the next try, and at the call's end.
     ///
     /// Answers the guard to keep, and the decode the request moved to where
     /// it moved, with its client and its gate's claim.
@@ -1021,6 +1022,7 @@ impl WorkerSelectionStage {
             inputs,
             first,
             ahead,
+            request.claimed,
         );
         let brought = brought.into_inner();
         let moved = moved.and_then(|decode| {
@@ -1234,6 +1236,9 @@ pub(crate) struct RequestAgain<'a> {
     /// The engines the request's failed attempts were sent to.
     pub tried: &'a [String],
     pub ledger: &'a AttemptLedger,
+    /// Whether the dispatch holds a claim at the first decode's admission
+    /// gate, as its load guards say.
+    pub claimed: bool,
 }
 
 /// A decode a request moved to behind its prefill: its placement's answer,
@@ -1737,7 +1742,8 @@ impl WorkerSelectionStage {
                 }
             };
             match verdict {
-                PlacementFailure::AllOverloaded(shed) => return shed,
+                PlacementFailure::AllOverloaded(refusal)
+                | PlacementFailure::NoPlanBound(refusal) => return refusal,
                 PlacementFailure::Unavailable
                 | PlacementFailure::PolicyDeclined(_)
                 | PlacementFailure::NoCompatiblePair { .. }
@@ -1824,7 +1830,8 @@ impl WorkerSelectionStage {
                 model_id,
                 self.worker_registry.overload_shed_enabled(),
             ) {
-                PlacementFailure::AllOverloaded(shed) => return shed,
+                PlacementFailure::AllOverloaded(refusal)
+                | PlacementFailure::NoPlanBound(refusal) => return refusal,
                 PlacementFailure::Unavailable
                 | PlacementFailure::PolicyDeclined(_)
                 | PlacementFailure::NoCompatiblePair { .. }
@@ -2064,14 +2071,24 @@ impl WorkerSelectionStage {
     fn pair_failure(&self, model_id: &str, failure: PairFailure) -> Response {
         let role = pair_role(failure.role).map_or("worker", role_name);
         match failure.verdict {
-            PlacementFailure::AllOverloaded(shed) => shed,
+            // Each was built where it was judged.
+            PlacementFailure::AllOverloaded(refusal) | PlacementFailure::NoPlanBound(refusal) => {
+                refusal
+            }
             PlacementFailure::Unavailable => Self::workers_unavailable(model_id),
             // The client reads the 503's usual message; the line names the
-            // policy and the role, as the HTTP PD router's does.
-            PlacementFailure::PolicyDeclined(policy) => Self::workers_unavailable_because(
-                model_id,
-                format!("Policy {policy} failed to select a {role} worker"),
-            ),
+            // policy and the role, as the HTTP PD router's does. Under Grand
+            // Central the name is the engine's, and a decline that names no
+            // side is the pair's whole.
+            PlacementFailure::PolicyDeclined(policy) => {
+                let reason = match failure.role {
+                    WorkerRole::Single => format!("Policy {policy} failed to select a pair"),
+                    WorkerRole::Prefill | WorkerRole::Decode => {
+                        format!("Policy {policy} failed to select a {role} worker")
+                    }
+                };
+                Self::workers_unavailable_because(model_id, reason)
+            }
             // Admission turns a capacity verdict into a wait before it gets here.
             PlacementFailure::PrefillAtCapacity => Self::workers_unavailable_because(
                 model_id,
@@ -2322,13 +2339,16 @@ impl WorkerSelectionStage {
     /// processes references, or none of those that do is on the side of
     /// the plan's pipeline pin. Both are the request's own 400, as the
     /// regular path answers them, not a retryable 503 over healthy workers.
+    /// A verdict for the pair's whole, as an unbound plan's, was judged
+    /// from no pool: no pool's media explains it, and it is answered as it
+    /// is.
     fn pd_pair_failure(
         &self,
         model_id: &str,
         failure: PairFailure,
         media: MediaDemands,
     ) -> Response {
-        if media.media_refs {
+        if media.media_refs && failure.role != WorkerRole::Single {
             let snapshot = self.worker_registry.get_routing_snapshot(model_id);
             let pairs = snapshot.pd_pairs(PdWire::Grpc, self.policy_registry.pd_pairing_mode());
             let pool = match failure.role {
@@ -4039,6 +4059,103 @@ mod tests {
         assert_eq!(said()[3..], ["issued", "released Abandoned"]);
     }
 
+    /// The stage asks its guards the handle a request's stream tells
+    /// Grand Central its end through. Every sub-request of a batch takes
+    /// the handle of the batch's one placement. A stream that holds it
+    /// tells its end once, and one dropped before its end tells nothing. One
+    /// let go at its reader's own stop tells the worker's 200 through the
+    /// layer under its tracked layer. A selection the classic policies made
+    /// asks no guard, and its stream is left as it is.
+    #[tokio::test]
+    async fn a_requests_stream_tells_the_engine_its_end_through_the_stages_guards() {
+        use crate::routers::{
+            common::placement::{tests::hearing_engine_on, RequestEnd},
+            grpc::{
+                context::LoadGuards,
+                proto_wrapper::{FanoutStream, ProtoStream},
+                regular::streaming::tests::eof::{chunk, scripted_stream},
+            },
+        };
+
+        let model_id = "test-model-engine-stream-end";
+        let nothing = || ProtoStream::Fanout(FanoutStream::new(Vec::new()));
+        let tracked = |stream: ProtoStream, selection: &WorkerSelection, guards: &LoadGuards| {
+            let worker = Arc::clone(selection.single().expect("a single worker"));
+            let mut stream = stream.tracked(worker, 0, false);
+            stream.report_through(selection.end(Some(guards)));
+            stream
+        };
+
+        let (classic, _policies) = stage_and_policies(model_id, 2);
+        let selection = WorkerSelection::Single {
+            worker: regular_pick(&classic, model_id, None),
+        };
+        let guards = LoadGuards::new(&selection, None);
+        assert!(!selection.tells_end());
+        assert!(selection.end(Some(&guards)).is_empty());
+        assert!(selection.end(None).is_empty());
+        let mut unreported = nothing();
+        unreported.report_through(RequestEnd::default());
+        assert!(matches!(unreported, ProtoStream::Fanout(_)));
+
+        let (stage, policies) = stage_and_policies(model_id, 2);
+        let heard = hearing_engine_on(&policies);
+        let said = || heard.lock().expect("the stage heard").clone();
+        let placed = || WorkerSelection::Single {
+            worker: regular_pick(&stage, model_id, None),
+        };
+
+        // A clean end of a batch's sub-request: the worker's 200, heard
+        // once the guards are gone.
+        let selection = placed();
+        assert!(selection.tells_end());
+        let guards = LoadGuards::scaled(&selection, None, 2);
+        let mut stream = tracked(nothing(), &selection, &guards);
+        assert!(stream.next().await.is_none());
+        drop(guards);
+        assert_eq!(said(), ["issued", "dispatched Single", "completed Ok 200"]);
+
+        // A failure and the end behind it: told once, as the failure.
+        let selection = placed();
+        let guards = LoadGuards::new(&selection, None);
+        let (failing, _server) = scripted_stream(vec![chunk(0, "a")], "13").await;
+        let mut stream = tracked(failing, &selection, &guards);
+        assert!(matches!(stream.next().await, Some(Ok(_))));
+        assert!(matches!(stream.next().await, Some(Err(_))));
+        assert!(stream.next().await.is_none());
+        drop((stream, guards));
+        assert_eq!(
+            said()[3..],
+            ["issued", "dispatched Single", "completed ServerError 500"]
+        );
+
+        // A stream dropped before its end: nobody tells it.
+        let selection = placed();
+        let guards = LoadGuards::new(&selection, None);
+        let (open, _server) = scripted_stream(vec![chunk(0, "a")], "0").await;
+        let mut stream = tracked(open, &selection, &guards);
+        assert!(matches!(stream.next().await, Some(Ok(_))));
+        drop((stream, guards));
+        assert_eq!(
+            said()[6..],
+            ["issued", "dispatched Single", "completed Cancelled"]
+        );
+
+        // A tracked stream let go at its reader's own stop: the layer
+        // under the tracked one tells the worker's 200.
+        let selection = placed();
+        let guards = LoadGuards::new(&selection, None);
+        let (open, _server) = scripted_stream(vec![chunk(0, "a")], "0").await;
+        let mut stream = tracked(open, &selection, &guards);
+        assert!(matches!(stream.next().await, Some(Ok(_))));
+        stream.abort_past_stop();
+        drop(guards);
+        assert_eq!(
+            said()[9..],
+            ["issued", "dispatched Single", "completed Ok 200"]
+        );
+    }
+
     /// The stage states the request's completion budget to Grand Central
     /// as the answer's limit. The regular selection reads it off the context
     /// requirements it is handed, a first attempt's and a retry's alike, and
@@ -5317,7 +5434,8 @@ mod tests {
         };
 
         /// The encode policy behind a count of the items it is asked to
-        /// place.
+        /// place. The stage reads a policy's type to choose what it hands
+        /// it, so the wrapper answers with the type of the policy inside.
         #[derive(Debug)]
         struct Counted {
             inner: Arc<dyn LoadBalancingPolicy>,
@@ -5339,7 +5457,7 @@ mod tests {
             }
 
             fn as_any(&self) -> &dyn std::any::Any {
-                self
+                self.inner.as_any()
             }
         }
 
@@ -6812,6 +6930,59 @@ mod tests {
         assert_ne!(
             error::extract_error_code_from_response(&response),
             "no_media_ref_capable_worker"
+        );
+    }
+
+    /// A pair that the policy spec in force binds no pair plan for is
+    /// refused as that for a request with media references too, whatever
+    /// its pools process: the verdict is the pair's whole, judged from no
+    /// pool. Here the one decode advertises no reference processing. Read
+    /// as the decode's role, the request was answered that no worker
+    /// processes its references, which an unbound plan is not about.
+    #[test]
+    fn an_unbound_pair_with_media_references_is_refused_as_unbound() {
+        use smg_grand_central::document::{AppliedSpec, PolicySpec};
+
+        use crate::routers::common::placement::tests::engine_on;
+
+        let model_id = "test-model-media-refs-unbound";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        for (url, worker_type, advertise_refs) in [
+            ("grpc://127.0.0.1:8750", WorkerType::Prefill, true),
+            ("grpc://127.0.0.1:8751", WorkerType::Decode, false),
+        ] {
+            worker_registry
+                .register(vllm_grpc_worker(url, model_id, worker_type, advertise_refs))
+                .unwrap();
+        }
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        // A stock preset binds single requests alone.
+        let document = PolicySpec::preset("round_robin").expect("a stock preset");
+        let spec = AppliedSpec::validate(&document);
+        engine_on(&policies, spec.expect("a valid document"));
+        let stage = WorkerSelectionStage::new(
+            Arc::clone(&worker_registry),
+            Arc::new(policies),
+            WorkerSelectionMode::PrefillDecode,
+            None,
+        );
+        let response = stage
+            .select_pd_pair(
+                model_id,
+                PlacementInputs {
+                    candidate_filter: Some(ACCEPTS_MEDIA_REFS),
+                    ..Default::default()
+                },
+                None,
+                None,
+                PairDemands::default(),
+            )
+            .map_err(|failure| stage.pd_selection_failure(model_id, failure, REFS))
+            .expect_err("no pair plan binds the model");
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            placement::NO_PLAN_BOUND_CODE
         );
     }
 
@@ -8682,6 +8853,89 @@ mod tests {
         );
     }
 
+    /// A pair of a model that the policy spec in force binds no pair plan
+    /// for is refused by the stage's entry point with a 501 under the
+    /// cause's own code, with no retry hint, in words that name the cause,
+    /// on a fleet whose every worker is open. It is marked as reported and
+    /// written at WARN within the allowance, never at ERROR. Judged from the
+    /// pools, the client read that every worker was unavailable and was told
+    /// to come back in a second.
+    #[tokio::test]
+    async fn a_pair_the_spec_binds_no_plan_for_is_refused_501_and_written_within_the_allowance() {
+        use smg_grand_central::document::{AppliedSpec, PolicySpec};
+
+        use crate::routers::common::placement::tests::engine_on;
+
+        let errors = Arc::new(AtomicUsize::new(0));
+        let refusal_lines = Arc::new(AtomicUsize::new(0));
+        let _subscriber = test_subscriber(RefusalLineCounter {
+            errors: Arc::clone(&errors),
+            refusal_lines: Arc::clone(&refusal_lines),
+        });
+        let registry = Arc::new(WorkerRegistry::new());
+        register_pd_workers(&registry, "test-model", 1);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        // A stock preset binds single requests alone.
+        let document = PolicySpec::preset("round_robin").expect("a stock preset");
+        let spec = AppliedSpec::validate(&document);
+        engine_on(&policies, spec.expect("a valid document"));
+        let stage = WorkerSelectionStage::new(
+            Arc::clone(&registry),
+            Arc::new(policies),
+            WorkerSelectionMode::PrefillDecode,
+            None,
+        );
+
+        let mut ctx = prepared_ctx(Arc::clone(&registry), None);
+        let refused = stage
+            .execute(&mut ctx)
+            .await
+            .expect_err("no pair plan binds the model");
+        assert_eq!(refused.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            error::extract_error_code_from_response(&refused),
+            placement::NO_PLAN_BOUND_CODE
+        );
+        assert_eq!(retry_after(&refused), None);
+        assert!(!is_retryable_response(&refused));
+        assert_eq!(
+            placement::refusal_reason(&refused),
+            Some("the policy spec in force binds no pair plan for model 'test-model'")
+        );
+        assert!(
+            refused.extensions().get::<ReportedRefusal>().is_some(),
+            "the refusal is marked as reported, so the pipeline and the access log keep quiet"
+        );
+
+        let allowance = usize::try_from(placement::REFUSAL_LINES_PER_SECOND).unwrap();
+        let throttle = KeyedLogThrottle::new(
+            placement::REFUSAL_LINES_PER_SECOND,
+            Duration::from_secs(60),
+            placement::REFUSAL_LOG_MODELS,
+        );
+        refusal_lines.store(0, Ordering::Relaxed);
+        for _ in 0..5 * allowance {
+            let mut ctx = prepared_ctx(Arc::clone(&registry), None);
+            let refused = stage
+                .select(&mut ctx)
+                .await
+                .expect_err("no pair plan binds the model");
+            stage.report_refusal_with(
+                &throttle,
+                "WorkerSelectionStage::execute",
+                None,
+                "test-model",
+                refused,
+            );
+        }
+        assert_eq!(refusal_lines.load(Ordering::Relaxed), allowance);
+        assert_eq!(
+            errors.load(Ordering::Relaxed),
+            0,
+            "a refusal is not an error of the gateway"
+        );
+    }
+
     /// A model nobody serves is refused with the `model_not_found` 404,
     /// marked as reported for the loggers downstream, and written at WARN
     /// within the per-second allowance, never at ERROR: a client retrying a
@@ -8843,6 +9097,20 @@ mod tests {
             Some("Policy cache_aware failed to select a prefill worker")
         );
 
+        // Under Grand Central a decline may name no side: the line then
+        // says the pair.
+        let whole = stage.pair_failure(
+            "test-model",
+            PairFailure {
+                role: WorkerRole::Single,
+                verdict: PlacementFailure::PolicyDeclined("a-stage"),
+            },
+        );
+        assert_eq!(
+            placement::refusal_reason(&whole),
+            Some("Policy a-stage failed to select a pair")
+        );
+
         let at_capacity = stage.pair_failure(
             "test-model",
             PairFailure {
@@ -8923,6 +9191,210 @@ mod tests {
             &stage,
         ));
         assert!(future <= 2048, "the dispatch future is {future} bytes");
+    }
+
+    /// A pair Grand Central placed, held as a pair route holds it ahead of
+    /// its prefill's send: one prefill and one decode on the KV transport
+    /// `connector`, what the hearing stage heard, the selection under the
+    /// runtime `runtime_type`, which the dispatch reads its shape from, and
+    /// the prefill's load not yet sent.
+    fn a_pair_ahead_of_its_send(
+        connector: &str,
+        runtime_type: RuntimeType,
+    ) -> (placement::tests::Heard, WorkerSelection, PrefillAhead) {
+        use crate::routers::common::{
+            placement::{
+                select_pair,
+                tests::{hearing_pairs_on, pairs_of, MODEL},
+                PlacedPair, PlacementInputs, Stated,
+            },
+            prefill_admission::hold_unbounded,
+        };
+
+        let registry = WorkerRegistry::new();
+        for (url, worker_type) in [
+            ("grpc://p:1", WorkerType::Prefill),
+            ("grpc://d:1", WorkerType::Decode),
+        ] {
+            let worker = BasicWorkerBuilder::new(url)
+                .model(ModelCard::new(MODEL))
+                .worker_type(worker_type)
+                .connection_mode(ConnectionMode::Grpc)
+                .runtime_type(RuntimeType::Vllm)
+                .health_config(no_health_check())
+                .kv_connector(connector)
+                .build();
+            registry
+                .register(Arc::new(worker))
+                .expect("worker registers");
+        }
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let heard = hearing_pairs_on(&policies, false);
+        let pairs = pairs_of(&registry, &policies);
+        let inputs = PlacementInputs::default();
+        let pair = select_pair(
+            &registry,
+            &policies,
+            MODEL,
+            &pairs,
+            None,
+            None,
+            inputs,
+            Stated::nothing,
+        );
+        let Ok(pair) = pair else {
+            panic!("the engine places the pair");
+        };
+        let ((prefill, decode), ahead) = hold_unbounded(
+            pair,
+            Some("key"),
+            |pair: &PlacedPair| &pair.prefill,
+            |pair: PlacedPair| {
+                let (prefill, unsent) = pair.prefill.unsent();
+                ((prefill, pair.decode), unsent)
+            },
+        );
+        let workers = WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill,
+            decode,
+            runtime_type,
+        };
+        (heard, workers, ahead)
+    }
+
+    /// The dispatch context of one attempt over `workers`, a pair held with
+    /// its prefill's load `ahead` of its send, with `client` for both sides.
+    fn an_attempt_over(
+        workers: WorkerSelection,
+        ahead: PrefillAhead,
+        client: &BackendClient,
+        runtime_type: RuntimeType,
+    ) -> DispatchContext {
+        use crate::routers::grpc::context::{ClientSelection, DispatchMetadata};
+
+        let mut ctx = dispatch_ctx("m", grpc_wire(runtime_type));
+        ctx.workers = Some(workers);
+        ctx.pd_prefill_guard = Some(ahead);
+        ctx.clients = Some(ClientSelection::Disaggregated {
+            prefill: client.clone(),
+            decode: client.clone(),
+        });
+        ctx.dispatch = Some(DispatchMetadata {
+            request_id: "r".to_string(),
+            model: "m".to_string(),
+            created: 0,
+            weight_version: None,
+        });
+        ctx
+    }
+
+    /// A pair's request that is refused ahead of any send is heard as a
+    /// release of both sides, with no dispatch and no end: the runtime's
+    /// refusal and the sequential plan's, for one request and for a batch.
+    /// Grand Central placed the pair, so the plan makes the decode's guards
+    /// ahead of its send, one for each sub-request, and the dispatch that
+    /// refuses the request has said neither side's send.
+    #[tokio::test]
+    async fn a_pair_refused_ahead_of_its_send_is_heard_as_a_release() {
+        use smg_worker::identity::basic::MORIIO_CONNECTOR;
+
+        use crate::routers::grpc::regular::stages::testing::mock_backend_client;
+
+        let (client, engine) = mock_backend_client("m").await;
+        let stage = regular_stage(Arc::new(WorkerRegistry::new()));
+        // Each refusal by a pair that meets it: a runtime with no pair
+        // protocol, and a decode whose connector the sequential plan refuses.
+        let refusals = [
+            (
+                RuntimeType::Mlx,
+                "NixlConnector",
+                "runtime_pd_not_supported",
+            ),
+            (
+                RuntimeType::Vllm,
+                MORIIO_CONNECTOR,
+                "moriio_grpc_pd_unsupported",
+            ),
+        ];
+        for (runtime_type, connector, code) in refusals {
+            for batched in [false, true] {
+                let (heard, workers, ahead) = a_pair_ahead_of_its_send(connector, runtime_type);
+                let said = || heard.lock().expect("the stage heard").clone();
+                assert_eq!(said(), ["issued", "issued"]);
+                let decode = Arc::clone(workers.decode_worker().expect("a pair's decode"));
+                let mut ctx = an_attempt_over(workers, ahead, &client, runtime_type);
+                let request = || ProtoGenerateRequest::Vllm(Box::default());
+                let plan = if batched {
+                    ExecutionPlan::Batch {
+                        kind: ExecutionPlanKind::PrefillDecode,
+                        shared_request_id: "r".to_string(),
+                        requests: vec![request(), request()],
+                    }
+                } else {
+                    ExecutionPlan::PrefillDecode(request())
+                };
+                let refused =
+                    execute_plan(&mut ctx, plan, true, None, GroupedDpSticky::Off, &stage).await;
+                let Err(refused) = refused else {
+                    panic!("{code}, batched {batched}: the plan is refused");
+                };
+                assert_eq!(
+                    refused
+                        .headers()
+                        .get(error::HEADER_X_SMG_ERROR_CODE)
+                        .unwrap(),
+                    code
+                );
+                assert_eq!(
+                    decode.load(),
+                    if batched { 2 } else { 1 },
+                    "{code}, batched {batched}: each sub-request counts on the decode"
+                );
+                drop(ctx);
+                assert_eq!(decode.load(), 0);
+                assert_eq!(
+                    said()[2..],
+                    ["released Abandoned", "released Abandoned"],
+                    "{code}, batched {batched}: both sides, with no dispatch and no end"
+                );
+            }
+        }
+        engine.abort();
+    }
+
+    /// A batch of a pair Grand Central placed that goes out says each side's
+    /// send once, behind its refusals: the decode's first, on the first of
+    /// its guards, which the plan made ahead of that send, and then the
+    /// prefill's. What the mock engine answers the sub-requests is no part
+    /// of this: both words are said ahead of them.
+    #[tokio::test]
+    async fn a_pairs_batch_that_goes_out_says_each_send_once() {
+        use crate::routers::grpc::regular::stages::testing::mock_backend_client;
+
+        let (client, engine) = mock_backend_client("m").await;
+        let stage = regular_stage(Arc::new(WorkerRegistry::new()));
+        let (heard, workers, ahead) = a_pair_ahead_of_its_send("NixlConnector", RuntimeType::Vllm);
+        let mut ctx = an_attempt_over(workers, ahead, &client, RuntimeType::Vllm);
+        let request = || ProtoGenerateRequest::Vllm(Box::default());
+        let plan = ExecutionPlan::Batch {
+            kind: ExecutionPlanKind::PrefillDecode,
+            shared_request_id: "r".to_string(),
+            requests: vec![request(), request()],
+        };
+        let bound = Some(Duration::from_secs(5));
+        let _answered =
+            execute_plan(&mut ctx, plan, true, bound, GroupedDpSticky::Off, &stage).await;
+        let sends: Vec<String> = heard
+            .lock()
+            .expect("the stage heard")
+            .iter()
+            .filter(|word| word.starts_with("dispatched"))
+            .cloned()
+            .collect();
+        assert_eq!(sends, ["dispatched Decode", "dispatched Prefill"]);
+        drop(ctx);
+        engine.abort();
     }
 
     /// A decode request is built for the decode the first decision named.

@@ -27,18 +27,14 @@ use prost_types::{
 use smg_grand_central::{
     cases,
     document::{PolicySpec, DENIED_HEADERS},
-    engine::{
-        fingerprint, Identity, LiftedVeto, Pair, Phase, Queue, RequestFacts, Role, Shed,
-        ShedReason, Target, Trace,
-    },
-    mirrored, record,
-    tracking::{Lease, LeaseKind, Side},
+    engine::{fingerprint, Identity, Phase, RequestFacts, Role, ShedReason},
+    mirrored,
+    tracking::Side,
 };
 use wit_parser::{InterfaceId, PackageId, Resolve, TypeDefKind, WorldId, WorldItem, WorldKey};
 
 const PLUGIN_PROTO: &str = "policy_plugin.proto";
 const CONTROLLER_PROTO: &str = "grand_central.proto";
-const ENGINE_WIRE_PROTO: &str = "common.proto";
 const WORLD_WIT: &str = "smg-policy.wit";
 const PACKAGE: &str = "smg.policy.v1";
 const WIT_NAMESPACE: &str = "smg";
@@ -114,89 +110,30 @@ fn health_record() -> &'static [&'static str] {
 }
 
 fn target_record() -> &'static [&'static str] {
-    record!(
-        Target,
-        Target {
-            position,
-            id,
-            dp_rank,
-            pair
-        }
-    )
+    mirrored::target()
 }
 
 fn pair_record() -> &'static [&'static str] {
-    record!(
-        Pair,
-        Pair {
-            decode_position,
-            decode_id,
-            decode_dp_rank,
-            decode_verdict
-        }
-    )
+    mirrored::pair()
 }
 
 fn shed_record() -> &'static [&'static str] {
-    record!(
-        Shed,
-        Shed {
-            reason,
-            emptied_by,
-            retry_after_secs,
-            wait_allowed,
-            trace
-        }
-    )
+    mirrored::shed()
 }
 
 fn queue_record() -> &'static [&'static str] {
-    record!(
-        Queue,
-        Queue {
-            ticket,
-            max_wait_micros,
-            trace
-        }
-    )
+    mirrored::queue()
 }
 
 fn trace_record() -> &'static [&'static str] {
-    record!(
-        Trace,
-        Trace {
-            profile,
-            survivors,
-            top,
-            top_len,
-            seed,
-            generation,
-            lifted
-        }
-    )
+    mirrored::trace()
 }
 
 /// The lease's session crosses under the name both contracts still spell,
 /// `session_key`. A gateway's client reads it under that name. A change that
 /// renames the field renames it in both contracts and takes this pair out.
 fn lease_record() -> &'static [&'static str] {
-    record!(
-        Lease,
-        Lease {
-            id,
-            kind,
-            side,
-            target_index,
-            booked,
-            generation,
-            session as "session_key",
-            session_verdict,
-            issued_micros,
-            tokens,
-            chars,
-            bytes,
-        }
-    )
+    mirrored::lease()
 }
 
 fn outcome_record() -> &'static [&'static str] {
@@ -272,13 +209,7 @@ fn enum_mirrors() -> Vec<(
             "LeaseKind",
             "LEASE_KIND",
             "lease-kind",
-            cases!(
-                LeaseKind,
-                LeaseKind {
-                    Credit,
-                    Reservation
-                }
-            ),
+            mirrored::lease_kind(),
         ),
         (
             "Completed.Class",
@@ -331,7 +262,8 @@ struct ProtoMirror {
     /// position, the in-process length of a fixed array, the trace the wire
     /// hoists into `Decision`, whether a report counts resident tokens, a
     /// fingerprint the host carries of a name the wire carries, the place
-    /// of a row's engine among the engines of its host's list.
+    /// of a row's engine among the engines of its host's list, the side of
+    /// a pair a refusal names.
     host_only: &'static [&'static str],
     /// Wire fields outside the record, in the wire's order: an event's key
     /// before it, controller facts, a wire-only input, the observability
@@ -436,6 +368,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 "signal_cells",
                 "ring",
                 "ring_positions",
+                "decode_ring_positions",
             ],
             wire_only: &["prompt_text"],
             wire: &[
@@ -474,6 +407,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 "stalled",
                 "held",
                 "places",
+                "target_worker",
             ],
             wire_only: &[],
             wire: &[
@@ -530,7 +464,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "Pair",
             record: pair_record(),
-            host_only: &["decode_position", "decode_verdict"],
+            host_only: &["decode_position", "decode_verdict", "decode_placing"],
             wire_only: &[],
             wire: &[
                 ("decode_id", Type::Fixed64),
@@ -542,7 +476,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "Shed",
             record: shed_record(),
-            host_only: &["trace"],
+            host_only: &["side", "trace"],
             wire_only: &[],
             wire: &[
                 ("reason", Type::Enum),
@@ -696,6 +630,7 @@ fn wit_mirrors() -> Vec<WitMirror> {
                 "client_key",
                 "ring",
                 "ring_positions",
+                "decode_ring_positions",
                 "session_key_from_rid",
             ],
             before: &[],
@@ -731,7 +666,7 @@ fn wit_mirrors() -> Vec<WitMirror> {
         WitMirror {
             record: "pair",
             crate_record: pair_record(),
-            host_only: &["decode_position", "decode_verdict"],
+            host_only: &["decode_position", "decode_verdict", "decode_placing"],
             before: &[],
             beside: &[],
         },
@@ -772,8 +707,6 @@ const CONTROLLER_RPCS: &[Rpc] = &[
         false,
         true,
     ),
-    ("PushLoad", "LoadReport", "Ack", true, false),
-    ("PushKvEvents", "RelayKvFrame", "Ack", true, false),
     (
         "RegisterWorker",
         "RegisterWorkerRequest",
@@ -919,12 +852,6 @@ const ONEOFS: &[(&str, &str, &str, &[&str])] = &[
         "made",
         &["registered", "replaced", "removed", "relabelled"],
     ),
-    (
-        CONTROLLER_PROTO,
-        "RelayKvFrame",
-        "frame",
-        &["batch", "subscribed", "resync", "ended"],
-    ),
     (CONTROLLER_PROTO, "ReplicaFrame", "frame", &["hello", "ack"]),
     (
         CONTROLLER_PROTO,
@@ -978,12 +905,6 @@ fn contracts_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("contracts")
 }
 
-/// The engine wire's protos (`smg.grpc.common`): the controller protocol
-/// imports the load record and the event batch a relay forwards unchanged.
-fn engine_wire_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../worker/proto")
-}
-
 fn compile_protocol() -> io::Result<FileDescriptorSet> {
     let dir = contracts_dir();
     let mut config = prost_build::Config::new();
@@ -992,7 +913,7 @@ fn compile_protocol() -> io::Result<FileDescriptorSet> {
     config.protoc_arg("--experimental_allow_proto3_optional");
     config.load_fds(
         &[dir.join(PLUGIN_PROTO), dir.join(CONTROLLER_PROTO)],
-        &[dir, engine_wire_dir()],
+        &[dir],
     )
 }
 
@@ -1263,8 +1184,8 @@ fn the_protocol_compiles_and_mirrors_the_engine_record() {
     assert_eq!(controller.package(), PACKAGE);
     assert_eq!(
         controller.dependency,
-        strings(&[PLUGIN_PROTO, ENGINE_WIRE_PROTO]),
-        "the controller protocol imports the plugin vocabulary and the engine wire"
+        strings(&[PLUGIN_PROTO]),
+        "the controller protocol imports the plugin vocabulary alone"
     );
 
     for mirror in proto_mirrors() {
@@ -1333,21 +1254,14 @@ fn the_protocol_compiles_and_mirrors_the_engine_record() {
     // The lifted veto: the mark's variants in order, numbered from zero.
     // Its zero is none, a case, on purpose: the enum's comment says why.
     let found = enum_values(plugin, "LiftedVeto").expect("LiftedVeto is an enum");
-    let expected: Vec<(String, i32)> = cases!(
-        LiftedVeto,
-        LiftedVeto {
-            None,
-            Overload,
-            Liveness
-        }
-    )
-    .iter()
-    .enumerate()
-    .map(|(i, case)| {
-        let number = i32::try_from(i).unwrap_or(i32::MAX);
-        (format!("LIFTED_VETO_{}", screaming_case(case)), number)
-    })
-    .collect();
+    let expected: Vec<(String, i32)> = mirrored::lifted_veto()
+        .iter()
+        .enumerate()
+        .map(|(i, case)| {
+            let number = i32::try_from(i).unwrap_or(i32::MAX);
+            (format!("LIFTED_VETO_{}", screaming_case(case)), number)
+        })
+        .collect();
     assert_eq!(
         found, expected,
         "the lifted vetoes are the mark's, from none"
@@ -1692,9 +1606,77 @@ fn the_named_worker_field_is_pinned() {
     assert_eq!(found, [pinned], "the named worker's field moved");
 }
 
+/// A request's hard demands on its frame, by name and number: the field of
+/// the request, the message whole, and the places a request's media by
+/// reference may be processed. The field and the places are named by their
+/// own types. The field is a message: its absence says the
+/// request demands nothing, so the frame of a host older than the field is
+/// decided as it was.
+#[test]
+fn the_demands_fields_are_pinned() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let controller =
+        file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
+    let request = message(controller, "DecideRequest").expect("the request is a message");
+    let found: Vec<(String, i32, Type)> = fields(request)
+        .into_iter()
+        .filter(|(name, _, _, _, _)| name == "demands")
+        .map(|(name, number, kind, _, _)| (name, number, kind))
+        .collect();
+    let pinned = ("demands".to_owned(), 9, Type::Message);
+    assert_eq!(found, [pinned], "the demands' field moved");
+
+    let demands = message(controller, "Demands").expect("Demands is in the controller file");
+    let found: Vec<(String, i32, Type)> = fields(demands)
+        .into_iter()
+        .map(|(name, number, kind, _, _)| (name, number, kind))
+        .collect();
+    let parts = [
+        ("runtime", 1, Type::Uint32),
+        ("vision", 2, Type::Bool),
+        ("references", 3, Type::Enum),
+        ("input_window", 4, Type::Uint32),
+        ("output_window", 5, Type::Uint32),
+        ("decoding", 6, Type::Uint32),
+    ];
+    let parts: Vec<(String, i32, Type)> = parts
+        .iter()
+        .map(|(name, number, kind)| ((*name).to_owned(), *number, *kind))
+        .collect();
+    assert_eq!(found, parts, "a part of a demand moved");
+
+    // Each of the two by its own type: a field of another message's or
+    // another enum's type would read by other names.
+    let typed = |message: &DescriptorProto, name: &str| -> Vec<String> {
+        let named = message.field.iter().filter(|field| field.name() == name);
+        named.map(|field| field.type_name().to_owned()).collect()
+    };
+    assert_eq!(typed(request, "demands"), [".smg.policy.v1.Demands"]);
+    assert_eq!(
+        typed(demands, "references"),
+        [".smg.policy.v1.Demands.References"]
+    );
+
+    let places = enum_values(controller, "Demands.References").expect("the places are an enum");
+    let pinned = [
+        ("REFERENCES_NONE", 0),
+        ("REFERENCES_ANY", 1),
+        ("REFERENCES_CALLER", 2),
+        ("REFERENCES_WORKER", 3),
+    ];
+    let pinned: Vec<(String, i32)> = pinned
+        .iter()
+        .map(|(name, number)| ((*name).to_owned(), *number))
+        .collect();
+    assert_eq!(places, pinned, "a place of media by reference moved");
+}
+
 /// What a registration states and its answer tells, by name and number: the
 /// prober's settings (one message for the registration and the row), the
-/// row's rank and engine, and the two thresholds a row is judged by.
+/// row's rank and engine, the two thresholds a row is judged by, what a
+/// worker states for a request's hard demands (one message for the two),
+/// whether it takes images, and its end of the encode handoff (one message
+/// for the two).
 const MEMBERSHIP_FIELDS: &[(&str, &[ResumeField])] = &[
     (
         "HealthPolicy",
@@ -1720,13 +1702,44 @@ const MEMBERSHIP_FIELDS: &[(&str, &[ResumeField])] = &[
             ("engine", 24, Type::String),
             ("health_policy", 25, Type::Message),
             ("maker", 27, Type::Message),
+            ("demand_facts", 28, Type::Message),
+            ("vision", 29, Type::Bool),
+            ("encode", 30, Type::Message),
+        ],
+    ),
+    (
+        "EncodeOffer",
+        &[
+            ("handoff", 1, Type::Enum),
+            ("producer", 2, Type::Bool),
+            ("consumer", 3, Type::Bool),
+            ("connector", 4, Type::String),
+            ("references", 5, Type::Bool),
+        ],
+    ),
+    (
+        "DemandFacts",
+        &[
+            ("runtime", 1, Type::Uint32),
+            ("references", 2, Type::Bool),
+            ("host_pipeline", 3, Type::Bool),
+            ("window", 4, Type::Uint32),
+            ("decoding", 5, Type::Uint32),
         ],
     ),
     (
         "Maker",
         &[("provider", 1, Type::String), ("key", 2, Type::String)],
     ),
-    ("WorkerSpec", &[("health_policy", 14, Type::Message)]),
+    (
+        "WorkerSpec",
+        &[
+            ("health_policy", 14, Type::Message),
+            ("demand_facts", 15, Type::Message),
+            ("vision", 16, Type::Bool),
+            ("encode", 17, Type::Message),
+        ],
+    ),
 ];
 
 /// A membership change on the plugin wire, by name and number: a plugin
@@ -1778,9 +1791,12 @@ fn the_membership_fields_are_pinned() {
     for (message_name, expected) in MEMBERSHIP_FIELDS {
         let compiled = message(controller, message_name)
             .unwrap_or_else(|| panic!("{message_name} is missing from {CONTROLLER_PROTO}"));
-        // The two small messages are pinned whole, the two rows by the
+        // The four small messages are pinned whole, the two rows by the
         // fields named here.
-        let whole = matches!(*message_name, "HealthPolicy" | "OverloadThresholds");
+        let whole = matches!(
+            *message_name,
+            "HealthPolicy" | "OverloadThresholds" | "DemandFacts" | "EncodeOffer"
+        );
         let found: Vec<(String, i32, Type)> = fields(compiled)
             .into_iter()
             .filter(|(name, _, _, _, _)| {
@@ -1797,6 +1813,21 @@ fn the_membership_fields_are_pinned() {
             .collect();
         assert_eq!(found, expected, "{message_name}: a membership field moved");
     }
+
+    // The offer's form by its own type: a field of another enum's type
+    // would read the same numbers by other names. A form keeps its number.
+    let offer = message(controller, "EncodeOffer").expect("EncodeOffer is in the controller file");
+    let typed: Vec<&str> = offer
+        .field
+        .iter()
+        .filter(|field| field.name() == "handoff")
+        .map(|field| field.type_name())
+        .collect();
+    assert_eq!(typed, [".smg.policy.v1.EncodeHandoff"]);
+    assert_eq!(
+        enum_values(controller, "EncodeHandoff"),
+        Some(proto_enum("ENCODE_HANDOFF", &["Push", "Rendezvous"]))
+    );
 
     // The two thresholds no judge read left the message: their numbers and
     // names stay reserved, so a reader brings one back under a new number.
@@ -1821,6 +1852,117 @@ fn the_membership_fields_are_pinned() {
             &["Pending", "Ready", "NotReady", "Draining", "Failed"]
         ))
     );
+}
+
+/// The ingestion scope left the principal's scopes with its two relay calls:
+/// its number and its name stay reserved, so a later scope takes neither.
+#[test]
+fn the_principals_scopes_keep_the_ingestion_scopes_number_and_name_reserved() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let controller =
+        file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
+    assert_eq!(
+        enum_values(controller, "Principal.Scope"),
+        Some(vec![
+            ("SCOPE_UNSPECIFIED".to_owned(), 0),
+            ("SCOPE_GATEWAY".to_owned(), 1),
+            ("SCOPE_CONTROL".to_owned(), 3),
+            ("SCOPE_REPLICATION".to_owned(), 4),
+        ])
+    );
+    let scopes = message(controller, "Principal")
+        .and_then(|principal| principal.enum_type.iter().find(|e| e.name() == "Scope"))
+        .expect("Principal.Scope is in the controller file");
+    let reserved: Vec<i32> = scopes
+        .reserved_range
+        .iter()
+        .flat_map(|range| range.start()..=range.end())
+        .collect();
+    assert_eq!(reserved, [2], "the reserved number");
+    assert_eq!(scopes.reserved_name, strings(&["SCOPE_INGESTION"]));
+}
+
+/// A pair's class left the pairing descriptor, and a snapshot's pair rows
+/// left with their message: no writer filled either. Whether a worker takes
+/// images left the descriptor for a field of the registration and of the
+/// row: no build took or told it there. So did a worker's end of the encode
+/// handoff, five numbers, for a message of its own. The numbers and names
+/// stay reserved, so a later field takes none of them, and no message takes
+/// the name of the one that left.
+#[test]
+fn the_pair_class_and_the_pair_rows_keep_their_numbers_and_names_reserved() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let controller =
+        file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
+    let left: [(&str, &[i32], &[&str]); 2] = [
+        (
+            "PairingDescriptor",
+            &[8, 11, 9, 10, 12, 13, 14],
+            &[
+                "pair_class",
+                "vision",
+                "ec_producer",
+                "ec_consumer",
+                "encode_handoff",
+                "ec_connector",
+                "encode_references",
+            ],
+        ),
+        ("Snapshot", &[9], &["pairs"]),
+    ];
+    for (message_name, numbers, names) in left {
+        let compiled = message(controller, message_name)
+            .unwrap_or_else(|| panic!("{message_name} is missing from {CONTROLLER_PROTO}"));
+        let reserved: Vec<i32> = compiled
+            .reserved_range
+            .iter()
+            .flat_map(|range| range.start()..range.end())
+            .collect();
+        assert_eq!(reserved, numbers, "{message_name}: the reserved numbers");
+        assert_eq!(
+            compiled.reserved_name,
+            strings(names),
+            "{message_name}: the reserved names"
+        );
+    }
+    assert!(
+        message(controller, "PairRow").is_none(),
+        "no message takes the name of the pair row that left"
+    );
+}
+
+/// The pair rows' slice left the snapshot request behind its rows: its
+/// number and its name stay reserved, so a later slice takes neither.
+#[test]
+fn the_snapshots_slices_keep_the_pair_slices_number_and_name_reserved() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let controller =
+        file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
+    assert_eq!(
+        enum_values(controller, "SnapshotRequest.Slice"),
+        Some(vec![
+            ("SLICE_UNSPECIFIED".to_owned(), 0),
+            ("SLICE_WORKERS".to_owned(), 1),
+            ("SLICE_HEALTH".to_owned(), 2),
+            ("SLICE_LOADS".to_owned(), 3),
+            ("SLICE_SESSIONS".to_owned(), 4),
+            ("SLICE_LEASES".to_owned(), 5),
+            ("SLICE_SPEC".to_owned(), 7),
+            ("SLICE_PLUGINS".to_owned(), 8),
+            ("SLICE_KV_INDEX".to_owned(), 9),
+            ("SLICE_GATEWAYS".to_owned(), 10),
+        ])
+    );
+    let slices = message(controller, "SnapshotRequest")
+        .and_then(|request| request.enum_type.iter().find(|e| e.name() == "Slice"))
+        .expect("SnapshotRequest.Slice is in the controller file");
+    let reserved: Vec<i32> = slices
+        .reserved_range
+        .iter()
+        .flat_map(|range| range.start()..=range.end())
+        .collect();
+    assert_eq!(reserved, [6], "the reserved number");
+    assert_eq!(slices.reserved_name, strings(&["SLICE_PAIRS"]));
 }
 
 /// The packed request block's layout as the world's comment states it: an

@@ -29,6 +29,23 @@ fn no_control_wire(rpc: &str) -> Status {
     Status::unimplemented(format!("{rpc} {NO_CONTROL_WIRE}"))
 }
 
+// Ordinary text uses the existing Generate/Abort lifecycle even in an EPD pool.
+// Media and the private control envelope still require the fenced control RPC.
+/// Separate native text generation from envelopes that require prepared-input ownership.
+fn requires_managed_control(request: &sg::GenerateRequest) -> bool {
+    request.mm_inputs.is_some()
+        || !request.extra_mm_inputs.is_empty()
+        || !request.input_embeds.is_empty()
+        || request.media_identity.is_some()
+        || !request.prepared_input.is_empty()
+        || request.sampling_params.as_ref().is_some_and(|params| {
+            params
+                .custom_params
+                .as_ref()
+                .is_some_and(|custom| custom.fields.contains_key("__smg_managed_epd_v1"))
+        })
+}
+
 #[tonic::async_trait]
 impl SglangScheduler for SglangService {
     type GenerateStream = BoxStream<sg::GenerateResponse>;
@@ -39,6 +56,14 @@ impl SglangScheduler for SglangService {
         &self,
         request: Request<sg::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
+        if !request.get_ref().prepared_control.is_empty() {
+            return super::native::generate(&self.state, request.into_inner()).map(Response::new);
+        }
+        if self.state.managed_config.is_some() && requires_managed_control(request.get_ref()) {
+            return Err(Status::failed_precondition(
+                "prepared-input metadata is required",
+            ));
+        }
         let trace_headers = trace_context::trace_headers(request.metadata());
         let stream = generate::generate(
             &self.state,
@@ -178,3 +203,7 @@ impl SglangScheduler for SglangService {
         }))
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/sglang/service/tests.rs"]
+mod tests;

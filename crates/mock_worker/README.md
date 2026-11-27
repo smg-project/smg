@@ -110,6 +110,43 @@ inside the prompt and disjoint across the request's items, and, when the item
 names its placeholder token id, spans that cover exactly the prompt's tokens of
 that id; a wrong item is refused with `InvalidArgument` naming the item and the
 field, so a gateway regression in a wire's items reads as a red row on the mock.
+A regular worker takes a request with media once the gateway lets it through:
+on every wire the gateway asks the model's family for a media spec (the model
+directory above), and on the vLLM wire it also asks the workers, refusing the
+request with `multimodal_not_supported` while every worker that would take the
+pixels reports `supports_vision` false, as a regular worker of the mock does
+unless `--supports-vision true` or the admin API's info patch says otherwise
+before the gateway reads the model info. The realistic engine keys a media
+item's tokens by the item. The gateway writes the same placeholder id under
+every image, so the cache reads the ids under each placeholder span as one id
+of the item's hash (below 2^30): on the vLLM wire the i-th entry of a batch's
+`mm_hashes` over the batch's i-th span, on the TokenSpeed wire an item's
+`content_hash` with its modality over the item's spans, on the SGLang wire one
+value over all the spans of a batch (its `feature_hash`, or a fold of its
+pixel tensor where the request carries none, taken where the cache reads the
+request, so a prefill-role or scripted request does not pay for it: one batch
+sent both ways reads as two items, and the mock cuts no batch into items by a
+model family's grid). Where the wire names the item's placeholder id, a token
+of another id under a span stays as sent; a token two spans claim goes to the
+first of them, in the prompt's order, that takes its id. A vLLM request's
+media is read one way, as the engine's servicer reads it: where a batch
+carries tensors (`pixel_values` or `model_specific_tensors`), the batches with
+tensors key their spans and a batch without them keys nothing; where none
+does, as on the decode side of a pair that holds the language model alone,
+every batch's hashes, in order, salt the whole prompt, folded with the first
+token into that token's key (an empty prompt has no token to carry them). The
+prompt's token count stays, a script and `--capture` read the ids as sent, the
+same image is the same prompt to the cache, and another image parts the prompt
+at the image's first token (`cached_tokens`, `GET /admin/truth`).
+`--output-seed prompt` reads the prompt as the cache does: the same image
+gives the same output, another image another. The KV
+events follow each wire's engine. On the vLLM wire a stored block carries the
+ids as sent and the item is in the block's hash alone, so an index built from
+the events reads a prompt by its ids, two images under one placeholder id as
+one prompt, as it does of the engine's events. On the SGLang and TokenSpeed
+wires, whose engines write the item's id under its tokens themselves, the
+events carry the keyed ids (read in the engines' servicers and clients, not
+compared with an engine's events).
 A reference batch on the SGLang wire (media URLs without a pixel tensor, the
 form the gateway hands a worker that processes media itself) is the primary
 batch's alone, travels with no extra batch, and is accepted as it stands: the
@@ -213,7 +250,8 @@ experiments against it transfer to engines:
   leaves it as it is: a restarted engine does not empty a shared store. A
   queued request's `num_waiting_uncached_tokens` leaves out what the tier
   would restore. The tier needs generating workers (a prefill or encode worker
-  runs no passes), `--prefix-cache true` and one main-attention KV cache group
+  runs no passes, but a gRPC prefill worker under `--prefill-engine true`
+  does), `--prefix-cache true` and one main-attention KV cache group
   (`full_attention`, `mla_attention` or `sink_full_attention`): the tier holds
   whole blocks of one group.
 - **repeatable output** — `--output-seed prompt` derives synthetic output from
@@ -223,8 +261,17 @@ experiments against it transfer to engines:
   decode blocks too. Request IDs still identify cancellation and records.
   The default `request-id` mode preserves existing stress workloads. This option
   applies to the realistic engine; canned and scripted responses are unchanged.
-  Synthetic output remains in the existing token range 100–30099; a benchmark
-  must separately verify those IDs against its pinned tokenizer and special IDs.
+  Synthetic output remains in the existing token range 100–30099. Where
+  `--tokenizer` names local tokenizer files, an ID of that range gives way to
+  another when the tokenizer does not decode it to text on its own (an ID
+  outside its vocabulary, a special token, a part of a character) or it is an
+  end-of-sequence ID; the other IDs stay as drawn. A tokenizer that decodes
+  no ID of the range leaves the output as drawn, as does a worker with no
+  local tokenizer: a benchmark must then separately verify those IDs against
+  its pinned tokenizer and special IDs. The worker logs a warning when local
+  tokenizer files give no such table (they do not load, or decode no ID of
+  the range); a `--tokenizer` that is no local path stays quiet. An HTTP
+  worker sends text and no IDs, so it loads no tokenizer for this.
 
 | Flag | Default | Meaning |
 |------|---------|---------|
@@ -239,19 +286,22 @@ experiments against it transfer to engines:
 | `--max-batched-tokens` | 8192 | token budget per pass |
 | `--max-running` | 256 | sequences per pass |
 | `--kv-tokens` / `--kv-blocks` | 524288 tokens | KV pool capacity |
-| `--worker-kv-tokens` | none | `worker=tokens,...`: the named workers' pool capacity instead, at most the fleet's or a calibration's pool, whichever is larger (any size under `--timing linear`, whose decode reads no utilisation; workers named `grpc:<port>`, `http:<port>` or `zmq:<index>`; a data-parallel worker is named once and every rank takes the override). The pool's size is room, not speed: the worker's decode keeps the fleet's pool as its utilisation reference (a calibration's reference when one gave it), so it steps as fast as its peers on the same context. Generating workers only: a prefill or encode worker answers without running its engine |
+| `--worker-kv-tokens` | none | `worker=tokens,...`: the named workers' pool capacity instead, at most the fleet's or a calibration's pool, whichever is larger (any size under `--timing linear`, whose decode reads no utilisation; workers named `grpc:<port>`, `http:<port>` or `zmq:<index>`; a data-parallel worker is named once and every rank takes the override). The pool's size is room, not speed: the worker's decode keeps the fleet's pool as its utilisation reference (a calibration's reference when one gave it), so it steps as fast as its peers on the same context. Generating workers only: a prefill or encode worker answers without running its engine, but a gRPC prefill worker under `--prefill-engine true` takes it |
 | `--worker-pass-time-scale` | none | `worker=factor,...`: every pass of the named workers takes `factor` times the timing model's duration (0.001 to 1000; above 1 a slower engine, below 1 a faster one); the rates the worker reports follow, as a servicer measures them. Named and limited as `--worker-kv-tokens` |
 | `--global-l3-blocks` | 0 (off) | capacity of the process-wide shared KV tier, in blocks (above) |
 | `--global-l3-ms-per-token` | 0 | pass time per token restored from the shared tier |
 | `--block-size` | 16 | cache block/page size (tokens); must match the worker's `kv_block_size` |
 | `--prefix-cache` | true | prefix caching + KV events |
+| `--grpc-kv-events` | true | serve the gRPC subscription to KV-cache events; `false` refuses it as an engine without the call does, so a gateway hears no KV event from the process over gRPC, while the engines keep their prefix cache and the load records stay served (the ZMQ publishers are not touched) |
 | `--prefill-first` | false | SGLang-style prefill-only passes |
 | `--reserve-full-isl` | true | admit a waiting prompt only when the free and evictable blocks could hold all of it beyond its cached blocks, stopping at the first that does not fit (vLLM's `scheduler_reserve_full_isl`: a gate, only the pass's chunk is allocated at admission); `false` skips the gate |
 | `--context-length` | 32768 | advertised context length |
 | `--output-prefix-ids` | none | the token ids every output starts with, before the synthetic ids: a stream shaped for a gateway that parses the engine's tokens (a channel header, say); the canned gRPC and ZMQ workers and the realistic engine shape their output with it (the canned HTTP worker does not read it) |
 | `--loads-like` | mock | `vllm`: report only what the vLLM servicer reports (running, waiting, `token_usage`, maxima), so the gateway's expected-wait routes as it does on a vLLM fleet |
+| `--supports-vision` | unset | what the gRPC workers' model info says of vision input from their start: the `supports_vision` entry of the info the admin API patches (`/admin/info/{port}`), seeded; unset, an encode worker on the vLLM wire says `true` and every other worker `false` |
 | `--admin-port` | off | process-wide admin API (below) |
 | `--drain-timeout-secs` | 5 | on SIGTERM or SIGINT: stop accepting, let the requests in flight finish for this long, then exit 0 either way |
+| `--prefill-engine` | false | a gRPC worker in the prefill role runs each prompt on its engine as a request of no output, so the engine's prefix cache, its request records, its KV events and its load record see the prompt, and the prompt side's completion carries the engine's cached count once the prompt is prefilled; such a worker runs its engine's passes, so it takes `--worker-kv-tokens`, `--worker-pass-time-scale` and `--global-l3-blocks` as a generating worker does; `false` answers without the engine (below) |
 | `--kv-events-zmq-base-port` | off | ZMQ KV-event publishers on vLLM's or SGLang's wire (below) |
 | `--kv-cache-groups` | `full_attention` | the KV cache groups a realistic engine publishes, `kind[:window],...`, one to eight of `full_attention`, `mla_attention`, `sink_full_attention`, `sliding_window:<tokens>`, `sliding_window_mla:<tokens>` and `mamba` (at most one of them one of the three main-attention kinds, at any index, and a model without one starts with a window kind; a window kind with its window, the others without): every group's events carry its index, kind and window, a window group stores only the window tail ending at the prompt's aligned replay boundary and a Mamba group the one state block there (vLLM 0.31.0's default retention), a sparse store's `token_ids` on the vLLM wire spanning the whole step as the engine writes it, and an eviction is published once per group, every group's in one batch from the mock's one pool where the engine's per-group pools may stagger them; one group only on the SGLang wire. The gRPC stream carries every group's events unfiltered (a servicer's relay forwards every group, a sparse group's store as its hashes; the gateway indexes the main group and keeps the other groups' blocks in a per-worker view that bounds its overlap the way the engine does), and the mock's own prefix hit and `cached_tokens` are the engine's fixed point over its groups (a window group's tail ending at the hit or its leading run, a Mamba group's rightmost state block, iterated until nothing moves) |
 
@@ -409,7 +459,7 @@ path has no engine to hook.
 
 | Endpoint | Answer |
 |----------|--------|
-| `POST /admin/truth/{worker}` with `{"token_ids": [...]}` | what the worker would serve from cache for that prompt right now: `cached_tokens`, `cached_blocks`, `restored_tokens`, `block_size` (the engine's own prefix match and, with the shared KV tier on, the run the tier holds after it, as `restored_tokens`; last-block rule included) |
+| `POST /admin/truth/{worker}` with `{"token_ids": [...]}` | what the worker would serve from cache for that prompt right now: `cached_tokens`, `cached_blocks`, `restored_tokens`, `block_size` (the engine's own prefix match and, with the shared KV tier on, the run the tier holds after it, as `restored_tokens`; last-block rule included); the ids are read as sent, with no media item beside them, so of a prompt with media it reads only the blocks in front of the first item, and nothing of a prompt its hashes salt |
 | `GET /admin/truth` | per worker, over every admitted request: `requests`, `prompt_tokens`, `cached_tokens`, `oracle_tokens`, `restored_tokens` (the shared tier's share of `cached_tokens`), so a gateway's hit-rate claim can be checked against what the engines actually served; `injected_failures` and `cut_streams` count what the `fail` hook refused before admission and cut after output |
 | `GET /admin/zmq/{worker}` | a ZMQ rank's output counts since it connected: `batch_messages`, the messages that carried request outputs, and `outputs`, the outputs in them (one per message without a step period, several with one; a utility reply is neither); cumulative, `POST /admin/reset` does not clear them; a rank name, not `all` |
 
@@ -456,6 +506,19 @@ rendezvous, so there is none to read. The encode role stays the gRPC wire's.
   accepts and closes each connection (the gateway probes the port once the
   worker is registered) and advertises it as
   `disaggregation_bootstrap_port`.
+  With `--prefill-engine true` a realistic gRPC prefill worker first runs
+  the prompt on its engine as a request of no output, as a regular worker
+  prefills it: the prefix cache holds the prompt, `/admin/requests` records
+  it with its cached and oracle tokens, the KV events name its blocks and
+  the load record counts it as pending prefill until its answer stream is
+  read to the engine's end or dropped, as a regular worker's request. The
+  answer is the same completion, sent once the engine has prefilled the
+  prompt (the engine's prefill time in place of `--gen-ms`), with the
+  engine's `cached_tokens`. An armed `finish=error` ends it with `error`
+  whatever the engine's end; with none armed, a prompt the engine aborts
+  ends with `abort`. The flag needs `--engine realistic` and gRPC workers
+  with no ZMQ rank: an HTTP worker and a ZMQ rank in the prefill role
+  answer without the engine.
 - A **decode** worker generates as a regular worker (canned, realistic or
   scripted: the answers a test states go to the decode side) and advertises
   `disaggregation_mode: decode`.
@@ -497,7 +560,9 @@ as its status at once, and `finish=error` ends the prompt side with `error`
 whatever the status (a 500 on `/v1/messages`, which has no `error` stop
 reason); both count under `cut_total`, as on any worker. The
 engine itself never runs the prompt: nothing is admitted and no record is
-left.
+left. A gRPC worker under `--prefill-engine true` is the exception: after
+these hooks its engine admits and records the prompt and prefills it in
+its passes, so `pause` holds the prompt side's completion until `resume`.
 
 ## Long prompts
 

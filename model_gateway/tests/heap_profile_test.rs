@@ -31,16 +31,30 @@ fn a_dump_writes_a_heap_profile_once_profiling_is_on() {
             matches!(parent, HeapProfile::Inactive | HeapProfile::Dumped { .. }),
             "profiling off in the parent: {parent:?}"
         );
-        let status = Command::new(std::env::current_exe().expect("the test binary"))
-            .args([TEST, "--exact", "--nocapture"])
+        // The child's output is captured: its lines stay out of this run's
+        // own, and a failure shows them.
+        let output = Command::new(std::env::current_exe().expect("the test binary"))
+            .args([TEST, "--exact"])
             .env(CHILD, "1")
             .env(
                 "_RJEM_MALLOC_CONF",
                 "prof:true,prof_active:true,lg_prof_sample:0",
             )
-            .status()
+            .output()
             .expect("re-run the test with profiling on");
-        assert!(status.success(), "the profiling child failed: {status}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "the profiling child failed: {}\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // A name that matches no test also exits with success: the child
+        // must have run this one case.
+        assert!(
+            stdout.contains("test result: ok. 1 passed;"),
+            "the profiling child ran no test:\n{stdout}"
+        );
         return;
     }
 

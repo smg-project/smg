@@ -289,37 +289,32 @@ fn bound_profile(
     scorer_fallback: Option<Box<dyn smg_grand_central::engine::Scorer>>,
     picker_fallback: Option<Box<dyn smg_grand_central::engine::Picker>>,
 ) -> Profile {
-    Profile {
-        name: "plugin".into(),
-        filters: vec![Box::new(WasmFilter::new(
-            Arc::clone(&bound),
-            filter_fallback,
-        ))],
-        scorers: vec![WeightedScorer {
-            scorer: Box::new(WasmScorer::new(Arc::clone(&bound), scorer_fallback)),
-            weight: 1.0,
-        }],
-        picker: Box::new(WasmPicker::new(bound, picker_fallback)),
-    }
+    let filters: Vec<Box<dyn smg_grand_central::engine::Filter>> = vec![Box::new(WasmFilter::new(
+        Arc::clone(&bound),
+        filter_fallback,
+    ))];
+    let scorers = vec![WeightedScorer::of(
+        Box::new(WasmScorer::new(Arc::clone(&bound), scorer_fallback)),
+        1.0,
+    )];
+    let mut profile = Profile::of(
+        "plugin".into(),
+        Box::new(WasmPicker::new(bound, picker_fallback)),
+    );
+    profile.filters = filters;
+    profile.scorers = scorers;
+    profile
 }
 
 fn single_engine(profile: Profile) -> Engine {
-    Engine::new(
-        vec![profile],
-        vec![Binding {
-            model: "*".into(),
-            phases: vec![],
-            plan: Plan::Single,
-            profile: 0,
-            decode_profile: None,
-            shadow: None,
-            decode_shadow: None,
-            sessions: None,
-            overload: None,
-        }],
-        1,
-        Needs::default(),
-    )
+    let mut binding = Binding::of("*".into(), 0);
+    binding.phases = vec![];
+    binding.plan = Plan::Single;
+    binding.decode_profile = None;
+    binding.shadow = None;
+    binding.decode_shadow = None;
+    binding.sessions = None;
+    Engine::new(vec![profile], vec![binding], 1, Needs::default())
 }
 
 fn plugin_engine(plugin: &Arc<Plugin>) -> Engine {
@@ -490,7 +485,7 @@ fn a_component_with_an_async_export_is_refused_at_its_compile() {
 fn the_abi_pin_the_memory_floor_the_init_failure_and_bad_bytes_are_refused() {
     let runtime = runtime();
     let mut pinned = spec("pinned", guest::record_guest(), mode::LEAST_IN_FLIGHT);
-    pinned.abi = Some(Abi { major: 1, minor: 3 });
+    pinned.abi = Some(Abi::of(1, 3));
     let err = Plugin::load(&runtime, pinned).expect_err("refused");
     assert!(
         matches!(
@@ -622,15 +617,13 @@ fn band_engine(
     plugin: &Arc<Plugin>,
     fallback: Option<Box<dyn smg_grand_central::engine::Scorer>>,
 ) -> Engine {
-    single_engine(Profile {
-        name: "band".into(),
-        filters: vec![],
-        scorers: vec![WeightedScorer {
-            scorer: Box::new(WasmScorer::new(plugin.bind(), fallback)),
-            weight: 1.0,
-        }],
-        picker: Box::new(Best),
-    })
+    let mut profile = Profile::of("band".into(), Box::new(Best));
+    profile.filters = vec![];
+    profile.scorers = vec![WeightedScorer::of(
+        Box::new(WasmScorer::new(plugin.bind(), fallback)),
+        1.0,
+    )];
+    single_engine(profile)
 }
 
 fn lead(decision: &Decision) -> Option<WorkerId> {
@@ -825,15 +818,13 @@ fn a_plugin_scorer_under_a_two_draw_picker_scores_the_two_drawn() {
         ("packed", guest::packed_guest()),
     ] {
         let plugin = load(&runtime, name, component, mode::LEAST_IN_FLIGHT);
-        let engine = single_engine(Profile {
-            name: "two-draw".into(),
-            filters: vec![],
-            scorers: vec![WeightedScorer {
-                scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
-                weight: 1.0,
-            }],
-            picker: Box::new(PowerOfTwo),
-        });
+        let mut profile = Profile::of("two-draw".into(), Box::new(PowerOfTwo));
+        profile.filters = vec![];
+        profile.scorers = vec![WeightedScorer::of(
+            Box::new(WasmScorer::new(plugin.bind(), None)),
+            1.0,
+        )];
+        let engine = single_engine(profile);
         // The in-flight counts descend, so of two rows the later scores
         // higher: one less a hundredth a request in flight.
         let candidates = pool(8);
@@ -1200,11 +1191,10 @@ fn a_declined_score_has_no_veto_under_either_failure_mode() {
 fn the_breaker_opens_on_the_failure_threshold_and_bypasses_the_guest() {
     let runtime = runtime();
     let mut spec = spec("breaking", guest::record_guest(), mode::TRAP_IN_FILTER);
-    spec.breaker = BreakerSpec {
-        failures: 2,
-        window_micros: 60_000_000,
-        cooldown_micros: 60_000_000,
-    };
+    spec.breaker = BreakerSpec::default();
+    spec.breaker.failures = 2;
+    spec.breaker.window_micros = 60_000_000;
+    spec.breaker.cooldown_micros = 60_000_000;
     let plugin = loaded(&runtime, spec);
     let engine = plugin_engine(&plugin);
     let candidates = pool(4);
@@ -1363,11 +1353,10 @@ fn an_opening_under_the_failure_rule_writes_one_line() {
     said();
     let runtime = runtime();
     let mut spec = spec("trapper", guest::record_guest(), mode::TRAP_IN_FILTER);
-    spec.breaker = BreakerSpec {
-        failures: 2,
-        window_micros: 60_000_000,
-        cooldown_micros: 60_000_000,
-    };
+    spec.breaker = BreakerSpec::default();
+    spec.breaker.failures = 2;
+    spec.breaker.window_micros = 60_000_000;
+    spec.breaker.cooldown_micros = 60_000_000;
     let plugin = loaded(&runtime, spec);
     let engine = plugin_engine(&plugin);
     let candidates = pool(4);
@@ -1638,22 +1627,14 @@ fn one_profile_on_both_pair_sides_opens_a_resource_per_side() {
 }
 
 fn pair_engine(profiles: Vec<Profile>, decode_profile: u16) -> Engine {
-    Engine::new(
-        profiles,
-        vec![Binding {
-            model: "*".into(),
-            phases: vec![],
-            plan: Plan::PdPair,
-            profile: 0,
-            decode_profile: Some(decode_profile),
-            shadow: None,
-            decode_shadow: None,
-            sessions: None,
-            overload: None,
-        }],
-        1,
-        Needs::default(),
-    )
+    let mut binding = Binding::of("*".into(), 0);
+    binding.phases = vec![];
+    binding.plan = Plan::PdPair;
+    binding.decode_profile = Some(decode_profile);
+    binding.shadow = None;
+    binding.decode_shadow = None;
+    binding.sessions = None;
+    Engine::new(profiles, vec![binding], 1, Needs::default())
 }
 
 /// Three prefills (100..102) and four decodes (200..203) of one pair class,
@@ -1677,14 +1658,13 @@ fn pair_decide_under(engine: &Engine, budget_micros: u32) -> Decision {
     pool_facts.generation = 1;
     let mut request_facts = facts(9);
     request_facts.budget_micros = budget_micros;
+    let mut pools = PairPools::default();
+    pools.prefills = &prefills;
+    pools.decodes = &decodes;
     engine.decide_pair(
         &request_facts,
         &pool_facts,
-        PairPools {
-            prefills: &prefills,
-            decodes: &decodes,
-            ..PairPools::default()
-        },
+        pools,
         &Constraints::default(),
         &Constraints::default(),
         &mut Scratch::new(),
@@ -1777,14 +1757,11 @@ fn warm_creates_the_threads_instance_and_a_cold_thread_counts_its_first_decision
 
 #[test]
 fn a_profile_of_built_ins_holds_no_scope_and_a_plugin_profile_does() {
-    let native = Profile {
-        name: "native".into(),
-        filters: vec![Box::new(Healthy)],
-        scorers: vec![WeightedScorer {
-            scorer: Box::new(LeastRequests),
-            weight: 1.0,
-        }],
-        picker: Box::new(Best),
+    let native = {
+        let mut profile = Profile::of("native".into(), Box::new(Best));
+        profile.filters = vec![Box::new(Healthy)];
+        profile.scorers = vec![WeightedScorer::of(Box::new(LeastRequests), 1.0)];
+        profile
     };
     assert!(!native.scoped());
     let runtime = runtime();
@@ -1816,10 +1793,8 @@ fn a_withheld_session_key_is_withheld_from_the_lifecycle_too() {
         facts.model = "m";
         facts.session_key = Identity::hashed(0xBEEF);
         let session = facts.session();
-        let lease = Lease {
-            session,
-            ..Lease::default()
-        };
+        let mut lease = Lease::default();
+        lease.session = session;
         for plugin in [&withheld, &hashed] {
             plugin_engine(plugin).on_dispatched(&lease, &Target::default(), Side::Single, 3);
         }
@@ -2276,14 +2251,13 @@ fn a_pair_shares_one_decision_budget() {
     let mut record = PoolFacts::default();
     record.pool_size = 7;
     record.generation = 1;
+    let mut pools = PairPools::default();
+    pools.prefills = &prefills;
+    pools.decodes = &decodes;
     let decision = pair.decide_pair(
         &facts_of(budget_micros),
         &record,
-        PairPools {
-            prefills: &prefills,
-            decodes: &decodes,
-            ..PairPools::default()
-        },
+        pools,
         &Constraints::default(),
         &Constraints::default(),
         &mut Scratch::new(),
@@ -2341,14 +2315,13 @@ fn a_fault_on_one_side_of_a_two_profile_pair_rebuilds_once_in_a_try(made: u32) -
     let mut pool_facts = PoolFacts::default();
     pool_facts.pool_size = 7;
     pool_facts.generation = 1;
+    let mut pools = PairPools::default();
+    pools.prefills = &prefills;
+    pools.decodes = &decodes;
     let decision = pair.decide_pair(
         &facts(1),
         &pool_facts,
-        PairPools {
-            prefills: &prefills,
-            decodes: &decodes,
-            ..PairPools::default()
-        },
+        pools,
         &Constraints::default(),
         &Constraints::default(),
         &mut Scratch::new(),
@@ -2464,10 +2437,10 @@ fn the_decisions_cpu_is_bounded_by_its_budget_whatever_the_fuel() {
         profile
             .filters
             .push(Box::new(SaysWhenAsked(Arc::clone(&asked))));
-        profile.scorers.push(WeightedScorer {
-            scorer: Box::new(ReadsTheClockWhenAsked(Arc::clone(&scored))),
-            weight: 1.0,
-        });
+        profile.scorers.push(WeightedScorer::of(
+            Box::new(ReadsTheClockWhenAsked(Arc::clone(&scored))),
+            1.0,
+        ));
         let engine = single_engine(profile);
         let cpu_before = bound_clock();
         let started = std::time::Instant::now();
@@ -2706,15 +2679,12 @@ fn an_exhaustion_under_another_plugins_clamp_is_the_decisions_budget_spent_in_a_
         &mut Scratch::new(),
     );
     let burn = (scorer.stats().fuel_used - before) / 3;
-    let profile = Profile {
-        name: "two".into(),
-        filters: vec![],
-        scorers: vec![WeightedScorer {
-            scorer: Box::new(WasmScorer::new(scorer.bind(), None)),
-            weight: 1.0,
-        }],
-        picker: Box::new(WasmPicker::new(picker.bind(), None)),
-    };
+    let mut profile = Profile::of("two".into(), Box::new(WasmPicker::new(picker.bind(), None)));
+    profile.filters = vec![];
+    profile.scorers = vec![WeightedScorer::of(
+        Box::new(WasmScorer::new(scorer.bind(), None)),
+        1.0,
+    )];
     let engine = single_engine(profile);
     let gauged = scorer.stats().answered;
     // A burn and a half, plus a little for the constructors: the scorer's
@@ -2830,14 +2800,13 @@ fn the_first_open_seeds_the_budget_and_later_opens_draw_on_it_in_a_try(made: u32
     let mut pool_facts = PoolFacts::default();
     pool_facts.pool_size = 7;
     pool_facts.generation = 1;
+    let mut pools = PairPools::default();
+    pools.prefills = &prefills;
+    pools.decodes = &decodes;
     let decision = pair.decide_pair(
         &request_facts,
         &pool_facts,
-        PairPools {
-            prefills: &prefills,
-            decodes: &decodes,
-            ..PairPools::default()
-        },
+        pools,
         &Constraints::default(),
         &Constraints::default(),
         &mut Scratch::new(),
@@ -2904,15 +2873,13 @@ fn runtimes_built_over_the_same_open_decisions_draw_one_remainder_and_apart_draw
             &mut Scratch::new(),
         );
         let burn = (scorer.stats().fuel_used - before) / 3;
-        let engine = single_engine(Profile {
-            name: "two".into(),
-            filters: vec![],
-            scorers: vec![WeightedScorer {
-                scorer: Box::new(WasmScorer::new(scorer.bind(), None)),
-                weight: 1.0,
-            }],
-            picker: Box::new(WasmPicker::new(picker.bind(), None)),
-        });
+        let mut profile = Profile::of("two".into(), Box::new(WasmPicker::new(picker.bind(), None)));
+        profile.filters = vec![];
+        profile.scorers = vec![WeightedScorer::of(
+            Box::new(WasmScorer::new(scorer.bind(), None)),
+            1.0,
+        )];
+        let engine = single_engine(profile);
         let gauged = scorer.stats().answered;
         // A burn and a half, plus a little for the constructors: the
         // scorer's burn fits, and the picker's fits only in a remainder the
@@ -3191,15 +3158,10 @@ fn a_scope_is_closed_only_after_its_open_returned() {
     let (panics, panicked) = StoresAtItsOpen::stage(true);
     let (after, never_reached) = StoresAtItsOpen::stage(false);
     let filters: Vec<Box<dyn smg_grand_central::engine::Filter>> = vec![before, panics, after];
-    let engine = single_engine(Profile {
-        name: "host-scopes".into(),
-        filters,
-        scorers: vec![WeightedScorer {
-            scorer: Box::new(LeastRequests),
-            weight: 1.0,
-        }],
-        picker: Box::new(Best),
-    });
+    let mut profile = Profile::of("host-scopes".into(), Box::new(Best));
+    profile.filters = filters;
+    profile.scorers = vec![WeightedScorer::of(Box::new(LeastRequests), 1.0)];
+    let engine = single_engine(profile);
     let candidates = pool(3);
     let mut pool_facts = PoolFacts::default();
     pool_facts.pool_size = 3;
@@ -3284,15 +3246,10 @@ fn a_close_that_panics_inside_an_opens_unwinding_stops_at_the_engine() {
     let (panics, panicked) = StoresAtItsOpen::stage(true);
     let filters: Vec<Box<dyn smg_grand_central::engine::Filter>> =
         vec![close_panics, after_it, panics];
-    let engine = single_engine(Profile {
-        name: "host-scopes".into(),
-        filters,
-        scorers: vec![WeightedScorer {
-            scorer: Box::new(LeastRequests),
-            weight: 1.0,
-        }],
-        picker: Box::new(Best),
-    });
+    let mut profile = Profile::of("host-scopes".into(), Box::new(Best));
+    profile.filters = filters;
+    profile.scorers = vec![WeightedScorer::of(Box::new(LeastRequests), 1.0)];
+    let engine = single_engine(profile);
     let candidates = pool(3);
     let mut pool_facts = PoolFacts::default();
     pool_facts.pool_size = 3;
@@ -3337,15 +3294,10 @@ fn a_close_that_panics_inside_an_opens_unwinding_stops_at_the_engine() {
 
 /// A profile of the host's own stages, in their order.
 fn host_profile(filters: Vec<Box<dyn smg_grand_central::engine::Filter>>) -> Profile {
-    Profile {
-        name: "host-scopes".into(),
-        filters,
-        scorers: vec![WeightedScorer {
-            scorer: Box::new(LeastRequests),
-            weight: 1.0,
-        }],
-        picker: Box::new(Best),
-    }
+    let mut profile = Profile::of("host-scopes".into(), Box::new(Best));
+    profile.filters = filters;
+    profile.scorers = vec![WeightedScorer::of(Box::new(LeastRequests), 1.0)];
+    profile
 }
 
 /// A scope whose close panics, once, with its counts.
@@ -4008,20 +3960,19 @@ fn a_plugins_close_that_stops_half_way_leaves_its_scope_closed() {
         filler.budget_micros = SLOW_FRAME_MICROS;
         // Every decision's destructor runs out: the failure rule is set out
         // of reach, so the breaker stays shut through the later decisions.
-        filler.breaker = BreakerSpec {
-            failures: u32::MAX,
-            ..BreakerSpec::default()
-        };
+        filler.breaker = BreakerSpec::default();
+        filler.breaker.failures = u32::MAX;
         let plugin = loaded(&runtime, filler);
-        let engine = single_engine(Profile {
-            name: "one-stage".into(),
-            filters: vec![],
-            scorers: vec![WeightedScorer {
-                scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
-                weight: 1.0,
-            }],
-            picker: Box::new(TellsThePick(Arc::clone(&shared))),
-        });
+        let mut profile = Profile::of(
+            "one-stage".into(),
+            Box::new(TellsThePick(Arc::clone(&shared))),
+        );
+        profile.filters = vec![];
+        profile.scorers = vec![WeightedScorer::of(
+            Box::new(WasmScorer::new(plugin.bind(), None)),
+            1.0,
+        )];
+        let engine = single_engine(profile);
         let candidates = pool(3);
         shared.armed.store(true, Ordering::Relaxed);
         let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -4101,15 +4052,13 @@ impl LeftLent {
     fn of(runtime: &Arc<Runtime>, row: PluginSpec) -> Self {
         let name = row.name.clone();
         let plugin = loaded(runtime, row);
-        let engine = single_engine(Profile {
-            name: "one-stage".into(),
-            filters: vec![],
-            scorers: vec![WeightedScorer {
-                scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
-                weight: 1.0,
-            }],
-            picker: Box::new(Best),
-        });
+        let mut profile = Profile::of("one-stage".into(), Box::new(Best));
+        profile.filters = vec![];
+        profile.scorers = vec![WeightedScorer::of(
+            Box::new(WasmScorer::new(plugin.bind(), None)),
+            1.0,
+        )];
+        let engine = single_engine(profile);
         let left = Self {
             plugin,
             engine,
@@ -4301,11 +4250,10 @@ fn a_hold_is_checked_by_the_open_that_reaches_the_bring_behind_an_open_breaker()
         );
         let mode = mode::TRAP_ON_FIVE_AND_LOG_IN_DESTRUCTOR;
         let mut row = spec("corner", guest::record_guest(), mode);
-        row.breaker = BreakerSpec {
-            failures: 1,
-            window_micros: 60_000_000,
-            cooldown_micros: COOL_DOWN,
-        };
+        row.breaker = BreakerSpec::default();
+        row.breaker.failures = 1;
+        row.breaker.window_micros = 60_000_000;
+        row.breaker.cooldown_micros = COOL_DOWN;
         let left = LeftLent::of(&runtime, row);
         let anew = left.heard_as_decider_1();
         let five: Vec<WorkerId> = (100..105).map(WorkerId).collect();
@@ -4569,11 +4517,10 @@ fn a_destructor_the_host_held_past_its_bound_is_not_ended() {
     const ENDED: [u64; 5] = [1, 0, 1, 1, 0];
     let runtime = runtime();
     let mut held = spec("held-dtor", guest::record_guest(), mode::LOG_IN_DESTRUCTOR);
-    held.breaker = BreakerSpec {
-        failures: 1,
-        window_micros: 60_000_000,
-        cooldown_micros: 60_000_000,
-    };
+    held.breaker = BreakerSpec::default();
+    held.breaker.failures = 1;
+    held.breaker.window_micros = 60_000_000;
+    held.breaker.cooldown_micros = 60_000_000;
     let plugin = loaded(&runtime, held);
     let engine = plugin_engine(&plugin);
     let candidates = pool(4);
@@ -4738,11 +4685,10 @@ fn a_stage_the_host_held_past_its_frame_fails_nothing_and_opens_nothing() {
 fn a_score_the_host_held_that_then_traps_is_the_plugins_failure_and_no_stall() {
     let runtime = runtime();
     let mut held = spec("held-trap", guest::record_guest(), mode::LOG_IN_SCORE);
-    held.breaker = BreakerSpec {
-        failures: 2,
-        window_micros: 60_000_000,
-        cooldown_micros: 60_000_000,
-    };
+    held.breaker = BreakerSpec::default();
+    held.breaker.failures = 2;
+    held.breaker.window_micros = 60_000_000;
+    held.breaker.cooldown_micros = 60_000_000;
     let plugin = loaded(&runtime, held);
     let engine = plugin_engine(&plugin);
     // On three candidates the guest's score traps after its log line.
@@ -4819,11 +4765,10 @@ fn burn_after_a_hold(
     let mut slow = spec(name, guest::record_guest(), mode::LOG_THEN_BURN);
     slow.fuel_per_micro = SLOW_CALIBRATION;
     slow.budget_micros = frame_micros;
-    slow.breaker = BreakerSpec {
-        failures: 1,
-        window_micros: 60_000_000,
-        cooldown_micros: 60_000_000,
-    };
+    slow.breaker = BreakerSpec::default();
+    slow.breaker.failures = 1;
+    slow.breaker.window_micros = 60_000_000;
+    slow.breaker.cooldown_micros = 60_000_000;
     let plugin = loaded(&runtime, slow);
     let engine = plugin_engine(&plugin);
     let candidates = pool(4);
@@ -5383,16 +5328,13 @@ fn a_scorer_held_short_of_late_through_half_a_window_before_a_spinner_stays_shut
         guest::record_guest(),
         mode::SPIN_IN_SCORE,
     );
-    let scorer = |plugin: &Arc<Plugin>| WeightedScorer {
-        scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
-        weight: 1.0,
+    let scorer = |plugin: &Arc<Plugin>| {
+        WeightedScorer::of(Box::new(WasmScorer::new(plugin.bind(), None)), 1.0)
     };
-    let engine = single_engine(Profile {
-        name: "held-first".into(),
-        filters: vec![],
-        scorers: vec![scorer(&held), scorer(&spinner)],
-        picker: Box::new(Best),
-    });
+    let mut profile = Profile::of("held-first".into(), Box::new(Best));
+    profile.filters = vec![];
+    profile.scorers = vec![scorer(&held), scorer(&spinner)];
+    let engine = single_engine(profile);
     let candidates = pool(4);
     let frame = std::time::Duration::from_micros(u64::from(FRAME_MICROS));
     let short = frame * 7 / 10;
@@ -5549,11 +5491,10 @@ fn a_guest_slow_in_what_fuel_does_not_price_is_opened_by_its_samples_at_the_firs
     );
     slow.fuel_per_micro = 20_000_000;
     slow.budget_micros = BUDGET_MICROS;
-    slow.breaker = BreakerSpec {
-        failures: 1_000,
-        window_micros: 60_000_000,
-        cooldown_micros: 60_000_000,
-    };
+    slow.breaker = BreakerSpec::default();
+    slow.breaker.failures = 1_000;
+    slow.breaker.window_micros = 60_000_000;
+    slow.breaker.cooldown_micros = 60_000_000;
     let plugin = loaded(&runtime, slow);
     let engine = plugin_engine(&plugin);
     let hold = std::time::Duration::from_micros(u64::from(BUDGET_MICROS) / 2);
@@ -5730,15 +5671,13 @@ fn a_guest_bound_as_one_stage_is_read_against_its_two_frames() {
     near.fuel_per_micro = SLOW_CALIBRATION;
     near.budget_micros = burn_micros * 10 / 9;
     let plugin = loaded(&runtime, near);
-    let engine = single_engine(Profile {
-        name: "one-stage".into(),
-        filters: vec![],
-        scorers: vec![WeightedScorer {
-            scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
-            weight: 1.0,
-        }],
-        picker: Box::new(Best),
-    });
+    let mut profile = Profile::of("one-stage".into(), Box::new(Best));
+    profile.filters = vec![];
+    profile.scorers = vec![WeightedScorer::of(
+        Box::new(WasmScorer::new(plugin.bind(), None)),
+        1.0,
+    )];
+    let engine = single_engine(profile);
     for seed in 1..=64 {
         let mut request_facts = facts(seed);
         request_facts.budget_micros = u32::MAX;
@@ -5799,9 +5738,8 @@ fn a_held_call_its_bound_ended_under_the_remainder_is_still_an_unread_sample() {
     held.fuel_per_micro = 20_000_000;
     held.budget_micros = LEFT_MICROS * 4;
     let held = loaded(&runtime, held);
-    let scorer = |plugin: &Arc<Plugin>| WeightedScorer {
-        scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
-        weight: 1.0,
+    let scorer = |plugin: &Arc<Plugin>| {
+        WeightedScorer::of(Box::new(WasmScorer::new(plugin.bind(), None)), 1.0)
     };
     let decide_with_budget = |engine: &Engine, budget_micros: u32, seed: u64| {
         let mut request_facts = facts(seed);
@@ -5820,23 +5758,19 @@ fn a_held_call_its_bound_ended_under_the_remainder_is_still_an_unread_sample() {
     };
     // What a decision costs the front plugin, read off one of its own under
     // its frame: a charge at the slow calibration is its fuel.
-    let alone = single_engine(Profile {
-        name: "front-alone".into(),
-        filters: vec![],
-        scorers: vec![scorer(&front)],
-        picker: Box::new(Best),
-    });
+    let mut profile = Profile::of("front-alone".into(), Box::new(Best));
+    profile.filters = vec![];
+    profile.scorers = vec![scorer(&front)];
+    let alone = single_engine(profile);
     let before = front.stats().fuel_used;
     decide_with_budget(&alone, SLOW_FRAME_MICROS, 0);
     let front_micros =
         u32::try_from((front.stats().fuel_used - before).div_ceil(SLOW_CALIBRATION)).expect("fits");
     let budget_micros = front_micros + LEFT_MICROS;
-    let engine = single_engine(Profile {
-        name: "front-then-held".into(),
-        filters: vec![],
-        scorers: vec![scorer(&front), scorer(&held)],
-        picker: Box::new(Best),
-    });
+    let mut profile = Profile::of("front-then-held".into(), Box::new(Best));
+    profile.filters = vec![];
+    profile.scorers = vec![scorer(&front), scorer(&held)];
+    let engine = single_engine(profile);
     hold(
         name,
         std::time::Duration::from_micros(u64::from(budget_micros)),
@@ -5891,15 +5825,13 @@ fn a_held_call_its_own_bound_ended_is_the_plugins_and_never_unread() {
     held.fuel_per_micro = 20_000_000;
     held.budget_micros = OWN_FRAME_MICROS;
     let held = loaded(&runtime, held);
-    let engine = single_engine(Profile {
-        name: "held-alone".into(),
-        filters: vec![],
-        scorers: vec![WeightedScorer {
-            scorer: Box::new(WasmScorer::new(held.bind(), None)),
-            weight: 1.0,
-        }],
-        picker: Box::new(Best),
-    });
+    let mut profile = Profile::of("held-alone".into(), Box::new(Best));
+    profile.filters = vec![];
+    profile.scorers = vec![WeightedScorer::of(
+        Box::new(WasmScorer::new(held.bind(), None)),
+        1.0,
+    )];
+    let engine = single_engine(profile);
     hold(
         name,
         std::time::Duration::from_micros(u64::from(OWN_FRAME_MICROS) * 2),
@@ -5950,15 +5882,13 @@ fn a_guest_another_plugins_draw_left_little_is_read_against_its_own_frames() {
         guest::record_guest(),
         mode::BURN_IN_CONSTRUCTOR,
     );
-    let engine = single_engine(Profile {
-        name: "two".into(),
-        filters: vec![],
-        scorers: vec![WeightedScorer {
-            scorer: Box::new(WasmScorer::new(scorer.bind(), None)),
-            weight: 1.0,
-        }],
-        picker: Box::new(WasmPicker::new(picker.bind(), None)),
-    });
+    let mut profile = Profile::of("two".into(), Box::new(WasmPicker::new(picker.bind(), None)));
+    profile.filters = vec![];
+    profile.scorers = vec![WeightedScorer::of(
+        Box::new(WasmScorer::new(scorer.bind(), None)),
+        1.0,
+    )];
+    let engine = single_engine(profile);
     let decide_under = |budget_micros: u32, seed: u64| {
         let mut request_facts = facts(seed);
         request_facts.budget_micros = budget_micros;
@@ -6541,21 +6471,18 @@ fn a_spinner_behind_an_honest_scorer_opens_its_breaker_at_the_window_in_either_o
             guest::record_guest(),
             mode::SPIN_IN_SCORE,
         );
-        let scorer = |plugin: &Arc<Plugin>| WeightedScorer {
-            scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
-            weight: 1.0,
+        let scorer = |plugin: &Arc<Plugin>| {
+            WeightedScorer::of(Box::new(WasmScorer::new(plugin.bind(), None)), 1.0)
         };
         let scorers = if spinner_first {
             vec![scorer(&spinner), scorer(&honest)]
         } else {
             vec![scorer(&honest), scorer(&spinner)]
         };
-        let engine = single_engine(Profile {
-            name: "shared".into(),
-            filters: vec![],
-            scorers,
-            picker: Box::new(Best),
-        });
+        let mut profile = Profile::of("shared".into(), Box::new(Best));
+        profile.filters = vec![];
+        profile.scorers = scorers;
+        let engine = single_engine(profile);
         let decide = |seed: u64| {
             engine.decide(
                 &timed(seed),
@@ -6647,21 +6574,18 @@ fn three_honest_quarters_and_a_spinner_charge_nobody_in_a_try(made: u32) -> bool
         &mut Scratch::new(),
     );
     let burn = (burners[0].stats().fuel_used - before) / 3;
-    let scorer = |plugin: &Arc<Plugin>| WeightedScorer {
-        scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
-        weight: 1.0,
+    let scorer = |plugin: &Arc<Plugin>| {
+        WeightedScorer::of(Box::new(WasmScorer::new(plugin.bind(), None)), 1.0)
     };
-    let engine = single_engine(Profile {
-        name: "quarters".into(),
-        filters: vec![],
-        scorers: vec![
-            scorer(&burners[0]),
-            scorer(&burners[1]),
-            scorer(&burners[2]),
-            scorer(&spinner),
-        ],
-        picker: Box::new(Best),
-    });
+    let mut profile = Profile::of("quarters".into(), Box::new(Best));
+    profile.filters = vec![];
+    profile.scorers = vec![
+        scorer(&burners[0]),
+        scorer(&burners[1]),
+        scorer(&burners[2]),
+        scorer(&spinner),
+    ];
+    let engine = single_engine(profile);
     // Four burns and a half, plus a little for the constructors.
     let budget_micros = u32::try_from((burn * 9 / 2).div_ceil(fuel_per_micro) + 40).expect("fits");
     let mut worst = std::time::Duration::ZERO;
@@ -6751,21 +6675,19 @@ fn an_init_the_remainder_clamps_is_the_decisions_budget_spent_and_the_close_rebu
         mode::LEAST_IN_FLIGHT,
     );
     let bound = heavy.bind();
-    let engine = single_engine(Profile {
-        name: "clamped-init".into(),
-        filters: vec![Box::new(WasmFilter::new(bound.clone(), None))],
-        scorers: vec![
-            WeightedScorer {
-                scorer: Box::new(WasmScorer::new(bound.clone(), None)),
-                weight: 1.0,
-            },
-            WeightedScorer {
-                scorer: Box::new(WasmScorer::new(neighbour.bind(), None)),
-                weight: 1.0,
-            },
-        ],
-        picker: Box::new(WasmPicker::new(bound, None)),
-    });
+    let filters: Vec<Box<dyn smg_grand_central::engine::Filter>> =
+        vec![Box::new(WasmFilter::new(bound.clone(), None))];
+    let scorers = vec![
+        WeightedScorer::of(Box::new(WasmScorer::new(bound.clone(), None)), 1.0),
+        WeightedScorer::of(Box::new(WasmScorer::new(neighbour.bind(), None)), 1.0),
+    ];
+    let mut profile = Profile::of(
+        "clamped-init".into(),
+        Box::new(WasmPicker::new(bound, None)),
+    );
+    profile.filters = filters;
+    profile.scorers = scorers;
+    let engine = single_engine(profile);
     for seed in 1..=5 {
         heavy.forget_instance();
         let (wall, cpu) = (std::time::Instant::now(), bound_clock());
@@ -6864,21 +6786,16 @@ fn decide_on_a_cold_slot(
     budget_micros: u32,
 ) -> std::time::Duration {
     let bound = cold.bind();
-    let engine = single_engine(Profile {
-        name: "cold-init".into(),
-        filters: vec![Box::new(WasmFilter::new(bound.clone(), None))],
-        scorers: vec![
-            WeightedScorer {
-                scorer: Box::new(WasmScorer::new(bound.clone(), None)),
-                weight: 1.0,
-            },
-            WeightedScorer {
-                scorer: Box::new(WasmScorer::new(neighbour.bind(), None)),
-                weight: 1.0,
-            },
-        ],
-        picker: Box::new(WasmPicker::new(bound, None)),
-    });
+    let filters: Vec<Box<dyn smg_grand_central::engine::Filter>> =
+        vec![Box::new(WasmFilter::new(bound.clone(), None))];
+    let scorers = vec![
+        WeightedScorer::of(Box::new(WasmScorer::new(bound.clone(), None)), 1.0),
+        WeightedScorer::of(Box::new(WasmScorer::new(neighbour.bind(), None)), 1.0),
+    ];
+    let mut profile = Profile::of("cold-init".into(), Box::new(WasmPicker::new(bound, None)));
+    profile.filters = filters;
+    profile.scorers = scorers;
+    let engine = single_engine(profile);
     cold.forget_instance();
     clock.store(steer, Ordering::Relaxed);
     let (wall, cpu) = (std::time::Instant::now(), bound_clock());
@@ -6965,6 +6882,41 @@ fn a_lazy_init_long_on_the_clock_is_the_decisions_budget_spent() {
     );
 }
 
+/// A cold slot opened under a budget an earlier open spent makes no
+/// instance. The plugin in front is the one of the case above, whose `init`
+/// outlasts the 10 ms decision. The neighbour's slot is cold at its open:
+/// the open is the decision's budget spent, no `init` runs under nothing,
+/// and the close has no slot of the decision's to rebuild. Nothing counts
+/// on the breaker, and the slot stays as cold as the open found it.
+#[test]
+fn a_cold_slot_opened_under_a_spent_budget_makes_no_instance() {
+    let (clock, runtime, cold) = plugin_whose_init_asks(20, |_| {});
+    let neighbour = load(
+        &runtime,
+        "after-the-init",
+        guest::record_guest(),
+        mode::LEAST_IN_FLIGHT,
+    );
+    neighbour.forget_instance();
+    let made = neighbour.stats().instantiations;
+    decide_on_a_cold_slot(&clock, 1, &cold, &neighbour, FRAME_MICROS);
+    let n = neighbour.stats();
+    assert_eq!(
+        (n.budget_spent, n.answered, n.breaker_opens),
+        (1, 0, 0),
+        "the open is the decision's budget spent and no failure: {n:?}"
+    );
+    assert_eq!(
+        (n.instantiations - made, n.lazy_instantiations),
+        (0, 0),
+        "no `init` ran under nothing and the close rebuilt nothing: {n:?}"
+    );
+    assert!(
+        !neighbour.is_warm(),
+        "the slot is as cold as its open found it"
+    );
+}
+
 /// The same `init` refusing after its 20 ms: the failure is the breaker's,
 /// and the time it took is the decision's all the same.
 #[test]
@@ -6997,7 +6949,9 @@ fn a_lazy_init_that_fails_long_on_the_clock_is_the_decisions_budget_spent_too() 
 /// wall time is charged its fuel at the calibration, the 100 ms of the init
 /// frame, which is the whole of a 100 ms decision. One failure on the breaker
 /// (the frame it ran out under was its own), and the neighbour's open finds
-/// the remainder gone. An `init` the wall clock ended with its thread off
+/// the remainder gone. The plugin itself counts no budget spent: its `init`
+/// was granted its whole frame, so no clamp ended it, though its charge took
+/// all that was left. An `init` the wall clock ended with its thread off
 /// the CPU burnt no frame: such a decision says so and is made again,
 /// [`TRIES`] at most.
 #[test]
@@ -7033,9 +6987,14 @@ fn a_lazy_init_that_burns_its_frame_out_is_charged_its_fuel_at_the_calibration()
             "the fuel the failed init burnt is in the plugin's count (try {made}, the thread off the CPU {held:?}): {s:?}"
         );
         assert_eq!(
-            (s.lazy_instantiations, s.answered, s.breaker_opens),
-            (0, 0, 0),
-            "the init ran its own frame out: one failure, short of the breaker's five: {s:?}"
+            (
+                s.lazy_instantiations,
+                s.answered,
+                s.breaker_opens,
+                s.budget_spent
+            ),
+            (0, 0, 0, 0),
+            "the init ran its own frame out: one failure, short of the breaker's five, and no budget spent of its own: {s:?}"
         );
         assert!(!cold.is_warm(), "an init that ran out leaves no instance");
         let n = neighbour.stats();
@@ -7177,10 +7136,8 @@ fn a_lazy_init_the_host_holds_on_every_cold_slot_is_one_slow_sample_however_it_e
     const BUDGET_MICROS: u32 = 4_000;
     for steer in [1, 2] {
         let (clock, _runtime, plugin) = plugin_whose_init_asks(3, |row| {
-            row.breaker = BreakerSpec {
-                failures: 100,
-                ..BreakerSpec::default()
-            };
+            row.breaker = BreakerSpec::default();
+            row.breaker.failures = 100;
         });
         let engine = plugin_engine(&plugin);
         let half = std::time::Duration::from_micros(u64::from(BUDGET_MICROS) / 2);
@@ -7512,10 +7469,8 @@ fn an_inits_sample_is_read_over_the_init_frame_alone_behind_a_decision_that_char
     let (clock, _runtime, plugin) = plugin_whose_init_asks(0, |row| {
         row.fuel_per_micro = SLOW_CALIBRATION;
         row.budget_micros = SLOW_FRAME_MICROS;
-        row.breaker = BreakerSpec {
-            failures: 100,
-            ..BreakerSpec::default()
-        };
+        row.breaker = BreakerSpec::default();
+        row.breaker.failures = 100;
     });
     let engine = plugin_engine(&plugin);
     let decide_at = |steer: u8, seed: u64| {
@@ -7893,10 +7848,8 @@ fn a_cold_init_that_traps_short_of_its_clamp_is_its_own_failure() {
         let runtime = runtime_steered_for(&clock, &asks);
         let mut row = spec("traps-once", guest::record_guest(), mode::LEAST_IN_FLIGHT);
         row.config.push(mode::INIT_ASKS_THE_CLOCK);
-        row.breaker = BreakerSpec {
-            failures: 2,
-            ..BreakerSpec::default()
-        };
+        row.breaker = BreakerSpec::default();
+        row.breaker.failures = 2;
         let cold = loaded(&runtime, row);
         let neighbour = load(
             &runtime,
@@ -7962,10 +7915,8 @@ fn a_cold_init_that_traps_short_of_its_clamp_is_its_own_failure() {
 #[test]
 fn a_refused_cold_init_fails_its_decision_once_on_a_pair() {
     let (clock, _runtime, plugin) = plugin_whose_init_asks(0, |row| {
-        row.breaker = BreakerSpec {
-            failures: 2,
-            ..BreakerSpec::default()
-        };
+        row.breaker = BreakerSpec::default();
+        row.breaker.failures = 2;
     });
     let pair = pair_engine(
         vec![
@@ -8000,10 +7951,8 @@ fn a_refused_cold_init_fails_its_decision_once_on_a_pair() {
 fn a_gone_budget_fails_its_decision_once_on_a_pair() {
     let runtime = runtime();
     let mut row = spec("gone", guest::record_guest(), mode::LEAST_IN_FLIGHT);
-    row.breaker = BreakerSpec {
-        failures: 2,
-        ..BreakerSpec::default()
-    };
+    row.breaker = BreakerSpec::default();
+    row.breaker.failures = 2;
     let plugin = loaded(&runtime, row);
     let pair = pair_engine(
         vec![
@@ -8050,10 +7999,8 @@ fn a_rebuild_refused_after_a_counted_trap_is_no_second_failure_in_a_try(made: u3
         mode::TRAP_IN_FILTER,
     );
     row.config.push(mode::INIT_ASKS_THE_CLOCK);
-    row.breaker = BreakerSpec {
-        failures: 2,
-        ..BreakerSpec::default()
-    };
+    row.breaker = BreakerSpec::default();
+    row.breaker.failures = 2;
     let plugin = loaded(&runtime, row);
     let engine = plugin_engine(&plugin);
     let decide = |seed: u64| {
@@ -8326,20 +8273,20 @@ fn an_honest_multi_stage_plugin_clamped_under_its_own_frame_is_not_charged_in_a_
         })
         .collect();
     let bound = three_stage.bind();
-    let engine = single_engine(Profile {
-        name: "clamped".into(),
-        filters: vec![Box::new(WasmFilter::new(bound.clone(), None))],
-        scorers: std::iter::once(WeightedScorer {
-            scorer: Box::new(WasmScorer::new(bound.clone(), None)),
-            weight: 1.0,
-        })
-        .chain(neighbours.iter().map(|neighbour| WeightedScorer {
-            scorer: Box::new(WasmScorer::new(neighbour.bind(), None)),
-            weight: 1.0,
-        }))
-        .collect(),
-        picker: Box::new(WasmPicker::new(bound, None)),
-    });
+    let filters: Vec<Box<dyn smg_grand_central::engine::Filter>> =
+        vec![Box::new(WasmFilter::new(bound.clone(), None))];
+    let scorers = std::iter::once(WeightedScorer::of(
+        Box::new(WasmScorer::new(bound.clone(), None)),
+        1.0,
+    ))
+    .chain(neighbours.iter().map(|neighbour| {
+        WeightedScorer::of(Box::new(WasmScorer::new(neighbour.bind(), None)), 1.0)
+    }))
+    .collect();
+    let mut profile = Profile::of("clamped".into(), Box::new(WasmPicker::new(bound, None)));
+    profile.filters = filters;
+    profile.scorers = scorers;
+    let engine = single_engine(profile);
     // Five burns and a half, plus the constructors: the filter, the score
     // and the neighbours' scores fit with half a burn of slack, the pick meets
     // half a burn under its frame of a burn and two thirds. The plugin's
@@ -8414,16 +8361,13 @@ fn a_fuel_fast_spinner_is_sampled_by_its_charge_not_its_clock() {
     let spinner = loaded(&runtime, slow_calibration);
     // What one `init` of the spinner costs: the load made one instance.
     let init_fuel = spinner.stats().fuel_used;
-    let scorer = |plugin: &Arc<Plugin>| WeightedScorer {
-        scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
-        weight: 1.0,
+    let scorer = |plugin: &Arc<Plugin>| {
+        WeightedScorer::of(Box::new(WasmScorer::new(plugin.bind(), None)), 1.0)
     };
-    let engine = single_engine(Profile {
-        name: "fuel-fast".into(),
-        filters: vec![],
-        scorers: vec![scorer(&honest), scorer(&spinner)],
-        picker: Box::new(Best),
-    });
+    let mut profile = Profile::of("fuel-fast".into(), Box::new(Best));
+    profile.filters = vec![];
+    profile.scorers = vec![scorer(&honest), scorer(&spinner)];
+    let engine = single_engine(profile);
     let (decisions, on_the_cpu) = decide_until_open(&spinner, |seed| {
         engine.decide(
             &timed(seed),
@@ -8511,21 +8455,18 @@ fn a_constructor_spinner_behind_another_constructor_opens_its_breaker_in_either_
             guest::record_guest(),
             mode::SPIN_IN_CONSTRUCTOR,
         );
-        let scorer = |plugin: &Arc<Plugin>| WeightedScorer {
-            scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
-            weight: 1.0,
+        let scorer = |plugin: &Arc<Plugin>| {
+            WeightedScorer::of(Box::new(WasmScorer::new(plugin.bind(), None)), 1.0)
         };
         let scorers = if spinner_first {
             vec![scorer(&spinner), scorer(&honest)]
         } else {
             vec![scorer(&honest), scorer(&spinner)]
         };
-        let engine = single_engine(Profile {
-            name: "ctor".into(),
-            filters: vec![],
-            scorers,
-            picker: Box::new(Best),
-        });
+        let mut profile = Profile::of("ctor".into(), Box::new(Best));
+        profile.filters = vec![];
+        profile.scorers = scorers;
+        let engine = single_engine(profile);
         let decide = |seed: u64| {
             engine.decide(
                 &timed(seed),
@@ -8637,16 +8578,13 @@ fn a_constructor_hog_that_answers_opens_at_the_window() {
     hog.fuel_per_micro = SLOW_CALIBRATION;
     hog.budget_micros = SLOW_FRAME_MICROS;
     let hog = loaded(&runtime, hog);
-    let scorer = |plugin: &Arc<Plugin>| WeightedScorer {
-        scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
-        weight: 1.0,
+    let scorer = |plugin: &Arc<Plugin>| {
+        WeightedScorer::of(Box::new(WasmScorer::new(plugin.bind(), None)), 1.0)
     };
-    let engine = single_engine(Profile {
-        name: "hog".into(),
-        filters: vec![],
-        scorers: vec![scorer(&honest), scorer(&hog)],
-        picker: Box::new(Best),
-    });
+    let mut profile = Profile::of("hog".into(), Box::new(Best));
+    profile.filters = vec![];
+    profile.scorers = vec![scorer(&honest), scorer(&hog)];
+    let engine = single_engine(profile);
     // A burn and a half: the hog's constructor takes two thirds of it and
     // answers, a third of a burn of slack for its stages.
     let budget_micros = burn_micros * 3 / 2;
@@ -8696,25 +8634,19 @@ fn a_third_stage_spinner_behind_its_own_cheap_stages_opens_at_the_window() {
             mode::SPIN_IN_PICK,
         );
         let bound = spinner.bind();
-        let own = WeightedScorer {
-            scorer: Box::new(WasmScorer::new(bound.clone(), None)),
-            weight: 1.0,
-        };
-        let other = WeightedScorer {
-            scorer: Box::new(WasmScorer::new(honest.bind(), None)),
-            weight: 1.0,
-        };
+        let own = WeightedScorer::of(Box::new(WasmScorer::new(bound.clone(), None)), 1.0);
+        let other = WeightedScorer::of(Box::new(WasmScorer::new(honest.bind(), None)), 1.0);
         let scorers = if spinner_first {
             vec![own, other]
         } else {
             vec![other, own]
         };
-        let engine = single_engine(Profile {
-            name: "third-stage".into(),
-            filters: vec![Box::new(WasmFilter::new(bound.clone(), None))],
-            scorers,
-            picker: Box::new(WasmPicker::new(bound, None)),
-        });
+        let filters: Vec<Box<dyn smg_grand_central::engine::Filter>> =
+            vec![Box::new(WasmFilter::new(bound.clone(), None))];
+        let mut profile = Profile::of("third-stage".into(), Box::new(WasmPicker::new(bound, None)));
+        profile.filters = filters;
+        profile.scorers = scorers;
+        let engine = single_engine(profile);
         let (decisions, on_the_cpu) = decide_until_open(&spinner, |seed| {
             engine.decide(
                 &timed(seed),
@@ -8869,24 +8801,16 @@ fn a_plugin_bound_as_a_filter_or_a_picker_alone_counts_in_the_profiles_needs() {
     let mut reading = spec("reader", guest::record_guest(), mode::LEAST_IN_FLIGHT);
     reading.needs.affinity = true;
     let plugin = loaded(&runtime, reading);
-    let scorers = || {
-        vec![WeightedScorer {
-            scorer: Box::new(LeastRequests),
-            weight: 1.0,
-        }]
-    };
-    let as_filter = Profile {
-        name: "filter".into(),
-        filters: vec![Box::new(WasmFilter::new(plugin.bind(), None))],
-        scorers: scorers(),
-        picker: Box::new(Best),
-    };
-    let as_picker = Profile {
-        name: "picker".into(),
-        filters: vec![Box::new(Healthy)],
-        scorers: scorers(),
-        picker: Box::new(WasmPicker::new(plugin.bind(), None)),
-    };
+    let scorers = || vec![WeightedScorer::of(Box::new(LeastRequests), 1.0)];
+    let mut as_filter = Profile::of("filter".into(), Box::new(Best));
+    as_filter.filters = vec![Box::new(WasmFilter::new(plugin.bind(), None))];
+    as_filter.scorers = scorers();
+    let mut as_picker = Profile::of(
+        "picker".into(),
+        Box::new(WasmPicker::new(plugin.bind(), None)),
+    );
+    as_picker.filters = vec![Box::new(Healthy)];
+    as_picker.scorers = scorers();
     assert!(as_filter.needs().affinity, "the plugin as the filter alone");
     assert!(as_picker.needs().affinity, "the plugin as the picker alone");
 }
@@ -9873,11 +9797,10 @@ fn a_pair_that_straddles_the_cool_down_hears_the_feed_at_the_open_that_reaches_i
         guest::record_guest(),
         mode::TRAP_ON_FIVE_MEMBERS,
     );
-    row.breaker = BreakerSpec {
-        failures: 1,
-        window_micros: 60_000_000,
-        cooldown_micros: COOL_DOWN,
-    };
+    row.breaker = BreakerSpec::default();
+    row.breaker.failures = 1;
+    row.breaker.window_micros = 60_000_000;
+    row.breaker.cooldown_micros = COOL_DOWN;
     let plugin = loaded(&runtime, row);
     let plain = Arc::new(plugin_engine(&plugin));
     // The first side's profile: the plugin's open, then the host's scope

@@ -21,7 +21,10 @@ use vllm::{
     vllm_engine_server::{VllmEngine, VllmEngineServer},
 };
 
-use super::{Frame, GenerateInput, LogProbs, MockScheduler, Rendezvous, TokenizerStream};
+use super::{
+    media_identity, Frame, GenerateInput, LogProbs, MediaSpan, MockScheduler, Rendezvous,
+    TokenizerStream,
+};
 use crate::{
     config::{Config, Role},
     drain::InFlight,
@@ -88,6 +91,40 @@ impl VllmEngine for MockScheduler {
                 Box::pin(in_flight.until_done(futures::stream::once(async move { Ok(complete) })));
             return Ok(Response::new(stream));
         }
+        // One road for a request's media, chosen as the engine's servicer
+        // chooses it. Where a batch carries tensors (pixels, or the grid
+        // tensors the decode side of a pair keeps), the i-th hash of each
+        // such batch keys the batch's i-th placeholder span, the tokens of
+        // the batch's image token id alone where it names one, and a batch
+        // without tensors keys nothing.
+        let batches = || req.mm_inputs.iter().chain(&req.extra_mm_inputs);
+        let tensors = |batch: &&vllm::MultimodalInputs| {
+            batch.pixel_values.is_some() || !batch.model_specific_tensors.is_empty()
+        };
+        let mut media: Vec<MediaSpan> = batches()
+            .filter(tensors)
+            .flat_map(|batch| {
+                let spans = batch.mm_hashes.iter().zip(&batch.mm_placeholders);
+                spans.map(|(hash, span)| MediaSpan {
+                    identity: media_identity(hash.as_bytes()),
+                    offset: span.offset,
+                    length: span.length,
+                    slot: batch.im_token_id,
+                })
+            })
+            .collect();
+        // Where no batch carries tensors, as on the decode side of a pair
+        // that holds the language model alone, every batch's hashes, in
+        // order, salt the prompt as a whole, folded with its first token
+        // into the key of that token.
+        let salt = if batches().any(|batch| tensors(&batch)) {
+            String::new()
+        } else {
+            batches()
+                .flat_map(|batch| batch.mm_hashes.iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
         let (prompt_ids, rendered) = match req.input {
             Some(vllm::generate_request::Input::Tokenized(tokenized)) => {
                 (tokenized.input_ids, tokenized.original_text)
@@ -101,6 +138,14 @@ impl VllmEngine for MockScheduler {
             }
             None => (Vec::new(), String::new()),
         };
+        if let Some(first) = prompt_ids.first().filter(|_| !salt.is_empty()) {
+            media.push(MediaSpan {
+                identity: media_identity(format!("{first}:{salt}").as_bytes()),
+                offset: 0,
+                length: 1,
+                slot: None,
+            });
+        }
         let params = req.sampling_params.unwrap_or_default();
         // The pair's rendezvous on this wire is the connector's parameters,
         // opaque to the mock: present in either form, or absent. A typed
@@ -140,6 +185,7 @@ impl VllmEngine for MockScheduler {
                 score_ids: Vec::new(),
                 pin: req.data_parallel_rank,
                 rendezvous,
+                media: Box::new(move || media),
             })
             .await?;
         Ok(Response::new(Box::pin(
@@ -1434,5 +1480,198 @@ mod tests {
             .await
             .expect_err("a service the worker does not serve");
         assert_eq!(unknown.code(), Code::NotFound);
+    }
+
+    /// A regular worker started with `--supports-vision true` reports it, and
+    /// the realistic engine keys a media item's tokens by the item's hash:
+    /// the same item is served from the cache, another item under the same
+    /// placeholder id parts the prompt at the item's first token.
+    #[tokio::test]
+    async fn a_media_items_tokens_are_cached_by_the_item() {
+        let (service, _stop) = MockScheduler::for_tests(
+            Config {
+                grpc_wire: SchedulerWire::Vllm,
+                supports_vision: Some(true),
+                realistic: true,
+                engine: engine::EngineParams {
+                    timing: engine::TimingModel::linear(),
+                    ..Default::default()
+                },
+                ..Config::default()
+            },
+            65_261,
+        );
+        let info = service
+            .get_model_info(Request::new(vllm::GetModelInfoRequest {}))
+            .await
+            .expect("model info")
+            .into_inner();
+        assert!(info.supports_vision, "the start flag's answer");
+        // A block of text, two blocks under the image token id, text again.
+        let ids: Vec<u32> = (100..116).chain([9; 32]).chain(200..219).collect();
+        let mut events = service
+            .subscribe_kv_events(Request::new(common::SubscribeKvEventsRequest::default()))
+            .await
+            .expect("subscribed")
+            .into_inner();
+        // A batch as a request carries it: its hashes, its spans, the image
+        // token id it names and whether it carries pixels.
+        let batch = |hashes: &[&str], spans: &[(u32, u32)], slot, pixels: bool| {
+            let span = |&(offset, length)| vllm::PlaceholderRange { offset, length };
+            vllm::MultimodalInputs {
+                im_token_id: slot,
+                mm_hashes: hashes.iter().map(ToString::to_string).collect(),
+                mm_placeholders: spans.iter().map(span).collect(),
+                pixel_values: pixels.then(vllm::TensorData::default),
+                ..Default::default()
+            }
+        };
+        let image = [(16, 32)];
+        let mut cached = Vec::new();
+        // A request's batches and one token it sends by its place: 9 at 16 is
+        // the prompt as it stands. "b2" names the span twice: the hash that
+        // comes first keys it, so it is the prompt of "b". "m7" and "m8" name
+        // the image token id and send a marker first under the span, which
+        // stays as sent: the image of "b" behind another marker parts there.
+        // "o-p" and "o-q" name that marker's id for a second item over the
+        // first one's span: the marker is the second item's, and another
+        // such item parts the prompt there. "b-c" ends an item of no named
+        // id halfway under an item of "c" that names the image token id: the
+        // first keeps its tokens and the rest are the second's, the prompt
+        // of "b" for one block more. "a-x" carries a batch of hashes
+        // alone beside the pixels of "a": it keys nothing. The last five
+        // carry no tensor, as the decode side of a pair does: the hashes
+        // salt the whole prompt whether or not a span is named, and the last
+        // of them, under the hashes of "d-a1", differs from it in the first
+        // token alone.
+        for (id, at, token, batches) in [
+            (
+                "vw-media-a1",
+                16,
+                9,
+                vec![batch(&["a"], &image, None, true)],
+            ),
+            (
+                "vw-media-a2",
+                16,
+                9,
+                vec![batch(&["a"], &image, None, true)],
+            ),
+            ("vw-media-b", 16, 9, vec![batch(&["b"], &image, None, true)]),
+            (
+                "vw-media-b2",
+                16,
+                9,
+                vec![batch(&["b", "c"], &[(16, 32), (16, 32)], None, true)],
+            ),
+            (
+                "vw-media-m7",
+                16,
+                7,
+                vec![batch(&["b"], &image, Some(9), true)],
+            ),
+            (
+                "vw-media-m8",
+                16,
+                8,
+                vec![batch(&["b"], &image, Some(9), true)],
+            ),
+            (
+                "vw-media-o-p",
+                16,
+                7,
+                vec![
+                    batch(&["b"], &image, Some(9), true),
+                    batch(&["p"], &[(16, 1)], Some(7), true),
+                ],
+            ),
+            (
+                "vw-media-o-q",
+                16,
+                7,
+                vec![
+                    batch(&["b"], &image, Some(9), true),
+                    batch(&["q"], &[(16, 1)], Some(7), true),
+                ],
+            ),
+            (
+                "vw-media-b-c",
+                16,
+                9,
+                vec![
+                    batch(&["b"], &[(16, 16)], None, true),
+                    batch(&["c"], &image, Some(9), true),
+                ],
+            ),
+            (
+                "vw-media-a-x",
+                16,
+                9,
+                vec![
+                    batch(&["a"], &image, None, true),
+                    batch(&["x"], &[], None, false),
+                ],
+            ),
+            (
+                "vw-media-d-a1",
+                16,
+                9,
+                vec![batch(&["a"], &[], None, false)],
+            ),
+            (
+                "vw-media-d-a2",
+                16,
+                9,
+                vec![batch(&["a"], &[], None, false)],
+            ),
+            (
+                "vw-media-d-b1",
+                16,
+                9,
+                vec![batch(&["b"], &image, None, false)],
+            ),
+            (
+                "vw-media-d-b2",
+                16,
+                9,
+                vec![batch(&["b"], &[], None, false)],
+            ),
+            (
+                "vw-media-d-a3",
+                0,
+                99,
+                vec![batch(&["a"], &[], None, false)],
+            ),
+        ] {
+            let mut ids = ids.clone();
+            ids[at] = token;
+            let mut req = request(id, &ids, false);
+            let mut batches = batches.into_iter();
+            req.mm_inputs = batches.next();
+            req.extra_mm_inputs = batches.collect();
+            read_frames(&service, req).await;
+            cached.push(
+                engine::records_since(0, usize::MAX)
+                    .into_iter()
+                    .find(|record| record.request_id == id)
+                    .map(|record| record.cached_tokens),
+            );
+        }
+        let expected = [0, 64, 16, 64, 16, 16, 16, 16, 32, 64, 0, 64, 0, 64, 0].map(Some);
+        assert_eq!(cached, expected);
+        // The item is in a block's key alone: the stored-block events keep
+        // the ids as sent, as the gateway's index hashes a request's. The
+        // first request's second block is the image token id sixteen times.
+        let stored = loop {
+            let batch = events.next().await.expect("an item").expect("a batch");
+            let stored = batch.events.into_iter().find_map(|event| match event.data {
+                Some(common::kv_cache_event::Data::Stored(stored)) => Some(stored),
+                _ => None,
+            });
+            if let Some(stored) = stored {
+                break stored;
+            }
+        };
+        assert_eq!(stored.blocks[1].token_ids, [9; 16]);
     }
 }

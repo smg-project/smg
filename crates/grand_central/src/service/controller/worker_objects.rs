@@ -7,9 +7,11 @@ mod lead;
 mod load_monitor;
 mod prober;
 
-#[cfg(all(test, feature = "discovery"))]
-pub(crate) use holder::tests::engine;
 pub(crate) use holder::WorkerObjects;
 pub(crate) use lead::ElectedLead;
 pub(crate) use load_monitor::LoadMonitor;
 pub(crate) use prober::Prober;
+
+#[cfg(all(test, feature = "discovery"))]
+#[path = "../../../tests/unit/service/controller/worker_objects/tests.rs"]
+pub(super) mod tests;
