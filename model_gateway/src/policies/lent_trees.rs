@@ -1034,10 +1034,8 @@ mod tests {
             stated.index.insert("*".to_owned(), unheld.clone());
             stated.index.insert("roomy*".to_owned(), unheld);
             stated.index.insert("held*".to_owned(), entry(max_size, 1));
-            let hashed = IndexSpec {
-                kind: IndexKind::Hash,
-                ..entry(max_size, u32::MAX)
-            };
+            let mut hashed = entry(max_size, u32::MAX);
+            hashed.kind = IndexKind::Hash;
             stated.index.insert("hashed*".to_owned(), hashed);
             owner(stated)
         };

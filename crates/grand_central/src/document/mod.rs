@@ -11,9 +11,10 @@
 //! - Ten have no start: [`ResidentWorkParams`], [`LeastCostParams`],
 //!   [`BestParams`], [`BestWithTemperatureParams`], [`HasRoomParams`],
 //!   [`Bounds`], [`HeaderMatch`], [`SessionsSpec`], [`CanarySpec`] and
-//!   [`SignalSpec`]. Code outside this crate builds none: it reads one from
-//!   its text, or in a spec the crate made. A start comes the day a caller
-//!   needs one.
+//!   [`SignalSpec`]. Code outside this crate builds none: it deserializes
+//!   one, or takes one in a spec the crate made. A [`Bounds`] of a caller's
+//!   own type needs that type's read. A start comes the day a caller needs
+//!   one.
 //! - Seven start from their `Default`, and the caller assigns what it states
 //!   otherwise: [`IndexSpec`], [`BucketParams`], [`CostMargin`], [`Match`],
 //!   [`OverloadSpec`], [`KeySourceSpec`] and [`BindingSpec`].
