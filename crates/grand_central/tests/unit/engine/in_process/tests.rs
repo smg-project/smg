@@ -395,6 +395,32 @@ fn a_pick_runs_under_the_handle_its_profile_was_asked_of() {
     }
 }
 
+/// A profile asked of one document and picked under another: where that
+/// document holds no profile at the position, a pick names no worker, by
+/// the pool's own turn and by a pass over a list alike.
+#[test]
+fn a_pick_under_a_document_with_no_profile_at_its_position_names_no_worker() {
+    let mut wide = PolicySpec::preset("round_robin").expect("a built-in preset");
+    let spare = wide.profiles["round_robin"].clone();
+    wide.profiles.insert("a_spare".to_owned(), spare);
+    let wide = engine_of(&wide);
+    // The spare stands first in the document's order: the model's profile
+    // is the second of two.
+    let profile = alone(&wide);
+    assert_eq!(profile, AloneProfile(1));
+    let list = pool(4);
+    let own = wide.pick_among(&wide.spec(), profile, &list, RoutingState::eligible);
+    assert!(own.is_some(), "its own document picks");
+
+    let engine = preset("round_robin");
+    let handle = engine.spec();
+    let members = PublishedList::new(Arc::clone(&list));
+    let turn = engine.pick(&handle, profile, members.lent(), RoutingState::eligible);
+    assert_eq!(turn, None);
+    let pass = engine.pick_among(&handle, profile, &list, RoutingState::eligible);
+    assert_eq!(pass, None);
+}
+
 /// The rotation is the pool's own word: two pools of one engine turn a
 /// rotation each, and a turn of one moves no turn of the other.
 #[test]

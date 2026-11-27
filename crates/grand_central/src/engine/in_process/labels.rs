@@ -10,8 +10,7 @@ use crate::{document::spec::AppliedSpec, names::intern};
 /// The labels of `spec`'s profiles, each at its profile's position in the
 /// document. One allocation a distinct name, for the life of the process.
 pub(super) fn of(spec: &AppliedSpec) -> Box<[&'static str]> {
-    let profiles = spec.engine().profiles().iter();
-    profiles.map(|profile| intern(&profile.name)).collect()
+    spec.engine().profile_names().map(intern).collect()
 }
 
 impl Loaded<'_, '_> {

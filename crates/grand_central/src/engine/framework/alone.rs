@@ -181,6 +181,15 @@ impl Engine {
         })
     }
 
+    /// The picker of `profile`, an alone place this document answered
+    /// ([`Self::place_for`]). `None` for a handle whose position is past
+    /// this document's profiles: one that another document answered.
+    #[cfg(feature = "in-process")]
+    #[inline]
+    pub(crate) fn alone_picker(&self, profile: AloneProfile) -> Option<&dyn super::Picker> {
+        Some(self.profiles.get(usize::from(profile.0))?.picker.as_ref())
+    }
+
     /// Every place a binding of the document names: each binding in the
     /// document's order, at each phase it covers and its plan has a side
     /// for.
