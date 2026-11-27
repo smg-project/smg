@@ -2921,9 +2921,13 @@ pub struct PolicySpec {
         "propertyNames" = { "pattern": SIGNAL_NAME_PATTERN }
     ))]
     pub signals: BTreeMap<String, SignalSpec>,
-    /// The profiles by name, each of at least one character.
+    /// From 1 to 65535 profiles by name, each name of at least one character.
     #[serde(deserialize_with = "keyed_once")]
-    #[schemars(extend("propertyNames" = { "minLength": 1 }))]
+    #[schemars(extend(
+        "minProperties" = 1,
+        "maxProperties" = u16::MAX,
+        "propertyNames" = { "minLength": 1 }
+    ))]
     pub profiles: BTreeMap<String, ProfileSpec>,
     /// The plans' rules.
     #[serde(default, skip_serializing_if = "is_default")]
