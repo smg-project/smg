@@ -329,16 +329,10 @@ fn the_overrides_settings_land_in_its_session_rule() {
     assert_eq!(sources(&[]), ("rid".to_string(), String::new()));
 }
 
-/// The override's rule has no document in three places. Each is refused
-/// by the setting's name, in a sentence that says which it is: a pair of
-/// which one side's policy reads the routing key itself, by that side,
-/// a plan with an encode side, and a gateway of many routers. So under
-/// every policy the rule lands beside, the prefix ring among them.
-///
-/// The gateway's sticky map places a role at a time, so beside a side
-/// under the hash policy it places the other side alone
-/// (`model_gateway/src/policies/registry.rs`, `sticky_for`). A binding's
-/// rule places every side of its plan.
+/// The override's rule has no document in two places. Each is refused
+/// by the setting's name, in a sentence that says which it is: a plan
+/// with an encode side, and a gateway of many routers. So under every
+/// policy the rule lands beside, the prefix ring among them.
 #[test]
 fn the_override_is_refused_where_its_rule_has_no_document() {
     let why = |config: &RoutingSettings| match config.policy_document() {
@@ -349,26 +343,7 @@ fn the_override_is_refused_where_its_rule_has_no_document() {
         }) => reason,
         other => panic!("expected the override refused by name, got {other:?}"),
     };
-    let ring = || Some(PolicySettings::ConsistentHashing);
     for name in PLACED.into_iter().chain(["prefix_hash"]) {
-        let mixed = [
-            (pair_mode(ring(), None), "prefill"),
-            (pair_mode(None, ring()), "decode"),
-        ];
-        for (mode, side) in mixed {
-            let pair = RoutingSettings {
-                mode,
-                ..sticky(name)
-            };
-            assert_eq!(
-                why(&pair),
-                format!(
-                    "the sticky sessions' rule places both sides of a pair, and the {side} \
-                         side's policy reads the routing key itself"
-                ),
-                "{name}"
-            );
-        }
         let encode = RoutingSettings {
             mode: ModeSettings::EncodePrefillDecode {
                 encode_policy: None,
@@ -388,6 +363,122 @@ fn the_override_is_refused_where_its_rule_has_no_document() {
             "the sticky sessions' rule has no document in a gateway of many routers yet",
             "{name}"
         );
+    }
+}
+
+/// A pair may hold a side under `consistent_hashing`, which keeps a
+/// routing key's handling to itself. The override then lands as the
+/// session rule of the other side alone (`sessions.sides`), and the hash
+/// side stays its own policy's.
+/// The rule is the one the binding of single requests holds, with the
+/// side named. A gateway's check takes the document, and its engine's
+/// rule covers the one side.
+///
+/// The gateway's sticky map places a role at a time. Beside a side
+/// under the hash policy it places the other side alone
+/// (`model_gateway/src/policies/registry.rs`, `sticky_for`).
+#[test]
+fn the_overrides_rule_names_the_side_it_places_beside_a_side_that_reads_the_key() {
+    use crate::engine::SessionSides;
+
+    let ring = || Some(PolicySettings::ConsistentHashing);
+    for name in PLACED.into_iter().chain(["prefix_hash"]) {
+        let mixed = [
+            (pair_mode(ring(), None), "decode", SessionSides::Decode),
+            (pair_mode(None, ring()), "prefill", SessionSides::Prefill),
+        ];
+        for (mode, placed, covered) in mixed {
+            let pair = RoutingSettings {
+                mode,
+                ..sticky(name)
+            };
+            let document = pair.policy_document().expect("the pair's document");
+            let form = serde_json::to_value(&document).expect("a document serializes");
+            // The pair's binding, then the binding of single requests.
+            let bindings = form["bindings"].as_array().expect("the bindings");
+            let [paired, single] = bindings.as_slice() else {
+                panic!("{name}: a pair's binding and a single's, got {bindings:?}");
+            };
+            assert_eq!(paired["plan"], "pd-pair", "{name}");
+            assert_eq!(single["sessions"].get("sides"), None, "{name}");
+            let mut named = single["sessions"].clone();
+            named["sides"] = json!([placed]);
+            assert_eq!(paired["sessions"], named, "{name}: the {placed} side");
+            let applied = validated(&document).expect("a gateway's check takes the document");
+            let engine = applied.engine();
+            let rule = engine.binding("", Phase::Prefill);
+            let rule = rule.and_then(|binding| binding.sessions);
+            assert_eq!(rule.map(|rule| rule.sides), Some(covered), "{name}");
+            assert!(engine.needs().session_in_flight, "{name}");
+        }
+    }
+}
+
+/// A mixed pair's document stands where no binding of the override is
+/// written behind the pair's. Two configurations have none: the hash
+/// policy as the main policy, and a gateway of one router over gRPC or
+/// ZMQ, which plans the pair alone. The view lists the session's headers
+/// alone, as under the override on a single binding. The hash side's
+/// client sources stay in the binding's own list, where its ring reads
+/// them, and a gateway's check takes the document.
+#[test]
+fn a_mixed_pairs_view_lists_no_client_header_where_no_single_rule_stands_behind_it() {
+    let placed = || Some(at_flag_defaults("round_robin"));
+    // The hash policy is the main one, and the prefill side's with it:
+    // the binding of single requests holds no rule.
+    let under_the_ring = RoutingSettings {
+        mode: pair_mode(None, placed()),
+        ..sticky("consistent_hashing")
+    };
+    // One router over gRPC or ZMQ binds no single request.
+    let alone = |connection_mode| RoutingSettings {
+        connection_mode,
+        mode: pair_mode(Some(PolicySettings::ConsistentHashing), None),
+        ..sticky("round_robin")
+    };
+    let single = sticky("round_robin").policy_document();
+    let headers = single.expect("the single binding's document").view.headers;
+    assert!(!headers.is_empty());
+    for (settings, bindings) in [
+        (under_the_ring, 2),
+        (alone(ConnectionModeSetting::Grpc), 1),
+        (alone(ConnectionModeSetting::Zmq), 1),
+    ] {
+        let document = settings.policy_document().expect("the pair's document");
+        assert_eq!(document.bindings.len(), bindings);
+        let paired = &document.bindings[0];
+        let rule = paired.sessions.as_ref().expect("the pair's rule");
+        assert_eq!(rule.sides, Some(vec!["decode".to_owned()]));
+        let rules = document.bindings.iter().filter(|b| b.sessions.is_some());
+        assert_eq!(rules.count(), 1, "the pair's rule alone");
+        assert_eq!(document.view.headers, headers);
+        let key = paired.routing_key.as_ref().expect("the pair's key");
+        assert!(key.sources.iter().any(|source| source.client));
+        validated(&document).expect("a gateway's check takes the document");
+    }
+}
+
+/// The settings name a side in a rule for that pair alone. Every other
+/// document they write names none: no rule of it holds a `sides` key. The
+/// case covers each preset's policy at its flags' defaults, alone and on
+/// both sides of a pair, with the override on and with it off. The
+/// settings write each of them: one they refused would fail the case.
+#[test]
+fn the_settings_name_no_side_in_any_other_document() {
+    for name in PRESETS {
+        for (paired, overridden) in [(false, false), (false, true), (true, false), (true, true)] {
+            let mut settings = config(at_flag_defaults(name));
+            settings.routing_key_override.enabled = overridden;
+            if paired {
+                settings.mode = pair_mode(None, None);
+            }
+            let case = format!("{name}, a pair {paired}, the override {overridden}");
+            let document = settings.policy_document().expect(&case);
+            let rules = document.bindings.iter().filter_map(|b| b.sessions.as_ref());
+            assert!(rules.clone().all(|rule| rule.sides.is_none()), "{case}");
+            let text = serde_json::to_string(&document).expect("a document serializes");
+            assert!(!text.contains("\"sides\""), "{case}: {text}");
+        }
     }
 }
 
@@ -484,12 +575,9 @@ fn the_sides_of_a_plan_share_one_list_of_key_sources() {
 #[test]
 fn a_setting_no_document_says_is_refused_by_its_name() {
     let round_robin = || config(PolicySettings::RoundRobin);
-    // The override's rule places both sides of a pair, and the hash
-    // policy on the prefill side reads the routing key itself.
-    let paired = RoutingSettings {
-        mode: pair_mode(Some(PolicySettings::ConsistentHashing), None),
-        ..sticky("random")
-    };
+    // The override's rule has no document in a gateway of many routers
+    // yet.
+    let many = many_routers(sticky("random"));
     let mut selection = config(at_flag_defaults("cache_aware"));
     if let PolicySettings::CacheAware {
         selection_policy, ..
@@ -498,7 +586,7 @@ fn a_setting_no_document_says_is_refused_by_its_name() {
         *selection_policy = Some("another".to_string());
     }
     for (refused, setting, value) in [
-        (paired, "routing_key_override.enabled", "true"),
+        (many, "routing_key_override.enabled", "true"),
         (
             RoutingSettings {
                 dp_minimum_tokens_scheduler: true,
@@ -915,7 +1003,7 @@ fn the_manual_policy_on_both_sides_of_a_pair_runs_under_three_sides() {
                 Err(RoutingSettingsError::UnsupportedSetting {
                     setting: "policy",
                     value: "manual".to_string(),
-                    reason: "the manual policy places by the binding's one session rule, so both sides of a pair are manual or neither is",
+                    reason: "the settings write the manual policy's session rule over both sides of a pair, so both sides are manual or neither is",
                 }),
                 "{:?}",
                 settings.mode
