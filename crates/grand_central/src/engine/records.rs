@@ -1844,16 +1844,18 @@ pub(crate) type DrawnRecords<'a> = (
 /// lists hold. Asked where both lists stand and neither is read at rest
 /// or holds an engine's ranks, under the engine's own question
 /// ([`Engine::pair_drawn_for`]); the caller says that the request states
-/// nothing beside its lists and that every row of a side pairs with every
-/// row of the other. `None` leaves the decision to the whole pass, which
-/// writes every record itself.
+/// nothing beside its lists, and answers two questions of the two lists:
+/// whether its host's admission refuses no row (`admits`) and whether
+/// every row of a side pairs with every row of the other (`pairs`).
+/// `None` leaves the decision to the whole pass, which writes every
+/// record itself.
 #[cfg(feature = "in-process")]
 pub(crate) fn decide_pair_drawn(
     engine: &Engine,
     facts: &RequestFacts<'_>,
     cx: &Constraints<'_>,
     [prefills, decodes]: [DrawnRecords<'_>; 2],
-    pairs: &dyn Fn() -> bool,
+    [admits, pairs]: [&dyn Fn() -> bool; 2],
     rows: [&mut Vec<Candidate>; 2],
     scratch: &mut Scratch,
 ) -> Option<Decision> {
@@ -1864,12 +1866,17 @@ pub(crate) fn decide_pair_drawn(
     }
     let unsaid = prefills.facts(prefill_live, false);
     let drawn = engine.pair_drawn_for(facts, &unsaid, [prefills.len(), decodes.len()], cx)?;
+    // The host's admission is asked behind the engine's own question, so
+    // that a pair no draw is asked of pays none of it, and ahead of the
+    // lists and the classes: a pair with a refused row leaves here.
+    if !admits() {
+        return None;
+    }
     let word = published_word();
     if !(prefills.stands(prefill_workers, word) && decodes.stands(decode_workers, word)) {
         return None;
     }
-    // The caller's word is asked last: it reads every row's class and
-    // admission bit, and a pair no draw is asked of pays none of it.
+    // The classes are asked last: the question reads every row's class.
     if !pairs() {
         return None;
     }

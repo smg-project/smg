@@ -14,7 +14,9 @@
 //! cell for its own value of the list, once a decision. A pair's first
 //! decision writes one record for each worker of the prefill list and of
 //! the decode list, each in its list's order, as the workers stand at that
-//! call ([`PoolRecords::write`](crate::engine::records::PoolRecords::write)).
+//! call ([`PoolRecords::write`](crate::engine::records::PoolRecords::write));
+//! a pair each side of which is asked by its draw writes the records of
+//! the workers its draws ask about alone.
 //! The decode decided again writes the decodes' records and, of the
 //! prefills', the held prefill's alone where its list names its place
 //! ([`PoolRecords::read`](crate::engine::records::PoolRecords::read)): it
@@ -592,12 +594,17 @@ impl<'a> PairLists<'a> {
             // Each side is asked by its draw where some binding's pair
             // draws (one byte of the engine, asked first), the request
             // states nothing beside its two lists and every row of a side
-            // pairs with every row of the other and is admitted. A side
-            // then writes the records its draw asks about.
+            // pairs with every row of the other and is admitted. A retry
+            // names the workers it tried on any list, with ranks or
+            // without, and is decided whole. The admission is asked
+            // behind the engine's own question and ahead of the classes:
+            // a pair no draw is asked of pays none of it, and a pair with
+            // a refused row leaves for the whole pass before a class is
+            // read. A side then writes the records its draw asks about.
             if spec.engine().pairs_drawn()
                 && held.is_none()
                 && said.is_none()
-                && tried.is_none()
+                && facts.tried.is_empty()
                 && cx.excluded.is_empty()
                 && cx.places.is_none()
                 && cx.stalled.is_empty()
@@ -616,7 +623,8 @@ impl<'a> PairLists<'a> {
             {
                 let (classes, admission) = (self.classes, self.admission);
                 let sizes = (prefill_records.len(), decode_records.len());
-                let pairs = || one_pair(classes, admission, sizes);
+                let admits = || admission.admits_all(sizes.0, sizes.1);
+                let pairs = || one_pair(classes, sizes);
                 let prefill_stamp = |row: &mut Candidate| {
                     let at = row.position as usize;
                     row.pair_class = classes.prefills().get(at).copied().unwrap_or(0);
@@ -635,7 +643,7 @@ impl<'a> PairLists<'a> {
                         (prefill_records, workers, &live, &prefill_stamp),
                         (decode_records, decode_workers, &decode_live, &decode_stamp),
                     ],
-                    &pairs,
+                    [&admits, &pairs],
                     [&mut *prefills, &mut *decodes],
                     &mut buffers.scratch,
                 );
@@ -1023,15 +1031,12 @@ pub(super) fn shed_over() -> Option<ShedOver> {
 }
 
 /// Whether every prefill of a list of
-/// `prefills` rows pairs with every decode of a list of `decodes` rows and
-/// the host's admission refuses none of them: one class a side, the two
-/// pair, neither is the other's first partner, and every admission bit is
-/// set. Each side's whole pass then keeps every row its draw may ask about.
-fn one_pair(
-    classes: &PartnerClasses,
-    admission: &dyn PairAdmission,
-    (prefills, decodes): (usize, usize),
-) -> bool {
+/// `prefills` rows pairs with every decode of a list of `decodes` rows:
+/// one class a side, the two pair, and neither is the other's first
+/// partner. Where the host's admission refuses none of them either
+/// ([`PairAdmission::admits_all`]), each side's whole pass keeps every row
+/// its draw may ask about.
+fn one_pair(classes: &PartnerClasses, (prefills, decodes): (usize, usize)) -> bool {
     let (prefill_classes, decode_classes) = (classes.prefills(), classes.decodes());
     let (Some(&prefill), Some(&decode)) = (prefill_classes.first(), decode_classes.first()) else {
         return false;
@@ -1044,7 +1049,6 @@ fn one_pair(
         && decode_classes.iter().all(|&class| class == decode)
         && classes.pairs(0, 0)
         && !classes.pairs_first(0, 0)
-        && admission.admits_all(prefills, decodes)
 }
 
 /// Writes on the two lists' records what a pair's decision reads beside a

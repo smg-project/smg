@@ -75,16 +75,18 @@ fn an_admission_that_takes_the_default_answers_what_the_walk_answers() {
 #[test]
 fn every_row_pairs_and_is_admitted_under_one_class_a_side_alone() {
     let all = every(8, 8);
-    assert!(one_pair(&all, &OPEN, (8, 8)));
+    assert!(one_pair(&all, (8, 8)));
     // A list longer than its classes holds a row of no class.
-    assert!(!one_pair(&all, &OPEN, (9, 8)));
-    assert!(!one_pair(&all, &OPEN, (8, 9)));
-    // One prefill with no capacity, one decode with no room.
-    assert!(!one_pair(&all, &Gates(|at| at != 3, |_| true), (8, 8)));
-    assert!(!one_pair(&all, &Gates(|_| true, |at| at != 5), (8, 8)));
+    assert!(!one_pair(&all, (9, 8)));
+    assert!(!one_pair(&all, (8, 9)));
+    // One prefill with no capacity, one decode with no room: the
+    // admission says so by itself, whatever the classes.
+    assert!(OPEN.admits_all(8, 8));
+    assert!(!Gates(|at| at != 3, |_| true).admits_all(8, 8));
+    assert!(!Gates(|_| true, |at| at != 5).admits_all(8, 8));
     // The second prefill pairs with the first decode alone: two classes.
     let narrowed = PartnerClasses::number(2, [&[0, 1][..], &[0][..]]);
-    assert!(!one_pair(&narrowed, &OPEN, (2, 2)));
+    assert!(!one_pair(&narrowed, (2, 2)));
 }
 
 #[test]
@@ -233,6 +235,47 @@ fn a_request_or_a_list_the_draw_is_not_asked_of_is_decided_whole() {
     let counted = Counted::default();
     let decision = turns.decide(&counted, 5, None);
     assert_eq!(whole(decision, &counted), 0);
+}
+
+#[test]
+fn a_retry_that_names_a_tried_worker_is_decided_whole() {
+    let host = drawing(8, 8);
+    let every_prefill = [0, 1, 2, 3, 4, 5, 6, 7];
+    // A retry: the request names the prefill it tried. The whole pass
+    // drops that row ahead of its two draws, which then stand over seven
+    // rows: the draw of a side is not asked.
+    let tried = [worker_id(host.prefills[3].as_ref())];
+    for seed in 0..256 {
+        let stated = || RequestFacts {
+            seed,
+            tried: &tried,
+            ..facts()
+        };
+        let counted = Counted::default();
+        let retried = host.decide_stated(
+            &counted,
+            (stated(), None),
+            Constraints::default(),
+            [None, None],
+            UNMASKED,
+        );
+        let (places, all) = counted.asked();
+        let whole = host.decide_stated(
+            &Counted::default(),
+            (stated(), None),
+            Constraints::default(),
+            [Some(&every_prefill[..]), None],
+            UNMASKED,
+        );
+        assert_ne!(host.picked(&retried).0, 3, "seed {seed}: {retried:?}");
+        assert_eq!(
+            format!("{retried:?}"),
+            format!("{whole:?}"),
+            "seed {seed}: a retry names the pair of the whole pass"
+        );
+        assert_eq!(all, 0, "seed {seed}: a retry is not asked by its draw");
+        assert!(places >= 7, "{places} capacity bits read by the whole pass");
+    }
 }
 
 /// An admission whose prefill filled behind its answer to the question of

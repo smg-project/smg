@@ -49,8 +49,10 @@
 //! saturated, by the engine's entry and by the one call alike. `--refused
 //! outage` takes every decode out of service under such a binding, and
 //! `--refused partners` under the cell's own: each request is shed with no
-//! endpoint, by either entry too. The result's `conversions=` counts the
-//! two lists together.
+//! endpoint, by either entry too. `--no-room N` leaves the last `N`
+//! decodes of the cell with no room at their host's gate ([`Rooms`]): every
+//! other place stays open, and each pair goes to a decode that has one. The
+//! result's `conversions=` counts the two lists together.
 
 use std::{
     cell::OnceCell,
@@ -218,6 +220,21 @@ impl PairAdmission for Full {
 
     fn has_room(&self, _: usize) -> bool {
         true
+    }
+}
+
+/// A pair's host whose first decodes alone have a room: every prefill has
+/// capacity, and no decode from the stated place on has a room.
+#[derive(Debug)]
+struct Rooms(usize);
+
+impl PairAdmission for Rooms {
+    fn has_capacity(&self, _: usize) -> bool {
+        true
+    }
+
+    fn has_room(&self, decode: usize) -> bool {
+        decode < self.0
     }
 }
 
@@ -519,6 +536,12 @@ pub(super) fn runs(run: &Run) -> bool {
         list: published(&decodes),
         admission: if run.refused == Refused::Limit {
             &Full
+        } else if run.no_room != 0 {
+            assert!(
+                run.no_room < decodes.len(),
+                "a pair needs a decode with a room"
+            );
+            Box::leak(Box::new(Rooms(decodes.len() - run.no_room)))
         } else {
             &Open
         },

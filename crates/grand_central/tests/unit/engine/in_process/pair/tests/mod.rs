@@ -830,6 +830,20 @@ impl Host {
         places: [Option<&[u32]>; 2],
         vetoes: [[&[u32]; 2]; 2],
     ) -> Decision {
+        let stated = RequestFacts { seed, ..facts() };
+        self.decide_stated(admission, (stated, held), constraints, places, vetoes)
+    }
+
+    /// [`Self::decide_vetoed`] for a request that states `stated` whole:
+    /// a retry names there the workers it tried.
+    fn decide_stated(
+        &self,
+        admission: &dyn PairAdmission,
+        (stated, held): (RequestFacts<'_>, Option<&Target>),
+        constraints: Constraints<'_>,
+        places: [Option<&[u32]>; 2],
+        vetoes: [[&[u32]; 2]; 2],
+    ) -> Decision {
         let [prefill, decode] = &self.lists;
         let classes = every(self.prefills.len(), self.decodes.len() as u32);
         let [[prefill_stalled, prefill_held], [decode_stalled, decode_held]] = vetoes;
@@ -847,7 +861,7 @@ impl Host {
         };
         let mut request = Request {
             id: b"",
-            facts: RequestFacts { seed, ..facts() },
+            facts: stated,
             constraints,
         };
         let (engine, now) = (&self.engine, Instant::now());
