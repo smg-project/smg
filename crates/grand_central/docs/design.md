@@ -1735,11 +1735,12 @@ refusal told late leaves it: the session's pins stay as that decision wrote them
 guard and a controller tell each dispatch and release of a pair under its first decision's lease,
 so a decode call there dates its claim by that lease.
 
-A dispatch, a move at the cap and a decode call's date write nothing into the session table when
-dated before every decision that read the key's current life.
+A dispatch and a move at the cap write nothing into the session table when dated before the oldest
+date a decision read the key's current life under. A pair's decode call reads under its lease's
+date. Neither does a decode call's date where the call's own instant is that old.
 
 The table keeps the low 32 bits of the instant. Two claims of one key on one worker that are
-dated alike read as one: at one microsecond, or 2^32 microseconds apart.
+dated alike read as one: at one microsecond, or a whole multiple of 2^32 microseconds apart.
 
 A decode call that panics behind its claim dates nothing. Its claim keeps the call's instant, and
 no event of the pair's lease reaches it. It ends at a dispatch on its worker or with the key's
