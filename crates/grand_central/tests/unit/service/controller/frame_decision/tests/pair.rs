@@ -389,6 +389,20 @@ fn transport_member(
     role: Role,
     transport: &str,
 ) -> WorkerId {
+    let stated = DemandFacts::default();
+    paired_member(store, objects, name, role, transport, stated)
+}
+
+/// [`transport_member`] for a worker that states `stated` for a request's
+/// hard demands.
+pub(super) fn paired_member(
+    store: &MemoryStore,
+    objects: &Objects<Members>,
+    name: &str,
+    role: Role,
+    transport: &str,
+    stated: DemandFacts,
+) -> WorkerId {
     let key = format!("http://{name}:8000");
     let descriptor = PairingDescriptor {
         transport: Some(transport.to_owned()),
@@ -404,6 +418,7 @@ fn transport_member(
         dp_size: 1,
         max_running: Some(4),
         pairing: Some(Arc::new(descriptor)),
+        demand_facts: stated,
         ..WorkerFacts::default()
     };
     written_ready(store, objects, facts)
