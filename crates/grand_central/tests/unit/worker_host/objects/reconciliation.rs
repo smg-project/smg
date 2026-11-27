@@ -457,90 +457,43 @@ fn a_cut_laid_whole_drops_the_rows_that_went_and_lays_the_moved_rows_again() {
     assert_eq!((told.len(), laid), (7, HashSet::from(each)));
 }
 
-/// A store that runs a callback after one row read.
-#[derive(Default)]
-struct Late {
-    store: Arc<MemoryStore>,
-    after_get: Mutex<Option<AfterGet>>,
-}
-
-type AfterGet = Box<dyn FnOnce(&MemoryStore) + Send>;
-
-impl WorkersStore for Late {
-    fn get(&self, id: WorkerId) -> Option<WorkerRow> {
-        let row = self.store.get(id);
-        if let Some(after_get) = self.after_get.lock().take() {
-            after_get(&self.store);
-        }
-        row
-    }
-
-    fn by_key(&self, key: &str) -> Option<WorkerRow> {
-        self.store.by_key(key)
-    }
-
-    fn epoch(&self) -> u64 {
-        self.store.epoch()
-    }
-
-    fn all_rows(&self) -> (u64, Vec<WorkerRow>) {
-        self.store.all_rows()
-    }
-}
-
+/// A holder reads the row's told status under the object's mutation
+/// lock, never ahead of it. The worker registry's test entry pauses the
+/// holder where it comes to that lock
+/// (`WorkerRegistry::with_another_write_before_the_lock`), and an
+/// adapter's write lands there: it moves the object and tells the store.
+/// The holder then reads the status the adapter told, and the object
+/// keeps it. A read made ahead of the lock would lay the older status
+/// over the adapter's.
 #[test]
-fn an_adapter_write_waits_for_the_holders_status_read() {
+fn a_holder_reads_the_status_an_adapter_told_while_it_stood_at_the_objects_lock() {
     let registry = Arc::new(WorkerRegistry::<Members>::new());
     let objects = Arc::new(Objects::new(Arc::clone(&registry)));
-    let store = Late::default();
-    let row = objects.upsert(&store.store, facts(A, 1), Registrant::Control);
+    let store = Arc::new(MemoryStore::default());
+    let row = objects.upsert(&store, facts(A, 1), Registrant::Control);
     let row = row.expect("the store takes the write").id();
     let id = objects.object(row).expect("the row's object");
     let worker = registry.get(&id).expect("a registered worker");
     let revision = store.get(row).expect("the worker's row").revision;
     assert!(store
-        .store
-        .set_status(row, WorkerStatus::Ready, revision)
+        .set_status(row, WorkerStatus::NotReady, revision)
         .is_some());
     objects.copy_status(&store, row);
-    assert_eq!(worker.status(), ObjectStatus::Ready);
+    assert_eq!(worker.status(), ObjectStatus::NotReady);
 
     let adapter = HealthAdapter::new(
         Arc::clone(&objects),
-        Arc::clone(&store.store),
+        Arc::clone(&store),
         Arc::new(SoleLead),
         SoleLead::TERM,
     );
-    assert!(store
-        .store
-        .set_status(row, WorkerStatus::NotReady, revision)
-        .is_some());
-    let (reading, read) = mpsc::channel();
-    let (attempting, attempt) = mpsc::channel();
-    let (written, write) = mpsc::channel();
-    *store.after_get.lock() = Some(Box::new(move |_| {
-        reading.send(()).expect("the adapter waits for the read");
-        attempt
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the adapter starts its write");
-        assert_eq!(
-            write.recv_timeout(Duration::from_secs(1)),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        );
-    }));
-    thread::scope(|scope| {
-        let connected = scope.spawn(move || {
-            read.recv_timeout(Duration::from_secs(5))
-                .expect("the holder reads the row");
-            attempting.send(()).expect("the holder waits for the write");
+    registry.with_another_write_before_the_lock(
+        |_| objects.copy_status(&store, row),
+        |_| {
             let answer = adapter.connected(&id, worker.revision());
-            let _ = written.send(());
             assert_eq!(answer, Some((ObjectStatus::NotReady, ObjectStatus::Ready)));
-            assert_eq!(worker.status(), ObjectStatus::Ready);
-        });
-        objects.copy_status(&store, row);
-        connected.join().expect("the adapter finished");
-    });
+        },
+    );
     assert_eq!(
         store.get(row).map(|row| row.status),
         Some(WorkerStatus::Ready)

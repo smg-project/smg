@@ -467,9 +467,11 @@ impl MemoryStore {
     /// the new id, where a new incarnation replaced the row. A standby's
     /// stages hold what its leader's hold, with no step at a take.
     ///
-    /// A status change has a door of its own, and this call hands it on
-    /// with no list of models (`MemoryStore::status_followed`): the journal
-    /// is told the ones the table's row serves.
+    /// A status change that comes with no row has a door of its own, and
+    /// this call hands it on with no list of models
+    /// (`MemoryStore::status_followed`): where the store tells a journal the
+    /// status, it tells the models the table's row serves. One that comes
+    /// with a row fits no table.
     pub fn follow(
         &self,
         at: Position,
@@ -1625,7 +1627,7 @@ impl Writing<'_> {
     /// copied here where a journal stands ([`table_models`]). Its writer
     /// names no term, so the journal takes it. Behind the telling stand
     /// the field's write and the epoch's step. The row is looked up once,
-    /// and no row is copied: the twin of [`Self::set_status`] for a told
+    /// and no row is copied: the twin of `Writing::set_status` for a told
     /// status.
     fn follow_status(
         &mut self,
@@ -1815,8 +1817,10 @@ impl MemoryStore {
     /// - a removal the store refused for its term, whose holder lays the
     ///   row's object again in it (`Objects::take_decided`).
     ///
-    /// What else reads a row's status reads the table's whole row and
-    /// goes with the table: the store's own reads of a row.
+    /// A tell the store refused and a holder that follows its leader's
+    /// log read one row's told status ([`Self::told_status`]). What else
+    /// reads a row's status reads the table's whole row and goes with the
+    /// table: the store's own reads of a row.
     pub(crate) fn told(&self) -> Told {
         let workers = self.workers.lock();
         let at = self
@@ -1833,6 +1837,24 @@ impl MemoryStore {
             epoch: workers.epoch,
             statuses,
         }
+    }
+
+    /// The told status of one row ([`Self::told`]): the status the table
+    /// holds for the row `id`, where the row stands at `revision`. `None`
+    /// where no row stands under the id, and where the row stands at
+    /// another revision. One hold of the membership lock copies one
+    /// status, and no row.
+    ///
+    /// A holder of worker objects reads it under an object's mutation
+    /// lock, for the status the object takes from the log's word
+    /// (`Objects::table_status`). `revision` is the row's revision the
+    /// object was built from. The test of it rests on the table's row,
+    /// which holds the revision today: it goes with the table, and the
+    /// read is then by the id alone.
+    pub(crate) fn told_status(&self, id: WorkerId, revision: u64) -> Option<WorkerStatus> {
+        let workers = self.workers.lock();
+        let held = workers.rows.get(&id)?;
+        (held.row.revision == revision).then_some(held.row.status)
     }
 
     /// One membership write this replica's worker objects decided, applied
