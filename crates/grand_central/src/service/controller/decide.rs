@@ -240,10 +240,7 @@ pub(crate) fn serve<S>(
     // has none to ask: the stream opens, and its requests are told.
     let (placed, presence) = match shared.fence.leader_term(now) {
         Some(term) => {
-            let presence = shared
-                .gateways
-                .presence(gateway, now)
-                .ok_or_else(|| Status::failed_precondition(NO_SESSION))?;
+            let presence = shared.present(gateway, now)?;
             (Some(term), Some(presence))
         }
         None => (None, None),
@@ -367,11 +364,7 @@ impl<S> Answers<S> {
             return Ok(());
         };
         if self.placed != Some(term) {
-            let presence = self
-                .shared
-                .gateways
-                .presence(self.gateway, received)
-                .ok_or_else(|| Status::failed_precondition(NO_SESSION))?;
+            let presence = self.shared.present(self.gateway, received)?;
             // The place has no waker yet: the stream arms it before it
             // sleeps, in the poll that took it.
             self.gone = ended(presence.clone());
