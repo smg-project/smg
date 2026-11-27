@@ -2034,21 +2034,23 @@ fn many_routers_keep_the_plan_they_had_where_three_sides_have_no_document() {
 
 /// The manual policy on both sides of a pair runs under a plan of three
 /// sides. Its rule is the binding's one, and places the pair's two
-/// sides: the encode side places an item by its content, under its own
-/// policy. So a gateway of many routers in a pair mode plans its three
-/// sides under that policy as under any other, and the encode mode says
-/// a document, of one router as of many.
+/// sides: the encode side places an item by its own policy. So a gateway
+/// of many routers in a pair mode plans its three sides under that policy
+/// as under any other. It does so where both sides name it, and where
+/// neither names a policy and the main one is manual. The encode mode
+/// says a document, of one router as of many.
 ///
 /// Both sides of the pair are manual or neither is, in the words that
-/// refusal has under a pair. A manual encode side is refused by its
-/// setting's name ahead of the document's check, with three manual
-/// sides too. A regular configuration under the manual policy plans its
-/// single requests alone.
+/// refusal has. A manual encode side is refused by its setting's name
+/// ahead of the document's check, whatever the pair's two sides run. A
+/// regular configuration under the manual policy plans its single
+/// requests alone, and so does a provider's in a gateway of many routers.
 ///
 /// The gateway's own check starts the encode mode under any policy on
-/// its prefill and its decode side, and holds the encode side to three
-/// policies, `manual` not among them
-/// (`model_gateway/src/config/validation.rs:1005-1010`, `:319-328`).
+/// its prefill and its decode side: `validate_mode`
+/// (`model_gateway/src/config/validation.rs`). It holds the encode side
+/// to three policies, the manual one not among them:
+/// `validate_encode_policy`, in the same file.
 #[test]
 fn the_manual_policy_on_both_sides_of_a_pair_runs_under_three_sides() {
     let manual = || Some(at_flag_defaults("manual"));
@@ -2079,6 +2081,22 @@ fn the_manual_policy_on_both_sides_of_a_pair_runs_under_three_sides() {
     assert_eq!(labelled.bindings.len(), 3);
     assert_eq!(labelled.bindings[0], three.bindings[0]);
     assert_eq!(labelled.bindings[2], three.bindings[1]);
+
+    // The same plan under a manual main policy whose pair mode names no
+    // side. Each side takes the main policy, and the main policy's single
+    // binding behind the plan runs under the rule too.
+    let unnamed = many_routers(RoutingSettings {
+        mode: pair_mode(None, None),
+        ..config(at_flag_defaults("manual"))
+    });
+    let two_families = before_three_sides(&unnamed).expect("the plan of two families");
+    assert_eq!(two_families.bindings[0].plan, Some(PlanName::PdPair));
+    let three = unnamed.policy_document().expect("the plan of three sides");
+    assert_eq!(three, with_encode_side(two_families));
+    assert_eq!(three.bindings[0].plan, Some(PlanName::Epd));
+    assert_eq!(three.bindings[0].sessions, rule);
+    assert_eq!(three.bindings[1].sessions, rule);
+    assert_eq!(validated(&three).err(), None);
 
     // The encode mode of one router: the mode's three presets, with the
     // manual preset's rule on their one binding.
@@ -2118,17 +2136,27 @@ fn the_manual_policy_on_both_sides_of_a_pair_runs_under_three_sides() {
                 Err(RoutingSettingsError::UnsupportedSetting {
                     setting: "policy",
                     value: "manual".to_string(),
-                    reason: "the manual policy places by the binding's one session rule, so every side of a plan is manual or none is",
+                    reason: "the manual policy places by the binding's one session rule, so both sides of a pair are manual or neither is",
                 }),
                 "{:?}",
                 settings.mode
             );
     }
 
-    // A manual encode side, beside two manual sides and beside none.
-    for decode in [manual(), Some(PolicySettings::RoundRobin)] {
+    // A manual encode side, beside two manual sides, beside one and
+    // beside none: its own setting is named whatever the pair's sides run.
+    let other = || Some(PolicySettings::RoundRobin);
+    for (prefill, decode) in [
+        (manual(), manual()),
+        (manual(), other()),
+        (other(), other()),
+    ] {
         let encode = RoutingSettings {
-            mode: encode_mode(manual(), decode),
+            mode: ModeSettings::EncodePrefillDecode {
+                encode_policy: manual(),
+                prefill_policy: prefill,
+                decode_policy: decode,
+            },
             ..config(PolicySettings::RoundRobin)
         };
         for settings in [encode.clone(), many_routers(encode)] {
@@ -2138,7 +2166,7 @@ fn the_manual_policy_on_both_sides_of_a_pair_runs_under_three_sides() {
                     setting: "encode_policy",
                     value: "manual".to_string(),
                     reason:
-                        "a session rule places no item: an item goes to its encoder by its content",
+                        "a session rule places no item: an item goes to its encoder by its side's policy",
                 }),
                 "{:?}",
                 settings.mode
@@ -2157,6 +2185,14 @@ fn the_manual_policy_on_both_sides_of_a_pair_runs_under_three_sides() {
         many_routers(regular.clone()).policy_document(),
         regular.policy_document()
     );
+    // A provider's configuration under it, the same: of many routers it
+    // plans the gateway's own workers, their single requests alone.
+    let provider = many_routers(RoutingSettings {
+        mode: ModeSettings::Provider("a_provider"),
+        ..config(at_flag_defaults("manual"))
+    });
+    assert!(matches!(three_sided(&provider), Ok(None)));
+    assert_eq!(provider.policy_document(), regular.policy_document());
 }
 
 #[test]

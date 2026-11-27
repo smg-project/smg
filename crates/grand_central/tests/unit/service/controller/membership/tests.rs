@@ -1782,17 +1782,27 @@ fn a_fact_the_log_does_not_carry_is_refused_by_its_name_and_nothing_is_written()
     let hosted = ReplicaMembershipWriter::new(Arc::new(door), operator(), under(TERM));
     let maker = found("pods/a");
     let epoch = store.epoch();
-    let lost: [(&str, State); 8] = [
+    let lost: [(&str, State); 9] = [
         ("row.pairing", |facts| {
             facts.pairing = Some(Arc::new(PairingDescriptor {
                 protocol: Some("pd".to_owned()),
                 ..PairingDescriptor::default()
             }));
         }),
+        // An empty connector, which the wire's row reads as none.
         ("row.encode", |facts| {
             facts.encode = EncodeOffer {
                 handoff: EncodeHandoff::Push,
                 producer: true,
+                connector: Some(String::new()),
+                ..EncodeOffer::default()
+            };
+        }),
+        ("row.encode.connector", |facts| {
+            facts.encode = EncodeOffer {
+                handoff: EncodeHandoff::Push,
+                producer: true,
+                connector: Some("connector a".to_owned()),
                 ..EncodeOffer::default()
             };
         }),
@@ -1819,8 +1829,8 @@ fn a_fact_the_log_does_not_carry_is_refused_by_its_name_and_nothing_is_written()
     assert_eq!((store.by_key(URL), store.epoch()), (None, epoch));
 
     // What the log carries is taken, and a standby reads it back whole:
-    // what the worker states for a request's hard demands among it, and
-    // whether it takes images.
+    // what the worker states for a request's hard demands among it,
+    // whether it takes images, and its end of the encode handoff.
     let stated = DemandFacts {
         runtime: 7,
         references: true,
@@ -1828,15 +1838,23 @@ fn a_fact_the_log_does_not_carry_is_refused_by_its_name_and_nothing_is_written()
         window: 32_768,
         decoding: 3,
     };
+    let offered = EncodeOffer {
+        handoff: EncodeHandoff::Push,
+        producer: true,
+        connector: Some("connector-a".to_owned()),
+        ..EncodeOffer::default()
+    };
     let stating = |_: Option<&WorkerFacts>| WorkerFacts {
         demand_facts: stated,
         vision: true,
+        encode: offered.clone(),
         ..found_facts()
     };
     hosted.found_one(&maker, URL, &stating).expect("found");
     let row = store.by_key(URL).expect("the found row");
     assert_eq!(row.facts.demand_facts, stated);
     assert!(row.facts.vision);
+    assert_eq!(row.facts.encode, offered);
     let back = worker_wire::told_row(&worker_wire::row(&row), std::time::Instant::now());
     assert_eq!(back.map(|back| back.facts), Ok(row.facts));
 }

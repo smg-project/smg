@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{cell::RefCell, collections::BTreeMap, sync::Arc};
 
 use parking_lot::Mutex;
 use smg_worker::registry::{WorkerId as ObjectId, WorkerRegistry};
@@ -53,6 +53,28 @@ impl Journal for Told {
     fn restart(&self, _: Position) -> bool {
         true
     }
+
+    fn released(&self) {
+        let hook = LET_GO.with(|held| held.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
+/// What [`on_let_go`] keeps for the journal to run.
+type Hook = Box<dyn FnOnce()>;
+
+thread_local! {
+    static LET_GO: RefCell<Option<Hook>> = const { RefCell::new(None) };
+}
+
+/// `hook` runs once on this thread, where the next write of a
+/// [`Replica`]'s store has let its locks go: behind a cut's write too,
+/// ahead of the holder's lay. It is taken out first: a write the hook
+/// itself makes meets none.
+pub(crate) fn on_let_go(hook: impl FnOnce() + 'static) {
+    LET_GO.with(|held| *held.borrow_mut() = Some(Box::new(hook)));
 }
 
 /// A replica as a controller keeps one: a journaled store, and a holder

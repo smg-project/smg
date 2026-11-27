@@ -37,7 +37,8 @@
 //! tell the store refuses ([`mod@super::status`]).
 //!
 //! A restore is the store's restore and the lay of the cut's own rows in
-//! one turn of the holder. No row is read back. Nothing that takes the
+//! one turn of the holder. No row is read back to lay an object: each
+//! row's status is read off the table. Nothing that takes the
 //! turn finds the objects of one history beside the rows of another.
 //!
 //! A gateway's watcher hands the holder the same two: each change of its
@@ -169,10 +170,12 @@ impl<G: Generation> Objects<G> {
 
     /// One body for a cut the store takes whole, under the holder's turn
     /// its caller holds: `door` is the store's own entry for it. The
-    /// holder keeps the cut's own rows and reads none back. Each is held
-    /// against the object that stands for it ([`Self::reconcile`]), on its
-    /// own: the rows' order moves no object. The keeper forgets the rows
-    /// that left behind the store's write.
+    /// holder lays the cut's own rows, copied ahead of that entry, which
+    /// takes the cut whole: a cut the store refuses is copied too. The one
+    /// read of the table left is each row's status. Each row is held
+    /// against the object that stands for it ([`Self::reconcile`]), and
+    /// the registry takes new objects in the rows' order. The keeper
+    /// forgets the rows that left behind the store's write.
     fn laid_whole(
         &self,
         store: &MemoryStore,

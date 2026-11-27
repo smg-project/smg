@@ -1428,9 +1428,9 @@ impl PDRouter {
     /// the healthy prefill worker beside it. On the early-commit path the
     /// drain records the prefill's once its body is known: the attempt's
     /// status is the decode's there, and recording it on the prefill would
-    /// reset the failures the drain counts. A streamed decode head's success
-    /// was recorded before its relay task was spawned
-    /// (`create_streaming_response`), so it is not recorded again. A failure
+    /// reset the failures the drain counts. A streamed decode head's sample
+    /// is its relay's to take, at the head or at the stream's end
+    /// (`create_streaming_response`), so it is not recorded here. A failure
     /// goes through the request's `ledger`, which charges a worker once a
     /// request however many of its attempts failed there.
     fn record_attempt_outcomes(
@@ -1580,8 +1580,9 @@ impl PDRouter {
     }
 
     /// The decode side's response head, once the prefill side is done with:
-    /// the side's outcome recorded (a streamed head's success is the relay's
-    /// to record, before it spawns its task, see `create_streaming_response`;
+    /// the side's outcome recorded (a streamed head's sample is the relay's
+    /// to take, at the head or at the stream's end, see
+    /// `create_streaming_response`;
     /// a non-streamed success is recorded after its body is read), an error
     /// status answered, the PD TTFT taken from the dispatch to this head (the
     /// prefill wait is part of what the client experiences), and the body
@@ -8627,8 +8628,8 @@ mod tests {
         worker
     }
 
-    /// The successful head of a decode stream is recorded on the decode
-    /// worker before the relay task is spawned, so a body the worker cuts
+    /// On a breaker that is not closed, a decode stream's successful head is
+    /// recorded before the relay task is spawned, so a body the worker cuts
     /// right behind the head is sampled after the head's success and stands.
     /// Read on a current-thread runtime, where the relay cannot run before
     /// the body is polled: the half-open breaker is closed by the head as
@@ -10260,6 +10261,43 @@ mod tests {
         );
     }
 
+    /// The drain's twin of the case above: a streamed pair's prefill body
+    /// that breaks off under its drain is told as a failed connection, no
+    /// answer of the worker's. The decode's stream is the client's and ends
+    /// well.
+    #[tokio::test]
+    async fn the_engine_hears_a_prefill_body_cut_under_its_drain_as_a_failed_connection() {
+        let (prefill_url, _refusing) = faulty_stub(Fault::CutAfterHead).await;
+        let decode_url = spawn_cut_stub(
+            "/v1/chat/completions",
+            "text/event-stream",
+            CHAT_SSE_CHUNKS,
+            false,
+        )
+        .await;
+        let router = single_attempt_router();
+        let heard = hearing_pair_sides_on(&router.policy_registry);
+        register_fleet(
+            &router,
+            Shape::Parallel,
+            &prefill_url,
+            &[decode_url.as_str()],
+        );
+
+        let response = stream_chat_through(&router).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            ends_heard_at(&heard, 2).await,
+            [
+                "completed Decode Ok 200",
+                "completed Prefill ConnectFailed 502"
+            ]
+        );
+    }
+
     /// A fan-out of more than one answer sends no prefill. The route lets
     /// the prefill's guard go unsent and tells its end nothing, and the
     /// decode is told its own answer.
@@ -10304,7 +10342,7 @@ mod tests {
     /// A MoRI-IO pair written concurrently tells the side that answered and
     /// leaves the side it dropped to nobody. The rows: a decode that
     /// refuses, or whose call fails, while its prefill is in flight, and a
-    /// prefill that refuses while its decode is.
+    /// prefill that does either while its decode is.
     #[tokio::test]
     async fn the_engine_hears_the_side_that_answered_of_a_pair_written_concurrently() {
         use Fault::{Refuses, Unreachable};
@@ -10329,6 +10367,14 @@ mod tests {
                 UNAVAILABLE,
                 "completed Decode Cancelled",
                 "completed Prefill ServerError 503",
+            ),
+            // The route's own answer for a call that failed is no answer
+            // of the worker's.
+            (
+                PdSide::Prefill,
+                Unreachable,
+                "completed Decode Cancelled",
+                "completed Prefill ConnectFailed 502",
             ),
         ];
         for (fails, fault, decode_end, prefill_end) in rows {

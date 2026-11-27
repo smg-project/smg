@@ -142,7 +142,7 @@ use crate::{
         pair_classes::PartnerClasses,
         records::{vetoes, with_shadow::Lends, HeldCells, Live, PoolRecords},
         shadow::{budget_left, ShadowSide, Shadowed, SHADOW_FLOOR},
-        sticky_sessions::DecodeVerdict,
+        sticky_sessions::SessionVerdict,
         view::{
             AffinityFacts, Candidate, Constraints, Feed, Phase, PoolFacts, RequestFacts, Role,
             Session, SessionCountedUnder, WorkerId,
@@ -213,10 +213,14 @@ pub struct PairLists<'a> {
     /// The places of the prefill list the request may take, ascending,
     /// each once; `None` for every place. The request's own fact and no
     /// veto of a worker: the prefill side's set opens with them under any
-    /// document ([`Constraints::places`]).
+    /// document ([`Constraints::places`]). Places are judged as stated,
+    /// with no fallback to the list whole: a shed is made over the
+    /// workers at them. A host that wants the gateway's own selection's
+    /// filter, with its fallback, states it as the route's rule.
     pub prefill_places: Option<&'a [u32]>,
-    /// The places of the decode list the request may take, stated as the
-    /// prefills' are. The two stand apart: a host may hold one side alone.
+    /// The places of the decode list the request may take, stated and
+    /// judged as the prefills' are. The two stand apart: a host may hold
+    /// one side alone.
     /// The decode asked again behind a held prefill is held to them too,
     /// and its held prefill is found wherever it stands in its list.
     pub decode_places: Option<&'a [u32]>,
@@ -665,6 +669,8 @@ impl<'a> PairLists<'a> {
                 decode_signal_cells,
                 table: self.classes.table(),
                 first: self.classes.first(),
+                // A demand left each side the workers that meet it.
+                part: demanded,
             };
             let mut decision = match (held, said) {
                 (None, None) => {
@@ -1003,7 +1009,7 @@ pub(super) fn not_decided(cx: &Constraints<'_>) -> Option<(ShedReason, &'static 
 
 /// The request's session under the decode phase: each side of a pair keeps
 /// its own.
-fn decode_session(facts: &RequestFacts<'_>) -> Session {
+pub(super) fn decode_session(facts: &RequestFacts<'_>) -> Session {
     RequestFacts {
         phase: Phase::Decode,
         ..*facts
@@ -1644,14 +1650,25 @@ fn decide_with(
     )
 }
 
-/// A decode call's claim takes the date of its pair's lease. The call's
-/// decision claims at its own instant, and each dispatch and release of
-/// the side it issues is told under the lease the pair's first decision
-/// issued, at `issued_micros`. Where `decision` claimed its decode for the
-/// request's key, the engine dates that claim by the lease
-/// ([`Engine::date_claim`]). The pair's refused commit, or the side's
-/// dispatch elsewhere, then takes the claim back. A lease that states no
-/// instant (`0`) dates nothing, and its words reach a claim by its worker.
+/// A decode call's words take the date of its pair's lease. The call's
+/// decision reads its key and claims at its own instant. Each dispatch
+/// and release of the side it issues is told under the lease the pair's
+/// first decision issued, at `issued_micros`.
+///
+/// Where `decision` states a verdict of the request's key for its decode,
+/// the engine takes that lease's date as a reader's of the key
+/// ([`Engine::told_under`]). The side's dispatch is then written. A claim
+/// the call made is dated by the lease too: the pair's refused commit, or
+/// the side's dispatch elsewhere, then takes the claim back.
+///
+/// A lease that states no instant (`0`) dates nothing, and its words
+/// reach a claim by its worker. A decode that states no verdict tells the
+/// table nothing, and the engine is not asked.
+///
+/// `key` makes the decode side's key, and is asked only where the engine
+/// is. A guard's call hands the key its side's issue made. A call with no
+/// lease makes it from the request ([`decode_session`]). `at` is the
+/// call's own instant.
 ///
 /// A call that faults behind its claim dates nothing. The claim then keeps
 /// the call's instant, as the claim of any decision that faults stands.
@@ -1660,19 +1677,23 @@ fn decide_with(
 #[inline]
 pub(super) fn date_decode_claim(
     own: Loaded<'_, '_>,
-    facts: &RequestFacts<'_>,
     decision: &Decision,
+    key: impl FnOnce() -> Session,
+    at: u64,
     issued_micros: u64,
 ) {
     let first = decision.pick().and_then(|pick| pick.targets.first());
     let Some(pair) = first.and_then(|first| first.pair) else {
         return;
     };
-    if pair.decode_verdict == DecodeVerdict::CLAIMED {
-        let engine = own.document.spec.engine();
-        let (key, at) = (decode_session(facts), facts.now_micros);
-        engine.date_claim(key, pair.decode_id, at, issued_micros);
-    }
+    // Every byte that names no verdict reads as none.
+    let claimed = match pair.decode_verdict.on(pair.decode_id) {
+        SessionVerdict::None => return,
+        SessionVerdict::Claimed(claimed) => Some(claimed),
+        _ => None,
+    };
+    let engine = own.document.spec.engine();
+    engine.told_under(key(), claimed, at, issued_micros);
 }
 
 /// One decision of a pair by `own`, the engine of a gateway's own process,
@@ -1820,9 +1841,12 @@ pub(super) fn issued(
     // A decode asked again decides under the pair's lease: a claim it made
     // takes that lease's date. The decision is read where the answer
     // stands, as it is written above: read ahead of its issue, it cost a
-    // decode call 160 instructions more, counted with Callgrind.
+    // decode call 160 instructions more, counted with Callgrind. The
+    // side's issue made the decode's key: the answer keeps it, and it is
+    // not made again.
     if let Some(held) = held {
-        date_decode_claim(own, facts, &outcome.decision, held.lease.issued_micros);
+        let (key, at) = (outcome.decode_session, facts.now_micros);
+        date_decode_claim(own, &outcome.decision, || key, at, held.lease.issued_micros);
     }
     outcome
 }

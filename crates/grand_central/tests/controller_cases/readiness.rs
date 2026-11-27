@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use smg_grand_central::service::{
     controller::{Controller, ElectionConfig, LeasePlace, Scope, State},
-    elector::{ElectionSettings, FileLease, LeaseBackend},
+    elector::{FileLease, LeaseBackend},
     proto::{
         controller_frame, decide_answer, gateway_frame, grand_central_client::GrandCentralClient,
         DecideRequest, GatewayFrame, Hello, LeaderRequest, RequestFacts,
@@ -224,15 +224,12 @@ async fn a_controller_that_cannot_read_its_lease_is_not_ready_until_it_can() {
     let mut config = config();
     // No settle window: the stop's release is all the serve waits for.
     config.shutdown_settle = Duration::ZERO;
-    config.election = ElectionConfig {
-        lease: LeasePlace::File(lease.clone()),
-        settings: ElectionSettings {
-            duration: Duration::from_millis(600),
-            renew_period: Duration::from_millis(50),
-            renew_deadline: Duration::from_millis(400),
-        },
-        advertise: None,
-    };
+    config.election = ElectionConfig::default();
+    config.election.lease = LeasePlace::File(lease.clone());
+    config.election.settings.duration = Duration::from_millis(600);
+    config.election.settings.renew_period = Duration::from_millis(50);
+    config.election.settings.renew_deadline = Duration::from_millis(400);
+    config.election.advertise = None;
     let controller = Controller::bind(config).await.expect("bind");
     let addresses = controller.addresses();
     let gateway = addresses.of(Scope::Gateway).expect("the gateway listener");

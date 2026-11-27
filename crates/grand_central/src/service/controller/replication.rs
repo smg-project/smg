@@ -39,10 +39,14 @@ use tokio::{
     time::{interval, Interval, MissedTickBehavior},
 };
 use tonic::{codegen::tokio_stream::Stream, Code, Status, Streaming};
-use tracing::info;
+use tracing::{info, warn};
 
 use super::{
-    election::LeasePlace, generations::Generations, service::not_leader, watch_workers, worker_wire,
+    election::LeasePlace,
+    floor::{unbelieved, Floors, Told, FLOORS_SPENT_MAX, FLOOR_REACH},
+    generations::Generations,
+    service::not_leader,
+    watch_workers, worker_wire,
 };
 use crate::{
     service::{
@@ -180,9 +184,10 @@ impl Replication {
     /// Refuses a controller no standby can follow, and a leader whose store
     /// does not lead `term`: the log's one read ([`Log::leads`]), made again
     /// in this call's turn behind the service's guard. That read has three
-    /// refusals: the moment between a take and the take's own write; the
-    /// whole lead, where the log followed a term at or above the take; and
-    /// a call admitted under a take the store has since passed.
+    /// refusals: the moment between a take and the take's own write; a
+    /// lead whose log followed a term at or above the take, which the
+    /// election leaves in the take's step; and a call admitted under a take
+    /// the store has since passed.
     fn serves(&self, term: u64) -> Result<(), Status> {
         if self.log.alone() {
             return Err(Status::failed_precondition(
@@ -213,8 +218,11 @@ impl Replication {
     /// and the log from its place, on the same stream. A frame out of the
     /// stream's order (a first frame that is not the hello, a second hello)
     /// is `FAILED_PRECONDITION`; a frame of no kind is `INVALID_ARGUMENT`.
+    /// A hello that states a term above `term` is refused, and its term is
+    /// said to the election through `floors` ([`said`]).
     pub(crate) async fn replicate(
         &self,
+        floors: &Floors,
         term: u64,
         standby: &str,
         mut inbound: Streaming<proto::ReplicaFrame>,
@@ -229,7 +237,7 @@ impl Replication {
                 ));
             }
         };
-        let feed = self.joins(term, standby, &hello, Instant::now())?;
+        let feed = self.joins(floors, term, standby, &hello, Instant::now())?;
         let mut idle = interval(IDLE);
         idle.set_missed_tick_behavior(MissedTickBehavior::Delay);
         Ok(Batches {
@@ -244,6 +252,7 @@ impl Replication {
     /// from the principal `standby`.
     fn joins(
         &self,
+        floors: &Floors,
         term: u64,
         standby: &str,
         hello: &proto::ReplicaHello,
@@ -261,9 +270,14 @@ impl Replication {
         // applied under a later term was seen under it.
         let seen = hello.term_seen.max(hello.last_applied_term);
         if seen > term {
-            // The standby knows a later term: this replica is deposed and
-            // has not learned it. No leader is named: it knows none. No
-            // re-sync is offered: a deposed leader restores no standby.
+            // The standby knows a later term. Either this replica is
+            // deposed and has not learned it: its next step reads the
+            // record. Or the standby's store is ahead of the lease's
+            // history, and no record says so: the term is said to the
+            // election. No leader is named: this replica knows none. No
+            // re-sync is offered: a replica under a lower term restores no
+            // standby.
+            said(floors, standby, seen, term);
             return Err(not_leader(
                 Code::FailedPrecondition,
                 format!("the standby has seen term {seen}, above this replica's {term}"),
@@ -559,6 +573,40 @@ impl Parts {
 /// An instant's age at `now`, in milliseconds: what crosses in its place.
 pub(super) fn age_ms(now: Instant, then: Instant) -> u64 {
     u64::try_from(now.saturating_duration_since(then).as_millis()).unwrap_or(u64::MAX)
+}
+
+/// A term a standby's hello states above `term`, the term this replica
+/// leads under, said to the election as a gateway's floor is: through the
+/// floors' one door, within their believed range, their budget and their
+/// reach ([`unbelieved`], [`Floors::say`]). The leader gives the lease up,
+/// and the next take is above the term. A term past a bound says nothing.
+fn said(floors: &Floors, standby: &str, seen: u64, term: u64) {
+    if unbelieved(seen, term).is_some() {
+        return;
+    }
+    match floors.say(seen, term) {
+        Told::Said => warn!(
+            standby,
+            seen,
+            term,
+            "a standby has seen a term above this controller's term; the election is told to leave the lease"
+        ),
+        Told::Spent { first: true } => warn!(
+            standby,
+            seen,
+            term,
+            budget = FLOORS_SPENT_MAX,
+            "this process has too few terms left for the term a standby has seen; a term past what is left moves nothing until the process starts again"
+        ),
+        Told::Past { first: true } => warn!(
+            standby,
+            seen,
+            term,
+            reach = FLOOR_REACH,
+            "the term a standby has seen is past the terms a word may move the lease to; it moves nothing, also after a restart"
+        ),
+        Told::Kept | Told::Spent { first: false } | Told::Past { first: false } => {}
+    }
 }
 
 /// `ABORTED` unless the fence calls this replica the leader of `term` at

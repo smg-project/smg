@@ -892,7 +892,7 @@ pub struct WorkerSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_monitor_interval_secs: Option<u64>,
 
-    /// Per-worker multimodal tensor transport override (`inline` | `shm` | `auto`).
+    /// Per-worker multimodal tensor transport override (`inline` | `shm` | `auto` | `rdma`).
     /// Overrides the router-level `multimodal_tensor_transport` for this worker
     /// (e.g. force `shm` for a co-located worker, `inline` for a remote one).
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -38,7 +38,8 @@
 //! - **Once a list of workers** ([`PoolAffinity`]): each worker's number in
 //!   the model's index, what the index held for it and when it was
 //!   admitted, and the list's warming rows by the profile's own ruling
-//!   ([`WarmUpRule`]). It is a ruling read from the index and the worker
+//!   ([`WarmUpRule`]), none while the model's index holds no block. It is
+//!   a ruling read from the index and the worker
 //!   objects, never a copy of a worker's health or load. One decision reads
 //!   it again once its second is up, once the index handed one of its
 //!   numbers on to another worker, or once the index's word of holding a
@@ -1050,7 +1051,8 @@ impl Table {
     /// number in the model's index (one lookup by address), the blocks the
     /// index holds for it, what its index gained since its admission and
     /// its admission instant. Then the profile's ruling of who warms, over
-    /// those columns.
+    /// those columns, asked while the index holds a block: under an index
+    /// that holds none the table names no warming row.
     fn read(asked: &Asked<'_>) -> Self {
         let Asked {
             affinity,
@@ -1169,7 +1171,12 @@ impl Table {
         table.within = within.into();
         table.numbers = numbers.into();
         table.heard = heard.into();
-        if let Some(rule) = engine.pool_rule_for(model, phase) {
+        // A warming row catches up to what the index holds: under an index
+        // that holds no block a single request is named none, as the classic
+        // policy calls its warm-up slice on its road of cache events alone.
+        // A pair's side reads the list's column, which its stage rules by
+        // age and size.
+        if let Some(rule) = engine.pool_rule_for(model, phase).filter(|_| table.holds) {
             let (mut level, mut warming) = (Vec::new(), Vec::new());
             table.ruled = rule.list_warming_rows_grown(
                 &sizes,

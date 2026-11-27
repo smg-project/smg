@@ -1473,10 +1473,12 @@ class RouterArgs:
             type=int,
             default=RouterArgs.max_tree_size,
             help="Maximum total size of each model's approximation tree for "
-            "cache-aware routing, shared across all workers: for HTTP the "
-            "chars of its texts plus 1024 for each node a worker stands on, "
-            "for gRPC tokens; eviction keeps every tree at or under this "
-            "bound",
+            "cache-aware routing, shared across all workers: for requests "
+            "routed by text the chars of its texts plus 1024 for each node a "
+            "worker stands on, for requests routed by token ids (gRPC, and "
+            "HTTP requests that carry them) tokens; each eviction cycle trims "
+            "every tree back toward this bound, and writes take a tree past "
+            "it until the next cycle",
         )
         routing_group.add_argument(
             f"--{prefix}block-size",
@@ -2596,7 +2598,10 @@ class RouterArgs:
             f"--{prefix}decode-expected-workers",
             type=_positive_int,
             default=None,
-            help="Desired decode fleet size, used only as the fixed percentage denominator",
+            help=(
+                "Desired decode fleet size: the fixed percentage denominator."
+                " The minimum of healthy decode workers may not exceed it."
+            ),
         )
         health_group.add_argument(
             f"--{prefix}decode-min-ready-percent",
@@ -2616,7 +2621,10 @@ class RouterArgs:
             f"--{prefix}prefill-expected-workers",
             type=_positive_int,
             default=None,
-            help="Desired prefill fleet size, used only as the fixed percentage denominator",
+            help=(
+                "Desired prefill fleet size: the fixed percentage denominator."
+                " The minimum of healthy prefill workers may not exceed it."
+            ),
         )
         health_group.add_argument(
             f"--{prefix}prefill-min-ready-percent",

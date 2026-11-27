@@ -318,6 +318,24 @@ fn a_shadow_that_picks_another_worker_is_counted_and_the_live_answer_served() {
     assert_eq!(seen.shadows(), 0);
 }
 
+/// A kept decision's record holds what its shadow said and the worker the
+/// shadow picked first. The document keeps every pick of a request that an
+/// id names. The live profile takes the first worker of the list and the
+/// shadow the second. The record names the second as the shadow's target.
+#[test]
+fn a_kept_decisions_record_names_the_worker_its_shadow_picked() {
+    let list = pool(3);
+    let keep_each = |document: &mut PolicySpec| document.explain.sample = 1;
+    let (engine, _) = bed_of("random", Rule::Place(0), Some(Rule::Place(1)), keep_each);
+    let live = placed(&engine, &list, request(7));
+    assert_eq!(first(&live), 0, "the live pick");
+    let record = engine.explained(b"request").expect("the pick is kept");
+    assert_eq!(record.decision, live);
+    let said = (record.shadow, record.shadow_target);
+    let second = worker_id(list[1].as_ref());
+    assert_eq!(said, (Some(ShadowKind::OtherTarget), Some(second)));
+}
+
 /// The shadow decisions are counted under the document that made them: a
 /// document put in force on the running engine starts its count at zero,
 /// and counts its own.
@@ -642,6 +660,65 @@ fn what_a_shadow_said_names_its_binding_its_kind_and_its_first_target() {
     };
     assert_eq!(said, Some(said_of));
     assert_eq!(kinds(&engine), [0; 4]);
+}
+
+/// Under the floor every profile draws from, a pick of two draws with no
+/// shadow and is decided by the whole pass with one, whose records are all
+/// written. The two hand out the same workers in the same order at every
+/// seed, also where the two drawn tie: the draw leaves the order of the two
+/// to the request's own seed, as the pass does. With no load report every
+/// worker ties.
+#[test]
+fn a_shadow_leaves_a_pick_of_two_as_it_is_under_the_floor_of_the_draws() {
+    let stages = StageRegistry::builtin();
+    let engine = engine_of(
+        with_shadow_profile("power_of_two", profile_of("power_of_two")),
+        &stages,
+    );
+    let unshadowed = engine_of(
+        PolicySpec::preset("power_of_two").expect("a built-in preset"),
+        &stages,
+    );
+    for workers in [8, 12] {
+        let list = pool(workers);
+        let reports = (0..workers).map(|at| {
+            let queued = i32::try_from(at * 7 % 13).expect("a small count") * 4_000;
+            let url = format!("http://worker-{at}:8000");
+            (url, one_rank_load(queued, 0.1, 1_000.0))
+        });
+        let snapshot = LoadSnapshot::from_loads_for_test(reports.collect());
+        let answer = |engine: &InProcess, loads: &Option<Arc<LoadSnapshot>>, seed: u64| {
+            let members = PublishedList::new(Arc::clone(&list));
+            let asks = Asks {
+                loads: loads.clone(),
+                ..Asks::of(request(seed), Some(&members))
+            };
+            match answered(engine, &asks).whole() {
+                Some((decided, _)) => decided.decision,
+                None => {
+                    let whole = engine.decide_without_lease(&asks, Instant::now());
+                    whole.expect("a whole decision").0
+                }
+            }
+        };
+        for loads in [None, Some(Arc::clone(&snapshot))] {
+            for seed in 0..64 {
+                let (with, without) = (
+                    answer(&engine, &loads, seed),
+                    answer(&unshadowed, &loads, seed),
+                );
+                assert!(without.trace().drew_first(), "{workers} workers: a draw");
+                assert!(!with.trace().drew_first(), "{workers} workers: the pass");
+                assert_eq!(
+                    with.pick().map(|pick| &pick.targets),
+                    without.pick().map(|pick| &pick.targets),
+                    "{workers} workers, seed {seed}, reports {}",
+                    loads.is_some()
+                );
+                assert_eq!(without.pick().expect("a pick").targets.len(), 2);
+            }
+        }
+    }
 }
 
 /// A shadow profile equal to the live one agrees with it on every decision
@@ -1180,4 +1257,31 @@ fn the_bindings_from_the_sixteenth_on_are_told_as_one_row() {
         counts_of(15, ShadowSide::Single, [0, 2, 0, 0]),
     ];
     assert_eq!(told(&engine), rows.concat());
+}
+
+/// A binding behind the sixteenth is told in the last row where it alone
+/// names a shadow. The scan of the bindings does not end with the rows.
+/// Here the seventeenth binding alone names one, the eighteenth names none,
+/// and the requests are the seventeenth's.
+#[test]
+fn a_binding_behind_the_sixteenth_that_alone_names_a_shadow_is_told() {
+    let list = pool(3);
+    let eighteen = |document: &mut PolicySpec| {
+        let shadowed = document.bindings.pop().expect("the preset's binding");
+        for at in 0..18 {
+            let mut binding = shadowed.clone();
+            if at != 16 {
+                binding.matcher.model = format!("model-{at}");
+                binding.shadow = None;
+            }
+            document.bindings.push(binding);
+        }
+    };
+    let (engine, _) = bed_of("random", Rule::Place(0), Some(Rule::Place(1)), eighteen);
+    let last_row = |counts| counts_of(15, ShadowSide::Single, counts);
+    assert_eq!(told(&engine), last_row([0; 4]), "zeros ahead of a decision");
+    for seed in 0..2 {
+        let _ = placed(&engine, &list, request(seed));
+    }
+    assert_eq!(told(&engine), last_row([0, 2, 0, 0]));
 }

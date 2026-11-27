@@ -4,6 +4,7 @@
 //! extracted from `responses/` for separation of concerns.
 
 #[cfg(test)]
+#[path = "../../../tests/unit/openai/mcp/test_support.rs"]
 pub(crate) mod test_support;
 mod tool_handler;
 mod tool_loop;

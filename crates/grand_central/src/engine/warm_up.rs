@@ -2,7 +2,10 @@
 //!
 //! The `warmup-slice` stage of the `cache_aware` policy applies it to a
 //! decision's rows. A host that names a pool's warming rows asks the same
-//! ruling ([`WarmUpRule::list_warming_rows`]), so the two never differ.
+//! ruling ([`WarmUpRule::list_warming_rows`]), so the two never differ
+//! where the host asks it. The in-process engine does not ask it for a
+//! single request while the model's index of cache events holds no block:
+//! it names no warming row there.
 
 /// How a host reads the rows a ruling named ([`WarmUpRule::list_warming_rows`])
 /// at an instant of the ruling's clock.

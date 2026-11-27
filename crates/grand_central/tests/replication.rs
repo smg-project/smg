@@ -39,17 +39,17 @@ use prost::Message as _;
 use smg_grand_central::{
     engine::{DemandFacts, WireModes, WorkerId},
     service::{
-        controller::{
-            Config, Controller, ElectionConfig, Error, LeasePlace, Listener, Readiness, Scope,
-            State,
-        },
+        controller::{Config, Controller, Error, LeasePlace, Listener, Readiness, Scope, State},
         elector::{ElectionSettings, Elector, FileLease, TickOutcome},
         proto::{
             self, grand_central_client::GrandCentralClient, replica_frame::Frame,
             replication_event::Event as Sent, worker_event::Event,
         },
     },
-    store::{HealthPolicy, MemoryStore, Registrant, WorkerFacts, WorkerStatus, WorkersStore},
+    store::{
+        EncodeHandoff, EncodeOffer, HealthPolicy, MemoryStore, Registrant, WorkerFacts,
+        WorkerStatus, WorkersStore,
+    },
     worker_host::{HealthAdapter, Members, Objects, SoleLead},
 };
 use smg_worker::health::port::{HealthSink, ProbeAnswer};
@@ -65,23 +65,20 @@ use tonic_health::pb::{
     health_check_response::ServingStatus, health_client::HealthClient, HealthCheckRequest,
 };
 
-/// Long against a loaded host: the leader of the case's start leads to its
-/// end.
+/// Long against a loaded host: the leader of a case's start leads to its
+/// end, unless the case makes it leave. A replica that left its lease
+/// holds its takes back for the duration, so it takes none again inside
+/// the case.
 fn settings() -> ElectionSettings {
-    ElectionSettings {
-        duration: Duration::from_secs(60),
-        renew_period: Duration::from_millis(500),
-        renew_deadline: Duration::from_secs(40),
-    }
+    let mut settings = ElectionSettings::default();
+    settings.duration = Duration::from_secs(60);
+    settings.renew_period = Duration::from_millis(500);
+    settings.renew_deadline = Duration::from_secs(40);
+    settings
 }
 
 fn listener(name: &str, scopes: &[Scope]) -> Listener {
-    Listener {
-        name: name.to_owned(),
-        addr: loopback(),
-        scopes: scopes.to_vec(),
-        tls: None,
-    }
+    Listener::of(name.to_owned(), loopback(), scopes.to_vec(), None)
 }
 
 /// What a case reaches of the controller it runs against.
@@ -129,28 +126,27 @@ where
 {
     // A replica under a shared lease follows, and one that follows names
     // its replication port: a number of the pairs' own.
-    let config = |port| Config {
-        controller_id: "replication-0".to_owned(),
-        listeners: vec![
-            listener("gateway", &[Scope::Gateway]),
-            listener("control", &[Scope::Control]),
-            Listener {
-                addr: SocketAddr::new(LEADER, port),
-                ..listener("replication", &[Scope::Replication])
-            },
-        ],
-        admin: loopback(),
-        shutdown_settle: Duration::from_millis(50),
-        shutdown_grace: Duration::from_secs(5),
-        load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
-        worker_overload: Config::DEFAULT_WORKER_OVERLOAD,
-        decide_shards: 2,
-        discovery: None,
-        election: ElectionConfig {
-            lease: place.clone(),
-            settings: settings(),
-            advertise: None,
-        },
+    let config = |port| {
+        let mut configuration = Config::of(
+            "replication-0".to_owned(),
+            vec![
+                listener("gateway", &[Scope::Gateway]),
+                listener("control", &[Scope::Control]),
+                {
+                    let mut listening = listener("replication", &[Scope::Replication]);
+                    listening.addr = SocketAddr::new(LEADER, port);
+                    listening
+                },
+            ],
+            loopback(),
+        );
+        configuration.shutdown_settle = Duration::from_millis(50);
+        configuration.shutdown_grace = Duration::from_secs(5);
+        configuration.decide_shards = 2;
+        configuration.election.lease = place.clone();
+        configuration.election.settings = settings();
+        configuration.election.advertise = None;
+        configuration
     };
     let mut controller = bind_drawn(LEADER, None, config).await;
     // Each listener takes an identity as told.
@@ -652,6 +648,16 @@ async fn a_standby_is_sent_the_log_from_its_place_and_restored_from_any_other() 
             assert_eq!((beat.first_seq, beat.term), (nth(7), term));
         }
 
+        // A second hello ends the stream.
+        joined
+            .frames
+            .send(proto::ReplicaFrame {
+                frame: Some(Frame::Hello(place(nth(6), term))),
+            })
+            .await
+            .expect("the stream's own channel");
+        assert_eq!(joined.ended().await, Some(Code::FailedPrecondition));
+
         // A standby that saw a later term than this replica leads under.
         let later = proto::ReplicaHello {
             term_seen: term + 1,
@@ -676,8 +682,14 @@ async fn a_standby_is_sent_the_log_from_its_place_and_restored_from_any_other() 
         let named = proto::NotLeader::decode(detail.value.as_slice()).expect("a NotLeader");
         assert_eq!(named.leader_address, "", "this replica knows no leader");
 
+        // The hello's term went to the election, and the leader left its
+        // lease: a stream that stood open under its term ends at its next
+        // look.
+        assert_eq!(fresh.ended().await, Some(Code::Aborted));
+
         // So is one whose place stands under a later term, whatever floor
-        // it states: a deposed leader restores no standby.
+        // it states. A replica that left its lease holds its takes back for
+        // the lease's duration (`settings`), and restores no standby.
         let ahead = proto::ReplicaHello {
             term_seen: term,
             ..place(nth(5), term + 1)
@@ -686,16 +698,6 @@ async fn a_standby_is_sent_the_log_from_its_place_and_restored_from_any_other() 
             panic!("a standby ahead of this replica's term is not served");
         };
         assert_eq!(deposed.code(), Code::FailedPrecondition);
-
-        // A second hello ends the stream.
-        joined
-            .frames
-            .send(proto::ReplicaFrame {
-                frame: Some(Frame::Hello(place(nth(6), term))),
-            })
-            .await
-            .expect("the stream's own channel");
-        assert_eq!(joined.ended().await, Some(Code::FailedPrecondition));
     })
     .await;
 }
@@ -1651,31 +1653,31 @@ impl Replica {
     /// leader, on its standby's address too ([`pair::free`]): the number a
     /// standby of this replica then binds on its own address.
     async fn serve(id: &str, ip: IpAddr, port: u16, place: LeasePlace) -> Self {
-        let listener = |name: &str, scopes: &[Scope], port| Listener {
-            name: name.to_owned(),
-            addr: SocketAddr::new(ip, port),
-            scopes: scopes.to_vec(),
-            tls: None,
+        let listener = |name: &str, scopes: &[Scope], port| {
+            Listener::of(
+                name.to_owned(),
+                SocketAddr::new(ip, port),
+                scopes.to_vec(),
+                None,
+            )
         };
-        let config = |port| Config {
-            controller_id: id.to_owned(),
-            listeners: vec![
-                listener("gateway", &[Scope::Gateway], 0),
-                listener("control", &[Scope::Control], 0),
-                listener("replication", &[Scope::Replication], port),
-            ],
-            admin: SocketAddr::new(ip, 0),
-            shutdown_settle: Duration::from_millis(50),
-            shutdown_grace: Duration::from_secs(5),
-            load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
-            worker_overload: Config::DEFAULT_WORKER_OVERLOAD,
-            decide_shards: 2,
-            discovery: None,
-            election: ElectionConfig {
-                lease: place.clone(),
-                settings: settings(),
-                advertise: None,
-            },
+        let config = |port| {
+            let mut configuration = Config::of(
+                id.to_owned(),
+                vec![
+                    listener("gateway", &[Scope::Gateway], 0),
+                    listener("control", &[Scope::Control], 0),
+                    listener("replication", &[Scope::Replication], port),
+                ],
+                SocketAddr::new(ip, 0),
+            );
+            configuration.shutdown_settle = Duration::from_millis(50);
+            configuration.shutdown_grace = Duration::from_secs(5);
+            configuration.decide_shards = 2;
+            configuration.election.lease = place.clone();
+            configuration.election.settings = settings();
+            configuration.election.advertise = None;
+            configuration
         };
         let mut controller = if port == 0 {
             bind_drawn(ip, (ip == LEADER).then_some(FOLLOWER), config).await
@@ -1818,19 +1820,24 @@ async fn a_promoted_standby_holds_every_row_of_its_leader() {
     let port = leader.replication.port();
     let mut standby = Replica::serve("replication-1", FOLLOWER, port, shared(&dir)).await;
     // A ready worker the load monitor polls, at an address nobody answers.
-    // It states what a worker states for a request's hard demands, and it
-    // takes images: the log's row tells both, so the standby holds the row
-    // whole.
+    // It states what a worker states for a request's hard demands, it
+    // takes images, and it states an end of the encode handoff: the log's
+    // row tells the three, so the standby holds the row whole.
     let mut stated = DemandFacts::default();
     stated.runtime = 7;
     stated.references = true;
     stated.host_pipeline = true;
     stated.window = 32_768;
     stated.decoding = 3;
+    let mut offered = EncodeOffer::default();
+    offered.handoff = EncodeHandoff::Push;
+    offered.producer = true;
+    offered.connector = Some("connector-a".to_owned());
     let polled = WorkerFacts {
         wire_modes: WireModes::GRPC,
         demand_facts: stated,
         vision: true,
+        encode: offered,
         ..facts("grpc://127.0.0.1:1", 1, 0)
     };
     let written = leader

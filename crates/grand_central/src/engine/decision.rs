@@ -1,6 +1,6 @@
 //! The typed decision (design 4.2): an ordered list of targets the host walks
-//! at dispatch, a shed with its reason and the stage that emptied the pool, or
-//! a queue ticket. A busy answer is not a decision: a remote decider gives it
+//! at dispatch, a shed with its reason and the stage it is named by, or a
+//! queue ticket. A busy answer is not a decision: a remote decider gives it
 //! on its stream and the host's fallback takes over at once, so the enum
 //! never carries one.
 
@@ -898,32 +898,66 @@ impl Pick {
 #[non_exhaustive]
 pub struct Shed {
     pub reason: ShedReason,
-    /// The name of the filter or picker that left nothing.
+    /// The name of the filter or picker that left nothing. A pair's shed
+    /// as saturated over whole lists names the overload veto, whichever
+    /// stage ended its pass: the list judged is wholly over its
+    /// thresholds. A pair's shed
+    /// with no endpoint behind a pass that the overload veto ended names
+    /// the stage that refused a worker with room of the list judged: the
+    /// first such worker in the list's order, and where none has room the
+    /// first ready one, or the list's first where none is ready. A list
+    /// that holds no worker names `partnered`
+    /// ([`Engine::decide_pair`](crate::engine::framework::Engine::decide_pair)).
     pub emptied_by: &'static str,
     pub retry_after_secs: u16,
     /// The binding's scale-from-zero budget lets the host hold the request.
     pub wait_allowed: bool,
-    /// The side of a pair this refusal is for: a host answers for that
-    /// role, as the gateway's own pair selection names a role in every
-    /// refusal. A decision fills it by its own list, the one its stages
-    /// left with nobody. The prefill side where no prefill passed its own
-    /// stages, where the prefill's own run declined, and where the
-    /// prefills stand at their admission limit. The decode side where the
-    /// prefills that passed had no decode to pair with, and where the
-    /// decode's run refused. A decode decided again names the decode
-    /// side, and the prefill side where the held prefill left its list.
-    /// Two refusals name the side of the list that selection judges
-    /// instead. A pair whose named worker's number reaches nobody
-    /// (`target-worker`) names the side it reaches nobody on, the
-    /// prefills' first. A call's shed that stands behind a route's rule
-    /// names the prefill side where none of the rule's prefills can take
-    /// the request, whichever list the decision said. An encode request
-    /// names the side of its pair that a hard demand left nobody, as its
-    /// pair alone does. `None` for a single decision, for a pair refused
+    /// The side of a pair this refusal is for: the role the gateway's own
+    /// pair selection names in the same refusal, for which a host
+    /// answers. The prefill side where the prefill's own run declined,
+    /// and where the prefills stand at their admission limit. Where the
+    /// prefill side places nobody else, the side is read in that
+    /// selection's order: the prefill side for a prefill pool that holds
+    /// no worker; the decode side where no prefill of the pool pairs with
+    /// any decode, a decode pool that holds no worker among them; the
+    /// decode side where a prefill that pairs with a decode stands as it
+    /// is, its admission limit aside; and else the prefill side
+    /// ([`Engine::decide_pair`](crate::engine::framework::Engine::decide_pair)).
+    /// That order is read over the pools the decision is handed. Two
+    /// cuts are made ahead of it: over lists that both hold a worker, a
+    /// request whose hard demand no worker of a list meets is refused
+    /// for that list's side, the prefills' first, and an encode
+    /// request's pass hands the decision the prefills an open encoder
+    /// serves, so a pool it leaves nobody reads as one that holds no
+    /// worker. Where both lists hold a worker and no prefill pairs with
+    /// any decode, both part from that selection, which asks the
+    /// pairing first: the design names the two open. A demand's cut
+    /// parts from it too where a pair stands only among the workers the
+    /// demand left out.
+    /// The decode side too where the prefill was picked and the decode's
+    /// run refused. A decode decided again names the decode side, and the
+    /// prefill side where the held prefill left its list. A pair whose
+    /// named worker's number reaches nobody (`target-worker`) names the
+    /// side it reaches nobody on, the prefills' first. A call's shed as
+    /// saturated that stands behind a route's rule names the side of the
+    /// list that selection judges among the rule's workers: the prefill
+    /// side where none of the rule's prefills can take the request,
+    /// whichever list the decision said. An encode request's refusal for
+    /// a hard demand names a side as its pair's alone does: over lists
+    /// that both hold a worker the side the demand left nobody, and where
+    /// a list of its pair holds no worker that list's side instead. A
+    /// refusal of its pair's own decision keeps that decision's side.
+    /// `None` for a single decision, for a pair refused
     /// before either side was read, for an encode request's other
-    /// refusals of its own pass (for its encoders, for the pairs they
-    /// serve, for a list's places), and for a refusal that came over a
-    /// link: the protocol's message has no field for it.
+    /// refusals of its own pass (ahead of either side's read, for its
+    /// encoders or an item, for the pairs they serve, for the decodes
+    /// that take its images, for a list's places), for a call's shed
+    /// with no endpoint that stands
+    /// behind a route's rule, whose lists the rule narrowed, and for a
+    /// refusal that came over a link: the protocol's message has no field
+    /// for it. A shed made where no prefill of the lists pairs with any
+    /// decode keeps its side under a route's rule: the rule is not asked
+    /// behind it.
     pub side: Option<PairSide>,
     pub trace: Trace,
 }
@@ -967,9 +1001,8 @@ impl Decision {
         }
     }
 
-    /// This decision, its refusal naming the side of a pair that was left
-    /// with nobody ([`Shed::side`]). A pick and a queue ticket pass as they
-    /// are.
+    /// This decision, its refusal naming the side of a pair it is for
+    /// ([`Shed::side`]). A pick and a queue ticket pass as they are.
     #[must_use]
     pub(crate) fn of_side(mut self, side: PairSide) -> Self {
         if let Self::Shed(shed) = &mut self {

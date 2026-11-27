@@ -39,7 +39,7 @@ use ndarray::Array4;
 use crate::{
     buffer_pool,
     encoder_inputs::{EncoderDtype, EncoderInput, PixelNorm},
-    pixel_convert::WireWriter,
+    pixel_convert::{Bf16Steps, StepsWriter},
     vision::{
         preprocessor_config::PreProcessorConfig,
         processor::{ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor},
@@ -294,8 +294,23 @@ impl Llama4VisionProcessor {
             .collect()
     }
 
+    /// The reference processor's arithmetic: it rescales by `1 / 255` and
+    /// normalizes in `bfloat16`, one rounded step after another, whatever
+    /// dtype the engine then casts to. Every float this processor emits is
+    /// that table's.
+    fn steps(&self) -> Bf16Steps {
+        Bf16Steps {
+            factor: 1.0 / 255.0,
+            mean: self.mean.map(|mean| mean as f32),
+            std: self.std.map(|std| std as f32),
+        }
+    }
+
     /// `(byte - 255 * mean) / (255 * std)` in `f32`, the fused order of
-    /// [`transforms::to_tensor_and_normalize`], in the form a wire carries.
+    /// [`transforms::to_tensor_and_normalize`], in the form a wire carries:
+    /// the nearest a `PixelNorm` comes to [`Self::steps`], whose values the
+    /// wire holds (at the default mean and std the two are within half a
+    /// byte step of each other).
     fn norm(&self) -> PixelNorm {
         let tile = self.tile_size as usize;
         PixelNorm {
@@ -477,7 +492,7 @@ impl VisionPreProcessor for Llama4VisionProcessor {
         let plans = self.plans(images);
         let tile = self.tile_size as usize;
         let tiles: usize = plans.iter().map(Plan::tiles).sum();
-        let table = self.norm().table_f32();
+        let table = self.steps().table_f32();
         // Every image's tiles land in the one buffer the engine reads:
         // [total_tiles, C, H, W], no batch dimension, no zero-padding.
         let mut data =
@@ -502,8 +517,7 @@ impl VisionPreProcessor for Llama4VisionProcessor {
         images: &[&DynamicImage],
         dtype: EncoderDtype,
     ) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
-        let norm = self.norm();
-        let writer = WireWriter::new(&norm, dtype)?;
+        let writer = StepsWriter::new(&self.steps(), dtype)?;
         if images.is_empty() {
             return Some(Err(TransformError::EmptyBatch));
         }
@@ -531,7 +545,7 @@ impl VisionPreProcessor for Llama4VisionProcessor {
         debug_assert_eq!(written, wire.len(), "the tiles cover the wire");
 
         Some(
-            EncoderInput::wire(wire, dtype, vec![tiles, 3, tile, tile], norm)
+            EncoderInput::wire(wire, dtype, vec![tiles, 3, tile, tile], self.norm())
                 .map(|encoder_input| self.outputs(images, &plans, encoder_input))
                 .map_err(TransformError::ShapeError),
         )
@@ -889,5 +903,165 @@ mod tests {
                 "{result:?}"
             );
         }
+    }
+
+    /// The reference processor's words for the byte levels 0 to 255 at the
+    /// default mean and std, the three channels alike: its `bfloat16`
+    /// tensor. A `float32` reads each word widened.
+    const REFERENCE_BF16: [u16; 256] = [
+        0xbf80, 0xbf7e, 0xbf7c, 0xbf7a, 0xbf78, 0xbf76, 0xbf74, 0xbf72, 0xbf70, 0xbf6e, 0xbf6c,
+        0xbf6a, 0xbf68, 0xbf66, 0xbf64, 0xbf62, 0xbf60, 0xbf5e, 0xbf5c, 0xbf5a, 0xbf58, 0xbf56,
+        0xbf54, 0xbf52, 0xbf50, 0xbf4e, 0xbf4c, 0xbf4a, 0xbf48, 0xbf46, 0xbf44, 0xbf42, 0xbf40,
+        0xbf3e, 0xbf3c, 0xbf3a, 0xbf38, 0xbf36, 0xbf34, 0xbf32, 0xbf30, 0xbf2e, 0xbf2c, 0xbf2a,
+        0xbf28, 0xbf26, 0xbf24, 0xbf22, 0xbf20, 0xbf1e, 0xbf1c, 0xbf1a, 0xbf18, 0xbf16, 0xbf14,
+        0xbf12, 0xbf10, 0xbf0e, 0xbf0c, 0xbf0a, 0xbf08, 0xbf06, 0xbf04, 0xbf02, 0xbefe, 0xbefa,
+        0xbef6, 0xbef2, 0xbeee, 0xbeea, 0xbee6, 0xbee2, 0xbede, 0xbeda, 0xbed6, 0xbed2, 0xbece,
+        0xbeca, 0xbec6, 0xbec2, 0xbebe, 0xbeba, 0xbeb6, 0xbeb2, 0xbeae, 0xbeaa, 0xbea6, 0xbea2,
+        0xbe9e, 0xbe9a, 0xbe96, 0xbe92, 0xbe8e, 0xbe8a, 0xbe86, 0xbe82, 0xbe7c, 0xbe74, 0xbe6c,
+        0xbe64, 0xbe5c, 0xbe54, 0xbe4c, 0xbe44, 0xbe3c, 0xbe34, 0xbe2c, 0xbe24, 0xbe1c, 0xbe14,
+        0xbe0c, 0xbe04, 0xbdf8, 0xbde8, 0xbdd8, 0xbdc8, 0xbdb8, 0xbda8, 0xbd98, 0xbd88, 0xbd70,
+        0xbd50, 0xbd30, 0xbd10, 0xbce0, 0xbca0, 0xbc40, 0xbb80, 0x3c00, 0x3c80, 0x3cc0, 0x3d00,
+        0x3d20, 0x3d40, 0x3d60, 0x3d80, 0x3d90, 0x3da0, 0x3db0, 0x3dc0, 0x3dd0, 0x3de0, 0x3df0,
+        0x3e00, 0x3e08, 0x3e10, 0x3e18, 0x3e20, 0x3e28, 0x3e30, 0x3e38, 0x3e40, 0x3e48, 0x3e50,
+        0x3e58, 0x3e60, 0x3e68, 0x3e70, 0x3e78, 0x3e80, 0x3e84, 0x3e88, 0x3e8c, 0x3e90, 0x3e94,
+        0x3e98, 0x3e9c, 0x3ea0, 0x3ea4, 0x3ea8, 0x3eac, 0x3eb0, 0x3eb4, 0x3eb8, 0x3ebc, 0x3ec0,
+        0x3ec4, 0x3ec8, 0x3ecc, 0x3ed0, 0x3ed4, 0x3ed8, 0x3edc, 0x3ee0, 0x3ee4, 0x3ee8, 0x3eec,
+        0x3ef0, 0x3ef4, 0x3ef8, 0x3efc, 0x3f00, 0x3f02, 0x3f04, 0x3f06, 0x3f08, 0x3f0a, 0x3f0c,
+        0x3f0e, 0x3f10, 0x3f12, 0x3f14, 0x3f16, 0x3f18, 0x3f1a, 0x3f1c, 0x3f1e, 0x3f20, 0x3f22,
+        0x3f24, 0x3f26, 0x3f28, 0x3f2a, 0x3f2c, 0x3f2e, 0x3f30, 0x3f32, 0x3f34, 0x3f36, 0x3f38,
+        0x3f3a, 0x3f3c, 0x3f3e, 0x3f40, 0x3f42, 0x3f44, 0x3f46, 0x3f48, 0x3f4a, 0x3f4c, 0x3f4e,
+        0x3f50, 0x3f52, 0x3f54, 0x3f56, 0x3f58, 0x3f5a, 0x3f5c, 0x3f5e, 0x3f60, 0x3f62, 0x3f64,
+        0x3f66, 0x3f68, 0x3f6a, 0x3f6c, 0x3f6e, 0x3f70, 0x3f72, 0x3f74, 0x3f76, 0x3f78, 0x3f7a,
+        0x3f7c, 0x3f7e, 0x3f80,
+    ];
+
+    /// [`REFERENCE_BF16`] cast to `float16`, which holds every value exactly.
+    const REFERENCE_F16: [u16; 256] = [
+        0xbc00, 0xbbf0, 0xbbe0, 0xbbd0, 0xbbc0, 0xbbb0, 0xbba0, 0xbb90, 0xbb80, 0xbb70, 0xbb60,
+        0xbb50, 0xbb40, 0xbb30, 0xbb20, 0xbb10, 0xbb00, 0xbaf0, 0xbae0, 0xbad0, 0xbac0, 0xbab0,
+        0xbaa0, 0xba90, 0xba80, 0xba70, 0xba60, 0xba50, 0xba40, 0xba30, 0xba20, 0xba10, 0xba00,
+        0xb9f0, 0xb9e0, 0xb9d0, 0xb9c0, 0xb9b0, 0xb9a0, 0xb990, 0xb980, 0xb970, 0xb960, 0xb950,
+        0xb940, 0xb930, 0xb920, 0xb910, 0xb900, 0xb8f0, 0xb8e0, 0xb8d0, 0xb8c0, 0xb8b0, 0xb8a0,
+        0xb890, 0xb880, 0xb870, 0xb860, 0xb850, 0xb840, 0xb830, 0xb820, 0xb810, 0xb7f0, 0xb7d0,
+        0xb7b0, 0xb790, 0xb770, 0xb750, 0xb730, 0xb710, 0xb6f0, 0xb6d0, 0xb6b0, 0xb690, 0xb670,
+        0xb650, 0xb630, 0xb610, 0xb5f0, 0xb5d0, 0xb5b0, 0xb590, 0xb570, 0xb550, 0xb530, 0xb510,
+        0xb4f0, 0xb4d0, 0xb4b0, 0xb490, 0xb470, 0xb450, 0xb430, 0xb410, 0xb3e0, 0xb3a0, 0xb360,
+        0xb320, 0xb2e0, 0xb2a0, 0xb260, 0xb220, 0xb1e0, 0xb1a0, 0xb160, 0xb120, 0xb0e0, 0xb0a0,
+        0xb060, 0xb020, 0xafc0, 0xaf40, 0xaec0, 0xae40, 0xadc0, 0xad40, 0xacc0, 0xac40, 0xab80,
+        0xaa80, 0xa980, 0xa880, 0xa700, 0xa500, 0xa200, 0x9c00, 0x2000, 0x2400, 0x2600, 0x2800,
+        0x2900, 0x2a00, 0x2b00, 0x2c00, 0x2c80, 0x2d00, 0x2d80, 0x2e00, 0x2e80, 0x2f00, 0x2f80,
+        0x3000, 0x3040, 0x3080, 0x30c0, 0x3100, 0x3140, 0x3180, 0x31c0, 0x3200, 0x3240, 0x3280,
+        0x32c0, 0x3300, 0x3340, 0x3380, 0x33c0, 0x3400, 0x3420, 0x3440, 0x3460, 0x3480, 0x34a0,
+        0x34c0, 0x34e0, 0x3500, 0x3520, 0x3540, 0x3560, 0x3580, 0x35a0, 0x35c0, 0x35e0, 0x3600,
+        0x3620, 0x3640, 0x3660, 0x3680, 0x36a0, 0x36c0, 0x36e0, 0x3700, 0x3720, 0x3740, 0x3760,
+        0x3780, 0x37a0, 0x37c0, 0x37e0, 0x3800, 0x3810, 0x3820, 0x3830, 0x3840, 0x3850, 0x3860,
+        0x3870, 0x3880, 0x3890, 0x38a0, 0x38b0, 0x38c0, 0x38d0, 0x38e0, 0x38f0, 0x3900, 0x3910,
+        0x3920, 0x3930, 0x3940, 0x3950, 0x3960, 0x3970, 0x3980, 0x3990, 0x39a0, 0x39b0, 0x39c0,
+        0x39d0, 0x39e0, 0x39f0, 0x3a00, 0x3a10, 0x3a20, 0x3a30, 0x3a40, 0x3a50, 0x3a60, 0x3a70,
+        0x3a80, 0x3a90, 0x3aa0, 0x3ab0, 0x3ac0, 0x3ad0, 0x3ae0, 0x3af0, 0x3b00, 0x3b10, 0x3b20,
+        0x3b30, 0x3b40, 0x3b50, 0x3b60, 0x3b70, 0x3b80, 0x3b90, 0x3ba0, 0x3bb0, 0x3bc0, 0x3bd0,
+        0x3be0, 0x3bf0, 0x3c00,
+    ];
+
+    /// The side of [`every_level`]'s tile.
+    const TILE: usize = 336;
+
+    /// One tile with no resize whose pixels hold every byte level in every
+    /// channel.
+    fn every_level() -> DynamicImage {
+        DynamicImage::ImageRgb8(image::RgbImage::from_fn(
+            TILE as u32,
+            TILE as u32,
+            |x, _| Rgb([x as u8, (x + 85) as u8, (x + 170) as u8]),
+        ))
+    }
+
+    /// The byte level behind element `index` of the `[1, 3, 336, 336]`
+    /// output of [`every_level`].
+    fn level(index: usize) -> usize {
+        (index % TILE + 85 * (index / (TILE * TILE))) % 256
+    }
+
+    /// The bytes of [`every_level`]'s wire in `dtype`.
+    fn wire_bytes(dtype: EncoderDtype) -> Vec<u8> {
+        let wire = Llama4VisionProcessor::new()
+            .preprocess_wire(&[&every_level()], dtype)
+            .unwrap()
+            .unwrap();
+        wire.encoder_input.write_as(dtype).to_vec()
+    }
+
+    /// The float tensor holds the reference processor's value for every
+    /// byte level.
+    #[test]
+    fn the_float_tensor_holds_the_reference_values() {
+        let floats = Llama4VisionProcessor::new()
+            .preprocess(&[&every_level()])
+            .unwrap();
+        let floats = floats.encoder_input.as_f32();
+        assert_eq!(floats.len(), 3 * TILE * TILE);
+        for (index, value) in floats.iter().enumerate() {
+            assert_eq!(
+                value.to_bits(),
+                u32::from(REFERENCE_BF16[level(index)]) << 16,
+                "float tensor, element {index}"
+            );
+        }
+    }
+
+    /// The wire of a two-byte float `dtype` holds `reference`'s word for
+    /// every byte level.
+    fn two_byte_wire_holds(dtype: EncoderDtype, reference: &[u16; 256]) {
+        let bytes = wire_bytes(dtype);
+        assert_eq!(bytes.len(), 2 * 3 * TILE * TILE);
+        for (index, word) in bytes.as_chunks::<2>().0.iter().enumerate() {
+            assert_eq!(
+                u16::from_le_bytes(*word),
+                reference[level(index)],
+                "{dtype} wire, element {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_bfloat16_wire_holds_the_reference_values() {
+        two_byte_wire_holds(EncoderDtype::BFloat16, &REFERENCE_BF16);
+    }
+
+    #[test]
+    fn the_float16_wire_holds_the_reference_values() {
+        two_byte_wire_holds(EncoderDtype::Float16, &REFERENCE_F16);
+    }
+
+    #[test]
+    fn the_float32_wire_holds_the_reference_values() {
+        let bytes = wire_bytes(EncoderDtype::Float32);
+        assert_eq!(bytes.len(), 4 * 3 * TILE * TILE);
+        for (index, word) in bytes.as_chunks::<4>().0.iter().enumerate() {
+            assert_eq!(
+                u32::from_le_bytes(*word),
+                u32::from(REFERENCE_BF16[level(index)]) << 16,
+                "float32 wire, element {index}"
+            );
+        }
+    }
+
+    /// The byte levels at which the fused formula
+    /// ([`Llama4VisionProcessor::norm`], the order this processor normalized
+    /// in before it took the reference's steps) gives another value than the
+    /// reference, by float form: half of the 256 levels as `bfloat16`, 240
+    /// as `float16` and 254 as `float32`.
+    #[test]
+    fn the_fused_formula_differs_from_the_reference_by_form() {
+        use crate::encoder_inputs::{f32_to_bf16_bits, f32_to_f16_bits};
+        let fused = Llama4VisionProcessor::new().norm().table_f32()[0];
+        let differing = |same: &dyn Fn(f32, usize) -> bool| {
+            (0..256).filter(|&level| !same(fused[level], level)).count()
+        };
+        let bf16 = differing(&|value, level| f32_to_bf16_bits(value) == REFERENCE_BF16[level]);
+        let f16 = differing(&|value, level| f32_to_f16_bits(value) == REFERENCE_F16[level]);
+        let f32s =
+            differing(&|value, level| value.to_bits() == u32::from(REFERENCE_BF16[level]) << 16);
+        assert_eq!((bf16, f16, f32s), (128, 240, 254));
     }
 }

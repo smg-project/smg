@@ -114,6 +114,130 @@ fn a_pool_under_the_draws_size_is_read_whole() {
     }
 }
 
+/// A picker that draws two rows is asked to draw before the pool's records
+/// are written from its own floor on, under the draw's size, and every
+/// other picker of the written road from the draw's size. Over a pool
+/// between the two the draw is the whole pass's rule: with every row ready
+/// it hands out the pass's targets in the pass's order, writes two records
+/// and counts no survivor; with rows refused it hands out rows the pass
+/// keeps, as many as the pass, a draw that lands on a refused row gives up
+/// at that row, and the pass behind it hands out its own pick of the seed;
+/// and a pool that keeps one row or none is the pass's own.
+#[cfg(feature = "in-process")]
+#[test]
+fn a_pick_of_two_draws_over_a_small_pool_before_its_records_are_written() {
+    const PAIRS: [&str; 2] = ["power_of_two", "power_of_two/requests"];
+    let (shared, cx) = (PoolFacts::default(), Constraints::default());
+    let sizes = [
+        WRITTEN_PAIR_FROM - 1,
+        WRITTEN_PAIR_FROM,
+        DRAW_FROM - 1,
+        DRAW_FROM,
+    ];
+    for name in ["passthrough", "random", "round_robin"]
+        .into_iter()
+        .chain(PAIRS)
+    {
+        let from = if PAIRS.contains(&name) {
+            WRITTEN_PAIR_FROM
+        } else {
+            DRAW_FROM
+        };
+        let engine = preset(name);
+        for rows in sizes {
+            let asked = engine.drawn_for(&request(3), &shared, rows).is_some();
+            assert_eq!(asked, rows >= from, "{name} over {rows} rows");
+        }
+    }
+    let (mut same, mut gave_up) = (0u32, 0u32);
+    for name in PAIRS {
+        let engine = preset(name);
+        // The decision over the same rows handed written (the whole pass,
+        // under the draw's size), the draw's over rows written as it asks
+        // about them, and the records it wrote.
+        let both = |facts: &RequestFacts<'_>, pool: &[Candidate]| {
+            let want = drawn(&engine, facts, pool);
+            let draw = engine.drawn_for(facts, &shared, pool.len());
+            let mut written = 0u32;
+            let mut write = |fixed: &Candidate, row: &mut Candidate| {
+                written += 1;
+                *row = *fixed;
+            };
+            let mut buffer = vec![Candidate::default(); pool.len()];
+            let got = engine.decide_drawn(
+                draw.expect("a pair's draw"),
+                facts,
+                &shared,
+                pool,
+                &mut buffer,
+                &mut write,
+                &cx,
+                &mut Scratch::new(),
+            );
+            (got, want, written)
+        };
+        for rows in WRITTEN_PAIR_FROM..DRAW_FROM {
+            for (fleet, refused) in REFUSED.into_iter().enumerate() {
+                let pool = pool_of(rows as u32, refused);
+                // The same fleet with a count of its own on every row: no
+                // two rows tie.
+                let mut loaded = pool.clone();
+                for row in &mut loaded {
+                    row.in_flight = row.position;
+                }
+                for seed in 0..64u64 {
+                    let facts = request(seed ^ (rows as u64) << 32);
+                    let at = format!("{name}, {rows} rows, fleet {fleet}, seed {seed}");
+                    let (got, want, written) = both(&facts, &pool);
+                    let kept = pool.iter().filter(|c| c.health.healthy).count();
+                    if kept < 2 {
+                        assert_eq!(positions(&got), positions(&want), "{at}: the pass's own");
+                        assert_eq!(got.pick().is_some(), kept == 1, "{at}");
+                        continue;
+                    }
+                    let (got_rows, want_rows) = (positions(&got), positions(&want));
+                    assert_eq!(got_rows.len(), 2, "{at}: the pick and its alternate");
+                    assert_eq!(want_rows.len(), 2, "{at}: the pass hands out two");
+                    assert_ne!(got_rows[0], got_rows[1], "{at}: a row handed out twice");
+                    assert!(
+                        got_rows.iter().all(|&row| !refused(row)),
+                        "{at}: {got_rows:?} holds a row a filter refuses"
+                    );
+                    if fleet != 0 {
+                        // A draw that stands was refused no row and wrote
+                        // its two alone. One that lands on a refused row
+                        // gives up there, and the pass behind it reads the
+                        // stream as it came: its pick of the seed is the
+                        // one it makes with no draw before it.
+                        if got.trace().survivors.get().is_none() {
+                            assert_eq!(written, 2, "{at}: two records of {rows}");
+                        } else {
+                            assert_eq!(got_rows, want_rows, "{at}: the pass's own pick");
+                            gave_up += 1;
+                        }
+                        continue;
+                    }
+                    // Every row ready: the two rows drawn are the pass's
+                    // two, in the pass's order. Tied, as here, both order
+                    // them by the request's own seed.
+                    assert_eq!(written, 2, "{at}: two records of {rows}");
+                    assert_eq!(got.trace().survivors.get(), None, "{at}: no count");
+                    let counted = want.trace().survivors.get();
+                    assert_eq!(counted, Some(rows as u32), "{at}: the pass counts");
+                    assert_eq!(got_rows, want_rows, "{at}: the pass's two rows");
+                    // And where they do not tie the better leads in both.
+                    let (got, want, _) = both(&facts, &loaded);
+                    assert_eq!(positions(&got), positions(&want), "{at}: the pass's order");
+                    same += 1;
+                }
+            }
+        }
+    }
+    let sizes = (DRAW_FROM - WRITTEN_PAIR_FROM) as u32;
+    assert_eq!(same, 2 * sizes * 64, "the decisions over a ready pool");
+    assert!(gave_up > 0, "no draw gave up at a refused row");
+}
+
 #[test]
 fn a_profile_with_a_stage_that_is_not_row_wise_never_draws() {
     /// A filter that keeps every row and does not say its word on one

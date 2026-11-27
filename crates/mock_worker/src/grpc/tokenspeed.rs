@@ -1153,4 +1153,58 @@ mod tests {
         }
         assert_eq!(cached, [Some(0), Some(64), Some(16), Some(16)]);
     }
+
+    /// A prefill worker under `--prefill-engine true` keys a media item's
+    /// tokens by the item as a regular worker does: the same item is served
+    /// from the cache, another item parts the prompt at its first token.
+    #[tokio::test]
+    async fn a_prefill_worker_on_its_engine_caches_a_media_items_tokens_by_the_item() {
+        let (service, _stop) = MockScheduler::for_tests(
+            Config {
+                realistic: true,
+                role: Some(Role::Prefill),
+                prefill_engine: true,
+                engine: crate::engine::EngineParams {
+                    timing: crate::engine::TimingModel::linear(),
+                    ..Default::default()
+                },
+                ..Config::default()
+            },
+            65_264,
+        );
+        // A block of text, two blocks under the placeholder id, text again.
+        let ids: Vec<u32> = (100..116).chain([9; 32]).chain(200..219).collect();
+        let mut cached = Vec::new();
+        // The last request carries the hash of the one before it under
+        // another modality: another item.
+        for (id, hash, modality) in [
+            ("tw-prefill-media-a1", 1, common::Modality::Image),
+            ("tw-prefill-media-a2", 1, common::Modality::Image),
+            ("tw-prefill-media-b", 2, common::Modality::Image),
+            ("tw-prefill-media-video", 2, common::Modality::Video),
+        ] {
+            let mut item = image_item(16, 32);
+            item.content_hash = vec![hash; 8];
+            item.modality = modality as i32;
+            let mut req = with_items(request(id, &ids), vec![item]);
+            req.kv_bootstrap_info = Some(ts::KvBootstrapInfo {
+                bootstrap_host: "127.0.0.1".to_string(),
+                bootstrap_port: 8998,
+                bootstrap_room: 7,
+            });
+            let mut frames = service
+                .generate(Request::new(req))
+                .await
+                .expect("accepted")
+                .into_inner();
+            while frames.next().await.is_some() {}
+            cached.push(
+                crate::engine::records_since(0, usize::MAX)
+                    .into_iter()
+                    .find(|record| record.request_id == id)
+                    .map(|record| record.cached_tokens),
+            );
+        }
+        assert_eq!(cached, [Some(0), Some(64), Some(16), Some(16)]);
+    }
 }

@@ -13,7 +13,7 @@ use crate::{
         framework::{
             Binding, DecisionScope, Engine, Filter, FirstPartners, Marks, PairPools, PairSide,
             PairTable, Picker, Plan, Profile, Scorer, Scratch, TieBand, WeightedScorer, DRAW_FROM,
-            WRITTEN_ROWS,
+            PARTNERED, WRITTEN_ROWS,
         },
         sticky_sessions::{SessionRule, SessionVerdict},
         view::{
@@ -678,16 +678,20 @@ fn pairs_side_shed(
     (shed_of(&decision), asked.load(Ordering::Relaxed))
 }
 
-/// A pair's prefill pool nobody is usable in is shed at the stage that
-/// emptied it. The prefill side's own run is put to no rule, and the
-/// pair's default asks the profile's filters once more with each veto
-/// lifted: the filter listed behind the veto refuses both prefills in
-/// each of its two passes.
+/// A pair's prefill pool nobody is usable in is shed by the stage that
+/// refuses its workers. The prefill side's own run is put to no rule,
+/// and the pair's default asks the profile's filters once more with
+/// each veto lifted: the filter listed behind the veto refuses both
+/// prefills in each of its two passes. Under a binding that steers no
+/// such shed is saturated: the veto ended the run, the prefills are
+/// wholly over their thresholds, and the shed names the stage that
+/// refuses the first of them with the veto set aside
+/// ([`Half::refused_room`]), which is asked of that one row once more.
 #[test]
-fn a_pairs_prefill_pool_with_no_usable_worker_sheds_at_the_veto() {
+fn a_pairs_prefill_pool_with_no_usable_worker_sheds_at_the_stage_behind_the_veto() {
     let none: (&[u32], &[u32]) = (&[], &[]);
     let side = pairs_side_shed(Box::new(NotOverloaded), [over(0, 1), over(1, 2)], none);
-    assert_eq!(side, ((ShedReason::Saturated, "not-overloaded"), 4));
+    assert_eq!(side, ((ShedReason::NoEndpoints, "refuses"), 5));
 }
 
 /// A pair's engine built by hand: each side filters by the health stage
@@ -1089,14 +1093,122 @@ fn the_admission_limit_has_the_last_word_on_a_pairs_default() {
     let paired = decide_pair(&engine, &[room(over(0, 4)), busier], &decodes);
     assert_eq!(pair_of(&paired), (0, 0));
     // The limit is set aside on the prefill side alone. A decode whose
-    // own profile lists the limit, and that is at it, pairs with nobody.
+    // own profile lists the limit, and that is at it, pairs with nobody:
+    // the prefill over its thresholds has no decode to be steered to,
+    // and the shed says so.
     let mut both = [vetoes(), vetoes()];
     for side in &mut both {
         side.push(Box::new(HasCapacity));
     }
+    let both_limited = pair_engine_of(false, both);
     let alone = [room(over(0, 4))];
-    let refused = decide_pair(&pair_engine_of(false, both), &alone, &decodes);
-    assert_eq!(shed_of(&refused), (ShedReason::Saturated, "not-overloaded"));
+    let refused = decide_pair(&both_limited, &alone, &decodes);
+    assert_eq!(shed_of(&refused), (ShedReason::NoEndpoints, PARTNERED));
+    // At its own limit too that prefill names no shed under the limit:
+    // no decode stands behind it, and a host that waits on the limit
+    // would wait for nothing.
+    let at_limit = [classed(over(0, 4), 1)];
+    let refused = decide_pair(&both_limited, &at_limit, &decodes);
+    assert_eq!(shed_of(&refused), (ShedReason::NoEndpoints, PARTNERED));
+}
+
+/// One rule names a pair's shed with no endpoint where the overload
+/// veto ended the pass ([`Half::refused_room`]): the stage that refused
+/// the worker with room the count ends at. The prefill's one partner
+/// is over its thresholds, beside two decodes with room that pair with
+/// nobody: one under a liveness doubt, and one that stands. The first
+/// of the two in the list's order names the shed. A worker with room
+/// that two stages refuse, the health stage and a filter of the
+/// profile's own, is named by the first of them in the profile's
+/// order, whichever that is. The admission limit names no such shed, on
+/// the decode side either: a decode with room that its own limit alone
+/// refuses pairs with nobody that stands. The rule is asked behind a
+/// pass the overload veto ended, and behind no other: a sole partner
+/// that its own limit alone refuses ends the pass at the limit, and
+/// that shed keeps the limit's name.
+///
+/// Where no worker of the list has room and each ready one is over its
+/// thresholds, a list no request is shed over under a binding that
+/// steers, the first ready one is asked the same way.
+#[test]
+fn a_pairs_shed_with_no_endpoint_is_named_by_the_first_worker_with_room() {
+    let shedding = pair_engine_of(true, [vetoes(), vetoes()]);
+    let prefills = [classed(free(0, 0), 1)];
+    let said = |engine: &Engine, prefills: &[Candidate], decodes: &[Candidate]| {
+        shed_of(&decide_pair(engine, prefills, decodes))
+    };
+    let (doubt, apart) = (
+        (ShedReason::NoEndpoints, "healthy"),
+        (ShedReason::NoEndpoints, PARTNERED),
+    );
+    let partner = classed(over(0, 0), 1);
+    let decodes = [partner, classed(doubted(1, 0), 2), classed(free(2, 0), 2)];
+    assert_eq!(said(&shedding, &prefills, &decodes), doubt);
+    let decodes = [partner, classed(free(1, 0), 2), classed(doubted(2, 0), 2)];
+    assert_eq!(said(&shedding, &prefills, &decodes), apart);
+    // The decode side lists its admission limit behind its two vetoes,
+    // and the doubted decode is at it.
+    let mut filters = vetoes();
+    filters.push(Box::new(HasCapacity));
+    let limited = pair_engine_of(true, [vetoes(), filters]);
+    let decodes = [partner, classed(doubted(1, 0), 2)];
+    assert_eq!(said(&limited, &prefills, &decodes), doubt);
+    // A decode with room that its own limit alone refuses: the limit
+    // is set aside for the name, since a host waits on that name for a
+    // prefill's room, and no prefill waits here.
+    let decodes = [partner, classed(free(1, 0), 2)];
+    assert_eq!(said(&limited, &prefills, &decodes), apart);
+    // So it is where the decode side lists its limit ahead of its two
+    // vetoes or between them, and the partner over its thresholds has
+    // a slot: the rule sets the limit aside wherever the profile lists
+    // it.
+    let mut slotted = partner;
+    slotted.has_capacity = true;
+    for at in [0, 1] {
+        let mut listed = vetoes();
+        listed.insert(at, Box::new(HasCapacity));
+        let limit_at = pair_engine_of(true, [vetoes(), listed]);
+        let decodes = [slotted, classed(free(1, 0), 2)];
+        assert_eq!(said(&limit_at, &prefills, &decodes), apart, "{at}");
+    }
+    // The rule is asked behind a pass that the overload veto ended, and
+    // behind no other. A sole partner under its thresholds that its own
+    // limit alone refuses ends the partners' pass at the limit: that
+    // shed keeps the limit's name, for the decode side.
+    let full = (ShedReason::NoEndpoints, "has-capacity");
+    let decodes = [classed(free(0, 0), 1)];
+    let at_limit = decide_pair(&limited, &prefills, &decodes);
+    assert_eq!(sided(&at_limit), (full, Some(PairSide::Decode)));
+    // A decode with room that two stages refuse: the health stage, and
+    // a filter that refuses every worker. The first of the two in the
+    // profile's order names the shed: the health stage where the filter
+    // is listed behind the two vetoes, and the filter where it is
+    // listed ahead of the health stage.
+    let mut twice = vetoes();
+    twice.push(Box::new(Refuses(Arc::default())));
+    let refused_twice = pair_engine_of(true, [vetoes(), twice]);
+    let decodes = [partner, classed(doubted(1, 0), 2)];
+    assert_eq!(said(&refused_twice, &prefills, &decodes), doubt);
+    let turned: Vec<Box<dyn Filter>> = vec![
+        Box::new(NotOverloaded),
+        Box::new(Refuses(Arc::default())),
+        Box::new(Healthy),
+    ];
+    let refuses_first = pair_engine_of(true, [vetoes(), turned]);
+    // The shed the rule names is the decode side's: a prefill that
+    // pairs stands.
+    let refused = (ShedReason::NoEndpoints, "refuses");
+    let named = decide_pair(&refuses_first, &prefills, &decodes);
+    assert_eq!(sided(&named), (refused, Some(PairSide::Decode)));
+    // Two prefills over their thresholds, one of them under a doubt,
+    // beside a decode that is down: no pair to be steered to.
+    let steering = pair_engine_of(false, [vetoes(), vetoes()]);
+    let mut down = classed(free(0, 0), 1);
+    down.health.healthy = false;
+    let prefills = [classed(doubted_over(0, 0), 1), classed(over(1, 0), 1)];
+    assert_eq!(said(&steering, &prefills, &[down]), doubt);
+    let prefills = [classed(over(0, 0), 1), classed(doubted_over(1, 0), 1)];
+    assert_eq!(said(&steering, &prefills, &[down]), apart);
 }
 
 /// The pools of a fleet some of whose partners go first. Both prefill
@@ -1902,19 +2014,21 @@ fn a_pairs_default_steers_each_side_by_its_own_facts() {
 /// (`model_gateway/src/routers/common/placement.rs:1315-1321`, `:1341`),
 /// and refuses these pairs. Its default answers for no such pool either:
 /// the decode pool is not vetoed on every worker (`:1094`, `:1443-1448`).
+/// It answers that it has no worker, and the decision sheds with no
+/// endpoint: the free decode pairs with nobody that stands.
 #[test]
 fn a_free_decode_keeps_its_pool_from_the_rule() {
     let engine = pair_engine(false);
     let refused = |prefills: &[Candidate], decodes: &[Candidate]| {
         shed_of(&decide_pair(&engine, prefills, decodes))
     };
-    let saturated = (ShedReason::Saturated, "not-overloaded");
+    let apart = (ShedReason::NoEndpoints, PARTNERED);
     let outside = [classed(over(0, 0), 1), free(1, 0)];
-    assert_eq!(refused(&[classed(free(0, 0), 1)], &outside), saturated);
+    assert_eq!(refused(&[classed(free(0, 0), 1)], &outside), apart);
     let mut prefills = [classed(free(0, 0), 1), classed(free(1, 0), 2)];
     prefills[1].health.healthy = false;
     let decodes = [classed(over(0, 0), 1), classed(free(1, 0), 2)];
-    assert_eq!(refused(&prefills, &decodes), saturated);
+    assert_eq!(refused(&prefills, &decodes), apart);
 }
 
 /// A room narrows a prefill's partners, and hides no prefill. Both

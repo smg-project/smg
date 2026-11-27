@@ -33,6 +33,7 @@ from vllm.multimodal.inputs import (
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind, StructuredOutputsParams
 
+from smg_grpc_servicer.constrained_decoding import structural_tag_vocabulary
 from smg_grpc_servicer.kv_relay import Engine, relay
 from smg_grpc_servicer.load_record import engine_load_from
 from smg_grpc_servicer.tokenizer_bundle import tokenizer_bundle, tokenizer_chunks
@@ -121,6 +122,16 @@ def _prompt_length(prompt) -> int:
         ids = prompt.get("prompt_token_ids")
         return len(ids) if ids is not None else 0
     return 0
+
+
+def _takes_reasoning_ended(engine) -> bool:
+    """Whether the engine's generate() takes `reasoning_ended`.
+
+    Read off its signature rather than a version: an engine whose generate()
+    does not name the keyword is never handed it (see Generate).
+    """
+    generate = getattr(engine, "generate", None)
+    return generate is not None and "reasoning_ended" in inspect.signature(generate).parameters
 
 
 def _managed_ranks(engine) -> list[int]:
@@ -248,13 +259,8 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         settle_logging()
         self.engine = async_llm
         self.start_time = start_time
-        # Whether the engine's generate() takes `reasoning_ended`, read once
-        # off its signature rather than a version: an engine whose generate()
-        # does not name the keyword is never handed it (see Generate).
-        generate = getattr(async_llm, "generate", None)
-        self._takes_reasoning_ended = (
-            generate is not None and "reasoning_ended" in inspect.signature(generate).parameters
-        )
+        # Read once: the engine's signature does not change under a servicer.
+        self._takes_reasoning_ended = _takes_reasoning_ended(async_llm)
         # Resolve KV-event publishing config from the engine. Non-None only when
         # vLLM was started with --kv-events-config enabling the ZMQ publisher.
         self._kv_events_config = resolve_kv_events_config(async_llm)
@@ -1067,6 +1073,14 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         # older package.
         if "cache_partition_fields" in info.DESCRIPTOR.fields_by_name:
             info.cache_partition_fields = "cache_salt"
+        # The vocabulary of structural-tag nodes the engine's grammar backend
+        # takes, as the Rust launcher reports it: the Router spells an older
+        # xgrammar's structural tags in the older vocabulary.
+        if "structural_tag_vocabulary" in info.DESCRIPTOR.fields_by_name:
+            view = EngineConfigView(self.engine.vllm_config)
+            info.structural_tag_vocabulary = structural_tag_vocabulary(
+                str(view.structured_outputs.backend or "auto")
+            )
         ec_config = getattr(self.engine.vllm_config, "ec_transfer_config", None)
         if "supports_ec_transfer" in info.DESCRIPTOR.fields_by_name:
             info.supports_ec_transfer = ec_config is not None
