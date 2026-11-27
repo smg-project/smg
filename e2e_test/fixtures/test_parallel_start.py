@@ -14,7 +14,9 @@ def fleet(monkeypatch):
     events = []
     clock = [100.0]
     monkeypatch.delenv(ENV_STARTUP_TIMEOUT, raising=False)
-    monkeypatch.setattr(setup, "get_model_spec", lambda _: {"tp": 1, "startup_timeout": 10})
+    monkeypatch.setitem(
+        import_module("infra.model_specs").MODEL_SPECS, "model", {"tp": 1, "startup_timeout": 10}
+    )
     monkeypatch.setattr(setup.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(setup, "_worker_start_failures", {})
 
