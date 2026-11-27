@@ -1464,14 +1464,25 @@ A profile is decided by *one pick* when its picker needs nothing of the request,
 and no filter beyond the health tests, and its binding has no sessions rule and names no shadow.
 On main three pickers say so: round robin, `random` and `passthrough`.
 
+A profile is decided *ahead of its request's making* when its picker draws first and reads of a
+request the seed alone, and every scorer of it reads no fact of a request but the model, the
+phase, the seed and the instant of the decision. The crate tells its own such stages by name: the
+picker `power-of-two` and the scorer `least-load`. Its filters and its binding are held as for one
+pick, its stages declare no need beyond the workers' load reports, and its binding names no source
+of a routing key: a request that may hold a key is made. Power of two under the `least-load`
+scorer is such a profile. A picker or a scorer of a host's own is read as one that reads the
+request: a profile that holds one has its request made.
+
 1. The engine asks `maker.plain()`. The request takes the short path where all of this holds:
    - the request is plain and a single one;
    - the host handed one list;
    - every worker of the list is dialed over a protocol the request states (where it states
      any);
-   - the list's model is bound to a profile that one pick decides.
+   - the list's model is bound to a profile that one pick decides, or to a profile that is
+     decided ahead of its request's making.
 
-   The picker then names a worker by its own rule, and the engine answers with its position.
+   For a profile that one pick decides, the picker then names a worker by its own rule, and the
+   engine answers with its position.
 
    | Picker | Its rule |
    |---|---|
@@ -1479,7 +1490,7 @@ On main three pickers say so: round robin, `random` and `passthrough`.
    | `random` | It draws a position below the list's size from the calling thread's own draw sequence, and again while the worker drawn is not eligible, eight draws at most. Past them the engine reads the list once and draws among the eligible workers. |
    | `passthrough` | It takes the first eligible worker in the list's order. |
 
-   Where no worker of the list is eligible, the request takes the full path.
+   Where one pick finds no worker of the list eligible, the request takes the full path.
 2. If no stage of the document needs lease events, that is all. No request is built, no clock is
    read, no lease exists, and the host owes the engine nothing more. Where the session table alone
    takes them, that is all too once the worker picked reads ready a second time: the binding of
@@ -1489,6 +1500,18 @@ On main three pickers say so: round robin, `random` and `passthrough`.
    behind the pick, and reads the clock for a place it keeps. A maker that answers the id itself
    builds no request for it, as the maker inside `InProcess::place` and a request stated ahead do.
    Under any other maker the request is made for its id.
+
+   For a profile that is decided ahead of its request's making, the call that places a request
+   runs the full path's decision, below, with the model, the phase, a seed and the instant stated,
+   every other fact of a request empty and no constraint. No request is made. The seed is one of
+   the calling thread's own draw sequence, drawn by the engine as the making draws one. A request
+   that a host states through a maker of its own is made, under such a profile too. The answer is
+   that decision as it stands, the one the full path gives the
+   request made with that seed: a pick holds a lease, as a whole decision's does, and any other
+   decision holds none. It reads the clock and the load snapshot, for its scorers. It is taken
+   under a document one of whose stages takes a word on a lease, and over a list no engine of
+   which holds several workers. It is taken for the model of the list's first single request: a
+   request of another model over that list is made.
 
 **The full path**, in logical order (the code interleaves some steps to save work):
 
@@ -2674,9 +2697,11 @@ pair: as saturated, or with no endpoint as the text above says.
 
 A rule that is the same for every request of a route belongs to the list itself. And a plain
 request touches neither the load snapshot nor the
-other fields of the request, with one exception in a gateway's own process. Where a stage needs
+other fields of the request, with two exceptions in a gateway's own process. Where a stage needs
 lease events, the lease states the text's bytes, and its characters where a stage reads a size.
-Counting the characters is the one pass over a plain request's text.
+Counting the characters is the one pass over a plain request's text. And a request that is
+decided ahead of its making reads the load snapshot as the full path reads it, and no other field
+of the request.
 
 A request decided inside a lent tree has the rule asked inside the tree's walk, of the
 pick's targets best first, so the tree stores the prompt for a worker the rule takes. The call

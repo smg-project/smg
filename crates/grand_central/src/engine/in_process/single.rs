@@ -13,6 +13,13 @@
 //! decisions the request's maker is asked its id behind the pick
 //! ([`RequestMaker::request_id`]).
 //!
+//! **The whole decision asked ahead, beside it** ([`ahead`]). Where the
+//! picker and the scorers of the place read of a request its model, its
+//! phase, its seed and the instant alone, the whole decision of a request
+//! the engine's own placing call would make is asked with those facts
+//! before the request is made, and no request is made: a plain request
+//! under power of two. The engine draws the seed that request would state.
+//!
 //! **A key's rows, between** ([`keys::decide`]). A keyed request that is
 //! made is decided by the rows its key names: under a sessions rule its
 //! key's pin, which is one worker's record, and under a ring the workers
@@ -24,7 +31,8 @@
 //! the gateway's own data ([`records::decide`]): where no key's rows
 //! answered it, a retry that names the workers it tried, a list the
 //! picker's turns find no eligible worker of, and a place whose profile
-//! scores. The binding's rule for a pool every worker of which is vetoed,
+//! scores, but for the one whose whole decision is asked ahead, above.
+//! The binding's rule for a pool every worker of which is vetoed,
 //! and the test of a tried worker, so have one home.
 //!
 //! **A hard demand** ([`Demands`](crate::engine::Demands)). A request that
@@ -134,10 +142,12 @@ pub(super) use crate::engine::decision::PLACES;
 /// The short path: the place in `members`, the engine's value of the list
 /// its host lent, of the worker picked for a plain single request of
 /// `model`, and the profile whose picker picked it ([`AlonePick`]). `None`
-/// where the request takes the whole pass ([`decide`]): its place is not
-/// decided by one pick of a picker, a worker of the list is not dialed on a
-/// wire it states, or the picker's rule finds no eligible worker. Its
-/// caller asks no list's value for a request of another phase.
+/// where one pick does not decide the request: its place is not decided
+/// by one pick of a picker, a worker of the list is not dialed on a wire
+/// it states, or the picker's rule finds no eligible worker. Such a
+/// request takes the whole pass ([`decide`]), or is decided ahead of its
+/// making where its place is one that is ([`ahead`]). Its caller asks no
+/// list's value for a request of another phase.
 ///
 /// It ends in the place picked. It reads no fact of a request, so none is
 /// made ahead of it, and nothing a host is handed of a pick is built here.
@@ -158,7 +168,7 @@ pub(super) fn alone(
     if !plain.wires.is_empty() && !plain.wires.contains(members.wires()) {
         return None;
     }
-    let profile = members.alone(&own.document.spec, model)?;
+    let profile = members.alone(own, model)?;
     let position = own.pick_over(profile, members, |state: RoutingState| state.eligible())?;
     Some(AlonePick {
         place: u32::try_from(position).ok()?,
@@ -187,12 +197,8 @@ pub(super) fn still_ready(pick: AlonePick, members: &PoolMembers) -> bool {
 
 /// The short path's pick under a document that takes a word on a lease,
 /// as its host takes it: the decision that names the worker at the place
-/// picked, alone ([`AlonePick::decision`]), and its lease, issued here as a
-/// whole pass's is ([`issued`]). The lease states the size `plain` states,
-/// the two lengths of its `text`, characters and bytes, and no session, and
-/// is dated at `now` on the engine's clock. The issue is told where a
-/// stage takes it, under a catch of its own as a whole pass's is. `None`
-/// where the list holds no worker at the place.
+/// picked, alone ([`AlonePick::decision`]), and its lease ([`leased`]).
+/// `None` where the list holds no worker at the place.
 pub(super) fn noted(
     own: Loaded<'_, '_>,
     pick: AlonePick,
@@ -205,26 +211,56 @@ pub(super) fn noted(
     let worker = members.workers().get(position)?;
     // The list's records name each worker once a list: a pick reads the id
     // there and hashes no address.
-    let document = own.document;
-    let records = members.records(&document.spec, &own.clock);
+    let records = members.records(&own.document.spec, &own.clock);
     let id = *records.ids().get(position)?;
     let dp_rank = records::worker_rank(worker.as_ref());
+    let decision = pick.decision(id, dp_rank);
+    let micros = own.clock.micros(now);
+    Some(leased(
+        own,
+        decision,
+        id,
+        pick.generation,
+        plain,
+        text,
+        (now, micros),
+    ))
+}
+
+/// A short path's `decision` with its lease, issued here as a whole
+/// pass's is ([`issued`]). The lease books `booked`, the worker the
+/// decision leads with, under the document's `generation`. It states the
+/// size `plain` states, the two lengths of its `text`, characters and
+/// bytes, and no session, and is dated at `now`, the decision's instant
+/// with its microseconds on the engine's clock. The issue is told where a
+/// stage takes it, under a catch of its own as a whole pass's is.
+#[inline(always)]
+fn leased(
+    own: Loaded<'_, '_>,
+    decision: Decision,
+    booked: WorkerId,
+    generation: u64,
+    plain: Plain,
+    text: (u32, u32),
+    (now, micros): (Instant, u64),
+) -> DecideOutcome {
+    let document = own.document;
     let lease = Lease {
         id: lease_id(own),
         kind: LeaseKind::Credit,
         side: Side::Single,
         target_index: 0,
-        booked: id,
-        generation: pick.generation,
+        booked,
+        generation,
         session: Session::NONE,
         session_verdict: SessionVerdict::None,
-        issued_micros: own.clock.micros(now),
+        issued_micros: micros,
         tokens: plain.prompt_tokens,
         chars: text.0,
         bytes: text.1,
     };
     let decided = DecideOutcome {
-        decision: pick.decision(id, dp_rank),
+        decision,
         lease: Some(Leased {
             lease,
             due: now + DISPATCH_TTL,
@@ -235,7 +271,96 @@ pub(super) fn noted(
         let stages = document.spec.engine();
         own.word_caught(|| stages.on_decision_issued(&lease, &decided.decision));
     }
-    Some(decided)
+    decided
+}
+
+/// Whether nobody reads the best rows of the trace of a decision kept
+/// behind a placement (`kept`), which hands out no trace: a kept sample and
+/// a stage that takes the issue are the two readers of those rows. The
+/// whole pass ([`decide`]) and the road asked ahead ([`ahead`]) both ask
+/// here, so the two name the same rows under one document.
+fn trace_unread(own: Loaded<'_, '_>, kept: bool) -> bool {
+    let document = own.document;
+    let read = document.samples || document.hears.contains(EventKind::Issued);
+    kept && !read
+}
+
+/// The whole decision of a plain single request, asked ahead of its
+/// making: under a place whose picker and scorers read of a request its
+/// model, its phase, its seed and the instant alone
+/// ([`PoolMembers::ahead`]), the engine's whole decision over the list's
+/// records ([`records::decide`]) is run with those four stated and no
+/// constraint, as [`decide`] runs it for the request made, and no request
+/// is made. The answer is that decision as it stands: a pick with its
+/// lease ([`leased`]), booked on the worker the pick leads with, and any
+/// other decision with none, as a whole pass issues one ([`issued`]).
+/// `seed` is the seed the request made would state: the pass draws it for
+/// the request of the engine's own placing call, and calls this for no
+/// request a host's maker states, which is made and drawn from the seed it
+/// states. No engine of the list holds several workers: the cell the pass
+/// read holds no place for such a list ([`PoolMembers::first_asked`]),
+/// whose reports are asked for by the pass behind a made request alone.
+/// Under a document that keeps a sample of its decisions the request's
+/// maker is asked its id behind the decision
+/// ([`RequestMaker::request_id`]).
+// Out of line: the call that places a request keeps the layout of the
+// roads beside this one.
+//
+// `kept` says that the decision is kept behind a placement, which hands
+// out no trace. Where the document keeps no sample and no stage of it
+// takes the issue, nobody reads the best rows of that trace, and it names
+// none, as a whole pass names none ([`records::Live::unread`]).
+#[inline(never)]
+pub(super) fn ahead(
+    own: Loaded<'_, '_>,
+    maker: &impl RequestMaker,
+    members: &PoolMembers,
+    plain: Plain,
+    seed: u64,
+    now: Instant,
+    kept: bool,
+) -> DecideOutcome {
+    let unread = trace_unread(own, kept);
+    let spec = &own.document.spec;
+    let records = members.records(spec, &own.clock);
+    debug_assert!(!records.has_ranks(), "the cell holds no such list");
+    let (workers, model) = (members.workers(), maker.model());
+    let read = own.loads_read(maker);
+    let loads = read.snapshot();
+    let word = &members.rotation.0;
+    let live = records::Live::at(spec.engine(), &own.clock, now, loads, None)
+        .turning(word)
+        .unread(unread);
+    // The decision's instant in microseconds, as the lease is dated.
+    let micros = live.now_micros();
+    // What a request made would state, of the facts such a place reads:
+    // every other fact is empty, and no constraint stands.
+    let mut facts = RequestFacts {
+        model,
+        phase: Phase::Single,
+        seed,
+        ..RequestFacts::default()
+    };
+    let cx = Constraints::default();
+    let decision = records::decide(spec.engine(), records, workers, &live, &mut facts, &cx);
+    let lead = decision.pick().and_then(|pick| pick.targets.first());
+    let Some(lead) = lead.map(|lead| lead.id) else {
+        return DecideOutcome {
+            decision,
+            lease: None,
+            decode_session: Session::NONE,
+        };
+    };
+    let text = (maker.prompt_chars(), maker.prompt_bytes());
+    leased(
+        own,
+        decision,
+        lead,
+        spec.generation(),
+        plain,
+        text,
+        (now, micros),
+    )
 }
 
 /// How a made request's whole decision runs over its pool's records. The
@@ -375,11 +500,10 @@ pub(super) fn decide(
     // The engine's own call made the request (`late`): its decision is kept
     // behind a placement, where a kept sample and a stage that takes the
     // issue are the two readers of the best rows of its trace.
-    let document = own.document;
-    let read = document.samples || document.hears.contains(EventKind::Issued);
+    let unread = trace_unread(own, late.is_some());
     let live = records::Live::at(spec.engine(), &own.clock, now, loads, key)
         .turning(&members.rotation.0)
-        .unread(late.is_some() && !read);
+        .unread(unread);
     // A retry leaves every worker of the engines it tried: over a list
     // where an engine holds several, its facts name them all.
     let decision = if facts.tried.is_empty() || !records.has_ranks() {

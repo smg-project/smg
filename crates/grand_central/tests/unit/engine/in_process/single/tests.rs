@@ -13,7 +13,8 @@ use smg_worker::{
 use super::{super::InProcess, *};
 use crate::{
     document::spec::{
-        AppliedSpec, Assignment, PolicySpec, RulePlaced, ScoreStage, ShadowSpec, WarmupSliceParams,
+        AppliedSpec, Assignment, KeySourceSpec, PolicySpec, RoutingKeySpec, RulePlaced, ScoreStage,
+        ShadowSpec, WarmupSliceParams,
     },
     engine::{
         decision::{LiftedVeto, Overlap, PlacedBy, Target, Targets, MAX_TARGETS},
@@ -21,7 +22,7 @@ use crate::{
             Decided, DecisionEngine, DecisionRefused, TextKey, TokenKey, WorkerLists,
         },
         demands::{DemandFacts, Demands},
-        framework::{Picker, Place, PoolWord, TieBand, DRAW_FROM},
+        framework::{Picker, Place, PoolWord, Scorer, TieBand, DRAW_FROM},
         list_cell::PublishedList,
         prompt_hashes::HashSeeds,
         records::worker_id,
@@ -283,6 +284,20 @@ pub(crate) fn decided(engine: &InProcess, asks: &Asks<'_>) -> DecideOutcome {
     answered(engine, asks).whole().expect("a whole decision").0
 }
 
+/// Runs `run`, a decision for `asks`, as the engine's own placing call
+/// runs one: the road ahead of a request's making is open to it, and a
+/// decision on that road draws from the seed `asks` states. A decision
+/// outside it is a host's, whose request is made.
+pub(crate) fn placing<T>(asks: &Asks<'_>, run: impl FnOnce() -> T) -> T {
+    use crate::engine::in_process::tests::seed_hook;
+    seed_hook::stated(asks.request.facts.seed, run)
+}
+
+/// The whole decision the entry answers the placing call ([`placing`]).
+pub(crate) fn ahead(engine: &InProcess, asks: &Asks<'_>) -> DecideOutcome {
+    placing(asks, || decided(engine, asks))
+}
+
 /// The place the entry answers: no whole decision.
 fn placed(engine: &InProcess, asks: &Asks<'_>) -> AlonePick {
     match answered(engine, asks) {
@@ -321,8 +336,9 @@ fn a_place_reads_no_clock_and_a_dated_decision_reads_it_once() {
     assert_eq!(read(&noting, false), (false, 1));
 }
 
-/// A place whose profile scores is never picked ahead of its request:
-/// the request is made for every decision, plain or not.
+/// A place whose profile scores, and whose picker reads the request, is
+/// never picked ahead of its request: the request is made for every
+/// decision, plain or not.
 #[test]
 fn a_place_that_scores_makes_its_request() {
     let engine = preset("least_load");
@@ -332,6 +348,545 @@ fn a_place_that_scores_makes_its_request() {
     for made in 1..=3 {
         assert!(decided(&engine, &asks).decision.pick().is_some());
         assert_eq!(asks.made.get(), made);
+    }
+}
+
+/// Power of two under a limit on the age of a load report
+/// (`view.max_report_age_ms`) is decided ahead of its making too: the
+/// limit wraps least-load, and the wrapper reads of a request what
+/// least-load reads.
+/// No request is made, and the whole pass of the same request names the
+/// same two workers in the same order.
+#[test]
+fn power_of_two_under_a_limit_on_a_reports_age_makes_no_request() {
+    let mut document = PolicySpec::preset("power_of_two").expect("a built-in preset");
+    document.generation = 1;
+    document.view.max_report_age_ms = Some(900);
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    let engine = InProcess::new(spec);
+    let members = PublishedList::new(pool(DRAW_FROM));
+    for seed in 0..64 {
+        let mut stated = request();
+        stated.facts.seed = seed;
+        let asks = Asks::of(stated, Some(&members));
+        let decision = ahead(&engine, &asks).decision;
+        assert_eq!(asks.made.get(), 0, "no request is made");
+        let whole = engine.decide_without_lease(&asks, Instant::now());
+        let whole = whole.expect("a whole decision").0;
+        let places = |decision: &Decision| -> Vec<u32> {
+            let pick = decision.pick().expect("a pick");
+            pick.targets.iter().map(|target| target.position).collect()
+        };
+        assert_eq!(
+            places(&whole),
+            places(&decision),
+            "the whole pass of {seed}"
+        );
+        assert_eq!(places(&decision).len(), 2, "the pick and the other draw");
+    }
+}
+
+/// Power of two's plain single request is decided whole ahead of its
+/// making, the pick and the other draw its two targets: no request is
+/// made. Over workers of distinct waits the longest wait never leads,
+/// since it loses beside whichever worker it is drawn with, and every
+/// other worker does. The decision is run with the seed the request
+/// states, which its trace states: the whole pass of the same request
+/// made names the same two workers in the same order. Under a binding
+/// that names a source of a routing key the request is made, since its
+/// key is derived at its making. Under a document whose session table
+/// alone takes a lease's words the decision of a request no sessions
+/// rule binds is not asked ahead: the request is made and its whole
+/// decision names two workers and holds no lease.
+#[test]
+fn power_of_two_is_decided_ahead_with_no_request_made() {
+    let places = |decision: &Decision| -> Vec<u32> {
+        let pick = decision.pick().expect("a pick");
+        pick.targets.iter().map(|target| target.position).collect()
+    };
+    let members = PublishedList::new(pool(DRAW_FROM));
+    let reports = (0..DRAW_FROM as i32)
+        .map(|at| {
+            let url = format!("http://worker-{at}:8000");
+            (url, one_rank_load(10_000 * (at + 1), 0.1, 1_000.0))
+        })
+        .collect();
+    let loads = Some(LoadSnapshot::from_loads_for_test(reports));
+    // The request of one seed, as its host states it ahead.
+    let stated = |seed: u64| {
+        let mut request = request();
+        request.facts.seed = seed;
+        request
+    };
+    let engine = preset("power_of_two");
+    let mut leads = [0_u32; DRAW_FROM];
+    for seed in 0..2_048 {
+        let asks = Asks {
+            loads: loads.clone(),
+            ..Asks::of(stated(seed), Some(&members))
+        };
+        let decision = ahead(&engine, &asks).decision;
+        assert_eq!(asks.made.get(), 0, "no request is made");
+        let drawn = places(&decision);
+        assert_eq!(drawn.len(), 2, "the pick and the other draw");
+        assert_eq!(decision.pick().expect("a pick").trace.seed, seed);
+        leads[drawn[0] as usize] += 1;
+        let whole = engine.decide_without_lease(&asks, Instant::now());
+        let whole = whole.expect("a whole decision").0;
+        assert_eq!(places(&whole), drawn, "the whole pass of seed {seed}");
+    }
+    assert_eq!(
+        leads[DRAW_FROM - 1],
+        0,
+        "the longest wait loses beside every other"
+    );
+    assert!(
+        leads[..DRAW_FROM - 1].iter().all(|&leads| leads > 0),
+        "{leads:?}"
+    );
+    // Equal scores, at the size a whole pass draws ahead of its rows
+    // from and over it: the tie falls as that pass draws it.
+    for workers in [DRAW_FROM, 2 * DRAW_FROM] {
+        let tied = PublishedList::new(pool(workers));
+        for seed in 0..64 {
+            let asks = Asks::of(stated(seed), Some(&tied));
+            let decision = ahead(&engine, &asks).decision;
+            let whole = engine.decide_without_lease(&asks, Instant::now());
+            let whole = whole.expect("a whole decision").0;
+            assert_eq!(places(&whole), places(&decision), "{workers} workers");
+        }
+    }
+
+    let mut document = PolicySpec::preset("power_of_two").expect("a built-in preset");
+    document.generation = 1;
+    document.bindings[0].routing_key = Some(RoutingKeySpec {
+        sources: vec![KeySourceSpec {
+            rid: true,
+            ..KeySourceSpec::default()
+        }],
+        strip_lineage: false,
+    });
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    let keyed = InProcess::new(spec);
+    let others = PublishedList::new(pool(DRAW_FROM));
+    let asks = Asks::of(request(), Some(&others));
+    assert_eq!(places(&ahead(&keyed, &asks).decision).len(), 2);
+    assert_eq!(asks.made.get(), 1, "a request that may hold a key is made");
+
+    // A sessions rule on another binding, and in the place of
+    // least-load a host's scorer that takes no word and reads no count
+    // of sends: the session table alone takes a lease's words, and it
+    // is told nothing of this pick. The host's scorer has the request
+    // made, as a host's own is read as one that reads the request: the
+    // decision is not asked ahead, and its whole decision holds no lease.
+    let mut stages = StageRegistry::builtin();
+    let added = stages.scorer("alike", || Box::new(Alike) as Box<dyn Scorer>);
+    added.expect("a free name");
+    let mut document = PolicySpec::preset("power_of_two").expect("a built-in preset");
+    let manual = PolicySpec::preset("manual").expect("a built-in preset");
+    document.view.headers.clone_from(&manual.view.headers);
+    let mut rule = manual.bindings[0].sessions.clone().expect("its rule");
+    rule.assignment = Assignment::Delegate;
+    let mut ruled = document.bindings[0].clone();
+    ruled.matcher.model = "ruled-*".to_owned();
+    ruled.sessions = Some(rule);
+    document.bindings.insert(0, ruled);
+    document.generation = 1;
+    let profile = document.profiles.get_mut("power_of_two");
+    profile.expect("the preset's profile").score = vec!["alike".into()];
+    let spec = AppliedSpec::validate_in(&document, &stages, &[]);
+    let quiet = InProcess::new(spec.expect("the stages hold the scorer"));
+    assert!(quiet.in_force().hears.intersects(EventSet::LEASE));
+    let asks = Asks::of(request(), Some(&others));
+    let whole = ahead(&quiet, &asks);
+    assert_eq!(places(&whole.decision).len(), 2, "two targets");
+    assert!(whole.lease.is_none(), "the table is told nothing");
+    assert_eq!(asks.made.get(), 1, "the whole pass decides it");
+}
+
+/// A request a host states through a maker of its own is made, under
+/// the floor of the draws and from it up: the engine asks a whole
+/// decision ahead of the making for the request of its own placing call
+/// alone. The decision draws from the seed the request states, and its
+/// trace states that seed.
+#[test]
+fn a_request_a_host_states_is_made_and_drawn_from_the_seed_it_states() {
+    let engine = preset("power_of_two");
+    for workers in [4, DRAW_FROM] {
+        let members = PublishedList::new(pool(workers));
+        for seed in 0..64 {
+            let mut stated = request();
+            stated.facts.seed = seed;
+            let asks = Asks::of(stated, Some(&members));
+            let decision = decided(&engine, &asks).decision;
+            let pick = decision.pick().expect("a pick");
+            assert_eq!(pick.trace.seed, seed, "{workers} workers");
+            assert_eq!(asks.made.get(), 1, "the request is made");
+        }
+    }
+}
+
+/// A list that holds an engine of several workers is decided whole,
+/// under the floor of the draws and from it up: a whole pass decides
+/// such a list over its engines and asks for its reports behind the
+/// making, so its decision is not asked ahead and the request is made.
+/// The answer is that pass's at every seed, the targets in their
+/// order, and its two targets are never two workers of one engine.
+#[test]
+fn a_list_that_holds_an_engine_of_several_workers_is_decided_whole() {
+    let places = |decision: &Decision| -> Vec<u32> {
+        let pick = decision.pick().expect("a pick");
+        pick.targets.iter().map(|target| target.position).collect()
+    };
+    let engine = preset("power_of_two");
+    // Two engines of two workers; then an engine of eight workers, one
+    // of four and four workers alone, at the floor of the draws.
+    for shape in [&[2, 2][..], &[8, 4, 1, 1, 1, 1]] {
+        let (list, engine_of) = engines(shape);
+        let members = PublishedList::new(list);
+        for seed in 0..256 {
+            let mut stated = request();
+            stated.facts.seed = seed;
+            let asks = Asks::of(stated, Some(&members));
+            let decision = ahead(&engine, &asks).decision;
+            assert_eq!(asks.made.get(), 1, "{shape:?}: the request is made");
+            let drawn = places(&decision);
+            let whole = engine.decide_without_lease(&asks, Instant::now());
+            let whole = whole.expect("a whole decision").0;
+            assert_eq!(places(&whole), drawn, "{shape:?}: the whole pass of {seed}");
+            let [lead, other] = drawn[..] else {
+                panic!("{shape:?}: seed {seed} names {drawn:?}");
+            };
+            assert_ne!(
+                engine_of[lead as usize], engine_of[other as usize],
+                "{shape:?}: seed {seed} names two workers of one engine"
+            );
+        }
+    }
+}
+
+/// A whole pass over a list under the draw's floor draws among the
+/// workers its filters keep, and the decision asked ahead of the making
+/// is that pass's. So the answer is the made request's at every seed,
+/// whichever bit of a worker's state refuses it and wherever in the
+/// list it stands, with equal scores and with distinct waits: the whole
+/// decision, which is the targets in their order and the whole trace,
+/// its count of the workers kept among it, or the refusal with its
+/// reason. No request is made, whether the list keeps two workers or
+/// more, one or none.
+#[test]
+fn a_list_under_the_draws_floor_is_decided_whole_with_no_request_made() {
+    use smg_worker::runtime::StallReason;
+    let refuse = |worker: &dyn Worker, kind: usize| match kind {
+        0 => worker.set_status(WorkerStatus::NotReady),
+        1 => {
+            worker.set_overloaded(true);
+        }
+        2 => {
+            worker.set_stall(Some(StallReason::Wedged));
+        }
+        3 => worker.set_status(WorkerStatus::Draining),
+        _ => (0..16).for_each(|_| worker.record_outcome(500)),
+    };
+    let engine = preset("power_of_two");
+    for workers in 2..DRAW_FROM {
+        // The cases: nobody refused; one worker refused by each bit, at
+        // the first, a middle and the last place; two refused by two
+        // bits; every worker but two, every worker but one, and every
+        // worker.
+        let mut cases: Vec<Vec<(usize, usize)>> = vec![vec![]];
+        for kind in 0..5 {
+            for place in [0, workers / 2, workers - 1] {
+                cases.push(vec![(place, kind)]);
+            }
+            cases.push(vec![(0, kind), (workers - 1, (kind + 1) % 5)]);
+        }
+        cases.push((2..workers).map(|place| (place, place % 5)).collect());
+        cases.push((1..workers).map(|place| (place, place % 5)).collect());
+        cases.push((0..workers).map(|place| (place, place % 5)).collect());
+        for (case, refused) in cases.iter().enumerate() {
+            for waits in [false, true] {
+                let list = pool(workers);
+                for &(place, kind) in refused {
+                    refuse(list[place].as_ref(), kind);
+                    let state = list[place].routing_state();
+                    assert!(!state.eligible(), "kind {kind} refuses");
+                }
+                let members = PublishedList::new(list);
+                let reports = (0..workers as i32)
+                    .map(|at| {
+                        let url = format!("http://worker-{at}:8000");
+                        (url, one_rank_load(10_000 * (at + 1), 0.1, 1_000.0))
+                    })
+                    .collect();
+                let loads = waits.then(|| LoadSnapshot::from_loads_for_test(reports));
+                for seed in 0..96 {
+                    let mut stated = request();
+                    stated.facts.seed = seed;
+                    let asks = Asks {
+                        loads: loads.clone(),
+                        ..Asks::of(stated, Some(&members))
+                    };
+                    let drawn = ahead(&engine, &asks).decision;
+                    assert_eq!(
+                        asks.made.get(),
+                        0,
+                        "{workers} workers, case {case}, waits {waits}, seed {seed}: no request is made"
+                    );
+                    let whole = engine.decide_without_lease(&asks, Instant::now());
+                    let whole = whole.expect("a whole decision").0;
+                    // The whole decision: the targets, the whole trace
+                    // with its count of the workers kept, and a
+                    // refusal by its reason.
+                    assert_eq!(
+                        drawn, whole,
+                        "{workers} workers, case {case}, waits {waits}, seed {seed}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A scorer of a host's own build that scores every worker alike and
+/// declares what least-load declares: its rows are read each alone, it
+/// reads no fact of the request and refuses by no report. It takes no
+/// word of a lease and reads no count of sends.
+#[derive(Debug)]
+struct Alike;
+
+impl Lifecycle for Alike {}
+
+impl Scorer for Alike {
+    fn name(&self) -> &'static str {
+        "alike"
+    }
+
+    fn score(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &[u32], out: &mut [f32]) -> TieBand {
+        out.fill(0.0);
+        TieBand::NORMALIZED
+    }
+
+    fn row_wise(&self) -> bool {
+        true
+    }
+
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+}
+
+/// Every fact a request of the placing call states, over a list under
+/// the draw's floor and at it. A request that states one a whole pass
+/// decides by is not plain, and is made and decided whole, each alone:
+/// a worker tried, a worker left out, a subset hint, a lifted veto, a
+/// later decode, a stalled row and places of its list. A session key, an
+/// affinity column and a later attempt are stated by no plain request of
+/// the placing call under such a place: its binding names no source of
+/// a key, no lender is asked for its profile, and its request is plain
+/// on a first attempt alone. A request that
+/// states every other fact at once is not made: a deadline, a tenant, a
+/// priority, a limit of its output, its three sizes, the hashes of its
+/// prompt, a client key, its places on a lent ring and a pair's decode
+/// side's, a header, media counts and a
+/// worker named for a pair's decode. Its answer is the whole pass's of
+/// that request at every seed, the targets in their order and the whole
+/// trace, and its lease states every word the lease of the request made
+/// states but the id: no stage of such a place reads one of those
+/// facts. Under a document that keeps a sample the decision is kept as
+/// it was answered, and it is the answer of a document that keeps none.
+#[test]
+fn what_a_request_states_has_it_made_or_changes_no_answer_asked_ahead() {
+    use crate::engine::view::{Header, MediaCounts};
+    let engine = preset("power_of_two");
+    let (tried, rows) = ([WorkerId(1)], [0_u32]);
+    let (hashes, ring, decode_ring) = ([3_u64, 5, 8], [17_u64, 19], [23_u64]);
+    let headers = [Header {
+        name: 0,
+        value: "a",
+    }];
+    let mut stated = request();
+    stated.facts = RequestFacts {
+        budget_micros: 250_000,
+        tenant: Identity::hashed(5),
+        priority: 3,
+        streaming: true,
+        max_output_tokens: 512,
+        prompt_tokens: 1_000,
+        prompt_chars: 4_000,
+        prompt_bytes: 4_100,
+        block_hashes: &hashes,
+        block_size: 16,
+        namespace_seed: 11,
+        client_key: 13,
+        ring_positions: &ring,
+        decode_ring_positions: Some(&decode_ring),
+        headers: &headers,
+        media: MediaCounts {
+            images: 1,
+            audio: 0,
+            video: 0,
+            bytes: 2_048,
+        },
+        ..stated.facts
+    };
+    stated.constraints.target_worker = Some(1);
+    stated.constraints.counted_on_decode = true;
+    assert!(
+        stated.plain().is_some(),
+        "none of them ends a plain request"
+    );
+    for workers in [2, 5, DRAW_FROM - 1, DRAW_FROM] {
+        let members = PublishedList::new(pool(workers));
+        let reports = (0..workers as i32)
+            .map(|at| {
+                let url = format!("http://worker-{at}:8000");
+                (url, one_rank_load(10_000 * (at + 1), 0.1, 1_000.0))
+            })
+            .collect();
+        let loads = Some(LoadSnapshot::from_loads_for_test(reports));
+        let asked = |request| Asks {
+            loads: loads.clone(),
+            ..Asks::of(request, Some(&members))
+        };
+        // Each fact a whole pass decides by, alone on a request.
+        let mut beyond = [request(); 7];
+        beyond[0].facts.tried = &tried;
+        beyond[1].constraints.excluded = &tried;
+        beyond[2].constraints.subset_hint = Some(2);
+        beyond[3].constraints.overload_lifted = true;
+        beyond[4].constraints.decode_later = true;
+        beyond[5].constraints.stalled = &rows;
+        beyond[6].constraints.places = Some(&rows);
+        for (fact, request) in beyond.into_iter().enumerate() {
+            let asks = asked(request);
+            let entry = || engine.decide_under(GatewayId::LOCAL, &asks, Instant::now());
+            let answered = placing(&asks, entry);
+            assert!(
+                matches!(answered, Ok(Decided::Whole(..))),
+                "{workers} workers, fact {fact}: {answered:?}"
+            );
+            assert_eq!(asks.made.get(), 1, "{workers} workers, fact {fact}: made");
+        }
+        // Every other fact at once.
+        for seed in 0..64 {
+            let case = format!("{workers} workers, seed {seed}");
+            let mut request = stated;
+            request.facts.seed = seed;
+            let asks = asked(request);
+            let now = Instant::now();
+            let entry = || engine.decide_under(GatewayId::LOCAL, &asks, now);
+            let answered = placing(&asks, entry);
+            let drawn = answered.expect("an answer").whole().expect("no place").0;
+            assert_eq!(asks.made.get(), 0, "{case}: no request is made");
+            let whole = engine.decide_without_lease(&asks, now);
+            assert_eq!(drawn.decision, whole.expect("a whole decision").0, "{case}");
+            // The lease of the same request made, as a host states it.
+            let made = asked(request);
+            let answered = engine.decide_under(GatewayId::LOCAL, &made, now);
+            let whole = answered.expect("an answer").whole().expect("no place").0;
+            assert_eq!(made.made.get(), 1, "{case}: the request is made");
+            let lease = drawn.lease.expect("a lease").lease;
+            let made = whole.lease.expect("a lease").lease;
+            assert_eq!(
+                Lease {
+                    id: made.id,
+                    ..lease
+                },
+                made,
+                "{case}"
+            );
+            assert_eq!(
+                (lease.tokens, lease.chars, lease.bytes),
+                (1_000, 4_000, 4_100)
+            );
+        }
+    }
+
+    let mut document = PolicySpec::preset("power_of_two").expect("a built-in preset");
+    document.generation = 1;
+    document.explain.sample = 1;
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    let sampling = InProcess::new(spec);
+    let (kept, plain) = (PublishedList::new(pool(5)), PublishedList::new(pool(5)));
+    let now = Instant::now();
+    let asks = Asks::of(stated, Some(&kept));
+    let answered = placing(&asks, || {
+        sampling.decide_under(GatewayId::LOCAL, &asks, now)
+    });
+    let drawn = answered.expect("an answer").whole().expect("no place").0;
+    let record = sampling
+        .explained(b"request")
+        .expect("the decision is kept");
+    assert_eq!((record.decision, record.at), (drawn.decision, now));
+    let unsampled = ahead(&engine, &Asks::of(stated, Some(&plain))).decision;
+    assert_eq!(record.decision, unsampled, "a sample changes no answer");
+}
+
+/// Under a document that keeps a sample a decision asked ahead of the
+/// making is kept as the made request's is, where it is no pick too. A
+/// list every worker of which is not ready sheds the request: the shed
+/// holds no lease and is the record found by the request's id, the one
+/// the whole pass of the request made keeps at the same instant. Over a
+/// list every worker of which is overloaded the two keep one record
+/// too. A sample changes no answer: an engine that keeps none answers
+/// the same decision, with no request made.
+#[test]
+fn a_shed_decided_ahead_of_its_request_is_kept_as_the_made_requests_is() {
+    let sampling = || {
+        let mut document = PolicySpec::preset("power_of_two").expect("a built-in preset");
+        document.generation = 1;
+        document.explain.sample = 1;
+        let spec = AppliedSpec::validate(&document).expect("the document validates");
+        InProcess::new(spec)
+    };
+    let unsampled = preset("power_of_two");
+    for workers in [5, DRAW_FROM] {
+        for overloaded in [false, true] {
+            let case = format!("{workers} workers, overloaded {overloaded}");
+            let refused = || {
+                let list = pool(workers);
+                for worker in list.iter() {
+                    if overloaded {
+                        worker.set_overloaded(true);
+                    } else {
+                        worker.set_status(WorkerStatus::NotReady);
+                    }
+                }
+                PublishedList::new(list)
+            };
+            let (first, second, third) = (refused(), refused(), refused());
+            let mut stated = request();
+            stated.facts.seed = 7;
+            let now = Instant::now();
+
+            // Asked ahead, as the placing call asks.
+            let keeps = sampling();
+            let asks = Asks::of(stated, Some(&first));
+            let answered = placing(&asks, || keeps.decide_under(GatewayId::LOCAL, &asks, now));
+            let ahead = answered.expect("an answer").whole().expect("no place").0;
+            let kept = keeps.explained(b"request");
+
+            // Made: a request a host states.
+            let keeps = sampling();
+            let asks = Asks::of(stated, Some(&second));
+            let answered = keeps.decide_under(GatewayId::LOCAL, &asks, now);
+            let made = answered.expect("an answer").whole().expect("no place").0;
+            assert_eq!(ahead.decision, made.decision, "{case}");
+            assert_eq!(kept, keeps.explained(b"request"), "{case}");
+
+            let asks = Asks::of(stated, Some(&third));
+            let plain = placing(&asks, || decided(&unsampled, &asks)).decision;
+            assert_eq!(asks.made.get(), 0, "{case}: no request is made");
+            assert_eq!(ahead.decision, plain, "{case}: a sample changes no answer");
+            if !overloaded {
+                assert!(matches!(ahead.decision, Decision::Shed(_)), "{case}");
+                assert!(ahead.lease.is_none(), "{case}: a shed holds no lease");
+                let record = kept.expect("the shed is kept");
+                assert_eq!(record.decision, ahead.decision, "{case}");
+                assert_eq!(record.at, now, "{case}");
+            }
+        }
     }
 }
 
@@ -375,6 +930,73 @@ fn a_place_that_scores_by_load_reads_the_reports_its_host_hands() {
         unread[picked_at(None, seed) as usize] += 1;
     }
     assert!(unread.iter().all(|&picks| picks > 0), "{unread:?}");
+}
+
+/// A request the list's cell does not answer for is made. One that states
+/// a wire its list does not dial is made, and the whole pass declines it
+/// under `wires`. One of a second model over the list is made too, the
+/// cell holding the place of the list's model alone: where that model's
+/// place is decided ahead as well, the decision is the whole pass's of
+/// the request made; so is one under a binding that states a sessions
+/// rule.
+#[test]
+fn a_wire_not_dialed_and_a_second_model_over_a_list_decided_ahead() {
+    use smg_worker::{test_support::worker_with_model_aliases, worker::WorkerType};
+    const SECOND: &str = "model-b";
+    let both = |workers: usize| -> Arc<[Arc<dyn Worker>]> {
+        (0..workers)
+            .map(|at| {
+                let url = format!("http://worker-{at}:8000");
+                let worker = worker_with_model_aliases(&url, MODEL, &[SECOND], WorkerType::Regular);
+                worker.set_status(WorkerStatus::Ready);
+                worker
+            })
+            .collect()
+    };
+    let engine = preset("power_of_two");
+    let members = PublishedList::new(both(4));
+    // The list's first request fills its cell under the list's model.
+    let first = Asks::of(request(), Some(&members));
+    assert!(ahead(&engine, &first).decision.pick().is_some());
+    assert_eq!(first.made.get(), 0, "the list's model is decided ahead");
+
+    let mut wired = request();
+    wired.constraints.wire_modes = WireModes::GRPC;
+    let asks = Asks::of(wired, Some(&members));
+    let declined = ahead(&engine, &asks).decision;
+    assert_eq!(asks.made.get(), 1, "a wire the list does not dial: made");
+    assert!(
+        matches!(&declined, Decision::Shed(shed) if shed.emptied_by == "wires"),
+        "{declined:?}"
+    );
+
+    for seed in 0..64 {
+        let mut second = request();
+        second.facts.model = SECOND;
+        second.facts.seed = seed;
+        let asks = Asks::of(second, Some(&members));
+        let drawn = ahead(&engine, &asks).decision;
+        assert_eq!(asks.made.get(), 1, "seed {seed}: a second model, made");
+        assert!(drawn.pick().is_some(), "seed {seed}: {drawn:?}");
+        let whole = engine.decide_without_lease(&asks, Instant::now());
+        assert_eq!(drawn, whole.expect("a whole decision").0, "seed {seed}");
+    }
+
+    // The same list's model under a document whose first binding rules
+    // the models `ruled-*` by sessions: a request of such a model is made.
+    let mut document = PolicySpec::preset("power_of_two").expect("a built-in preset");
+    document.generation = 1;
+    let spec = AppliedSpec::validate(&ruled_ahead(document)).expect("the document validates");
+    let ruling = InProcess::new(spec);
+    let members = PublishedList::new(pool(4));
+    let first = Asks::of(request(), Some(&members));
+    assert!(ahead(&ruling, &first).decision.pick().is_some());
+    assert_eq!(first.made.get(), 0, "the list's model is decided ahead");
+    let mut ruled = request();
+    ruled.facts.model = "ruled-b";
+    let asks = Asks::of(ruled, Some(&members));
+    placing(&asks, || answered(&ruling, &asks));
+    assert_eq!(asks.made.get(), 1, "a second model under a rule: made");
 }
 
 /// A request stated ahead is plain where it is a first attempt that

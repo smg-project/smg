@@ -3288,6 +3288,26 @@ const DRAWS_BY_ITS_TEST: [&str; 6] = [
     "round-robin",
 ];
 
+/// The crate's own pickers, by name, whose draw ahead of the rows and whose
+/// pick read of a request its seed alone. The whole decision of a place of
+/// one of them, all of whose scorers score by their rows
+/// ([`SCORES_BY_ITS_ROWS`]), reads of a request its model, its phase, its
+/// seed and the instant, and so can be asked before the request is made
+/// ([`Engine::place_ahead_for`]). A host's stage takes no built-in's name
+/// ([`DRAWS_BY_ITS_TEST`]), so a host's own picker stands in no such list
+/// and is read as one that reads the request.
+#[cfg(feature = "in-process")]
+const PICKS_BY_ITS_SEED: [&str; 1] = ["power-of-two"];
+
+/// The crate's own scorers, by name, whose score reads no fact of a request
+/// but its model, its phase, its seed and the instant of its decision: each
+/// scores by its rows and those four. Under a limit on the age of a load
+/// report a scorer keeps its name. A host's own scorer stands in no such
+/// list, as a host's picker stands in none ([`PICKS_BY_ITS_SEED`]), and is
+/// read as one that reads the request.
+#[cfg(feature = "in-process")]
+const SCORES_BY_ITS_ROWS: [&str; 1] = ["least-load"];
+
 /// The crate's own pickers, by name, that read no count a worker object
 /// alone holds: neither a row's requests in flight nor a count of its
 /// sessions. A profile of the engine's own filters, no scorer and one of

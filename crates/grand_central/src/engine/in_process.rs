@@ -278,8 +278,10 @@ pub(crate) struct PoolMembers {
     wires: OnceLock<WireModes>,
     /// The model of the list's first single request and the profile the
     /// engine picks alone for it, where the document holds one
-    /// ([`Self::alone`]).
-    alone: OnceLock<(Box<str>, Option<AloneProfile>)>,
+    /// ([`Self::alone`]); and behind it, where it holds none, the profile
+    /// whose whole decision is asked ahead of a request's making
+    /// ([`Self::ahead`]).
+    alone: OnceLock<(Box<str>, Option<AloneProfile>, Option<AloneProfile>)>,
     /// The model of the list's first whole decision under a document that
     /// names a shadow, and the document's word of that model's shadow
     /// ([`Self::shadow`]).
@@ -359,17 +361,98 @@ impl PoolMembers {
     /// asks more than one pick. Found once a list, for the model of its
     /// first request: a gateway's list is one model's. Another model's
     /// request is answered by the document at its call.
-    fn alone(&self, spec: &AppliedSpec, model: &str) -> Option<AloneProfile> {
-        let find = || match spec.engine().place_for(model, Phase::Single) {
-            Place::Alone(profile) => Some(profile),
-            _ => None,
+    fn alone(&self, own: Loaded<'_, '_>, model: &str) -> Option<AloneProfile> {
+        let (named, alone, _) = match self.alone.get() {
+            Some(found) => found,
+            None => self.first_asked(own, model),
         };
-        let (named, alone) = self.alone.get_or_init(|| (model.into(), find()));
         if **named == *model {
             *alone
         } else {
-            find()
+            Self::alone_place(&own.document.spec, model)
         }
+    }
+
+    /// The cell [`Self::alone`] and [`Self::ahead`] read, filled for
+    /// `model`, the model of the list's first single request.
+    ///
+    /// The place decided ahead is kept where a decision over this list
+    /// can take that road at all. Two facts say so, both fixed for as long
+    /// as the list's value stands. A stage or a count of sends of the
+    /// document takes a word on a lease, as a whole decision leases a pick
+    /// the session table is told nothing of ([`single::issued`]). And no
+    /// engine of the list holds several workers
+    /// ([`PoolRecords::has_ranks`]): such a list's reports are asked for by
+    /// the whole pass alone. So a request that is turned back reads the
+    /// cell and neither fact again. The list's records are made here where
+    /// the fill reads them, as the whole pass makes them in the decision
+    /// that fills the cell.
+    // Out of line: a list's later requests read the cell and run no fill.
+    #[cold]
+    #[inline(never)]
+    fn first_asked(
+        &self,
+        own: Loaded<'_, '_>,
+        model: &str,
+    ) -> &(Box<str>, Option<AloneProfile>, Option<AloneProfile>) {
+        self.alone.get_or_init(|| {
+            let document = own.document;
+            let spec = &document.spec;
+            let alone = Self::alone_place(spec, model);
+            let ahead = || {
+                let place = Self::ahead_place(spec, model)?;
+                // True under every place the lists name today: least-load
+                // counts its sends, and that count takes a dispatch. The
+                // test guards a name a list takes later.
+                let leased = document.hears_beside_table.intersects(EventSet::LEASE);
+                let ranked = || self.records(spec, &own.clock).has_ranks();
+                (leased && !ranked()).then_some(place)
+            };
+            (model.into(), alone, alone.is_none().then(ahead).flatten())
+        })
+    }
+
+    /// The profile the engine picks alone for a single request of `model`
+    /// ([`Place::Alone`]), as the document says it.
+    fn alone_place(spec: &AppliedSpec, model: &str) -> Option<AloneProfile> {
+        match spec.engine().place_for(model, Phase::Single) {
+            Place::Alone(profile) => Some(profile),
+            _ => None,
+        }
+    }
+
+    /// The profile whose whole decision of a single request of `model`
+    /// reads of the request its model, its phase, its seed and the instant
+    /// alone ([`Engine::place_ahead_for`]), under a binding that names no
+    /// source of a routing key: a request of a binding that names one is
+    /// made, since its key is derived at its making.
+    fn ahead_place(spec: &AppliedSpec, model: &str) -> Option<AloneProfile> {
+        if spec.key_sources_for(model, Phase::Single).is_some() {
+            return None;
+        }
+        spec.engine().place_ahead_for(model, Phase::Single)
+    }
+
+    /// The model of the list's first request with the profile whose whole
+    /// decision of a single request of it over this list is asked ahead of
+    /// the request's making: it reads of the request its model, its phase,
+    /// its seed and the instant alone ([`Self::ahead_place`]), and a
+    /// decision over this list can take that road ([`Self::first_asked`]).
+    /// Read in the cell [`Self::alone`] filled: asked behind it, one read
+    /// that calls nothing. A list whose first model has no such place
+    /// answers none.
+    fn ahead(&self) -> Option<(&str, AloneProfile)> {
+        let (named, _, ahead) = self.alone.get()?;
+        Some((named, (*ahead)?))
+    }
+
+    /// The profile of [`Self::ahead`] for a request of `model`: the cell's
+    /// for the model it names, and none for another model. A gateway's
+    /// list is one model's: another model's request over it is made ahead
+    /// of its decision, as over a list whose first model has no such
+    /// place, and pays one compare of the two names here.
+    fn ahead_for((named, profile): (&str, AloneProfile), model: &str) -> Option<AloneProfile> {
+        (*named == *model).then_some(profile)
     }
 
     /// What the document says of the shadow of a request of `model` that
@@ -1249,6 +1332,8 @@ impl Loaded<'_, '_> {
         let mut picked = None;
         // The cell the pick asked, with the value it gave.
         let mut asked = None;
+        // The list and the request of a decision asked ahead of the making.
+        let mut ahead = None;
         match (maker.plain(), maker.workers()) {
             (Some(plain), WorkerLists::Single(lent)) if plain.phase == Phase::Single => {
                 // The engine's own value of the list, asked of its cell.
@@ -1284,6 +1369,27 @@ impl Loaded<'_, '_> {
                         return Ok(Some(pick));
                     }
                     picked = Some((pick, members, plain));
+                } else if seed_ahead::asked(late) {
+                    // The placing call's request, which no maker of a host
+                    // states: where its place is one whose picker and
+                    // scorers read of a request its seed alone, its whole
+                    // decision is asked ahead of the making, behind the
+                    // clock, which its scorers read. The cell holds such a
+                    // place where a decision over the list can take the
+                    // road ([`PoolMembers::first_asked`]), so a request
+                    // that is turned back reads the cell alone. It holds
+                    // the place of the list's model: another model's
+                    // request is made. The list's wires stand where the
+                    // request names any ([`single::alone`] read them).
+                    if let Some(listed) = members.ahead() {
+                        let dials = |wires: &WireModes| plain.wires.contains(*wires);
+                        let dialed =
+                            plain.wires.is_empty() || members.wires.get().is_some_and(dials);
+                        if dialed {
+                            let place = PoolMembers::ahead_for(listed, maker.model());
+                            ahead = place.map(|_| (members, plain));
+                        }
+                    }
                 }
             }
             _ => {}
@@ -1298,6 +1404,17 @@ impl Loaded<'_, '_> {
                 sample::noted(self, maker, now, whole.as_ref());
                 return Ok(None);
             }
+        } else if let Some((members, plain)) = ahead {
+            // The request's seed, drawn here as its making would draw it:
+            // one a request, and none where the request is made.
+            let seed = seed_ahead::drawn();
+            let kept = late.is_some();
+            let decided = single::ahead(self, maker, members, plain, seed, now, kept);
+            *whole = Some((decided, false));
+            // No request was made for the decision: a sample asks the
+            // maker its id, as behind a noted pick.
+            sample::noted(self, maker, now, whole.as_ref());
+            return Ok(None);
         }
         let mut request = self.made(maker);
         let later = request.constraints.decode_later;
@@ -1577,6 +1694,42 @@ const fn finalized(mut z: u64) -> u64 {
 /// A word drawn from a count: counts one apart give words far apart.
 const fn mixed(count: u64) -> u64 {
     finalized(count.wrapping_mul(GOLDEN))
+}
+
+/// The seed of a decision that is asked ahead of its request's making.
+///
+/// The placing call hands the pass the request it would make, and the
+/// engine draws that request's seed itself, as the making would
+/// ([`fresh_seed`]): no maker is asked for one. A request a host states
+/// through a maker of its own is made ahead of its whole decision.
+mod seed_ahead {
+    // The unit tests state a seed of their own: read in a test build alone.
+    #[cfg(test)]
+    use super::tests::seed_hook;
+    use super::Made;
+    use crate::fresh_seed;
+
+    /// Whether the pass may decide its request ahead of the making: the
+    /// request is the placing call's, handed as `late`.
+    #[inline(always)]
+    pub(super) fn asked(late: Option<&Made<'_, '_>>) -> bool {
+        #[cfg(test)]
+        if seed_hook::seed().is_some() {
+            return true;
+        }
+        late.is_some()
+    }
+
+    /// The seed of a decision asked ahead: one no other request of this
+    /// thread was given, as a request's making states one.
+    #[inline(always)]
+    pub(super) fn drawn() -> u64 {
+        #[cfg(test)]
+        if let Some(seed) = seed_hook::seed() {
+            return seed;
+        }
+        fresh_seed()
+    }
 }
 
 #[cfg(test)]

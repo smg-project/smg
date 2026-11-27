@@ -27,7 +27,10 @@
 //! publishes once. `--overloaded 1` puts every worker over its
 //! overload threshold, so the list admits no worker, and gives each worker
 //! requests in flight: its place plus one, the middle worker none, so the
-//! rule for such a list has loads to steer by. `--refused limit` puts every
+//! rule for such a list has loads to steer by. `--overloaded 2` does the
+//! same but for the middle worker, which stays under its threshold: the
+//! one worker the list admits. A pair's cell reads that value as `1`.
+//! `--refused limit` puts every
 //! prefill of a pair's cell at its host's admission limit, and `--refused
 //! partners` takes its every decode out of service: each decision is then
 //! refused, and a turn refused that way counts. `--refused overload` puts
@@ -774,6 +777,9 @@ struct Run {
     /// the cell's profile under a name of its own.
     other_models: usize,
     overloaded: bool,
+    /// Whether the list's middle worker stays under its overload threshold
+    /// (`--overloaded 2`): the one worker such a list admits.
+    spared: bool,
     publish_ms: u64,
     /// What refuses every pair of a pair's cell: the bench's `pair` file
     /// reads it.
@@ -801,6 +807,7 @@ fn run() -> Run {
         no_room: 0,
         other_models: 0,
         overloaded: false,
+        spared: false,
         publish_ms: 0,
         refused: pair::Refused::No,
         shadow: Shadowed::No,
@@ -832,7 +839,11 @@ fn run() -> Run {
             "--no-room" => run.no_room = number() as usize,
             "--other-models" => run.other_models = number() as usize,
             "--runtimes" => RUNTIMES.store(number() as u32, Ordering::Relaxed),
-            "--overloaded" => run.overloaded = number() != 0,
+            "--overloaded" => {
+                let mode = number();
+                run.overloaded = mode != 0;
+                run.spared = mode == 2;
+            }
             "--publish-ms" => run.publish_ms = number(),
             "--refused" => run.refused = pair::Refused::named(&value),
             "--shadow" => {
@@ -1096,7 +1107,7 @@ fn main() {
     lend(&workers);
     if run.overloaded {
         for (at, worker) in workers.iter().enumerate() {
-            worker.set_overloaded(true);
+            worker.set_overloaded(!(run.spared && at == workers.len() / 2));
             if at != workers.len() / 2 {
                 for _ in 0..=at {
                     worker.increment_load();

@@ -916,3 +916,126 @@ fn a_dispatch_across_a_new_document_settles_its_decisions_claim() {
         );
     }
 }
+
+/// The engine draws the seed of the request its placing call would make,
+/// so a place whose picker and scorers read the seed alone is decided
+/// whole with no request made for the call: with
+/// both workers of two eligible, and with one, whose pick names that
+/// worker alone. The pick's lease books the worker it leads with.
+#[test]
+fn a_call_that_places_a_request_is_decided_whole_with_none_made() {
+    let engine = preset("power_of_two");
+    for eligible in [2_usize, 1] {
+        let list = pool(2);
+        if eligible == 1 {
+            list[0].set_overloaded(true);
+        }
+        let members = PublishedList::new(list);
+        let request = PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()));
+        let made = Made::new(&engine, &request, &[]);
+        let document = engine.in_force();
+        let mut whole = None;
+        decide(engine.under(&document), &made, &mut whole).expect("a decision");
+        // A pick either way: of both workers, or of the one eligible.
+        let (outcome, _) = whole.expect("a whole decision");
+        let pick = outcome.decision.pick().expect("a pick");
+        let mut placed: Vec<u32> = pick.targets.iter().map(|target| target.position).collect();
+        placed.sort_unstable();
+        let want: &[u32] = if eligible == 2 { &[0, 1] } else { &[1] };
+        assert_eq!(placed, want, "{eligible} eligible: the targets");
+        let booked = outcome.lease.as_ref().map(|leased| leased.lease.booked);
+        let lead = pick.targets.first().map(|target| target.id);
+        assert_eq!(booked, lead, "{eligible} eligible: the lease");
+        // Every making lists the headers the document's view shows.
+        assert!(
+            made.headers.get().is_none(),
+            "{eligible} eligible: no request is made"
+        );
+    }
+}
+
+/// The call's decision is its made request's: with the seed the engine
+/// draws stated, the whole pass of a request made with that seed names
+/// the same workers in the same order. Its lease states the sizes the
+/// call's request would state: the count of its token ids, or its text's
+/// bytes, and the text's characters under a document a stage of which
+/// reads a request's size.
+#[test]
+fn a_call_decided_ahead_picks_and_leases_as_its_made_request() {
+    use crate::engine::in_process::{
+        single::tests::{request as stated, Asks},
+        tests::seed_hook as hook,
+    };
+    let places = |decision: &Decision| -> Vec<u32> {
+        let pick = decision.pick().expect("a pick");
+        pick.targets.iter().map(|target| target.position).collect()
+    };
+    let engine = preset("power_of_two");
+    let members = PublishedList::new(pool(4));
+    let request = PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()));
+    let mut leads = [0_u32; 4];
+    for seed in 0..256_u64 {
+        let made = Made::new(&engine, &request, &[]);
+        let document = engine.in_force();
+        let mut whole = None;
+        hook::stated(seed, || decide(engine.under(&document), &made, &mut whole))
+            .expect("a decision");
+        let (outcome, _) = whole.expect("a whole decision");
+        assert!(made.headers.get().is_none(), "seed {seed}: none is made");
+        let mut host = stated();
+        host.facts.seed = seed;
+        let asks = Asks::of(host, Some(&members));
+        let want = engine.decide_without_lease(&asks, Instant::now());
+        let want = places(&want.expect("a whole decision").0);
+        assert_eq!(places(&outcome.decision), want, "seed {seed}");
+        leads[want[0] as usize] += 1;
+    }
+    let led = leads.iter().filter(|&&leads| leads > 0).count();
+    assert!(led > 1, "the seed decides the pick: {leads:?}");
+
+    let sizes = |engine: &InProcess, prompt: Prompt<'_>| {
+        let members = PublishedList::new(pool(4));
+        let request = PlaceRequest {
+            prompt,
+            ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
+        };
+        // The call's own maker: it keeps whether its document sizes a
+        // request.
+        let (document, call) = (engine.in_force(), Call::default());
+        let made = Made::asked(engine.under(&document), &request, &call);
+        let mut whole = None;
+        decide(engine.under(&document), &made, &mut whole).expect("a decision");
+        let (outcome, _) = whole.expect("a whole decision");
+        assert!(made.headers.get().is_none(), "no request is made");
+        let lease = outcome.lease.expect("a lease").lease;
+        (lease.tokens, lease.chars, lease.bytes)
+    };
+    let tokens = [7_u32; 40];
+    // A text of 200 two-byte characters.
+    let text = "\u{e9}".repeat(200);
+    let ids = Prompt {
+        tokens: Some(&tokens),
+        ..Prompt::NONE
+    };
+    let worded = || Prompt {
+        text: Some(&text[..]),
+        ..Prompt::NONE
+    };
+    assert_eq!(sizes(&engine, ids), (40, 0, 0));
+    assert_eq!(sizes(&engine, worded()), (0, 0, 400));
+    // A document whose first binding places the models `sized-*` by a
+    // stage that reads a request's size: the text's characters are
+    // counted for every request under it.
+    let mut document = PolicySpec::preset("power_of_two").expect("a built-in preset");
+    document.generation = 1;
+    let bucket = PolicySpec::preset("bucket").expect("a built-in preset");
+    let mut sized = bucket.bindings[0].clone();
+    sized.matcher.model = "sized-*".to_owned();
+    document.bindings.insert(0, sized);
+    for (name, profile) in &bucket.profiles {
+        document.profiles.insert(name.clone(), profile.clone());
+    }
+    let sizing = engine_of(&document);
+    assert!(sizing.spec().needs().prompt_size, "a stage reads the size");
+    assert_eq!(sizes(&sizing, worded()), (0, 200, 400));
+}
