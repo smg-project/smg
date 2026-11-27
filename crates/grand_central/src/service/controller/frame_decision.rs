@@ -46,8 +46,9 @@
 //! A frame states its request's hard demands (`DecideRequest.demands`). The
 //! engine holds each list of its decision to the workers that meet them,
 //! each side of a pair by its role's part. The count of a frame that names
-//! its worker passes over the rest. An encode request's frame states none:
-//! its reader refuses one that does.
+//! its worker passes over the rest. Where an encode request carries an
+//! item, its encoders are held to its runtime and its media's parts, and
+//! its pair to every part but the media's.
 //!
 //! An encode request is its pair's one request, read at the prefill phase
 //! ([`Checked::carries_items`]): [`decide_encode`] decides it over its
@@ -582,6 +583,15 @@ pub(crate) fn decide_pair(
 ///
 /// Each of the three profiles that holds a stage that may refuse by a
 /// report of leases asks the apply a pair's frame asks.
+///
+/// A hard demand the frame states is held by the engine's entry. The
+/// encoders of a request with an item are held to its runtime and its
+/// media's parts
+/// ([`Demands::beside_pair`](crate::engine::demands::Demands::beside_pair)),
+/// and the pair's sides to every part but the media's
+/// ([`Demands::beside_encoders`](crate::engine::demands::Demands::beside_encoders)).
+/// A request with no item takes no encoder, and its pair is held as a
+/// pair's own.
 ///
 /// An encode request's frame is read for no number its request names its
 /// worker by: it is placed by the rest of its document.

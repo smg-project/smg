@@ -867,11 +867,15 @@ fn the_numbers_count_among_the_workers_that_meet_the_frames_demands() {
 /// the pair under `target-worker`, and a frame that states no demand
 /// counts all three.
 ///
+/// Where neither decode on the runtime 2 can be sent to, no decode is
+/// counted, though the first decode is ready: the number is not read, and
+/// the frame is answered the decode a frame that names no worker is.
+///
 /// The one call:
 /// `a_decode_named_alone_takes_no_number_behind_a_mask_or_a_demand` (`D`).
 #[test]
 fn a_decode_named_alone_takes_no_number_behind_a_demand() {
-    use super::super::demanding;
+    use super::super::{demanding, together};
 
     let store = pair_store("round_robin", RING);
     let objects = holder(&store);
@@ -881,14 +885,14 @@ fn a_decode_named_alone_takes_no_number_behind_a_demand() {
     let decodes = stating(&store, &objects, Role::Decode, decodes);
     let behind = list_order(&objects, Role::Decode, &decodes);
     let now = Instant::now();
-    // The prefills and the decodes that sixteen frames are answered.
+    // The prefills and the decodes that sixteen frames are answered, or
+    // the one shed each of them was.
     let turns = |number: u32, demands: proto::Demands| {
-        let named = (1..=16).map(|n| {
+        let named = together((1..=16).map(|n| {
             let frame = keyed(pair_frame(n, Some(number)), u64::from(n));
             let frame = demanding(frame, demands);
             reached(&served_pair(&store, &objects, frame, GATEWAY, now))
-        });
-        let named: Result<Vec<(WorkerId, WorkerId)>, _> = named.collect();
+        }));
         named.map(|pairs| pairs.into_iter().unzip::<_, _, BTreeSet<_>, BTreeSet<_>>())
     };
     let none = proto::Demands::default();
@@ -904,4 +908,76 @@ fn a_decode_named_alone_takes_no_number_behind_a_demand() {
         assert_eq!(ahead.len(), prefills.len(), "the prefills' turns");
     }
     assert_eq!(turns(2, wire), Err(MISSED), "two decodes meet the demand");
+
+    // Both decodes on the runtime 2 are over their thresholds, and the
+    // first of them holds a lease: the binding's rule takes the other.
+    for (name, _) in &decodes[1..] {
+        overload(&objects, name, true);
+    }
+    file(&store, 1, decodes[1].1, now);
+    let decode_of = |number: Option<u32>| {
+        let frame = demanding(keyed(pair_frame(1, number), 1), wire);
+        let answer = served_pair(&store, &objects, frame, GATEWAY, now);
+        reached(&answer).map(|(_, decode)| decode)
+    };
+    let least = Ok(decodes[2].1);
+    assert_eq!(decode_of(None), least, "the fewest leases");
+    for number in [0, 1, u32::MAX] {
+        assert_eq!(decode_of(Some(number)), least, "{number}: not read");
+    }
+}
+
+/// Each side's count judges the media a frame demands, as the frame's
+/// decision does: a worker that processes no media by reference takes no
+/// number of a frame that needs one that does. One of two prefills and one
+/// of two decodes state that they process it. The number 0 reaches those
+/// two, whichever place of its list each stands at, and the number 1 sheds
+/// the pair under `target-worker`. A frame that states no demand counts
+/// both workers of each side.
+///
+/// The worker that processes it is the first one written on its side, then
+/// the second: in one of the two fleets it stands behind the other.
+#[test]
+fn each_sides_number_passes_over_a_worker_that_takes_no_media_by_reference() {
+    use super::super::{demanding, stating_member};
+    use crate::engine::DemandFacts;
+
+    let now = Instant::now();
+    let none = proto::Demands::default();
+    let by_reference = proto::Demands {
+        references: proto::demands::References::Any.into(),
+        ..none
+    };
+    for takes in [0_usize, 1] {
+        let store = rings();
+        let objects = holder(&store);
+        let member = |name: &'static str, role, references| {
+            let stated = DemandFacts {
+                references,
+                ..DemandFacts::default()
+            };
+            let id = stating_member(&store, &objects, name, role, None, stated);
+            (name, id)
+        };
+        let prefills = [
+            member("p0", Role::Prefill, takes == 0),
+            member("p1", Role::Prefill, takes == 1),
+        ];
+        let decodes = [
+            member("d0", Role::Decode, takes == 0),
+            member("d1", Role::Decode, takes == 1),
+        ];
+        let ahead = list_order(&objects, Role::Prefill, &prefills);
+        let behind = list_order(&objects, Role::Decode, &decodes);
+        let asked = |number: u32, demands: proto::Demands| {
+            let frame = demanding(pair_frame(1, Some(number)), demands);
+            reached(&served_pair(&store, &objects, frame, GATEWAY, now))
+        };
+        for (number, pair) in numbered(&ahead, &behind) {
+            assert_eq!(asked(number, none), Ok(pair), "no demand, {number}");
+        }
+        let one = Ok((prefills[takes].1, decodes[takes].1));
+        assert_eq!(asked(0, by_reference), one, "worker {takes} takes it");
+        assert_eq!(asked(1, by_reference), Err(MISSED), "one is counted");
+    }
 }

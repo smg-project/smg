@@ -546,16 +546,22 @@ message DecideRequest {
   // no part stated, the request demands nothing and the frame is decided as
   // it was.
   //
-  // A stated demand is read on every frame but an encode request's. On
-  // that frame it is out of range, by this field, in this protocol version.
-  // A worker is held by its role:
+  // A stated demand is read on every frame. A worker is held by its role:
   // - a single worker, a decode and a decode call's decode: to every part
   // - a prefill, in a pair or alone: to every part but output_window and
   //   decoding
+  // - an encoder that takes an encode request's items: to runtime, vision
+  //   and references. The request's pair is then held to neither of the
+  //   last two
   //
   // A decode call states its request's demands again: the lease keeps
   // none. A frame that states named_worker counts its number among the
   // workers that meet the demand.
+  //
+  // An encode request that states an item leaves a demand for vision or
+  // references to its encoders. One that states such a demand and
+  // decode_later is declined under `decode-later`: its decode call states
+  // no items, and would hold the decode to both.
   //
   // A host states a demand only on a session whose Welcome chose protocol 2
   // or later. A controller of protocol 1 reads no such field, and would
