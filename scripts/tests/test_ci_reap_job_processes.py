@@ -410,20 +410,33 @@ def test_strict_bound_exit_during_ownership_read_keeps_cleaning_peers(
     runtime = _Pidfds(strict_tree)
     original_owned = mod._strict_owned
     original_exited = runtime.exited
+    handoff = []
+    bound_checks = []
     ready = set()
 
     def exit_during_read(proc_root, pid, *args, **kwargs):
-        if pid == 100 and pid in runtime.opened.values():
+        if pid == 100 and pid in runtime.opened.values() and pid not in ready:
+            if not handoff:
+                current = original_owned(proc_root, pid, *args, **kwargs)
+                assert current is not None
+                handoff.append(current)
+                return current
+            assert bound_checks  # The matching handoff reached a bound pidfd check.
             ready.add(pid)
             stat = strict_tree / str(pid) / "stat"
             stat.write_bytes(stat.read_bytes().replace(b") S ", b") Z "))
             return None
         return original_owned(proc_root, pid, *args, **kwargs)
 
+    def exited(fd):
+        if runtime.opened[fd] == 100 and handoff:
+            bound_checks.append(fd)
+        return runtime.opened[fd] in ready or original_exited(fd)
+
     monkeypatch.setattr(mod, "_strict_owned", exit_during_read)
-    assert runtime.run(
-        mod, pidfd_exited=lambda fd: runtime.opened[fd] in ready or original_exited(fd)
-    )
+    assert runtime.run(mod, pidfd_exited=exited)
+    assert [process.pid for process in handoff] == [100]
+    assert ready == {100}
     assert (strict_tree / "100" / "stat").exists()  # Unreaped Z can remain visible.
     assert all(pid != 100 for pid, _ in runtime.sent)
     assert (101, signal.SIGTERM) in runtime.sent
