@@ -1138,3 +1138,52 @@ async fn a_call_that_waits_for_approval_does_not_run() {
         );
     }
 }
+
+/// The object form of `require_approval` holds a call the same way, streamed or not: a tool
+/// its `always` filter names does not run and its call closes as failed with the approval
+/// error; a tool the filter does not name runs as it does with no approval asked.
+#[tokio::test]
+async fn a_call_an_always_filter_names_does_not_run() {
+    for (named, stream) in [(true, false), (true, true), (false, false), (false, true)] {
+        let mut mcp = common::mock_mcp_server::MockMCPServer::start()
+            .await
+            .unwrap();
+        let name = if named {
+            "brave_web_search"
+        } else {
+            "another_tool"
+        };
+        let (response, _) = responses_result_for_input(
+            json!("Hello"),
+            json!([{"type":"mcp","server_label":"test-tools","server_url":mcp.url(),"require_approval":{"always":{"tool_names":[name]}}}]),
+            Some("<tool_call>\n{\"name\":\"brave_web_search\"}\n</tool_call>\n"),
+            None,
+            "completed",
+            stream,
+            Some((1, "Final answer after tools")),
+            vec!["stop"],
+            false,
+        )
+        .await;
+        mcp.stop().await;
+
+        let pass = format!("named={named} stream={stream}: {response}");
+        let call = response["output"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|item| item["type"] == "mcp_call")
+            .unwrap_or(&Value::Null);
+        if named {
+            assert_eq!(mcp.call_count(), 0, "{pass}");
+            assert_eq!(call["status"], "failed", "{pass}");
+            assert!(
+                call["error"].to_string().contains("requires approval"),
+                "{pass}"
+            );
+        } else {
+            assert_eq!(mcp.call_count(), 1, "{pass}");
+            assert_eq!(call["status"], "completed", "{pass}");
+        }
+    }
+}
