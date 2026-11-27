@@ -229,6 +229,14 @@ jobs:
         if: inputs.engine == 'tokenspeed'
         uses: ./.github/actions/setup-tokenspeed
 
+      # Persist Triton / FlashInfer / vLLM torch_compile_cache / TorchInductor /
+      # TVM-FFI / CUDA PTX JIT artifacts on the node NVMe, keyed by engine +
+      # GPU arch + exact package/compiler versions.
+      - name: Setup persistent JIT cache
+        env:
+          E2E_GPU_VENDOR: ${{ inputs.gpu_vendor }}
+        run: bash scripts/ci_setup_jit_cache.sh "${{ inputs.engine }}"
+
       - name: Download build artifacts
         uses: ./.github/actions/download-build-artifacts
         with:
@@ -398,10 +406,13 @@ jobs:
         if: always() && env.E2E_JOB_MARKER != ''
         run: python3 scripts/ci_reap_job_processes.py "$E2E_JOB_MARKER"
 
-      # The prebuilt TokenSpeed payload is a per-job copy on the node's shared
-      # NVMe cache (scripts/ci_fetch_tokenspeed_prebuilt.sh); drop it so the
-      # cache does not keep one copy per lane. A hard-killed runner never
-      # reaches this step; those copies are swept by the next fetch on the node.
+      # Remove per-job copies extracted from prebuilt backend / TokenSpeed
+      # carriers on the node's shared NVMe cache. A hard-killed runner never
+      # reaches these steps; those copies are swept by the next fetch on the node.
+      - name: Remove per-job prebuilt backend payload copy
+        if: always() && env.SMG_PREBUILT_JOB_DIR != ''
+        run: rm -rf "$SMG_PREBUILT_JOB_DIR"
+
       - name: Remove per-job TokenSpeed payload copy
         if: always() && env.TOKENSPEED_PREBUILT_JOB_DIR != ''
         run: rm -rf "$TOKENSPEED_PREBUILT_JOB_DIR"

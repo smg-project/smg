@@ -35,16 +35,35 @@ PY
 
 smg_prepared_env_manifest() {
     smg_backend_recipe "$1" || return 1
-    # Both transports are baked. Missing or changed engine/native packages
+    # Both transports are baked for vLLM/SGLang; TRT-LLM pins its wheel, torch,
+    # cuda-bindings, typer, and NCCL runtime. Missing or changed packages
     # invalidate reuse even if a previous recipe stamp was left behind.
     "$2/bin/python" - "$1" <<'PY'
 import importlib.metadata as metadata
 import sys
 
-packages = [sys.argv[1], "torch", "flashinfer-python", "flashinfer-jit-cache",
-            "nixl", "mooncake-transfer-engine-cuda13"]
-packages += sorted(name for d in metadata.distributions()
-                   if (name := d.metadata.get("Name", "")).lower().replace("_", "-").startswith("nixl-cu"))
+backend = sys.argv[1]
+if backend == "trtllm":
+    packages = ["tensorrt-llm", "torch", "cuda-bindings", "typer"]
+    packages += sorted(
+        name
+        for d in metadata.distributions()
+        if (name := d.metadata.get("Name", "")).lower().replace("_", "-").startswith("nvidia-nccl-cu")
+    )
+else:
+    packages = [
+        backend,
+        "torch",
+        "flashinfer-python",
+        "flashinfer-jit-cache",
+        "nixl",
+        "mooncake-transfer-engine-cuda13",
+    ]
+    packages += sorted(
+        name
+        for d in metadata.distributions()
+        if (name := d.metadata.get("Name", "")).lower().replace("_", "-").startswith("nixl-cu")
+    )
 for name in packages:
     print(name, metadata.version(name))
 PY

@@ -665,6 +665,9 @@ jobs:
       - name: Setup SGLang backend
         uses: ./.github/actions/setup-sglang
 
+      - name: Setup persistent JIT cache
+        run: bash scripts/ci_setup_jit_cache.sh sglang
+
       - name: Download build artifacts
         uses: ./.github/actions/download-build-artifacts
         with:
@@ -712,6 +715,10 @@ jobs:
           path: benchmark-logs/
           if-no-files-found: ignore
           retention-days: 7
+
+      - name: Remove per-job prebuilt backend payload copy
+        if: always() && env.SMG_PREBUILT_JOB_DIR != ''
+        run: rm -rf "$SMG_PREBUILT_JOB_DIR"
 
   # Initial advisory AMD PR performance slice: same regular HTTP/gRPC test,
   # four TP1 workers and thresholds as NVIDIA. PD performance remains separate.
@@ -2485,6 +2492,9 @@ jobs:
       - name: Setup SGLang backend
         uses: ./.github/actions/setup-sglang
 
+      - name: Setup persistent JIT cache
+        run: bash scripts/ci_setup_jit_cache.sh sglang
+
       - name: Setup Go
         uses: actions/setup-go@v7
         with:
@@ -2526,6 +2536,10 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+      - name: Remove per-job prebuilt backend payload copy
+        if: always() && env.SMG_PREBUILT_JOB_DIR != ''
+        run: rm -rf "$SMG_PREBUILT_JOB_DIR"
+
   go-bindings-benchmark:
     name: go-bindings-benchmark
     needs: build-wheel
@@ -2541,6 +2555,9 @@ jobs:
 
       - name: Setup SGLang backend
         uses: ./.github/actions/setup-sglang
+
+      - name: Setup persistent JIT cache
+        run: bash scripts/ci_setup_jit_cache.sh sglang
 
       - name: Setup Go
         uses: actions/setup-go@v7

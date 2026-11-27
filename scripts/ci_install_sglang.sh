@@ -127,6 +127,14 @@ if [ "${E2E_KV_BACKEND:-${E2E_SGLANG_TRANSFER_BACKEND:-}}" = mooncake ] \
     if [ "${SMG_BUILD_PREPARED_ENV:-0}" = 1 ]; then
         echo "Deferring Mooncake driver import to the GPU job"
     else
+        if [ "$PREPARED_ENV" = 1 ] \
+            && ! python3 -c "import torch; from mooncake.engine import TransferEngine" 2>/dev/null \
+            && ! ldconfig -p 2>/dev/null | grep -q 'libibverbs\.so\.1'; then
+            echo "Installing missing mooncake RDMA runtime libraries..."
+            bash "${SCRIPT_DIR}/ci_apt_mirror.sh"
+            $RETRY 3 10 $SUDO apt-get update -qq
+            $RETRY 3 10 $SUDO apt-get install -y --no-install-recommends libnuma-dev libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils
+        fi
         python3 -c "import torch; from mooncake.engine import TransferEngine"
     fi
 fi

@@ -61,7 +61,7 @@ setup_cuda_env() {
         # ci_install_trtllm.sh) so the system headers -- which the kernel build
         # compiles against -- are a complete, self-consistent 13.0.88 set matching
         # the system nvcc.
-        $RETRY 3 10 $SUDO apt-get install -y cuda-toolkit-13-0
+        $RETRY 3 10 $SUDO apt-get install -y --no-install-recommends cuda-toolkit-13-0
     fi
     # Point CUDA_HOME at the versioned toolkit dir directly (mirrors
     # ci_install_trtllm.sh). The job env sets CUDA_HOME=/usr/local/cuda, but on this

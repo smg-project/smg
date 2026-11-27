@@ -8,6 +8,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RETRY="bash ${SCRIPT_DIR}/ci_retry.sh"
 source "${SCRIPT_DIR}/ci_prepared_backend_env.sh"
+if [ "$(id -u)" != 0 ] && command -v sudo &> /dev/null; then SUDO="sudo"; else SUDO=""; fi
 
 # A CPU builder must supply the target driver profile for uv's auto selection.
 # Keep its cross-index fallback: some auxiliary wheels exist only on CPU.
@@ -58,7 +59,6 @@ else
     # FFmpeg 4-7). This step is unconditional, so refresh apt lists first.
     echo "Installing FFmpeg for torchcodec..."
     bash "${SCRIPT_DIR}/ci_apt_mirror.sh"
-    if [ "$(id -u)" != 0 ] && command -v sudo &> /dev/null; then SUDO="sudo"; else SUDO=""; fi
     $RETRY 3 10 $SUDO apt-get update
     $RETRY 3 10 $SUDO apt-get install -y --no-install-recommends ffmpeg
 
@@ -83,7 +83,16 @@ echo "nixl import canary OK"
 
 # Import canary: fail here (not mid-e2e) if vLLM's eager torchcodec import
 # can't find the FFmpeg shared libs installed above (torch first so its
-# bundled CUDA libraries are loaded)
+# bundled CUDA libraries are loaded). Bare pods adopting a carrier venv may
+# lack distro FFmpeg, so self-heal once when libavcodec is absent.
+if [ "$PREPARED_ENV" = 1 ] && ! python3 -c "import torch, torchcodec, vllm" 2>/dev/null; then
+    if ! ldconfig -p 2>/dev/null | grep -q 'libavcodec\.so'; then
+        echo "Installing missing FFmpeg runtime libraries for torchcodec..."
+        bash "${SCRIPT_DIR}/ci_apt_mirror.sh"
+        $RETRY 3 10 $SUDO apt-get update -qq
+        $RETRY 3 10 $SUDO apt-get install -y --no-install-recommends ffmpeg
+    fi
+fi
 python3 -c "import torch, torchcodec, vllm"
 echo "vllm/torchcodec import canary OK"
 
@@ -116,6 +125,14 @@ if [ "${E2E_VLLM_KV_BACKEND:-nixl}" = "mooncake" ] \
     if [ "${SMG_BUILD_PREPARED_ENV:-0}" = 1 ]; then
         echo "Deferring Mooncake driver import to the GPU job"
     else
+        if [ "$PREPARED_ENV" = 1 ] \
+            && ! python3 -c "import torch; from mooncake.engine import TransferEngine" 2>/dev/null \
+            && ! ldconfig -p 2>/dev/null | grep -q 'libibverbs\.so\.1'; then
+            echo "Installing missing mooncake RDMA runtime libraries..."
+            bash "${SCRIPT_DIR}/ci_apt_mirror.sh"
+            $RETRY 3 10 $SUDO apt-get update -qq
+            $RETRY 3 10 $SUDO apt-get install -y --no-install-recommends libnuma1 libibverbs1 ibverbs-providers
+        fi
         python3 -c "import torch; from mooncake.engine import TransferEngine"
         echo "mooncake import canary OK"
     fi

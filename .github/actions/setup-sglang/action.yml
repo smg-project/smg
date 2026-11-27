@@ -1,9 +1,17 @@
 name: 'Setup SGLang Backend'
-description: 'Create Python venv and install SGLang.'
+description: 'Fetch prebuilt SGLang environment if available, create/adopt Python venv, and install SGLang.'
 
 runs:
   using: 'composite'
   steps:
+    - name: Fetch prebuilt SGLang
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        GITHUB_ACTOR: ${{ github.actor }}
+        GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+      run: bash scripts/ci_fetch_backend_prebuilt.sh sglang
+
     - name: Setup Python venv
       shell: bash
       env:

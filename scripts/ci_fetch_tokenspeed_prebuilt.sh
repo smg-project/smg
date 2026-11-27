@@ -43,6 +43,7 @@ set -uo pipefail # deliberately NOT -e: every failure is a soft fallback
 IMAGE="${TOKENSPEED_PREBUILT_IMAGE:-}"
 CACHE_ROOT="${TOKENSPEED_PREBUILT_CACHE_ROOT:-/models/.ci-cache/tokenspeed}"
 INSTALL_ROOT="${TOKENSPEED_PREBUILT_INSTALL_ROOT:-/opt}"
+CUDA_INSTALL_ROOT="${TOKENSPEED_PREBUILT_CUDA_ROOT:-/usr/local}"
 
 log() { echo "[fetch-tokenspeed-prebuilt] $*"; }
 fallback() {
@@ -116,13 +117,17 @@ populate() {
     }
     # The payload was baked as root; the job user needs write access for the
     # per-PR glue installs, so repair ownership before the entry goes live.
-    if docker cp "$cid:/opt/smg-ci" "$tmp/smg-ci" \
-        && $SUDO chown -R "$(id -u):$(id -g)" "$tmp" \
-        && retire_entry \
-        && mv -T "$tmp" "$entry" \
-        && touch "$entry/.complete"; then
-        docker rm -f "$cid" > /dev/null 2>&1 || true
-        return 0
+    if docker cp "$cid:/opt/smg-ci" "$tmp/smg-ci"; then
+        # The carrier image already installs /usr/local/cuda-13.0 during its
+        # build; extract it once per node so jobs skip the ~2.5 min apt install.
+        docker cp "$cid:/usr/local/cuda-13.0" "$tmp/cuda-13.0" > /dev/null 2>&1 || rm -rf "$tmp/cuda-13.0"
+        if $SUDO chown -R "$(id -u):$(id -g)" "$tmp" \
+            && retire_entry \
+            && mv -T "$tmp" "$entry" \
+            && touch "$entry/.complete"; then
+            docker rm -f "$cid" > /dev/null 2>&1 || true
+            return 0
+        fi
     fi
     docker rm -f "$cid" > /dev/null 2>&1 || true
     rm -rf "$tmp"
@@ -174,6 +179,28 @@ abort_install() {
 if ! { $SUDO rm -rf "${INSTALL_ROOT}/smg-ci" \
     && $SUDO ln -s "$job/smg-ci" "${INSTALL_ROOT}/smg-ci"; }; then
     abort_install "install to ${INSTALL_ROOT} failed"
+fi
+
+# Link read-only CUDA 13.0 toolkit from the shared NVMe cache when present in
+# the carrier and absent on the runner (zero per-job copy).
+cuda_src=""
+if [ -x "$entry/cuda-13.0/bin/nvcc" ]; then
+    if [ "$job_local" = 1 ]; then
+        if mv -T "$entry/cuda-13.0" "$job/cuda-13.0"; then
+            cuda_src="$job/cuda-13.0"
+        fi
+    else
+        cuda_src="$entry/cuda-13.0"
+    fi
+fi
+if [ -n "$cuda_src" ] && [ ! -x "${CUDA_INSTALL_ROOT}/cuda-13.0/bin/nvcc" ]; then
+    if $SUDO mkdir -p "${CUDA_INSTALL_ROOT}" \
+        && $SUDO rm -rf "${CUDA_INSTALL_ROOT}/cuda-13.0" \
+        && $SUDO ln -s "$cuda_src" "${CUDA_INSTALL_ROOT}/cuda-13.0"; then
+        log "Linked cached CUDA 13.0 toolkit from ${cuda_src}"
+    else
+        log "WARNING: could not link cached CUDA 13.0 toolkit; setup_cuda_env will apt-install it"
+    fi
 fi
 
 # Later steps only learn about the payload through GITHUB_ENV; if that write

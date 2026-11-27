@@ -37,12 +37,12 @@ if [ "$(id -u)" != 0 ] && command -v sudo &> /dev/null; then SUDO="sudo"; else S
 
 HOST_VERSION="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "none")"
 
-# vLLM and SGLang runner images have separate, Pod-local environments. Only
-# adopt one when its installation recipe still matches this checkout; stale
-# images fall back to the existing fresh-venv installation path.
+# vLLM, SGLang, and TRT-LLM runner/carrier images have separate, Pod-local
+# environments. Only adopt one when its installation recipe still matches this
+# checkout; stale images fall back to the existing fresh-venv installation path.
 if [ -n "${SMG_CI_BACKEND:-}" ]; then
     source "${SCRIPT_DIR}/ci_prepared_backend_env.sh"
-    case "$SMG_CI_BACKEND" in vllm|sglang) ;; *) echo "Unknown backend: $SMG_CI_BACKEND" >&2; exit 1 ;; esac
+    case "$SMG_CI_BACKEND" in vllm|sglang|trtllm) ;; *) echo "Unknown backend: $SMG_CI_BACKEND" >&2; exit 1 ;; esac
     PREPARED_VENV="${SMG_PREINSTALLED_ROOT:-/opt/smg-ci}/${SMG_CI_BACKEND}/.venv"
     SMG_BAKED_VENV=""
     if smg_prepared_env_matches "$SMG_CI_BACKEND" "$PREPARED_VENV"; then
@@ -129,7 +129,7 @@ echo "venv interpreter: $ACTUAL_VERSION (pinned)"
 if [ -n "${GITHUB_PATH:-}" ]; then
     echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
     CI_CUDA_HOME=/usr/local/cuda
-    if [ -n "$ADOPTED_VENV" ] && [ "${SMG_CI_BACKEND:-}" = sglang ]; then
+    if [ -n "$ADOPTED_VENV" ] && { [ "${SMG_CI_BACKEND:-}" = sglang ] || [ "${SMG_CI_BACKEND:-}" = trtllm ]; }; then
         CI_CUDA_HOME=/usr/local/cuda-13.0
     fi
     echo "CUDA_HOME=$CI_CUDA_HOME" >> "$GITHUB_ENV"

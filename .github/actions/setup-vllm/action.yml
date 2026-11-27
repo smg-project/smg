@@ -1,9 +1,17 @@
 name: 'Setup vLLM Backend'
-description: 'Create Python venv and install vLLM.'
+description: 'Fetch prebuilt vLLM environment if available, create/adopt Python venv, and install vLLM.'
 
 runs:
   using: 'composite'
   steps:
+    - name: Fetch prebuilt vLLM
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        GITHUB_ACTOR: ${{ github.actor }}
+        GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+      run: bash scripts/ci_fetch_backend_prebuilt.sh vllm
+
     - name: Setup Python venv
       shell: bash
       env:
