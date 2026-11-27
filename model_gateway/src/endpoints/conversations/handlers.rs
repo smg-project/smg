@@ -26,9 +26,12 @@ use smg_data_connector::{
 };
 use tracing::{info, warn};
 
-use crate::routers::{
-    common::{openai_bridge, persistence_utils::item_to_json},
-    error as route_error,
+use crate::{
+    endpoints::responses::InputItemsQuery,
+    routers::{
+        common::{openai_bridge, persistence_utils::item_to_json},
+        error as route_error,
+    },
 };
 
 // ============================================================================
@@ -432,7 +435,12 @@ pub async fn list_conversation_items(
         return response;
     }
 
-    let limit = limit.unwrap_or(DEFAULT_LIST_LIMIT);
+    // A page is at most the largest the public API serves: a larger `limit`
+    // lists a page of that size and the paging fields say that rows follow,
+    // so no store is asked for more than that page and the row past it.
+    let limit = limit
+        .unwrap_or(DEFAULT_LIST_LIMIT)
+        .min(InputItemsQuery::MAX_LIMIT);
     let order = match order {
         Some("asc") => SortOrder::Asc,
         _ => SortOrder::Desc,
@@ -440,10 +448,17 @@ pub async fn list_conversation_items(
 
     // A page of the rows the caller may read: a row the item's own rule
     // refuses is read past, a further page of the store at a time, so the
-    // paging fields below describe the rows in `data`.
+    // paging fields below describe the rows in `data`. One row past the
+    // page is read: only a row the caller may read makes `has_more` true.
+    // A store read ends the list where it holds fewer than `least` rows: the
+    // page on the first read, one row on a further read. A store may leave a
+    // row whose record is gone (an expired one) out of what it read, so a
+    // first read that holds exactly the page and a further read that is
+    // short say nothing of the end: the next read tells it.
     let mut after = after.map(String::from);
     let mut visible = Vec::new();
-    let mut read = limit;
+    let mut read = limit.saturating_add(1);
+    let mut least = limit;
     let listed = loop {
         let params = ListParams {
             limit: read,
@@ -454,22 +469,25 @@ pub async fn list_conversation_items(
             Ok(page) => page,
             Err(e) => break Err(e),
         };
-        let last_page = page.len() < read;
+        let last_page = page.len() < least;
         after = page.last().map(|item| item.id.0.clone());
         visible.extend(page.into_iter().filter(|item| item.is_visible_to(tenant)));
-        if last_page || visible.len() >= limit {
-            visible.truncate(limit);
+        // A limit of 0 lists nothing and reads no further.
+        if last_page || visible.len() > limit || limit == 0 {
             break Ok(visible);
         }
         // The refused rows may be another caller's: a further page is at
         // least a default page, so a small `limit` does not pay a store read
         // a row.
         read = limit.max(DEFAULT_LIST_LIMIT);
+        least = 1;
     };
 
     match listed {
-        Ok(items) => {
-            let has_more = items.len() == limit;
+        Ok(mut items) => {
+            // A limit of 0 lists nothing, so nothing is said to follow it.
+            let has_more = limit > 0 && items.len() > limit;
+            items.truncate(limit);
             let first_id = items.first().map(|item| item.id.0.clone());
             let last_id = items.last().map(|item| item.id.0.clone());
             // The item objects as the public API lists them: each item's own
@@ -1239,6 +1257,8 @@ pub fn conversation_to_json(conversation: &Conversation) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use serde_json::Value;
     use smg_data_connector::{
         MemoryConfig, MemoryConversationItemStorage, MemoryConversationStorage,
@@ -1515,6 +1535,428 @@ mod tests {
         )
         .await;
         assert_eq!(adopted.status(), StatusCode::OK);
+    }
+
+    /// A page says `has_more` only while an item follows it: the page that
+    /// holds a list's last items ends the walk, full or not, and a limit of 0
+    /// lists nothing and says nothing follows.
+    #[tokio::test]
+    async fn a_full_page_with_nothing_behind_it_ends_the_list() {
+        let conversations: Arc<dyn ConversationStorage> =
+            Arc::new(MemoryConversationStorage::new());
+        let items: Arc<dyn ConversationItemStorage> =
+            Arc::new(MemoryConversationItemStorage::new());
+        let created = json_of(
+            create_conversation(
+                &conversations,
+                &items,
+                None,
+                json!({"items": [
+                    {"type": "message", "role": "user", "content": "first"},
+                    {"type": "message", "role": "assistant", "content": "second"}
+                ]}),
+            )
+            .await,
+        )
+        .await;
+        let id = created["id"].as_str().unwrap();
+
+        let mut after: Option<String> = None;
+        for (limit, text, has_more) in [
+            (0, None, false),
+            (1, Some("first"), true),
+            (1, Some("second"), false),
+        ] {
+            let page = json_of(
+                list_conversation_items(
+                    &conversations,
+                    &items,
+                    None,
+                    id,
+                    Some(limit),
+                    Some("asc"),
+                    after.as_deref(),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(page["data"].as_array().map(Vec::len), Some(limit), "{page}");
+            assert_eq!(
+                page["data"][0]["content"][0]["text"].as_str(),
+                text,
+                "{page}"
+            );
+            assert_eq!(page["last_id"], page["data"][0]["id"], "{page}");
+            assert_eq!(page["has_more"], has_more, "limit {limit}: {page}");
+            after = page["last_id"].as_str().map(String::from);
+        }
+    }
+
+    /// A `limit` above the largest page of the public API lists a page of
+    /// that size, up to the largest count a caller can name: `has_more` says
+    /// that items follow, and the next page from `last_id` lists the rest.
+    #[tokio::test]
+    async fn a_limit_above_the_largest_page_lists_that_page() {
+        let conversations: Arc<dyn ConversationStorage> =
+            Arc::new(MemoryConversationStorage::new());
+        let items: Arc<dyn ConversationItemStorage> =
+            Arc::new(MemoryConversationItemStorage::new());
+        let created =
+            json_of(create_conversation(&conversations, &items, None, json!({})).await).await;
+        let id = created["id"].as_str().unwrap();
+        // 120 items, a full batch a request.
+        for batch in 0..6 {
+            let messages: Vec<Value> = (0..MAX_ITEMS_PER_REQUEST)
+                .map(|n| {
+                    json!({
+                        "type": "message",
+                        "role": "user",
+                        "content": format!("{batch}-{n}")
+                    })
+                })
+                .collect();
+            let added = create_conversation_items(
+                &conversations,
+                &items,
+                None,
+                id,
+                json!({"items": messages}),
+            )
+            .await;
+            assert_eq!(added.status(), StatusCode::OK);
+        }
+        let largest = InputItemsQuery::MAX_LIMIT;
+        let rest = 6 * MAX_ITEMS_PER_REQUEST - largest;
+
+        // One row past the largest page, the largest count a signed 64-bit
+        // column holds, and the largest a caller can name.
+        for limit in [
+            largest + 1,
+            usize::try_from(i64::MAX).unwrap_or(usize::MAX),
+            usize::MAX,
+        ] {
+            let listed = list_conversation_items(
+                &conversations,
+                &items,
+                None,
+                id,
+                Some(limit),
+                Some("asc"),
+                None,
+            )
+            .await;
+            assert_eq!(listed.status(), StatusCode::OK, "limit {limit}");
+            let first = json_of(listed).await;
+            assert_eq!(
+                first["data"].as_array().map(Vec::len),
+                Some(largest),
+                "limit {limit}"
+            );
+            assert_eq!(first["has_more"], true, "limit {limit}");
+            assert_eq!(
+                first["last_id"],
+                first["data"][largest - 1]["id"],
+                "limit {limit}"
+            );
+
+            let listed = list_conversation_items(
+                &conversations,
+                &items,
+                None,
+                id,
+                Some(limit),
+                Some("asc"),
+                first["last_id"].as_str(),
+            )
+            .await;
+            assert_eq!(listed.status(), StatusCode::OK, "limit {limit}");
+            let next = json_of(listed).await;
+            assert_eq!(
+                next["data"].as_array().map(Vec::len),
+                Some(rest),
+                "limit {limit}"
+            );
+            assert_eq!(next["has_more"], false, "limit {limit}");
+        }
+    }
+
+    type Stored<T> = Result<T, smg_data_connector::ConversationItemStorageError>;
+
+    /// The in-memory store read as a store with a retention reads: the rows
+    /// by count, then the gone one left out of them. It counts its list
+    /// reads.
+    struct LeavesOutGone {
+        inner: MemoryConversationItemStorage,
+        gone: std::sync::OnceLock<String>,
+        reads: AtomicUsize,
+    }
+
+    impl LeavesOutGone {
+        fn new() -> Self {
+            Self {
+                inner: MemoryConversationItemStorage::new(),
+                gone: std::sync::OnceLock::new(),
+                reads: AtomicUsize::new(0),
+            }
+        }
+
+        fn reads(&self) -> usize {
+            self.reads.load(Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ConversationItemStorage for LeavesOutGone {
+        async fn create_item(&self, item: NewConversationItem) -> Stored<ConversationItem> {
+            self.inner.create_item(item).await
+        }
+
+        async fn link_item(
+            &self,
+            conversation_id: &ConversationId,
+            item_id: &ConversationItemId,
+            added_at: chrono::DateTime<chrono::Utc>,
+        ) -> Stored<()> {
+            self.inner
+                .link_item(conversation_id, item_id, added_at)
+                .await
+        }
+
+        async fn list_items(
+            &self,
+            conversation_id: &ConversationId,
+            params: ListParams,
+        ) -> Stored<Vec<ConversationItem>> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            let mut page = self.inner.list_items(conversation_id, params).await?;
+            page.retain(|item| Some(&item.id.0) != self.gone.get());
+            Ok(page)
+        }
+
+        async fn get_item(&self, item_id: &ConversationItemId) -> Stored<Option<ConversationItem>> {
+            self.inner.get_item(item_id).await
+        }
+
+        async fn is_item_linked(
+            &self,
+            conversation_id: &ConversationId,
+            item_id: &ConversationItemId,
+        ) -> Stored<bool> {
+            self.inner.is_item_linked(conversation_id, item_id).await
+        }
+
+        async fn delete_item(
+            &self,
+            conversation_id: &ConversationId,
+            item_id: &ConversationItemId,
+        ) -> Stored<()> {
+            self.inner.delete_item(conversation_id, item_id).await
+        }
+    }
+
+    /// A store may leave a row whose record is gone out of a page it read (a
+    /// store with a retention takes the ids by count and skips an expired
+    /// one), so a first read that holds the page and no row past it is not
+    /// the end of the list: wherever the gone row lies, the pages list the
+    /// rows around it and `has_more` holds while one follows.
+    #[tokio::test]
+    async fn a_gone_row_ends_no_list_ahead_of_the_rows_behind_it() {
+        // Five rows, each in turn the gone one: two pages of two list the
+        // four that are left.
+        for gone in 0..5 {
+            let conversations: Arc<dyn ConversationStorage> =
+                Arc::new(MemoryConversationStorage::new());
+            let store = Arc::new(LeavesOutGone::new());
+            let items: Arc<dyn ConversationItemStorage> = store.clone();
+            let messages: Vec<Value> = ["a", "b", "c", "d", "e"]
+                .iter()
+                .map(|text| json!({"type": "message", "role": "user", "content": text}))
+                .collect();
+            let created = json_of(
+                create_conversation(&conversations, &items, None, json!({"items": messages})).await,
+            )
+            .await;
+            let id = created["id"].as_str().unwrap();
+            let all = json_of(
+                list_conversation_items(&conversations, &items, None, id, None, Some("asc"), None)
+                    .await,
+            )
+            .await;
+            let text_of = |item: &Value| item["content"][0]["text"].as_str().map(String::from);
+            let rows = all["data"].as_array().unwrap();
+            assert_eq!(rows.len(), 5, "{all}");
+            let gone_id = rows[gone]["id"].as_str().unwrap();
+            assert!(store.gone.set(gone_id.to_string()).is_ok());
+            let live: Vec<Option<String>> = rows
+                .iter()
+                .filter(|item| item["id"] != gone_id)
+                .map(text_of)
+                .collect();
+
+            let mut after: Option<String> = None;
+            for (texts, has_more) in [(&live[..2], true), (&live[2..], false)] {
+                let page = json_of(
+                    list_conversation_items(
+                        &conversations,
+                        &items,
+                        None,
+                        id,
+                        Some(2),
+                        Some("asc"),
+                        after.as_deref(),
+                    )
+                    .await,
+                )
+                .await;
+                let listed: Vec<Option<String>> = page["data"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(text_of)
+                    .collect();
+                assert_eq!(listed, texts, "gone row {gone}: {page}");
+                assert_eq!(page["has_more"], has_more, "gone row {gone}: {page}");
+                after = page["last_id"].as_str().map(String::from);
+            }
+        }
+    }
+
+    /// A further read past rows the caller may not read ends the list only
+    /// where it comes back empty: a store that leaves a gone row out returns
+    /// such a read short while rows of the caller stand behind it. A listing
+    /// that meets no refused row reads the store as often as before.
+    #[tokio::test]
+    async fn a_short_read_past_refused_rows_ends_no_list_ahead_of_the_rows_behind_it() {
+        let conversations: Arc<dyn ConversationStorage> =
+            Arc::new(MemoryConversationStorage::new());
+        let store = Arc::new(LeavesOutGone::new());
+        let items: Arc<dyn ConversationItemStorage> = store.clone();
+
+        // Three rows of tenant b in its own conversation.
+        let created =
+            json_of(create_conversation(&conversations, &items, B, json!({})).await).await;
+        let conv_of_b = created["id"].as_str().unwrap();
+        let added = json_of(
+            create_conversation_items(
+                &conversations,
+                &items,
+                B,
+                conv_of_b,
+                json!({"items": [
+                    {"type": "message", "role": "user", "content": "one"},
+                    {"type": "message", "role": "user", "content": "two"},
+                    {"type": "message", "role": "user", "content": "three"}
+                ]}),
+            )
+            .await,
+        )
+        .await;
+        let own: Vec<&str> = added["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["id"].as_str())
+            .collect();
+        assert_eq!(own.len(), 3, "{added}");
+
+        // Newer than them, the rows of tenant a that fill the first read of
+        // a page of two (three rows) and a further read (a default page).
+        let refused_rows = 3 + DEFAULT_LIST_LIMIT;
+        let created =
+            json_of(create_conversation(&conversations, &items, A, json!({})).await).await;
+        let conv_of_a = created["id"].as_str().unwrap();
+        let mut refused = Vec::new();
+        for batch in 0..refused_rows.div_ceil(MAX_ITEMS_PER_REQUEST) {
+            let messages: Vec<Value> = (0..MAX_ITEMS_PER_REQUEST)
+                .map(|n| {
+                    json!({
+                        "type": "message",
+                        "role": "user",
+                        "content": format!("{batch}-{n}")
+                    })
+                })
+                .collect();
+            let added = json_of(
+                create_conversation_items(
+                    &conversations,
+                    &items,
+                    A,
+                    conv_of_a,
+                    json!({"items": messages}),
+                )
+                .await,
+            )
+            .await;
+            refused.extend(
+                added["data"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|item| item["id"].as_str())
+                    .map(|id| (ConversationItemId::from(id), chrono::Utc::now())),
+            );
+        }
+        refused.truncate(refused_rows);
+        assert_eq!(refused.len(), refused_rows);
+        let conv_of_b_id = ConversationId::from(conv_of_b);
+        items.link_items(&conv_of_b_id, &refused).await.unwrap();
+
+        // The first row of the further read is gone.
+        let newest = store
+            .inner
+            .list_items(
+                &conv_of_b_id,
+                ListParams {
+                    limit: 4,
+                    order: SortOrder::Desc,
+                    after: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(store.gone.set(newest[3].id.0.clone()).is_ok());
+
+        // The texts listed, `has_more` and the store reads of a page, newest
+        // first. The first three meet no refused row: one store read, and
+        // one more where the page holds exactly the rows left. The last
+        // walks past the refused rows: its further read comes back a row
+        // short of a default page with the rows of tenant b behind it.
+        for (limit, after, texts, has_more, reads) in [
+            (1, Some(own[2]), &["two"][..], true, 1),
+            (3, Some(own[2]), &["two", "one"][..], false, 1),
+            (2, Some(own[2]), &["two", "one"][..], false, 2),
+            (2, None, &["three", "two"][..], true, 3),
+        ] {
+            let reads_before = store.reads();
+            let page = json_of(
+                list_conversation_items(
+                    &conversations,
+                    &items,
+                    B,
+                    conv_of_b,
+                    Some(limit),
+                    None,
+                    after,
+                )
+                .await,
+            )
+            .await;
+            let listed: Vec<&str> = page["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|item| item["content"][0]["text"].as_str())
+                .collect();
+            assert_eq!(
+                (
+                    listed.as_slice(),
+                    page["has_more"].as_bool(),
+                    store.reads() - reads_before
+                ),
+                (texts, Some(has_more), reads),
+                "limit {limit} after {after:?}: {page}"
+            );
+        }
     }
 
     /// A batch refused after its first item (an unknown reference, an
@@ -2760,11 +3202,15 @@ mod tests {
                 .await,
         )
         .await;
-        // the further store page holds both of the caller's rows: the page
-        // keeps the newer one
+        // the first store page holds the refused row and `own`; only the
+        // further page finds `older`, the row that makes `has_more` true
         let own = &added["data"][1]["id"];
         let rows = page["data"].as_array().map(Vec::len);
         let ids = (&page["data"][0]["id"], &page["first_id"], &page["last_id"]);
-        assert_eq!((rows, ids), (Some(1), (own, own, own)), "{page}");
+        assert_eq!(
+            (rows, ids, page["has_more"].as_bool()),
+            (Some(1), (own, own, own), Some(true)),
+            "{page}"
+        );
     }
 }
