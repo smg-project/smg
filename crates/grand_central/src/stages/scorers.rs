@@ -421,6 +421,8 @@ pub(crate) struct RankCredit {
     /// dispatch lowers it under its lane's lock; a release recomputes it
     /// under every lane's lock, so it never reads above any lane's front.
     oldest_micros: AtomicU64,
+    /// Each lane's front instant, as the lane published it under its lock.
+    fronts: LaneFronts,
     lanes: [DispatchLane; DISPATCH_LANES],
 }
 
@@ -547,13 +549,20 @@ impl Dispatches {
 
 /// One lane of a row's dispatches, on a cache line of its own: the threads
 /// mapped to it append here, and its traffic never invalidates another lane.
-#[derive(Debug)]
+/// The instant at its front stands beside the other lanes' ([`LaneFronts`]).
+#[derive(Debug, Default)]
 #[repr(align(64))]
 struct DispatchLane {
     dispatches: Mutex<Dispatches>,
-    /// The instant at this lane's front; `u64::MAX` when none.
-    oldest_micros: AtomicU64,
 }
+
+/// The instant at the front of each of a row's lanes, `u64::MAX` when none,
+/// on one cache line of their own: a retirement reads all of them, and a
+/// lane's own line stays with the threads that append to it and with the
+/// retirement that takes its front.
+#[derive(Debug)]
+#[repr(align(64))]
+struct LaneFronts([AtomicU64; DISPATCH_LANES]);
 
 /// Lanes per rank row. A deciding thread keeps the lane it drew first; a
 /// host with more deciding threads than lanes shares them.
@@ -620,24 +629,21 @@ fn lane_of_this_thread() -> usize {
     })
 }
 
-impl Default for DispatchLane {
+impl Default for LaneFronts {
     fn default() -> Self {
-        Self {
-            dispatches: Mutex::default(),
-            oldest_micros: AtomicU64::new(u64::MAX),
-        }
+        Self(std::array::from_fn(|_| AtomicU64::new(u64::MAX)))
     }
 }
 
-impl DispatchLane {
-    /// Under the largest value where the lane holds a dispatch: that value
-    /// says an empty lane alone, to a retirement that reads the fronts with
-    /// no lock.
-    fn publish_oldest(&self, dispatches: &Dispatches) {
+impl LaneFronts {
+    /// Publishes the front of lane `at`, under that lane's lock. Under the
+    /// largest value where the lane holds a dispatch: that value says an
+    /// empty lane alone, to a retirement that reads the fronts with no lock.
+    fn publish(&self, at: usize, dispatches: &Dispatches) {
         let oldest = dispatches
             .oldest()
-            .map_or(u64::MAX, |at| at.min(u64::MAX - 1));
-        self.oldest_micros.store(oldest, Ordering::Release);
+            .map_or(u64::MAX, |front| front.min(u64::MAX - 1));
+        self.0[at].store(oldest, Ordering::Release);
     }
 }
 
@@ -648,6 +654,7 @@ impl Default for RankCredit {
             unsized_held: AtomicU16::new(0),
             estimated_held: AtomicU64::new(0),
             oldest_micros: AtomicU64::new(u64::MAX),
+            fronts: LaneFronts::default(),
             lanes: Default::default(),
         }
     }
@@ -663,8 +670,8 @@ impl RankCredit {
     /// stated no size is counted as one, and its estimate is kept beside
     /// the stated token-work.
     pub(crate) fn record(&self, at_micros: u64, size: SendSize) {
-        let lane = &self.lanes[lane_of_this_thread()];
-        let mut dispatches = lane.dispatches.lock();
+        let at = lane_of_this_thread();
+        let mut dispatches = self.lanes[at].dispatches.lock();
         // The lane's front moves only where the dispatch lands there.
         let front = dispatches.hold(at_micros, size);
         let held = self
@@ -676,7 +683,7 @@ impl RankCredit {
                 .fetch_add(u64::from(size.estimate()), Ordering::Relaxed);
         }
         if front {
-            lane.publish_oldest(&dispatches);
+            self.fronts.publish(at, &dispatches);
         }
         // Under the lane's lock: a release, which holds every lane, never
         // recomputes the row's oldest past this dispatch. Dispatch instants
@@ -721,18 +728,20 @@ impl RankCredit {
         loop {
             // Each lane's front as the lane published it, read with no
             // lock; the lowest lane of the lowest instant.
-            let (oldest, lane) = self
-                .lanes
-                .iter()
-                .fold((u64::MAX, &self.lanes[0]), |low, lane| {
-                    let front = lane.oldest_micros.load(Ordering::Acquire);
-                    if front < low.0 {
-                        (front, lane)
-                    } else {
-                        low
-                    }
-                });
-            let mut dispatches = lane.dispatches.lock();
+            let (oldest, at) =
+                self.fronts
+                    .0
+                    .iter()
+                    .enumerate()
+                    .fold((u64::MAX, 0), |low, (at, front)| {
+                        let front = front.load(Ordering::Acquire);
+                        if front < low.0 {
+                            (front, at)
+                        } else {
+                            low
+                        }
+                    });
+            let mut dispatches = self.lanes[at].dispatches.lock();
             // The bound read again under the lock: a release since this
             // dispatch landed may have taken the row to it, and then the
             // newer credits stay.
@@ -742,7 +751,7 @@ impl RankCredit {
             // Under the lock the lane's published front is its own. One
             // past the instant read means the one read went to another
             // dispatch's retirement, and the lanes are read again.
-            let front = lane.oldest_micros.load(Ordering::Relaxed);
+            let front = self.fronts.0[at].load(Ordering::Relaxed);
             if front > oldest {
                 continue;
             }
@@ -779,7 +788,7 @@ impl RankCredit {
                 return;
             }
             dispatches.0.pop_front();
-            lane.publish_oldest(&dispatches);
+            self.fronts.publish(at, &dispatches);
             return;
         }
     }
@@ -927,17 +936,18 @@ impl RankCredit {
         if self.unsized_held.load(Ordering::Relaxed) != 0 {
             self.release_marked(held_lanes, sampled_at_micros);
         } else {
-            for (dispatches, lane) in held_lanes.iter_mut().zip(&self.lanes) {
+            for (at, dispatches) in held_lanes.iter_mut().enumerate() {
                 while let Some(size) = dispatches.let_go(sampled_at_micros) {
                     self.take_out(size.tokens());
                 }
-                lane.publish_oldest(dispatches);
+                self.fronts.publish(at, dispatches);
             }
         }
         let oldest = self
-            .lanes
+            .fronts
+            .0
             .iter()
-            .map(|lane| lane.oldest_micros.load(Ordering::Acquire))
+            .map(|front| front.load(Ordering::Acquire))
             .min()
             .unwrap_or(u64::MAX);
         self.oldest_micros.store(oldest, Ordering::Release);
@@ -954,7 +964,7 @@ impl RankCredit {
         held_lanes: &mut [MutexGuard<'_, Dispatches>; DISPATCH_LANES],
         sampled_at_micros: u64,
     ) {
-        for (dispatches, lane) in held_lanes.iter_mut().zip(&self.lanes) {
+        for (at, dispatches) in held_lanes.iter_mut().enumerate() {
             while let Some(size) = dispatches.let_go(sampled_at_micros) {
                 if size.is_unsized() {
                     self.estimated_held
@@ -963,7 +973,7 @@ impl RankCredit {
                 }
                 self.take_out(size.tokens());
             }
-            lane.publish_oldest(dispatches);
+            self.fronts.publish(at, dispatches);
         }
     }
 
