@@ -163,10 +163,12 @@ impl Run {
     }
 }
 
+/// The headers and the first words have the chunk's fixed length, so their boxes are thin: an
+/// entry of the directory, made whole with the index, is no larger for the further words.
 pub(super) struct RunChunk {
-    pub(super) runs: Box<[Run]>,
+    pub(super) runs: Box<[Run; RUN_CHUNK]>,
     /// Word 0 of every run's coverage (workers 0 to 63), made with the chunk.
-    first: Box<[AtomicU64]>,
+    first: Box<[AtomicU64; RUN_CHUNK]>,
     /// Every further word of the runs' coverage, one array a word, made when a worker of
     /// that word first holds a whole run of this chunk. A word whose array is missing reads
     /// as zero, so a fleet that fits one word holds one word a run, not the index's ceiling.
@@ -259,8 +261,8 @@ impl RunSlab {
     #[inline]
     pub(super) fn chunk(&self, index: usize) -> &RunChunk {
         self.dir[index].get_or_init(|| RunChunk {
-            runs: (0..RUN_CHUNK).map(|_| Run::blank()).collect(),
-            first: zeroed_words(),
+            runs: Box::new(std::array::from_fn(|_| Run::blank())),
+            first: Box::new(std::array::from_fn(|_| AtomicU64::new(0))),
             more: (1..self.words).map(|_| OnceLock::new()).collect(),
         })
     }

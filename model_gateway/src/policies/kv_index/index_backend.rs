@@ -26,8 +26,9 @@ use smg_worker::kv_events::apply::{BlockIndex, HeldBlocks};
 /// Workers one chain index interns at once: the index's own ceiling per shard.
 /// Ids are handed back when a worker is removed, so this bounds the workers
 /// of one model that stream events at the same time, not the churn over a
-/// lifetime. Coverage costs one bit per worker per run, rounded up to 64,
-/// and the lookup ANDs that many words per run on the matched path.
+/// lifetime. A run holds one coverage word for the first 64 workers and one
+/// more for each further 64 once such a worker holds a run of its chunk; the
+/// lookup reads one word per 64 workers interned on the matched path.
 const CHAIN_INDEX_MAX_WORKERS: usize = 1024;
 
 /// Shards of the chain index: one. The sharded type keeps one chain index per

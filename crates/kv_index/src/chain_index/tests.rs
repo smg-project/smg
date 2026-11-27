@@ -1754,10 +1754,12 @@ fn a_split_and_a_store_read_a_holder_of_a_further_word() {
     // A hole splits the run: the tail keeps its only holder, so the healed chain matches whole.
     index.apply_removed(far, &[blocks[2].seq_hash], &mut far_map);
     assert_eq!(scores(&index, &held), vec![(far, 2)]);
+    assert_eq!(index.entry_count(), 7, "the hole takes one block");
     index
         .apply_stored(far, &blocks[2..3], Some(blocks[1].seq_hash), &mut far_map)
         .expect("heal");
     assert_eq!(scores(&index, &held), vec![(far, 8)]);
+    assert_eq!(index.entry_count(), 8, "the heal gives it back");
     // The near worker holds the tail whole too and stores past it: no leaf of one worker.
     index
         .apply_stored(near, &blocks[..8], None, &mut near_map)
@@ -1774,6 +1776,11 @@ fn a_split_and_a_store_read_a_holder_of_a_further_word() {
         .apply_stored(near, &blocks, None)
         .expect("ref near");
     assert_eq!(index.debug_blocks(), reference.blocks());
+    assert_eq!(
+        index.entry_count(),
+        10,
+        "the distinct blocks: positions 0 to 9"
+    );
 }
 
 /// A removal reads a run's coverage as far as a worker can hold a bit: a run the 65th worker
@@ -1812,6 +1819,11 @@ fn a_removal_leaves_a_run_a_holder_of_a_further_word_still_holds() {
     assert_eq!(scores(&index, &evicted), vec![(far, 6)]);
     assert_eq!(scores(&index, &left), vec![(far, 6)]);
     assert_eq!(index.debug_blocks(), reference.blocks());
+    assert_eq!(
+        index.entry_count(),
+        12,
+        "the far worker still holds both chains"
+    );
 }
 
 /// A coverage word no worker reached reads as zero and stays unmade: neither a read nor a
@@ -1853,4 +1865,11 @@ fn two_stores_that_meet_at_the_first_bit_of_a_word_both_land() {
         assert_eq!(workers(slab.coverage(round)), vec![64, 65], "round {round}");
         assert_eq!(slab.chunk_bytes(), slab_chunk_bytes(2));
     }
+}
+
+/// The directory of chunks is made whole with the index, one entry for every chunk it may ever
+/// hold: an entry is five pointers, as it is without the further words.
+#[test]
+fn a_directory_entry_is_no_larger_for_the_further_words() {
+    assert_eq!(size_of::<OnceLock<RunChunk>>(), 5 * size_of::<usize>());
 }
