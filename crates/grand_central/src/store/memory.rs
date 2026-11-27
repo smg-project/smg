@@ -5,8 +5,10 @@
 //! reads the world the store publishes ([`MemoryStore::snapshot`]), not
 //! through these locks.
 
+// A case pauses a snapshot behind its copy of the rows: the store holds
+// that pause in a field, so the two ends of its channel are named here.
 #[cfg(test)]
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::{
     collections::{HashMap, VecDeque},
     mem,
@@ -698,6 +700,8 @@ impl MemoryStore {
             self.pins_follow(old, new);
         }
         drop(workers);
+        // A case's hook runs here, once the workers lock is let go and before
+        // the gone keys' pins are forgotten.
         #[cfg(test)]
         seam::released();
         self.forget_gone(&ended);
@@ -797,13 +801,6 @@ impl MemoryStore {
         self.apply_at(None, spec, admit)
     }
 
-    /// Holds the loads' lock: a case keeps an entry waiting where the
-    /// store's entry waits last.
-    #[cfg(all(test, feature = "controller"))]
-    pub(crate) fn holding_loads(&self) -> impl Drop + '_ {
-        self.loads.lock()
-    }
-
     /// A leader's generation, applied as the replication stream tells it:
     /// [`MemoryStore::apply`] with the place of the leader's event, `at`,
     /// which the journal keeps for this write where the applier holds it.
@@ -885,6 +882,8 @@ impl MemoryStore {
             // the load lock alone waits for it.
             let writer = &mut loads.writer;
             let (world, before) = writer.apply(spec, workers.members())?;
+            // A case's hook runs here, under both locks, between the engine's
+            // turn and the publication of the generation's world.
             #[cfg(test)]
             seam::turned();
             // The pools are published as they stood: a build the membership
@@ -1185,14 +1184,6 @@ impl MemoryStore {
         self.show(&mut loads.writer, world);
     }
 
-    /// How many vetoes the health table holds, over every gateway: a case
-    /// asks it to show that a row or a gateway that left took its vetoes
-    /// out of the table.
-    #[cfg(test)]
-    pub(crate) fn health_entries(&self) -> usize {
-        self.health.lock().vetoes.len()
-    }
-
     /// The counts one scrape reports.
     pub fn stats(&self) -> StoreStats {
         let loads = self.loads.lock();
@@ -1209,31 +1200,6 @@ impl MemoryStore {
     /// a generation that declares no list counts none.
     pub fn outside_lists(&self) -> OutsideLists {
         self.stats().outside
-    }
-
-    /// How many members' reads under the standing generation's lists the
-    /// store keeps: one a member under lists that name an engine family or
-    /// a zone, and none under any other.
-    #[cfg(all(test, feature = "operator"))]
-    pub(crate) fn listed_members(&self) -> usize {
-        self.loads.lock().writer.listed()
-    }
-
-    /// How many members the table of the ones no world lists holds.
-    #[cfg(test)]
-    pub(super) fn filed_members(&self) -> usize {
-        self.joined.lock().len()
-    }
-
-    /// Whether no lock a journaled write takes is held at this instant:
-    /// the membership lock, the turn of the leases' file and the load lock,
-    /// each tried.
-    #[cfg(test)]
-    pub(crate) fn unlocked(&self) -> bool {
-        let free = |file: &turn::File| file.try_take().is_some();
-        self.workers.try_lock().is_some()
-            && self.files.iter().all(free)
-            && self.loads.try_lock().is_some()
     }
 
     /// A worker's row is gone (removed, or replaced by a new incarnation):
@@ -1664,23 +1630,6 @@ enum StatusSet {
 }
 
 impl MemoryStore {
-    #[cfg(test)]
-    pub(super) fn pause_snapshot_after_clone(&self) -> (Receiver<()>, SyncSender<()>) {
-        let (cloned_tx, cloned_rx) = mpsc::sync_channel(0);
-        let (resume_tx, resume_rx) = mpsc::sync_channel(0);
-        *self.snapshot_pause.lock() = Some((cloned_tx, resume_rx));
-        (cloned_rx, resume_tx)
-    }
-
-    #[cfg(test)]
-    fn pause_snapshot(&self) {
-        let pause = self.snapshot_pause.lock().take();
-        if let Some((cloned, resume)) = pause {
-            cloned.send(()).expect("snapshot test receives clone point");
-            resume.recv().expect("snapshot test resumes sorting");
-        }
-    }
-
     /// The word to the journal, at its drop, that a write's locks are let
     /// go.
     fn released(&self) -> Released<'_> {
@@ -1941,6 +1890,7 @@ impl WorkersStore for MemoryStore {
             let rows: Vec<WorkerRow> = workers.rows.values().map(|row| row.row.clone()).collect();
             (workers.epoch, rows)
         };
+        // A case's pause, between the copy of the rows and their sort.
         #[cfg(test)]
         self.pause_snapshot();
         rows.sort_by(|a, b| a.facts.key.cmp(&b.facts.key));
@@ -2060,6 +2010,7 @@ struct Leases {
     term: u64,
     #[cfg(not(test))]
     records: FxHashMap<Key, Held>,
+    // A case counts a lease's lookups through this hasher.
     #[cfg(test)]
     records: HashMap<Key, Held, super::tests::LeaseHashes>,
     /// The decode side of each pair's lease on file: a place for each
@@ -3090,58 +3041,6 @@ fn marked(
 }
 
 impl MemoryStore {
-    /// Spends the ids of the store's term but for the last `left`: no door
-    /// reaches a term's last ids in under 2^32 issues, and their cases
-    /// start here.
-    #[cfg(test)]
-    pub(crate) fn spend_ids(&self, left: u32) {
-        let mut leases = self.turn_of(0);
-        leases.minted = self.blocks.spend(leases.term, left, 0);
-    }
-
-    /// The terms whose tables the blocks keep, the newest first: no door
-    /// tells them.
-    #[cfg(test)]
-    pub(crate) fn kept_terms(&self) -> Vec<u64> {
-        self.blocks.kept_terms()
-    }
-
-    /// The places of the deadline queue: no door tells its length.
-    #[cfg(test)]
-    pub(crate) fn queued(&self) -> usize {
-        let files = 0..self.files.len();
-        files.map(|at| self.turn_of(at).due.len()).sum()
-    }
-
-    /// The length of the files' lists of places, summed: in each the most
-    /// pairs that stood at once.
-    #[cfg(test)]
-    pub(crate) fn places(&self) -> usize {
-        let files = 0..self.files.len();
-        files.map(|at| self.turn_of(at).decodes.places.len()).sum()
-    }
-
-    /// The leases whose decode side stands in a place of the file's list,
-    /// and the leases whose record carries the mark of a pair's lease,
-    /// each in order: one list twice while the records and the places
-    /// stand together.
-    #[cfg(test)]
-    pub(crate) fn paired(&self) -> [Vec<(GatewayId, u64)>; 2] {
-        let id = |key: &Key| (key.0, key.1 .0);
-        let marked = |(_, held): &(&Key, &Held)| held.record.decode.is_some();
-        let (mut sides, mut marks) = (Vec::new(), Vec::new());
-        for at in 0..self.files.len() {
-            let leases = self.turn_of(at);
-            let places = leases.decodes.places.iter().flatten();
-            sides.extend(places.map(|(key, _)| id(key)));
-            let records = leases.records.iter().filter(marked);
-            marks.extend(records.map(|(key, _)| id(key)));
-        }
-        sides.sort_unstable();
-        marks.sort_unstable();
-        [sides, marks]
-    }
-
     /// Issues the lease of one decision made under `record.term`, the
     /// store's own term: the store mints its id ([`Leases::mint`]), files
     /// the record under it and books `booked`, the slot of the record's
@@ -3954,8 +3853,10 @@ mod tests;
 /// replica's worker objects decided. A told status runs none. A second
 /// hook runs inside an apply
 /// of a generation, between the engine's turn and the publication of the
-/// generation's world ([`MemoryStore::apply`]). No case reaches either
-/// place from outside. In no build but the cases'.
+/// generation's world ([`MemoryStore::apply`]). No case reaches the
+/// second place from outside, and the first only where the store has a
+/// journal, which hears there that the write's locks are let go
+/// ([`Journal::released`]). In no build but the cases'.
 #[cfg(test)]
 #[path = "../../tests/unit/store/memory/seam.rs"]
 pub(crate) mod seam;

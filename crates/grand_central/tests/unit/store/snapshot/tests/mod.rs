@@ -1,14 +1,24 @@
 //! The fixtures over [`MemoryStore`] of the cases of a publication's
-//! reader of one gateway's standing vetoes ([`veto_reader`]). Every
-//! instant is handed in, none is slept.
+//! reader of one gateway's standing vetoes ([`veto_reader`]), and the one
+//! count a case of the operator reads of the snapshot's writer
+//! (`Writer::listed`). Every instant is handed in, none is slept.
 
-use super::StoreSnapshot;
+use super::{StoreSnapshot, Writer};
 use crate::{
     engine::view::{Role, WorkerId},
     store::{GatewayId, MemoryStore, WorkerFacts},
 };
 
 mod veto_reader;
+
+impl Writer {
+    /// How many members' reads under the standing generation's lists are
+    /// kept ([`Self::list`], [`Self::relist`]).
+    #[cfg(feature = "operator")]
+    pub(in crate::store) fn listed(&self) -> usize {
+        self.listed.len()
+    }
+}
 
 const MODEL: &str = "m";
 const ASKER: GatewayId = GatewayId(1);
