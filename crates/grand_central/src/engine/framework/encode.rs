@@ -275,35 +275,94 @@ impl EncodePlaced {
 }
 
 /// Rows admitted from a pool, each standing at its index here, with where
-/// it stood in the pool, its affinity facts and its signal cells.
+/// it stood in the pool, its affinity facts and its signal cells. One
+/// operation admits them ([`Self::admit`]). What it returns lends them in
+/// the pool's stead ([`Lent`]), and nothing else reads them.
 #[derive(Debug, Default)]
 struct Admitted {
     rows: Vec<Candidate>,
     /// Each row's index in the pool it was admitted from.
     from: Vec<u32>,
     affinity: Vec<AffinityFacts>,
-    /// The rows' signal cells, a row's after the row's before it: emptied
-    /// and filled for a side that was handed cells
-    /// ([`Admitted::copy_cells`]) and lent to that side alone. A pass that
-    /// was handed none leaves them as they were: it pays nothing for them.
+    /// The rows' signal cells, a row's after the row's before it. Where
+    /// the pool handed none they are an earlier admission's: such an
+    /// admission pays nothing for them, and lends none.
     cells: SignalCells,
-    /// The rows here that a mask over the pool names, by their index here:
-    /// empty until a mask is numbered anew ([`Admitted::renumber`]). Its
-    /// room is taken with the rows ([`Admitted::take_room`]).
+    /// The rows here that a mask over the pool names, by their index here.
     masked: Vec<u32>,
-    /// The rows here that the mask's held rows name, by their index here.
-    /// Emptied and filled where a mask is numbered anew
-    /// ([`Admitted::renumber`]) and read with that mask alone: a decision
-    /// under no mask leaves it as it was. Its room is taken where a hold is
-    /// numbered, not with the rows: a decision under no hold pays nothing
-    /// for it.
+    /// The rows here that the mask's held rows name, by their index here:
+    /// an earlier admission's where this one numbered nothing.
     held: Vec<u32>,
     /// The rows here at the places of the pool its host holds the request
-    /// to, by their index here. Emptied and filled where the places are
-    /// numbered anew ([`Admitted::renumber`]) and read with those places
-    /// alone. Its room is taken there: a decision held to no place pays
-    /// nothing for it.
+    /// to, by their index here: an earlier admission's where this one
+    /// numbered nothing.
     places: Vec<u32>,
+}
+
+/// A pool as its host handed it, for one admission from it: its affinity
+/// column, its signal cells where it handed any, and its count of rows.
+#[derive(Clone, Copy)]
+struct Handed<'a> {
+    affinity: &'a [AffinityFacts],
+    cells: Option<&'a SignalCells>,
+    rows: usize,
+}
+
+/// What one admission lends in its pool's stead ([`Admitted::admit`]): the
+/// rows admitted, and what this admission did for them. It borrows the rows
+/// for as long as anything of them is read, so no later admission
+/// overwrites what a reader still holds.
+struct Lent<'a> {
+    admitted: &'a Admitted,
+    /// The side's constraints, as the admission was handed them.
+    cx: &'a Constraints<'a>,
+    /// Whether the pool handed cells: this admission copied them.
+    copied: bool,
+    /// Whether this admission numbered the side's lists anew.
+    numbered: bool,
+    held_off: bool,
+}
+
+impl<'a> Lent<'a> {
+    /// What stands in the pool's stead, together: the rows admitted, each
+    /// at its index here, their entries of the pool's affinity column, and
+    /// their signal cells where this admission copied any. One call hands
+    /// all three, so no reader pairs one list's rows with another's column.
+    #[inline(always)]
+    fn stand_in(
+        &self,
+    ) -> (
+        &'a [Candidate],
+        &'a [AffinityFacts],
+        Option<&'a SignalCells>,
+    ) {
+        (
+            &self.admitted.rows,
+            &self.admitted.affinity,
+            self.copied.then_some(&self.admitted.cells),
+        )
+    }
+
+    /// The side's constraints over its mask, the mask's held rows and its
+    /// places as the rows admitted number them: `None` where the admission
+    /// numbered nothing, and the side's own constraints stand.
+    #[inline(always)]
+    fn numbered(&self) -> Option<Constraints<'a>> {
+        self.numbered.then(|| self.admitted.numbered(self.cx))
+    }
+
+    /// Whether the request is held off every row admitted
+    /// ([`Admitted::held_off`]). A side whose host states places asks.
+    #[inline(always)]
+    fn held_off(&self) -> bool {
+        self.held_off
+    }
+
+    /// The pool's index of the row at `position` here.
+    #[inline(always)]
+    fn origin(&self, position: u32) -> u32 {
+        self.admitted.origin(position)
+    }
 }
 
 /// One mask over a pool's rows numbered by the rows admitted from it, whose
@@ -323,6 +382,62 @@ fn number(from: &[u32], mask: &[u32], numbered: &mut Vec<u32>) {
 }
 
 impl Admitted {
+    /// Admits `kept`, rows of a pool each with its index there, and lends
+    /// them in the pool's stead. The rows of the admission before are
+    /// emptied. Each row kept is pushed with its entry of the pool's
+    /// affinity column, the pool's cells are copied where it handed any,
+    /// and the mask's room is taken. Under a mask or places of `cx`, the
+    /// side's constraints, the lists are numbered anew by the rows
+    /// admitted ([`Self::renumber`]), unless those are the whole pool: a
+    /// whole pool's rows stand where the host numbered them.
+    #[inline(always)]
+    fn admit<'a, 'r>(
+        &'a mut self,
+        kept: impl Iterator<Item = (usize, &'r Candidate)>,
+        pool: Handed<'_>,
+        cx: &'a Constraints<'a>,
+    ) -> Lent<'a> {
+        self.clear();
+        kept.for_each(|(at, row)| self.push(row, at, pool.affinity));
+        if let Some(cells) = pool.cells {
+            self.copy_cells(cells);
+        }
+        self.take_room();
+        let numbered =
+            (!cx.stalled.is_empty() || cx.places.is_some()) && self.rows.len() != pool.rows;
+        if numbered {
+            self.renumber(cx.stalled, cx.held, cx.places);
+        }
+        Lent {
+            held_off: numbered && self.held_off(cx.places, pool.rows),
+            admitted: self,
+            cx,
+            copied: pool.cells.is_some(),
+            numbered,
+        }
+    }
+
+    /// `cx` over the lists as the rows here number them
+    /// ([`Self::renumber`]).
+    #[inline(always)]
+    fn numbered<'a>(&'a self, cx: &Constraints<'a>) -> Constraints<'a> {
+        Constraints {
+            stalled: &self.masked,
+            held: &self.held,
+            places: cx.places.map(|_| self.places.as_slice()),
+            ..*cx
+        }
+    }
+
+    /// The pool's index of the row at `position` here.
+    #[inline(always)]
+    fn origin(&self, position: u32) -> u32 {
+        self.from
+            .get(position as usize)
+            .copied()
+            .unwrap_or(position)
+    }
+
     fn clear(&mut self) {
         self.rows.clear();
         self.from.clear();
@@ -334,9 +449,8 @@ impl Admitted {
     /// here. The host's cells are by the pool's positions, and a stage
     /// reads an admitted row by its index here: left on the host's cells
     /// it would read another row's value. A row outside the host's cells
-    /// takes cells of no value. Asked once a pass, after its last row is
-    /// admitted, and only for a side that was handed cells. The cells here
-    /// keep their room from pass to pass.
+    /// takes cells of no value. The cells here keep their room from
+    /// admission to admission.
     fn copy_cells(&mut self, cells: &SignalCells) {
         let signals = cells.signals();
         let admitted = self.cells.refill(signals);
@@ -405,14 +519,6 @@ impl Admitted {
             self.affinity.push(*facts);
         }
     }
-
-    /// The pool's index of the row at `position` here.
-    fn origin(&self, position: u32) -> u32 {
-        self.from
-            .get(position as usize)
-            .copied()
-            .unwrap_or(position)
-    }
 }
 
 /// The encode side's scratch, inside the host's [`Scratch`].
@@ -473,8 +579,8 @@ impl EncoderClasses {
     /// read over every encoder all the same: it says what the model takes,
     /// and a place says what this request may reach.
     ///
-    /// The answer is whether a registered encoder takes the request,
-    /// whatever its filters and the places say.
+    /// The answer is whether a registered encoder that states a class takes
+    /// the request, whatever its filters and the places say.
     #[inline(always)]
     fn read(
         &mut self,
@@ -1378,75 +1484,67 @@ impl Engine {
         // A list handed on in a pool's stead is numbered anew. A mask and
         // the places a side's host holds the request to number the rows of
         // the host's pool: beside such a list both are numbered with the
-        // rows, by one walk. A side whose places name rows and none that
-        // was admitted is held off every worker that takes the request,
-        // and says so.
-        let (prefill_mask, decode_mask);
+        // rows, by one walk ([`Admitted::admit`]). A side whose places name
+        // rows and none that was admitted is held off every worker that
+        // takes the request, and says so.
         let (mut cx, mut decode_cx) = (cx, decode_cx);
-        if !every_prefill {
-            side.prefills.clear();
+        let (prefill_lists, decode_lists);
+        let prefill_side = if every_prefill {
+            None
+        } else {
             // The open classes are read once a row here, so they are bound
             // ahead of the pass.
             let open = encoders.open();
-            for (at, row) in pools.prefills.iter().enumerate() {
-                if open.holds(class_of(at)) {
-                    side.prefills.push(row, at, pools.prefill_affinity);
-                }
+            let kept = pools.prefills.iter().enumerate();
+            let handed = Handed {
+                affinity: pools.prefill_affinity,
+                cells: pools.prefill_signal_cells,
+                rows: pools.prefills.len(),
+            };
+            let lent =
+                side.prefills
+                    .admit(kept.filter(|&(at, _)| open.holds(class_of(at))), handed, cx);
+            if lent.held_off() {
+                return gap(PLACES);
             }
-            if let Some(cells) = pools.prefill_signal_cells {
-                side.prefills.copy_cells(cells);
+            (
+                admitted.prefills,
+                admitted.prefill_affinity,
+                admitted.prefill_signal_cells,
+            ) = lent.stand_in();
+            if let Some(numbered) = lent.numbered() {
+                prefill_lists = numbered;
+                cx = &prefill_lists;
             }
-            side.prefills.take_room();
-            if !cx.stalled.is_empty() || cx.places.is_some() {
-                side.prefills.renumber(cx.stalled, cx.held, cx.places);
-                if side.prefills.held_off(cx.places, pools.prefills.len()) {
-                    return gap(PLACES);
-                }
-                prefill_mask = Constraints {
-                    stalled: &side.prefills.masked,
-                    held: &side.prefills.held,
-                    places: cx.places.map(|_| side.prefills.places.as_slice()),
-                    ..*cx
-                };
-                cx = &prefill_mask;
-            }
-            admitted.prefills = &side.prefills.rows;
-            admitted.prefill_affinity = &side.prefills.affinity;
-            // The side's cells are numbered with its rows: the admitted
-            // rows' cells stand in the host's stead, where it handed any.
-            admitted.prefill_signal_cells =
-                pools.prefill_signal_cells.map(|_| &side.prefills.cells);
-        }
+            Some(lent)
+        };
         let every_decode = !vision || pools.decodes.iter().all(|row| row.vision);
-        if !every_decode {
-            side.decodes.clear();
-            for (at, row) in pools.decodes.iter().enumerate() {
-                if row.vision {
-                    side.decodes.push(row, at, pools.decode_affinity);
-                }
+        let decode_side = if every_decode {
+            None
+        } else {
+            let kept = pools.decodes.iter().enumerate();
+            let handed = Handed {
+                affinity: pools.decode_affinity,
+                cells: pools.decode_signal_cells,
+                rows: pools.decodes.len(),
+            };
+            let lent = side
+                .decodes
+                .admit(kept.filter(|(_, row)| row.vision), handed, decode_cx);
+            if lent.held_off() {
+                return gap(PLACES);
             }
-            if let Some(cells) = pools.decode_signal_cells {
-                side.decodes.copy_cells(cells);
+            (
+                admitted.decodes,
+                admitted.decode_affinity,
+                admitted.decode_signal_cells,
+            ) = lent.stand_in();
+            if let Some(numbered) = lent.numbered() {
+                decode_lists = numbered;
+                decode_cx = &decode_lists;
             }
-            side.decodes.take_room();
-            if !decode_cx.stalled.is_empty() || decode_cx.places.is_some() {
-                side.decodes
-                    .renumber(decode_cx.stalled, decode_cx.held, decode_cx.places);
-                if side.decodes.held_off(decode_cx.places, pools.decodes.len()) {
-                    return gap(PLACES);
-                }
-                decode_mask = Constraints {
-                    stalled: &side.decodes.masked,
-                    held: &side.decodes.held,
-                    places: decode_cx.places.map(|_| side.decodes.places.as_slice()),
-                    ..*decode_cx
-                };
-                decode_cx = &decode_mask;
-            }
-            admitted.decodes = &side.decodes.rows;
-            admitted.decode_affinity = &side.decodes.affinity;
-            admitted.decode_signal_cells = pools.decode_signal_cells.map(|_| &side.decodes.cells);
-        }
+            Some(lent)
+        };
         // The pair's pick is turned where its decision stands and returned
         // as that decision: taking it out and putting it back copies it
         // twice.
@@ -1473,10 +1571,9 @@ impl Engine {
             // by where its rows stood, so the list keeps the prefill
             // side's word of who placed it: a sessions rule's pick stays
             // the rule's, told or untold, beside a pool that was cut.
-            let (prefills, decodes) = (&side.prefills, &side.decodes);
             pick.targets.renumber(
-                (!every_prefill).then_some(|at| prefills.origin(at)),
-                (!every_decode).then_some(|at| decodes.origin(at)),
+                prefill_side.as_ref().map(|lent| move |at| lent.origin(at)),
+                decode_side.as_ref().map(|lent| move |at| lent.origin(at)),
             );
         }
         if !needs {
@@ -1486,39 +1583,31 @@ impl Engine {
         // class is every target's.
         let chosen = pick.targets.first().map(|target| target.position as usize);
         let class = chosen.map_or(0, class_of);
-        side.offered.clear();
+        // The chosen class's opened encoders are offered to each key. A
+        // key's constraints state no place, so the admission asks none and
+        // nothing holds a key off them.
         let mut pushes = false;
-        for &at in encoders.opened() {
+        let kept = encoders.opened().iter().filter_map(|&at| {
             let at = at as usize;
-            let (Some(row), Some(of)) = (encode.encoders.get(at), encode.facts.get(at)) else {
-                continue;
-            };
-            if of.class == class {
+            let (row, of) = (encode.encoders.get(at)?, encode.facts.get(at)?);
+            (of.class == class).then(|| {
                 pushes = of.pushes;
-                side.offered.push(row, at, encode.affinity);
-            }
-        }
-        // The offered encoders' cells, numbered with them: the pool's are
-        // by the pool's positions.
-        if let Some(cells) = encode.signal_cells {
-            side.offered.copy_cells(cells);
-        }
-        side.offered.take_room();
-        // The offered encoders are numbered anew unless they are the whole
-        // pool, and the encode side's mask is numbered with them.
-        let offered_mask;
+                (at, row)
+            })
+        });
+        let handed = Handed {
+            affinity: encode.affinity,
+            cells: encode.signal_cells,
+            rows: encode.encoders.len(),
+        };
+        let offered = side.offered.admit(kept, handed, key_cx);
+        let (offered_rows, offered_affinity, offered_cells) = offered.stand_in();
+        let offered_lists;
         let mut encode_cx = key_cx;
-        if !encode_cx.stalled.is_empty() && side.offered.rows.len() != encode.encoders.len() {
-            side.offered
-                .renumber(encode_cx.stalled, encode_cx.held, None);
-            offered_mask = Constraints {
-                stalled: &side.offered.masked,
-                held: &side.offered.held,
-                ..*encode_cx
-            };
-            encode_cx = &offered_mask;
+        if let Some(numbered) = offered.numbered() {
+            offered_lists = numbered;
+            encode_cx = &offered_lists;
         }
-        let offered_cells = encode.signal_cells.map(|_| &side.offered.cells);
         let one = items.one.filter(|_| pushes);
         placed.one = one.is_some();
         let keys = one.as_ref().map_or(items.keys, std::slice::from_ref);
@@ -1554,7 +1643,7 @@ impl Engine {
             let key_facts = RequestFacts {
                 session_key: *key,
                 seed: seeds.next_u64(),
-                affinity: &side.offered.affinity,
+                affinity: offered_affinity,
                 signal_cells: offered_cells,
                 ring,
                 ring_positions,
@@ -1565,7 +1654,7 @@ impl Engine {
                 index,
                 &key_facts,
                 pool,
-                Set::side(&side.offered.rows, None, None),
+                Set::side(offered_rows, None, None),
                 encode_cx,
                 &mut side.run,
             );
@@ -1589,7 +1678,7 @@ impl Engine {
                 };
             };
             placed.encoders.push(Target {
-                position: side.offered.origin(target.position),
+                position: offered.origin(target.position),
                 pair: None,
                 ..*target
             });

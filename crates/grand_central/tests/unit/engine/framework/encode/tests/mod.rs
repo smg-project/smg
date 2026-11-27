@@ -97,6 +97,7 @@ struct Bed {
     facts: Vec<EncoderFacts>,
     prefill_classes: Vec<u32>,
     prefill_affinity: Vec<AffinityFacts>,
+    decode_affinity: Vec<AffinityFacts>,
     encode_affinity: Vec<AffinityFacts>,
     /// Each pool's signal cells, one a row under one signal; empty for a
     /// pool that is handed none.
@@ -134,6 +135,7 @@ impl Bed {
             facts: vec![pushing(1)],
             prefill_classes: vec![1],
             prefill_affinity: Vec::new(),
+            decode_affinity: Vec::new(),
             encode_affinity: Vec::new(),
             prefill_cells: Vec::new(),
             decode_cells: Vec::new(),
@@ -174,6 +176,7 @@ impl Bed {
     fn pools(&self) -> PairPools<'_> {
         PairPools {
             prefill_affinity: &self.prefill_affinity,
+            decode_affinity: &self.decode_affinity,
             ..PairPools::of(&self.prefills, &self.decodes)
         }
     }
