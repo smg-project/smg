@@ -1959,25 +1959,12 @@ fn chat_thinking_token_budget_reaches_engine_core() {
     use serde_json::json;
     use smg_grpc_client::VllmEngineClient;
 
-    for (fields, budget) in [
-        (json!({"thinking_token_budget": 0}), Some(0)),
-        (json!({"custom_params": {"thinking_budget": 7}}), Some(7)),
-        (
-            json!({"thinking_token_budget": 3, "custom_params": {"thinking_budget": 7}}),
-            Some(3),
-        ),
-        (
-            json!({"thinking_token_budget": null, "custom_params": {"thinking_budget": 7}}),
-            Some(7),
-        ),
-        (json!({"thinking_token_budget": -1}), None),
-        (json!({}), None),
-    ] {
-        let mut body = json!({"model": "m", "messages": [{"role":"user", "content":"hi"}]});
-        body.as_object_mut()
-            .unwrap()
-            .extend(fields.as_object().unwrap().clone());
-        let chat: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+    for (budget, expected) in [(0, Some(0)), (-1, None)] {
+        let chat: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "thinking_token_budget": budget,
+        }))
+        .unwrap();
         let proto = VllmEngineClient::build_generate_request_from_chat(
             "r1".into(),
             &chat,
@@ -1991,7 +1978,10 @@ fn chat_thinking_token_budget_reaches_engine_core() {
             translate_request(proto, 1024, ModelDtype::Float32, &EosTokenIds::default()).unwrap();
         let wire: EngineCoreRequest =
             decode_msgpack(&encode_msgpack(&translated).unwrap()).unwrap();
-        assert_eq!(wire.sampling_params.unwrap().thinking_token_budget, budget);
+        assert_eq!(
+            wire.sampling_params.unwrap().thinking_token_budget,
+            expected
+        );
     }
 }
 

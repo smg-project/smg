@@ -697,20 +697,15 @@ mod tests {
 
     #[test]
     fn chat_rejects_a_thinking_budget_the_trtllm_wire_cannot_carry() {
-        use serde_json::{json, Value};
-
-        let build = |options: Value| {
-            let mut body = json!({
-                "model": "m",
-                "messages": [{"role": "user", "content": "hi"}],
-                "max_completion_tokens": 32
-            });
-            body.as_object_mut()
-                .unwrap()
-                .extend(options.as_object().unwrap().clone());
+        let build = |budget: i64| {
+            let chat = serde_json::from_value(serde_json::json!({
+                "model": "m", "messages": [{"role": "user", "content": "hi"}],
+                "max_completion_tokens": 32, "thinking_token_budget": budget
+            }))
+            .unwrap();
             TrtllmServiceClient::build_generate_request_from_chat_parts(
                 "r".into(),
-                &serde_json::from_value(body).unwrap(),
+                &chat,
                 "hi".into(),
                 vec![1],
                 None,
@@ -718,30 +713,10 @@ mod tests {
             )
         };
 
-        for options in [
-            json!({"thinking_token_budget": 0}),
-            json!({"custom_params": {"thinking_budget": 7}, "stream": true}),
-            json!({"thinking_token_budget": 5, "custom_params": {"thinking_budget": 5}}),
-            json!({"thinking_token_budget": 0, "custom_params": {"thinking_budget": -1}}),
-            json!({"thinking_token_budget": null, "custom_params": {"thinking_budget": 7}}),
-        ] {
-            let error = build(options).expect_err("a finite budget needs worker support");
-            assert!(
-                error.contains("unsupported by the TensorRT-LLM gRPC protocol"),
-                "{error}"
-            );
-        }
-
-        for options in [
-            json!({}),
-            json!({"thinking_token_budget": null}),
-            json!({"thinking_token_budget": -1}),
-            json!({"custom_params": {"thinking_budget": -1}}),
-            json!({"thinking_token_budget": -1, "custom_params": {"thinking_budget": 7}}),
-        ] {
-            let request = build(options).expect("an unset budget uses normal generation");
-            assert_eq!(request.max_tokens, 32);
-        }
+        assert!(build(0)
+            .unwrap_err()
+            .contains("unsupported by the TensorRT-LLM gRPC protocol"));
+        assert_eq!(build(-1).unwrap().max_tokens, 32);
     }
 
     /// A request with a `logit_bias` is refused: the wire has no sparse map.

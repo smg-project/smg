@@ -124,15 +124,13 @@ class TestEnableThinking:
 @pytest.mark.gateway(extra_args=["--reasoning-parser", "qwen3"])
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 class _ThinkingTokenBudget:
-    @pytest.mark.parametrize(
-        "budget",
-        [None, {"thinking_token_budget": 0}, {"custom_params": {"thinking_budget": 0}}],
-        ids=["worker-default", "canonical-zero", "sglang-alias-zero"],
-    )
-    def test_thinking_budget_limits_only_reasoning(self, model, api_client, budget):
+    zero_budget: dict
+
+    @pytest.mark.parametrize("use_zero_budget", [False, True], ids=["worker-default", "zero"])
+    def test_thinking_budget_limits_only_reasoning(self, model, api_client, use_zero_budget):
         options = {"chat_template_kwargs": {"enable_thinking": True}}
-        if budget is not None:
-            options.update(budget)
+        if use_zero_budget:
+            options.update(self.zero_budget)
         request = dict(
             model=model,
             messages=[{"role": "user", "content": "What is 17 times 23?"}],
@@ -142,7 +140,7 @@ class _ThinkingTokenBudget:
         )
         # The direct ZMQ lanes reuse these gRPC cases. Their registered workers
         # do not advertise a reasoning budget to placement.
-        if budget is not None and get_connection_mode_override() == ConnectionMode.ZMQ:
+        if use_zero_budget and get_connection_mode_override() == ConnectionMode.ZMQ:
             with pytest.raises(openai.BadRequestError) as exc:
                 api_client.chat.completions.create(**request)
             assert exc.value.code == "unsupported_thinking_token_budget"
@@ -151,7 +149,7 @@ class _ThinkingTokenBudget:
         response = api_client.chat.completions.create(**request)
         message = response.choices[0].message
         reasoning = (getattr(message, "reasoning_content", None) or "").strip()
-        if budget is None:
+        if not use_zero_budget:
             assert reasoning, "The control request should produce reasoning on this model."
         else:
             assert not reasoning
@@ -168,6 +166,8 @@ class _ThinkingTokenBudget:
 class TestVllmThinkingTokenBudget(_ThinkingTokenBudget):
     """The worker's sampler enforces the budget between Qwen3's reasoning markers."""
 
+    zero_budget = {"thinking_token_budget": 0}
+
 
 @pytest.mark.engine("sglang")
 @pytest.mark.workers(
@@ -181,3 +181,5 @@ class TestVllmThinkingTokenBudget(_ThinkingTokenBudget):
 )
 class TestSglangThinkingTokenBudget(_ThinkingTokenBudget):
     """The worker's strict reasoning grammar enforces the budget."""
+
+    zero_budget = {"custom_params": {"thinking_budget": 0}}

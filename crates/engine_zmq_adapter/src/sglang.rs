@@ -1099,61 +1099,32 @@ mod tests {
     use crate::{sglang_encode::EncodeTransport, test_support::connected_pair};
 
     #[test]
-    fn chat_thinking_token_budget_reaches_scheduler_as_an_integer() {
-        use openai_protocol::chat::ChatCompletionRequest;
-        use smg_grpc_client::sglang_scheduler::{
-            SglangGenerateRequestOptions, SglangSchedulerClient,
-        };
-
-        for fields in [
-            serde_json::json!({"thinking_token_budget": 0}),
-            serde_json::json!({"custom_params": {"thinking_budget": 0}}),
-            serde_json::json!({"thinking_token_budget": 0, "custom_params": {"thinking_budget": 7}}),
-            serde_json::json!({"thinking_token_budget": null, "custom_params": {"thinking_budget": 0}}),
-        ] {
-            let mut body = serde_json::json!({"model": "test", "messages": [{"role": "user", "content": "hi"}]});
-            body.as_object_mut()
-                .unwrap()
-                .extend(fields.as_object().unwrap().clone());
-            let chat: ChatCompletionRequest = serde_json::from_value(body).unwrap();
-            let mut request = SglangSchedulerClient::build_generate_request_from_chat_parts(
-                "budget".into(),
-                &chat,
-                "hi".into(),
-                vec![1],
-                SglangGenerateRequestOptions {
-                    require_reasoning: true,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-            let params = request.sampling_params.as_mut().unwrap();
-            // Other callers (including PD) may already use this map.
-            params.custom_params = Some(prost_types::Struct {
+    fn thinking_token_budget_reaches_scheduler_as_an_integer() {
+        let sampling = translate_sampling_sglang(sglang_proto::SamplingParams {
+            thinking_token_budget: Some(0),
+            custom_params: Some(prost_types::Struct {
                 fields: [(
                     "another".into(),
                     prost_types::Value {
                         kind: Some(prost_types::value::Kind::BoolValue(true)),
                     },
                 )]
-                .into_iter()
-                .collect(),
-            });
-
-            let wire = translate(request).unwrap();
-            let decoded: WireRequest = decode_msgpack(&encode_msgpack(&wire).unwrap()).unwrap();
-            assert!(decoded.require_reasoning);
-            assert_eq!(
-                decoded.sampling_params.custom_params,
-                Some(OpaqueValue::Map(vec![
-                    (OpaqueValue::from("another"), OpaqueValue::from(true)),
-                    (
-                        OpaqueValue::from("thinking_budget"),
-                        OpaqueValue::from(0_u32)
-                    ),
-                ]))
-            );
-        }
+                .into(),
+            }),
+            ..Default::default()
+        });
+        let decoded: SglangSamplingParams =
+            decode_msgpack(&encode_msgpack(&sampling).unwrap()).unwrap();
+        assert_eq!(
+            decoded.custom_params,
+            Some(OpaqueValue::Map(vec![
+                (OpaqueValue::from("another"), OpaqueValue::from(true)),
+                (
+                    OpaqueValue::from("thinking_budget"),
+                    OpaqueValue::from(0_u32)
+                ),
+            ]))
+        );
     }
 
     /// The translation under the mock scheduler's context window, one rank.

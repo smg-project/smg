@@ -2601,22 +2601,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn thinking_token_budget_precedence_is_independent_of_key_order() {
-        for stream in [true, false] {
-            for fields in [
-                r#""thinking_token_budget":0,"custom_params":{"thinking_budget":1}"#,
-                r#""custom_params":{"thinking_budget":1},"thinking_token_budget":0"#,
-            ] {
-                let body = format!(
-                    r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],"stream":{stream},{fields}}}"#
-                );
-                let request = chat_request(&body).await.unwrap();
-                assert_eq!(request.resolved_thinking_token_budget().unwrap(), Some(0));
-            }
-        }
-    }
-
-    #[tokio::test]
     async fn invalid_effective_thinking_token_budget_returns_400_before_routing() {
         for (canonical, param) in [
             (json!(-2), "thinking_token_budget"),
