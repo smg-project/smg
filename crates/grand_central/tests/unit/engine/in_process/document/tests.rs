@@ -23,7 +23,7 @@ use crate::{
     engine::{
         decision::{Decision, Target, Targets},
         decision_engine::{DecisionEngine, DecisionRefused, Request, RequestMaker, WorkerLists},
-        framework::{EncodeItems, EncodePlaced, Issuing, Picker, TieBand},
+        framework::{EncodeItems, EncodePlaced, Issuing, Picker, Scorer, TieBand},
         in_process::{
             membership::tests::{handed, id, registry, remove},
             single::tests::{
@@ -40,7 +40,10 @@ use crate::{
     policies::random::Random,
     stages::{registry::StageRegistry, Lifecycle},
     store::{GatewayId, StaleGeneration},
-    tracking::{lease::Membership, DecisionGuard, Placement, PlacementSide},
+    tracking::{
+        lease::{EventKind, EventSet, Membership},
+        DecisionGuard, Lease, Placement, PlacementSide, ReleaseReason, Side,
+    },
 };
 
 impl InProcess {
@@ -704,14 +707,14 @@ fn a_stage_built_since_a_leases_generation_and_kept_later_did_not_stand_at_it() 
         applied.expect("a number above the standing one");
     }
     for generation in [1, 2] {
-        let lease = crate::tracking::Lease {
+        let lease = Lease {
             generation,
             ..Default::default()
         };
         let held = engine.spec();
         let stood = held.under(&engine).hearing(generation);
         let stood = stood.expect("a generation under the standing one");
-        let side = crate::tracking::Side::Single;
+        let side = Side::Single;
         stood.dispatched_stages(&lease, &Target::default(), side, 0);
     }
     // The pickers by the place the table built them at: `random` of the
@@ -724,11 +727,11 @@ fn a_stage_built_since_a_leases_generation_and_kept_later_did_not_stand_at_it() 
     let held = engine.spec();
     let own = held.under(&engine).hearing(3);
     let own = own.expect("the standing generation");
-    let lease = crate::tracking::Lease {
+    let lease = Lease {
         generation: 3,
         ..Default::default()
     };
-    own.dispatched_stages(&lease, &Target::default(), crate::tracking::Side::Single, 0);
+    own.dispatched_stages(&lease, &Target::default(), Side::Single, 0);
     assert_eq!(words(&built, 0).len(), 3, "kept since the first");
     assert_eq!(words(&built, 3).len(), 2, "kept since the second");
     assert!(
@@ -743,11 +746,11 @@ fn a_stage_built_since_a_leases_generation_and_kept_later_did_not_stand_at_it() 
     let held = engine.spec();
     let own = held.under(&engine).hearing(4);
     let own = own.expect("the standing generation");
-    let lease = crate::tracking::Lease {
+    let lease = Lease {
         generation: 4,
         ..Default::default()
     };
-    own.dispatched_stages(&lease, &Target::default(), crate::tracking::Side::Single, 0);
+    own.dispatched_stages(&lease, &Target::default(), Side::Single, 0);
     assert_eq!(words(&built, 0).len(), 4, "kept since the first");
     assert_eq!(words(&built, 7), ["dispatched"], "built under the fourth");
     assert_eq!(words(&built, 3).len(), 2, "replaced: it hears no more");
@@ -766,8 +769,8 @@ fn a_lease_of_the_last_generation_reaches_the_profile_its_document_built() {
     let applied = engine.apply(hearing_over(&stages, u64::MAX, second_profile));
     applied.expect("a number above the standing one");
     let held = engine.spec();
-    let side = crate::tracking::Side::Single;
-    let lease = |generation| crate::tracking::Lease {
+    let side = Side::Single;
+    let lease = |generation| Lease {
         generation,
         ..Default::default()
     };
@@ -792,11 +795,13 @@ fn a_lease_of_the_last_generation_reaches_the_profile_its_document_built() {
 /// generation: a word of an older lease is told by the generations the
 /// document's own profiles were made under ([`InForce::stood_at`]). Twelve
 /// documents each add one profile and keep the ones that stand, as a
-/// supplied spec may. Under the last, a dispatch of
-/// a lease of each earlier generation reaches the profiles made by then,
-/// one more a generation. Asked the document's own generation or one
-/// above it, `stood_at` answers the eleven the document kept. Each
-/// profile's object is held by the document in force alone.
+/// supplied spec may. Under the last, a dispatch of a lease of each
+/// earlier generation reaches the pickers made by then and no other: the
+/// ones the lease before reached, and one that its own generation's
+/// document built. Asked the document's own generation, one above it or
+/// the last a document can bear, `stood_at` answers the eleven the
+/// document kept. Each profile's object is held by the document in force
+/// alone.
 #[test]
 fn a_document_holds_each_profile_once_whatever_generations_made_them() {
     const DOCUMENTS: u64 = 12;
@@ -826,35 +831,160 @@ fn a_document_holds_each_profile_once_whatever_generations_made_them() {
         let applied = engine.apply(hearing_over(&stages, number, grown(number)));
         applied.expect("a number above the standing one");
     }
-    // The dispatches every picker the table built has heard so far.
-    let dispatches = || -> u64 {
+    // The dispatches each picker the table built has heard so far, by the
+    // place the table built it at.
+    let dispatches = || -> Vec<usize> {
         let heard = |picker: &Heard| {
             let words = picker.lock();
-            words.iter().filter(|word| word.0 == "dispatched").count() as u64
+            words.iter().filter(|word| word.0 == "dispatched").count()
         };
-        built.lock().iter().map(heard).sum()
+        built.lock().iter().map(heard).collect()
     };
     let held = engine.spec();
     let document = &held.0;
-    let side = crate::tracking::Side::Single;
-    for (generation, stood) in (1..DOCUMENTS)
-        .map(|at| (at, at))
-        .chain([(DOCUMENTS, DOCUMENTS - 1), (DOCUMENTS + 5, DOCUMENTS - 1)])
-    {
-        let lease = crate::tracking::Lease {
+    let side = Side::Single;
+    // The pickers the lease before reached, by their places, and the count
+    // of pickers the documents before this lease's built: a document
+    // builds one for each profile it holds.
+    let mut reached_before: Vec<usize> = Vec::new();
+    let mut built_before = 0;
+    let above = [DOCUMENTS, DOCUMENTS + 5, u64::MAX];
+    for (holds, generation) in (1_usize..).zip((1..DOCUMENTS).chain(above)) {
+        let lease = Lease {
             generation,
             ..Default::default()
         };
         let before = dispatches();
         let hears = document.stood_at(generation);
         hears.dispatched_stages(&lease, &Target::default(), side, 0);
-        assert_eq!(dispatches() - before, stood, "a lease of {generation}");
+        let after = dispatches();
+        let places = 0..after.len();
+        let reached: Vec<usize> = places.filter(|&at| after[at] != before[at]).collect();
+        for &at in &reached {
+            assert_eq!(after[at], before[at] + 1, "a lease of {generation}");
+        }
+        if generation < DOCUMENTS {
+            // The ones the lease before reached, and one more: a picker
+            // that this generation's document built.
+            let own = built_before..built_before + holds;
+            let joined = |at: &&usize| !reached_before.contains(at);
+            let joined: Vec<usize> = reached.iter().filter(joined).copied().collect();
+            assert_eq!(reached.len(), reached_before.len() + 1, "{generation}");
+            assert_eq!(joined.len(), 1, "a lease of {generation}: {reached:?}");
+            assert!(own.contains(&joined[0]), "a lease of {generation}");
+            built_before += holds;
+        } else {
+            assert_eq!(reached, reached_before, "a lease of {generation}");
+        }
+        reached_before = reached;
     }
     let profiles = document.spec.engine().profiles();
     assert_eq!(profiles.len() as u64, DOCUMENTS);
+    assert_eq!(reached_before.len() + 1, profiles.len(), "the eleven kept");
     for profile in profiles {
         let holders = Arc::strong_count(profile);
         assert_eq!(holders, 1, "{} is held {holders} times", profile.name);
+    }
+}
+
+/// A scorer that keeps the words it hears and names the dispatch alone.
+/// It implements a release too: an engine that told it one would show
+/// here.
+#[derive(Debug)]
+struct Sends(Heard);
+
+impl Lifecycle for Sends {
+    fn hears(&self) -> EventSet {
+        EventSet::NONE.with(EventKind::Dispatched)
+    }
+
+    fn on_dispatched(&self, lease: &Lease, target: &Target, _: Side, _: u32) {
+        let heard = ("dispatched", target.id, lease.target_index);
+        self.0.lock().push(heard);
+    }
+
+    fn on_released(&self, lease: &Lease, _: ReleaseReason) {
+        let heard = ("released", lease.booked, lease.target_index);
+        self.0.lock().push(heard);
+    }
+}
+
+impl Scorer for Sends {
+    fn name(&self) -> &'static str {
+        "sends"
+    }
+
+    fn score(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &[u32], out: &mut [f32]) -> TieBand {
+        out.fill(0.0);
+        TieBand::NORMALIZED
+    }
+}
+
+/// A word of an older lease that is told to the stages goes to the ones
+/// that name it among those that stood under its generation
+/// ([`InForce::stood_at`]). The profile `second` scores by a stage that
+/// takes the dispatch alone, and picks by one that takes every word, as
+/// `random` does. The second document keeps both profiles and adds a copy
+/// of `second`. A dispatch of a lease of the first document reaches the
+/// three stages that stood. Its release reaches the two pickers, and not
+/// the scorer, which does not name it. Neither word reaches a stage of
+/// the profile made since.
+#[test]
+fn an_older_leases_word_is_told_to_the_stages_that_stood_and_name_it() {
+    let (mut stages, built) = hearing_stages();
+    // The scorers' lists, in the order the table built the scorers.
+    let scored = Arc::new(Mutex::new(Vec::new()));
+    let lists = Arc::clone(&scored);
+    let added = stages.scorer("sends", move || {
+        let heard = Heard::default();
+        lists.lock().push(Arc::clone(&heard));
+        Box::new(Sends(heard))
+    });
+    added.expect("a free name");
+    // The registration built one scorer, to ask its name.
+    scored.lock().clear();
+    let scoring = |document: &mut PolicySpec| {
+        second_profile(document);
+        let second = document.profiles.get_mut("second");
+        second
+            .expect("the profile added")
+            .score
+            .push("sends".into());
+    };
+    let grown = |document: &mut PolicySpec| {
+        scoring(document);
+        let third = document.profiles["second"].clone();
+        document.profiles.insert("third".into(), third);
+        let mut bound = document.bindings[0].clone();
+        "a third model".clone_into(&mut bound.matcher.model);
+        bound.profile = Some("third".into());
+        document.bindings.insert(0, bound);
+    };
+    let engine = InProcess::new(hearing_over(&stages, 1, scoring));
+    let applied = engine.apply(hearing_over(&stages, 2, grown));
+    applied.expect("a number above the standing one");
+
+    let held = engine.spec();
+    let stood = held.0.stood_at(1);
+    let lease = Lease {
+        generation: 1,
+        ..Lease::default()
+    };
+    stood.dispatched_stages(&lease, &Target::default(), Side::Single, 0);
+    stood.released(&lease, ReleaseReason::ClientGone);
+    // The pickers by the place the table built them at: the first
+    // document's `random` and `second`, kept by the second, then the
+    // second's own two, let go, and its `third`, made since. The scorers
+    // likewise: of `second`, the one let go for it, and of `third`.
+    for kept in [0, 1] {
+        assert_eq!(words(&built, kept), ["dispatched", "released"]);
+    }
+    assert_eq!(words(&scored, 0), ["dispatched"], "it names no release");
+    for untold in [2, 3, 4] {
+        assert!(words(&built, untold).is_empty(), "the picker at {untold}");
+    }
+    for untold in [1, 2] {
+        assert!(words(&scored, untold).is_empty(), "the scorer at {untold}");
     }
 }
 

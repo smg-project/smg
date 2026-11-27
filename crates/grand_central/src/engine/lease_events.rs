@@ -18,6 +18,9 @@
 //! a controller by the one its store's standing world holds. What hears at
 //! the issuing engine is one of two things ([`Issuing`]): an engine whole,
 //! or the stages a later engine kept that stood by the lease's generation.
+//! A host that holds its decisions names the first as the engine itself,
+//! and a controller names either as a `Stood`, the first under no bound
+//! (`Engine::stands`).
 //!
 //! A request its binding's sessions rule keeps from the profile is told to
 //! the session table at its dispatch, and to no stage ahead of its end

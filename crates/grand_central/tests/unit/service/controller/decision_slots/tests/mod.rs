@@ -58,7 +58,9 @@ use crate::{
         DecodeIssue, DecodeMark, GatewayId, HealthSink, LeaseState, LeasesStore, MembershipChange,
         MemoryStore, Registrant, WorkerFacts, WorkerStatus, WorkersStore,
     },
-    tracking::lease::{Dispatch, Lease, LeaseId, ReleaseReason, Said, Side, DISPATCH_TTL},
+    tracking::lease::{
+        Dispatch, EventKind, EventSet, Lease, LeaseId, ReleaseReason, Said, Side, DISPATCH_TTL,
+    },
     worker_host::{tests::stand, Members, Objects},
 };
 
@@ -1977,6 +1979,10 @@ impl Lifecycle for Told {
     fn on_released(&self, lease: &Lease, reason: ReleaseReason) {
         self.0.lock().push((lease.id.0, Some(reason)));
     }
+
+    fn hears(&self) -> EventSet {
+        EventSet::of([EventKind::Issued, EventKind::Released])
+    }
 }
 
 impl Picker for Told {
@@ -2037,6 +2043,10 @@ impl Lifecycle for Waits {
     fn on_released(&self, lease: &Lease, reason: ReleaseReason) {
         assert!(!self.bursts, "the case's stage panics at a release");
         self.told.on_released(lease, reason);
+    }
+
+    fn hears(&self) -> EventSet {
+        EventSet::of([EventKind::Issued, EventKind::Released])
     }
 }
 
@@ -2767,6 +2777,10 @@ impl Lifecycle for Named {
     fn on_released(&self, _: &Lease, _: ReleaseReason) {
         self.0.lock().push(DecisionSlot::acting());
     }
+
+    fn hears(&self) -> EventSet {
+        EventSet::of([EventKind::Issued, EventKind::Released])
+    }
 }
 
 impl Picker for Named {
@@ -2825,6 +2839,10 @@ impl Lifecycle for Threads {
     fn on_released(&self, _: &Lease, _: ReleaseReason) {
         let name = thread::current().name().map(str::to_owned);
         self.0.lock().push(name);
+    }
+
+    fn hears(&self) -> EventSet {
+        EventSet::of([EventKind::Released])
     }
 }
 
@@ -2975,6 +2993,10 @@ struct Heard(Arc<Mutex<Vec<Instant>>>);
 impl Lifecycle for Heard {
     fn on_released(&self, _: &Lease, _: ReleaseReason) {
         self.0.lock().push(Instant::now());
+    }
+
+    fn hears(&self) -> EventSet {
+        EventSet::of([EventKind::Released])
     }
 }
 
@@ -4303,6 +4325,10 @@ impl Lifecycle for Sided {
     fn on_released(&self, lease: &Lease, reason: ReleaseReason) {
         self.0.lock().push((lease.side, lease.booked, Some(reason)));
     }
+
+    fn hears(&self) -> EventSet {
+        EventSet::of([EventKind::Issued, EventKind::Released])
+    }
 }
 
 impl Picker for Sided {
@@ -4374,6 +4400,10 @@ impl Lifecycle for HeardSides {
 
     fn on_released(&self, lease: &Lease, reason: ReleaseReason) {
         self.0.lock().push((lease.side, lease.booked, Some(reason)));
+    }
+
+    fn hears(&self) -> EventSet {
+        EventSet::of([EventKind::Issued, EventKind::Released])
     }
 }
 

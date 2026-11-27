@@ -32,7 +32,9 @@ use crate::{
     service::proto,
     stages::lifecycle::Lifecycle,
     store::{DecodeSide, LeaseRecord, LeaseState, LeasesStore, PickRecord, Sides, StoreSnapshot},
-    tracking::lease::{Dispatch, Lease, LeaseId, LeaseKind, Outcome, ReleaseReason, Said, Side},
+    tracking::lease::{
+        Dispatch, EventSet, Lease, LeaseId, LeaseKind, Outcome, ReleaseReason, Said, Side,
+    },
 };
 
 /// The prefill of every pair here, at its rank 1.
@@ -345,6 +347,10 @@ impl Lifecycle for Books {
 
     fn on_released(&self, lease: &Lease, _: ReleaseReason) {
         self.add(lease.booked, -1);
+    }
+
+    fn hears(&self) -> EventSet {
+        EventSet::LEASE
     }
 }
 

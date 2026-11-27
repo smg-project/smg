@@ -50,6 +50,57 @@ fn without_an_end(case: impl FnOnce()) {
     TAKES.set(EventSet::LEASE);
 }
 
+/// Whether the stage of this thread's hosts takes an end.
+fn takes_ends() -> bool {
+    TAKES.get().contains(EventKind::Completed)
+}
+
+/// What a stage hears of the words `said`: each of them where it takes
+/// every word, and each but the ends where it takes no end
+/// ([`without_an_end`]). The engine tells a stage no word it does not
+/// name.
+fn heard_of<'a, W: Copy + 'a>(
+    said: impl IntoIterator<Item = &'a W>,
+    word: impl Fn(&W) -> &'static str,
+) -> Vec<W> {
+    let hears = |said: &&W| takes_ends() || word(said) != "ended";
+    said.into_iter().filter(hears).copied().collect()
+}
+
+/// The words a stage heard since a read ([`Host::words`]), each with its
+/// side. A case sets them against the words its sides said: the two are
+/// equal where the stage heard what it hears of those ([`heard_of`]).
+#[derive(Debug)]
+struct Heard(Vec<(&'static str, Side)>);
+
+impl Heard {
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl PartialEq<[(&'static str, Side)]> for Heard {
+    fn eq(&self, said: &[(&'static str, Side)]) -> bool {
+        self.0 == heard_of(said, |word| word.0)
+    }
+}
+
+impl<const N: usize> PartialEq<[(&'static str, Side); N]> for Heard {
+    fn eq(&self, said: &[(&'static str, Side); N]) -> bool {
+        *self == said[..]
+    }
+}
+
+impl PartialEq<Vec<(&'static str, Side)>> for Heard {
+    fn eq(&self, said: &Vec<(&'static str, Side)>) -> bool {
+        *self == said[..]
+    }
+}
+
 /// A picker that names the workers the filters keep in their list's
 /// order, takes the words of a lease it is made to take, and keeps
 /// every word it hears, with each end's outcome beside. A release under
@@ -322,19 +373,25 @@ impl Host {
     /// What the stage heard since the last call: each word and its
     /// side. No word went unheard, no decision faulted, and no end
     /// said an outcome its case did not read ([`Self::ends`]).
-    fn words(&self) -> Vec<(&'static str, Side)> {
+    fn words(&self) -> Heard {
         assert_eq!((self.engine.faults(), self.engine.unheard()), (0, 0));
         self.no_outcome();
         let heard = std::mem::take(&mut *self.heard.lock());
-        heard
-            .into_iter()
-            .map(|(word, side, _)| (word, side))
-            .collect()
+        let words = heard.into_iter().map(|(word, side, _)| (word, side));
+        Heard(words.collect())
     }
 
     /// The span the prefill's end states, in microseconds: the last
     /// word the stage heard since the last call, behind `ahead`.
+    ///
+    /// A stage that takes no end hears none ([`without_an_end`]): the
+    /// words `ahead` are then the whole of what it heard, and the span
+    /// reads zero.
     fn prefills_end(&self, ahead: &[(&'static str, Side)]) -> u128 {
+        if !takes_ends() {
+            assert_eq!(self.words(), *ahead);
+            return 0;
+        }
         self.no_outcome();
         let heard = std::mem::take(&mut *self.heard.lock());
         let [before @ .., ("ended", P, span)] = heard.as_slice() else {
@@ -853,10 +910,11 @@ fn a_pairs_two_sides_speak_from_two_threads() {
         first.join().expect("the prefill's thread");
         second.join().expect("the decode's thread");
         let words = host.words();
-        let of = |side| words.iter().filter(move |word| word.1 == side);
+        let of = |side| words.0.iter().filter(move |word| word.1 == side);
         for side in [P, D] {
             let told: Vec<_> = of(side).map(|word| word.0).collect();
-            assert_eq!(told, ["issued", "sent", "ended"], "{side:?}: {words:?}");
+            let said = heard_of(&["issued", "sent", "ended"], |word| *word);
+            assert_eq!(told, said, "{side:?}: {words:?}");
         }
     }
 }
@@ -865,8 +923,9 @@ fn a_pairs_two_sides_speak_from_two_threads() {
 /// of the document takes an end, and each side keeps the pair's
 /// placement by itself: every case of a pair's words above, run again
 /// under such a document, and the case of what a side says of its
-/// decode standing chosen. A pair's every word is told, so its stage
-/// still hears the ends it did not name.
+/// decode standing chosen. The engine tells a stage no word it does not
+/// name, of a pair's sides either: the stage of these runs hears the
+/// other words of each case in their order, and no end ([`heard_of`]).
 #[test]
 fn a_pairs_words_stand_where_no_stage_takes_an_end() {
     let cases: [fn(); 10] = [

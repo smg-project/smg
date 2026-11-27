@@ -1378,9 +1378,10 @@ impl Loaded<'_, '_> {
 /// and is counted with them. A panic in a stage that hears a word is held
 /// here too and counted ([`InProcess::unheard`]): the request goes on.
 ///
-/// A word of a lease is told to the stages of the document in force, where
-/// that document issued the lease. A lease issued under a document that a
-/// new one replaced since is told to nobody ([`InProcess::apply`]). The
+/// The engine tells a word of a lease to stages that take it and to no
+/// other. Such a stage is the document in force's where that document
+/// issued the lease. For a lease an earlier document issued it is one the
+/// document in force kept that stood then ([`InProcess::apply`]). The
 /// shadow counts are those of the document in force.
 impl DecisionEngine for InProcess {
     fn decide_under(
@@ -1436,7 +1437,8 @@ impl DecisionEngine for InProcess {
 
     fn say(&self, _: GatewayId, held: &HeldDecision<'_>, said: Said, _: Instant) {
         // A single's word no stage takes is told to nobody. A pair's
-        // dispatch may carry its decode's issue: every word of one is told.
+        // dispatch may carry its decode's issue: every word of one goes to
+        // the rule of a lease's words, which says what its stages hear.
         let kind = match said {
             Said::Dispatched(..) => EventKind::Dispatched,
             Said::Completed(_) => EventKind::Completed,
