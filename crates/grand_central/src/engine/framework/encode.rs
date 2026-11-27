@@ -1601,6 +1601,10 @@ impl Engine {
             rows: encode.encoders.len(),
         };
         let offered = side.offered.admit(kept, handed, key_cx);
+        debug_assert!(
+            key_cx.places.is_none() && !offered.held_off(),
+            "a key's constraints state no place, so nothing holds a key off the encoders offered"
+        );
         let (offered_rows, offered_affinity, offered_cells) = offered.stand_in();
         let offered_lists;
         let mut encode_cx = key_cx;
