@@ -40,7 +40,9 @@ use crate::{
         DecodeSide, GatewayId, LeaseRecord, LeaseState, LeasesStore, MemoryStore, PickRecord,
         Sides, StoreSnapshot,
     },
-    tracking::lease::{Dispatch, Lease, LeaseId, LeaseKind, Outcome, ReleaseReason, Said, Side},
+    tracking::lease::{
+        Dispatch, EventSet, Lease, LeaseId, LeaseKind, Outcome, ReleaseReason, Said, Side,
+    },
 };
 
 pub(super) const GATEWAY: GatewayId = GatewayId(11);
@@ -89,6 +91,10 @@ impl Lifecycle for Records {
 
     fn on_released(&self, lease: &Lease, reason: ReleaseReason) {
         self.0.lock().push(Event::Released(*lease, reason));
+    }
+
+    fn hears(&self) -> EventSet {
+        EventSet::LEASE
     }
 }
 

@@ -186,8 +186,9 @@ impl Replication {
     /// in this call's turn behind the service's guard. That read has three
     /// refusals: the moment between a take and the take's own write; a
     /// lead whose log followed a term at or above the take, which the
-    /// election leaves in the take's step; and a call admitted under a take
-    /// the store has since passed.
+    /// election leaves in the take's step, or keeps where no term is left
+    /// to take; and a call admitted under a take the store has since
+    /// passed.
     fn serves(&self, term: u64) -> Result<(), Status> {
         if self.log.alone() {
             return Err(Status::failed_precondition(

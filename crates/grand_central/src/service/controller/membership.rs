@@ -26,7 +26,7 @@
 //! **A call reads the record that stands off the worker objects.** The row
 //! under a URL, the row under an id and an engine's rows are read back from
 //! the objects in their holder's turn
-//! ([`Objects::record`]). A worker object's status leads its row's, so
+//! ([`Objects::read_row`]). A worker object's status leads its row's, so
 //! a record read carries the status its object states.
 //!
 //! **A call writes under the term it reads once it holds the door's turn.**
@@ -62,6 +62,18 @@
 //! that can mint no life does ([`MembershipCalls::next_life`]), and
 //! otherwise the row moved. A registration that waits answers the row as it
 //! reads behind its connect signal, written or not.
+//!
+//! **A row is written under its call's term, or not at all.** A
+//! registration's write, a patch and a removal go to the holder with the
+//! term the call was admitted under ([`Objects::upsert_under`]). The store
+//! tells its journal first, with that term, and moves its tables behind
+//! the journal's yes. Where the log has left the term, it takes no event
+//! and the store moves nothing. The door then asks the term once more and
+//! answers that its store does not lead it, as a drain does
+//! ([`MembershipCalls::unwritten`]). The status the holder tells behind a
+//! change in place goes under that term too. A removal's object left the
+//! registry ahead of the store's word: it is laid again from the row
+//! read off it, in the status the table holds.
 //!
 //! **A signal that was not written is sent again by an upsert of the same
 //! registration.** Its row waits for it: its checks are off, and it is
@@ -228,10 +240,20 @@ impl MembershipCalls {
 
     /// The door's write of a registration's facts, in its turn: decided
     /// over the worker objects, which the store follows
-    /// ([`Objects::upsert`]). `None` where another writer moved the row
-    /// under the turn.
-    fn lay_row(&self, facts: WorkerFacts, maker: Registrant) -> Option<MembershipChange> {
-        self.objects.upsert(&self.store, facts, maker)
+    /// ([`Objects::upsert_under`]). It goes with `term`, the term the call
+    /// was admitted under: the store's journal takes the row's event only
+    /// while the log leads it, asked where the event takes its place.
+    /// `None` where another writer moved the row under the turn, and where
+    /// the log has left `term`: nothing is written then
+    /// ([`Self::unwritten`]).
+    fn lay_row(
+        &self,
+        facts: WorkerFacts,
+        maker: Registrant,
+        term: u64,
+    ) -> Option<MembershipChange> {
+        self.objects
+            .upsert_under(&self.store, facts, maker, Some(term))
     }
 
     /// The door's write of a patch, as [`Self::lay_row`] writes a
@@ -241,14 +263,17 @@ impl MembershipCalls {
         id: WorkerId,
         patch: WorkerPatch,
         revision: u64,
+        term: u64,
     ) -> Option<MembershipChange> {
-        self.objects.patch(&self.store, id, patch, revision)
+        self.objects
+            .patch_under(&self.store, id, patch, revision, Some(term))
     }
 
     /// The door's removal of a row, as [`Self::lay_row`] writes a
     /// registration.
-    fn take_row(&self, id: WorkerId, revision: u64) -> Option<MembershipChange> {
-        self.objects.remove(&self.store, id, revision)
+    fn take_row(&self, id: WorkerId, revision: u64, term: u64) -> Option<MembershipChange> {
+        self.objects
+            .remove_under(&self.store, id, revision, Some(term))
     }
 
     /// The door's connect signal for a row whose checks are off, in its
@@ -287,14 +312,14 @@ impl MembershipCalls {
 
     /// The door's read of the row under `id`, in its turn: the record read
     /// back from the worker object that stands, with the status that
-    /// object states ([`Objects::record`]).
+    /// object states ([`Objects::read_row`]).
     fn row(&self, id: WorkerId) -> Option<WorkerRow> {
-        self.objects.record(id)
+        self.objects.read_row(id)
     }
 
     /// The door's read of the row under `url`, as [`Self::row`] reads one.
     fn row_under(&self, url: &str) -> Option<WorkerRow> {
-        self.objects.record_under(url)
+        self.objects.read_row_under(url)
     }
 
     /// The door's read of the rows that name `engine`, as [`Self::row`]
@@ -357,6 +382,16 @@ impl MembershipCalls {
         Ok(())
     }
 
+    /// The refusal of a call whose write the store did not take, asked
+    /// behind that write. Where the term the call was admitted under has
+    /// ended by this ask, the store does not lead it, and the call says
+    /// so whatever refused the write: the row need not have moved.
+    /// Otherwise the call is refused as one whose row another writer
+    /// moved: the table did not hold what the holder read.
+    fn unwritten(&self, admitted: u64) -> Status {
+        self.check_term(admitted).err().unwrap_or_else(moved)
+    }
+
     fn life(&self, term: u64) -> u64 {
         life(term, self.base, self.store.epoch())
     }
@@ -392,6 +427,41 @@ impl MembershipCalls {
             audit_refusal(call, by, refusal.code(), refusal.message(), None);
         }
         answer
+    }
+
+    /// One call of the replica's own writer ([`ReplicaMembershipWriter`]),
+    /// from `by`: its turn, the term `leading` (the replica's read of the
+    /// fence) tells once the turn is held, and its write under that term.
+    /// A refusal, the fence's or the write's, leaves its audit line once
+    /// the turn is let go, with `asker` where the write was asked for.
+    #[cfg_attr(
+        not(any(test, feature = "discovery")),
+        expect(dead_code, reason = "the replica's own writer makes the call")
+    )]
+    fn writer_call<T>(
+        &self,
+        call: &'static str,
+        by: &Principal,
+        asker: Option<&str>,
+        leading: impl FnOnce() -> Result<u64, Status>,
+        write: impl FnOnce(u64) -> Result<T, MembershipWriteRefused>,
+    ) -> Result<T, MembershipWriteRefused> {
+        match self.in_turn(|| leading().map(write)) {
+            // The worker objects hold the write when the call answers, as
+            // behind a control call's ([`Self::call`]).
+            Ok(Ok(answer)) => Ok(answer),
+            Ok(Err(refusal)) => {
+                let status = refused(&refusal);
+                audit_refusal(call, by, status.code(), status.message(), asker);
+                Err(refusal)
+            }
+            Err(status) => {
+                audit_refusal(call, by, status.code(), status.message(), asker);
+                Err(MembershipWriteRefused::NotLeading(
+                    status.message().to_owned(),
+                ))
+            }
+        }
     }
 
     /// `RegisterWorker`, admitted from `by` under the term `leading` reads.
@@ -530,8 +600,8 @@ impl MembershipCalls {
         // The row's bound holds with its maker: the facts' own was told
         // where they were read.
         worker_wire::room(&facts, &facts.labels, maker, "spec").map_err(invalid)?;
-        let wrote = self.lay_row(facts, maker.clone());
-        let id = wrote.ok_or_else(moved)?.id();
+        let wrote = self.lay_row(facts, maker.clone(), admitted);
+        let id = wrote.ok_or_else(|| self.unwritten(admitted))?.id();
         // The row, the epoch and the place as the registration's write left
         // them: the answer of a call that does not wait.
         let (mut now, mut epoch, mut at) = (self.read(id)?, self.store.epoch(), self.place());
@@ -561,16 +631,18 @@ impl MembershipCalls {
         leading: impl FnOnce() -> Result<u64, Status>,
         request: &proto::PatchWorkerRequest,
     ) -> Result<proto::WorkerEvent, Status> {
-        self.call(PATCH, by, leading, |_| {
-            self.relabel(by, &Registrant::Control, request)
+        self.call(PATCH, by, leading, |term| {
+            self.relabel(by, &Registrant::Control, term, request)
         })
     }
 
-    /// The write of [`Self::patch`], in the door's turn, from `maker`.
+    /// The write of [`Self::patch`], in the door's turn, from `maker`,
+    /// under `admitted`, the term the call was admitted under.
     fn relabel(
         &self,
         by: &Principal,
         maker: &Registrant,
+        admitted: u64,
         request: &proto::PatchWorkerRequest,
     ) -> Result<proto::WorkerEvent, Status> {
         let standing = self.guarded(maker, request.worker_id, request.revision)?;
@@ -581,8 +653,8 @@ impl MembershipCalls {
                     worker_wire::room(&standing.facts, labels, &standing.maker, "labels")
                         .map_err(invalid)?;
                 }
-                self.patch_row(standing.id, patch, standing.revision)
-                    .ok_or_else(moved)?;
+                self.patch_row(standing.id, patch, standing.revision, admitted)
+                    .ok_or_else(|| self.unwritten(admitted))?;
                 (self.read(standing.id)?, true)
             }
         };
@@ -625,18 +697,14 @@ impl MembershipCalls {
     ) -> Result<proto::WorkerEvent, Status> {
         let standing = self.guarded(maker, request.worker_id, request.revision)?;
         let (event, wrote) = if !request.drain {
-            self.take_row(standing.id, standing.revision)
-                .ok_or_else(moved)?;
+            self.take_row(standing.id, standing.revision, admitted)
+                .ok_or_else(|| self.unwritten(admitted))?;
             (worker_wire::removed(&standing), true)
         } else if standing.status == WorkerStatus::Draining {
             (worker_wire::relabelled(&standing), false)
         } else {
             if !self.drain_row(standing.id, standing.revision, admitted) {
-                // The drain wrote nothing. Where its term ended, it answers
-                // that the store does not lead the term: its row need not
-                // have moved.
-                self.check_term(admitted)?;
-                return Err(moved());
+                return Err(self.unwritten(admitted));
             }
             let event =
                 worker_wire::status_changed(standing.id, standing.status, WorkerStatus::Draining);
@@ -751,15 +819,15 @@ impl Turn for CallTurn<'_> {
     }
 
     fn upsert(&self, facts: WorkerFacts, maker: Registrant) -> Option<MembershipChange> {
-        self.door.lay_row(facts, maker)
+        self.door.lay_row(facts, maker, self.term)
     }
 
     fn patch(&self, id: WorkerId, patch: WorkerPatch, revision: u64) -> Option<MembershipChange> {
-        self.door.patch_row(id, patch, revision)
+        self.door.patch_row(id, patch, revision, self.term)
     }
 
     fn remove(&self, id: WorkerId, revision: u64) -> Option<MembershipChange> {
-        self.door.take_row(id, revision)
+        self.door.take_row(id, revision, self.term)
     }
 
     fn connect(&self, id: WorkerId, revision: u64) {
@@ -972,24 +1040,10 @@ impl ReplicaMembershipWriter {
         asker: Option<&str>,
         write: impl FnOnce(u64) -> Result<T, MembershipWriteRefused>,
     ) -> Result<T, MembershipWriteRefused> {
-        // The term is read and the write is made in the door's turn. A
-        // refusal's audit line is written once the turn is let go.
-        match self.door.in_turn(|| (self.leading)().map(write)) {
-            // The worker objects hold the write when the call answers, as
-            // behind a control call's ([`MembershipCalls::call`]).
-            Ok(Ok(answer)) => Ok(answer),
-            Ok(Err(refusal)) => {
-                let status = refused(&refusal);
-                audit_refusal(call, &self.by, status.code(), status.message(), asker);
-                Err(refusal)
-            }
-            Err(status) => {
-                audit_refusal(call, &self.by, status.code(), status.message(), asker);
-                Err(MembershipWriteRefused::NotLeading(
-                    status.message().to_owned(),
-                ))
-            }
-        }
+        // The door reads the term and makes the write in its own turn, and
+        // writes a refusal's audit line ([`MembershipCalls::writer_call`]).
+        self.door
+            .writer_call(call, &self.by, asker, || (self.leading)(), write)
     }
 
     /// The registration's write over rows of stated facts, in the door's
@@ -1054,15 +1108,15 @@ impl Turn for ReplicaTurn<'_> {
     }
 
     fn upsert(&self, facts: WorkerFacts, maker: Registrant) -> Option<MembershipChange> {
-        self.host.door.lay_row(facts, maker)
+        self.host.door.lay_row(facts, maker, self.term)
     }
 
     fn patch(&self, id: WorkerId, patch: WorkerPatch, revision: u64) -> Option<MembershipChange> {
-        self.host.door.patch_row(id, patch, revision)
+        self.host.door.patch_row(id, patch, revision, self.term)
     }
 
     fn remove(&self, id: WorkerId, revision: u64) -> Option<MembershipChange> {
-        self.host.door.take_row(id, revision)
+        self.host.door.take_row(id, revision, self.term)
     }
 
     fn connect(&self, id: WorkerId, revision: u64) {

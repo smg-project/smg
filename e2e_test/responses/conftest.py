@@ -49,6 +49,7 @@ import yaml
 # intentionally — pytest needs the name to be bound at module scope.
 from infra import MockMcpServer, launch_cloud_gateway
 from infra.cloud_credentials import resolve_cloud_credentials
+from infra.constants import get_gpu_vendor
 from infra.mock_mcp import mock_mcp_server as mock_mcp_server  # noqa: F401
 
 logger = logging.getLogger(__name__)
@@ -288,10 +289,10 @@ def _start_local_grpc_gateway_with_mcp(
     Returns ``(gateway, client, workers, model_path)``. Workers come from
     the session-scoped pool (``infra.worker_pool``), so the caller MUST
     NOT stop them on teardown — only ``gateway.shutdown()`` is required.
-    Skips (not fails) when worker startup fails — CI runs without GPUs
-    would otherwise poison every engine-parametrized suite.
+    AMD worker startup failures propagate. Other environments retain the
+    startup skip for suites run without GPUs.
     """
-    from infra import ConnectionMode, Gateway
+    from infra import ConnectionMode, ExternalWorkerAttachError, Gateway
     from infra.model_specs import get_model_spec
     from infra.worker_pool import get_pool
 
@@ -302,7 +303,11 @@ def _start_local_grpc_gateway_with_mcp(
             mode=ConnectionMode.GRPC,
             count=1,
         )
+    except ExternalWorkerAttachError:
+        raise
     except Exception as e:
+        if get_gpu_vendor() == "amd":
+            raise
         pytest.skip(f"gRPC {engine} worker for {model_id} not available: {e}")
 
     # Worker stays in the pool on any downstream failure; the gateway is
@@ -322,6 +327,8 @@ def _start_local_grpc_gateway_with_mcp(
                 "memory",
             ],
         )
+        if any(getattr(w, "external", False) and getattr(w, "flush_cache", False) for w in workers):
+            gateway.flush_cache()
         client = openai.OpenAI(base_url=f"{gateway.base_url}/v1", api_key="not-used")
     except Exception:
         gateway.shutdown()
@@ -338,8 +345,8 @@ def gateway_with_mock_mcp_grpc_sglang(
     """Launch a local SGLang gRPC gateway wired to the mock MCP server.
 
     Uses the gpt-oss-20b model, which flows through the harmony path
-    (R6.3). Skips when the worker can't start (no GPU available, missing
-    model weights, etc.) rather than hard-failing.
+    (R6.3). AMD worker startup failures propagate; other environments retain
+    the startup skip.
     """
     gateway, client, _workers, model_path = _start_local_grpc_gateway_with_mcp(
         engine="sglang",
@@ -360,7 +367,8 @@ def gateway_with_mock_mcp_grpc_vllm(
     """Launch a local vLLM gRPC gateway wired to the mock MCP server.
 
     Uses Llama-3.1-8B-Instruct, which flows through the regular (non-
-    harmony) path (R6.4). Skips when the worker can't start.
+    harmony) path (R6.4). AMD worker startup failures propagate; other
+    environments retain the startup skip.
     """
     gateway, client, _workers, model_path = _start_local_grpc_gateway_with_mcp(
         engine="vllm",

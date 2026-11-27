@@ -658,6 +658,7 @@ fn a_pin_is_followed_under_a_scorer_that_states_its_picks_holding() {
         sweep_micros: 60_000_000,
         recovery: Recovery::Original,
         rule_placed: RulePlaced::Told,
+        sides: Default::default(),
     };
     for states in [true, false] {
         let stage = Alike {
@@ -752,6 +753,7 @@ fn a_sessions_rules_key_with_no_pin_is_not_walked_on_a_lent_ring() {
         sweep_micros: 60_000_000,
         recovery: Recovery::Original,
         rule_placed: RulePlaced::Told,
+        sides: Default::default(),
     };
     let profile = profile_of("ring", Box::new(ConsistentHash::new(None)));
     let engine = Engine::new(vec![profile], vec![single(Some(rule))], 1, Needs::default());
@@ -799,6 +801,7 @@ fn a_pin_under_a_scope_or_a_shadow_is_left_to_the_whole_decision() {
         sweep_micros: 60_000_000,
         recovery: Recovery::Original,
         rule_placed: RulePlaced::Told,
+        sides: Default::default(),
     };
     for (scoped, shadow) in [(false, None), (true, None), (false, Some(1))] {
         let alike = || {

@@ -57,6 +57,7 @@
 //! stage's credit of dispatches is released by a report sampled after them
 //! and by no other.
 
+mod pair_drawn;
 pub(crate) mod vetoes;
 pub(crate) mod with_shadow;
 
@@ -87,7 +88,7 @@ use smg_worker::{
 use super::{
     decision::Decision,
     demands::{DemandFacts, Demands, UnmetDemand},
-    framework::{Engine, Scratch},
+    framework::{Engine, Scratch, WholeRows},
     view::{
         Candidate, Constraints, Engines, FixedFacts, Health, LoadRow, OverloadRegime, PoolFacts,
         RequestFacts, Role, SignalSource, WireModes, WorkerId, LOAD_REPORT_CLOCK_HISTORY_MS,
@@ -96,6 +97,7 @@ use super::{
 use crate::{
     document::spec::AppliedSpec,
     load::{load_row, signal_values, ReportSignals, SignalCells, SignalColumn},
+    policies::round_robin::RoundRobin,
 };
 
 /// A worker's id in the engine's own state (a load stage's credit of
@@ -684,6 +686,10 @@ pub struct PoolRecords {
     /// The claim to ask the list's workers ([`Self::ask`]): taken by one
     /// compare and exchange and never waited for, as the conversion's is.
     asking: Mutex<()>,
+    /// The key of the list's rows in their order, as a rotation keys the
+    /// rows a pass kept: made once, here, and said to the engine's scratch
+    /// with the rows a decision wrote whole ([`Self::whole_rows`]).
+    whole_key: u64,
 }
 
 impl PoolRecords {
@@ -785,6 +791,7 @@ impl PoolRecords {
         let (engine_rows, engine_ends) = engines_of(workers, &mut fixed);
         let number = clock.next_pool();
         Self {
+            whole_key: RoundRobin::whole_key(&fixed),
             regular: fixed.iter().all(|row| row.role == Role::Single),
             fixed,
             ids,
@@ -1078,6 +1085,15 @@ impl PoolRecords {
             engines: Engines::new(self.number, &self.engine_rows, &self.engine_ends),
             word: live.word,
         }
+    }
+
+    /// What the list says to the engine's scratch of `rows`, its rows as one
+    /// decision wrote them whole ([`Self::write_over`]): where they stand,
+    /// how many they are and the list's key. The one place a front makes
+    /// the word.
+    #[inline]
+    fn whole_rows(&self, rows: &[Candidate]) -> WholeRows {
+        WholeRows::said(rows, self.whole_key)
     }
 
     /// Every worker's record for one decision, written into `rows` in the
@@ -1931,6 +1947,9 @@ pub fn decide(
             return decision;
         }
         let (rows, pool_facts) = pool.write_over::<true, false>(workers, live, whole, stands);
+        if engine.turns_a_set() {
+            scratch.whole(pool.whole_rows(rows));
+        }
         let written;
         let cx = if cx.stalled.is_empty() {
             cx
@@ -1951,7 +1970,9 @@ pub fn decide(
 /// cleared ([`Live::unread`]): the word of the thread's last decision
 /// never stands for this one, and a decision that states none reads them.
 /// A live decision and the shadow profile decided behind it on this
-/// borrow share the word: the front states it once, for both.
+/// borrow share the word: the front states it once, for both. Its word on
+/// the rows written whole is taken back here too ([`Scratch::whole`]): a
+/// front states it behind its write, for the decisions of this borrow.
 #[inline]
 fn with_buffers<T>(decide: impl FnOnce(&mut Buffers) -> T) -> T {
     // The key's own call hands out the pointer alone: what a decision
@@ -1963,6 +1984,7 @@ fn with_buffers<T>(decide: impl FnOnce(&mut Buffers) -> T) -> T {
         return decide(&mut Buffers::default());
     };
     buffers.scratch.unread(false);
+    buffers.scratch.no_whole();
     decide(&mut buffers)
 }
 

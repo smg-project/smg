@@ -97,6 +97,11 @@ pub trait RequestMaker {
     /// the other. A panic here is the shadow's fault, and the time it
     /// takes is the shadow's: spent, like the rest of a shadow's run,
     /// ahead of a later ask of the same call.
+    ///
+    /// There, for a side's shadow profile one of whose filters declares
+    /// the ring need ([`Needs::ring`](crate::document::spec::Needs::ring)),
+    /// it asks this ahead of the shadow's filters, which read the answer:
+    /// it asks whether or not they keep a worker, and once a decision.
     fn shadow_ring<'w>(
         &'w self,
         spec: &'w AppliedSpec,

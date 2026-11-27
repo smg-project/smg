@@ -843,7 +843,8 @@ pub(crate) fn translate_request_with_backend(
     let support: StructuredOutputsSupport = structured_backend.into();
     // The client refuses an unenforceable constraint before it fans the
     // request out (`ZmqEngineClient::generate_vllm_streams`).
-    if let Some(sp) = req.sampling_params.as_ref() {
+    if let Some(sp) = req.sampling_params.as_mut() {
+        send_answer_tag_as_schema(sp, support);
         crate::structured_outputs::refuse_unenforceable_constraint(constraint_ref(sp), support)?;
     }
     translate_request_with_media(req, media, max_model_len, eos, support)
@@ -1428,6 +1429,21 @@ pub(crate) fn constraint_ref(sp: &vllm::SamplingParams) -> Option<ConstraintRef<
         Constraint::JsonObject(true) => Some(ConstraintRef::JsonObject),
         Constraint::JsonObject(false) => None,
         Constraint::Choice(_) => Some(ConstraintRef::Choice),
+    }
+}
+
+/// A structural tag that is a JSON answer's schema alone, swapped for that
+/// schema where the engine's backend is not the one the tag is spelled for
+/// ([`crate::structured_outputs::answer_schema_in_place_of_tag`]); every
+/// other constraint stays as it came.
+pub(crate) fn send_answer_tag_as_schema(
+    sp: &mut vllm::SamplingParams,
+    support: StructuredOutputsSupport,
+) {
+    let schema =
+        crate::structured_outputs::answer_schema_in_place_of_tag(constraint_ref(sp), support);
+    if let Some(schema) = schema {
+        sp.constraint = Some(vllm::sampling_params::Constraint::JsonSchema(schema));
     }
 }
 

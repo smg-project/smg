@@ -18,8 +18,9 @@
 //!
 //! Under a policy spec that keeps a sample of its decisions the gateway
 //! also restates the chosen id on the request, under the header
-//! `x-smg-request-id` (`restate`). The engine's side of a placement reads
-//! it there (`restated`) as the gateway's own id of the request. That
+//! `x-smg-request-id` (`restate`). The engine reads what stands there
+//! as the gateway's own id of the request, by the name a placement
+//! states to it. That
 //! write is no part of this layer: the server installs it as a layer of its
 //! own inside the edge layers, behind this one, and under no other
 //! configuration, so this layer is the same for every gateway. The write
@@ -29,7 +30,11 @@
 //! any other: a request plugin sees it and can change it, and a policy spec
 //! that names it as a header reads what stands there. Under a spec that
 //! keeps no sample, and in a gateway that places with its classic policies,
-//! nothing is written there, and a client's value stays as it came.
+//! nothing is written there, and a client's value stays as it came. A
+//! configuration that names that header for a use of its own is served as
+//! for any header it names so. Named as a request id header, it is read
+//! and rewritten by this layer where it is the first configured header
+//! that is present.
 
 use std::{
     future::Future,
@@ -66,14 +71,6 @@ pub(crate) static REQUEST_ID: HeaderName = HeaderName::from_static("request-id")
 /// request-id headers by their names and by the prefix `x-request-id-`,
 /// and this name is neither.
 pub(crate) static OWN_REQUEST_ID: HeaderName = HeaderName::from_static("x-smg-request-id");
-
-/// The gateway's own id of the request `headers` belong to, where the
-/// gateway restated it on the request ([`restate`]): the id the response's
-/// `x-request-id` header shows. `None` where nothing restated one. The
-/// engine's side of a placement asks, and a classic placement never does.
-pub(crate) fn restated(headers: &http::HeaderMap) -> Option<&str> {
-    headers.get(&OWN_REQUEST_ID)?.to_str().ok()
-}
 
 /// Restates the id the layer chose for `request` on the request itself,
 /// under [`OWN_REQUEST_ID`], as the one value there: whatever a client sent
@@ -599,6 +596,13 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.headers()["x-request-id"], "ok-1");
+    }
+
+    /// What stands on `headers` under [`OWN_REQUEST_ID`]: the first value
+    /// under the name, where it is text. The engine's reader of a header
+    /// map takes the same first value, as its bytes.
+    fn restated(headers: &http::HeaderMap) -> Option<&str> {
+        headers.get(&OWN_REQUEST_ID)?.to_str().ok()
     }
 
     /// The handler of [`own_for`]'s route: every value it received under

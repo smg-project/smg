@@ -21,6 +21,7 @@ pub mod softmax;
 mod default;
 
 #[cfg(test)]
+#[path = "../../../tests/unit/policies/cost/sim_tests.rs"]
 mod sim_tests;
 
 pub use accounting::OptimisticAccounting;

@@ -18,7 +18,8 @@ mod tests;
 use std::{sync::Arc, time::Duration};
 
 use engine_zmq_adapter::{
-    StructuredOutputBackend, StructuredOutputsBackendConfig, StructuredOutputsSupport,
+    ConstraintKinds, StructuredOutputBackend, StructuredOutputsBackendConfig,
+    StructuredOutputsSupport,
 };
 use smg_grpc_client::{
     common_proto as common, trtllm_proto::trtllm_service_server::TrtllmServiceServer,
@@ -99,16 +100,25 @@ pub struct TrtllmModelInfo {
 /// What the engine enforces of a structured request, read off the
 /// launcher's facts: the `guided_decoding_backend` the engine's arguments
 /// resolve to. `none` enforces nothing (the engine refuses a guided request
-/// at admission, which the shim reports as a 400 abort); `xgrammar` and
-/// `llguidance` compile all four kinds. A launcher that could not tell leaves
-/// nothing judged ahead of the engine. The adapter refuses a constraint
-/// outside this before the engine, as on every wire.
+/// at admission, which the shim reports as a 400 abort); `xgrammar` compiles
+/// all four kinds; `llguidance` compiles JSON schemas, regular expressions
+/// and EBNF grammars and fails a structural tag at compile. A launcher that
+/// could not tell leaves nothing judged ahead of the engine. The adapter
+/// refuses a constraint outside this before the engine, as on every wire.
 pub(super) fn structured_outputs_support(model: &TrtllmModelInfo) -> StructuredOutputsSupport {
     use StructuredOutputsBackendConfig::{Other, Pinned};
 
     match model.guided_decoding_backend.trim() {
         "xgrammar" => Pinned(StructuredOutputBackend::Xgrammar).into(),
-        "llguidance" => Pinned(StructuredOutputBackend::Guidance).into(),
+        "llguidance" => StructuredOutputsSupport::new(
+            Pinned(StructuredOutputBackend::Guidance),
+            ConstraintKinds {
+                json_schema: true,
+                regex: true,
+                ebnf: true,
+                structural_tag: false,
+            },
+        ),
         "none" => StructuredOutputsSupport::DISABLED,
         _ => Other.into(),
     }

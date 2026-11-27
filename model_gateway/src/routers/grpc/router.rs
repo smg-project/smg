@@ -1397,4 +1397,5 @@ fn clear_unapplied_reasoning_keys(body: &mut ResponsesRequest) {
 }
 
 #[cfg(test)]
+#[path = "../../../tests/unit/routers/grpc/router/tests.rs"]
 mod tests;

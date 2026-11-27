@@ -10,7 +10,7 @@
 //!
 //! | trait | who calls | how often |
 //! |---|---|---|
-//! | [`WorkersStore`] | the readers of a membership row: a host, and the holder of its worker objects for a row's status and its count. The trait holds no write: a row is written through that holder, or as a decided change ([`MemoryStore::follow`]) | per membership change or status tell, never per request |
+//! | [`WorkersStore`] | the readers of a membership row: a host, and the holder of its worker objects for a row's count. A row's told status the holder reads off the crate's own store (`MemoryStore::told_status`). The trait holds no write: a row is written through that holder, or as a decided change ([`MemoryStore::follow`]) | in this repository: the count per object laid and per row that stands at a cut laid whole; the epoch per membership call, per veto frame at a gateway's ceiling and per turn of a controller to ready. No decision calls it |
 //! | [`HealthSink`] | every gateway's vetoes. A worker's status is its worker object's word, told by the holder of the objects | per veto a gateway sets or lifts |
 //! | [`LeasesStore`] | every decision, dispatch and completion report, the dispatch-deadline sweep, `Hello` pages | two to three frames per request |
 //!

@@ -12,6 +12,7 @@
 //! - Efficient prefix matching with match counts
 //!
 //! [`ModelTrees`] keeps one tree of each kind per model.
+//! [`ModelPlacements`] keeps one placement map per model.
 
 mod block;
 pub mod chain_index;
@@ -24,6 +25,7 @@ mod lane_map;
 pub mod lane_pool;
 mod model_trees;
 mod path_hash;
+mod placements;
 mod prefetch;
 pub mod reference;
 pub mod salt;
@@ -45,6 +47,9 @@ pub use lane_pool::{
 };
 pub use model_trees::ModelTrees;
 pub use path_hash::{hash_node_path, hash_token_path, GLOBAL_EVICTION_HASH};
+pub use placements::{
+    hash_token_head, ModelPlacements, PlacementHolder, PlacementMap, PLACEMENT_HOLDER_CAP,
+};
 pub use reference::{request_prefix_hashes, ReferenceIndexer};
 pub use sharded::{ShardedChainIndex, SHARD_SHIFT};
 // Re-export under names matching old tree.rs API for easier migration

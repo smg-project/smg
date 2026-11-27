@@ -1083,6 +1083,11 @@ impl Loaded<'_, '_> {
     /// ([`pair::date_decode_claim`]): the host tells each word of the side
     /// under that lease's date.
     ///
+    /// `claimed` is the claim the lease's first decision made for its
+    /// decode side, as the host's record states it: the key, and the
+    /// worker, `WorkerId(0)` where it claimed none. A call that claims
+    /// another worker under that key hands it on with its date.
+    ///
     /// A call that hands no pair's lists is decided over no worker.
     ///
     /// # Errors
@@ -1096,6 +1101,7 @@ impl Loaded<'_, '_> {
         self,
         maker: &impl RequestMaker,
         held: &super::decision::Target,
+        claimed: (super::view::Session, WorkerId),
         issued_micros: u64,
         now: Instant,
     ) -> Result<super::decision::Decision, DecisionRefused> {
@@ -1129,7 +1135,8 @@ impl Loaded<'_, '_> {
             if let Ok(decision) = &decided {
                 let facts = &request.facts;
                 let key = || pair::decode_session(facts);
-                pair::date_decode_claim(own, decision, key, facts.now_micros, issued_micros);
+                let at = facts.now_micros;
+                pair::date_decode_claim(own, decision, key, at, || claimed, issued_micros);
             }
             decided
         })
@@ -1378,9 +1385,10 @@ impl Loaded<'_, '_> {
 /// and is counted with them. A panic in a stage that hears a word is held
 /// here too and counted ([`InProcess::unheard`]): the request goes on.
 ///
-/// A word of a lease is told to the stages of the document in force, where
-/// that document issued the lease. A lease issued under a document that a
-/// new one replaced since is told to nobody ([`InProcess::apply`]). The
+/// The engine tells a word of a lease to stages that take it and to no
+/// other. Such a stage is the document in force's where that document
+/// issued the lease. For a lease an earlier document issued it is one the
+/// document in force kept that stood then ([`InProcess::apply`]). The
 /// shadow counts are those of the document in force.
 impl DecisionEngine for InProcess {
     fn decide_under(
@@ -1436,7 +1444,8 @@ impl DecisionEngine for InProcess {
 
     fn say(&self, _: GatewayId, held: &HeldDecision<'_>, said: Said, _: Instant) {
         // A single's word no stage takes is told to nobody. A pair's
-        // dispatch may carry its decode's issue: every word of one is told.
+        // dispatch may carry its decode's issue: every word of one goes to
+        // the rule of a lease's words, which says what its stages hear.
         let kind = match said {
             Said::Dispatched(..) => EventKind::Dispatched,
             Said::Completed(_) => EventKind::Completed,

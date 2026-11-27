@@ -63,6 +63,7 @@ async def _engine_prompts(request):
         _mm_inflight=Mock(),
         _build_preprocessed_mm_inputs=Mock(),
         _off_the_event_loop=processed,
+        _structured_outputs_backend="auto",
         _sampling_params_from_proto=lambda *args, **kwargs: SimpleNamespace(
             extra_args=None, logprobs=None, prompt_logprobs=None
         ),

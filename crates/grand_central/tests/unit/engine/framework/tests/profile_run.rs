@@ -667,26 +667,66 @@ fn a_profile_of_one_stage_scores_as_the_sum_scores_it() {
     assert_ne!(41.0f32 * (1.0 / 41.0f32), 1.0);
 }
 
-/// A profile may hold as many scorers as a place can name: the walk
-/// that lists the stages that keep reports ends with the list.
+/// The list of the stages that keep reports holds a scorer wherever it
+/// stands in its profile. The profile holds 65,536 scorers that keep
+/// none, as many as sixteen bits count, and then one that keeps reports.
+/// The engine says it keeps reports, and a report told to its keepers
+/// reaches that last scorer.
 #[test]
-fn an_engine_of_as_many_scorers_as_a_place_names_is_built() {
-    let scorers = (0..u16::MAX)
-        .map(|_| WeightedScorer {
-            scorer: Box::new(LeastRequests),
+fn an_engine_lists_a_keeper_past_sixteen_bits_of_its_profiles_scorers() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// A scorer that says it keeps reports, and counts the signals it is
+    /// told.
+    #[derive(Debug)]
+    struct Keeps(Arc<AtomicU32>);
+    impl Lifecycle for Keeps {
+        fn keeps_loads(&self) -> bool {
+            true
+        }
+        fn on_signal(&self, _: &Signal<'_>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    impl Scorer for Keeps {
+        fn name(&self) -> &'static str {
+            "keeps"
+        }
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            _: &[Candidate],
+            _: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            out.fill(0.0);
+            TieBand::NORMALIZED
+        }
+    }
+    let wide = |last: Option<Box<dyn Scorer>>| {
+        let ahead = (0..=u16::MAX).map(|_| -> Box<dyn Scorer> { Box::new(LeastRequests) });
+        let scorers = ahead.chain(last);
+        let scorers = scorers.map(|scorer| WeightedScorer {
+            scorer,
             weight: 1.0,
-        })
-        .collect();
-    let engine = Engine::new(
-        vec![Profile {
+        });
+        let profile = Profile {
             name: "wide".into(),
             filters: Vec::new(),
-            scorers,
+            scorers: scorers.collect(),
             picker: Box::new(Best),
-        }],
-        vec![single_binding()],
-        1,
-        Needs::default(),
-    );
-    assert!(!engine.keeps_loads(), "no stage of it keeps a report");
+        };
+        Engine::new(vec![profile], vec![single_binding()], 1, Needs::default())
+    };
+    assert!(!wide(None).keeps_loads(), "no stage of it keeps a report");
+    let told = Arc::new(AtomicU32::new(0));
+    let engine = wide(Some(Box::new(Keeps(Arc::clone(&told)))));
+    assert!(engine.keeps_loads(), "the last one");
+    // The engine over worker lists tells its keepers a report.
+    #[cfg(feature = "in-process")]
+    {
+        let report = Signal::load(WorkerId(1), 0, view::LoadRow::default(), 0);
+        engine.tell_loads(|tell| tell(&report));
+        assert_eq!(told.load(Ordering::Relaxed), 1, "the report reaches it");
+    }
 }

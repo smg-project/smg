@@ -703,3 +703,226 @@ fn survivors_hold_a_count_or_none_in_one_word() {
     };
     assert!(drew.drew_first());
 }
+
+/// The one bare word `text` is in quotes, as a stage is named: lower-case
+/// letters, digits and hyphens behind a letter.
+fn bare_word(text: &str) -> Option<&str> {
+    let word = text.strip_prefix('"')?.strip_suffix('"')?;
+    let plain = |ch: char| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-';
+    (word.starts_with(|ch: char| ch.is_ascii_lowercase()) && word.chars().all(plain))
+        .then_some(word)
+}
+
+/// The arguments of the call whose opening bracket ends `lines[at][..open]`,
+/// read to the bracket that closes it, on that line or on lines below: each
+/// argument between two commas of the call's own, trimmed.
+fn arguments(lines: &[&str], at: usize, open: usize) -> Vec<String> {
+    let mut found = vec![String::new()];
+    let mut depth = 1_usize;
+    let mut rest = &lines[at][open..];
+    let mut below = at + 1;
+    loop {
+        for ch in rest.chars() {
+            match ch {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 {
+                return found.iter().map(|one| one.trim().to_owned()).collect();
+            }
+            if ch == ',' && depth == 1 {
+                found.push(String::new());
+            } else if let Some(last) = found.last_mut() {
+                last.push(ch);
+            }
+        }
+        let Some(next) = lines.get(below) else {
+            return Vec::new();
+        };
+        rest = next;
+        below += 1;
+    }
+}
+
+/// The bare words a source file spells where a name of the engine's own
+/// would stand, outside their list ([`KEPT`]), each with its place. `file`
+/// is the file's path under `src`. Two things are read, and a line comment
+/// is not: a `&str` constant of one bare word, and a bare word where a
+/// refusal takes its name. Those places are a shed's `emptied_by` field, an
+/// argument of a call that makes a refusal (`shed`, `turned_away`,
+/// `declined`, `gap`, `Emptied`), and under `engine` a name handed on as
+/// `Some(..)` or `unwrap_or(..)`.
+fn own_names_spelled(file: &str, text: &str) -> Vec<String> {
+    const MAKERS: [&str; 5] = ["shed(", "turned_away(", "declined(", "gap(", "Emptied("];
+    const HANDED_ON: [&str; 2] = ["Some(", "unwrap_or("];
+    let lines: Vec<&str> = text
+        .lines()
+        .map(|line| line.split("//").next().unwrap_or_default().trim())
+        .collect();
+    let mut faults = Vec::new();
+    for (at, line) in lines.iter().enumerate() {
+        let place = format!("src/{file}:{}", at + 1);
+        let constant = line
+            .split_once(": &str = ")
+            .or_else(|| line.split_once(": &'static str = "))
+            .filter(|(declared, _)| declared.contains("const "));
+        if let Some((declared, value)) = constant {
+            if let Some(word) = bare_word(value.trim_end_matches(';')) {
+                let name = declared.rsplit(' ').next().unwrap_or_default();
+                faults.push(format!("{place}: the constant {name} spells {word:?}"));
+            }
+        }
+        if let Some((_, value)) = line.split_once("emptied_by: ") {
+            if let Some(word) = bare_word(value.trim_end_matches(',')) {
+                faults.push(format!("{place}: a shed's `emptied_by` spells {word:?}"));
+            }
+        }
+        let handed_on = HANDED_ON.iter().filter(|_| file.starts_with("engine/"));
+        for maker in MAKERS.iter().chain(handed_on) {
+            for (found, _) in line.match_indices(maker) {
+                // A longer name that ends so is another function.
+                let own = !line[..found].ends_with(|ch: char| ch.is_alphanumeric() || ch == '_');
+                for argument in arguments(&lines, at, found + maker.len()) {
+                    if let Some(word) = bare_word(&argument).filter(|_| own) {
+                        faults.push(format!("{place}: `{maker}..)` spells {word:?}"));
+                    }
+                }
+            }
+        }
+    }
+    faults
+}
+
+/// Every `.rs` file under `dir`, as its path under `src` with `/` between
+/// its parts and its text, in the order of the paths.
+fn read_sources(src: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+    let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .unwrap_or_else(|error| panic!("{}: {error}", dir.display()))
+        .map(|entry| entry.expect("a directory entry").path())
+        .collect();
+    entries.sort();
+    for path in entries {
+        if path.is_dir() {
+            read_sources(src, &path, out);
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            let under = path.strip_prefix(src).expect("a file under src");
+            out.push((under.to_string_lossy().replace('\\', "/"), text));
+        }
+    }
+}
+
+/// At the places the guard reads ([`own_names_spelled`]), the engine's own
+/// refusal names are spelled in one place, the list of the decision's
+/// module ([`KEPT`]): the validator refuses a document that names a host's
+/// stage under one. No other file under `src/engine` or `src/service`
+/// spells such a name there: a refusal reads a constant of the list or a
+/// stage's own name. A new word written at one of those places then enters
+/// by the list. No other file of the two folders declares a constant of
+/// one bare word but three, none a name of the engine's own: the names
+/// of the stock filter `has-capacity` and the stock picker `round-robin`,
+/// which the stock table holds, and a header's name.
+#[test]
+fn the_engines_own_refusal_names_are_spelled_in_their_list_alone() {
+    // Each by its file and what the guard says of it behind the line.
+    const OTHER_WORDS: [(&str, &str); 3] = [
+        (
+            "src/engine/framework.rs:",
+            ": the constant TURNS_ITS_SET spells \"round-robin\"",
+        ),
+        (
+            "src/engine/in_process/pair.rs:",
+            ": the constant HAS_CAPACITY spells \"has-capacity\"",
+        ),
+        (
+            "src/service/controller/principal.rs:",
+            ": the constant ENTRY spells \"x-smg-principal\"",
+        ),
+    ];
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    read_sources(&src, &src.join("engine"), &mut files);
+    read_sources(&src, &src.join("service"), &mut files);
+    assert!(files.len() > 60, "the walk read {} files", files.len());
+    let mut faults = Vec::new();
+    for (file, text) in &files {
+        if file != "engine/decision.rs" {
+            faults.extend(own_names_spelled(file, text));
+        }
+    }
+    faults.retain(|fault| {
+        !OTHER_WORDS
+            .iter()
+            .any(|(file, said)| fault.starts_with(file) && fault.ends_with(said))
+    });
+    assert!(
+        faults.is_empty(),
+        "{}\nA name the engine refuses under goes in `KEPT` (src/engine/decision.rs); \
+         a word that is no refusal goes in `OTHER_WORDS` above.",
+        faults.join("\n")
+    );
+    // The list's own file spells each of its names once, as a constant.
+    let list = std::fs::read_to_string(src.join("engine/decision.rs")).expect("the list's file");
+    let spelled = own_names_spelled("engine/decision.rs", &list);
+    for name in KEPT {
+        let ends = format!(" spells {name:?}");
+        let times = spelled
+            .iter()
+            .filter(|fault| fault.ends_with(&ends))
+            .count();
+        assert_eq!(times, 1, "{name}: {spelled:?}");
+    }
+    assert_eq!(spelled.len(), KEPT.len(), "{spelled:?}");
+}
+
+/// The guard reads a name at each place it reads for one, over the lines
+/// the format step wraps a call into, and reads no line comment, no longer
+/// function's name and no word that is not a stage's shape.
+#[test]
+fn the_guard_reads_a_name_where_a_refusal_takes_one() {
+    let spelled = "\
+const WORD: &str = \"new-word\";
+pub(crate) const OTHER: &'static str = \"other\";
+    return shed(ShedReason::NoEndpoints, \"partners\", trace);
+        emptied_by: \"budget\",
+    turned_away(
+        ShedReason::PolicyDeclined,
+        \"binding\",
+        unbound,
+    )
+    return Some(\"none\");
+    .unwrap_or(\"none\")
+    Taken::Emptied(\"wires\")
+";
+    assert_eq!(
+        own_names_spelled("engine/made_up.rs", spelled),
+        [
+            "src/engine/made_up.rs:1: the constant WORD spells \"new-word\"",
+            "src/engine/made_up.rs:2: the constant OTHER spells \"other\"",
+            "src/engine/made_up.rs:3: `shed(..)` spells \"partners\"",
+            "src/engine/made_up.rs:4: a shed's `emptied_by` spells \"budget\"",
+            "src/engine/made_up.rs:5: `turned_away(..)` spells \"binding\"",
+            "src/engine/made_up.rs:10: `Some(..)` spells \"none\"",
+            "src/engine/made_up.rs:11: `unwrap_or(..)` spells \"none\"",
+            "src/engine/made_up.rs:12: `Emptied(..)` spells \"wires\"",
+        ]
+    );
+    // A name handed on is read under `engine` alone.
+    assert_eq!(
+        own_names_spelled("service/made_up.rs", "    .unwrap_or(\"none\")\n"),
+        [""; 0]
+    );
+    let clean = "\
+// return shed(ShedReason::NoEndpoints, \"partners\", trace);
+    return shed(ShedReason::NoEndpoints, PARTNERS, trace); // \"partners\"
+    return shed(reason_of(stage), stage, trace);
+    watershed(\"partners\");
+    emptied_by: TARGET_WORKER,
+    const TOTAL: &str = \"smg_policy_faults_total\";
+    return Some(\"Mixed-Case\");
+    let stage = filter(profile, facts).unwrap_or(NO_STAGE);
+";
+    assert_eq!(own_names_spelled("engine/made_up.rs", clean), [""; 0]);
+}

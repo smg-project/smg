@@ -36,18 +36,23 @@ fn watcher_of(store: Arc<MemoryStore>) -> Watcher<Members> {
     Watcher::new(store, Arc::new(objects))
 }
 
-/// What a watcher holds of its controller's workers, by id: each row's
-/// facts, status and revision. Each row has its worker object, built at the
-/// row's revision, and no other object stands.
+/// What a watcher holds of its controller's workers, by id, in a first
+/// copy. Each row's facts and revision are as the watcher's holder reads
+/// them off its worker objects, and its status is the one the store told.
+/// The watcher's table holds each row with the same facts at the same
+/// revision, and no object stands that the table does not tell. A row the
+/// table alone holds is not seen here.
 fn watched(watcher: &Watcher<Members>) -> Vec<(WorkerId, WorkerFacts, WorkerStatus, u64)> {
-    let (_, mut rows) = WorkersStore::all_rows(&**watcher.store());
+    let mut rows = watcher.objects().checkpoint(watcher.store()).rows;
     rows.sort_by_key(|row| row.id.0);
     let objects = watcher.objects();
-    assert_eq!(objects.len(), rows.len(), "one worker object a row");
-    let built = |id| Some(objects.standing(&objects.object(id)?)?.revision);
+    assert_eq!(objects.len(), rows.len(), "one told row a worker object");
+    let table = |id| WorkersStore::get(&**watcher.store(), id);
     rows.into_iter()
         .map(|row| {
-            assert_eq!(built(row.id), Some(row.revision), "the row's object");
+            let held = table(row.id).map(|held| (held.facts, held.revision));
+            let stated = (row.facts.clone(), row.revision);
+            assert_eq!(held, Some(stated), "the table's row");
             (row.id, row.facts, row.status, row.revision)
         })
         .collect()

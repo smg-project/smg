@@ -163,7 +163,7 @@ pub(crate) struct PreparedInput {
 pub(crate) fn prepare(ctx: &RequestContext) -> Result<Option<PreparedInput>, PrepareError> {
     let (plan, unsupported_flags) = match &ctx.input.request_type {
         RequestType::Chat(body) => (
-            media_plan_chat(&body.messages),
+            media_plan_chat(&body.messages, &body.other),
             body.session_params.is_some() || body.return_hidden_states,
         ),
         RequestType::Messages(body) => (media_plan_messages(&body.messages), false),

@@ -94,6 +94,8 @@ mod handles {
         pub(super) ttft: OnceCell<Histogram>,
         /// `smg_router_dispatch_wait_seconds`.
         pub(super) dispatch_wait: OnceCell<Histogram>,
+        /// `smg_router_dispatch_wait_after_body_seconds`.
+        pub(super) dispatch_wait_after_body: OnceCell<Histogram>,
         /// `smg_router_tpot_seconds`.
         pub(super) tpot: OnceCell<Histogram>,
         /// `smg_router_time_to_first_token_seconds`.
@@ -346,6 +348,20 @@ pub(crate) const REQUEST_TIME_PER_OUTPUT_TOKEN_SECONDS: &str =
 /// is not the count of `smg_router_ttft_seconds`. A Responses tool loop
 /// observes one per turn, a later turn's from that turn's start.
 pub(crate) const DISPATCH_WAIT_SECONDS: &str = "smg_router_dispatch_wait_seconds";
+
+/// The dispatch wait without the upload of the request body: the
+/// observation of [`DISPATCH_WAIT_SECONDS`] (once per answer, the same
+/// labels, buckets and end) less the time the read of the body waited for
+/// the client, from the first read that found the body not yet there to
+/// where its reader let go of the body. What the gateway does for the
+/// request is in both, on either side of that read: authentication, the
+/// wait for an admission permit, the run of the WASM modules. A body that
+/// came whole, and a generation that read no body (a later turn of a tool
+/// loop), takes nothing off: its dispatch wait is observed here unchanged.
+/// A multipart upload is measured as any other body: its route stands
+/// outside the request-body deadline layer and takes the measure alone.
+pub(crate) const DISPATCH_WAIT_AFTER_BODY_SECONDS: &str =
+    "smg_router_dispatch_wait_after_body_seconds";
 
 /// Histogram buckets for `smg_router_time_to_first_token_seconds`: six per
 /// decade (1, 1.5, 2, 3, 5, 7.5) from 10 ms to 10 s, where a first-token
@@ -694,6 +710,10 @@ pub(crate) fn init_metrics() {
     describe_histogram!(
         DISPATCH_WAIT_SECONDS,
         "Dispatch wait of streamed and collected answers by router_type, backend_type, model, endpoint (gRPC only; a Responses answer on the Harmony pipeline records none, streamed or collected, nor does a background Responses request that is not streamed): from the request's entry at the edge to the answering attempt's RPC dispatch (the prefill dispatch of a prefill-decode pair, after the encode call when encode pushes), where the clock of smg_router_ttft_seconds starts, so the body read, admission, tokenizing, templating, worker selection, a refused attempt's wait and its backoff are here; observed once per answer, under the labels of smg_router_ttft_seconds; for a streamed answer the two add up to the time to first token from the request's receipt; a collected answer records no first token, so this family's count also holds the collected answers and is not the count of smg_router_ttft_seconds; a Responses tool loop observes one per turn, streamed or collected: the first turn's from the request's entry, a later turn's from that turn's start, after the generations and tool calls before it, so a later streamed turn's two add up to the time to first token from the turn's start"
+    );
+    describe_histogram!(
+        DISPATCH_WAIT_AFTER_BODY_SECONDS,
+        "Dispatch wait without the upload of the request body, by router_type, backend_type, model, endpoint (gRPC only; observed wherever smg_router_dispatch_wait_seconds is, under the same labels and buckets): smg_router_dispatch_wait_seconds less the time the read of the request body waited for the client; authentication, the wait for an admission permit, the run of WASM modules, parsing, tokenizing, templating, worker selection, a refused attempt's wait and its backoff are in both; the body's upload is in smg_router_dispatch_wait_seconds alone; a body that came whole and a later turn of a Responses tool loop take nothing off and observe the same value in both; a multipart upload is measured as any other body"
     );
     describe_histogram!(
         "smg_router_tpot_seconds",
@@ -1290,6 +1310,10 @@ fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Mat
     // keeps the request-latency buckets (an operator's list with them), as
     // the TTFT it adds up with does.
     let dispatch_wait_matcher = Matcher::Full(String::from(DISPATCH_WAIT_SECONDS));
+    // The dispatch wait without the upload lies beside it, on
+    // the same edges.
+    let dispatch_wait_after_body_matcher =
+        Matcher::Full(String::from(DISPATCH_WAIT_AFTER_BODY_SECONDS));
 
     // The first-token and per-output-token families: their own log-spaced
     // edges, which `--prometheus-duration-buckets` does not replace.
@@ -1330,7 +1354,8 @@ fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Mat
         (duration_matcher, duration_bucket.clone()),
         (ttft_matcher, duration_bucket.clone()),
         (tpot_matcher, duration_bucket.clone()),
-        (dispatch_wait_matcher, duration_bucket),
+        (dispatch_wait_matcher, duration_bucket.clone()),
+        (dispatch_wait_after_body_matcher, duration_bucket),
         (first_token_matcher, TIME_TO_FIRST_TOKEN_BUCKETS.to_vec()),
         (
             per_output_token_matcher,
@@ -1411,6 +1436,10 @@ pub struct StreamingMetricsParams<'a> {
     /// no first token. None for a generation dispatched under no entry
     /// stamp.
     pub dispatch_wait: Option<Duration>,
+    /// The same wait less what the read of the request's body waited for
+    /// the client: given whenever `dispatch_wait` is, and equal to it for a
+    /// generation whose body came whole or that read none.
+    pub dispatch_wait_after_body: Option<Duration>,
     /// Total generation time
     pub generation_duration: Duration,
     /// Input token count (None for endpoints that don't track this)
@@ -1983,6 +2012,7 @@ impl Metrics {
             endpoint,
             ttft,
             dispatch_wait,
+            dispatch_wait_after_body,
             generation_duration,
             input_tokens,
             cached_tokens,
@@ -2009,6 +2039,8 @@ impl Metrics {
         };
         let ttft_histogram = || duration_histogram("smg_router_ttft_seconds");
         let dispatch_wait_histogram = || duration_histogram(DISPATCH_WAIT_SECONDS);
+        let dispatch_wait_after_body_histogram =
+            || duration_histogram(DISPATCH_WAIT_AFTER_BODY_SECONDS);
         let tpot_histogram = || duration_histogram("smg_router_tpot_seconds");
         let first_token_histogram = || duration_histogram(TIME_TO_FIRST_TOKEN_SECONDS);
         let per_output_token_histogram =
@@ -2036,6 +2068,9 @@ impl Metrics {
             }
             if let Some(wait) = dispatch_wait {
                 dispatch_wait_histogram().record(wait.as_secs_f64());
+            }
+            if let Some(wait) = dispatch_wait_after_body {
+                dispatch_wait_after_body_histogram().record(wait.as_secs_f64());
             }
             if let Some(tpot) = tpot {
                 let seconds = tpot.as_secs_f64();
@@ -2074,6 +2109,11 @@ impl Metrics {
                     if let Some(wait) = dispatch_wait {
                         kept.dispatch_wait
                             .get_or_init(dispatch_wait_histogram)
+                            .record(wait.as_secs_f64());
+                    }
+                    if let Some(wait) = dispatch_wait_after_body {
+                        kept.dispatch_wait_after_body
+                            .get_or_init(dispatch_wait_after_body_histogram)
                             .record(wait.as_secs_f64());
                     }
                     if let Some(tpot) = tpot {

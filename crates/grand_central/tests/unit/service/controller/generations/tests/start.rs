@@ -9,7 +9,7 @@ use std::{
 
 use super::{
     super::Generations, applied, candidate_under, election, followed, generations,
-    generations_under, sent, stored, yaml, REPLICA_NOTICES,
+    generations_under, sent, stored, yaml,
 };
 use crate::{
     document::{
@@ -132,11 +132,13 @@ fn a_replica_that_deferred_its_document_follows_a_leader_under_any_number() {
     );
 }
 
-/// A host can publish and serve its start's document without using
-/// the replica's source and standing notifications.
+/// A replica's source applies its document through the replica. The
+/// check its caller hands in is asked ahead of the pass and behind it,
+/// and the pass's notice runs between the two: at the second asking the
+/// document the source handed has passed and has not stood. It stands
+/// behind the apply.
 #[test]
-fn a_local_start_serves_its_document_without_notifying_a_replica() {
-    REPLICA_NOTICES.with(|notices| notices.set(Some(0)));
+fn a_sources_apply_tells_its_pass_between_its_callers_two_checks() {
     let (_, replica) = generations();
     let admissions = Cell::new(0);
     let applied = replica.apply_where(
@@ -145,17 +147,24 @@ fn a_local_start_serves_its_document_without_notifying_a_replica() {
         Format::Yaml,
         true,
         |_| {
-            assert_eq!(REPLICA_NOTICES.with(Cell::get), Some(admissions.get()));
+            assert_eq!(
+                replica.source_stood(),
+                admissions.get() == 0,
+                "nothing handed at the first asking, passed and not stood at the second"
+            );
             admissions.set(admissions.get() + 1);
             None
         },
     );
     assert_eq!(applied, Ok(ApplyOutcome::Generation(1)));
-    assert_eq!(
-        REPLICA_NOTICES.with(|notices| notices.replace(Some(0))),
-        Some(2)
-    );
+    assert_eq!(admissions.get(), 2, "asked ahead of the pass and behind it");
+    assert!(replica.source_stood(), "the source's document stands");
+}
 
+/// A host can publish and serve its start's document with no replica
+/// beside its door: the door applies it, holds it and answers it.
+#[test]
+fn a_local_start_serves_its_document_with_no_replica() {
     let door = DocumentManager::new(Arc::new(MemoryStore::new()), stock(), Vec::new());
     assert_eq!(
         door.apply(RANDOM.into(), Format::Yaml),
@@ -168,7 +177,6 @@ fn a_local_start_serves_its_document_without_notifying_a_replica() {
         (1, RANDOM.as_bytes())
     );
     assert_eq!((status.generation, status.digest), (1, Some(held.digest)));
-    assert_eq!(REPLICA_NOTICES.with(Cell::get), Some(0));
 }
 
 /// A start that defers its document passes it under the door's lock,

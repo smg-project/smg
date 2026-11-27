@@ -1067,11 +1067,15 @@ impl AppContextBuilder {
     /// requests by no routing policy, so the option moves nothing there,
     /// and this start says so in one log line.
     ///
-    /// The engine builds no hash index yet. Where the document the routing
-    /// settings mean holds an index entry of the hash kind, the start runs
-    /// and `cache_aware` remembers no request, which this start says in one
-    /// warning that names the setting, `cache_index`. A supplied document
-    /// states its own index entries, which the warning does not read.
+    /// A request carries `view.max_block_hashes` block hashes at most, and
+    /// the routing settings never raise that count. Where the document the
+    /// settings mean holds an index entry of the hash kind and a boundary
+    /// past those blocks, the start runs and `cache_aware` remembers no
+    /// request at that boundary, which this start says in one warning that
+    /// names the setting, `cache_boundaries`. It counts with the document's
+    /// block size, which a request is hashed by until the model's workers
+    /// report their own. A supplied document states its own view, which
+    /// the warning does not read.
     fn policy_in_force(
         config: &RouterConfig,
         stages: Option<&StageRegistry>,
@@ -1094,14 +1098,26 @@ impl AppContextBuilder {
             None => config.hosted_policy(&document, &StageRegistry::builtin()),
         };
         let spec = checked.map_err(|refused| format!("Grand Central: {refused}"))?;
-        // The engine keeps its record of sent prefixes under the tree index
-        // alone: a hash entry runs and remembers no request. The line stands
+        // A hash entry keys a request at the view's boundaries, and no
+        // request carries a block past the view's bound. The line stands
         // behind the check, so a refused start says its refusal alone.
         let mut entries = document.index.values();
         if config.policy_spec.is_none() && entries.any(|entry| entry.kind == IndexKind::Hash) {
-            tracing::warn!(
-                "Grand Central: cache_index = hash: the engine builds no hash index yet, so cache_aware remembers no request: use the tree index"
-            );
+            let block = spec.block_size().max(1);
+            let most = u32::try_from(spec.max_block_hashes()).unwrap_or(u32::MAX);
+            let past: Vec<u32> = document
+                .view
+                .boundaries
+                .iter()
+                .copied()
+                .filter(|boundary| boundary / block > most)
+                .collect();
+            if !past.is_empty() {
+                let reach = u64::from(most) * u64::from(block);
+                tracing::warn!(
+                    "Grand Central: cache_index = hash: cache_boundaries {past:?} lie past the {reach} tokens a request is hashed to at the document's block size of {block} tokens, so cache_aware remembers no request at them unless the model's workers report a larger block"
+                );
+            }
         }
         Ok(Some((document, spec)))
     }
@@ -2217,19 +2233,18 @@ mod tests {
         });
     }
 
-    /// The engine builds no hash index yet, so under Grand Central a
-    /// `cache_aware` policy over the hash kind of the cache index remembers
-    /// no request. The start runs its engine and says so once, by the
-    /// setting's name. The settings' other readers say nothing, and neither
-    /// does the start's step with Grand Central off, under the tree kind,
-    /// or over a supplied document, which states its own index entries. A
-    /// start the check refuses says its refusal alone.
+    /// Under Grand Central a `cache_aware` policy over the hash kind of the
+    /// cache index keeps what it placed in the engine's record of sent
+    /// prefixes. With boundaries a request reaches, the start runs its
+    /// engine and says no line of the index: not at its step with Grand
+    /// Central off, under the tree kind or over a supplied document, not
+    /// where the check refuses the start, and not where the gateway starts.
     #[traced_test]
     #[tokio::test]
-    async fn the_start_alone_says_once_that_the_hash_index_remembers_no_request() {
+    async fn the_start_under_the_hash_index_runs_its_engine_and_says_nothing_of_it() {
         use crate::config::{validation::ConfigValidator, CacheIndexKind, PolicyConfig};
 
-        const LINE: &str = "Grand Central: cache_index = hash: the engine builds no hash index yet";
+        const LINE: &str = "cache_index = hash";
         let of_kind = |kind: CacheIndexKind| {
             let boundaries = vec![512, 2048];
             let mut config = RouterConfig {
@@ -2269,7 +2284,7 @@ mod tests {
             ..hashed.clone()
         };
         assert!(matches!(step(&supplied), Ok(Some(_))));
-        assert!(!logs_contain(LINE), "a reader other than the start said it");
+        assert!(!logs_contain(LINE), "a step of the start said it");
         // A setting the check refuses: the settings translate, and the start
         // ends by the refusal alone.
         let mut refused = hashed.clone();
@@ -2295,10 +2310,69 @@ mod tests {
             .expect("the gateway starts");
         let registry = &context.policy_registry;
         assert!(registry.engine().is_some(), "the engine runs");
+        assert!(!logs_contain(LINE), "the start said it");
+    }
+
+    /// A request carries `view.max_block_hashes` block hashes at most, which
+    /// the routing settings never raise, so under the hash kind of the
+    /// cache index a boundary past them keys no request. The start runs its
+    /// engine and says so once, by the setting's name and the boundaries
+    /// past. Its step says nothing with Grand Central off, under the tree
+    /// kind, or over a supplied document, which states its own view.
+    #[traced_test]
+    #[tokio::test]
+    async fn the_start_says_once_which_boundaries_of_a_hash_index_key_no_request() {
+        use crate::config::{CacheIndexKind, PolicyConfig};
+
+        const LINE: &str = "cache_index = hash";
+        const SAID: &str = "cache_boundaries [8192, 32768] lie past the 4096 tokens a request is hashed to at the document's block size of 16 tokens";
+        let of_kind = |kind: CacheIndexKind| {
+            let boundaries = vec![512, 8192, 32768];
+            let mut config = RouterConfig {
+                policy: PolicyConfig::cache_aware(0.5, 32, 1.1, 60, 1_000),
+                cache_boundaries: boundaries.clone(),
+                grand_central: true,
+                ..RouterConfig::default()
+            };
+            if let PolicyConfig::CacheAware {
+                cache_index,
+                cache_boundaries,
+                ..
+            } = &mut config.policy
+            {
+                *cache_index = kind;
+                *cache_boundaries = boundaries;
+            }
+            config.health_check.disable_health_check = true;
+            config
+        };
+        let hashed = of_kind(CacheIndexKind::Hash);
+        let document = hashed
+            .policy_document_in_force()
+            .expect("the settings' document");
+        let step = |config: &RouterConfig| AppContextBuilder::policy_in_force(config, None);
+        let off = RouterConfig {
+            grand_central: false,
+            ..hashed.clone()
+        };
+        assert!(matches!(step(&off), Ok(None)));
+        assert!(matches!(step(&of_kind(CacheIndexKind::Tree)), Ok(Some(_))));
+        let supplied = RouterConfig {
+            policy_spec: Some(document),
+            ..hashed.clone()
+        };
+        assert!(matches!(step(&supplied), Ok(Some(_))));
+        assert!(!logs_contain(LINE), "a step of the start said it");
+
+        let context = AppContext::from_config(hashed, 30, None, None)
+            .await
+            .expect("the gateway starts");
+        let registry = &context.policy_registry;
+        assert!(registry.engine().is_some(), "the engine runs");
         logs_assert(|lines: &[&str]| {
             let said: Vec<_> = lines.iter().filter(|line| line.contains(LINE)).collect();
             match said.as_slice() {
-                [line] if line.contains("WARN") && line.contains("use the tree index") => Ok(()),
+                [line] if line.contains("WARN") && line.contains(SAID) => Ok(()),
                 [line] => Err(format!("the start said it otherwise: {line}")),
                 said => Err(format!("the start said the line {} times", said.len())),
             }

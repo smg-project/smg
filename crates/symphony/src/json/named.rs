@@ -121,6 +121,8 @@ pub struct Assembler {
     /// header still reads, the marker's end in the piece that carried it, zero once the object
     /// has begun ([`CallAssembler::quote_value`](crate::engine::CallAssembler::quote_value)).
     value_from: usize,
+    /// Whether the object starts its call at the name (`Declared::calls_start_at_name`).
+    at_name: bool,
 }
 
 /// The JSON after the marker, read as it arrives.
@@ -144,6 +146,7 @@ impl Assembler {
             header: Header::new(marker),
             body: None,
             value_from: 0,
+            at_name: false,
         }
     }
 
@@ -167,6 +170,9 @@ impl Assembler {
         };
         self.value_from = bytes.len() - after.len();
         let mut body = self.after.open(self.index, &self.id, framing, at, out);
+        if let Body::Object(object) = &mut body {
+            object.start_at_name(self.at_name);
+        }
         // What followed the marker is the header's own text, so the events of this first piece
         // are taken owned; every later piece is the delta's and its fragments borrow it.
         let mut first = Events::new();
@@ -236,6 +242,11 @@ impl crate::engine::CallAssembler for Assembler {
         out: &mut Events<'d>,
     ) -> usize {
         self.feed(text, out)
+    }
+
+    /// The object behind the marker starts its call at the name.
+    fn start_at_name(&mut self) {
+        self.at_name = true;
     }
 
     /// The object's bytes alone: the header before the marker is the tool's name, no JSON.
@@ -515,5 +526,27 @@ mod tests {
         assert_eq!(bytes(&events), cut);
         assert_eq!(arguments(&events), "{\"city\": \"Par");
         assert!(matches!(events.last(), Some(Event::ToolCallEnd { .. })));
+    }
+
+    #[test]
+    fn the_object_behind_a_marker_starts_at_its_name_under_an_engine_that_starts_calls_there() {
+        use crate::engine::CallAssembler;
+        let started = |at_name: bool| {
+            let mut assembler = Assembler::new(0, "call_0", "<call>", After::Object);
+            if at_name {
+                CallAssembler::start_at_name(&mut assembler);
+            }
+            let mut out = Events::new();
+            let piece = "<call>{\"name\": \"get_weather\"";
+            assembler.feed(piece, &mut out);
+            out.as_slice().iter().any(
+                |event| matches!(event, Event::ToolCallStart { name, .. } if name == "get_weather"),
+            )
+        };
+        assert!(started(true), "the name is whole");
+        assert!(
+            !started(false),
+            "by default the start waits for the arguments"
+        );
     }
 }

@@ -750,17 +750,13 @@ fn the_print_option_says_a_refusal_in_one_sentence() {
     // A setting no document says: no document, and one sentence with the
     // setting by its name at the head. The words behind the head are the
     // Grand Central crate's, and no case of the gateway holds them. The sticky
-    // override's rule places both sides of a pair, and this line's prefill
-    // policy reads the routing key itself.
-    let mut line = vec!["smg"];
-    line.extend_from_slice(PAIR);
-    line.extend_from_slice(&[
-        "--prefill-policy",
-        "consistent_hashing",
+    // override's rule has no document in a gateway of many routers yet.
+    let sticky = printed(&[
+        "smg",
+        "--enable-igw",
         "--routing-key-override",
         "--print-policy-spec",
     ]);
-    let sticky = printed(&line);
     assert_eq!(sticky.document(), None);
     assert!(
         sticky
@@ -835,6 +831,45 @@ fn the_print_checks_its_document_as_the_gateway_checks_one_it_hosts() {
         tenant.refusal(),
         Some("view.headers[0]: header \"x-tenant-id\" is on the deny-list")
     );
+}
+
+/// A start reads its connection mode off the worker addresses. Over gRPC
+/// or ZMQ a pair mode of one router binds no single request, so the
+/// start's document is the pair's alone. Under the sticky override, beside
+/// a prefill under `consistent_hashing`, the pair's rule names the decode
+/// side. The gateway's check of a document it hosts takes the start's
+/// document over each connection mode.
+#[test]
+fn a_start_takes_a_mixed_pairs_document_over_each_connection_mode() {
+    for (prefill, decode, bindings) in [
+        ("http://prefill-a:8000", "http://decode-a:8000", 2),
+        ("grpc://prefill-a:8000", "grpc://decode-a:8000", 1),
+        ("ipc:///tmp/smg-zmq/p0", "ipc:///tmp/smg-zmq/d0", 1),
+    ] {
+        let line = [
+            "smg",
+            "--pd-disaggregation",
+            "--prefill",
+            prefill,
+            "--decode",
+            decode,
+            "--prefill-policy",
+            "consistent_hashing",
+            "--routing-key-override",
+        ];
+        let argv: Vec<String> = line.iter().map(|word| (*word).to_string()).collect();
+        let config = router_config(&argv).expect("the start's configuration");
+        let document = config.policy_document().expect("the start's document");
+        assert_eq!(document.bindings.len(), bindings, "{prefill}");
+        let rule = document.bindings[0].sessions.as_ref();
+        let sides = rule.and_then(|rule| rule.sides.clone());
+        assert_eq!(sides, Some(vec!["decode".to_string()]), "{prefill}");
+        let hosted = config.hosted_policy(
+            &document,
+            &smg_grand_central::stages::StageRegistry::builtin(),
+        );
+        assert_eq!(hosted.err(), None, "{prefill}");
+    }
 }
 
 #[test]

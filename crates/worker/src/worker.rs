@@ -888,15 +888,20 @@ pub struct WorkerSpec {
 
     /// Per-worker load monitor interval override (seconds).
     /// When set, workers in the same group use this interval for load polling.
-    /// Falls back to the global `load_monitor_interval_secs` from router config.
+    /// Falls back to the router's interval: `load_monitor_interval_ms` of the
+    /// router config where it is set, else its `load_monitor_interval_secs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_monitor_interval_secs: Option<u64>,
 
     /// Per-worker multimodal tensor transport override (`inline` | `shm` | `auto` | `rdma`).
     /// Overrides the router-level `multimodal_tensor_transport` for this worker
     /// (e.g. force `shm` for a co-located worker, `inline` for a remote one).
-    /// The RDMA lane is process-wide and only the router-level setting turns it
-    /// on or off: `rdma` here alone carries this worker's tensors inline.
+    /// The RDMA lane is process-wide and only the router-level settings turn
+    /// it on or off (the router-level `multimodal_tensor_transport`, or the
+    /// legacy `mm_pixel_rdma`): `rdma` here alone does not turn it on. While
+    /// the lane is on, the gateway tries it first for each encoder input of
+    /// a gRPC worker whose runtime pulls from it, unless that input went to
+    /// shared memory: `inline` here does not keep a worker off the lane.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multimodal_tensor_transport: Option<TransportMode>,
 
@@ -1074,13 +1079,15 @@ impl WorkerSpec {
 
 /// Multimodal tensor transport mode for large payloads.
 ///
-/// - `Inline`: always carry tensor bytes in the gRPC message.
+/// - `Inline`: carry tensor bytes in the gRPC message; while the RDMA lane is
+///   on, a worker whose runtime pulls from it is still tried over the lane.
 /// - `Shm`: use same-host `/dev/shm` when SMG can write it.
 /// - `Auto`: use `/dev/shm` only when the receiving worker is verified to share
 ///   SMG's `/dev/shm`; otherwise fall back to inline.
-/// - `Rdma`: use the NIXL RDMA pixel lane for large tensors (requires the
-///   `mm-rdma` build feature + NIXL); falls back to inline when RDMA is
-///   unavailable.
+/// - `Rdma`: use the NIXL RDMA pixel lane (requires the `mm-rdma` build
+///   feature + NIXL); falls back to inline when RDMA is unavailable. Only the
+///   router-level settings turn the lane on: as a per-worker value, `rdma`
+///   carries the tensors as `inline` does.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, schemars::JsonSchema,
 )]

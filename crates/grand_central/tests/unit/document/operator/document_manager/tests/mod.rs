@@ -1167,6 +1167,132 @@ fn a_publication_that_waits_keeps_the_document_counts_and_log_as_they_were() {
     assert!(lines.0.lock().is_empty());
 }
 
+/// What the door promises of an apply's two notices. The pass is told
+/// behind the first admission check and ahead of the second, before the
+/// apply publishes: the apply holds the apply lock then, and not the
+/// document lock. The standing number is told behind the second check
+/// and behind the publication, while the apply holds both locks: the
+/// notice is handed the published number and the document's digest. The
+/// standing document applied again publishes nothing, and is told the
+/// same way with the number the apply read at its start. A document that
+/// does not pass is told as no pass and has no standing number. A
+/// publication that does not land has none either. An admission check
+/// that answers ends the apply where it stands: the first ahead of both
+/// notices, the second behind the pass's alone.
+#[test]
+fn an_applys_two_notices_run_under_the_doors_locks_in_their_order() {
+    use std::cell::{Cell, RefCell};
+
+    let (store, door) = generations();
+    let admissions = Cell::new(0);
+    let lands = Cell::new(true);
+    let told = RefCell::new(Vec::new());
+    // What a notice finds where it runs: whether the apply lock and the
+    // document lock are held, the admission checks asked so far, and the
+    // store's number. A standing notice adds the number it was handed,
+    // and whether the digest it was handed is the store's.
+    let found = |notice, handed: Option<(u64, Digest)>| {
+        let locks = (
+            door.applying.try_lock().is_none(),
+            door.held.try_lock().is_none(),
+        );
+        let (number, stands) = standing(&store);
+        let handed = handed.map(|(handed, digest)| (handed, Some(digest) == stands));
+        told.borrow_mut()
+            .push((notice, locks, admissions.get(), number, handed));
+    };
+    // An apply whose admission check answers at its `waits`-th asking,
+    // and admits at every asking where that is 0. Its publication lands
+    // where `lands` says so.
+    let apply = |document: &str, waits: u32| {
+        admissions.set(0);
+        door.apply_notifying(
+            document.into(),
+            Format::Yaml,
+            |number| {
+                admissions.set(admissions.get() + 1);
+                (admissions.get() == waits).then_some(ApplyOutcome::Waits(number))
+            },
+            |published, spec| {
+                if lands.get() {
+                    publish_local(published, spec)
+                } else {
+                    Ok(false)
+                }
+            },
+            |passed| found(if passed.is_some() { "pass" } else { "no pass" }, None),
+            |number, digest| found("standing", Some((number, digest))),
+        )
+    };
+
+    assert_eq!(apply(LEAST_LOAD, 0), Ok(ApplyOutcome::Generation(1)));
+    let first = [
+        ("pass", (true, false), 1, 0, None),
+        ("standing", (true, true), 2, 1, Some((1, true))),
+    ];
+    assert_eq!(told.take(), first);
+    assert_eq!(apply(LEAST_LOAD, 0), Ok(ApplyOutcome::Unchanged(1)));
+    let again = [
+        ("pass", (true, false), 1, 1, None),
+        ("standing", (true, true), 2, 1, Some((1, true))),
+    ];
+    assert_eq!(told.take(), again);
+
+    assert!(apply("{ no policy", 0).is_err());
+    assert_eq!(told.take(), [("no pass", (true, false), 1, 1, None)]);
+    assert_eq!(apply(RANDOM, 1), Ok(ApplyOutcome::Waits(1)));
+    assert!(told.take().is_empty(), "the first check answered");
+    assert_eq!(apply(RANDOM, 2), Ok(ApplyOutcome::Waits(1)));
+    assert_eq!(told.take(), [("pass", (true, false), 1, 1, None)]);
+    lands.set(false);
+    assert_eq!(apply(RANDOM, 0), Ok(ApplyOutcome::Waits(1)));
+    assert_eq!(told.take(), [("pass", (true, false), 1, 1, None)]);
+    assert_eq!(
+        standing(&store).0,
+        1,
+        "none of the last three applies entered"
+    );
+    assert!(
+        door.applying.try_lock().is_some(),
+        "the apply lock is let go"
+    );
+}
+
+/// A followed generation enters through the turn that holds the apply
+/// lock from ahead of its pass. Its entry publishes the generation and
+/// then tells its number once, while the turn holds the apply lock and
+/// the entry the document lock. The turn's end lets the apply lock go.
+#[cfg(feature = "controller")]
+#[test]
+fn a_followed_generations_entry_tells_its_number_under_both_locks() {
+    use std::cell::RefCell;
+
+    let (store, door) = generations();
+    let turn = door.follower_turn();
+    let checked = door.pass((0, None), RANDOM.as_bytes(), Format::Yaml, Line::Record(3));
+    let Checked { digest, next, .. } = checked.expect("the document passes");
+    let kept = Held {
+        generation: 3,
+        digest,
+        document: RANDOM.into(),
+        format: Format::Yaml,
+        applied: SystemTime::now(),
+    };
+    let told = RefCell::new(Vec::new());
+    let entered = turn.enter(None, next.expect("above none"), kept, |number, stands| {
+        let locks = (
+            door.applying.try_lock().is_none(),
+            door.held.try_lock().is_none(),
+        );
+        let seen = (number, stands == digest, locks, standing(&store).0);
+        told.borrow_mut().push(seen);
+    });
+    entered.expect("a number above the standing one enters");
+    assert_eq!(told.take(), [(3, true, (true, true), 3)]);
+    assert!(door.applying.try_lock().is_some(), "the turn is over");
+    assert_eq!(door.document(0).expect("held").document, RANDOM.as_bytes());
+}
+
 #[test]
 fn the_same_document_is_refused_only_by_a_host_that_denies_its_header() {
     let document = format!("{LEAST_LOAD}view:\n  headers: [x-private]\n");

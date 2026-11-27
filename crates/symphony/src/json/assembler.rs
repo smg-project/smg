@@ -2,7 +2,8 @@
 //!
 //! [`Assembler`] takes a call's JSON object in pieces, as the format cuts it out of the model's
 //! text, and turns it into the events of one call: `ToolCallStart` once the name is whole and the
-//! arguments value has begun (or the object has closed without one), `ToolCallArguments` for every
+//! arguments value has begun (or the object has closed without one; at the name itself where the
+//! engine starts calls there, `Engine::starts_calls_at_name`), `ToolCallArguments` for every
 //! run of new argument bytes, `ToolCallEnd` when the object closes. The fragments are the model's
 //! own bytes: what a client receives, concatenated, is exactly what the model wrote as the
 //! arguments value, spacing included, but for a raw control character inside a string, which JSON
@@ -34,6 +35,15 @@ pub struct Assembler {
     /// The outline of `text`, read as it grows.
     scanner: Scanner,
     started: bool,
+    /// Whether the call starts at its name, behind the closing quote, and not where its arguments
+    /// value begins: the engine's choice (`Engine::starts_calls_at_name`), said once, when the
+    /// call is made.
+    at_name: bool,
+    /// For a call that started at its name: where the bytes behind the start begin, while no
+    /// event has accounted for them. The start says the object up to its name, and what stands
+    /// between the name and the arguments value (a comma, the key, the colon) leaves with the
+    /// value's first fragment, or with the call's end where no value begins.
+    unsaid: Option<usize>,
     /// The argument bytes, sent, held or reported as they arrive.
     fragments: Fragments,
     done: bool,
@@ -56,11 +66,19 @@ impl Assembler {
             text: String::new(),
             scanner: Scanner::default(),
             started: false,
+            at_name: false,
+            unsaid: None,
             fragments: Fragments::default(),
             done: false,
             ends_where_refused: false,
             ended_at: None,
         }
+    }
+
+    /// Whether the call starts at its name, as the engine's declared record says
+    /// (`Declared::calls_start_at_name`): for an assembler that feeds this one itself.
+    pub(crate) fn start_at_name(&mut self, at_name: bool) {
+        self.at_name = at_name;
     }
 
     /// Whether the arguments stopped being a JSON prefix.
@@ -160,14 +178,29 @@ impl Assembler {
                 }
                 return taken;
             };
-            let head_end = match (&arguments, close) {
-                (Some(span), _) => span.start,
-                (None, Some(close)) => close,
-                // Stopped short of its close before any arguments: a call without them.
-                (None, None) => match self.stopped_at() {
-                    Some(at) => at,
-                    None => return taken,
-                },
+            let head_end = if self.at_name {
+                // The call starts with its name, at the closing quote, whatever the piece holds
+                // behind it: every cut starts the same call, and a client learns the name before
+                // the arguments' key has arrived. Arguments that came before the name end the
+                // head where they begin, since the name is read behind them.
+                let name_end = self.scanner.found().name_end;
+                match &arguments {
+                    Some(span) if span.start < name_end => span.start,
+                    _ => {
+                        self.unsaid = Some(name_end);
+                        name_end
+                    }
+                }
+            } else {
+                match (&arguments, close) {
+                    (Some(span), _) => span.start,
+                    (None, Some(close)) => close,
+                    // Stopped short of its close before any arguments: a call without them.
+                    (None, None) => match self.stopped_at() {
+                        Some(at) => at,
+                        None => return taken,
+                    },
+                }
             };
             out.push(Event::ToolCallStart {
                 index: self.index,
@@ -198,10 +231,13 @@ impl Assembler {
                     why: MalformedReason::InvalidArguments,
                 });
             }
-            let tail_start = arguments
-                .as_ref()
-                .and_then(|span| span.end)
-                .map_or(at, |end| end.min(at));
+            // What stood behind the name and left with no fragment is the end's, with the tail.
+            let tail_start = self.unsaid.take().unwrap_or_else(|| {
+                arguments
+                    .as_ref()
+                    .and_then(|span| span.end)
+                    .map_or(at, |end| end.min(at))
+            });
             out.push(Event::ToolCallEnd {
                 index: self.index,
                 source: Text::uncounted(self.text[tail_start..at].to_owned()),
@@ -225,10 +261,12 @@ impl Assembler {
                     why: MalformedReason::InvalidArguments,
                 });
             }
-            let tail_start = arguments
-                .as_ref()
-                .and_then(|span| span.end)
-                .unwrap_or(close);
+            let tail_start = self.unsaid.take().unwrap_or_else(|| {
+                arguments
+                    .as_ref()
+                    .and_then(|span| span.end)
+                    .unwrap_or(close)
+            });
             out.push(Event::ToolCallEnd {
                 index: self.index,
                 source: Text::uncounted(self.text[tail_start..close].to_owned()),
@@ -293,17 +331,23 @@ impl Assembler {
             // and a `Malformed` event of no bytes, before its end, says that its arguments are no
             // whole value, where a client would otherwise take them for one. The engine names the
             // reason for a region a marker closed.
-            if !self.fragments.refused() && !self.arguments_whole(found.arguments.as_ref()) {
+            // A call that started at its name and ends before its arguments value began says the
+            // same: no value came, and `{}` is not made up for an object the model did not close.
+            let whole = found.arguments.is_some() && self.fragments.whole();
+            if !self.fragments.refused() && !whole {
                 out.push(Event::Malformed {
                     text: Text::default(),
                     why: MalformedReason::UnterminatedRegion,
                 });
             }
-            let tail_start = found
-                .arguments
-                .as_ref()
-                .and_then(|span| span.end)
-                .unwrap_or(self.text.len());
+            // What stood behind the name and left with no fragment is left over, as the tail is.
+            let tail_start = self.unsaid.take().unwrap_or_else(|| {
+                found
+                    .arguments
+                    .as_ref()
+                    .and_then(|span| span.end)
+                    .unwrap_or(self.text.len())
+            });
             if tail_start < self.text.len() {
                 left_over(
                     self.text[tail_start..].to_owned(),
@@ -346,13 +390,60 @@ impl Assembler {
         out: &mut Events<'d>,
     ) {
         if let Some(span) = arguments {
+            let from = out.len();
             self.fragments.send_held(
                 span.text(&self.text),
                 arrived.map(|arrived| arrived.from(span.start)),
                 self.index,
                 out,
             );
+            if let Some(gap) = self.unsaid {
+                self.unsaid = self.say_the_gap(gap, span, from, arrived, out);
+            }
         }
+    }
+
+    /// The bytes between the call's name and its arguments value, which the start left unsaid
+    /// (`unsaid`), leave in front of the source of the value's first fragment, the event pushed
+    /// at `from`, where they stand in the output: borrowed with the fragment where the delta
+    /// carried both, copied where they came before it. A value that broke at its first byte has
+    /// no such fragment, and the ones behind the break are the model's bytes and no others: the
+    /// bytes are said before the break by a fragment of no JSON, unless the object ends at the
+    /// break, where they are the end's. Called only while the mark stands, until the value's
+    /// first fragment leaves, so a call that did not start at its name pays one test per piece
+    /// for it. Returns the mark that still stands: none once the bytes are said.
+    #[cold]
+    #[inline(never)]
+    fn say_the_gap<'d>(
+        &self,
+        gap: usize,
+        span: &Span,
+        from: usize,
+        arrived: Option<Arrived<'d>>,
+        out: &mut Events<'d>,
+    ) -> Option<usize> {
+        if matches!(out.as_slice().get(from), Some(Event::Malformed { .. })) {
+            if self.ended_where_refused() {
+                return Some(gap);
+            }
+            let Some(broke) = out.pop() else {
+                return Some(gap);
+            };
+            out.push(Event::ToolCallArguments {
+                index: self.index,
+                json: "".into(),
+                source: Text::uncounted(Arrived::bytes(&self.text, gap, span.start, arrived)),
+            });
+            out.push(broke);
+        } else if let Some(Event::ToolCallArguments { source, .. }) =
+            out.as_mut_slice().get_mut(from)
+        {
+            let end = span.start + source.text.len();
+            source.text = Arrived::bytes(&self.text, gap, end, arrived);
+        } else {
+            return Some(gap);
+        }
+        None
     }
 
     /// The argument bytes that arrived since the last call: a fragment for the part that keeps the
@@ -369,11 +460,15 @@ impl Assembler {
             return;
         };
         let bytes = span.text(&self.text);
-        let arrived = Some(arrived.from(span.start));
-        let Some(sent_to) =
-            self.fragments
-                .send(bytes, arrived, span.end.is_none(), self.index, out)
-        else {
+        let from = out.len();
+        let within = Some(arrived.from(span.start));
+        let sent_to = self
+            .fragments
+            .send(bytes, within, span.end.is_none(), self.index, out);
+        if let Some(gap) = self.unsaid {
+            self.unsaid = self.say_the_gap(gap, span, from, Some(arrived), out);
+        }
+        let Some(sent_to) = sent_to else {
             return;
         };
         if self.ends_where_refused && self.fragments.refused() {
@@ -382,7 +477,7 @@ impl Assembler {
             self.ended_at = Some(span.start + sent_to);
             return;
         }
-        self.fragments.send_rest(bytes, arrived, self.index, out);
+        self.fragments.send_rest(bytes, within, self.index, out);
     }
 }
 
@@ -403,6 +498,11 @@ impl crate::engine::CallAssembler for Assembler {
         out: &mut Events<'d>,
     ) -> usize {
         self.feed(text, out)
+    }
+
+    /// The object starts its call at the name.
+    fn start_at_name(&mut self) {
+        self.at_name = true;
     }
 
     /// The object closed the call at its brace; the region's closing marker is the region's.
@@ -717,6 +817,72 @@ mod tests {
         assert_eq!(
             starts(out.as_slice()),
             vec![("f", r#"{"name": "f", "arguments": "#)]
+        );
+    }
+
+    #[test]
+    fn under_an_engine_that_starts_calls_at_the_name_the_call_starts_before_its_arguments() {
+        use crate::engine::CallAssembler;
+        const CUT: &str = r#"{"name": "f", "argu"#;
+        let declared = crate::Declared::default();
+        let mut assembler = Assembler::new(0, "call_0");
+        CallAssembler::start_at_name(&mut assembler);
+        let mut out = Events::new();
+        for piece in ["{\"", "name", "\": \"", "f", "\""] {
+            CallAssembler::feed(&mut assembler, piece, &declared, &mut out);
+        }
+        assert_eq!(
+            starts(out.as_slice()),
+            vec![("f", r#"{"name": "f""#)],
+            "the name is whole: the call starts before the arguments' key comes"
+        );
+        for piece in [",", " \"", "arguments", "\":"] {
+            CallAssembler::feed(&mut assembler, piece, &declared, &mut out);
+        }
+        assert_eq!(out.len(), 1, "the key says nothing");
+        CallAssembler::feed(&mut assembler, " {", &declared, &mut out);
+        // What stood between the name and the value leaves with the value's first fragment.
+        assert_eq!(arguments(out.as_slice()), "{");
+        assert_eq!(sources(out.as_slice()), r#"{"name": "f", "arguments": {"#);
+        // An output that ends behind the name and before the arguments value is a call that
+        // started: it ends with no arguments and the word that they are no whole value, and what
+        // stood behind the name comes back as the tail of an object that never closed does.
+        let mut cut = Assembler::new(0, "call_0");
+        CallAssembler::start_at_name(&mut cut);
+        let mut out = Events::new();
+        CallAssembler::feed(&mut cut, CUT, &declared, &mut out);
+        cut.finish(&mut out);
+        assert_eq!(
+            out.into_owned().drain(),
+            vec![
+                Event::ToolCallStart {
+                    index: 0,
+                    id: "call_0".into(),
+                    name: "f".into(),
+                    source: Text::uncounted(r#"{"name": "f""#),
+                },
+                Event::Malformed {
+                    text: Text::default(),
+                    why: MalformedReason::UnterminatedRegion,
+                },
+                Event::Malformed {
+                    text: Text::uncounted(r#", "argu"#),
+                    why: MalformedReason::UnterminatedRegion,
+                },
+                Event::ToolCallEnd {
+                    index: 0,
+                    source: Text::default(),
+                    ended: CallEnd::Closed,
+                },
+            ]
+        );
+        // By default the same output holds no call: its bytes come back whole.
+        assert_eq!(
+            run(&[CUT]),
+            vec![Event::Malformed {
+                text: Text::uncounted(CUT),
+                why: MalformedReason::UnterminatedRegion,
+            }]
         );
     }
 

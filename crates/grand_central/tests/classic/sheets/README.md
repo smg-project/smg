@@ -503,10 +503,13 @@ fails once the reason no longer holds.
 - `pair_named.json`: none. All 23 rows replay, through the one call of a host in process. Of a refusal the replay
   holds why and the role, as the pair placement's does. The gateway's `declined` is the engine's shed under
   `target-worker`, and its role is the side that shed names.
-- `pair_sticky.json`: 23 rows replay, through the one call of a host in process, under the document the routing
-  settings give for the row. The other 2 are pairs of which one side runs under `consistent_hashing`: the gateway's
-  sticky map places the other side alone, the settings write no document for such a pair yet, and the replay holds
-  their refusal to the override's setting and to that side.
+- `pair_sticky.json`: none. All 25 rows replay, through the one call of a host in process, under the document the
+  routing settings give for the row. Two are pairs with one side under `consistent_hashing`: the gateway's sticky
+  map places the other side alone, and the settings' rule names that side.
+  - The gateway lends the engine its own ring, and the sheet does not record it. The replay lends those two rows
+    a ring built from their answers.
+  - No step of those rows takes a key's owner on the ring down. Two rows of the replay's own do, and bring it
+    up again.
 - `overload.json`: none where the worker is one object for all its ranks, as the recording gateway held it. All 25
   rows replay there, verdict for verdict, through the worker crate's load monitor. The replay builds the holder of
   worker objects with the calls a controller builds its own with, and writes the row's worker into the store the

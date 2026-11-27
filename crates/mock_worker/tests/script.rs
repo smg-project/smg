@@ -4,7 +4,7 @@
 
 use std::{
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -1146,6 +1146,64 @@ fn the_binary_refuses_a_script_it_cannot_load_before_any_worker_starts() {
         assert!(stderr.contains("cannot load script"), "{stderr}");
         assert!(stderr.contains(reason), "{stderr}");
     }
+}
+
+/// A recorder that cannot start ends the process at its start with one line:
+/// a record path in a directory that does not exist, and an upstream with no
+/// scheme, which parses as a bare host and port and would fail every call
+/// with nothing recorded. The refused address makes no file.
+#[test]
+fn the_binary_refuses_a_recorder_that_cannot_start() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let record = dir.path().join("session.jsonl");
+    for (upstream, path, reason) in [
+        (
+            "grpc://127.0.0.1:9",
+            dir.path().join("missing").join("session.jsonl"),
+            "No such file",
+        ),
+        ("127.0.0.1:9", record.clone(), "needs a scheme"),
+        ("localhost:9", record.clone(), "needs a scheme"),
+    ] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_mock-worker"))
+            .args([
+                "--grpc-base-port",
+                &free_port().expect("a free port").to_string(),
+                "--grpc-count",
+                "1",
+                "--record-upstream",
+                upstream,
+            ])
+            .arg("--record")
+            .arg(&path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("run the mock worker");
+        // A start that is not refused runs on: five seconds for the exit.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let code = loop {
+            if let Some(status) = child.try_wait().expect("the exit of the mock worker") {
+                break status.code();
+            }
+            if Instant::now() >= deadline {
+                child.kill().expect("stop the mock worker");
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let output = child
+            .wait_with_output()
+            .expect("what the mock worker wrote");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(code, Some(2), "{upstream}: {stderr}");
+        assert!(stderr.contains("cannot start the recorder"), "{stderr}");
+        assert!(stderr.contains(reason), "{stderr}");
+    }
+    assert!(
+        !record.exists() && !record.with_extension("info.jsonl").exists(),
+        "a refused address makes no file"
+    );
 }
 
 // ── load reports ────────────────────────────────────────────────────────────

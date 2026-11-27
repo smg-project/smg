@@ -202,7 +202,7 @@ impl Bed {
         for _ in 0..ROUNDS * self.workers.len().max(1) {
             match self
                 .router
-                .select_transcription_worker(None, MODEL, &routing, None)
+                .select_transcription_worker(None, MODEL, &routing, None, None, &[])
             {
                 Ok(worker) => {
                     let at = self
@@ -432,7 +432,7 @@ fn kinds_spread(bed: &Bed) -> (usize, usize) {
         chats.insert(at(placed.expect("a free pool places").url()));
         let placed = bed
             .router
-            .select_transcription_worker(None, MODEL, &routing, None);
+            .select_transcription_worker(None, MODEL, &routing, None, None, &[]);
         forms.insert(at(placed.expect("a free pool places").url()));
     }
     (chats.len(), forms.len())

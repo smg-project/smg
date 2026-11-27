@@ -463,9 +463,9 @@ async fn a_session_that_ends_and_one_that_follows_inside_the_grace_period_change
     let bed = bed().await;
     let seat = bed.welcomed(NAME, 1);
     let mut early = bed.opened(NAME).await;
-    // The session ends; a millisecond of its gateway's period is left.
+    // The session ends; a nanosecond of its gateway's period is left.
     seat.end(bed.now());
-    bed.at(GRACE_PERIOD - MS);
+    bed.at(GRACE_PERIOD - Duration::from_nanos(1));
     let mut late = bed.opened(NAME).await;
     bed.decides(&mut early, 1, 1).await;
     bed.decides(&mut late, 2, 1).await;

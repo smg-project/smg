@@ -15,9 +15,9 @@ use crate::{
 /// by key.
 fn read(replica: &Replica, id: WorkerId) -> Option<WorkerRow> {
     let (store, objects) = (&replica.store, &replica.objects);
-    let by_id = objects.record(id);
+    let by_id = objects.read_row(id);
     assert_eq!(by_id, store.get(id), "by id against the table");
-    let by_key = objects.record_under(A);
+    let by_key = objects.read_row_under(A);
     assert_eq!(by_key, store.by_key(A), "by key against the table");
     by_id
 }
@@ -63,8 +63,8 @@ fn a_row_written_around_the_holder_is_read_once_the_holder_lays_it() {
             let (store, objects) = (&replica.store, &replica.objects);
             objects.rows_serving(store, &[], 1).0.pop()
         }),
-        ("by id", |replica| replica.objects.record(identity(A, 1))),
-        ("by key", |replica| replica.objects.record_under(A)),
+        ("by id", |replica| replica.objects.read_row(identity(A, 1))),
+        ("by key", |replica| replica.objects.read_row_under(A)),
         ("by engine", |replica| replica.objects.records_of(A).pop()),
     ];
     for (name, read) in reads {
@@ -132,8 +132,8 @@ fn a_record_carries_the_status_its_object_states() {
     let id = change.expect("registered").id();
     objects.connect_row(&store, id, 1);
     let read = || {
-        let by_id = objects.record(id);
-        let by_key = objects.record_under(A);
+        let by_id = objects.read_row(id);
+        let by_key = objects.read_row_under(A);
         let by_engine = objects.records_of(A).pop();
         [by_id, by_key, by_engine].map(|row| row.map(|row| row.status))
     };
@@ -210,7 +210,7 @@ fn a_first_copy_carries_the_status_the_journal_told() {
     let object = replica.object(A).expect("the row's object");
     let object = objects.registry().get(&object).expect("it stands");
     object.set_status(ObjectStatus::NotReady);
-    let door = objects.record(id).map(|row| row.status);
+    let door = objects.read_row(id).map(|row| row.status);
     assert_eq!(door, Some(WorkerStatus::NotReady), "the object's");
     assert_eq!(copies(), [Some(WorkerStatus::Ready); 2], "the journal's");
 }

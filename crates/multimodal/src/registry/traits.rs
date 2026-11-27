@@ -339,6 +339,16 @@ pub trait ModelProcessorSpec: Send + Sync {
         false
     }
 
+    /// Whether the language model computes its rotary token positions from
+    /// the grid tensors the processor emits (`image_grid_thw` and friends),
+    /// as an M-RoPE model (the Qwen-VL family) does. `false` for a family
+    /// whose language model runs plain RoPE over token positions, where the
+    /// grids feed the vision tower alone. Default `true`: grids are taken to
+    /// set the positions unless the family says otherwise.
+    fn language_model_reads_grids(&self) -> bool {
+        true
+    }
+
     fn placeholder_token(&self, metadata: &ModelMetadata) -> RegistryResult<String>;
     fn placeholder_token_id(&self, metadata: &ModelMetadata) -> RegistryResult<TokenId>;
     fn placeholder_token_for(
@@ -754,6 +764,11 @@ mod tests {
     fn worker_expandable_defaults_to_false() {
         assert!(!TestSpec.worker_expandable(Modality::Image));
         assert!(!TestSpec.worker_expandable(Modality::Video));
+    }
+
+    #[test]
+    fn language_model_reads_grids_defaults_to_true() {
+        assert!(TestSpec.language_model_reads_grids());
     }
 
     #[test]

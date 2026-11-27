@@ -255,6 +255,12 @@ pub fn inject_client_visible_mcp_output_items(
 /// Parses `ResponseTool::Mcp::require_approval`/`allowed_tools` and forwards
 /// the resolved approval mode + scoping to `session.set_approval_mode`.
 ///
+/// An approval is asked where `require_approval` is the string `always` or
+/// the object form with an `always` filter: a filter of `tool_names` alone
+/// asks it of the named tools, one that reads `read_only` or names nothing
+/// asks it of every tool the entry allows (over-gate, as below). A `never`
+/// filter asks none, and a tool named under both is asked for.
+///
 /// `McpAllowedTools` projection (T11):
 /// - `None` or `Filter { None, None }` → no name constraint (every binding
 ///   on the server inherits the explicit approval mode).
@@ -270,21 +276,31 @@ pub fn configure_response_tools_approval(session: &mut McpToolSession<'_>, tools
             continue;
         };
 
-        let approval_mode = match mcp_tool.require_approval.as_ref() {
-            Some(RequireApproval::Mode(RequireApprovalMode::Always)) => ApprovalMode::Interactive,
-            _ => ApprovalMode::PolicyOnly,
+        // The names an `always` filter narrows the approval to; `None` asks
+        // it of every tool the entry allows.
+        let always_names: Option<&[String]> = match mcp_tool.require_approval.as_ref() {
+            Some(RequireApproval::Mode(RequireApprovalMode::Always)) => None,
+            Some(RequireApproval::Rules(rules)) => match rules.always.as_ref() {
+                Some(always) => always
+                    .tool_names
+                    .as_deref()
+                    .filter(|_| always.read_only.is_none()),
+                None => continue,
+            },
+            _ => continue,
         };
 
-        if approval_mode == ApprovalMode::PolicyOnly {
-            continue;
-        }
-
-        let allowed_tool_names: Option<&[String]> =
+        let allowed_tool_names: Option<&[String]> = always_names.or_else(|| {
             mcp_tool.allowed_tools.as_ref().and_then(|at| match at {
                 McpAllowedTools::List(names) => Some(names.as_slice()),
                 McpAllowedTools::Filter(filter) => filter.tool_names.as_deref(),
-            });
-        session.set_approval_mode(&mcp_tool.server_label, allowed_tool_names, approval_mode);
+            })
+        });
+        session.set_approval_mode(
+            &mcp_tool.server_label,
+            allowed_tool_names,
+            ApprovalMode::Interactive,
+        );
     }
 }
 

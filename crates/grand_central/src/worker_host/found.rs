@@ -25,6 +25,20 @@ pub(super) fn engine_of(worker: &dyn Worker) -> &str {
     spec.dp_base_url.as_deref().unwrap_or(&spec.url)
 }
 
+/// The ids of the models `worker` serves now, in the order
+/// [`Worker::any_model`] hands its cards. The worker crate's object and
+/// the trait's own body hand them in the order of [`Worker::models`].
+/// Each id is copied, and no card: a card holds its chat template, and
+/// [`Worker::models`] copies every card whole.
+fn model_ids(worker: &dyn Worker) -> Vec<String> {
+    let mut ids = Vec::new();
+    worker.any_model(&mut |card| {
+        ids.push(card.id.clone());
+        false
+    });
+    ids
+}
+
 /// The facts a provider states of a worker it found, from the object to the
 /// row as the module's table describes. Facts the object does not carry
 /// come from the standing row, or from the store's defaults. The models are
@@ -32,7 +46,9 @@ pub(super) fn engine_of(worker: &dyn Worker) -> &str {
 /// is stated over the standing row's. A threshold it leaves out stays the
 /// standing row's: this reading keeps it under every verb. A door that
 /// writes a replacement by id ([`Over::Replaced`]) clears it past this
-/// reading.
+/// reading. A drain window at the default goes the same way: this reading
+/// keeps the number where the standing row states it, and a replacement by
+/// id states none.
 ///
 /// The pairing descriptor is the standing row's here too. A host that
 /// states the worker's own reads it of the worker ([`pairing_descriptor`]).
@@ -57,7 +73,7 @@ pub fn facts(worker: &dyn Worker, standing: Option<&WorkerFacts>) -> WorkerFacts
         } else {
             String::new()
         },
-        models: worker.models().into_iter().map(|card| card.id).collect(),
+        models: model_ids(worker),
         // Values wider than a row's fields take the largest value they hold.
         dp_rank: u16::try_from(spec.dp_rank.unwrap_or(0)).unwrap_or(u16::MAX),
         dp_size: u16::try_from(spec.dp_size.unwrap_or(1)).unwrap_or(u16::MAX),
@@ -90,11 +106,7 @@ pub fn facts(worker: &dyn Worker, standing: Option<&WorkerFacts>) -> WorkerFacts
                 waiting_requests: own.waiting_requests.or(standing.overload.waiting_requests),
             }
         },
-        // A window the object's registration left at the default is not a
-        // fact of the row: the object built from the row takes the default.
-        drain_settle_secs: (checks.drain_settle_secs
-            != HealthCheckConfig::default().drain_settle_secs)
-            .then(|| u32::try_from(checks.drain_settle_secs).unwrap_or(u32::MAX)),
+        drain_settle_secs: window(checks, standing.drain_settle_secs),
         demand_facts: standing.demand_facts,
     }
 }
@@ -143,11 +155,29 @@ fn thresholds(spec: &WorkerSpec) -> Overload {
     }
 }
 
+/// The drain window a row states of an object that waits `checks`' window:
+/// the window itself where it is not the default, or the widest number a
+/// row holds where the window is wider. The object built from a row takes
+/// the default where the row states none. So at the default the window is
+/// a fact of the row only where the row states the default's own number
+/// (`standing`): the row's object waits that number, and it reads back.
+fn window(checks: &HealthCheckConfig, standing: Option<u32>) -> Option<u32> {
+    let own = u32::try_from(checks.drain_settle_secs).unwrap_or(u32::MAX);
+    let default = HealthCheckConfig::default().drain_settle_secs;
+    (checks.drain_settle_secs != default || standing == Some(own)).then_some(own)
+}
+
 /// The facts `built` states at a write that names `over`: [`facts`], and at
-/// a replacement by id the thresholds as its own registration states them.
-/// A replacement is its maker's whole statement of what a registration can
-/// state, so a threshold it leaves out is cleared. An add finds no row to
-/// keep one from. An upsert and an update keep the standing row's.
+/// a replacement by id the thresholds and the drain window with no word of
+/// the standing row. A threshold the replacement leaves out is cleared, and
+/// a replacement that waits the default window states none.
+///
+/// Every other write reads both over the row that stands, where one does:
+/// an upsert, an update in place, a label refresh, and an add tried again
+/// over a rank that stands. There a threshold the worker leaves out stays
+/// the row's. So does the row's window, where it states the default's
+/// number and the worker waits the default. An add over no standing rank
+/// finds no row to keep either from.
 #[cfg_attr(
     not(any(test, feature = "discovery")),
     expect(dead_code, reason = "the replica's own door reads a worker so")
@@ -159,10 +189,14 @@ pub(crate) fn stated(
 ) -> WorkerFacts {
     let facts = facts(built, standing);
     match over {
-        Some(Over::Replaced(_)) => WorkerFacts {
-            overload: thresholds(&built.metadata().spec),
-            ..facts
-        },
+        Some(Over::Replaced(_)) => {
+            let metadata = built.metadata();
+            WorkerFacts {
+                overload: thresholds(&metadata.spec),
+                drain_settle_secs: window(&metadata.health_config, None),
+                ..facts
+            }
+        }
         Some(Over::Updated(_)) | None => facts,
     }
 }
