@@ -160,6 +160,9 @@ pub struct Controller {
     metrics: Arc<metrics::Metrics>,
     /// This replica's candidate: the election thread steps it once served.
     elector: Elector,
+    /// The candidate's fence, taken at the bind: [`Self::fence`] hands it
+    /// out.
+    fence: Arc<Fence>,
     /// The election's sight of the lease, written by its thread.
     standing: watch::Sender<ElectionObservation>,
     /// The listeners' close: one word, said once by the serve's drain.
@@ -544,7 +547,7 @@ impl Controller {
                     settings,
                     &workers.holder(),
                     Arc::new(door),
-                    Arc::clone(&shared.fence),
+                    elector.fence(),
                     config.worker_overload,
                 )
                 .map(Box::new)
@@ -556,6 +559,7 @@ impl Controller {
             phase,
             readiness,
             metrics: Arc::new(metrics::Metrics::new()),
+            fence: elector.fence(),
             elector,
             standing,
             stop,
@@ -833,7 +837,7 @@ impl Controller {
     /// renew deadline. A shard thread reads it before every decision it
     /// sends; readiness and the `Leader` call read the same one.
     pub fn fence(&self) -> Arc<Fence> {
-        Arc::clone(&self.shared.fence)
+        Arc::clone(&self.fence)
     }
 
     /// The load reports of this replica's workers as its decisions are
@@ -1024,7 +1028,7 @@ impl Controller {
         }
         #[cfg(feature = "discovery")]
         if let Some(discovery) = discovery {
-            let standing = shared.standing.clone();
+            let standing = shared.steps();
             let discovery_stop = stop.subscribe();
             tasks.spawn(async move {
                 discovery.run(standing, discovery_stop).await;
@@ -1090,7 +1094,7 @@ impl Controller {
                 .await
                 .map_err(Error::Admin)
         });
-        let mut looks = shared.standing.clone();
+        let mut looks = shared.steps();
         let mut election = shared
             .elect(elector, standing)
             .map_err(Error::ElectionThread)?;
