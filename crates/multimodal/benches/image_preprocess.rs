@@ -312,7 +312,9 @@ fn bench_llama4_steps(c: &mut Criterion) {
             },
         );
 
-        // Just resize
+        // Just resize: the generic bilinear resizer. `full_preprocess` runs
+        // it only for an image with an empty side; every other image goes
+        // through the crate's torch `uint8` kernel, which a bench cannot name.
         group.bench_with_input(
             BenchmarkId::new("resize_only", format!("{w}x{h}")),
             &image,
