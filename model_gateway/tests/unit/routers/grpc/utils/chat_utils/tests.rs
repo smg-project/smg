@@ -3259,3 +3259,108 @@ fn a_render_the_request_can_break_stays_a_400() {
     let bare = PromptError::from("a check of the gateway's own".to_string());
     assert_eq!(answered(bare), still_a_400);
 }
+
+/// A replayed refusal, audio reference or deprecated function call stays out
+/// of the template when it is the turn's only such field, as it does beside
+/// the others: the template gets the turn it would get without it.
+#[test]
+fn each_replayed_field_alone_stays_out_of_the_template() {
+    let without: Vec<ChatMessage> = serde_json::from_value(json!([
+        {"role": "user", "content": "What is the weather in Paris?"},
+        {"role": "assistant", "content": "Let me look."}
+    ]))
+    .unwrap();
+    for (key, value) in [
+        ("refusal", json!("I can't share that.")),
+        ("audio", json!({"id": "audio_abc123"})),
+        (
+            "function_call",
+            json!({"name": "get_weather", "arguments": "{}"}),
+        ),
+    ] {
+        let mut turn = json!({"role": "assistant", "content": "Let me look."});
+        turn[key] = value;
+        let with: Vec<ChatMessage> = serde_json::from_value(json!([
+            {"role": "user", "content": "What is the weather in Paris?"},
+            turn
+        ]))
+        .unwrap();
+        let replayed = serde_json::to_value(&with[1]).unwrap();
+        assert!(replayed.get(key).is_some(), "{key} is replayed: {replayed}");
+        for format in [
+            ChatTemplateContentFormat::String,
+            ChatTemplateContentFormat::OpenAI,
+        ] {
+            assert_eq!(
+                process_content_format(&with, format, None).unwrap(),
+                process_content_format(&without, format, None).unwrap(),
+                "{key} {format:?}"
+            );
+        }
+    }
+}
+
+/// A list of content parts is written in the template's format in every role
+/// that takes one: under the string format each such turn reaches the
+/// template as one text.
+#[test]
+fn content_parts_of_every_role_reach_a_string_template_as_one_text() {
+    let parts = json!([
+        {"type": "text", "text": "first"},
+        {"type": "text", "text": "second"}
+    ]);
+    let messages: Vec<ChatMessage> = serde_json::from_value(json!([
+        {"role": "system", "content": parts.clone()},
+        {"role": "developer", "content": parts.clone()},
+        {"role": "user", "content": parts.clone()},
+        {"role": "assistant", "content": parts.clone()},
+        {"role": "tool", "tool_call_id": "call_1", "content": parts}
+    ]))
+    .unwrap();
+    let turns = process_content_format(&messages, ChatTemplateContentFormat::String, None).unwrap();
+    assert_eq!(turns.len(), 5);
+    for turn in &turns {
+        let text = turn["content"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no text: {turn}"));
+        assert!(text.contains("first") && text.contains("second"), "{turn}");
+    }
+}
+
+/// The arguments of an assistant turn's tool calls are parsed wherever the
+/// turn's fields stand, and nothing else is touched: a turn of another role
+/// that carries calls, a turn whose calls are no list and a value that is no
+/// object stay as they were.
+#[test]
+fn tool_call_arguments_are_parsed_in_any_field_order_and_of_an_assistant_alone() {
+    let call = json!({
+        "id": "call_1",
+        "type": "function",
+        "function": {"name": "lookup", "arguments": "{\"city\":\"Paris\"}"}
+    });
+    let mut calls_first = serde_json::Map::new();
+    calls_first.insert("tool_calls".to_string(), json!([call.clone()]));
+    calls_first.insert("content".to_string(), json!("Let me look."));
+    calls_first.insert("role".to_string(), json!("assistant"));
+    let untouched = vec![
+        json!({"role": "user", "content": "hi", "tool_calls": [call.clone()]}),
+        json!({"role": "assistant", "content": "hi", "tool_calls": null}),
+        json!({"role": 7, "tool_calls": [call.clone()]}),
+        json!("a bare text"),
+        json!(null),
+    ];
+    let mut messages = vec![
+        Value::Object(calls_first),
+        json!({"role": "assistant", "tool_calls": [call]}),
+    ];
+    messages.extend(untouched.iter().cloned());
+    process_tool_call_arguments(&mut messages);
+    for turn in &messages[..2] {
+        assert_eq!(
+            turn["tool_calls"][0]["function"]["arguments"],
+            json!({"city": "Paris"}),
+            "{turn}"
+        );
+    }
+    assert_eq!(&messages[2..], untouched.as_slice());
+}
