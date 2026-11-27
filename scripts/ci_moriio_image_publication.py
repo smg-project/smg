@@ -56,6 +56,28 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def builder_daemon_options(info):
+    """Preserve docker-container driver defaults for this admitted daemon."""
+    security = info.get("SecurityOptions")
+    assert security is None or isinstance(security, list), "invalid daemon security options"
+    names = set()
+    for option in security or []:
+        assert isinstance(option, str), "invalid daemon security option"
+        name = option  # Docker < 1.13 reports a plain name.
+        if "=" in option:
+            name = ""
+            for field in option.split(","):
+                key, separator, value = field.partition("=")
+                assert separator and key and value, "invalid daemon security option"
+                if key == "name":
+                    name = value
+        names.add(name)
+    flags = ["--cgroup-parent=/docker/buildx"] if info.get("CgroupDriver") == "cgroupfs" else []
+    if "userns" in names:
+        flags.append("--userns=host")
+    return flags
+
+
 def write_json(path, value):
     fd, name = tempfile.mkstemp(prefix=path.name + ".", suffix=".new", dir=path.parent)
     temporary = Path(name)
@@ -860,9 +882,15 @@ def publish(engine_checkout, output):
             "type=volume,volume-driver=local,dst=/var/lib/buildkit",
             "--mount",
             "type=bind,src=" + str(config) + ",dst=/etc/buildkit/buildkitd.toml,readonly",
+            *builder_daemon_options(info),
             BUILDKIT,
             "--config=/etc/buildkit/buildkitd.toml",
         ]
+        state["container_create_daemon_configuration"] = {
+            "daemon_id": state["docker_daemon_id"],
+            "security_options": info.get("SecurityOptions"),
+            "cgroup_driver": info.get("CgroupDriver"),
+        }
         state["container_create_argv"] = create
         event("create_intent", builder=builder, container_name=name, argv=create)
         creation_submitted = True
@@ -880,6 +908,10 @@ def publish(engine_checkout, output):
             created_limits["MemorySwap"],
         ) == (QUOTA, PERIOD, MEMORY, MEMORY)
         assert not created_limits.get("Devices") and not created_limits.get("DeviceRequests")
+        if "--userns=host" in create:
+            assert created_limits["UsernsMode"] == "host"
+        if "--cgroup-parent=/docker/buildx" in create:
+            assert created_limits["CgroupParent"] == "/docker/buildx"
         assert (
             created_limits.get("NetworkMode") != "host" and created_limits.get("PidMode") != "host"
         )

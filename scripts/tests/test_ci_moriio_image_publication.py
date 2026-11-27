@@ -1422,7 +1422,7 @@ class AttributableCreation(unittest.TestCase):
                 ns["command"]("later_productive", [sys.executable, "-c", "pass"])
             self.assertTrue(all(not c["Popen_attempted"] for c in ns["state"]["clients"][before:]))
 
-    def flow(self, directory, fault=None):
+    def flow(self, directory, fault=None, daemon_info=None):
         """Exact productive creation statements with protocol responses, never Docker."""
         pub = ast.parse(textwrap.dedent(inspect.getsource(p.publish))).body[0]
         body = next(n for n in pub.body if isinstance(n, ast.Try)).body
@@ -1448,6 +1448,7 @@ class AttributableCreation(unittest.TestCase):
             builder="owned-builder",
             name="owned-container",
             owned_id=None,
+            info=daemon_info or {"SecurityOptions": [], "CgroupDriver": "systemd"},
         )
         ns["persist"] = lambda: p.write_json(out / "result.json", ns["state"])
         ns["event"] = lambda *_a, **_k: None
@@ -1472,6 +1473,13 @@ class AttributableCreation(unittest.TestCase):
             if phase == "container_create":
                 if fault == "foreign_conflict":
                     raise RuntimeError("create conflict; foreign matching container")
+                if fault == "require_userns" and "--userns=host" not in argv:
+                    raise RuntimeError("daemon rejects privileged creation with userns-remap")
+                if (
+                    fault == "require_cgroup_parent"
+                    and "--cgroup-parent=/docker/buildx" not in argv
+                ):
+                    raise RuntimeError("cgroupfs creation left the original Buildx parent")
                 kwargs["on_success"](
                     b"a" * 64 + b"\n", {"handle": {"pid": 123, "start_ticks": 456}}
                 )
@@ -1491,6 +1499,15 @@ class AttributableCreation(unittest.TestCase):
                                 "Memory": p.MEMORY,
                                 "MemorySwap": p.MEMORY,
                                 "NetworkMode": "bridge",
+                                "UsernsMode": "host"
+                                if "--userns=host" in ns["state"]["container_create_argv"]
+                                and fault != "userns_unapplied"
+                                else "",
+                                "CgroupParent": "/docker/buildx"
+                                if "--cgroup-parent=/docker/buildx"
+                                in ns["state"]["container_create_argv"]
+                                and fault != "cgroup_unapplied"
+                                else "",
                             },
                             "Mounts": [
                                 {
@@ -1577,6 +1594,73 @@ class AttributableCreation(unittest.TestCase):
             self.assertIsInstance(error, AssertionError)
             self.assertFalse(ns["state"].get("cleanup_verified_absent", False))
             self.assertFalse(any(a[1] in {"stop", "rm"} for a in calls))
+
+
+class DaemonCompatibility(unittest.TestCase):
+    def flow(self, directory, fault=None, daemon_info=None):
+        return AttributableCreation.flow(self, directory, fault, daemon_info)
+
+    def test_privileged_userns_remap_completes_witnessed_creation(self):
+        for security in [["name=seccomp,profile=builtin", "name=userns"], ["userns"]]:
+            with self.subTest(security=security), tempfile.TemporaryDirectory() as directory:
+                info = {"SecurityOptions": security, "CgroupDriver": "systemd"}
+                ns, calls, error = self.flow(directory, "require_userns", info)
+                self.assertIsNone(error)
+                self.assertEqual(ns["state"]["container_creation_receipt"]["Id"], "a" * 64)
+                self.assertIn(("start", ["docker", "start", "a" * 64]), calls)
+                self.assertEqual(
+                    ns["state"]["container_create_daemon_configuration"]["security_options"],
+                    security,
+                )
+
+    def test_cgroupfs_preserves_original_buildx_parent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            info = {"SecurityOptions": [], "CgroupDriver": "cgroupfs"}
+            ns, calls, error = self.flow(directory, "require_cgroup_parent", info)
+            self.assertIsNone(error)
+            self.assertIn("--cgroup-parent=/docker/buildx", calls[0][1])
+            self.assertEqual(ns["owned_id"], "a" * 64)
+            self.assertIn(("start", ["docker", "start", "a" * 64]), calls)
+
+    def test_combined_remap_cgroupfs_keeps_both_settings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            info = {"SecurityOptions": ["name=userns"], "CgroupDriver": "cgroupfs"}
+            _ns, calls, error = self.flow(directory, daemon_info=info)
+            self.assertIsNone(error)
+            self.assertIn("--userns=host", calls[0][1])
+            self.assertIn("--cgroup-parent=/docker/buildx", calls[0][1])
+
+    def test_other_daemon_settings_retain_their_defaults(self):
+        for security in [
+            None,
+            [],
+            ["name=seccomp,profile=userns"],
+            ["apparmor", "name=userns-other"],
+        ]:
+            with self.subTest(security=security), tempfile.TemporaryDirectory() as directory:
+                info = {"SecurityOptions": security, "CgroupDriver": "systemd"}
+                _ns, calls, error = self.flow(directory, daemon_info=info)
+                self.assertIsNone(error)
+                self.assertNotIn("--userns=host", calls[0][1])
+                self.assertFalse(any(arg.startswith("--cgroup-parent=") for arg in calls[0][1]))
+
+    def test_malformed_security_options_stop_before_create(self):
+        for security in [["name=userns,broken"], ["name="], [False], "name=userns"]:
+            with self.subTest(security=security), tempfile.TemporaryDirectory() as directory:
+                info = {"SecurityOptions": security, "CgroupDriver": "cgroupfs"}
+                ns, calls, error = self.flow(directory, daemon_info=info)
+                self.assertIsInstance(error, AssertionError)
+                self.assertEqual(calls, [])
+                self.assertNotIn("container_creation_receipt", ns["state"])
+
+    def test_unapplied_namespace_or_parent_cannot_start_builder(self):
+        for fault in ["userns_unapplied", "cgroup_unapplied"]:
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                info = {"SecurityOptions": ["name=userns"], "CgroupDriver": "cgroupfs"}
+                ns, calls, error = self.flow(directory, fault, info)
+                self.assertIsInstance(error, AssertionError)
+                self.assertEqual(ns["owned_id"], "a" * 64)
+                self.assertFalse(any(phase == "start" for phase, _ in calls))
 
 
 if __name__ == "__main__":

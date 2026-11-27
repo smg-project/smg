@@ -163,7 +163,13 @@ response remains HOLD even when a subsequent name scan is empty.
 
 The container receives the read-only BuildKit configuration, resource limits
 and a fresh anonymous local state volume. Before starting it, the publisher
-checks those mounts and limits against the returned container ID. It registers
+checks those mounts and limits against the returned container ID. It uses
+`--userns=host` for this privileged container when daemon remapping is enabled,
+and retains the original Buildx parent
+`/docker/buildx` specifically for the cgroupfs driver. Both requested settings
+are checked before start. Other daemon configurations retain their defaults.
+These conditions follow the [original docker-container driver](https://github.com/docker/buildx/blob/v0.21.3/driver/docker-container/driver.go).
+It registers
 Buildx's remote driver at `docker-container://<full-ID>?context=default`, after
 confirming that context uses the same local Unix endpoint. Start, inspection,
 stop and container removal use the returned ID. The remote driver does not
