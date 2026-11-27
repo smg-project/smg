@@ -54,8 +54,10 @@
 //! `--refused partners` under the cell's own: each request is shed with no
 //! endpoint, by either entry too. `--no-room N` leaves the last `N`
 //! decodes of the cell with no room at their host's gate ([`Rooms`]): every
-//! other place stays open, and each pair goes to a decode that has one. The
-//! result's `conversions=` counts the two lists together.
+//! other place stays open, and each pair goes to a decode that has one.
+//! `--live-gates 1` gives the cell a host that reads each place's worker at
+//! every answer of its gate ([`Gates`]), with `--no-room N` or without it.
+//! The result's `conversions=` counts the two lists together.
 
 use std::{
     cell::OnceCell,
@@ -238,6 +240,36 @@ impl PairAdmission for Rooms {
 
     fn has_room(&self, decode: usize) -> bool {
         decode < self.0
+    }
+}
+
+/// A pair's host that reads each place's worker at every answer, as a
+/// gateway that keeps its gate on its workers does: a prefill has capacity
+/// by its load, and a decode ahead of the stated place has a room by its
+/// running window, its admitted requests and the rooms waited for at its
+/// gate. No decode from the stated place on has a room. Whether it refuses
+/// no place is the trait's own walk of the two lists.
+#[derive(Debug)]
+struct Gates {
+    prefills: Arc<[Arc<dyn Worker>]>,
+    decodes: Arc<[Arc<dyn Worker>]>,
+    rooms: usize,
+}
+
+impl PairAdmission for Gates {
+    fn has_capacity(&self, prefill: usize) -> bool {
+        self.prefills
+            .get(prefill)
+            .is_some_and(|worker| worker.load() < usize::MAX)
+    }
+
+    fn has_room(&self, decode: usize) -> bool {
+        decode < self.rooms
+            && self.decodes.get(decode).is_some_and(|worker| {
+                worker.max_running_requests().is_none_or(|window| {
+                    worker.pd_admitted() + worker.pd_waiting_rooms() < usize::from(window)
+                })
+            })
     }
 }
 
@@ -561,12 +593,21 @@ pub(super) fn runs(run: &Run) -> bool {
         list: published(&decodes),
         admission: if run.refused == Refused::Limit {
             &Full
-        } else if run.no_room != 0 {
+        } else if run.live_gates || run.no_room != 0 {
             assert!(
                 run.no_room < decodes.len(),
                 "a pair needs a decode with a room"
             );
-            Box::leak(Box::new(Rooms(decodes.len() - run.no_room)))
+            let rooms = decodes.len() - run.no_room;
+            if run.live_gates {
+                Box::leak(Box::new(Gates {
+                    prefills: Arc::clone(&prefills),
+                    decodes: Arc::clone(&decodes),
+                    rooms,
+                }))
+            } else {
+                Box::leak(Box::new(Rooms(rooms)))
+            }
         } else {
             &Open
         },

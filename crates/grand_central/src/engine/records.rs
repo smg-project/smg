@@ -1860,17 +1860,18 @@ pub(crate) type DrawnRecords<'a> = (
 /// or holds an engine's ranks, under the engine's own question
 /// ([`Engine::pair_drawn_for`]); the caller says that the request states
 /// nothing beside its lists, and answers two questions of the two lists:
-/// whether its host's admission refuses no row (`admits`) and whether
-/// every row of a side pairs with every row of the other (`pairs`).
-/// `None` leaves the decision to the whole pass, which writes every
-/// record itself.
+/// whether its host's admission refuses no row (`admits`, asked once at
+/// most: it may read its host) and whether every row of a side pairs with
+/// every row of the other (`pairs`). A side's stamp is called behind the
+/// yes of `admits` alone. `None` leaves the decision to the whole pass,
+/// which writes every record itself.
 #[cfg(feature = "in-process")]
 pub(crate) fn decide_pair_drawn(
     engine: &Engine,
     facts: &RequestFacts<'_>,
     cx: &Constraints<'_>,
     [prefills, decodes]: [DrawnRecords<'_>; 2],
-    [admits, pairs]: [&dyn Fn() -> bool; 2],
+    (admits, pairs): (&mut dyn FnMut() -> bool, &dyn Fn() -> bool),
     rows: [&mut Vec<Candidate>; 2],
     scratch: &mut Scratch,
 ) -> Option<Decision> {

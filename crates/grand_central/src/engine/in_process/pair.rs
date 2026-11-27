@@ -172,7 +172,8 @@ pub fn prefills_full(decision: &Decision) -> bool {
 
 /// What the host of a pair reads of its own admission at a decision's
 /// instant, a worker at a time. Each answer is a live read of the host's
-/// own gate: nothing of it is kept.
+/// own gate: a decision asks a place once at most, and nothing of an
+/// answer is kept past it.
 pub trait PairAdmission: fmt::Debug {
     /// Whether the prefill at place `prefill` of the prefill list can take
     /// one more request by the host's prefill limit.
@@ -182,16 +183,58 @@ pub trait PairAdmission: fmt::Debug {
     /// for this request: one that nothing waiting at its gate is in line
     /// for, or the room the request holds there already.
     fn has_room(&self, decode: usize) -> bool;
+}
 
-    /// Whether the admission refuses none of the first `prefills` places of
-    /// the prefill list and none of the first `decodes` places of the
-    /// decode list at this instant: what [`Self::has_capacity`] and
-    /// [`Self::has_room`] answer of each of those places, asked at once.
-    ///
-    /// A host may leave it alone: the default asks each place. A host that
-    /// knows the answer without a walk of its lists states it here.
-    fn admits_all(&self, prefills: usize, decodes: usize) -> bool {
-        (0..prefills).all(|at| self.has_capacity(at)) && (0..decodes).all(|at| self.has_room(at))
+/// What a pair's host answered of every place of its two lists where one
+/// decision asked them all ahead of its rows: each prefill's capacity bit
+/// and each decode's room bit, by its place. A pair decided by each
+/// side's draw asks so, once a place. Where a place is refused the whole
+/// pass that follows stamps its rows from these answers and asks the host
+/// no place again ([`Self::stamp`]).
+#[derive(Debug, Default)]
+pub(super) struct GatesRead {
+    prefills: Vec<bool>,
+    decodes: Vec<bool>,
+}
+
+impl GatesRead {
+    /// Asks `admission` of each of the first `prefills` places of the
+    /// prefill list and each of the first `decodes` places of the decode
+    /// list, once a place and every place, and says whether it refuses
+    /// none of them.
+    fn read(&mut self, admission: &dyn PairAdmission, (prefills, decodes): (usize, usize)) -> bool {
+        self.prefills.clear();
+        self.decodes.clear();
+        self.prefills
+            .extend((0..prefills).map(|at| admission.has_capacity(at)));
+        self.decodes
+            .extend((0..decodes).map(|at| admission.has_room(at)));
+        !(self.prefills.contains(&false) || self.decodes.contains(&false))
+    }
+
+    /// [`stamp`] with the answers read here: a record takes the answer of
+    /// its place, and `admission` is asked of a place past them alone.
+    fn stamp(
+        &self,
+        prefills: &mut [Candidate],
+        decodes: &mut [Candidate],
+        classes: &PartnerClasses,
+        admission: &dyn PairAdmission,
+    ) {
+        let (capacity, room) = (&self.prefills[..], &self.decodes[..]);
+        stamp_with(
+            prefills,
+            decodes,
+            classes,
+            |at| match capacity.get(at) {
+                Some(&has) => has,
+                None => admission.has_capacity(at),
+            },
+            |at| match room.get(at) {
+                Some(&has) => has,
+                None => admission.has_room(at),
+            },
+        );
     }
 }
 
@@ -597,10 +640,13 @@ impl<'a> PairLists<'a> {
             // pairs with every row of the other and is admitted. A retry
             // names the workers it tried on any list, with ranks or
             // without, and is decided whole. The admission is asked
-            // behind the engine's own question and ahead of the classes:
-            // a pair no draw is asked of pays none of it, and a pair with
-            // a refused row leaves for the whole pass before a class is
-            // read. A side then writes the records its draw asks about.
+            // behind the engine's own question and ahead of the classes,
+            // every place once: a pair no draw is asked of pays none of
+            // it, and a pair with a refused row leaves for the whole pass
+            // before a class is read, and that pass stamps its rows from
+            // the answers and asks no place again. A side then writes the
+            // records its draw asks about.
+            let mut read = None;
             if spec.engine().pairs_drawn()
                 && held.is_none()
                 && said.is_none()
@@ -623,17 +669,24 @@ impl<'a> PairLists<'a> {
             {
                 let (classes, admission) = (self.classes, self.admission);
                 let sizes = (prefill_records.len(), decode_records.len());
-                let admits = || admission.admits_all(sizes.0, sizes.1);
+                let gates = &mut buffers.gates;
+                let mut asked = false;
+                let mut admits = || {
+                    asked = true;
+                    gates.read(admission, sizes)
+                };
                 let pairs = || one_pair(classes, sizes);
+                // A row a draw writes is admitted: the draw is taken only
+                // where the admission refused no place.
                 let prefill_stamp = |row: &mut Candidate| {
                     let at = row.position as usize;
                     row.pair_class = classes.prefills().get(at).copied().unwrap_or(0);
-                    row.has_capacity = admission.has_capacity(at);
+                    row.has_capacity = true;
                 };
                 let decode_stamp = |row: &mut Candidate| {
                     let at = row.position as usize;
                     row.pair_class = classes.decodes().get(at).copied().unwrap_or(0);
-                    row.has_room = admission.has_room(at);
+                    row.has_room = true;
                 };
                 let drawn = decide_pair_drawn(
                     spec.engine(),
@@ -643,7 +696,7 @@ impl<'a> PairLists<'a> {
                         (prefill_records, workers, &live, &prefill_stamp),
                         (decode_records, decode_workers, &decode_live, &decode_stamp),
                     ],
-                    [&admits, &pairs],
+                    (&mut admits, &pairs),
                     [&mut *prefills, &mut *decodes],
                     &mut buffers.scratch,
                 );
@@ -661,6 +714,9 @@ impl<'a> PairLists<'a> {
                         &sends_to,
                     );
                     return decision;
+                }
+                if asked {
+                    read = Some(&buffers.gates);
                 }
             }
             // The decode asked again reads one prefill, the held one.
@@ -690,7 +746,10 @@ impl<'a> PairLists<'a> {
                     row.session_in_flight = row.session_in_flight.saturating_sub(1);
                 }
             }
-            stamp(prefills, decodes, self.classes, self.admission);
+            match read {
+                Some(read) => read.stamp(prefills, decodes, self.classes, self.admission),
+                None => stamp(prefills, decodes, self.classes, self.admission),
+            }
             let (engine, scratch) = (spec.engine(), &mut buffers.scratch);
             let [prefill_side, decode_side] = sides;
             // A hard demand the request states is judged here, a side at a
@@ -981,12 +1040,14 @@ fn held_prefill<'a, 'f>(
 /// an encode request's alike: such a request allocates nothing once each
 /// list has grown to its side.
 /// A side whose phase reads who holds the prompt keeps its list's column
-/// here, the prefills' first.
+/// here, the prefills' first. A pair asked by its draws keeps what its
+/// host's admission answered of every place here for that decision.
 #[derive(Debug, Default)]
 pub(super) struct Buffers {
     pub(super) rows: [Vec<Candidate>; 2],
     pub(super) encoders: Vec<Candidate>,
     pub(super) scratch: Scratch,
+    pub(super) gates: GatesRead,
     pub(super) meeting: [Vec<u32>; 2],
     pub(super) columns: [Vec<AffinityFacts>; 2],
 }
@@ -1034,8 +1095,8 @@ pub(super) fn shed_over() -> Option<ShedOver> {
 /// `prefills` rows pairs with every decode of a list of `decodes` rows:
 /// one class a side, the two pair, and neither is the other's first
 /// partner. Where the host's admission refuses none of them either
-/// ([`PairAdmission::admits_all`]), each side's whole pass keeps every row
-/// its draw may ask about.
+/// ([`GatesRead::read`]), each side's whole pass keeps every row its draw
+/// may ask about.
 fn one_pair(classes: &PartnerClasses, (prefills, decodes): (usize, usize)) -> bool {
     let (prefill_classes, decode_classes) = (classes.prefills(), classes.decodes());
     let (Some(&prefill), Some(&decode)) = (prefill_classes.first(), decode_classes.first()) else {
@@ -1063,16 +1124,35 @@ pub(super) fn stamp(
     classes: &PartnerClasses,
     admission: &dyn PairAdmission,
 ) {
+    stamp_with(
+        prefills,
+        decodes,
+        classes,
+        |at| admission.has_capacity(at),
+        |at| admission.has_room(at),
+    );
+}
+
+/// [`stamp`] with each place's two bits as `capacity` and `room` answer
+/// them: the host itself, or what a decision read of it already
+/// ([`GatesRead::stamp`]).
+fn stamp_with(
+    prefills: &mut [Candidate],
+    decodes: &mut [Candidate],
+    classes: &PartnerClasses,
+    capacity: impl Fn(usize) -> bool,
+    room: impl Fn(usize) -> bool,
+) {
     let class = |classes: &[u32], at: usize| classes.get(at).copied().unwrap_or(0);
     for row in prefills.iter_mut() {
         let at = row.position as usize;
         row.pair_class = class(classes.prefills(), at);
-        row.has_capacity = admission.has_capacity(at);
+        row.has_capacity = capacity(at);
     }
     for row in decodes.iter_mut() {
         let at = row.position as usize;
         row.pair_class = class(classes.decodes(), at);
-        row.has_room = admission.has_room(at);
+        row.has_room = room(at);
     }
 }
 
