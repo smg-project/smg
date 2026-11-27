@@ -4132,7 +4132,7 @@ fn the_held_pair_names_the_prefill_and_the_decode_of_the_target_its_dispatch_too
         let held = store.held_pair(owner, LeaseId(id));
         assert!(store.unlocked(), "the turn is given back");
         assert_eq!(file(), before, "the read moves nothing");
-        held
+        held.map(|(prefill, decode, _, issued)| (prefill, decode, issued))
     };
     // No prefill was sent yet.
     assert_eq!(held(gateway, 1), Err(PrefillNotHeld));

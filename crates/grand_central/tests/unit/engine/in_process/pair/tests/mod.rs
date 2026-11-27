@@ -4559,6 +4559,65 @@ fn a_decode_asked_again_reads_its_keys_other_requests_on_its_first_decode() {
     );
 }
 
+/// A decode asked again takes the key's pin with it from the first claim
+/// of its own pair alone. A key that idled out behind a pair's first
+/// decision starts over, and a second request of the key that claims the
+/// same decode holds a claim of its own. The first pair's decode, asked
+/// again, then claims its decode behind that claim, and its dispatch
+/// leaves both: the key's next request follows the second request's
+/// decode, though it is the busier of the two by then.
+#[test]
+fn a_decode_asked_again_leaves_the_claim_of_a_later_request_of_its_key() {
+    let pair = PolicySpec::pair_presets("manual", "manual");
+    let mut document = pair.expect("the pair presets");
+    let stock = PolicySpec::preset("manual").expect("a built-in preset");
+    let mut rule = stock.bindings[0].sessions.clone();
+    let ruled = rule.as_mut().expect("the stock rule");
+    // A key idles out inside the life of a pair's lease.
+    (ruled.ttl_s, ruled.sweep_s) = (1, 1);
+    ruled.assignment = Assignment::MinLoad;
+    document.bindings[0].sessions = rule;
+    let (host, classes) = (host_of(document, 1, 2), every(1, 2));
+    let asks = host.asks(&classes, true);
+    let decided = |at: Instant| {
+        DecisionGuard::decide_under(&host.engine, GatewayId::LOCAL, &asks, at).expect("a decision")
+    };
+    let verdict = |decision: &Decision| {
+        let pair = target_at(decision, 0).pair.expect("a pair");
+        (host.picked(decision), pair.decode_verdict)
+    };
+    let claimed = |decode: usize| ((0, decode), DecodeVerdict::CLAIMED);
+    let now = Instant::now();
+    let later = now + Duration::from_secs(3);
+    // The first pair claims the one decode that is ready.
+    host.decodes[1].set_status(WorkerStatus::NotReady);
+    let mut first = decided(now);
+    assert_eq!(verdict(first.decision()), claimed(0), "the first claim");
+    first.dispatched(now);
+    // Past the key's idle time a second request claims that decode anew.
+    let second = decided(later);
+    assert_eq!(verdict(second.decision()), claimed(0), "the second claim");
+    // The first pair's decode, asked again, lands on the other decode and
+    // claims it.
+    host.decodes[0].set_status(WorkerStatus::NotReady);
+    host.decodes[1].set_status(WorkerStatus::Ready);
+    let again = *first.decide_decode_under(&asks, later).expect("a decision");
+    assert_eq!(verdict(&again), claimed(1), "the call's claim");
+    first.dispatched_decode(later);
+    // The key's next request, with the first decode ready again and the
+    // busier of the two: the load alone would take the call's decode.
+    host.decodes[0].set_status(WorkerStatus::Ready);
+    for _ in 0..8 {
+        host.decodes[0].increment_load();
+    }
+    let next = decided(later);
+    assert_eq!(
+        host.picked(next.decision()),
+        (0, 0),
+        "the second request's decode"
+    );
+}
+
 /// A pair's decision asks its request's maker where the key's requests
 /// are counted under a document that reads the count, once a decision,
 /// and under no other: a rule with no cap asks nothing, and neither
@@ -4988,7 +5047,8 @@ fn a_decode_call_that_follows_a_pin_dates_its_keys_life_through_each_entry() {
         } else {
             let held = first_target(guard.decision());
             let own = host.engine.loaded();
-            let again = own.decide_decode_without_lease(&asks, &held, issued, call);
+            let none = (Session::NONE, WorkerId(0));
+            let again = own.decide_decode_without_lease(&asks, &held, none, issued, call);
             again.expect("a decision")
         };
         let pair = first_target(&again).pair.expect("a pair");
@@ -5072,7 +5132,8 @@ fn a_decode_calls_verdict_hands_the_table_its_pairs_lease_date() {
             asked.set(true);
             key
         };
-        date_decode_claim(own, &call(verdict), made, 5_000, lease);
+        let none = || (Session::NONE, WorkerId(0));
+        date_decode_claim(own, &call(verdict), made, 5_000, none, lease);
         let stated = verdict != SessionVerdict::None;
         assert_eq!(asked.get(), stated, "{verdict:?} under {lease}");
         table.dispatched(key, pinned, id(101), 10);
@@ -5089,7 +5150,8 @@ fn a_decode_calls_verdict_hands_the_table_its_pairs_lease_date() {
     let made = table.claim(key, seen, id(102), 5_000);
     assert_eq!(made, Claim::Made(id(102)));
     let claimed = SessionVerdict::Claimed(id(102));
-    date_decode_claim(own, &call(claimed), || key, 5_000, 10);
+    let none = || (Session::NONE, WorkerId(0));
+    date_decode_claim(own, &call(claimed), || key, 5_000, none, 10);
     table.dispatched(key, claimed, id(101), 10);
     assert_eq!(table.pins(key), Some([id(101), id(0)]), "with a claim");
 }

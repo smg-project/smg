@@ -605,7 +605,7 @@ fn served_call(
     let request = Checked::new(frame).expect("a frame the record holds");
     let taken = taken_at(&request, gateway, (now, now), place);
     let (mut frames, own) = (FrameBuffers::default(), Part::default());
-    let held = (held.0, held.1, 0);
+    let held = (held.0, held.1, Default::default(), 0);
     let decided = store
         .deciding(|world| decide_decode(world, objects, &taken, held, &mut frames, loads, &own));
     decided.expect("the engine decides").0
@@ -745,9 +745,13 @@ fn a_decode_call_answers_no_decode_then_the_decodes_emptied_then_none_dialed() {
                 id: p,
                 ..Target::default()
             };
-            let decided = world
-                .front()
-                .decide_decode_without_lease(&maker, &held, 0, now);
+            let decided = world.front().decide_decode_without_lease(
+                &maker,
+                &held,
+                Default::default(),
+                0,
+                now,
+            );
             let decided = decided.expect("the engine decides");
             let trace = decided.trace();
             (shed_of(&decided), (trace.seed, trace.generation))
@@ -929,7 +933,7 @@ fn a_decode_call_starts_from_the_decode_of_the_target_its_prefills_dispatch_took
         let took = chosen[usize::from(index)].1;
         let held = store.held_pair(GATEWAY, prefill.id);
         assert_eq!(
-            held.map(|(prefill, decode, _)| (prefill, decode.map(|at| at.0))),
+            held.map(|(prefill, decode, ..)| (prefill, decode.map(|at| at.0))),
             Ok((p, Some(took)))
         );
         let frame = at_call(n + 10, prefill.id, WireModes::NONE, None);
@@ -1519,4 +1523,391 @@ fn a_frame_is_decided_over_rows_that_state_demand_facts_as_over_rows_that_state_
         decoding: 3,
     };
     assert_eq!(answers(stated), answers(DemandFacts::default()));
+}
+
+/// A decode call the rule places on another decode than its pair's first
+/// decision claimed takes the key with it at its dispatch. Behind the call
+/// the key holds both decodes, the one its first decision claimed ahead.
+/// Behind the dispatch of the call's decode it holds that decode alone:
+/// the decode the request left is no pin of the key. The pair's refusal
+/// leaves the key on the first decode, with a release of the decode ahead
+/// of it or without one. A call that follows an older pin of the key
+/// claims nothing, and its dispatch leaves the key's pins as they stood.
+/// A prefill dispatched on the pick's second target changes none of it.
+#[test]
+fn a_served_decode_call_on_another_decode_takes_the_keys_pin_with_it() {
+    /// How the pair ends behind its decode call.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Ends {
+        Refused,
+        DecodeReleasedFirst,
+        DecodeDispatched,
+    }
+    let store = Arc::new(MemoryStore::new());
+    let objects = holder(&store);
+    store
+        .apply(ruled_pair_plan())
+        .expect("above the unbound start");
+    let p = side_member(&store, &objects, "p0", Role::Prefill, None);
+    for name in ["d0", "d1"] {
+        side_member(&store, &objects, name, Role::Decode, None);
+    }
+    LeasesStore::set_term(&*store, 1);
+    let now = Instant::now();
+    let hand = open(&store, GATEWAY);
+    let alone = |id| Some([id, WorkerId(0)]);
+    let refused = |lease: &Lease, side: proto::Side| {
+        let word = proto::Released {
+            what: Some(proto::released::What::LeaseId(lease.id.0)),
+            reason: proto::released::Reason::CommitFailed.into(),
+            side: side.into(),
+        };
+        lifecycle::released(&store, &hand, &word).expect("the frame reads");
+    };
+    // Each pair by the number of its first frame, the key its frames
+    // hand, the target its prefill's dispatch names, its end, and whether
+    // the key holds an older pin on the decode its call takes.
+    let pairs = [
+        (1, 7, 0, Ends::Refused, false),
+        (3, 8, 0, Ends::DecodeReleasedFirst, false),
+        (5, 9, 0, Ends::DecodeDispatched, true),
+        (9, 10, 0, Ends::DecodeDispatched, false),
+        (11, 11, 1, Ends::DecodeDispatched, false),
+    ];
+    for (n, key, taken, ends, older) in pairs {
+        // The key's older pin: an earlier pair of the key sent on both
+        // sides, whose decode is not ready for the pair of this row.
+        let older = older.then(|| {
+            let frame = keyed(at_prefill(n + 2, WireModes::NONE, None), key);
+            let (decision, earlier, _) = leased_pair(&store, &objects, frame, now);
+            for side in [proto::Side::Prefill, proto::Side::Decode] {
+                let word = sent(&earlier, side, 0);
+                lifecycle::dispatched(&store, &hand, &word, now).expect("the frame reads");
+            }
+            let pinned = pairs_of(&decision)[0].1;
+            stand(&objects, &store, pinned, WorkerStatus::NotReady);
+            pinned
+        });
+        let mut frame = keyed(at_prefill(n, WireModes::NONE, None), key);
+        frame.decode_later = true;
+        let (decision, prefill, _) = leased_pair(&store, &objects, frame, now);
+        let first = pairs_of(&decision)[0].1;
+        let sides = LeasesStore::sides(&*store, GATEWAY, prefill.id).expect("on file");
+        let chosen = sides.decode.expect("a pair's lease").session;
+        // The pins of the prefill side's key, then of the decode side's as
+        // the pair's first frame states it.
+        let pins = || [prefill.session, chosen].map(|session| pins_of(&store, session));
+        let own = sent(&prefill, proto::Side::Prefill, taken);
+        lifecycle::dispatched(&store, &hand, &own, now).expect("the frame reads");
+        // The decode side's key ahead of the call: the first claim, behind
+        // the older pin where the key holds one.
+        let held = older.map_or_else(|| alone(first), |pinned| Some([pinned, first]));
+        assert_eq!(pins(), [alone(p), held], "pair {n}: the first claim");
+        stand(&objects, &store, first, WorkerStatus::NotReady);
+        if let Some(pinned) = older {
+            stand(&objects, &store, pinned, WorkerStatus::Ready);
+        }
+        let call = keyed(at_call(n + 1, prefill.id, WireModes::NONE, None), key);
+        let (again, issued) = leased_call(&store, &objects, call, now);
+        let other = pairs_of(&again)[0].1;
+        assert_ne!(other, first, "pair {n}: the call names the other decode");
+        let (side, _) = issued.expect("a pick's issue");
+        // The call follows the key's older pin where one stands, and
+        // claims its decode behind the first claim where none does.
+        let (verdict, called) = match older {
+            Some(_) => (SessionVerdict::Pinned, held),
+            None => (SessionVerdict::Claimed(other), Some([first, other])),
+        };
+        assert_eq!(side.session_verdict, verdict, "pair {n}: the verdict");
+        assert_eq!(
+            pins_of(&store, side.session),
+            called,
+            "pair {n}: the call's claim"
+        );
+        assert_eq!(
+            pins(),
+            [alone(p), called],
+            "pair {n}: behind the call's issue"
+        );
+        let left = match ends {
+            Ends::Refused | Ends::DecodeReleasedFirst => {
+                if ends == Ends::DecodeReleasedFirst {
+                    refused(&prefill, proto::Side::Decode);
+                    assert_eq!(
+                        pins(),
+                        [alone(p), alone(first)],
+                        "pair {n}: the decode released"
+                    );
+                }
+                refused(&prefill, proto::Side::Unspecified);
+                alone(first)
+            }
+            Ends::DecodeDispatched => {
+                let to = sent(&prefill, proto::Side::Decode, 0);
+                lifecycle::dispatched(&store, &hand, &to, now).expect("the frame reads");
+                // Every word the dispatch tells returned: none faulted.
+                assert_eq!(store.lifecycle_faults(), 0, "pair {n}: no fault");
+                older.map_or_else(|| alone(other), |_| held)
+            }
+        };
+        assert_eq!(pins(), [alone(p), left], "pair {n}: at the end");
+        // The decode the request left is ready again: the key reads the same.
+        stand(&objects, &store, first, WorkerStatus::Ready);
+        assert_eq!(pins(), [alone(p), left], "pair {n}: the first decode ready");
+    }
+}
+
+/// A decode call that is taken back leaves the key's pins as the call
+/// wrote them until the next word of its pair. The dispatch of the decode
+/// the pair's first decision claimed, told under the pair's own lease,
+/// leaves the key on that decode alone. A call whose commit failed leaves
+/// the key there at once. A second call behind one taken back follows a
+/// pin of the key and claims nothing: sent on the first call's decode, the
+/// pair's decode leaves the key on that decode alone; sent on the first
+/// decision's decode, it leaves both pins.
+#[test]
+fn a_served_decode_call_taken_back_takes_the_keys_pin_with_it_to_its_first_decode() {
+    let store = Arc::new(MemoryStore::new());
+    let objects = holder(&store);
+    store
+        .apply(ruled_pair_plan())
+        .expect("above the unbound start");
+    side_member(&store, &objects, "p0", Role::Prefill, None);
+    for name in ["d0", "d1"] {
+        side_member(&store, &objects, name, Role::Decode, None);
+    }
+    LeasesStore::set_term(&*store, 1);
+    let now = Instant::now();
+    let hand = open(&store, GATEWAY);
+    let alone = |id| Some([id, WorkerId(0)]);
+    // Each pair by the number of its first frame, the key its frames
+    // hand, the reason its call is taken back under, and for a second call
+    // behind the one taken back whether the first decode is ready for it.
+    let pairs = [
+        (1, 7, ReleaseReason::CommitFailed, None, "commit failed"),
+        (3, 8, ReleaseReason::Abandoned, None, "abandoned"),
+        (5, 9, ReleaseReason::LateDecision, None, "late decision"),
+        (7, 10, ReleaseReason::Abandoned, Some(false), "called again"),
+        (
+            10,
+            11,
+            ReleaseReason::Abandoned,
+            Some(true),
+            "called again, ready",
+        ),
+    ];
+    for (n, key, reason, second, name) in pairs {
+        let mut frame = keyed(at_prefill(n, WireModes::NONE, None), key);
+        frame.decode_later = true;
+        let (decision, prefill, _) = leased_pair(&store, &objects, frame, now);
+        let first = pairs_of(&decision)[0].1;
+        let sides = LeasesStore::sides(&*store, GATEWAY, prefill.id).expect("on file");
+        let chosen = sides.decode.expect("a pair's lease").session;
+        let own = sent(&prefill, proto::Side::Prefill, 0);
+        lifecycle::dispatched(&store, &hand, &own, now).expect("the frame reads");
+        stand(&objects, &store, first, WorkerStatus::NotReady);
+        let call = keyed(at_call(n + 1, prefill.id, WireModes::NONE, None), key);
+        let (again, _) = leased_call(&store, &objects, call, now);
+        let other = pairs_of(&again)[0].1;
+        assert_ne!(other, first, "{name}: the other decode");
+        assert!(
+            store.take_back_decode(GATEWAY, prefill.id, reason),
+            "{name}: the call's issue is taken back"
+        );
+        // A failed commit takes the call's claim back with the issue.
+        let behind = if matches!(reason, ReleaseReason::CommitFailed) {
+            alone(first)
+        } else {
+            Some([first, other])
+        };
+        assert_eq!(pins_of(&store, chosen), behind, "{name}: taken back");
+        // A second call follows a pin of the key and claims nothing: the
+        // first call's decode while the first decode is not ready, the
+        // first decode once it is.
+        let second = second.map(|ready| {
+            if ready {
+                stand(&objects, &store, first, WorkerStatus::Ready);
+            }
+            let call = keyed(at_call(n + 2, prefill.id, WireModes::NONE, None), key);
+            let (again, issued) = leased_call(&store, &objects, call, now);
+            let (side, _) = issued.expect("a pick's issue");
+            let verdict = side.session_verdict;
+            assert_eq!(verdict, SessionVerdict::Pinned, "{name}: a pin followed");
+            let decode = pairs_of(&again)[0].1;
+            assert_eq!(decode, if ready { first } else { other }, "{name}: the pin");
+            assert_eq!(pins_of(&store, chosen), behind, "{name}: called again");
+            decode
+        });
+        // The pair's decode is sent. The first pick's own leaves the key on
+        // it alone. A second call's on the first call's decode leaves the
+        // key on that decode alone: the lease went where the call's claim
+        // stands. A second call's on the first decode claimed nothing
+        // there, and leaves both pins.
+        let to = sent(&prefill, proto::Side::Decode, 0);
+        lifecycle::dispatched(&store, &hand, &to, now).expect("the frame reads");
+        let left = match second {
+            None => alone(first),
+            Some(decode) if decode == other => alone(other),
+            Some(_) => Some([first, other]),
+        };
+        assert_eq!(pins_of(&store, chosen), left, "{name}: dispatched");
+        stand(&objects, &store, first, WorkerStatus::Ready);
+    }
+}
+
+/// A decode call takes the key's pin with it from the first claim of its
+/// own pair alone. A key that idled out behind a pair's first decision
+/// starts over, and a second request of the key that claims the same
+/// decode holds a claim of its own. The first pair's call then claims its
+/// decode behind that claim, and the dispatch of the call's decode leaves
+/// both: the key reads the second request's decode ahead of the call's.
+/// The second request's dispatch there, or its refusal, moves no pin.
+#[test]
+fn a_served_decode_call_leaves_the_claim_of_a_later_request_of_its_key() {
+    for dispatched in [true, false] {
+        let store = Arc::new(MemoryStore::new());
+        let objects = holder(&store);
+        // A key idles out inside the life of a pair's lease.
+        let idle = ruled_pair_plan_with(|rule| (rule.ttl_s, rule.sweep_s) = (1, 1));
+        store.apply(idle).expect("above the unbound start");
+        side_member(&store, &objects, "p0", Role::Prefill, None);
+        let d0 = side_member(&store, &objects, "d0", Role::Decode, None);
+        let d1 = side_member(&store, &objects, "d1", Role::Decode, None);
+        LeasesStore::set_term(&*store, 1);
+        let now = Instant::now();
+        let later = now + Duration::from_secs(3);
+        let hand = open(&store, GATEWAY);
+        let alone = |id| Some([id, WorkerId(0)]);
+        // A pair of the key by the number of its first frame, its decode
+        // asked for later: its lease and the decode side's key.
+        let pair = |n: u8, at: Instant| {
+            let mut frame = keyed(at_prefill(n, WireModes::NONE, None), 7);
+            frame.decode_later = true;
+            let (_, prefill, _) = leased_pair(&store, &objects, frame, at);
+            let sides = LeasesStore::sides(&*store, GATEWAY, prefill.id).expect("on file");
+            (prefill, sides.decode.expect("a pair's lease").session)
+        };
+        // The first pair claims the one decode that is ready.
+        stand(&objects, &store, d1, WorkerStatus::NotReady);
+        let (first, key) = pair(1, now);
+        let own = sent(&first, proto::Side::Prefill, 0);
+        lifecycle::dispatched(&store, &hand, &own, now).expect("the frame reads");
+        assert_eq!(pins_of(&store, key), alone(d0), "the first claim");
+        // Past the key's idle time a second request claims that decode anew.
+        let (second, again) = pair(3, later);
+        assert_eq!(again, key, "one key");
+        assert_eq!(pins_of(&store, key), alone(d0), "the second claim");
+        // The first pair's call lands on the other decode and claims it.
+        stand(&objects, &store, d0, WorkerStatus::NotReady);
+        stand(&objects, &store, d1, WorkerStatus::Ready);
+        let call = keyed(at_call(2, first.id, WireModes::NONE, None), 7);
+        let (_, issued) = leased_call(&store, &objects, call, later);
+        let (side, _) = issued.expect("a pick's issue");
+        assert_eq!(
+            side.session_verdict,
+            SessionVerdict::Claimed(d1),
+            "the call's verdict"
+        );
+        let both = Some([d0, d1]);
+        assert_eq!(pins_of(&store, key), both, "the call's claim");
+        // The call's decode is sent: the second request's claim stands.
+        let to = sent(&first, proto::Side::Decode, 0);
+        lifecycle::dispatched(&store, &hand, &to, later).expect("the frame reads");
+        assert_eq!(pins_of(&store, key), both, "the call's decode sent");
+        if dispatched {
+            let to = sent(&second, proto::Side::Decode, 0);
+            lifecycle::dispatched(&store, &hand, &to, later).expect("the frame reads");
+        } else {
+            let word = proto::Released {
+                what: Some(proto::released::What::LeaseId(second.id.0)),
+                reason: proto::released::Reason::CommitFailed.into(),
+                side: proto::Side::Unspecified.into(),
+            };
+            lifecycle::released(&store, &hand, &word).expect("the frame reads");
+        }
+        assert_eq!(
+            pins_of(&store, key),
+            both,
+            "the second request's end, dispatched {dispatched}"
+        );
+    }
+}
+
+/// A second request of the key that follows the first claim of a pair is
+/// placed on that claim's decode. The pair's call then claims another
+/// decode, and the dispatch of the call's decode leaves the key on it
+/// alone. The second request's dispatch on the decode it followed puts
+/// that decode back where it stood, ahead of the call's: the key was
+/// served on both. A second request that is refused was sent nowhere, and
+/// the key stays on the call's decode.
+#[test]
+fn a_served_decode_calls_dispatch_keeps_the_decode_a_later_request_followed() {
+    for dispatched in [true, false] {
+        let store = Arc::new(MemoryStore::new());
+        let objects = holder(&store);
+        // A key that does not idle out inside the life of a pair's lease.
+        let plan = ruled_pair_plan_with(|_| ());
+        store.apply(plan).expect("above the unbound start");
+        side_member(&store, &objects, "p0", Role::Prefill, None);
+        let d0 = side_member(&store, &objects, "d0", Role::Decode, None);
+        let d1 = side_member(&store, &objects, "d1", Role::Decode, None);
+        LeasesStore::set_term(&*store, 1);
+        let now = Instant::now();
+        let later = now + Duration::from_secs(3);
+        let hand = open(&store, GATEWAY);
+        let alone = |id| Some([id, WorkerId(0)]);
+        // A pair of the key by the number of its first frame, its decode
+        // asked for later: its lease and its decode side.
+        let pair = |n: u8, at: Instant| {
+            let mut frame = keyed(at_prefill(n, WireModes::NONE, None), 7);
+            frame.decode_later = true;
+            let (_, prefill, _) = leased_pair(&store, &objects, frame, at);
+            let sides = LeasesStore::sides(&*store, GATEWAY, prefill.id).expect("on file");
+            (prefill, sides.decode.expect("a pair's lease"))
+        };
+        // The first pair claims the one decode that is ready.
+        stand(&objects, &store, d1, WorkerStatus::NotReady);
+        let (first, side) = pair(1, now);
+        let key = side.session;
+        let own = sent(&first, proto::Side::Prefill, 0);
+        lifecycle::dispatched(&store, &hand, &own, now).expect("the frame reads");
+        assert_eq!(pins_of(&store, key), alone(d0), "the first claim");
+        // A second request of the key follows that claim.
+        let (second, side) = pair(3, later);
+        assert_eq!(side.session, key, "one key");
+        assert_eq!(side.session_verdict, SessionVerdict::Pinned, "it follows");
+        assert_eq!(pins_of(&store, key), alone(d0), "no second claim");
+        // The first pair's call lands on the other decode and claims it.
+        stand(&objects, &store, d0, WorkerStatus::NotReady);
+        stand(&objects, &store, d1, WorkerStatus::Ready);
+        let call = keyed(at_call(2, first.id, WireModes::NONE, None), 7);
+        let (_, issued) = leased_call(&store, &objects, call, later);
+        let (side, _) = issued.expect("a pick's issue");
+        assert_eq!(
+            side.session_verdict,
+            SessionVerdict::Claimed(d1),
+            "the call's verdict"
+        );
+        let both = Some([d0, d1]);
+        assert_eq!(pins_of(&store, key), both, "the call's claim");
+        // The call's decode is sent: the key holds it alone.
+        let to = sent(&first, proto::Side::Decode, 0);
+        lifecycle::dispatched(&store, &hand, &to, later).expect("the frame reads");
+        assert_eq!(pins_of(&store, key), alone(d1), "the call's decode sent");
+        if dispatched {
+            // The second request is sent on the decode it followed.
+            let to = sent(&second, proto::Side::Decode, 0);
+            lifecycle::dispatched(&store, &hand, &to, later).expect("the frame reads");
+            assert_eq!(pins_of(&store, key), both, "where it stood");
+        } else {
+            // The second request is refused: it was sent nowhere.
+            let word = proto::Released {
+                what: Some(proto::released::What::LeaseId(second.id.0)),
+                reason: proto::released::Reason::CommitFailed.into(),
+                side: proto::Side::Unspecified.into(),
+            };
+            lifecycle::released(&store, &hand, &word).expect("the frame reads");
+            assert_eq!(pins_of(&store, key), alone(d1), "sent nowhere");
+        }
+    }
 }

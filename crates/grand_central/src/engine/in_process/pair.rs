@@ -142,7 +142,7 @@ use crate::{
         pair_classes::PartnerClasses,
         records::{vetoes, with_shadow::Lends, HeldCells, Live, PoolRecords},
         shadow::{budget_left, ShadowSide, Shadowed, SHADOW_FLOOR},
-        sticky_sessions::SessionVerdict,
+        sticky_sessions::{DecodeVerdict, SessionVerdict},
         view::{
             AffinityFacts, Candidate, Constraints, Feed, Phase, PoolFacts, RequestFacts, Role,
             Session, SessionCountedUnder, WorkerId,
@@ -1674,12 +1674,21 @@ fn decide_with(
 /// the call's instant, as the claim of any decision that faults stands.
 /// The lease's words do not reach it: it ends at a dispatch on its worker
 /// or with the key's idle time.
+///
+/// `first_claim` is the claim the pair's first decision made for its
+/// decode side: the key, and the worker, `WorkerId(0)` where it claimed
+/// none. A call that claims another worker under the same key hands that
+/// worker on: the table then holds the two claims as one lease's, and the
+/// decode's dispatch leaves the key on the worker the decode went to.
+/// It is asked behind the call's own claim: a call that claims nothing
+/// reads none.
 #[inline]
 pub(super) fn date_decode_claim(
     own: Loaded<'_, '_>,
     decision: &Decision,
     key: impl FnOnce() -> Session,
     at: u64,
+    first_claim: impl FnOnce() -> (Session, WorkerId),
     issued_micros: u64,
 ) {
     let first = decision.pick().and_then(|pick| pick.targets.first());
@@ -1692,8 +1701,30 @@ pub(super) fn date_decode_claim(
         SessionVerdict::Claimed(claimed) => Some(claimed),
         _ => None,
     };
+    let key = key();
+    let first = claimed.map_or(WorkerId(0), |_| {
+        let (first_key, first) = first_claim();
+        if first_key == key {
+            first
+        } else {
+            WorkerId(0)
+        }
+    });
     let engine = own.document.spec.engine();
-    engine.told_under(key(), claimed, at, issued_micros);
+    engine.told_under(key, claimed, at, issued_micros, first);
+}
+
+/// The decode `decision` claimed for its key: the decode of its pick's
+/// first target, where that side's verdict is a claim. `WorkerId(0)` where
+/// it claimed none.
+#[inline]
+fn claimed_decode(decision: &Decision) -> WorkerId {
+    decision
+        .pick()
+        .and_then(|pick| pick.targets.first())
+        .and_then(|first| first.pair)
+        .filter(|pair| pair.decode_verdict == DecodeVerdict::CLAIMED)
+        .map_or(WorkerId(0), |pair| pair.decode_id)
 }
 
 /// One decision of a pair by `own`, the engine of a gateway's own process,
@@ -1846,7 +1877,14 @@ pub(super) fn issued(
     // not made again.
     if let Some(held) = held {
         let (key, at) = (outcome.decode_session, facts.now_micros);
-        date_decode_claim(own, &outcome.decision, || key, at, held.lease.issued_micros);
+        date_decode_claim(
+            own,
+            &outcome.decision,
+            || key,
+            at,
+            || (held.decode.session, claimed_decode(held.decision)),
+            held.lease.issued_micros,
+        );
     }
     outcome
 }

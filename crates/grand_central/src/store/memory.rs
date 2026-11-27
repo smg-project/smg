@@ -25,7 +25,7 @@ use parking_lot::{Mutex, MutexGuard};
 use rustc_hash::FxHashMap;
 
 #[cfg(feature = "controller")]
-use crate::engine::CacheIndexes;
+use crate::engine::{sticky_sessions::SessionVerdict, CacheIndexes};
 use crate::{
     document::spec::AppliedSpec,
     engine::{
@@ -2256,10 +2256,12 @@ type Replaced = (DecodeSide, Instant);
 
 /// What a decode call reads of the lease it names
 /// ([`MemoryStore::held_pair`]). The held prefill's worker comes first,
-/// then the worker and the rank of the decode its first decision chose.
-/// Last comes the instant the lease was issued at.
+/// then the worker and the rank of the decode its first decision chose,
+/// then the claim that decision made for the decode side: its key, and the
+/// worker it claimed, `WorkerId(0)` where it claimed none. Last comes the
+/// instant the lease was issued at.
 #[cfg(feature = "controller")]
-pub(crate) type HeldPair = (WorkerId, Option<(WorkerId, u16)>, u64);
+pub(crate) type HeldPair = (WorkerId, Option<(WorkerId, u16)>, (Session, WorkerId), u64);
 
 impl FiledDecode {
     /// `side` as a door files it with `booked`, the slot of its worker's
@@ -2285,6 +2287,18 @@ impl FiledDecode {
     #[cfg(feature = "controller")]
     fn taken_decode(&self) -> Option<(WorkerId, u16)> {
         self.side.target_at(self.taken)
+    }
+
+    /// The claim the side's decision made for its session: the key, and
+    /// the worker its verdict claimed, `WorkerId(0)` where it claimed
+    /// none. The verdict is of the pick's first target, whichever target
+    /// the prefill's dispatch took.
+    #[cfg(feature = "controller")]
+    const fn claimed(&self) -> (Session, WorkerId) {
+        match self.side.session_verdict {
+            SessionVerdict::Claimed(worker) => (self.side.session, worker),
+            _ => (self.side.session, WorkerId(0)),
+        }
     }
 }
 
@@ -3330,6 +3344,9 @@ impl MemoryStore {
     /// target, or the one that dispatch named. The call reads this before
     /// it decides, and its issue tests the same again under its own turn.
     ///
+    /// Then comes the claim that first decision made for the decode side's
+    /// key, by the side's own verdict.
+    ///
     /// Last comes the instant the lease was issued at, as the record's own
     /// lease states it (`Lease::issued_micros`). Every word of the lease is
     /// told under that date, and a claim the call makes is dated by it.
@@ -3348,7 +3365,12 @@ impl MemoryStore {
             .chosen_decode(&(gateway, lease))
             .map(|(held, decode)| {
                 let issued_micros = held.record.lease.issued_micros;
-                (held.record.target, decode.taken_decode(), issued_micros)
+                (
+                    held.record.target,
+                    decode.taken_decode(),
+                    decode.claimed(),
+                    issued_micros,
+                )
             })
     }
 

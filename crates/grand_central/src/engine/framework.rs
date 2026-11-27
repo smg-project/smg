@@ -10044,12 +10044,20 @@ impl Engine {
     /// its key ([`SessionTable::told_under`]). The call read `key` at `at`,
     /// its own instant, and tells its words under `issued`, the instant of
     /// the lease its pair's first decision issued. A claim it made, of
-    /// `claimed`, takes that date. The pair's decode entries ask here, so
-    /// they read no table of the engine's.
+    /// `claimed`, takes that date. `first` is the worker that decision
+    /// claimed for `key`, `WorkerId(0)` where it claimed none. The pair's
+    /// decode entries ask here, so they read no table of the engine's.
     #[cfg(feature = "in-process")]
     #[inline]
-    pub(crate) fn told_under(&self, key: Session, claimed: Option<WorkerId>, at: u64, issued: u64) {
-        self.sessions.told_under(key, claimed, at, issued);
+    pub(crate) fn told_under(
+        &self,
+        key: Session,
+        claimed: Option<WorkerId>,
+        at: u64,
+        issued: u64,
+        first: WorkerId,
+    ) {
+        self.sessions.told_under(key, claimed, at, issued, first);
     }
 
     /// The stages' part of a release, behind the table's
