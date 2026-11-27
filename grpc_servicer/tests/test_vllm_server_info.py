@@ -197,7 +197,10 @@ def test_get_server_info_reports_the_structural_tag_vocabulary(
         ),
     )
     servicer = SimpleNamespace(
-        engine=SimpleNamespace(vllm_config=config), _mm_processor=None, _mm_encoder_budget=0
+        _supports_thinking_token_budget=False,
+        engine=SimpleNamespace(vllm_config=config),
+        _mm_processor=None,
+        _mm_encoder_budget=0,
     )
     info = asyncio.run(_server_info_method(_response_type(False))(servicer, None, None))
     assert info.structural_tag_vocabulary == label
