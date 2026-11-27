@@ -111,10 +111,7 @@ def resolve_approval(template, context, now=None):
             or actual not in values
         ):
             raise BudgetError("Job outside approved standing allowance")
-    if (
-        not approval["workflow_ref"]
-        or context.get("workflow_ref") != approval["workflow_ref"]
-    ):
+    if not approval["workflow_ref"] or context.get("workflow_ref") != approval["workflow_ref"]:
         raise BudgetError("Workflow/ref outside approved standing allowance")
 
     def utc(value):
@@ -132,9 +129,7 @@ def resolve_approval(template, context, now=None):
 def load_policy(policy_path, contexts_path, contexts_sha256):
     raw = Path(contexts_path).read_bytes()
     if not contexts_sha256 or hashlib.sha256(raw).hexdigest() != contexts_sha256:
-        raise BudgetError(
-            "Independently reviewed provider context evidence hash required"
-        )
+        raise BudgetError("Independently reviewed provider context evidence hash required")
     contexts = json.loads(raw)
     data = json.loads(Path(policy_path).read_text())
     if not isinstance(contexts, dict) or not isinstance(data, dict):
@@ -144,22 +139,16 @@ def load_policy(policy_path, contexts_path, contexts_sha256):
         raise BudgetError("Policy/context model collections must be JSON objects")
     if not {"cap_nusd", "calls", "calls_per_arm", "scope_id"}.issubset(data):
         raise BudgetError("Missing shared policy limits or scope")
-    if contexts.get("schema_version") != 1 or set(context_models) != set(
-        MODELS.values()
-    ):
+    if contexts.get("schema_version") != 1 or set(context_models) != set(MODELS.values()):
         raise BudgetError("Both provider context bounds must be independently verified")
     if set(model_prices) != {"openai/" + name for name in MODELS.values()}:
-        raise BudgetError(
-            "Both user and required NL judge model policies are mandatory"
-        )
+        raise BudgetError("Both user and required NL judge model policies are mandatory")
     prices = {}
     for model in MODELS.values():
         key = "openai/" + model
         bound, price = context_models[model], model_prices[key]
         if not isinstance(bound, dict) or not isinstance(price, dict):
-            raise BudgetError(
-                "Each reviewed context bound and model price must be an object"
-            )
+            raise BudgetError("Each reviewed context bound and model price must be an object")
         if not {
             "service_tier",
             "input_per_million",
@@ -181,16 +170,11 @@ def load_policy(policy_path, contexts_path, contexts_sha256):
         if (
             not isinstance(bound.get("response_models"), list)
             or not bound["response_models"]
-            or any(
-                not isinstance(name, str) or not name
-                for name in bound["response_models"]
-            )
+            or any(not isinstance(name, str) or not name for name in bound["response_models"])
         ):
             raise BudgetError("Reviewed resolved response model IDs required")
         if price.get("service_tier") != "default":
-            raise BudgetError(
-                "Only explicitly priced standard service tier is qualified"
-            )
+            raise BudgetError("Only explicitly priced standard service tier is qualified")
         prices[key] = Policy(
             key,
             price["input_per_million"],
@@ -202,9 +186,7 @@ def load_policy(policy_path, contexts_path, contexts_sha256):
             price["output_limit"],
         )
         if prices[key].input_limit < bound["context_tokens"]:
-            raise BudgetError(
-                "Reservation cannot cover the complete provider context bound"
-            )
+            raise BudgetError("Reservation cannot cover the complete provider context bound")
     return RunPolicy(
         prices,
         data["cap_nusd"],
@@ -233,14 +215,10 @@ def verify_sources():
             or root != Path(locations[0]).resolve()
             or root != Path(distribution.locate_file(package)).resolve()
         ):
-            raise BudgetError(
-                "SDK import origin differs from qualified distribution: " + package
-            )
+            raise BudgetError("SDK import origin differs from qualified distribution: " + package)
         for name, digest in files.items():
             if hashlib.sha256((root / name).read_bytes()).hexdigest() != digest:
-                raise BudgetError(
-                    "Unqualified SDK request source: " + package + "/" + name
-                )
+                raise BudgetError("Unqualified SDK request source: " + package + "/" + name)
     # uv's editable install keeps metadata in site-packages but imports the
     # package from the checkout. Check the actual import target in both modes.
     spec = importlib.util.find_spec("tau2")
@@ -336,9 +314,7 @@ class Guard:
 
         guard = self
         underlying = (
-            self.transport_factory()
-            if self.transport_factory
-            else httpx.HTTPTransport(retries=0)
+            self.transport_factory() if self.transport_factory else httpx.HTTPTransport(retries=0)
         )
 
         class PaidTransport(httpx.BaseTransport):
@@ -395,22 +371,16 @@ class Guard:
                 for message in data["messages"]:
                     if (
                         not isinstance(message, dict)
-                        or message.get("role")
-                        not in {"system", "user", "assistant", "tool"}
+                        or message.get("role") not in {"system", "user", "assistant", "tool"}
                         or not isinstance(message.get("content", ""), (str, type(None)))
-                        or set(message)
-                        - {"role", "content", "tool_calls", "tool_call_id", "name"}
+                        or set(message) - {"role", "content", "tool_calls", "tool_call_id", "name"}
                     ):
-                        guard.deny(
-                            "Only complete plain text message payloads are qualified"
-                        )
+                        guard.deny("Only complete plain text message payloads are qualified")
                 if any(
                     not isinstance(tool, dict) or tool.get("type") != "function"
                     for tool in data.get("tools", []) or []
                 ):
-                    guard.deny(
-                        "Billable server tools/other modalities are not qualified"
-                    )
+                    guard.deny("Billable server tools/other modalities are not qualified")
                 request_id = uuid.uuid4().hex
                 metadata = dict(
                     role=role,
@@ -426,9 +396,7 @@ class Guard:
                     with guard._admission_lock:
                         try:
                             if guard.failed:
-                                raise BudgetError(
-                                    "This process has stopped paid admission"
-                                )
+                                raise BudgetError("This process has stopped paid admission")
                             guard.ledger.reserve(
                                 request_id,
                                 guard.arm,
@@ -447,8 +415,7 @@ class Guard:
                         guard.stop_paid()
                     except BaseException as halt_error:
                         error.add_note(
-                            "Shared paid halt NOT_ATTESTED: "
-                            + type(halt_error).__name__
+                            "Shared paid halt NOT_ATTESTED: " + type(halt_error).__name__
                         )
                     raise
                 outcome = {}
@@ -460,18 +427,14 @@ class Guard:
                         raise BudgetError("Unknown paid outcome: HTTP error")
                     decoded = response.json()
                     observed_model = decoded.get("model")
-                    if (
-                        observed_model
-                        not in guard.contexts["models"][model]["response_models"]
-                    ):
+                    if observed_model not in guard.contexts["models"][model]["response_models"]:
                         outcome["response_model"] = "<unapproved>"
                         raise BudgetError("Unknown actual paid response model")
                     outcome["response_model"] = observed_model
                     observed_tier = decoded.get("service_tier")
                     outcome["service_tier"] = (
                         observed_tier
-                        if observed_tier
-                        in (None, "auto", "default", "flex", "priority", "scale")
+                        if observed_tier in (None, "auto", "default", "flex", "priority", "scale")
                         else "<unrecognized>"
                     )
                     if outcome["service_tier"] != "default":
@@ -511,8 +474,7 @@ class Guard:
                         guard.stop_paid()
                     except BaseException as halt_error:
                         error.add_note(
-                            "Shared paid halt NOT_ATTESTED: "
-                            + type(halt_error).__name__
+                            "Shared paid halt NOT_ATTESTED: " + type(halt_error).__name__
                         )
                     raise
                 return response
@@ -536,9 +498,7 @@ class Guard:
             ):
                 # HTTPX follows redirects internally without calling Client.send
                 # again. Neither paid nor uncharged local traffic may escape.
-                response = original_send(
-                    client, request, **(kwargs | {"follow_redirects": False})
-                )
+                response = original_send(client, request, **(kwargs | {"follow_redirects": False}))
                 if response.is_redirect:
                     response.close()
                     self.deny("Redirect outside the fixed request contract")
@@ -598,9 +558,7 @@ class Guard:
             key = os.environ.get("OPENAI_API_KEY")
             if not key or self.ledger.summary()["halted"]:
                 self.deny("Missing credential or halted shared budget")
-            http_client = httpx.Client(
-                transport=self.transport(), follow_redirects=False
-            )
+            http_client = httpx.Client(transport=self.transport(), follow_redirects=False)
             self.clients.append(http_client)
             client = None
             try:
@@ -666,9 +624,7 @@ class Guard:
 
             return wrapped
 
-        self.patch(
-            user_simulator, "generate", role_wrapper(user_simulator.generate, "user")
-        )
+        self.patch(user_simulator, "generate", role_wrapper(user_simulator.generate, "user"))
         self.patch(
             evaluator_nl_assertions,
             "generate",
@@ -698,11 +654,7 @@ class Guard:
                 _thread.start_new_thread(ordered_stop, ())
                 completed = done.wait(10)
                 if not completed or failures:
-                    reason = (
-                        type(failures[0]).__name__
-                        if failures
-                        else "ordering-or-IO-timeout"
-                    )
+                    reason = type(failures[0]).__name__ if failures else "ordering-or-IO-timeout"
                     print(
                         "Shared paid halt before hard exit NOT_ATTESTED: " + reason,
                         file=sys.stderr,
@@ -710,8 +662,7 @@ class Guard:
                     )
             except BaseException as error:
                 print(
-                    "Shared paid halt before hard exit NOT_ATTESTED: "
-                    + type(error).__name__,
+                    "Shared paid halt before hard exit NOT_ATTESTED: " + type(error).__name__,
                     file=sys.stderr,
                     flush=True,
                 )
@@ -779,9 +730,7 @@ def validate_command(command, domain):
         )
     flags = [arg for arg in command[1:] if arg.startswith("--")]
     if any(flag not in allowed for flag in flags) or len(flags) != len(set(flags)):
-        raise BudgetError(
-            "Unknown or duplicate options cannot override the reviewed text scope"
-        )
+        raise BudgetError("Unknown or duplicate options cannot override the reviewed text scope")
     values = vars(parser.parse_args(command[1:]))
 
     def value(flag):
@@ -849,9 +798,7 @@ def main(argv=None):
         return 0  # no ledger created/SDK imported/provider call
     if args.initialize:
         destination = Path(args.ledger).absolute()
-        fd, private = tempfile.mkstemp(
-            prefix="." + destination.name + "-", dir=destination.parent
-        )
+        fd, private = tempfile.mkstemp(prefix="." + destination.name + "-", dir=destination.parent)
         os.close(fd)
         try:
             Ledger(private, policy)
@@ -892,7 +839,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except (BudgetError, OSError, ValueError, KeyError, ImportError) as error:
-        print(
-            f"Budgeted tau2 refused: {type(error).__name__}: {error}", file=sys.stderr
-        )
+        print(f"Budgeted tau2 refused: {type(error).__name__}: {error}", file=sys.stderr)
         raise SystemExit(2)
