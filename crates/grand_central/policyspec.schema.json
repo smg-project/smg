@@ -163,7 +163,7 @@
           "default": 180
         },
         "max_size": {
-          "description": "The size bound of a tree index: on a text host its characters plus\n1024 for each node a worker stands on, tokens otherwise.\nThe crate's engine reads it for a pool whose profile reads sent\nprefixes: the model's record is bound to `max_size` over the block\nsize placements, never under one. A placement is a block a worker\nwas sent, and under a hash index a boundary a worker was sent. A\nlowered bound is met by sweeps, at the record's next writes and at\nthe engine's upkeep.",
+          "description": "The size bound of a tree index, summed over the workers: on a text\nhost the characters of the nodes each worker stands on plus 1024 for\neach such node, otherwise the tokens each worker holds, so a prefix\nthat several workers hold counts once for each of them.\nThe crate's engine reads it for a pool whose profile reads sent\nprefixes: the model's record is bound to `max_size` over the block\nsize placements, never under one. A placement is a block a worker\nwas sent, and under a hash index a boundary a worker was sent. A\nlowered bound is met by sweeps, at the record's next writes and at\nthe engine's upkeep.",
           "type": "integer",
           "format": "uint64",
           "minimum": 1,

@@ -140,10 +140,10 @@ Other readers follow their own rules:
 | `max_size` | The size bound of a `tree`. The crate's engine bounds its record by it under either kind. | 67108864 |
 | `sweep_s` | How many seconds pass between sweeps. | 120 |
 
-Each number is above zero. `max_size` counts a tree in one of two ways:
+Each number is above zero. `max_size` counts a tree in one of two ways, summed over the workers, so a prefix that several workers hold counts once for each of them:
 
-- For text, it counts the characters, plus 1024 for each node a worker stands on.
-- Otherwise it counts the tokens.
+- For text, it counts the characters of the nodes each worker stands on, plus 1024 for each such node.
+- Otherwise it counts the tokens each worker holds.
 
 Where several patterns match one model, the most specific wins:
 

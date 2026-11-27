@@ -761,8 +761,9 @@ supplied document states its own view and gets none.
 Both trees are read and written in one walk: the walk finds the longest stored prefix, hands the
 match to the policy, and stores the request for the worker the policy chose. So no write is lost
 when many requests decide at once. A tree is brought back under a size bound
-(67,108,864 for a model by default: tokens, or for text its characters plus 1024 for each node
-a worker stands on) by an eviction pass every 120 seconds.
+(67,108,864 for a model by default, summed over the workers: the tokens each worker holds, or for
+text the characters of the nodes each worker stands on plus 1024 for each such node) by an
+eviction pass every 120 seconds.
 Between two passes it grows past the bound.
 
 A request's prompt is stored under its **cache partition** (cache salt, extra value, adapter), so
