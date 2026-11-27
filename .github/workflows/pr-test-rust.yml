@@ -2043,7 +2043,7 @@ jobs:
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
-      && needs.detect-changes.outputs.skip-chat-one-engine != 'true'
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: sglang
