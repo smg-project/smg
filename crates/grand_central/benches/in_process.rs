@@ -71,10 +71,15 @@
 //! buffer of N KiB, which pushes what the decision reads out of a cache
 //! smaller than the buffer, and then writes 16 KiB of stack under its own
 //! frame again, as the stack of a thread that serves stays warm. Count
-//! such a run under callgrind's cache model: a function's data misses are
-//! then the lines of memory outside the stack that it is first to touch.
-//! The walk is inside the stretch, so its time says nothing; a cell whose
-//! callers time their own turns refuses the flag.
+//! such a run with one caller under callgrind's cache model, its caches
+//! smaller than the buffer: a function's data misses are then the lines
+//! of memory it is first to touch in a decision outside those 16 KiB.
+//! What the run keeps on the main thread's stack is among them. With more
+//! callers than one, a line another caller's decision has just read is
+//! met warm, so such a run counts fewer. The walk is inside the stretch:
+//! the row of such a run says `cold_kb=N`, and its times hold the walk and
+//! say nothing of a decision. A size above 1,048,576 (1 GiB) is refused,
+//! and so is the flag by a cell whose callers time their own turns.
 
 #![expect(
     clippy::expect_used,
@@ -747,6 +752,10 @@ struct Run {
     workers: usize,
 }
 
+/// The most KiB a caller walks before a timed decision, 1 GiB: above every
+/// cache a decision reads from, and its bytes fit a `usize` on any target.
+const COLD_KB_MOST: u64 = 1 << 20;
+
 fn run() -> Run {
     let mut run = Run {
         callers: 1,
@@ -773,7 +782,13 @@ fn run() -> Run {
         match switch.as_str() {
             "--callers" => run.callers = number() as usize,
             "--cell" => run.cell = Cell::named(&value),
-            "--cold-kb" => run.cold_kb = number() as usize,
+            "--cold-kb" => {
+                // Here, where the size is read: the bytes of a greater one
+                // can wrap, down to a run that walks nothing.
+                let kb = number();
+                assert!(kb <= COLD_KB_MOST, "--cold-kb: at most {COLD_KB_MOST}");
+                run.cold_kb = kb as usize;
+            }
             "--decisions" => run.decisions = number(),
             "--engines" => run.engines = number(),
             "--entry" => run.entry = place::named(&value),
@@ -966,13 +981,15 @@ fn ask(beside: Option<&InProcess>) {
 }
 
 /// One caller's turns by `turn`: its first untimed, then, behind the start
-/// every caller waits at, its timed ones as one stretch. Says how many of
-/// those were placed, the stretch in nanoseconds and its allocations.
-/// A caller with `cold` to walk walks it before each timed turn.
+/// every caller waits at, its timed ones as one stretch, each behind
+/// `before`. Says how many of those were placed, the stretch in
+/// nanoseconds and its allocations. A caller with nothing ahead of a turn
+/// hands `|| {}`: its stretch then runs the instructions of a loop
+/// without `before`.
 fn stretch<T>(
     start: &Barrier,
     decisions: u64,
-    cold: &[u8],
+    mut before: impl FnMut(),
     mut turn: impl FnMut(u64) -> Option<T>,
 ) -> (u64, u64, u64) {
     for at in 0..CALLER_WARM {
@@ -981,19 +998,9 @@ fn stretch<T>(
     start.wait();
     let (allocated, started) = (calls(), Instant::now());
     let mut took = 0;
-    // Two loops: a run that walks nothing runs the instructions it ran.
-    if cold.is_empty() {
-        for at in CALLER_WARM..CALLER_WARM + decisions {
-            took += u64::from(black_box(turn(at)).is_some());
-        }
-    } else {
-        for at in CALLER_WARM..CALLER_WARM + decisions {
-            // The buffer is hidden at every turn: a walk of a buffer the
-            // build knows unchanged is done once, ahead of the loop.
-            black_box(cold_walk(black_box(cold)));
-            warm_stack();
-            took += u64::from(black_box(turn(at)).is_some());
-        }
+    for at in CALLER_WARM..CALLER_WARM + decisions {
+        before();
+        took += u64::from(black_box(turn(at)).is_some());
     }
     let nanos = started.elapsed().as_nanos() as u64;
     (took, nanos, (calls() - allocated) as u64)
@@ -1037,7 +1044,8 @@ fn main() {
     // others at their start.
     assert!(
         run.cold_kb == 0 || run.cell.caller.is_none(),
-        "--cold-kb: this cell's callers time their own turns"
+        "--cold-kb: the callers of cell {} time their own turns",
+        run.cell.name
     );
     let workers: Arc<[Arc<dyn Worker>]> = (0..run.workers)
         .map(|at| ready_worker(&address(at), MODEL))
@@ -1189,9 +1197,26 @@ fn measure(
             // itself; any other caller asks the run's `decide`.
             let (took, nanos, allocated) = match run.cell.caller {
                 Some(turns) => turns(host, &start, run.decisions, caller),
-                None => stretch(&start, run.decisions, &cold, |turn| {
-                    decide(black_box(seed(turn)))
-                }),
+                None => {
+                    let turn = |turn: u64| decide(black_box(seed(turn)));
+                    // Chosen ahead of the start: no timed turn pays for it.
+                    if cold.is_empty() {
+                        stretch(&start, run.decisions, || {}, turn)
+                    } else {
+                        // The walk holds the buffer as a slice of its own:
+                        // no turn reads the vector's place on the main
+                        // thread's stack.
+                        let cold = cold.as_slice();
+                        let walk = move || {
+                            // The buffer is hidden at every turn: a walk
+                            // of a buffer the build knows unchanged is
+                            // done once, ahead of the loop.
+                            black_box(cold_walk(black_box(cold)));
+                            warm_stack();
+                        };
+                        stretch(&start, run.decisions, walk, turn)
+                    }
+                }
             };
             busy_nanos.fetch_add(nanos, Ordering::Relaxed);
             allocations.fetch_add(allocated, Ordering::Relaxed);
@@ -1236,6 +1261,10 @@ fn measure(
         total as f64 / wall.as_secs_f64(),
         busy_nanos.into_inner() as f64 / total as f64,
     );
+    // A run that walked says so on its row: its times hold the walk.
+    if run.cold_kb > 0 {
+        print!(" cold_kb={}", run.cold_kb);
+    }
     // The words a file of its own adds, then the cell's, and the line's end.
     print!("{}", place::word());
     println!("{}", (run.cell.words)());
