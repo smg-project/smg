@@ -23,6 +23,7 @@ import sglang
 from google.protobuf.json_format import MessageToDict
 from google.protobuf.struct_pb2 import Struct
 from google.protobuf.timestamp_pb2 import Timestamp
+from google.protobuf.unknown_fields import UnknownFieldSet
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.kv_events import (
     KVEventsConfig,
@@ -1336,9 +1337,14 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             if grpc_params.HasField("custom_params")
             else None
         )
-        if getattr(grpc_params, "thinking_token_budget", None) is not None and grpc_params.HasField(
-            "thinking_token_budget"
-        ):
+        if "thinking_token_budget" not in grpc_params.DESCRIPTOR.fields_by_name:
+            # Older stubs retain an explicit uint32 budget as unknown field 24 (varint).
+            if any(
+                field.field_number == 24 and field.wire_type == 0
+                for field in UnknownFieldSet(grpc_params)
+            ):
+                raise ValueError("installed smg-grpc-proto cannot read thinking_token_budget")
+        elif grpc_params.HasField("thinking_token_budget"):
             if not self._supports_thinking_token_budget:
                 raise ValueError(
                     "thinking_token_budget requires an active SGLang reasoning token filter"
