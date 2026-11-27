@@ -5,6 +5,7 @@ use std::sync::Arc;
 use axum::response::Response;
 use openai_protocol::profile::ProviderProfile;
 use smg_grpc_client::FormatSetAside;
+use smg_worker::identity::basic::RuntimeType;
 
 use crate::routers::{
     error,
@@ -108,9 +109,11 @@ pub(crate) async fn build_chat_backed_plan(
             .routing_snapshot
             .as_ref()
             .is_some_and(|snapshot| snapshot.needs_thinking_budget)
-        && ctx.state.clients.as_ref().is_some_and(|clients| {
-            clients.builder().runtime_type() == smg_worker::identity::basic::RuntimeType::Sglang
-        })
+        && ctx
+            .state
+            .clients
+            .as_ref()
+            .is_some_and(|clients| clients.builder().runtime_type() == RuntimeType::Sglang)
         && ctx.state.tokenizer.as_deref().is_some_and(|tokenizer| {
             utils::chat_budget_has_disabled_thinking(
                 chat_request,
