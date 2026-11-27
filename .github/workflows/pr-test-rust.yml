@@ -236,6 +236,7 @@ jobs:
         uses: ./.github/actions/download-build-artifacts
         with:
           wheel-path: dist/
+          client-types: 'true'
 
       - name: Install wheel
         run: pip install dist/*.whl
@@ -297,7 +298,7 @@ jobs:
         env:
           PYTHONPATH: e2e_test
         run: |
-          pip install ./e2e_test
+          pip install ./e2e_test ./clients/python
           pytest -q --noconftest e2e_test/infra e2e_test/fixtures
 
   # --- Rust lint and tests (CPU) ---
