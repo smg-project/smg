@@ -256,7 +256,9 @@ measured code alone), then runs them interleaved and compares them with
 (`--out` is the directory for `results.json` and `gate.md`); the job fails on a gated regression. A push to `main`, the
 weekly schedule and a manual dispatch run the single `cargo bench -p smg --bench tokenizer_benchmark`
 without the gate. Both are the default build, so the encode rows measure the encoder a default build ships; with the
-`tokenizers-v1` feature the opt-in pipeline would serve this bench's encodes.
+`tokenizers-v1` feature the opt-in pipeline would serve this bench's encodes. Every encode row encodes one text again
+and again, so it measures that encoder's warm road (behind the first call its per-thread piece cache answers the pieces
+of the text); no row of the gate times the first encode of a text.
 
 ### Against other implementations
 

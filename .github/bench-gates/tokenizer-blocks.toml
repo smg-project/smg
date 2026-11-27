@@ -10,10 +10,11 @@
 # a change that leaves the loop scalar fails no test. Built with the loop and SLP vectorizers off
 # (`-C no-vectorize-loops -C no-vectorize-slp`), this row reads 2.5 times slower.
 #
-# Threshold: 10 %, the floor of tokenizer.toml's method and the threshold of its encode rows, which time
-# the same encoder (0.8 to 3.3 % on an identical build, 1.4 to 5.3 % across builds). The row guards a
-# factor of 2.5, so no spread of that size decides its verdict. Every job uploads bench-gate/results.json
-# with the raw per-run medians of both sides; the row's own spread on the hosted runner is read from those.
+# Threshold: 10 %, the floor of tokenizer.toml's method and the threshold of its encode rows of 1 KB and
+# more, which time the same encoder in the default build (0.9 to 4.6 % between three runs of one build,
+# 0.1 to 1.0 % between two builds). The row guards a factor of 2.5, so no spread of that size decides its
+# verdict. Every job uploads bench-gate/results.json with the raw per-run medians of both sides; the row's
+# own spread on the hosted runner is read from those.
 #
 # The gate fails an id only when every pull-request run is slower than every base run, so one slow run
 # cannot fail the job.
