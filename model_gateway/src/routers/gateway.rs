@@ -189,6 +189,20 @@ impl EpdDemand {
         Self::PairAndEncoder { vision }
     }
 
+    /// The `registered` weights of the families that take the request: the
+    /// EPD family takes none on a route its router refuses.
+    fn admit(self, registered: &[usize; ROUTER_FAMILIES.len()]) -> [usize; ROUTER_FAMILIES.len()] {
+        let mut registered = *registered;
+        if self == Self::Refused {
+            for (weight, family) in registered.iter_mut().zip(&ROUTER_FAMILIES) {
+                if family.encode.is_some() {
+                    *weight = 0;
+                }
+            }
+        }
+        registered
+    }
+
     /// The demand of a request whose media is `plan`. It needs vision as
     /// the EPD router reads it ([`request_needs_vision`]).
     fn of_plan(plan: &MediaPlan) -> Self {
@@ -489,15 +503,7 @@ impl Gateway {
             EpdDemand::PairAndEncoder { .. } if engine.is_some() => EpdDemand::Refused,
             epd => epd,
         };
-        // An EPD family takes no request on a route its router refuses.
-        let mut registered = *registered;
-        if epd == EpdDemand::Refused {
-            for (weight, family) in registered.iter_mut().zip(&ROUTER_FAMILIES) {
-                if family.encode.is_some() {
-                    *weight = 0;
-                }
-            }
-        }
+        let registered = epd.admit(registered);
         if registered.iter().filter(|weight| **weight > 0).count() <= 1 {
             return self.pick_router_by_weights(&registered);
         }
@@ -754,6 +760,22 @@ impl Gateway {
             healthy(RoutingPool::HttpRegular),
         ])
         .or_else(|| self.select_router_for_request(None))
+    }
+
+    /// The router for a cancel. A cancel needs no worker of the family it
+    /// goes to: a gRPC router cancels from the response store, and the HTTP
+    /// router asks every worker. So the draw weighs the registered workers,
+    /// not the workers that can serve. Otherwise a cancel would miss the
+    /// router of its response every time while that router's workers cannot
+    /// serve. The EPD router refuses a cancel, so the EPD family takes none.
+    fn select_router_for_cancel(&self) -> Option<Arc<dyn RouterTrait>> {
+        if !self.enable_igw {
+            return self.select_router_for_request(None);
+        }
+        let snapshot = self.worker_registry.get_routing_snapshot(UNKNOWN_MODEL_ID);
+        let registered = self.family_weights(|pool| snapshot.pool(pool).len());
+        self.pick_router_by_weights(&EpdDemand::Refused.admit(&registered))
+            .or_else(|| self.select_router_for_request(None))
     }
 
     /// Whether an external worker serves `model` through a provider router
@@ -1211,7 +1233,7 @@ impl RouterTrait for Gateway {
                 format!("No router available to cancel response '{response_id}'"),
             )
         };
-        self.dispatch(None, miss, |router| async move {
+        Self::dispatch_to(self.select_router_for_cancel(), miss, |router| async move {
             router
                 .cancel_response(headers, tenant_meta, response_id)
                 .await
@@ -2227,6 +2249,15 @@ mod tests {
             _tenant_meta: &TenantRequestMeta,
             _body: ResponsesRequest,
             _model_id: &str,
+        ) -> Response {
+            (StatusCode::OK, self.0).into_response()
+        }
+
+        async fn cancel_response(
+            &self,
+            _headers: Option<&HeaderMap>,
+            _tenant_meta: &TenantRequestMeta,
+            _response_id: &str,
         ) -> Response {
             (StatusCode::OK, self.0).into_response()
         }
@@ -3398,6 +3429,53 @@ mod tests {
         assert_eq!(chat(json!("hi")), EpdDemand::Pair);
         assert_eq!(chat(json!([image])), media(true));
         assert_eq!(chat(json!([audio])), media(false));
+    }
+
+    /// A cancel needs no worker of the family it goes to, so it is drawn by
+    /// the registered workers, as on main. A gRPC worker that is not ready
+    /// keeps its share of the cancels, because the gRPC router cancels from
+    /// the response store. The EPD router refuses a cancel, so the EPD
+    /// family takes none.
+    #[tokio::test]
+    async fn a_cancel_is_drawn_by_the_registered_workers() {
+        use Serving::{NotReady, Yes};
+        use WorkerType::{Decode, Encode, Prefill, Regular};
+        const CANCELS: u32 = 2_000;
+        const TOLERANCE: f64 = 0.05;
+        let tenant = test_tenant_meta();
+        for (fleet, expected) in [
+            (
+                vec![(GRPC, Regular, NotReady), (HTTP, Regular, Yes)],
+                vec![("grpc", 0.5), ("http", 0.5)],
+            ),
+            (
+                vec![
+                    (GRPC, Encode, Yes),
+                    (GRPC, Prefill, Yes),
+                    (GRPC, Decode, Yes),
+                    (HTTP, Regular, NotReady),
+                ],
+                vec![("http", 1.0)],
+            ),
+        ] {
+            let gateway = named_family_gateway(&fleet);
+            let mut drawn = BTreeMap::<String, f64>::new();
+            for _ in 0..CANCELS {
+                let response = gateway.cancel_response(None, &tenant, "resp_1").await;
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let family = String::from_utf8(bytes.to_vec()).expect("a family name");
+                *drawn.entry(family).or_default() += 1.0 / f64::from(CANCELS);
+            }
+            let within = drawn.len() == expected.len()
+                && expected.iter().all(|(family, share)| {
+                    drawn
+                        .get(*family)
+                        .is_some_and(|drawn| (drawn - share).abs() < TOLERANCE)
+                });
+            assert!(within, "{fleet:?}: drew {drawn:?}, expected {expected:?}");
+        }
     }
 
     /// Under Grand Central the EPD router refuses a request with media,
