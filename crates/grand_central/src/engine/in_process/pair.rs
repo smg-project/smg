@@ -640,12 +640,12 @@ impl<'a> PairLists<'a> {
             // pairs with every row of the other and is admitted. A retry
             // names the workers it tried on any list, with ranks or
             // without, and is decided whole. The admission is asked
-            // behind the engine's own question and ahead of the classes,
-            // every place once: a pair no draw is asked of pays none of
-            // it, and a pair with a refused row leaves for the whole pass
-            // before a class is read, and that pass stamps its rows from
-            // the answers and asks no place again. A side then writes the
-            // records its draw asks about.
+            // behind the engine's own question and the lists' and ahead of
+            // the classes, every place once: a pair no draw is asked of
+            // pays none of it, and a pair with a refused row leaves for the
+            // whole pass before a class is read, and that pass stamps its
+            // rows from the answers and asks no place again. A side then
+            // writes the records its draw asks about.
             let mut read = None;
             if spec.engine().pairs_drawn()
                 && held.is_none()

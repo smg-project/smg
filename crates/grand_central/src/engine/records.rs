@@ -1882,14 +1882,17 @@ pub(crate) fn decide_pair_drawn(
     }
     let unsaid = prefills.facts(prefill_live, false);
     let drawn = engine.pair_drawn_for(facts, &unsaid, [prefills.len(), decodes.len()], cx)?;
-    // The host's admission is asked behind the engine's own question, so
-    // that a pair no draw is asked of pays none of it, and ahead of the
-    // lists and the classes: a pair with a refused row leaves here.
-    if !admits() {
-        return None;
-    }
+    // The lists are asked first, by one load each where no published state
+    // moved: a list with a worker that is not available leaves here before
+    // the host is asked, and its whole pass asks the host itself.
     let word = published_word();
     if !(prefills.stands(prefill_workers, word) && decodes.stands(decode_workers, word)) {
+        return None;
+    }
+    // The host's admission is asked behind the engine's own question and
+    // the lists', so that a pair no draw is asked of pays none of it, and
+    // ahead of the classes: a pair with a refused row leaves here.
+    if !admits() {
         return None;
     }
     // The classes are asked last: the question reads every row's class.

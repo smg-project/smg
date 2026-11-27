@@ -394,3 +394,41 @@ fn a_pair_decided_by_its_draws_asks_its_places_ahead_of_the_rows_it_writes() {
         "no seed moved off the prefill loaded as its gates were read"
     );
 }
+
+#[test]
+fn a_pair_with_a_worker_that_is_not_available_asks_its_places_behind_its_rows() {
+    // A list with a worker whose published state is not available leaves
+    // the draw before the host is asked: its whole pass writes every row
+    // and asks behind them, as for a pair no draw is asked of. So a load
+    // the host lays at its first answer is read by no row, and no seed
+    // moves its pick.
+    let host = drawing(8, 8);
+    host.decodes[7].set_status(WorkerStatus::Draining);
+    for seed in 0..256 {
+        let level = host.decide_vetoed(
+            &Counted::default(),
+            (seed, None),
+            Constraints::default(),
+            [None, None],
+            UNMASKED,
+        );
+        let (prefill, _) = host.picked(&level);
+        let loading = Loading {
+            worker: Arc::clone(&host.prefills[prefill]),
+            asked: AtomicU32::new(0),
+        };
+        let whole = host.decide_vetoed(
+            &loading,
+            (seed, None),
+            Constraints::default(),
+            [None, None],
+            UNMASKED,
+        );
+        host.prefills[prefill].decrement_load();
+        assert_eq!(
+            host.picked(&whole).0,
+            prefill,
+            "seed {seed}: the prefill loaded as its gates were read lost its pick"
+        );
+    }
+}
