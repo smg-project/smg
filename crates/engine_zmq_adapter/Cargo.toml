@@ -18,6 +18,7 @@ bytes.workspace = true
 half.workspace = true
 rustix = { version = "1", features = ["fs", "process"] }
 futures.workspace = true
+regex = "1.12"
 serde_json.workspace = true
 sha2 = "0.11"
 tokio = { workspace = true, features = ["fs", "rt", "sync", "time", "net", "macros"] }

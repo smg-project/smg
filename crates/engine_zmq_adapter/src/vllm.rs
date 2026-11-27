@@ -6,6 +6,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     num::NonZeroUsize,
     ops::Range,
+    sync::OnceLock,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -26,6 +27,7 @@ use engine_zmq_client::{
     },
 };
 use futures::Stream;
+use regex::Regex;
 use smg_grpc_client::vllm_proto as vllm;
 
 use crate::{
@@ -178,6 +180,50 @@ impl finish::Parts for VllmGenerateStream {
     }
 }
 
+/// How vLLM's scheduler words a grammar it failed to compile (`RequestError` "validation_error").
+const COMPILE_FAILURE_PREFIX: &str = "Invalid structured outputs: ";
+
+/// A failed compile's `validation_error` is a refused constraint; any other is `InvalidArgument`.
+fn validation_error_status(message: &str) -> tonic::Status {
+    let refused = message.starts_with(COMPILE_FAILURE_PREFIX);
+    let message = sanitize_message(message);
+    if refused {
+        let head = COMPILE_FAILURE_PREFIX.trim_end();
+        let reason = message.strip_prefix(head).unwrap_or(&message).trim_start();
+        // In words saying the grammar failed to compile, not only that the outputs were invalid.
+        let words = format!("{head} the grammar failed to compile: {reason}");
+        smg_grpc_client::constraint_refused_status(words.trim_end())
+    } else {
+        tonic::Status::invalid_argument(message)
+    }
+}
+
+/// vLLM's `sanitize_message`: memory addresses, tracebacks and file paths stripped.
+#[expect(
+    clippy::expect_used,
+    reason = "static patterns; an invalid one is a developer bug"
+)]
+fn sanitize_message(message: &str) -> String {
+    static PATTERNS: OnceLock<[(Regex, &str); 4]> = OnceLock::new();
+    let patterns = PATTERNS.get_or_init(|| {
+        [
+            (r" at 0x[0-9a-fA-F]+>", ">"),
+            (r#"\n?\s*File "[^"]+", line \d+, in \S+(\n\s+.*)?"#, ""),
+            (
+                r"/(?:home|usr|opt|var|tmp|root|lib|mnt|srv)(?:/[\w.\-]+)+",
+                "<path>",
+            ),
+            (r"(?:/[\w\-]+)+/[\w\-]+\.\w+", "<path>"),
+        ]
+        .map(|(pattern, replacement)| (Regex::new(pattern).expect("a valid pattern"), replacement))
+    });
+    let mut message = message.to_string();
+    for (pattern, replacement) in patterns {
+        message = pattern.replace_all(&message, *replacement).into_owned();
+    }
+    message.trim().to_string()
+}
+
 impl MappedGenerateStream for VllmGenerateStream {
     type Output = EngineCoreOutput;
     type Inner = EngineCoreStream;
@@ -319,6 +365,13 @@ impl MappedGenerateStream for VllmGenerateStream {
         // output, which the reader logs. The gateway tells the engine's own
         // report by the words of this status, so they stay.
         if matches!(output.finish_reason, Some(EngineCoreFinishReason::Error)) {
+            // vLLM's `validation_error` is the exception: it names a failed compile.
+            if let Some(error) = output
+                .error
+                .filter(|error| error.code == "validation_error")
+            {
+                return Err(validation_error_status(&error.message));
+            }
             return Err(tonic::Status::internal(
                 "engine finished the request with an error (see engine logs)",
             ));

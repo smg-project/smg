@@ -2383,3 +2383,52 @@ async fn usage_prompt_count_is_the_requests_until_the_engine_reports_one() {
         );
     }
 }
+
+/// vLLM's `sanitize_message`, case by case: addresses, a traceback and paths go.
+#[test]
+fn a_validation_error_is_cleaned_as_vllm_cleans_it() {
+    for (raw, cleaned) in [
+        ("bad <Grammar object at 0x7f3a2bC0>", "bad <Grammar object>"),
+        (
+            "bad\n  File \"/srv/app/x.py\", line 3, in compile\n    raise ValueError()",
+            "bad",
+        ),
+        (
+            "cannot open /usr/lib/x86_64/libxgrammar.so now",
+            "cannot open <path> now",
+        ),
+        (
+            "/build/cpp/json_schema_converter.cc:4944: Invalid range",
+            "<path>:4944: Invalid range",
+        ),
+        ("  plain words  ", "plain words"),
+    ] {
+        assert_eq!(sanitize_message(raw), cleaned, "{raw:?}");
+    }
+}
+
+/// A failed compile is refused naming the grammar even when its reason is empty.
+#[test]
+fn a_failed_compile_with_no_reason_is_still_a_refused_constraint() {
+    for raw in [
+        "Invalid structured outputs: ",
+        "Invalid structured outputs:   ",
+    ] {
+        let status = validation_error_status(raw);
+        assert!(smg_grpc_client::is_constraint_refusal(&status), "{raw:?}");
+        assert_eq!(
+            status.message(),
+            "Invalid structured outputs: the grammar failed to compile:",
+            "{raw:?}"
+        );
+    }
+}
+
+/// Only a message that starts with the compile prefix is a refusal; one naming it mid-message is not.
+#[test]
+fn a_validation_error_naming_the_prefix_mid_message_is_no_refusal() {
+    let status = validation_error_status("x: Invalid structured outputs: y");
+    assert!(!smg_grpc_client::is_constraint_refusal(&status));
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert_eq!(status.message(), "x: Invalid structured outputs: y");
+}
