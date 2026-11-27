@@ -1,11 +1,14 @@
 use std::{
     sync::{atomic::AtomicUsize, mpsc},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use super::*;
-use crate::service::replication::tests::ascends;
+use crate::{
+    service::replication::tests::ascends,
+    store::{Registrant, WorkerFacts},
+};
 
 impl Log {
     /// The log's lock, held: for a case that shows what waits for it.
@@ -1558,6 +1561,61 @@ fn a_write_refused_for_its_term_ends_no_hold_of_an_applier() {
         "the hold stood through the refused write"
     );
     assert_eq!(places(&all(&log)), [at(1, 3), at(2, 4), at(3, 4)]);
+    assert_eq!(marks(&all(&log)), [TERM, 1, 2]);
+}
+
+/// A status has its own call. One told as a membership change is
+/// refused, under a term the log leads and under none, with a record and
+/// with none: the log answers no and keeps no entry. A refusal is no
+/// move of the log and owes no telling: with no move untold, the release
+/// behind these tells the listener nothing. A refusal ends no applier's
+/// hold either: here the status handed by its own call behind one lands
+/// at the place the guard holds.
+#[test]
+fn a_status_told_as_a_membership_change_is_refused_and_keeps_no_entry() {
+    let told = Arc::new(AtomicUsize::new(0));
+    let log = {
+        let told = Arc::clone(&told);
+        Log::new(16).on_watched(move || {
+            told.fetch_add(1, Ordering::Relaxed);
+        })
+    };
+    // The term's start is told at its release.
+    log.term_rose(3);
+    log.released();
+    let (id, from, to) = (WorkerId(7), WorkerStatus::Ready, WorkerStatus::Draining);
+    let change = MembershipChange::StatusChanged { id, from, to };
+    let record = WorkerRow {
+        id,
+        facts: WorkerFacts::default(),
+        status: to,
+        revision: 1,
+        admitted_at: Instant::now(),
+        maker: Registrant::default(),
+    };
+    let records = [(None, None), (Some(&record), None), (None, Some(&record))];
+    for term in [None, Some(3)] {
+        for (row, left) in records {
+            let took = log.member(None, term, 1, change, row, left);
+            let with = (row.is_some(), left.is_some());
+            assert!(!took, "under the term {term:?}, with a record {with:?}");
+        }
+    }
+    assert_eq!(log.head(), at(1, 3), "the term's start alone");
+    // A refusal is no move: with none untold, this release tells nothing.
+    log.released();
+    assert_eq!(told.load(Ordering::Relaxed), 1, "the term's start alone");
+    // The store follows term 4 from here, and a guard holds the next
+    // place for its leader's event.
+    apply(&log, at(2, 4), 1);
+    let adopting = log.adopt(at(3, 4)).expect("the next position");
+    assert!(!log.member(Some(at(3, 4)), None, 2, change, None, None));
+    assert!(!adopting.landed(), "nothing landed at the held place");
+    status_at(&log, at(3, 4), 2);
+    assert!(
+        adopting.landed(),
+        "the hold stood through the refused write"
+    );
     assert_eq!(marks(&all(&log)), [TERM, 1, 2]);
 }
 

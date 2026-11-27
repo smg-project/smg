@@ -905,6 +905,15 @@ impl Journal for Log {
         row: Option<&WorkerRow>,
         left: Option<&WorkerRow>,
     ) -> bool {
+        // A status has its own call and its own kind of entry. Taken
+        // here as a membership write, it would be kept where such a write
+        // is kept, as an entry with no wire form: no watch is told such
+        // an entry, and a standby that is sent one stops. So the log
+        // takes none: nothing is appended, no applier's hold ends, and
+        // the answer is no.
+        if matches!(change, MembershipChange::StatusChanged { .. }) {
+            return false;
+        }
         // The rows are copied before the log's lock is taken.
         let copy = |row: &WorkerRow| Arc::new(row.clone());
         self.push(
