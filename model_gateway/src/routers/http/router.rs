@@ -112,7 +112,7 @@ use crate::{
         },
         http::{
             request_body::{
-                serialize_request_body, serialize_request_body_preserving_fields, RequestBodyError,
+                serialize_request_body, serialize_request_body_with_edits, RequestBodyError,
             },
             request_stream::{CappedBodyStream, StreamProgress},
             stream_failure::{cause, head_success_recorded, RelaySource},
@@ -948,7 +948,7 @@ impl Router {
     /// worker takes one, the typed request with its backend fields kept on the
     /// routes whose extensions have no shared defaults, the typed request
     /// otherwise; a serialization or preparation failure is the 400 it was.
-    fn serialize_attempt_body<T: serde::Serialize>(
+    fn serialize_attempt_body<T: GenerationRequest + serde::Serialize>(
         attempt: &TypedAttempt<'_, T>,
         decision_adapter: Option<&SglangDecisionAdapter>,
         worker: &dyn Worker,
@@ -961,15 +961,15 @@ impl Router {
             .serialize_with(|view| {
                 if let Some(adapter) = decision_adapter {
                     serialize_request_body(adapter.request(), canonical_model, worker, raw_body_len)
-                } else if matches!(route, "/v1/decisions" | "/v1/systemone") {
-                    serialize_request_body_preserving_fields(
+                } else {
+                    serialize_request_body_with_edits(
                         view.request,
                         canonical_model,
                         worker,
                         raw_body_len,
+                        !matches!(route, "/v1/decisions" | "/v1/systemone"),
+                        view.request.thinking_token_budget(),
                     )
-                } else {
-                    serialize_request_body(view.request, canonical_model, worker, raw_body_len)
                 }
             })
             .map_err(|failure| match failure {
@@ -977,6 +977,9 @@ impl Router {
                     "serialization_failed",
                     format!("Failed to serialize request body: {e}"),
                 ),
+                RequestBodyError::ThinkingBudget(e) => {
+                    error::bad_request("invalid_thinking_token_budget", e)
+                }
                 RequestBodyError::Prepare(e) => error::bad_request(
                     "request_preparation_failed",
                     format!("Failed to prepare request: {e}"),
@@ -7716,7 +7719,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streamed_chat_upload_validates_the_winning_thinking_budget() {
+    async fn streamed_chat_upload_validates_and_translates_the_thinking_budget() {
         use openai_protocol::validated::ValidatedJson;
 
         const CHAT: &str = "/v1/chat/completions";
@@ -7731,7 +7734,7 @@ mod tests {
         let (url, captured) =
             spawn_capture_stub_for_route(CHAT, "text/event-stream", "data: [DONE]\n\n").await;
         let worker = BasicWorkerBuilder::new(url)
-            .runtime_type(RuntimeType::Generic)
+            .runtime_type(RuntimeType::Sglang)
             .model(ModelCard::new("m"))
             .health_config(no_health_check())
             .build();
@@ -7786,7 +7789,7 @@ mod tests {
             let body: Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(body["stream"], true);
             assert_eq!(body["custom_params"]["thinking_budget"], 0);
-            assert_eq!(body["thinking_token_budget"], 0);
+            assert!(body.get("thinking_token_budget").is_none());
         }
     }
 

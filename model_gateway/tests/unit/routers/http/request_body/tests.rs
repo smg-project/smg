@@ -10,7 +10,7 @@ use smg_worker::{
     connection::engine::EngineConnection,
     health::{circuit_breaker::CircuitState, resilience::ResolvedResilience},
     identity::{
-        basic::{BasicWorker, WorkerMetadata, WorkerType},
+        basic::{BasicWorker, RuntimeType, WorkerMetadata, WorkerType},
         error::WorkerResult,
     },
 };
@@ -587,6 +587,23 @@ fn a_custom_prepare_request_keeps_the_value_pipeline() {
 }
 
 #[test]
+fn a_custom_prepare_keeps_its_edits_when_the_budget_is_translated() {
+    let worker = CustomPrepare(
+        BasicWorkerBuilder::new("http://worker")
+            .runtime_type(RuntimeType::Vllm)
+            .build(),
+    );
+    let req = json!({"model":"alias","custom_params":{"thinking_budget":0,"keep":true}});
+    let bytes =
+        serialize_request_body_with_edits(&req, Some("model"), &worker, None, true, Some(0))
+            .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bytes).unwrap(),
+        json!({"model":"model","custom":true,"thinking_token_budget":0,"custom_params":{"keep":true}})
+    );
+}
+
+#[test]
 fn preserving_fields_retains_extensions_with_alias_and_dp_rank() {
     let req = json!({
         "model": "alias-model",
@@ -595,9 +612,15 @@ fn preserving_fields_retains_extensions_with_alias_and_dp_rank() {
         "chat_template_kwargs": null,
         "native": {"keep": [false, null]}
     });
-    let body =
-        serialize_request_body_preserving_fields(&req, Some("canonical-model"), &dp_worker(), None)
-            .unwrap();
+    let body = serialize_request_body_with_edits(
+        &req,
+        Some("canonical-model"),
+        &dp_worker(),
+        None,
+        false,
+        None,
+    )
+    .unwrap();
     let parsed: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(
         parsed,
@@ -620,10 +643,12 @@ fn preserving_fields_retains_extensions_through_custom_prepare() {
         "separate_reasoning": true,
         "chat_template_kwargs": null
     });
-    let body = serialize_request_body_preserving_fields(
+    let body = serialize_request_body_with_edits(
         &req,
         Some("canonical-model"),
         &CustomPrepare(dp_worker()),
+        None,
+        false,
         None,
     )
     .unwrap();

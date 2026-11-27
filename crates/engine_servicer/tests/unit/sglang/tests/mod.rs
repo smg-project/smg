@@ -2858,6 +2858,24 @@ async fn hidden_states_pass_through_as_tick_rows_and_positions() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+#[tokio::test]
+async fn thinking_token_budget_is_refused_by_a_scheduler_without_a_filter() {
+    let mut h = harness(model_info()).await;
+    let mut req = generate_request("budget", false, Vec::new());
+    req.sampling_params
+        .get_or_insert_default()
+        .thinking_token_budget = Some(0);
+    let refused = h
+        .client
+        .generate(req)
+        .await
+        .expect_err("budget requires a filter");
+    assert_eq!(refused.code(), Code::InvalidArgument);
+    assert!(refused.message().contains("thinking_token_budget"));
+    assert_scheduler_idle(&mut h.engine_in).await;
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// `return_hidden_states` is kept to the scheduler's launch-time cap ahead of
 /// the scheduler, with the engine frontend's own words: refused under
 /// `--return-hidden-states-mode last` or none, forwarded under `full` (the

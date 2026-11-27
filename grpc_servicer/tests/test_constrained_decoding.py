@@ -107,6 +107,42 @@ def test_tokenspeed_starts_the_grammar_at_the_first_token_whatever_the_parser():
     ) == {cd.CONSTRAINED_DECODING_START_KEY: "first_token"}
 
 
+def test_thinking_token_budget_requires_a_live_sglang_token_filter(monkeypatch):
+    import sys
+
+    detector = SimpleNamespace(think_excluded_tokens=[], get_think_end_token_ids=lambda _: [7])
+    limit = SimpleNamespace(get=lambda: -1)
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.parser.reasoning_parser",
+        SimpleNamespace(ReasoningParser=lambda **_: SimpleNamespace(detector=detector)),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.environ",
+        SimpleNamespace(envs=SimpleNamespace(SGLANG_MAX_THINK_TOKENS=limit)),
+    )
+    args = SimpleNamespace(
+        enable_strict_thinking=True,
+        reasoning_parser="qwen3",
+        grammar_backend="xgrammar",
+        skip_tokenizer_init=False,
+    )
+    tokenizer = object()
+    assert not cd.sglang_supports_thinking_budget(args, tokenizer)
+    limit.get = lambda: 0
+    assert cd.sglang_supports_thinking_budget(args, tokenizer)
+    limit.get = lambda: -1
+    detector.think_excluded_tokens = ["<tool_call>"]
+    assert cd.sglang_supports_thinking_budget(args, tokenizer)
+    assert not cd.sglang_supports_thinking_budget(args, None)
+    args.enable_strict_thinking = False
+    assert not cd.sglang_supports_thinking_budget(args, tokenizer)
+    args.enable_strict_thinking = True
+    detector.get_think_end_token_ids = lambda _: []
+    assert not cd.sglang_supports_thinking_budget(args, tokenizer)
+
+
 def test_sglang_grammar_backend_is_the_resolved_argument_or_the_default():
     # Given as typed.
     assert cd.sglang_grammar_backend(SimpleNamespace(grammar_backend="outlines")) == "outlines"
