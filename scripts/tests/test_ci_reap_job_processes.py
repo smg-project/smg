@@ -419,7 +419,7 @@ def test_strict_bound_exit_during_ownership_read_keeps_cleaning_peers(
             if not handoff:
                 current = original_owned(proc_root, pid, *args, **kwargs)
                 assert current is not None
-                handoff.append(current)
+                handoff.append(max(fd for fd, owner in runtime.opened.items() if owner == pid))
                 return current
             assert bound_checks  # The matching handoff reached a bound pidfd check.
             ready.add(pid)
@@ -429,13 +429,13 @@ def test_strict_bound_exit_during_ownership_read_keeps_cleaning_peers(
         return original_owned(proc_root, pid, *args, **kwargs)
 
     def exited(fd):
-        if runtime.opened[fd] == 100 and handoff:
+        if handoff and fd == handoff[0]:
             bound_checks.append(fd)
         return runtime.opened[fd] in ready or original_exited(fd)
 
     monkeypatch.setattr(mod, "_strict_owned", exit_during_read)
     assert runtime.run(mod, pidfd_exited=exited)
-    assert [process.pid for process in handoff] == [100]
+    assert runtime.opened[handoff[0]] == 100 and handoff[0] in runtime.closed
     assert ready == {100}
     assert (strict_tree / "100" / "stat").exists()  # Unreaped Z can remain visible.
     assert all(pid != 100 for pid, _ in runtime.sent)
@@ -1201,7 +1201,7 @@ def test_strict_clean_acceptance_rechecks_exact_deadline(mod, strict_tree, monke
     assert runtime.sent == [] and runtime.closed == set(runtime.opened)
 
 
-def test_known_unbound_identity_cannot_disappear_when_marker_is_lost(mod, strict_tree, tmp_path):
+def test_known_unbound_identity_cannot_disappear_when_marker_is_lost(mod, strict_tree):
     runtime = _Pidfds(strict_tree)
     attempts = []
 
@@ -1213,22 +1213,9 @@ def test_known_unbound_identity_cannot_disappear_when_marker_is_lost(mod, strict
         return runtime.open(pid, flags)
 
     clean = runtime.run(mod, pidfd_open=opener)
-    (tmp_path / "known-unbound-witness.json").write_text(
-        __import__("json").dumps(
-            {
-                "clean": clean,
-                "known_pid_alive": (strict_tree / "100/stat").is_file(),
-                "marker_negative": (strict_tree / "100/environ").read_bytes()
-                == b"HOME=/owned-worker\0",
-                "sent": runtime.sent,
-                "open_attempts": attempts,
-                "clock": runtime.now,
-                "all_fds_closed": runtime.closed == set(runtime.opened),
-            },
-            indent=2,
-        )
-    )
     assert not clean
+    assert attempts == [100]
+    assert (strict_tree / "100/environ").read_bytes() == b"HOME=/owned-worker\0"
     assert (strict_tree / "100/stat").is_file()
     assert all(pid != 100 for pid, _ in runtime.sent)
     assert (101, signal.SIGTERM) in runtime.sent
