@@ -230,6 +230,9 @@ fn stream_failed(
     if let Some(response) = status.constraint_failure_response() {
         return response;
     }
+    if let Some(response) = status.constraint_refusal_response() {
+        return response;
+    }
     match (rendezvous, side) {
         (Some(rendezvous), _) => status.to_http_error(
             "pd_rendezvous_failed",

@@ -945,6 +945,9 @@ pub(crate) async fn sequential_prefill_side(
                 );
                 account_pd_side_failure(metrics_labels::WORKER_PREFILL, &e);
                 error!(function = "execute_sequential_pd", error = %e, "Prefill stream error");
+                if let Some(response) = e.constraint_refusal_response() {
+                    return Err(response);
+                }
                 let mut response =
                     PdSide::Prefill.answer(SidePhase::Stream, e.http_status(), e.message());
                 mark_error_reason(&mut response, e.error_reason());
