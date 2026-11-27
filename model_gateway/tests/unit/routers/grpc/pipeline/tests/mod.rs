@@ -3217,15 +3217,18 @@ async fn cancelled_pd_stream_with_admitted_prefill_reports_and_frees_the_slot() 
 // like the tokenizer crate's parity test.
 // ------------------------------------------------------------------
 
-const V41_RENDER_FIXTURES: &str = include_str!(
-    "../../../../../../crates/tokenizer/tests/fixtures/deepseek_v41/render_fixtures.json"
-);
-const V41_ID_FIXTURES: &str = include_str!(
-    "../../../../../../crates/tokenizer/tests/fixtures/deepseek_v41/render_ids_fixtures.json"
-);
-const V41_CORN_PNG: &[u8] = include_bytes!(
-    "../../../../../../crates/multimodal/tests/fixtures/images/deepseek_v41_corn.png"
-);
+const V41_RENDER_FIXTURES: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../crates/tokenizer/tests/fixtures/deepseek_v41/render_fixtures.json"
+));
+const V41_ID_FIXTURES: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../crates/tokenizer/tests/fixtures/deepseek_v41/render_ids_fixtures.json"
+));
+const V41_CORN_PNG: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../crates/multimodal/tests/fixtures/images/deepseek_v41_corn.png"
+));
 /// `<｜deepseek_image｜>` in the checkpoint's `config.json`.
 const V41_IMAGE_TOKEN_ID: u32 = 129264;
 /// The reference span for `deepseek_v41_corn.png` (450x308), recorded in
