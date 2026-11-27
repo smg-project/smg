@@ -116,9 +116,9 @@ fn counted_first(answered: [(Option<Unplaced>, u32); 3]) {
     assert_eq!(reads, [1; 3], "the header is looked for once a call");
 }
 
-/// A filter of a host's own that keeps every worker for a request, and
-/// none for the cases' one item ([`KEYS`]): it is asked for an item under
-/// the item's key.
+/// A filter of a host's own that keeps no worker under the key of the
+/// cases' one item ([`KEYS`]), and every worker under another key: it is
+/// asked for an item under the item's key.
 #[derive(Debug)]
 struct NotTheItem;
 
@@ -373,8 +373,8 @@ fn a_number_that_reaches_a_prefill_no_encoder_serves_is_shed_under_the_targets_n
 /// counted ahead of its answer: over the same encoders, a number past the
 /// prefills is the target's miss.
 ///
-/// The classic router answers such a request by its encoders, ahead of
-/// its pair selection (`WS:2590`, `WS:2605-2634`).
+/// The classic router answers a request that no available encoder takes
+/// ahead of its pair selection (`WS:2590`, `WS:2605-2634`).
 #[test]
 fn a_shed_made_for_the_encoders_of_a_named_pair_stands() {
     let three = Three::of([2, 2, 2], |_, _| false);
@@ -522,11 +522,12 @@ fn a_gap_the_encode_pass_says_over_the_lists_whole_stands_for_a_named_request() 
 /// request that holds its decode to the workers that take images, and
 /// states no rule, has its decode counted among them all: the number can
 /// reach a decode that takes no images. The encode pass refuses that
-/// place, and the request is shed under `target-worker`, on no side. Under
-/// the rule the gateway's encode stage states, which takes a decode of
-/// such a request only where it takes images (`WS:2650-2654`,
-/// `WS:2669-2674`), the number passes over that decode: it reaches the
-/// decode the gateway's own selection reaches (`P:3458-3460`, `P:3490`).
+/// place, and the request is shed under `target-worker`, on no side. The
+/// rule here refuses that decode, as the rule the gateway's encode stage
+/// states refuses, for such a request, a decode of one serving engine
+/// that takes no images (`WS:2650-2654`, `WS:2669-2674`). Under it the
+/// number passes over that decode: it reaches the decode the gateway's
+/// own selection reaches (`P:3458-3460`, `P:3490`).
 ///
 /// The first decode takes no images, and every other worker does.
 #[test]
@@ -538,7 +539,8 @@ fn a_decode_that_takes_no_images_takes_a_number_under_no_rule() {
         decode_images: true,
         ..EncodeItems::default()
     };
-    // The stage's rule for a request that holds its decode to images.
+    // The rule: it refuses the first decode, the one worker of the bed
+    // that takes no images.
     let rule = |worker: &dyn Worker| worker_id(worker) != three.id(1, 0);
     let at = |number: &str, admits: Option<WorkerRule<'_>>| {
         let headers = [(MANUAL_SESSION_HEADER, "talk-1"), (TARGET, number)];
@@ -768,10 +770,11 @@ fn a_side_refused_behind_an_encoder_that_could_not_be_sent_to_ends_the_call() {
     assert_eq!(of_prefill.get(), 3, "the count's ask and two decisions'");
 }
 
-/// A worker the count reached that cannot take the request after all is
-/// missed on its own side, in an encode request's call as in a pair's.
-/// The rule is asked of a worker as the count takes it, and the worker it
-/// names here changes behind that. One that stops being ready leaves the
+/// A named worker that changes between the count that reached it and its
+/// request's decision is missed on its own side in each leg here. Each
+/// request carries its item, and its pair is held on both sides. The rule
+/// is asked of a worker as the count takes it, and the worker it names
+/// here changes behind that. One that stops being ready leaves the
 /// decision held to the two places nobody on its side, and that shed
 /// takes the target's name with the side. A named worker that comes over
 /// its thresholds, under a binding that sheds such a list, is missed so
@@ -843,22 +846,22 @@ fn a_named_worker_that_cannot_take_an_encode_request_after_all_is_missed_on_its_
 /// under `target-worker` and not under the rule's own name. A pair's own
 /// call answers so.
 ///
-/// Where that prefill stops being ready as the count takes it, the first
-/// decision finds nobody on the prefill's side and sheds the request with
-/// that side. A request the encode pass is laid for keeps such a shed
-/// from the rule (`pair::goes_to_the_rule`): the miss names the prefill's
-/// side. A request that states no items is one the pass is not laid for,
-/// and is its pair's alone: the shed goes to the rule, the rule takes
-/// nobody at the one place, and the miss names no side.
+/// The last two legs make that prefill not ready as the count takes it,
+/// so the first decision sheds the request with the prefill's side. The
+/// leg with its item is a request the encode pass is laid for: such a
+/// shed answers its call ahead of the rule (`pair::goes_to_the_rule`),
+/// and the miss names the prefill's side. The leg that states no items is
+/// its pair's alone, and states no hard demand: there that shed goes to
+/// the rule, the rule takes nobody at the one place, and the miss names
+/// no side.
 ///
 /// The classic router asks its filter of the workers it gathers as
 /// candidates, ahead of its policies (`P:3208-3213`, `P:3329-3344`). The
 /// rule that changes its worker is this case's device for a worker that
-/// leaves between the count and the decision. That router asks its filter
-/// ahead of a worker's availability (`P:3249-3252`), and the count reads
-/// the worker's state first: under this very rule that router would count
-/// past the prefill. A rule that answers by its worker alone, and changes
-/// none, shows no such difference.
+/// leaves between the count and the decision. Where that router gathers
+/// its candidates it asks its filter ahead of a worker's availability
+/// (`P:3249-3252`), and the count reads the worker's state first: under
+/// this very rule that router would count past the prefill.
 #[test]
 fn a_rule_that_refuses_the_named_prefill_behind_the_count_misses_the_target() {
     let engine = stock("consistent_hashing", "round_robin");
@@ -880,7 +883,7 @@ fn a_rule_that_refuses_the_named_prefill_behind_the_count_misses_the_target() {
     assert_eq!(placed(engine, &three, &request, 1), Err(MISSED));
     assert!(of_prefill.get() > 2, "asked again at the one place");
 
-    // The same rule over a prefill that stops being ready as the count
+    // The rule again, and it makes the prefill not ready as the count
     // takes it: the answer of the request with its item, or with no items
     // stated, and how often the rule was asked of that prefill.
     let left = |item: bool| {
@@ -905,9 +908,9 @@ fn a_rule_that_refuses_the_named_prefill_behind_the_count_misses_the_target() {
     // The pass is laid for the request with its item: the first decision's
     // shed answers the call with its side, and no rule is asked behind it.
     assert_eq!(left(true), (Err(missed_on(PairSide::Prefill)), 1));
-    // With no items stated the pass is not laid, and the request is its
-    // pair's alone: that shed goes to the rule, which takes nobody at the
-    // place, and the miss names no side.
+    // This leg states no items and no hard demand: it is its pair's alone,
+    // its first decision's shed goes to the rule, which takes nobody at
+    // the place, and the miss names no side.
     assert_eq!(left(false), (Err(MISSED), 2));
 }
 
@@ -1115,13 +1118,13 @@ fn a_pair_held_on_its_prefill_alone_stays_on_it_behind_an_encoder() {
     assert_eq!(answer, Some(Unplaced::NoWorkers), "its encoders' answer");
 }
 
-/// An encode request held to the two workers it names is decided once for
-/// its pair. Under a document that picks a pair's decode behind its
-/// prefill, its decision books the decode with its prefill, as a pair's
-/// own does: a decode asked again is refused as one that never stood
-/// chosen, and the placement stands on the decode the request named. The
-/// same request with no worker named has its decode decided again, and so
-/// has one held to its prefill alone: it names no decode.
+/// An encode request held to the two workers it names has its decode
+/// decided with its prefill. Under a document that picks a pair's decode
+/// behind its prefill, its decision books the decode with its prefill, as
+/// a pair's own does: a decode asked again is refused as one that never
+/// stood chosen, and the placement stands on the decode the request
+/// named. The same request with no worker named has its decode decided
+/// again, and so has one held to its prefill alone: it names no decode.
 ///
 /// The classic router picks a pair's decode once, with its prefill, by
 /// its pair selection (`P:3458-3460`, `P:3490`).
