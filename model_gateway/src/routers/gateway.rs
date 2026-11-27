@@ -545,7 +545,9 @@ impl Gateway {
     /// EPD router asks this of the prepared media. The draw runs before the
     /// request is prepared, so it asks the model's spec
     /// ([`Self::media_carries_mrope_grids`]). If the spec does not tell, the
-    /// decode worker must take grids.
+    /// images carry no grids, as before. Only a gRPC pipeline caches the
+    /// config that the spec needs, and it does so when it prepares the
+    /// model's first request with media.
     ///
     /// A worker can serve if it is ready, permitted by the circuit breaker,
     /// and not stalled. If no family gets weight, a stalled worker can serve
@@ -595,10 +597,15 @@ impl Gateway {
             .unwrap_or_default();
         let vision = matches!(epd, EpdDemand::PairAndEncoder { vision: true });
         // Whether the model's images carry mRoPE grids, read once and only
-        // for a decode worker that does not take them.
+        // for a decode worker that does not take them. While the spec does
+        // not tell, they carry none, as before: only a gRPC pipeline caches
+        // the config, so a draw that kept images off EPD until then could
+        // keep them off for good. The first image that a gRPC router
+        // prepares caches the config, and the draw reads the spec from then
+        // on.
         let grids = OnceCell::new();
         let carries_grids =
-            || *grids.get_or_init(|| self.media_carries_mrope_grids(model_id) != Some(false));
+            || *grids.get_or_init(|| self.media_carries_mrope_grids(model_id) == Some(true));
         // Whether `pool` holds an encode worker that the EPD router can use
         // for `worker`. The EPD router has no fallback to a stalled encode
         // worker, so this does not change with the check.
@@ -3508,16 +3515,18 @@ mod tests {
         assert_drawn(&gateway, audio, fleet, &[("grpc_epd", 1.0)]);
     }
 
-    /// For an image, the EPD router takes only a decode worker that takes
-    /// mRoPE grids when the prepared image carries them, and the draw cannot
-    /// see grids. So for every image the vLLM pair needs a decode worker with
-    /// a vision encoder. Here it has none, so an image goes to the stalled
+    /// A `qwen2_vl` model's images carry mRoPE grids, and for those the EPD
+    /// router takes only a decode worker that takes grids. Here the vLLM
+    /// decode worker has no vision encoder, so an image goes to the stalled
     /// HTTP worker, while audio and text go to the EPD family. With a vision
     /// decode worker, the EPD family takes the image too.
-    #[test]
-    fn an_epd_family_takes_an_image_only_if_its_decode_worker_takes_vision() {
+    #[tokio::test]
+    async fn an_epd_family_takes_an_image_only_if_its_decode_worker_takes_vision() {
         for (decode_vision, image) in [("false", "http"), ("true", "grpc_epd")] {
-            let gateway = named_family_gateway(&[(HTTP, WorkerType::Regular, Serving::Stalled)]);
+            let (gateway, configs) = media_spec_gateway().await;
+            cache_config(&configs, "qwen2_vl");
+            let gateway =
+                named_families_over(gateway, &[(HTTP, WorkerType::Regular, Serving::Stalled)]);
             register_vllm_epd(&gateway, decode_vision);
             let fleet = format!("vLLM EPD, decode supports_vision={decode_vision}, stalled HTTP");
             let media = |vision| EpdDemand::PairAndEncoder { vision };
@@ -3567,48 +3576,66 @@ mod tests {
         }
     }
 
+    /// A gateway whose media specs hold a tokenizer for model `m`, and the
+    /// config cache that they read. The cache holds no config yet.
+    async fn media_spec_gateway() -> (Gateway, Arc<MultimodalConfigRegistry>) {
+        use llm_tokenizer::{mock::MockTokenizer, TokenizerTrait};
+
+        let tokenizers = Arc::new(TokenizerRegistry::new());
+        let mock: Arc<dyn TokenizerTrait> = Arc::new(MockTokenizer::new());
+        tokenizers
+            .load("tok-m", "m", "m", || async { Ok(mock) })
+            .await
+            .expect("the mock tokenizer loads");
+        let configs = Arc::new(MultimodalConfigRegistry::new());
+        let gateway = Gateway::new(Arc::new(WorkerRegistry::new()))
+            .with_media_specs(tokenizers, Arc::clone(&configs));
+        (gateway, configs)
+    }
+
+    /// Caches a config of `model_type` for the tokenizer of model `m`, as a
+    /// gRPC router does when it prepares the model's first request with
+    /// media.
+    fn cache_config(configs: &MultimodalConfigRegistry, model_type: &str) {
+        use llm_multimodal::PreProcessorConfig;
+
+        use crate::routers::grpc::multimodal::MultimodalModelConfig;
+
+        let config = MultimodalModelConfig::new(
+            serde_json::json!({ "model_type": model_type }),
+            PreProcessorConfig::default(),
+            None,
+        );
+        configs.insert("tok-m".to_string(), Arc::new(config));
+    }
+
     /// The decode worker must take mRoPE grids only if the model's images
     /// carry them, as its media spec tells. A `llava` model's images carry
     /// none, so its image goes to the vLLM pair whose decode worker has no
     /// vision encoder. A `qwen2_vl` model's images carry grids, so its image
-    /// goes to the stalled HTTP worker. While the spec does not tell (no
-    /// registries, or no cached config), the decode worker must take grids.
+    /// goes to the stalled HTTP worker. While the spec does not tell, an
+    /// image of either model goes to the vLLM pair. Its preparation caches
+    /// the config, and the draw reads the spec from then on.
     #[tokio::test]
     async fn an_image_needs_a_decode_worker_that_takes_grids_only_if_the_model_has_them() {
-        use llm_multimodal::PreProcessorConfig;
-        use llm_tokenizer::{mock::MockTokenizer, TokenizerTrait};
-
-        use crate::routers::grpc::multimodal::MultimodalModelConfig;
-
-        for (model_type, image) in [
-            (None, "http"),
-            (Some("llava"), "grpc_epd"),
-            (Some("qwen2_vl"), "http"),
-        ] {
-            let tokenizers = Arc::new(TokenizerRegistry::new());
-            let mock: Arc<dyn TokenizerTrait> = Arc::new(MockTokenizer::new());
-            tokenizers
-                .load("tok-m", "m", "m", || async { Ok(mock) })
-                .await
-                .expect("the mock tokenizer loads");
-            let configs = Arc::new(MultimodalConfigRegistry::new());
-            if let Some(model_type) = model_type {
-                let config = MultimodalModelConfig::new(
-                    serde_json::json!({ "model_type": model_type }),
-                    PreProcessorConfig::default(),
-                    None,
-                );
-                configs.insert("tok-m".to_string(), Arc::new(config));
-            }
-            let gateway =
-                Gateway::new(Arc::new(WorkerRegistry::new())).with_media_specs(tokenizers, configs);
+        let image_demand = EpdDemand::PairAndEncoder { vision: true };
+        for (model_type, image) in [("llava", "grpc_epd"), ("qwen2_vl", "http")] {
+            let (gateway, configs) = media_spec_gateway().await;
             let gateway =
                 named_families_over(gateway, &[(HTTP, WorkerType::Regular, Serving::Stalled)]);
             register_vllm_epd(&gateway, "false");
-            let fleet = format!("{model_type:?}, vLLM EPD, decode supports_vision=false");
-            let image_demand = EpdDemand::PairAndEncoder { vision: true };
+            let fleet = format!(
+                "{model_type} with no cached config, vLLM EPD, decode supports_vision=false"
+            );
+            assert_drawn(&gateway, image_demand, &fleet, &[("grpc_epd", 1.0)]);
+            cache_config(&configs, model_type);
+            let fleet = format!("{model_type}, vLLM EPD, decode supports_vision=false");
             assert_drawn(&gateway, image_demand, &fleet, &[(image, 1.0)]);
         }
+        let gateway = named_family_gateway(&[(HTTP, WorkerType::Regular, Serving::Stalled)]);
+        register_vllm_epd(&gateway, "false");
+        let fleet = "no media specs, vLLM EPD, decode supports_vision=false";
+        assert_drawn(&gateway, image_demand, fleet, &[("grpc_epd", 1.0)]);
     }
 
     /// A generate request with media for a model that only gRPC regular
