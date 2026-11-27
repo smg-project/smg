@@ -53,7 +53,7 @@ use super::{
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
-    middleware::TenantRequestMeta,
+    middleware::{sse_keepalive::names_event_stream, TenantRequestMeta},
     observability::{
         events::{self, Event},
         metrics::{bool_to_static_str, metrics_labels, Metrics},
@@ -2939,7 +2939,7 @@ impl PDRouter {
             .and_then(|headers| headers.get(CONTENT_TYPE))
             .and_then(|value| value.to_str().ok())
         {
-            Some(content_type) => content_type.starts_with("text/event-stream"),
+            Some(content_type) => names_event_stream(content_type),
             None => status.is_success(),
         };
         let mut response_headers = headers.unwrap_or_default();
@@ -9116,6 +9116,42 @@ mod tests {
             .expect("the error event is a frame of its own");
         assert_eq!(error["error"]["type"], "stream_error", "{body}");
         assert_eq!(events[2], "data: [DONE]");
+    }
+
+    /// The decode side's answer is an event stream however the worker spells
+    /// the type (a media type's name is case-insensitive, RFC 9110, section
+    /// 8.3.1): the relay may change its length, so a sized
+    /// `Text/Event-Stream` answer reaches the client without the decode
+    /// worker's `Content-Length` too.
+    #[tokio::test]
+    async fn a_decode_stream_is_an_event_stream_however_the_worker_spells_its_type() {
+        const BODY: &str =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\ndata: [DONE]\n\n";
+        for content_type in ["text/event-stream", "Text/Event-Stream"] {
+            let prefill = axum::Router::new().route(
+                "/v1/chat/completions",
+                axum::routing::post(|| async { axum::Json(json!({})) }),
+            );
+            let decode = axum::Router::new().route(
+                "/v1/chat/completions",
+                axum::routing::post(move || async move { ([(CONTENT_TYPE, content_type)], BODY) }),
+            );
+            let router = create_test_pd_router();
+            register_pd_pair(&router, spawn_stub(prefill).await, spawn_stub(decode).await);
+            let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+            let response = tokio::time::timeout(
+                ROUND_TRIP_GUARD,
+                router.route_chat(None, &tenant, Arc::new(streaming_chat()), UNKNOWN_MODEL_ID),
+            )
+            .await
+            .expect("the client stream starts once the prefill answered");
+            assert_eq!(response.status(), StatusCode::OK, "{content_type}");
+            assert!(
+                !response.headers().contains_key(CONTENT_LENGTH),
+                "{content_type}: the decode worker's length is not the relay's"
+            );
+        }
     }
 
     /// With logprobs asked for, the relay re-encodes each frame with the
