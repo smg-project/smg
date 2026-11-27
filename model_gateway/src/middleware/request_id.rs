@@ -18,8 +18,9 @@
 //!
 //! Under a policy spec that keeps a sample of its decisions the gateway
 //! also restates the chosen id on the request, under the header
-//! `x-smg-request-id` (`restate`). The engine's side of a placement reads
-//! it there (`restated`) as the gateway's own id of the request. That
+//! `x-smg-request-id` (`restate`). The engine reads it there as the
+//! gateway's own id of the request, by the name a placement states to it,
+//! and the gateway reads the header for no request. That
 //! write is no part of this layer: the server installs it as a layer of its
 //! own inside the edge layers, behind this one, and under no other
 //! configuration, so this layer is the same for every gateway. The write
@@ -66,14 +67,6 @@ pub(crate) static REQUEST_ID: HeaderName = HeaderName::from_static("request-id")
 /// request-id headers by their names and by the prefix `x-request-id-`,
 /// and this name is neither.
 pub(crate) static OWN_REQUEST_ID: HeaderName = HeaderName::from_static("x-smg-request-id");
-
-/// The gateway's own id of the request `headers` belong to, where the
-/// gateway restated it on the request ([`restate`]): the id the response's
-/// `x-request-id` header shows. `None` where nothing restated one. The
-/// engine's side of a placement asks, and a classic placement never does.
-pub(crate) fn restated(headers: &http::HeaderMap) -> Option<&str> {
-    headers.get(&OWN_REQUEST_ID)?.to_str().ok()
-}
 
 /// Restates the id the layer chose for `request` on the request itself,
 /// under [`OWN_REQUEST_ID`], as the one value there: whatever a client sent
@@ -599,6 +592,12 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.headers()["x-request-id"], "ok-1");
+    }
+
+    /// What a reader of [`OWN_REQUEST_ID`] finds on `headers`: the first
+    /// value under the name, as the engine reads a header by its name.
+    fn restated(headers: &http::HeaderMap) -> Option<&str> {
+        headers.get(&OWN_REQUEST_ID)?.to_str().ok()
     }
 
     /// The handler of [`own_for`]'s route: every value it received under
