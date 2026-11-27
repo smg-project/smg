@@ -305,7 +305,9 @@ two of the `tokenizers` crate's other model types (BERT base, WordPiece; T5 smal
 BERT base itself since 1.16.0 and hands T5 small to that crate, and the reference hands it both.
 
 Setup: one x86-64 core per cell with its sibling idle, release builds (opt-level 3, fat LTO, one codegen unit; the
-fastokens stack under its own workspace's profile, thin LTO), three rounds and eight on the edge cells, medians. Measured
+fastokens stack under its own workspace's profile, thin LTO), three rounds and eight on the edge cells, medians. A batch
+change between the two releases is shown where both hold ten rounds or every round of one stands beyond every round of
+the other, and reads `-` otherwise. Measured
 on the SMG 1.16.0 release candidate, commit 378df2a52 (2026-11-18); v1.15.0 is the crate at the `v1.15.0` tag, built by
 the same toolchain. Other work ran on the machine's other cores during part of the run, so absolute figures may read
 high; the implementations of a cell run within the same minute, so the margins hold. Numbers are nanoseconds per token
