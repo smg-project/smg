@@ -314,7 +314,10 @@ pub(crate) trait Turn {
     /// The turn's write of a registration's facts: a door with a holder
     /// decides it over its worker objects
     /// ([`Objects::upsert`](super::Objects::upsert)). `None` where another
-    /// writer moved the row under the turn.
+    /// writer moved the row under the turn. A turn under a term hands it
+    /// on with the write, and answers `None` too where the log left the
+    /// term ahead of the row's event: the routine then asks
+    /// [`Self::check_term`].
     fn upsert(&self, facts: WorkerFacts, maker: Registrant) -> Option<MembershipChange>;
 
     /// The turn's write of a patch, as [`Self::upsert`] writes a
@@ -345,7 +348,8 @@ pub(crate) trait Turn {
     fn drain(&self, id: WorkerId, revision: u64) -> bool;
 
     /// Check the term ahead of a write. A registration asks before each
-    /// row it writes and each row it removes.
+    /// row it writes and each row it removes, and once more behind a
+    /// write the store did not take.
     fn check_term(&self) -> Result<(), MembershipWriteRefused> {
         Ok(())
     }
@@ -376,6 +380,17 @@ pub(crate) fn asks_events_under(facts: &WorkerFacts, store: &MemoryStore) -> boo
 fn made_by(row: &WorkerRow, maker: &Registrant) -> Result<(), MembershipWriteRefused> {
     row.made_by(maker)
         .map_err(|not| MembershipWriteRefused::NotRegistrant(not.to_string()))
+}
+
+/// The refusal of a write the turn's store did not take, asked behind that
+/// write. Where the turn's term has ended by this ask, it is refused as a
+/// turn that does not lead, whatever refused the write: its row need not
+/// have moved. Otherwise it is refused as a row another writer moved: the
+/// table did not hold what the turn read.
+fn unwritten(turn: &impl Turn) -> MembershipWriteRefused {
+    turn.check_term()
+        .err()
+        .unwrap_or(MembershipWriteRefused::Moved)
 }
 
 /// The row an asker saw, where it still stands under the URL at the
@@ -668,6 +683,7 @@ pub(crate) fn lay_ready(
     for row in left {
         turn.check_term()?;
         let wrote = changed(
+            turn,
             turn.remove(row.id, row.revision),
             MembershipWriteOutcome::Removed,
         )?;
@@ -712,7 +728,7 @@ fn write_row(
     }
     let probes = facts.health.probes;
     let change = turn.upsert(facts, maker.clone());
-    let change = change.ok_or(MembershipWriteRefused::Moved)?;
+    let change = change.ok_or_else(|| unwritten(turn))?;
     let wrote = match change {
         MembershipChange::Registered { id } => MembershipWriteOutcome::Registered(id),
         MembershipChange::Relabelled { id } | MembershipChange::Resized { id } => {
@@ -735,12 +751,13 @@ fn write_row(
 }
 
 fn changed(
+    turn: &impl Turn,
     change: Option<MembershipChange>,
     wrote: fn(WorkerId) -> MembershipWriteOutcome,
 ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
     change
         .map(|change| wrote(change.id()))
-        .ok_or(MembershipWriteRefused::Moved)
+        .ok_or_else(|| unwritten(turn))
 }
 
 fn removal_row(
@@ -796,10 +813,7 @@ pub(crate) fn drain(
         return Ok(MembershipWriteOutcome::Unmoved(row.id));
     }
     if !turn.drain(row.id, row.revision) {
-        // The drain wrote nothing. Where its term ended, it is refused as
-        // a turn that does not lead: its row need not have moved.
-        turn.check_term()?;
-        return Err(MembershipWriteRefused::Moved);
+        return Err(unwritten(turn));
     }
     Ok(MembershipWriteOutcome::Draining(row.id))
 }
@@ -813,6 +827,7 @@ pub(crate) fn take(
 ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
     let row = removal_row(turn, by, url, seen)?;
     changed(
+        turn,
         turn.remove(row.id, row.revision),
         MembershipWriteOutcome::Removed,
     )
@@ -894,8 +909,8 @@ fn refresh_stated(
                 | MembershipChange::Replaced { .. }
                 | MembershipChange::Removed { .. }
                 | MembershipChange::StatusChanged { .. },
-            )
-            | None => Err(MembershipWriteRefused::Moved),
+            ) => Err(MembershipWriteRefused::Moved),
+            None => Err(unwritten(turn)),
         };
     }
     let patch = WorkerPatch {
@@ -903,6 +918,7 @@ fn refresh_stated(
         ..WorkerPatch::default()
     };
     changed(
+        turn,
         turn.patch(row.id, patch, row.revision),
         MembershipWriteOutcome::InPlace,
     )

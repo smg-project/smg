@@ -2037,13 +2037,18 @@ fn a_drain_marks_the_makers_row_once_and_a_removal_takes_it() {
     let stale = row.revision - 1;
     assert_eq!(
         changed(
+            &door,
             store.set_status(row.id, WorkerStatus::Draining, stale),
             MembershipWriteOutcome::Draining
         ),
         Err(MembershipWriteRefused::Moved)
     );
     assert_eq!(
-        changed(store.remove(row.id, stale), MembershipWriteOutcome::Removed),
+        changed(
+            &door,
+            store.remove(row.id, stale),
+            MembershipWriteOutcome::Removed
+        ),
         Err(MembershipWriteRefused::Moved)
     );
     assert_eq!(

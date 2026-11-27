@@ -72,7 +72,9 @@ pub trait Journal: Send + Sync {
     /// write that names no term always goes on. The crate's log answers
     /// yes to one that names a term where its store leads that term, and
     /// nowhere else. The store steps its epoch behind a yes: `epoch` is
-    /// the one that step gives.
+    /// the one that step gives. The store hands a write `at`, `term` or
+    /// neither, never both: an applier's write goes by its leader's
+    /// place, and names no term of the store's own.
     #[must_use = "a write the journal refuses moves nothing in the store"]
     fn member(
         &self,
