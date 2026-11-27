@@ -592,8 +592,10 @@ pub struct IndexSpec {
     /// read it: a placement of its record stays until `max_size` takes it.
     #[schemars(range(min = 1))]
     pub ttl_s: u32,
-    /// The size bound of a tree index: on a text host its characters plus
-    /// 1024 for each node a worker stands on, tokens otherwise.
+    /// The size bound of a tree index, summed over the workers: on a text
+    /// host the characters of the nodes each worker stands on plus 1024 for
+    /// each such node, otherwise the tokens each worker holds, so a prefix
+    /// that several workers hold counts once for each of them.
     /// The crate's engine reads it for a pool whose profile reads sent
     /// prefixes: the model's record is bound to `max_size` over the block
     /// size placements, never under one. A placement is a block a worker
