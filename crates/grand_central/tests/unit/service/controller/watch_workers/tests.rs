@@ -45,11 +45,6 @@ use crate::{
 };
 
 impl Feed {
-    /// The cuts of every row this feed took, for a case.
-    pub(in crate::service::controller) fn cuts(&self) -> usize {
-        self.cuts.load(Ordering::Relaxed)
-    }
-
     /// The kept cut, for a case.
     pub(in crate::service::controller) fn kept(&self) -> Option<Arc<StoreCheckpoint>> {
         self.rows.lock().clone()

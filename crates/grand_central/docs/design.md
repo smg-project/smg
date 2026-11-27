@@ -1742,11 +1742,12 @@ refusal told late leaves it: the session's pins stay as that decision wrote them
 guard and a controller tell each dispatch and release of a pair under its first decision's lease,
 so a decode call there dates its claim by that lease.
 
-A dispatch, a move at the cap and a decode call's date write nothing into the session table when
-dated before every decision that read the key's current life.
+A dispatch and a move at the cap write nothing into the session table when dated before the oldest
+date a decision read the key's current life under. A pair's decode call reads under its lease's
+date. Neither does a decode call's date where the call's own instant is that old.
 
 The table keeps the low 32 bits of the instant. Two claims of one key on one worker that are
-dated alike read as one: at one microsecond, or 2^32 microseconds apart.
+dated alike read as one: at one microsecond, or a whole multiple of 2^32 microseconds apart.
 
 A decode call that panics behind its claim dates nothing. Its claim keeps the call's instant, and
 no event of the pair's lease reaches it. It ends at a dispatch on its worker or with the key's
@@ -2289,11 +2290,14 @@ request states no hard demand, its host states no places of the prefills or the 
 encode pass is laid for it. One decision more is then held to the rule's prefills, with no decode
 lent.
 
-Under a binding that sheds a list wholly over its thresholds, that decision sheds the request as
-saturated where the rule's prefills that pair with a decode are so. That shed is the answer, for
-the prefill side. Any other
-shed of it leaves the answer as it was. A decision that panics there is answered as refused, as
-any is. The gateway's own selection judges the rule's prefills
+Under a binding that sheds a list wholly over its thresholds, that decision may shed the request
+as saturated: that shed is the answer, for the prefill side. It does where the rule's prefills that
+pair with a decode are so and none of them stands under the prefill side's hard filters, its limit
+set aside. Under a side that lists no overload veto, one over its thresholds may stand, and the
+answer stays as it was.
+
+Any other shed of that decision leaves the answer as it was. A decision that panics there is
+answered as refused, as any is. The gateway's own selection judges the rule's prefills
 first there (`pair_pass` in `model_gateway/src/routers/common/placement.rs`, where no prefill is
 eligible).
 

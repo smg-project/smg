@@ -140,7 +140,8 @@ impl GrpcRouter {
                 ctx.configured_reasoning_parser.clone(),
                 &tool_parser_factory,
                 &reasoning_parser_factory,
-            ),
+            )
+            .reading_by_alias(Arc::clone(&ctx.by_alias)),
             multimodal,
             tokenizer_autoload: !ctx.router_config.disable_tokenizer_autoload,
             tokenizer_load_failures: ctx.tokenizer_load_failures.clone(),

@@ -1864,4 +1864,5 @@ pub(crate) fn parse_finish_reason(
 }
 
 #[cfg(test)]
+#[path = "../../../../tests/unit/routers/grpc/utils/chat_utils/tests.rs"]
 mod tests;
