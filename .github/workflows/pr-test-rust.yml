@@ -655,15 +655,17 @@ jobs:
     needs: [build-wheel, detect-changes]
     # Opt-in on pull requests via the `ci:bench` label (read from the event
     # like `ci:full`, so labelling after a push takes effect on the next push
-    # or close/reopen); runs on push and workflow_dispatch except for
-    # docs-only or version-only changes (whose numbers are the commit's it
-    # inherits the card tier from).
+    # or close/reopen) or automatically when the PR modifies the PR benchmark
+    # harness; runs on push and workflow_dispatch except for docs-only or
+    # version-only changes (whose numbers are the commit's it inherits the card
+    # tier from).
     if: >-
       needs.detect-changes.outputs.docs-only != 'true'
       && needs.detect-changes.outputs.card-tier-from == ''
       && (
         github.event_name != 'pull_request'
         || contains(github.event.pull_request.labels.*.name, 'ci:bench')
+        || needs.detect-changes.outputs.bench-harness == 'true'
       )
     runs-on: ${{ vars.SMG_RUNNER_GPU_4 || '4-gpu-h100' }}
     container: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
@@ -728,8 +730,8 @@ jobs:
 
   # Initial advisory AMD PR performance slice: same regular HTTP/gRPC test,
   # four TP1 workers and thresholds as NVIDIA. Opt-in via the `ci:bench` label
-  # like `benchmarks`, in addition to the AMD repo variables. PD performance
-  # remains separate.
+  # (or changes to the PR benchmark harness) like `benchmarks`, in addition to
+  # the AMD repo variables. PD performance remains separate.
   benchmarks-amd:
     needs: [build-wheel, detect-changes]
     if: >-
@@ -738,7 +740,10 @@ jobs:
       && vars.SMG_RUN_AMD_ON_PRS == 'true'
       && vars.SMG_RUN_AMD_PR_BENCHMARK == 'true'
       && github.event_name == 'pull_request'
-      && contains(github.event.pull_request.labels.*.name, 'ci:bench')
+      && (
+        contains(github.event.pull_request.labels.*.name, 'ci:bench')
+        || needs.detect-changes.outputs.bench-harness == 'true'
+      )
       && needs.build-wheel.result == 'success'
       && needs.detect-changes.result == 'success'
       && needs.detect-changes.outputs.docs-only != 'true'
@@ -831,6 +836,8 @@ jobs:
       # request can affect (every shard on a push or a dispatch); '[]' skips the job.
       rust-shards: ${{ steps.rust-shards.outputs.rust-shards }}
       dependencies: ${{ steps.filter.outputs.dependencies }}
+      # Whether the pull request modifies the PR benchmark harness itself.
+      bench-harness: ${{ steps.filter.outputs.bench-harness }}
       # The GPU e2e lanes' decisions, one per area, from the tier table (the same step).
       skip-chat-one-engine: ${{ steps.lanes.outputs.skip-chat-one-engine }}
       skip-chat-completions: ${{ steps.lanes.outputs.skip-chat-completions }}
@@ -1064,6 +1071,16 @@ jobs:
               - '.cargo/audit.toml'
               - 'scripts/ci_cargo_audit.sh'
               - '.github/workflows/pr-test-rust.yml'
+            # The PR benchmark harness: automatically runs the advisory
+            # benchmark job(s) on PRs that modify the harness itself, excluding
+            # docs and the nightly-only / disabled Go benchmark scripts.
+            bench-harness:
+              - 'e2e_test/benchmarks/**'
+              - '!e2e_test/benchmarks/**/*.md'
+              - '!e2e_test/benchmarks/test_nightly_perf.py'
+              - '!e2e_test/benchmarks/nightly_summarize.py'
+              - '!e2e_test/benchmarks/test_go_bindings_perf.py'
+              - 'scripts/ci/validate_pr_benchmark.py'
 
       # The version-only shortcut: a change that moves nothing but the release version
       # carriers (scripts/ci_version_only.py: the manifests' version lines and workspace

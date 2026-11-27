@@ -166,7 +166,7 @@ edits, so upstream syncs stay conflict-free.
 | `SMG_RUNNER_AMD_GPU_4` | `4-gpu-mi300x` | AMD weekly and opt-in PR benchmarks (require `SMG_RUN_AMD_LEGS=true`) |
 | `SMG_RUNNER_AMD_GPU_8` | `8-gpu-mi300x` | AMD BFCL and nightly PD runner; automatic AMD selection requires `SMG_RUN_AMD_LEGS=true` |
 | `SMG_RUN_AMD_BFCL` | `false` | Required for every AMD BFCL selection, including explicit dispatch; keep off until shared-host admission and owned teardown are qualified |
-| `SMG_RUN_AMD_PR_BENCHMARK` | `false` | Advisory AMD PR performance measurements; also requires `SMG_RUN_AMD_LEGS=true` and `SMG_RUN_AMD_ON_PRS=true`. Keep off until the native environment, performance budget and shared-host admission are qualified |
+| `SMG_RUN_AMD_PR_BENCHMARK` | `false` | Advisory AMD PR performance measurements; also requires `SMG_RUN_AMD_LEGS=true`, `SMG_RUN_AMD_ON_PRS=true`, and either the `ci:bench` PR label or a change to the PR benchmark harness (`e2e_test/benchmarks/` or `scripts/ci/validate_pr_benchmark.py`). Keep off until the native environment, performance budget and shared-host admission are qualified |
 
 GitHub-hosted labels (`ubuntu-latest`, `macos-latest`) are left as-is — every
 fork already has those.
@@ -216,6 +216,14 @@ if: github.repository == 'smg-project/smg' || vars.SMG_RUN_BENCHMARKS == 'true'
 They stay off in a fork until you set `SMG_RUN_BENCHMARKS` to `true`. Only
 `benchmark-radix-tree` runs on the self-hosted CPU pool, so it also needs
 `SMG_RUNNER_CPU`; the other four are on `ubuntu-latest` and need nothing else.
+
+In `PR Test (SMG)` (`.github/workflows/pr-test-rust.yml`), the advisory 4-GPU
+`benchmarks` job is opt-in on pull requests via the `ci:bench` label (read from
+the PR event like `ci:full`, so labelling after a push takes effect on the next
+push or close/reopen) and runs automatically when a PR modifies the PR
+benchmark harness (`e2e_test/benchmarks/` or `scripts/ci/validate_pr_benchmark.py`).
+It continues to run on `push` to `main`/`release/**` and `workflow_dispatch`
+(excluding docs-only and version-only changes).
 
 A pull request's bench binary is gated against the base's by `scripts/bench_gate.py`,
 with the thresholds of `.github/bench-gates/*.toml`. A gated bench binary's sources, the

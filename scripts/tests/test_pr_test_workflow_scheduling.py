@@ -1,9 +1,10 @@
 """Scheduling contracts for `.github/workflows/pr-test-rust.yml`.
 
-Advisory 4-GPU benchmark jobs must opt in via `ci:bench` on pull requests so they
-do not starve blocking 4-GPU E2E lanes or delay `finish`, while remaining enabled
-on `push` and `workflow_dispatch`. Branch runs must not cancel in-progress runs so
-back-to-back merges collapse in the single pending slot at zero compute cost.
+Advisory 4-GPU benchmark jobs must opt in via `ci:bench` on pull requests (or
+run automatically when a PR modifies the PR benchmark harness itself) so they do
+not starve blocking 4-GPU E2E lanes or delay `finish`, while remaining enabled
+on `push` and `workflow_dispatch`. Branch runs must not cancel in-progress runs
+so back-to-back merges collapse in the single pending slot at zero compute cost.
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ def _eval_gha_bool(
     labels: tuple[str, ...] = (),
     docs_only: str = "false",
     card_tier_from: str = "",
+    bench_harness: str = "false",
     cancelled: bool = False,
     needs_results: dict[str, str] | None = None,
     vars_map: dict[str, str] | None = None,
@@ -64,6 +66,7 @@ def _eval_gha_bool(
     py = py.replace("||", " or ")
     py = re.sub(r"needs\.detect-changes\.outputs\.docs-only", repr(docs_only), py)
     py = re.sub(r"needs\.detect-changes\.outputs\.card-tier-from", repr(card_tier_from), py)
+    py = re.sub(r"needs\.detect-changes\.outputs\.bench-harness", repr(bench_harness), py)
     py = re.sub(
         r"needs\.([a-z0-9_-]+)\.result",
         lambda m: repr(needs_results.get(m.group(1), "success")),
@@ -81,28 +84,53 @@ def _eval_gha_bool(
     return bool(result)
 
 
+def _pattern_regex(pattern: str) -> re.Pattern[str]:
+    """Compile a `dorny/paths-filter` glob pattern into a full-path regular expression."""
+    out, idx = "", 0
+    while idx < len(pattern):
+        if pattern.startswith("**/", idx):
+            out, idx = out + "(?:.*/)?", idx + 3
+        elif pattern.startswith("**", idx):
+            out, idx = out + ".*", idx + 2
+        elif pattern[idx] == "*":
+            out, idx = out + "[^/]*", idx + 1
+        else:
+            out, idx = out + re.escape(pattern[idx]), idx + 1
+    return re.compile(out + r"\Z")
+
+
+def _matches_some_with_excludes(patterns: list[str], path: str) -> bool:
+    """Evaluate `dorny/paths-filter` `some-with-excludes` matching for one path."""
+    includes = [_pattern_regex(p) for p in patterns if not p.startswith("!")]
+    excludes = [_pattern_regex(p[1:]) for p in patterns if p.startswith("!")]
+    return any(rx.match(path) for rx in includes) and not any(rx.match(path) for rx in excludes)
+
+
 @pytest.mark.parametrize(
-    ("event_name", "labels", "docs_only", "card_tier_from", "expected"),
+    ("event_name", "labels", "bench_harness", "docs_only", "card_tier_from", "expected"),
     [
-        ("pull_request", (), "false", "", False),
-        ("pull_request", ("ci:full",), "false", "", False),
-        ("pull_request", ("ci:bench",), "false", "", True),
-        ("pull_request", ("ci:bench",), "true", "", False),
-        ("pull_request", ("ci:bench",), "false", "a" * 40, False),
-        ("push", (), "false", "", True),
-        ("push", (), "false", "a" * 40, False),
-        ("workflow_dispatch", (), "false", "", True),
+        ("pull_request", (), "false", "false", "", False),
+        ("pull_request", ("ci:full",), "false", "false", "", False),
+        ("pull_request", ("ci:bench",), "false", "false", "", True),
+        ("pull_request", (), "true", "false", "", True),
+        ("pull_request", ("ci:bench",), "false", "true", "", False),
+        ("pull_request", (), "true", "true", "", False),
+        ("pull_request", ("ci:bench",), "false", "false", "a" * 40, False),
+        ("push", (), "false", "false", "", True),
+        ("push", (), "false", "false", "a" * 40, False),
+        ("workflow_dispatch", (), "false", "false", "", True),
     ],
 )
 def test_benchmarks_job_opts_in_on_prs_and_runs_on_push_or_dispatch(
     workflow: dict,
     event_name: str,
     labels: tuple[str, ...],
+    bench_harness: str,
     docs_only: str,
     card_tier_from: str,
     expected: bool,
 ) -> None:
-    """`benchmarks` skips PRs without `ci:bench`, runs on `ci:bench` PRs, and stays on for push/dispatch."""
+    """`benchmarks` skips PRs without `ci:bench` or harness edits, and stays on for push/dispatch."""
     job = workflow["jobs"]["benchmarks"]
     assert job["continue-on-error"] is True
     expr = job["if"]
@@ -113,6 +141,7 @@ def test_benchmarks_job_opts_in_on_prs_and_runs_on_push_or_dispatch(
             expr,
             event_name=event_name,
             labels=labels,
+            bench_harness=bench_harness,
             docs_only=docs_only,
             card_tier_from=card_tier_from,
         )
@@ -121,26 +150,37 @@ def test_benchmarks_job_opts_in_on_prs_and_runs_on_push_or_dispatch(
 
 
 @pytest.mark.parametrize(
-    ("event_name", "labels", "amd_enabled", "docs_only", "card_tier_from", "expected"),
+    (
+        "event_name",
+        "labels",
+        "bench_harness",
+        "amd_enabled",
+        "docs_only",
+        "card_tier_from",
+        "expected",
+    ),
     [
-        ("pull_request", (), True, "false", "", False),
-        ("pull_request", ("ci:bench",), True, "false", "", True),
-        ("pull_request", ("ci:bench",), False, "false", "", False),
-        ("pull_request", ("ci:bench",), True, "true", "", False),
-        ("pull_request", ("ci:bench",), True, "false", "a" * 40, False),
-        ("push", (), True, "false", "", False),
+        ("pull_request", (), "false", True, "false", "", False),
+        ("pull_request", ("ci:bench",), "false", True, "false", "", True),
+        ("pull_request", (), "true", True, "false", "", True),
+        ("pull_request", ("ci:bench",), "false", False, "false", "", False),
+        ("pull_request", (), "true", False, "false", "", False),
+        ("pull_request", ("ci:bench",), "false", True, "true", "", False),
+        ("pull_request", ("ci:bench",), "false", True, "false", "a" * 40, False),
+        ("push", (), "false", True, "false", "", False),
     ],
 )
-def test_benchmarks_amd_job_requires_ci_bench_label_and_amd_vars(
+def test_benchmarks_amd_job_requires_ci_bench_or_harness_and_amd_vars(
     workflow: dict,
     event_name: str,
     labels: tuple[str, ...],
+    bench_harness: str,
     amd_enabled: bool,
     docs_only: str,
     card_tier_from: str,
     expected: bool,
 ) -> None:
-    """`benchmarks-amd` requires both the AMD repo variables and the `ci:bench` PR label."""
+    """`benchmarks-amd` requires both the AMD repo vars and `ci:bench` or a harness change."""
     job = workflow["jobs"]["benchmarks-amd"]
     assert job["continue-on-error"] is True
     flag = "true" if amd_enabled else "false"
@@ -154,6 +194,7 @@ def test_benchmarks_amd_job_requires_ci_bench_label_and_amd_vars(
             job["if"],
             event_name=event_name,
             labels=labels,
+            bench_harness=bench_harness,
             docs_only=docs_only,
             card_tier_from=card_tier_from,
             needs_results={"build-wheel": "success", "detect-changes": "success"},
@@ -161,6 +202,34 @@ def test_benchmarks_amd_job_requires_ci_bench_label_and_amd_vars(
         )
         is expected
     )
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("e2e_test/benchmarks/test_regular_perf.py", True),
+        ("e2e_test/benchmarks/test_pd_perf.py", True),
+        ("e2e_test/benchmarks/summarize.py", True),
+        ("e2e_test/benchmarks/conftest.py", True),
+        ("scripts/ci/validate_pr_benchmark.py", True),
+        ("e2e_test/benchmarks/test_nightly_perf.py", False),
+        ("e2e_test/benchmarks/nightly_summarize.py", False),
+        ("e2e_test/benchmarks/test_go_bindings_perf.py", False),
+        ("e2e_test/benchmarks/README.md", False),
+        ("model_gateway/src/lib.rs", False),
+    ],
+)
+def test_bench_harness_filter_matches_pr_benchmark_files_only(
+    workflow: dict, path: str, expected: bool
+) -> None:
+    """`detect-changes.outputs.bench-harness` triggers on PR benchmark harness edits only."""
+    detect = workflow["jobs"]["detect-changes"]
+    assert detect["outputs"]["bench-harness"] == "${{ steps.filter.outputs.bench-harness }}"
+    filter_step = next(s for s in detect["steps"] if s.get("id") == "filter")
+    assert filter_step["with"]["predicate-quantifier"] == "some-with-excludes"
+    filters = yaml.safe_load(filter_step["with"]["filters"])
+    patterns = filters["bench-harness"]
+    assert _matches_some_with_excludes(patterns, path) is expected
 
 
 def test_pull_request_trigger_omits_labeled_to_avoid_cancellation_storms(workflow: dict) -> None:
