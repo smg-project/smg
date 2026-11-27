@@ -1820,5 +1820,4 @@ fn generate_response_body(
 }
 
 #[cfg(test)]
-#[path = "../../../tests/unit/routers/grpc/pipeline/tests/mod.rs"]
 mod tests;
