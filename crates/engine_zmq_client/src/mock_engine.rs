@@ -75,6 +75,7 @@ impl IpcNamespace {
 pub fn default_ready_response() -> EngineCoreReadyResponse {
     EngineCoreReadyResponse {
         sglang_managed: None,
+        supports_thinking_token_budget: false,
         max_model_len: 1024 * 1024,
         num_gpu_blocks: 0,
         block_size: 16,

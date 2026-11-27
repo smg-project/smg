@@ -4,15 +4,18 @@
 //! entry points keep what differs around it: which engine takes the request,
 //! and the load a request holds on the worker a policy selected.
 
-use std::{os::raw::c_char, sync::Arc, time::Duration};
+use std::{future::Future, os::raw::c_char, sync::Arc, time::Duration};
 
 use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::chat::ChatCompletionRequest;
 use smg::routers::grpc::utils::{chat_reasoning_starts_in_rendered_prefill, process_chat_messages};
 use smg_grpc_client::{
+    engine_labels::ServerInfo,
+    sglang_proto::GetServerInfoResponse,
     sglang_scheduler::{SglangGenerateRequestOptions, SglangSchedulerClient},
     FormatSetAside,
 };
+use smg_worker::labels::SUPPORTS_THINKING_TOKEN_BUDGET_LABEL;
 use uuid::Uuid;
 
 use super::{
@@ -24,10 +27,38 @@ use super::{
     tool_constraint::{tool_constraint_for, tools_keep_special_tokens},
 };
 
-/// How long a client waits for the engine's model information at creation:
-/// a client is built before its first request, so the lookup must not hold
-/// the caller on an engine that does not answer.
-const MODEL_INFO_BOUND: Duration = Duration::from_secs(2);
+/// Bound metadata reads for the client's fingerprint and the worker's capabilities.
+const ENGINE_INFO_BOUND: Duration = Duration::from_secs(2);
+
+/// A legacy worker ignores the new field. Check the selected endpoint only for finite budgets.
+fn verify_thinking_budget<E, F: Future<Output = Result<GetServerInfoResponse, E>>>(
+    budget: Option<u32>,
+    lookup: impl FnOnce() -> F,
+) -> Result<(), (SglErrorCode, &'static str)> {
+    if budget.is_none() {
+        return Ok(());
+    }
+    let info = RUNTIME
+        .block_on(async { tokio::time::timeout(ENGINE_INFO_BOUND, lookup()).await })
+        .ok()
+        .and_then(Result::ok)
+        .ok_or((
+            SglErrorCode::UnknownError,
+            "Could not verify worker support for thinking_token_budget",
+        ))?;
+    if ServerInfo::Sglang(Box::new(info))
+        .to_labels()
+        .get(SUPPORTS_THINKING_TOKEN_BUDGET_LABEL)
+        .is_some_and(|value| value == "true")
+    {
+        Ok(())
+    } else {
+        Err((
+            SglErrorCode::InvalidArgument,
+            "Selected worker does not advertise thinking_token_budget support",
+        ))
+    }
+}
 
 /// The weight version the engine reports in its model information, the
 /// value the gateway puts in `system_fingerprint`: the gateway's fallback,
@@ -35,7 +66,7 @@ const MODEL_INFO_BOUND: Duration = Duration::from_secs(2);
 /// does not answer within the bound (both logged, so an absent version is
 /// diagnosable).
 pub(crate) async fn weight_version_of(client: &SglangSchedulerClient) -> String {
-    match tokio::time::timeout(MODEL_INFO_BOUND, client.get_model_info()).await {
+    match tokio::time::timeout(ENGINE_INFO_BOUND, client.get_model_info()).await {
         Ok(Ok(info)) => fingerprint_of(Some(&info.weight_version)),
         Ok(Err(status)) => {
             tracing::warn!(%status, "model info lookup failed; system_fingerprint is the default");
@@ -43,7 +74,7 @@ pub(crate) async fn weight_version_of(client: &SglangSchedulerClient) -> String 
         }
         Err(_) => {
             tracing::warn!(
-                ?MODEL_INFO_BOUND,
+                ?ENGINE_INFO_BOUND,
                 "model info lookup timed out; system_fingerprint is the default"
             );
             fingerprint_of(None)
@@ -207,6 +238,14 @@ pub(crate) unsafe fn start_chat_stream(
             return Err(SglErrorCode::ParsingError);
         }
     };
+    let budget = proto_request
+        .sampling_params
+        .as_ref()
+        .and_then(|params| params.thinking_token_budget);
+    if let Err((code, message)) = verify_thinking_budget(budget, || client.get_server_info()) {
+        set_error_message(error_out, message);
+        return Err(code);
+    }
     let stream = match RUNTIME.block_on(client.generate(proto_request)) {
         Ok(s) => s,
         Err(e) => {

@@ -140,6 +140,9 @@ pub struct EngineCoreReadyResponse {
     /// release and declare nothing.
     #[serde(default)]
     pub tensor_aux_frames: bool,
+    /// The SGLang scheduler can force its reasoning end marker at a per-request budget.
+    #[serde(default)]
+    pub supports_thinking_token_budget: bool,
     /// The request types this engine role takes, by name (`add`, `abort`,
     /// `control`, `encode`), as the engine's own declaration lists them: a
     /// scheduler lists the first three, a disaggregated encode worker lists

@@ -6,7 +6,7 @@
 
 use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
-use engine_zmq_adapter::{to_sglang_response, SglangGenerateStream};
+use engine_zmq_adapter::{to_sglang_response, SglangGenerateStream, ZmqEngineClient};
 use futures::StreamExt;
 use smg_grpc_client::{
     media_identity::{self as media, sglang as contract},
@@ -22,6 +22,15 @@ use crate::{
     stream::{Choices, RequestStream},
     BoxStream,
 };
+
+/// Any rank may serve a request routed to this worker.
+pub(super) fn supports_thinking_token_budget(client: &ZmqEngineClient) -> bool {
+    let ranks = client.engines();
+    !ranks.is_empty()
+        && ranks
+            .iter()
+            .all(|rank| rank.ready_response.supports_thinking_token_budget)
+}
 
 /// Handle one `Generate` request against the connected scheduler.
 /// `trace_headers` is the caller's W3C trace context (see
@@ -45,6 +54,16 @@ pub(super) async fn generate(
     let client = state.shared.engine()?;
     if req.request_id.is_empty() {
         return Err(Status::invalid_argument("request_id is required"));
+    }
+    if req
+        .sampling_params
+        .as_ref()
+        .is_some_and(|params| params.thinking_token_budget.is_some())
+        && !supports_thinking_token_budget(client)
+    {
+        return Err(Status::invalid_argument(
+            "thinking_token_budget requires an active SGLang reasoning token filter",
+        ));
     }
     req.lora_id = state.loras.resolve(&req.lora_id)?;
     if req.return_hidden_states {
