@@ -950,10 +950,11 @@ class RouterArgs:
                 "Idle timeout in seconds for pooled upstream connections. Must"
                 " stay below the backend HTTP server's keep-alive timeout (vLLM"
                 " and SGLang default to 5). 0 keeps idle connections forever."
-                " While a nonzero value is below the load monitor interval, an"
-                " idle HTTP worker is connected anew for every load poll; where"
-                " the server's keep-alive can be raised above that interval, a"
-                " value between the two keeps the connection."
+                " While a nonzero value is below the interval the load monitor"
+                " polls a worker at (the router's, unless a worker of its group"
+                " sets its own), an idle HTTP worker is connected anew for every"
+                " load poll; where the server's keep-alive can be raised above"
+                " that interval, a value between the two keeps the connection."
                 " Defaults to 3."
             ),
         )
@@ -1031,6 +1032,9 @@ class RouterArgs:
             help=(
                 "Choose off for the classic routing policies or on for Grand Central."
                 " With on, the routing options keep their meaning through a policy document."
+                f" Under a provider backend alone (such as --{prefix}backend openai, without"
+                f" --{prefix}enable-igw) the gateway places by no routing policy: on without a"
+                " policy document moves nothing there, and the start says so once."
             ),
         )
         routing_group.add_argument(
@@ -1039,10 +1043,13 @@ class RouterArgs:
             default=RouterArgs.policy_spec,
             help=(
                 "Run a policy document with Grand Central."
-                " The document replaces the routing options: one that is not at its"
-                " default is refused beside it by name. The two overload thresholds"
-                " stand beside it: the gateway builds its workers with them, unless"
-                " the document switches its overload block off."
+                " The document replaces the routing options. A policy name, a policy's"
+                " own setting, the overload switch and shed flag, the warm-up and"
+                f" pairing settings, --{prefix}routing-key-override,"
+                f" --{prefix}grouped-dp-sticky and --{prefix}dp-minimum-tokens-scheduler"
+                " are each refused beside it by name where not at the default. The two"
+                " overload thresholds stand beside it: the gateway builds its workers"
+                " with them, unless the document switches its overload block off."
             ),
         )
         routing_group.add_argument(
@@ -1804,7 +1811,7 @@ class RouterArgs:
             choices=["inline", "shm", "auto", "rdma"],
             default=RouterArgs.multimodal_tensor_transport,
             help="Multimodal tensor transport: inline (default), shm, auto, or rdma "
-            "(NIXL lane; needs mm-rdma build and --rdma-listen-ip)",
+            f"(NIXL lane; needs mm-rdma build and --{prefix}rdma-listen-ip)",
         )
         parser.add_argument(
             f"--{prefix}multimodal-shm-min-bytes",
@@ -1867,7 +1874,7 @@ class RouterArgs:
             default=RouterArgs.mm_pixel_rdma,
             help=(
                 "Serve cached pixels over RDMA instead of inline bytes (the legacy"
-                " switch; --multimodal-tensor-transport rdma is the first-class one)."
+                f" switch; --{prefix}multimodal-tensor-transport rdma is the first-class one)."
                 " Falls back to SMG_MM_PIXEL_RDMA"
             ),
         )
