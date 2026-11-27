@@ -4039,37 +4039,34 @@ pub struct Engine {
 
 /// A stage by its place in the engine. The engine lists by it the stages
 /// that keep a number of the reports ([`Lifecycle::keeps_loads`]) and the
-/// stages that take each word of a lease ([`Takers`]).
+/// stages that take each word of a lease ([`Takers`]). A place names any
+/// scorer a profile holds, and its picker: a list leaves out none of them
+/// for where it stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StagePlace {
     /// The scorer at `stage` of the profile at `profile`.
-    Scorer { profile: u16, stage: u16 },
+    Scorer { profile: usize, stage: usize },
     /// The picker of the profile at `profile`.
-    Picker { profile: u16 },
+    Picker { profile: usize },
 }
 
 impl StagePlace {
-    /// Each scorer and picker of `profiles` beside its place: in the
-    /// profiles' order, a profile's scorers ahead of its picker.
-    fn each(profiles: &[Profile]) -> impl Iterator<Item = (Self, &dyn Lifecycle)> {
-        // Inclusive ranges: a walk over as many stages as a place can
-        // name ends with the list, where an open range steps past its end.
-        (0..=u16::MAX).zip(profiles).flat_map(|(at, profile)| {
-            let scorers = (0..=u16::MAX).zip(&profile.scorers);
-            let scorers = scorers.map(move |(stage, weighted)| {
-                let scorer: &dyn Lifecycle = &*weighted.scorer;
-                (Self::Scorer { profile: at, stage }, scorer)
-            });
-            let picker: &dyn Lifecycle = &*profile.picker;
-            scorers.chain([(Self::Picker { profile: at }, picker)])
-        })
-    }
-
     /// The stages of `profiles` that say they keep the reports, by their
-    /// places.
+    /// places: in the profiles' order, a profile's scorers ahead of its
+    /// picker.
     fn keepers(profiles: &[Profile]) -> Vec<Self> {
-        let keepers = Self::each(profiles).filter(|(_, stage)| stage.keeps_loads());
-        keepers.map(|(place, _)| place).collect()
+        let mut keepers = Vec::new();
+        for (at, profile) in profiles.iter().enumerate() {
+            for (stage, weighted) in profile.scorers.iter().enumerate() {
+                if weighted.scorer.keeps_loads() {
+                    keepers.push(Self::Scorer { profile: at, stage });
+                }
+            }
+            if profile.picker.keeps_loads() {
+                keepers.push(Self::Picker { profile: at });
+            }
+        }
+        keepers
     }
 
     /// The stage at this place of `profiles`, the list the place was read
@@ -4077,10 +4074,8 @@ impl StagePlace {
     #[inline(always)]
     fn stage(self, profiles: &[Arc<Profile>]) -> &dyn Lifecycle {
         match self {
-            Self::Scorer { profile, stage } => {
-                &*profiles[usize::from(profile)].scorers[usize::from(stage)].scorer
-            }
-            Self::Picker { profile } => &*profiles[usize::from(profile)].picker,
+            Self::Scorer { profile, stage } => &*profiles[profile].scorers[stage].scorer,
+            Self::Picker { profile } => &*profiles[profile].picker,
         }
     }
 
@@ -4089,7 +4084,17 @@ impl StagePlace {
     #[inline(always)]
     fn profile(self) -> usize {
         let (Self::Scorer { profile, .. } | Self::Picker { profile }) = self;
-        usize::from(profile)
+        profile
+    }
+
+    /// The stage's place in its profile: a scorer's among the scorers,
+    /// and none for the picker.
+    #[cfg(feature = "in-process")]
+    fn within(self) -> Option<usize> {
+        match self {
+            Self::Scorer { stage, .. } => Some(stage),
+            Self::Picker { .. } => None,
+        }
     }
 }
 
@@ -5591,15 +5596,21 @@ impl Engine {
         } else {
             EventSet::NONE
         };
-        // Each scorer and picker is asked once what it takes. Its answer
-        // is in the document's, and lists it under each word of a lease it
-        // names.
+        // Each scorer and picker is asked once what it takes, a profile's
+        // picker ahead of its scorers. Its answer is in the document's,
+        // and lists it under each word of a lease it names: a profile's
+        // scorers ahead of its picker, the order the words are told in.
         let mut takers = Takers::default();
         let mut stages_hear = EventSet::NONE;
-        for (place, stage) in StagePlace::each(&profiles) {
-            let hears = stage.hears();
-            stages_hear = stages_hear.union(hears);
-            takers.list(place, hears);
+        for (at, profile) in profiles.iter().enumerate() {
+            let picker = profile.picker.hears();
+            for (stage, weighted) in profile.scorers.iter().enumerate() {
+                let hears = weighted.scorer.hears();
+                stages_hear = stages_hear.union(hears);
+                takers.list(StagePlace::Scorer { profile: at, stage }, hears);
+            }
+            stages_hear = stages_hear.union(picker);
+            takers.list(StagePlace::Picker { profile: at }, picker);
         }
         let hears = stages_hear.union(own);
         let shadows = bindings
@@ -5891,20 +5902,49 @@ impl Engine {
     /// `standing` holds of its profile at `stood`: each table an engine
     /// folds from a profile's stages at its making and reads in their
     /// place, and whether a stage asked its build for the profile's count
-    /// of sends. Two tables are not compared. The profile's needs are its
-    /// stages' own, which its caller compares stage by stage, less a
-    /// sample the marks rule. Whether its draw may be asked first is read
-    /// of the marks and the picker's name. A table added to the making is
-    /// added here.
+    /// of sends. The lists of the stages that keep reports and that take
+    /// each word are such tables ([`Self::listed`]): a stage kept is told
+    /// as the build that made it listed it, and not as its twin of the
+    /// later build answered. Two tables are not compared. The profile's
+    /// needs are its stages' own, which its caller compares stage by
+    /// stage, less a sample the marks rule. Whether its draw may be asked
+    /// first is read of the marks and the picker's name. A table added to
+    /// the making is added here.
     #[cfg(feature = "in-process")]
     fn read_as(&self, at: usize, standing: &Self, stood: usize) -> bool {
         let asked = |of: &Self, at: usize| of.sent_of.get(at).is_some_and(Option::is_some);
+        // Asked last: the two engines' lists are searched only where the
+        // profile's other tables agree.
+        let listed = || {
+            let mut lists = self.listed(at).into_iter().zip(standing.listed(stood));
+            lists.all(|(here, there)| here.eq(there))
+        };
         self.marks[at] == standing.marks[stood]
             && self.orders[at] == standing.orders[stood]
             && self.named_by[at] == standing.named_by[stood]
             && self.row_tests[at] == standing.row_tests[stood]
             && self.head_places[at] == standing.head_places[stood]
             && asked(self, at) == asked(standing, stood)
+            && listed()
+    }
+
+    /// What the build listed of the profile at `at`: of the list of the
+    /// stages that keep reports and of each word's list, the profile's
+    /// stages by their places in it. Each list is in the engine's order,
+    /// so a profile's stages stand together in it.
+    #[cfg(feature = "in-process")]
+    fn listed(&self, at: usize) -> [impl Iterator<Item = Option<usize>> + '_; 5] {
+        let Takers {
+            issued,
+            dispatched,
+            completed,
+            released,
+        } = &self.takers;
+        [&self.keepers, issued, dispatched, completed, released].map(|list| {
+            let from = list.partition_point(|place| place.profile() < at);
+            let upto = list.partition_point(|place| place.profile() <= at);
+            list[from..upto].iter().map(|place| place.within())
+        })
     }
 
     /// An engine of no binding that holds this engine's profiles and
@@ -10179,16 +10219,8 @@ impl Engine {
     #[cfg(feature = "in-process")]
     pub(crate) fn tell_loads(&self, reports: impl Fn(&mut dyn FnMut(&Signal<'_>))) {
         for keeper in &self.keepers {
-            match *keeper {
-                StagePlace::Scorer { profile, stage } => {
-                    let scorer = &self.profiles[usize::from(profile)].scorers[usize::from(stage)];
-                    reports(&mut |report| scorer.scorer.on_signal(report));
-                }
-                StagePlace::Picker { profile } => {
-                    let picker = &self.profiles[usize::from(profile)].picker;
-                    reports(&mut |report| picker.on_signal(report));
-                }
-            }
+            let stage = keeper.stage(&self.profiles);
+            reports(&mut |report| stage.on_signal(report));
         }
     }
 
@@ -10203,11 +10235,11 @@ impl Engine {
     pub(crate) fn keepers_read_signals(&self) -> bool {
         self.keepers.iter().any(|keeper| match *keeper {
             StagePlace::Scorer { profile, stage } => {
-                let scorer = &self.profiles[usize::from(profile)].scorers[usize::from(stage)];
+                let scorer = &self.profiles[profile].scorers[stage];
                 scorer.scorer.needs().signal_cells
             }
             StagePlace::Picker { profile } => {
-                let picker = &self.profiles[usize::from(profile)].picker;
+                let picker = &self.profiles[profile].picker;
                 picker.needs().signal_cells
             }
         })

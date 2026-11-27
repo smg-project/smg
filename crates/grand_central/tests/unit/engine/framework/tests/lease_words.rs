@@ -152,18 +152,26 @@ fn a_word_of_a_lease_is_told_to_the_stages_that_name_it_in_the_engines_order() {
     let told = Told::default();
     let engine = written(&told);
     let rows = [candidate(0, 3), candidate(1, 13)];
-    let (facts, pool, cx) = (
-        RequestFacts::default(),
-        PoolFacts::default(),
-        Constraints::default(),
-    );
+    let (facts, cx) = (RequestFacts::default(), Constraints::default());
+    // The pool's facts state the engine's generation, as its host states
+    // it: the decision bears it, and the lease its host issues of that
+    // decision bears the decision's.
+    let pool = PoolFacts {
+        generation: engine.generation(),
+        ..PoolFacts::default()
+    };
     let mut scratch = Scratch::new();
     let decision = engine.decide(&facts, &pool, &rows, &cx, &mut scratch);
     let target = decision.pick().and_then(|pick| pick.targets.first());
     let target = *target.expect("the second profile's pick");
     assert!(told.lock().expect("the words told").is_empty());
 
-    let lease = Lease::default();
+    let lease = Lease {
+        booked: target.id,
+        generation: decision.trace().generation,
+        ..Lease::default()
+    };
+    assert_eq!(lease.generation, engine.generation());
     let outcome = Outcome::reported(200, TransportClass::Ok);
     // The names of the stages told since the last read, under one word.
     let heard = |kind: EventKind| {
@@ -198,4 +206,109 @@ fn a_word_of_a_lease_is_told_to_the_stages_that_name_it_in_the_engines_order() {
         stands.released(&lease, ReleaseReason::ClientGone);
         assert_eq!(heard(Released), released);
     }
+}
+
+/// A word's list holds a scorer wherever it stands in its profile. The
+/// profile holds 65,537 scorers, one more than sixteen bits count, and
+/// the last alone names a word. The document's answer holds that word,
+/// and the engine tells it to that scorer.
+#[test]
+fn a_word_reaches_a_scorer_past_sixteen_bits_of_its_profiles_scorers() {
+    let told = Told::default();
+    let scorer = |name, takes: &[EventKind]| WeightedScorer {
+        scorer: Writes::boxed(name, takes, &told),
+        weight: 1.0,
+    };
+    let mut scorers: Vec<_> = (0..=u16::MAX).map(|_| scorer("ahead", &[])).collect();
+    scorers.push(scorer("last", &[Released]));
+    assert_eq!(scorers.len(), 65_537);
+    let wide = Profile {
+        name: "wide".into(),
+        filters: vec![],
+        scorers,
+        picker: Writes::boxed("picker", &[], &told),
+    };
+    let engine = Engine::new(vec![wide], vec![single_binding()], 1, Needs::default());
+    assert!(engine.hears().contains(Released), "the document's answer");
+
+    let lease = Lease {
+        generation: engine.generation(),
+        ..Lease::default()
+    };
+    engine.on_released(&lease, ReleaseReason::ClientGone);
+    let told = told.lock().expect("the words told");
+    assert_eq!(*told, [("last", Released)]);
+}
+
+/// The build asks each scorer and each picker once what it takes: a
+/// profile's picker ahead of its scorers, the scorers in their order, and
+/// the profiles in theirs.
+#[test]
+fn the_build_asks_a_profiles_picker_ahead_of_its_scorers_and_each_once() {
+    /// A stage that writes its name where it is asked what it takes.
+    #[derive(Debug)]
+    struct Asked(&'static str, Arc<Mutex<Vec<&'static str>>>);
+    impl Lifecycle for Asked {
+        fn hears(&self) -> EventSet {
+            self.1.lock().expect("the askings").push(self.0);
+            EventSet::NONE
+        }
+    }
+    impl Scorer for Asked {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            _: &[Candidate],
+            _: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            out.fill(0.0);
+            TieBand::NORMALIZED
+        }
+    }
+    impl Picker for Asked {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn pick(
+            &self,
+            _: &RequestFacts<'_>,
+            _: &[Candidate],
+            _: &[u32],
+            _: &[f32],
+            _: TieBand,
+            _: &mut Targets,
+        ) {
+        }
+    }
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let profile = |name: &str, scorers: &[&'static str], picker| Profile {
+        name: name.into(),
+        filters: vec![],
+        scorers: scorers
+            .iter()
+            .map(|&scorer| WeightedScorer {
+                scorer: Box::new(Asked(scorer, Arc::clone(&asked))),
+                weight: 1.0,
+            })
+            .collect(),
+        picker: Box::new(Asked(picker, Arc::clone(&asked))),
+    };
+    let profiles = vec![
+        profile("first", &["first-a", "first-b"], "first-picker"),
+        profile("second", &["second-a"], "second-picker"),
+    ];
+    let _engine = Engine::new(profiles, vec![single_binding()], 1, Needs::default());
+    let asked = asked.lock().expect("the askings");
+    let in_order = [
+        "first-picker",
+        "first-a",
+        "first-b",
+        "second-picker",
+        "second-a",
+    ];
+    assert_eq!(*asked, in_order);
 }

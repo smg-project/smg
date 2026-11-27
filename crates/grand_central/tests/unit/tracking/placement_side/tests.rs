@@ -381,16 +381,17 @@ impl Host {
         Heard(words.collect())
     }
 
-    /// The span the prefill's end states, in microseconds: the last
-    /// word the stage heard since the last call, behind `ahead`.
+    /// The prefill's end is the last word the stage heard since the last
+    /// call, behind `ahead`, and the span it states is `longest`
+    /// microseconds at most.
     ///
     /// A stage that takes no end hears none ([`without_an_end`]): the
-    /// words `ahead` are then the whole of what it heard, and the span
-    /// reads zero.
-    fn prefills_end(&self, ahead: &[(&'static str, Side)]) -> u128 {
+    /// words `ahead` are then the whole of what it heard, and no span is
+    /// compared.
+    fn prefills_end(&self, ahead: &[(&'static str, Side)], longest: u128) {
         if !takes_ends() {
             assert_eq!(self.words(), *ahead);
-            return 0;
+            return;
         }
         self.no_outcome();
         let heard = std::mem::take(&mut *self.heard.lock());
@@ -399,7 +400,7 @@ impl Host {
         };
         let before: Vec<_> = before.iter().map(|&(word, side, _)| (word, side)).collect();
         assert_eq!(before, ahead);
-        u128::from(*span)
+        assert!(u128::from(*span) <= longest, "{span} over {longest}");
     }
 }
 
@@ -518,9 +519,8 @@ fn a_prefill_side_dropped_first_holds_its_end_for_the_decodes_word() {
     assert_eq!(host.words(), told[..2], "the end waits");
     thread::sleep(Duration::from_millis(20));
     decode.sent();
-    let span = host.prefills_end(&told[2..]);
     let longest = dropped.duration_since(start).as_micros();
-    assert!(span <= longest, "{span} over {longest}");
+    host.prefills_end(&told[2..], longest);
     drop(decode);
     assert_eq!(host.words(), [("ended", D)]);
 }
@@ -543,9 +543,8 @@ fn a_decode_side_dropped_unsent_ends_the_pair_behind_a_held_prefill() {
     assert_eq!(host.words(), [("issued", P), ("sent", P)]);
     thread::sleep(Duration::from_millis(20));
     drop(decode);
-    let span = host.prefills_end(&[]);
     let longest = dropped.duration_since(start).as_micros();
-    assert!(span <= longest, "{span} over {longest}");
+    host.prefills_end(&[], longest);
 
     let (mut prefill, decode) = host.pair(true);
     prefill.sent();
@@ -630,9 +629,8 @@ fn a_decode_side_asks_its_decode_again_behind_its_prefills_send() {
     assert_eq!(host.words(), [("issued", P), ("sent", P)], "the end waits");
     thread::sleep(Duration::from_millis(20));
     decode.decode_again(&request).expect("a decode");
-    let span = host.prefills_end(&[("issued", D)]);
     let longest = dropped.duration_since(start).as_micros();
-    assert!(span <= longest, "{span} over {longest}");
+    host.prefills_end(&[("issued", D)], longest);
     decode.sent();
     drop(decode);
     assert_eq!(host.words(), [("sent", D), ("ended", D)]);
@@ -1173,9 +1171,8 @@ fn a_prefills_end_with_a_handle_left_keeps_the_pairs_order() {
     drop(end);
     assert_eq!(host.words(), told[..2], "the end waits");
     decode.sent();
-    let span = host.prefills_end(&told[2..]);
     let longest = dropped.duration_since(start).as_micros();
-    assert!(span <= longest, "{span} over {longest}");
+    host.prefills_end(&told[2..], longest);
     drop(decode);
     assert_eq!(host.words(), [("ended", D)]);
 

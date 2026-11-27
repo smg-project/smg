@@ -955,8 +955,9 @@ header under any list. A binding names its headers by name, and every binding is
 
 A profile is built anew too where one of its stages, built again, says otherwise of itself than the
 standing one. That is another name, other words of a request's life to hear, or anything else the
-engine reads of a stage when it builds a profile. A factory of the host's own may build such a
-stage.
+engine reads of a stage when it builds a profile. The words to hear and `Lifecycle::keeps_loads`
+are compared as the two stages answer at the apply, and as each answered at its own build. A
+factory of the host's own may build such a stage.
 
 A count of sends stands where a profile that reads it is kept. A profile built new beside it reads
 the same count, and a send is counted once. A count none of whose readers is kept is built new, and
@@ -965,8 +966,9 @@ count under the same `sent_ttl_ms` and `sent_report_delay_ms` read one count. A 
 neither, as the one built from the routing settings does, puts them all under one.
 
 A word of a lease issued under an earlier document is told by one rule, in a gateway's own process
-and on a controller: the stages kept since the lease's document hear it, every count of sends in
-force takes a dispatch, the session table hears it, and a stage built since hears nothing. Either
+and on a controller: the stages kept since the lease's document hear it where they name it
+(`Lifecycle::hears`), every count of sends in force takes a dispatch, the session table hears it,
+and a stage built since hears nothing. Either
 host keeps one session table for its engine's life, so a lease's word reaches the table its claim
 was made in. On a controller the document in force at a word is the one its store's standing world
 holds, and a lease of a generation above it tells no stage (section 10.2).
@@ -1721,8 +1723,9 @@ with each event (`DecisionEngine::say`). The crate has a guard for that, `Decisi
 `released`, and releases at its drop. A controller keeps its leases in a file. It lends a lease
 back from that file in the guard's form, so one rule tells a lease's events under either host
 (`lease_events::single`, `lease_events::pair`). The host says who hears. Behind a new document the
-stages that document kept of the ones that stood at the issue hear a lease's events, and no stage
-it built new: in a gateway's own process and on a controller alike. Every count of sends in force
+stages that document kept of the ones that stood at the issue hear a lease's events of the kinds
+they name, and no stage it built new: in a gateway's own process and on a controller alike. Every
+count of sends in force
 takes the dispatch (section 5.1). A file meets events no guard says. An end is told once for each
 side of a pair that is still live. A release of a decode side behind its dispatch names the worker
 that side went to. It states the side's claim only where the side claimed that worker: behind a
@@ -1757,7 +1760,7 @@ What an event does:
 |---|---|
 | Dispatched | the session's pin follows the worker the request went to, unless the dispatch is dated before every decision that read the key's current life; every count of sends takes it, whichever profile placed the request; scorers and pickers that asked hear it. A pick a sessions rule keeps from the profile moves the pin alone. A pin at its rule's cap moved already, to the worker under the cap that the request which met the cap was placed on: where that request was decided, or for a pair's prefill side where the pair formed (decision 13). The dispatch finds the pin there, or fronts the later target the request went to. A request placed on another worker at the cap moves no pin |
 | Completed | scorers and pickers that asked hear the outcome (status, time to first token, tokens in and out, duration) |
-| Released | the same stages hear the reason. Under a sessions rule a commit that refused every target takes back the pin its decision claimed, on each side of a pair, and no pin a later decision claimed on the same worker. A pair's later decode, issued no lease, gives its claim back with its prefill, or with a release that names it alone: a controller's file tells that word, and a request's guard says none for a later decode its host gives up by name. On a controller's file a side a decode call issued stands in that later decode's place, and the release that ends the issued side gives the first decision's claim back as well where the call went to the decode that decision claimed |
+| Released | scorers and pickers that asked for it hear the reason. Under a sessions rule a commit that refused every target takes back the pin its decision claimed, on each side of a pair, and no pin a later decision claimed on the same worker. A pair's later decode, issued no lease, gives its claim back with its prefill, or with a release that names it alone: a controller's file tells that word, and a request's guard says none for a later decode its host gives up by name. On a controller's file a side a decode call issued stands in that later decode's place, and the release that ends the issued side gives the first decision's claim back as well where the call went to the decode that decision claimed |
 
 A count of sends holds a send until one of four ends: a load report of the worker sampled at or
 after the send (later by `sent_report_delay_ms`, where the profile sets it), the age `sent_ttl_ms`
@@ -1770,7 +1773,7 @@ A list of the ids that stand
 A sessions rule places some requests alone, behind the profile's filters and with no scorer or
 picker of the profile asked: it follows a pin of the request's key, or its own assignment places
 the key. The rule says whether such a request is the profile's own (`rule_placed`). Under `told`,
-the default, it is: the stages hear its issue and its dispatch,
+the default, it is: the stages that name them hear its issue and its dispatch,
 every count of sends takes it, and its prompt is recorded as behind any pick. Under
 `untold` it is kept from the profile: no stage hears its issue or its dispatch, no count of sends
 takes it, and neither the engine's record of sent prefixes nor a lent tree takes its prompt.
@@ -3316,7 +3319,8 @@ replaced document on its own thread, and a hold of the engine's own document has
 Between the engine's turn of an apply and the publication of the apply's world the standing world
 still holds the document before, and a word said there is told by it: no lease of the new document
 exists before its world is published. A lease issued under an earlier document is told to the stages
-kept and to the session table, which is the one its claim was made in, and a lease of a generation
+kept that name its word and to the session table, which is the one its claim was made in, and a
+lease of a generation
 above the document in force to no stage. A document a later one replaced is let go by a thread that
 writes the store, the one that applies or one that publishes, and by no deciding thread. That engine
 runs no task of its own. The store tells it each word of its

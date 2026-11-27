@@ -11,8 +11,9 @@
 //! the same form (`Sides::with_held_single`, `Sides::with_held_pair`), so
 //! [`single`] and [`pair`] are the one rule of a lease's words under either
 //! host. The host says who hears ([`Hearers`]). Behind a later document's
-//! start the stages that document kept hear a lease's words, and every
-//! count of sends in force takes its dispatch, under either host. Each
+//! start the stages that document kept hear a lease's words of the kinds
+//! they name, and every count of sends in force takes its dispatch, under
+//! either host. Each
 //! keeps one engine object across its documents. A host that holds its
 //! decisions names the hearers by the document in force ([`of_host`]), and
 //! a controller by the one its store's standing world holds. What hears at

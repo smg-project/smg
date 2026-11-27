@@ -924,11 +924,11 @@ impl Scorer for Sends {
 /// that name it among those that stood under its generation
 /// ([`InForce::stood_at`]). The profile `second` scores by a stage that
 /// takes the dispatch alone, and picks by one that takes every word, as
-/// `random` does. The second document keeps both profiles and adds a copy
-/// of `second`. A dispatch of a lease of the first document reaches the
-/// three stages that stood. Its release reaches the two pickers, and not
-/// the scorer, which does not name it. Neither word reaches a stage of
-/// the profile made since.
+/// the case's `random` does. The second document keeps both profiles and
+/// adds a copy of `second`. A dispatch of a lease of the first document
+/// reaches the three stages that stood. Its release reaches the two
+/// pickers, and not the scorer, which does not name it. Neither word
+/// reaches a stage of the profile made since.
 #[test]
 fn an_older_leases_word_is_told_to_the_stages_that_stood_and_name_it() {
     let (mut stages, built) = hearing_stages();
@@ -985,6 +985,149 @@ fn an_older_leases_word_is_told_to_the_stages_that_stood_and_name_it() {
     }
     for untold in [1, 2] {
         assert!(words(&scored, untold).is_empty(), "the scorer at {untold}");
+    }
+}
+
+/// What the two [`Switched`] scorers of a profile say of themselves while
+/// their case's switch stands so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Says {
+    /// The first names the release and the second the dispatch, and
+    /// neither keeps a report.
+    First,
+    /// The first names the dispatch and the second the release: each
+    /// word's list holds one of the two, as under [`Self::First`], and
+    /// the other one.
+    Second,
+    /// As [`Self::First`], and the first keeps reports.
+    Reports,
+}
+
+/// A scorer that answers of itself by a switch its case turns and by its
+/// place in its profile, the first or the second, and keeps the words it
+/// hears. It implements the dispatch and the release.
+#[derive(Debug)]
+struct Switched {
+    heard: Heard,
+    says: Arc<Mutex<Says>>,
+    second: bool,
+}
+
+impl Lifecycle for Switched {
+    fn hears(&self) -> EventSet {
+        let crossed = *self.says.lock() == Says::Second;
+        let kind = if self.second == crossed {
+            EventKind::Released
+        } else {
+            EventKind::Dispatched
+        };
+        EventSet::NONE.with(kind)
+    }
+
+    fn keeps_loads(&self) -> bool {
+        !self.second && *self.says.lock() == Says::Reports
+    }
+
+    fn on_dispatched(&self, lease: &Lease, target: &Target, _: Side, _: u32) {
+        let heard = ("dispatched", target.id, lease.target_index);
+        self.heard.lock().push(heard);
+    }
+
+    fn on_released(&self, lease: &Lease, _: ReleaseReason) {
+        let heard = ("released", lease.booked, lease.target_index);
+        self.heard.lock().push(heard);
+    }
+}
+
+impl Scorer for Switched {
+    fn name(&self) -> &'static str {
+        "switched"
+    }
+
+    fn score(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &[u32], out: &mut [f32]) -> TieBand {
+        out.fill(0.0);
+        TieBand::NORMALIZED
+    }
+}
+
+/// A later document keeps a profile only where its build listed the
+/// profile's scorers and its picker as the standing engine's did: each
+/// under the same words of a lease, and each among the stages that keep
+/// reports or not. The profile scores by two scorers that answer by a
+/// switch. The standing ones answered under [`Says::First`] at their
+/// build, and by the apply the later document's two say the same of
+/// themselves. Where they said so at their own build too, the profile is
+/// kept. Where the two named each other's word there, each word's list
+/// holds one scorer in both engines and another one: the profile is built
+/// new. Where the first said it keeps reports there, the profile is built
+/// new too.
+///
+/// A dispatch under the later document then reaches the one scorer that
+/// named it at the build that made it, and no other. Where the two named
+/// each other's word, a standing scorer kept would be told a dispatch it
+/// never named.
+#[test]
+fn a_later_document_keeps_a_profile_its_build_listed_as_the_standing_one() {
+    for later in [Says::First, Says::Second, Says::Reports] {
+        let (mut stages, _) = hearing_stages();
+        // The scorers' lists, in the order the table built the scorers:
+        // a document's first and its second, by turns.
+        let scored = Arc::new(Mutex::new(Vec::new()));
+        let says = Arc::new(Mutex::new(Says::First));
+        let (lists, switch) = (Arc::clone(&scored), Arc::clone(&says));
+        let added = stages.scorer("switched", move || {
+            let heard = Heard::default();
+            let mut lists = lists.lock();
+            let second = lists.len() % 2 == 1;
+            lists.push(Arc::clone(&heard));
+            let says = Arc::clone(&switch);
+            Box::new(Switched {
+                heard,
+                says,
+                second,
+            })
+        });
+        added.expect("a free name");
+        // The registration built one scorer, to ask its name.
+        scored.lock().clear();
+        let scoring = |document: &mut PolicySpec| {
+            let profile = document.profiles.get_mut("random");
+            let profile = profile.expect("the preset's profile");
+            profile.score.extend(["switched".into(), "switched".into()]);
+        };
+        let engine = InProcess::new(hearing_over(&stages, 1, scoring));
+        let stood = engine.spec();
+        // The later document's build asks its scorers under `later`. The
+        // apply asks all four under the first answer.
+        *says.lock() = later;
+        let next = hearing_over(&stages, 2, scoring);
+        *says.lock() = Says::First;
+        engine.apply(next).expect("a number above the standing one");
+        let in_force = engine.spec();
+        let profile = |of: &SpecHandle| Arc::clone(&of.0.spec.engine().profiles()[0]);
+        let kept = Arc::ptr_eq(&profile(&in_force), &profile(&stood));
+        assert_eq!(kept, later == Says::First, "{later:?}");
+
+        let members = PublishedList::new(pool(2));
+        let asks = Asks::of(request(), Some(&members));
+        let now = Instant::now();
+        let decided = DecisionGuard::decide_under(&engine, GatewayId::LOCAL, &asks, now);
+        let mut held = decided.expect("a decision");
+        assert!(held.take(0).is_some(), "the first target");
+        held.dispatched(now);
+        // The scorer that named the dispatch at the build that made it,
+        // by the place the table built it at: the standing second where
+        // the profile is kept, and of the later document's two the first
+        // under `Second` and the second under `Reports`.
+        let named = match later {
+            Says::First => 1,
+            Says::Second => 2,
+            Says::Reports => 3,
+        };
+        for at in 0..4 {
+            let told: &[&str] = if at == named { &["dispatched"] } else { &[] };
+            assert_eq!(words(&scored, at), told, "{later:?}: the scorer at {at}");
+        }
     }
 }
 

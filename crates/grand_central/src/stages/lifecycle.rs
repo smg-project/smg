@@ -171,7 +171,11 @@ pub trait Lifecycle: Send + Sync {
     /// keeps nothing for a word nobody takes: a document none of whose
     /// stages takes one costs a request no lease. The engine asks once,
     /// at its build: the answer is the stage's for the engine's life, and
-    /// a stage whose answer moves later is told by the first.
+    /// a stage whose answer moves later is told by the first. A later
+    /// engine keeps the stage only where the stage its own build made in
+    /// that place named the same words, and answered
+    /// [`Self::keeps_loads`] the same: a stage kept is told by its first
+    /// answers still.
     ///
     /// A change of membership and a signal are told to every stage,
     /// whatever it answers: no host reads those two kinds of the answer

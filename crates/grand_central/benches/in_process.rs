@@ -40,10 +40,11 @@
 //! a binding of another model: the cell's decisions then have no shadow,
 //! under a document that names one. `--other-models N` states `N` other
 //! models ahead of the cell's own, each bound to a copy of the cell's
-//! profile under a name of its own: the document then holds `N` profiles
-//! beside the cell's, as one that gives each model a profile does. No
-//! request names one of them, and a single request's cell alone takes the
-//! switch. `--runtimes N` has the host state a
+//! profile under a name of its own: the document then holds `N` more
+//! profiles, as one that gives each model a profile does. No request
+//! names one of them. A single request's cell alone takes the switch,
+//! and a run under it says `N` on its row.
+//! `--runtimes N` has the host state a
 //! fact of each worker beside its object: the number of one of `N` runtimes
 //! by the worker's place, as a gateway that dials several runtimes states
 //! it; `0`, the default, states nothing. The two cells named `on_runtime`
@@ -1296,6 +1297,11 @@ fn measure(
     // A run that walked says so on its row: its times hold the walk.
     if run.cold_kb > 0 {
         print!(" cold_kb={}", run.cold_kb);
+    }
+    // A run beside other models says so too: its times are of the
+    // document that holds them.
+    if run.other_models > 0 {
+        print!(" other_models={}", run.other_models);
     }
     // The words a file of its own adds, then the cell's, and the line's end.
     print!("{}", place::word());

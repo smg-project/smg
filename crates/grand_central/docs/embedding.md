@@ -179,7 +179,7 @@ For example, after the prefill is sent, call `guard.dispatched(sent_at)` and the
 - A pick carries the decode side's lease under the pair's id, and a shed carries none.
 - That lease keeps the generation and the time of the pair's first issue.
 - The guard counts the decode's dispatch from the first decision.
-- Behind a new spec the engine in force decides the side. It tells the issue to the stages it kept since the pair's spec, on a controller and in its host's own process alike.
+- Behind a new spec the engine in force decides the side. It tells the issue to the stages it kept since the pair's spec that name it, on a controller and in its host's own process alike.
 - A refusal comes back as `DecisionRefused::Decode` with its reason, and a decision that panics as `DecisionRefused::Faulted`.
 
 ### What a stage hears
