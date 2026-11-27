@@ -154,17 +154,16 @@ impl TokenizerShares {
     /// `read` runs before the load and again behind it: the tokenizer is
     /// recorded only where both agree, so one loaded while its files were
     /// rewritten is never handed to a later load. A `read` of `None` (see
-    /// [`FilesRead::of`]) loads alone and records nothing.
-    pub(super) async fn load<F, Fut, E>(
-        &self,
-        read: impl Fn() -> Option<FilesRead>,
-        load: F,
-    ) -> Result<Arc<dyn Tokenizer>, E>
+    /// [`FilesRead::of`]) loads alone and records nothing. Each `read` runs
+    /// on the blocking pool (see [`off_the_runtime`]).
+    pub(super) async fn load<R, F, Fut, E>(&self, read: R, load: F) -> Result<Arc<dyn Tokenizer>, E>
     where
+        R: Fn() -> Option<FilesRead> + Send + Sync + 'static,
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Arc<dyn Tokenizer>, E>>,
     {
-        let Some(files) = read() else {
+        let read = Arc::new(read);
+        let Some(files) = off_the_runtime(&read).await else {
             return load().await;
         };
 
@@ -184,7 +183,7 @@ impl TokenizerShares {
         }
 
         let tokenizer = load().await?;
-        if read().as_ref() == Some(&files) {
+        if off_the_runtime(&read).await.as_ref() == Some(&files) {
             *held = Some(Arc::downgrade(&tokenizer));
         }
         Ok(tokenizer)
@@ -196,14 +195,32 @@ impl TokenizerShares {
     }
 }
 
+/// One `read` on the blocking pool: it walks a tree and hashes up to
+/// [`HASHED_BYTES`], tens of milliseconds a runtime worker would be held
+/// from the requests it serves. A read that did not end (it panicked, or
+/// the runtime is shutting down) is a read of `None`.
+async fn off_the_runtime<R>(read: &Arc<R>) -> Option<FilesRead>
+where
+    R: Fn() -> Option<FilesRead> + Send + Sync + 'static,
+{
+    let read = Arc::clone(read);
+    tokio::task::spawn_blocking(move || read())
+        .await
+        .ok()
+        .flatten()
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
         convert::Infallible,
-        sync::atomic::{AtomicUsize, Ordering},
+        io::Write as _,
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+        time::{Duration, Instant},
     };
 
     use llm_tokenizer::MockTokenizer;
+    use tokio::sync::Notify;
 
     use super::*;
     use crate::workflow::tokenizer_registration::test_support::tokenizer_dir;
@@ -238,7 +255,10 @@ mod tests {
     #[test]
     fn a_tree_beyond_the_limits_is_not_read() {
         let dir = tokenizer_dir();
-        let read = || FilesRead::of(&source(&dir), None);
+        let read = {
+            let source = source(&dir);
+            move || FilesRead::of(&source, None)
+        };
         let sized = |name: &str, len: u64| {
             let file = fs::File::create(dir.path().join(name)).unwrap();
             file.set_len(len).unwrap();
@@ -369,10 +389,10 @@ mod tests {
                 tokio::spawn(async move {
                     shares
                         .load(
-                            || FilesRead::of(&source, None),
+                            move || FilesRead::of(&source, None),
                             || async {
                                 loads.fetch_add(1, Ordering::SeqCst);
-                                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                                tokio::time::sleep(Duration::from_millis(20)).await;
                                 Ok::<_, Infallible>(mock())
                             },
                         )
@@ -396,10 +416,13 @@ mod tests {
     async fn a_tokenizer_loaded_while_its_files_were_rewritten_is_not_recorded() {
         let dir = tokenizer_dir();
         let shares = TokenizerShares::default();
-        let read = || FilesRead::of(&source(&dir), None);
+        let read = {
+            let source = source(&dir);
+            move || FilesRead::of(&source, None)
+        };
 
         let first = shares
-            .load(read, || async {
+            .load(read.clone(), || async {
                 fs::write(dir.path().join("tokenizer_config.json"), "{}").unwrap();
                 Ok::<_, Infallible>(mock())
             })
@@ -417,9 +440,12 @@ mod tests {
     async fn a_failed_load_and_a_dropped_tokenizer_leave_nothing_behind() {
         let dir = tokenizer_dir();
         let shares = TokenizerShares::default();
-        let read = || FilesRead::of(&source(&dir), None);
+        let read = {
+            let source = source(&dir);
+            move || FilesRead::of(&source, None)
+        };
 
-        let failed = shares.load(read, || async { Err("no") }).await;
+        let failed = shares.load(read.clone(), || async { Err("no") }).await;
         assert!(failed.is_err());
 
         let tokenizer = shares
@@ -432,13 +458,151 @@ mod tests {
 
         // The next load of any files forgets the key of the dropped one.
         let other = tokenizer_dir();
+        let other_source = source(&other);
         let _held = shares
             .load(
-                || FilesRead::of(&source(&other), None),
+                move || FilesRead::of(&other_source, None),
                 || async { Ok::<_, &str>(mock()) },
             )
             .await
             .unwrap();
         assert_eq!(shares.len(), 1);
+    }
+
+    /// One runtime thread: a read that ran on it would wait in vain for the
+    /// task below, which that thread alone can run.
+    #[tokio::test]
+    async fn a_read_holds_no_runtime_worker() {
+        let shares = TokenizerShares::default();
+        let ran = Arc::new(AtomicBool::new(false));
+        let seen = Arc::new(AtomicBool::new(false));
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test awaits the task it spawns"
+        )]
+        let other = tokio::spawn({
+            let ran = ran.clone();
+            async move { ran.store(true, Ordering::SeqCst) }
+        });
+
+        let read = {
+            let (ran, seen) = (ran.clone(), seen.clone());
+            move || {
+                let until = Instant::now() + Duration::from_secs(5);
+                while !ran.load(Ordering::SeqCst) && Instant::now() < until {
+                    std::thread::yield_now();
+                }
+                seen.store(ran.load(Ordering::SeqCst), Ordering::SeqCst);
+                None
+            }
+        };
+        shares
+            .load(read, || async { Ok::<_, Infallible>(mock()) })
+            .await
+            .unwrap();
+        other.await.unwrap();
+
+        assert!(seen.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_load_cancelled_under_the_slot_lock_leaves_the_slot_to_the_next() {
+        let dir = tokenizer_dir();
+        let shares = Arc::new(TokenizerShares::default());
+        let read = {
+            let source = source(&dir);
+            move || FilesRead::of(&source, None)
+        };
+        let entered = Arc::new(Notify::new());
+
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test awaits the task it spawns"
+        )]
+        let cancelled = tokio::spawn({
+            let (shares, read, entered) = (shares.clone(), read.clone(), entered.clone());
+            async move {
+                shares
+                    .load(read, || {
+                        entered.notify_one();
+                        std::future::pending::<Result<Arc<dyn Tokenizer>, Infallible>>()
+                    })
+                    .await
+            }
+        });
+        entered.notified().await;
+        cancelled.abort();
+        assert!(cancelled.await.is_err_and(|ended| ended.is_cancelled()));
+
+        let next = shares
+            .load(read.clone(), || async { Ok::<_, Infallible>(mock()) })
+            .await
+            .unwrap();
+        let shared = shares
+            .load(read, || async { Ok::<_, Infallible>(mock()) })
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&next, &shared));
+    }
+
+    /// A file above the bound enters by path, size and time: its bytes
+    /// rewritten in place under both read the same.
+    #[test]
+    fn a_file_above_the_bound_enters_without_its_bytes() {
+        let dir = tokenizer_dir();
+        let file = dir.path().join("weights.bin");
+        // The length alone is set: no block is written.
+        fs::File::create(&file)
+            .unwrap()
+            .set_len(HASHED_BYTES + 1)
+            .unwrap();
+        let metadata = fs::metadata(&file).unwrap();
+        let before = FilesRead::of(&source(&dir), None).unwrap();
+
+        let mut rewritten = fs::File::options().write(true).open(&file).unwrap();
+        rewritten.write_all(b"other").unwrap();
+        rewritten
+            .set_modified(metadata.modified().unwrap())
+            .unwrap();
+        drop(rewritten);
+
+        let after = fs::metadata(&file).unwrap();
+        assert_eq!(after.len(), metadata.len());
+        assert_eq!(after.modified().unwrap(), metadata.modified().unwrap());
+        assert!(before == FilesRead::of(&source(&dir), None).unwrap());
+    }
+
+    /// A link back up the tree is walked until the entries bound: such a
+    /// tree is not read.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_loop_below_the_directory_is_not_read() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tokenizer_dir();
+        for n in 0..9 {
+            fs::write(dir.path().join(format!("file-{n}")), "x").unwrap();
+        }
+        symlink(dir.path(), dir.path().join("loop")).unwrap();
+
+        assert!(FilesRead::of(&source(&dir), None).is_none());
+    }
+
+    /// A source or a chat template that is not there is not read; a link to
+    /// nothing below the directory is passed by.
+    #[cfg(unix)]
+    #[test]
+    fn what_is_not_there_is_not_read() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tokenizer_dir();
+        let before = FilesRead::of(&source(&dir), None).unwrap();
+
+        let gone = dir.path().join("gone");
+        assert!(FilesRead::of(gone.to_str().unwrap(), None).is_none());
+        assert!(FilesRead::of(&source(&dir), gone.to_str()).is_none());
+
+        symlink(&gone, dir.path().join("link")).unwrap();
+        assert!(before == FilesRead::of(&source(&dir), None).unwrap());
     }
 }

@@ -412,11 +412,14 @@ async fn load_from_source(
     source: &str,
     chat_template: Option<&str>,
 ) -> anyhow::Result<Arc<dyn Tokenizer>> {
+    let read = {
+        let (source, chat_template) = (source.to_owned(), chat_template.map(str::to_owned));
+        move || FilesRead::of(&source, chat_template.as_deref())
+    };
     tokenizer_shares::shares()
-        .load(
-            || FilesRead::of(source, chat_template),
-            || factory::create_tokenizer_async_with_chat_template(source, chat_template),
-        )
+        .load(read, || {
+            factory::create_tokenizer_async_with_chat_template(source, chat_template)
+        })
         .await
 }
 
@@ -1315,6 +1318,19 @@ mod tests {
         assert!(Arc::ptr_eq(&first.tokenizer, &second.tokenizer));
         assert_ne!(first.id, second.id);
         assert_eq!(app_context.tokenizer_registry.len(), 2);
+    }
+
+    /// Two spellings of one directory are two sources: each name holds its
+    /// own tokenizer.
+    #[tokio::test]
+    async fn two_spellings_of_one_directory_hold_two_tokenizers() {
+        let dir = test_support::tokenizer_dir();
+        let app_context = app_context(WorkerRegistry::new());
+
+        let first = registered(&app_context, request("first", dir.path())).await;
+        let second = registered(&app_context, request("second", &dir.path().join("."))).await;
+
+        assert!(!Arc::ptr_eq(&first.tokenizer, &second.tokenizer));
     }
 
     /// Two names registered at once over one directory end with one
