@@ -355,6 +355,8 @@ impl ShortPieceTable {
     pub(super) fn read_through(&self) {
         const LINE_STEP: usize = 64 / size_of::<Entry>();
         const _: () = assert!(LINE_STEP > 0, "an entry wider than a line reads none");
+        #[cfg(test)]
+        super::READS_THROUGH.with(|reads| reads.borrow_mut().push("short pieces"));
         let mut sum = 0u64;
         for tag in self.tags.iter().step_by(64) {
             sum = sum.wrapping_add(u64::from(*tag));

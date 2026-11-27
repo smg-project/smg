@@ -441,6 +441,15 @@ const READ_AT_ONCE_BYTES: usize = PARALLEL_MIN_BYTES;
 /// weight in between, the load of another tokenizer for one, is past it
 /// and reads the table itself.
 const LOAD_READ_HOLDS: Duration = Duration::from_millis(10);
+
+#[cfg(test)]
+thread_local! {
+    /// The tables read through on this thread, in order
+    /// (`ShortPieceTable::read_through`, `MergeTable::read_through`), for
+    /// the test of what a load reads.
+    static READS_THROUGH: RefCell<Vec<&'static str>> =
+        const { RefCell::new(Vec::new()) };
+}
 /// A text at least this long may have the thread's packed table read back
 /// before it (`PieceCache::reads_back`).
 const READ_BACK_MIN_BYTES: usize = 4096;
@@ -3381,9 +3390,19 @@ impl NativeEncoder {
     }
 
     /// The last step of a load: two short built-in texts encoded on a piece
-    /// cache of its own, which is dropped, then the merge table read through
-    /// once (`MergeTable::read_through`). The first request of a process
-    /// finds the encode path mapped and the table's lines in the caches. The
+    /// cache of its own, which is dropped, then, where the vocabulary has a
+    /// merge table, the seed and that table read through once
+    /// (`ShortPieceTable::read_through`, `MergeTable::read_through`). The
+    /// first request of a process finds the encode path mapped and the
+    /// tables' lines in the caches. The seed is read first: what is read
+    /// last stays, and the merge table's lines are the ones a first-sight
+    /// piece waits for one dependent probe at a time (read behind it, the
+    /// seed made the second encode of a text of 2k tokens slower than no
+    /// seed read; read before it, it takes about 2 % off the loading
+    /// thread's first encodes of texts of 256 and of 2k tokens, for
+    /// 0.3-0.5 ms at the load). A vocabulary without a merge table reads
+    /// neither: its seed alone would push out what the load left in the
+    /// caches. The
     /// loading thread does not read the table again while this read is
     /// fresh ([`Self::load_read_holds`]); every other thread's second call
     /// still reads it itself ([`Self::piece_cache_for_text`]): a thread may
@@ -3407,6 +3426,9 @@ impl NativeEncoder {
             }
         }
         if let Some(merges) = &self.merges {
+            // The seed first: read behind the merge table, its lines push
+            // that table's out of the caches.
+            self.seed.read_through();
             merges.read_through();
         }
         let _ = self

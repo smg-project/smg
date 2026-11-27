@@ -873,6 +873,8 @@ impl MergeTable {
         const GRID_STEP: usize = 64 / size_of::<Merge>();
         #[cfg(test)]
         self.reads.fetch_add(1, super::Ordering::Relaxed);
+        #[cfg(test)]
+        super::READS_THROUGH.with(|reads| reads.borrow_mut().push("merges"));
         let mut sum = 0u64;
         for bucket in &self.buckets {
             sum = sum.wrapping_add(bucket.0[0].key);

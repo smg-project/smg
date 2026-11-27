@@ -5270,6 +5270,21 @@ fn a_rehearsal_reads_for_the_loading_thread_and_makes_no_cache_of_it() {
     assert_eq!(elsewhere, 2, "another thread reads the table itself");
 }
 
+/// A load reads the seed through before the merge table, each once: read
+/// behind it, the seed's lines push the merge table's out of the caches.
+#[test]
+fn a_rehearsal_reads_the_seed_through_before_the_merge_table() {
+    let mut state = 0xDEAD_BEEF_CAFE_F00Du64;
+    let tokenizer = tokenizer_of(&shapes()[0], &mut state);
+    let model = tokenizer.get_model();
+    let native = seeded(&tokenizer);
+    assert!(native.merges.is_some(), "a vocabulary with a merge table");
+    READS_THROUGH.with(|reads| reads.borrow_mut().clear());
+    native.rehearse(Some(model));
+    let reads = READS_THROUGH.with(|reads| reads.borrow().clone());
+    assert_eq!(reads, ["short pieces", "merges"]);
+}
+
 /// A thread whose share fell (threads joined) since it last read it is
 /// within the new share from the start of its next encode call, with no
 /// miss in that call.
