@@ -155,6 +155,7 @@ impl ServerInfo {
 
 /// Keys worth extracting from SGLang gRPC `server_args` (which contains the full config).
 const SGLANG_GRPC_KEYS: &[&str] = &[
+    smg_worker::labels::SUPPORTS_THINKING_TOKEN_BUDGET_LABEL,
     "multimodal_encoder_dtype",
     media_contract::LABEL,
     "mm_processor",
@@ -842,9 +843,11 @@ mod tests {
     /// SGLang server facts expose routing capabilities while filtering secrets.
     #[test]
     fn server_info_to_labels_sglang_picks_curated_keys_and_version() {
+        let budget = smg_worker::labels::SUPPORTS_THINKING_TOKEN_BUDGET_LABEL;
         let info = ServerInfo::Sglang(Box::new(sglang_proto::GetServerInfoResponse {
             server_args: Some(prost_types::Struct {
                 fields: BTreeMap::from([
+                    (budget.to_owned(), true.into()),
                     ("model_path".to_string(), string_value("Qwen/Qwen3-8B")),
                     ("dp_size".to_string(), number_value(4.0)),
                     (
@@ -892,6 +895,7 @@ mod tests {
             Some("Qwen/Qwen3-8B")
         );
         assert_eq!(labels.get("dp_size").map(String::as_str), Some("4"));
+        assert_eq!(labels.get(budget).map(String::as_str), Some("true"));
         // Booleans are kept even when false (embedding detection relies on it).
         assert_eq!(
             labels.get("is_embedding").map(String::as_str),
