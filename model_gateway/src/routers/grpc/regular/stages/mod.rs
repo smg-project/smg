@@ -16,6 +16,7 @@ pub(crate) mod rendered_prompt;
 pub(crate) mod request_building;
 pub(crate) mod response_processing;
 #[cfg(test)]
+#[path = "../../../../../tests/unit/routers/grpc/regular/stages/testing.rs"]
 pub(crate) mod testing;
 pub(crate) mod token_ids;
 pub(crate) mod transcription;
