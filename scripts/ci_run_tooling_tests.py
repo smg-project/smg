@@ -45,6 +45,10 @@ REGRESSIONS = (
     ),
     ("scripts/bfcl/run_ab.py", "scripts/tests/test_bfcl_run_ab.py"),
     (".github/workflows/nightly-bfcl.yml", "scripts/tests/test_bfcl_score_caller.py"),
+    (
+        ".github/workflows/pr-test-rust.yml",
+        "scripts/tests/test_pr_test_workflow_scheduling.py",
+    ),
 )
 
 
