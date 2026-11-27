@@ -146,9 +146,9 @@ pub(crate) fn stated_facts(workers: &[Arc<dyn Worker>]) -> Box<[FixedFacts]> {
 ///   ([`request_id::OWN_REQUEST_ID`]): the id the response's `x-request-id`
 ///   header shows. The gateway restates it on the request under a policy
 ///   spec that keeps a sample ([`request_id::restate`]), and under no other.
-///   The engine reads the header there, off the same headers, where the
+///   The engine reads the id there, off the same headers, where the
 ///   request states no id of its own: it finds a kept decision by the
-///   value, and reads it for nothing else. This function reads the header
+///   id, and reads it for nothing else. This function reads the header
 ///   for no request. No route hands the id on by a word of its own, and a
 ///   request whose route hands no headers holds none.
 /// - The route's own rule for a worker (the candidate filter). The engine

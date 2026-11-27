@@ -316,9 +316,10 @@ fn a_request_with_no_id_is_found_by_the_header_its_host_names() {
     assert_eq!(kept, [false, true, false]);
 }
 
-/// The header a host names is read under a document that keeps a sample,
-/// and under no other. There it is read for a request that states no id,
-/// and not for one that states an id of its own or its host's by word.
+/// A host's id is read off the header the host names under a document
+/// that keeps a sample, and under no other. There it is read for a request
+/// that states no id, and not for one that states an id of its own or its
+/// host's by word.
 #[test]
 fn the_header_a_host_names_is_read_under_a_sample_alone() {
     let reads = |sample: u32, request_id: Option<&str>, explain_id: Option<&str>| {

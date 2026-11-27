@@ -20,7 +20,7 @@
 //! also restates the chosen id on the request, under the header
 //! `x-smg-request-id` (`restate`). The engine reads it there as the
 //! gateway's own id of the request, by the name a placement states to it,
-//! and the gateway reads the header for no request. That
+//! and no placement reads the header itself. That
 //! write is no part of this layer: the server installs it as a layer of its
 //! own inside the edge layers, behind this one, and under no other
 //! configuration, so this layer is the same for every gateway. The write
@@ -30,7 +30,10 @@
 //! any other: a request plugin sees it and can change it, and a policy spec
 //! that names it as a header reads what stands there. Under a spec that
 //! keeps no sample, and in a gateway that places with its classic policies,
-//! nothing is written there, and a client's value stays as it came.
+//! nothing is written there, and a client's value stays as it came. The one
+//! exception is a gateway whose configuration names that header as a
+//! request id header: this layer reads and rewrites it there, under a spec
+//! or under the classic policies.
 
 use std::{
     future::Future,
