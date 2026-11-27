@@ -358,8 +358,8 @@ pub(crate) const DISPATCH_WAIT_SECONDS: &str = "smg_router_dispatch_wait_seconds
 /// wait for an admission permit, the run of the WASM modules. A body that
 /// came whole, and a generation that read no body (a later turn of a tool
 /// loop), takes nothing off: its dispatch wait is observed here unchanged.
-/// So is that of a multipart upload, whose route stands outside the
-/// request-body deadline layer that takes the measure.
+/// A multipart upload is measured as any other body: its route stands
+/// outside the request-body deadline layer and takes the measure alone.
 pub(crate) const DISPATCH_WAIT_AFTER_BODY_SECONDS: &str =
     "smg_router_dispatch_wait_after_body_seconds";
 
@@ -713,7 +713,7 @@ pub(crate) fn init_metrics() {
     );
     describe_histogram!(
         DISPATCH_WAIT_AFTER_BODY_SECONDS,
-        "Dispatch wait without the upload of the request body, by router_type, backend_type, model, endpoint (gRPC only; observed wherever smg_router_dispatch_wait_seconds is, under the same labels and buckets): smg_router_dispatch_wait_seconds less the time the read of the request body waited for the client; authentication, the wait for an admission permit, the run of WASM modules, parsing, tokenizing, templating, worker selection, a refused attempt's wait and its backoff are in both; the body's upload is in smg_router_dispatch_wait_seconds alone; a body that came whole, a later turn of a Responses tool loop and a multipart upload take nothing off and observe the same value in both"
+        "Dispatch wait without the upload of the request body, by router_type, backend_type, model, endpoint (gRPC only; observed wherever smg_router_dispatch_wait_seconds is, under the same labels and buckets): smg_router_dispatch_wait_seconds less the time the read of the request body waited for the client; authentication, the wait for an admission permit, the run of WASM modules, parsing, tokenizing, templating, worker selection, a refused attempt's wait and its backoff are in both; the body's upload is in smg_router_dispatch_wait_seconds alone; a body that came whole and a later turn of a Responses tool loop take nothing off and observe the same value in both; a multipart upload is measured as any other body"
     );
     describe_histogram!(
         "smg_router_tpot_seconds",
