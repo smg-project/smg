@@ -127,6 +127,8 @@ fn full() -> WorkerRow {
             connector: Some("connector-a".to_owned()),
             references: true,
         },
+        priority: -5,
+        drain_settle_secs: Some(45),
         ..WorkerFacts::default()
     };
     WorkerRow {
@@ -211,6 +213,8 @@ fn the_wires_row_tells_every_fact_of_the_stores_row() {
             connector: "connector-a".to_owned(),
             references: true,
         }),
+        priority: -5,
+        drain_settle_secs: Some(45),
     };
     assert_eq!(told, expected);
 }
@@ -1010,6 +1014,103 @@ fn a_descriptor_that_still_states_a_number_of_the_encode_offer_reads_as_one_that
     assert_eq!(made.encode, EncodeOffer::default());
 }
 
+/// A worker's priority and its drain window are its registration's where
+/// it states them. A registration that states neither keeps the row's, and
+/// a new row stands at priority zero and waits the default window.
+#[test]
+fn a_registration_states_a_priority_and_a_drain_window_and_one_that_states_none_keeps_the_rows() {
+    let with = |priority: Option<i32>, window: Option<u32>| proto::WorkerSpec {
+        priority,
+        drain_settle_secs: window,
+        ..spec()
+    };
+    let stated = |stated: &proto::WorkerSpec, standing: Option<&WorkerFacts>| {
+        facts(stated, standing).map(|made| (made.priority, made.drain_settle_secs))
+    };
+    assert_eq!(stated(&spec(), None), Ok((0, None)));
+    assert_eq!(stated(&with(Some(-5), None), None), Ok((-5, None)));
+    // A window of no wait is a window, and not the default one.
+    assert_eq!(stated(&with(None, Some(0)), None), Ok((0, Some(0))));
+    assert_eq!(stated(&with(Some(7), Some(45)), None), Ok((7, Some(45))));
+
+    // Over a standing row: a registration that states neither keeps the
+    // row's, and one that states either is the row's for that fact alone.
+    let standing = facts(&with(Some(7), Some(45)), None).expect("a registration");
+    assert_eq!(stated(&spec(), Some(&standing)), Ok((7, Some(45))));
+    let zero = with(Some(0), None);
+    assert_eq!(stated(&zero, Some(&standing)), Ok((0, Some(45))));
+    let no_wait = with(None, Some(0));
+    assert_eq!(stated(&no_wait, Some(&standing)), Ok((7, Some(0))));
+}
+
+/// The wire's row tells its worker's priority and drain window, and its
+/// reader holds them. A row of a worker that states neither tells no byte
+/// of the two fields, so it is the row a build before the fields told.
+/// Such a row reads at priority zero and the default window.
+#[test]
+fn a_row_tells_its_workers_priority_and_drain_window_and_one_that_tells_none_reads_the_defaults() {
+    let stating = full();
+    let plain = WorkerRow {
+        facts: WorkerFacts {
+            priority: 0,
+            drain_settle_secs: None,
+            ..full().facts
+        },
+        ..full()
+    };
+    let (told_stating, told_plain) = (row(&stating), row(&plain));
+    let told = |told: &proto::WorkerRow| (told.priority, told.drain_settle_secs);
+    assert_eq!(told(&told_stating), (-5, Some(45)));
+    assert_eq!(told(&told_plain), (0, None));
+    let read = |told: &proto::WorkerRow| {
+        let read = told_row(told, Instant::now());
+        read.map(|row| (row.facts.priority, row.facts.drain_settle_secs))
+    };
+    assert_eq!(read(&told_stating), Ok((-5, Some(45))));
+    assert_eq!(read(&told_plain), Ok((0, None)));
+    // Each number is three bytes of the row that tells it, and none of the
+    // row that does not.
+    assert_eq!(told_stating.encoded_len() - told_plain.encoded_len(), 6);
+    let bytes = told_plain.encode_to_vec();
+    let again = proto::WorkerRow::decode(bytes.as_slice()).expect("a row");
+    assert_eq!(read(&again), Ok((0, None)));
+    // A window of no wait crosses as a window.
+    let no_wait = WorkerRow {
+        facts: WorkerFacts {
+            drain_settle_secs: Some(0),
+            ..full().facts
+        },
+        ..full()
+    };
+    assert_eq!(read(&row(&no_wait)), Ok((-5, Some(0))));
+}
+
+/// A watcher builds its worker's object from the row it was told, and the
+/// object waits the window that row tells. A row that tells none builds an
+/// object of the default window.
+#[test]
+fn an_object_built_from_a_told_row_waits_the_window_the_row_tells() {
+    use smg_worker::worker::HealthCheckConfig;
+
+    let window = |stored: &WorkerRow| {
+        let told = told_row(&row(stored), Instant::now()).expect("a row");
+        let object = crate::worker_host::object(&told);
+        object.metadata().health_config.drain_settle_secs
+    };
+    assert_eq!(window(&full()), 45);
+    let plain = WorkerRow {
+        facts: WorkerFacts {
+            drain_settle_secs: None,
+            ..full().facts
+        },
+        ..full()
+    };
+    assert_eq!(
+        window(&plain),
+        HealthCheckConfig::default().drain_settle_secs
+    );
+}
+
 #[test]
 fn a_registration_over_a_standing_row_keeps_what_it_leaves_unsaid_save_its_labels_and_its_policy() {
     let standing = full().facts;
@@ -1759,7 +1860,6 @@ fn the_stores_measure_is_never_under_the_wires_weight() {
         kv_block_size: Some(u32::MAX),
         max_running: Some(u32::MAX),
         bootstrap_port: Some(u16::MAX),
-        priority: i32::MAX,
         reachable_from: Reachability::Gateway(GatewayId(u64::MAX)),
         overload: Overload {
             kv_usage_permille: Some(u16::MAX),
@@ -1845,6 +1945,27 @@ fn the_stores_measure_is_never_under_the_wires_weight() {
         ..offering.clone()
     };
     assert_eq!(charged(&on) - charged(&offering), 300 + WorkerFacts::FRAME);
+    // The same row again where its worker states a priority, and then a
+    // drain window too, each at its widest. The store charges the wire's
+    // number for each, and the measure adds each where the row states it.
+    let ranked = WorkerFacts {
+        priority: i32::MIN,
+        ..offering.clone()
+    };
+    let waiting = WorkerFacts {
+        drain_settle_secs: Some(u32::MAX),
+        ..ranked.clone()
+    };
+    assert_eq!(numeric(&ranked) - numeric(&offering), WorkerFacts::PRIORITY);
+    assert_eq!(charged(&ranked) - charged(&offering), WorkerFacts::PRIORITY);
+    assert_eq!(
+        numeric(&waiting) - numeric(&ranked),
+        WorkerFacts::DRAIN_WINDOW
+    );
+    assert_eq!(
+        charged(&waiting) - charged(&ranked),
+        WorkerFacts::DRAIN_WINDOW
+    );
 
     let makers = [
         Registrant::Control,
@@ -1865,6 +1986,8 @@ fn the_stores_measure_is_never_under_the_wires_weight() {
             (true, &seeing),
             (false, &offering),
             (true, &offering),
+            (false, &waiting),
+            (true, &waiting),
         ];
         for (scrape, numbers) in cells {
             let facts = WorkerFacts {
