@@ -168,23 +168,38 @@ pub fn fresh_for_port(port: u16) -> Arc<WorkerOverrides> {
     fresh
 }
 
-/// The reported info as the `server_args` struct of a server-info answer.
+/// The reported info as the `server_args` struct of a server-info answer: a
+/// list and an object go out as a list and a struct of their members, as an
+/// engine servicer sends its server args.
 pub fn server_args(info: &BTreeMap<String, Value>) -> prost_types::Struct {
-    let fields = info
-        .iter()
-        .map(|(key, value)| {
-            let kind = match value {
-                Value::Bool(b) => prost_types::value::Kind::BoolValue(*b),
-                Value::Number(n) => {
-                    prost_types::value::Kind::NumberValue(n.as_f64().unwrap_or(0.0))
-                }
-                Value::String(s) => prost_types::value::Kind::StringValue(s.clone()),
-                other => prost_types::value::Kind::StringValue(other.to_string()),
-            };
-            (key.clone(), prost_types::Value { kind: Some(kind) })
-        })
-        .collect();
-    prost_types::Struct { fields }
+    prost_types::Struct {
+        fields: info
+            .iter()
+            .map(|(key, value)| (key.clone(), proto_value(value)))
+            .collect(),
+    }
+}
+
+/// A JSON value as the proto value of its own kind.
+fn proto_value(value: &Value) -> prost_types::Value {
+    use prost_types::value::Kind;
+
+    let kind = match value {
+        Value::Null => Kind::NullValue(0),
+        Value::Bool(flag) => Kind::BoolValue(*flag),
+        Value::Number(number) => Kind::NumberValue(number.as_f64().unwrap_or(0.0)),
+        Value::String(text) => Kind::StringValue(text.clone()),
+        Value::Array(items) => Kind::ListValue(prost_types::ListValue {
+            values: items.iter().map(proto_value).collect(),
+        }),
+        Value::Object(entries) => Kind::StructValue(prost_types::Struct {
+            fields: entries
+                .iter()
+                .map(|(key, value)| (key.clone(), proto_value(value)))
+                .collect(),
+        }),
+    };
+    prost_types::Value { kind: Some(kind) }
 }
 
 #[cfg(test)]
@@ -216,6 +231,48 @@ mod tests {
             !overrides.info().contains_key("weight_version"),
             "a null removes the key"
         );
+    }
+
+    /// A list and an object of the reported info go out as a list and a
+    /// struct of their members, as an engine servicer sends its server args,
+    /// not as one string of their JSON text.
+    #[test]
+    fn a_list_and_an_object_of_the_info_keep_their_kinds() {
+        use prost_types::value::Kind;
+
+        let value = |kind| prost_types::Value { kind: Some(kind) };
+        let list = |values| value(Kind::ListValue(prost_types::ListValue { values }));
+        let patch = json!({
+            "schemes": ["file", 2, null],
+            "limits": {"image": 4, "kinds": [true]},
+            "window": 8,
+        });
+        let overrides = WorkerOverrides::fresh();
+        overrides.patch_info(patch.as_object().unwrap());
+
+        let limits = BTreeMap::from([
+            ("image".to_string(), value(Kind::NumberValue(4.0))),
+            (
+                "kinds".to_string(),
+                list(vec![value(Kind::BoolValue(true))]),
+            ),
+        ]);
+        let expected = BTreeMap::from([
+            (
+                "limits".to_string(),
+                value(Kind::StructValue(prost_types::Struct { fields: limits })),
+            ),
+            (
+                "schemes".to_string(),
+                list(vec![
+                    value(Kind::StringValue("file".to_string())),
+                    value(Kind::NumberValue(2.0)),
+                    value(Kind::NullValue(0)),
+                ]),
+            ),
+            ("window".to_string(), value(Kind::NumberValue(8.0))),
+        ]);
+        assert_eq!(server_args(&overrides.info()).fields, expected);
     }
 
     /// A worker on a port that an earlier worker served on starts from fresh

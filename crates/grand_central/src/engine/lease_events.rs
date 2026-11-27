@@ -11,13 +11,17 @@
 //! the same form (`Sides::with_held_single`, `Sides::with_held_pair`), so
 //! [`single`] and [`pair`] are the one rule of a lease's words under either
 //! host. The host says who hears ([`Hearers`]). Behind a later document's
-//! start the stages that document kept hear a lease's words, and every
-//! count of sends in force takes its dispatch, under either host. Each
+//! start the stages that document kept hear a lease's words of the kinds
+//! they name, and every count of sends in force takes its dispatch, under
+//! either host. Each
 //! keeps one engine object across its documents. A host that holds its
 //! decisions names the hearers by the document in force ([`of_host`]), and
 //! a controller by the one its store's standing world holds. What hears at
 //! the issuing engine is one of two things ([`Issuing`]): an engine whole,
 //! or the stages a later engine kept that stood by the lease's generation.
+//! A host that holds its decisions names the first as the engine itself,
+//! and a controller names either as a `Stood`, the first under no bound
+//! (`Engine::stands`).
 //!
 //! A request its binding's sessions rule keeps from the profile is told to
 //! the session table at its dispatch, and to no stage ahead of its end

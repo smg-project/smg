@@ -47,6 +47,10 @@ mod tests;
 use std::{sync::Arc, time::Duration};
 
 use engine::connect_engine;
+use engine_zmq_adapter::{
+    structured_outputs_backend_from_config, ConstraintKinds, StructuredOutputBackend,
+    StructuredOutputsBackendConfig, StructuredOutputsSupport,
+};
 use llm_tokenizer::traits::Tokenizer;
 use media::MediaGate;
 pub use media::{
@@ -199,6 +203,34 @@ pub struct VllmModelInfo {
     /// the launcher did not say (an older one): the wire is then classified
     /// by what it shows.
     pub log_stats: Option<bool>,
+}
+
+/// What the engine enforces of a structured request, read off the
+/// launcher's facts: the backend `structured_outputs_backend` names.
+/// `outlines` and `lm-format-enforcer` compile JSON schemas, regular
+/// expressions and choices and fail a structural tag at compile. Neither
+/// compiles an EBNF grammar either; that kind stays set for them because a
+/// choice is judged by it, so a grammar still goes to the engine. Every other
+/// name compiles all four kinds or is not judged here. The adapter refuses a
+/// constraint outside this before the engine, as on every wire.
+pub(super) fn structured_outputs_support(model: &VllmModelInfo) -> StructuredOutputsSupport {
+    use StructuredOutputBackend::{LmFormatEnforcer, Outlines};
+
+    let backend = structured_outputs_backend_from_config(&model.structured_outputs_backend);
+    match backend {
+        StructuredOutputsBackendConfig::Pinned(Outlines | LmFormatEnforcer) => {
+            StructuredOutputsSupport::new(
+                backend,
+                ConstraintKinds {
+                    json_schema: true,
+                    regex: true,
+                    ebnf: true,
+                    structural_tag: false,
+                },
+            )
+        }
+        _ => backend.into(),
+    }
 }
 
 /// How to bind, where the engine dials in, and what to advertise.

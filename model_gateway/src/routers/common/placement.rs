@@ -8050,13 +8050,9 @@ pub(crate) mod tests {
         let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
         let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
         let mut document = PolicySpec::preset("consistent_hashing").expect("a stock preset");
-        document.bindings[0].routing_key = Some(RoutingKeySpec {
-            sources: vec![KeySourceSpec {
-                rid: true,
-                ..KeySourceSpec::default()
-            }],
-            strip_lineage: false,
-        });
+        let mut source = KeySourceSpec::default();
+        source.rid = true;
+        document.bindings[0].routing_key = Some(RoutingKeySpec::of(vec![source]));
         let spec = AppliedSpec::validate(&document);
         engine_on(&policies, spec.expect("a valid document"));
         let keyed = PlacementInputs {
@@ -8786,10 +8782,9 @@ pub(crate) mod tests {
     /// stock pair of two rotations under that word, on `policies`.
     fn shedding_pair_engine_on(policies: &PolicyRegistry) {
         let mut sheds = PolicySpec::pair_presets("round_robin", "round_robin").expect("presets");
-        sheds.bindings[0].overload = Some(OverloadSpec {
-            shed_when_all_vetoed: true,
-            ..OverloadSpec::default()
-        });
+        let mut overload = OverloadSpec::default();
+        overload.shed_when_all_vetoed = true;
+        sheds.bindings[0].overload = Some(overload);
         engine_on(
             policies,
             AppliedSpec::validate(&sheds).expect("a valid document"),
@@ -10619,13 +10614,9 @@ pub(crate) mod tests {
         let document = PolicySpec::pair_presets("round_robin", "round_robin");
         let mut document = document.expect("the pair presets");
         document.generation = 1;
-        document.bindings[0].routing_key = Some(RoutingKeySpec {
-            sources: vec![KeySourceSpec {
-                rid: true,
-                ..KeySourceSpec::default()
-            }],
-            strip_lineage: false,
-        });
+        let mut source = KeySourceSpec::default();
+        source.rid = true;
+        document.bindings[0].routing_key = Some(RoutingKeySpec::of(vec![source]));
         let spec = AppliedSpec::validate(&document);
         engine_on(policies, spec.expect("a valid document"));
     }
@@ -10952,10 +10943,9 @@ pub(crate) mod tests {
         // and its engine decides under that word.
         let shedding = PolicyRegistry::new(PolicyConfig::RoundRobin);
         let mut sheds = PolicySpec::pair_presets("round_robin", "round_robin").expect("presets");
-        sheds.bindings[0].overload = Some(OverloadSpec {
-            shed_when_all_vetoed: true,
-            ..OverloadSpec::default()
-        });
+        let mut overload = OverloadSpec::default();
+        overload.shed_when_all_vetoed = true;
+        sheds.bindings[0].overload = Some(overload);
         engine_on(
             &shedding,
             AppliedSpec::validate(&sheds).expect("a valid document"),

@@ -325,4 +325,5 @@ impl Changed {
 }
 
 #[cfg(test)]
+#[path = "../../tests/unit/policies/kept_rings/tests.rs"]
 mod tests;

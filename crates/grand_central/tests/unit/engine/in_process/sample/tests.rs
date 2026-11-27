@@ -1,6 +1,7 @@
 //! The cases of the decisions an engine keeps under `explain.sample`.
 
 use std::{
+    cell::Cell,
     sync::{atomic::Ordering, Arc},
     thread,
     time::Duration,
@@ -15,7 +16,7 @@ use smg_worker::{
 
 use super::{
     super::{
-        place::{PlaceRequest, Prompt},
+        place::{HeaderRead, PlaceRequest, Prompt},
         single::tests::{pool, request, ruled_ahead, Asks, MODEL},
     },
     *,
@@ -245,6 +246,107 @@ fn a_request_with_no_id_is_found_by_the_id_its_host_states() {
     assert_eq!(kept, [false, true, false, false, true]);
 }
 
+/// The header a host names for its id of a request, among headers that
+/// count the reads of that one name.
+const HOST_ID_HEADER: &str = "x-host-id";
+
+/// A request's headers as pairs, which count each read of
+/// [`HOST_ID_HEADER`].
+struct CountedHeaders<'a> {
+    held: &'a [(&'a str, &'a str)],
+    reads: Cell<usize>,
+}
+
+impl HeaderRead for CountedHeaders<'_> {
+    fn header(&self, name: &str) -> Option<&[u8]> {
+        if name == HOST_ID_HEADER {
+            self.reads.set(self.reads.get() + 1);
+        }
+        let (_, value) = self.held.iter().find(|(held, _)| *held == name)?;
+        Some(value.as_bytes())
+    }
+}
+
+/// A request whose host names a header for its id is kept under that
+/// header's value. Its own id wins over the header, and so does the id its
+/// host states by word. A request that states no id and whose headers hold
+/// no such header is not counted: it takes no step of the sample's count.
+#[test]
+fn a_request_with_no_id_is_found_by_the_header_its_host_names() {
+    let engine = hosted(&sampling("round_robin", 1));
+    let list = pool(4);
+    let members = PublishedList::new(Arc::clone(&list));
+    let stated = [
+        (None, None, "header-1"),
+        (Some("own-2"), None, "header-2"),
+        (None, Some("host-3"), "header-3"),
+    ];
+    for (request_id, explain_id, header) in stated {
+        let headers = [(HOST_ID_HEADER, header)];
+        let request = PlaceRequest {
+            headers: &headers,
+            request_id,
+            explain_id,
+            explain_id_header: Some(HOST_ID_HEADER),
+            ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
+        };
+        let _ = engine.place(&request).expect("a placement");
+    }
+    let ids = ["header-1", "own-2", "header-2", "host-3", "header-3"];
+    let kept = ids.map(|id| engine.explained(id.as_bytes()).is_some());
+    assert_eq!(kept, [true, true, false, true, false]);
+
+    let engine = hosted(&sampling("round_robin", 2));
+    let list = pool(4);
+    let members = PublishedList::new(Arc::clone(&list));
+    for header in [Some("held-a"), None, Some("held-c"), None, Some("held-d")] {
+        let held = header.map(|value| [(HOST_ID_HEADER, value)]);
+        let headers: &dyn HeaderRead = match &held {
+            Some(held) => held,
+            None => &(),
+        };
+        let request = PlaceRequest {
+            headers,
+            explain_id_header: Some(HOST_ID_HEADER),
+            ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
+        };
+        let _ = engine.place(&request).expect("a placement");
+    }
+    let kept = ["held-a", "held-c", "held-d"].map(|id| engine.explained(id.as_bytes()).is_some());
+    assert_eq!(kept, [false, true, false]);
+}
+
+/// A host's id is read off the header the host names under a document
+/// that keeps a sample, and under no other. There it is read for a request
+/// that states no id, and not for one that states an id of its own or its
+/// host's by word.
+#[test]
+fn the_header_a_host_names_is_read_under_a_sample_alone() {
+    let reads = |sample: u32, request_id: Option<&str>, explain_id: Option<&str>| {
+        let engine = hosted(&sampling("round_robin", sample));
+        let list = pool(4);
+        let members = PublishedList::new(Arc::clone(&list));
+        let headers = CountedHeaders {
+            held: &[(HOST_ID_HEADER, "header-1")],
+            reads: Cell::new(0),
+        };
+        let request = PlaceRequest {
+            headers: &headers,
+            request_id,
+            explain_id,
+            explain_id_header: Some(HOST_ID_HEADER),
+            ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
+        };
+        let _ = engine.place(&request).expect("a placement");
+        let found = engine.explained(b"header-1").is_some();
+        (headers.reads.get(), found)
+    };
+    assert_eq!(reads(0, None, None), (0, false), "no sample");
+    assert_eq!(reads(1, None, None), (1, true), "a sample");
+    assert_eq!(reads(1, Some("own"), None), (0, false), "its own id");
+    assert_eq!(reads(1, None, Some("host")), (0, false), "its host's word");
+}
+
 /// A place one pick decides, a noted place and a whole decision alike keep
 /// a request that states no id under its host's. The record names the
 /// worker the request was placed on. Each document is held to its road:
@@ -354,7 +456,9 @@ fn a_whole_decision_is_kept_as_it_was_answered() {
 }
 
 /// A single's record holds what its binding's shadow said beside the
-/// decision: the word the engine counted for the binding.
+/// decision: the word the engine counted for the binding. It holds the
+/// worker that shadow picked too, and its JSON form writes that worker in
+/// the trace.
 #[test]
 fn a_singles_record_holds_what_its_shadow_said() {
     let mut document = sampling("power_of_two", 1);
@@ -372,6 +476,11 @@ fn a_singles_record_holds_what_its_shadow_said() {
     let said = record.shadow.expect("the shadow's word");
     let counted = engine.shadow_kinds(0)[said.index()];
     assert_eq!(counted, 1, "the word the engine counted");
+    let picked = record.shadow_target.expect("the worker its shadow picked");
+    let handle = engine.spec();
+    let json = record.json(handle.engine(), &|_| None);
+    let written = &json["decision"]["trace"]["shadow_pick"];
+    assert_eq!(*written, picked.0.to_string(), "{json}");
 }
 
 /// Under a document a count of sends of which takes a word on a lease and

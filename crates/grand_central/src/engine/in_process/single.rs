@@ -71,7 +71,7 @@ use smg_worker::{identity::basic::Worker, load::state::LoadSnapshot, runtime::Ro
 use super::{keys, overlap, place::Made, Loaded, PoolMembers};
 use crate::{
     engine::{
-        decision::{Decision, Shed, ShedReason, Trace, SUBSET_HINT, WIRES},
+        decision::{Decision, Shed, ShedReason, Trace, NO_STAGE, SUBSET_HINT, WIRES},
         decision_engine::{AlonePick, DecideOutcome, Leased, Plain, Request, RequestMaker},
         demands::UnmetDemand,
         framework::Engine,
@@ -130,9 +130,6 @@ fn lease_id(own: Loaded<'_, '_>) -> LeaseId {
 /// one set of places cannot hold a pair's two lists. An encode request
 /// that states places of its own is declined under it too.
 pub(super) use crate::engine::decision::PLACES;
-
-/// The crate's word, in a shed's `emptied_by`, for a pool no stage emptied.
-const NO_STAGE: &str = "none";
 
 /// The short path: the place in `members`, the engine's value of the list
 /// its host lent, of the worker picked for a plain single request of

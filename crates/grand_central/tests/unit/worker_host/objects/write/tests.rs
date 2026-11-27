@@ -438,7 +438,7 @@ fn a_row_in_place_keeps_the_tables_status_and_a_next_life_takes_its_rows() {
         ..row
     });
     let relabelled = MembershipChange::Relabelled { id };
-    assert!(store.follow_objects(relabelled, stale, Some(1), None));
+    assert!(store.follow_objects(relabelled, stale, Some(1), None, None));
     let status = |url: &str| store.by_key(url).map(|row| row.status);
     assert_eq!(status(A), Some(WorkerStatus::Ready));
     // The next life, decided over that same reading.
@@ -454,7 +454,7 @@ fn a_row_in_place_keeps_the_tables_status_and_a_next_life_takes_its_rows() {
         now,
     );
     assert_eq!(next.status, WorkerStatus::Pending, "as the holder read it");
-    assert!(store.follow_objects(change, Some(next), Some(2), standing.as_mut()));
+    assert!(store.follow_objects(change, Some(next), Some(2), standing.as_mut(), None));
     assert_eq!(status(A), Some(WorkerStatus::Pending));
     let (_, laid, left) = replica.last();
     assert_eq!(laid.map(|row| row.status), Some(WorkerStatus::Pending));
@@ -478,7 +478,7 @@ fn a_row_a_write_takes_out_is_told_as_handed_in_the_status_the_table_holds() {
     });
     let handed = read.as_ref().map(|row| std::ptr::from_ref(row).addr());
     let removed = MembershipChange::Removed { id };
-    assert!(store.follow_objects(removed, None, Some(1), read.as_mut()));
+    assert!(store.follow_objects(removed, None, Some(1), read.as_mut(), None));
     assert_eq!(replica.took_at(), handed, "the handed row itself");
     let (_, _, left) = replica.last();
     assert_eq!(left, read, "as the store left the handed row");
@@ -527,7 +527,7 @@ fn a_row_handed_with_a_change_in_place_stops_a_debug_build() {
     let mut standing = store.by_key(A);
     let next = standing.clone().map(|row| WorkerRow { revision: 2, ..row });
     let relabelled = MembershipChange::Relabelled { id };
-    assert!(store.follow_objects(relabelled, next, Some(1), standing.as_mut()));
+    assert!(store.follow_objects(relabelled, next, Some(1), standing.as_mut(), None));
 }
 
 /// A host with no journal tells no entry, so the row its holder hands
@@ -737,7 +737,7 @@ fn a_write_over_a_row_written_around_the_holder_is_refused_and_lays_nothing() {
         let seen = Some(read.revision);
         replica
             .objects
-            .lay_decided(&replica.store, change, &row, seen, None)
+            .lay_decided(&replica.store, change, &row, seen, None, None)
     }
     let writes: [(&str, Write); 4] = [
         ("a registration in place", |replica, read| {
@@ -750,13 +750,15 @@ fn a_write_over_a_row_written_around_the_holder_is_refused_and_lays_nothing() {
             let change = MembershipChange::Relabelled { id: read.id };
             replica
                 .objects
-                .lay_decided(&replica.store, change, &read, seen, None)
+                .lay_decided(&replica.store, change, &read, seen, None, None)
         }),
         ("a key's next life", |replica, read| {
             lay(replica, facts(2, "gold"), &read)
         }),
         ("a removal", |replica, mut read| {
-            replica.objects.take_decided(&replica.store, &mut read)
+            replica
+                .objects
+                .take_decided(&replica.store, &mut read, None)
         }),
     ];
     let others: [(&str, Other); 2] = [

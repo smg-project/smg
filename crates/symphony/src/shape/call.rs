@@ -524,7 +524,10 @@ impl Value {
             // The reader takes the delta's own bytes, so a fragment within them borrows them.
             let taken = match &mut self.reader {
                 JsonReader::Json(arguments) => arguments.feed(bytes, &typing, out),
-                JsonReader::Envelope(assembler) => assembler.feed(bytes, out),
+                JsonReader::Envelope(assembler) => {
+                    assembler.start_at_name(declared.calls_start_at_name());
+                    assembler.feed(bytes, out)
+                }
             };
             if let Some(last) = bytes[..taken].chars().next_back() {
                 self.before = Some(last);
@@ -1445,6 +1448,48 @@ mod tests {
                 finish(1),
             ],
             "a literal in another member runs into the trailer"
+        );
+    }
+
+    #[test]
+    fn an_envelope_starts_its_call_at_the_name_under_an_engine_that_starts_calls_there() {
+        let format = table(intern(CallShape {
+            header: Pattern::default(),
+            name: NameSource::Body,
+            arguments: Arguments::Envelope {
+                dialect: Dialect::default(),
+                name: Path::new(["name"]),
+                arguments: Path::new(["arguments"]),
+            },
+            trailer: closing_f(),
+            word: word(),
+            hold_cap: 64,
+        }));
+        let mut at_name = Declared::default();
+        at_name.start_calls_at_name();
+        // Every cut starts the call at its name, and what stands between the name and the value
+        // leaves with the value's first fragment.
+        assert_eq!(
+            run_declared(
+                &format,
+                &at_name,
+                "",
+                "<c>{\"name\": \"f\", \"arguments\": {\"a\": 1}</f>\n</c>Done.",
+                EngineFinish::Stop,
+            ),
+            [
+                wrapper("<c>"),
+                start("f", "{\"name\": \"f\""),
+                Event::ToolCallArguments {
+                    index: 0,
+                    json: "{\"a\": 1}".to_string().into(),
+                    source: Text::uncounted(", \"arguments\": {\"a\": 1}".to_owned()),
+                },
+                end(""),
+                wrapper("</f>\n</c>"),
+                content("Done."),
+                finish(1),
+            ],
         );
     }
 

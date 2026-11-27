@@ -101,6 +101,9 @@ pub(crate) fn decide(
             ..
         } = buffers;
         let (rows, pool_facts) = pool.write_over::<true, false>(workers, live, whole, stands);
+        if engine.turns_a_set() {
+            scratch.whole(pool.whole_rows(rows));
+        }
         let written;
         let cx = if cx.stalled.is_empty() {
             cx

@@ -617,6 +617,7 @@ fn first_token_and_per_output_token_families_render_on_their_own_edges() {
             endpoint: metrics_labels::ENDPOINT_CHAT,
             ttft: Some(Duration::from_millis(120)),
             dispatch_wait: None,
+            dispatch_wait_after_body: None,
             generation_duration: Duration::from_millis(156),
             input_tokens: Some(10),
             cached_tokens: None,
@@ -692,6 +693,7 @@ fn the_dispatch_wait_renders_on_the_request_duration_edges() {
             endpoint: metrics_labels::ENDPOINT_CHAT,
             ttft: Some(Duration::from_millis(120)),
             dispatch_wait: Some(Duration::from_millis(7)),
+            dispatch_wait_after_body: None,
             generation_duration: Duration::from_millis(156),
             input_tokens: Some(10),
             cached_tokens: None,
@@ -717,6 +719,70 @@ fn the_dispatch_wait_renders_on_the_request_duration_edges() {
         !rendered.contains(&summary),
         "{DISPATCH_WAIT_SECONDS} rendered as a summary; rendered:\n{rendered}"
     );
+}
+
+/// The dispatch wait without the upload renders beside the
+/// dispatch wait, a histogram on the same edges: its name has a matcher of
+/// its own, as the dispatch wait's has, and an operator's list replaces the
+/// edges of both. A 7 ms wait of which 1 ms is the body's upload lands
+/// under the 10 ms edge and not under the 5 ms one in both families.
+#[test]
+fn the_dispatch_wait_after_body_renders_on_the_dispatch_wait_edges() {
+    let mut builder = PrometheusBuilder::new();
+    for (matcher, buckets) in histogram_bucket_overrides(None) {
+        builder = builder
+            .set_buckets_for_metric(matcher, &buckets)
+            .expect("bucket override");
+    }
+    let recorder = builder.build_recorder();
+    let handle = recorder.handle();
+    metrics::with_local_recorder(&recorder, || {
+        Metrics::record_streaming_metrics(StreamingMetricsParams {
+            router_type: metrics_labels::ROUTER_GRPC,
+            backend_type: metrics_labels::BACKEND_REGULAR,
+            model_id: "m1",
+            endpoint: metrics_labels::ENDPOINT_CHAT,
+            ttft: Some(Duration::from_millis(120)),
+            dispatch_wait: Some(Duration::from_millis(7)),
+            dispatch_wait_after_body: Some(Duration::from_millis(6)),
+            generation_duration: Duration::from_millis(156),
+            input_tokens: Some(10),
+            cached_tokens: None,
+            output_tokens: 3,
+        });
+    });
+    let rendered = handle.render();
+
+    let labels = "router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\"";
+    for (family, sum) in [
+        (DISPATCH_WAIT_SECONDS, "0.007"),
+        (DISPATCH_WAIT_AFTER_BODY_SECONDS, "0.006"),
+    ] {
+        for series in [
+            format!("{family}_bucket{{{labels},le=\"0.005\"}} 0"),
+            format!("{family}_bucket{{{labels},le=\"0.01\"}} 1"),
+            format!("{family}_count{{{labels}}} 1"),
+            format!("{family}_sum{{{labels}}} {sum}"),
+        ] {
+            assert!(
+                rendered.lines().any(|l| l == series),
+                "{series} missing; rendered:\n{rendered}"
+            );
+        }
+        let summary = format!("{family}{{");
+        assert!(
+            !rendered.contains(&summary),
+            "{family} rendered as a summary; rendered:\n{rendered}"
+        );
+    }
+
+    let after_body = Matcher::Full(String::from(DISPATCH_WAIT_AFTER_BODY_SECONDS));
+    let dispatch_wait = Matcher::Full(String::from(DISPATCH_WAIT_SECONDS));
+    let defaults = histogram_bucket_overrides(None);
+    assert_eq!(defaults[&after_body], defaults[&dispatch_wait]);
+    let custom = vec![0.5, 1.0];
+    let overridden = histogram_bucket_overrides(Some(custom.clone()));
+    assert_eq!(overridden[&after_body], custom);
 }
 
 /// An operator's `--prometheus-duration-buckets` list replaces the
@@ -1192,6 +1258,7 @@ fn router_stream_families_name_the_attempt_anchor() {
             endpoint: "chat",
             ttft: Some(Duration::from_millis(5)),
             dispatch_wait: None,
+            dispatch_wait_after_body: None,
             generation_duration: Duration::from_millis(9),
             input_tokens: None,
             cached_tokens: None,
@@ -1251,6 +1318,7 @@ fn the_dispatch_wait_help_names_its_clock_its_answers_and_its_sum_with_the_ttft(
             endpoint: "chat",
             ttft: Some(Duration::from_millis(5)),
             dispatch_wait: Some(Duration::from_millis(2)),
+            dispatch_wait_after_body: None,
             generation_duration: Duration::from_millis(9),
             input_tokens: None,
             cached_tokens: None,
@@ -1277,6 +1345,112 @@ fn the_dispatch_wait_help_names_its_clock_its_answers_and_its_sum_with_the_ttft(
     }
 }
 
+/// The dispatch wait without the upload says on `/metrics` what it takes off
+/// the dispatch wait (the time the read of the body waited for the client),
+/// that it is observed where the dispatch wait is under the same labels and
+/// buckets, what both families hold, what the dispatch wait alone holds and
+/// which requests read the same value in both.
+#[test]
+fn the_dispatch_wait_after_body_help_names_what_it_takes_off_and_what_each_family_holds() {
+    let (rendered, ()) = with_test_recorder(|| {
+        init_metrics();
+        Metrics::record_streaming_metrics(StreamingMetricsParams {
+            router_type: metrics_labels::ROUTER_GRPC,
+            backend_type: metrics_labels::BACKEND_REGULAR,
+            model_id: "m",
+            endpoint: "chat",
+            ttft: Some(Duration::from_millis(5)),
+            dispatch_wait: Some(Duration::from_millis(2)),
+            dispatch_wait_after_body: Some(Duration::from_millis(1)),
+            generation_duration: Duration::from_millis(9),
+            input_tokens: None,
+            cached_tokens: None,
+            output_tokens: 2,
+        });
+    });
+    let family = DISPATCH_WAIT_AFTER_BODY_SECONDS;
+    let help = rendered
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("# HELP {family} ")))
+        .unwrap_or_else(|| panic!("no # HELP for {family}; rendered:\n{rendered}"));
+    for phrase in [
+        "by router_type, backend_type, model, endpoint (gRPC only; observed wherever smg_router_dispatch_wait_seconds is, under the same labels and buckets)",
+        "smg_router_dispatch_wait_seconds less the time the read of the request body waited for the client",
+        "authentication, the wait for an admission permit, the run of WASM modules, parsing, tokenizing, templating, worker selection, a refused attempt's wait and its backoff are in both",
+        "the body's upload is in smg_router_dispatch_wait_seconds alone",
+        "a body that came whole and a later turn of a Responses tool loop take nothing off and observe the same value in both",
+        "a multipart upload is measured as any other body",
+    ] {
+        assert!(help.contains(phrase), "{phrase:?} is not in: {help}");
+    }
+}
+
+/// The dispatch wait without the upload is recorded beside the
+/// dispatch wait: once per answer that carries one, streamed or collected,
+/// under the same four labels, through a key built per record and through
+/// kept handles alike. An answer dispatched outside a request's entry stamp
+/// carries neither wait and records neither, and the dispatch wait reads
+/// what it is handed, whatever the other family reads.
+#[test]
+fn the_dispatch_wait_after_body_is_recorded_beside_the_dispatch_wait() {
+    let records = || {
+        let waits = Some((Duration::from_millis(17), Duration::from_millis(6)));
+        for (model_id, ttft, waits) in [
+            ("streamed", Some(Duration::from_millis(40)), waits),
+            ("collected", None, waits),
+            ("unstamped", Some(Duration::from_millis(40)), None),
+        ] {
+            Metrics::record_streaming_metrics(StreamingMetricsParams {
+                router_type: metrics_labels::ROUTER_GRPC,
+                backend_type: metrics_labels::BACKEND_PD,
+                model_id,
+                endpoint: metrics_labels::ENDPOINT_MESSAGES,
+                ttft,
+                dispatch_wait: waits.map(|(since_entry, _)| since_entry),
+                dispatch_wait_after_body: waits.map(|(_, since_body)| since_body),
+                generation_duration: Duration::from_millis(90),
+                input_tokens: Some(4),
+                cached_tokens: None,
+                output_tokens: 2,
+            });
+        }
+    };
+    let built = render_with_recorder(records);
+    let kept = render_with_recorder(|| {
+        handles::force_on_this_thread(Some(true));
+        records();
+        handles::reset();
+    });
+    assert_eq!(sorted_series(&kept), sorted_series(&built));
+    let labels = |model: &str| {
+        format!("router_type=\"grpc\",backend_type=\"pd\",model=\"{model}\",endpoint=\"messages\"")
+    };
+    for rendered in [&built, &kept] {
+        for model in ["streamed", "collected"] {
+            let labels = labels(model);
+            for series in [
+                format!("{DISPATCH_WAIT_SECONDS}_count{{{labels}}} 1"),
+                format!("{DISPATCH_WAIT_SECONDS}_sum{{{labels}}} 0.017"),
+                format!("{DISPATCH_WAIT_AFTER_BODY_SECONDS}_count{{{labels}}} 1"),
+                format!("{DISPATCH_WAIT_AFTER_BODY_SECONDS}_sum{{{labels}}} 0.006"),
+            ] {
+                assert!(
+                    rendered.lines().any(|line| line == series),
+                    "{series} missing; rendered:\n{rendered}"
+                );
+            }
+        }
+        let unstamped = labels("unstamped");
+        for family in [DISPATCH_WAIT_SECONDS, DISPATCH_WAIT_AFTER_BODY_SECONDS] {
+            let wait = format!("{family}_count{{{unstamped}}}");
+            assert!(
+                !rendered.contains(&wait),
+                "an answer with no wait recorded {family}; rendered:\n{rendered}"
+            );
+        }
+    }
+}
+
 /// The dispatch wait is recorded whenever an answer carries one: once, under
 /// the TTFT's four labels. A streamed answer with a first token records both
 /// families. An answer with no first token (a collected one) records its
@@ -1292,6 +1466,7 @@ fn the_dispatch_wait_is_recorded_whenever_an_answer_carries_one() {
             endpoint: metrics_labels::ENDPOINT_MESSAGES,
             ttft,
             dispatch_wait,
+            dispatch_wait_after_body: None,
             generation_duration: Duration::from_millis(90),
             input_tokens: Some(4),
             cached_tokens: None,
@@ -1507,6 +1682,7 @@ fn the_stream_timing_set_renders_the_same_through_kept_handles() {
                 endpoint: metrics_labels::ENDPOINT_CHAT,
                 ttft,
                 dispatch_wait,
+                dispatch_wait_after_body: None,
                 generation_duration: Duration::from_millis(50),
                 input_tokens,
                 cached_tokens: input_tokens.map(|input| input / 10),
@@ -1520,6 +1696,7 @@ fn the_stream_timing_set_renders_the_same_through_kept_handles() {
             endpoint: metrics_labels::ENDPOINT_GENERATE,
             ttft: None,
             dispatch_wait: None,
+            dispatch_wait_after_body: None,
             generation_duration: Duration::from_millis(20),
             input_tokens: None,
             cached_tokens: None,
@@ -1654,6 +1831,7 @@ fn time_per_router_record() {
             endpoint: metrics_labels::ENDPOINT_CHAT,
             ttft: Some(Duration::from_millis(50)),
             dispatch_wait,
+            dispatch_wait_after_body: None,
             generation_duration: Duration::from_secs(1),
             input_tokens: Some(128),
             cached_tokens: Some(64),

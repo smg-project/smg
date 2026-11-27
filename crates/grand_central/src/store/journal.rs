@@ -55,7 +55,8 @@ pub trait Journal: Send + Sync {
     /// is told and the table then takes it. Where it handed the row the
     /// write takes out, that row is told with the table's status. A write
     /// that hands none tells that row as the table held it. A status is
-    /// not told here: it has its own call ([`Journal::status`]). `at` is
+    /// not told here: it has its own call ([`Journal::status`]), and the
+    /// crate's log refuses one that is handed here. `at` is
     /// the place of the leader's event the write applies, on a store that
     /// follows ([`crate::store::MemoryStore::follow`]), and none for a
     /// write of the store's own: a journal keeps that place for the
@@ -64,13 +65,17 @@ pub trait Journal: Send + Sync {
     /// journaled nowhere otherwise.
     ///
     /// `term` is the term the write is made under, where its writer names
-    /// one. The answer is whether the write goes on. A journal says no in
-    /// one case alone: its store does not lead `term` in the moment the
-    /// event would take its place. The store then moves nothing, neither
-    /// a table nor its epoch. A write that names no term always goes on,
-    /// and a journal that leads no terms answers yes to every write. The
-    /// store steps its epoch behind a yes: `epoch` is the one that step
-    /// gives.
+    /// one. The answer is whether the write goes on. To a membership
+    /// write the crate's log says no in one case alone: its store does not
+    /// lead `term` in the moment the event would take its place. The store
+    /// then moves nothing, neither a table nor its epoch. A membership
+    /// write that names no term always goes on. A journal that keeps no
+    /// terms says yes to one under any term. The crate's log answers
+    /// yes to one that names a term where its store leads that term, and
+    /// nowhere else. The store steps its epoch behind a yes: `epoch` is
+    /// the one that step gives. The store hands a write `at`, `term` or
+    /// neither, never both: an applier's write goes by its leader's
+    /// place, and names no term of the store's own.
     #[must_use = "a write the journal refuses moves nothing in the store"]
     fn member(
         &self,
@@ -88,10 +93,13 @@ pub trait Journal: Send + Sync {
     /// reader of a status reads: a watch that asked for some. They are the
     /// writer's where it handed them, as a holder of worker objects does
     /// on a leader and on a standby, and the table's row's otherwise.
-    /// `at`, `term` and the answer are as [`Journal::member`] has
-    /// them. A status of the store's own is told ahead of the table's
-    /// move, and the table takes the status behind a yes alone. A status
-    /// the store follows names no term.
+    /// `at` and `term` are as [`Journal::member`] has them, and the answer
+    /// is whether the write goes on. No journal says no to a status that
+    /// names no term. To a status handed here the crate's log says no in
+    /// one case alone, as to a membership write: its store does not lead
+    /// a `term` the status names. A status of the store's own is told
+    /// ahead of the table's move, and the table takes the status behind a
+    /// yes alone. A status the store follows names no term.
     #[must_use = "a write the journal refuses moves nothing in the store"]
     #[expect(
         clippy::too_many_arguments,

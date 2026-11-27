@@ -339,6 +339,15 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
         true
     }
 
+    /// M3's language model runs plain partial RoPE over token positions
+    /// (`text_config` sets `rope_theta`, `rotary_dim` and
+    /// `partial_rotary_factor`, and no M-RoPE section); the 3-D rotary
+    /// embedding is the vision tower's (`vision_config.rope_mode: 3d`). The
+    /// grid tensors therefore feed only the vision tower.
+    fn language_model_reads_grids(&self) -> bool {
+        false
+    }
+
     fn placeholder_token_for(
         &self,
         metadata: &ModelMetadata,
@@ -443,9 +452,11 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
     /// A clip is stamped only where its preprocessor config carries
     /// [`SGLANG_RESIZE_KEY`]: the worker that sets it follows a processor that
     /// stamps every clip it decodes. Everywhere else the frame blocks stand
-    /// bare: the reference writes a stamp only for a clip whose frame rate and
-    /// sampled frame indices it is handed, and the serving engine, started with
-    /// its defaults, hands it neither.
+    /// bare, as an engine that runs the reference processor lays them out when
+    /// started with its defaults: the reference stamps only a clip whose frame
+    /// rate and sampled frame indices it is handed, and with that engine's
+    /// processor cache on, its default, neither reaches the reference. With
+    /// the cache off both do, and the stamps are written.
     fn prompt_replacements_with_media(
         &self,
         metadata: &ModelMetadata,
@@ -487,9 +498,10 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
         // sizes key (or the other way round), or a request carrying both is
         // sliced by a tensor the batch does not have. The frame spacing the
         // shared video processor emits is batched here, so clips sampled at
-        // different rates join one batch (M3 reads the timing off its text
-        // stamps). The entry declares no legacy field map: the trait's
-        // default reads one, and this override replaces that default.
+        // different rates join one batch (where a clip is stamped, M3 reads
+        // the timing off its text stamps). The entry declares no legacy field
+        // map: the trait's default reads one, and this override replaces that
+        // default.
         grid_patch_layouts_for(modality)
     }
 
@@ -596,6 +608,13 @@ mod tests {
     fn matches_by_model_type_and_id() {
         let spec = MiniMaxM3VisionSpec;
         assert!(spec.matches(&metadata()));
+    }
+
+    /// The grids M3's processor emits feed the vision tower alone: the
+    /// language model's positions do not read them.
+    #[test]
+    fn the_language_model_reads_no_grids() {
+        assert!(!MiniMaxM3VisionSpec.language_model_reads_grids());
     }
 
     #[test]
@@ -857,12 +876,14 @@ mod tests {
     }
 
     #[test]
-    fn sampled_video_carries_no_time_stamp() {
-        // The serving engine, started with its defaults, hands its processor
-        // neither a clip's frame rate nor its sampled frame indices, so the
-        // prompt it builds holds the frame blocks alone. The test tokenizer
-        // encodes any text, so a stamp laid between the blocks would show in
-        // the sequence.
+    fn sampled_video_without_the_mark_carries_no_time_stamp() {
+        // The road without the mark, every worker but the one that sets
+        // `SGLANG_RESIZE_KEY`: the default preprocessor config is handed as it
+        // stands. An engine that runs the reference processor with its
+        // defaults hands it neither a clip's frame rate nor its sampled frame
+        // indices, so the prompt it builds holds the frame blocks alone. The
+        // test tokenizer encodes any text, so a stamp laid between the blocks
+        // would show in the sequence.
         //
         // Five sampled frames pair into three temporal frames; a lone frame stays one block.
         for (frame_indices, frames, grid_t) in [(vec![0, 15, 30, 45, 60], 3, 3), (vec![7], 1, 1)] {
@@ -885,8 +906,11 @@ mod tests {
     }
 
     #[test]
-    fn sampled_video_stamps_each_frame_with_its_source_time() {
-        // Five frames at 30 fps pair into three temporal frames, each stamped with its first frame's time.
+    fn sampled_video_under_the_mark_stamps_each_frame_with_its_source_time() {
+        // The road under the mark, the worker whose processor stamps every
+        // clip (`video_replacement` lays the mark on the config by `stamping`):
+        // five frames at 30 fps pair into three temporal frames, each stamped
+        // with its first frame's time.
         let replacement = video_replacement(
             &metadata(),
             vec![12],

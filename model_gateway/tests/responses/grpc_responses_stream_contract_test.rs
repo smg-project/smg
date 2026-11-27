@@ -58,6 +58,35 @@ async fn responses_result_with_final_answer(
 }
 
 #[expect(
+    clippy::too_many_arguments,
+    reason = "one case: its script, its request and its reader"
+)]
+async fn responses_result_with_finishes(
+    tools: Value,
+    output: Option<&str>,
+    max_tool_calls: Option<u32>,
+    expected_status: &str,
+    stream: bool,
+    final_answer_after: Option<(usize, &str)>,
+    finish_reasons: Vec<&'static str>,
+    legacy_reader: bool,
+) -> (Value, Vec<Value>) {
+    responses_result_for_input(
+        json!("Hello"),
+        tools,
+        output,
+        max_tool_calls,
+        expected_status,
+        stream,
+        final_answer_after,
+        finish_reasons,
+        legacy_reader,
+    )
+    .await
+}
+
+/// The same case under an `input` of its own: a request may declare tools inside an input item.
+#[expect(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::disallowed_methods,
@@ -67,7 +96,8 @@ async fn responses_result_with_final_answer(
     clippy::too_many_arguments,
     reason = "one case: its script, its request and its reader"
 )]
-async fn responses_result_with_finishes(
+async fn responses_result_for_input(
+    input: Value,
     tools: Value,
     output: Option<&str>,
     max_tool_calls: Option<u32>,
@@ -155,7 +185,7 @@ async fn responses_result_with_finishes(
     // storage on all of them, so a stored status that disagrees with the wire
     // (a failed tool loop stored as completed) is caught here.
     let request = serde_json::from_value(json!({
-        "model": MODEL, "input": "Hello", "stream": stream, "store": true,
+        "model": MODEL, "input": input, "stream": stream, "store": true,
         "max_output_tokens": 16, "tools": tools, "max_tool_calls": max_tool_calls,
     }))
     .unwrap();
@@ -1057,5 +1087,103 @@ async fn engine_error_never_dispatches_mcp_calls() {
         ).await;
         mcp.stop().await;
         assert_eq!(mcp.call_count(), 0);
+    }
+}
+
+/// A server call under `require_approval: always` is held, streamed or not: the tool does not
+/// run and its call closes as failed with the approval error. The same holds where the request
+/// declares the server inside an `additional_tools` input item and has no top-level `tools`.
+#[tokio::test]
+async fn a_call_that_waits_for_approval_does_not_run() {
+    for (in_input, stream) in [(false, false), (false, true), (true, false), (true, true)] {
+        let mut mcp = common::mock_mcp_server::MockMCPServer::start()
+            .await
+            .unwrap();
+        let server = json!([{"type":"mcp","server_label":"test-tools","server_url":mcp.url(),"require_approval":"always"}]);
+        let (input, tools) = if in_input {
+            let declared = json!({"type":"additional_tools","role":"developer","tools":server});
+            (
+                json!([declared, {"role":"user","content":"Hello"}]),
+                Value::Null,
+            )
+        } else {
+            (json!("Hello"), server)
+        };
+        let (response, _) = responses_result_for_input(
+            input,
+            tools,
+            Some("<tool_call>\n{\"name\":\"brave_web_search\"}\n</tool_call>\n"),
+            None,
+            "completed",
+            stream,
+            Some((1, "Final answer after tools")),
+            vec!["stop"],
+            false,
+        )
+        .await;
+        mcp.stop().await;
+
+        let pass = format!("in_input={in_input} stream={stream}: {response}");
+        assert_eq!(mcp.call_count(), 0, "{pass}");
+        let call = response["output"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|item| item["type"] == "mcp_call")
+            .unwrap_or(&Value::Null);
+        assert_eq!(call["status"], "failed", "{pass}");
+        assert!(
+            call["error"].to_string().contains("requires approval"),
+            "{pass}"
+        );
+    }
+}
+
+/// The object form of `require_approval` holds a call the same way, streamed or not: a tool
+/// its `always` filter names does not run and its call closes as failed with the approval
+/// error; a tool the filter does not name runs as it does with no approval asked.
+#[tokio::test]
+async fn a_call_an_always_filter_names_does_not_run() {
+    for (named, stream) in [(true, false), (true, true), (false, false), (false, true)] {
+        let mut mcp = common::mock_mcp_server::MockMCPServer::start()
+            .await
+            .unwrap();
+        let name = if named {
+            "brave_web_search"
+        } else {
+            "another_tool"
+        };
+        let (response, _) = responses_result_for_input(
+            json!("Hello"),
+            json!([{"type":"mcp","server_label":"test-tools","server_url":mcp.url(),"require_approval":{"always":{"tool_names":[name]}}}]),
+            Some("<tool_call>\n{\"name\":\"brave_web_search\"}\n</tool_call>\n"),
+            None,
+            "completed",
+            stream,
+            Some((1, "Final answer after tools")),
+            vec!["stop"],
+            false,
+        )
+        .await;
+        mcp.stop().await;
+
+        let pass = format!("named={named} stream={stream}: {response}");
+        let call = response["output"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|item| item["type"] == "mcp_call")
+            .unwrap_or(&Value::Null);
+        if named {
+            assert_eq!(mcp.call_count(), 0, "{pass}");
+            assert_eq!(call["status"], "failed", "{pass}");
+            assert!(
+                call["error"].to_string().contains("requires approval"),
+                "{pass}"
+            );
+        } else {
+            assert_eq!(mcp.call_count(), 1, "{pass}");
+            assert_eq!(call["status"], "completed", "{pass}");
+        }
     }
 }

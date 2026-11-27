@@ -1,7 +1,10 @@
 use std::{borrow::Cow, sync::Arc};
 
 use rmcp::model::{Tool, ToolAnnotations as RmcpToolAnnotations};
-use smg_mcp::ToolEntry;
+use smg_mcp::{
+    McpConfig, McpOrchestrator, McpServerBinding, ToolEntry, ToolExecutionInput,
+    ToolExecutionResult,
+};
 
 use super::*;
 
@@ -69,6 +72,98 @@ fn the_json_tool_info_is_the_typed_one() {
         assert_eq!(
             serde_json::to_string(&mcp_tool_info_json(&entry)).expect("a JSON info"),
             typed
+        );
+    }
+}
+
+/// Whether a call of `echo` and a call of `write` wait for an approval, in
+/// that order, once the `require_approval` of a request's one server entry
+/// is applied to a session that lists both tools.
+async fn waits_for_approval(require_approval: Value) -> [bool; 2] {
+    let orchestrator = McpOrchestrator::new(McpConfig::default())
+        .await
+        .expect("an orchestrator");
+    for name in ["echo", "write"] {
+        let tool = Tool::new(
+            Cow::Borrowed(name),
+            Cow::Borrowed("a tool"),
+            Arc::new(serde_json::Map::new()),
+        );
+        orchestrator
+            .tool_inventory()
+            .insert_entry(ToolEntry::from_server_tool("srv", tool));
+    }
+    let binding = McpServerBinding {
+        label: "tools".to_string(),
+        server_key: "srv".to_string(),
+        allowed_tools: None,
+        list_error: None,
+        pool_key: None,
+    };
+    let mut session = McpToolSession::new(&orchestrator, vec![binding], "test-request");
+    let entry: ResponseTool = serde_json::from_value(json!({
+        "type": "mcp",
+        "server_label": "tools",
+        "require_approval": require_approval,
+    }))
+    .expect("a server entry");
+    configure_response_tools_approval(&mut session, &[entry]);
+
+    let mut waits = [false; 2];
+    for (waits, name) in waits.iter_mut().zip(["echo", "write"]) {
+        let result = session
+            .execute_tool_result(ToolExecutionInput {
+                call_id: format!("call-{name}"),
+                tool_name: name.to_string(),
+                arguments: json!({}),
+            })
+            .await;
+        *waits = matches!(result, ToolExecutionResult::PendingApproval(_));
+    }
+    waits
+}
+
+/// The object form of `require_approval`: an `always` filter of names asks
+/// an approval of the named tools alone; one that reads `read_only`, or
+/// names nothing, asks it of every tool; a tool also under `never` is still
+/// asked for.
+#[tokio::test]
+async fn an_always_filter_asks_approval_of_the_tools_it_names() {
+    for (require_approval, waits) in [
+        (json!({"always": {"tool_names": ["echo"]}}), [true, false]),
+        (json!({"always": {"read_only": true}}), [true, true]),
+        (
+            json!({"always": {"read_only": false, "tool_names": ["echo"]}}),
+            [true, true],
+        ),
+        (json!({"always": {}}), [true, true]),
+        (
+            json!({"always": {"tool_names": ["echo"]}, "never": {"tool_names": ["echo", "write"]}}),
+            [true, false],
+        ),
+    ] {
+        assert_eq!(
+            waits_for_approval(require_approval.clone()).await,
+            waits,
+            "{require_approval}"
+        );
+    }
+}
+
+/// What asked no approval asks none: a `never` filter alone and the string
+/// `never`; the string `always` asks it of every tool.
+#[tokio::test]
+async fn a_never_filter_asks_no_approval_and_the_strings_ask_as_before() {
+    for (require_approval, waits) in [
+        (json!({"never": {"tool_names": ["echo"]}}), [false, false]),
+        (json!({"never": {}}), [false, false]),
+        (json!("never"), [false, false]),
+        (json!("always"), [true, true]),
+    ] {
+        assert_eq!(
+            waits_for_approval(require_approval.clone()).await,
+            waits,
+            "{require_approval}"
         );
     }
 }

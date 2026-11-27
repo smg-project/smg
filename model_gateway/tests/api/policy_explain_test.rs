@@ -521,7 +521,9 @@ async fn a_worker_is_sent_no_header_of_the_private_name() {
 /// decode of a pair record what they are sent of a generation request and
 /// of a count of tokens: each request carries the request-id header the
 /// client sent and none under the private name. Both requests are found by
-/// the client's id, with the prefill as the one target.
+/// the client's id, with the prefill as the one target. A count of tokens
+/// that states no id is found by the id its response's `x-request-id`
+/// header shows, and its worker is sent none under the private name.
 #[tokio::test]
 async fn a_pairs_workers_are_sent_no_header_of_the_private_name() {
     let mut config = RouterConfig::builder()
@@ -558,6 +560,10 @@ async fn a_pairs_workers_are_sent_no_header_of_the_private_name() {
         "model": RECORDED_MODEL,
         "messages": [{"role": "user", "content": "count me"}],
     });
+    // A count of tokens that states no id, sent behind the two that state one.
+    let mut unnamed = posted("/v1/messages/count_tokens", &count);
+    let private = HeaderValue::from_static("a-clients-value");
+    unnamed.headers_mut().insert(PRIVATE_HEADER, private);
     for (path, asked, id) in [
         ("/generate", generation, "explain-recorded-pair"),
         ("/v1/messages/count_tokens", count, "explain-recorded-count"),
@@ -571,6 +577,10 @@ async fn a_pairs_workers_are_sent_no_header_of_the_private_name() {
         let target = one_target(&app, id).await;
         assert_eq!(target, json!(prefill), "{path}");
     }
+    let (status, headers, answer) = sent(&app, unnamed).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let target = one_target(&app, &own_id(&headers)).await;
+    assert_eq!(target, json!(prefill), "no id stated");
 
     let (prefill_got, decode_got) = (prefill_got.lock().await, decode_got.lock().await);
     for (side, got) in [("prefill", &prefill_got), ("decode", &decode_got)] {
@@ -581,9 +591,9 @@ async fn a_pairs_workers_are_sent_no_header_of_the_private_name() {
         }
         assert!(!holds_the_private_header(got), "{side}: {:?}", listed(got));
     }
-    // A count of tokens goes to the prefill alone.
+    // Each count of tokens goes to the prefill alone.
     let counts = sent_to(&prefill_got, "/v1/messages/count_tokens");
-    assert_eq!(counts.len(), 1, "{:?}", listed(&prefill_got));
+    assert_eq!(counts.len(), 2, "{:?}", listed(&prefill_got));
     assert_eq!(counts[0]["x-request-id"], "explain-recorded-count");
     let counted_by_decode = sent_to(&decode_got, "/v1/messages/count_tokens");
     assert!(counted_by_decode.is_empty(), "{:?}", listed(&decode_got));

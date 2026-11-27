@@ -985,5 +985,5 @@ fn unread(refused: Refused) -> String {
 }
 
 #[cfg(test)]
-#[path = "../../../tests/unit/service/controller/standby/tests.rs"]
+#[path = "../../../tests/unit/service/controller/standby/tests/mod.rs"]
 mod tests;

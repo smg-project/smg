@@ -12,7 +12,7 @@ use crate::{
     engine::{
         decision::{
             Decision, LiftedVeto, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets,
-            Trace, MAX_TARGETS, TRACE_TOP,
+            Trace, CONTROLLER, MAX_TARGETS, TRACE_TOP,
         },
         decision_engine::{DecideOutcome, Leased, Request},
         demands::{Demands, References, UnmetDemand},
@@ -247,7 +247,7 @@ fn emptied_by(stage: &str) -> &'static str {
     successors(Some(UnmetDemand::Runtime), |demand| behind(*demand))
         .map(UnmetDemand::stage)
         .find(|kept| *kept == stage)
-        .unwrap_or("controller")
+        .unwrap_or(CONTROLLER)
 }
 
 /// The demand a host answers for behind `demand`, and none behind the

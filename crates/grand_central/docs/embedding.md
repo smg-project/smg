@@ -78,7 +78,8 @@ A host that keeps one `InProcess` for its life gives it a later spec with `InPro
 
 **What stands across the call.**
 
-- The session table and the record of sent prompts stand.
+- The session table stands.
+- The record of sent prefixes stands as a rule: [The record of sent prefixes](#the-record-of-sent-prefixes) names the new specs that can start one anew.
 - The stages of a profile whose name and text did not change stand too, with what they hold.
 - That holds where the new spec changes no `signals`, and its `view` is the same or differs in its header list alone.
 - A profile is built anew too where one of its stages, built again, describes itself otherwise than the standing one. A host's own factory may build such a stage.
@@ -179,12 +180,12 @@ For example, after the prefill is sent, call `guard.dispatched(sent_at)` and the
 - A pick carries the decode side's lease under the pair's id, and a shed carries none.
 - That lease keeps the generation and the time of the pair's first issue.
 - The guard counts the decode's dispatch from the first decision.
-- Behind a new spec the engine in force decides the side. It tells the issue to the stages it kept since the pair's spec, on a controller and in its host's own process alike.
+- Behind a new spec the engine in force decides the side. It tells the issue to the stages it kept since the pair's spec that name it, on a controller and in its host's own process alike.
 - A refusal comes back as `DecisionRefused::Decode` with its reason, and a decision that panics as `DecisionRefused::Faulted`.
 
 ### What a stage hears
 
-- A scorer or a picker hears a side's issue and its dispatch unless the sessions rule keeps that side's pick from the profile, or a stage panics as below. Each side of a pair answers for itself.
+- A scorer or a picker hears a side's issue and its dispatch only where it names them (`Lifecycle::hears`). It hears them then unless the sessions rule keeps that side's pick from the profile, or a stage panics as below. Each side of a pair answers for itself.
 - A plugin bound as a scorer or a picker hears the events its spec lists (`PluginSpec::observes`, `GrpcPluginSpec::observes`), and none by default.
 - A filter hears no word of a lease.
 - A stage that keeps state by issue hears the issue of each decode it is told of, before that decode's dispatch.
@@ -346,22 +347,22 @@ The lists below take the rows in that order.
 
 ### The record of sent prefixes
 
-- A standalone controller's engine keeps a record of the prefixes sent to its workers. It keeps one for a pool whose prefix stage reads sent prefixes, under an index of the kind `tree`.
+- A standalone controller's engine keeps a record of the prefixes sent to its workers. It keeps the records by model, for a pool whose prefix stage reads sent prefixes.
 - A stage that says `source: index` reads cache events alone, and no such record.
 - A decision can write a placement there: a single request's, and each side of a pair's.
 - It writes for the first target its maker says the caller sends to. On the stock controller that is the pick's first. Under an encode request it writes none where the maker says the caller sends to a placed encoder no more.
 - It writes none for a pick the sessions rule keeps from the profile.
-- The record has room for `max_size` over the block size placements, and for one at least.
+- A model's record takes its room from the index's `max_size`, and has room for one placement at least. The index's `kind` says how the record is keyed. [Index](policy-spec.md#index) has both rules.
 - A placement is a prediction made at the decision.
 - A decision turned back after its lease's issue keeps the placement it wrote. A later request with that prefix can read it as a predicted hit, which must exceed the stage's `threshold`.
 - A decision does not wait to write its placement: a write that meets the record's lock held is kept by its thread and written behind the thread's next picks. A write that eight newer ones push out, or that its thread ends with, is left out.
 - Which record names a request's holders, this one or the model's KV tables, is by the profile's prefix stages and by the request. [The cache records](design.md#45-the-cache-records) in the design has the rule.
 - The store tells the engine each word of its membership. The record forgets a worker that left, was replaced, stopped serving a model or changed its role.
-- The record stands across a new spec.
+- As a rule the record stands across a new spec. A new spec can start a model's record anew: one that states another `kind` for the model's index, or other `view.boundaries` under a `hash` index.
 - A standby starts with an empty record.
-- A text request is recorded as a token request is, by the hashes of its windows.
+- Under a `tree` index a text request is recorded as a token request is, by the hashes of its windows. Under `hash` it is not recorded.
 - Readers of the record wait for a writer. Under many callers that never pause, a fleet whose requests mostly grow decides slower than one that reads no record.
-- A host with a store of its own keeps the same record with the crate's `PrefixPredictor`. It folds a request's keys once (`PrefixPredictor::fold_into`), reads by a shared reference, and writes with a tick of the host's clock.
+- A host with a store of its own keeps a `tree` index's record with the crate's `PrefixPredictor`. It folds a request's keys once (`PrefixPredictor::fold_into`), reads by a shared reference, and writes with a tick of the host's clock.
 
 ### Hashing a request
 

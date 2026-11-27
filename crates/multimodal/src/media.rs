@@ -5265,6 +5265,7 @@ pub(crate) fn decode_frame_bytes(
                         .with_guessed_format()
                         .map_err(MediaConnectorError::Io)?;
                     let is_png = reader.format() == Some(image::ImageFormat::Png);
+                    let is_bmp = reader.format() == Some(image::ImageFormat::Bmp);
                     let mut decoder = reader.into_decoder()?;
                     // `ImageReader::decode` reserves the decoded buffer against the
                     // crate's allocation limit (512 MiB by default) before it
@@ -5278,8 +5279,18 @@ pub(crate) fn decode_frame_bytes(
                     let orientation = decoder
                         .orientation()
                         .unwrap_or(image::metadata::Orientation::NoTransforms);
+                    // A bitmap of the plain kind is read here, behind the
+                    // decoder's own reading of the header and the reservation
+                    // above; any other one stays with the decoder.
+                    let plain_bmp = if is_bmp {
+                        plain_bmp_into_pool(bytes, decoder.dimensions())
+                    } else {
+                        None
+                    };
                     let image = if is_png {
                         png_into_pool(decoder)?
+                    } else if let Some(image) = plain_bmp {
+                        image
                     } else {
                         image::DynamicImage::from_decoder(decoder)?
                     };
@@ -5339,6 +5350,86 @@ fn png_into_pool(decoder: impl image::ImageDecoder) -> image::ImageResult<image:
             image::error::ParameterErrorKind::DimensionMismatch,
         ))
     })
+}
+
+/// What `DynamicImage::from_decoder` returns for a bitmap of the plain kind,
+/// with the pixels in a buffer of the pool: an info header (of 40, 52, 56,
+/// 108 or 124 bytes, which the `image` crate reads alike), one plane, 24 bits
+/// a pixel, no compression, and every row with its padding inside the file.
+/// A row is stored blue first and padded to four bytes, the bottom row first
+/// unless the height is negative; each goes to its place in one pass, where
+/// the crate's decoder makes a read call and a reverse for every pixel into
+/// a fresh zeroed vector.
+///
+/// `dimensions` is what the crate's decoder read from the same header, and
+/// the caller has reserved the image against the allocation limit. `None`
+/// for any other bitmap (a palette, a run-length or bit-field compression,
+/// 16 or 32 bits a pixel, the 12-byte header), for a header that does not
+/// give `dimensions` and for a file short of its rows: the crate's decoder
+/// then reads or refuses it as before.
+fn plain_bmp_into_pool(bytes: &[u8], dimensions: (u32, u32)) -> Option<image::DynamicImage> {
+    // The file header (14 bytes) and the first 40 bytes of the info header,
+    // the part every size of it shares.
+    let header = bytes.get(..54)?;
+    let word = |at: usize| -> Option<[u8; 4]> { header.get(at..at + 4)?.try_into().ok() };
+    let plain = header.starts_with(b"BM")
+        && matches!(u32::from_le_bytes(word(14)?), 40 | 52 | 56 | 108 | 124)
+        // One plane and 24 bits a pixel, then no compression.
+        && word(26)? == [1, 0, 24, 0]
+        && word(30)? == [0; 4];
+    if !plain {
+        return None;
+    }
+    let (width, height) = dimensions;
+    let stored_height = i32::from_le_bytes(word(22)?);
+    let as_declared = u32::try_from(i32::from_le_bytes(word(18)?)) == Ok(width)
+        && stored_height.unsigned_abs() == height;
+    if !as_declared || width == 0 || height == 0 {
+        return None;
+    }
+    let row_len = usize::try_from(width).ok()?.checked_mul(3)?;
+    let rows = usize::try_from(height).ok()?;
+    // A stored row is padded to a multiple of four bytes.
+    let stride = row_len.checked_add(3)? & !3;
+    let offset = usize::try_from(u32::from_le_bytes(word(10)?)).ok()?;
+    let stored = bytes.get(offset..)?.get(..stride.checked_mul(rows)?)?;
+    let mut pixels = buffer_pool::take(row_len.checked_mul(rows)?);
+    bgr_rows_into_rgb(stored, stride, stored_height < 0, row_len, &mut pixels);
+    image::RgbImage::from_raw(width, height, pixels).map(image::DynamicImage::ImageRgb8)
+}
+
+/// The stored rows of a 24-bit bitmap (`stride` bytes each, blue first, the
+/// top row first when `top_down`) into `pixels` (`row_len` bytes a row, red
+/// first, the top row first). The pixel loop is a fixed permutation of three
+/// bytes, which the compiler turns into byte shuffles where the target has
+/// them: `multiversion` compiles the function with AVX2 and without and
+/// selects the clone at the first call.
+#[cfg_attr(
+    target_arch = "x86_64",
+    multiversion::multiversion(targets("x86_64+avx2"))
+)]
+fn bgr_rows_into_rgb(
+    stored: &[u8],
+    stride: usize,
+    top_down: bool,
+    row_len: usize,
+    pixels: &mut [u8],
+) {
+    let rows = pixels.len() / row_len;
+    for (y, row) in pixels.chunks_exact_mut(row_len).enumerate() {
+        let from_top = if top_down { y } else { rows - 1 - y };
+        let Some(stored) = stored.chunks_exact(stride).nth(from_top) else {
+            return;
+        };
+        for (pixel, &[blue, green, red]) in row
+            .as_chunks_mut::<3>()
+            .0
+            .iter_mut()
+            .zip(stored.as_chunks::<3>().0)
+        {
+            *pixel = [red, green, blue];
+        }
+    }
 }
 
 /// The four bytes that open an icon file (reserved 0, type 1), the magic the

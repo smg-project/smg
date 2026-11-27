@@ -136,14 +136,14 @@ Other readers follow their own rules:
 | Field | What it holds | Default |
 |---|---|---|
 | `kind` | `tree` or `hash`. | `tree` |
-| `ttl_s` | How many seconds a `hash` placement lives. | 180 |
-| `max_size` | The size bound of a `tree`. | 67108864 |
+| `ttl_s` | How many seconds a placement of the classic hash index lives. The crate's engine does not read it: no placement of its record expires. | 180 |
+| `max_size` | The size bound of a `tree`. The crate's engine bounds its record by it under either kind. | 67108864 |
 | `sweep_s` | How many seconds pass between sweeps. | 120 |
 
-Each number is above zero. `max_size` counts a tree in one of two ways:
+Each number is above zero. `max_size` counts a tree in one of two ways, summed over the workers, so a prefix that several workers hold counts once for each of them:
 
-- For text, it counts the characters, plus 1024 for each node a worker stands on.
-- Otherwise it counts the tokens.
+- For text, it counts the characters of the nodes each worker stands on, plus 1024 for each such node.
+- Otherwise it counts the tokens each worker holds.
 
 Where several patterns match one model, the most specific wins:
 
@@ -155,11 +155,15 @@ A spec that holds a `prefix*` and a `*suffix` of equal length is refused.
 
 A host can read these settings for an index of its own. The gateway does: at each sweep it trims each tree of a model toward `max_size`, each tree by itself. Writes take a tree past it until the next sweep. At a `sweep_s` of 4294967295 it starts no sweep, and a tree under that entry is held to no size. The engine's record keeps its bound at any cadence.
 
+The gateway's flags write an index they never sweep with that cadence. A `tree` then states the largest size, 18446744073709551615, and a `hash` keeps the size the flags name.
+
 The crate's engine reads `kind` and `max_size` alone, for a pool whose profile reads sent prefixes:
 
-- Under `tree`, the engine bounds the model's record of sent prefixes at `max_size` divided by the block size. The record holds one placement for each block a worker was sent.
+- Under `tree`, the engine bounds the model's record of sent prefixes at `max_size` divided by the block size, and at one placement at least. The record holds one placement for each block a worker was sent.
 - At the defaults that is 4,194,304 placements. The record takes about 55 bytes a block, so about 230 MB a model.
-- Under `hash`, the pool keeps no record.
+- Under `hash`, the engine keeps the same record under the same bound, keyed at `view.boundaries` alone. For a request of token ids it holds one placement at most for each boundary and each worker sent the request.
+- Under `hash`, a request that carries fewer block hashes than the first boundary has whole blocks, or one hashed by its text, is recorded nowhere.
+- A boundary of more whole blocks than `max_block_hashes` keys nothing. A key ends at the last whole block under its boundary, and a request that holds those blocks reaches it. As a rule every worker sent a head stays its holder until the bound takes the placement.
 - The entry read is the one for the model the request names, under the id by which the first worker of its list lists that model. A model that workers list behind their primary one keeps its own record under its own entry.
 - A record read for a model behind a first worker's primary one is bounded by the smallest block size any list asked with, for as long as it lives.
 - An id and an alias of one model share one record. A name no model of that worker answers to reads the record and the entry of the worker's primary model id.
@@ -266,6 +270,7 @@ A binding with no block says the defaults.
 `bindings[].sessions` configures sticky placement. The rule pins a key to a worker, and a later request of the key follows that pin where it can. Among what sends it elsewhere: the rule's cap, a filter that refuses the worker for that request, and a target entry that names another worker.
 
 - The rule runs under `single`. It also runs on the two sides of `pd-pair` and of the pair in `epd`, each side by its own session.
+- Under `pd-pair` a rule's `sides` can name the one side it covers, `prefill` or `decode`. A side it leaves out is placed by its profile alone, and the rule reads, claims and writes no pin of that side's session.
 - Under `epd` it places no encode item.
 - A picker that places by session assignment runs on the pair's two sides of `epd`, and is refused on its encode side.
 - The stock controller refuses a rule that states `rule_placed: untold` under `pd-pair` and under `epd`.
@@ -280,6 +285,7 @@ A binding with no block says the defaults.
 | `inflight_cap` | 2 | Requests of one key a worker holds before the next is placed again. Above zero. 65535 means no cap. |
 | `recovery` | `original` | Which pin leads once both of a key's pins are usable again. |
 | `rule_placed` | `told` | Whether a request the rule placed alone is the profile's own. |
+| `sides` | Left out: both sides | Under `pd-pair`, the sides the rule covers: `prefill`, `decode` or both, each once. An empty list is refused. So is any list under `single` and under `epd`. |
 | `issue_session_id` | `false` | `true` is refused. |
 
 **The assignment.**

@@ -3,18 +3,20 @@
 
 use std::sync::Arc;
 
-use smg_grpc_client::tokenspeed_encoder::TokenSpeedEncoderClient;
 use smg_worker::{
     identity::basic::Worker,
     registry::{event::WorkerEvent, WorkerId, WorkerOrigin},
 };
 use tokio::sync::broadcast::error::RecvError;
 
-use super::steps::local::{submit_tokenizer_job::submit_tokenizer_job, ReleaseTokenizerStep};
+use super::steps::local::{
+    submit_tokenizer_job::submit_tokenizer_job, ReleaseTokenizerStep, RemoveFromPolicyRegistryStep,
+};
 use crate::app_context::AppContext;
 
-/// Spawns the task that follows the registry's events. It walks the registry
-/// at its start and after a lag, when an event had no reader.
+/// Spawns the task that follows the registry's events. With tokenizer
+/// autoload on it also walks the registry at its start and after a lag, when
+/// an event had no reader; with autoload off it walks nothing.
 pub(crate) fn spawn_worker_event_reactions(app_context: &Arc<AppContext>) {
     // With autoload off the gateway manages no tokenizer: the task then
     // follows the removals alone.
@@ -33,10 +35,15 @@ pub(crate) fn spawn_worker_event_reactions(app_context: &Arc<AppContext>) {
             };
             // The removal workflow's step drops the encode connections pooled
             // to its worker's URL; a worker a peer's tombstone took ran none.
-            // A removal lost in a lag keeps its pool: the walk below cannot
-            // name the URLs that left.
+            // A URL a worker stands under again by the time this event is read
+            // keeps its pool, the connections dialled before the removal
+            // included. A removal lost in a lag keeps its pool: the walk below
+            // cannot name the URLs that left.
             if let Some(WorkerEvent::Removed { worker, .. }) = &event {
-                TokenSpeedEncoderClient::forget_cached(worker.url());
+                RemoveFromPolicyRegistryStep::forget_encode_pool_if_unserved(
+                    &context.worker_registry,
+                    worker.url(),
+                );
             }
             match event {
                 _ if !manages_tokenizers => {}

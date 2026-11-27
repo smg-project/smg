@@ -126,6 +126,8 @@ pub struct Assembler {
     /// records nothing and `value` stays empty, so a request without the option pays nothing
     /// per piece for the runs.
     tracked: bool,
+    /// Whether the objects start their calls at the name (`Declared::calls_start_at_name`).
+    at_name: bool,
 }
 
 /// What frames the calls: how the first byte that is not whitespace reads, and what text in place
@@ -216,6 +218,7 @@ impl Assembler {
             separated: false,
             value: Vec::new(),
             tracked: false,
+            at_name: false,
         }
     }
 
@@ -506,7 +509,9 @@ impl Assembler {
         self.released = false;
         let index = self.next_index;
         self.objects += 1;
-        self.stage = Stage::Object(Box::new(json::Assembler::new(index, self.ids.id(index))));
+        let mut object = json::Assembler::new(index, self.ids.id(index));
+        object.start_at_name(self.at_name);
+        self.stage = Stage::Object(Box::new(object));
     }
 
     /// The bytes held and `text` are not a list of calls: content under the bare list, malformed
@@ -540,6 +545,11 @@ impl crate::engine::CallAssembler for Assembler {
     ) -> usize {
         self.feed(text, out);
         text.len()
+    }
+
+    /// Every object of the list starts its call at the name from here on.
+    fn start_at_name(&mut self) {
+        self.at_name = true;
     }
 
     /// Between markers the region's closing marker closes it, wherever it stands. With no
@@ -1244,5 +1254,27 @@ mod tests {
             assert_eq!(bytes(&events), LIST, "cut at {cut}");
             assert_eq!(calls(&events), whole, "cut at {cut}");
         }
+    }
+
+    #[test]
+    fn a_list_starts_its_objects_at_the_name_under_an_engine_that_starts_calls_there() {
+        use crate::engine::CallAssembler;
+        let started = |at_name: bool| {
+            let mut assembler = Assembler::new(0, ids(), Framing::Bare);
+            if at_name {
+                CallAssembler::start_at_name(&mut assembler);
+            }
+            let mut out = Events::new();
+            let piece = "[{\"name\": \"get_weather\"";
+            assembler.feed(piece, &mut out);
+            out.as_slice().iter().any(
+                |event| matches!(event, Event::ToolCallStart { name, .. } if name == "get_weather"),
+            )
+        };
+        assert!(started(true), "the name is whole");
+        assert!(
+            !started(false),
+            "by default the start waits for the arguments"
+        );
     }
 }

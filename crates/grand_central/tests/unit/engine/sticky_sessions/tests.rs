@@ -12,6 +12,7 @@ const RULE: SessionRule = SessionRule {
     sweep_micros: 100,
     recovery: Recovery::Latest,
     rule_placed: RulePlaced::Told,
+    sides: SessionSides::Any,
 };
 
 const ORIGINAL: SessionRule = SessionRule {
@@ -1087,6 +1088,28 @@ fn a_moved_claim_keeps_the_instant_of_its_decisions_lease() {
     assert_eq!(table.pins(s(1)), Some([id(0); 2]), "its own");
 }
 
+/// A withdrawn claim leaves no mark for its lease's next word. A commit
+/// every target refused withdraws its decision's claim. Another decision
+/// is served elsewhere, and a third meets that pin at its cap and moves
+/// to the worker the claim was on. The refusal told again finds no claim
+/// of record, and the move's pin stands.
+#[test]
+fn a_withdrawn_claims_lease_told_again_moves_nothing() {
+    let (id, pinned) = (WorkerId, SessionVerdict::Pinned);
+    let table = SessionTable::new(RULE.sweep_micros);
+    let seen = table.lookup(s(1), 10, &RULE);
+    assert_eq!(table.claim(s(1), seen, id(2), 10), Claim::Made(id(2)));
+    assert_eq!(table.move_claim(s(1), id(2), id(0), 10), pinned);
+    assert_eq!(table.pins(s(1)), Some([id(0); 2]));
+    table.lookup(s(1), 20, &RULE);
+    table.dispatched(s(1), pinned, id(3), 20);
+    table.lookup(s(1), 30, &RULE);
+    table.respilled(s(1), id(2), 30);
+    assert_eq!(table.pins(s(1)), Some([id(2), id(3)]));
+    assert_eq!(table.move_claim(s(1), id(2), id(0), 10), pinned);
+    assert_eq!(table.pins(s(1)), Some([id(2), id(3)]), "the move's pin");
+}
+
 /// The claim's date is the low 32 bits of its lease's instant, so the
 /// map's slot keeps its 72 bytes: eight for the key and 64 for its entry,
 /// whose fields take 61. Two claims of one key on one worker a whole 2^32
@@ -1122,16 +1145,16 @@ fn a_decode_calls_claim_takes_the_date_of_its_pairs_lease() {
     assert_eq!(table.claim(s(1), seen, id(2), 40), Claim::Made(id(2)));
     // A lease that states no instant dates nothing: a word of the
     // call's own date still reaches the claim.
-    table.told_under(s(1), Some(id(2)), 40, 0);
+    table.told_under(s(1), Some(id(2)), 40, 0, id(0));
     assert_eq!(table.move_claim(s(1), id(2), id(0), 40), pinned);
     assert_eq!(table.pins(s(1)), Some([id(0); 2]), "the call's date");
     assert_eq!(table.claim(s(1), seen, id(2), 40), Claim::Made(id(2)));
     // A write that names another worker dates no claim.
-    table.told_under(s(1), Some(id(3)), 40, 10);
+    table.told_under(s(1), Some(id(3)), 40, 10, id(0));
     assert_eq!(table.move_claim(s(1), id(2), id(0), 10), pinned);
     assert_eq!(table.pins(s(1)), Some([id(2), id(0)]), "dated by the call");
     // The call's own claim takes the lease's date.
-    table.told_under(s(1), Some(id(2)), 40, 10);
+    table.told_under(s(1), Some(id(2)), 40, 10, id(0));
     assert_eq!(table.move_claim(s(1), id(2), id(0), 40), pinned);
     assert_eq!(
         table.pins(s(1)),
@@ -1143,13 +1166,13 @@ fn a_decode_calls_claim_takes_the_date_of_its_pairs_lease() {
     // Another decision claims 2 at 50, ahead of a call's second write:
     // that claim keeps its own date.
     assert_eq!(table.claim(s(1), seen, id(2), 50), Claim::Made(id(2)));
-    table.told_under(s(1), Some(id(2)), 40, 10);
+    table.told_under(s(1), Some(id(2)), 40, 10, id(0));
     assert_eq!(table.move_claim(s(1), id(2), id(0), 10), pinned);
     assert_eq!(table.pins(s(1)), Some([id(2), id(0)]), "another's claim");
     assert_eq!(table.move_claim(s(1), id(2), id(0), 50), pinned);
     assert_eq!(table.pins(s(1)), Some([id(0); 2]), "its own lease's");
     // A key the table does not hold is not written.
-    table.told_under(s(9), Some(id(2)), 40, 10);
+    table.told_under(s(9), Some(id(2)), 40, 10, id(0));
     assert_eq!(table.len(), 1);
 }
 
@@ -1288,7 +1311,7 @@ fn a_decode_calls_dispatch_is_written_under_its_pairs_lease() {
     let seen = table.lookup(s(7), 5_000, &RULE);
     assert_eq!(seen, [id(0); 2], "the key started over");
     assert_eq!(table.claim(s(7), seen, id(2), 5_000), Claim::Made(id(2)));
-    table.told_under(s(7), Some(id(2)), 5_000, 10);
+    table.told_under(s(7), Some(id(2)), 5_000, 10, id(0));
     table.dispatched(s(7), SessionVerdict::Claimed(id(2)), id(3), 10);
     assert_eq!(table.pins(s(7)), Some([id(3), id(0)]), "with a claim");
 
@@ -1301,11 +1324,11 @@ fn a_decode_calls_dispatch_is_written_under_its_pairs_lease() {
     assert_eq!(table.pins_renewed(s(7), 4_500, &RULE), [id(2), id(0)]);
     // A lease that states no instant is no reader's date, and neither is
     // a call's with no key.
-    table.told_under(s(7), None, 4_500, 0);
-    table.told_under(s(0), None, 4_500, 10);
+    table.told_under(s(7), None, 4_500, 0, id(0));
+    table.told_under(s(0), None, 4_500, 10, id(0));
     table.dispatched(s(7), SessionVerdict::Pinned, id(3), 10);
     assert_eq!(table.pins(s(7)), Some([id(2), id(0)]), "not told yet");
-    table.told_under(s(7), None, 4_500, 10);
+    table.told_under(s(7), None, 4_500, 10, id(0));
     table.dispatched(s(7), SessionVerdict::Pinned, id(3), 10);
     assert_eq!(table.pins(s(7)), Some([id(3), id(2)]), "with no claim");
     // The date fell to the lease's and no lower: a word one microsecond
@@ -1314,7 +1337,7 @@ fn a_decode_calls_dispatch_is_written_under_its_pairs_lease() {
     assert_eq!(table.pins(s(7)), Some([id(3), id(2)]), "one before");
     // A later call under a newer lease leaves the oldest reader's date
     // where it stands: a word of the first call is still written.
-    table.told_under(s(7), None, 4_600, 3_000);
+    table.told_under(s(7), None, 4_600, 3_000, id(0));
     table.dispatched(s(7), SessionVerdict::Pinned, id(4), 10);
     assert_eq!(table.pins(s(7)), Some([id(4), id(3)]), "never rises");
     assert_eq!(table.len(), 1);
@@ -1432,13 +1455,334 @@ fn a_decode_calls_date_is_written_into_no_life_the_call_did_not_read() {
     table.lookup(s(7), 20, &RULE);
     let seen = table.lookup(s(7), 5_000, &RULE);
     assert_eq!(table.claim(s(7), seen, id(2), 5_000), Claim::Made(id(2)));
-    table.told_under(s(7), None, 20, 10);
+    table.told_under(s(7), None, 20, 10, id(0));
     table.dispatched(s(7), SessionVerdict::Pinned, id(3), 10);
     assert_eq!(table.pins(s(7)), Some([id(2), id(0)]), "not its life");
     // A call of 5,000, the instant the new life began at, read it.
-    table.told_under(s(7), None, 5_000, 10);
+    table.told_under(s(7), None, 5_000, 10, id(0));
     table.dispatched(s(7), SessionVerdict::Pinned, id(3), 10);
     assert_eq!(table.pins(s(7)), Some([id(3), id(2)]), "its life");
+}
+
+/// A decode call that claims another worker than its pair's first decision
+/// claimed takes the key with it at its dispatch: the lease's dispatch on
+/// the call's worker withdraws the first claim, which no request was sent
+/// on. Until then the key holds both. A first decision that claimed
+/// nothing leaves its worker a pin, and so does another request sent
+/// there ahead of the call's dispatch. The lease's dispatch on the first
+/// claim's worker, behind a call taken back, withdraws the call's claim,
+/// where another request sent there at the lease's instant withdraws
+/// none, and the lease's refusal takes the call's claim back alone. A
+/// decode sent on another target of the call's pick, and a pin moved
+/// between the call's dating and the lease's dispatch, read as any claim
+/// and pin do.
+#[test]
+fn a_decode_calls_dispatch_takes_the_keys_pin_with_it_from_its_leases_first_claim() {
+    let (id, claimed) = (WorkerId, SessionVerdict::Claimed);
+    // The pair's lease is of 10: its first decision claims 2, and its
+    // decode call claims 3 at 40. The rule fronts the newer worker.
+    let called = |first: WorkerId| {
+        let table = SessionTable::new(RULE.sweep_micros);
+        let seen = table.lookup(s(1), 10, &RULE);
+        assert_eq!(table.claim(s(1), seen, id(2), 10), Claim::Made(id(2)));
+        let seen = table.lookup(s(1), 40, &RULE);
+        assert_eq!(table.claim(s(1), seen, id(3), 40), Claim::Made(id(3)));
+        table.told_under(s(1), Some(id(3)), 40, 10, first);
+        assert_eq!(table.pins(s(1)), Some([id(3), id(2)]), "behind the call");
+        table
+    };
+    // The call's decode is dispatched: the key holds it alone.
+    let table = called(id(2));
+    table.dispatched(s(1), claimed(id(3)), id(3), 10);
+    assert_eq!(table.pins(s(1)), Some([id(3), id(0)]), "the call's worker");
+    // The first decision followed a pin: its worker stays.
+    let table = called(id(0));
+    table.dispatched(s(1), claimed(id(3)), id(3), 10);
+    assert_eq!(table.pins(s(1)), Some([id(3), id(2)]), "no first claim");
+    // Another request is sent to the first worker ahead of the call's
+    // dispatch: the key was served there.
+    let table = called(id(2));
+    table.dispatched(s(1), SessionVerdict::Pinned, id(2), 20);
+    table.dispatched(s(1), claimed(id(3)), id(3), 10);
+    assert_eq!(
+        table.pins(s(1)),
+        Some([id(3), id(2)]),
+        "served on the first"
+    );
+    // The call is taken back and the lease's first decode is sent: the
+    // call's claim leaves.
+    let table = called(id(2));
+    table.dispatched(s(1), claimed(id(2)), id(2), 10);
+    assert_eq!(table.pins(s(1)), Some([id(2), id(0)]), "the first worker");
+    // Another request of the lease's instant is sent to the first worker:
+    // it claimed nothing there, and the call's claim stands.
+    let table = called(id(2));
+    table.dispatched(s(1), SessionVerdict::Pinned, id(2), 10);
+    assert_eq!(
+        table.pins(s(1)),
+        Some([id(3), id(2)]),
+        "another request of the instant"
+    );
+    // The lease's decode is sent on another target of the call's pick: the
+    // call's claim leaves, as a decision's does that goes elsewhere, and
+    // the first claim stays a pin.
+    let table = called(id(2));
+    table.dispatched(s(1), claimed(id(3)), id(4), 10);
+    assert_eq!(table.pins(s(1)), Some([id(4), id(2)]), "another target");
+    // A move fronts a third worker between the call's dating and the
+    // lease's dispatch: the tie ends there, and the dispatch on the call's
+    // worker withdraws no pin.
+    let table = called(id(2));
+    table.respilled(s(1), id(4), 0);
+    table.dispatched(s(1), claimed(id(3)), id(3), 10);
+    assert_eq!(table.pins(s(1)), Some([id(4), id(3)]), "behind a move");
+    // The lease's refusal takes the call's claim back alone.
+    let table = called(id(2));
+    assert_eq!(
+        table.move_claim(s(1), id(3), id(0), 10),
+        SessionVerdict::Pinned
+    );
+    assert_eq!(table.pins(s(1)), Some([id(2), id(0)]), "the refusal");
+    // Another request is sent to the first worker between the call's
+    // claim and its dating: the key was served there, and nothing is tied.
+    let table = SessionTable::new(RULE.sweep_micros);
+    let seen = table.lookup(s(1), 10, &RULE);
+    assert_eq!(table.claim(s(1), seen, id(2), 10), Claim::Made(id(2)));
+    let seen = table.lookup(s(1), 40, &RULE);
+    assert_eq!(table.claim(s(1), seen, id(3), 40), Claim::Made(id(3)));
+    table.dispatched(s(1), SessionVerdict::Pinned, id(2), 20);
+    table.told_under(s(1), Some(id(3)), 40, 10, id(2));
+    table.dispatched(s(1), claimed(id(3)), id(3), 10);
+    assert_eq!(
+        table.pins(s(1)),
+        Some([id(3), id(2)]),
+        "served ahead of the dating"
+    );
+}
+
+/// A move at the cap onto the worker that leads a key's pins writes no pin,
+/// and it ends the tie of a decode call's claim and its lease's first claim
+/// all the same, under either recovery: the lease's dispatch behind it takes
+/// back neither pin, on the call's worker or on the first one. So does a
+/// move that comes between the call's claim and its dating.
+#[test]
+fn a_move_onto_the_leading_worker_keeps_both_pins_behind_the_leases_dispatch() {
+    let (id, claimed) = (WorkerId, SessionVerdict::Claimed);
+    // The pair's lease is of 10: its first decision claims 2, and its
+    // decode call claims 3 at 40. The pins behind the call's claim, by
+    // the rule: the newer worker fronted, or appended.
+    for (rule, both) in [(&RULE, [id(3), id(2)]), (&ORIGINAL, [id(2), id(3)])] {
+        let claims = || {
+            let table = SessionTable::new(rule.sweep_micros);
+            let seen = table.lookup(s(1), 10, rule);
+            assert_eq!(table.claim(s(1), seen, id(2), 10), Claim::Made(id(2)));
+            let seen = table.lookup(s(1), 40, rule);
+            assert_eq!(table.claim(s(1), seen, id(3), 40), Claim::Made(id(3)));
+            table
+        };
+        let called = || {
+            let table = claims();
+            table.told_under(s(1), Some(id(3)), 40, 10, id(2));
+            assert_eq!(table.pins(s(1)), Some(both), "behind the call");
+            table
+        };
+        // A request decided at 20 moves onto the worker that leads, and
+        // the call's decode is dispatched.
+        let table = called();
+        table.respilled(s(1), both[0], 20);
+        table.dispatched(s(1), claimed(id(3)), id(3), 10);
+        assert_eq!(table.pins(s(1)), Some(both), "the call's worker");
+        // The call is taken back and the lease's first decode is sent.
+        let table = called();
+        table.respilled(s(1), both[0], 20);
+        table.dispatched(s(1), claimed(id(2)), id(2), 10);
+        assert_eq!(table.pins(s(1)), Some(both), "the first worker");
+        // The move comes between the call's claim and its dating.
+        let table = claims();
+        table.respilled(s(1), both[0], 20);
+        table.told_under(s(1), Some(id(3)), 40, 10, id(2));
+        table.dispatched(s(1), claimed(id(3)), id(3), 10);
+        assert_eq!(table.pins(s(1)), Some(both), "ahead of the dating");
+    }
+}
+
+/// A request that followed the pin of a lease's first claim and is sent
+/// there behind that lease's dispatch on its decode call's worker puts the
+/// pin back where it stood, under either recovery: the key was served on
+/// both workers. A dispatch on a third worker between the two moves the
+/// pins by the rule, and the request sent on the first worker then joins
+/// them as any worker does. A respill on the call's worker between the two
+/// fronts it over the pin, at its decision as at its dispatch. The pin
+/// follows its worker's rename, and a forgotten worker's is not put back.
+#[test]
+fn a_decode_calls_dispatch_leaves_the_pin_of_a_request_that_followed_the_first_claim() {
+    let (id, claimed) = (WorkerId, SessionVerdict::Claimed);
+    let (pinned, respill) = (SessionVerdict::Pinned, SessionVerdict::Respill);
+    // The pair's lease is of 10: its first decision claims 2, its decode
+    // call claims 3 at 40, and the lease's decode is sent on 3.
+    let sent = |rule: &SessionRule| {
+        let table = SessionTable::new(rule.sweep_micros);
+        let seen = table.lookup(s(1), 10, rule);
+        assert_eq!(table.claim(s(1), seen, id(2), 10), Claim::Made(id(2)));
+        let seen = table.lookup(s(1), 40, rule);
+        assert_eq!(table.claim(s(1), seen, id(3), 40), Claim::Made(id(3)));
+        table.told_under(s(1), Some(id(3)), 40, 10, id(2));
+        table.dispatched(s(1), claimed(id(3)), id(3), 10);
+        assert_eq!(table.pins(s(1)), Some([id(3), id(0)]), "the call's worker");
+        table
+    };
+    // The pins behind the call's claim, by the rule: the newer worker
+    // fronted, or appended.
+    for (rule, both) in [(&RULE, [id(3), id(2)]), (&ORIGINAL, [id(2), id(3)])] {
+        // The request that followed 2 at 20 is sent there.
+        let table = sent(rule);
+        table.dispatched(s(1), pinned, id(2), 20);
+        assert_eq!(table.pins(s(1)), Some(both), "where it stood");
+        // A request is sent on a third worker between the two.
+        let table = sent(rule);
+        table.dispatched(s(1), pinned, id(4), 30);
+        table.dispatched(s(1), pinned, id(2), 20);
+        let joined = match rule.recovery {
+            Recovery::Latest => [id(2), id(4)],
+            Recovery::Original => [id(4), id(2)],
+        };
+        assert_eq!(table.pins(s(1)), Some(joined), "behind a third worker");
+        // A respill lands on the call's worker between the two.
+        let table = sent(rule);
+        table.dispatched(s(1), respill, id(3), 30);
+        table.dispatched(s(1), pinned, id(2), 20);
+        assert_eq!(
+            table.pins(s(1)),
+            Some([id(3), id(2)]),
+            "behind a respill on the call's worker"
+        );
+        // A decision that met the first claim's pin at its cap moves the
+        // key onto the call's worker behind the lease's dispatch, and its
+        // request is never sent.
+        let table = sent(rule);
+        table.respilled(s(1), id(3), 0);
+        table.dispatched(s(1), pinned, id(2), 20);
+        assert_eq!(
+            table.pins(s(1)),
+            Some([id(3), id(2)]),
+            "behind a move onto the call's worker"
+        );
+        // The first worker is registered again under 5 behind the lease's
+        // dispatch: the request names the id it read.
+        let table = sent(rule);
+        table.rename_worker(id(2), id(5));
+        table.dispatched(s(1), pinned, id(2), 20);
+        let renamed = both.map(|pin| if pin == id(2) { id(5) } else { pin });
+        assert_eq!(table.pins(s(1)), Some(renamed), "under the id that stands");
+        // The first worker is forgotten: its request joins as any does.
+        let table = sent(rule);
+        table.forget_workers(&[id(2)]);
+        table.dispatched(s(1), pinned, id(2), 20);
+        let forgotten = match rule.recovery {
+            Recovery::Latest => [id(2), id(3)],
+            Recovery::Original => [id(3), id(2)],
+        };
+        assert_eq!(table.pins(s(1)), Some(forgotten), "behind a forget");
+    }
+}
+
+/// The tie of a decode call's claim to its lease's first claim under a
+/// lease that states no instant, across a rename and behind a forgotten
+/// worker. A lease with no instant is known by its worker alone: its
+/// dispatch on the call's worker withdraws the first claim, and its
+/// dispatch on the first claim's worker withdraws nothing. A rename
+/// between the call's dating and the lease's dispatch keeps the tie under
+/// the id that stands. A first worker the table forgot leaves the call's
+/// worker alone, and the lease's dispatch there withdraws nothing more.
+#[test]
+fn a_decode_calls_tie_to_its_leases_first_claim_reads_no_instant_a_rename_and_a_forget() {
+    let (id, claimed) = (WorkerId, SessionVerdict::Claimed);
+    // The pair's lease states no instant: its first decision claims 2, and
+    // its decode call claims 3 at 40.
+    let undated = || {
+        let table = SessionTable::new(RULE.sweep_micros);
+        let seen = table.lookup(s(1), 10, &RULE);
+        assert_eq!(table.claim(s(1), seen, id(2), 0), Claim::Made(id(2)));
+        let seen = table.lookup(s(1), 40, &RULE);
+        assert_eq!(table.claim(s(1), seen, id(3), 40), Claim::Made(id(3)));
+        table.told_under(s(1), Some(id(3)), 40, 0, id(2));
+        assert_eq!(table.pins(s(1)), Some([id(3), id(2)]), "behind the call");
+        table
+    };
+    let table = undated();
+    table.dispatched(s(1), claimed(id(3)), id(3), 0);
+    assert_eq!(table.pins(s(1)), Some([id(3), id(0)]), "by the id alone");
+    let table = undated();
+    table.dispatched(s(1), claimed(id(2)), id(2), 0);
+    assert_eq!(
+        table.pins(s(1)),
+        Some([id(3), id(2)]),
+        "no instant, no take-back"
+    );
+    // The pair's lease is of 10: its first decision claims 2, and its
+    // decode call claims 3 at 40.
+    let called = || {
+        let table = SessionTable::new(RULE.sweep_micros);
+        let seen = table.lookup(s(1), 10, &RULE);
+        assert_eq!(table.claim(s(1), seen, id(2), 10), Claim::Made(id(2)));
+        let seen = table.lookup(s(1), 40, &RULE);
+        assert_eq!(table.claim(s(1), seen, id(3), 40), Claim::Made(id(3)));
+        table.told_under(s(1), Some(id(3)), 40, 10, id(2));
+        table
+    };
+    // The first worker is registered again under 5 ahead of the dispatch.
+    let table = called();
+    table.rename_worker(id(2), id(5));
+    assert_eq!(table.pins(s(1)), Some([id(3), id(5)]), "renamed");
+    table.dispatched(s(1), claimed(id(3)), id(3), 10);
+    assert_eq!(table.pins(s(1)), Some([id(3), id(0)]), "the tie follows");
+    // The first worker is forgotten ahead of the dispatch.
+    let table = called();
+    table.forget_workers(&[id(2)]);
+    assert_eq!(table.pins(s(1)), Some([id(3), id(0)]), "forgotten");
+    table.dispatched(s(1), claimed(id(3)), id(3), 10);
+    assert_eq!(table.pins(s(1)), Some([id(3), id(0)]), "nothing more");
+}
+
+/// A decode call's dispatch takes the key's pin with it from the first
+/// claim of its own lease alone. A key that idled out behind that first
+/// claim starts over, and a later decision's claim on the same worker is
+/// no claim of the lease: the call's claim stands behind it, and the
+/// lease's dispatch on the call's worker leaves both. A shard states the
+/// claim its newest claim over a standing one replaced, so a second key
+/// of the shard that writes such a claim between the call's claim and its
+/// dating leaves the call's two claims as any pin and claim: both stand.
+#[test]
+fn a_decode_calls_dispatch_leaves_a_claim_that_is_not_its_leases_first() {
+    let (id, claimed) = (WorkerId, SessionVerdict::Claimed);
+    // The lease is of 10 and its first decision claims 2. The key idles
+    // out, and a decision of 5000 claims 2 anew ahead of the call's.
+    let table = SessionTable::new(RULE.sweep_micros);
+    let seen = table.lookup(s(1), 10, &RULE);
+    assert_eq!(table.claim(s(1), seen, id(2), 10), Claim::Made(id(2)));
+    let seen = table.lookup(s(1), 5_000, &RULE);
+    assert_eq!(seen, [id(0); 2], "the key starts over");
+    assert_eq!(table.claim(s(1), seen, id(2), 5_000), Claim::Made(id(2)));
+    let seen = table.lookup(s(1), 5_040, &RULE);
+    assert_eq!(table.claim(s(1), seen, id(3), 5_040), Claim::Made(id(3)));
+    table.told_under(s(1), Some(id(3)), 5_040, 10, id(2));
+    table.dispatched(s(1), claimed(id(3)), id(3), 10);
+    assert_eq!(table.pins(s(1)), Some([id(3), id(2)]), "a later claim");
+    // The call's claim replaces its lease's first, and a second key of
+    // the shard (the two keys share their upper half) replaces a claim of
+    // its own ahead of the call's dating.
+    let table = SessionTable::new(RULE.sweep_micros);
+    let seen = table.lookup(s(1), 10, &RULE);
+    assert_eq!(table.claim(s(1), seen, id(2), 10), Claim::Made(id(2)));
+    let seen = table.lookup(s(2), 20, &RULE);
+    assert_eq!(table.claim(s(2), seen, id(5), 20), Claim::Made(id(5)));
+    let seen = table.lookup(s(1), 40, &RULE);
+    assert_eq!(table.claim(s(1), seen, id(3), 40), Claim::Made(id(3)));
+    let seen = table.lookup(s(2), 41, &RULE);
+    assert_eq!(table.claim(s(2), seen, id(6), 41), Claim::Made(id(6)));
+    table.told_under(s(1), Some(id(3)), 40, 10, id(2));
+    table.dispatched(s(1), claimed(id(3)), id(3), 10);
+    assert_eq!(table.pins(s(1)), Some([id(3), id(2)]), "the word taken");
 }
 
 #[test]
@@ -1876,6 +2220,29 @@ fn a_moved_claim_beside_a_pin_the_renames_walk_has_yet_to_reach_takes_the_walks_
         };
         assert_eq!(table.pins(s(1)), Some(both));
     }
+}
+
+/// A refusal on a key with a slot free takes no rename's step. It names
+/// no worker, and the empty id reads as the pin of a free slot, so the
+/// table asks no rename for it. The key's pin stands as written until
+/// the rename's walk reaches it.
+#[test]
+fn a_refusal_on_a_key_with_a_slot_free_takes_no_renames_step() {
+    let (id, pinned) = (WorkerId, SessionVerdict::Pinned);
+    let table = SessionTable::new(RULE.sweep_micros);
+    // Every target refused the commit of the decision that claimed 9.
+    let seen = table.lookup(s(1), 10, &RULE);
+    assert_eq!(table.claim(s(1), seen, id(9), 10), Claim::Made(id(9)));
+    assert_eq!(table.move_claim(s(1), id(9), id(0), 10), pinned);
+    table.lookup(s(1), 20, &RULE);
+    table.dispatched(s(1), pinned, id(1), 20);
+    // The rename's first half: remembered, the shard not yet walked.
+    table.remember(id(1), id(11));
+    // The refusal told again.
+    assert_eq!(table.move_claim(s(1), id(9), id(0), 10), pinned);
+    assert_eq!(table.pins(s(1)), Some([id(1), id(0)]), "as written");
+    table.rename_worker(id(1), id(11));
+    assert_eq!(table.pins(s(1)), Some([id(11), id(0)]));
 }
 
 /// A commit and a respill's move on an id a worker had meet the
@@ -2525,6 +2892,32 @@ fn a_claim_renamed_ahead_of_the_bound_is_withdrawn_by_its_commit() {
     assert_eq!(table.renamed(), 1, "the list started over");
     table.dispatched(s(9), SessionVerdict::Claimed(WorkerId(1)), WorkerId(2), 0);
     assert_eq!(table.pins(s(9)), Some([WorkerId(2), WorkerId(0)]));
+}
+
+/// Its own dispatch confirms such a claim behind a list that started
+/// over too. The dispatch names the id the claim's lease names, and no
+/// rename the table remembers says which id stands for it. The claim of
+/// record does: the key keeps its worker's pin under the id that stands,
+/// a pin the key was served on.
+#[test]
+fn a_claim_renamed_ahead_of_the_bound_is_confirmed_by_its_dispatch() {
+    let table = SessionTable::new(ORIGINAL.sweep_micros);
+    table.lookup(s(9), 10, &ORIGINAL);
+    let claim = table.claim(s(9), [WorkerId(0); 2], WorkerId(1), 0);
+    assert_eq!(claim, Claim::Made(WorkerId(1)));
+    table.rename_worker(WorkerId(1), WorkerId(11));
+    let bound = RENAMED_WORKERS as u64;
+    for life in 0..bound {
+        table.rename_worker(WorkerId(100_000 + life), WorkerId(200_000 + life));
+    }
+    assert_eq!(table.renamed(), 1, "the list started over");
+    table.dispatched(s(9), SessionVerdict::Claimed(WorkerId(1)), WorkerId(1), 0);
+    let led = [WorkerId(11), WorkerId(0)];
+    assert_eq!(table.pins(s(9)), Some(led));
+    // The claim is a pin now: its decision's refusal withdraws nothing.
+    let verdict = table.move_claim(s(9), WorkerId(1), WorkerId(0), 0);
+    assert_eq!(verdict, SessionVerdict::Pinned);
+    assert_eq!(table.pins(s(9)), Some(led));
 }
 
 /// The table remembers a bounded count of renames: at the bound the

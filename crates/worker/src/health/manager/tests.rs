@@ -1514,8 +1514,8 @@ fn apply_connect_signal_reschedules_a_promoted_worker() {
 }
 
 /// A replacement inherits the status of the worker it replaces, so the
-/// replacement of a draining worker is off the schedule. The activation that
-/// follows is the only notice the loop gets that the worker serves again.
+/// replacement of a draining worker is off the schedule. A transition out of
+/// `Draining` is the only notice the loop gets that the worker serves again.
 #[test]
 fn a_worker_activated_over_a_draining_registration_is_probed_at_once() {
     let registry = Arc::new(WorkerRegistry::new());

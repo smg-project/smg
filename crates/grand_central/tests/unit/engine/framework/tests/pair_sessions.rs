@@ -586,6 +586,10 @@ fn a_stage_that_unwinds_at_a_pairs_release_leaves_no_claim_behind() {
         fn on_released(&self, _: &Lease, _: ReleaseReason) {
             panic!("this stage unwinds at a release");
         }
+
+        fn hears(&self) -> EventSet {
+            EventSet::of([EventKind::Released])
+        }
     }
 
     impl Scorer for Unwinds {
@@ -1168,7 +1172,9 @@ fn a_decode_side_under_a_rule_leaves_the_prefills_buffer_to_the_prefill() {
 /// same rule is its profiles', and each run speaks. A side whose picker
 /// leaves the placement to the assignment is placed so with a key and
 /// with none: its shadow is run for no request, and the other side's
-/// is, by the live side's own profile.
+/// is, by the live side's own profile. A side the rule does not name
+/// (`sessions.sides`) is its profile's with a key too, and its shadow's
+/// run speaks.
 #[test]
 fn a_side_its_sessions_rule_placed_is_run_no_shadow() {
     let [prefills, decodes] = two_sides(&[0, 5], &[0, 5]);
@@ -1228,6 +1234,24 @@ fn a_side_its_sessions_rule_placed_is_run_no_shadow() {
     let engine = Engine::new(profiles, vec![ruled], 1, Needs::default());
     assert_eq!(ran(&engine, Some(7)), ([false; 2], false));
     assert_eq!(ran(&engine, None), ([true; 2], true));
+    // A rule that names one side leaves the other to its profile: that
+    // side's shadow speaks beside a keyed request, the decode's at a
+    // decode decided again too.
+    for (sides, speak) in [
+        (SessionSides::Prefill, ([false, true], true)),
+        (SessionSides::Decode, ([true, false], false)),
+    ] {
+        let one_side = Binding {
+            shadow: Some(1),
+            decode_shadow: Some(2),
+            sessions: Some(SessionRule { sides, ..rule }),
+            ..pair_binding()
+        };
+        let profiles = (0..3).map(|_| least_requests_profile()).collect();
+        let engine = Engine::new(profiles, vec![one_side], 1, Needs::default());
+        assert_eq!(ran(&engine, Some(7)), speak, "{sides:?}");
+        assert_eq!(ran(&engine, None), ([true; 2], true), "{sides:?}");
+    }
     let assigned = Binding {
         decode_profile: Some(3),
         shadow: Some(1),
@@ -1418,4 +1442,304 @@ fn each_side_of_a_pair_states_who_placed_it_under_the_rules_word() {
         let unkeyed = engine.decide_pair(&plain, &pool, pools, &cx, &cx, &mut scratch);
         assert_eq!(words(&unkeyed), [stages; 2], "{kept:?}: no key");
     }
+}
+
+/// The least-requests profile on both sides of a pair, under a
+/// sessions rule with no cap that names `sides`. Where `times` states
+/// them, the rule has its two times: its idle time, then its sweep.
+fn sided_engine(sides: SessionSides, times: Option<(u64, u64)>) -> Engine {
+    let rule = SessionRule {
+        sides,
+        inflight_cap: 0,
+        ttl_micros: times.map(|(idle, _)| idle),
+        sweep_micros: times.map_or(0, |(_, sweep)| sweep),
+        ..SESSIONS
+    };
+    let binding = Binding {
+        sessions: Some(rule),
+        ..pair_binding()
+    };
+    let profiles = vec![least_requests_profile()];
+    Engine::new(profiles, vec![binding], 1, Needs::default())
+}
+
+/// The two rules that name one side of a pair. Each stands with the
+/// place of the side it leaves to its profile: `0` for the prefill
+/// side, `1` for the decode side.
+const ONE_SIDE: [(SessionSides, usize); 2] =
+    [(SessionSides::Decode, 0), (SessionSides::Prefill, 1)];
+
+/// A sessions rule that names one side of a pair reads no pin of the
+/// other side's session (`sessions.sides`). A pin may stand for that
+/// session, as a document before left one, and the rule does not follow
+/// it. The side goes where its profile says, and its key's entry stands
+/// as it stood, its end not renewed. The side the rule names follows its
+/// pin past the loads, and its key's end moves with the read. A decode
+/// asked again is the rule's or its profile's by the same word.
+///
+/// A gateway decides its sticky override a role at a time, and leaves a
+/// role to a policy that keeps a routing key's handling to itself:
+/// `manual` and `consistent_hashing` (`sticky_for` in
+/// `model_gateway/src/policies/registry.rs`).
+#[test]
+fn a_rule_reads_no_pin_on_a_side_of_a_pair_it_does_not_name() {
+    let (pool, cx) = (PoolFacts::default(), Constraints::default());
+    for (sides, left) in ONE_SIDE {
+        let engine = sided_engine(sides, Some((100, 10)));
+        let rule = engine.binding("m", Phase::Prefill);
+        let rule = rule.and_then(|binding| binding.sessions).expect("the rule");
+        // The least loaded worker of each side is its second, and each
+        // side's session is pinned to the side's third.
+        let rows = two_sides(&[5, 0, 5], &[5, 0, 5]);
+        let sessions = side_sessions(&pair_request(Some(7)));
+        for (session, side) in sessions.iter().zip(&rows) {
+            engine.sessions.lookup(*session, 10, &rule);
+            let pinned = SessionVerdict::Pinned;
+            engine.sessions.dispatched(*session, pinned, side[2].id, 0);
+        }
+        let held = |side: usize| engine.sessions.held(sessions[side]);
+        let pinned = |side: usize, ends| {
+            let pins = [rows[side][2].id, WorkerId(0)];
+            Some((pins, SessionExpiry::At(ends)))
+        };
+        assert_eq!([held(0), held(1)], [pinned(0, 110), pinned(1, 110)]);
+        let keyed = RequestFacts {
+            now_micros: 20,
+            ..pair_request(Some(7))
+        };
+        let [prefills, decodes] = &rows;
+        let pools = PairPools {
+            prefills,
+            decodes,
+            ..PairPools::default()
+        };
+        let mut scratch = Scratch::new();
+        let decision = engine.decide_pair(&keyed, &pool, pools, &cx, &cx, &mut scratch);
+        let pick = decision.pick().expect("a pair");
+        let target = *pick.targets.first().expect("a target");
+        let pair = target.pair.expect("a decode");
+        let mut expected = [2; 2];
+        expected[left] = 1;
+        let places = [target.position, pair.decode_position];
+        assert_eq!(places, expected, "{sides:?}");
+        // The side left out states the stages' word, the other the
+        // rule's.
+        let mut placed = [decision::PlacedBy::Rule; 2];
+        placed[left] = decision::PlacedBy::Stages;
+        let words = [pick.placed_by(), pair.decode_placing.placed_by()];
+        assert_eq!(words, placed, "{sides:?}");
+        assert_eq!(held(left), pinned(left, 110), "{sides:?}: as it stood");
+        assert_eq!(held(1 - left), pinned(1 - left, 120), "{sides:?}");
+        // The decode asked again behind the pair's prefill.
+        let again = engine.decide_decode(&keyed, &pool, pools, target.id, None, &cx, &mut scratch);
+        let again = again.pick().and_then(|pick| pick.targets.first().copied());
+        let again = again.and_then(|target| target.pair);
+        let again = again.map(|pair| pair.decode_position);
+        assert_eq!(again, Some(expected[1]), "{sides:?}");
+        assert_eq!(held(left), pinned(left, 110), "{sides:?}: as it stood");
+    }
+}
+
+/// A sessions rule that names one side of a pair claims no pin of the
+/// other side's session. A new key's pair states the claim of the side
+/// the rule names and no verdict of the other, and ahead of any
+/// dispatch the table holds the one key.
+#[test]
+fn a_rule_claims_no_pin_on_a_side_of_a_pair_it_does_not_name() {
+    let (pool, cx) = (PoolFacts::default(), Constraints::default());
+    for (sides, left) in ONE_SIDE {
+        let engine = sided_engine(sides, None);
+        // The least loaded prefill is the second, the least loaded
+        // decode the third.
+        let rows = two_sides(&[5, 0, 5], &[5, 5, 0]);
+        let [prefills, decodes] = &rows;
+        let pools = PairPools {
+            prefills,
+            decodes,
+            ..PairPools::default()
+        };
+        let keyed = pair_request(Some(7));
+        let mut scratch = Scratch::new();
+        let decision = engine.decide_pair(&keyed, &pool, pools, &cx, &cx, &mut scratch);
+        let pick = decision.pick().expect("a pair");
+        let pair = pick.targets.first().and_then(|target| target.pair);
+        let verdicts = (pick.session_verdict, pair.expect("a decode").decode_verdict);
+        // What the pick states under a rule of the prefill side alone,
+        // then under one of the decode side alone.
+        let stated = [
+            (SessionVerdict::Claimed(prefills[1].id), DecodeVerdict::NONE),
+            (SessionVerdict::None, DecodeVerdict::CLAIMED),
+        ];
+        assert_eq!(verdicts, stated[1 - left], "{sides:?}");
+        let sessions = side_sessions(&keyed);
+        assert_eq!(engine.sessions.pins(sessions[left]), None, "{sides:?}");
+        assert!(engine.sessions.pins(sessions[1 - left]).is_some());
+        assert_eq!(engine.sessions.len(), 1, "{sides:?}");
+    }
+}
+
+/// A sessions rule that names one side of a pair writes no pin of the
+/// other side's session. Each side's dispatch states the side's own
+/// session and its decision's verdict. Behind both the table holds the
+/// pin of the side the rule names and nothing of the other. The key's
+/// next pair keeps the one worker, and the other side goes where the
+/// loads point.
+#[test]
+fn a_rule_writes_no_pin_on_a_side_of_a_pair_it_does_not_name() {
+    for (sides, left) in ONE_SIDE {
+        let engine = sided_engine(sides, None);
+        let mut scratch = Scratch::new();
+        let keyed = pair_request(Some(7));
+        // The least loaded worker of each side is its second.
+        let first = two_sides(&[5, 0, 5], &[5, 0, 5]);
+        let (places, _) = pair_placed(&engine, &keyed, &first, &mut scratch);
+        assert_eq!(places, (1, 1), "{sides:?}");
+        // The loads point at the third worker of each side.
+        let moved = two_sides(&[9, 9, 0], &[9, 9, 0]);
+        let (places, _) = pair_placed(&engine, &keyed, &moved, &mut scratch);
+        let mut expected = [1; 2];
+        expected[left] = 2;
+        assert_eq!([places.0, places.1], expected, "{sides:?}");
+        let sessions = side_sessions(&keyed);
+        let pin = |side: usize| engine.sessions.pins(sessions[side]).map(|pins| pins[0]);
+        assert_eq!(pin(left), None, "{sides:?}");
+        assert_eq!(pin(1 - left), Some(first[1 - left][1].id), "{sides:?}");
+        assert_eq!(engine.sessions.len(), 1, "{sides:?}");
+    }
+}
+
+/// The rule's word of a side holds in each of the two runs a host's
+/// first partners make of the prefill side. Where the one prefill with
+/// a first partner open is healthy, the first run makes the pair of it
+/// and that partner. Where it is not, the first run sheds, and the
+/// second places the key over every open partner. The key is fresh,
+/// and the rule's assignment leaves a fresh key's worker to the
+/// profile, so the profile picks the prefill in either run. A rule that
+/// names the prefill side claims that pick and states its claim. Under
+/// a rule that does not, the prefill states no verdict.
+#[test]
+fn a_side_the_rule_does_not_name_is_its_profiles_in_both_prefill_runs() {
+    // Prefill class 1 pairs with both decode classes, and its first
+    // partner is decode class 1. Prefill class 2 pairs with decode
+    // class 2 and has no first partner.
+    let table = PairTable::new(&[2, 3], &[1, 2, 2]);
+    let first = FirstPartners::new(&[1, 1], &[1]);
+    // A side's two workers, of class 1 and of class 2.
+    let rows = |first_id: u64| -> Vec<Candidate> {
+        let mut rows = classed_rows(&[1, 2]);
+        for row in &mut rows {
+            row.id = WorkerId(first_id + u64::from(row.position));
+        }
+        rows
+    };
+    let (mut prefills, decodes) = (rows(100), rows(200));
+    // The first run makes the pair where the prefill of class 1 is
+    // healthy, and the second where it is not: each side's first worker,
+    // then each side's second.
+    for (healthy, place) in [(true, 0), (false, 1)] {
+        prefills[0].health.healthy = healthy;
+        let claimed = SessionVerdict::Claimed(WorkerId(100 + u64::from(place)));
+        for (sides, verdicts) in [
+            (SessionSides::Prefill, (claimed, DecodeVerdict::NONE)),
+            (
+                SessionSides::Decode,
+                (SessionVerdict::None, DecodeVerdict::CLAIMED),
+            ),
+        ] {
+            let engine = sided_engine(sides, None);
+            let pools = PairPools {
+                prefills: &prefills,
+                decodes: &decodes,
+                table,
+                first,
+                ..PairPools::default()
+            };
+            let keyed = pair_request(Some(8));
+            let answer = pair_placed_in(&engine, &keyed, pools, &mut Scratch::new());
+            assert_eq!(answer, ((place, place), verdicts), "{sides:?}, {healthy}");
+        }
+    }
+}
+
+/// A document that takes a side out of its rule's list leaves the pins
+/// that side held to the sweep. The engine of the new document reads
+/// the table of the one before it, as a host that keeps one table over
+/// its documents hands it on.
+///
+/// The rule that left the side out follows none of its pins and renews
+/// none. The side goes where its profile says. Its key's entry ends
+/// where the rule's idle time put it at its last read, and the sweep
+/// forgets the entry there. The side the rule still names follows its
+/// pin all along.
+#[cfg(feature = "in-process")]
+#[test]
+fn a_side_taken_out_of_the_rules_list_leaves_its_pins_to_the_sweep() {
+    // An idle time of 100 and a sweep every 10.
+    let before = sided_engine(SessionSides::Any, Some((100, 10)));
+    let at = |now_micros| RequestFacts {
+        now_micros,
+        ..pair_request(Some(7))
+    };
+    let [prefill_session, decode_session] = side_sessions(&at(0));
+    let mut scratch = Scratch::new();
+    // The least loaded worker of each side is its second: the key's
+    // two pins, read at 10 and so held until 110.
+    let first = two_sides(&[5, 0, 5], &[5, 0, 5]);
+    let (places, _) = pair_placed(&before, &at(10), &first, &mut scratch);
+    assert_eq!(places, (1, 1));
+    let held = before.sessions.held(prefill_session);
+    let pins = [first[0][1].id, WorkerId(0)];
+    assert_eq!(held, Some((pins, SessionExpiry::At(110))));
+    // The document behind it names the decode side alone.
+    let mut after = sided_engine(SessionSides::Decode, Some((100, 10)));
+    after.share_sessions(Arc::clone(&before.sessions));
+    // The loads point at the third worker of each side.
+    let moved = two_sides(&[9, 9, 0], &[9, 9, 0]);
+    let (places, verdicts) = pair_placed(&after, &at(50), &moved, &mut scratch);
+    assert_eq!(places, (2, 1), "the prefill's profile, the decode's pin");
+    assert_eq!(verdicts, (SessionVerdict::None, DecodeVerdict::PINNED));
+    assert_eq!(after.sessions.held(prefill_session), held, "not renewed");
+    // Past the end of the prefill key's idle time, the sweep that a
+    // read of the decode's key runs forgets it.
+    let (places, _) = pair_placed(&after, &at(120), &moved, &mut scratch);
+    assert_eq!(places, (2, 1));
+    assert_eq!(after.sessions.pins(prefill_session), None);
+    assert!(after.sessions.pins(decode_session).is_some());
+    assert_eq!(after.sessions.len(), 1);
+}
+
+/// A binding built in code can leave out of its rule a side whose picker
+/// leaves the placement to the rule. A document's check refuses that
+/// binding by the side's profile, so no document reaches the engine with
+/// it. Built in code, it stops a debug build where the engine is built.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "on a side the rule's sides leave out")]
+fn a_side_left_out_under_a_picker_that_waits_for_the_rule_stops_a_debug_build() {
+    let rule = SessionRule {
+        sides: SessionSides::Decode,
+        ..SESSIONS
+    };
+    let binding = Binding {
+        sessions: Some(rule),
+        ..pair_binding()
+    };
+    let _ = Engine::new(vec![manual_profile()], vec![binding], 1, Needs::default());
+}
+
+/// The check's other half: the decode side left out under such a picker
+/// stops a debug build too.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "on a side the rule's sides leave out")]
+fn a_decode_side_left_out_under_a_picker_that_waits_for_the_rule_stops_a_debug_build() {
+    let rule = SessionRule {
+        sides: SessionSides::Prefill,
+        ..SESSIONS
+    };
+    let binding = Binding {
+        sessions: Some(rule),
+        ..pair_binding()
+    };
+    let _ = Engine::new(vec![manual_profile()], vec![binding], 1, Needs::default());
 }

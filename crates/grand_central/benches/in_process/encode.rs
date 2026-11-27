@@ -391,6 +391,10 @@ pub(super) fn runs(run: &Run) -> bool {
     // A shadow profile decides beside a single request's decision, and the
     // rule for a list over its thresholds is a pair's cell's to run.
     assert!(run.shadow == Shadowed::No, "an encode cell runs no shadow");
+    assert!(
+        run.other_models == 0,
+        "an encode cell states no other model"
+    );
     assert!(!run.overloaded, "an encode cell's lists are open");
     let one_call = place::asked_with_lists(run, false);
     assert!(

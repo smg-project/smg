@@ -116,3 +116,15 @@ def test_seed_reaches_engine_request(servicer, seed, choices):
     assert result.rid == (
         "seed-contract" if choices == 1 else ["seed-contract-n0", "seed-contract-n1"]
     )
+
+
+def test_an_answer_tag_goes_on_as_the_tag(servicer):
+    """The engine runs xgrammar, the backend a structural tag is spelled for,
+    or no grammar backend at all: a tag that is a JSON answer's schema alone
+    reaches it as the tag it is, never as the bare schema."""
+    convert, _, _ = servicer
+    schema = '{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"integer"}}}'
+    tag = '{"format":{"type":"json_schema","json_schema":' + schema + ',"max_whitespace_cnt":32}}'
+    result = convert(proto.SamplingParams(structural_tag=tag))
+    assert result["structural_tag"] == tag
+    assert "json_schema" not in result

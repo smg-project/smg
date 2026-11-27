@@ -200,6 +200,13 @@ pub struct ReplayConfig {
     /// token ids, served on every wire ahead of the engine
     /// ([`crate::script`]).
     pub script: Option<PathBuf>,
+    /// `--record-upstream URL`: the gRPC workers serve no engine of their
+    /// own: every call is forwarded to the engine at `URL` and its answer
+    /// handed back as it came.
+    pub record_upstream: Option<String>,
+    /// `--record PATH`: beside `--record-upstream`, append every `Generate`
+    /// exchange to `PATH` as lines `--script` reads.
+    pub record: Option<PathBuf>,
 }
 
 /// A worker's role in a disaggregated fleet (`--worker-type`, on the HTTP
@@ -441,12 +448,20 @@ impl Default for Config {
 impl Config {
     /// Parse the configuration from `std::env::args`, falling back to
     /// defaults, with what the environment names (`SMG_PAIRING_PROTOCOL`).
+    /// A recorder the flags ask for is checked here: an address that does
+    /// not parse or names no scheme, or one of its two files that cannot be
+    /// opened, is an error.
     pub fn from_args() -> Result<Self, String> {
         let mut cfg = Self::parse(std::env::args().skip(1))?;
         cfg.pairing_protocol = std::env::var("SMG_PAIRING_PROTOCOL")
             .ok()
             .map(|protocol| protocol.trim().to_string())
             .filter(|protocol| !protocol.is_empty());
+        // A recorder that cannot start is a config error: each gRPC worker
+        // opens it again, and one that cannot would stop while the process
+        // kept running, so it is checked once here.
+        crate::grpc::recorder_starts(&cfg)
+            .map_err(|e| format!("cannot start the recorder: {e}"))?;
         Ok(cfg)
     }
 
@@ -489,6 +504,10 @@ impl Config {
                 }
                 "--capture" => cfg.replay.capture = Some(value(&mut args, &flag)?.into()),
                 "--script" => cfg.replay.script = Some(value(&mut args, &flag)?.into()),
+                "--record-upstream" => {
+                    cfg.replay.record_upstream = Some(value(&mut args, &flag)?);
+                }
+                "--record" => cfg.replay.record = Some(value(&mut args, &flag)?.into()),
                 "--engine" => {
                     cfg.realistic = match value(&mut args, &flag)?.as_str() {
                         "realistic" => true,
@@ -657,6 +676,28 @@ impl Config {
         }
         if cfg.grpc_dp_size > 1 && !cfg.realistic {
             return Err("--grpc-dp-size above 1 needs --engine realistic".to_string());
+        }
+        if cfg.replay.record_upstream.is_some() != cfg.replay.record.is_some() {
+            return Err(
+                "--record-upstream and --record come as a pair: the engine whose answers are \
+                 recorded and the file they are appended to"
+                    .to_string(),
+            );
+        }
+        if cfg.replay.record_upstream.is_some() {
+            if cfg.grpc_count == 0 {
+                return Err(
+                    "--record-upstream needs --grpc-count above 0: a gRPC worker is what records"
+                        .to_string(),
+                );
+            }
+            if cfg.replay.capture.is_some() {
+                return Err(
+                    "--record-upstream and --capture do not go together: a recording worker \
+                     serves no request of its own to capture"
+                        .to_string(),
+                );
+            }
         }
         cfg.check_worker_overrides()?;
         cfg.check_load_values()?;
@@ -1239,6 +1280,13 @@ pub fn usage() -> String {
        --capture <path>         append each gRPC Generate request to <path> as a JSON line\n\
        --script <path>          scripted answers (JSONL keyed by the prompt's token ids), served on\n\
                                 every wire ahead of the engine; the admin API enqueues more\n\
+       --record-upstream <url>  the gRPC workers run no engine: each forwards every call to the\n\
+                                engine at <url> (http://host:port or grpc://host:port) and hands\n\
+                                its answer back as it came (with --record); --script, --engine and\n\
+                                --worker-type do not reach a gRPC worker that records\n\
+       --record <path>          with --record-upstream: append each Generate exchange to <path> as\n\
+                                lines --script replays, and the engine's info answers to <path>\n\
+                                with its extension replaced by info.jsonl\n\
      \n\
      Realistic engine simulator (vLLM pass loop over a block-level KV pool; opt-in):\n\
        --engine <canned|realistic>  engine mode (default canned)\n\
@@ -2137,6 +2185,34 @@ mod tests {
         let cfg = parse(&[&grpc[..], &["--script", "/tmp/answers.jsonl"]].concat())
             .expect("--script parses");
         assert_eq!(cfg.replay.script, Some(PathBuf::from("/tmp/answers.jsonl")));
+    }
+
+    #[test]
+    fn record_flags_come_as_a_pair() {
+        let grpc = ["--grpc-base-port", "19000", "--grpc-count", "1"];
+        let upstream = ["--record-upstream", "grpc://127.0.0.1:50051"];
+        let file = ["--record", "/tmp/session.jsonl"];
+        let cfg = parse(&[&grpc[..], &upstream, &file].concat()).expect("the pair parses");
+        assert_eq!(
+            cfg.replay.record_upstream.as_deref(),
+            Some("grpc://127.0.0.1:50051")
+        );
+        assert_eq!(cfg.replay.record, Some(PathBuf::from("/tmp/session.jsonl")));
+
+        for alone in [&upstream, &file] {
+            let refused = parse(&[&grpc[..], alone].concat()).expect_err("one without the other");
+            assert!(refused.contains("come as a pair"), "{refused}");
+        }
+
+        // A recorder with no gRPC worker records nothing, and a recording
+        // worker serves no request of its own to capture: both are refused.
+        let http = ["--http-base-port", "9000", "--http-count", "1"];
+        let refused = parse(&[&http[..], &upstream, &file].concat()).expect_err("no gRPC worker");
+        assert!(refused.contains("needs --grpc-count"), "{refused}");
+        let capture = ["--capture", "/tmp/generate.jsonl"];
+        let refused = parse(&[&grpc[..], &upstream, &file, &capture].concat())
+            .expect_err("a capture file beside the recorder");
+        assert!(refused.contains("do not go together"), "{refused}");
     }
 
     /// The encode role is the two gRPC wires' with an encoder: it parses on

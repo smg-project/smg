@@ -1460,4 +1460,5 @@ fn hash_hex_strings<'a>(hashes: impl Iterator<Item = &'a str>) -> Vec<u8> {
 }
 
 #[cfg(test)]
+#[path = "../../../../tests/unit/routers/grpc/multimodal/assemble/tests.rs"]
 pub(crate) mod tests;

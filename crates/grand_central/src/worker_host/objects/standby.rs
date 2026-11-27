@@ -36,9 +36,10 @@
 //! So are the statuses of a cut laid whole, each on its row's object. A
 //! told row lays its status too: an object laid in another's place takes
 //! the standing object's, and a probe of a term that ended can have moved
-//! that one ahead of the row's event. This is one of the two ways from a
-//! table's status to an object's where the objects lead. The other is a
-//! tell the store refuses ([`mod@super::status`]).
+//! that one ahead of the row's event. This is one of the three ways from
+//! a table's status to an object's where the objects lead. The others
+//! are a tell the store refuses ([`mod@super::status`]) and a removal
+//! the store refuses for its term ([`mod@super::write`]).
 //!
 //! A restore is the store's restore and the lay of the cut's own rows in
 //! one turn of the holder. No row of the table is read back to lay an
@@ -198,8 +199,10 @@ impl<G: Generation> Objects<G> {
     /// One body for a cut the store takes whole, under the holder's turn
     /// its caller holds: `door` is the store's own entry for it. The
     /// holder lays the cut's own rows, copied ahead of that entry, which
-    /// takes the cut whole: a cut the store refuses is copied too. The one
-    /// read of the table left is each row's status. Each row is held
+    /// takes the cut whole: a cut the store refuses is copied too. The
+    /// pass uses one thing of the table, a row's status where the row
+    /// stands at its object's revision, and hands the store each row's
+    /// count. Each row is held
     /// against the object that stands for it ([`Self::reconcile`]), and
     /// the registry takes new objects in the rows' order. The keeper
     /// forgets the rows that left behind the store's write.
