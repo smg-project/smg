@@ -411,7 +411,7 @@ difference between implementations.
 | MiniMax M3 | -4.9 % | +0.4 % | +0.0 % | -20.0 % | +0.8 % | +29.2 % |
 | MiMo V2.6 | -6.8 % | +0.3 % | +0.0 % | -18.0 % | -6.9 % | +32.6 % |
 | Mistral (tekken) | -12.9 % | +0.1 % | +0.0 % | -2.4 % | +100.8 % | +10.8 % |
-| Gemma 3 | -0.8 % | +0.9 % | +0.0 % | -15.0 % | -7.1 % | +8.9 % |
+| Gemma 3 | -0.8 % | +0.9 % | +0.0 % | -15.0 % | -7.1 % | - |
 | Gemma 4 | +2.5 % | +1.6 % | -0.4 % | -15.0 % | -5.1 % | +49.1 % |
 | Llama 2 (byte fallback) | +2.0 % | +0.7 % | -3.6 % | +0.0 % | +2.8 % | +6.6 % |
 | Kimi K3 | -9.7 % | -0.3 % | +0.0 % | +0.0 % | +0.0 % | +48.6 % |
@@ -444,7 +444,7 @@ difference between implementations.
 - Of 192 encode cells SMG 1.16.0 reads a lower time than every reference in the csv files (fastokens, tiktoken-rs, tokenizers, v1) on 127: 42 of 96 cold and 85 of 96 warm; SMG v1.15.0 in the same rounds reads 83.
 - Against v1.15.0, cold: of 96 encode cells 91 read faster and 0 slower by more than 5 %, 5 within it; the median change is -17.3 %.
 - Against v1.15.0, warm: of 96 encode cells 95 read faster and 0 slower by more than 5 %, 1 within it; the median change is -23.7 %.
-- Against v1.15.0, decode, streaming and batch: of 96 cells 47 read faster and 2 slower by more than 5 %, 47 within it. Slower: Mistral (tekken), 64 streams: first delta, 241.0 against 120.0 ns (+100.8 %); Llama 3.2, 64 streams: first delta, 120.0 against 110.0 ns (+9.1 %, one step of the clock). The step and first-delta cells read a clock that moves in steps of about 10 ns; 9 of the faster cells differ by one step or less.
+- Against v1.15.0, decode, streaming and batch: of 95 cells 46 read faster and 2 slower by more than 5 %, 47 within it. Slower: Mistral (tekken), 64 streams: first delta, 241.0 against 120.0 ns (+100.8 %); Llama 3.2, 64 streams: first delta, 120.0 against 110.0 ns (+9.1 %, one step of the clock). The step and first-delta cells read a clock that moves in steps of about 10 ns; 9 of the faster cells differ by one step or less.
 - Against fastokens, cold: of 96 encode cells SMG is ahead beyond the placement band (20 %) on 40 and behind beyond it on 36; 20 read inside the band (the margins run from -43 % to +1647 %).
 - Against fastokens, warm: of 96 encode cells SMG is ahead beyond the placement band (20 %) on 82 and behind beyond it on 0; 14 read inside the band (the margins run from -14 % to +6873 %).
 - Against v1, cold: of 72 encode cells SMG is ahead beyond the placement band (20 %) on 66 and behind beyond it on 0; 6 read inside the band (the margins run from +9 % to +2120 %).

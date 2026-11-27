@@ -136,4 +136,9 @@ pools until a text reaches its class's token count.
   what it ran on.
 - `tables.py`: writes [RESULTS.md](RESULTS.md) from those three files and, with `--readme`, the tables and the reading
   list of the crate README. A figure is the median over a cell's rounds; the `v1` column has none where its
-  `backend` string has no `hf:v1`.
+  `backend` string has no `hf:v1`. In the release table of decode, streaming and batch, a `-` in the batch column
+  means the rounds do not tell a change from their own spread: the two releases hold fewer than ten rounds each
+  and their rounds overlap. Such a cell is left out of the reading list. The default run takes three rounds, and
+  the edge pass adds rounds to encode cells alone, so a batch change is read only where every round of one release
+  stands beyond every round of the other; at three rounds a side, two columns of equal speed do that by chance one
+  time in ten, and `run --rounds 10 --cells decode` settles a cell that matters.
