@@ -1106,6 +1106,7 @@ pub(crate) fn translate_sampling(
         repetition_penalty: normalize_one(sp.repetition_penalty),
         max_tokens: sp.max_tokens.unwrap_or(default_max_tokens),
         min_tokens: sp.min_tokens,
+        thinking_token_budget: sp.thinking_token_budget.map(u64::from),
         stop_token_ids,
         eos_token_id: (!sp.ignore_eos).then_some(eos.primary).flatten(),
         all_stop_token_ids,

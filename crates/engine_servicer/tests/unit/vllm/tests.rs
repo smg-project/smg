@@ -2111,12 +2111,20 @@ async fn duplicate_in_flight_request_ids_are_refused() {
         .expect("generate")
         .into_inner();
     recv_add(&mut h.engine_in).await;
-    let status = h
-        .client
-        .generate(generate_request("r5", true, Vec::new()))
-        .await
-        .expect_err("duplicate id");
-    assert_eq!(status.code(), Code::AlreadyExists);
+    for budget in [None, Some(0)] {
+        let mut duplicate = generate_request("r5", true, Vec::new());
+        duplicate
+            .sampling_params
+            .as_mut()
+            .unwrap()
+            .thinking_token_budget = budget;
+        let status = h
+            .client
+            .generate(duplicate)
+            .await
+            .expect_err("duplicate id");
+        assert_eq!(status.code(), Code::AlreadyExists);
+    }
     drop(stream);
     assert_eq!(recv_abort(&mut h.engine_in).await, vec!["r5".to_string()]);
 }
@@ -4343,6 +4351,49 @@ async fn server_info_advertises_the_engines_encoder_budget() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+#[tokio::test]
+async fn generate_enforces_the_advertised_thinking_token_budget_capability() {
+    for supported in [false, true] {
+        let mut model = model_info();
+        model.supports_thinking_token_budget = supported;
+        let mut h = harness(model, None).await;
+        for budget in [None, Some(0), Some(7)] {
+            let mut request = generate_request("budget", false, Vec::new());
+            request
+                .sampling_params
+                .as_mut()
+                .unwrap()
+                .thinking_token_budget = budget;
+            let response = h.client.generate(request).await;
+            if !supported && budget.is_some() {
+                let status = response.expect_err("the sampler cannot enforce this budget");
+                assert_eq!(status.code(), Code::InvalidArgument);
+                assert!(status.message().contains("thinking_token_budget"));
+                assert_engine_idle(&mut h.engine_in).await;
+                continue;
+            }
+            let mut stream = response.expect("generation accepted").into_inner();
+            let request = recv_add(&mut h.engine_in).await;
+            assert_eq!(
+                request.sampling_params.unwrap().thinking_token_budget,
+                budget.map(u64::from)
+            );
+            h.engine_out
+                .send_outputs(&batch(
+                    "budget",
+                    vec![7],
+                    Some(EngineCoreFinishReason::Length),
+                    None,
+                ))
+                .await
+                .unwrap();
+            assert!(stream.message().bounded().await.unwrap().is_some());
+            assert!(stream.message().bounded().await.unwrap().is_none());
+        }
+        h.server.stop(Duration::from_secs(5)).expect("clean stop");
+    }
+}
+
 /// Where the engine starts a request's grammar on a thinking prompt is a fact
 /// of its config the launcher read: advertised with the reasoning parser's
 /// name so the Router shapes a forced tool call's grammar as the engine's own
@@ -4351,6 +4402,7 @@ async fn server_info_advertises_the_engines_encoder_budget() {
 async fn server_info_advertises_where_the_engine_starts_a_grammar() {
     let mut model = model_info();
     model.engine_reasoning_parser = "glm45".to_string();
+    model.supports_thinking_token_budget = true;
     model.constrained_decoding_start = "after_reasoning".to_string();
     let mut h = harness_with(model, None, None).await;
     let info = h
@@ -4360,6 +4412,7 @@ async fn server_info_advertises_where_the_engine_starts_a_grammar() {
         .unwrap()
         .into_inner();
     assert_eq!(info.engine_reasoning_parser, "glm45");
+    assert!(info.supports_thinking_token_budget);
     assert_eq!(info.constrained_decoding_start, "after_reasoning");
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 
@@ -4371,6 +4424,7 @@ async fn server_info_advertises_where_the_engine_starts_a_grammar() {
         .unwrap()
         .into_inner();
     assert_eq!(info.engine_reasoning_parser, "");
+    assert!(!info.supports_thinking_token_budget);
     assert_eq!(info.constrained_decoding_start, "");
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
