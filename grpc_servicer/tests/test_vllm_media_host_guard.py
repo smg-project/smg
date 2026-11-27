@@ -9,7 +9,9 @@ hosts are allowed.
 from __future__ import annotations
 
 import asyncio
+import errno
 import ipaddress
+import socket
 import sys
 import types
 
@@ -77,10 +79,25 @@ async def _serve(handler_routes, host="127.0.0.1"):
     app.add_routes(handler_routes)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, host, 0)
-    await site.start()
-    port = site._server.sockets[0].getsockname()[1]  # noqa: SLF001
-    return runner, port
+    for _ in range(16):
+        site = web.TCPSite(runner, host, 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]  # noqa: SLF001
+        if host != "127.0.0.1":
+            return runner, port
+        # The cases reach the default origin by the name localhost too, and a
+        # host may resolve that name to ::1 alone: the origin answers there as
+        # well, on the same port. A host with no IPv6 loopback cannot bind ::1
+        # and the origin stands on 127.0.0.1 alone; a port another process
+        # holds on ::1 is given up for a new one.
+        try:
+            await web.TCPSite(runner, "::1", port).start()
+        except OSError as error:
+            if error.errno == errno.EADDRINUSE:
+                await site.stop()
+                continue
+        return runner, port
+    raise RuntimeError("no port is free on both loopbacks")
 
 
 def _routes(state):
@@ -125,6 +142,29 @@ def _no_proxy(monkeypatch):
         "NO_PROXY",
     ):
         monkeypatch.delenv(name, raising=False)
+
+
+def test_the_default_origin_answers_on_both_loopbacks():
+    """The cases below reach the origin by the name localhost, which a host
+    may resolve to either loopback."""
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as probe:
+            probe.bind(("::1", 0))
+    except OSError:
+        pytest.skip("no IPv6 loopback here")
+
+    async def run():
+        state = {"hits": 0}
+        runner, port = await _serve(_routes(state))
+        permissive = MediaHostPolicy(None, allow_private_hosts=True)
+        try:
+            for host in ("127.0.0.1", "[::1]"):
+                assert await _fetch(permissive, f"http://{host}:{port}/media") == b"img"
+            assert state["hits"] == 2
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
 
 
 def test_loopback_is_refused_by_name_by_literal_and_as_a_redirect_target():
