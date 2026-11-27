@@ -64,7 +64,9 @@ def run_setup(tmp_path, *, backend="nixl", legacy="", hip="fixture", alias=True,
         "PYTHONPATH": str(modules),
         "E2E_KV_BACKEND": backend,
         "E2E_SGLANG_TRANSFER_BACKEND": legacy,
-        "LD_LIBRARY_PATH": "/image/rocm/lib",
+        "LD_LIBRARY_PATH": os.pathsep.join(
+            filter(None, ["/image/rocm/lib", os.environ.get("LD_LIBRARY_PATH")])
+        ),
         "GITHUB_ENV": str(tmp_path / "github.env"),
         "PIP_LOG": str(tmp_path / "pip.log"),
     }
@@ -80,7 +82,7 @@ def test_rocm_nixl_preflight_and_next_step_loader_path(tmp_path, backend, legacy
     assert result.returncode == 0, result.stderr
     assert "SGLang ROCm NIXL import canary OK" in result.stdout
     exports = dict(line.split("=", 1) for line in Path(env["GITHUB_ENV"]).read_text().splitlines())
-    assert exports["LD_LIBRARY_PATH"] == "/opt/ucx/lib:/image/rocm/lib"
+    assert exports["LD_LIBRARY_PATH"] == "/opt/ucx/lib:" + env["LD_LIBRARY_PATH"]
     # A separate process consumes the producer's actual environment file.
     child = subprocess.run(
         [sys.executable, "-c", "import os; print(os.environ['LD_LIBRARY_PATH'])"],
@@ -89,7 +91,7 @@ def test_rocm_nixl_preflight_and_next_step_loader_path(tmp_path, backend, legacy
         text=True,
         check=True,
     )
-    assert child.stdout.strip() == "/opt/ucx/lib:/image/rocm/lib"
+    assert child.stdout.strip() == "/opt/ucx/lib:" + env["LD_LIBRARY_PATH"]
     assert "nixl" not in Path(env["PIP_LOG"]).read_text()
 
 
