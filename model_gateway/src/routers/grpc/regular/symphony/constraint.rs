@@ -21,7 +21,7 @@ use symphony::{
 #[cfg(test)]
 use super::names::reading;
 use super::{
-    names::{reads, table_reading, Reading},
+    names::{reads, table_reading, ByAlias, Reading},
     template::Templates,
     SymphonyError,
 };
@@ -1162,6 +1162,9 @@ pub(crate) struct AutoTag {
     /// resolver, which the stamp outlives).
     pub labels: Names,
     pub flags: Names,
+    /// The served models an alias reads, as the context of the names read them
+    /// ([`ModelNames`]); `None` where it read none.
+    pub by_alias: Option<Arc<[ByAlias]>>,
     pub request: AutoRequest,
     /// The prompt leaves the model inside its thought.
     pub reasoning_open: bool,
@@ -1217,6 +1220,7 @@ impl AutoTag {
             &ModelNames {
                 labels: self.labels.clone(),
                 flags: &self.flags,
+                by_alias: self.by_alias.as_deref().unwrap_or_default(),
             },
             asks,
             &tools,
@@ -3154,6 +3158,7 @@ mod tests {
             parser: ParserChoice::Symphony,
             labels: pair(Some("deepseek_v4"), Some("deepseek_v4")),
             flags: Names::default(),
+            by_alias: None,
             request: AutoRequest::Chat(Arc::new(request(json!({"tools": tools()})))),
             reasoning_open: true,
             thought_closed: false,
@@ -3235,6 +3240,7 @@ mod tests {
             parser: ParserChoice::Symphony,
             labels: pair(Some("deepseek_v4"), Some("deepseek_v4")),
             flags: Names::default(),
+            by_alias: None,
             request: AutoRequest::Chat(Arc::new(request(json!({"tools": tools()})))),
             reasoning_open: true,
             thought_closed: false,
@@ -3405,6 +3411,7 @@ mod tests {
                 parser: ParserChoice::Symphony,
                 labels: pair(Some("deepseek_v4"), Some("deepseek_v4")),
                 flags: Names::default(),
+                by_alias: None,
                 request: AutoRequest::Chat(Arc::new(request(json!({})))),
                 reasoning_open: true,
                 thought_closed: false,
@@ -3575,6 +3582,7 @@ mod tests {
                 parser: ParserChoice::Symphony,
                 labels: names.labels.clone(),
                 flags: Names::default(),
+                by_alias: None,
                 request: AutoRequest::Chat(Arc::new(chat.clone())),
                 reasoning_open: true,
                 thought_closed: false,
@@ -3584,6 +3592,7 @@ mod tests {
                 parser: ParserChoice::Symphony,
                 labels: names.labels.clone(),
                 flags: Names::default(),
+                by_alias: None,
                 request: AutoRequest::Messages {
                     request: Arc::new(messages.clone()),
                     tools: tools().into(),
@@ -3649,6 +3658,7 @@ mod tests {
             parser: ParserChoice::Symphony,
             labels: names.labels,
             flags: Names::default(),
+            by_alias: None,
             request: AutoRequest::Chat(Arc::new(request(json!({})))),
             reasoning_open: true,
             thought_closed: false,

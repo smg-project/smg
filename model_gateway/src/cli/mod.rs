@@ -1092,7 +1092,11 @@ struct DiscoveryArgs {
     /// including workers registered by Kubernetes service discovery.
     /// Matching is case-sensitive. A vendor-named alias (kimi-*, minimax-*,
     /// ...) also gives the served model that vendor's contract profile under
-    /// both names.
+    /// both names. An alias that is the name of a checkpoint Symphony lists
+    /// gives the served model that checkpoint's table, where the served name
+    /// is not listed, the legacy parsers detect no parser by it and no
+    /// parser name is set for the model; of several such aliases the first
+    /// in sorted order gives its table.
     #[arg(long = "model-alias", action = ArgAction::Append, value_parser = parse_model_alias, help_heading = "Service Discovery (Kubernetes)")]
     model_alias: Vec<String>,
 

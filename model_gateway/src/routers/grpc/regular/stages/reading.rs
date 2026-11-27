@@ -473,6 +473,7 @@ pub(crate) fn decide(
                 parser,
                 labels: names.labels.clone(),
                 flags: names.flags.clone(),
+                by_alias: ctx.components.parser_resolver.by_alias(),
                 request,
                 reasoning_open,
                 thought_closed,
