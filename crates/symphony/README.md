@@ -229,7 +229,9 @@ and later and Qwen3-Coder). `formats::for_model` picks the table from the model 
 repository name in any case, the group's primary or any checkpoint under **Also**, so a model
 listed here with a table needs neither flag once the gateway reads it with Symphony (a quantized
 or renamed checkpoint is not listed: the flags, or its workers' labels, name its table until its
-group names it, else it keeps the older parsers). The flags stay: under `--parser symphony` the gateway maps a legacy tool-call or reasoning parser's
+group names it; where neither names anything and the older parsers detect no parser by its served
+name, a `--model-alias` of it that is a listed name gives
+it that name's table (of several, the first in sorted order); else it keeps the older parsers). The flags stay: under `--parser symphony` the gateway maps a legacy tool-call or reasoning parser's
 name whose format a table reads to that table (`qwen` for `qwen3`, `qwen_xml` for `qwen3_tagged`, a
 launcher's `muse` for `muse_spark`; a family's name reads with the table of the family's current
 line, `minimax` for `minimax_m3`, and the M2 line names `minimax_m2`; the map is the gateway's `routers::grpc::utils::ALIASES`, beside

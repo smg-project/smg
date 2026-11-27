@@ -2213,7 +2213,12 @@ class RouterArgs:
                 " Format: <alias>=<canonical>. Repeat for multiple aliases."
                 " Matching is case-sensitive. A vendor-named alias (kimi-*,"
                 " minimax-*, ...) also gives the served model that vendor's"
-                " contract profile under both names."
+                " contract profile under both names. An alias that is the name"
+                " of a checkpoint Symphony lists gives the served model that"
+                " checkpoint's table, where the served name is not listed, the"
+                " legacy parsers detect no parser by it and no parser name is"
+                " set for the model; of several such aliases the first in"
+                " sorted order gives its table."
             ),
         )
         # Prometheus configuration

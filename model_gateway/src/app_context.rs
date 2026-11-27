@@ -57,7 +57,7 @@ use crate::{
         grpc::{
             backend_client::{BackendConnector, Fronting},
             multimodal::MultimodalConfigRegistry,
-            regular::symphony::{check_names, named_table, names_template},
+            regular::symphony::{check_names, named_table, names_template, read_by_alias, ByAlias},
             utils::{Names, ALIASES},
         },
     },
@@ -126,6 +126,10 @@ pub struct AppContext {
     pub worker_monitor: Option<Arc<WorkerMonitor>>,
     pub configured_reasoning_parser: Option<String>,
     pub configured_tool_parser: Option<String>,
+    /// The served models a `--model-alias` reads under Symphony, read once at the build
+    /// (`regular::symphony::read_by_alias`): this context's own, which its gRPC router and
+    /// its workers' registration read, so no context reads what another recorded.
+    pub(crate) by_alias: Arc<[ByAlias]>,
     pub worker_job_queue: Arc<OnceLock<Arc<JobQueue>>>,
     pub workflow_engines: Arc<OnceLock<WorkflowEngines>>,
     pub mcp_orchestrator: Arc<OnceLock<Arc<McpOrchestrator>>>,
@@ -595,6 +599,19 @@ impl AppContextBuilder {
                  those models with that table"
             );
         }
+        // A served model the registry does not know and no parser name is set for is read,
+        // under Symphony, by the registry's table for a `--model-alias` it is served under,
+        // where neither legacy registry detects a parser by the served name: recorded here,
+        // once, so no request asks the aliases (`regular::symphony::read_by_alias`).
+        let by_alias = read_by_alias(
+            router_config
+                .model_aliases
+                .iter()
+                .map(|(alias, served)| (alias.as_str(), served.as_str())),
+            self.tool_parser_factory.as_ref(),
+            self.reasoning_parser_factory.as_ref(),
+        )
+        .into();
 
         let worker_registry = self
             .worker_registry
@@ -680,6 +697,7 @@ impl AppContextBuilder {
             worker_monitor: self.worker_monitor,
             configured_reasoning_parser,
             configured_tool_parser,
+            by_alias,
             worker_job_queue,
             workflow_engines: self
                 .workflow_engines
@@ -2614,6 +2632,7 @@ pub(crate) mod testing {
             worker_monitor: None,
             configured_reasoning_parser: None,
             configured_tool_parser: None,
+            by_alias: Arc::new([]),
             worker_job_queue: Arc::clone(&job_queue),
             workflow_engines: Arc::new(std::sync::OnceLock::new()),
             mcp_orchestrator: Arc::new(std::sync::OnceLock::new()),
