@@ -19,7 +19,8 @@
 //! on each ([`again`]): they are lent the same two lists with each side's
 //! places beside it ([`PairLists::prefill_places`],
 //! [`PairLists::decode_places`]). A list the rule takes no worker of ends
-//! the call there: behind such prefills the decodes are not asked. The
+//! the call there, but for the one decision more below: behind such
+//! prefills the decodes are not asked. The
 //! request is then shed by its first decision's shed, where that decision
 //! shed it with no endpoint, or as saturated and that shed stands, and
 //! else with no endpoint under the rule's name ([`again`]). One decision
@@ -495,10 +496,13 @@ fn stands(lists: &PairLists<'_>, taken: &[u32], word: ShedOver) -> Option<PairSi
 /// decode lent: behind a first decision that picked, behind one that shed
 /// the request with no endpoint, and behind a shed as saturated that does
 /// not stand.
-/// Under a document that sheds a list wholly over its thresholds it sheds
-/// the request as saturated over the rule's prefills that pair with a
-/// decode where they are so, and
-/// that shed is the call's answer, for the prefill side. Any other shed
+/// Under a document that sheds a list wholly over its thresholds it may
+/// shed the request as saturated over the rule's prefills that pair with
+/// a decode, and that shed is the call's answer, for the prefill side. It
+/// does where they are so and none of them stands under the prefill
+/// side's hard filters, its limit set aside. Under a side that lists no
+/// overload veto, one over its thresholds may stand, and the answer
+/// stays as it was. Any other shed
 /// of it leaves the answer as it was: under a document that steers no shed
 /// of a pair is saturated, and the binding's word is a decision's to say.
 /// A refusal of it that is no shed is the call's answer, as behind any
