@@ -432,9 +432,9 @@ fn a_wildcard_names_no_model_and_an_unset_width_is_one() {
     );
 }
 
-/// A window at the default is no fact of the row. A standing row that
-/// states the default's own number keeps it: the object built from that
-/// row waits the number and reads back as its row.
+/// A window at the default is a fact of the row only where the standing
+/// row states the default's own number: the object built from that row
+/// waits the number, and the number reads back.
 #[test]
 fn a_window_at_the_default_reads_back_as_the_standing_row_states_it() {
     let default = HealthCheckConfig::default().drain_settle_secs;
@@ -459,6 +459,10 @@ fn a_window_at_the_default_reads_back_as_the_standing_row_states_it() {
     // Away from the default the window is the object's own.
     assert_eq!(read(default + 40, Some(stated)), Some(stated + 40));
     assert_eq!(read(default + 40, None), Some(stated + 40));
+    // No wait is a window, and one past a row's width is the widest a row
+    // holds.
+    assert_eq!(read(0, None), Some(0));
+    assert_eq!(read(u64::from(u32::MAX) + 1, None), Some(u32::MAX));
 }
 
 #[test]
