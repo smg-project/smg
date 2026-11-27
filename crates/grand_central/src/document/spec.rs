@@ -470,8 +470,10 @@ pub struct ViewSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub block_size: Option<u32>,
-    /// Ascending token positions the hash index and the prefix-hash ring
-    /// key on; empty for none. A hash index needs at least one.
+    /// Ascending token positions, each above zero, that the hash index and
+    /// the prefix-hash ring key on; empty for none. A hash index needs at
+    /// least one.
+    #[schemars(inner(range(min = 1)))]
     pub boundaries: Vec<u32>,
     /// How many prefix block hashes a request carries into the view, 8,190
     /// at most: one frame of the Decide call carries no more.

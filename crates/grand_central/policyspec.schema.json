@@ -95,12 +95,12 @@
           "minimum": 1
         },
         "boundaries": {
-          "description": "Ascending token positions the hash index and the prefix-hash ring\nkey on; empty for none. A hash index needs at least one.",
+          "description": "Ascending token positions, each above zero, that the hash index and\nthe prefix-hash ring key on; empty for none. A hash index needs at\nleast one.",
           "type": "array",
           "items": {
             "type": "integer",
             "format": "uint32",
-            "minimum": 0
+            "minimum": 1
           },
           "default": []
         },

@@ -367,6 +367,7 @@ fn the_schema_names_every_section_and_refuses_unknown_properties() {
     assert_eq!(field("BucketParams", "rel_threshold")["minimum"], 1.0);
     assert_eq!(field("IndexSpec", "ttl_s")["minimum"], 1);
     assert_eq!(field("ViewSpec", "block_size")["minimum"], 1);
+    assert_eq!(field("ViewSpec", "boundaries")["items"]["minimum"], 1);
     assert_eq!(field("ViewSpec", "headers")["maxItems"], MAX_HEADERS);
     assert_eq!(field("ViewSpec", "labels")["maxItems"], MAX_LABELS);
     assert_eq!(field("ViewSpec", "zones")["maxItems"], MAX_ZONES);
