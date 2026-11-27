@@ -163,16 +163,19 @@ impl Run {
     }
 }
 
-/// The headers and the first words have the chunk's fixed length, so their boxes are thin: an
-/// entry of the directory, made whole with the index, is no larger for the further words.
+/// The headers have the chunk's fixed length, so their box is thin, and the further block sits
+/// behind a boxed cell: an entry of the directory, made whole with the index, is no larger for
+/// the further words.
 pub(super) struct RunChunk {
     pub(super) runs: Box<[Run; RUN_CHUNK]>,
-    /// Word 0 of every run's coverage (workers 0 to 63), made with the chunk.
-    first: Box<[AtomicU64; RUN_CHUNK]>,
-    /// Every further word of the runs' coverage, one array a word, made when a worker of
-    /// that word first holds a whole run of this chunk. A word whose array is missing reads
-    /// as zero, so a fleet that fits one word holds one word a run, not the index's ceiling.
-    more: Box<[OnceLock<Box<[AtomicU64]>>]>,
+    /// The first coverage words of every run, a run's words side by side: as many a run as
+    /// the pool's workers spanned when the chunk was made, at least one. A fleet that fits
+    /// one word holds one word a run, not the index's ceiling.
+    base: Box<[AtomicU64]>,
+    /// Every later word of the runs' coverage up to the index's ceiling, a run's words side
+    /// by side, made when a worker of such a word first holds a whole run of this chunk:
+    /// the pool grew after the chunk was made. While it is missing those words read as zero.
+    side: Box<OnceLock<Box<[AtomicU64]>>>,
 }
 
 /// The coverage words of one run: the workers that hold the whole run.
@@ -180,13 +183,14 @@ pub(super) struct RunChunk {
 pub(super) struct Coverage<'a> {
     chunk: &'a RunChunk,
     slot: usize,
+    words: usize,
 }
 
 impl<'a> Coverage<'a> {
     /// Words a run can hold: the index's ceiling of workers, in words.
     #[inline]
     pub(super) fn words(self) -> usize {
-        1 + self.chunk.more.len()
+        self.words
     }
 
     /// Word `index`; zero where no worker of that word ever held a run of the chunk.
@@ -198,22 +202,33 @@ impl<'a> Coverage<'a> {
 
     #[inline]
     fn cell(self, index: usize) -> Option<&'a AtomicU64> {
-        if index == 0 {
-            return Some(&self.chunk.first[self.slot]);
+        debug_assert!(index < self.words);
+        let base = self.chunk.base.len() >> RUN_CHUNK_BITS;
+        if index < base {
+            return Some(&self.chunk.base[self.slot * base + index]);
         }
-        self.chunk.more[index - 1]
+        let rest = self.words - base;
+        self.chunk
+            .side
             .get()
-            .map(|words| &words[self.slot])
+            .map(|words| &words[self.slot * rest + (index - base)])
     }
 
-    /// The cell of word `index`, its array made first where no worker of that word held a
-    /// run of the chunk yet.
+    /// The cell of word `index`, the further block made first where the word lies past the
+    /// chunk's first block and no worker of such a word held a run of the chunk yet.
     #[inline]
     fn cell_or_make(self, index: usize) -> &'a AtomicU64 {
-        if index == 0 {
-            return &self.chunk.first[self.slot];
+        debug_assert!(index < self.words);
+        let base = self.chunk.base.len() >> RUN_CHUNK_BITS;
+        if index < base {
+            return &self.chunk.base[self.slot * base + index];
         }
-        &self.chunk.more[index - 1].get_or_init(zeroed_words)[self.slot]
+        let rest = self.words - base;
+        let words = self
+            .chunk
+            .side
+            .get_or_init(|| zeroed_words(RUN_CHUNK * rest));
+        &words[self.slot * rest + (index - base)]
     }
 
     /// Every word, in order.
@@ -235,8 +250,8 @@ impl<'a> Coverage<'a> {
     }
 }
 
-fn zeroed_words() -> Box<[AtomicU64]> {
-    (0..RUN_CHUNK).map(|_| AtomicU64::new(0)).collect()
+fn zeroed_words(len: usize) -> Box<[AtomicU64]> {
+    (0..len).map(|_| AtomicU64::new(0)).collect()
 }
 
 /// Run storage: a directory of fixed-size chunks created on first use, with a free list of dead
@@ -246,6 +261,11 @@ pub(super) struct RunSlab {
     pub(super) next: AtomicU32,
     pub(super) free: SegQueue<u32>,
     pub(super) words: usize,
+    /// Coverage words a lookup has to read: enough for the highest worker id interned so far
+    /// (ids are handed out densely and reused), at most `words`. An index sized for a thousand
+    /// workers that serves eight reads one word per run instead of sixteen, and a chunk made
+    /// now lays that many words a run.
+    pub(super) live_words: AtomicUsize,
 }
 
 impl RunSlab {
@@ -255,15 +275,21 @@ impl RunSlab {
             next: AtomicU32::new(0),
             free: SegQueue::new(),
             words,
+            live_words: AtomicUsize::new(0),
         }
     }
 
     #[inline]
     pub(super) fn chunk(&self, index: usize) -> &RunChunk {
-        self.dir[index].get_or_init(|| RunChunk {
-            runs: Box::new(std::array::from_fn(|_| Run::blank())),
-            first: Box::new(std::array::from_fn(|_| AtomicU64::new(0))),
-            more: (1..self.words).map(|_| OnceLock::new()).collect(),
+        self.dir[index].get_or_init(|| {
+            // As wide as the pool needs now: a worker of a later word finds its bit in the
+            // further block.
+            let base = self.live_words.load(Ordering::Acquire).clamp(1, self.words);
+            RunChunk {
+                runs: Box::new(std::array::from_fn(|_| Run::blank())),
+                base: zeroed_words(RUN_CHUNK * base),
+                side: Box::new(OnceLock::new()),
+            }
         })
     }
 
@@ -279,6 +305,7 @@ impl RunSlab {
         Coverage {
             chunk: self.chunk(id >> RUN_CHUNK_BITS),
             slot: id & (RUN_CHUNK - 1),
+            words: self.words,
         }
     }
 
@@ -315,22 +342,18 @@ impl RunSlab {
         self.next.load(Ordering::Relaxed) as usize
     }
 
-    /// Bytes of chunks taken from the process allocator: the headers and the first coverage
-    /// word of every slot, used or not, and every further word array a chunk has made.
+    /// Bytes of chunks taken from the process allocator: the headers and the first block of
+    /// coverage words of every slot, used or not, and the further block of a chunk that made
+    /// one.
     pub(super) fn chunk_bytes(&self) -> usize {
-        let word_array = RUN_CHUNK * size_of::<AtomicU64>();
         self.dir
             .iter()
             .filter_map(OnceLock::get)
             .map(|chunk| {
-                let made = chunk
-                    .more
-                    .iter()
-                    .filter(|words| words.get().is_some())
-                    .count();
+                let words = chunk.base.len() + chunk.side.get().map_or(0, |words| words.len());
                 RUN_CHUNK * size_of::<Run>()
-                    + (1 + made) * word_array
-                    + chunk.more.len() * size_of::<OnceLock<Box<[AtomicU64]>>>()
+                    + words * size_of::<AtomicU64>()
+                    + size_of::<OnceLock<Box<[AtomicU64]>>>()
             })
             .sum()
     }

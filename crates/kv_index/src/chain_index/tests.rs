@@ -1662,10 +1662,11 @@ fn the_deepest_read_keeps_only_the_workers_its_caller_names() {
     assert_eq!(deepest(&index, &chain, &[], 16, 1).0, vec![]);
 }
 
-/// What one chunk of the run slab holds once `words` of its coverage word arrays are made.
+/// What one chunk of the run slab holds with `words` coverage words a run laid, its first
+/// block and its further block together.
 fn slab_chunk_bytes(words: usize) -> usize {
     RUN_CHUNK * (size_of::<Run>() + words * size_of::<AtomicU64>())
-        + (MAX_WORDS - 1) * size_of::<OnceLock<Box<[AtomicU64]>>>()
+        + size_of::<OnceLock<Box<[AtomicU64]>>>()
 }
 
 /// A fleet that fits the first coverage word holds one word a run, however high the index's
@@ -1694,8 +1695,8 @@ fn a_fleet_within_one_word_holds_one_coverage_word_a_run() {
 }
 
 /// The 65th worker of an index is the first of the second coverage word: its store gives the
-/// chunk that word's array, it is read as a holder beside the first 64, and its removal
-/// leaves them whole.
+/// chunk, made at one word a run, its further block, it is read as a holder beside the first
+/// 64, and its removal leaves them whole.
 #[test]
 fn the_sixty_fifth_worker_reads_and_writes_right() {
     let index = ChainIndex::with_max_workers(MAX_WORDS * 64);
@@ -1713,7 +1714,7 @@ fn the_sixty_fifth_worker_reads_and_writes_right() {
         }
         maps.push((worker, map));
     }
-    assert_eq!(index.stats().slab_bytes, slab_chunk_bytes(2));
+    assert_eq!(index.stats().slab_bytes, slab_chunk_bytes(MAX_WORDS));
     let mut holders = scores(&index, &held);
     holders.sort_unstable();
     assert_eq!(holders, (0..65u32).map(|w| (w, 4)).collect::<Vec<_>>());
@@ -1827,7 +1828,7 @@ fn a_removal_leaves_a_run_a_holder_of_a_further_word_still_holds() {
 }
 
 /// A coverage word no worker reached reads as zero and stays unmade: neither a read nor a
-/// clear makes its array.
+/// clear makes the further block.
 #[test]
 fn a_missing_coverage_word_reads_as_zero() {
     let slab = RunSlab::new(MAX_WORDS);
@@ -1843,10 +1844,98 @@ fn a_missing_coverage_word_reads_as_zero() {
     assert_eq!(slab.chunk_bytes(), slab_chunk_bytes(1));
     set(coverage, 200);
     assert_eq!(workers(coverage), vec![3, 200]);
-    assert_eq!(slab.chunk_bytes(), slab_chunk_bytes(2));
+    assert_eq!(slab.chunk_bytes(), slab_chunk_bytes(MAX_WORDS));
 }
 
-/// Two stores that meet at the first bit of a word: the word's array is made once and both
+/// A chunk lays as many coverage words a run as the pool's workers span when it is made, a
+/// run's words side by side: an index whose 256 workers are interned before its second chunk
+/// lays four words a run there and makes no further block for a holder of the fourth word,
+/// while the chunk made with the index, at one word a run, takes the rest of the ceiling.
+#[test]
+fn a_chunk_made_at_a_wider_pool_lays_its_words_side_by_side() {
+    let index = ChainIndex::with_max_workers(MAX_WORDS * 64);
+    let ids: Vec<u32> = (0..256)
+        .map(|name| index.intern_worker(&format!("w{name}")).expect("id"))
+        .collect();
+    let last = ids[255];
+    let mut map = ChainBlockMap::default();
+    let chains = RUN_CHUNK as u64 + 8;
+    for chain in 0..chains {
+        let blocks = blocks_of(&[content(7_000 + chain, 0)]);
+        index
+            .apply_stored(last, &blocks, None, &mut map)
+            .expect("stored");
+    }
+    let stats = index.stats();
+    assert!(stats.runs_allocated > RUN_CHUNK && stats.runs_allocated <= 2 * RUN_CHUNK);
+    assert_eq!(
+        stats.slab_bytes,
+        slab_chunk_bytes(MAX_WORDS) + slab_chunk_bytes(4)
+    );
+    for chain in [0, chains - 1] {
+        assert_eq!(
+            scores(&index, &[content(7_000 + chain, 0)]),
+            vec![(last, 1)]
+        );
+    }
+}
+
+/// A chunk made while the pool spans the whole ceiling lays every word in its first block: no
+/// further block is ever made, and the last worker of the last run reads and writes right.
+#[test]
+fn a_chunk_made_at_the_ceiling_never_makes_a_further_block() {
+    let slab = RunSlab::new(MAX_WORDS);
+    slab.live_words.store(MAX_WORDS, Ordering::Release);
+    let last = slab.coverage(RUN_CHUNK as u32 - 1);
+    for worker in [0, 63, 64, 1023] {
+        set(last, worker);
+    }
+    assert_eq!(workers(last), vec![0, 63, 64, 1023]);
+    assert!(coverage_is_empty(
+        slab.coverage(RUN_CHUNK as u32 - 2),
+        MAX_WORDS
+    ));
+    clear(last, 1023);
+    assert_eq!(workers(last), vec![0, 63, 64]);
+    assert_eq!(slab.chunk_bytes(), slab_chunk_bytes(MAX_WORDS));
+}
+
+/// A worker past the first block of a chunk made at a narrower pool: its bit lands in the
+/// further block of its own run alone, beside the bits of the first block, and its removal
+/// leaves every other holder of the run and of the runs beside it.
+#[test]
+fn a_worker_past_the_first_block_of_a_chunk_reads_and_writes_right() {
+    let slab = RunSlab::new(MAX_WORDS);
+    slab.live_words.store(4, Ordering::Release);
+    let (before, run, after) = (slab.coverage(6), slab.coverage(7), slab.coverage(8));
+    assert_eq!(slab.chunk_bytes(), slab_chunk_bytes(4));
+    set(before, 255);
+    set(after, 0);
+    for worker in [3, 64, 255] {
+        set(run, worker);
+    }
+    assert_eq!(slab.chunk_bytes(), slab_chunk_bytes(4));
+    assert!(!has(run, 256) && !has(run, 1023));
+    for worker in [256, 1023] {
+        set(run, worker);
+    }
+    set(before, 1023);
+    set(after, 256);
+    assert_eq!(slab.chunk_bytes(), slab_chunk_bytes(MAX_WORDS));
+    assert_eq!(workers(run), vec![3, 64, 255, 256, 1023]);
+    assert_eq!(workers(before), vec![255, 1023]);
+    assert_eq!(workers(after), vec![0, 256]);
+    clear(run, 256);
+    clear(run, 3);
+    assert_eq!(workers(run), vec![64, 255, 1023]);
+    assert_eq!(workers(before), vec![255, 1023]);
+    assert_eq!(workers(after), vec![0, 256]);
+    let copy = slab.coverage(9);
+    run.copy_into(copy, MAX_WORDS);
+    assert_eq!(workers(copy), vec![64, 255, 1023]);
+}
+
+/// Two stores that meet at the first bit of a word: the further block is made once and both
 /// bits stand.
 #[test]
 fn two_stores_that_meet_at_the_first_bit_of_a_word_both_land() {
@@ -1863,7 +1952,7 @@ fn two_stores_that_meet_at_the_first_bit_of_a_word_both_land() {
             }
         });
         assert_eq!(workers(slab.coverage(round)), vec![64, 65], "round {round}");
-        assert_eq!(slab.chunk_bytes(), slab_chunk_bytes(2));
+        assert_eq!(slab.chunk_bytes(), slab_chunk_bytes(MAX_WORDS));
     }
 }
 

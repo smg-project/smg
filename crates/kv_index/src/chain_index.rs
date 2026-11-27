@@ -276,10 +276,6 @@ pub struct ChainIndex {
     /// Stores whose blocks carried the engine hashes the index holds for other content.
     landing_mismatches: AtomicUsize,
     /// Blocks a store moved to another place for their worker (the old membership released).
-    /// Coverage words a lookup has to read: enough for the highest worker id interned so far
-    /// (ids are handed out densely and reused), at most `words`. An index sized for a thousand
-    /// workers that serves eight reads one word per run instead of sixteen.
-    live_words: AtomicUsize,
     moved_hashes: AtomicUsize,
     /// Splits by cause and runs unlinked, always counted (one relaxed increment per split or
     /// death): the fragmentation figures a churn harness and the gateway's gauges read.
@@ -399,9 +395,9 @@ impl ChainIndex {
         self.arena.cap_words = words;
     }
 
-    /// An index for up to `max_workers` interned workers (at most 1024). Coverage costs one
-    /// word per run, and one more per run of a chunk for each further 64 workers once one of
-    /// them holds a whole run there.
+    /// An index for up to `max_workers` interned workers (at most 1024). A chunk of runs lays
+    /// one coverage word per run for each 64 workers interned when the chunk is made, at least
+    /// one, and the rest of the ceiling once a worker of a later word holds a whole run there.
     pub fn with_max_workers(max_workers: usize) -> Self {
         let max_workers = max_workers.clamp(1, MAX_WORDS * 64);
         let words = max_workers.div_ceil(64);
@@ -438,7 +434,6 @@ impl ChainIndex {
             engine_conflicts: AtomicUsize::new(0),
             cap_refusals: AtomicUsize::new(0),
             landing_mismatches: AtomicUsize::new(0),
-            live_words: AtomicUsize::new(0),
             moved_hashes: AtomicUsize::new(0),
             splits_branch: AtomicUsize::new(0),
             splits_hole: AtomicUsize::new(0),
@@ -495,7 +490,8 @@ impl ChainIndex {
                         let id = (registry.names.len() - 1) as u32;
                         // Published before the id can hold anything: the worker's first store
                         // comes after this returns.
-                        self.live_words
+                        self.slab
+                            .live_words
                             .fetch_max(id as usize / 64 + 1, Ordering::Release);
                         id
                     }
@@ -950,11 +946,11 @@ impl ChainIndex {
         }
     }
 
-    /// Coverage words that can carry a holder: see `live_words`. An id is published there
-    /// before its first store, so a walk of a whole coverage reads these and no further.
+    /// Coverage words that can carry a holder: see the slab's `live_words`. An id is published
+    /// there before its first store, so a walk of a whole coverage reads these and no further.
     #[inline]
     fn coverage_words(&self) -> usize {
-        self.live_words.load(Ordering::Acquire).min(self.words)
+        self.slab.live_words.load(Ordering::Acquire).min(self.words)
     }
 
     /// Blocks of a run held by at least one worker: all of them while anybody holds the whole
