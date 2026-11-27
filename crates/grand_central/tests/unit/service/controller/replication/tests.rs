@@ -26,6 +26,7 @@ use crate::{
         LeadWord, LeasesStore, MembershipChange, Registrant, WorkerFacts, WorkerRow, WorkerStatus,
         WorkersStore,
     },
+    worker_host::tests::stand,
 };
 
 /// The same over one file of leases with the log's places starting after
@@ -1383,6 +1384,19 @@ impl Journal for AtTheCut {
         self.log.member(at, term, epoch, change, row, left)
     }
 
+    fn status(
+        &self,
+        at: Option<Position>,
+        term: Option<u64>,
+        epoch: u64,
+        id: WorkerId,
+        from: WorkerStatus,
+        to: WorkerStatus,
+        models: Arc<[String]>,
+    ) -> bool {
+        self.log.status(at, term, epoch, id, from, to, models)
+    }
+
     fn term_rose(&self, term: u64) {
         self.log.term_rose(term);
     }
@@ -1761,10 +1775,14 @@ fn a_copy_behind_a_status_tell_holds_the_told_status_at_its_place() {
         panic!("one row was written");
     };
     assert_eq!(row.status, WorkerStatus::Pending);
-    // The store's entry a holder's tell ends in, with no turn here.
-    let ready = WorkerStatus::Ready;
+    // The store's entry a holder's tell ends in, with no turn here: the
+    // models are the row's, as a holder reads them off its object.
+    let (ready, models) = (WorkerStatus::Ready, row.facts.models.as_slice().into());
     let word = LeadWord::FREE;
-    leader.store.status_told(id, ready, row.revision, word);
+    let told = leader
+        .store
+        .status_told(id, ready, row.revision, word, Some(models));
+    assert!(told.moved().is_some(), "the store took the status");
     let (behind, held) = first_copy(&leader, &objects);
     assert!(behind.seq > before.seq, "the tell moved the place");
     let told = WorkerRow {
@@ -1772,4 +1790,37 @@ fn a_copy_behind_a_status_tell_holds_the_told_status_at_its_place() {
         ..row.clone()
     };
     assert_eq!(held, [told]);
+}
+
+/// A status entry names the models its worker object served at the
+/// write, and no row: the holder reads them under the object's lock
+/// and hands them ahead of the store's. A row whose models change in
+/// place behind a told status leaves that entry as it was told, and
+/// the row's next status names the new ones.
+#[test]
+fn a_status_entry_names_the_models_its_row_served_at_the_write() {
+    let leader = Leader::leading();
+    let id = leader.writes(0);
+    stand(&leader.objects, &leader.store, id, WorkerStatus::Ready);
+    // The row's models change in place, and its object moves again.
+    let stood = WorkersStore::get(leader.store.as_ref(), id).expect("the row");
+    let mut wider = stood.facts;
+    wider.models.push("n".to_owned());
+    assert_eq!(leader.registers(wider), id, "a change in place");
+    stand(&leader.objects, &leader.store, id, WorkerStatus::NotReady);
+    let mut entries = Vec::new();
+    leader
+        .log
+        .read(START, Log::BATCH, &mut entries)
+        .expect("the log holds its start");
+    let statuses = entries.iter().filter_map(|entry| match &entry.event {
+        Written::Status { to, models, .. } => Some((*to, models.to_vec())),
+        Written::Member { .. } | Written::Term | Written::Generation { .. } => None,
+    });
+    let (m, n) = ("m".to_owned(), "n".to_owned());
+    let told = [
+        (WorkerStatus::Ready, vec![m.clone()]),
+        (WorkerStatus::NotReady, vec![m, n]),
+    ];
+    assert_eq!(statuses.collect::<Vec<_>>(), told);
 }

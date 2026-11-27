@@ -3404,15 +3404,28 @@ A fact leaves the remainder when the worker object gets a field that holds it as
    log last told of the record. A standby's applier hands its own log the record its applied
    change takes out the same way, read back from the object.
 
-   The table still gives an event five things until step 4. The status told with a handed
-   record is the first: it is the log's own word, which the table holds for the log. The
+   The table still gives an event six things until step 4. The status the log last told of a
+   record is the first: a handed record is told in it, and a status event names it as the
+   status its record left. It is the log's own word, which the table holds for the log. The
    second is the instant a record changed in place was admitted at: the one body lays the
    table's over every writer's record, and a keeper and a standby's applier hand that same
-   instant. The third is the record of a status event, on a leader and on a standby, until a
-   status entry holds what its readers read **[planned]**. The fourth is the record taken out
-   by a decided change that a host hands the store itself (`MemoryStore::follow`): no product code hands one so.
+   instant. The third is the models of a status a standby applies. A status event holds no
+   record: it names the models its record served at the write, the one fact a reader of a
+   status reads, for a watch that asked for some. A leader's keeper hands them off the worker
+   object, under the hold that reads the status **[built]**. A standby's applier hands none,
+   and its log is told the models of the table's record until the applier hands its object's
+   **[planned]**. No watch reads a standby's log: a watch of the leader it becomes reads those
+   entries. The fourth is the record taken out
+   by a decided change that a host hands the store itself (`MemoryStore::follow`), and the models of a status it hands so: no product code hands one so.
+   A keeper's status that hands no models is told the table's too: a keeper hands them wherever a log is told.
    The fifth is the record a standby's applied change takes out where that record has no
-   object.
+   object. The sixth is the kind of a change in place: the one body tells a resize where the
+   width of the table's record differs from the handed record's, whatever kind its writer
+   handed.
+
+   Two more reads of the table in that body reach no event, and they end with the table too:
+   the test whether a key's next life is the same worker, for its session pins, and the models
+   a registration takes its worker off, which the stages are told.
 
    In a controller the
    code that keeps the objects alone writes a worker object's own facts, so the record a change
@@ -3520,8 +3533,9 @@ Three writes move the log's place outside the keeper's turn, and a
 copy stays whole beside each: a status tell changes no fact, and a generation's apply and a
 term's start change no record.
 
-The told status has five readers: the next status event, for
-the status a record moved from, the event of a record changed in place, which carries it, a
+The told status has six readers: the next status event, for
+the status a record moved from, the event of a record changed in place, which carries it, the
+event of a record a write takes out, which is told in it where its writer handed the record, a
 first copy, a tell the store refused, whose object takes it back, and a standby's applier or
 a watcher, which lays it on the object. No decision reads it. An operator's read of a few
 records is read as a first copy is cut, in the keeper's turn and with each record's told status,
