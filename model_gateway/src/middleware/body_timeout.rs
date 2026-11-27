@@ -295,7 +295,7 @@ impl Drop for UploadWait {
 
 /// `body` under the upload wait this layer's body measures, for a reader
 /// outside the layer: the WASM request hook, which reads the body ahead of
-/// it.
+/// it, and the multipart routes, which stand under no body deadline.
 pub(crate) fn upload_measured(body: Body) -> Body {
     Body::new(UploadMeasured {
         inner: body,
