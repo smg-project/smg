@@ -11,7 +11,7 @@ use std::{
 
 use super::{
     super::{Generations, NOT_ABOVE, NUMBER},
-    applied, followed, generations, sent, stored, switched, yaml, REPLICA_NOTICES,
+    applied, followed, generations, sent, stored, switched, yaml,
 };
 use crate::{
     document::{
@@ -269,8 +269,9 @@ fn a_shown_document_stood_by_the_order_of_its_hand_and_the_generations() {
 }
 
 /// A leader's generation holds the door's lock from its pass until it
-/// lands, its entry included. No apply comes between the two. An event
-/// that changes nothing holds it the same way.
+/// lands: held behind the pass, and let go behind the entry. No apply
+/// comes between the two. An event that changes nothing holds it the
+/// same way.
 #[test]
 fn a_followed_generation_holds_the_doors_lock_from_its_pass_until_it_lands() {
     let (_, leader) = generations();
@@ -281,11 +282,7 @@ fn a_followed_generation_holds_the_doors_lock_from_its_pass_until_it_lands() {
 
     let following = standby.following(&told).expect("above no generation");
     assert!(locked(), "held behind the pass");
-    // The entry's notice looks at the lock where it runs.
-    REPLICA_NOTICES.with(|notices| notices.set(Some(0)));
-    let landed = following.land(None);
-    assert_eq!(REPLICA_NOTICES.with(Cell::take), Some(1));
-    landed.expect("it lands");
+    following.land(None).expect("it lands");
     assert!(!locked(), "let go behind the entry");
     assert_eq!(standing(&store).0, 1);
 
