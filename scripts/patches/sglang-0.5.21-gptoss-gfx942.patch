@@ -40,7 +40,7 @@
  from dataclasses import replace
  from functools import lru_cache
  from typing import TYPE_CHECKING, List, Optional
-@@ -199,6 +203,216 @@
+@@ -199,6 +203,215 @@
  _is_xpu = is_xpu()
  _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
  _aiter_k3_opt = _use_aiter and get_bool_env_var("SGLANG_AITER_K3_OPT")
@@ -190,11 +190,10 @@
 +def _validate_gfx942_gptoss_bf16_model(model_path, hf_config, quantization):
 +    if not _gfx942_gptoss_bf16_requested():
 +        return
-+    if str(model_path).rstrip("/") != "openai/gpt-oss-20b":
-+        try:
-+            _validate_gptoss_local_checkpoint(model_path)
-+        except (OSError, ValueError) as exc:
-+            raise ValueError("GPTOSS fallback requires the validated original local checkpoint") from exc
++    try:
++        _validate_gptoss_local_checkpoint(model_path)
++    except (OSError, ValueError) as exc:
++        raise ValueError("GPTOSS fallback requires the validated original local checkpoint") from exc
 +    if getattr(hf_config, "model_type", None) != "gpt_oss" or quantization != "mxfp4":
 +        raise ValueError(
 +            "GPTOSS gfx942 BF16 fallback requires original openai/gpt-oss-20b MXFP4 checkpoint"
@@ -257,7 +256,7 @@
  _is_shuffle_moe_mxfp4 = is_gfx95_supported()
  _is_cpu_amx_available = cpu_has_amx_support()
  
-@@ -296,16 +510,31 @@
+@@ -296,16 +509,31 @@
          self,
          ignored_layers: Optional[list[str]] = None,
          is_checkpoint_mxfp4_serialized: bool = False,
@@ -290,7 +289,7 @@
  
          if _is_hip:
              if is_gfx95_supported():
-@@ -342,7 +571,6 @@
+@@ -342,7 +570,6 @@
      def get_quant_method(
          self, layer: torch.nn.Module, prefix: str
      ) -> Optional[QuantizeMethodBase]:
@@ -298,7 +297,7 @@
          from sglang.srt.layers.linear import LinearBase
          from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
          from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-@@ -358,7 +586,10 @@
+@@ -358,7 +585,10 @@
                  return UnquantizedLinearMethod()
          elif isinstance(layer, FusedMoE):
              if self.is_checkpoint_mxfp4_serialized:
@@ -310,7 +309,7 @@
              else:
                  return Mxfp4DynamicQuantMoEMethod()
          else:
-@@ -374,8 +605,12 @@
+@@ -374,8 +604,12 @@
      def __init__(
          self,
          prefix: str,
@@ -323,7 +322,7 @@
  
          self.prefix = prefix
          self.topk_indices_dtype = None
-@@ -437,6 +672,10 @@
+@@ -437,6 +671,10 @@
          with_bias: bool = False,
          **extra_weight_attrs,
      ):
@@ -334,7 +333,7 @@
          self.num_experts = num_experts
          weight_dtype = torch.uint8
          scale_dtype = torch.uint8
-@@ -619,6 +858,33 @@
+@@ -619,6 +857,33 @@
              set_weight_attrs(w2_weight_bias, extra_weight_attrs)
  
      def process_weights_after_loading(self, layer):
@@ -368,7 +367,7 @@
          if self.use_marlin and not self.use_mega_moe:
              from sglang.srt.layers.quantization.marlin_utils import (
                  check_moe_marlin_supports_layer,
-@@ -1580,6 +1846,24 @@
+@@ -1580,6 +1845,24 @@
          layer: torch.nn.Module,
          dispatch_output: StandardDispatchOutput,
      ) -> CombineInput:
@@ -393,7 +392,7 @@
  
          from sglang.srt.layers.moe.token_dispatcher import (
              DispatchOutputChecker,
-@@ -1805,7 +2089,6 @@
+@@ -1805,7 +2088,6 @@
          params_dtype: torch.dtype,
          **extra_weight_attrs,
      ):

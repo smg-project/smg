@@ -278,7 +278,7 @@ def test_original_local_snapshot_alias_and_copy(local_checkpoint):
     root, snapshot, alias, ns = local_checkpoint
     validate = ns["_validate_gfx942_gptoss_bf16_model"]
     config = SimpleNamespace(model_type="gpt_oss")
-    for path in (snapshot, alias, "openai/gpt-oss-20b"):
+    for path in (snapshot, alias):
         validate(path, config, "mxfp4")
     alias.unlink()
     shutil.copytree(snapshot, alias)
@@ -460,3 +460,63 @@ def test_shared_blob_chain_rejects_unanchored_or_escaping_links(local_checkpoint
     assert not ns["_original_shared_blob"](shard, snapshot.parents[1], snapshot.name)
     with pytest.raises((ValueError, OSError)):
         ns["_validate_gptoss_local_checkpoint"](alias)
+
+
+def test_shipped_patch_matches_pinned_digest():
+    spec = importlib.util.spec_from_file_location("shipped_sglang_patch", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert hashlib.sha256(module.PATCH.read_bytes()).hexdigest() == module.PATCH_SHA
+
+
+@pytest.mark.parametrize("model_path", ["openai/gpt-oss-20b", "openai/gpt-oss-20b/"])
+def test_bare_hub_id_cannot_bypass_revision_or_cwd_checkpoint(
+    local_checkpoint, monkeypatch, model_path
+):
+    from types import SimpleNamespace
+
+    root, _, _, namespace = local_checkpoint
+    # The engine would treat this relative Hub identifier as an existing local
+    # directory in this CWD. It must still undergo the fixed absolute-path gate.
+    monkeypatch.chdir(root)
+    assert Path(model_path).is_dir()
+    config = SimpleNamespace(model_type="gpt_oss", _commit_hash="0" * 40)
+    with pytest.raises(ValueError, match="validated original local checkpoint"):
+        namespace["_validate_gfx942_gptoss_bf16_model"](model_path, config, "mxfp4")
+
+
+@pytest.mark.parametrize("failure", ["exit", "timeout"])
+def test_failed_patch_reports_both_bounded_streams_without_sdk_writes(
+    sdk, monkeypatch, tmp_path, failure
+):
+    import importlib.metadata
+    import json
+    import subprocess
+
+    module, root = sdk
+    monkeypatch.setenv("E2E_ENGINE", "sglang")
+    monkeypatch.setenv("E2E_GPU_VENDOR", "amd")
+    monkeypatch.setenv("SMG_SGLANG_ROCM_IMAGE", module.IMAGE)
+    monkeypatch.setattr(module, "sdk_root", lambda: root)
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: "0.5.21")
+    out = b"x" * 2048 + b"\xff Hunk #1 FAILED"
+    err = b"y" * 2048 + b"\xfe unsupported option"
+
+    def failed_patch(argv, **kwargs):
+        assert argv[0] == "patch" and kwargs["capture_output"] is True
+        if failure == "exit":
+            raise subprocess.CalledProcessError(1, argv, output=out, stderr=err)
+        raise subprocess.TimeoutExpired(argv, 10, output=out, stderr=err)
+
+    monkeypatch.setattr(module.subprocess, "run", failed_patch)
+    output = tmp_path / "failure.json"
+    assert module.main(["--output", str(output)]) == 1
+    record = json.loads(output.read_text())
+    assert record["status"] == "failed"
+    assert record["error"]["type"] == (
+        "CalledProcessError" if failure == "exit" else "TimeoutExpired"
+    )
+    for name, captured in (("stdout", out), ("stderr", err)):
+        assert record["error"][name] == captured.decode(errors="replace")[-1024:]
+        assert len(record["error"][name]) == 1024
+    assert all((root / name).read_bytes() == b"before\n" for name in module.FILES)

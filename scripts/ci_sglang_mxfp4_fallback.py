@@ -25,11 +25,11 @@ FILES = {
     ),
     "srt/layers/quantization/mxfp4.py": (
         "10692c68bc5e1d412fc4489d2c469e9916948d396f209b5ba6835c942676d9f9",
-        "77170fb5097e5623276e8a70201bb39aea1b07fd078fb75a589173ccad2fa2ce",
+        "b0f90a0b1e539657e5d23ac4893550975136e5c46d7deb2e07e724f7d94f9e5c",
     ),
 }
 PATCH = Path(__file__).with_name("patches") / "sglang-0.5.21-gptoss-gfx942.patch"
-PATCH_SHA = "f28f934faca6c84a8f66d8e3c364047ba4f9859cdcef07f31bbb1ed54a069f50"
+PATCH_SHA = "db59b663d2e4a0f87f6bd7f788ade509a60780bfa0d756b5c63eddb77fe4422e"
 
 
 def enabled():
@@ -168,6 +168,13 @@ def main(argv=None):
         return 0
     except Exception as error:
         record["error"] = {"type": type(error).__name__, "message": str(error)[:2048]}
+        if isinstance(error, (subprocess.CalledProcessError, subprocess.TimeoutExpired)):
+            for stream in ("stdout", "stderr"):
+                captured = getattr(error, stream, None)
+                if captured is not None:
+                    if isinstance(captured, bytes):
+                        captured = captured.decode(errors="replace")
+                    record["error"][stream] = captured[-1024:]
         return 1
     finally:
         body = json.dumps(record, sort_keys=True) + "\n"
