@@ -20,9 +20,12 @@
 
 # Main source code (model_gateway)
 /model_gateway/src/config @slin1237 @CatherineSue @smg-project-bot
+/model_gateway/tests/unit/config @slin1237 @CatherineSue @smg-project-bot
 /model_gateway/src/core @slin1237 @CatherineSue @smg-project-bot
 /model_gateway/src/policies @slin1237 @smg-project-bot
+/model_gateway/tests/unit/policies @slin1237 @smg-project-bot
 /model_gateway/src/routers @CatherineSue @key4ng @slin1237 @smg-project-bot
+/model_gateway/tests/unit/routers @CatherineSue @key4ng @slin1237 @smg-project-bot
 /crates/service_discovery @slin1237 @CatherineSue @key4ng @XinyueZhang369 @smg-project-bot
 
 # Workspace crates
