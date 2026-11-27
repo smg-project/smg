@@ -15,7 +15,7 @@ pub(super) enum BudgetWire {
 pub(super) fn wire(runtime: RuntimeType) -> BudgetWire {
     match runtime {
         RuntimeType::Sglang => BudgetWire::Sglang,
-        RuntimeType::Vllm => BudgetWire::Canonical,
+        RuntimeType::Vllm | RuntimeType::Trtllm => BudgetWire::Canonical,
         _ => BudgetWire::Passthrough,
     }
 }
