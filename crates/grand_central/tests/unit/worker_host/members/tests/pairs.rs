@@ -55,6 +55,14 @@ pub(super) fn pair_side(url: &str, role: Role, transport: &str) -> WorkerFacts {
     }
 }
 
+/// The worker crate's word for no runtime with its first letter alone
+/// upper: a letter case that is neither all lower nor all upper.
+pub(super) fn no_runtime_in_title_case() -> String {
+    let none = smg_worker::worker::RuntimeType::default().as_str();
+    let (first, rest) = none.split_at(1);
+    format!("{}{rest}", first.to_uppercase())
+}
+
 /// A prefill another writer registered: the holder lays no row for it.
 pub(super) fn stray_prefill() -> Arc<dyn Worker> {
     let worker = <BasicWorkerBuilder>::new(STRAY).model(ModelCard::new(MODEL));
@@ -148,6 +156,144 @@ fn a_pairs_classes_read_each_rows_wires_and_engine_kind() {
         (classes.prefills(), classes.decodes()),
         (&[0, 1, 0][..], &[1][..])
     );
+}
+
+/// A row keeps its runtime's name as its host wrote it, and the holder
+/// hands the rule the worker crate's reading of that name. Two spellings of
+/// one runtime are one name on either side, and so are two names that
+/// crate reads as one runtime. Beside that name the two here state one
+/// transport and no other fact of a handoff, and pair under every mode, on
+/// a wire whose requests are one runtime's.
+#[test]
+fn two_spellings_of_one_runtime_are_one_name_to_a_pairs_classes() {
+    use smg_worker::worker::RuntimeType;
+
+    let name = RuntimeType::Generic.as_str();
+    let spelled = [
+        (name.to_uppercase(), name.to_string()),
+        (name.to_string(), name.to_uppercase()),
+        ("TensorRT-LLM".to_string(), "trtllm".to_string()),
+    ];
+    for (prefill, decode) in spelled {
+        let replica = Replica::new();
+        let sides = [
+            (PREFILL, Role::Prefill, &prefill),
+            (DECODE, Role::Decode, &decode),
+        ];
+        for (url, role, kind) in sides {
+            let facts = WorkerFacts {
+                wire_modes: WireModes::GRPC,
+                engine_kind: kind.clone(),
+                ..pair_side(url, role, "a")
+            };
+            state(&replica, facts);
+        }
+        let generation = replica.generation();
+        for mode in [Pairing::Off, Pairing::Lenient, Pairing::Strict] {
+            let classes = replica.objects.pair_classes(&generation, mode);
+            assert_eq!(
+                (classes.prefills(), classes.decodes()),
+                (&[1][..], &[1][..]),
+                "{prefill} and {decode} under {mode:?}"
+            );
+        }
+    }
+}
+
+/// The worker crate's word for no runtime is no name to the rule, in any
+/// letter case: such a row's runtime is unknown. Strict refuses a pair
+/// whose runtime neither side names, though both state one protocol and
+/// both write the word alike, and lenient pairs it. Two rows that write
+/// the word in two letter cases are of no two runtimes. Beside a worker
+/// that names its runtime such a row is of no different runtime: on a wire
+/// whose requests are one runtime's, the two here report one transport and
+/// pair leniently, and strict refuses the side that names none.
+#[test]
+fn the_word_for_no_runtime_is_no_name_to_a_pairs_classes() {
+    use smg_worker::worker::RuntimeType;
+
+    let none = RuntimeType::default().as_str();
+    let upper = none.to_uppercase();
+    let mixed = no_runtime_in_title_case();
+    let ask = |replica: &Replica, mode: Pairing| {
+        let generation = replica.generation();
+        let classes = replica.objects.pair_classes(&generation, mode);
+        (classes.prefills().to_vec(), classes.decodes().to_vec())
+    };
+
+    // Two rows on the HTTP wire that state one protocol.
+    let agreed = |url: &str, role: Role, kind: &str| {
+        let descriptor = PairingDescriptor {
+            protocol: Some("p".to_string()),
+            ..PairingDescriptor::default()
+        };
+        WorkerFacts {
+            wire_modes: WireModes::HTTP,
+            engine_kind: kind.to_string(),
+            pairing: Some(Arc::new(descriptor)),
+            ..pair_side(url, role, "a")
+        }
+    };
+    // Both write the word alike, in three letter cases.
+    for word in [none, upper.as_str(), mixed.as_str()] {
+        let alike = Replica::new();
+        state(&alike, agreed(PREFILL, Role::Prefill, word));
+        state(&alike, agreed(DECODE, Role::Decode, word));
+        assert_eq!(ask(&alike, Pairing::Strict), (vec![0], vec![0]), "{word}");
+        assert_eq!(ask(&alike, Pairing::Lenient), (vec![1], vec![1]), "{word}");
+    }
+    // Each writes it in a letter case of its own.
+    let apart = Replica::new();
+    state(&apart, agreed(PREFILL, Role::Prefill, none));
+    state(&apart, agreed(DECODE, Role::Decode, &mixed));
+    assert_eq!(ask(&apart, Pairing::Strict), (vec![0], vec![0]));
+    assert_eq!(ask(&apart, Pairing::Lenient), (vec![1], vec![1]));
+
+    // Such a row beside a decode that names its runtime.
+    let sided = |url: &str, role: Role, kind: &str| WorkerFacts {
+        wire_modes: WireModes::GRPC,
+        engine_kind: kind.to_string(),
+        ..pair_side(url, role, "a")
+    };
+    let named = Replica::new();
+    state(&named, sided(PREFILL, Role::Prefill, none));
+    let known = RuntimeType::Generic.as_str();
+    state(&named, sided(DECODE, Role::Decode, known));
+    assert_eq!(ask(&named, Pairing::Lenient), (vec![1], vec![1]));
+    assert_eq!(ask(&named, Pairing::Off), (vec![1], vec![1]));
+    assert_eq!(ask(&named, Pairing::Strict), (vec![0], vec![0]));
+}
+
+/// A name the worker crate does not know stays the row's own word to the
+/// rule, compared as the row wrote it. One that is not empty is one known
+/// runtime on both sides, under strict too, and two spellings of it are
+/// two runtimes, which no mode pairs on a wire whose requests are one
+/// runtime's.
+#[test]
+fn a_name_the_worker_crate_does_not_know_is_compared_as_the_row_wrote_it() {
+    let replica = Replica::new();
+    let sides = [
+        (PREFILL, Role::Prefill, "one"),
+        (PREFILL_1, Role::Prefill, "ONE"),
+        (DECODE, Role::Decode, "one"),
+    ];
+    for (url, role, kind) in sides {
+        let facts = WorkerFacts {
+            wire_modes: WireModes::GRPC,
+            engine_kind: kind.to_string(),
+            ..pair_side(url, role, "a")
+        };
+        state(&replica, facts);
+    }
+    let generation = replica.generation();
+    for mode in [Pairing::Off, Pairing::Lenient, Pairing::Strict] {
+        let classes = replica.objects.pair_classes(&generation, mode);
+        assert_eq!(
+            (classes.prefills(), classes.decodes()),
+            (&[1, 0][..], &[1][..]),
+            "{mode:?}"
+        );
+    }
 }
 
 /// A row that states no pairing descriptor pairs by what its worker object

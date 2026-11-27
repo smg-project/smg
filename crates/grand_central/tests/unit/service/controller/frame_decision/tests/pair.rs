@@ -485,7 +485,7 @@ fn a_pair_and_its_decode_call_pair_by_the_classes_of_the_documents_pairing() {
 /// A ready member `name` of [`PAIRED`] on `role`'s side, on the gRPC wire,
 /// written through `objects`, whose registration names the engine kind
 /// `kind`: none where it is empty.
-fn kind_member(
+pub(super) fn kind_member(
     store: &MemoryStore,
     objects: &Objects<Members>,
     name: &str,

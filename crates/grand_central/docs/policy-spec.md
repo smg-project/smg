@@ -580,6 +580,7 @@ These rules stand beside the modes:
 Workers of the standalone service pair by their labels:
 
 - Over the registration RPC, the pairing descriptor accepts only a bootstrap port. The runtime comes from `spec.runtime`.
+- The pair rule and the encode classes read that name as the worker crate does. Two spellings of one runtime are one runtime to both. That crate's word for no runtime states none, like a row that names none. Another name it does not know is compared as written.
 - A worker registered this way, or found by the controller's own discovery, pairs by what its labels report, as a gateway reads them.
 - The labels report its transfer backend or `kv_connector`, its version, its KV layout facts and its operator's `pairing_protocol`.
 - The controller's discovery writes a found worker's pairing protocol and KV connector among that worker's labels.

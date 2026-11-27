@@ -1065,6 +1065,51 @@ fn the_numbers_count_among_the_workers_that_meet_the_frames_demands() {
     assert_eq!(asked(0, unmet), Err(shed));
 }
 
+/// The numbers count workers by a generation's pair classes, and the
+/// classes read a row's runtime name as the worker crate reads it. On the
+/// gRPC wire, whose requests are one runtime's, a prefill and a decode
+/// register one runtime in two spellings, beside a prefill and two decodes
+/// that name none. The two spellings are one known runtime, so that pair
+/// goes ahead of every pair with a worker of unknown runtime. While it can
+/// take the frame the numbers count its prefill alone, and its decode
+/// alone behind that prefill: the number 0 reaches the pair, and the
+/// number 1 reaches no worker.
+///
+/// Compared letter by letter the two names were two runtimes, which no
+/// mode pairs on that wire. Every pair then held a worker of unknown
+/// runtime and both prefills were counted: each of the two numbers reached
+/// a pair, and neither the pair of the two spellings.
+///
+/// The one call: `first_partners_are_counted_alone_while_one_can_be_sent_to`
+/// (`N`), which is handed its classes. Here the holder derives them from
+/// the rows' names.
+#[test]
+fn the_numbers_count_two_spellings_of_one_runtime_as_one_known_runtime() {
+    use smg_worker::worker::RuntimeType;
+
+    use super::super::pair::kind_member;
+
+    let name = RuntimeType::Generic.as_str();
+    let store = rings();
+    let objects = holder(&store);
+    let spelled = kind_member(&store, &objects, "p0", Role::Prefill, &name.to_uppercase());
+    let same = kind_member(&store, &objects, "d0", Role::Decode, name);
+    for (nameless, role) in [
+        ("p1", Role::Prefill),
+        ("d1", Role::Decode),
+        ("d2", Role::Decode),
+    ] {
+        kind_member(&store, &objects, nameless, role, "");
+    }
+    let now = Instant::now();
+    let asked = |number: u32| {
+        let frame = pair_frame(1, Some(number));
+        reached(&served_pair(&store, &objects, frame, GATEWAY, now))
+    };
+    assert_eq!(asked(0), Ok((spelled, same)));
+    assert_eq!(asked(1), Err(MISSED));
+}
+
 /// A completion's bound is the decodes' to meet. The decodes' count passes
 /// over a decode whose window is under it, and a prefill under it keeps
 /// its number: a prefill is held to no part of that bound
