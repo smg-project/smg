@@ -2221,6 +2221,38 @@ fn a_providers_write_on_a_replica_that_does_not_lead_is_refused_and_writes_nothi
     assert_eq!(hosted.door.place(), at);
 }
 
+/// A provider's write on the replica that leads is made in the door's
+/// turn: the fence is read and the row's facts are stated while the turn
+/// is held, and the call holds it no more once it answers.
+#[test]
+fn a_providers_write_on_the_replica_that_leads_is_made_in_the_doors_turn() {
+    let (store, door) = door();
+    let door = Arc::new(door);
+    let fenced = Arc::clone(&door);
+    let hosted = ReplicaMembershipWriter::new(Arc::clone(&door), operator(), move || {
+        assert!(fenced.turn.is_locked(), "the fence is read inside the turn");
+        Ok(TERM)
+    });
+    let maker = found("pods/a");
+    let stated = AtomicBool::new(false);
+    hosted
+        .found_one(&maker, URL, &|_| {
+            assert!(
+                door.turn.is_locked(),
+                "the facts are stated inside the turn"
+            );
+            stated.store(true, Ordering::Relaxed);
+            found_facts()
+        })
+        .expect("registered");
+    assert!(
+        stated.load(Ordering::Relaxed),
+        "the write asked for the facts"
+    );
+    assert!(!door.turn.is_locked(), "the call let the turn go");
+    assert!(store.by_key(URL).is_some(), "the row stands");
+}
+
 #[test]
 fn a_providers_registration_numbers_its_life_under_the_term_the_log_leads() {
     use super::{ReplicaTurn, Turn};
@@ -3831,11 +3863,18 @@ fn every_write_of_a_provider_leaves_its_audit_line() {
 }
 
 /// A provider's write on a replica that does not lead leaves a refusal's
-/// audit line under the call's own name: the code and the words the fence
-/// answered, and a removal's asker. No line holds the URL or the
-/// provider's key.
+/// audit line under the call's own name: the code and the words that
+/// call's read of the fence answered, and an asker on the drain's line and
+/// on the removal's alone. No line holds the URL or the provider's key.
 #[test]
 fn a_write_refused_where_the_replica_does_not_lead_leaves_its_audit_line() {
+    // What the fence answers at each read, another code or other words
+    // each time: a line carries the code and the words of its own call.
+    const READS: [(Code, &str); 3] = [
+        (Code::FailedPrecondition, "this replica does not lead"),
+        (Code::Unavailable, "the lease of this replica ran out"),
+        (Code::FailedPrecondition, "this replica follows another"),
+    ];
     let lines = Logged::default();
     let writer = lines.clone();
     let subscriber = tracing_subscriber::fmt()
@@ -3846,41 +3885,116 @@ fn a_write_refused_where_the_replica_does_not_lead_leaves_its_audit_line() {
     let _kept = tracing::subscriber::set_default(subscriber);
 
     let (_store, door) = door();
-    let follower = ReplicaMembershipWriter::new(Arc::new(door), operator(), || {
-        Err(Status::failed_precondition("this replica does not lead"))
+    let reads = AtomicUsize::new(0);
+    let follower = ReplicaMembershipWriter::new(Arc::new(door), operator(), move || {
+        let (code, words) = READS[reads.fetch_add(1, Ordering::Relaxed)];
+        Err(Status::new(code, words))
     });
     let key = "private/provider-key";
     let maker = found(key);
-    let refused = Err(MembershipWriteRefused::NotLeading(
-        "this replica does not lead".to_owned(),
-    ));
-    assert_eq!(follower.found_one(&maker, URL, &|_| found_facts()), refused);
+    let refused = |read: usize| {
+        let (_, words) = READS[read];
+        Err(MembershipWriteRefused::NotLeading(words.to_owned()))
+    };
+    assert_eq!(
+        follower.found_one(&maker, URL, &|_| found_facts()),
+        refused(0)
+    );
     let seen = RowRevision {
         row: WorkerId(1),
         revision: 1,
     };
-    assert_eq!(
-        follower.drained(Remover::Provider("cluster"), URL, seen),
-        refused
-    );
+    let by = Remover::Provider("cluster");
+    assert_eq!(follower.drained(by, URL, seen), refused(1));
+    assert_eq!(follower.gone(by, URL, seen), refused(2));
 
     let logged = String::from_utf8(lines.0.lock().clone()).expect("the lines are text");
     let lines: Vec<&str> = logged.lines().collect();
-    let want = [("worker registration", false), ("worker drain", true)];
-    assert_eq!(lines.len(), want.len(), "{logged}");
-    for (line, (call, asked)) in lines.iter().zip(want) {
-        let refusal = format!(
-            "call=\"{call}\" by=operator-a code=FailedPrecondition why=\"this replica does not lead\""
-        );
+    let calls = [
+        ("worker registration", false),
+        ("worker drain", true),
+        ("worker removal", true),
+    ];
+    assert_eq!(lines.len(), calls.len(), "{logged}");
+    for ((line, (call, asked)), (code, words)) in lines.iter().zip(calls).zip(READS) {
+        let refusal = format!("call=\"{call}\" by=operator-a code={code:?} why=\"{words}\"");
         assert!(
             line.contains("membership call refused") && line.contains(&refusal),
             "{line}"
         );
-        assert_eq!(line.contains("asker=\"cluster\""), asked, "{line}");
+        assert_eq!(line.contains("asker="), asked, "{line}");
+        assert!(!asked || line.contains("asker=\"cluster\""), "{line}");
     }
     for private in [URL, key] {
         assert!(!logged.contains(private), "{logged}");
     }
+}
+
+/// A refusal's audit line is written once its call has let the door's
+/// turn go, at both doors: the line of a control call the fence refuses,
+/// of a provider's write the fence refuses, and of a provider's write the
+/// door refuses under a term that leads.
+#[test]
+fn a_refusals_audit_line_is_written_once_the_turn_is_let_go() {
+    let (_store, door) = door();
+    let door = Arc::new(door);
+    let maker = found("pods/a");
+    // The row stands before the lines are kept: a write's own line is
+    // written inside the turn.
+    let leader = ReplicaMembershipWriter::new(Arc::clone(&door), operator(), under(TERM));
+    leader
+        .found_one(&maker, URL, &|_| found_facts())
+        .expect("registered");
+
+    // The lines' writer reads the door's turn as each line reaches it.
+    let lines = Logged::default();
+    let held = Arc::new(AtomicUsize::new(0));
+    let (writer, watched, seen) = (lines.clone(), Arc::clone(&door), Arc::clone(&held));
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(move || {
+            seen.fetch_add(usize::from(watched.turn.is_locked()), Ordering::Relaxed);
+            writer.clone()
+        })
+        .finish();
+    let _beside = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+    let _kept = tracing::subscriber::set_default(subscriber);
+
+    let follows = || -> Result<u64, Status> {
+        Err(Status::failed_precondition("this replica does not lead"))
+    };
+    door.register(&operator(), follows, &ask(spec(URL), Mode::Add))
+        .expect_err("the fence refuses the control call");
+    ReplicaMembershipWriter::new(Arc::clone(&door), operator(), follows)
+        .found_one(&maker, URL, &|_| found_facts())
+        .expect_err("the fence refuses the provider's write");
+    assert_eq!(
+        leader.found(&maker, Precondition::Absent, URL, &|_| found_facts()),
+        Err(MembershipWriteRefused::Stands)
+    );
+
+    // A line a refusal, in the calls' order, each told by its call and
+    // its code.
+    let logged = String::from_utf8(lines.0.lock().clone()).expect("the lines are text");
+    let lines: Vec<&str> = logged.lines().collect();
+    let want = [
+        ("RegisterWorker", "FailedPrecondition"),
+        ("worker registration", "FailedPrecondition"),
+        ("worker registration", "AlreadyExists"),
+    ];
+    assert_eq!(lines.len(), want.len(), "{logged}");
+    for (line, (call, code)) in lines.iter().zip(want) {
+        let refusal = format!("call=\"{call}\" by=operator-a code={code} ");
+        assert!(
+            line.contains("membership call refused") && line.contains(&refusal),
+            "{line}"
+        );
+    }
+    assert_eq!(
+        held.load(Ordering::Relaxed),
+        0,
+        "a line arrived with the turn held: {logged}"
+    );
 }
 
 #[test]
