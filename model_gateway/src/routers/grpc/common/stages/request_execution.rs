@@ -7671,85 +7671,11 @@ pub(crate) mod tests {
             assert_eq!(heard_of(&heard), ["issued", "dispatched Single", end_heard]);
         }
     }
-    /// A pair Grand Central placed, held as a pair route holds it ahead of
-    /// its prefill's send: one prefill and one decode on the KV transport
-    /// `connector`, what the hearing stage heard, the selection under the
-    /// runtime `runtime_type`, which the dispatch reads its shape from, and
-    /// the prefill's load not yet sent.
-    fn a_pair_ahead_of_its_send(
-        connector: &str,
-        runtime_type: RuntimeType,
-    ) -> (Heard, WorkerSelection, PrefillAhead) {
-        use openai_protocol::model_card::ModelCard;
-
-        use crate::{
-            config::types::PolicyConfig,
-            policies::PolicyRegistry,
-            routers::common::{
-                placement::{
-                    select_pair,
-                    tests::{hearing_pairs_on, pairs_of, MODEL},
-                    PlacedPair, PlacementInputs, Stated,
-                },
-                prefill_admission::hold_unbounded,
-                snapshot::WorkerRegistry,
-            },
-        };
-
-        let registry = WorkerRegistry::new();
-        for (url, worker_type) in [
-            ("grpc://p:1", WorkerType::Prefill),
-            ("grpc://d:1", WorkerType::Decode),
-        ] {
-            let worker = BasicWorkerBuilder::new(url)
-                .model(ModelCard::new(MODEL))
-                .worker_type(worker_type)
-                .connection_mode(ConnectionMode::Grpc)
-                .runtime_type(RuntimeType::Vllm)
-                .health_config(no_health_check())
-                .kv_connector(connector)
-                .build();
-            registry
-                .register(Arc::new(worker))
-                .expect("worker registers");
-        }
-        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
-        let heard = hearing_pairs_on(&policies, false);
-        let pairs = pairs_of(&registry, &policies);
-        let inputs = PlacementInputs::default();
-        let pair = select_pair(
-            &registry,
-            &policies,
-            MODEL,
-            &pairs,
-            None,
-            None,
-            inputs,
-            Stated::nothing,
-        );
-        let Ok(pair) = pair else {
-            panic!("the engine places the pair");
-        };
-        let ((prefill, decode), ahead) = hold_unbounded(
-            pair,
-            Some("key"),
-            |pair: &PlacedPair| &pair.prefill,
-            |pair: PlacedPair| {
-                let (prefill, unsent) = pair.prefill.unsent();
-                ((prefill, pair.decode), unsent)
-            },
-        );
-        let workers = WorkerSelection::Disaggregated {
-            encode_assignments: None,
-            prefill,
-            decode,
-            runtime_type,
-        };
-        (heard, workers, ahead)
-    }
 
     #[tokio::test]
     async fn prepared_input_epd_failure_is_marked_non_retryable() {
+        use smg_worker::identity::basic::WorkerLoadGuard;
+
         use crate::routers::grpc::{
             context::RequestContext, regular::stages::testing::mock_backend_client,
         };
@@ -7759,7 +7685,25 @@ pub(crate) mod tests {
             prefill: client.clone(),
             decode: client,
         };
-        let (_heard, workers, ahead) = a_pair_ahead_of_its_send("NixlConnector", RuntimeType::Vllm);
+        let side = |url, worker_type| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(worker_type)
+                    .runtime_type(RuntimeType::Vllm)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .build(),
+            )
+        };
+        let prefill = side("grpc://p:1", WorkerType::Prefill);
+        let workers = WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill: Arc::clone(&prefill),
+            decode: side("grpc://d:1", WorkerType::Decode).into(),
+            runtime_type: RuntimeType::Vllm,
+        };
+        let ahead = PrefillAhead::classic(PrefillLoadGuard::Unbounded {
+            _guard: WorkerLoadGuard::with_key(prefill, None),
+        });
         let ledger = AttemptLedger::default();
         let mut watch = None;
         let req = Arc::new(

@@ -11,7 +11,8 @@
 //! A worker is named by its place in its list. An encoder's `handoff` is the
 //! form its runtime hands an encoded item to a prefill worker in, as the
 //! gateway's table has it: a push to the prefill worker, a meeting at a
-//! rendezvous, or none. `offered` and `keys` are written down by a wrapper
+//! rendezvous, `prepared_input` when the worker advertises `sglang_prepared`,
+//! or none. `offered` and `keys` are written down by a wrapper
 //! around the encode policy, which passes every call on unchanged: they are
 //! what the selection handed that policy, in its order.
 //!
@@ -63,8 +64,9 @@ const MODEL: &str = "m";
 const PUSH: RuntimeType = RuntimeType::Vllm;
 /// The runtime whose encoder and prefill worker meet at a rendezvous.
 const MEET: RuntimeType = RuntimeType::TokenSpeed;
-/// A runtime that serves a prefill and decode pair and states no encode
-/// handoff.
+/// A runtime that serves a prefill and decode pair and, when registered
+/// without the `sglang_prepared` capability, serves no prepared-input encode
+/// item (so its `handoff` records as `null`).
 const BARE: RuntimeType = RuntimeType::Sglang;
 
 /// The policies, in their configuration spelling; the load metric follows
@@ -170,7 +172,7 @@ fn meet() -> Reg {
     Reg::of(MEET, &[])
 }
 
-/// A worker of the runtime with no encode handoff, in any role.
+/// An SGLang worker registered without `sglang_prepared` labels, in any role.
 fn bare() -> Reg {
     Reg::of(BARE, &[])
 }
@@ -204,7 +206,8 @@ fn closing(fleet: &Fleet, encoders: &[usize]) -> Fleet {
 struct Encoder {
     runtime: &'static str,
     /// The form the runtime hands an encoded item over in: `push`,
-    /// `rendezvous`, or nothing.
+    /// `rendezvous`, `prepared_input` (when `sglang_prepared` is advertised),
+    /// or nothing.
     handoff: Option<&'static str>,
     /// The registration states the producer role of a connector.
     ec_producer: bool,
