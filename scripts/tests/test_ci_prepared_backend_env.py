@@ -378,6 +378,23 @@ os.execv({sys.executable!r}, [{sys.executable!r}] + sys.argv[1:])
         self.assertIn("apt-get install", self.commands())
         self.assertNotIn("sudo ", self.commands())
 
+    def test_sglang_prepared_unset_transport_repairs_missing_rdma_libs(self):
+        self.metadata("torch", "2.13.0")
+        self.write_torch("13.0")
+        venv = self.make_prepared("sglang")
+        self.run_script("ci_setup_python_venv.sh", SMG_CI_BACKEND="sglang")
+        self.assertEqual(self.job.joinpath(".venv").resolve(), venv)
+        # Simulate a bare pod without libibverbs.so.1 where TransferEngine import fails
+        # and E2E_KV_BACKEND / E2E_SGLANG_TRANSFER_BACKEND are unset (default PD Mooncake).
+        self.write_tool("ldconfig", "#!/bin/sh\nexit 0\n")
+        result = self.run_script("ci_install_sglang.sh", TEST_DRIVER_ABSENT="1")
+        self.assertIn("Installing missing mooncake RDMA runtime libraries", result.stdout)
+        self.assertIn(
+            "apt-get install -y --no-install-recommends "
+            "libnuma-dev libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils",
+            self.commands(),
+        )
+
     def test_trtllm_prepared_env_adoption_skips_apt_and_pip(self):
         venv = self.make_prepared("trtllm")
         self.run_script("ci_setup_python_venv.sh", SMG_CI_BACKEND="trtllm")

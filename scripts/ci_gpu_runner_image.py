@@ -8,6 +8,10 @@ import re
 import subprocess
 from pathlib import Path
 
+DEFAULT_CARRIER_BASE = (
+    "ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55"
+)
+
 COMMON_INPUTS = (
     "docker/ci-gpu-runner.Dockerfile",
     "scripts/ci_retry.sh",
@@ -34,6 +38,8 @@ BUILD_INPUTS = COMMON_INPUTS + (
     "scripts/ci_install_flashinfer_jit_cache.sh",
 )
 
+DIGEST_REF_RE = re.compile(r"[A-Za-z0-9._:/-]+@sha256:[0-9a-f]{64}")
+
 
 def image_tag(
     root: Path,
@@ -41,18 +47,20 @@ def image_tag(
     driver: str,
     force_run: str = "",
     backend: str = "all",
+    carrier_base_image: str = DEFAULT_CARRIER_BASE,
 ) -> str:
     """Compute a deterministic content-addressed GHCR tag for a prepared GPU image.
 
     When ``backend == "all"`` (the combined self-hosted runner image), hashes
-    ``base_image``, ``driver``, and every file in ``BUILD_INPUTS`` under the
-    ``ci-gpu-runner-<sha256>`` prefix. When ``backend`` names a single carrier
-    (``vllm``, ``sglang``, or ``trtllm``), hashes only the inputs affecting that
-    carrier under ``ci-gpu-backend-<backend>-<sha256>``.
+    ``base_image``, ``carrier_base_image``, ``driver``, and every file in
+    ``BUILD_INPUTS`` under the ``ci-gpu-runner-<sha256>`` prefix. When
+    ``backend`` names a single carrier (``vllm``, ``sglang``, or ``trtllm``),
+    hashes only the inputs affecting that carrier under
+    ``ci-gpu-backend-<backend>-<sha256>``.
     """
     if backend not in ("all", *BACKEND_INPUTS):
         raise ValueError(f"Unsupported backend: {backend}")
-    if not re.fullmatch(r"[A-Za-z0-9._:/-]+@sha256:[0-9a-f]{64}", base_image):
+    if not DIGEST_REF_RE.fullmatch(base_image):
         raise ValueError("BASE_IMAGE must be a digest-pinned image reference")
     if not re.fullmatch(r"[0-9]+(?:\.[0-9]+){0,2}", driver):
         raise ValueError("UV_CUDA_DRIVER_VERSION must be a target driver version")
@@ -60,8 +68,10 @@ def image_tag(
         raise ValueError("forced build identity must be <run-id>-<run-attempt>")
 
     if backend == "all":
+        if not DIGEST_REF_RE.fullmatch(carrier_base_image):
+            raise ValueError("CARRIER_BASE_IMAGE must be a digest-pinned image reference")
         inputs = BUILD_INPUTS
-        seed: list[str] = [base_image, driver]
+        seed: list[str] = [base_image, carrier_base_image, driver]
         prefix = "ci-gpu-runner"
     else:
         inputs = BACKEND_INPUTS[backend]
@@ -98,6 +108,7 @@ def main() -> None:
     commands = parser.add_subparsers(dest="command", required=True)
     tag = commands.add_parser("tag")
     tag.add_argument("--base-image", required=True)
+    tag.add_argument("--carrier-base-image", default=DEFAULT_CARRIER_BASE)
     tag.add_argument("--cuda-driver-version", required=True)
     tag.add_argument("--force-run", default="")
     tag.add_argument("--backend", default="all", choices=("all", *BACKEND_INPUTS))
@@ -113,6 +124,7 @@ def main() -> None:
                     args.cuda_driver_version,
                     args.force_run,
                     args.backend,
+                    args.carrier_base_image,
                 )
             )
         else:

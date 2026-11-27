@@ -33,6 +33,10 @@ COMPONENTS = (
         "scripts/tests/test_runner_values_policy.py",
     ),
     ("scripts/ci_setup_jit_cache.sh", "scripts/tests/test_ci_jit_cache.py"),
+    (
+        "scripts/ci_prune_gpu_runner_images.sh",
+        "scripts/tests/test_ci_prune_gpu_runner_images.py",
+    ),
 )
 # Regression suites of scripts that predate them. A pair is named in the change
 # that brings the suite, and both paths must exist: a suite the tree lacks is an

@@ -434,6 +434,10 @@ jobs:
       - name: Setup vLLM env (provides vllm + grpc servicer + smg)
         if: matrix.vendor != 'amd'
         uses: ./.github/actions/setup-vllm
+        with:
+          carrier_base_image: ${{ vars.SMG_CI_GPU_CARRIER_BASE_IMAGE }}
+          cuda_driver_version: ${{ vars.SMG_CI_GPU_RUNNER_CUDA_DRIVER_VERSION }}
+          image_repository: ${{ vars.SMG_CI_GPU_RUNNER_IMAGE_REPOSITORY }}
       - name: Setup vLLM env in its ROCm image (AMD legs)
         if: matrix.vendor == 'amd'
         run: bash scripts/ci_setup_vllm_rocm_image.sh

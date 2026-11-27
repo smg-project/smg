@@ -178,6 +178,9 @@ jobs:
       E2E_TOKENSPEED_SERVICER_IMPL: ${{ inputs.engine == 'tokenspeed' && inputs.servicer_impl || '' }}
       E2E_TRTLLM_SERVICER_IMPL: ${{ inputs.engine == 'trtllm' && inputs.servicer_impl || '' }}
       TOKENSPEED_PREBUILT_IMAGE: ${{ inputs.tokenspeed_prebuilt_image }}
+      SMG_CI_GPU_CARRIER_BASE_IMAGE: ${{ vars.SMG_CI_GPU_CARRIER_BASE_IMAGE }}
+      SMG_CI_GPU_RUNNER_CUDA_DRIVER_VERSION: ${{ vars.SMG_CI_GPU_RUNNER_CUDA_DRIVER_VERSION }}
+      SMG_CI_GPU_RUNNER_IMAGE_REPOSITORY: ${{ vars.SMG_CI_GPU_RUNNER_IMAGE_REPOSITORY }}
       ROUTER_LOCAL_MODEL_PATH: /models
     steps:
       - name: Checkout code

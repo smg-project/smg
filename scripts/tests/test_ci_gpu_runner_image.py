@@ -50,6 +50,12 @@ class ImageTagTests(unittest.TestCase):
     def test_base_digest_and_driver_change_identity(self):
         self.assertNotEqual(self.tag(), self.tag(base=BASE[:-1] + "b"))
         self.assertNotEqual(self.tag(), self.tag(driver="590"))
+        self.assertNotEqual(
+            helper.image_tag(self.root, BASE, "580", carrier_base_image=CARRIER_BASE),
+            helper.image_tag(self.root, BASE, "580", carrier_base_image=CARRIER_BASE[:-1] + "c"),
+        )
+        with self.assertRaises(ValueError):
+            helper.image_tag(self.root, BASE, "580", carrier_base_image="ubuntu:24.04")
 
     def test_per_backend_carrier_tags_are_isolated(self):
         original = {
@@ -149,6 +155,59 @@ class ImageTagTests(unittest.TestCase):
                 text = (ROOT / ".github/workflows" / wf_name).read_text()
                 self.assertNotIn("cpu-e5", text)
                 self.assertIn("vars.SMG_RUNNER_DOCKER || 'ubuntu-24.04'", text)
+
+    def test_publisher_and_consumers_forward_nondefault_carrier_settings(self):
+        required_vars = (
+            "vars.SMG_CI_GPU_CARRIER_BASE_IMAGE",
+            "vars.SMG_CI_GPU_RUNNER_CUDA_DRIVER_VERSION",
+            "vars.SMG_CI_GPU_RUNNER_IMAGE_REPOSITORY",
+        )
+        for wf_name in (
+            "ci-gpu-runner-image.yml",
+            "e2e-gpu-job.yml",
+            "pr-test-rust.yml",
+            "nightly-bfcl.yml",
+            "nightly-tau2.yml",
+        ):
+            with self.subTest(workflow=wf_name):
+                text = (ROOT / ".github/workflows" / wf_name).read_text()
+                for var in required_vars:
+                    self.assertIn(var, text, f"{wf_name} missing {var}")
+
+        publisher = (ROOT / ".github/workflows/ci-gpu-runner-image.yml").read_text()
+        self.assertIn('--carrier-base-image "$CARRIER_BASE_IMAGE"', publisher)
+
+        for action in ("setup-vllm", "setup-sglang", "setup-trtllm"):
+            with self.subTest(action=action):
+                text = (ROOT / ".github/actions" / action / "action.yml").read_text()
+                for env_name in (
+                    "SMG_CI_GPU_CARRIER_BASE_IMAGE",
+                    "SMG_CI_GPU_RUNNER_CUDA_DRIVER_VERSION",
+                    "SMG_CI_GPU_RUNNER_IMAGE_REPOSITORY",
+                ):
+                    self.assertIn(env_name, text, f"{action} missing {env_name}")
+
+        # Verify consumer script and publisher helper resolve the exact same non-default image.
+        custom_base = "ubuntu:24.04@sha256:" + "c" * 64
+        custom_driver = "590.10.01"
+        expected_tag = helper.image_tag(ROOT, custom_base, custom_driver, backend="vllm")
+        result = subprocess.run(
+            [
+                "python3",
+                str(ROOT / "scripts/ci_gpu_runner_image.py"),
+                "tag",
+                "--backend",
+                "vllm",
+                "--base-image",
+                custom_base,
+                "--cuda-driver-version",
+                custom_driver,
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertEqual(result.stdout.strip(), expected_tag)
 
     def test_cuda_layout_probe_requires_the_compatible_toolkit_alias(self):
         workflow = (ROOT / ".github/workflows/ci-gpu-runner-image.yml").read_text()

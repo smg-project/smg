@@ -120,6 +120,18 @@ if [ "${E2E_KV_BACKEND:-}" = "nixl" ] || [ "${E2E_SGLANG_TRANSFER_BACKEND:-}" = 
 fi
 
 python3 -c "import torch, sglang, flashinfer"
+# Bare pods adopting a carrier venv skip the apt install above; default SGLang
+# PD lanes leave the transport unset and resolve to Mooncake, so repair missing
+# host RDMA libraries whenever TransferEngine cannot load due to absent libibverbs.
+if [ "$PREPARED_ENV" = 1 ] \
+    && [ "${SMG_BUILD_PREPARED_ENV:-0}" != 1 ] \
+    && ! python3 -c "import torch; from mooncake.engine import TransferEngine" 2>/dev/null \
+    && ! ldconfig -p 2>/dev/null | grep -q 'libibverbs\.so\.1'; then
+    echo "Installing missing mooncake RDMA runtime libraries..."
+    bash "${SCRIPT_DIR}/ci_apt_mirror.sh"
+    $RETRY 3 10 $SUDO apt-get update -qq
+    $RETRY 3 10 $SUDO apt-get install -y --no-install-recommends libnuma-dev libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils
+fi
 # Probe only explicit Mooncake lanes; unset transport preserves baseline setup.
 if [ "${E2E_KV_BACKEND:-${E2E_SGLANG_TRANSFER_BACKEND:-}}" = mooncake ] \
     || [ "${SMG_BUILD_PREPARED_ENV:-0}" = 1 ]; then
@@ -127,14 +139,6 @@ if [ "${E2E_KV_BACKEND:-${E2E_SGLANG_TRANSFER_BACKEND:-}}" = mooncake ] \
     if [ "${SMG_BUILD_PREPARED_ENV:-0}" = 1 ]; then
         echo "Deferring Mooncake driver import to the GPU job"
     else
-        if [ "$PREPARED_ENV" = 1 ] \
-            && ! python3 -c "import torch; from mooncake.engine import TransferEngine" 2>/dev/null \
-            && ! ldconfig -p 2>/dev/null | grep -q 'libibverbs\.so\.1'; then
-            echo "Installing missing mooncake RDMA runtime libraries..."
-            bash "${SCRIPT_DIR}/ci_apt_mirror.sh"
-            $RETRY 3 10 $SUDO apt-get update -qq
-            $RETRY 3 10 $SUDO apt-get install -y --no-install-recommends libnuma-dev libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils
-        fi
         python3 -c "import torch; from mooncake.engine import TransferEngine"
     fi
 fi

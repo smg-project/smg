@@ -199,7 +199,10 @@ jobs:
           force_run=""
           if [ "$FORCE_REBUILD" = true ]; then force_run="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"; fi
           tag="$(python3 scripts/ci_gpu_runner_image.py tag \
-            --base-image "$BASE_IMAGE" --cuda-driver-version "$UV_CUDA_DRIVER_VERSION" --force-run "$force_run")"
+            --base-image "$BASE_IMAGE" \
+            --carrier-base-image "$CARRIER_BASE_IMAGE" \
+            --cuda-driver-version "$UV_CUDA_DRIVER_VERSION" \
+            --force-run "$force_run")"
           if [[ ! "$IMAGE_REPOSITORY" =~ ^ghcr\.io/[a-z0-9._/-]+$ ]]; then
             echo 'SMG_CI_GPU_RUNNER_IMAGE_REPOSITORY must be an untagged GHCR repository' >&2
             exit 1
@@ -294,3 +297,32 @@ jobs:
         env:
           IMAGE: ${{ steps.resolve.outputs.image }}
         run: docker rmi "$IMAGE" || true
+
+  # Keep recent carrier/runner images for in-flight PRs and prune superseded tags
+  # per prefix so GHCR storage stays bounded.
+  prune:
+    name: Prune superseded GPU images
+    needs: [build-backend-carriers, build-and-push]
+    if: >-
+      always()
+      && github.repository == 'smg-project/smg'
+      && needs.build-backend-carriers.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    env:
+      SMG_CI_GPU_RUNNER_BASE_IMAGE: ${{ vars.SMG_CI_GPU_RUNNER_BASE_IMAGE || 'ghcr.io/actions/actions-runner:2.337.0@sha256:5036480998280bb21e32ade9fe1b02b493861ac314b62ba1aea320b94f56ec97' }}
+      SMG_CI_GPU_CARRIER_BASE_IMAGE: ${{ vars.SMG_CI_GPU_CARRIER_BASE_IMAGE || 'ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55' }}
+      SMG_CI_GPU_RUNNER_CUDA_DRIVER_VERSION: ${{ vars.SMG_CI_GPU_RUNNER_CUDA_DRIVER_VERSION || '580.65.06' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Prune superseded images
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/ci_prune_gpu_runner_images.sh

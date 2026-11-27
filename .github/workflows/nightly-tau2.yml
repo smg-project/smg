@@ -273,6 +273,10 @@ jobs:
           path: wheel
       - name: Setup vLLM env (provides vllm + grpc servicer + smg)
         uses: ./.github/actions/setup-vllm
+        with:
+          carrier_base_image: ${{ vars.SMG_CI_GPU_CARRIER_BASE_IMAGE }}
+          cuda_driver_version: ${{ vars.SMG_CI_GPU_RUNNER_CUDA_DRIVER_VERSION }}
+          image_repository: ${{ vars.SMG_CI_GPU_RUNNER_IMAGE_REPOSITORY }}
       - name: Override vLLM with a per-commit main wheel (legs newer than the CI pin)
         # See nightly-bfcl.yml: legs the pinned vLLM release cannot serve set
         # vllm_commit + vllm_version. Skipped (matrix key absent) otherwise.
