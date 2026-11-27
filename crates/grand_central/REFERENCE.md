@@ -159,7 +159,7 @@ filter:
 - A filter registered with `filter` takes no parameter, and neither does a stock filter but `has-room`. Whatever a document writes under such a name is refused.
 - `filter_with` runs no factory at registration, so validation refuses a filter that answers another name.
 - The factory can call `build.dispatch_credit()` for the profile's `DispatchCredit`, as a scorer's can. A profile whose filter reads it may set `sent_ttl_ms`.
-- A Rust caller that builds a `ProfileSpec` by hand holds its filters as `document::FilterSpec`. `"healthy".into()` reads as before. A `String` pushed or compared does not: use `.into()` and `FilterSpec::name()`.
+- A Rust caller that makes a `ProfileSpec` by `ProfileSpec::of(pick)` and assigns its filters holds them as `document::FilterSpec`. `"healthy".into()` reads as before. A `String` pushed or compared does not: use `.into()` and `FilterSpec::name()`.
 
 A picker can take settings from the document too. Register it with `picker_with`, and write the pick entry as the name mapped to its parameters.
 

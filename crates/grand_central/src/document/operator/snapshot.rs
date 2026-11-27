@@ -8,11 +8,6 @@
 //! A page writes itself as JSON ([`WorkerRowsPage`]): a host in process serves
 //! the rows an operator reads with no mapping of its own.
 
-#![expect(
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
-
 use std::{borrow::Cow, collections::BTreeMap, sync::Arc, time::Instant};
 
 use serde::{Serialize, Serializer};
@@ -36,13 +31,28 @@ pub(crate) const PAGE_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) const MODELS: usize = 128;
 
 /// What a snapshot caller asks of the worker rows.
+///
+/// The default asks for every model's rows under the byte bound alone. The
+/// record gains fields: code outside this crate starts from the default and
+/// assigns what it asks otherwise, and a pattern of it ends with `..`.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct WorkerRowsQuery {
     /// The model ids to include. An empty list includes every model.
     pub models: Vec<String>,
     /// The maximum number of rows to return. `usize::MAX` uses only the
     /// byte bound.
     pub limit: usize,
+}
+
+impl Default for WorkerRowsQuery {
+    /// Every model's rows, under the byte bound alone.
+    fn default() -> Self {
+        Self {
+            models: Vec::new(),
+            limit: usize::MAX,
+        }
+    }
 }
 
 impl WorkerRowsQuery {

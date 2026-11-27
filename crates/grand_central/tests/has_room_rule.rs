@@ -3,6 +3,8 @@
 
 #![expect(clippy::expect_used, reason = "tests that stop on a broken setup")]
 
+use std::collections::BTreeMap;
+
 use smg_grand_central::{
     document::{
         Capacity, FilterSpec, FilterStage, HasRoomParams, PolicySpec, SpecError, API_VERSION,
@@ -712,18 +714,30 @@ fn a_rule_written_as_a_list_reads_as_its_map() {
 fn a_document_with_the_rule_round_trips_and_its_digest_ignores_the_key_order() {
     let rule = r#"{"has-room":{"headroom":0.05,"capacity":200000,"used":{"sent.tokens":1,"load.resident_tokens":1,"request.prompt_tokens":1}}}"#;
     let spec = document(&format!(r#""healthy",{rule}"#));
+    // The rule as the document's read made it, its three fields by name: a
+    // crate outside the library builds no such record by a literal, and
+    // this one comes of the document's text.
+    let FilterSpec::Params(FilterStage::HasRoom(HasRoomParams {
+        used,
+        capacity,
+        headroom,
+        ..
+    })) = &spec.profiles["p"].filter[1]
+    else {
+        panic!("the rule reads as its typed form");
+    };
+    let coefficients = BTreeMap::from([
+        ("load.resident_tokens".to_string(), 1.0),
+        ("request.prompt_tokens".to_string(), 1.0),
+        ("sent.tokens".to_string(), 1.0),
+    ]);
     assert_eq!(
-        spec.profiles["p"].filter[1],
-        FilterSpec::Params(FilterStage::HasRoom(HasRoomParams {
-            used: [
-                ("load.resident_tokens".to_string(), 1.0),
-                ("request.prompt_tokens".to_string(), 1.0),
-                ("sent.tokens".to_string(), 1.0),
-            ]
-            .into(),
-            capacity: Capacity::Fixed(200_000.0),
-            headroom: 0.05,
-        }))
+        (used, capacity, headroom.to_bits()),
+        (
+            &coefficients,
+            &Capacity::Fixed(200_000.0),
+            0.05_f64.to_bits()
+        )
     );
     let written = serde_json::to_string(&spec).expect("serializes");
     assert!(

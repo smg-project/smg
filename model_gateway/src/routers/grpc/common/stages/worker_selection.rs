@@ -4232,13 +4232,9 @@ mod tests {
         let model_id = "test-model-engine-rid";
         let (stage, policies) = stage_and_policies(model_id, 3);
         let mut document = PolicySpec::preset("consistent_hashing").expect("a stock preset");
-        document.bindings[0].routing_key = Some(RoutingKeySpec {
-            sources: vec![KeySourceSpec {
-                rid: true,
-                ..KeySourceSpec::default()
-            }],
-            strip_lineage: false,
-        });
+        let mut source = KeySourceSpec::default();
+        source.rid = true;
+        document.bindings[0].routing_key = Some(RoutingKeySpec::of(vec![source]));
         let spec = AppliedSpec::validate(&document);
         engine_on(&policies, spec.expect("a valid document"));
 

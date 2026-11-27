@@ -951,18 +951,13 @@ impl Scorer for OwnCost {
         out: &mut [f32],
     ) -> TieBand {
         let mut next = 0;
-        let band = score_costs(
-            out,
-            CostMargin {
-                absolute: 12.0,
-                ..CostMargin::default()
-            },
-            |i| {
-                assert_eq!(i, next);
-                next += 1;
-                f64::from(rows[kept[i] as usize].in_flight) * 4.0
-            },
-        );
+        let mut margin = CostMargin::default();
+        margin.absolute = 12.0;
+        let band = score_costs(out, margin, |i| {
+            assert_eq!(i, next);
+            next += 1;
+            f64::from(rows[kept[i] as usize].in_flight) * 4.0
+        });
         assert_eq!(next, out.len());
         band
     }

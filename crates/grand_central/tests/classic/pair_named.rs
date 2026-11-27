@@ -183,10 +183,9 @@ fn engine(row: &Row) -> Result<&'static InProcess, String> {
         .bindings
         .first_mut()
         .ok_or("the presets bind nothing")?;
-    binding.overload = Some(OverloadSpec {
-        shed_when_all_vetoed: row.shed,
-        ..OverloadSpec::default()
-    });
+    let mut overload = OverloadSpec::default();
+    overload.shed_when_all_vetoed = row.shed;
+    binding.overload = Some(overload);
     let applied = AppliedSpec::validate(&spec).map_err(|err| err.to_string())?;
     // An engine as its host holds it: for the life of the process.
     Ok(Box::leak(Box::new(InProcess::new(applied))))
