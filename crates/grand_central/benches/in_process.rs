@@ -1113,6 +1113,10 @@ fn main() {
     let (publish, converted) = (|| feed.publish(&loads), || host.conversions());
     // The one call a host makes for a request, where the run asks it.
     if place::asked(&run, &host) {
+        assert!(
+            run.entry != ruled::ALONE,
+            "a pair's cell alone takes place_alone"
+        );
         let (rule, ring) = (ruled::stated(&run), place::lent(&host));
         if worded::stated(&run) {
             measure(&run, &host, upkeep, publish, converted, |_| {
