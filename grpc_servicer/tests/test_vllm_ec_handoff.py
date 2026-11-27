@@ -13,6 +13,8 @@ from unittest.mock import AsyncMock, Mock
 import grpc
 import pytest
 from smg_grpc_proto import vllm_engine_pb2 as pb
+from smg_grpc_servicer import constrained_decoding
+from smg_grpc_servicer.vllm.config_view import EngineConfigView
 from smg_grpc_servicer.vllm.mm_keys import batches_missing_pixels, mm_batches
 from smg_grpc_servicer.vllm.mm_salt import has_preprocessed_mm_payload, request_cache_salt
 
@@ -29,7 +31,8 @@ def _generate(**overrides):
         n
         for n in module.body
         if isinstance(n, ast.FunctionDef)
-        and n.name in ("_valid_cpu_ec_handle", "_takes_reasoning_ended")
+        and n.name
+        in ("_valid_cpu_ec_handle", "_takes_reasoning_ended", "_structured_outputs_backend")
     ]
     cls = next(
         n for n in module.body if isinstance(n, ast.ClassDef) and n.name == "VllmEngineServicer"
@@ -45,6 +48,7 @@ def _generate(**overrides):
         "json": json,
         "asyncio": asyncio,
         "build_media_identity": Mock(),
+        "EngineConfigView": EngineConfigView,
         "time": time,
         "logger": logging.getLogger(__name__),
         "grpc": grpc,
@@ -131,6 +135,7 @@ async def test_grid_only_requires_a_handoff(hashes, consumer, ec, kv):
         ),
         _build_preprocessed_mm_inputs=build,
         _off_the_event_loop=AsyncMock(side_effect=lambda fn, *args: fn(*args)),
+        _structured_outputs_backend="auto",
         _sampling_params_from_proto=lambda *args, **kwargs: SimpleNamespace(
             extra_args=None, logprobs=None, prompt_logprobs=None
         ),
@@ -207,6 +212,7 @@ async def test_encoder_only_validates_connector_specific_handles(consumer, conne
         ),
         _build_preprocessed_mm_inputs=lambda *args: {"prompt_token_ids": [1, 2]},
         _off_the_event_loop=AsyncMock(side_effect=lambda fn, *args: fn(*args)),
+        _structured_outputs_backend="auto",
         _sampling_params_from_proto=lambda *args, **kwargs: SimpleNamespace(
             extra_args=None, logprobs=None, prompt_logprobs=None
         ),
@@ -259,6 +265,7 @@ async def test_reasoning_template_kwargs_reach_engine_or_fail_before_submission(
             renderer=SimpleNamespace(process_for_engine=lambda prompt, **kwargs: prompt),
             vllm_config=SimpleNamespace(ec_transfer_config=None),
         ),
+        _structured_outputs_backend="auto",
         _sampling_params_from_proto=lambda *args, **kwargs: SimpleNamespace(
             extra_args=None, logprobs=None, prompt_logprobs=None
         ),
@@ -329,6 +336,7 @@ async def test_grammar_from_first_token_reaches_engine_as_reasoning_ended(
         engine=engine,
         # The servicer's own read, the one its constructor makes once.
         _takes_reasoning_ended=handler.__globals__["_takes_reasoning_ended"](engine),
+        _structured_outputs_backend="auto",
         _sampling_params_from_proto=lambda *args, **kwargs: SimpleNamespace(
             extra_args=None, logprobs=None, prompt_logprobs=None
         ),
@@ -339,3 +347,84 @@ async def test_grammar_from_first_token_reaches_engine_as_reasoning_ended(
     context = SimpleNamespace(abort=abort, invocation_metadata=lambda: ())
     assert [reply async for reply in handler(servicer, request, context)] == []
     assert seen == [True if handed else "unsaid"]
+
+
+def _converter():
+    """Compile the actual sampling-params conversion over plain records in
+    place of the engine's parameter classes."""
+    path = Path(__file__).parents[1] / "smg_grpc_servicer/vllm/servicer.py"
+    function = next(
+        n
+        for n in ast.walk(ast.parse(path.read_text()))
+        if isinstance(n, ast.FunctionDef) and n.name == "_sampling_params_from_proto"
+    )
+    function.decorator_list = []
+    function.returns = None
+    for arg in function.args.args:
+        arg.annotation = None
+    namespace = {
+        **vars(constrained_decoding),
+        "SamplingParams": SimpleNamespace,
+        "StructuredOutputsParams": dict,
+        "RequestOutputKind": SimpleNamespace(DELTA="delta", FINAL_ONLY="final_only"),
+        "logger": logging.getLogger(__name__),
+    }
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)
+    return namespace["_sampling_params_from_proto"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("backend", "sent_as"),
+    [
+        ("guidance", "json"),
+        ("outlines", "json"),
+        ("lm-format-enforcer", "json"),
+        ("xgrammar", "structural_tag"),
+        ("auto", "structural_tag"),
+    ],
+)
+async def test_an_answer_tag_reaches_another_backend_as_its_schema(backend, sent_as):
+    """A structural tag is spelled for xgrammar: one that is a JSON answer's
+    schema alone reaches an engine started with another backend as that
+    schema, and stays a tag under xgrammar and the engine's default."""
+    schema = '{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"integer"}}}'
+    tag = '{"format":{"type":"json_schema","json_schema":' + schema + ',"max_whitespace_cnt":32}}'
+    request = pb.GenerateRequest(
+        request_id="tag-test",
+        tokenized=pb.TokenizedInput(input_ids=[1, 2]),
+        sampling_params=pb.SamplingParams(structural_tag=tag),
+    )
+    seen = []
+
+    async def generate(**kwargs):
+        """Record the constraint the engine is handed."""
+        seen.append(kwargs["sampling_params"].structured_outputs)
+        if False:
+            yield
+
+    async def abort(code, message):
+        """Make gRPC validation failures observable to the test."""
+        raise _Aborted(code, message)
+
+    handler = _generate()
+    engine = SimpleNamespace(
+        generate=generate,
+        renderer=SimpleNamespace(process_for_engine=lambda prompt, **kwargs: prompt),
+        vllm_config=SimpleNamespace(
+            ec_transfer_config=None,
+            structured_outputs_config=SimpleNamespace(backend=backend),
+        ),
+    )
+    servicer = SimpleNamespace(
+        engine=engine,
+        # The servicer's own read, the one its constructor makes once.
+        _structured_outputs_backend=handler.__globals__["_structured_outputs_backend"](engine),
+        _sampling_params_from_proto=_converter(),
+        _tokenization_kwargs_from_proto=lambda _: {},
+        _loads=Mock(),
+        _notify_kv_transfer_rejected=AsyncMock(),
+    )
+    context = SimpleNamespace(abort=abort, invocation_metadata=lambda: ())
+    assert [reply async for reply in handler(servicer, request, context)] == []
+    assert seen == [{sent_as: schema if sent_as == "json" else tag}]
