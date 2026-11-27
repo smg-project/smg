@@ -1,7 +1,8 @@
 use std::{
+    cell::RefCell,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Barrier,
+        Arc, Barrier, Mutex,
     },
     thread,
 };
@@ -259,34 +260,132 @@ fn a_call_builds_a_rows_object_at_its_write_and_its_status_follows() {
     assert_eq!(told(), ["registered", "status"]);
 }
 
+/// The door's log as its store's journal, for a case that stands behind
+/// a membership write. It hands every call on and keeps each membership
+/// change it is told. At the first release behind one it runs the hook
+/// the case armed, once.
+struct BehindAMembershipWrite {
+    log: Arc<replication::Log>,
+    /// The membership changes told since the case last took them.
+    told: Mutex<Vec<store::MembershipChange>>,
+    /// Whether a membership change was told and its release has not come.
+    owed: AtomicBool,
+}
+
+thread_local! {
+    /// What [`BehindAMembershipWrite`] runs on this thread at the first
+    /// release behind a membership change.
+    static BEHIND: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+}
+
+impl store::Journal for BehindAMembershipWrite {
+    fn member(
+        &self,
+        at: Option<Position>,
+        term: Option<u64>,
+        epoch: u64,
+        change: store::MembershipChange,
+        row: Option<&WorkerRow>,
+        left: Option<&WorkerRow>,
+    ) -> bool {
+        let goes_on = self.log.member(at, term, epoch, change, row, left);
+        self.told.lock().expect("the case's own lock").push(change);
+        self.owed.store(true, Ordering::Relaxed);
+        goes_on
+    }
+
+    fn status(
+        &self,
+        at: Option<Position>,
+        term: Option<u64>,
+        epoch: u64,
+        id: WorkerId,
+        from: WorkerStatus,
+        to: WorkerStatus,
+        models: Arc<[String]>,
+    ) -> bool {
+        self.log.status(at, term, epoch, id, from, to, models)
+    }
+
+    fn generation(&self, at: Option<Position>, generation: u64) {
+        self.log.generation(at, generation);
+    }
+
+    fn term_rose(&self, term: u64) {
+        self.log.term_rose(term);
+    }
+
+    fn term_followed(&self, at: Position) {
+        self.log.term_followed(at);
+    }
+
+    fn head(&self) -> Position {
+        self.log.head()
+    }
+
+    fn followed(&self) -> Option<u64> {
+        self.log.followed()
+    }
+
+    fn released(&self) {
+        self.log.released();
+        if self.owed.swap(false, Ordering::Relaxed) {
+            let hook = BEHIND.with(|held| held.borrow_mut().take());
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+    }
+
+    fn restart(&self, at: Position) -> bool {
+        self.log.restart(at).is_ok()
+    }
+}
+
 /// A door's patch and removal are decided over the worker objects, as
-/// its registration is: each runs the store's one body,
-/// and a removal's object has
-/// left the registry when the store hears of it. So it is for a control
-/// call and for a removal by the replica's own writer.
+/// its registration is: each runs the store's one body, and a removal's
+/// object has left the registry when the store hears of it. So it is for
+/// a control call and for a removal by the replica's own writer.
+///
+/// The store's journal is the witness. The one body alone tells it a
+/// membership change, so one change told with the release behind it is
+/// that body's run: one for the patch and one for each removal. A patch's
+/// call takes the write's hold a second time, for its object's status.
+/// That hold tells no membership change, so the case does not count it.
 #[test]
 fn a_doors_patch_and_removal_are_decided_over_the_worker_objects() {
     use std::{cell::Cell, rc::Rc};
 
-    use crate::store::memory::seam;
+    use store::MembershipChange::{Relabelled, Removed};
 
-    let (store, feed) = journaled_from(&LeasePlace::Process, 0);
+    let (_, feed) = journaled_from(&LeasePlace::Process, 0);
+    let journal = Arc::new(BehindAMembershipWrite {
+        log: Arc::clone(&feed.log),
+        told: Mutex::default(),
+        owed: AtomicBool::new(false),
+    });
+    let handed = Arc::clone(&journal);
+    let store = Arc::new(MemoryStore::journaled(handed).with_decision_slots(1));
     store::LeasesStore::set_term(store.as_ref(), TERM);
     let objects = holder(&store);
     let calls = MembershipCalls::based(Arc::clone(&store), feed.log, 0, Arc::clone(&objects));
     let door = Arc::new(calls);
-    // Whether `write` ran the one body, with the object of the row
-    // `gone` out of the registry by then.
+    // The membership changes `write` told the journal, and whether the
+    // first release behind one came with the object of the row `gone`
+    // out of the registry.
     let decided = |gone: Option<WorkerId>, write: &dyn Fn()| {
         let ran = Rc::new(Cell::new(false));
-        let (told, objects) = (Rc::clone(&ran), Arc::clone(&objects));
-        seam::on_release(move || {
+        let (released, objects) = (Rc::clone(&ran), Arc::clone(&objects));
+        let told = || std::mem::take(&mut *journal.told.lock().expect("the case's own lock"));
+        // What was told ahead of `write` is another call's.
+        drop(told());
+        BEHIND.set(Some(Box::new(move || {
             let stands = gone.and_then(|gone| objects.object(gone));
             assert_eq!(stands, None, "the object leaves first");
-            told.set(true);
-        });
+            released.set(true);
+        })));
         write();
-        ran.get()
+        (told(), ran.get())
     };
     door.register(&operator(), under(TERM), &ask(spec(URL), Mode::Add))
         .expect("registered");
@@ -302,7 +401,11 @@ fn a_doors_patch_and_removal_are_decided_over_the_worker_objects() {
         door.patch(&operator(), under(TERM), &patch)
             .expect("patched");
     });
-    assert!(patched, "a patch call");
+    assert_eq!(
+        patched,
+        (vec![Relabelled { id: row.id }], true),
+        "a patch call"
+    );
     let row = store.by_key(URL).expect("the row");
     let leave = proto::DeregisterWorkerRequest {
         worker_id: row.id.0,
@@ -313,7 +416,11 @@ fn a_doors_patch_and_removal_are_decided_over_the_worker_objects() {
         door.deregister(&operator(), under(TERM), &leave)
             .expect("removed");
     });
-    assert!(removed, "a removal call");
+    assert_eq!(
+        removed,
+        (vec![Removed { id: row.id }], true),
+        "a removal call"
+    );
     let hosted = ReplicaMembershipWriter::new(Arc::clone(&door), operator(), under(TERM));
     let maker = found("pods/a");
     hosted
@@ -325,7 +432,11 @@ fn a_doors_patch_and_removal_are_decided_over_the_worker_objects() {
             .gone(Remover::Registrant(&maker), URL, standing(&made))
             .expect("gone");
     });
-    assert!(gone, "a removal by the replica's own writer");
+    assert_eq!(
+        gone,
+        (vec![Removed { id: made.id }], true),
+        "a removal by the replica's own writer"
+    );
 }
 
 #[test]
