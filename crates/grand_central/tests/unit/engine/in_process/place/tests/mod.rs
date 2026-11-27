@@ -2939,6 +2939,33 @@ fn a_decodes_shadow_of_another_depth_walks_the_lent_ring_from_its_own_head() {
     assert_eq!(engine.faults(), 0, "no fault");
 }
 
+/// A maker that hands on the engine's own and keeps the shadow profiles
+/// it was asked for.
+struct Recorded<'r, 'a>(Made<'r, 'a>, RefCell<Vec<u16>>);
+
+impl RequestMaker for Recorded<'_, '_> {
+    fn model(&self) -> &str {
+        self.0.model()
+    }
+
+    fn make<'w>(&'w self, spec: &'w AppliedSpec) -> Request<'w> {
+        self.0.make(spec)
+    }
+
+    fn workers(&self) -> WorkerLists<'_> {
+        self.0.workers()
+    }
+
+    fn shadow_ring<'w>(
+        &'w self,
+        spec: &'w AppliedSpec,
+        shadow: u16,
+    ) -> Option<(&'w dyn LentRing, &'w [u64])> {
+        self.1.borrow_mut().push(shadow);
+        self.0.shadow_ring(spec, shadow)
+    }
+}
+
 /// A decode's shadow of another depth moves no live side, and a maker is
 /// asked once for each side's shadow. Under the document of the test
 /// above, a maker that hands on the engine's own is asked for two shadow
@@ -2948,33 +2975,6 @@ fn a_decodes_shadow_of_another_depth_walks_the_lent_ring_from_its_own_head() {
 /// shadow, at the pair's decision and at the decode decided again.
 #[test]
 fn a_decodes_shadow_of_another_depth_asks_its_own_profile_and_moves_no_live_side() {
-    /// A maker that hands on the engine's own and keeps the shadow
-    /// profiles it was asked for.
-    struct Recorded<'r, 'a>(Made<'r, 'a>, RefCell<Vec<u16>>);
-
-    impl RequestMaker for Recorded<'_, '_> {
-        fn model(&self) -> &str {
-            self.0.model()
-        }
-
-        fn make<'w>(&'w self, spec: &'w AppliedSpec) -> Request<'w> {
-            self.0.make(spec)
-        }
-
-        fn workers(&self) -> WorkerLists<'_> {
-            self.0.workers()
-        }
-
-        fn shadow_ring<'w>(
-            &'w self,
-            spec: &'w AppliedSpec,
-            shadow: u16,
-        ) -> Option<(&'w dyn LentRing, &'w [u64])> {
-            self.1.borrow_mut().push(shadow);
-            self.0.shadow_ring(spec, shadow)
-        }
-    }
-
     let live = |shadowed: bool| {
         let mut document = prefix_shadowed(Some(16), true);
         if !shadowed {
@@ -3064,6 +3064,38 @@ fn a_lender_that_declined_one_sides_shadow_is_asked_nothing_for_the_other() {
     assert_eq!((asked, engine.faults()), (1, 0), "one head, no walk");
 }
 
+/// A pair whose request states less than the floor of a shadow's budget
+/// asks the lender nothing: neither side's shadow runs, so no head's place
+/// is wanted. At the floor the same pair asks about one head, as it does
+/// where no budget is stated.
+#[test]
+fn a_pair_under_the_shadows_floor_asks_the_lender_nothing() {
+    use crate::engine::shadow::SHADOW_FLOOR;
+
+    let list = pool(2);
+    let members = PublishedList::new(Arc::clone(&list));
+    let classes = PartnerClasses::number(2, [&[0_u32, 1][..], &[0, 1][..]]);
+    let ids: Vec<u32> = (0..256).collect();
+    let floor = u32::try_from(SHADOW_FLOOR.as_micros()).expect("a floor in microseconds");
+    let asked = |budget_micros: u32| {
+        let engine = hosted(engine_of(&prefix_shadowed(Some(16), false)));
+        let ring = Scripted(&[None], AtomicU32::new(0));
+        let request = PlaceRequest {
+            prompt: Prompt {
+                tokens: Some(&ids),
+                ..Prompt::NONE
+            },
+            ring: Some(&ring),
+            budget_micros,
+            ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair_of(&members, &classes)))
+        };
+        engine.place(&request).expect("a pair");
+        (ring.1.load(atomic::Ordering::Relaxed), engine.faults())
+    };
+    assert_eq!(asked(floor - 1), (0, 0), "under the floor no shadow runs");
+    assert_eq!(asked(floor), (1, 0), "one head, no walk");
+}
+
 /// A lender that panics when it is asked a head's place faults each
 /// side's shadow that asks it, of one depth and of two: two faults a
 /// pair's decision, and neither shadow says a word. The pair is placed
@@ -3131,12 +3163,13 @@ fn a_decode_decided_again_walks_the_lent_ring_once_more() {
     assert_eq!(engine.faults(), 0, "no fault");
 }
 
-/// A decode's shadow the all-vetoed rule steers is stated no place: every
-/// partner of the prefill stands over its thresholds, the rule picks among
-/// them for the shadow as it does for the live decode, and no stage reads
-/// a place. The lender is not asked, at the pair's decision or at the
-/// decode decided again: a ring that panics where it is asked counts no
-/// fault, and the shadow agrees both times.
+/// A decode's shadow the all-vetoed rule steers, none of whose filters
+/// declares the ring need, is stated no place: every partner of the
+/// prefill stands over its thresholds, the rule picks among them for the
+/// shadow as it does for the live decode, and no stage reads a place. The
+/// lender is not asked, at the pair's decision or at the decode decided
+/// again: a ring that panics where it is asked counts no fault, and the
+/// shadow agrees both times.
 #[test]
 fn a_steered_decodes_shadow_asks_the_lender_nothing() {
     let plain = "consistent_hashing";
@@ -3222,6 +3255,413 @@ fn a_prefix_shadow_alone_walks_the_lent_ring() {
     // A lender that places no head panics where it is asked for a key's
     // place or walked: the shadow ran, and no fault is counted.
     assert_eq!(placed(&Headless), (0, 0), "a lender of no head");
+}
+
+/// What a [`SeesPlace`] was shown: at each ask whether a ring, and the
+/// places.
+type Shown = BTreeSet<(bool, Vec<u64>)>;
+
+/// A filter of the host's own that records what each ask shows it. It
+/// declares the ring need or not.
+#[derive(Debug)]
+struct SeesPlace {
+    name: &'static str,
+    declares: bool,
+    shown: Arc<Mutex<Shown>>,
+}
+
+impl Filter for SeesPlace {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn keep(&self, facts: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+        let shown = (facts.ring.is_some(), facts.ring_positions.to_vec());
+        self.shown.lock().insert(shown);
+        true
+    }
+
+    fn needs(&self) -> Needs {
+        Needs {
+            ring: self.declares,
+            ..Needs::default()
+        }
+    }
+}
+
+/// A filter in a pair side's shadow profile that is lent the request's
+/// ring. One that declares the ring need is shown the ring and the place
+/// of the request's key on it at every ask, as a live profile shows it.
+/// So is a filter that declares nothing and is listed ahead of it in the
+/// same profile: no filter of that profile is asked ahead of the lender.
+/// The other side's shadow holds a filter that declares nothing, which is
+/// shown neither. Each way round: under each side's shadow at the pair's
+/// decision, and under the decode's at the decode decided again. Each
+/// side's shadow names the ring's owner still.
+#[test]
+fn a_filter_that_declares_the_ring_need_is_shown_the_ring_a_sides_shadow_is_lent() {
+    let names = ["declares-ring", "declares-nothing", "listed-first"];
+    // What the three filters were shown at the pair's decision and then at
+    // the decode decided again, the shadow of the side `declaring` holding
+    // the third ahead of the first and the other side's the second: beside
+    // the place of the key on the lent ring, and what each side's shadow
+    // said by the end with the engine's faults.
+    let shown = |declaring: &str| {
+        let cells = [(); 3].map(|()| Arc::new(Mutex::new(Shown::new())));
+        let mut stages = StageRegistry::builtin();
+        for (at, name) in names.into_iter().enumerate() {
+            let cell = Arc::clone(&cells[at]);
+            let added = stages.filter(name, move || {
+                Box::new(SeesPlace {
+                    name,
+                    declares: at == 0,
+                    shown: Arc::clone(&cell),
+                })
+            });
+            added.expect("a free name");
+        }
+        let plain = "consistent_hashing";
+        let mut document = ring_shadowed(plain, plain, true);
+        for shadow in ["prefill-next", "decode-next"] {
+            let declares = shadow == declaring;
+            let filter = names[usize::from(!declares)];
+            let shadow = document.profiles.get_mut(shadow);
+            let shadow = shadow.expect("the side's shadow profile");
+            shadow.filter.push(FilterSpec::Name(filter.to_owned()));
+            if declares {
+                let first = FilterSpec::Name(names[2].to_owned());
+                shadow.filter.insert(0, first);
+            }
+        }
+        let spec = AppliedSpec::validate_in(&document, &stages, &[]);
+        let engine = hosted(InProcess::new(spec.expect("the stages hold the filters")));
+        let list = pool(2);
+        let members = PublishedList::new(Arc::clone(&list));
+        let classes = PartnerClasses::number(2, [&[0_u32, 1][..], &[0, 1][..]]);
+        let addresses = list.iter().map(|worker| worker.url().to_owned());
+        let ring = Lent(addresses.collect());
+        // The key's owner is the busy worker: each live side takes the
+        // idle one, and each side's shadow names the owner.
+        for _ in 0..8 {
+            list[1].increment_load();
+        }
+        let headers = [("x-smg-routing-key", "conv-1")];
+        let request = PlaceRequest {
+            headers: &headers,
+            ring: Some(&ring),
+            decode_again: true,
+            ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair_of(&members, &classes)))
+        };
+        let read = || [0, 1, 2].map(|at| std::mem::take(&mut *cells[at].lock()));
+        let mut placement = engine.place(&request).expect("a pair");
+        let first = read();
+        placement.sent(Side::Prefill);
+        let decided = placement.decode_again(&request);
+        assert!(decided.is_ok(), "the decode decided again");
+        let said = (sides_said(engine), engine.faults());
+        (first, read(), ring.position("conv-1"), said)
+    };
+    // Each side's shadow names the ring's owner, as under no such filter.
+    let another = [0, 1, 0, 0];
+    // The decode's shadow alone is asked again: `later` are the filters it
+    // holds.
+    for (declaring, later) in [("prefill-next", &[1][..]), ("decode-next", &[0, 2][..])] {
+        let (first, again, place, said) = shown(declaring);
+        let ring = Shown::from([(true, vec![place])]);
+        let none = Shown::from([(false, Vec::new())]);
+        // The filter listed first is shown what the declaring one is.
+        let all = [ring.clone(), none, ring];
+        let mut alone = [Shown::new(), Shown::new(), Shown::new()];
+        for &at in later {
+            alone[at].clone_from(&all[at]);
+        }
+        assert_eq!((first, again), (all, alone), "{declaring} declares");
+        assert_eq!(said, ([another; 3], 0), "the sides' words, and no fault");
+    }
+}
+
+/// A filter that declares the ring need and answers by the ring it is
+/// shown: with a ring it keeps the one worker it holds, with none every
+/// row.
+#[derive(Debug)]
+struct OwnerAlone(WorkerId);
+
+impl Filter for OwnerAlone {
+    fn name(&self) -> &'static str {
+        "owner-alone"
+    }
+
+    fn keep(&self, facts: &RequestFacts<'_>, row: &Candidate, _: &Constraints<'_>) -> bool {
+        facts.ring.is_none() || row.id == self.0
+    }
+
+    fn needs(&self) -> Needs {
+        Needs {
+            ring: true,
+            ..Needs::default()
+        }
+    }
+}
+
+/// A prefill's shadow one of whose filters declares the ring need judges
+/// its admission limit on the lent ring too. The pair is made among first
+/// partners that do not list the key's owner, and the filter keeps the
+/// owner alone where it is shown a ring. The shadow's run among them is
+/// refused and none of them stands but for the limit: the shadow runs
+/// again over every open class and names the owner, as a live profile with
+/// that filter does. It does not say the limit's shed. Its two runs and
+/// the test between them read one answer: the lender is asked once.
+#[test]
+fn a_prefills_shadow_judges_its_admission_limit_on_the_lent_ring() {
+    let list = pool(2);
+    let owner = worker_id(list[1].as_ref());
+    let name = "owner-alone";
+    let mut stages = StageRegistry::builtin();
+    let added = stages.filter(name, move || Box::new(OwnerAlone(owner)));
+    added.expect("a free name");
+    let plain = "consistent_hashing";
+    let mut document = ring_shadowed(plain, plain, false);
+    // The prefill's shadow alone: every ask of the lender is its own.
+    if let Some(ShadowSpec::Sides(sides)) = document.bindings[0].shadow.as_mut() {
+        sides.retain(|side, _| side.contains("prefill"));
+    }
+    let shadow = document.profiles.get_mut("prefill-next");
+    let shadow = shadow.expect("the prefill's shadow profile");
+    shadow.filter.push(FilterSpec::Name(name.to_owned()));
+    let spec = AppliedSpec::validate_in(&document, &stages, &[]);
+    let engine = hosted(InProcess::new(spec.expect("the stages hold the filter")));
+    let members = PublishedList::new(Arc::clone(&list));
+    // The first prefill goes first with the first decode: the pair is made
+    // among those two, and the key's owner, the second worker, is not
+    // listed.
+    let both = &[0_u32, 1][..];
+    let classes = PartnerClasses::number_first(2, [(both, &[0][..]), (both, &[][..])]);
+    let addresses = list.iter().map(|worker| worker.url().to_owned());
+    let ring = Lent(addresses.collect());
+    assert_eq!(ring.position("conv-1") % 2, 1, "the key's owner");
+    let headers = [("x-smg-routing-key", "conv-1")];
+    let request = PlaceRequest {
+        headers: &headers,
+        ring: Some(&ring),
+        ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair_of(&members, &classes)))
+    };
+    let maker = Counted(Made::new(engine, &request, &[]), AtomicU32::new(0));
+    let decided = engine.decide_at(&maker, Instant::now);
+    assert!(decided.is_ok(), "the pair's decision");
+    // Another target, the owner: no other outcome, no fault, and one ask
+    // of the lender across the shadow's two runs.
+    let asks = maker.1.load(atomic::Ordering::Relaxed);
+    let said = (sides_said(engine)[0], engine.faults(), asks);
+    assert_eq!(said, ([0, 1, 0, 0], 0, 1), "the prefill's shadow");
+}
+
+/// A decode's shadow the all-vetoed rule steers, one of whose filters
+/// declares the ring need, asks the lender ahead of its filters: a ring
+/// that panics where it is asked counts one fault of the shadow at the
+/// pair's decision and one at the decode decided again, the shadow says
+/// nothing, and both live decisions stand.
+#[test]
+fn a_steered_decodes_shadow_whose_filter_declares_the_ring_need_asks_the_lender() {
+    let mut stages = StageRegistry::builtin();
+    let added = stages.filter("declares-ring", || {
+        Box::new(SeesPlace {
+            name: "declares-ring",
+            declares: true,
+            shown: Arc::default(),
+        })
+    });
+    added.expect("a free name");
+    let plain = "consistent_hashing";
+    let mut document = ring_shadowed(plain, plain, true);
+    // The decode's shadow alone, as under the steered shadow that asks
+    // nothing.
+    if let Some(ShadowSpec::Sides(sides)) = document.bindings[0].shadow.as_mut() {
+        sides.retain(|side, _| side.contains("decode"));
+    }
+    let shadow = document.profiles.get_mut("decode-next");
+    let shadow = shadow.expect("the decode's shadow profile");
+    shadow
+        .filter
+        .push(FilterSpec::Name("declares-ring".to_owned()));
+    let spec = AppliedSpec::validate_in(&document, &stages, &[]);
+    let engine = hosted(InProcess::new(spec.expect("the stages hold the filter")));
+    let members = PublishedList::new(pool(1));
+    let decodes: Arc<[Arc<dyn Worker>]> = (0..2)
+        .map(|at| ready_worker(&format!("http://decode-{at}:8000"), MODEL))
+        .collect();
+    let decode_members = PublishedList::new(Arc::clone(&decodes));
+    let classes = PartnerClasses::number(2, [&[0_u32, 1][..]]);
+    for worker in decodes.iter() {
+        worker.set_overloaded(true);
+    }
+    let headers = [("x-smg-routing-key", "conv-1")];
+    let pair = PairLists {
+        decode: decode_members.lent(),
+        ..pair_of(&members, &classes)
+    };
+    let request = PlaceRequest {
+        headers: &headers,
+        ring: Some(&Unasked),
+        decode_again: true,
+        ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair))
+    };
+    let seen = || (sides_said(engine), engine.faults());
+    let mut placement = engine.place(&request).expect("a pair");
+    assert_eq!(seen(), ([[0; 4]; 3], 1), "the pair's decision");
+    placement.sent(Side::Prefill);
+    let decided = placement.decode_again(&request);
+    assert!(decided.is_ok(), "the decode decided again");
+    assert_eq!(seen(), ([[0; 4]; 3], 2), "the later call");
+}
+
+/// A maker that hands on the engine's own and counts the asks for a
+/// shadow's ring.
+struct Counted<'r, 'a>(Made<'r, 'a>, AtomicU32);
+
+impl RequestMaker for Counted<'_, '_> {
+    fn model(&self) -> &str {
+        self.0.model()
+    }
+
+    fn make<'w>(&'w self, spec: &'w AppliedSpec) -> Request<'w> {
+        self.0.make(spec)
+    }
+
+    fn workers(&self) -> WorkerLists<'_> {
+        self.0.workers()
+    }
+
+    fn shadow_ring<'w>(
+        &'w self,
+        spec: &'w AppliedSpec,
+        shadow: u16,
+    ) -> Option<(&'w dyn LentRing, &'w [u64])> {
+        self.1.fetch_add(1, atomic::Ordering::Relaxed);
+        self.0.shadow_ring(spec, shadow)
+    }
+}
+
+/// How often a pair's decision asks the lender for the ring of a side's
+/// shadow: once where the shadow's filters keep a worker, whether or not
+/// one of them declares the ring need; once too where one declares it and
+/// they empty the set, ahead of them; and never where none declares it
+/// and they empty the set.
+#[test]
+fn a_sides_shadow_asks_the_lender_once_a_decision_or_never() {
+    // The asks of one pair's decision and the engine's faults, under the
+    // decode's shadow alone: its profile holds a filter that declares the
+    // ring need or not, and every decode stands over its thresholds or
+    // none does.
+    let asks = |declares: bool, emptied: bool| {
+        let mut stages = StageRegistry::builtin();
+        let added = stages.filter("sees-place", move || {
+            Box::new(SeesPlace {
+                name: "sees-place",
+                declares,
+                shown: Arc::default(),
+            })
+        });
+        added.expect("a free name");
+        let plain = "consistent_hashing";
+        let mut document = ring_shadowed(plain, plain, true);
+        if let Some(ShadowSpec::Sides(sides)) = document.bindings[0].shadow.as_mut() {
+            sides.retain(|side, _| side.contains("decode"));
+        }
+        let shadow = document.profiles.get_mut("decode-next");
+        let shadow = shadow.expect("the decode's shadow profile");
+        let filter = FilterSpec::Name("sees-place".to_owned());
+        shadow.filter.push(filter);
+        let spec = AppliedSpec::validate_in(&document, &stages, &[]);
+        let engine = hosted(InProcess::new(spec.expect("the stages hold the filter")));
+        let members = PublishedList::new(pool(1));
+        let decodes: Arc<[Arc<dyn Worker>]> = (0..2)
+            .map(|at| ready_worker(&format!("http://decode-{at}:8000"), MODEL))
+            .collect();
+        let decode_members = PublishedList::new(Arc::clone(&decodes));
+        let classes = PartnerClasses::number(2, [&[0_u32, 1][..]]);
+        for worker in decodes.iter() {
+            worker.set_overloaded(emptied);
+        }
+        let addresses = decodes.iter().map(|worker| worker.url().to_owned());
+        let ring = Lent(addresses.collect());
+        let headers = [("x-smg-routing-key", "conv-1")];
+        let pair = PairLists {
+            decode: decode_members.lent(),
+            ..pair_of(&members, &classes)
+        };
+        let request = PlaceRequest {
+            headers: &headers,
+            ring: Some(&ring),
+            ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair))
+        };
+        let maker = Counted(Made::new(engine, &request, &[]), AtomicU32::new(0));
+        let decided = engine.decide_at(&maker, Instant::now);
+        assert!(decided.is_ok(), "the pair's decision");
+        (maker.1.load(atomic::Ordering::Relaxed), engine.faults())
+    };
+    assert_eq!(asks(true, false), (1, 0), "declared, a worker kept");
+    assert_eq!(asks(true, true), (1, 0), "declared, the set emptied");
+    assert_eq!(asks(false, false), (1, 0), "not declared, a worker kept");
+    assert_eq!(asks(false, true), (0, 0), "not declared, the set emptied");
+}
+
+/// A decode's shadow that cuts a request by another depth than the
+/// prefill's shadow, and one of whose filters declares the ring need, is
+/// asked for its own profile ahead of its filters: also where every
+/// decode stands over its thresholds and they drop every worker. A maker
+/// is asked once for each side's shadow profile in that pair's decision.
+#[test]
+fn a_declaring_decodes_shadow_of_another_depth_is_asked_ahead_of_its_filters() {
+    let mut stages = StageRegistry::builtin();
+    let added = stages.filter("sees-place", || {
+        Box::new(SeesPlace {
+            name: "sees-place",
+            declares: true,
+            shown: Arc::default(),
+        })
+    });
+    added.expect("a free name");
+    let mut document = prefix_shadowed(Some(16), true);
+    let shadow = document.profiles.get_mut("decode-next");
+    let shadow = shadow.expect("the decode's shadow profile");
+    let filter = FilterSpec::Name("sees-place".to_owned());
+    shadow.filter.push(filter);
+    let spec = AppliedSpec::validate_in(&document, &stages, &[]);
+    let engine = hosted(InProcess::new(spec.expect("the stages hold the filter")));
+    let members = PublishedList::new(pool(1));
+    let decodes: Arc<[Arc<dyn Worker>]> = (0..2)
+        .map(|at| ready_worker(&format!("http://decode-{at}:8000"), MODEL))
+        .collect();
+    let decode_members = PublishedList::new(Arc::clone(&decodes));
+    let classes = PartnerClasses::number(2, [&[0_u32, 1][..]]);
+    for worker in decodes.iter() {
+        worker.set_overloaded(true);
+    }
+    let ring = ByDepth {
+        shallowest: decodes[0].url().to_owned(),
+        deeper: decodes[1].url().to_owned(),
+    };
+    let ids: Vec<u32> = (0..256).collect();
+    let pair = PairLists {
+        decode: decode_members.lent(),
+        ..pair_of(&members, &classes)
+    };
+    let request = PlaceRequest {
+        prompt: Prompt {
+            tokens: Some(&ids),
+            ..Prompt::NONE
+        },
+        ring: Some(&ring),
+        ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair))
+    };
+    let maker = Recorded(Made::new(engine, &request, &[]), RefCell::default());
+    let decided = engine.decide_at(&maker, Instant::now);
+    assert!(decided.is_ok(), "the pair's decision");
+    let asked = maker.1.take();
+    let faults = engine.faults();
+    assert_eq!(asked.len(), 2, "one ask a side's shadow: {asked:?}");
+    assert_ne!(asked[0], asked[1], "each side's own profile");
+    assert_eq!(faults, 0, "no fault");
 }
 
 /// A ring no decision may ask.
