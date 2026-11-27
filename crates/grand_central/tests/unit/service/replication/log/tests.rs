@@ -1436,6 +1436,31 @@ fn a_store_that_follows_writes_under_no_term_until_it_takes_one() {
     }
 }
 
+/// A write names an applier's place or a term of its own, never both:
+/// an applier's write goes by its leader's place. A membership write
+/// that names both stops a debug build where the log would stamp it. A
+/// status handed as a membership write is refused ahead of that, as it
+/// was.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "a write names an applier's place or a term, never both")]
+fn a_write_that_names_a_place_and_a_term_stops_a_debug_build() {
+    let log = Log::new(16);
+    log.term_rose(3);
+    let _ = log.member(Some(at(2, 4)), Some(3), 1, relabel(1), None, None);
+}
+
+/// A status's write that names both stops a debug build, as a
+/// membership write does.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "a write names an applier's place or a term, never both")]
+fn a_status_that_names_a_place_and_a_term_stops_a_debug_build() {
+    let log = Log::new(16);
+    log.term_rose(3);
+    let _ = drains(&log, Some(at(2, 4)), Some(3), 1);
+}
+
 #[test]
 fn a_store_that_leads_applies_no_event_under_its_own_term() {
     let log = Log::new(16);

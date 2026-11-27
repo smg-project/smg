@@ -374,6 +374,15 @@ const CELLS: &[Cell] = &[
         document: || preset("least_load"),
         ..Cell::PLAIN
     },
+    // The hash ring's pair document with a request that carries no key
+    // and bounds its completion: a pair's decodes alone are held to that
+    // demand. `--entry place_named` counts the pair's numbers under it.
+    Cell {
+        name: "pair_consistent_hashing_bounded",
+        document: || pair::of("consistent_hashing"),
+        request: pair::bounded,
+        ..Cell::PLAIN
+    },
     // The hash ring's pair document with a request that carries no key:
     // through the one call (`--entry place`) a pair's headers are read for
     // the worker it may name, and `--entry place_named` names one.

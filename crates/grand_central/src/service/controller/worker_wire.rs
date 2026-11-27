@@ -1359,5 +1359,5 @@ pub(crate) fn patch(
 }
 
 #[cfg(test)]
-#[path = "../../../tests/unit/service/controller/worker_wire/tests.rs"]
+#[path = "../../../tests/unit/service/controller/worker_wire/tests/mod.rs"]
 mod tests;

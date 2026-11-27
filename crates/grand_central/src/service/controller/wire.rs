@@ -448,7 +448,9 @@ impl Checked {
 
     /// The request's hard demands as the frame states them
     /// (`DecideRequest.demands`). The count of a frame that names its
-    /// worker reads them: a worker they leave out takes no number.
+    /// worker reads them: a worker they leave out takes no number. A pair
+    /// that reads the number on neither side runs no count, and its
+    /// decision holds them as every frame's does.
     pub(crate) const fn demands(&self) -> Demands {
         self.demands
     }

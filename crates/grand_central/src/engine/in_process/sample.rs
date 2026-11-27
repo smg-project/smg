@@ -213,8 +213,10 @@ impl InProcess {
     /// A request that states no id of its own is counted and found by the
     /// id its host states for it
     /// ([`PlaceRequest::explain_id`](crate::engine::PlaceRequest::explain_id)),
-    /// and is not counted and not kept where it has neither. A record
-    /// names its plan, its profile and that profile's stages through
+    /// or else by the value of the header its host names
+    /// ([`PlaceRequest::explain_id_header`](crate::engine::PlaceRequest::explain_id_header)),
+    /// and is not counted and not kept where it states none of the three.
+    /// A record names its plan, its profile and that profile's stages through
     /// [`DecisionRecord::names`], read under the document's engine
     /// ([`AppliedSpec::engine`](crate::document::spec::AppliedSpec::engine)).
     ///

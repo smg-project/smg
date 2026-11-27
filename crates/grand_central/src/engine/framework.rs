@@ -5,6 +5,7 @@
 
 use std::{
     any::Any,
+    cell::OnceCell,
     collections::HashMap,
     fmt::Debug,
     sync::{atomic::AtomicU64, Arc},
@@ -15,7 +16,8 @@ use crate::{
     engine::{
         decision::{
             Decision, LiftedVeto, Overlap, PairSide, Pick, Placing, Shed, ShedReason, Survivors,
-            Target, Targets, Trace, MAX_TARGETS, TARGET_WORKER, TRACE_TOP,
+            Target, Targets, Trace, AFFINITY_COLUMN, BINDING, EC_COMPATIBLE, MAX_TARGETS, NO_STAGE,
+            PARTNERED, PARTNERS, PREFILL_GONE, TARGET_WORKER, TRACE_TOP, VISION, WRITTEN_ROWS,
         },
         sticky_sessions::{self, Claim, SessionRule, SessionTable, SessionVerdict},
         view::{
@@ -101,8 +103,15 @@ pub trait Filter: Any + Send + Sync + Debug {
     /// ([`RequestFacts::ring`]) declares [`Needs::ring`], and a live
     /// profile one of whose scorers places by the ring shows it the ring
     /// and the request's place on it. A pair side's shadow that reads a
-    /// ring where neither live side does is lent that ring for its
-    /// scoring half alone: its filters are shown no ring and no place.
+    /// ring where neither live side does is lent that ring. Where one of
+    /// its filters declares the need, every stage of the shadow's own run
+    /// is shown what its lender answers: the ring and the shadow's place
+    /// on it, or the facts as they stand where it answers none. So are
+    /// the hard filters a prefill's shadow asks once more at its admission
+    /// limit's test. Where no filter declares it, the scoring half alone
+    /// is: the filters are shown no ring and no place. Neither are they in
+    /// the steps of the pair's default that a side's shadow follows,
+    /// whatever they declare.
     ///
     /// Asked only while the stage's generation is built, perhaps more than
     /// once there. The answer stands for that generation: no decision and
@@ -2185,7 +2194,7 @@ fn filter(
             places::open(kept, candidates.len(), cx);
             kept.retain(|&i| classed(classes, candidates[i as usize].pair_class));
             if kept.is_empty() {
-                return Some("partners");
+                return Some(PARTNERS);
             }
             // The decode a pair's request names: the row its number reaches
             // among these, and the side's one row. A number past them
@@ -2206,13 +2215,13 @@ fn filter(
                     .extend(rows.filter(|&i| classed(classes, candidates[i as usize].pair_class))),
             }
             if kept.is_empty() {
-                return Some("partners");
+                return Some(PARTNERS);
             }
         }
         None => places::open(kept, candidates.len(), cx),
     }
     if kept.is_empty() {
-        return Some("none");
+        return Some(NO_STAGE);
     }
     if let Some(p) = partnered {
         match only(p) {
@@ -2226,7 +2235,7 @@ fn filter(
     if encode {
         kept.retain(|&i| candidates[i as usize].ec_compatible);
         if kept.is_empty() {
-            return Some("ec-compatible");
+            return Some(EC_COMPATIBLE);
         }
         kept.retain(|&i| vision_fits(facts, &candidates[i as usize]));
         if kept.is_empty() {
@@ -2590,12 +2599,6 @@ impl<'a> Set<'a> {
     }
 }
 
-/// The stage a pool is shed under when none of its rows takes the pixels
-/// its request holds, an image or a video: the `epd` plan's vision rule
-/// sheds under it, and so does a request's vision demand
-/// ([`UnmetDemand::Vision`](crate::engine::demands::UnmetDemand::Vision)).
-pub(crate) const VISION: &str = "vision";
-
 /// The `epd` plan's vision rule: a request that holds pixels, an image or
 /// a video ([`MediaCounts::holds_pixels`]), takes an encoder with a vision
 /// encoder; a request that holds none takes any.
@@ -2758,17 +2761,35 @@ fn run_side(
     score_survivors(profile, index, facts, pool, candidates, buf, first)
 }
 
+/// `facts` with the ring and the places a lender answered, where it
+/// answered any. A shadow's run ([`run_side_lent`]) and the admission
+/// limit's test behind it (`shadow_side`) both state the request through
+/// this, so the test judges on the facts the run showed its filters.
+fn with_lent<'f>(
+    facts: &RequestFacts<'f>,
+    lent: Option<(&'f dyn LentRing, &'f [u64])>,
+) -> Option<RequestFacts<'f>> {
+    lent.map(|(ring, places)| RequestFacts {
+        ring: Some(ring),
+        ring_positions: places,
+        ..*facts
+    })
+}
+
 /// [`run_side`] for a pair side's shadow, which may be stated a place of
-/// its own on the ring its request lends ([`Engine::side_ring_profile`]):
-/// `lent` is asked between the two halves, behind the filter half. A set
-/// the filters emptied ends where every side's does ([`single_emptied`]),
-/// in the all-vetoed rule's pick or in a shed, and asks nothing: no stage
-/// would read the place. The filter half reads `facts` as they stand: a
-/// filter is shown no ring and no place here, one of the host's own that
-/// declares the ring need ([`Filter::needs`]) too, which a live profile
-/// shows both. The scoring half reads them with the ring and the places
-/// `lent` answers, where it answers any. Out of line: a shadow's run
-/// alone enters here.
+/// its own on the ring its request lends ([`Engine::side_ring_profile`]).
+/// Under a profile none of whose filters declares the ring need
+/// ([`Filter::needs`]), `lent` is asked between the two halves, behind the
+/// filter half. A set the filters emptied ends where every side's does
+/// ([`single_emptied`]), in the all-vetoed rule's pick or in a shed, and
+/// asks nothing: no stage would read the place. The filter half reads
+/// `facts` as they stand, with no ring and no place, and the scoring half
+/// reads them with the ring and the places `lent` answers, where it
+/// answers any. Under a profile with such a filter (`ahead`), `lent` is
+/// asked ahead of the filter half and both halves read what it answers,
+/// as the stages of a live profile do, or `facts` as they stand where it
+/// answers none: the lender is then asked for a set the filters may
+/// empty. Out of line: a shadow's run alone enters here.
 #[expect(
     clippy::too_many_arguments,
     reason = "a side's run, beside what its shadow is lent"
@@ -2782,17 +2803,17 @@ fn run_side_lent<'l>(
     cx: &Constraints<'_>,
     buf: &mut Buffers,
     first: Option<(WorkerId, u16)>,
+    ahead: bool,
     lent: &dyn Fn() -> Option<(&'l dyn LentRing, &'l [u64])>,
 ) -> Decision {
     let candidates = set.candidates;
-    if let Some(emptied_by) = filter(profile, facts, cx, buf, set) {
-        return single_emptied(index, facts, pool, candidates, emptied_by, buf);
+    let state = || with_lent(facts, lent());
+    let stated = if ahead { state() } else { None };
+    let shown = stated.as_ref().unwrap_or(facts);
+    if let Some(emptied_by) = filter(profile, shown, cx, buf, set) {
+        return single_emptied(index, shown, pool, candidates, emptied_by, buf);
     }
-    let stated = lent().map(|(ring, places)| RequestFacts {
-        ring: Some(ring),
-        ring_positions: places,
-        ..*facts
-    });
+    let stated = if ahead { stated } else { state() };
     let facts = stated.as_ref().unwrap_or(facts);
     score_survivors(profile, index, facts, pool, candidates, buf, first)
 }
@@ -4542,6 +4563,11 @@ impl Marks {
     /// reads it for its prefill profile ([`Engine::weighs`]). No single
     /// decision does: each of its masked reads names other marks.
     const WEIGHS: u16 = 1 << 13;
+    /// A filter declares the ring need ([`Filter::needs`]). The run of a
+    /// pair side's shadow that is lent a ring reads it: it asks its
+    /// lender ahead of such a profile's filter half ([`run_side_lent`]).
+    /// No other decision reads it.
+    const RING_FILTER: u16 = 1 << 14;
 
     fn of(profile: &Profile, order: Order) -> Self {
         let scoped = if profile.scoped() { Self::SCOPED } else { 0 };
@@ -4619,11 +4645,18 @@ impl Marks {
         } else {
             0
         };
+        let ring_filter = if profile.filters.iter().any(|filter| filter.needs().ring) {
+            Self::RING_FILTER
+        } else {
+            0
+        };
         // The three marks no run of the engine reads.
         let for_hosts = by_reports | key_place | other_place;
         // What says when the profile draws, and how.
         let draws = draws_first | joined | turns;
-        Self(scoped | by_assignment | draws | ranked | engines | owns | for_hosts | weighs)
+        // The two marks a pair's decision alone reads.
+        let for_pairs = weighs | ring_filter;
+        Self(scoped | by_assignment | draws | ranked | engines | owns | for_hosts | for_pairs)
     }
 
     /// A profile whose requests take their list's own turn first.
@@ -4634,6 +4667,11 @@ impl Marks {
     /// A scorer that weighs load against affinity by a gate of its own.
     const fn weighs(self) -> bool {
         self.0 & Self::WEIGHS != 0
+    }
+
+    /// A filter that declares the ring need.
+    const fn ring_filter(self) -> bool {
+        self.0 & Self::RING_FILTER != 0
     }
 
     /// Whether no stage asks anything before the profile's run: no scope
@@ -5387,17 +5425,6 @@ impl<'a> PairPools<'a> {
     }
 }
 
-/// The stage a decision names when it is refused for its affinity column:
-/// what a host counts its sheds under.
-const AFFINITY_COLUMN: &str = "affinity-column";
-
-/// The stage a pair's decision names where the workers left pair with
-/// nobody that stands: a prefill side narrowed to the classes with an open
-/// partner that keeps no row ([`filter`]), prefills that stand and pair
-/// with no decode, and a shed with no endpoint whose worker with room
-/// pairs with nobody ([`Half::refused_room`]).
-const PARTNERED: &str = "partnered";
-
 /// Whether the request carries a column of its own or names rows. A pair
 /// reads neither: its columns ride its two pools ([`PairPools`]), and
 /// either on the request names neither pool.
@@ -5456,10 +5483,6 @@ fn target_missed(decision: Decision) -> Decision {
         other => other,
     }
 }
-
-/// The stage a decision names when a profile that shows its rows to a
-/// plugin was handed rows that carry a mask beside them.
-const WRITTEN_ROWS: &str = "written-rows";
 
 /// The decline of a decision whose rows were not written for the plugin
 /// they are shown to, under the profile that declines. Cold and out of
@@ -6408,8 +6431,9 @@ impl Engine {
     /// states no place when it is made, so the side's shadow is asked for
     /// its own inside its run, as a single binding's is
     /// ([`Self::shadow_ring_profile`]). A side's run asks behind its
-    /// filter half ([`run_side_lent`]): a shadow that says none ahead of
-    /// its profile ([`Self::shadow_side`]) and one whose set the filters
+    /// filter half where no filter of its profile declares the ring need
+    /// ([`run_side_lent`]): a shadow that says none ahead of its profile
+    /// ([`Self::shadow_side`]) and, there, one whose set the filters
     /// emptied are asked nothing. `None` under every other binding: beside
     /// a live side that reads the ring, a side's shadow reads the place
     /// the two live sides state, or none ([`Self::unlent`]). Each side's
@@ -7385,7 +7409,7 @@ impl Engine {
             return shed(ShedReason::PolicyDeclined, AFFINITY_COLUMN, bare);
         }
         let Some((entry, index, profile)) = self.resolve(facts.model, facts.phase) else {
-            return shed(ShedReason::PolicyDeclined, "binding", bare);
+            return shed(ShedReason::PolicyDeclined, BINDING, bare);
         };
         let Entry {
             binding,
@@ -8725,7 +8749,7 @@ impl Engine {
         // profile is the pair's decode side. A binding of the single plan
         // declines a pair decision: the host and the spec disagree.
         let Some(entry) = self.pair_entry(facts.model) else {
-            return shed(ShedReason::PolicyDeclined, "binding", bare);
+            return shed(ShedReason::PolicyDeclined, BINDING, bare);
         };
         // The binding's word for a pool a soft veto empties: the live
         // decode side is put to the all-vetoed rule by it ([`Set::ruled`]).
@@ -8735,7 +8759,7 @@ impl Engine {
             self.profiles.get(usize::from(binding.profile)),
             self.profiles.get(usize::from(decode_index)),
         ) else {
-            return shed(ShedReason::PolicyDeclined, "binding", bare);
+            return shed(ShedReason::PolicyDeclined, BINDING, bare);
         };
         // A plugin reads a row's own fields: a side that shows its rows is
         // handed rows written for the decision. A mask beside that side's
@@ -9101,7 +9125,7 @@ impl Engine {
                         let whole = Set::side(prefills, None, None);
                         let buf = &mut scratch.single;
                         let stage = filter(prefill_profile, &prefill_facts, run_cx, buf, whole);
-                        Some(stage.unwrap_or("none"))
+                        Some(stage.unwrap_or(NO_STAGE))
                     } else if scratch.classes.is_empty() {
                         Some(PARTNERED)
                     } else {
@@ -9113,7 +9137,7 @@ impl Engine {
                         let partners = Set::side(decodes, None, Some(&scratch.classes));
                         let buf = &mut scratch.decode;
                         filter(decode_profile, &decode_facts, decode_cx, buf, partners)
-                            .filter(|&stage| stage != "none")
+                            .filter(|&stage| stage != NO_STAGE)
                     };
                     let reason = named.map_or(prefill_shed.reason, reason_of);
                     // A pass the overload veto ended names that veto, the
@@ -9296,7 +9320,7 @@ impl Engine {
             // target's name.
             Some(last) if decode_cx.target_worker.is_some() => target_missed(Decision::Shed(last)),
             Some(last) => Decision::Shed(last),
-            None => shed(ShedReason::NoEndpoints, "partners", prefill_pick.trace),
+            None => shed(ShedReason::NoEndpoints, PARTNERS, prefill_pick.trace),
         }
         .of_side(PairSide::Decode)
     }
@@ -9443,6 +9467,13 @@ impl Engine {
     /// Neither does the pair's default that a side's shadow follows: no
     /// step of it scores.
     ///
+    /// A shadow profile with a filter that declares the ring need
+    /// ([`Filter::needs`]) asks ahead of the filter half of its run,
+    /// whatever its filters then keep, and once a decision: a prefill's
+    /// shadow that runs again reads the answer of its first run. The
+    /// pair's default asks nothing there either, and its steps show the
+    /// shadow's filters no ring and no place.
+    ///
     /// The decode's shadow is put to the binding's all-vetoed rule by the
     /// binding's word, as its live side is ([`Set::ruled`]): where a veto
     /// leaves the live prefill's partners nobody, the rule steers the
@@ -9461,7 +9492,8 @@ impl Engine {
     ///
     /// - Among first partners, the admission limit's test of the prefills
     ///   shown. Where one of them waits on its limit, the shed is the
-    ///   limit's and names the prefill side.
+    ///   limit's and names the prefill side. The test reads the facts the
+    ///   shadow's run showed its filters.
     /// - Among first partners, its run over every open class.
     /// - The default's first step, which answers its prefill
     ///   ([`vetoed::shadow_prefill`]). The live decode profile stands on
@@ -9548,8 +9580,12 @@ impl Engine {
         let facts = unlent.as_ref().unwrap_or(facts);
         let (prefills, prefill_facts) = pools.side(PairSide::Prefill, facts)?;
         let (decodes, decode_facts) = pools.side(PairSide::Decode, facts)?;
-        // The shadow's own place, asked behind the filter half alone.
-        let lent = || self.side_ring_profile(at, side).and_then(lends);
+        // The shadow's own place, asked behind the filter half, or ahead
+        // of it where a filter of the profile declares the ring need. It
+        // is asked once: a run of the side that follows reads the answer.
+        let asked = OnceCell::new();
+        let lent = || *asked.get_or_init(|| self.side_ring_profile(at, side).and_then(lends));
+        let ahead = self.marks[usize::from(index)].ring_filter();
         // The mark the pair's decision left on the prefill's buffer: the
         // tier the pair's default paired in, and none beside a pair the
         // profiles made ([`Self::decide_pair`]).
@@ -9576,7 +9612,8 @@ impl Engine {
                     Decision::Pick(_) | Decision::Queue(_) => false,
                 };
                 // The shadow's own run over the prefills of `classes`. It asks
-                // for its place behind its filter half ([`run_side_lent`]).
+                // for its place behind its filter half, or ahead of it
+                // ([`run_side_lent`]).
                 let own = |classes: &[u32], buf: &mut Buffers| {
                     let set = Set::side(prefills, None, Some(classes));
                     run_side_lent(
@@ -9588,6 +9625,7 @@ impl Engine {
                         run_cx,
                         buf,
                         None,
+                        ahead,
                         &lent,
                     )
                 };
@@ -9597,10 +9635,17 @@ impl Engine {
                 // but for its admission limit keeps the request under the
                 // limit's stage. Else the side runs again over every open
                 // class, which stand in `firsts` behind that decision's
-                // swap.
-                let takes = Half::new(profile, index, &prefill_facts, prefills, run_cx);
+                // swap. The limit's test asks the hard filters on the facts
+                // the run showed them: with what the lender answered that
+                // run where one of them declares the ring need. The answer
+                // stands, and the lender is asked nothing more.
                 let firsts_shed = scratch.among_first && refused(&run);
-                let waits = firsts_shed && takes.waits_among(&scratch.classes);
+                let waits = firsts_shed && {
+                    let stated = with_lent(&prefill_facts, if ahead { lent() } else { None });
+                    let shown = stated.as_ref().unwrap_or(&prefill_facts);
+                    let takes = Half::new(profile, index, shown, prefills, run_cx);
+                    takes.waits_among(&scratch.classes)
+                };
                 if waits {
                     // The limit's shed names the prefill side, as the live
                     // decision's does.
@@ -9666,6 +9711,7 @@ impl Engine {
                         decode_cx,
                         &mut scratch.decode,
                         None,
+                        ahead,
                         &lent,
                     )
                 } else {
@@ -9688,8 +9734,7 @@ impl Engine {
                                 lifted: LiftedVeto::None,
                                 ..pick.trace
                             };
-                            shed(ShedReason::NoEndpoints, "partners", trace)
-                                .of_side(PairSide::Decode)
+                            shed(ShedReason::NoEndpoints, PARTNERS, trace).of_side(PairSide::Decode)
                         }
                         step => step,
                     }
@@ -9711,7 +9756,8 @@ impl Engine {
     /// ([`Self::shadow_side`]): held against both live sides, or against
     /// the decode's own alone where each side is stated its own places
     /// ([`Self::unlent`]). And it is asked its own place of `lends` as a
-    /// side's is there: behind the filter half of its run.
+    /// side's is there: behind the filter half of its run, or ahead of it
+    /// where a filter of the profile declares the ring need.
     ///
     /// `first_decode` is the decode the pair's first decision named, as
     /// that call is handed it. A shadow profile that keeps such a decode
@@ -9789,6 +9835,7 @@ impl Engine {
             decode_cx,
             &mut scratch.decode,
             first_decode.filter(|_| keeps_its_first(profile)),
+            self.marks[usize::from(index)].ring_filter(),
             &|| self.side_ring_profile(at, side).and_then(lends),
         ))
     }
@@ -9870,12 +9917,12 @@ impl Engine {
             return shed(ShedReason::PolicyDeclined, AFFINITY_COLUMN, bare);
         };
         let Some(entry) = self.pair_entry(facts.model) else {
-            return shed(ShedReason::PolicyDeclined, "binding", bare);
+            return shed(ShedReason::PolicyDeclined, BINDING, bare);
         };
         let binding = &entry.binding;
         let index = binding.decode_profile.unwrap_or(binding.profile);
         let Some(profile) = self.profiles.get(usize::from(index)) else {
-            return shed(ShedReason::PolicyDeclined, "binding", bare);
+            return shed(ShedReason::PolicyDeclined, BINDING, bare);
         };
         // The held prefill is looked for before any constraint is read: a
         // call whose prefill left the lists says so, whatever it states.
@@ -9886,7 +9933,7 @@ impl Engine {
                 ..bare
             };
             // The held prefill is the side left with nobody.
-            return shed(ShedReason::NoEndpoints, "prefill-gone", under).of_side(PairSide::Prefill);
+            return shed(ShedReason::NoEndpoints, PREFILL_GONE, under).of_side(PairSide::Prefill);
         };
         let shown = self.marks[usize::from(index)].scoped();
         if shown && !decode_cx.stalled.is_empty() {
@@ -10044,12 +10091,20 @@ impl Engine {
     /// its key ([`SessionTable::told_under`]). The call read `key` at `at`,
     /// its own instant, and tells its words under `issued`, the instant of
     /// the lease its pair's first decision issued. A claim it made, of
-    /// `claimed`, takes that date. The pair's decode entries ask here, so
-    /// they read no table of the engine's.
+    /// `claimed`, takes that date. `first` is the worker that decision
+    /// claimed for `key`, `WorkerId(0)` where it claimed none. The pair's
+    /// decode entries ask here, so they read no table of the engine's.
     #[cfg(feature = "in-process")]
     #[inline]
-    pub(crate) fn told_under(&self, key: Session, claimed: Option<WorkerId>, at: u64, issued: u64) {
-        self.sessions.told_under(key, claimed, at, issued);
+    pub(crate) fn told_under(
+        &self,
+        key: Session,
+        claimed: Option<WorkerId>,
+        at: u64,
+        issued: u64,
+        first: WorkerId,
+    ) {
+        self.sessions.told_under(key, claimed, at, issued, first);
     }
 
     /// The stages' part of a release, behind the table's

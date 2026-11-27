@@ -36,6 +36,10 @@
 //! such prefill is over its thresholds under a binding that sheds a list
 //! wholly over them: each request is shed, and a turn counts the shed.
 //!
+//! A request by the one call states the hard demands of its cell's
+//! request. The cell `pair_consistent_hashing_bounded` bounds its
+//! completion ([`bounded`]): a demand a pair's decodes alone are held to.
+//!
 //! Every worker has a load report, and a prefill states its rate as its
 //! measured input rate too: the one drain a prefill's record reads. Under
 //! a document that declares the signal of the `signal_cost` cells, each
@@ -68,7 +72,7 @@ use std::{
 use smg_grand_central::{
     document::{AppliedSpec, Assignment, PolicySpec},
     engine::{
-        prefills_full, Decided, Decision, DecodeVerdict, Identity, InProcess, LiftedVeto,
+        prefills_full, Decided, Decision, DecodeVerdict, Demands, Identity, InProcess, LiftedVeto,
         PairAdmission, PairLists, PartnerClasses, Phase, PlaceRequest, Plain, Prompt,
         PublishedList, Request, RequestMaker, ShedReason, Unplaced, WorkerLists,
     },
@@ -124,6 +128,15 @@ pub(super) fn of(name: &str) -> PolicySpec {
 pub(super) fn request(seed: u64) -> Request<'static> {
     let mut request = plain(seed);
     request.facts.phase = Phase::Prefill;
+    request
+}
+
+/// [`request`] that bounds its completion, as a host states a request's
+/// budget: a pair's decodes alone are held to it. No worker of a run
+/// states a window, so each meets the bound.
+pub(super) fn bounded(seed: u64) -> Request<'static> {
+    let mut request = request(seed);
+    request.constraints.demands.output_window = 256;
     request
 }
 
@@ -265,6 +278,9 @@ struct Decodes {
     classes: PartnerClasses,
     admission: &'static (dyn PairAdmission + Sync),
     refused: Refused,
+    /// The hard demands the cell's request states: a request by the one
+    /// call states them too.
+    demands: Demands,
     /// Under a sessions rule, how far behind a pair's decision its later
     /// decode is asked for, sent and ended. It is a second more than the
     /// rule's idle time and its sweep interval together. The pair's key has
@@ -333,11 +349,12 @@ impl Decodes {
     }
 
     /// One pair request of `host` by the one call: the model, the two
-    /// lists and a prompt of the plain request's size, with both sides'
-    /// dispatch and end said of the placement. With `rule` the request
-    /// states the run's rule of its route ([`ruled::admits`]), and with
-    /// `named` the worker it names ([`NAMED`]). The call answers workers
-    /// and no place of a list, so the place this says is the first.
+    /// lists, the cell's hard demands and a prompt of the plain request's
+    /// size, with both sides' dispatch and end said of the placement. With
+    /// `rule` the request states the run's rule of its route
+    /// ([`ruled::admits`]), and with `named` the worker it names
+    /// ([`NAMED`]). The call answers workers and no place of a list, so the
+    /// place this says is the first.
     fn called(&self, host: &Host, rule: bool, named: bool) -> Option<u32> {
         let mut request = PlaceRequest {
             prompt: Prompt {
@@ -345,6 +362,7 @@ impl Decodes {
                 ..Prompt::NONE
             },
             admits: ruled::admits(rule),
+            demands: self.demands,
             ..PlaceRequest::of(MODEL, self.lists(host))
         };
         if named {
@@ -548,6 +566,7 @@ pub(super) fn runs(run: &Run) -> bool {
             &Open
         },
         refused: run.refused,
+        demands: request(0).constraints.demands,
         idle_out: rule.map(|rule| {
             let ends = u64::from(rule.ttl_s) + u64::from(rule.sweep_s);
             Duration::from_secs(ends + 1)

@@ -1378,7 +1378,8 @@ fn the_dispatch_wait_after_body_help_names_what_it_takes_off_and_what_each_famil
         "smg_router_dispatch_wait_seconds less the time the read of the request body waited for the client",
         "authentication, the wait for an admission permit, the run of WASM modules, parsing, tokenizing, templating, worker selection, a refused attempt's wait and its backoff are in both",
         "the body's upload is in smg_router_dispatch_wait_seconds alone",
-        "a body that came whole, a later turn of a Responses tool loop and a multipart upload take nothing off and observe the same value in both",
+        "a body that came whole and a later turn of a Responses tool loop take nothing off and observe the same value in both",
+        "a multipart upload is measured as any other body",
     ] {
         assert!(help.contains(phrase), "{phrase:?} is not in: {help}");
     }

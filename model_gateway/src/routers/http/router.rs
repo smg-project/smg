@@ -8660,13 +8660,9 @@ mod tests {
         );
         let router = streaming_router_with_registry(Arc::new(policies), 1024 * 1024, workers);
         let mut document = PolicySpec::preset("consistent_hashing").expect("a stock preset");
-        document.bindings[0].routing_key = Some(RoutingKeySpec {
-            sources: vec![KeySourceSpec {
-                rid: true,
-                ..KeySourceSpec::default()
-            }],
-            strip_lineage: false,
-        });
+        let mut source = KeySourceSpec::default();
+        source.rid = true;
+        document.bindings[0].routing_key = Some(RoutingKeySpec::of(vec![source]));
         let spec = AppliedSpec::validate(&document).expect("a valid document");
         engine_on(&router.policy_registry, spec);
 

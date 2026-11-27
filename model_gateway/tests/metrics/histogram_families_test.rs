@@ -12,7 +12,7 @@ use metrics::histogram;
 use crate::metrics::recorder;
 
 /// The histogram families the gateway records with no `worker` label.
-const FAMILIES: [&str; 28] = [
+const FAMILIES: [&str; 29] = [
     "router_mesh_sync_round_duration_seconds",
     "smg_cache_aware_match_ratio",
     "smg_discovery_sync_duration_seconds",
@@ -30,6 +30,7 @@ const FAMILIES: [&str; 28] = [
     "smg_pd_ttft_seconds",
     "smg_rl_control_call_duration_seconds",
     "smg_rl_fanout_duration_seconds",
+    "smg_router_dispatch_wait_after_body_seconds",
     "smg_router_dispatch_wait_seconds",
     "smg_router_generation_duration_seconds",
     "smg_router_request_duration_seconds",

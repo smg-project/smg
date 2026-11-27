@@ -3311,6 +3311,7 @@ fn content_parts_of_every_role_reach_a_string_template_as_one_text() {
     ]);
     let messages: Vec<ChatMessage> = serde_json::from_value(json!([
         {"role": "system", "content": parts.clone()},
+        {"role": "root", "content": parts.clone()},
         {"role": "developer", "content": parts.clone()},
         {"role": "user", "content": parts.clone()},
         {"role": "assistant", "content": parts.clone()},
@@ -3318,7 +3319,7 @@ fn content_parts_of_every_role_reach_a_string_template_as_one_text() {
     ]))
     .unwrap();
     let turns = process_content_format(&messages, ChatTemplateContentFormat::String, None).unwrap();
-    assert_eq!(turns.len(), 5);
+    assert_eq!(turns.len(), 6);
     for turn in &turns {
         let text = turn["content"]
             .as_str()

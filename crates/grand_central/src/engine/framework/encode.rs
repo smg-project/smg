@@ -47,11 +47,15 @@
 use super::{
     carries_a_column, column_fits, debug_assert_cells, debug_assert_indexed, reason_of,
     run_profile, shed, Buffers, ClassBits, Engine, PairPools, PairSide, PairTable, Plan, Profile,
-    Scratch, Set, ShedOver, AFFINITY_COLUMN,
+    Scratch, Set, ShedOver,
 };
 use crate::{
     engine::{
-        decision::{Decision, Pick, ShedReason, Target, Trace, PLACES, TARGET_WORKER},
+        decision::{
+            Decision, Pick, ShedReason, Target, Trace, AFFINITY_COLUMN, BINDING, DECODE_VISION,
+            EC_COMPATIBLE, ENCODERS, ENCODE_COLUMN, ENCODE_MEDIA, ENCODE_SCOPE, ENCODE_VISION,
+            PLACES, TARGET_WORKER,
+        },
         demands::{DemandFacts, Demands, References, UnmetDemand},
         sticky_sessions::SessionVerdict,
         view::{
@@ -67,32 +71,6 @@ use crate::{
 #[cfg(test)]
 #[path = "../../../tests/unit/engine/framework/encode/tests/mod.rs"]
 mod tests;
-
-/// The stage named when no encoder is open for the request though one that
-/// takes it is registered, or when none is registered at all: a retry may
-/// find one. Where the overload veto left none open under a binding that
-/// sheds, the veto's own stage, `not-overloaded`, is named in its stead
-/// ([`saturation`]).
-const ENCODERS: &str = "encoders";
-/// The stage named when the request holds pixels, an image or a video, and
-/// none of the registered encoders that would take it otherwise takes
-/// images. A demand for vision the request states is the same test.
-const ENCODE_VISION: &str = "encode-vision";
-/// The stage named when no registered encoder hands to a prefill of a pair:
-/// a pushing encoder states no role, or no prefill states its end.
-const EC_COMPATIBLE: &str = "ec-compatible";
-/// The stage named when no registered encoder takes the request's media,
-/// by the request's own facts or by the media a demand of it names.
-const ENCODE_MEDIA: &str = "encode-media";
-/// The stage named when the decode must take images and no decode of a pair
-/// an encoder serves does.
-const DECODE_VISION: &str = "decode-vision";
-/// The stage named when a column of the encode pool is not one entry a row.
-const ENCODE_COLUMN: &str = "encode-column";
-/// The stage named when a request with items meets an encode profile that
-/// shows its rows to a plugin: no scope is opened over the encoders offered
-/// to a key.
-const ENCODE_SCOPE: &str = "encode-scope";
 
 /// What the encode side reads of one encoder beside its candidate row, as
 /// its host states it.
@@ -1228,10 +1206,10 @@ impl Engine {
                 Plan::Single | Plan::PdPair => None,
             });
         let Some(index) = epd else {
-            return turned_away(ShedReason::PolicyDeclined, "binding", unbound);
+            return turned_away(ShedReason::PolicyDeclined, BINDING, unbound);
         };
         let Some(profile) = self.profiles.get(usize::from(index)) else {
-            return turned_away(ShedReason::PolicyDeclined, "binding", unbound);
+            return turned_away(ShedReason::PolicyDeclined, BINDING, unbound);
         };
         // The encode profile is resolved: a shed of the encode side below
         // is made under it, and its trace says so. A column of the pair's

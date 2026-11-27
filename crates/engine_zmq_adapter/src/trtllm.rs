@@ -26,7 +26,7 @@ use crate::{
         finish, map_slim_output, matched_stop_of, poll_mapped, FinishParts, MappedGenerateStream,
         StreamState,
     },
-    structured_outputs::ConstraintRef,
+    structured_outputs::{ConstraintRef, StructuredOutputsSupport},
 };
 
 /// Streaming generate output for one TensorRT-LLM sub-request, mapping each
@@ -297,6 +297,22 @@ pub(crate) fn constraint_ref(req: &trtllm::GenerateRequest) -> Option<Constraint
         "grammar" => ConstraintRef::Ebnf(&guided.guide),
         _ => ConstraintRef::StructuralTag(&guided.guide),
     })
+}
+
+/// A structural tag that is a JSON answer's schema alone, swapped for that
+/// schema where the engine's backend is not the one the tag is spelled for
+/// ([`crate::structured_outputs::answer_schema_in_place_of_tag`]); every
+/// other guide stays as it came.
+pub(crate) fn send_answer_tag_as_schema(
+    req: &mut trtllm::GenerateRequest,
+    support: StructuredOutputsSupport,
+) {
+    let schema =
+        crate::structured_outputs::answer_schema_in_place_of_tag(constraint_ref(req), support);
+    if let (Some(schema), Some(guided)) = (schema, req.guided_decoding.as_mut()) {
+        guided.guide_type = trtllm::guided_decoding_params::GuideType::JsonSchema as i32;
+        guided.guide = schema;
+    }
 }
 
 /// A field the wire does not carry, refused with the way out rather than
@@ -867,6 +883,40 @@ mod tests {
         assert_eq!(complete.prompt_logprobs[0].logprob, 0.0);
         assert_eq!(complete.prompt_logprobs[1].token_id, 2);
         assert_eq!(complete.prompt_logprobs[1].logprob, -2.0);
+    }
+
+    /// A structural tag that is a JSON answer's schema alone reaches an engine
+    /// whose backend is pinned to another name than the tags are spelled for
+    /// as that schema, its keys in the order written; a call's tag reaches it
+    /// as it came.
+    #[tokio::test]
+    async fn an_answer_tag_reaches_a_pinned_other_backend_as_its_schema() {
+        use trtllm::guided_decoding_params::GuideType;
+
+        use crate::test_support::{answer_tag, call_tag, pinned_other_backend, ANSWER_SCHEMA};
+
+        let (client, engine, _dir) = connected_pair(RuntimeType::Trtllm).await;
+        client.set_structured_outputs_support(pinned_other_backend());
+        let (mut input, _output) = engine.split();
+        let mut streams = Vec::new();
+        for (id, tag, schema) in [
+            ("answer", answer_tag(), Some(ANSWER_SCHEMA)),
+            ("call", call_tag(), None),
+        ] {
+            let mut req = request(id);
+            req.guided_decoding = Some(trtllm::GuidedDecodingParams {
+                guide_type: GuideType::StructuralTag as i32,
+                guide: tag.clone(),
+            });
+            streams.push(client.generate_trtllm_streams(req, None).await.expect(id));
+            let frames = input.recv_frames().await.unwrap();
+            let sent: TrtllmGenerateReqInput = decode_msgpack(frames[1].as_ref()).unwrap();
+            let guide = match schema {
+                Some(schema) => ("json_schema".to_string(), schema.to_string()),
+                None => ("structural_tag".to_string(), tag),
+            };
+            assert_eq!(sent.sampling.guided_decoding, Some(guide), "{id}");
+        }
     }
 
     /// End-to-end over ipc:// for a TensorRT-LLM backend: the adapter frames a

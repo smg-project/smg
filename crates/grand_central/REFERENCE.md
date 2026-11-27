@@ -52,7 +52,7 @@ The standalone service stands on [a page of its own](docs/service.md): its flags
 
 ### Register a Rust stage
 
-Implement `Filter`, `Scorer` or `Picker`. Add a factory to `StageRegistry::builtin()` and pass it to `PolicySpec::validate_in`, `Controller::bind_with` or `service::controller::run`. Each stage name is unique across the catalog. A simple scorer factory accepts the document's `weight`. It runs once at registration, where its stage's name is checked, and at every validation, including a dry run. Keep its effects inside the stage it returns.
+Implement `Filter`, `Scorer` or `Picker`. Add a factory to `StageRegistry::builtin()` and pass it to `PolicySpec::validate_in`, `Controller::bind_with` or `service::controller::run`. Each stage name is unique across the catalog. A simple scorer factory accepts the document's `weight`. It runs once at registration, where its stage's name is checked, and at every validation, including a dry run. Under one of the engine's own refusal names, such as `binding`, it runs at registration alone: validation refuses a document that names the stage. Keep its effects inside the stage it returns.
 
 The example registers a scorer with `stages.scorer("pack", || Box::new(Pack))?`. It favors workers with more reported running requests. The document names it in `score: [pack]` and uses `not-overloaded` to steer away at the threshold.
 
@@ -112,7 +112,7 @@ score:
 ```
 
 - `weight` is the profile's and stays out of the parameters. A bare name hands the factory an empty map.
-- The factory runs for each entry that names it, at every start, apply and dry run. A value it refuses with `StageError::bad` is reported at its field's path in the document. A parameter that fails to deserialize is reported at the entry's path.
+- The factory runs for each entry that names it, at every start, apply and dry run. Under one of the engine's own refusal names it runs for none. A value it refuses with `StageError::bad` is reported at its field's path in the document. A parameter that fails to deserialize is reported at the entry's path.
 - Derive `deny_unknown_fields` on the parameters' type. Without it a misspelled key is ignored and its default runs.
 - The keys of a parameter map carry no order. The factory reads them in key order, and two files that differ in that order alone have one digest. A key written twice is refused.
 - A stage is asked what it needs while the document that names it is built, and not at a decision. The engine keeps the answer, so a stage's `needs` must give the same answer every time it is asked.
@@ -155,11 +155,11 @@ filter:
 ```
 
 - A filter has no weight, so the whole map is the factory's. A bare name hands it an empty map.
-- The rules of a scorer's parameters hold. The factory runs for each entry that names it, at every start, apply and dry run. A value it refuses is reported at its field's path, `profiles.<profile>.filter[<index>].<name>.<field>`. The keys carry no order, and a key written twice is refused.
+- The rules of a scorer's parameters hold. The factory runs for each entry that names it, at every start, apply and dry run. Under one of the engine's own refusal names it runs for none. A value it refuses is reported at its field's path, `profiles.<profile>.filter[<index>].<name>.<field>`. The keys carry no order, and a key written twice is refused.
 - A filter registered with `filter` takes no parameter, and neither does a stock filter but `has-room`. Whatever a document writes under such a name is refused.
 - `filter_with` runs no factory at registration, so validation refuses a filter that answers another name.
 - The factory can call `build.dispatch_credit()` for the profile's `DispatchCredit`, as a scorer's can. A profile whose filter reads it may set `sent_ttl_ms`.
-- A Rust caller that builds a `ProfileSpec` by hand holds its filters as `document::FilterSpec`. `"healthy".into()` reads as before. A `String` pushed or compared does not: use `.into()` and `FilterSpec::name()`.
+- A Rust caller that makes a `ProfileSpec` by `ProfileSpec::of(pick)` and assigns its filters holds them as `document::FilterSpec`. `"healthy".into()` reads as before. A `String` pushed or compared does not: use `.into()` and `FilterSpec::name()`.
 
 A picker can take settings from the document too. Register it with `picker_with`, and write the pick entry as the name mapped to its parameters.
 
@@ -206,7 +206,7 @@ pick:
 ```
 
 - A picker has no weight, so the whole map is the factory's. A bare name hands it an empty map.
-- The rules of a filter's parameters hold. The factory runs for each profile that names the picker, at every start, apply and dry run. A value it refuses is reported at its field's path, `profiles.<profile>.pick.<name>.<field>`. The keys carry no order, and a key written twice is refused.
+- The rules of a filter's parameters hold. The factory runs for each profile that names the picker, at every start, apply and dry run. Under one of the engine's own refusal names it runs for none. A value it refuses is reported at its field's path, `profiles.<profile>.pick.<name>.<field>`. The keys carry no order, and a key written twice is refused.
 - A picker registered with `picker` takes no parameter. Neither does a stock picker, but `best` and `best-with-temperature`, which the validator builds. Whatever a document writes under such a name is refused.
 - `picker_with` runs no factory at registration, so validation refuses a picker that answers another name.
 - A picker built by `picker_with` can resolve a signal's column through its build context, and its needs then set `signal_cells`. A picker registered with `picker` resolves none.
@@ -296,7 +296,7 @@ fn socket_picker(
 
 ### Plugin inputs and fallback
 
-Host code sets up both plugin kinds. A policy document can name a registered stage adapter through the host's catalog. It has no `plugins` field. A host building a profile in Rust can bind several adapters to one plugin binding. Catalog registration requires a distinct stage name for each entry, and each adapter takes its name from its plugin.
+Host code sets up both plugin kinds. A policy document can name a registered stage adapter through the host's catalog. Under one of the engine's own refusal names it cannot: validation refuses that document. It has no `plugins` field. A host building a profile in Rust can bind several adapters to one plugin binding. Catalog registration requires a distinct stage name for each entry, and each adapter takes its name from its plugin.
 
 Exposure defaults to hashed tenant and session identities and no headers. A host can withhold identities, expose the clear form it holds, and expose selected allow-listed header positions. Request hashes are passed only when declared in the plugin's needs, up to 8190. Lifecycle events default to none. Scorers and pickers receive the subscribed events. The gRPC observe queue holds 1024 events. Gaps in the sequence identify lost events.
 
@@ -483,7 +483,7 @@ including role, replication, election, and load polling.
 
 ## Presets
 
-`PolicySpec::preset("least_load")` builds a complete document with generation 1. Each preset has one profile, the same three filters and a binding for every model. The copies below leave the number to the source. `PolicySpec::power_of_two` also accepts `ExpectedWait`, `Requests`, `LeastRequests` or `ResidentTokens { request_tokens }`. The resident variant ranks the full set by resident work. `pair_presets` and `epd_presets` compose side profiles from preset names and add `has-capacity` to the prefill side and `has-room` to the decode side. The standalone controller places a pair at its prefill, and reads both bits open. [Preset constructors](src/document/spec.rs)
+`PolicySpec::preset("least_load")` builds a complete document with generation 1. Each preset has one profile, the same three filters and a binding for every model. The copies below leave the number to the source. `PolicySpec::power_of_two` also accepts `ExpectedWait`, `Requests`, `LeastRequests` or `ResidentTokens { request_tokens }`. The resident variant ranks the full set by resident work. `pair_presets` and `epd_presets` compose side profiles from preset names and add `has-capacity` to the prefill side and `has-room` to the decode side. The standalone controller places a pair at its prefill, and reads both bits open. [Preset constructors](src/document/spec/presets.rs)
 
 <details>
 <summary>Preset documents</summary>

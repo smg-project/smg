@@ -8,11 +8,6 @@
 //! A page writes itself as JSON ([`WorkerRowsPage`]): a host in process serves
 //! the rows an operator reads with no mapping of its own.
 
-#![expect(
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
-
 use std::{borrow::Cow, collections::BTreeMap, sync::Arc, time::Instant};
 
 use serde::{Serialize, Serializer};
@@ -36,13 +31,28 @@ pub(crate) const PAGE_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) const MODELS: usize = 128;
 
 /// What a snapshot caller asks of the worker rows.
+///
+/// The default asks for every model's rows under the byte bound alone. The
+/// record gains fields: code outside this crate starts from the default and
+/// assigns what it asks otherwise, and a pattern of it ends with `..`.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct WorkerRowsQuery {
     /// The model ids to include. An empty list includes every model.
     pub models: Vec<String>,
     /// The maximum number of rows to return. `usize::MAX` uses only the
     /// byte bound.
     pub limit: usize,
+}
+
+impl Default for WorkerRowsQuery {
+    /// Every model's rows, under the byte bound alone.
+    fn default() -> Self {
+        Self {
+            models: Vec::new(),
+            limit: usize::MAX,
+        }
+    }
 }
 
 impl WorkerRowsQuery {
@@ -387,9 +397,9 @@ impl<'a> PairingJson<'a> {
 
 /// Takes a redacted page at `now`, limited by row count and by the bytes
 /// its JSON takes ([`WorkerRowsPage`]), written compact. A host that writes
-/// the page another way, as with indentation, writes more. A row admitted
-/// after `now` reads as new at that instant. The first row must fit the
-/// byte bound too.
+/// the page another way, as with indentation, can write more. A row
+/// admitted after `now` reads as new at that instant. The first row must
+/// fit the byte bound too.
 pub fn worker_rows_page(asked: &WorkerRowsQuery, read: Rows, now: Instant) -> WorkerRowsPage {
     counted_page(asked, read, now).0
 }
@@ -585,9 +595,10 @@ pub(crate) fn without_userinfo(address: &str) -> Option<String> {
 
 /// The bytes the JSON writer writes for `value`, written compact. The
 /// count goes through the writer itself, so it holds no second copy of the
-/// JSON's layout. No value counted here fails to write: its maps are keyed
-/// by texts, and the writer that counts takes every byte. A count that
-/// failed all the same would be past any bound.
+/// JSON's layout. No value a page counts fails to write: its maps are
+/// keyed by texts, and the writer that counts takes every byte. A count
+/// that failed all the same reads as the largest number, past the page's
+/// bound.
 fn written<T: Serialize>(value: &T) -> usize {
     let mut counted = Counted(0);
     match serde_json::to_writer(&mut counted, value) {

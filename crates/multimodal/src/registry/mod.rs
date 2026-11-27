@@ -267,6 +267,21 @@ mod tests {
         EncoderFieldLayouts, Modality, ModelSpecificValue, PreProcessorConfig, VideoClipOptions,
     };
 
+    /// MiniMax M3 is the one family whose language model reads none of the
+    /// grid tensors its processor emits; every other spec keeps the default.
+    #[test]
+    fn only_minimax_m3_says_its_language_model_reads_no_grids() {
+        let registry = ModelRegistry::new();
+        let plain_rope: Vec<&str> = registry
+            .specs
+            .iter()
+            .map(LazySpec::get)
+            .filter(|spec| !spec.language_model_reads_grids())
+            .map(|spec| spec.name())
+            .collect();
+        assert_eq!(plain_rope, ["minimax_m3"]);
+    }
+
     /// A checkpoint of this family resolves to a spec by its `model_type`
     /// alone (the served id is often an opaque path).
     #[test]

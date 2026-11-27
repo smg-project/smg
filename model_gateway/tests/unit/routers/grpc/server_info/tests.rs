@@ -206,13 +206,21 @@ async fn an_engine_that_fails_the_call_reads_502() {
     assert_eq!(body["error"]["code"], "server_info_failed", "{body}");
 }
 
-/// A worker that sends no answer within the bound reads `504`: with no time
-/// at all, the engine that would answer is not waited for.
+/// A worker that sends no answer within the bound reads `504`: the listener
+/// takes the connection and never answers, so the bound alone ends the wait.
 #[tokio::test]
 async fn no_answer_within_the_bound_reads_504() {
-    let (worker, _, engine) = asked_worker().await;
-    let (status, body) = parts(within(&worker, std::time::Duration::ZERO).await).await;
-    engine.abort();
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a listener binds");
+    let address = silent.local_addr().expect("the listener has an address");
+    let worker = BasicWorkerBuilder::new(format!("grpc://{address}"))
+        .worker_type(WorkerType::Regular)
+        .connection_mode(ConnectionMode::Grpc)
+        .runtime_type(RuntimeType::TokenSpeed)
+        .build();
+    let bound = std::time::Duration::from_millis(20);
+    let (status, body) = parts(within(&worker, bound).await).await;
     assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
     assert_eq!(body["error"]["code"], "server_info_timeout", "{body}");
 }

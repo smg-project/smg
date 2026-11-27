@@ -15,10 +15,10 @@ use crate::{
         decision, decision_engine::DecisionEngine, framework, Candidate, Constraints, Engine,
         Filter, LoadRow, Pair, PoolFacts, RequestFacts, Scorer, Scratch, Target, TieBand, WorkerId,
     },
-    stages::{pickers, scorers::tests::take_lane, Lifecycle, StageRegistry},
+    stages::{pickers, Lifecycle, StageRegistry},
     tracking::{
-        decision_guard::DecisionGuard, CreditedDispatches, DispatchCounts, DispatchCredit, Lease,
-        Membership, Side,
+        decision_guard::DecisionGuard, rank_credit::tests::take_lane, CreditedDispatches,
+        DispatchCounts, DispatchCredit, Lease, Membership, Side,
     },
 };
 

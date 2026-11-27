@@ -4422,13 +4422,9 @@ mod tests {
             let mut binding = stock.bindings[0].clone();
             binding.matcher.model = model.to_string();
             if by_request_id {
-                binding.routing_key = Some(RoutingKeySpec {
-                    sources: vec![KeySourceSpec {
-                        rid: true,
-                        ..KeySourceSpec::default()
-                    }],
-                    strip_lineage: false,
-                });
+                let mut source = KeySourceSpec::default();
+                source.rid = true;
+                binding.routing_key = Some(RoutingKeySpec::of(vec![source]));
             }
             binding
         };
