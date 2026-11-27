@@ -339,6 +339,15 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
         true
     }
 
+    /// M3's language model runs plain partial RoPE over token positions
+    /// (`text_config` sets `rope_theta`, `rotary_dim` and
+    /// `partial_rotary_factor`, and no M-RoPE section); the 3-D rotary
+    /// embedding is the vision tower's (`vision_config.rope_mode: 3d`). The
+    /// grid tensors therefore feed only the vision tower.
+    fn language_model_reads_grids(&self) -> bool {
+        false
+    }
+
     fn placeholder_token_for(
         &self,
         metadata: &ModelMetadata,
@@ -599,6 +608,13 @@ mod tests {
     fn matches_by_model_type_and_id() {
         let spec = MiniMaxM3VisionSpec;
         assert!(spec.matches(&metadata()));
+    }
+
+    /// The grids M3's processor emits feed the vision tower alone: the
+    /// language model's positions do not read them.
+    #[test]
+    fn the_language_model_reads_no_grids() {
+        assert!(!MiniMaxM3VisionSpec.language_model_reads_grids());
     }
 
     #[test]

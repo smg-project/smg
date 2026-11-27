@@ -613,7 +613,8 @@ fn intermediate_of(
         .collect::<Vec<_>>();
     Ok(MultimodalIntermediate::try_new(batches)?
         .with_encoder_input_format(spec.encoder_input_format())
-        .with_image_prompt_tokens(image_prompt_tokens))
+        .with_image_prompt_tokens(image_prompt_tokens)
+        .with_language_model_reads_grids(spec.language_model_reads_grids()))
 }
 
 /// The tokens the expansion writes into the prompt for the request's images:
