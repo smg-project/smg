@@ -15,11 +15,13 @@ fn encode_profile(engine: &Engine) -> Option<u16> {
 /// says, where that decision was handed the pair's two lists whole. Where
 /// the pass handed it a part of either list, the decision says no list,
 /// of the list that was cut or of the other: the pair's decision judged
-/// the part. It says its encoders of one shed with no endpoint too: the
-/// places their host states hold the request off every encoder that takes
-/// it. A side of the pair that its own places hold off is shed under the
-/// same name, and says no list. Each decision takes back the word of the
-/// one before where it begins, so any other answer leaves none.
+/// the part. It says its encoders of one shed with no endpoint too, the
+/// one under the places' name: the places their host states hold the
+/// request off every encoder that takes it, where no gap of the pairs'
+/// membership stands. A side of the pair that its own places hold off is
+/// shed under the same name, and says no list. Each decision takes back
+/// the word of the one before where it begins, so any other answer leaves
+/// none.
 #[test]
 fn an_encode_decision_says_the_list_it_sheds_over() {
     let mut shedding = engine();
@@ -83,8 +85,8 @@ fn an_encode_decision_says_the_list_it_sheds_over() {
     assert_eq!(shed_of(&bed.decide_in(&shedding, &mut scratch)), saturated);
     assert_eq!(scratch.shed_over(), None, "the decodes cut, the prefills");
 
-    // The shed of a bed whose sides are held as `sides` say, and the word
-    // its decision leaves: the prefill's, the decode's and the encode's.
+    // The shed of a bed held as `sides` say (the prefill's side, the
+    // decode's and the encode's), and the one word its decision leaves.
     let mut held = |bed: &Bed, sides: [&Constraints<'_>; 3]| {
         let (facts, _) = bed.asked();
         let pools = bed.pools();
@@ -99,13 +101,14 @@ fn an_encode_decision_says_the_list_it_sheds_over() {
     };
     // The encoders' places name the first encoder, which takes no image:
     // they hold the request off the one that does, and the decision says
-    // the encoders.
-    let mut bed = Bed::new();
-    bed.encoders = vec![row(0, Role::Encode, 0, 0), row(1, Role::Encode, 0, 0)];
-    bed.encoders[0].vision = false;
-    bed.facts = vec![pushing(1), pushing(1)];
-    let encoders = Some(ShedOver::Encoders);
-    assert_eq!(held(&bed, [&open, &open, &first]), (held_off, encoders));
+    // the encoders. It is decided ahead of each side's bed below, so that
+    // side's decision has a word to take back.
+    let mut off_encoders = Bed::new();
+    off_encoders.encoders = vec![row(0, Role::Encode, 0, 0), row(1, Role::Encode, 0, 0)];
+    off_encoders.encoders[0].vision = false;
+    off_encoders.facts = vec![pushing(1), pushing(1)];
+    let by_encoders = (held_off, Some(ShedOver::Encoders));
+    assert_eq!(held(&off_encoders, [&open, &open, &first]), by_encoders);
     // The prefill's places name the first prefill, whose class has no
     // encoder: the same name and no list, and the word before is gone.
     let mut bed = Bed::new();
@@ -113,7 +116,9 @@ fn an_encode_decision_says_the_list_it_sheds_over() {
     bed.prefill_classes = vec![2, 1];
     assert_eq!(held(&bed, [&first, &open, &open]), (held_off, None));
     // The decode's places name the first decode, which takes no image
-    // under a request that asks images of its decode: no list either.
+    // under a request that asks images of its decode: no list either,
+    // behind the encoders' word once more.
+    assert_eq!(held(&off_encoders, [&open, &open, &first]), by_encoders);
     let mut bed = Bed::new();
     bed.decodes = vec![row(0, Role::Decode, 1, 0), row(1, Role::Decode, 1, 0)];
     bed.decodes[0].vision = false;
@@ -325,7 +330,8 @@ fn a_column_of_another_length_and_a_binding_of_another_plan_decline() {
 /// An encode decision counts no number: one that states a number on its
 /// decode side ([`Constraints::target_worker`]) is declined under
 /// `target-worker`, beside places of that side and beside none, with an
-/// item and with none. The pair entry counts such a number.
+/// item and with none. The pair entry counts such a number beside places
+/// of that side.
 #[test]
 fn a_number_on_the_decode_side_declines_an_encode_request() {
     let (bed, engine) = (Bed::new(), engine());

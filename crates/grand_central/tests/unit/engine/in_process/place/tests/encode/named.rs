@@ -14,9 +14,10 @@
 //! `WS:2683`), and the selection counts the workers its filter takes
 //! (`P:3208-3213`, `P:3249-3252`). Here the count asks the route's rule
 //! ([`PlaceRequest::admits`]) and no encoder. One case says where the
-//! engine answers otherwise: under a ring on the decode's side alone. The
-//! cases of a header reader that panics and of a request that names no
-//! worker hold the engine to its own word, and name no line.
+//! engine answers otherwise: under a ring on the decode's side alone. One
+//! says where its own device would: a rule that changes the worker it is
+//! asked of. The cases of a header reader that panics and of a request
+//! that names no worker hold the engine to its own word, and name no line.
 
 use super::{
     super::target::{missed_on, Counted, MISSED, TARGET},
@@ -297,8 +298,9 @@ fn where_no_prefill_is_counted_an_encode_request_leaves_its_hold() {
 /// a pair's two lists are, by the pair's own rule: each number takes the
 /// prefill and the decode at that place, a number that reaches no worker
 /// is shed under `target-worker` on its side, and the placement names no
-/// encoder. A request that states no items and one that states an empty
-/// list of them are answered alike: the encode pass is laid for neither.
+/// encoder. A request that states no items, and one that states an empty
+/// list of them and holds its decode to no images, are answered alike:
+/// the encode pass is laid for neither.
 ///
 /// The classic router assigns no encoder where a request has no item
 /// (`WS:2584`, `WS:2673`), and takes its pair by the same pair selection
@@ -339,7 +341,8 @@ fn three_lists_with_no_item_are_held_to_the_worker_their_request_names() {
 /// The classic router's hash policy names nobody where its number reaches
 /// no worker it may use, and the request is refused (`CH:150-162`,
 /// `CH:187-193`). Its count is narrowed by its stage's rule, which the
-/// next case states.
+/// case `the_number_counts_among_the_workers_the_gateways_rule_takes`
+/// states.
 #[test]
 fn a_number_that_reaches_a_prefill_no_encoder_serves_is_shed_under_the_targets_name() {
     let engine = rings();
@@ -515,8 +518,8 @@ fn a_gap_the_encode_pass_says_over_the_lists_whole_stands_for_a_named_request() 
     }
 }
 
-/// The count holds a side of the pair to no word of the request's items.
-/// A request that holds its decode to the workers that take images, and
+/// The count does not read the items' hold of the decode to images. A
+/// request that holds its decode to the workers that take images, and
 /// states no rule, has its decode counted among them all: the number can
 /// reach a decode that takes no images. The encode pass refuses that
 /// place, and the request is shed under `target-worker`, on no side. Under
@@ -844,12 +847,18 @@ fn a_named_worker_that_cannot_take_an_encode_request_after_all_is_missed_on_its_
 /// decision finds nobody on the prefill's side and sheds the request with
 /// that side. A request the encode pass is laid for keeps such a shed
 /// from the rule (`pair::goes_to_the_rule`): the miss names the prefill's
-/// side. With no item the request is its pair's alone: the shed goes to
-/// the rule, the rule takes nobody at the one place, and the miss names
-/// no side.
+/// side. A request that states no items is one the pass is not laid for,
+/// and is its pair's alone: the shed goes to the rule, the rule takes
+/// nobody at the one place, and the miss names no side.
 ///
 /// The classic router asks its filter of the workers it gathers as
-/// candidates, ahead of its policies (`P:3208-3213`, `P:3329-3344`).
+/// candidates, ahead of its policies (`P:3208-3213`, `P:3329-3344`). The
+/// rule that changes its worker is this case's device for a worker that
+/// leaves between the count and the decision. That router asks its filter
+/// ahead of a worker's availability (`P:3249-3252`), and the count reads
+/// the worker's state first: under this very rule that router would count
+/// past the prefill. A rule that answers by its worker alone, and changes
+/// none, shows no such difference.
 #[test]
 fn a_rule_that_refuses_the_named_prefill_behind_the_count_misses_the_target() {
     let engine = stock("consistent_hashing", "round_robin");
@@ -872,8 +881,8 @@ fn a_rule_that_refuses_the_named_prefill_behind_the_count_misses_the_target() {
     assert!(of_prefill.get() > 2, "asked again at the one place");
 
     // The same rule over a prefill that stops being ready as the count
-    // takes it: the answer of the request with its item or with none, and
-    // how often the rule was asked of that prefill.
+    // takes it: the answer of the request with its item, or with no items
+    // stated, and how often the rule was asked of that prefill.
     let left = |item: bool| {
         let three = Three::of([3, 3, 2], |_, _| false);
         let of_prefill = Cell::new(0_u32);
@@ -896,8 +905,9 @@ fn a_rule_that_refuses_the_named_prefill_behind_the_count_misses_the_target() {
     // The pass is laid for the request with its item: the first decision's
     // shed answers the call with its side, and no rule is asked behind it.
     assert_eq!(left(true), (Err(missed_on(PairSide::Prefill)), 1));
-    // With no item the request is its pair's alone: that shed goes to the
-    // rule, which takes nobody at the place, and the miss names no side.
+    // With no items stated the pass is not laid, and the request is its
+    // pair's alone: that shed goes to the rule, which takes nobody at the
+    // place, and the miss names no side.
     assert_eq!(left(false), (Err(MISSED), 2));
 }
 
