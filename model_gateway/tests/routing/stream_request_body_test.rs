@@ -33,7 +33,7 @@ use crate::common::AppTestContext;
 
 type Captured = Arc<Mutex<Vec<(HeaderMap, Bytes)>>>;
 
-/// Loopback engine stub: captures every forwarded generate/chat request and
+/// Loopback engine stub: captures every forwarded inference request and
 /// answers with canned JSON.
 #[expect(
     clippy::disallowed_methods,
@@ -51,6 +51,7 @@ async fn spawn_capture_worker() -> (String, Captured) {
     let app = axum::Router::new()
         .route("/generate", axum::routing::post(capture))
         .route("/v1/chat/completions", axum::routing::post(capture))
+        .route("/v1/completions", axum::routing::post(capture))
         // Outsize axum's 2MB default so multi-MiB streamed forwards land.
         .layer(axum::extract::DefaultBodyLimit::max(256 * 1024 * 1024))
         .with_state(Arc::clone(&captured));
@@ -193,7 +194,7 @@ async fn large_generate_body_streams_to_worker_chunked() {
 }
 
 #[tokio::test]
-async fn large_chat_body_streams_to_worker_chunked() {
+async fn large_chat_body_uses_the_typed_route_above_the_retry_buffer_cap() {
     let (app, captured, ctx) = streaming_app(least_load_policy(), 1024, 64 * 1024 * 1024).await;
     let payload = serde_json::to_vec(&json!({
         "model": "mock-model",
@@ -211,8 +212,11 @@ async fn large_chat_body_streams_to_worker_chunked() {
     assert_eq!(resp.status(), StatusCode::OK);
     let captured = captured.lock().await;
     let (headers, body) = captured.first().unwrap();
-    assert_eq!(body.as_ref(), payload.as_slice());
-    assert!(headers.get(CONTENT_LENGTH).is_none());
+    assert!(headers.contains_key(CONTENT_LENGTH));
+    let original: Value = serde_json::from_slice(&payload).unwrap();
+    let forwarded: Value = serde_json::from_slice(body).unwrap();
+    assert_eq!(forwarded["model"], original["model"]);
+    assert_eq!(forwarded["messages"], original["messages"]);
     drop(captured);
     ctx.shutdown().await;
 }
@@ -440,11 +444,11 @@ async fn multi_model_registry_buffers_and_routes_to_the_right_model() {
 
     let payload = serde_json::to_vec(&json!({
         "model": "model-b",
-        "messages": [{"role": "user", "content": "y".repeat(2 * 1024 * 1024)}]
+        "prompt": "y".repeat(2 * 1024 * 1024)
     }))
     .unwrap();
     let req = chunked_json_request(
-        "/v1/chat/completions",
+        "/v1/completions",
         payload.clone(),
         Some(payload.len() as u64),
     );

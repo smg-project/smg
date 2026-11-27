@@ -2659,9 +2659,8 @@ impl StreamBodyState {
     }
 }
 
-/// The typed routes whose bodies may be streamed, by path; `None` for any
-/// other route.
-fn streamable_route(path: &str) -> Option<&'static str> {
+/// Routes for which this layer decides whether to upload the request body verbatim.
+fn body_policy_route(path: &str) -> Option<&'static str> {
     Some(match path {
         "/generate" => "/generate",
         "/v1/chat/completions" => "/v1/chat/completions",
@@ -2718,7 +2717,7 @@ where
     }
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
-        let Some(route) = streamable_route(req.uri().path()) else {
+        let Some(route) = body_policy_route(req.uri().path()) else {
             return Either::Left(self.inner.call(req));
         };
         let resolved = match self.state.forward_capable_router() {
@@ -2728,6 +2727,12 @@ where
                 return Either::Left(self.inner.call(req));
             }
         };
+        // Either spelling of the thinking budget can appear in the last frame.
+        // Let the typed chat handler validate the winner before contacting a worker.
+        if route == "/v1/chat/completions" {
+            Metrics::record_request_body_path(BODY_PATH_BUFFERED, "chat_validation");
+            return Either::Left(self.inner.call(req));
+        }
         let wasm_request_hooks = self.state.wasm_request_hooks();
         let cancel = PreemptionGuard::from_extensions(req.extensions());
         // The route service a declined request is handed to is the one that
@@ -4670,18 +4675,26 @@ mod tests {
 
     /// Loopback engine stub: captures the forwarded `/generate` request and
     /// answers with the given content type and body.
+    pub(super) async fn spawn_capture_stub(
+        content_type: &'static str,
+        response_body: &'static str,
+    ) -> (String, CapturedUpstreamRequest) {
+        spawn_capture_stub_for_route("/generate", content_type, response_body).await
+    }
+
     #[expect(
         clippy::disallowed_methods,
         reason = "test stub server lives for the duration of the test process"
     )]
-    pub(super) async fn spawn_capture_stub(
+    async fn spawn_capture_stub_for_route(
+        route: &str,
         content_type: &'static str,
         response_body: &'static str,
     ) -> (String, CapturedUpstreamRequest) {
         let captured: CapturedUpstreamRequest = Arc::new(tokio::sync::Mutex::new(None));
         let sink = Arc::clone(&captured);
         let app = axum::Router::new().route(
-            "/generate",
+            route,
             axum::routing::post(move |headers: HeaderMap, body: Bytes| {
                 let sink = Arc::clone(&sink);
                 async move {
@@ -7700,6 +7713,81 @@ mod tests {
             .header(CONTENT_LENGTH, body.len())
             .body(Body::from(body))
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn streamed_chat_upload_validates_the_winning_thinking_budget() {
+        use openai_protocol::validated::ValidatedJson;
+
+        const CHAT: &str = "/v1/chat/completions";
+        const HEAD: &[u8] =
+            br#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true"#;
+        let request = |first: &'static [u8], last: &'static [u8]| {
+            let mut req = streamed_request(&[HEAD, first, last]);
+            *req.uri_mut() = CHAT.parse().unwrap();
+            req
+        };
+
+        let (url, captured) =
+            spawn_capture_stub_for_route(CHAT, "text/event-stream", "data: [DONE]\n\n").await;
+        let worker = BasicWorkerBuilder::new(url)
+            .runtime_type(RuntimeType::Generic)
+            .model(ModelCard::new("m"))
+            .health_config(no_health_check())
+            .build();
+        assert!(!worker.mutates_request());
+        let mut router = streaming_router(least_load_policy(), 1024 * 1024, vec![worker]);
+        router.retry_config = fast_retry_config(1);
+        let router = Arc::new(router);
+        let state = StreamBodyState::new(router.clone(), create_test_app_context());
+        let app = axum::Router::new()
+            .route(CHAT, axum::routing::post(
+                move |headers: HeaderMap, ValidatedJson(body): ValidatedJson<ChatCompletionRequest>| {
+                    let router = Arc::clone(&router);
+                    async move {
+                        let tenant = TenantRequestMeta::new(TenantKey::new("test"));
+                        let model = body.model.clone();
+                        router.route_chat(Some(&headers), &tenant, Arc::new(body), &model).await
+                    }
+                },
+            ))
+            .route_layer(state.layer());
+
+        let (status, error) = posted(
+            app.clone(),
+            request(
+                br#","custom_params":{"thinking_budget":1}"#,
+                br#","thinking_token_budget":-2}"#,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&error).unwrap()["error"]["code"],
+            "invalid_thinking_token_budget"
+        );
+        assert!(captured.lock().await.is_none());
+
+        let orders: [(&[u8], &[u8]); 2] = [
+            (
+                br#","thinking_token_budget":0"#,
+                br#","custom_params":{"thinking_budget":1}}"#,
+            ),
+            (
+                br#","custom_params":{"thinking_budget":1}"#,
+                br#","thinking_token_budget":0}"#,
+            ),
+        ];
+        for (first, last) in orders {
+            let (status, events) = posted(app.clone(), request(first, last)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(events.as_ref(), b"data: [DONE]\n\n");
+            let (_, bytes) = captured.lock().await.take().unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["stream"], true);
+            assert_eq!(body["custom_params"]["thinking_budget"], 0);
+            assert_eq!(body["thinking_token_budget"], 0);
+        }
     }
 
     /// The lean layer does what the `from_fn` form did on the paths that do
