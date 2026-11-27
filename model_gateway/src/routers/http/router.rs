@@ -4678,18 +4678,26 @@ mod tests {
 
     /// Loopback engine stub: captures the forwarded `/generate` request and
     /// answers with the given content type and body.
+    pub(super) async fn spawn_capture_stub(
+        content_type: &'static str,
+        response_body: &'static str,
+    ) -> (String, CapturedUpstreamRequest) {
+        spawn_capture_stub_for_route("/generate", content_type, response_body).await
+    }
+
     #[expect(
         clippy::disallowed_methods,
         reason = "test stub server lives for the duration of the test process"
     )]
-    pub(super) async fn spawn_capture_stub(
+    async fn spawn_capture_stub_for_route(
+        route: &str,
         content_type: &'static str,
         response_body: &'static str,
     ) -> (String, CapturedUpstreamRequest) {
         let captured: CapturedUpstreamRequest = Arc::new(tokio::sync::Mutex::new(None));
         let sink = Arc::clone(&captured);
         let app = axum::Router::new().route(
-            "/generate",
+            route,
             axum::routing::post(move |headers: HeaderMap, body: Bytes| {
                 let sink = Arc::clone(&sink);
                 async move {
@@ -7711,10 +7719,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the loopback worker task is aborted at the end of the test"
-    )]
     async fn streamed_chat_upload_validates_and_translates_the_thinking_budget() {
         use openai_protocol::validated::ValidatedJson;
 
@@ -7727,26 +7731,8 @@ mod tests {
             req
         };
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let calls = Arc::new(AtomicUsize::new(0));
-        let count = Arc::clone(&calls);
-        let (sent, mut received) = mpsc::unbounded_channel();
-        let worker_app = axum::Router::new().route(
-            CHAT,
-            axum::routing::post(move |req: Request<Body>| {
-                count.fetch_add(1, AtomicOrdering::SeqCst);
-                let sent = sent.clone();
-                async move {
-                    let bytes = to_bytes(req.into_body(), usize::MAX).await.unwrap();
-                    sent.send(serde_json::from_slice::<Value>(&bytes).unwrap())
-                        .unwrap();
-                    ([(CONTENT_TYPE, "text/event-stream")], "data: [DONE]\n\n")
-                }
-            }),
-        );
-        let server = tokio::spawn(async move { axum::serve(listener, worker_app).await.unwrap() });
-
+        let (url, captured) =
+            spawn_capture_stub_for_route(CHAT, "text/event-stream", "data: [DONE]\n\n").await;
         let worker = BasicWorkerBuilder::new(url)
             .runtime_type(RuntimeType::Sglang)
             .model(ModelCard::new("m"))
@@ -7783,7 +7769,7 @@ mod tests {
             serde_json::from_slice::<Value>(&error).unwrap()["error"]["code"],
             "invalid_thinking_token_budget"
         );
-        assert_eq!(calls.load(AtomicOrdering::SeqCst), 0);
+        assert!(captured.lock().await.is_none());
 
         let orders: [(&[u8], &[u8]); 2] = [
             (
@@ -7799,13 +7785,12 @@ mod tests {
             let (status, events) = posted(app.clone(), request(first, last)).await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(events.as_ref(), b"data: [DONE]\n\n");
-            let body = received.try_recv().unwrap();
+            let (_, bytes) = captured.lock().await.take().unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(body["stream"], true);
             assert_eq!(body["custom_params"]["thinking_budget"], 0);
             assert!(body.get("thinking_token_budget").is_none());
         }
-        assert_eq!(calls.load(AtomicOrdering::SeqCst), 2);
-        server.abort();
     }
 
     /// The lean layer does what the `from_fn` form did on the paths that do

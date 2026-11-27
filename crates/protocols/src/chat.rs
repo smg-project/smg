@@ -1804,9 +1804,23 @@ impl<'a> From<ChatStreamChoice> for ChatStreamChoiceRef<'a> {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::{json, Value};
+
+    use super::{
+        thinking_from_reasoning_effort, ChatCompletionRequest, ChatMessage, ChatMessageDelta,
+        ChatMessageDeltaRef, ChatStreamChoice, ChatStreamChoiceRef, GenerationRequest,
+        ThinkingParam, ThinkingType,
+    };
+    use crate::{
+        common::{FunctionCallDelta, FunctionCallResponse, ToolCall, ToolCallDelta},
+        profile::ProviderProfile,
+    };
+
+    /// The borrowed stream choice serializes to the bytes of the owned one, shape for shape:
+    /// text deltas, a reasoning delta, a tool call's start and arguments, the finishing choice,
+    /// a role, a matched stop.
     #[test]
     fn thinking_token_budget_aliases() {
-        use serde_json::{json, Value};
         let request = |top: Value, nested: Value| {
             serde_json::from_value::<ChatCompletionRequest>(json!({
                 "model":"test", "messages":[{"role":"user","content":"hello"}],
@@ -1855,21 +1869,6 @@ mod tests {
         }
     }
 
-    use serde_json::{json, Value};
-
-    use super::{
-        thinking_from_reasoning_effort, ChatCompletionRequest, ChatMessage, ChatMessageDelta,
-        ChatMessageDeltaRef, ChatStreamChoice, ChatStreamChoiceRef, GenerationRequest,
-        ThinkingParam, ThinkingType,
-    };
-    use crate::{
-        common::{FunctionCallDelta, FunctionCallResponse, ToolCall, ToolCallDelta},
-        profile::ProviderProfile,
-    };
-
-    /// The borrowed stream choice serializes to the bytes of the owned one, shape for shape:
-    /// text deltas, a reasoning delta, a tool call's start and arguments, the finishing choice,
-    /// a role, a matched stop.
     #[test]
     fn borrowed_stream_choice_serializes_as_the_owned_one() {
         let delta = |role: Option<&str>,
