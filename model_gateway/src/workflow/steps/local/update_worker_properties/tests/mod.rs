@@ -1937,3 +1937,43 @@ async fn a_worker_registered_unread_is_warned_at_its_first_refresh_without_a_gra
         )),
     });
 }
+
+/// A refresh the registry drops writes no warning: the worker changed while
+/// its engine was read, and it stays as the newer registration holds it, its
+/// grammar start included.
+#[tokio::test]
+#[traced_test]
+async fn a_dropped_label_refresh_does_not_warn_of_a_grammar_start() {
+    const URL: &str = "grpc://start-kept:9000";
+    const START: &str = "constrained_decoding_start";
+    let named = labels_of(&[("page_size", "128"), (START, "after_reasoning")]);
+    let worker = grpc_worker_a_grammar_reaches(URL, named.clone(), named);
+    let app_ctx = make_app_context(std::slice::from_ref(&worker));
+    let silent = labels_of(&[("page_size", "128")]);
+    let mut refresh = make_refresh_context(Arc::clone(&app_ctx), Arc::clone(&worker), silent);
+    // An update lands while the engine is read: the registry replaces the
+    // worker, and the snapshot of the refresh is stale.
+    let id = app_ctx.worker_registry.get_id_by_url(URL).unwrap();
+    let patched: Arc<dyn Worker> = Arc::new(
+        worker
+            .as_any()
+            .downcast_ref::<BasicWorker>()
+            .expect("a BasicWorker")
+            .clone(),
+    );
+    assert!(app_ctx.worker_registry.replace(&id, patched));
+    step_succeeds(UpdateWorkerPropertiesStep.execute(&mut refresh).await);
+    let kept = app_ctx
+        .worker_registry
+        .get_by_url(URL)
+        .expect("the worker stays registered");
+    assert_eq!(
+        kept.metadata().spec.labels.get(START).map(String::as_str),
+        Some("after_reasoning"),
+        "a stale snapshot is not written back"
+    );
+    logs_assert(|lines: &[&str]| match grammar_start_warnings(lines) {
+        0 => Ok(()),
+        n => Err(format!("a dropped refresh wrote {n} warnings")),
+    });
+}
