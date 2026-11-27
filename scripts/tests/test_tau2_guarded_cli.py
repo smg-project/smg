@@ -23,7 +23,12 @@ def no_network_or_credentials(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "offline-test-key")
     monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
     monkeypatch.setenv("LITELLM_TELEMETRY", "False")
-    for name in ("ANTHROPIC_API_KEY", "AZURE_API_KEY", "GOOGLE_API_KEY", "LANGFUSE_SECRET_KEY"):
+    for name in (
+        "ANTHROPIC_API_KEY",
+        "AZURE_API_KEY",
+        "GOOGLE_API_KEY",
+        "LANGFUSE_SECRET_KEY",
+    ):
         monkeypatch.delenv(name, raising=False)
 
     def forbidden(*args, **kwargs):
@@ -135,7 +140,9 @@ def user_turn(**kwargs):
         system_messages=[SystemMessage(role="system", content="offline")],
         flip_roles=lambda: [],
     )
-    user = types.SimpleNamespace(llm="gpt-5.2", tools=[], llm_args={"temperature": 0.0, **kwargs})
+    user = types.SimpleNamespace(
+        llm="gpt-5.2", tools=[], llm_args={"temperature": 0.0, **kwargs}
+    )
     return user_simulator.UserSimulator._generate_next_message(
         user, AssistantMessage(role="assistant", content="offline"), state
     )
@@ -151,9 +158,14 @@ def test_actual_user_method_and_two_sdk_chain(installed):
     assert len(sent) == 1 and sent[0]["max_completion_tokens"] == 2
     record = guard.ledger.audit()["requests"][0]
     assert record["model"] == "openai/gpt-5.2"
-    assert record["metadata"]["role"] == "user" and record["metadata"]["task_id"] == "task0"
+    assert (
+        record["metadata"]["role"] == "user"
+        and record["metadata"]["task_id"] == "task0"
+    )
     assert record["state"] == "complete"
-    assert record["allocated_nusd"] == 12_000  # whole verified context, not prompt usage1
+    assert (
+        record["allocated_nusd"] == 12_000
+    )  # whole verified context, not prompt usage1
 
 
 def judge_turn():
@@ -218,7 +230,9 @@ def test_actual_required_nl_and_user_share_money_not_separate_caps(installed):
         (200, {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 99}),
     ],
 )
-def test_actual_sdk_error_or_unknown_usage_retains_and_blocks_resend(installed, status, usage):
+def test_actual_sdk_error_or_unknown_usage_retains_and_blocks_resend(
+    installed, status, usage
+):
     import httpx
 
     guard, sent = installed
@@ -237,11 +251,17 @@ def test_actual_sdk_error_or_unknown_usage_retains_and_blocks_resend(installed, 
     finally:
         gc.TASK.reset(token)
     assert len(sent) == 1
-    assert guard.ledger.summary() == {"calls": 1, "allocated_nusd": 12_000, "halted": True}
+    assert guard.ledger.summary() == {
+        "calls": 1,
+        "allocated_nusd": 12_000,
+        "halted": True,
+    }
     assert guard.ledger.audit()["unknown"] == 1
 
 
-def test_actual_sdk_internal_retry_cannot_forward_unreserved_attempt(installed, monkeypatch):
+def test_actual_sdk_internal_retry_cannot_forward_unreserved_attempt(
+    installed, monkeypatch
+):
     import httpx
     from litellm.llms.openai.openai import OpenAIChatCompletion
 
@@ -254,7 +274,9 @@ def test_actual_sdk_internal_retry_cannot_forward_unreserved_attempt(installed, 
         original(self, client, **kwargs)
         client.max_retries = 2
 
-    monkeypatch.setattr(OpenAIChatCompletion, "_set_dynamic_params_on_client", legacy_retry_client)
+    monkeypatch.setattr(
+        OpenAIChatCompletion, "_set_dynamic_params_on_client", legacy_retry_client
+    )
     # Deliberately re-enable the exact SDK's retry layer, but not any network.
     from openai._base_client import SyncAPIClient
 
@@ -289,7 +311,9 @@ def test_actual_sdk_internal_retry_cannot_forward_unreserved_attempt(installed, 
         {"fallbacks": ["paid/other"]},
     ],
 )
-def test_actual_source_call_rejects_alternate_paid_route_before_send(installed, overrides):
+def test_actual_source_call_rejects_alternate_paid_route_before_send(
+    installed, overrides
+):
     guard, sent = installed
     token = gc.TASK.set(("task0", 0))
     try:
@@ -356,7 +380,9 @@ def test_unqualified_sdk_bootstrap_never_calls_tau2_main(configured, monkeypatch
     assert ledger.summary()["calls"] == 0
 
 
-def test_explicit_cli_runs_real_batch_context_and_both_sdk_roles(configured, monkeypatch, request):
+def test_explicit_cli_runs_real_batch_context_and_both_sdk_roles(
+    configured, monkeypatch, request
+):
     import httpx
     from tau2 import cli
     from tau2.runner import batch
@@ -390,7 +416,9 @@ def test_explicit_cli_runs_real_batch_context_and_both_sdk_roles(configured, mon
 
     def init(self, *args, **kwargs):
         real_init(
-            self, *args, **(kwargs | {"transport_factory": lambda: httpx.MockTransport(handle)})
+            self,
+            *args,
+            **(kwargs | {"transport_factory": lambda: httpx.MockTransport(handle)}),
         )
         created_guards.append(self)
 
@@ -427,7 +455,9 @@ def test_explicit_cli_runs_real_batch_context_and_both_sdk_roles(configured, mon
         )
         # Actual pinned run_unit, run_with_retry, source aliases and both SDKs;
         # only the simulation's model interaction and HTTP transport are fake.
-        assert batch.run_unit(ctx, types.SimpleNamespace(id="retail0"), 1, 300).trial == 1
+        assert (
+            batch.run_unit(ctx, types.SimpleNamespace(id="retail0"), 1, 300).trial == 1
+        )
 
     monkeypatch.setattr(cli, "main", main)
     assert (
@@ -472,13 +502,16 @@ def test_explicit_cli_runs_real_batch_context_and_both_sdk_roles(configured, mon
     records = ledger.audit()["requests"]
     assert {r["metadata"]["role"] for r in records} == {"user", "nl_judge"}
     assert all(
-        r["metadata"]["invocation_id"] == "real-entry" and r["metadata"]["task_id"] == "retail0"
+        r["metadata"]["invocation_id"] == "real-entry"
+        and r["metadata"]["task_id"] == "retail0"
         for r in records
     )
 
 
 @pytest.mark.parametrize("field", ["service_tier", "max_completion_tokens"])
-def test_actual_sdk_dropped_protected_wire_field_zero_send(installed, monkeypatch, field):
+def test_actual_sdk_dropped_protected_wire_field_zero_send(
+    installed, monkeypatch, field
+):
     from litellm.llms.openai.openai import OpenAIChatCompletion
 
     guard, sent = installed
@@ -488,7 +521,9 @@ def test_actual_sdk_dropped_protected_wire_field_zero_send(installed, monkeypatc
         kwargs["data"].pop(field, None)
         return original(self, **kwargs)
 
-    monkeypatch.setattr(OpenAIChatCompletion, "make_sync_openai_chat_completion_request", drop)
+    monkeypatch.setattr(
+        OpenAIChatCompletion, "make_sync_openai_chat_completion_request", drop
+    )
     token = gc.TASK.set(("task0", 0))
     try:
         with pytest.raises(Exception):
@@ -522,7 +557,9 @@ def test_unknown_actual_service_tier_retains_and_halts(installed, tier):
     assert guard.ledger.audit()["requests"][0]["metadata"]["service_tier"] == tier
 
 
-def sdk_contender(policy_path, context_path, digest, ledger_path, arm, role, ready, sent, attempts):
+def sdk_contender(
+    policy_path, context_path, digest, ledger_path, arm, role, ready, sent, attempts
+):
     import os
 
     os.environ["OPENAI_API_KEY"] = "offline-test-key"
@@ -546,7 +583,10 @@ def sdk_contender(policy_path, context_path, digest, ledger_path, arm, role, rea
         try:
             result = original_reserve(*args, **kwargs)
         except gc.BudgetError as error:
-            assert str(error) in {"Shared budget exhausted", "The shared budget is halted"}
+            assert str(error) in {
+                "Shared budget exhausted",
+                "The shared budget is halted",
+            }
             refused.append(True)
             attempts.put(("refused", arm))
             raise
@@ -614,7 +654,17 @@ def test_two_actual_sdk_processes_two_models_share_last_global_slot(configured):
     workers = [
         ctx.Process(
             target=sdk_contender,
-            args=(policy_path, context_path, digest, ledger.path, arm, role, ready, sent, attempts),
+            args=(
+                policy_path,
+                context_path,
+                digest,
+                ledger.path,
+                arm,
+                role,
+                ready,
+                sent,
+                attempts,
+            ),
         )
         for arm, role in [("vllm", "user"), ("smg", "nl_judge")]
     ]
@@ -624,14 +674,20 @@ def test_two_actual_sdk_processes_two_models_share_last_global_slot(configured):
         for worker in workers:
             worker.join(35)
             assert worker.exitcode == 0
-        assert sent.get(timeout=1) in [("vllm", "gpt-5.2"), ("smg", "gpt-4.1-2025-04-14")]
+        assert sent.get(timeout=1) in [
+            ("vllm", "gpt-5.2"),
+            ("smg", "gpt-4.1-2025-04-14"),
+        ]
         with pytest.raises(queue.Empty):
             sent.get(timeout=0.2)
         observed = [attempts.get(timeout=1) for _ in range(4)]
         assert {arm for state, arm in observed if state == "attempt"} == {"vllm", "smg"}
         assert sum(state == "reserved" for state, _ in observed) == 1
         assert sum(state == "refused" for state, _ in observed) == 1
-        assert ledger.summary()["calls"] == 1 and ledger.summary()["allocated_nusd"] <= 24_000
+        assert (
+            ledger.summary()["calls"] == 1
+            and ledger.summary()["allocated_nusd"] <= 24_000
+        )
         assert ledger.audit()["pending"] == 0
     finally:
         for worker in workers:
@@ -650,14 +706,20 @@ def test_actual_async_openai_alternate_path_zero_send(installed):
     guard, sent = installed
 
     async def attempt():
-        async with openai.AsyncOpenAI(api_key="offline-test-key", max_retries=0) as client:
+        async with openai.AsyncOpenAI(
+            api_key="offline-test-key", max_retries=0
+        ) as client:
             with pytest.raises(openai.APIConnectionError):
                 await client.chat.completions.create(
                     model="gpt-5.2", messages=[{"role": "user", "content": "offline"}]
                 )
 
     asyncio.run(attempt())
-    assert not sent and guard.ledger.summary()["calls"] == 0 and guard.ledger.summary()["halted"]
+    assert (
+        not sent
+        and guard.ledger.summary()["calls"] == 0
+        and guard.ledger.summary()["halted"]
+    )
 
 
 @pytest.mark.parametrize("failure", [400, 500, "timeout"])
@@ -677,7 +739,9 @@ def test_local_sdk_failure_does_not_halt_paid_budget(installed, monkeypatch, fai
 
     transport = httpx.MockTransport(handle)
     monkeypatch.setattr(
-        httpx.HTTPTransport, "handle_request", lambda _, request: transport.handle_request(request)
+        httpx.HTTPTransport,
+        "handle_request",
+        lambda _, request: transport.handle_request(request),
     )
     token = gc.TASK.set(("task-local-failure", 0))
     try:
@@ -700,7 +764,9 @@ def test_local_sdk_failure_does_not_halt_paid_budget(installed, monkeypatch, fai
         gc.TASK.reset(token)
 
 
-def test_actual_local_sdk_redirect_cannot_become_free_external_send(installed, monkeypatch):
+def test_actual_local_sdk_redirect_cannot_become_free_external_send(
+    installed, monkeypatch
+):
     import httpx
     from tau2.data_model.message import UserMessage
     from tau2.utils import llm_utils
@@ -729,7 +795,11 @@ def test_actual_local_sdk_redirect_cannot_become_free_external_send(installed, m
             max_retries=0,
         )
     assert visited and all(httpx.URL(url).host == "127.0.0.1" for url in visited)
-    assert not sent and guard.ledger.summary()["calls"] == 0 and guard.ledger.summary()["halted"]
+    assert (
+        not sent
+        and guard.ledger.summary()["calls"] == 0
+        and guard.ledger.summary()["halted"]
+    )
 
 
 def test_real_source_fingerprint_mismatch_refuses_bootstrap(configured, monkeypatch):
@@ -754,13 +824,17 @@ def test_real_source_fingerprint_mismatch_refuses_bootstrap(configured, monkeypa
     assert ledger.summary()["calls"] == 0
 
 
-def test_editable_package_source_initializes_and_rejects_changed_bytes(configured, tmp_path):
+def test_editable_package_source_initializes_and_rejects_changed_bytes(
+    configured, tmp_path
+):
     import importlib.metadata
     import importlib.util
 
     policy, contexts, digest, _, _ = configured
     environment = tmp_path / "editable-venv"
-    subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(environment)], check=True)
+    subprocess.run(
+        [sys.executable, "-m", "venv", "--without-pip", str(environment)], check=True
+    )
     site = environment / "lib/python3.12/site-packages"
     source = tmp_path / "editable-source/tau2"
     source.mkdir(parents=True)
@@ -798,19 +872,27 @@ def test_editable_package_source_initializes_and_rejects_changed_bytes(configure
         "--scope",
         "offline-two-model-scope",
     ]
-    result = subprocess.run(command + ["--initialize"], capture_output=True, text=True, timeout=20)
+    result = subprocess.run(
+        command + ["--initialize"], capture_output=True, text=True, timeout=20
+    )
     assert not (site / "tau2").exists()
     assert result.returncode == 0, result.stderr
     assert ledger.is_file()
     changed = source / "utils/llm_utils.py"
     changed.write_bytes(changed.read_bytes() + b"\n# changed fixture\n")
-    rejected = subprocess.run(command + ["--check"], capture_output=True, text=True, timeout=20)
+    rejected = subprocess.run(
+        command + ["--check"], capture_output=True, text=True, timeout=20
+    )
     assert rejected.returncode == 2
     assert "Unqualified tau2 source: utils/llm_utils.py" in rejected.stderr
 
 
-@pytest.mark.parametrize("parallel, fail", [(False, False), (True, False), (False, True)])
-def test_actual_sdk_client_handles_bound_to_inflight_and_close_on_error(installed, parallel, fail):
+@pytest.mark.parametrize(
+    "parallel, fail", [(False, False), (True, False), (False, True)]
+)
+def test_actual_sdk_client_handles_bound_to_inflight_and_close_on_error(
+    installed, parallel, fail
+):
     import concurrent.futures
     import threading
 
@@ -864,13 +946,17 @@ def test_actual_sdk_client_handles_bound_to_inflight_and_close_on_error(installe
     assert counts["peak"] <= workers and not guard.clients
 
 
-def test_actual_litellm_semantic_retry_needs_a_second_reservation(installed, monkeypatch):
+def test_actual_litellm_semantic_retry_needs_a_second_reservation(
+    installed, monkeypatch
+):
     from dataclasses import replace
 
     from litellm.llms.openai.openai import OpenAIChatCompletion
 
     guard, sent = installed
-    policy = replace(guard.ledger.policy, cap_nusd=12_000, scope_id="offline-semantic-retry")
+    policy = replace(
+        guard.ledger.policy, cap_nusd=12_000, scope_id="offline-semantic-retry"
+    )
     guard.ledger = gc.Ledger(guard.ledger.path.with_name("semantic-retry.db"), policy)
     original = OpenAIChatCompletion.make_sync_openai_chat_completion_request
     attempts = []
@@ -894,11 +980,20 @@ def test_actual_litellm_semantic_retry_needs_a_second_reservation(installed, mon
     finally:
         gc.TASK.reset(token)
     assert len(attempts) == 2 and len(sent) == 1
-    assert guard.ledger.summary() == {"calls": 1, "allocated_nusd": 12_000, "halted": True}
+    assert guard.ledger.summary() == {
+        "calls": 1,
+        "allocated_nusd": 12_000,
+        "halted": True,
+    }
 
 
 @pytest.mark.parametrize(
-    "extra", [["--domain", "banking_knowledge"], ["--auto-review"], ["--task-split-name", "test"]]
+    "extra",
+    [
+        ["--domain", "banking_knowledge"],
+        ["--auto-review"],
+        ["--task-split-name", "test"],
+    ],
 )
 def test_cli_cannot_override_fixed_text_scope(extra):
     command = [
@@ -985,7 +1080,8 @@ def test_standing_allowance_reuses_explicit_caps_for_each_approved_job():
     ]
     assert len({p["scope_id"] for p in policies}) == 4
     assert all(
-        p == {"cap_nusd": 100, "calls": 2, "calls_per_arm": 1, "scope_id": p["scope_id"]}
+        p
+        == {"cap_nusd": 100, "calls": 2, "calls_per_arm": 1, "scope_id": p["scope_id"]}
         for p in policies
     )
     assert "scope_id" not in template  # approval template stays immutable
@@ -1004,9 +1100,13 @@ def test_standing_context_mismatch_refuses_before_initialization(change, monkeyp
     from datetime import datetime
 
     context = standing_context() | change
-    monkeypatch.setattr(gc.os, "open", lambda *a, **k: pytest.fail("must not initialize"))
+    monkeypatch.setattr(
+        gc.os, "open", lambda *a, **k: pytest.fail("must not initialize")
+    )
     with pytest.raises(gc.BudgetError):
-        gc.resolve_approval(standing_fixture(), context, datetime(2026, 11, 10, tzinfo=UTC))
+        gc.resolve_approval(
+            standing_fixture(), context, datetime(2026, 11, 10, tzinfo=UTC)
+        )
 
 
 @pytest.mark.parametrize("day", [8, 11])
@@ -1024,7 +1124,9 @@ def test_exact_job_mode_stays_exact_and_cannot_mix_modes():
 
     now = datetime(2026, 11, 10, tzinfo=UTC)
     assert (
-        gc.resolve_approval({"scope_id": "123:1:small"}, standing_context(), now)["scope_id"]
+        gc.resolve_approval({"scope_id": "123:1:small"}, standing_context(), now)[
+            "scope_id"
+        ]
         == "123:1:small"
     )
     with pytest.raises(gc.BudgetError):
@@ -1057,7 +1159,9 @@ def test_isolated_guarded_entry_does_not_activate_legacy_startup_hook(configured
         ledger.policy.scope_id,
         "--check",
     ]
-    isolated = subprocess.run(command, env=env, capture_output=True, text=True, timeout=20)
+    isolated = subprocess.run(
+        command, env=env, capture_output=True, text=True, timeout=20
+    )
     assert isolated.returncode == 0, isolated.stderr
     # Causal control: identical environment and entry, removing only -I, is
     # rejected by the preserved real legacy startup module before main runs.
@@ -1074,7 +1178,14 @@ def test_isolated_guarded_entry_does_not_activate_legacy_startup_hook(configured
 
 
 @pytest.mark.parametrize(
-    "extra", [["-d", "telecom"], ["-h"], ["unclaimed"], ["--domain=telecom"], ["--seed", "1", "2"]]
+    "extra",
+    [
+        ["-d", "telecom"],
+        ["-h"],
+        ["unclaimed"],
+        ["--domain=telecom"],
+        ["--seed", "1", "2"],
+    ],
 )
 def test_parent98_regression_entire_command_surface_is_consumed(extra):
     base = [
@@ -1131,7 +1242,8 @@ def test_sdk_shadow_import_origin_is_rejected_before_import(
     def find(name):
         if name == package:
             return types.SimpleNamespace(
-                origin=str(shadow / "__init__.py"), submodule_search_locations=[str(shadow)]
+                origin=str(shadow / "__init__.py"),
+                submodule_search_locations=[str(shadow)],
             )
         return actual(name)
 
@@ -1140,7 +1252,9 @@ def test_sdk_shadow_import_origin_is_rejected_before_import(
         gc.verify_sources()
 
 
-def test_failed_initializer_does_not_publish_or_poison_final_path(configured, monkeypatch):
+def test_failed_initializer_does_not_publish_or_poison_final_path(
+    configured, monkeypatch
+):
     policy, contexts, digest, ledger, _ = configured
     destination = ledger.path.with_name("atomic-new.db")
     argv = [
@@ -1243,7 +1357,9 @@ else:
     assert guard.ledger.audit()["pending"] == 1
 
 
-@pytest.mark.parametrize("location", ["policy_models", "context_models", "price", "bound"])
+@pytest.mark.parametrize(
+    "location", ["policy_models", "context_models", "price", "bound"]
+)
 @pytest.mark.parametrize("bad", [None, [], 7])
 def test_unified_nested_policy_shapes_raise_budget_error(configured, location, bad):
     policy_path, contexts_path, digest, _, contexts = configured
@@ -1264,9 +1380,13 @@ def test_unified_nested_policy_shapes_raise_budget_error(configured, location, b
 
 
 @pytest.mark.parametrize(
-    "interrupt", [KeyboardInterrupt, SystemExit], ids=["keyboard_interrupt", "system_exit"]
+    "interrupt",
+    [KeyboardInterrupt, SystemExit],
+    ids=["keyboard_interrupt", "system_exit"],
 )
-def test_interrupted_paid_send_halts_independent_sibling(installed, tmp_path, interrupt):
+def test_interrupted_paid_send_halts_independent_sibling(
+    installed, tmp_path, interrupt
+):
     import httpx
 
     guard, sent = installed
@@ -1335,7 +1455,9 @@ else:
     assert len(sent) == 1
     assert before["audit"]["unknown"] == 1 and before["audit"]["pending"] == 0
     assert before["summary"]["calls"] == 1 and before["summary"]["halted"]
-    assert guard.ledger.summary()["allocated_nusd"] == before["summary"]["allocated_nusd"]
+    assert (
+        guard.ledger.summary()["allocated_nusd"] == before["summary"]["allocated_nusd"]
+    )
 
 
 def test_same_process_stop_blocks_request_past_sdk_precheck(installed, monkeypatch):
@@ -1446,7 +1568,9 @@ def test_local_stop_published_before_blocked_settlement(installed, monkeypatch):
     assert not thread.is_alive() and len(errors) == 1 and len(sent) == 1
 
 
-def test_previously_admitted_request_can_settle_after_local_stop(installed, monkeypatch):
+def test_previously_admitted_request_can_settle_after_local_stop(
+    installed, monkeypatch
+):
     import threading
 
     import httpx
@@ -1731,7 +1855,9 @@ def test_reserve_refusal_sets_failed_before_unlock_handoff(installed, monkeypatc
 
         def __exit__(self, *args):
             nonlocal first_release
-            handoff = threading.current_thread().name == "refused-reserver" and first_release
+            handoff = (
+                threading.current_thread().name == "refused-reserver" and first_release
+            )
             if handoff:
                 first_release = False
             real_lock.release()
@@ -1785,7 +1911,9 @@ def test_reserve_refusal_sets_failed_before_unlock_handoff(installed, monkeypatc
 
 
 @pytest.mark.parametrize("committed", [False, True])
-def test_success_response_finish_failure_stops_before_sdk_unwind(installed, monkeypatch, committed):
+def test_success_response_finish_failure_stops_before_sdk_unwind(
+    installed, monkeypatch, committed
+):
     guard, sent = installed
     original_finish = guard.ledger.finish
     finish_calls = []
@@ -1799,11 +1927,15 @@ def test_success_response_finish_failure_stops_before_sdk_unwind(installed, monk
     monkeypatch.setattr(guard.ledger, "finish", unavailable)
     with pytest.raises(gc.BudgetError, match="settlement cleanup"):
         direct_paid_request(guard)
-    assert guard.failed, "successful-response settlement failure escaped without STOP_PENDING"
+    assert guard.failed, (
+        "successful-response settlement failure escaped without STOP_PENDING"
+    )
     assert guard.ledger.summary()["halted"]
     with pytest.raises(gc.BudgetError, match="stopped paid admission"):
         direct_paid_request(guard)
-    assert len(sent) == 1 and len(finish_calls) == 1, "must not retry possibly committed finish"
+    assert len(sent) == 1 and len(finish_calls) == 1, (
+        "must not retry possibly committed finish"
+    )
     audit = guard.ledger.audit()
     assert audit["pending"] == (0 if committed else 1)
     assert guard.ledger.summary()["calls"] == 1
@@ -1985,7 +2117,9 @@ else:
     assert ledger.audit()["pending"] == 1
 
 
-@pytest.mark.parametrize("failure", ["before-ignore", "Event-after-ignore"])
+@pytest.mark.parametrize(
+    "failure", ["before-ignore", "Event-after-ignore", "native-start"]
+)
 def test_hard_exit_setup_failure_exits_once_and_restores_handler(
     configured, monkeypatch, capsys, failure
 ):
@@ -2010,7 +2144,13 @@ def test_hard_exit_setup_failure_exits_once_and_restores_handler(
         local_url="http://127.0.0.1:8000",
     )
     ledger.reserve(
-        "pending-setup", "vllm", "openai/gpt-5.2", 10, 2, num_retries=0, output_limit_verified=True
+        "pending-setup",
+        "vllm",
+        "openai/gpt-5.2",
+        10,
+        2,
+        num_retries=0,
+        output_limit_verified=True,
     )
     guard.install()
 
@@ -2026,6 +2166,12 @@ def test_hard_exit_setup_failure_exits_once_and_restores_handler(
             raise MemoryError("offline Event setup allocation")
 
         monkeypatch.setattr(gc.threading, "Event", unavailable)
+    if failure == "native-start":
+
+        def unavailable_start(*args):
+            raise RuntimeError("offline native thread creation failure")
+
+        monkeypatch.setattr(gc._thread, "start_new_thread", unavailable_start)
     observed = None
     try:
         try:
@@ -2042,7 +2188,9 @@ def test_hard_exit_setup_failure_exits_once_and_restores_handler(
     assert os._exit is global_exit and batch.os is fake_os
     assert "NOT_ATTESTED" in capsys.readouterr().err
     assert not ledger.summary()["halted"] and ledger.audit()["pending"] == 1
-    assert ledger.summary()["calls"] == 1 and ledger.summary()["allocated_nusd"] == 12000
+    assert (
+        ledger.summary()["calls"] == 1 and ledger.summary()["allocated_nusd"] == 12000
+    )
 
 
 @pytest.mark.parametrize("exit_raises", [False, True])
@@ -2086,7 +2234,9 @@ def test_hard_exit_atomic_handler_transition_and_exact_once_control(
     monkeypatch.setattr(gc.signal, "signal", transition)
 
     def forbidden_getsignal(*args):
-        raise AssertionError("separate get-handler/install-ignore handoff must not exist")
+        raise AssertionError(
+            "separate get-handler/install-ignore handoff must not exist"
+        )
 
     monkeypatch.setattr(gc.signal, "getsignal", forbidden_getsignal)
     try:
@@ -2102,3 +2252,268 @@ def test_hard_exit_atomic_handler_transition_and_exact_once_control(
     assert exits == [130] and transitions == [signal.SIG_IGN, previous]
     assert after is previous and batch.os is fake_os
     assert guard.failed and ledger.summary()["halted"]
+
+
+def test_pinned_batch_second_sigint_during_monitor_stop_cannot_escape_halt(
+    configured, tmp_path
+):
+    policy, contexts, digest, ledger, _ = configured
+    witness = tmp_path / "pending-hardexit.json"
+    script = r"""
+import hashlib, json, os, signal, socket, sys, threading, types
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import guarded_cli as gc
+import httpx
+from tau2.runner import batch
+from tau2.user import user_simulator
+from tau2.data_model.message import AssistantMessage, SystemMessage
+
+def forbidden(*args, **kwargs):
+    raise AssertionError("real socket forbidden")
+socket.socket.connect = forbidden
+socket.create_connection = forbidden
+os.environ["OPENAI_API_KEY"] = "offline-test-key"
+p, contexts = gc.load_policy(sys.argv[2], sys.argv[3], sys.argv[4])
+ledger = gc.Ledger(sys.argv[5], p, create=False)
+pending = threading.Event()
+original_exit = os._exit
+
+def transport(request):
+    Path(sys.argv[6]).write_text(json.dumps({
+        "pid": os.getpid(),
+        "start": Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()[19],
+        "audit": ledger.audit(),
+        "batch_sha256": hashlib.sha256(Path(batch.__file__).read_bytes()).hexdigest(),
+        "global_os_exit_unchanged": os._exit is original_exit,
+    }))
+    pending.set()
+    threading.Event().wait(30)
+    raise AssertionError("worker should end only with its owned process")
+
+guard = gc.Guard(ledger, contexts, arm="vllm", domain="retail",
+                 invocation_id="offline-hardexit", local_model="local-model",
+                 local_url="http://127.0.0.1:8000",
+                 transport_factory=lambda: httpx.MockTransport(transport))
+guard.install()
+assert os._exit is original_exit
+
+def unit(*args, **kwargs):
+    token = gc.TASK.set(("task0", 0))
+    try:
+        state = types.SimpleNamespace(messages=[],
+            system_messages=[SystemMessage(role="system", content="offline")],
+            flip_roles=lambda: [])
+        user = types.SimpleNamespace(llm="gpt-5.2", tools=[], llm_args={"temperature": 0.0})
+        return user_simulator.UserSimulator._generate_next_message(
+            user, AssistantMessage(role="assistant", content="offline"), state)
+    finally:
+        gc.TASK.reset(token)
+
+batch.run_unit = unit  # Only task/model execution; real batch loop/exit remain.
+task = types.SimpleNamespace(id="task0")
+result = types.SimpleNamespace(simulations=[], info=None)
+work = batch.WorkUnit(unit_id="offline/task0/t0", run_id="offline",
+                      task_id="task0", trial=0, seed=1)
+prep = types.SimpleNamespace(tasks=[task], simulation_results=result, done_runs=[],
+    user_voice_settings=None, user_persona_config=None, save_fn=None, units=[work])
+batch.prepare_batch = lambda *args, **kwargs: prep
+class Monitor:
+    def __init__(self, *args, **kwargs): pass
+    def set_results(self, *args): pass
+    def start(self): pass
+    def stop(self):
+        if not getattr(self, "sent_second", False):
+            self.sent_second = True
+            Path(sys.argv[6] + ".before-adapter-second").write_text("actual second SIGINT in SDK monitor.stop")
+            os.kill(os.getpid(), signal.SIGINT)
+batch.StatusMonitor = Monitor
+
+def interrupt():
+    if not pending.wait(15):
+        return
+    os.kill(os.getpid(), signal.SIGINT)
+
+signal.signal(signal.SIGINT, signal.default_int_handler)
+threading.Thread(target=interrupt, daemon=True).start()
+def actual_run():
+    return batch.run_tasks(types.SimpleNamespace(log_level="ERROR", num_trials=1,
+        workers=0, max_concurrency=1), [task])
+try:
+    if hasattr(gc, "run_with_interrupt_handoff"):
+        gc.run_with_interrupt_handoff(actual_run, batch.os._exit)
+    else:
+        actual_run()  # Previous production's direct CLI/SDK call, for causal control.
+except KeyboardInterrupt:
+    Path(sys.argv[6] + ".escaped-before-adapter").write_text("second SIGINT escaped before guarded exit")
+    original_exit(130)  # Controlled old-failure teardown; never let test workers leak.
+raise AssertionError("pinned hard exit did not happen")
+"""
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            "-c",
+            script,
+            str(Path(gc.__file__).parent),
+            str(policy),
+            str(contexts),
+            digest,
+            str(ledger.path),
+            str(witness),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=25,
+        env={**os.environ, "PYTHONPATH": "", "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+    assert child.returncode == 130, child.stdout + child.stderr
+    observed = json.loads(witness.read_text())
+    assert observed["global_os_exit_unchanged"]
+    assert observed["batch_sha256"] == gc.TAU2_SHA["runner/batch.py"]
+    assert observed["audit"]["pending"] == 1
+    assert not Path(f"/proc/{observed['pid']}").exists()
+    sibling = r"""
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import guarded_cli as gc
+p, _ = gc.load_policy(sys.argv[2], sys.argv[3], sys.argv[4])
+l = gc.Ledger(sys.argv[5], p, create=False)
+try:
+ l.reserve("after-hard-exit", "smg", "openai/gpt-5.2", 10, 2,
+           num_retries=0, output_limit_verified=True)
+except gc.BudgetError as error:
+ print(json.dumps({"refused": "halted" in str(error).lower(), "error": str(error)}))
+else:
+ print(json.dumps({"refused": False}))
+"""
+    peer = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            "-c",
+            sibling,
+            str(Path(gc.__file__).parent),
+            str(policy),
+            str(contexts),
+            digest,
+            str(ledger.path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert peer.returncode == 0, peer.stderr
+    outcome = json.loads(peer.stdout)
+    (tmp_path / "hard-exit-result.json").write_text(
+        json.dumps(
+            {
+                "child_returncode": child.returncode,
+                "pending_witness": observed,
+                "sibling": outcome,
+                "final_audit": ledger.audit(),
+                "final_summary": ledger.summary(),
+            },
+            indent=2,
+        )
+    )
+    assert outcome["refused"], outcome
+    assert ledger.summary()["halted"]
+    assert ledger.summary()["calls"] == 1
+    assert ledger.summary()["allocated_nusd"] == 12000
+    assert ledger.audit()["pending"] == 1
+    assert Path(str(witness) + ".before-adapter-second").exists()
+    assert not Path(str(witness) + ".escaped-before-adapter").exists()
+
+
+def test_hard_exit_worker_bootstrap_failure_is_bounded(tmp_path):
+    import signal
+
+    marker = tmp_path / "lowlevel-stop"
+    script = r"""
+import ast, _thread, os, signal, sys, threading, types
+from pathlib import Path
+source = ast.parse(Path(sys.argv[1]).read_text())
+install = next(n for c in source.body if isinstance(c, ast.ClassDef) and c.name == "Guard"
+               for n in c.body if isinstance(n, ast.FunctionDef) and n.name == "install")
+stop = next(n for n in install.body if isinstance(n, ast.FunctionDef) and n.name == "stop_before_hard_exit")
+class BrokenBootstrap(threading.Thread):
+    def _set_tstate_lock(self):
+        Path(sys.argv[2]+".bootstrap-fault").write_text("controlled pre-started sentinel failure")
+        raise MemoryError("controlled thread-state sentinel failure, not host OOM")
+namespace = dict(_thread=_thread, signal=signal, sys=sys,
+    threading=types.SimpleNamespace(Event=threading.Event, Thread=BrokenBootstrap),
+    self=types.SimpleNamespace(stop_paid=lambda: Path(sys.argv[2]).write_text("halt callback completed")),
+    original_exit=os._exit)
+exec(compile(ast.Module(body=[stop], type_ignores=[]), "<exact production hard-exit adapter>", "exec"), namespace)
+namespace["stop_before_hard_exit"](130)
+raise AssertionError("original hard exit returned")
+"""
+    child = subprocess.Popen(
+        [sys.executable, "-I", "-B", "-c", script, str(Path(gc.__file__)), str(marker)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    timed_out = False
+    try:
+        out, error = child.communicate(timeout=2)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        os.killpg(child.pid, signal.SIGKILL)
+        out, error = child.communicate(timeout=3)
+    (tmp_path / "bootstrap-child-result.json").write_text(
+        json.dumps(
+            {
+                "returncode": child.returncode,
+                "timed_out": timed_out,
+                "reaped": child.poll() is not None,
+                "stdout": out.decode(errors="replace"),
+                "stderr": error.decode(errors="replace"),
+                "controlled_bootstrap_fault": Path(
+                    str(marker) + ".bootstrap-fault"
+                ).exists(),
+                "halt_callback_completed": marker.exists(),
+            }
+        )
+    )
+    assert not timed_out, (
+        "Thread.start waited forever for failed bootstrap acknowledgement"
+    )
+    assert child.returncode == 130, error.decode(errors="replace")
+    assert marker.read_text() == "halt callback completed"
+
+
+@pytest.mark.parametrize("outcome", ["normal", "interrupt", "ignored"])
+def test_interrupt_handoff_preserves_normal_result_and_handler(outcome):
+    import signal
+
+    before = signal.getsignal(signal.SIGINT)
+    exits = []
+    try:
+        signal.signal(
+            signal.SIGINT,
+            signal.SIG_IGN if outcome == "ignored" else signal.default_int_handler,
+        )
+        expected = signal.getsignal(signal.SIGINT)
+
+        def command():
+            if outcome == "interrupt":
+                os.kill(os.getpid(), signal.SIGINT)
+            return "ordinary-result"
+
+        if outcome == "interrupt":
+            with pytest.raises(KeyboardInterrupt):
+                gc.run_with_interrupt_handoff(command, exits.append)
+            assert exits == [130]
+        else:
+            assert (
+                gc.run_with_interrupt_handoff(command, exits.append)
+                == "ordinary-result"
+            )
+            assert not exits
+        assert signal.getsignal(signal.SIGINT) is expected
+    finally:
+        signal.signal(signal.SIGINT, before)

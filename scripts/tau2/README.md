@@ -261,3 +261,12 @@ admission held for reconciliation. Both stores unavailable, blocking I/O,
 SIGKILL and host loss do not have an unconditional durable-stop guarantee.
 Calls admitted before STOP_PENDING may settle; settlement is never retried after
 a reported error because its original transaction may already have committed.
+
+The guarded main invocation keeps the first Python SIGINT handler's behavior,
+while ignoring later SIGINT through the pinned runner's shutdown and hard-exit
+handoff. An escaped KeyboardInterrupt is forwarded to the same guarded exit.
+The stop worker uses a low-level thread start with no `Thread.start()` bootstrap
+handshake; its explicit completion wait remains bounded to 10 seconds. Thread
+creation/setup or completion failure still reports `NOT_ATTESTED`. Explicitly
+ignored/default-termination signal dispositions, SIGKILL, host loss, and blocking
+stderr/OS shutdown retain their existing unqualified limits.
