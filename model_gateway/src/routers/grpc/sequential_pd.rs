@@ -56,7 +56,7 @@ use crate::{
             utils::{
                 account_pd_side_failure, mark_error_reason,
                 stream_failure::UpstreamClass,
-                tonic_ext::{is_the_engines_own_report, TonicStatusExt},
+                tonic_ext::{is_receive_bound_refusal, is_the_engines_own_report, TonicStatusExt},
             },
         },
     },
@@ -912,6 +912,11 @@ pub(crate) async fn sequential_prefill_side(
                 error!(function = "execute_sequential_pd", error = %e, "Prefill stream error");
                 let mut response =
                     PdSide::Prefill.answer(SidePhase::Stream, e.http_status(), e.message());
+                // An answer above the receive bound is as large from any
+                // prefill worker: final, as the collector's drain makes it.
+                if is_receive_bound_refusal(&e) {
+                    mark_non_retryable(&mut response);
+                }
                 mark_error_reason(&mut response, e.error_reason());
                 return Err(response);
             }

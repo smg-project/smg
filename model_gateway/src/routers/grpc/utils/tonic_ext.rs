@@ -56,7 +56,10 @@ pub(crate) trait TonicStatusExt {
     /// reset below gRPC, a protocol fault), whatever code tonic picked from
     /// the frame's reason, and one made of the socket under the call
     /// failing (the connection reset or closed with the call in flight),
-    /// which tonic has no code for.
+    /// which tonic has no code for. A worker's answer above the receive
+    /// bound ([`is_receive_bound_refusal`]) is a bad gateway too: an answer
+    /// the gateway could not read, where any other `OUT_OF_RANGE` is the
+    /// request's fault.
     fn http_status(&self) -> StatusCode;
 
     /// Convert this gRPC error into an HTTP error response with the appropriate
@@ -83,10 +86,11 @@ pub(crate) trait TonicStatusExt {
     /// predicates, in the same order: a constraint the engine could not
     /// continue under, a fault of the request's media, the worker's
     /// connection failing under the call (an HTTP/2 or socket fault, or the
-    /// worker's side cancelling), then the code the worker answered: its
-    /// deadline, its capacity pushback, its unavailability, the request's
-    /// own fault, the engine's own report that the request failed, or a
-    /// failure inside the worker.
+    /// worker's side cancelling), a worker's answer above the receive bound
+    /// ([`is_receive_bound_refusal`], a bad response), then the code the
+    /// worker answered: its deadline, its capacity pushback, its
+    /// unavailability, the request's own fault, the engine's own report
+    /// that the request failed, or a failure inside the worker.
     fn error_reason(&self) -> &'static str;
 
     /// The worker's report that the request's media failed, when the status

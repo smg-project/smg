@@ -967,6 +967,44 @@ mod tests {
         }
     }
 
+    /// A prefill message above the receive bound ends the sequential drain
+    /// as it ends the collector's: a 502 that is never replayed, since
+    /// another prefill worker's answer would be as large.
+    #[tokio::test]
+    async fn a_prefill_message_above_the_receive_bound_ends_the_sequential_drain_for_good() {
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://prefill:30001")
+                .worker_type(WorkerType::Prefill)
+                .connection_mode(ConnectionMode::Grpc)
+                .build(),
+        );
+        let workers = WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill: Arc::clone(&prefill),
+            decode: Arc::clone(&prefill).into(),
+            runtime_type: RuntimeType::Vllm,
+        };
+        let request = ProtoGenerateRequest::Vllm(Box::default());
+        // A finish reason of five million bytes: one message above the 4 MiB
+        // the stream's decoder reads by default.
+        let oversized = complete(0, &"e".repeat(5_000_000));
+        let (stream, _server) = scripted_stream(vec![oversized], "0").await;
+        let ledger = AttemptLedger::default();
+        let Err(failure) = sequential_prefill_side(
+            &PdSides::of(&workers, &ledger, &request, false),
+            Box::pin(async move { Ok::<_, tonic::Status>(stream) }),
+            PrefillLoadGuard::Unbounded {
+                _guard: WorkerLoadGuard::with_key(Arc::clone(&prefill), None),
+            },
+        )
+        .await
+        else {
+            panic!("the drain met a message above the receive bound");
+        };
+        assert_eq!(failure.status(), StatusCode::BAD_GATEWAY);
+        assert!(!is_retryable_response(&failure));
+    }
+
     #[tokio::test]
     async fn drain_prefill_accepts_exhausted_stream_with_released_guard() {
         // Sequential PD releases the prefill guard in the execution stage, so
