@@ -794,9 +794,9 @@ fn a_lease_of_the_last_generation_reaches_the_profile_its_document_built() {
 /// documents each add one profile and keep the ones that stand, as a
 /// supplied spec may. Under the last, a dispatch of
 /// a lease of each earlier generation reaches the profiles made by then,
-/// one more a generation, and a lease of the document's own generation or
-/// of one above it reaches the eleven it kept. Each profile's object is
-/// held by the document in force alone.
+/// one more a generation. Asked the document's own generation or one
+/// above it, `stood_at` answers the eleven the document kept. Each
+/// profile's object is held by the document in force alone.
 #[test]
 fn a_document_holds_each_profile_once_whatever_generations_made_them() {
     const DOCUMENTS: u64 = 12;

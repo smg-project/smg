@@ -11,7 +11,7 @@
 //! (`.github/bench-gates/grand-central-engine.toml`).
 //!
 //! Under the feature `in-process`, one apply on a running engine whose
-//! document gained one profile at each of its generations, as a supplied
+//! document grew to its size by one profile a generation, as a supplied
 //! spec may. Ids:
 //! `engine/spec/apply_grown/<profiles>` at ten, a hundred and a thousand
 //! profiles. A row is the check of the document and its apply: the engine
@@ -90,8 +90,8 @@ fn grown(profiles: usize, generation: u64) -> PolicySpec {
     document
 }
 
-/// One apply on an engine whose document gained one profile at each of
-/// its generations. The apply keeps every profile, each made under a
+/// One apply on an engine whose document grew to its size by one profile
+/// a generation. The apply keeps every profile, each made under a
 /// generation of its own.
 #[cfg(feature = "in-process")]
 fn spec_apply_grown(c: &mut Criterion) {

@@ -9968,12 +9968,12 @@ fn tell_completed<'p>(
 /// profiles whose object was made below a generation. It hears the words
 /// of a lease issued under that earlier generation.
 ///
-/// It holds nothing of its own. Each word walks the engine's profiles
-/// beside the generations they were made under, in the engine's order,
-/// and tells the ones that stood. So an engine keeps no list for an
-/// earlier generation, whatever the number of generations its profiles
-/// were made under: a document that gained one profile at each of a
-/// thousand applies holds a thousand profiles once.
+/// It holds nothing of its own. A word told to the stages walks the
+/// engine's profiles beside the generations they were made under, in the
+/// engine's order, and tells the ones that stood. So an engine keeps no
+/// list for an earlier generation, whatever the number of generations its
+/// profiles were made under: a document that gained one profile at each
+/// of a thousand applies holds a thousand profiles once.
 ///
 /// A host that tells leases off a file of its own names the engine whole
 /// as one too (`Engine::stands`): every profile hears, under no
