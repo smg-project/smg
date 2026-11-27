@@ -277,7 +277,9 @@ impl Frames {
 /// collects wide taps and a scratch row of its own, and its height pass skips the scalar
 /// path's sums buffer); on x86-64 they are the Pillow-exact passes of
 /// `vision/transforms.rs` (`portable`, or the `avx2` and `avx512` arms with a scratch row
-/// pair per band), so a class counts a few calls more or fewer per path. Every count is
+/// per band; on the `avx2` arm taps that fit 16 bits allocate no high halves, and a width
+/// pass over them holds two tables more: a second layout of the taps and where every four
+/// outputs start), so a class counts a few calls more or fewer per path. Every count is
 /// recorded on its own path (the other arms forced off on a host that has them); CI runs
 /// this test on each architecture.
 struct Calls {
@@ -345,7 +347,7 @@ const PINS: &[Pin] = &[
             scalar: 6038,
             neon: 6037,
             portable: 6037,
-            avx2: 6038,
+            avx2: 6037,
             avx512: 6037,
         },
         preprocess_large: 2,
@@ -363,7 +365,7 @@ const PINS: &[Pin] = &[
             neon: 1051,
             portable: 1048,
             avx2: 1052,
-            avx512: 1052,
+            avx512: 1051,
         },
         preprocess_large: 0,
         serialize_calls: 0,
@@ -380,7 +382,7 @@ const PINS: &[Pin] = &[
             neon: 1371,
             portable: 1368,
             avx2: 1372,
-            avx512: 1372,
+            avx512: 1371,
         },
         preprocess_large: 2,
         serialize_calls: 0,
@@ -397,7 +399,7 @@ const PINS: &[Pin] = &[
             neon: 1051,
             portable: 1048,
             avx2: 1052,
-            avx512: 1052,
+            avx512: 1051,
         },
         preprocess_large: 0,
         serialize_calls: 0,
@@ -413,7 +415,7 @@ const PINS: &[Pin] = &[
             scalar: 1429,
             neon: 1428,
             portable: 1428,
-            avx2: 1429,
+            avx2: 1428,
             avx512: 1428,
         },
         preprocess_large: 1,
@@ -608,7 +610,7 @@ const VIDEO_CALLS: Calls = Calls {
     scalar: 8741,
     neon: 8737,
     portable: 8737,
-    avx2: 8741,
+    avx2: 8737,
     avx512: 8737,
 };
 const VIDEO_LARGE: usize = 4;
