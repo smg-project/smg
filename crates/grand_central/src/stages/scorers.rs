@@ -21,9 +21,9 @@ use crate::{
         lifecycle::Lifecycle,
     },
     tracking::{
-        dispatch_credit::{DispatchCounts, DispatchCredit},
+        dispatch_credit::DispatchCredit,
         lease::{EventKind, EventSet, Lease, Membership, Outcome, ReleaseReason, Side, Signal},
-        rank_credit::{Credits, HeldCredit, RankCredit, RankTable, SendSize},
+        rank_credit::{Credits, DispatchCounts, HeldCredit, RankCredit, RankTable, SendSize},
     },
 };
 
