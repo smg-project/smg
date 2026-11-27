@@ -7,8 +7,11 @@
 use std::{os::raw::c_char, sync::Arc, time::Duration};
 
 use llm_tokenizer::traits::Tokenizer;
-use openai_protocol::chat::ChatCompletionRequest;
-use smg::routers::grpc::utils::{chat_reasoning_starts_in_rendered_prefill, process_chat_messages};
+use openai_protocol::{chat::ChatCompletionRequest, profile::ProviderProfile};
+use smg::routers::grpc::utils::{
+    chat_budget_has_disabled_thinking, chat_reasoning_starts_in_rendered_prefill,
+    process_chat_messages,
+};
 use smg_grpc_client::{
     sglang_scheduler::{SglangGenerateRequestOptions, SglangSchedulerClient},
     FormatSetAside,
@@ -178,6 +181,17 @@ pub(crate) unsafe fn start_chat_stream(
         request_id.clone(),
         &text,
     );
+    let thinking_disabled = !require_reasoning
+        && generation_prompt
+        && !continued_final_message
+        && chat_budget_has_disabled_thinking(
+            &request,
+            ProviderProfile::for_model(&request.model),
+            tokenizer.as_ref(),
+            &text,
+            || symphony::formats::for_model_shared(&request.model),
+            |without_header| process_chat_messages(without_header, tokenizer.as_ref(), None).ok(),
+        );
     let proto_request = match client.build_generate_request_from_chat(
         request_id,
         &request,
@@ -189,6 +203,7 @@ pub(crate) unsafe fn start_chat_stream(
             // No table answers the body's format here: the engine reads it as sent.
             format_set_aside: FormatSetAside::default(),
             require_reasoning,
+            thinking_disabled,
         },
     ) {
         Ok(req) => req,

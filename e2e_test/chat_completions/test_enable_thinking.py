@@ -167,3 +167,19 @@ class TestVllmThinkingTokenBudget(_ThinkingTokenBudget):
     """The worker's sampler enforces the budget between Qwen3's reasoning markers."""
 
     zero_budget = {"thinking_token_budget": 0}
+
+
+@pytest.mark.engine("sglang")
+@pytest.mark.workers(
+    extra_engine_args=[
+        "--enable-strict-thinking",
+        "--reasoning-parser",
+        "qwen3",
+        "--grammar-backend",
+        "xgrammar",
+    ]
+)
+class TestSglangThinkingTokenBudget(_ThinkingTokenBudget):
+    """The worker's strict reasoning grammar enforces the budget."""
+
+    zero_budget = {"custom_params": {"thinking_budget": 0}}

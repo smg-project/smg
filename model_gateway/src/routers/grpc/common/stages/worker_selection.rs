@@ -202,11 +202,13 @@ pub(crate) enum WorkerSelectionMode {
 pub(crate) fn supports_thinking_budget(worker: &dyn Worker) -> bool {
     let metadata = worker.metadata();
     // An operator label cannot enable a capability the worker never reported.
-    metadata.spec.runtime_type == RuntimeType::Vllm
-        && metadata
-            .discovered_labels
-            .get(SUPPORTS_THINKING_TOKEN_BUDGET_LABEL)
-            .is_some_and(|value| value == "true")
+    matches!(
+        metadata.spec.runtime_type,
+        RuntimeType::Sglang | RuntimeType::Vllm
+    ) && metadata
+        .discovered_labels
+        .get(SUPPORTS_THINKING_TOKEN_BUDGET_LABEL)
+        .is_some_and(|value| value == "true")
         && metadata
             .spec
             .labels
@@ -996,11 +998,7 @@ impl WorkerSelectionStage {
         // The index the placement reads, kept for the rule: the rule is
         // asked behind that read.
         let read: OnceLock<Arc<PdPairIndex>> = OnceLock::new();
-        let pairs = || {
-            let snapshot = self.worker_registry.get_routing_snapshot(model_id);
-            let mode = self.policy_registry.pd_pairing_mode();
-            Arc::clone(read.get_or_init(|| snapshot.pd_pairs(PdWire::Grpc, mode)))
-        };
+        let pairs = || Arc::clone(read.get_or_init(|| self.retry_pd_pairs(model_id)));
         // What the decode the rule last said yes to brings with it. The
         // engine asks the rule once a decode, best first, and takes the
         // first it says yes to that is ready: that last yes is the decode
@@ -2472,6 +2470,12 @@ impl WorkerSelectionStage {
             }
         }
         self.pair_failure(model_id, failure)
+    }
+
+    fn retry_pd_pairs(&self, model_id: &str) -> Arc<PdPairIndex> {
+        self.worker_registry
+            .get_routing_snapshot(model_id)
+            .pd_pairs(PdWire::Grpc, self.policy_registry.pd_pairing_mode())
     }
 
     /// Apply media and context constraints within the existing compatible-pair
@@ -9625,10 +9629,7 @@ mod tests {
             let first = decode(true);
             let legacy = decode(false);
             let wire = grpc_wire(runtime);
-            assert_eq!(
-                takes_the_built_request(&first, &first, "m", wire, true),
-                runtime == RuntimeType::Vllm
-            );
+            assert!(takes_the_built_request(&first, &first, "m", wire, true));
             assert!(!takes_the_built_request(&first, &legacy, "m", wire, true));
             assert!(takes_the_built_request(&first, &legacy, "m", wire, false));
         }

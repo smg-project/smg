@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use axum::response::Response;
 use smg_grpc_client::{
-    FormatSetAside, OutputConstraint, SglangGenerateRequestOptions, SglangSchedulerClient,
+    OutputConstraint, SglangGenerateRequestOptions, SglangSchedulerClient,
     TokenSpeedSchedulerClient, VllmEngineClient,
 };
 use tracing::{debug, error};
@@ -277,10 +277,8 @@ fn build_harmony_proto(
                 text,
                 token_ids,
                 SglangGenerateRequestOptions {
-                    multimodal_inputs: None,
                     tool_call_constraint: tool_constraints,
-                    format_set_aside: FormatSetAside::default(),
-                    require_reasoning: false,
+                    ..Default::default()
                 },
             )?))
         }
@@ -424,10 +422,8 @@ fn build_sglang(
             text,
             token_ids,
             SglangGenerateRequestOptions {
-                multimodal_inputs: None, // Harmony path: multimodal not yet wired
                 tool_call_constraint: tool_constraints,
-                format_set_aside: FormatSetAside::default(),
-                require_reasoning: false,
+                ..Default::default()
             },
         )?,
         HarmonyBody::Responses(b) => {
@@ -441,4 +437,28 @@ fn build_sglang(
         }
     };
     Ok(ProtoGenerateRequest::Sglang(Box::new(request)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn harmony_sglang_thinking_budget_cannot_use_a_template_kwarg_as_an_off_switch() {
+        let chat = serde_json::from_value(serde_json::json!({
+            "model": "openai/gpt-oss-20b", "messages": [],
+            "chat_template_kwargs": {"enable_thinking": false}, "thinking_token_budget": 0,
+        }))
+        .unwrap();
+        let err = build_sglang(
+            HarmonyBody::Chat(&chat),
+            "id".into(),
+            String::new(),
+            vec![1],
+            None,
+        )
+        .err()
+        .expect("Harmony did not render a thinking switch");
+        assert!(err.contains("active reasoning grammar"));
+    }
 }

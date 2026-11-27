@@ -423,6 +423,110 @@ impl Tokenizer for T {
     }
 }
 
+#[test]
+fn sglang_thinking_budget_checks_the_selected_templates_generation_header() {
+    use llm_multimodal::{MediaPartOrder, Modality};
+    use serde_json::{json, Value};
+
+    use crate::routers::grpc::{
+        multimodal::PlaceholderTokens, utils::process_chat_messages_with_placeholders,
+    };
+    const MODEL: &str = "Qwen/Qwen3-8B";
+    const OFF: &str = "<think>\n\n</think>\n\n";
+    const TURN: &str =
+        "{{ messages[-1].content }}{% if add_generation_prompt %}<|im_start|>assistant\n";
+    let normal = format!("{TURN}{{% if enable_thinking|default(true) %}}<think>{{% else %}}{{{{ '<think>\\n\\n</think>\\n\\n' }}}}{{% endif %}}{{% endif %}}");
+    let named = normal.replace(
+        "enable_thinking|default(true)",
+        "thinking_mode != 'disabled'",
+    );
+    let echo = format!("{{# enable_thinking #}}{TURN}{{{{ messages[-1].content }}}}{{% endif %}}");
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("tokenizer.json"),
+        r#"{"version":"1.0","model":{"type":"BPE","vocab":{"hi":0},"merges":[]}}"#,
+    )
+    .unwrap();
+    let allows = |template: Value, tools: bool, kwargs: Value, content: Value| {
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            json!({"chat_template":template}).to_string(),
+        )
+        .unwrap();
+        let tokenizer = llm_tokenizer::create_tokenizer(dir.path().to_str().unwrap()).unwrap();
+        let request = serde_json::from_value(json!({
+            "model":MODEL, "messages":[{"role":"user","content":content}],
+            "tools":tools.then(Vec::<Value>::new), "chat_template_kwargs":kwargs, "thinking_token_budget":0
+        })).unwrap();
+        let mut placeholders = PlaceholderTokens::default();
+        placeholders.insert(Modality::Image, "<image>".to_owned());
+        let render = |chat: &ChatCompletionRequest| {
+            process_chat_messages_with_placeholders(
+                chat,
+                tokenizer.as_ref(),
+                Some(&placeholders),
+                MediaPartOrder::Authored,
+                ProviderProfile::Generic,
+            )
+            .ok()
+            .map(|(rendered, _)| rendered)
+        };
+        let prompt = render(&request).unwrap().text;
+        if content.is_array() {
+            assert!(prompt.starts_with("hi\n<image>"));
+        }
+        chat_budget_has_disabled_thinking(
+            &request,
+            ProviderProfile::Generic,
+            tokenizer.as_ref(),
+            &prompt,
+            || ::symphony::formats::for_model_shared(MODEL),
+            render,
+        )
+    };
+    let off = json!({"enable_thinking":false});
+    for tools in [false, true] {
+        assert!(allows(json!(normal), tools, off.clone(), json!("hi")));
+    }
+    assert!(allows(
+        json!(normal),
+        false,
+        off.clone(),
+        json!("What does </think> mean?")
+    ));
+    assert!(allows(
+        json!(normal),
+        false,
+        off.clone(),
+        json!([
+            {"type":"text","text":"hi"},
+            {"type":"image_url","image_url":{"url":"https://example.com/image.png"}}
+        ])
+    ));
+    let templates =
+        json!([{"name":"default","template":normal},{"name":"tool_use","template":named}]);
+    assert!(!allows(templates.clone(), true, off.clone(), json!("hi")));
+    assert!(allows(
+        templates,
+        true,
+        json!({"thinking_mode":"disabled"}),
+        json!("hi")
+    ));
+    assert!(
+        !allows(json!(echo), true, off.clone(), json!(OFF)),
+        "a user-supplied close inside the header"
+    );
+    assert!(
+        !allows(
+            json!("{# enable_thinking #}{{ messages[-1].content }}"),
+            false,
+            off,
+            json!(OFF)
+        ),
+        "a close in history"
+    );
+}
+
 /// A tokenizer shaped like the DeepSeek-V4.1 renderer: `thinking` key,
 /// native effort names, thinking on by default, and V4.1's rendering
 /// capabilities declared.

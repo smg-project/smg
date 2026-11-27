@@ -10,7 +10,7 @@ use llm_tokenizer::{
 /// protocol crate; it is re-exported here, where the routers read it.
 pub use openai_protocol::worker::TagVocabulary;
 use openai_protocol::{
-    chat::{thinking_from_reasoning_effort, ChatCompletionRequest},
+    chat::{thinking_from_reasoning_effort, ChatCompletionRequest, ChatMessage, MessageContent},
     model_card::ModelCard,
     profile::ProviderProfile,
     worker::{ConstrainedDecoding, GrammarStart},
@@ -870,6 +870,78 @@ pub fn resolve_user_thinking(
         thinking,
         effort_thinking,
     )
+}
+
+/// Whether the selected chat renderer switched thinking off for this budget.
+pub fn chat_budget_has_disabled_thinking(
+    request: &ChatCompletionRequest,
+    provider: ProviderProfile,
+    tokenizer: &dyn Tokenizer,
+    prompt: &str,
+    format: impl FnOnce() -> Option<Arc<::symphony::Format>>,
+    render_history: impl FnOnce(&ChatCompletionRequest) -> Option<super::super::ProcessedMessages>,
+) -> bool {
+    if !request
+        .resolved_thinking_token_budget()
+        .is_ok_and(|budget| budget.is_some())
+    {
+        return false;
+    }
+    if let Some(enabled) = rendered_thinking_mode(
+        request.chat_template_kwargs.as_ref(),
+        request.effective_reasoning_effort(),
+        request.template_thinking_for(provider),
+        tokenizer,
+        provider,
+    ) {
+        return !enabled;
+    }
+    let Some(format) = format() else {
+        return false;
+    };
+    let Some(thought) = format.layout().and_then(|layout| layout.thought.as_ref()) else {
+        return false;
+    };
+    let (Some(opener), Some(close)) = (format.turn_opener(), thought.close.as_deref()) else {
+        return false;
+    };
+    let Some(before_close) = prompt
+        .strip_suffix(&*thought.after)
+        .and_then(|tail| tail.strip_suffix(close))
+    else {
+        return false;
+    };
+
+    // Render without the generation header. History, the selected tool template
+    // and its kwargs stay the same; a closing marker in history is no proof.
+    let mut without_header = request.clone();
+    without_header.add_generation_prompt = Some(false);
+    let Some(history) = render_history(&without_header) else {
+        return false;
+    };
+    if history.generation_prompt || history.text.is_empty() {
+        return false;
+    }
+    let Some(header) = before_close.strip_prefix(&history.text) else {
+        return false;
+    };
+    let Some(before) = header.strip_prefix(opener).map(str::trim) else {
+        return false;
+    };
+    // The added header can contain only the assistant role and the optional
+    // thought opener. A template may even echo the last turn inside its header.
+    if !before.is_empty()
+        && !(format.terminal_texts().any(|marker| marker == before)
+            && format.reasoning_open(header))
+    {
+        return false;
+    }
+    let generation_thought = prompt[history.text.len() + opener.len()..].trim();
+    let echoed = |text: &str| text.trim() == generation_thought || text.trim() == close;
+    !matches!(request.messages.last(), Some(ChatMessage::User { content, .. }) if match content {
+        MessageContent::Text(text) => echoed(text),
+        MessageContent::Parts(parts) => parts.iter().filter_map(|part| part.text()).any(echoed),
+    })
 }
 
 /// The mode a renderer with its own thinking rule renders for the request,

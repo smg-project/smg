@@ -38,6 +38,55 @@ SGLang with `pyzmq>=25.0.0` and `msgspec>=0.18.0`).
 
 ## Usage
 
+### Reasoning token budgets in Chat Completions
+
+Use `thinking_token_budget` or `custom_params.thinking_budget` on
+`POST /v1/chat/completions` to limit reasoning within a generated answer.
+Zero is an explicit budget. Reasoning mode and the total output token limit
+are controlled separately. For every backend, SMG reads `thinking_token_budget`
+first, in either JSON key order. It reads the nested field only when the
+top-level value is missing or null. An invalid effective budget returns HTTP 400.
+
+```json
+{
+  "model": "Qwen/Qwen3-8B",
+  "messages": [{"role": "user", "content": "Explain why a prime greater than 2 is odd."}],
+  "thinking_token_budget": 64
+}
+```
+
+**HTTP workers.** SGLang reads `custom_params.thinking_budget`. vLLM and
+TensorRT-LLM read `thinking_token_budget`. SMG uses its typed chat request
+path to send the selected worker its native field and preserve other
+`custom_params` entries. It buffers the full chat request body before
+contacting the worker. Clients can still stream the response with
+`stream: true`. For unknown runtimes and external providers, SMG keeps
+a single budget under the name the client used. If the client sends both
+names with a non-null top-level value, SMG sends that value under both
+names. A request with only null budget values uses the worker default.
+
+HTTP forwarding is independent of the worker's version, capability labels
+and strict-thinking setting. Enforcement depends on the upstream model and
+configuration. Omit the budget to use the worker default. Both `0` and `-1`
+reach the upstream as supplied.
+In SGLang strict thinking, `-1` removes even a finite server-wide cap for
+that request. TensorRT-LLM applies a finite budget separately to each
+reasoning block. Its GPT-OSS/Harmony path rejects finite budgets and accepts
+`reasoning_effort` instead. [SGLang thinking budgets](https://github.com/sgl-project/sglang/blob/v0.5.23/docs/docs/advanced_features/thinking_budget.mdx#L54-L97) · [TensorRT-LLM sampling parameters](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.3.0rc24/tensorrt_llm/sampling_params.py#L264) · [GPT-OSS/Harmony handling](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.3.0rc24/tensorrt_llm/serve/openai_server.py#L2075-L2081)
+
+**gRPC workers.** A finite budget from 0 through 4,294,967,295 requires a
+SGLang servicer advertising an active reasoning token filter or a vLLM
+servicer advertising a configured reasoning budget. SMG reads this capability
+from worker discovery. Leave the capability label out of manual registration.
+For SGLang, the request must use the reasoning grammar or its renderer must
+confirm thinking is disabled. A custom chat template with an ambiguous
+reasoning state receives HTTP 400 for a finite budget. TensorRT-LLM gRPC
+also returns HTTP 400 for a finite budget. Omission, `null` and `-1` all use
+the worker default on gRPC. On a mixed pool, the gateway places finite
+budgets on capable workers. Standalone SGLang and vLLM workers registered
+over direct ZMQ currently lack this capability label, so the gateway
+returns HTTP 400 for a finite budget on those routes.
+
 ### vLLM
 
 ```bash
