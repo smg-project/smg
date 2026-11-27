@@ -54,6 +54,8 @@ pub struct SglangGenerateRequestOptions {
     /// answers, read as absent; a Messages body names none.
     pub format_set_aside: FormatSetAside,
     pub require_reasoning: bool,
+    /// The chat renderer confirmed that the prompt disables thinking.
+    pub thinking_disabled: bool,
 }
 
 crate::impl_abort_for_drop_with_reason!(SglangSchedulerClient);
@@ -238,18 +240,14 @@ impl SglangSchedulerClient {
             },
         )?;
 
-        if sampling_params.thinking_token_budget.is_some() && !options.require_reasoning {
-            // A disabled template already keeps reasoning closed. Otherwise a
-            // first-token grammar may bypass the engine's reasoning filter.
-            let enable_thinking = body
-                .chat_template_kwargs
-                .as_ref()
-                .and_then(|kwargs| kwargs.get("enable_thinking"))
-                .and_then(serde_json::Value::as_bool)
-                .or_else(|| body.template_thinking());
-            if enable_thinking != Some(false) {
-                return Err("thinking_token_budget requires an active reasoning grammar on this SGLang request".into());
-            }
+        if sampling_params.thinking_token_budget.is_some()
+            && !options.require_reasoning
+            && !options.thinking_disabled
+        {
+            return Err(
+                "thinking_token_budget requires an active reasoning grammar on this SGLang request"
+                    .into(),
+            );
         }
 
         let grpc_request = proto::GenerateRequest {
@@ -1328,28 +1326,34 @@ mod tests {
     }
 
     #[test]
-    fn thinking_token_budget_preserves_an_explicitly_disabled_template() {
-        let build = |kwargs: serde_json::Value| {
-            let chat = serde_json::from_value(json!({"model": "test-model", "messages": [],
-                "chat_template_kwargs": kwargs, "thinking_token_budget": 0}))
-            .unwrap();
+    fn thinking_token_budget_requires_a_grammar_or_a_rendered_off_switch() {
+        let chat = serde_json::from_value(json!({"model": "m", "messages": [],
+            "chat_template_kwargs": {"enable_thinking": false}, "thinking_token_budget": 0}))
+        .unwrap();
+        let build = |require_reasoning, thinking_disabled| {
             SglangSchedulerClient::build_generate_request_from_chat_parts(
                 "budget".into(),
                 &chat,
                 "hello".into(),
                 vec![1],
-                Default::default(),
+                SglangGenerateRequestOptions {
+                    require_reasoning,
+                    thinking_disabled,
+                    ..Default::default()
+                },
             )
         };
-        assert!(build(json!({}))
+        assert!(build(false, false)
             .unwrap_err()
             .contains("active reasoning grammar"));
-        let request = build(json!({"enable_thinking": false})).unwrap();
-        assert!(!request.require_reasoning);
-        assert_eq!(
-            request.sampling_params.unwrap().thinking_token_budget,
-            Some(0)
-        );
+        for (require_reasoning, disabled) in [(true, false), (false, true)] {
+            let request = build(require_reasoning, disabled).unwrap();
+            assert_eq!(request.require_reasoning, require_reasoning);
+            assert_eq!(
+                request.sampling_params.unwrap().thinking_token_budget,
+                Some(0)
+            );
+        }
     }
 
     #[test]

@@ -79,7 +79,9 @@ SGLang servicer advertising an active reasoning token filter or a vLLM
 servicer advertising a configured reasoning budget. SMG reads this capability
 from worker discovery. Leave the capability label out of manual registration.
 For SGLang, the request must use the reasoning grammar or its renderer must
-confirm thinking is disabled. TensorRT-LLM gRPC returns HTTP 400 for a finite budget. Omission, `null` and `-1` all use
+confirm thinking is disabled. A custom chat template with an ambiguous
+reasoning state receives HTTP 400 for a finite budget. TensorRT-LLM gRPC
+also returns HTTP 400 for a finite budget. Omission, `null` and `-1` all use
 the worker default on gRPC. On a mixed pool, the gateway places finite
 budgets on capable workers. Standalone SGLang and vLLM workers registered
 over direct ZMQ currently lack this capability label, so the gateway

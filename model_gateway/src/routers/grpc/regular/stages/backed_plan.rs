@@ -166,6 +166,7 @@ pub(crate) fn build(
             format_set_aside,
             require_reasoning,
             first_token_grammar: first_token_tag || led_for_first_token,
+            thinking_disabled: false,
         },
     )
     .map_err(|e| {

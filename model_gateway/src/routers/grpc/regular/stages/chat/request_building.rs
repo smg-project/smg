@@ -92,9 +92,7 @@ pub(crate) async fn build_chat_backed_plan(
 ) -> Result<(ExecutionPlan, AttemptStamp, bool), Response> {
     let multimodal_data = helpers::assemble_prompt_media(ctx, "build_chat_backed_plan").await?;
 
-    // The plan needs the decision alone; the prompt's closed thought shapes the
-    // `auto` tag in `reading::decide`, which reads it with the decision.
-    let (require_reasoning, _thought_closed) = reasoning_decision(
+    let (require_reasoning, _) = reasoning_decision(
         ctx,
         chat_request,
         provider,
@@ -102,6 +100,55 @@ pub(crate) async fn build_chat_backed_plan(
         generation_prompt,
         continued_final_message,
     );
+    let thinking_disabled = !require_reasoning
+        && generation_prompt
+        && !continued_final_message
+        && ctx
+            .state
+            .routing_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.needs_thinking_budget)
+        && ctx.state.clients.as_ref().is_some_and(|clients| {
+            clients.builder().runtime_type() == smg_worker::identity::basic::RuntimeType::Sglang
+        })
+        && ctx.state.tokenizer.as_deref().is_some_and(|tokenizer| {
+            utils::chat_budget_has_disabled_thinking(
+                chat_request,
+                provider,
+                tokenizer,
+                &processed_text,
+                || {
+                    let names = ctx
+                        .components
+                        .parser_resolver
+                        .names_for(ctx.state.parser_names.as_ref(), &chat_request.model);
+                    match symphony::reading(
+                        crate::config::ParserChoice::Symphony,
+                        &names,
+                        &chat_request.model,
+                        &ctx.components.templates,
+                    ) {
+                        Ok(symphony::Reading::Table(format, _)) => Some(format),
+                        _ => None,
+                    }
+                },
+                |without_header| {
+                    let (placeholders, order) = ctx.state.chat_budget_media.as_deref().map_or(
+                        (None, llm_multimodal::MediaPartOrder::MediaFirst),
+                        |(order, placeholders)| (placeholders.as_ref(), *order),
+                    );
+                    utils::process_chat_messages_with_placeholders(
+                        &utils::request_as_rendered(without_header),
+                        tokenizer,
+                        placeholders,
+                        order,
+                        provider,
+                    )
+                    .ok()
+                    .map(|(history, _)| history)
+                },
+            )
+        });
 
     let (plan, stamp) = backed_plan::build(
         ctx,
@@ -123,7 +170,8 @@ pub(crate) async fn build_chat_backed_plan(
             )),
             settings,
         },
-        |client, request_id, processed_text, token_ids, options| {
+        |client, request_id, processed_text, token_ids, mut options| {
+            options.thinking_disabled = thinking_disabled;
             client.build_chat_request(request_id, chat_request, processed_text, token_ids, options)
         },
     )?;

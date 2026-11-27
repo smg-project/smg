@@ -59,6 +59,8 @@ pub struct GenerateRequestBuildOptions {
     /// the engine's request carries the constraint alone.
     pub format_set_aside: FormatSetAside,
     pub require_reasoning: bool,
+    /// A rendered chat prompt disables thinking; SGLang then needs no reasoning grammar.
+    pub thinking_disabled: bool,
     /// `tool_constraints` was led with the model's thought and its close for
     /// a worker whose engine starts the grammar at the first generated token:
     /// the request says so where its dialect has a switch for the gate behind
@@ -562,6 +564,7 @@ impl GrpcClient {
             tool_constraints,
             format_set_aside,
             require_reasoning,
+            thinking_disabled,
             first_token_grammar,
         } = options;
         let constraint = OutputConstraint {
@@ -594,6 +597,7 @@ impl GrpcClient {
                         tool_call_constraint: constraint.tool,
                         format_set_aside: constraint.set_aside,
                         require_reasoning,
+                        thinking_disabled,
                     },
                 )?;
                 req.extra_mm_inputs = extras;

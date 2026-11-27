@@ -10,7 +10,7 @@ use llm_tokenizer::{
 /// protocol crate; it is re-exported here, where the routers read it.
 pub use openai_protocol::worker::TagVocabulary;
 use openai_protocol::{
-    chat::{thinking_from_reasoning_effort, ChatCompletionRequest},
+    chat::{thinking_from_reasoning_effort, ChatCompletionRequest, ChatMessage, MessageContent},
     model_card::ModelCard,
     profile::ProviderProfile,
     worker::{ConstrainedDecoding, GrammarStart},
@@ -837,6 +837,78 @@ pub fn resolve_user_thinking(
     )
 }
 
+/// Whether the selected chat renderer switched thinking off for this budget.
+pub fn chat_budget_has_disabled_thinking(
+    request: &ChatCompletionRequest,
+    provider: ProviderProfile,
+    tokenizer: &dyn Tokenizer,
+    prompt: &str,
+    format: impl FnOnce() -> Option<Arc<::symphony::Format>>,
+    render_history: impl FnOnce(&ChatCompletionRequest) -> Option<super::super::ProcessedMessages>,
+) -> bool {
+    if !request
+        .resolved_thinking_token_budget()
+        .is_ok_and(|budget| budget.is_some())
+    {
+        return false;
+    }
+    if let Some(enabled) = rendered_thinking_mode(
+        request.chat_template_kwargs.as_ref(),
+        request.effective_reasoning_effort(),
+        request.template_thinking_for(provider),
+        tokenizer,
+        provider,
+    ) {
+        return !enabled;
+    }
+    let Some(format) = format() else {
+        return false;
+    };
+    let Some(thought) = format.layout().and_then(|layout| layout.thought.as_ref()) else {
+        return false;
+    };
+    let (Some(opener), Some(close)) = (format.turn_opener(), thought.close.as_deref()) else {
+        return false;
+    };
+    let Some(before_close) = prompt
+        .strip_suffix(&*thought.after)
+        .and_then(|tail| tail.strip_suffix(close))
+    else {
+        return false;
+    };
+
+    // Render without the generation header. History, the selected tool template
+    // and its kwargs stay the same; a closing marker in history is no proof.
+    let mut without_header = request.clone();
+    without_header.add_generation_prompt = Some(false);
+    let Some(history) = render_history(&without_header) else {
+        return false;
+    };
+    if history.generation_prompt || history.text.is_empty() {
+        return false;
+    }
+    let Some(header) = before_close.strip_prefix(&history.text) else {
+        return false;
+    };
+    let Some(before) = header.strip_prefix(opener).map(str::trim) else {
+        return false;
+    };
+    // The added header can contain only the assistant role and the optional
+    // thought opener. A template may even echo the last turn inside its header.
+    if !before.is_empty()
+        && !(format.terminal_texts().any(|marker| marker == before)
+            && format.reasoning_open(header))
+    {
+        return false;
+    }
+    let generation_thought = prompt[history.text.len() + opener.len()..].trim();
+    let echoed = |text: &str| text.trim() == generation_thought || text.trim() == close;
+    !matches!(request.messages.last(), Some(ChatMessage::User { content, .. }) if match content {
+        MessageContent::Text(text) => echoed(text),
+        MessageContent::Parts(parts) => parts.iter().filter_map(|part| part.text()).any(echoed),
+    })
+}
+
 /// The mode a renderer with its own thinking rule renders for the request,
 /// asked with the inputs the render receives (`build_chat_template_kwargs`
 /// and `resolve_template_thinking` in `chat_utils` build the same for the
@@ -1440,6 +1512,111 @@ mod tests {
         fn thinking_key_name(&self) -> Option<ThinkingKeyName> {
             Some(ThinkingKeyName::ThinkingMode)
         }
+    }
+
+    #[test]
+    fn sglang_thinking_budget_checks_the_selected_templates_generation_header() {
+        use llm_multimodal::{MediaPartOrder, Modality};
+        use serde_json::{json, Value};
+
+        use crate::routers::grpc::{
+            multimodal::PlaceholderTokens, utils::process_chat_messages_with_placeholders,
+        };
+        const MODEL: &str = "Qwen/Qwen3-8B";
+        const OFF: &str = "<think>\n\n</think>\n\n";
+        const TURN: &str =
+            "{{ messages[-1].content }}{% if add_generation_prompt %}<|im_start|>assistant\n";
+        let normal = format!("{TURN}{{% if enable_thinking|default(true) %}}<think>{{% else %}}{{{{ '<think>\\n\\n</think>\\n\\n' }}}}{{% endif %}}{{% endif %}}");
+        let named = normal.replace(
+            "enable_thinking|default(true)",
+            "thinking_mode != 'disabled'",
+        );
+        let echo =
+            format!("{{# enable_thinking #}}{TURN}{{{{ messages[-1].content }}}}{{% endif %}}");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer.json"),
+            r#"{"version":"1.0","model":{"type":"BPE","vocab":{"hi":0},"merges":[]}}"#,
+        )
+        .unwrap();
+        let allows = |template: Value, tools: bool, kwargs: Value, content: Value| {
+            std::fs::write(
+                dir.path().join("tokenizer_config.json"),
+                json!({"chat_template":template}).to_string(),
+            )
+            .unwrap();
+            let tokenizer = llm_tokenizer::create_tokenizer(dir.path().to_str().unwrap()).unwrap();
+            let request = serde_json::from_value(json!({
+                "model":MODEL, "messages":[{"role":"user","content":content}],
+                "tools":tools.then(Vec::<Value>::new), "chat_template_kwargs":kwargs, "thinking_token_budget":0
+            })).unwrap();
+            let mut placeholders = PlaceholderTokens::default();
+            placeholders.insert(Modality::Image, "<image>".to_owned());
+            let render = |chat: &ChatCompletionRequest| {
+                process_chat_messages_with_placeholders(
+                    chat,
+                    tokenizer.as_ref(),
+                    Some(&placeholders),
+                    MediaPartOrder::Authored,
+                    ProviderProfile::Generic,
+                )
+                .ok()
+                .map(|(rendered, _)| rendered)
+            };
+            let prompt = render(&request).unwrap().text;
+            if content.is_array() {
+                assert!(prompt.starts_with("hi\n<image>"));
+            }
+            chat_budget_has_disabled_thinking(
+                &request,
+                ProviderProfile::Generic,
+                tokenizer.as_ref(),
+                &prompt,
+                || ::symphony::formats::for_model_shared(MODEL),
+                render,
+            )
+        };
+        let off = json!({"enable_thinking":false});
+        for tools in [false, true] {
+            assert!(allows(json!(normal), tools, off.clone(), json!("hi")));
+        }
+        assert!(allows(
+            json!(normal),
+            false,
+            off.clone(),
+            json!("What does </think> mean?")
+        ));
+        assert!(allows(
+            json!(normal),
+            false,
+            off.clone(),
+            json!([
+                {"type":"text","text":"hi"},
+                {"type":"image_url","image_url":{"url":"https://example.com/image.png"}}
+            ])
+        ));
+        let templates =
+            json!([{"name":"default","template":normal},{"name":"tool_use","template":named}]);
+        assert!(!allows(templates.clone(), true, off.clone(), json!("hi")));
+        assert!(allows(
+            templates,
+            true,
+            json!({"thinking_mode":"disabled"}),
+            json!("hi")
+        ));
+        assert!(
+            !allows(json!(echo), true, off.clone(), json!(OFF)),
+            "a user-supplied close inside the header"
+        );
+        assert!(
+            !allows(
+                json!("{# enable_thinking #}{{ messages[-1].content }}"),
+                false,
+                off,
+                json!(OFF)
+            ),
+            "a close in history"
+        );
     }
 
     /// A tokenizer shaped like the DeepSeek-V4.1 renderer: `thinking` key,

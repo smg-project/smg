@@ -7,7 +7,7 @@
 use std::{sync::Arc, time::Instant};
 
 use axum::http::HeaderMap;
-use llm_multimodal::registry::transcription::TranscriptionFamily;
+use llm_multimodal::{registry::transcription::TranscriptionFamily, MediaPartOrder};
 use llm_tokenizer::{stop::StopSequenceDecoder, traits::Tokenizer, TokenizerRegistry};
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatCompletionResponse},
@@ -41,7 +41,7 @@ use super::{
     },
     multimodal::{
         ec_push::PushEncodePlan, InflightPermit, MediaPlan, MultimodalComponents,
-        MultimodalIntermediate,
+        MultimodalIntermediate, PlaceholderTokens,
     },
     proto_wrapper::{
         EncodeItemBootstrapInfo, ProtoEmbedComplete, ProtoEmbedRequest, ProtoGenerateRequest,
@@ -285,6 +285,8 @@ pub(crate) struct ProcessingState {
     /// second replay of the same prompt (`reading::reasoning_decision`). `None` where the
     /// endpoint's preparation reads no prompt; a decision then replays itself.
     pub prompt_thought: Option<PromptReplay>,
+    /// The media inputs for re-rendering a budgeted chat without its generation header.
+    pub chat_budget_media: Option<Box<(MediaPartOrder, Option<PlaceholderTokens>)>>,
     /// The table decision for the request's model under its parser (`regular::symphony::reading`:
     /// the table that reads the response, or why the legacy parsers do), as the chat and Messages
     /// preparations made it once for the replay, the constraint and the decoder's special tokens
