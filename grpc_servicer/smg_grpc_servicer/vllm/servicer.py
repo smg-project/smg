@@ -33,6 +33,7 @@ from vllm.multimodal.inputs import (
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind, StructuredOutputsParams
 
+from smg_grpc_servicer.constrained_decoding import structural_tag_vocabulary
 from smg_grpc_servicer.kv_relay import Engine, relay
 from smg_grpc_servicer.load_record import engine_load_from
 from smg_grpc_servicer.tokenizer_bundle import tokenizer_bundle, tokenizer_chunks
@@ -1072,6 +1073,14 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         # older package.
         if "cache_partition_fields" in info.DESCRIPTOR.fields_by_name:
             info.cache_partition_fields = "cache_salt"
+        # The vocabulary of structural-tag nodes the engine's grammar backend
+        # takes, as the Rust launcher reports it: the Router spells an older
+        # xgrammar's structural tags in the older vocabulary.
+        if "structural_tag_vocabulary" in info.DESCRIPTOR.fields_by_name:
+            view = EngineConfigView(self.engine.vllm_config)
+            info.structural_tag_vocabulary = structural_tag_vocabulary(
+                str(view.structured_outputs.backend or "auto")
+            )
         ec_config = getattr(self.engine.vllm_config, "ec_transfer_config", None)
         if "supports_ec_transfer" in info.DESCRIPTOR.fields_by_name:
             info.supports_ec_transfer = ec_config is not None
