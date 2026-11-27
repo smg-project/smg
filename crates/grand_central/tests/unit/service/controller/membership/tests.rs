@@ -3718,6 +3718,59 @@ fn every_write_of_a_provider_leaves_its_audit_line() {
     }
 }
 
+/// A provider's write on a replica that does not lead leaves a refusal's
+/// audit line under the call's own name: the code and the words the fence
+/// answered, and a removal's asker. No line holds the URL or the
+/// provider's key.
+#[test]
+fn a_write_refused_where_the_replica_does_not_lead_leaves_its_audit_line() {
+    let lines = Logged::default();
+    let writer = lines.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _beside = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+    let _kept = tracing::subscriber::set_default(subscriber);
+
+    let (_store, door) = door();
+    let follower = ReplicaMembershipWriter::new(Arc::new(door), operator(), || {
+        Err(Status::failed_precondition("this replica does not lead"))
+    });
+    let key = "private/provider-key";
+    let maker = found(key);
+    let refused = Err(MembershipWriteRefused::NotLeading(
+        "this replica does not lead".to_owned(),
+    ));
+    assert_eq!(follower.found_one(&maker, URL, &|_| found_facts()), refused);
+    let seen = RowRevision {
+        row: WorkerId(1),
+        revision: 1,
+    };
+    assert_eq!(
+        follower.drained(Remover::Provider("cluster"), URL, seen),
+        refused
+    );
+
+    let logged = String::from_utf8(lines.0.lock().clone()).expect("the lines are text");
+    let lines: Vec<&str> = logged.lines().collect();
+    let want = [("worker registration", false), ("worker drain", true)];
+    assert_eq!(lines.len(), want.len(), "{logged}");
+    for (line, (call, asked)) in lines.iter().zip(want) {
+        let refusal = format!(
+            "call=\"{call}\" by=operator-a code=FailedPrecondition why=\"this replica does not lead\""
+        );
+        assert!(
+            line.contains("membership call refused") && line.contains(&refusal),
+            "{line}"
+        );
+        assert_eq!(line.contains("asker=\"cluster\""), asked, "{line}");
+    }
+    for private in [URL, key] {
+        assert!(!logged.contains(private), "{logged}");
+    }
+}
+
 #[test]
 fn a_registration_states_its_bootstrap_port_and_a_change_of_it_is_made_in_place() {
     let (store, door) = door();
