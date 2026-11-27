@@ -19,6 +19,7 @@ on:
       - model_gateway/src/discovery_host.rs
       - model_gateway/src/discovery_host/**
       - model_gateway/src/mesh/discovery/**
+      - model_gateway/tests/unit/mesh/discovery/**
       # The start/skip gating for both discoveries now lives in `startup`,
       # and `cli/configure.rs` owns the CLI -> discovery-config conversion
       # feeding it.
@@ -26,10 +27,12 @@ on:
       - model_gateway/src/cli/mod.rs
       - model_gateway/src/cli/configure.rs
       - model_gateway/src/config/**
+      - model_gateway/tests/unit/config/**
       # What a discovered worker becomes: its endpoint, and the workflow that
       # registers it.
       - crates/worker/src/identity/endpoint.rs
       - model_gateway/src/workflow/**
+      - model_gateway/tests/unit/workflow/**
       - crates/workflow/**
       - crates/worker/src/workflow/**
       - crates/worker/src/workflow.rs
