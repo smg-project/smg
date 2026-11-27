@@ -397,9 +397,9 @@ impl<'a> PairingJson<'a> {
 
 /// Takes a redacted page at `now`, limited by row count and by the bytes
 /// its JSON takes ([`WorkerRowsPage`]), written compact. A host that writes
-/// the page another way, as with indentation, writes more. A row admitted
-/// after `now` reads as new at that instant. The first row must fit the
-/// byte bound too.
+/// the page another way, as with indentation, can write more. A row
+/// admitted after `now` reads as new at that instant. The first row must
+/// fit the byte bound too.
 pub fn worker_rows_page(asked: &WorkerRowsQuery, read: Rows, now: Instant) -> WorkerRowsPage {
     counted_page(asked, read, now).0
 }
@@ -595,9 +595,10 @@ pub(crate) fn without_userinfo(address: &str) -> Option<String> {
 
 /// The bytes the JSON writer writes for `value`, written compact. The
 /// count goes through the writer itself, so it holds no second copy of the
-/// JSON's layout. No value counted here fails to write: its maps are keyed
-/// by texts, and the writer that counts takes every byte. A count that
-/// failed all the same would be past any bound.
+/// JSON's layout. No value a page counts fails to write: its maps are
+/// keyed by texts, and the writer that counts takes every byte. A count
+/// that failed all the same reads as the largest number, past the page's
+/// bound.
 fn written<T: Serialize>(value: &T) -> usize {
     let mut counted = Counted(0);
     match serde_json::to_writer(&mut counted, value) {
