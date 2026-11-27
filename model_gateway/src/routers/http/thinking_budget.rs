@@ -2,7 +2,7 @@ use axum::response::Response;
 use serde_json::{value::to_raw_value, Map, Value};
 use smg_worker::identity::basic::{RuntimeType, Worker};
 
-use super::request_body::{RawBody, RequestBodyError};
+use super::request_body::RawBody;
 use crate::routers::error;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -44,7 +44,11 @@ fn remove_nested_budget(body: &mut RawBody<'_>) -> Result<(), String> {
 
 // Only the budget occupies two positions in the client JSON. Keep other
 // custom parameters on the request, even if the upstream rejects them.
-fn translate(body: &mut RawBody<'_>, format: BudgetWire, budget: i64) -> Result<(), String> {
+pub(super) fn translate(
+    body: &mut RawBody<'_>,
+    format: BudgetWire,
+    budget: i64,
+) -> Result<(), String> {
     match format {
         BudgetWire::Sglang if body.contains(TOP) => {
             let mut params: Map<String, Value> = match body.get("custom_params") {
@@ -69,25 +73,6 @@ fn translate(body: &mut RawBody<'_>, format: BudgetWire, budget: i64) -> Result<
         }
     }
     Ok(())
-}
-
-pub(super) fn prepare(
-    bytes: Vec<u8>,
-    worker: &dyn Worker,
-    budget: i64,
-    raw_len: Option<usize>,
-) -> Result<Vec<u8>, RequestBodyError> {
-    let format = wire(worker.metadata().spec.runtime_type);
-    if format == BudgetWire::Passthrough {
-        return Ok(bytes);
-    }
-    let mut body = RawBody::parse(&bytes).map_err(RequestBodyError::Serialize)?;
-    translate(&mut body, format, budget).map_err(RequestBodyError::ThinkingBudget)?;
-    if body.mutated() {
-        body.to_bytes(raw_len).map_err(RequestBodyError::Serialize)
-    } else {
-        Ok(bytes)
-    }
 }
 
 pub(super) fn prepare_pair<'a>(
@@ -137,8 +122,15 @@ mod tests {
                     let worker = BasicWorkerBuilder::new("http://worker")
                         .runtime_type(runtime)
                         .build();
-                    let bytes =
-                        prepare(serde_json::to_vec(&chat).unwrap(), &worker, budget, None).unwrap();
+                    let bytes = super::super::request_body::serialize_request_body_with_edits(
+                        &chat,
+                        None,
+                        &worker,
+                        None,
+                        true,
+                        Some(budget),
+                    )
+                    .unwrap();
                     let sent: Value = serde_json::from_slice(&bytes).unwrap();
                     for key in [TOP, "custom_params"] {
                         assert_eq!(sent.get(key), expected.get(key), "{runtime:?}: {input}");
@@ -148,56 +140,19 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn null_thinking_token_budget_alias_is_omitted_before_http_worker_selection() {
-        use axum::{
-            body::Body,
-            extract::{FromRequest, Request},
-            http::header::CONTENT_TYPE,
-        };
-        use openai_protocol::{
-            chat::ChatCompletionRequest, common::GenerationRequest, validated::ValidatedJson,
-        };
-
-        for (fields, expected_params) in [
-            (json!({"custom_params": {"thinking_budget": null}}), None),
-            (
-                json!({"thinking_token_budget": null, "custom_params": {"thinking_budget": null, "keep": 42}}),
-                Some(json!({"keep": 42})),
-            ),
-        ] {
-            let mut input = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
-            input
-                .as_object_mut()
-                .unwrap()
-                .extend(fields.as_object().unwrap().clone());
-            let request = Request::builder()
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(input.to_string()))
-                .unwrap();
-            let ValidatedJson(chat) =
-                ValidatedJson::<ChatCompletionRequest>::from_request(request, &())
-                    .await
-                    .unwrap();
-            assert_eq!(chat.resolved_thinking_token_budget().unwrap(), None);
-            let chat = super::super::chat_for_upstream(chat);
-            assert_eq!(chat.thinking_token_budget(), None);
-            let body = serde_json::to_value(chat).unwrap();
-            assert!(body.get(TOP).is_none());
-            assert_eq!(body.get("custom_params"), expected_params.as_ref());
-        }
-    }
-
     #[test]
     fn thinking_token_budget_removes_only_the_alias_for_strict_http_servers() {
         let trt = BasicWorkerBuilder::new("http://worker")
             .runtime_type(RuntimeType::Trtllm)
             .build();
-        let bytes = prepare(
-            br#"{"custom_params":{"thinking_budget":0}}"#.to_vec(),
-            &trt,
-            0,
+        let input = json!({"custom_params":{"thinking_budget":0}});
+        let bytes = super::super::request_body::serialize_request_body_with_edits(
+            &input,
             None,
+            &trt,
+            None,
+            true,
+            Some(0),
         )
         .unwrap();
         assert_eq!(

@@ -112,7 +112,7 @@ use crate::{
         },
         http::{
             request_body::{
-                serialize_request_body, serialize_request_body_preserving_fields, RequestBodyError,
+                serialize_request_body, serialize_request_body_with_edits, RequestBodyError,
             },
             request_stream::{CappedBodyStream, StreamProgress},
             stream_failure::{cause, head_success_recorded, RelaySource},
@@ -961,24 +961,15 @@ impl Router {
             .serialize_with(|view| {
                 if let Some(adapter) = decision_adapter {
                     serialize_request_body(adapter.request(), canonical_model, worker, raw_body_len)
-                } else if matches!(route, "/v1/decisions" | "/v1/systemone") {
-                    serialize_request_body_preserving_fields(
-                        view.request,
-                        canonical_model,
-                        worker,
-                        raw_body_len,
-                    )
                 } else {
-                    let bytes = serialize_request_body(
+                    serialize_request_body_with_edits(
                         view.request,
                         canonical_model,
                         worker,
                         raw_body_len,
-                    )?;
-                    let Some(budget) = view.request.thinking_token_budget() else {
-                        return Ok(bytes);
-                    };
-                    super::thinking_budget::prepare(bytes, worker, budget, raw_body_len)
+                        !matches!(route, "/v1/decisions" | "/v1/systemone"),
+                        view.request.thinking_token_budget(),
+                    )
                 }
             })
             .map_err(|failure| match failure {

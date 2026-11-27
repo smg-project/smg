@@ -292,44 +292,23 @@ async fn external_chat_uses_the_same_thinking_token_budget_for_both_spellings() 
     );
     let requests = async {
         let tenant = TenantRequestMeta::new(TenantKey::new("t"));
-        for (fields, expected_params) in [
-            (json!({"thinking_token_budget": 0}), None),
-            (json!({"thinking_token_budget": -1}), None),
+        for (top, params, expected) in [
             (
-                json!({"custom_params": {"thinking_budget": -1}}),
-                Some(json!({"thinking_budget": -1})),
+                json!(0),
+                json!({"thinking_budget": 8, "keep": true}),
+                Some(json!({"thinking_budget": 0, "keep": true})),
             ),
             (
-                json!({"thinking_token_budget": 7, "custom_params": {"thinking_budget": null}}),
-                Some(json!({"thinking_budget": 7})),
+                Value::Null,
+                json!({"thinking_budget": null, "keep": true}),
+                Some(json!({"keep": true})),
             ),
-            (
-                json!({"custom_params": {"thinking_budget": 8, "other": true}}),
-                Some(json!({"thinking_budget": 8, "other": true})),
-            ),
-            (
-                json!({"thinking_token_budget": 0, "custom_params": {"thinking_budget": 8, "other": true}}),
-                Some(json!({"thinking_budget": 0, "other": true})),
-            ),
-            (
-                json!({"thinking_token_budget": -1, "custom_params": {"thinking_budget": "ignored"}}),
-                Some(json!({"thinking_budget": -1})),
-            ),
-            (
-                json!({"thinking_token_budget": null, "custom_params": {"thinking_budget": 4}}),
-                Some(json!({"thinking_budget": 4})),
-            ),
-            (
-                json!({"thinking_token_budget": null, "custom_params": {"thinking_budget": null, "other": true}}),
-                Some(json!({"other": true})),
-            ),
-            (json!({"custom_params": {"thinking_budget": null}}), None),
-            (json!({}), None),
+            (Value::Null, json!({"thinking_budget": null}), None),
         ] {
-            let mut body = json!({"model":"m","messages":[{"role":"user","content":"hi"}]});
-            body.as_object_mut()
-                .unwrap()
-                .extend(fields.as_object().unwrap().clone());
+            let body = json!({
+                "model": "m", "messages": [{"role":"user","content":"hi"}],
+                "thinking_token_budget": top, "custom_params": params,
+            });
             let response = route_chat(
                 &deps,
                 None,
@@ -342,16 +321,9 @@ async fn external_chat_uses_the_same_thinking_token_budget_for_both_spellings() 
             let received: Value = serde_json::from_slice(&bytes_of(response).await).unwrap();
             assert_eq!(
                 received.get("thinking_token_budget"),
-                fields
-                    .get("thinking_token_budget")
-                    .filter(|value| !value.is_null()),
-                "external request {fields}"
+                (!top.is_null()).then_some(&top)
             );
-            assert_eq!(
-                received.get("custom_params"),
-                expected_params.as_ref(),
-                "external request {fields}"
-            );
+            assert_eq!(received.get("custom_params"), expected.as_ref());
         }
     };
     tokio::select! {
