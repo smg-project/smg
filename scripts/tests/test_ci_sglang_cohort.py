@@ -491,7 +491,9 @@ def test_start_hashes_exactly_the_manifest_bytes_it_validated(cohort, monkeypatc
     before = cohort.manifest.read_bytes()
     monkeypatch.setattr(api, "__file__", str(cohort.manifest.with_name("ci_sglang_cohort.py")))
     monkeypatch.setitem(sys.modules, "ci_sglang_cohort", api)
-    monkeypatch.delitem(sys.modules, "sitecustomize", raising=False)
+    # Record the original presence/value even when no startup module existed.
+    monkeypatch.setitem(sys.modules, "sitecustomize", object())
+    monkeypatch.delitem(sys.modules, "sitecustomize")
 
     def validate(path, *, manifest_bytes=None):
         assert manifest_bytes == before

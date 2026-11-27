@@ -89,6 +89,18 @@ def install_command(manifest_path, arguments, *, cwd=None):
     site = directory(target / f"lib/python{version[0]}.{version[1]}/site-packages")
     if site.is_relative_to(prefix):
         raise ValueError("Install site must be outside the interpreter prefix")
+    if prefix.is_relative_to(target):
+        raise ValueError("Install target must not contain the interpreter prefix")
+
+    # Every prefix scheme can encounter an existing entry, including arbitrary
+    # wheel data paths. Refuse aliases before pip can write through them. This
+    # does not sandbox a backend or repair a partially installed target.
+    def walk_error(error):
+        raise error
+
+    for root, directories, files in os.walk(target, followlinks=False, onerror=walk_error):
+        if any((Path(root) / name).is_symlink() for name in directories + files):
+            raise ValueError("Private install target contains a symlink alias")
     if str(site) not in spec["import_roots"]:
         raise ValueError("Install scheme is absent from the cohort import contract")
     python = prefix / "bin/python"
@@ -110,7 +122,10 @@ def install_command(manifest_path, arguments, *, cwd=None):
         raise ValueError("Caller cannot override the private install destination")
 
     def editable(value):
-        project = directory((Path.cwd() if cwd is None else Path(cwd)) / value.split("[", 1)[0])
+        # Extras belong only to a trailing bracket expression. Brackets in a
+        # parent directory are part of the actual declared project path.
+        project_value = re.sub(r"\[[^/\[\]]+\]$", "", value)
+        project = directory((Path.cwd() if cwd is None else Path(cwd)) / project_value)
         roots = spec.get("editable_projects", {}).get(str(project))
         if not roots or any(str(directory(root)) not in spec["import_roots"] for root in roots):
             raise ValueError("Editable project requires explicit cohort import mapping")
@@ -128,6 +143,8 @@ def install_command(manifest_path, arguments, *, cwd=None):
         if argument.startswith("-"):
             name, equal, value = argument.partition("=")
             if name in TAIL_VALUES:
+                if name == "-e" and equal:
+                    raise ValueError("Use separate -e arguments or --editable=project")
                 if equal and not value:
                     raise ValueError("Empty pip option value")
                 if name in ("-e", "--editable") and equal:
@@ -195,6 +212,7 @@ def installed_records(manifest_path):
     major, minor = spec["python_version"]
     site = directory(target / f"lib/python{major}.{minor}/site-packages")
     found = {}
+    owners = {}
     for folder in site.glob("*.dist-info"):
         directory(folder)
         metadata, record = folder / "METADATA", folder / "RECORD"
@@ -213,7 +231,10 @@ def installed_records(manifest_path):
             path = site / row[0]
             if path.is_symlink() or not path.resolve().is_relative_to(target):
                 raise ValueError("Owned installed RECORD escapes its target")
-            paths.add(path.resolve())
+            resolved = path.resolve()
+            if owners.setdefault(resolved, name) != name:
+                raise ValueError("Owned RECORD path is claimed by multiple distributions")
+            paths.add(resolved)
         found[name] = paths
     return found
 
