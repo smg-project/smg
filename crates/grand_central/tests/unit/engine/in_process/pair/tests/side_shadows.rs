@@ -16,7 +16,7 @@ use crate::{
     engine::{
         decision::{LiftedVeto, ShadowKind},
         in_process::{
-            place::{Made, PlaceRequest},
+            request::{Made, PlaceRequest},
             with_shadow::tests::{Heard, Rule, Takes},
         },
         shadow::{ShadowSide, Shadowed, SHADOW_FLOOR},

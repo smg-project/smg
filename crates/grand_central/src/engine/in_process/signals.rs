@@ -76,7 +76,7 @@ use std::{sync::Arc, time::Instant};
 
 use smg_worker::load::state::LoadSnapshot;
 
-use super::{place::Made, Loaded, PoolMembers};
+use super::{request::Made, Loaded, PoolMembers};
 use crate::{
     document::spec::AppliedSpec,
     engine::{

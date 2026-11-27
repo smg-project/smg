@@ -10,7 +10,7 @@ mod target;
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeSet, HashMap},
-    ptr,
+    fmt, ptr,
     sync::{
         atomic::{self, AtomicU32},
         OnceLock,
@@ -38,11 +38,16 @@ use crate::{
     engine::{
         decision::{Queue, Shed, Target, Targets, Trace},
         decision_engine::{Decided, DecisionEngine},
-        framework::{Filter, Picker, Place, PoolWord, Scorer, TieBand, DRAW_FROM},
-        in_process::single::tests::ruled_ahead,
+        demands::Demands,
+        framework::{EncodeItems, Filter, Picker, Place, PoolWord, Scorer, TieBand, DRAW_FROM},
+        in_process::{
+            request::{HeaderRead, Prompt, PromptEntry, WorkerRule},
+            single::tests::ruled_ahead,
+        },
         list_cell::PublishedList,
+        prompt_hashes::HashSeeds,
         records::worker_id,
-        view::{fingerprint, Candidate, FixedFacts, HashKind},
+        view::{fingerprint, Candidate, FixedFacts, HashKind, MediaCounts, Phase},
         CacheIndex, CacheIndexes, EncodeLists, PairAdmission, PairLists, PartnerClasses,
     },
     policies::{

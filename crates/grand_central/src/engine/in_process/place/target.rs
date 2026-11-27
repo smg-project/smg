@@ -72,14 +72,17 @@ use std::{iter, sync::Arc};
 
 use smg_worker::identity::basic::Worker;
 
-use super::{admitted, hold_to_rule, Call, PlaceRequest, Unplaced, WorkerRule, ASKS};
+use super::{admitted, hold_to_rule, Unplaced, ASKS};
 #[cfg(feature = "controller")]
 use crate::engine::decision::{Decision, Shed};
 use crate::{
     document::spec::AppliedSpec,
     engine::{
         decision::{PairSide, ShedReason, TARGET_WORKER},
-        in_process::Loaded,
+        in_process::{
+            request::{Call, PlaceRequest, WorkerRule},
+            Loaded,
+        },
         list_cell::LentList,
         view::Role,
         PairLists, WorkerLists,

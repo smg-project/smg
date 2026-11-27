@@ -40,16 +40,17 @@
 
 use std::{sync::Arc, time::Instant};
 
-use super::{
-    decide, hold_to_rule, raise, ready_by, sendable, walk_naming_side, Call, Made, PlaceRequest,
-    Sent, Sides, Unplaced,
-};
+use super::{decide, hold_to_rule, raise, sendable, walk_naming_side, Sides, Unplaced};
 use crate::{
     engine::{
         decision::{PairSide, ShedReason, Target},
         decision_engine::DecisionRefused,
         framework::ShedOver,
-        in_process::{pair::shed_over, Loaded},
+        in_process::{
+            pair::shed_over,
+            request::{ready_by, Call, Made, PlaceRequest, Sent},
+            Loaded,
+        },
         list_cell::LentList,
         prefills_full,
         view::{Phase, WorkerId},

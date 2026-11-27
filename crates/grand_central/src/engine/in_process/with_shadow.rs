@@ -51,7 +51,7 @@ use std::{
 use smg_worker::{identity::basic::Worker, load::state::LoadSnapshot};
 
 use super::{
-    place::Made,
+    request::Made,
     single::{self, WholeDecision},
     InProcess, Loaded, PoolMembers,
 };

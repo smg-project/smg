@@ -16,7 +16,7 @@ use smg_worker::{
 
 use super::{
     super::{
-        place::{HeaderRead, PlaceRequest, Prompt},
+        request::{HeaderRead, PlaceRequest, Prompt},
         single::tests::{pool, request, ruled_ahead, Asks, MODEL},
     },
     *,

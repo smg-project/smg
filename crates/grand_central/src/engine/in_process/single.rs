@@ -68,7 +68,7 @@ use std::{
 
 use smg_worker::{identity::basic::Worker, load::state::LoadSnapshot, runtime::RoutingState};
 
-use super::{keys, overlap, place::Made, Loaded, PoolMembers};
+use super::{keys, overlap, request::Made, Loaded, PoolMembers};
 use crate::{
     engine::{
         decision::{Decision, Shed, ShedReason, Trace, NO_STAGE, SUBSET_HINT, WIRES},
@@ -168,7 +168,7 @@ pub(super) fn alone(
 }
 
 /// Whether the worker at the place `pick` names reads ready now
-/// ([`super::place::ready`]): the second read of it, behind the one that
+/// ([`super::request::ready`]): the second read of it, behind the one that
 /// found it eligible, as a noted pick's target has at its walk. Under a
 /// document whose session table alone takes a word on a lease a place is
 /// the whole answer where this holds. A pick whose worker turned not
@@ -182,7 +182,7 @@ pub(super) fn still_ready(pick: AlonePick, members: &PoolMembers) -> bool {
     members
         .workers()
         .get(pick.place as usize)
-        .is_some_and(|worker| super::place::ready(worker.as_ref()))
+        .is_some_and(|worker| super::request::ready(worker.as_ref()))
 }
 
 /// The short path's pick under a document that takes a word on a lease,

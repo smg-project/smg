@@ -2370,7 +2370,7 @@ pub fn decide<'p>(
 /// facts that holds it. A request decided inside a lent tree's match reads
 /// none of the list, and asks nothing.
 ///
-/// [`Made::hashed_whole`]: super::place::Made::hashed_whole
+/// [`Made::hashed_whole`]: super::request::Made::hashed_whole
 #[expect(
     clippy::too_many_arguments,
     reason = "what `decide` takes, and the prompt's hashes where the request's making left them out"
