@@ -17,7 +17,14 @@
 //! - [`refs`]: router-vs-worker processing resolution and the media-reference
 //!   payload for workers that process media themselves.
 
-use std::{collections::HashSet, fmt::Display, sync::Arc};
+use std::{
+    collections::HashSet,
+    fmt::Display,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 use axum::response::Response;
 use llm_multimodal::{
@@ -301,6 +308,76 @@ pub(crate) fn invalid_multimodal_request(error: impl Display) -> Response {
 /// request.
 pub(crate) fn log_mm_timing_enabled() -> bool {
     mm_settings().log_mm_timing.value
+}
+
+/// How often the media crate's buffer pool is asked to trim. It frees its
+/// idle buffers at the second tick in a row with no take between them, so
+/// 30 to 60 seconds after the last image request took a buffer.
+const POOL_TRIM_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Trims the media crate's buffer pool for the life of the process: a
+/// gateway at rest behind a burst of image requests gives back the buffers
+/// the burst left idle, up to the pool's bound and its one buffer of the top
+/// class.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a tick for the life of the process; nothing waits for it at shutdown"
+)]
+pub(crate) fn spawn_buffer_pool_trim() {
+    tokio::spawn(trim_on_a_period(
+        &POOL_TRIMMER,
+        llm_multimodal::buffer_pool::trim_if_quiet,
+    ));
+}
+
+/// Set while a task of this process holds the role of trimming the pool.
+static POOL_TRIMMER: AtomicBool = AtomicBool::new(false);
+
+/// The role of trimming the pool: one task of the process holds it at a
+/// time and gives it back when it goes with its runtime.
+struct TrimRole(&'static AtomicBool);
+
+impl TrimRole {
+    /// Takes the role behind `held` unless a live task holds it.
+    fn claim(held: &'static AtomicBool) -> Option<Self> {
+        // The guard is made only where the exchange won: one made on a lost
+        // exchange would give the role back at its drop.
+        held.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self(held))
+    }
+}
+
+impl Drop for TrimRole {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Calls `trim` every [`POOL_TRIM_EVERY`] while this task holds the role
+/// behind `held`. A process may start more than one router, every start
+/// spawns this task, and the pool compares two calls in a row whoever makes
+/// them: so one task trims at a time and the others wait for the role, which
+/// comes free when its holder goes with its runtime.
+async fn trim_on_a_period(held: &'static AtomicBool, trim: impl Fn() -> usize) {
+    let mut tick = tokio::time::interval(POOL_TRIM_EVERY);
+    // A late tick is not caught up: two ticks stay a period apart, so a
+    // trim always follows a whole period with no take.
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut role = None;
+    loop {
+        tick.tick().await;
+        if role.is_none() {
+            // Taken at one tick and used from the next: the holder before
+            // this one may have trimmed less than a period ago.
+            role = TrimRole::claim(held);
+            continue;
+        }
+        let freed = trim();
+        if freed > 0 {
+            tracing::debug!(freed, "the media buffer pool freed its idle buffers");
+        }
+    }
 }
 
 /// Output of the multimodal processing pipeline.
