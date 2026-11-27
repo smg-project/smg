@@ -313,9 +313,9 @@ jobs:
       contents: read
       packages: write
     env:
-      SMG_CI_GPU_RUNNER_BASE_IMAGE: ${{ vars.SMG_CI_GPU_RUNNER_BASE_IMAGE || 'ghcr.io/actions/actions-runner:2.337.0@sha256:5036480998280bb21e32ade9fe1b02b493861ac314b62ba1aea320b94f56ec97' }}
       SMG_CI_GPU_CARRIER_BASE_IMAGE: ${{ vars.SMG_CI_GPU_CARRIER_BASE_IMAGE || 'ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55' }}
       SMG_CI_GPU_RUNNER_CUDA_DRIVER_VERSION: ${{ vars.SMG_CI_GPU_RUNNER_CUDA_DRIVER_VERSION || '580.65.06' }}
+      SMG_CI_GPU_RUNNER_IMAGE_REPOSITORY: ${{ vars.SMG_CI_GPU_RUNNER_IMAGE_REPOSITORY || format('ghcr.io/{0}/smg', github.repository_owner) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v7

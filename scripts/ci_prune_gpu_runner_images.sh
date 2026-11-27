@@ -1,31 +1,30 @@
 #!/bin/bash
-# Delete superseded prebuilt GPU backend carrier and combined runner images from GHCR.
+# Delete superseded prebuilt GPU backend carrier images from GHCR.
 #
-# Each prefix (`ci-gpu-backend-vllm-`, `ci-gpu-backend-sglang-`,
-# `ci-gpu-backend-trtllm-`, `ci-gpu-runner-`) is pruned independently so
-# rebuilding one backend never evicts another. For each prefix, the currently
-# resolved tag is always protected, plus the newest SMG_GPU_IMAGE_KEEP (default
-# 2) versions so in-flight PRs on a recent base commit still find their image.
+# Each carrier prefix (`ci-gpu-backend-vllm-`, `ci-gpu-backend-sglang-`,
+# `ci-gpu-backend-trtllm-`) is pruned independently so rebuilding one backend
+# never evicts another. For each prefix, the currently resolved tag is always
+# protected, plus the newest SMG_GPU_IMAGE_KEEP (default 2) versions so
+# in-flight PRs on a recent base commit still find their image.
 #
-# Only versions whose tags ALL carry that exact prefix are eligible. Release,
-# nightly, and TokenSpeed tags in the same GHCR package are never touched.
+# Combined runner images (`ci-gpu-runner-*`) are deliberately NOT pruned here
+# because runner fleet rollout waits on a manual GPU canary and nothing in the
+# repo records which digest the live fleet still pulls. Release, nightly, and
+# TokenSpeed tags in the same GHCR package are also never touched.
 #
 # TOLERANT BY DESIGN: cleanup must never fail the publish it follows.
 #
 # Env knobs:
-#   SMG_GPU_IMAGE_KEEP  how many recent versions to keep per prefix (default 2)
-#   DRY_RUN=1           list what would be deleted, delete nothing
+#   SMG_GPU_IMAGE_KEEP                  versions to keep per prefix (default 2)
+#   SMG_CI_GPU_RUNNER_IMAGE_REPOSITORY  untagged GHCR repo (default ghcr.io/<owner>/smg)
+#   DRY_RUN=1                           list what would be deleted, delete nothing
 
 set -uo pipefail # deliberately NOT -e: every failure is a soft skip
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KEEP="${SMG_GPU_IMAGE_KEEP:-2}"
-OWNER="${GITHUB_REPOSITORY_OWNER:-smg-project}"
-PACKAGE="${SMG_GPU_IMAGE_PACKAGE:-smg}"
 
-DEFAULT_RUNNER_BASE="ghcr.io/actions/actions-runner:2.337.0@sha256:5036480998280bb21e32ade9fe1b02b493861ac314b62ba1aea320b94f56ec97"
 DEFAULT_CARRIER_BASE="ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55"
-RUNNER_BASE="${SMG_CI_GPU_RUNNER_BASE_IMAGE:-$DEFAULT_RUNNER_BASE}"
 CARRIER_BASE="${SMG_CI_GPU_CARRIER_BASE_IMAGE:-$DEFAULT_CARRIER_BASE}"
 DRIVER_VER="${SMG_CI_GPU_RUNNER_CUDA_DRIVER_VERSION:-580.65.06}"
 
@@ -40,12 +39,30 @@ if ! command -v gh &> /dev/null; then
     exit 0
 fi
 
+# Derive GHCR owner and URL-encoded package name from SMG_CI_GPU_RUNNER_IMAGE_REPOSITORY
+# when configured so pruning always targets the exact package published to.
+IMAGE_REPO="${SMG_CI_GPU_RUNNER_IMAGE_REPOSITORY:-}"
+if [ -n "$IMAGE_REPO" ]; then
+    if [[ "$IMAGE_REPO" =~ ^ghcr\.io/([a-z0-9._-]+)/([a-z0-9._/-]+)$ ]]; then
+        OWNER="${BASH_REMATCH[1]}"
+        RAW_PACKAGE="${BASH_REMATCH[2]}"
+        PACKAGE="${RAW_PACKAGE//\//%2F}"
+    else
+        log "SMG_CI_GPU_RUNNER_IMAGE_REPOSITORY='${IMAGE_REPO}' is not a valid ghcr.io/<owner>/<package> reference; skipping"
+        exit 0
+    fi
+else
+    OWNER="${GITHUB_REPOSITORY_OWNER:-smg-project}"
+    RAW_PACKAGE="${SMG_GPU_IMAGE_PACKAGE:-smg}"
+    PACKAGE="${RAW_PACKAGE//\//%2F}"
+fi
+
 # Fetch all package versions once; filter per prefix locally to avoid extra API calls.
 all_versions="$(gh api --paginate \
     "/orgs/${OWNER}/packages/container/${PACKAGE}/versions?per_page=100" \
     -q '.[] | select(.metadata.container.tags | length > 0) | [.id, .created_at, (.metadata.container.tags | join(","))] | @tsv' 2>&1)"
 if [ $? -ne 0 ]; then
-    log "listing package versions failed; skipping"
+    log "listing package versions for ${OWNER}/${RAW_PACKAGE} failed; skipping"
     log "${all_versions}"
     exit 0
 fi
@@ -59,7 +76,7 @@ prune_prefix() {
         log "could not resolve current tag for ${prefix}*; skipping prefix"
         return 0
     fi
-    log "prefix ${prefix}*: current=${current} (keeping newest ${KEEP})"
+    log "prefix ${prefix}* (${OWNER}/${RAW_PACKAGE}): current=${current} (keeping newest ${KEEP})"
 
     local matches sorted kept=0 deleted=0
     matches="$(awk -F'\t' -v p="$prefix" '
@@ -113,14 +130,7 @@ for backend in vllm sglang trtllm; do
     prune_prefix "ci-gpu-backend-${backend}-" "$current_tag"
 done
 
-runner_tag="$(python3 "${SCRIPT_DIR}/ci_gpu_runner_image.py" tag \
-    --backend all \
-    --base-image "$RUNNER_BASE" \
-    --carrier-base-image "$CARRIER_BASE" \
-    --cuda-driver-version "$DRIVER_VER" 2> /dev/null || true)"
-prune_prefix "ci-gpu-runner-" "$runner_tag"
-
 log "total: kept ${total_kept}, deleted ${total_deleted}"
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-    echo "**Pruned GPU runner/carrier images:** kept ${total_kept}, deleted ${total_deleted}" >> "$GITHUB_STEP_SUMMARY"
+    echo "**Pruned GPU carrier images (${OWNER}/${RAW_PACKAGE}):** kept ${total_kept}, deleted ${total_deleted}" >> "$GITHUB_STEP_SUMMARY"
 fi

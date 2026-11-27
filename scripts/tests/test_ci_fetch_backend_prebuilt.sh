@@ -132,6 +132,25 @@ test_self_resolves_content_addressed_tag_when_env_unset() {
     assert_link_into "$T/opt-auto/trtllm" "$CACHE/trtllm/jobs"
 }
 
+test_self_resolves_nondefault_carrier_settings() {
+    setup
+    local custom_base="ubuntu:24.04@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    local custom_driver="590.10.01"
+    local custom_repo="ghcr.io/example/other"
+    local expected_tag
+    expected_tag="$(python3 "$REPO_ROOT/scripts/ci_gpu_runner_image.py" tag \
+        --backend vllm --base-image "$custom_base" --cuda-driver-version "$custom_driver")"
+    local out
+    out="$(run_fetch vllm "$T/opt-custom" "$T/usr-custom" 100 \
+        SMG_BACKEND_PREBUILT_IMAGE="" \
+        SMG_CI_GPU_CARRIER_BASE_IMAGE="$custom_base" \
+        SMG_CI_GPU_RUNNER_CUDA_DRIVER_VERSION="$custom_driver" \
+        SMG_CI_GPU_RUNNER_IMAGE_REPOSITORY="$custom_repo")"
+    assert_contains "$out" "Prebuilt image: ${custom_repo}:${expected_tag}"
+    assert_eq 1 "$(pull_count)" "pulled non-default image"
+    assert_link_into "$T/opt-custom/vllm" "$CACHE/vllm/jobs"
+}
+
 test_failed_pull_falls_back_softly() {
     setup
     local out; out="$(run_fetch vllm "$T/opt-fail" "$T/usr-fail" 100 FAKE_PULL_FAIL=1)"
@@ -170,6 +189,7 @@ tests=(
     test_warm_cache_skips_docker_entirely
     test_job_copies_are_private_and_cuda_is_shared_readonly
     test_self_resolves_content_addressed_tag_when_env_unset
+    test_self_resolves_nondefault_carrier_settings
     test_failed_pull_falls_back_softly
     test_concurrent_callers_pull_once
     test_stale_jobs_and_superseded_tags_are_swept
