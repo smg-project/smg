@@ -269,8 +269,8 @@ impl HeaderRead for CountedHeaders<'_> {
 
 /// A request whose host names a header for its id is kept under that
 /// header's value. Its own id wins over the header, and so does the id its
-/// host states by word. A request whose headers hold no such header is not
-/// counted: the requests that hold one are counted among themselves.
+/// host states by word. A request that states no id and whose headers hold
+/// no such header is not counted: it takes no step of the sample's count.
 #[test]
 fn a_request_with_no_id_is_found_by_the_header_its_host_names() {
     let engine = hosted(&sampling("round_robin", 1));

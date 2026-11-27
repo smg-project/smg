@@ -18,9 +18,9 @@
 //!
 //! Under a policy spec that keeps a sample of its decisions the gateway
 //! also restates the chosen id on the request, under the header
-//! `x-smg-request-id` (`restate`). The engine reads it there as the
-//! gateway's own id of the request, by the name a placement states to it,
-//! and no placement reads the header itself. That
+//! `x-smg-request-id` (`restate`). The engine reads what stands there
+//! as the gateway's own id of the request, by the name a placement
+//! states to it. That
 //! write is no part of this layer: the server installs it as a layer of its
 //! own inside the edge layers, behind this one, and under no other
 //! configuration, so this layer is the same for every gateway. The write
@@ -30,10 +30,11 @@
 //! any other: a request plugin sees it and can change it, and a policy spec
 //! that names it as a header reads what stands there. Under a spec that
 //! keeps no sample, and in a gateway that places with its classic policies,
-//! nothing is written there, and a client's value stays as it came. The one
-//! exception is a gateway whose configuration names that header as a
-//! request id header: this layer reads and rewrites it there, under a spec
-//! or under the classic policies.
+//! nothing is written there, and a client's value stays as it came. A
+//! configuration that names that header for a use of its own is served as
+//! for any header it names so. Named as a request id header, it is read
+//! and rewritten by this layer where it is the first configured header
+//! that is present.
 
 use std::{
     future::Future,
@@ -597,8 +598,9 @@ mod tests {
         assert_eq!(response.headers()["x-request-id"], "ok-1");
     }
 
-    /// What a reader of [`OWN_REQUEST_ID`] finds on `headers`: the first
-    /// value under the name, as the engine reads a header by its name.
+    /// What stands on `headers` under [`OWN_REQUEST_ID`]: the first value
+    /// under the name, where it is text. The engine's reader of a header
+    /// map takes the same first value, as its bytes.
     fn restated(headers: &http::HeaderMap) -> Option<&str> {
         headers.get(&OWN_REQUEST_ID)?.to_str().ok()
     }
