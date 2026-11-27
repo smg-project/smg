@@ -26,6 +26,10 @@ impl Lifecycle for Waits {
         assert!(!self.bursts, "the case's stage panics at a release");
         self.told.on_released(lease, reason);
     }
+
+    fn hears(&self) -> EventSet {
+        EventSet::of([EventKind::Issued, EventKind::Released])
+    }
 }
 
 impl Picker for Waits {

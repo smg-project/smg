@@ -17,6 +17,10 @@ impl Lifecycle for HeardSides {
     fn on_released(&self, lease: &Lease, reason: ReleaseReason) {
         self.0.lock().push((lease.side, lease.booked, Some(reason)));
     }
+
+    fn hears(&self) -> EventSet {
+        EventSet::of([EventKind::Issued, EventKind::Released])
+    }
 }
 
 impl Scorer for HeardSides {

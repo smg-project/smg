@@ -2659,7 +2659,8 @@ impl Picker for Hears {
 
 /// A host under the stock encode document whose encode side picks through
 /// a stage that keeps the issues it hears, and those issues. The engine
-/// tells every profile's picker each word, so one stage hears them all.
+/// tells a word to the stages of every profile that name it, and this
+/// stage names each: it hears them all.
 fn hearing(prefills: usize, decodes: usize, encoders: usize) -> (Host, Heard) {
     let heard = Heard::default();
     let kept = Arc::clone(&heard);

@@ -40,7 +40,10 @@ use crate::{
         memory::seam, DecodeSide, LeaseRecord, LeaseState, LeasesStore, MemoryStore, PickRecord,
         Position, StoreSnapshot,
     },
-    tracking::lease::{Dispatch, Lease, LeaseId, Membership, Outcome, ReleaseReason, Said, Side},
+    tracking::lease::{
+        Dispatch, EventKind, EventSet, Lease, LeaseId, Membership, Outcome, ReleaseReason, Said,
+        Side,
+    },
 };
 
 /// The filter a document gives the profile `moved` to build it anew.
@@ -106,6 +109,14 @@ impl Lifecycle for Notes {
             Membership::Added(joined) => self.note(Word::Joined(*joined)),
             _ => {}
         }
+    }
+
+    fn hears(&self) -> EventSet {
+        EventSet::of([
+            EventKind::Dispatched,
+            EventKind::Completed,
+            EventKind::Released,
+        ])
     }
 }
 
@@ -715,6 +726,10 @@ impl Lifecycle for Leaves {
             // A case that failed lets the gate go by dropping its end.
             let _gone = go.recv();
         }
+    }
+
+    fn hears(&self) -> EventSet {
+        EventSet::of([EventKind::Dispatched])
     }
 }
 

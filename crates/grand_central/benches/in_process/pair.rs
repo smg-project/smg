@@ -547,6 +547,7 @@ pub(super) fn runs(run: &Run) -> bool {
     }
     // A shadow profile decides beside a single request's decision.
     assert!(run.shadow == Shadowed::No, "a pair's cell runs no shadow");
+    assert!(run.other_models == 0, "a pair's cell states no other model");
     let side = |side: &str, worker_type| -> Arc<[Arc<dyn Worker>]> {
         let url = |at: usize| format!("http://{side}-{at:04}:8000");
         (0..run.workers)

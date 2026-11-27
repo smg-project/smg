@@ -27,7 +27,7 @@ use crate::{
     stages::{Best, HasCapacity, StageRegistry},
     store::GatewayId,
     tracking::{
-        lease::{Dispatch, Outcome, ReleaseReason, Said, TransportClass},
+        lease::{Dispatch, EventKind, EventSet, Outcome, ReleaseReason, Said, TransportClass},
         DecisionGuard,
     },
 };
@@ -100,6 +100,10 @@ impl Lifecycle for Hears {
 
     fn on_released(&self, lease: &Lease, _: ReleaseReason) {
         self.heard("released", lease, 0);
+    }
+
+    fn hears(&self) -> EventSet {
+        EventSet::LEASE
     }
 }
 
@@ -821,6 +825,10 @@ struct StopsAt(Side);
 impl Lifecycle for StopsAt {
     fn on_decision_issued(&self, lease: &Lease, _: &Decision) {
         assert!(lease.side != self.0, "this stage panics there");
+    }
+
+    fn hears(&self) -> EventSet {
+        EventSet::of([EventKind::Issued])
     }
 }
 

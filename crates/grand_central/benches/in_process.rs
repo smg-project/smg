@@ -41,7 +41,13 @@
 //! copy of the cell's profile as its binding's shadow, so each decision is
 //! followed by its shadow profile's. `--shadow other` names that shadow at
 //! a binding of another model: the cell's decisions then have no shadow,
-//! under a document that names one. `--runtimes N` has the host state a
+//! under a document that names one. `--other-models N` states `N` other
+//! models ahead of the cell's own, each bound to a copy of the cell's
+//! profile under a name of its own: the document then holds `N` more
+//! profiles, as one that gives each model a profile does. No request
+//! names one of them. A single request's cell alone takes the switch,
+//! and a run under it says `N` on its row.
+//! `--runtimes N` has the host state a
 //! fact of each worker beside its object: the number of one of `N` runtimes
 //! by the worker's place, as a gateway that dials several runtimes states
 //! it; `0`, the default, states nothing. The two cells named `on_runtime`
@@ -764,6 +770,9 @@ struct Run {
     /// How many decodes at the end of a pair's cell have no room at their
     /// host's gate: the bench's `pair` file reads it.
     no_room: usize,
+    /// How many other models the document states, each bound to a copy of
+    /// the cell's profile under a name of its own.
+    other_models: usize,
     overloaded: bool,
     publish_ms: u64,
     /// What refuses every pair of a pair's cell: the bench's `pair` file
@@ -790,6 +799,7 @@ fn run() -> Run {
         entry: "decide_at".to_owned(),
         live_gates: false,
         no_room: 0,
+        other_models: 0,
         overloaded: false,
         publish_ms: 0,
         refused: pair::Refused::No,
@@ -820,6 +830,7 @@ fn run() -> Run {
             "--entry" => run.entry = place::named(&value),
             "--live-gates" => run.live_gates = number() != 0,
             "--no-room" => run.no_room = number() as usize,
+            "--other-models" => run.other_models = number() as usize,
             "--runtimes" => RUNTIMES.store(number() as u32, Ordering::Relaxed),
             "--overloaded" => run.overloaded = number() != 0,
             "--publish-ms" => run.publish_ms = number(),
@@ -1109,6 +1120,24 @@ fn main() {
             document.bindings[0].shadow = named;
         }
     }
+    if run.other_models != 0 {
+        // The cell's own binding stands behind the one a shadow of another
+        // model put ahead of it. Each other model takes a copy of it and of
+        // the profile it names, ahead of the cell's.
+        let own = document.bindings[usize::from(run.shadow == Shadowed::Other)].clone();
+        let live = own.profile.as_ref().expect("a binding of one profile");
+        let profile = document.profiles[live].clone();
+        let others = (0..run.other_models).map(|at| {
+            let name = format!("other-model-{at:05}");
+            document.profiles.insert(name.clone(), profile.clone());
+            let mut other = own.clone();
+            name.clone_into(&mut other.matcher.model);
+            other.profile = Some(name);
+            other
+        });
+        let others: Vec<_> = others.collect();
+        document.bindings.splice(0..0, others);
+    }
     let spec = AppliedSpec::validate(&document).expect("a valid document");
     let engine: &'static InProcess = Box::leak(Box::new(InProcess::new(spec)));
     behind(engine);
@@ -1300,6 +1329,11 @@ fn measure(
     // A run that walked says so on its row: its times hold the walk.
     if run.cold_kb > 0 {
         print!(" cold_kb={}", run.cold_kb);
+    }
+    // A run beside other models says so too: its times are of the
+    // document that holds them.
+    if run.other_models > 0 {
+        print!(" other_models={}", run.other_models);
     }
     // The words a file of its own adds, then the cell's, and the line's end.
     print!("{}", place::word());

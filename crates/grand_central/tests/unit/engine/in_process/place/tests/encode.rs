@@ -88,10 +88,10 @@ fn keeping() -> PolicySpec {
 }
 
 /// An engine under `document`, and what its stages heard of each lease.
-/// One more profile, which no binding names, picks by [`InOrder`]: every
-/// profile's stages hear every lease, so that picker hears each word once
-/// and picks for no request. The encode side's [`ByItem`] is at hand under
-/// its name.
+/// One more profile, which no binding names, picks by [`InOrder`]: a
+/// lease's word goes to the stages of every profile that name it, so that
+/// picker hears each word once and picks for no request. The encode
+/// side's [`ByItem`] is at hand under its name.
 fn hearing(mut document: PolicySpec) -> (&'static InProcess, Heard) {
     let heard = Heard::default();
     let kept = Arc::clone(&heard);

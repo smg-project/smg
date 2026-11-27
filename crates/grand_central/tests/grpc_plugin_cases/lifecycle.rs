@@ -732,9 +732,10 @@ fn an_observe_answer_past_the_message_bound_is_refused_by_its_length() {
 }
 
 /// A build that binds the plugin to two profiles takes both bound sets from
-/// one binder: the engine hands an event to every profile and the plugin
-/// hears it once. An engine built later over the same plugin has an observer
-/// of its own, beside the first engine and once it is gone.
+/// one binder: the engine hands an event to the stages of each profile that
+/// take it, and the plugin hears it once. An engine built later over the
+/// same plugin has an observer of its own, beside the first engine and once
+/// it is gone.
 #[test]
 fn the_lifecycle_reaches_the_plugin_once_per_engine_build() {
     let served = TestPlugin::serve();

@@ -58,7 +58,9 @@ use crate::{
         DecodeIssue, DecodeMark, GatewayId, HealthSink, LeaseState, LeasesStore, MembershipChange,
         MemoryStore, Registrant, WorkerFacts, WorkerStatus, WorkersStore,
     },
-    tracking::lease::{Dispatch, Lease, LeaseId, ReleaseReason, Said, Side, DISPATCH_TTL},
+    tracking::lease::{
+        Dispatch, EventKind, EventSet, Lease, LeaseId, ReleaseReason, Said, Side, DISPATCH_TTL,
+    },
     worker_host::{tests::stand, Members, Objects},
 };
 
@@ -1057,6 +1059,10 @@ impl Lifecycle for Told {
 
     fn on_released(&self, lease: &Lease, reason: ReleaseReason) {
         self.0.lock().push((lease.id.0, Some(reason)));
+    }
+
+    fn hears(&self) -> EventSet {
+        EventSet::of([EventKind::Issued, EventKind::Released])
     }
 }
 
