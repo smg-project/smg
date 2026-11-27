@@ -78,15 +78,5 @@ impl Event for RequestReceivedEvent {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::mem::size_of;
-
-    use super::*;
-
-    #[test]
-    fn test_event_sizes() {
-        assert_eq!(size_of::<RequestReceivedEvent>(), 0);
-        assert_eq!(size_of::<RequestSentEvent>(), 16);
-        assert_eq!(size_of::<RequestPDSentEvent>(), 32);
-    }
-}
+#[path = "../../tests/unit/observability/events/tests.rs"]
+mod tests;

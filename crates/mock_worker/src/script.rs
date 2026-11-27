@@ -30,6 +30,7 @@
 //! such answers are filed for the worker.
 
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::{
@@ -931,7 +932,8 @@ type OutputTable = Option<Arc<[u32]>>;
 /// tokens skipped; a part of a character is no text) and it is no
 /// end-of-sequence id. `None` where the tokenizer does not load from local
 /// files: the ids are then the ids drawn. A load that fails here is not
-/// kept, so [`tokenizer`] still loads at its first use.
+/// kept, so [`tokenizer`] still loads at its first use. Local files that give
+/// no table are warned of where the table of their path is built.
 pub(crate) fn output_table(cfg: &Config) -> OutputTable {
     static TABLES: OnceLock<Mutex<HashMap<String, OutputTable>>> = OnceLock::new();
     TABLES
@@ -940,32 +942,68 @@ pub(crate) fn output_table(cfg: &Config) -> OutputTable {
         .unwrap_or_else(PoisonError::into_inner)
         .entry(cfg.tokenizer_path.clone())
         .or_insert_with(|| {
-            let mut loaded = TOKENIZERS
-                .get_or_init(|| Mutex::new(HashMap::new()))
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            let tokenizer = match loaded.get(&cfg.tokenizer_path) {
-                Some(kept) => kept.clone().ok()?,
-                None => {
-                    let tokenizer = load_tokenizer(cfg).ok()?;
-                    loaded.insert(cfg.tokenizer_path.clone(), Ok(Arc::clone(&tokenizer)));
-                    tokenizer
-                }
-            };
-            drop(loaded);
-            output_table_of(tokenizer.as_ref())
+            let (table, warning) = build_output_table(cfg);
+            if let Some(warning) = warning {
+                tracing::warn!("{warning}");
+            }
+            table
         })
         .clone()
 }
 
-fn output_table_of(tokenizer: &dyn Tokenizer) -> OutputTable {
+/// The table of `cfg`'s tokenizer path, and the warning owed where local
+/// files give none: files that do not load, and a tokenizer that decodes no
+/// id of the draw. A path that is no local file (a model id of a hub) is
+/// expected to give no table and owes no warning.
+fn build_output_table(cfg: &Config) -> (OutputTable, Option<String>) {
+    let mut loaded = TOKENIZERS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let kept = match loaded.get(&cfg.tokenizer_path) {
+        Some(kept) => kept.clone(),
+        None => {
+            let fresh = load_tokenizer(cfg);
+            if let Ok(tokenizer) = &fresh {
+                loaded.insert(cfg.tokenizer_path.clone(), Ok(Arc::clone(tokenizer)));
+            }
+            fresh
+        }
+    };
+    drop(loaded);
+    let tokenizer = match kept {
+        Ok(tokenizer) => tokenizer,
+        Err(e) => {
+            let local = Path::new(&cfg.tokenizer_path).exists();
+            let warning = local.then(|| format!("{e}: synthetic output keeps the IDs drawn"));
+            return (None, warning);
+        }
+    };
+    let (table, any_decodes) = output_table_of(tokenizer.as_ref());
+    let warning = (!any_decodes).then(|| {
+        format!(
+            "tokenizer {}: decodes no ID of the synthetic output range: \
+             synthetic output keeps the IDs drawn",
+            cfg.tokenizer_path
+        )
+    });
+    (table, warning)
+}
+
+/// The table of `tokenizer`, and whether any id of the draw decodes under it
+/// (no table stands for both ends: every id decodes, or none does).
+fn output_table_of(tokenizer: &dyn Tokenizer) -> (OutputTable, bool) {
     let eos = tokenizer.eos_token_ids();
-    crate::engine::output_table(|id| {
-        !eos.contains(&id)
+    let any_decodes = Cell::new(false);
+    let table = crate::engine::output_table(|id| {
+        let decodes = !eos.contains(&id)
             && tokenizer
                 .decode(&[id], true)
-                .is_ok_and(|text| !text.is_empty() && !text.contains('\u{fffd}'))
-    })
+                .is_ok_and(|text| !text.is_empty() && !text.contains('\u{fffd}'));
+        any_decodes.set(any_decodes.get() || decodes);
+        decodes
+    });
+    (table, any_decodes.get())
 }
 
 /// The prompt's text for the answers filed under one: the rendered text the
@@ -1669,7 +1707,7 @@ mod tests {
             .with_tokens(&words)
             .with_tokens(&[("\u{fffd}", 2_500)])
             .with_eos_token("</s>");
-        let table = output_table_of(&tokenizer).expect("a table");
+        let table = output_table_of(&tokenizer).0.expect("a table");
         assert_eq!(table.len(), 30_000);
         assert!(
             table
@@ -1732,6 +1770,96 @@ mod tests {
             ..Config::default()
         };
         assert!(unnamed.engine_for("grpc:19000").output_table.is_none());
+    }
+
+    /// Writes into the folder `dir` the files of a tokenizer whose
+    /// vocabulary is the ids under `size`, one word an id.
+    fn write_word_tokenizer(dir: &str, size: u32) {
+        let vocab: Vec<String> = (0..size).map(|id| format!(r#""w{id}":{id}"#)).collect();
+        let json = format!(
+            r#"{{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{{"type":"Whitespace"}},"post_processor":null,"decoder":null,"model":{{"type":"WordLevel","vocab":{{{}}},"unk_token":"w0"}}}}"#,
+            vocab.join(",")
+        );
+        std::fs::write(Path::new(dir).join("tokenizer.json"), json).expect("tokenizer.json");
+    }
+
+    /// Local tokenizer files that give the synthetic output no table owe a
+    /// warning: files that do not load, and a tokenizer that decodes no id
+    /// of the draw. Files that give a table owe none, and neither does a
+    /// path that is no local file, which is expected to give no table.
+    #[test]
+    fn local_tokenizer_files_that_give_no_table_owe_a_warning() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let at = |name: &str| {
+            let cfg = Config {
+                tokenizer_path: dir.path().join(name).display().to_string(),
+                ..Config::default()
+            };
+            std::fs::create_dir(&cfg.tokenizer_path).expect("a folder");
+            cfg
+        };
+
+        let unloadable = at("unloadable");
+        let (table, warning) = build_output_table(&unloadable);
+        assert!(table.is_none());
+        let warning = warning.expect("files that do not load");
+        assert!(
+            warning.starts_with(&format!("tokenizer {}: ", unloadable.tokenizer_path)),
+            "{warning}"
+        );
+        assert!(
+            warning.ends_with(": synthetic output keeps the IDs drawn"),
+            "{warning}"
+        );
+
+        // A vocabulary that ends under the first id of the draw.
+        let small = at("small");
+        write_word_tokenizer(&small.tokenizer_path, 50);
+        let (table, warning) = build_output_table(&small);
+        assert!(table.is_none());
+        assert_eq!(
+            warning,
+            Some(format!(
+                "tokenizer {}: decodes no ID of the synthetic output range: \
+                 synthetic output keeps the IDs drawn",
+                small.tokenizer_path
+            ))
+        );
+
+        let decoding = at("decoding");
+        write_word_tokenizer(&decoding.tokenizer_path, 300);
+        let (table, warning) = build_output_table(&decoding);
+        assert!(table.is_some());
+        assert_eq!(warning, None, "files that give a table");
+
+        let hub = Config {
+            tokenizer_path: "no-such-org/no-such-model".to_string(),
+            ..Config::default()
+        };
+        assert_eq!(build_output_table(&hub), (None, None), "no local file");
+    }
+
+    /// An HTTP worker sends text and no ids: its engine takes no table and
+    /// builds none, so nothing is kept for its tokenizer path.
+    #[test]
+    fn an_http_workers_engine_builds_no_table() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cfg = Config {
+            tokenizer_path: dir.path().display().to_string(),
+            ..Config::default()
+        };
+        // The folder holds no tokenizer yet: a table built now would be kept
+        // as none for the path, and the files written next would give none.
+        assert!(cfg.engine_for("http:18000").output_table.is_none());
+        write_word_tokenizer(&cfg.tokenizer_path, 300);
+        assert!(
+            cfg.engine_for("grpc:19000").output_table.is_some(),
+            "the HTTP worker built none"
+        );
+        assert!(
+            cfg.engine_for("http:18000").output_table.is_none(),
+            "the HTTP worker takes none"
+        );
     }
 
     #[test]

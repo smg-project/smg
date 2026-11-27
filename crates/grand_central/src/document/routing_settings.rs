@@ -666,7 +666,7 @@ impl RoutingSettings {
     /// names there a stage its build does not run yet.
     pub fn policy_document(&self) -> Result<PolicySpec, RoutingSettingsError> {
         refuse_unsupported(self)?;
-        if let Some(three) = three_sided(self)? {
+        if let Some(three) = three_sided(&self.mode, &self.policy, self.enable_igw)? {
             if let Some(said) = taken(written(self, three), true) {
                 return said;
             }
@@ -768,7 +768,7 @@ impl RoutingSettings {
         }
         // The plan that document was written from ([`written_from`]),
         // written again with the labels' sides.
-        let plan = match three_sided(self)? {
+        let plan = match three_sided(&self.mode, &self.policy, self.enable_igw)? {
             Some(three) if written_from(&three, &document) => three,
             _ => match both_families(self)? {
                 Some(both) if written_from(&both, &document) => both,

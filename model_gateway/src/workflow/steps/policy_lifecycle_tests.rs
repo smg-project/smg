@@ -585,3 +585,77 @@ async fn a_removal_closes_the_encode_connection_pooled_to_its_worker() {
         .expect("the removal closes the pooled connection")
         .expect("a read to its end");
 }
+
+/// A worker imported from a mesh peer leaves by the mesh sync's registry
+/// removal, which runs no removal workflow here: the task that follows the
+/// registry's events closes the connections pooled to it.
+async fn a_mesh_removal_closes_the_pooled_encode_connection(tokenizer_autoload_off: bool) {
+    use std::time::Duration;
+
+    use smg_grpc_client::tokenspeed_encoder::tokenspeed_encoder_proto::EncodeRequest;
+    use smg_worker::registry::{RemoteWorkerState, WorkerId};
+    use tokio::io::AsyncReadExt;
+
+    use crate::{
+        routers::grpc::backend_client::send_tokenspeed_encode_rpc,
+        workflow::worker_events::spawn_worker_event_reactions,
+    };
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a loopback listener");
+    let url = format!("grpc://{}", listener.local_addr().expect("its address"));
+    let config = RouterConfig::builder()
+        .round_robin_policy()
+        .disable_tokenizer_autoload(tokenizer_autoload_off)
+        .build_unchecked();
+    let app_context = app_context_for_tests(config, Arc::new(WorkerRegistry::new()), None);
+    spawn_worker_event_reactions(&app_context);
+    app_context
+        .worker_registry
+        .on_remote_worker_state(&RemoteWorkerState {
+            worker_id: "peer-encoder".to_string(),
+            model_id: "vision".to_string(),
+            url: url.clone(),
+            health: true,
+            version: 1,
+            spec: vec![],
+        });
+    // The peer answers nothing: the send ends at its bound and leaves the
+    // connection it dialled in the pool.
+    let send = tokio::time::timeout(
+        Duration::from_millis(200),
+        send_tokenspeed_encode_rpc(url, EncodeRequest::default()),
+    );
+    let (_, dialled) = tokio::join!(send, listener.accept());
+    let (mut pooled, _) = dialled.expect("the dialled connection");
+    let mut preface = Vec::new();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), pooled.read_to_end(&mut preface))
+            .await
+            .is_err(),
+        "the pooled connection is open before the removal"
+    );
+
+    // What the mesh sync does with a peer's tombstone.
+    app_context
+        .worker_registry
+        .remove_remote(&WorkerId::from_string("peer-encoder".to_string()))
+        .expect("the import leaves the registry");
+
+    let mut received = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), pooled.read_to_end(&mut received))
+        .await
+        .expect("the mesh removal closes the pooled connection")
+        .expect("a read to its end");
+}
+
+#[tokio::test]
+async fn a_mesh_removal_closes_the_encode_connection_pooled_to_its_worker() {
+    a_mesh_removal_closes_the_pooled_encode_connection(false).await;
+}
+
+#[tokio::test]
+async fn a_mesh_removal_closes_the_pooled_encode_connection_with_tokenizer_autoload_off() {
+    a_mesh_removal_closes_the_pooled_encode_connection(true).await;
+}

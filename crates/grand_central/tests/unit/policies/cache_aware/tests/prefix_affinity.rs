@@ -14,6 +14,29 @@ fn the_deepest_holders_rank_first_and_a_miss_leaves_every_row_alike() {
     assert_eq!(scores(&affinity(None), &facts(16), &miss), vec![0.5, 0.5]);
 }
 
+/// The pass reads a kept row's entry once: the row's match rides its score
+/// slot to the scoring, which reads no entry again.
+#[test]
+fn the_affinity_pass_reads_a_kept_rows_entry_once() {
+    let pool = [candidate(0, 1, 2), candidate(1, 1, 8)];
+    let (rows, column) = (rows(&pool), column(&pool));
+    let facts = RequestFacts {
+        affinity: &column,
+        ..facts(16)
+    };
+    let reads = std::cell::Cell::new(0u32);
+    let mut out = [0.0; 2];
+    let feed = Feed::Column(&column);
+    affinity(None).rank(&facts, &rows, &kept(2), &mut out, feed, || {
+        |i: u32| {
+            reads.set(reads.get() + 1);
+            column[i as usize]
+        }
+    });
+    assert_eq!(out, [0.5, 1.0], "the deeper holder leads");
+    assert_eq!(reads.get(), 2, "one read a kept row");
+}
+
 #[test]
 fn a_holder_over_the_spill_gate_yields_to_the_rows_under_it() {
     // Mean 10 in flight; the holder at 40 is over 1.5 times the mean and

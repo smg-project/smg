@@ -92,7 +92,14 @@ pub(crate) fn unnamed(models: &[String]) -> Option<&'static str> {
 /// searched in a sorted list (the `rows_serving` of its worker objects'
 /// holder): the two change together.
 pub(crate) fn serves(models: &[String], row: &WorkerRow) -> bool {
-    models.is_empty() || row.facts.models.iter().any(|model| models.contains(model))
+    serves_models(models, &row.facts.models)
+}
+
+/// The rule of [`serves`] over the models a row serves, `served`: the one
+/// fact of a row the rule reads. A status entry of the membership log holds
+/// that list in its row's place, and a watch reads it by this rule.
+pub(crate) fn serves_models(models: &[String], served: &[String]) -> bool {
+    models.is_empty() || served.iter().any(|model| models.contains(model))
 }
 
 /// The store rows read for a snapshot.
@@ -182,8 +189,11 @@ enum ReachableJson {
     GatewayId(String),
 }
 
-/// What a row states of a pair and of an encode handoff, under the names
-/// of the contract's pairing descriptor.
+/// What a row states of a pair and of an encode handoff, in one object. A
+/// pair's fields stand under the names of the contract's pairing
+/// descriptor. `vision` and the encode offer's five fields keep the names
+/// the descriptor reserves: the contract states them on the registration
+/// and on the row themselves.
 #[derive(Serialize)]
 struct PairingJson<'a> {
     protocol: Option<&'a str>,
@@ -529,14 +539,15 @@ pub(crate) fn without_userinfo(address: &str) -> Option<String> {
     userinfo.then(|| format!("{scheme}{host}{tail}"))
 }
 
-/// Count each text with room for its framing and allow 512 bytes for
-/// fixed fields and the row envelope. Count the addresses and facts that
-/// can be told twice and include the pairing and encode descriptors. Count
-/// the block of demand facts at its longest for a worker that states one,
-/// and as `null` for a worker that states none.
+/// Count each text by what a page's JSON writes for it ([`escaped_len`]),
+/// with room for its framing, and allow 512 bytes for fixed fields and the
+/// row envelope. Count the addresses and facts that can be told twice and
+/// include the pairing and encode descriptors. Count the block of demand
+/// facts at its longest for a worker that states one, and as `null` for a
+/// worker that states none.
 fn measure(row: &WorkerRow) -> usize {
     let facts = &row.facts;
-    let text = |text: &str| text.len().saturating_add(16);
+    let text = |text: &str| escaped_len(text).saturating_add(16);
     let demand_facts = if DemandFactsJson::of(facts.demand_facts).is_some() {
         DEMAND_FACTS_BYTES
     } else {
@@ -581,6 +592,20 @@ fn measure(row: &WorkerRow) -> usize {
             .saturating_add(16);
     }
     bytes
+}
+
+/// The bytes a page's JSON writes for `text` between its quotes. A quote,
+/// a backslash and the five control characters JSON names by a letter take
+/// two bytes each. Any other control character takes six, and every other
+/// byte is written as it stands.
+fn escaped_len(text: &str) -> usize {
+    text.bytes()
+        .map(|byte| match byte {
+            b'"' | b'\\' | 0x08..=0x0A | 0x0C | 0x0D => 2,
+            0x00..=0x07 | 0x0B | 0x0E..=0x1F => 6,
+            _ => 1,
+        })
+        .sum()
 }
 
 #[cfg(test)]

@@ -454,14 +454,15 @@ async fn named(
     }
 }
 
-/// One encode request's frame for `model`, numbered `n`, with one item,
-/// and what its answer names: the encoder of the item, or the stage that
-/// shed the request with no endpoint.
+/// One encode request's frame for `model`, numbered `n`, with one item and
+/// the hard demands it states, and what its answer names: the encoder of
+/// the item, or the stage that shed the request with no endpoint.
 async fn encoded(
     requests: &mpsc::Sender<DecideRequest>,
     answers: &mut tonic::Streaming<proto::DecideAnswer>,
     n: u32,
     model: &str,
+    demands: Option<proto::Demands>,
 ) -> Result<Named, String> {
     use smg_grand_central::service::proto::{identity::Form, EncodeItems, Identity, Phase};
     requests
@@ -480,6 +481,7 @@ async fn encoded(
                 }],
                 ..EncodeItems::default()
             }),
+            demands,
             ..Default::default()
         })
         .await
@@ -510,8 +512,11 @@ async fn encoded(
 /// pick.
 ///
 /// A prefill frame states its demand too, and its list is held as a
-/// prefill is: to a runtime, and to no way to decide a constraint. A frame
-/// of the encode phase that states a demand ends its stream by the field.
+/// prefill is: to a runtime, and to no way to decide a constraint. So does
+/// a frame of the encode phase: one that states no list of items is
+/// answered `Busy` with no reason, as one that states no demand is, and
+/// its stream stands. A part of a demand out of its range ends its frame's
+/// stream by the part's name.
 #[tokio::test]
 async fn a_frame_that_states_a_demand_is_held_to_the_workers_whose_registrations_meet_it() {
     use std::collections::BTreeSet;
@@ -606,7 +611,7 @@ async fn a_frame_that_states_a_demand_is_held_to_the_workers_whose_registrations
             .expect("a present gateway's stream opens")
             .into_inner();
 
-        // Three workers whose policy turns their probes off: each call's
+        // Five workers whose policy turns their probes off: each call's
         // connect signal readies its worker.
         let on = |runtime: u32| DemandFacts {
             runtime,
@@ -866,12 +871,12 @@ async fn a_frame_that_states_a_demand_is_held_to_the_workers_whose_registrations
         }
         assert_eq!(named, BTreeSet::from([seeing.id]), "vision");
 
-        // An encode request's frame holds no demand yet: a frame of the
-        // encode phase that states a demand is out of range by the field,
-        // and its stream ends.
+        // A frame of the encode phase states its demand too. This one
+        // states no list of items, so it has no decision: it is answered
+        // `Busy` with no reason, and the stream stands.
         requests
             .send(DecideRequest {
-                request_id: vec![0xd],
+                request_id: vec![0xe],
                 facts: Some(RequestFacts {
                     model: MODEL.to_owned(),
                     phase: proto::Phase::Encode.into(),
@@ -879,6 +884,39 @@ async fn a_frame_that_states_a_demand_is_held_to_the_workers_whose_registrations
                     ..RequestFacts::default()
                 }),
                 demands: Some(Demands { runtime: 7, ..none }),
+                ..Default::default()
+            })
+            .await
+            .expect("the stream takes the request");
+        let (of, told) = loop {
+            let next = timeout(Duration::from_secs(20), answers.message())
+                .await
+                .expect("an answer within the case's patience")
+                .expect("an answer, not the stream's status")
+                .expect("an answer, not the stream's end");
+            match next.answer {
+                Some(decide_answer::Answer::Credit(_)) => {}
+                Some(decide_answer::Answer::Busy(told)) => break (next.request_id, told),
+                other => panic!("a frame of the encode phase with no list: {other:?}"),
+            }
+        };
+        assert_eq!(of[..], [0xe], "the frame's own answer");
+        assert_eq!(told.reason(), busy::Reason::Unspecified);
+
+        // A way to decide a constraint past the engine's byte is out of
+        // range by its part's name, and its frame's stream ends.
+        requests
+            .send(DecideRequest {
+                request_id: vec![0xd],
+                facts: Some(RequestFacts {
+                    model: MODEL.to_owned(),
+                    budget_micros: 5_000_000,
+                    ..RequestFacts::default()
+                }),
+                demands: Some(Demands {
+                    decoding: 256,
+                    ..none
+                }),
                 ..Default::default()
             })
             .await
@@ -897,7 +935,7 @@ async fn a_frame_that_states_a_demand_is_held_to_the_workers_whose_registrations
         assert_eq!(ended.code(), Code::InvalidArgument, "{ended:?}");
         assert_eq!(
             ended.message(),
-            "demands is out of its range in this protocol version"
+            "demands.decoding is out of its range in this protocol version"
         );
 
         stop.send(()).expect("the serve is listening for the stop");
@@ -916,6 +954,11 @@ async fn a_frame_that_states_a_demand_is_held_to_the_workers_whose_registrations
 /// again and states that it produces the push over that connector. Its row
 /// changes in place, the answer tells the block, and every frame's answer
 /// names that encoder for its item.
+///
+/// A frame that demands vision is its encoder's to meet. It is shed under
+/// the encode pass's stage for vision while no encoder's registration
+/// states that it takes images. Once one more encoder registers and
+/// states that it does, such a frame's item goes to that encoder.
 #[tokio::test]
 async fn an_encode_frames_item_goes_to_the_encoder_whose_registration_states_its_end() {
     use smg_grand_central::service::proto::{
@@ -1054,14 +1097,23 @@ async fn an_encode_frames_item_goes_to_the_encoder_whose_registration_states_its
 
         // The encoder states no end: no frame's item has an encoder. Frames
         // are asked until the served loop has paid the builds the three
-        // registrations owe, and each is shed with no endpoint.
+        // registrations owe. From the first frame the encode stage sheds,
+        // every frame is shed there with no endpoint, and by no other stage.
+        const ENCODERS: &str = "encoders";
         let mut asked = 0u32;
         let mut sheds = Vec::new();
         while sheds.len() < 8 {
             asked += 1;
-            assert!(asked < 4_096, "no frame is decided: {sheds:?}");
-            match encoded(&requests, &mut answers, asked, MODEL).await {
-                Ok(Err(stage)) => sheds.push(stage),
+            assert!(
+                asked < 4_096,
+                "no frame is shed at the encode stage: {sheds:?}"
+            );
+            match encoded(&requests, &mut answers, asked, MODEL, None).await {
+                Ok(Err(stage)) if stage == ENCODERS => sheds.push(stage),
+                Ok(Err(stage)) => assert!(
+                    sheds.is_empty(),
+                    "frame {asked} is shed by {stage} behind {sheds:?}"
+                ),
                 Ok(Ok(encoders)) => panic!("an encoder with no end is named: {encoders:?}"),
                 Err(why) => panic!("{why}"),
             }
@@ -1081,13 +1133,58 @@ async fn an_encode_frames_item_goes_to_the_encoder_whose_registration_states_its
             panic!("a change in place: {:?}", again.event);
         };
         assert_eq!(encoder.encode, producing, "the answer tells the block");
+        // A change in place keeps the row's status: the encoder was ready
+        // while its frames were shed, so its missing end shed them.
+        assert_eq!(
+            encoder.status,
+            proto::WorkerStatus::Ready as i32,
+            "{encoder:?}"
+        );
 
         // The change is acknowledged, so each frame behind it reads the
         // fleet it left: its item goes to that encoder.
         for _ in 0..8 {
             asked += 1;
-            match encoded(&requests, &mut answers, asked, MODEL).await {
+            match encoded(&requests, &mut answers, asked, MODEL, None).await {
                 Ok(Ok(encoders)) => assert_eq!(encoders, [encoder.id], "frame {asked}"),
+                Ok(Err(stage)) => panic!("frame {asked} is shed by {stage}"),
+                Err(why) => panic!("{why}"),
+            }
+        }
+
+        // A frame that demands vision holds its item's encoder to it. This
+        // encoder states that it takes no image: the frame is shed under
+        // the encode pass's own stage for vision.
+        let pixels = proto::Demands {
+            vision: true,
+            ..proto::Demands::default()
+        };
+        asked += 1;
+        match encoded(&requests, &mut answers, asked, MODEL, Some(pixels)).await {
+            Ok(Err(stage)) => assert_eq!(stage, "encode-vision", "frame {asked}"),
+            Ok(Ok(encoders)) => panic!("an encoder that takes no image: {encoders:?}"),
+            Err(why) => panic!("{why}"),
+        }
+
+        // One more encoder registers. It states the same end, and that it
+        // takes images. The add is acknowledged, so each frame behind it
+        // that demands vision reads the fleet it left: its item goes to
+        // that encoder and to no other.
+        let spec = WorkerSpec {
+            vision: Some(true),
+            ..worker("e1", proto::Role::Encode, producing.clone())
+        };
+        let added = register(spec, Mode::Add)
+            .await
+            .expect("the add is taken")
+            .into_inner();
+        let Some(Event::Registered(seeing)) = added.event else {
+            panic!("a registration's answer: {:?}", added.event);
+        };
+        for _ in 0..4 {
+            asked += 1;
+            match encoded(&requests, &mut answers, asked, MODEL, Some(pixels)).await {
+                Ok(Ok(encoders)) => assert_eq!(encoders, [seeing.id], "frame {asked}"),
                 Ok(Err(stage)) => panic!("frame {asked} is shed by {stage}"),
                 Err(why) => panic!("{why}"),
             }

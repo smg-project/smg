@@ -110,4 +110,5 @@ impl Gateway {
 }
 
 #[cfg(test)]
+#[path = "../../../tests/unit/routers/gateway/lora/tests.rs"]
 mod tests;

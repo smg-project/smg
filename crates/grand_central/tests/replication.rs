@@ -1821,8 +1821,11 @@ async fn a_promoted_standby_holds_every_row_of_its_leader() {
     let mut standby = Replica::serve("replication-1", FOLLOWER, port, shared(&dir)).await;
     // A ready worker the load monitor polls, at an address nobody answers.
     // It states what a worker states for a request's hard demands, it
-    // takes images, and it states an end of the encode handoff: the log's
-    // row tells the three, so the standby holds the row whole.
+    // takes images, and it states an end of the encode handoff, a priority
+    // and a drain window: the log's row tells the five, so the standby
+    // holds the row whole. The offer's connector holds a blank: a holder's
+    // write takes any text, the log tells it, and a standby reads it as
+    // told.
     let mut stated = DemandFacts::default();
     stated.runtime = 7;
     stated.references = true;
@@ -1832,12 +1835,14 @@ async fn a_promoted_standby_holds_every_row_of_its_leader() {
     let mut offered = EncodeOffer::default();
     offered.handoff = EncodeHandoff::Push;
     offered.producer = true;
-    offered.connector = Some("connector-a".to_owned());
+    offered.connector = Some("a b".to_owned());
     let polled = WorkerFacts {
         wire_modes: WireModes::GRPC,
         demand_facts: stated,
         vision: true,
         encode: offered,
+        priority: -5,
+        drain_settle_secs: Some(45),
         ..facts("grpc://127.0.0.1:1", 1, 0)
     };
     let written = leader
@@ -1846,7 +1851,17 @@ async fn a_promoted_standby_holds_every_row_of_its_leader() {
     let polled = written.expect("the store took the registration").id();
     let revision = leader.store.get(polled).expect("the row").revision;
     leader.workers.connect_row(&leader.store, polled, revision);
-    // A row nobody polls.
+    // A row nobody polls, whose offer states a connector past a name's 256
+    // bytes, and one that states no offer.
+    let mut taking = EncodeOffer::default();
+    taking.handoff = EncodeHandoff::Push;
+    taking.consumer = true;
+    taking.connector = Some("c".repeat(300));
+    let wide = WorkerFacts {
+        encode: taking,
+        ..facts("http://wide:8000", 1, 0)
+    };
+    lays(&leader, wide);
     writes(&leader, 0);
     // The leader writes while the standby follows.
     let stop = Arc::new(AtomicBool::new(false));

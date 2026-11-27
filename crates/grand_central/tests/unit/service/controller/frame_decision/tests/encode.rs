@@ -43,6 +43,8 @@ use crate::{
     worker_host::{Members, Objects},
 };
 
+mod sessions;
+
 /// [`member_of`] for [`ENCODED`].
 fn member(
     store: &MemoryStore,
@@ -459,8 +461,8 @@ fn a_frame_with_items_under_a_plan_with_no_encode_side_is_declined_by_its_bindin
 /// It does so in a controller whose catalog holds no stage that needs the
 /// lifecycle's calls. Each side then takes the worker that holds the fewest
 /// requests, by the leases on file, and an item goes to its encoder beside
-/// the pair. A sessions rule under that plan stays refused in such a build,
-/// by the document's check.
+/// the pair. A sessions rule that tells its stages runs under that plan in
+/// such a build too, each side by its own session.
 ///
 /// The gateway's manual policy always keeps its table, so it has no twin of
 /// a binding with no rule. Its nearest answer is for a request that states
@@ -764,4 +766,112 @@ fn an_encode_request_is_decided_over_rows_that_state_demand_facts_as_over_rows_t
         "a pair, a key an item"
     );
     assert_eq!((pairs, encoders), answers(DemandFacts::default()));
+}
+
+/// An encode request's frame that states a hard demand is held to it a
+/// list at a time, as the engine's entry holds it in a host's own process.
+/// Two workers stand in each role, one on the runtime 7 and one on the
+/// runtime 8. A frame that stays on a runtime is answered the pair and the
+/// encoder on it.
+///
+/// A frame's references and its vision are its encoders' to meet. No
+/// encoder here processes media by reference or takes images, so a frame
+/// that demands either is shed under the encode pass's own word for it.
+/// The way a constraint was decided is the decode's alone: a way no decode
+/// states sheds the frame under `decoding`.
+///
+/// A frame that states the later decode is declined where its demand names
+/// its media: its decode call states no items, and would hold the decode
+/// to the whole demand. One that stays on a runtime is picked.
+///
+/// The one call:
+/// `an_encode_request_that_states_a_demand_is_held_to_it_a_list_at_a_time`
+/// and
+/// `a_list_the_demand_leaves_nobody_sheds_an_encode_request_under_that_demands_stage`
+/// of `engine/in_process/encode/tests/mod.rs`.
+#[test]
+fn an_encode_requests_frame_that_states_a_demand_is_held_to_it_a_list_at_a_time() {
+    use super::{demanding, together};
+
+    let store = encode_store();
+    let objects = holder(&store);
+    let on = |name: &str, role, runtime| {
+        let stated = DemandFacts {
+            runtime,
+            ..DemandFacts::default()
+        };
+        member_stating(&store, &objects, ENCODED, (name, role), PUSHING, stated)
+    };
+    let (prefill, decode, encode) = (Role::Prefill, Role::Decode, Role::Encode);
+    let seven = [
+        on("p0", prefill, 7),
+        on("d0", decode, 7),
+        on("e0", encode, 7),
+    ];
+    let eight = [
+        on("p1", prefill, 8),
+        on("d1", decode, 8),
+        on("e1", encode, 8),
+    ];
+    let now = Instant::now();
+    // The pairs and the encoders sixteen frames are answered, or the one
+    // shed each of them was. Each pick names its one item's encoder.
+    let answered = |demands: proto::Demands| {
+        let picks = together((1..=16).map(|n| {
+            let frame = demanding(encode_frame(n, 1), demands);
+            let (answer, placed) = served_encode(&store, &objects, frame, GATEWAY, now);
+            match answer.pick() {
+                Some(_) => Ok((pairs_of(&answer), encoders_of(placed.as_ref()))),
+                None => Err(shed_of(&answer)),
+            }
+        }))?;
+        let mut named = (BTreeSet::new(), BTreeSet::new());
+        for (pairs, encoders) in picks {
+            assert_eq!(encoders.len(), 1, "an item, an encoder");
+            named.0.extend(pairs);
+            named.1.extend(encoders);
+        }
+        Ok(named)
+    };
+    let none = proto::Demands::default();
+    for (runtime, [p, d, e]) in [(7, seven), (8, eight)] {
+        let stays = proto::Demands { runtime, ..none };
+        let held = (BTreeSet::from([(p, d)]), BTreeSet::from([e]));
+        assert_eq!(answered(stays), Ok(held), "the runtime {runtime}");
+    }
+    let (pairs, encoders) = answered(none).expect("a frame that states no demand is picked");
+    assert!(!pairs.is_empty() && !encoders.is_empty());
+
+    let references = proto::Demands {
+        references: proto::demands::References::Any.into(),
+        ..none
+    };
+    let media = Some((ShedReason::NoEndpoints, "encode-media"));
+    assert_eq!(answered(references), Err(media), "no encoder's to meet");
+    let vision = proto::Demands {
+        vision: true,
+        ..none
+    };
+    let images = Some((ShedReason::NoEndpoints, "encode-vision"));
+    assert_eq!(answered(vision), Err(images), "no encoder takes images");
+    let decided = proto::Demands {
+        decoding: 5,
+        ..none
+    };
+    let way = Some((ShedReason::NoEndpoints, "decoding"));
+    assert_eq!(answered(decided), Err(way), "no decode states the way");
+
+    let later = |demands| {
+        let mut frame = demanding(encode_frame(17, 1), demands);
+        frame.decode_later = true;
+        served_encode(&store, &objects, frame, GATEWAY, now).0
+    };
+    let declined = Some((ShedReason::PolicyDeclined, "decode-later"));
+    assert_eq!(shed_of(&later(references)), declined, "the encoders' part");
+    assert_eq!(shed_of(&later(vision)), declined, "vision: the encoders'");
+    // A runtime is no part of the media: its later decode is not declined,
+    // and the pair on it is picked.
+    let stays = proto::Demands { runtime: 7, ..none };
+    let [p, d, _] = seven;
+    assert_eq!(pairs_of(&later(stays)), [(p, d)], "the pair on runtime 7");
 }

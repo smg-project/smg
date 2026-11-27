@@ -224,6 +224,8 @@ fn numbers(
         health_policy: Some(health_policy(facts.health)),
         demand_facts: stated_demand_facts(facts.demand_facts),
         vision: facts.vision,
+        priority: facts.priority,
+        drain_settle_secs: facts.drain_settle_secs,
         ..Default::default()
     }
 }
@@ -315,14 +317,11 @@ const fn offer_numbers(offer: &EncodeOffer) -> proto::EncodeOffer {
 
 /// The store's offer of the contract's block, in a registration and in a
 /// told row alike. A form this build does not know is refused by the path
-/// `handoff`. The connector is a name: one past its bound, or that holds a
-/// blank or a control character, is refused by the path `connector`, never
-/// mended. An empty one states none.
-fn offer(
-    block: &proto::EncodeOffer,
-    handoff: &'static str,
-    connector: &'static str,
-) -> Result<EncodeOffer, Refused> {
+/// `handoff`: no reader can hold it. The connector is read as told, with no
+/// rule of its words: it is the store's text, compared whole and never
+/// parsed, and its one bound is the row's. So a row a leader's store took
+/// is a row its standby reads. An empty one states none.
+fn offer(block: &proto::EncodeOffer, handoff: &'static str) -> Result<EncodeOffer, Refused> {
     // Every field by its name: one the contract gains stops the build here,
     // so none passes unread.
     let proto::EncodeOffer {
@@ -343,15 +342,6 @@ fn offer(
             ))
         }
     };
-    if name.len() > NAME_BYTES {
-        return Err(refused(connector, "a connector is at most 256 bytes"));
-    }
-    if blank(name) {
-        return Err(refused(
-            connector,
-            "a connector holds no blank and no control character",
-        ));
-    }
     Ok(EncodeOffer {
         handoff: form,
         producer: *producer,
@@ -533,11 +523,13 @@ fn maker_weight(maker: &Registrant) -> usize {
 /// Refuses, by its fact's path, a row the log would not give back whole. A
 /// standby builds its rows from the log, so it would hold the row without
 /// the fact, and a promoted one would decide by other facts than its leader
-/// did. The row on the wire carries a pairing's port alone and no priority
-/// or drain window. It reads an empty zone, an empty connector of an encode
-/// offer and a zero admission window, block size or port as none. The facts
-/// are written as the log writes them and read back as a standby reads
-/// them, so a fact the wire gains is taken here with no second list.
+/// did. The row on the wire carries a pairing's port alone. It reads an
+/// empty zone, an empty connector of an encode offer and a zero admission
+/// window, block size or port as none. The facts are written as the log
+/// writes them and read back as a standby reads them, so a fact the wire
+/// gains is taken here with no second list. A text the log tells comes back
+/// as it was told, so the door holds an encode offer's connector to no rule
+/// of its words.
 #[cfg_attr(
     not(any(test, feature = "discovery")),
     expect(dead_code, reason = "the host's door asks it of each registration")
@@ -549,7 +541,6 @@ pub(crate) fn carried(facts: &WorkerFacts) -> Result<(), Refused> {
     let lost = [
         ("row.pairing", back.pairing != facts.pairing),
         ("row.encode", back.encode != facts.encode),
-        ("row.priority", back.priority != facts.priority),
         ("row.zone", back.zone != facts.zone),
         ("row.max_running", back.max_running != facts.max_running),
         (
@@ -559,10 +550,6 @@ pub(crate) fn carried(facts: &WorkerFacts) -> Result<(), Refused> {
         (
             "row.bootstrap_port",
             back.bootstrap_port != facts.bootstrap_port,
-        ),
-        (
-            "row.drain_settle_secs",
-            back.drain_settle_secs != facts.drain_settle_secs,
         ),
         ("row", back != *facts),
     ];
@@ -647,34 +634,43 @@ pub(crate) fn start_again(floor: Position) -> proto::WorkerEvent {
 
 /// A log entry of a membership or status write in its envelope, at the
 /// entry's position and term. `None` for any other entry, and for a shape
-/// the store never tells.
+/// the store never tells. An entry's kind says which it is: a status
+/// entry holds no row, and its event tells none.
 pub(crate) fn member(entry: &Entry) -> Option<proto::WorkerEvent> {
-    let Written::Member {
-        epoch,
-        change,
-        row,
-        left,
-    } = &entry.event
-    else {
-        return None;
+    let (epoch, told) = match &entry.event {
+        Written::Member {
+            epoch,
+            change,
+            row,
+            left,
+        } => {
+            let told = match (*change, row.as_deref(), left.as_deref()) {
+                (MembershipChange::Registered { .. }, Some(new), _) => registered(new),
+                (
+                    MembershipChange::Relabelled { .. } | MembershipChange::Resized { .. },
+                    Some(now),
+                    _,
+                ) => relabelled(now),
+                // A fresh row is pending: any other status the write left
+                // came over from the old incarnation.
+                (MembershipChange::Replaced { .. }, Some(new), Some(old)) => {
+                    replaced(old, new, new.status != WorkerStatus::Pending)
+                }
+                (MembershipChange::Removed { .. }, _, Some(last)) => removed(last),
+                _ => return None,
+            };
+            (*epoch, told)
+        }
+        Written::Status {
+            epoch,
+            id,
+            from,
+            to,
+            ..
+        } => (*epoch, status_changed(*id, *from, *to)),
+        Written::Term | Written::Generation { .. } => return None,
     };
-    let told = match (*change, row.as_deref(), left.as_deref()) {
-        (MembershipChange::Registered { .. }, Some(new), _) => registered(new),
-        (MembershipChange::Relabelled { .. } | MembershipChange::Resized { .. }, Some(now), _) => {
-            relabelled(now)
-        }
-        // A fresh row is pending: any other status the write left came
-        // over from the old incarnation.
-        (MembershipChange::Replaced { .. }, Some(new), Some(old)) => {
-            replaced(old, new, new.status != WorkerStatus::Pending)
-        }
-        (MembershipChange::Removed { .. }, _, Some(last)) => removed(last),
-        (MembershipChange::StatusChanged { id, from, to }, Some(_), _) => {
-            status_changed(id, from, to)
-        }
-        _ => return None,
-    };
-    Some(event(told, entry.at.seq, *epoch, entry.at.term))
+    Some(event(told, entry.at.seq, epoch, entry.at.term))
 }
 
 /// A log entry as a standby is sent it. An entry this build
@@ -683,7 +679,7 @@ pub(crate) fn member(entry: &Entry) -> Option<proto::WorkerEvent> {
 pub(crate) fn replication(entry: &Entry) -> proto::ReplicationEvent {
     use proto::replication_event::Event as Sent;
     let event = match &entry.event {
-        Written::Member { .. } => member(entry).map(Sent::Membership),
+        Written::Member { .. } | Written::Status { .. } => member(entry).map(Sent::Membership),
         Written::Term => Some(Sent::TermStart(proto::TermStart {})),
         Written::Generation { generation } => Some(Sent::Generation(generation_told(*generation))),
     };
@@ -729,13 +725,16 @@ fn told_status(status: i32) -> Option<WorkerStatus> {
 /// The store's row of the wire's, the standby's half of [`row`]: every fact
 /// the wire's row tells, as told, the admission instant `now` less the age
 /// the row crossed with. Of a pairing descriptor the wire's row tells the
-/// bootstrap port alone. The facts it does not tell (the store's typed
-/// descriptor, the priority) stand at the store's defaults: no call states
-/// them in this build.
+/// bootstrap port alone. The one fact it does not tell, the store's typed
+/// descriptor, stands at the store's default: no call states it in this
+/// build.
 ///
-/// A value this build cannot hold (a status, a role or a scope it does not
-/// know, a count past the store's width) is refused by its path: a standby
-/// that guessed would hold another row than its leader's.
+/// A value this build cannot hold (a status, a role, a scope or an encode
+/// handoff it does not know, a count past the store's width) is refused by
+/// its path: a standby that guessed would hold another row than its
+/// leader's. A fact's text is read as told, an encode offer's connector as
+/// a URL, a model id, a zone and a label are: the leader's store took it,
+/// and the reader asks no second rule of it.
 pub(crate) fn told_row(told: &proto::WorkerRow, now: Instant) -> Result<WorkerRow, Refused> {
     use proto::reachability::Scope;
     let status = told_status(told.status).ok_or_else(|| unknown("row.status"))?;
@@ -840,9 +839,11 @@ pub(crate) fn told_row(told: &proto::WorkerRow, now: Instant) -> Result<WorkerRo
         encode: told
             .encode
             .as_ref()
-            .map(|block| offer(block, "row.encode.handoff", "row.encode.connector"))
+            .map(|block| offer(block, "row.encode.handoff"))
             .transpose()?
             .unwrap_or_default(),
+        priority: told.priority,
+        drain_settle_secs: told.drain_settle_secs,
         ..WorkerFacts::default()
     };
     let maker = match &told.maker {
@@ -1177,9 +1178,19 @@ fn over(
         facts.vision = vision;
     }
     // The worker's end of the encode handoff is the block's, whole: an
-    // empty one states no end, and one left out keeps the row's.
+    // empty one states nothing, and one left out keeps the row's. Its
+    // connector is read as the store holds it, past the blanks around it,
+    // so a registration that states the row's offer again finds it unmoved.
     if let Some(block) = &spec.encode {
-        facts.encode = offer(block, "spec.encode.handoff", "spec.encode.connector")?;
+        facts.encode = offer(block, "spec.encode.handoff")?.normalized();
+    }
+    // A priority and a drain window are the registration's where it states
+    // them: one that states none keeps the row's.
+    if let Some(priority) = spec.priority {
+        facts.priority = priority;
+    }
+    if let Some(window) = spec.drain_settle_secs {
+        facts.drain_settle_secs = Some(window);
     }
     // The health policy of record is the registration's, whole: one that
     // states none is checked under the defaults.

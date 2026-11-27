@@ -138,7 +138,7 @@ use crate::{
         },
         decision_engine::{DecideOutcome, HeldDecision, Leased, Request},
         demands::{Demands, UnmetDemand},
-        framework::{Engine, PairPools, Scratch, ShadowRows, ShedOver},
+        framework::{Engine, Issuing, PairPools, Scratch, ShadowRows, ShedOver},
         lease_events,
         list_cell::LentList,
         pair_classes::PartnerClasses,
@@ -1618,7 +1618,7 @@ fn first_decode(held: &Target) -> Option<(WorkerId, u16)> {
 ///
 /// `None` for a decision that picks no pair.
 pub(super) fn issue_decode(
-    engine: &Engine,
+    engine: impl Issuing,
     facts: &RequestFacts<'_>,
     decision: &Decision,
     prefill: &Lease,
@@ -1630,7 +1630,7 @@ pub(super) fn issue_decode(
             issued_micros: now_micros,
             ..decode
         };
-        engine.on_decision_issued(&issued, decision);
+        engine.decision_issued(&issued, decision);
     }
     Some(decode)
 }
@@ -1665,7 +1665,7 @@ fn decode_side(facts: &RequestFacts<'_>, decision: &Decision, prefill: &Lease) -
 /// decision, as a first decision's does.
 fn issue_decode_caught(
     own: Loaded<'_, '_>,
-    engine: &Engine,
+    engine: impl Issuing,
     facts: &RequestFacts<'_>,
     decision: &Decision,
     prefill: &Lease,
@@ -1919,13 +1919,13 @@ pub(super) fn issued(
             // is told as its later words are: to the stages that stood
             // under that document.
             let document = own.document;
-            let hearing = if held.lease.generation == document.spec.generation() {
-                document.spec.engine()
+            let issued = if held.lease.generation == document.spec.generation() {
+                issue_decode_caught(own, document.spec.engine(), facts, &decision, held.lease)
             } else {
-                document.stood_at(held.lease.generation)
+                let stood = document.stood_at(held.lease.generation);
+                issue_decode_caught(own, stood, facts, &decision, held.lease)
             };
-            issue_decode_caught(own, hearing, facts, &decision, held.lease)
-                .map(|decode| (decode, decode.session))
+            issued.map(|decode| (decode, decode.session))
         }
     };
     let mut outcome = DecideOutcome {

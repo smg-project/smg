@@ -61,6 +61,7 @@ use crate::{
             request_body_stalled_response, REQUEST_BODY_STALLED, REQUEST_BODY_TOO_LARGE,
         },
         scheduler::PreemptionGuard,
+        sse_keepalive::names_event_stream,
         TenantRequestMeta,
     },
     observability::{
@@ -1546,7 +1547,7 @@ impl Router {
                 .get(CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
             {
-                Some(ct) => ct.starts_with("text/event-stream"),
+                Some(ct) => names_event_stream(ct),
                 None => status.is_success(),
             };
             let rechunker = rechunk
@@ -1692,7 +1693,7 @@ impl Router {
             .headers()
             .get(CONTENT_TYPE)
             .and_then(|ct| ct.to_str().ok())
-            .is_some_and(|ct| ct.starts_with("text/event-stream"));
+            .is_some_and(names_event_stream);
         self.forward_worker_response(
             res,
             StreamRelayMode {
@@ -7820,6 +7821,71 @@ mod tests {
                             \"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\
                             \"finish_reason\":null}]}\n\n\
                             data: [DONE]\n\n";
+
+    /// A media type's name is case-insensitive (RFC 9110, section 8.3.1):
+    /// a typed route relays a worker's event stream as one however the
+    /// worker spells the type. Matched by its lowercase spelling alone, a
+    /// `Text/Event-Stream` answer kept the upstream's `Content-Length`, as
+    /// a body that is no event stream does.
+    #[tokio::test]
+    async fn a_typed_routes_event_stream_is_one_however_the_worker_spells_its_type() {
+        use openai_protocol::validated::Normalizable;
+
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let mut answers = Vec::new();
+        for content_type in ["text/event-stream", "Text/Event-Stream"] {
+            let url = spawn_sized_worker(SIZED_DELTA_BODY, content_type).await;
+            let router =
+                streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
+            let mut request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "served-plain-relay-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 16,
+                "stream": true,
+            }))
+            .unwrap();
+            request.normalize();
+            let response = router
+                .route_chat(None, &tenant, Arc::new(request), UNKNOWN_MODEL_ID)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK, "{content_type}");
+            let sized = response.headers().contains_key(CONTENT_LENGTH);
+            let bytes = http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .unwrap()
+                .to_bytes();
+            answers.push((sized, bytes));
+        }
+        assert!(!answers[0].0, "an event stream carries no upstream length");
+        assert_eq!(
+            answers[1], answers[0],
+            "the answer under `Text/Event-Stream` is the one under `text/event-stream`"
+        );
+    }
+
+    /// The pass-through reads the type the same way: a worker's event
+    /// stream under another spelling is relayed, where it was buffered
+    /// whole and refused above the payload limit.
+    #[tokio::test]
+    async fn a_passed_through_event_stream_is_relayed_however_the_worker_spells_its_type() {
+        for content_type in ["text/event-stream", "Text/Event-Stream"] {
+            let (url, _captured) = spawn_capture_stub(content_type, SIZED_DELTA_BODY).await;
+            // A payload limit under the answer's length: a relayed stream
+            // passes it, a buffered answer does not.
+            let router = streaming_router(PolicyConfig::RoundRobin, 64, vec![plain_worker(&url)]);
+
+            let response = router
+                .route_streaming_request(streamed_request(&[b"{}"]), "/generate", false)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{content_type}");
+            let bytes = http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .unwrap()
+                .to_bytes();
+            assert_eq!(bytes, SIZED_DELTA_BODY.as_bytes(), "{content_type}");
+        }
+    }
 
     /// A streamed SSE relay may change the body's length, by re-slicing it
     /// or by ending a cut stream with its error event, so a sized upstream

@@ -74,12 +74,16 @@ pub use leases::{
 #[cfg(feature = "controller")]
 pub(crate) use memory::DecodeIssue;
 pub use memory::{AtWork, Hand, LookOutcome, MemoryStore, StoreCheckpoint, StoreStats, Wake};
-pub use snapshot::{OutsideLists, StaleGeneration, StoreSnapshot, PUBLISH_WINDOW};
+pub use snapshot::{OutsideLists, StoreSnapshot, PUBLISH_WINDOW};
 pub use workers::{
     identity, identity_of, token, HealthPolicy, MembershipChange, Overload, ProviderKey,
     ProviderKeyError, Reachability, Registrant, Signals, WorkerFacts, WorkerPatch, WorkerRow,
     WorkerStatus, WorkersStore,
 };
+
+// What stands in this file itself: a record that several modules of the
+// store and their callers name by the store's path, and that has no method
+// of its own.
 
 /// The verified identity of a gateway: the fingerprint of the subject its
 /// session was authenticated as, never a message field. Leases, vetoes and
@@ -92,4 +96,16 @@ impl GatewayId {
     /// The gateway deciding in its own process: the embedded mode's one
     /// principal.
     pub const LOCAL: Self = Self(0);
+}
+
+/// Why a generation was not applied: its number is not above the standing
+/// one. The store's number only rises.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("generation {offered} is not above the standing generation {standing}")]
+#[expect(clippy::exhaustive_structs, reason = "its two numbers are the record")]
+pub struct StaleGeneration {
+    /// The number of the generation the store holds.
+    pub standing: u64,
+    /// The number of the generation that was offered.
+    pub offered: u64,
 }

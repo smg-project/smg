@@ -8,9 +8,9 @@ use smg_worker::{
 };
 
 use super::{
-    super::found, awaits_connect, changed, drain, lay, lay_one, refresh, refresh_stated, stating,
-    take, MembershipWriteOutcome, MembershipWriteRefused, MembershipWriter, Over, Precondition,
-    Remover, RowRevision, Stated, Turn,
+    super::found, asks_events_under, awaits_connect, changed, drain, lay, lay_one, refresh,
+    refresh_stated, stating, take, MembershipWriteOutcome, MembershipWriteRefused,
+    MembershipWriter, Over, Precondition, Remover, RowRevision, Stated, Turn,
 };
 use crate::{
     document::spec::{AppliedSpec, PolicySpec},
@@ -32,11 +32,16 @@ const URL: &str = "http://worker:8000";
 
 /// The reads and the writes of a turn over a store alone, which every
 /// turn of these cases is: the store's own table, where no holder
-/// states or decides a record.
+/// states or decides a record. `$store` names the turn's field that
+/// holds the store.
 macro_rules! over_the_table {
-    () => {
+    ($store:tt) => {
+        fn asks_events(&self, facts: &WorkerFacts) -> bool {
+            asks_events_under(facts, &self.$store)
+        }
+
         fn upsert(&self, facts: WorkerFacts, maker: Registrant) -> Option<MembershipChange> {
-            Some(self.store().upsert_by(facts, maker))
+            Some(self.$store.upsert_by(facts, maker))
         }
 
         fn patch(
@@ -45,36 +50,36 @@ macro_rules! over_the_table {
             patch: WorkerPatch,
             revision: u64,
         ) -> Option<MembershipChange> {
-            self.store().patch(id, patch, revision)
+            self.$store.patch(id, patch, revision)
         }
 
         fn remove(&self, id: WorkerId, revision: u64) -> Option<MembershipChange> {
-            self.store().remove(id, revision)
+            self.$store.remove(id, revision)
         }
 
         fn connect(&self, id: WorkerId, revision: u64) {
-            let standing = self.store().get(id).map(|row| row.status);
+            let standing = self.$store.get(id).map(|row| row.status);
             if !matches!(standing, Some(WorkerStatus::Draining | WorkerStatus::Ready)) {
-                self.store().set_status(id, WorkerStatus::Ready, revision);
+                self.$store.set_status(id, WorkerStatus::Ready, revision);
             }
         }
 
         fn drain(&self, id: WorkerId, revision: u64) -> bool {
-            self.store()
+            self.$store
                 .set_status(id, WorkerStatus::Draining, revision)
                 .is_some()
         }
 
         fn row(&self, id: WorkerId) -> Option<WorkerRow> {
-            self.store().get(id)
+            self.$store.get(id)
         }
 
         fn row_under(&self, url: &str) -> Option<WorkerRow> {
-            self.store().by_key(url)
+            self.$store.by_key(url)
         }
 
         fn rows_of(&self, engine: &str) -> Vec<WorkerRow> {
-            let (_, rows) = self.store().all_rows();
+            let (_, rows) = self.$store.all_rows();
             rows.into_iter()
                 .filter(|row| row.facts.engine == engine)
                 .collect()
@@ -101,11 +106,7 @@ impl StoreDoor {
 }
 
 impl Turn for StoreDoor {
-    fn store(&self) -> &MemoryStore {
-        &self.store
-    }
-
-    over_the_table!();
+    over_the_table!(store);
 
     fn life(&self) -> Result<u64, MembershipWriteRefused> {
         Ok(membership::life(0, self.base, self.store.epoch()))
@@ -189,8 +190,8 @@ impl HolderDoor {
 }
 
 impl Turn for HolderDoor {
-    fn store(&self) -> &MemoryStore {
-        &self.store
+    fn asks_events(&self, facts: &WorkerFacts) -> bool {
+        asks_events_under(facts, &self.store)
     }
 
     fn row(&self, id: WorkerId) -> Option<WorkerRow> {
@@ -1779,11 +1780,7 @@ fn a_life_refused_between_two_rows_leaves_the_row_before() {
     struct OneLife<'a>(&'a MemoryStore, std::cell::Cell<bool>);
 
     impl Turn for OneLife<'_> {
-        fn store(&self) -> &MemoryStore {
-            self.0
-        }
-
-        over_the_table!();
+        over_the_table!(0);
 
         fn life(&self) -> Result<u64, MembershipWriteRefused> {
             if self.1.replace(true) {
@@ -1828,11 +1825,7 @@ fn a_life_refused_between_two_rows_leaves_the_row_before() {
 struct TermFor<'a>(&'a MemoryStore, std::cell::Cell<usize>);
 
 impl Turn for TermFor<'_> {
-    fn store(&self) -> &MemoryStore {
-        self.0
-    }
-
-    over_the_table!();
+    over_the_table!(0);
 
     fn check_term(&self) -> Result<(), MembershipWriteRefused> {
         let Some(left) = self.1.get().checked_sub(1) else {
@@ -1969,11 +1962,7 @@ fn a_fact_past_its_bound_writes_nothing() {
     struct Shut<'a>(&'a MemoryStore);
 
     impl Turn for Shut<'_> {
-        fn store(&self) -> &MemoryStore {
-            self.0
-        }
-
-        over_the_table!();
+        over_the_table!(0);
 
         fn life(&self) -> Result<u64, MembershipWriteRefused> {
             Ok(0)

@@ -150,8 +150,8 @@ pub struct WorkerFacts {
     /// shared pointer: a worker that reports none holds one word for it,
     /// and every copy of a row shares the one its worker reported.
     pub pairing: Option<Arc<PairingDescriptor>>,
-    /// The worker's end of the encode handoff, as the handshake learned it;
-    /// the default states none. A worker host derives its encode classes
+    /// The worker's end of the encode handoff, as its registration states
+    /// it; the default states none. A worker host derives its encode classes
     /// from it by the engine's rule, with the engine kind as the runtime
     /// ([`EncodeClasses`](crate::engine::EncodeClasses)). The door drops a
     /// blank connector and reads its name past its blanks.
@@ -172,9 +172,11 @@ pub struct WorkerFacts {
     pub signals: Signals,
     pub health: HealthPolicy,
     pub overload: Overload,
-    /// The seconds a removal waits behind a drain, where the worker's
-    /// registration states another window than the default. A host that
-    /// builds the worker's object from the row gives the object this window.
+    /// The seconds a removal waits behind a drain, where the row states a
+    /// window: a control call's registration states any, and a found
+    /// worker's is a fact of its row where it is not the default. A host
+    /// that builds the worker's object from the row gives the object this
+    /// window.
     pub drain_settle_secs: Option<u32>,
     /// What the worker states for a request's hard demands beside its
     /// vision ([`DemandFacts`]), in its registering host's own numbers. A
@@ -425,7 +427,8 @@ impl MembershipChange {
 /// Every write moves the store's epoch; a write of a row's facts moves the
 /// row's revision, a status change does not. The store keeps no log of
 /// its changes. A journaled store tells each write to its journal
-/// ([`Journal::member`](super::Journal::member)), and a watcher reads
+/// ([`Journal::member`](super::Journal::member), and a status write
+/// [`Journal::status`](super::Journal::status)), and a watcher reads
 /// the journal's log. A
 /// snapshot carries the
 /// facts the gateways' pools derive from (role, wire modes, engine kind,

@@ -16,6 +16,7 @@ use crate::{
             attempt_ledger::mark_pending_charge,
             pd_failure::{PdSide, SidePhase},
             prefill_admission::PrefillLoadGuard,
+            retry::mark_non_retryable,
         },
         error,
         grpc::{
@@ -28,7 +29,7 @@ use crate::{
             utils::{
                 account_pd_side_failure, dead_rendezvous_of, mark_error_reason,
                 stream_failure::UpstreamClass,
-                tonic_ext::{is_the_engines_own_report, TonicStatusExt},
+                tonic_ext::{is_receive_bound_refusal, is_the_engines_own_report, TonicStatusExt},
                 DeadRendezvous,
             },
         },
@@ -292,6 +293,11 @@ fn stream_failed(
         (None, Some(side)) if !is_request_timeout(status) => {
             let mut response =
                 side.answer(SidePhase::Stream, status.http_status(), status.message());
+            // An answer above the receive bound is as large from any
+            // worker: final, as `to_http_error` makes it for a single one.
+            if is_receive_bound_refusal(status) {
+                mark_non_retryable(&mut response);
+            }
             mark_error_reason(&mut response, status.error_reason());
             response
         }
@@ -806,6 +812,33 @@ mod tests {
         );
     }
 
+    /// A stream a worker's message above the receive bound ended, a single
+    /// worker's or a side's: a 502 under the code each failure has, and
+    /// never replayed, since another worker's answer would be as large.
+    #[test]
+    fn a_stream_the_receive_bound_ended_is_an_upstream_fault_and_final() {
+        let code = |response: &Response| {
+            let header = response.headers().get(error::HEADER_X_SMG_ERROR_CODE);
+            header.and_then(|v| v.to_str().ok()).map(str::to_owned)
+        };
+        let refused = tonic::Status::out_of_range(
+            "Error, decoded message length too large: found 9886731 bytes, the limit is: 4194304 bytes",
+        );
+        let single = stream_failed(None, "worker", &refused, None);
+        assert_eq!(single.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(code(&single).as_deref(), Some("worker_stream_failed"));
+        assert!(!is_retryable_response(&single));
+        for side in [PdSide::Prefill, PdSide::Decode] {
+            let response = stream_failed(Some(side), side.name(), &refused, None);
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(
+                code(&response).as_deref(),
+                Some(side.code(SidePhase::Stream))
+            );
+            assert!(!is_retryable_response(&response));
+        }
+    }
+
     /// A side's stream the request timeout cut is answered as on every other
     /// path: under the timeout's code, and never replayed. A worker's own
     /// deadline is still the side's failure: its code, and a replay.
@@ -1070,6 +1103,44 @@ mod tests {
             prefill.circuit_breaker_can_execute(),
             "one request charges the prefill worker once"
         );
+    }
+
+    /// A prefill message above the receive bound ends the sequential drain
+    /// as it ends the collector's: a 502 that is never replayed, since
+    /// another prefill worker's answer would be as large.
+    #[tokio::test]
+    async fn a_prefill_message_above_the_receive_bound_ends_the_sequential_drain_for_good() {
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://prefill:30001")
+                .worker_type(WorkerType::Prefill)
+                .connection_mode(ConnectionMode::Grpc)
+                .build(),
+        );
+        let workers = WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill: Arc::clone(&prefill),
+            decode: Arc::clone(&prefill).into(),
+            runtime_type: RuntimeType::Vllm,
+        };
+        let request = ProtoGenerateRequest::Vllm(Box::default());
+        // A finish reason of five million bytes: one message above the 4 MiB
+        // the stream's decoder reads by default.
+        let oversized = complete(0, &"e".repeat(5_000_000));
+        let (stream, _server) = scripted_stream(vec![oversized], "0").await;
+        let ledger = AttemptLedger::default();
+        let Err(failure) = sequential_prefill_side(
+            &PdSides::of(&workers, &ledger, &request, false),
+            Box::pin(async move { Ok::<_, tonic::Status>(stream) }),
+            PrefillLoadGuard::Unbounded {
+                _guard: WorkerLoadGuard::with_key(Arc::clone(&prefill), None),
+            },
+        )
+        .await
+        else {
+            panic!("the drain met a message above the receive bound");
+        };
+        assert_eq!(failure.status(), StatusCode::BAD_GATEWAY);
+        assert!(!is_retryable_response(&failure));
     }
 
     #[tokio::test]

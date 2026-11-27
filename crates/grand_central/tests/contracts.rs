@@ -1705,6 +1705,8 @@ const MEMBERSHIP_FIELDS: &[(&str, &[ResumeField])] = &[
             ("demand_facts", 28, Type::Message),
             ("vision", 29, Type::Bool),
             ("encode", 30, Type::Message),
+            ("priority", 31, Type::Sint32),
+            ("drain_settle_secs", 32, Type::Uint32),
         ],
     ),
     (
@@ -1738,6 +1740,8 @@ const MEMBERSHIP_FIELDS: &[(&str, &[ResumeField])] = &[
             ("demand_facts", 15, Type::Message),
             ("vision", 16, Type::Bool),
             ("encode", 17, Type::Message),
+            ("priority", 18, Type::Sint32),
+            ("drain_settle_secs", 19, Type::Uint32),
         ],
     ),
 ];
@@ -1813,6 +1817,21 @@ fn the_membership_fields_are_pinned() {
             .collect();
         assert_eq!(found, expected, "{message_name}: a membership field moved");
     }
+
+    // The offer's form by its own type: a field of another enum's type
+    // would read the same numbers by other names. A form keeps its number.
+    let offer = message(controller, "EncodeOffer").expect("EncodeOffer is in the controller file");
+    let typed: Vec<&str> = offer
+        .field
+        .iter()
+        .filter(|field| field.name() == "handoff")
+        .map(|field| field.type_name())
+        .collect();
+    assert_eq!(typed, [".smg.policy.v1.EncodeHandoff"]);
+    assert_eq!(
+        enum_values(controller, "EncodeHandoff"),
+        Some(proto_enum("ENCODE_HANDOFF", &["Push", "Rendezvous"]))
+    );
 
     // The two thresholds no judge read left the message: their numbers and
     // names stay reserved, so a reader brings one back under a new number.

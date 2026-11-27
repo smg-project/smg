@@ -268,7 +268,10 @@ experiments against it transfer to engines:
   end-of-sequence ID; the other IDs stay as drawn. A tokenizer that decodes
   no ID of the range leaves the output as drawn, as does a worker with no
   local tokenizer: a benchmark must then separately verify those IDs against
-  its pinned tokenizer and special IDs.
+  its pinned tokenizer and special IDs. The worker logs a warning when local
+  tokenizer files give no such table (they do not load, or decode no ID of
+  the range); a `--tokenizer` that is no local path stays quiet. An HTTP
+  worker sends text and no IDs, so it loads no tokenizer for this.
 
 | Flag | Default | Meaning |
 |------|---------|---------|
