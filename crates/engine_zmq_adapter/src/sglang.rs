@@ -25,6 +25,7 @@ use tracing::warn;
 
 use crate::{
     abort_status::engine_abort_status,
+    client::ZmqDialect,
     context_window::admit_prompt,
     fanout::fan_out_n,
     pin_yield::PinYieldNote,
@@ -439,12 +440,13 @@ pub(crate) struct SglangConnection<'a> {
 /// `translate_request_sglang` gives to the scheduler. The gateway reads it as
 /// a worker label.
 pub fn cache_partition_fields_arg() -> (String, prost_types::Value) {
+    let fields = ZmqDialect::Sglang
+        .cache_partition_fields()
+        .unwrap_or_default();
     (
         "cache_partition_fields".to_string(),
         prost_types::Value {
-            kind: Some(prost_types::value::Kind::StringValue(
-                "cache_salt,extra_key".to_string(),
-            )),
+            kind: Some(prost_types::value::Kind::StringValue(fields.to_string())),
         },
     )
 }

@@ -11,12 +11,13 @@ use smg_worker::{
         endpoint::Endpoint,
         sampling_defaults::{SamplingDefaults, DEFAULT_SAMPLING_PARAMS_LABEL},
     },
+    labels::CACHE_PARTITION_FIELDS_LABEL,
     workflow::{resolve_model_id, WorkerKind},
 };
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowResult};
 
-use crate::workflow::data::WorkerWorkflowData;
+use crate::{routers::grpc::zmq_client::ZmqDialect, workflow::data::WorkerWorkflowData};
 
 /// The id of the step that writes a ZMQ worker's runtime default and labels.
 pub(crate) const ZMQ_LABELS_STEP: &str = "discover_zmq_labels";
@@ -126,7 +127,9 @@ async fn sampling_defaults_label(path: &std::path::Path) -> HashMap<String, Stri
 /// (a local directory, or a Hub id through the HF cache), for a worker that
 /// serves that model (one registered for another model, by spec or label,
 /// must not inherit them), and where the gateway's own link starts a
-/// grammar, which is the link's rule and needs no engine.
+/// grammar, which is the link's rule and needs no engine. The cache
+/// partition fields are the link's rule too: the fields that the worker's
+/// dialect gives to the engine.
 pub struct DiscoverZmqLabelsStep;
 
 #[async_trait]
@@ -167,7 +170,17 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverZmqLabelsStep {
             .as_ref()
             .and_then(|app| app.router_config.model_path.clone());
         let model = zmq_model(router_model, resolve_model_id(config, &config.labels));
-        let labels = zmq_worker_labels(model.as_deref()).await;
+        let mut labels = zmq_worker_labels(model.as_deref()).await;
+        let fields = context
+            .data
+            .detected_runtime_type
+            .as_deref()
+            .and_then(|runtime| runtime.parse().ok())
+            .and_then(ZmqDialect::for_runtime)
+            .and_then(ZmqDialect::cache_partition_fields);
+        if let Some(fields) = fields {
+            labels.insert(CACHE_PARTITION_FIELDS_LABEL.to_string(), fields.to_string());
+        }
 
         debug!(
             "Discovered {} labels for {}",

@@ -127,6 +127,32 @@ pub enum ZmqDialect {
     Trtllm,
 }
 
+impl ZmqDialect {
+    /// The dialect the ZMQ lane speaks to an engine of `runtime`, or none
+    /// for a runtime with no ZMQ engine adapter.
+    pub fn for_runtime(runtime: RuntimeType) -> Option<Self> {
+        match runtime {
+            // vLLM EngineCore is the default ZMQ wire; an unspecified runtime
+            // maps to it for backward compatibility (see `detect_backend`).
+            RuntimeType::Vllm | RuntimeType::Unspecified => Some(Self::Vllm),
+            RuntimeType::TokenSpeed => Some(Self::TokenSpeed),
+            RuntimeType::Sglang => Some(Self::Sglang),
+            RuntimeType::Trtllm => Some(Self::Trtllm),
+            _ => None,
+        }
+    }
+
+    /// The prefix-cache partition fields that this dialect's translation gives
+    /// to the engine, comma-separated. `None` means no field.
+    pub fn cache_partition_fields(self) -> Option<&'static str> {
+        match self {
+            Self::Vllm => Some("cache_salt"),
+            Self::Sglang => Some("cache_salt,extra_key"),
+            Self::TokenSpeed | Self::Trtllm => None,
+        }
+    }
+}
+
 /// The connected client for a [`ZmqDialect`]. All share the transport and
 /// handshake; only the request/output struct shapes and the translation to/from
 /// SMG proto differ.
@@ -615,20 +641,12 @@ impl ZmqEngineClient {
         // Resolve the dialect before the handshake: no silent fallback for a
         // runtime with no ZMQ engine adapter, and no such engine ever dials in,
         // so the handshake would just block for the full timeout.
-        let dialect = match runtime {
-            // vLLM EngineCore is the default ZMQ wire; an unspecified runtime
-            // maps to it for backward compatibility (see `detect_backend`).
-            RuntimeType::Vllm | RuntimeType::Unspecified => ZmqDialect::Vllm,
-            RuntimeType::TokenSpeed => ZmqDialect::TokenSpeed,
-            RuntimeType::Sglang => ZmqDialect::Sglang,
-            RuntimeType::Trtllm => ZmqDialect::Trtllm,
-            other => {
-                return Err(format!(
-                    "ZMQ direct backend has no engine implementation for runtime \
-                     {other}; only vllm, tokenspeed, sglang and trtllm are supported"
-                )
-                .into())
-            }
+        let Some(dialect) = ZmqDialect::for_runtime(runtime) else {
+            return Err(format!(
+                "ZMQ direct backend has no engine implementation for runtime \
+                 {runtime}; only vllm, tokenspeed, sglang and trtllm are supported"
+            )
+            .into());
         };
 
         let transport = connect_handshake(
@@ -2158,6 +2176,10 @@ impl ZmqEngineClient {
             ZmqBackend::Vllm(_) => ZmqServerInfo::Vllm(Box::new(vllm::GetServerInfoResponse {
                 data_parallel_size: i32::try_from(data_parallel_size).unwrap_or(i32::MAX),
                 server_type: "vllm".to_string(),
+                cache_partition_fields: ZmqDialect::Vllm
+                    .cache_partition_fields()
+                    .unwrap_or_default()
+                    .to_string(),
                 ..Default::default()
             })),
             // TokenSpeed's server-info proto carries no data-parallel size or
@@ -3381,6 +3403,43 @@ mod tests {
         assert!(
             error.to_string().contains("no engine implementation"),
             "{error}"
+        );
+    }
+
+    /// Each runtime's dialect names the cache partition fields that its
+    /// translation gives to the engine. A runtime with no dialect names none.
+    #[test]
+    fn each_dialect_names_the_cache_partition_fields_it_forwards() {
+        for (runtime, fields) in [
+            (RuntimeType::Vllm, Some("cache_salt")),
+            (RuntimeType::Unspecified, Some("cache_salt")),
+            (RuntimeType::Sglang, Some("cache_salt,extra_key")),
+            (RuntimeType::TokenSpeed, None),
+            (RuntimeType::Trtllm, None),
+            (RuntimeType::Mlx, None),
+        ] {
+            assert_eq!(
+                ZmqDialect::for_runtime(runtime).and_then(ZmqDialect::cache_partition_fields),
+                fields,
+                "{runtime}"
+            );
+        }
+    }
+
+    /// The vLLM lane gives `cache_salt` to the engine, so its server info
+    /// gives the worker the `cache_partition_fields` label.
+    #[tokio::test]
+    async fn a_direct_zmq_vllm_worker_advertises_the_cache_partition_fields() {
+        use smg_grpc_client::engine_labels::ServerInfo;
+
+        let (client, _engine, _dir) = connected_pair(RuntimeType::Vllm).await;
+        let ZmqServerInfo::Vllm(info) = client.server_info() else {
+            panic!("expected vLLM server info");
+        };
+        let labels = ServerInfo::Vllm(info).to_labels();
+        assert_eq!(
+            labels.get("cache_partition_fields").map(String::as_str),
+            Some("cache_salt")
         );
     }
 

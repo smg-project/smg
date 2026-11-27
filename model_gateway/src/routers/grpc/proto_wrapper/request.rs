@@ -5,6 +5,7 @@
 //! the four names the code takes from sibling modules come through the
 //! parent's imports.
 
+use openai_protocol::common::CachePartition;
 use smg_grpc_client::{
     mlx_proto as mlx, sglang_proto as sglang, tokenspeed_proto as tokenspeed,
     trtllm_proto as trtllm, vllm_proto as vllm,
@@ -355,6 +356,38 @@ impl ProtoGenerateRequest {
             Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => {
                 tracing::warn!("set_kv_transfer_params called on non-vLLM request, ignoring");
             }
+        }
+    }
+
+    /// Set the request's cache salt and extra key. A wire without a field
+    /// leaves it out. Worker selection sends a request with a field only to a
+    /// worker whose label lists it and whose wire carries it
+    /// ([`Self::cache_partition_fields`]). The LoRA adapter does not change here.
+    pub fn set_cache_partition(&mut self, partition: CachePartition<'_>) {
+        match self {
+            Self::Vllm(req) => req.cache_salt = partition.cache_salt.map(str::to_owned),
+            Self::Sglang(req) => {
+                req.cache_partition = Some(Box::new(sglang::CachePartition {
+                    cache_salt: partition.cache_salt.map(str::to_owned),
+                    extra_key: partition.extra_key.map(str::to_owned),
+                }));
+            }
+            Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => {}
+        }
+    }
+
+    /// The cache partition fields that [`Self::set_cache_partition`] writes on
+    /// the wire of `runtime`. A runtime without a gRPC wire has none.
+    pub fn cache_partition_fields(runtime: RuntimeType) -> &'static [&'static str] {
+        match runtime {
+            RuntimeType::Vllm => &["cache_salt"],
+            RuntimeType::Sglang => &["cache_salt", "extra_key"],
+            RuntimeType::Trtllm
+            | RuntimeType::Mlx
+            | RuntimeType::TokenSpeed
+            | RuntimeType::Unspecified
+            | RuntimeType::Generic
+            | RuntimeType::External => &[],
         }
     }
 

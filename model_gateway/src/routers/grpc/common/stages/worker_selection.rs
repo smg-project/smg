@@ -11,7 +11,6 @@ use axum::{
     response::Response,
 };
 use futures::{future::Either, FutureExt};
-use openai_protocol::common::CachePartition;
 use parking_lot::Mutex;
 use smg_worker::identity::{
     basic::{ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerType},
@@ -20,6 +19,7 @@ use smg_worker::identity::{
 use tracing::{debug, error, warn};
 
 use super::{
+    cache_partition::{self, CachePartitionDemand},
     context_length::{output_budget, pair_context_length},
     helpers,
     pd_protocol::{EncodeHandoff, PdProtocol},
@@ -101,6 +101,8 @@ enum EpdSelectionFailure {
     /// Grand Central places the gateway's requests, and it places no
     /// encoder: a request that carries an encode item is not served.
     EncodeUnderGrandCentral,
+    /// No pair gives the request's cache partition fields to its engines.
+    CachePartitionUnsupported(CachePartitionDemand),
 }
 
 impl PrefillCandidateError for EpdSelectionFailure {
@@ -116,6 +118,8 @@ impl PrefillCandidateError for EpdSelectionFailure {
 enum PdSelectionFailure {
     Placement(Box<PairFailure>),
     NoVisionCapablePrefill,
+    /// No pair gives the request's cache partition fields to its engines.
+    CachePartitionUnsupported(CachePartitionDemand),
     Context(Box<Response>),
 }
 
@@ -419,6 +423,9 @@ struct SelectionInputs<'a> {
     /// the side of the pipeline pin the plan carries) from the inputs and
     /// their vision demands from `PairDemands` in the pair selection.
     media: MediaDemands,
+    /// The cache partition fields the request carries: each worker that
+    /// builds or runs it must give them to its engine.
+    partition: CachePartitionDemand,
     wire: Option<WireConstraint>,
     model_id: &'a str,
 }
@@ -439,12 +446,19 @@ impl<'a> SelectionInputs<'a> {
         } else {
             ContextRequirements::new(prep, &input.request_type)
         };
+        // The fields that the gRPC wire forwards split affinity, as on the
+        // HTTP path. Names match the engine's KV-event namespace. Internal
+        // LoRA IDs stay isolated too, but cannot match name-keyed events
+        // without a name mapping.
+        let forwarded = cache_partition::request_partition(&input.request_type);
+        let partition = CachePartitionDemand::of(&forwarded);
         let demand = PairDemands::new(
             stage.prefill_side_needs_vision(needs_vision),
             stage.decode_side_needs_vision(&input.request_type, intermediate, media_refs),
         )
         .with_media_refs(media_refs, media_refs_pipeline)
-        .with_context(context_requirements);
+        .with_context(context_requirements)
+        .with_partition(partition);
 
         let text = prep.routing_text();
 
@@ -463,16 +477,8 @@ impl<'a> SelectionInputs<'a> {
             || stage
                 .policy_registry
                 .any_policy_needs_request_text_with_tokens(headers);
-        // Only LoRA selection is forwarded; salts and extra_key still are
-        // not, so they must not split affinity on the tokenized wire. Names
-        // match the engine's KV-event namespace. Internal IDs stay isolated
-        // too, but cannot match name-keyed events without a name mapping.
-        let lora_adapter = input.request_type.lora_adapter();
-        let cache_namespace = CacheNamespace::derive(&CachePartition {
-            cache_salt: None,
-            extra_key: None,
-            lora_path: lora_adapter,
-        });
+        let lora_adapter = forwarded.lora_path;
+        let cache_namespace = CacheNamespace::derive(&forwarded);
         let media = MediaDemands {
             media_refs,
             vision: needs_vision,
@@ -509,6 +515,7 @@ impl<'a> SelectionInputs<'a> {
             keep_text,
             cache_namespace,
             media,
+            partition,
             wire,
             model_id,
         }
@@ -543,6 +550,7 @@ impl<'a> SelectionInputs<'a> {
             language_model_reads_grids: self
                 .intermediate
                 .is_none_or(multimodal::MultimodalIntermediate::language_model_reads_grids),
+            cache_partition: self.partition,
         }
     }
 
@@ -601,9 +609,11 @@ impl WorkerSelectionStage {
         // regular mode awaits nothing.
         let model_id = inputs.model_id;
         let media = inputs.media;
+        let partition = inputs.partition;
         let context_requirements = inputs.context_requirements;
         let wire = inputs.wire;
         let accepts_refs = |worker: &dyn Worker| media.accepts_refs(worker);
+        let meets_partition = |worker: &dyn Worker| partition.met_by(worker);
         let placement = inputs.placement(inputs.media_refs.then_some(&accepts_refs));
         let sticky_key = ctx.state.sticky_key.as_deref();
         let (workers, prefill_guard) = match self.mode {
@@ -612,7 +622,9 @@ impl WorkerSelectionStage {
                     model_id,
                     context_requirements,
                     media,
-                    None,
+                    partition
+                        .any()
+                        .then_some(&meets_partition as CandidateFilter<'_>),
                     inputs.text,
                     inputs.tokens(),
                     inputs.headers,
@@ -628,6 +640,7 @@ impl WorkerSelectionStage {
                             model_id,
                             wire,
                             media,
+                            partition,
                             context_requirements,
                         ));
                     }
@@ -698,6 +711,7 @@ impl WorkerSelectionStage {
                                 encode: media,
                                 decode_vision: inputs.demand.decode,
                                 image_fanout: ctx.state.image_anchor.is_some(),
+                                partition,
                             },
                             // This mode captures no context requirements, so
                             // this call reads the budget off the body. The
@@ -763,6 +777,7 @@ impl WorkerSelectionStage {
                 return Err(err.into_response());
             }
         }
+        ensure_selection_meets_partition(&workers, partition, model_id)?;
 
         ctx.state.workers = Some(workers);
         Ok(())
@@ -839,9 +854,11 @@ impl WorkerSelectionStage {
         // that decision.
         let ledger = &ctx.ledger;
         let decided_on = ctx.constraint_decided_on;
+        let partition = ctx.routing.cache_partition;
         let admits = |worker: &dyn Worker| {
             ledger.admits(worker)
                 && decided_on.is_none_or(|decoding| decoding.decides_alike(worker))
+                && partition.met_by(worker)
         };
 
         let workers = match self.mode {
@@ -866,6 +883,7 @@ impl WorkerSelectionStage {
                             model_id,
                             wire,
                             media,
+                            partition,
                             context_requirements,
                         ))
                     }
@@ -914,7 +932,8 @@ impl WorkerSelectionStage {
                                         == Some(EncodeHandoff::Push)),
                         )
                         .with_media_refs(media_refs, ctx.wire.pipeline)
-                        .with_context(context_requirements),
+                        .with_context(context_requirements)
+                        .with_partition(partition),
                         restated,
                     )
                     .await?;
@@ -922,6 +941,7 @@ impl WorkerSelectionStage {
                 disaggregated(pair)
             }
         };
+        ensure_selection_meets_partition(&workers, partition, model_id)?;
 
         ctx.workers = Some(workers);
         Ok(())
@@ -977,7 +997,10 @@ impl WorkerSelectionStage {
             let mut brought = brought.lock();
             *brought = None;
             let alike = takes_the_built_request(&**first, worker, model_id, request.wire);
-            if !alike || !request.ledger.admits(worker) {
+            if !alike
+                || !request.ledger.admits(worker)
+                || !request.routing.cache_partition.met_by(worker)
+            {
                 return false;
             }
             if same_worker(first.worker(), worker) {
@@ -1188,6 +1211,9 @@ impl WorkerSelectionStage {
                     EpdSelectionFailure::EncodeUnderGrandCentral => {
                         return self.encode_under_grand_central(model_id)
                     }
+                    EpdSelectionFailure::CachePartitionUnsupported(partition) => {
+                        return partition.refusal(model_id, "prefill/decode pairs that meet the other demands")
+                    }
                     EpdSelectionFailure::Unavailable => {}
                 }
                 // Encode is a demanded role only when the request carries
@@ -1380,6 +1406,9 @@ struct PairDemands {
     /// ([`pipeline_admits`]); the probes count only the pairs on that side,
     /// so a pair the pin excludes never stands in for one it admits.
     pipeline: PipelinePin,
+    /// The cache partition fields the request carries, which both sides
+    /// must give to their engines.
+    partition: CachePartitionDemand,
 }
 
 impl PairDemands {
@@ -1393,6 +1422,7 @@ impl PairDemands {
             decode,
             refs: false,
             pipeline: PipelinePin::Any,
+            partition: CachePartitionDemand::default(),
         }
     }
 
@@ -1411,6 +1441,11 @@ impl PairDemands {
     /// Context bounds shared by both token-processing sides, never the encoder.
     fn with_context(self, context: ContextRequirements) -> Self {
         Self { context, ..self }
+    }
+
+    /// The cache partition fields of the request, for both sides.
+    fn with_partition(self, partition: CachePartitionDemand) -> Self {
+        Self { partition, ..self }
     }
 
     /// The demand on the side `worker` serves.
@@ -1652,6 +1687,25 @@ fn selection_runtime(workers: &WorkerSelection) -> RuntimeType {
     }
 }
 
+/// Refuse a selection with a worker that does not give the request's cache
+/// partition fields to its engine. Each selection path filters by the same
+/// rule. This check is a backstop for a later path that skips the filter.
+/// A field must never reach a worker that drops it.
+fn ensure_selection_meets_partition(
+    workers: &WorkerSelection,
+    partition: CachePartitionDemand,
+    model_id: &str,
+) -> Result<(), Response> {
+    if workers
+        .workers()
+        .all(|worker| partition.met_by(worker.as_ref()))
+    {
+        Ok(())
+    } else {
+        Err(partition.refusal(model_id, "selected workers"))
+    }
+}
+
 impl WorkerSelectionStage {
     /// The regular pool's workers on `wire` that take `media`, as the wire
     /// reads it, healthy or not.
@@ -1676,17 +1730,24 @@ impl WorkerSelectionStage {
 
     /// Judge capacity over the same wire and media candidates, before health.
     /// A sufficiently large but unavailable worker yields 503, never a false 400.
+    /// A pool with capable workers but none that gives the request's cache
+    /// partition fields to its engine is the request's own 400.
     fn context_selection_failure(
         &self,
         model_id: &str,
         wire: Option<WireConstraint>,
         media: MediaDemands,
+        partition: CachePartitionDemand,
         context: ContextRequirements,
     ) -> Response {
         let media = media.with_wire(wire);
-        let capable = self.capable_regular(model_id, wire, media);
+        let mut capable = self.capable_regular(model_id, wire, media);
         if capable.is_empty() {
             return self.selection_failure(model_id, &[WorkerType::Regular], wire, media);
+        }
+        capable.retain(|worker| partition.met_by(worker.as_ref()));
+        if capable.is_empty() {
+            return partition.refusal(model_id, "workers");
         }
         if let Some(refusal) = unheld_by(&capable, context, model_id) {
             return refusal;
@@ -2011,6 +2072,9 @@ impl WorkerSelectionStage {
             PdSelectionFailure::Context(response) => *response,
             PdSelectionFailure::NoVisionCapablePrefill => {
                 self.vision_refusal(model_id, "prefill workers")
+            }
+            PdSelectionFailure::CachePartitionUnsupported(partition) => {
+                partition.refusal(model_id, "prefill/decode pairs that meet the other demands")
             }
         }
     }
@@ -2512,8 +2576,26 @@ impl WorkerSelectionStage {
         {
             return Err(PdSelectionFailure::NoVisionCapablePrefill);
         }
+        // Both sides must give the request's cache partition fields to their
+        // engines. The pair must also meet the prefill vision demand above.
+        // When pairs exist but none meets both, the answer is a 400. A 503
+        // would make the client retry for ever.
+        let partition = demand.partition;
+        let takes_refs_and_vision = |worker: &dyn Worker| {
+            takes_refs(worker) && (!demand.prefill || prefill_vision_capable(worker))
+        };
+        if partition.any()
+            && pair_admitted_by(pairs, wire, &takes_refs_and_vision)
+            && !pair_admitted_by(pairs, wire, &|worker: &dyn Worker| {
+                takes_refs_and_vision(worker) && partition.met_by(worker)
+            })
+        {
+            return Err(PdSelectionFailure::CachePartitionUnsupported(partition));
+        }
         let caller = inputs.candidate_filter;
-        let admitted = move |worker: &dyn Worker| caller.is_none_or(|accepts| accepts(worker));
+        let admitted = move |worker: &dyn Worker| {
+            caller.is_none_or(|accepts| accepts(worker)) && partition.met_by(worker)
+        };
         let with_vision = move |worker: &dyn Worker| {
             (!demand.on(worker) || vision_capable(worker)) && admitted(worker)
         };
@@ -2524,6 +2606,8 @@ impl WorkerSelectionStage {
             Some(&with_vision)
         } else if demand.prefill {
             Some(&prefill_with_vision)
+        } else if partition.any() {
+            Some(&admitted)
         } else {
             inputs.candidate_filter
         };
@@ -2531,6 +2615,7 @@ impl WorkerSelectionStage {
         // a failed large worker does not make the client's prompt oversized.
         let takes_media = |worker: &dyn Worker| {
             takes_refs(worker)
+                && partition.met_by(worker)
                 && (!demand.prefill || prefill_vision_capable(worker))
                 && (!require_decode_vision || !demand.on(worker) || vision_capable(worker))
         };
@@ -2609,6 +2694,53 @@ impl WorkerSelectionStage {
         let capable = |worker: &Arc<dyn Worker>| capable_for(worker, demand.encode);
         available_encode.retain(capable);
         let registered_encode = snapshot.pool(RoutingPool::GrpcEncode);
+        // References go to E only; P consumes EC and D consumes KV. Diagnose
+        // permanent constraints against membership, not transient health.
+        let compatible = |encoder: &Arc<dyn Worker>, worker: &dyn Worker| {
+            let runtime = worker.metadata().spec.runtime_type;
+            encoder.metadata().spec.runtime_type == runtime
+                && (PdProtocol::encode_handoff(runtime) != Some(EncodeHandoff::Push)
+                    || worker.worker_type() != &WorkerType::Prefill
+                    || ec_pair(encoder.as_ref(), worker))
+        };
+        let registered_ec = |worker: &dyn Worker| {
+            !needs_encode
+                || registered_encode
+                    .iter()
+                    .any(|e| capable(e) && compatible(e, worker))
+        };
+        let decode_vision = |worker: &dyn Worker| {
+            worker.metadata().spec.runtime_type != RuntimeType::Vllm
+                || worker.worker_type() != &WorkerType::Decode
+                || vision_capable(worker)
+        };
+        let pairs = snapshot.pd_pairs(PdWire::Grpc, self.policy_registry.pd_pairing_mode());
+        let ec_pair_exists = pair_admitted_by(&pairs, demand.wire, &registered_ec);
+        let vision_pair_exists = pair_admitted_by(&pairs, demand.wire, &|worker| {
+            registered_ec(worker) && decode_vision(worker)
+        });
+        // The encoders take no cache partition field; the pair takes them all.
+        // The pair must also take the encoder's output and meet the decode
+        // vision demand. A pair that lacks the fields is a fact of membership.
+        // An encoder that is down is not. So this check runs before encoder
+        // health. It waits for a pair that the EC and vision checks below pass.
+        // With no encoder registered, no pair takes an encoder's output yet.
+        // The fields are still a fact of membership, so it judges every pair.
+        let partition = demand.partition;
+        let fed = |worker: &dyn Worker| registered_encode.is_empty() || registered_ec(worker);
+        let applies = |worker: &dyn Worker| fed(worker) && partition.met_by(worker);
+        if partition.any()
+            && pair_admitted_by(&pairs, demand.wire, &fed)
+            && (!demand.decode_vision
+                || pair_admitted_by(&pairs, demand.wire, &|worker| {
+                    fed(worker) && decode_vision(worker)
+                }))
+            && !pair_admitted_by(&pairs, demand.wire, &|worker| {
+                applies(worker) && (!demand.decode_vision || decode_vision(worker))
+            })
+        {
+            return Err(EpdSelectionFailure::CachePartitionUnsupported(partition));
+        }
         if needs_encode && available_encode.is_empty() {
             // Only membership can prove a permanent configuration gap.
             return Err(if registered_encode.iter().any(capable) {
@@ -2637,44 +2769,25 @@ impl WorkerSelectionStage {
                 EpdSelectionFailure::Unavailable
             });
         }
-        // References go to E only; P consumes EC and D consumes KV. Diagnose
-        // permanent constraints against membership, not transient health.
-        let compatible = |encoder: &Arc<dyn Worker>, worker: &dyn Worker| {
-            let runtime = worker.metadata().spec.runtime_type;
-            encoder.metadata().spec.runtime_type == runtime
-                && (PdProtocol::encode_handoff(runtime) != Some(EncodeHandoff::Push)
-                    || worker.worker_type() != &WorkerType::Prefill
-                    || ec_pair(encoder.as_ref(), worker))
-        };
-        let registered_ec = |worker: &dyn Worker| {
-            !needs_encode
-                || registered_encode
-                    .iter()
-                    .any(|e| capable(e) && compatible(e, worker))
-        };
-        let decode_vision = |worker: &dyn Worker| {
-            worker.metadata().spec.runtime_type != RuntimeType::Vllm
-                || worker.worker_type() != &WorkerType::Decode
-                || vision_capable(worker)
-        };
-        let pairs = snapshot.pd_pairs(PdWire::Grpc, self.policy_registry.pd_pairing_mode());
-        let ec_pair_exists = pair_admitted_by(&pairs, demand.wire, &registered_ec);
         if !ec_pair_exists && pair_admitted_by(&pairs, demand.wire, &|_| true) {
             return Err(EpdSelectionFailure::EcIncompatible);
         }
-        let vision_pair_exists = pair_admitted_by(&pairs, demand.wire, &|worker| {
-            registered_ec(worker) && decode_vision(worker)
-        });
         if demand.decode_vision && ec_pair_exists && !vision_pair_exists {
             return Err(EpdSelectionFailure::DecodeVisionUnsupported);
         }
         // Unknown reference identities may be grid-free. Prefer a vision D
         // when registered, but retain the stripped-hash path otherwise; the
         // post-encode dispatch check rejects actual grids before sending P/D.
+        // Only a pair that applies the request's fields counts.
         let prefer_vision = demand.decode_vision
-            || (demand.encode.media_refs && demand.encode.vision && vision_pair_exists);
+            || (demand.encode.media_refs
+                && demand.encode.vision
+                && pair_admitted_by(&pairs, demand.wire, &|worker| {
+                    applies(worker) && decode_vision(worker)
+                }));
         let eligible = |worker: &dyn Worker| {
             (!prefer_vision || decode_vision(worker))
+                && partition.met_by(worker)
                 && (!needs_encode || available_encode.iter().any(|e| compatible(e, worker)))
         };
         let pair = placement::select_pair(
@@ -2771,6 +2884,8 @@ struct EpdDemands {
     encode: MediaDemands,
     decode_vision: bool,
     image_fanout: bool,
+    /// The cache partition fields the request carries, for the pair.
+    partition: CachePartitionDemand,
 }
 
 /// A configured connector must explicitly support the selected E/P role.
@@ -2968,6 +3083,7 @@ impl SelectionBench {
 #[cfg(test)]
 mod tests {
     mod lora;
+    mod partition;
     mod rank;
 
     use std::{
@@ -3696,6 +3812,9 @@ mod tests {
             }
             Err(PdSelectionFailure::NoVisionCapablePrefill) => {
                 panic!("a request no island holds is a 400 at selection, not a vision refusal")
+            }
+            Err(PdSelectionFailure::CachePartitionUnsupported(_)) => {
+                panic!("a request with no cache partition field is not refused for one")
             }
         }
 
@@ -4503,6 +4622,7 @@ mod tests {
                 needs_vision: false,
                 decode_needs_vision: false,
                 language_model_reads_grids: true,
+                cache_partition: CachePartitionDemand::default(),
             },
             wire,
             constraint_decided_on: None,
@@ -5403,6 +5523,7 @@ mod tests {
                         },
                         decode_vision: false,
                         image_fanout: true,
+                        partition: CachePartitionDemand::default(),
                     },
                     None,
                 )
@@ -5489,6 +5610,7 @@ mod tests {
             },
             decode_vision: false,
             image_fanout: items,
+            partition: CachePartitionDemand::default(),
         };
         let item = [vec![1]];
 
@@ -5708,6 +5830,7 @@ mod tests {
                         },
                         decode_vision: false,
                         image_fanout: true,
+                        partition: CachePartitionDemand::default(),
                     },
                     None,
                 )
@@ -5828,6 +5951,7 @@ mod tests {
                             },
                             decode_vision: true,
                             image_fanout,
+                            partition: CachePartitionDemand::default(),
                         },
                         None,
                     )
@@ -5877,6 +6001,7 @@ mod tests {
                         },
                         decode_vision: true,
                         image_fanout: false,
+                        partition: CachePartitionDemand::default(),
                     },
                     None,
                 )
@@ -6073,6 +6198,7 @@ mod tests {
                         },
                         decode_vision: grids,
                         image_fanout: false,
+                        partition: CachePartitionDemand::default(),
                     },
                     None,
                 );
@@ -6113,6 +6239,7 @@ mod tests {
                                 },
                                 decode_vision: grids,
                                 image_fanout: false,
+                                partition: CachePartitionDemand::default(),
                             },
                             None
                         ),
@@ -6129,6 +6256,7 @@ mod tests {
                         },
                         decode_vision: false,
                         image_fanout: false,
+                        partition: CachePartitionDemand::default(),
                     };
                     assert!(
                         stage
@@ -7301,6 +7429,7 @@ mod tests {
                 refs: false,
                 context: ContextRequirements::default(),
                 pipeline: PipelinePin::Any,
+                partition: CachePartitionDemand::default(),
             },
             "a single-sample image: the prefill side takes the pixels, the decode side is stripped"
         );
@@ -7312,6 +7441,7 @@ mod tests {
                 refs: false,
                 context: ContextRequirements::default(),
                 pipeline: PipelinePin::Any,
+                partition: CachePartitionDemand::default(),
             },
             "what the decode side cannot run without the encoder, the prefill side cannot either"
         );

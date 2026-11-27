@@ -53,6 +53,7 @@ pub trait ProcessStage: Send + Sync {
     fn name(&self) -> &'static str;
 }
 
+pub(crate) mod cache_partition;
 mod client_acquisition;
 mod context_length;
 mod dispatch_metadata;

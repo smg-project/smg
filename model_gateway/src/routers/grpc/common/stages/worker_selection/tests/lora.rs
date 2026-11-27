@@ -1,3 +1,6 @@
+use openai_protocol::common::CachePartition;
+use smg_worker::labels::CACHE_PARTITION_FIELDS_LABEL;
+
 use super::*;
 
 fn disaggregated_registry(sglang: bool) -> Arc<WorkerRegistry> {
@@ -120,6 +123,7 @@ async fn lora_epd_media_refuses_an_unsupported_handoff_instead_of_running_vllm()
                 encode: MediaDemands::NONE,
                 decode_vision: false,
                 image_fanout: false,
+                partition: CachePartitionDemand::default(),
             },
             None,
         );
@@ -150,24 +154,33 @@ async fn lora_initial_selection_and_retry_stay_on_sglang_in_a_mixed_pool() {
                     .connection_mode(ConnectionMode::Grpc)
                     .runtime_type(runtime)
                     .health_config(no_health_check())
+                    .label(
+                        CACHE_PARTITION_FIELDS_LABEL,
+                        if runtime == RuntimeType::Sglang {
+                            "cache_salt,extra_key"
+                        } else {
+                            "cache_salt"
+                        },
+                    )
                     .build(),
             ))
             .unwrap();
     }
     let stage = regular_stage(Arc::clone(&registry));
-    for (request, selector) in [
+    // A salted request keys its namespace by the salt and the adapter.
+    for (request, selector, salt) in [
         (RequestType::Generate(Arc::new(serde_json::from_value(serde_json::json!({
-            "model": "test-model", "text": "hi", "lora_path": "adapter", "cache_salt": "unforwarded"
-        })).unwrap())), "adapter"),
+            "model": "test-model", "text": "hi", "lora_path": "adapter", "cache_salt": "tenant-salt"
+        })).unwrap())), "adapter", Some("tenant-salt")),
         (RequestType::Generate(Arc::new(serde_json::from_value(serde_json::json!({
             "model": "test-model", "text": "hi", "lora_id": "engine-id"
-        })).unwrap())), "engine-id"),
+        })).unwrap())), "engine-id", None),
         (RequestType::Chat(Arc::new(serde_json::from_value(serde_json::json!({
             "model": "test-model", "messages": [], "lora_path": "adapter"
-        })).unwrap())), "adapter"),
+        })).unwrap())), "adapter", None),
         (RequestType::Completion(Arc::new(serde_json::from_value(serde_json::json!({
             "model": "test-model", "prompt": "hi", "lora_path": "adapter"
-        })).unwrap())), "adapter"),
+        })).unwrap())), "adapter", None),
     ] {
         let mut ctx = prepared_ctx(Arc::clone(&registry), None);
         let openai = matches!(&request, RequestType::Chat(_) | RequestType::Completion(_));
@@ -175,7 +188,7 @@ async fn lora_initial_selection_and_retry_stay_on_sglang_in_a_mixed_pool() {
         stage.execute(&mut ctx).await.unwrap();
         let namespace = ctx.state.routing_snapshot.as_ref().unwrap().cache_namespace;
         assert_eq!(namespace, CacheNamespace::derive(&CachePartition {
-            cache_salt: None, extra_key: None, lora_path: Some(selector),
+            cache_salt: salt, extra_key: None, lora_path: Some(selector),
         }));
         assert!(namespace.is_some(), "adapter affinity must be separate from the base model");
         match ctx.state.workers.as_ref().unwrap() {

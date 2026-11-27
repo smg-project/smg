@@ -548,6 +548,10 @@ impl RequestPipeline {
 
         let stages = &self.stages;
         step!(
+            "CachePartition",
+            cache_partition::refuse_unforwarded(&ctx.input.request_type)
+        )?;
+        step!(
             stages.preparation.name(),
             stages.preparation.execute(ctx).await
         )?;
@@ -581,10 +585,17 @@ impl RequestPipeline {
         if let Some(encode) = &stages.encode {
             step!(encode.name(), encode.execute(ctx).await)?;
         }
-        step!(
+        let mut build = step!(
             stages.request_building.name(),
             stages.request_building.build(ctx).await
-        )
+        )?;
+        // One stamp covers every attempt: a retry and each disaggregated
+        // side clone the built requests.
+        cache_partition::stamp(
+            &mut build.plan,
+            cache_partition::request_partition(&ctx.input.request_type),
+        );
+        Ok(build)
     }
 
     /// One dispatch attempt: (re-)selection for retries, plan stamping,
