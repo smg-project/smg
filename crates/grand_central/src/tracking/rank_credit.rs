@@ -22,10 +22,7 @@ use rustc_hash::FxBuildHasher;
 
 use crate::{
     engine::{decision::Target, view::WorkerId},
-    tracking::{
-        dispatch_credit::DispatchCounts,
-        lease::{Lease, Membership, Side},
-    },
+    tracking::lease::{Lease, Membership, Side},
 };
 
 /// The dispatches credited to one rank since its last load report, oldest
@@ -260,6 +257,29 @@ pub(crate) struct SentCredit {
     pub(crate) tokens: u64,
     /// How many of the held dispatches stated no size.
     pub(crate) unsized_requests: u32,
+}
+
+/// The sends a row holds and their prompt tokens: the two numbers a
+/// document's `sent.` terms read
+/// ([`DispatchCreditPass::counts`](crate::tracking::DispatchCreditPass::counts)).
+/// A send that stated no token count is one of `requests` and adds its
+/// estimate, the bytes of its text over four:
+/// [`CreditedDispatches`](crate::tracking::CreditedDispatches) states the
+/// stated tokens and the estimates apart, and how many such sends there
+/// are. The pair is closed: a further number goes on
+/// [`CreditedDispatches`](crate::tracking::CreditedDispatches).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[expect(clippy::exhaustive_structs, reason = "the pair is closed: see its doc")]
+pub struct DispatchCounts {
+    /// The number of sends.
+    pub requests: u32,
+    /// The prompt tokens of the sends: the count each one stated, and for
+    /// a send that stated none the bytes of its text over four. A send of
+    /// no tokens and no text adds none. A stage that reads this number
+    /// asks for each request's size
+    /// ([`Needs::prompt_size`](crate::document::Needs::prompt_size)), as
+    /// the document's two stages do where a term names `sent.tokens`.
+    pub tokens: u64,
 }
 
 thread_local! {

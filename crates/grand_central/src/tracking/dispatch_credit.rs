@@ -10,7 +10,7 @@ use arc_swap::Guard;
 use crate::{
     engine::{Candidate, RequestFacts, Target},
     tracking::{
-        rank_credit::{Credits, RankTable, SentCredit},
+        rank_credit::{Credits, DispatchCounts, RankTable, SentCredit},
         Lease, Membership, Side,
     },
 };
@@ -37,27 +37,6 @@ pub struct CreditedDispatches {
     /// a host that can send a request on without reading its prompt states
     /// a text's bytes only where a stage asks.
     pub estimated_tokens: u64,
-}
-
-/// The sends a row holds and their prompt tokens: the two numbers a
-/// document's `sent.` terms read ([`DispatchCreditPass::counts`]). A send
-/// that stated no token count is one of `requests` and adds its estimate,
-/// the bytes of its text over four: [`CreditedDispatches`] states the
-/// stated tokens and the estimates apart, and how many such sends there
-/// are. The pair is closed: a further number goes on
-/// [`CreditedDispatches`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[expect(clippy::exhaustive_structs, reason = "the pair is closed: see its doc")]
-pub struct DispatchCounts {
-    /// The number of sends.
-    pub requests: u32,
-    /// The prompt tokens of the sends: the count each one stated, and for
-    /// a send that stated none the bytes of its text over four. A send of
-    /// no tokens and no text adds none. A stage that reads this number
-    /// asks for each request's size
-    /// ([`Needs::prompt_size`](crate::document::Needs::prompt_size)), as
-    /// the document's two stages do where a term names `sent.tokens`.
-    pub tokens: u64,
 }
 
 /// A profile's two settings on its count of sends, as its document writes
