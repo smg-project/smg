@@ -1083,6 +1083,8 @@ type SidesSaid = [Option<Shadowed>; 2];
 /// A side's shadow asks it inside its run, under its catch, so a lender
 /// that panics is the shadow's fault, and behind the run's filters, so a
 /// shadow whose set they emptied asks nothing ([`Engine::shadow_side`]).
+/// A shadow profile one of whose filters declares the ring need asks
+/// ahead of them.
 type Room<'s, 'l> = (&'s mut SidesSaid, Lends<'l>);
 
 /// A pair's first decision by `own` over the records of its two lists
@@ -1125,7 +1127,8 @@ fn decide_shadowed(
 /// the scratch it left, under that side's own places and mask. A shadow
 /// profile that reads a ring where neither live side does is stated its
 /// own place on the ring the request lends, asked of `lends` inside the
-/// run, behind its filters. The run writes the scratch and the shadow
+/// run, behind its filters or, where one of them declares the ring need,
+/// ahead of them. The run writes the scratch and the shadow
 /// profile's stages. It writes no record of sent prefixes, issues nothing
 /// and tells no stage.
 ///
