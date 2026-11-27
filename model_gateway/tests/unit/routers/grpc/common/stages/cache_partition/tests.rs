@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::http::StatusCode;
 use serde_json::json;
 use smg_grpc_client::{sglang_proto as sglang, tokenspeed_proto as tokenspeed, vllm_proto as vllm};
-use smg_worker::identity::basic::Worker;
+use smg_worker::identity::basic::{RuntimeType, Worker};
 
 use super::*;
 use crate::routers::grpc::{
@@ -24,8 +24,10 @@ fn embedding(mut body: Value) -> RequestType {
     RequestType::Embedding(Arc::new(serde_json::from_value(body).unwrap()))
 }
 
+/// An SGLang worker: its wire carries both fields, so only the label decides.
 fn worker(label: Option<&str>) -> impl Worker {
-    let builder = BasicWorkerBuilder::new("grpc://127.0.0.1:9000");
+    let builder =
+        BasicWorkerBuilder::new("grpc://127.0.0.1:9000").runtime_type(RuntimeType::Sglang);
     match label {
         Some(value) => builder.label(CACHE_PARTITION_FIELDS_LABEL, value),
         None => builder,
@@ -159,6 +161,35 @@ fn a_worker_meets_the_demand_when_its_label_lists_each_field() {
     }
 }
 
+/// A label counts only for a field that the gateway's wire for the worker's
+/// runtime carries. An operator label cannot open a wire without the field.
+#[test]
+fn a_label_counts_only_for_a_field_that_the_wire_carries() {
+    let salt = CachePartitionDemand::of(&CachePartition {
+        cache_salt: Some("s"),
+        ..Default::default()
+    });
+    let key = CachePartitionDemand::of(&CachePartition {
+        extra_key: Some("k"),
+        ..Default::default()
+    });
+    for (runtime, takes_salt, takes_key) in [
+        (RuntimeType::Sglang, true, true),
+        (RuntimeType::Vllm, true, false),
+        (RuntimeType::TokenSpeed, false, false),
+        (RuntimeType::Trtllm, false, false),
+        (RuntimeType::Mlx, false, false),
+        (RuntimeType::Unspecified, false, false),
+    ] {
+        let worker = BasicWorkerBuilder::new("grpc://127.0.0.1:9000")
+            .runtime_type(runtime)
+            .label(CACHE_PARTITION_FIELDS_LABEL, "cache_salt,extra_key")
+            .build();
+        assert_eq!(salt.met_by(&worker), takes_salt, "{runtime:?}");
+        assert_eq!(key.met_by(&worker), takes_key, "{runtime:?}");
+    }
+}
+
 #[tokio::test]
 async fn the_refusal_names_the_fields() {
     let both = CachePartitionDemand {
@@ -247,6 +278,43 @@ fn the_stamp_reaches_every_generate_request_of_the_plan() {
         panic!("the plan holds one generate request of that wire");
     };
     assert_eq!(**req, tokenspeed::GenerateRequest::default());
+}
+
+/// The fields that the gate counts for a runtime are the fields that the
+/// stamp writes on the wire of that runtime.
+#[test]
+fn the_gate_counts_the_fields_that_the_stamp_writes() {
+    let both = CachePartition {
+        cache_salt: Some("s"),
+        extra_key: Some("k"),
+        lora_path: None,
+    };
+    for (runtime, request) in [
+        (RuntimeType::Vllm, vllm_request()),
+        (RuntimeType::Sglang, sglang_request()),
+        (
+            RuntimeType::Trtllm,
+            ProtoGenerateRequest::Trtllm(Box::default()),
+        ),
+        (RuntimeType::Mlx, ProtoGenerateRequest::Mlx(Box::default())),
+        (
+            RuntimeType::TokenSpeed,
+            ProtoGenerateRequest::TokenSpeed(Box::default()),
+        ),
+    ] {
+        let mut plan = ExecutionPlan::Single(ProtoRequest::Generate(request));
+        stamp(&mut plan, both);
+        let (salt, key) = stamped(&mut plan).remove(0);
+        let written: Vec<&str> = [(CACHE_SALT, salt.is_some()), (EXTRA_KEY, key.is_some())]
+            .into_iter()
+            .filter_map(|(field, set)| set.then_some(field))
+            .collect();
+        assert_eq!(
+            written,
+            ProtoGenerateRequest::cache_partition_fields(runtime),
+            "{runtime:?}"
+        );
+    }
 }
 
 #[test]

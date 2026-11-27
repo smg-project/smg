@@ -43,33 +43,50 @@ async fn the_pipeline_refuses_a_salted_chat_that_no_worker_applies() {
     assert_eq!(calls(&seen), 0);
 }
 
+/// The TokenSpeed wire has no salt field. A label that lists the salt does
+/// not change that, so the pipeline refuses the salted chat.
 #[tokio::test]
-async fn a_salted_chat_reaches_a_worker_that_applies_the_salt() {
-    for (fields, labels) in [
-        (
-            serde_json::json!({"cache_salt": "tenant-a"}),
-            &[(CACHE_PARTITION_FIELDS_LABEL, "cache_salt")][..],
-        ),
-        // An empty value is unset: any worker takes the request.
-        (
-            serde_json::json!({"cache_salt": "", "extra_key": null}),
-            &[][..],
-        ),
-    ] {
-        let model_dir = unreadable_model_dir();
-        let (pipeline, components, seen) =
-            chat_pipeline_over(RuntimeType::TokenSpeed, labels, model_dir.path()).await;
-        let response = chat_response(&pipeline, components, chat_with(fields.clone())).await;
-        assert_eq!(response.status(), http::StatusCode::OK, "{fields}");
-        assert_eq!(calls(&seen), 1, "{fields}");
-    }
+async fn the_pipeline_refuses_a_salt_that_the_wire_cannot_carry() {
+    let model_dir = unreadable_model_dir();
+    let (pipeline, components, seen) = chat_pipeline_over(
+        RuntimeType::TokenSpeed,
+        &[(CACHE_PARTITION_FIELDS_LABEL, "cache_salt")],
+        model_dir.path(),
+    )
+    .await;
+    let (status, body) = chat_error_body(
+        &pipeline,
+        components,
+        chat_with(serde_json::json!({"cache_salt": "tenant-secret"})),
+    )
+    .await;
+    assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error"]["code"], "cache_partition_not_supported",
+        "{body}"
+    );
+    assert!(!body.to_string().contains("tenant-secret"), "{body}");
+    assert_eq!(calls(&seen), 0);
+}
+
+/// An empty value is unset: any worker takes the request.
+#[tokio::test]
+async fn a_chat_with_an_empty_salt_reaches_any_worker() {
+    let model_dir = unreadable_model_dir();
+    let (pipeline, components, seen) =
+        chat_pipeline_over(RuntimeType::TokenSpeed, &[], model_dir.path()).await;
+    let fields = serde_json::json!({"cache_salt": "", "extra_key": null});
+    let response = chat_response(&pipeline, components, chat_with(fields)).await;
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert_eq!(calls(&seen), 1);
 }
 
 #[tokio::test]
 async fn an_extra_key_needs_a_worker_that_lists_it() {
+    // The SGLang wire carries the extra key, but the label lists only the salt.
     let model_dir = unreadable_model_dir();
     let (pipeline, components, seen) = chat_pipeline_over(
-        RuntimeType::TokenSpeed,
+        RuntimeType::Sglang,
         &[(CACHE_PARTITION_FIELDS_LABEL, "cache_salt")],
         model_dir.path(),
     )

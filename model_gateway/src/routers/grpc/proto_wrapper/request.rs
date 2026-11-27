@@ -375,6 +375,21 @@ impl ProtoGenerateRequest {
         }
     }
 
+    /// The cache partition fields that [`Self::set_cache_partition`] writes on
+    /// the wire of `runtime`. A runtime without a gRPC wire has none.
+    pub fn cache_partition_fields(runtime: RuntimeType) -> &'static [&'static str] {
+        match runtime {
+            RuntimeType::Vllm => &["cache_salt"],
+            RuntimeType::Sglang => &["cache_salt", "extra_key"],
+            RuntimeType::Trtllm
+            | RuntimeType::Mlx
+            | RuntimeType::TokenSpeed
+            | RuntimeType::Unspecified
+            | RuntimeType::Generic
+            | RuntimeType::External => &[],
+        }
+    }
+
     /// Pin the request to a data-parallel rank (engines without the field ignore it).
     pub fn set_data_parallel_rank(&mut self, rank: i32) {
         match self {

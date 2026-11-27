@@ -18,7 +18,10 @@ use crate::{
     routers::{
         common::placement,
         error,
-        grpc::context::{ExecutionPlan, RequestType},
+        grpc::{
+            context::{ExecutionPlan, RequestType},
+            proto_wrapper::ProtoGenerateRequest,
+        },
     },
 };
 
@@ -132,8 +135,9 @@ impl CachePartitionDemand {
         self.cache_salt || self.extra_key
     }
 
-    /// Whether `worker` gives every field the request carries to its engine,
-    /// as its `cache_partition_fields` label says.
+    /// Whether `worker` gives every field the request carries to its engine.
+    /// Its `cache_partition_fields` label must list each field. The gateway's
+    /// wire for its runtime must also carry each field.
     pub(crate) fn met_by(self, worker: &dyn Worker) -> bool {
         if !self.any() {
             return true;
@@ -144,7 +148,11 @@ impl CachePartitionDemand {
             .labels
             .get(CACHE_PARTITION_FIELDS_LABEL)
             .map_or("", String::as_str);
-        let lists = |field: &str| listed.split(',').any(|name| name.trim() == field);
+        let carried =
+            ProtoGenerateRequest::cache_partition_fields(worker.metadata().spec.runtime_type);
+        let lists = |field: &str| {
+            carried.contains(&field) && listed.split(',').any(|name| name.trim() == field)
+        };
         (!self.cache_salt || lists(CACHE_SALT)) && (!self.extra_key || lists(EXTRA_KEY))
     }
 
