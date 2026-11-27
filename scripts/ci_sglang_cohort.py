@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Fresh interpreter bootstrap primitive; does not install or qualify an SDK.
 
 The caller supplies a reviewed package-origin manifest. Borrowed paths are added
