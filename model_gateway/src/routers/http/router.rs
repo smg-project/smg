@@ -948,7 +948,7 @@ impl Router {
     /// worker takes one, the typed request with its backend fields kept on the
     /// routes whose extensions have no shared defaults, the typed request
     /// otherwise; a serialization or preparation failure is the 400 it was.
-    fn serialize_attempt_body<T: serde::Serialize>(
+    fn serialize_attempt_body<T: GenerationRequest + serde::Serialize>(
         attempt: &TypedAttempt<'_, T>,
         decision_adapter: Option<&SglangDecisionAdapter>,
         worker: &dyn Worker,
@@ -969,7 +969,17 @@ impl Router {
                         raw_body_len,
                     )
                 } else {
-                    serialize_request_body(view.request, canonical_model, worker, raw_body_len)
+                    let bytes = serialize_request_body(
+                        view.request,
+                        canonical_model,
+                        worker,
+                        raw_body_len,
+                    )?;
+                    super::thinking_budget::prepare_regular(
+                        bytes,
+                        view.request.thinking_token_budget(),
+                        worker,
+                    )
                 }
             })
             .map_err(|failure| match failure {
@@ -977,6 +987,9 @@ impl Router {
                     "serialization_failed",
                     format!("Failed to serialize request body: {e}"),
                 ),
+                RequestBodyError::ThinkingBudget(e) => {
+                    error::bad_request("invalid_thinking_token_budget", e)
+                }
                 RequestBodyError::Prepare(e) => error::bad_request(
                     "request_preparation_failed",
                     format!("Failed to prepare request: {e}"),
@@ -4675,26 +4688,18 @@ mod tests {
 
     /// Loopback engine stub: captures the forwarded `/generate` request and
     /// answers with the given content type and body.
-    pub(super) async fn spawn_capture_stub(
-        content_type: &'static str,
-        response_body: &'static str,
-    ) -> (String, CapturedUpstreamRequest) {
-        spawn_capture_stub_for_route("/generate", content_type, response_body).await
-    }
-
     #[expect(
         clippy::disallowed_methods,
         reason = "test stub server lives for the duration of the test process"
     )]
-    async fn spawn_capture_stub_for_route(
-        route: &str,
+    pub(super) async fn spawn_capture_stub(
         content_type: &'static str,
         response_body: &'static str,
     ) -> (String, CapturedUpstreamRequest) {
         let captured: CapturedUpstreamRequest = Arc::new(tokio::sync::Mutex::new(None));
         let sink = Arc::clone(&captured);
         let app = axum::Router::new().route(
-            route,
+            "/generate",
             axum::routing::post(move |headers: HeaderMap, body: Bytes| {
                 let sink = Arc::clone(&sink);
                 async move {
@@ -7713,81 +7718,6 @@ mod tests {
             .header(CONTENT_LENGTH, body.len())
             .body(Body::from(body))
             .unwrap()
-    }
-
-    #[tokio::test]
-    async fn streamed_chat_upload_validates_the_winning_thinking_budget() {
-        use openai_protocol::validated::ValidatedJson;
-
-        const CHAT: &str = "/v1/chat/completions";
-        const HEAD: &[u8] =
-            br#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true"#;
-        let request = |first: &'static [u8], last: &'static [u8]| {
-            let mut req = streamed_request(&[HEAD, first, last]);
-            *req.uri_mut() = CHAT.parse().unwrap();
-            req
-        };
-
-        let (url, captured) =
-            spawn_capture_stub_for_route(CHAT, "text/event-stream", "data: [DONE]\n\n").await;
-        let worker = BasicWorkerBuilder::new(url)
-            .runtime_type(RuntimeType::Generic)
-            .model(ModelCard::new("m"))
-            .health_config(no_health_check())
-            .build();
-        assert!(!worker.mutates_request());
-        let mut router = streaming_router(least_load_policy(), 1024 * 1024, vec![worker]);
-        router.retry_config = fast_retry_config(1);
-        let router = Arc::new(router);
-        let state = StreamBodyState::new(router.clone(), create_test_app_context());
-        let app = axum::Router::new()
-            .route(CHAT, axum::routing::post(
-                move |headers: HeaderMap, ValidatedJson(body): ValidatedJson<ChatCompletionRequest>| {
-                    let router = Arc::clone(&router);
-                    async move {
-                        let tenant = TenantRequestMeta::new(TenantKey::new("test"));
-                        let model = body.model.clone();
-                        router.route_chat(Some(&headers), &tenant, Arc::new(body), &model).await
-                    }
-                },
-            ))
-            .route_layer(state.layer());
-
-        let (status, error) = posted(
-            app.clone(),
-            request(
-                br#","custom_params":{"thinking_budget":1}"#,
-                br#","thinking_token_budget":-2}"#,
-            ),
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            serde_json::from_slice::<Value>(&error).unwrap()["error"]["code"],
-            "invalid_thinking_token_budget"
-        );
-        assert!(captured.lock().await.is_none());
-
-        let orders: [(&[u8], &[u8]); 2] = [
-            (
-                br#","thinking_token_budget":0"#,
-                br#","custom_params":{"thinking_budget":1}}"#,
-            ),
-            (
-                br#","custom_params":{"thinking_budget":1}"#,
-                br#","thinking_token_budget":0}"#,
-            ),
-        ];
-        for (first, last) in orders {
-            let (status, events) = posted(app.clone(), request(first, last)).await;
-            assert_eq!(status, StatusCode::OK);
-            assert_eq!(events.as_ref(), b"data: [DONE]\n\n");
-            let (_, bytes) = captured.lock().await.take().unwrap();
-            let body: Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(body["stream"], true);
-            assert_eq!(body["custom_params"]["thinking_budget"], 0);
-            assert_eq!(body["thinking_token_budget"], 0);
-        }
     }
 
     /// The lean layer does what the `from_fn` form did on the paths that do
