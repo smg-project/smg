@@ -72,6 +72,7 @@ mod reader;
 pub(crate) mod telemetry;
 pub(crate) mod template;
 #[cfg(test)]
+#[path = "../../../../../tests/unit/routers/grpc/regular/symphony/testing.rs"]
 pub(crate) mod testing;
 
 use axum::http::HeaderMap;

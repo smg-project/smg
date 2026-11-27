@@ -6392,6 +6392,7 @@ impl<'a> MessagesStream<'a> {
 use crate::routers::common::sse::sse_channel;
 
 #[cfg(test)]
+#[path = "../../../../tests/unit/routers/grpc/regular/streaming/tests/mod.rs"]
 pub(crate) mod tests;
 
 #[cfg(any(test, feature = "test-util"))]
