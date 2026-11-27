@@ -364,6 +364,7 @@ def _converter():
         "SamplingParams": SimpleNamespace,
         "StructuredOutputsParams": dict,
         "RequestOutputKind": SimpleNamespace(DELTA="delta", FINAL_ONLY="final_only"),
+        "logger": logging.getLogger(__name__),
     }
     exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)
     return namespace["_sampling_params_from_proto"]

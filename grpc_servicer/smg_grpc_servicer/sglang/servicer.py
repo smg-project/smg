@@ -1321,14 +1321,17 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         elif grpc_params.HasField("structural_tag"):
             structural_tag = grpc_params.structural_tag
             # A tag that is a JSON answer's schema alone goes as that schema
-            # to a backend the tag is not spelled for (llguidance, outlines);
-            # a servicer with no server arguments keeps the tag.
+            # to a backend the tag is not spelled for (llguidance, outlines).
+            grammar_backend = sglang_grammar_backend(self.server_args)
             schema = answer_schema_in_place_of_tag(
-                structural_tag,
-                sglang_grammar_backend(getattr(self, "server_args", None)),
-                SGLANG_SCHEMA_BACKENDS,
+                structural_tag, grammar_backend, SGLANG_SCHEMA_BACKENDS
             )
             if schema is not None:
+                logger.debug(
+                    "a structural tag that is a JSON answer's schema alone goes to the "
+                    "%s grammar backend as that schema",
+                    grammar_backend,
+                )
                 json_schema, structural_tag = schema, None
 
         # Handle optional parameters conversion

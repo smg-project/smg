@@ -1359,6 +1359,11 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     params.structural_tag, structured_outputs_backend, VLLM_SCHEMA_BACKENDS
                 )
                 if schema is not None:
+                    logger.debug(
+                        "a structural tag that is a JSON answer's schema alone goes to the "
+                        "%s backend as that schema",
+                        structured_outputs_backend,
+                    )
                     structured_outputs = StructuredOutputsParams(json=schema)
                 else:
                     structured_outputs = StructuredOutputsParams(

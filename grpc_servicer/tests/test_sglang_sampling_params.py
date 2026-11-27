@@ -21,7 +21,8 @@ def convert(monkeypatch, servicer_mod):
     # it keeps the keywords the conversion hands it.
     monkeypatch.setattr(servicer_mod, "SGLSamplingParams", lambda **kw: SimpleNamespace(**kw))
     servicer = servicer_mod.SGLangSchedulerServicer
-    return lambda params: servicer._convert_sampling_params(None, params)
+    unconfigured = SimpleNamespace(server_args=None)
+    return lambda params: servicer._convert_sampling_params(unconfigured, params)
 
 
 @pytest.mark.parametrize(
@@ -85,5 +86,5 @@ def test_an_answer_tag_reaches_another_backend_as_its_schema(monkeypatch, servic
         servicer = SimpleNamespace(server_args=SimpleNamespace(grammar_backend=backend))
         params = convert(servicer, sent)
         assert (params.json_schema, params.structural_tag) == (None, tag), backend
-    params = convert(None, sent)
+    params = convert(SimpleNamespace(server_args=None), sent)
     assert (params.json_schema, params.structural_tag) == (None, tag)
