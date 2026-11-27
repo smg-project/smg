@@ -1513,6 +1513,35 @@ fn apply_connect_signal_reschedules_a_promoted_worker() {
     );
 }
 
+/// A replacement inherits the status of the worker it replaces, so the
+/// replacement of a draining worker is off the schedule. The activation that
+/// follows is the only notice the loop gets that the worker serves again.
+#[test]
+fn a_worker_activated_over_a_draining_registration_is_probed_at_once() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let config = test_config();
+    let mut events = registry.subscribe_events();
+    let mut apply_events = |next_check: &mut HashMap<WorkerId, tokio::time::Instant>| {
+        while let Ok(event) = events.try_recv() {
+            assert!(apply_registry_event(Ok(event), &registry, next_check, &config).is_continue());
+        }
+    };
+    let mut next_check = HashMap::new();
+    let url = "http://relisted:8000";
+    let worker_id = registry
+        .register(probed_worker(url, ConnectionMode::Http))
+        .unwrap();
+    registry.transition_status(&worker_id, WorkerStatus::Draining);
+    assert!(registry.replace(&worker_id, probed_worker(url, ConnectionMode::Http)));
+    apply_events(&mut next_check);
+    assert!(!next_check.contains_key(&worker_id));
+
+    registry.transition_status(&worker_id, WorkerStatus::Ready);
+    apply_events(&mut next_check);
+    let due = next_check.get(&worker_id).copied();
+    assert!(due.is_some_and(|due| due <= tokio::time::Instant::now()));
+}
+
 /// The signal's promotion is reported for what follows a transition into
 /// service (the label refresh): the worker it moved, and nothing when the
 /// signal moved nothing (already Ready, or an unknown URL).
