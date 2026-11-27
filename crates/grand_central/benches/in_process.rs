@@ -419,6 +419,12 @@ const CELLS: &[Cell] = &[
         ..Cell::PLAIN
     },
     Cell {
+        name: "pair_power_of_two",
+        document: || pair::of("power_of_two"),
+        request: pair::request,
+        ..Cell::PLAIN
+    },
+    Cell {
         name: "pair_round_robin",
         document: || pair::of("round_robin"),
         request: pair::request,

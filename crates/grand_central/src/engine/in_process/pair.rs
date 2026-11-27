@@ -140,7 +140,7 @@ use crate::{
         lease_events,
         list_cell::LentList,
         pair_classes::PartnerClasses,
-        records::{vetoes, with_shadow::Lends, HeldCells, Live, PoolRecords},
+        records::{decide_pair_drawn, vetoes, with_shadow::Lends, HeldCells, Live, PoolRecords},
         shadow::{budget_left, ShadowSide, Shadowed, SHADOW_FLOOR},
         sticky_sessions::SessionVerdict,
         view::{
@@ -180,6 +180,17 @@ pub trait PairAdmission: fmt::Debug {
     /// for this request: one that nothing waiting at its gate is in line
     /// for, or the room the request holds there already.
     fn has_room(&self, decode: usize) -> bool;
+
+    /// Whether the admission refuses none of the first `prefills` places of
+    /// the prefill list and none of the first `decodes` places of the
+    /// decode list at this instant: what [`Self::has_capacity`] and
+    /// [`Self::has_room`] answer of each of those places, asked at once.
+    ///
+    /// A host may leave it alone: the default asks each place. A host that
+    /// knows the answer without a walk of its lists states it here.
+    fn admits_all(&self, prefills: usize, decodes: usize) -> bool {
+        (0..prefills).all(|at| self.has_capacity(at)) && (0..decodes).all(|at| self.has_room(at))
+    }
 }
 
 /// A pair's two lists as their host lends them for one decision: each list
@@ -578,6 +589,72 @@ impl<'a> PairLists<'a> {
             // The decodes' records read the key's count under their own
             // name, and are written at rest where the prefills' are.
             let decode_live = live.counted_under(decode_key);
+            // Each side is asked by its draw where some binding's pair
+            // draws (one byte of the engine, asked first), the request
+            // states nothing beside its two lists and every row of a side
+            // pairs with every row of the other and is admitted. A side
+            // then writes the records its draw asks about.
+            if spec.engine().pairs_drawn()
+                && held.is_none()
+                && said.is_none()
+                && tried.is_none()
+                && cx.excluded.is_empty()
+                && cx.places.is_none()
+                && cx.stalled.is_empty()
+                && cx.held.is_empty()
+                && cx.subset_hint.is_none()
+                && cx.demands.is_none()
+                && self.prefill_places.is_none()
+                && self.decode_places.is_none()
+                && self.prefill_stalled.is_empty()
+                && self.decode_stalled.is_empty()
+                && self.prefill_held.is_empty()
+                && self.decode_held.is_empty()
+                && !spec.needs().signal_cells
+                && !spec.engine().needs_for_phase(Phase::Prefill).affinity
+                && !spec.engine().needs_for_phase(Phase::Decode).affinity
+            {
+                let (classes, admission) = (self.classes, self.admission);
+                let sizes = (prefill_records.len(), decode_records.len());
+                let pairs = || one_pair(classes, admission, sizes);
+                let prefill_stamp = |row: &mut Candidate| {
+                    let at = row.position as usize;
+                    row.pair_class = classes.prefills().get(at).copied().unwrap_or(0);
+                    row.has_capacity = admission.has_capacity(at);
+                };
+                let decode_stamp = |row: &mut Candidate| {
+                    let at = row.position as usize;
+                    row.pair_class = classes.decodes().get(at).copied().unwrap_or(0);
+                    row.has_room = admission.has_room(at);
+                };
+                let drawn = decide_pair_drawn(
+                    spec.engine(),
+                    facts,
+                    cx,
+                    [
+                        (prefill_records, workers, &live, &prefill_stamp),
+                        (decode_records, decode_workers, &decode_live, &decode_stamp),
+                    ],
+                    &pairs,
+                    [&mut *prefills, &mut *decodes],
+                    &mut buffers.scratch,
+                );
+                if let Some(decision) = drawn {
+                    let first = Some((prefill, prefill_records));
+                    let columns = &mut buffers.columns;
+                    let read =
+                        side_columns(loaded, facts, first, (decode, decode_records), columns);
+                    record_sides(
+                        &decision,
+                        facts,
+                        (prefill, decode),
+                        read,
+                        &buffers.columns,
+                        &sends_to,
+                    );
+                    return decision;
+                }
+            }
             // The decode asked again reads one prefill, the held one.
             let (prefills, prefill_facts) = match held {
                 Some(held) => held_prefill(prefill_records, workers, &live, held, prefills),
@@ -808,7 +885,7 @@ pub(super) fn side_columns(
 /// the record (`read`, as [`side_columns`] returned it, and `columns` as
 /// it filled them). A pair neither side of which read its record asks
 /// nothing of the pick.
-#[inline]
+#[inline(always)]
 pub(super) fn record_sides(
     decision: &Decision,
     facts: &RequestFacts<'_>,
@@ -943,6 +1020,31 @@ pub(super) fn shed_over() -> Option<ShedOver> {
         // the buffers: its own decision was made on buffers of its own.
         Err(_) => SAID_APART.get(),
     })
+}
+
+/// Whether every prefill of a list of
+/// `prefills` rows pairs with every decode of a list of `decodes` rows and
+/// the host's admission refuses none of them: one class a side, the two
+/// pair, neither is the other's first partner, and every admission bit is
+/// set. Each side's whole pass then keeps every row its draw may ask about.
+fn one_pair(
+    classes: &PartnerClasses,
+    admission: &dyn PairAdmission,
+    (prefills, decodes): (usize, usize),
+) -> bool {
+    let (prefill_classes, decode_classes) = (classes.prefills(), classes.decodes());
+    let (Some(&prefill), Some(&decode)) = (prefill_classes.first(), decode_classes.first()) else {
+        return false;
+    };
+    prefill != 0
+        && decode != 0
+        && prefill_classes.len() >= prefills
+        && decode_classes.len() >= decodes
+        && prefill_classes.iter().all(|&class| class == prefill)
+        && decode_classes.iter().all(|&class| class == decode)
+        && classes.pairs(0, 0)
+        && !classes.pairs_first(0, 0)
+        && admission.admits_all(prefills, decodes)
 }
 
 /// Writes on the two lists' records what a pair's decision reads beside a

@@ -32,6 +32,7 @@ use crate::{
     },
 };
 
+mod drawn;
 mod side_shadows;
 mod vetoed;
 
