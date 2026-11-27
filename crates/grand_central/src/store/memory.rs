@@ -41,12 +41,9 @@ use crate::{
             LeaseState, LeasesStore, Sides, WorkerSlot,
         },
         membership::same_worker,
-        snapshot::{
-            left_models, micros, OutsideLists, StaleGeneration, StoreSnapshot, Writer,
-            PUBLISH_WINDOW,
-        },
+        snapshot::{left_models, micros, OutsideLists, StoreSnapshot, Writer, PUBLISH_WINDOW},
         workers::{MembershipChange, WorkerFacts, WorkerRow, WorkerStatus, WorkersStore},
-        GatewayId,
+        GatewayId, StaleGeneration,
     },
     tracking::lease::{
         Dispatch, LeaseId, Membership, Outcome, ReleaseReason, Said, Side, DISPATCH_TTL,
