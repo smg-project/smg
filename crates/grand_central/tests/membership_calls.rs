@@ -627,6 +627,9 @@ async fn the_store_holds_the_rows_the_door_answered() {
                 connector: "connector-a".to_owned(),
                 references: false,
             }),
+            // And a priority and a drain window of its own.
+            priority: Some(-5),
+            drain_settle_secs: Some(45),
             ..unchecked("http://127.0.0.1:9/b")
         };
         let block = stating.demand_facts;
@@ -696,6 +699,14 @@ async fn the_store_holds_the_rows_the_door_answered() {
         };
         assert_eq!(end(&rows[0]), (false, None));
         assert_eq!(end(&rows[1]), (true, Some("connector-a".to_owned())));
+        // So do the worker's priority and its drain window. A registration
+        // that states neither is told zero and no window.
+        let numbers = told
+            .each_ref()
+            .map(|told| (told.priority, told.drain_settle_secs));
+        assert_eq!(numbers, [(0, None), (-5, Some(45))]);
+        let kept = |row: &WorkerRow| (row.facts.priority, row.facts.drain_settle_secs);
+        assert_eq!([kept(&rows[0]), kept(&rows[1])], numbers);
 
         // A registration that states two ranks is answered a row a rank.
         let ranked = proto::WorkerSpec {

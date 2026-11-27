@@ -7,9 +7,10 @@
 //! row as the pair does, by the pair's own routine ([`again`]).
 //!
 //! A request that carries an item has the pass laid. Its pair's decision
-//! is told so (`PairPools::part`) and asks no question of its shed, and
-//! its rule is asked behind a shed as saturated alone. So it answers each
-//! row as the row answered before the question stood ([`BEFORE`]).
+//! is told so (`PairPools::part`) and asks no question of its shed, its
+//! rule is asked behind a shed as saturated alone, and no decision more
+//! is held to its rule's prefills. So it answers each row as the row
+//! answered before the question stood ([`BEFORE`]).
 //!
 //! The gateway's own selection for such a request makes its pair by its
 //! pair selection, under one filter of its own, which takes the workers
@@ -232,10 +233,13 @@ fn held(kind: Kind) {
 /// The decision of such a request asks no question: the stage that ended
 /// its pass names its shed, as before the question stood. Its rule is not
 /// asked behind a shed with no endpoint. Behind a shed as saturated the
-/// rule is told by name where the decision said no list. Behind one made
-/// over the prefills, a rule that takes prefills none of which pairs with
-/// a decode is asked of the decodes too: the table's last two lines,
-/// which part from their rows by that count alone.
+/// rule is told by name where the decision said no list. No decision more
+/// is held to its rule's prefills: a rule that takes only a prefill over
+/// its thresholds and no decode is told by name, in the lines of the two
+/// rows such a decision judges for a pair ([`Kind::Judged`]). Behind a
+/// shed made over the prefills, a rule that takes prefills none of which
+/// pairs with a decode is asked of the decodes too: the table's last two
+/// lines, which part from their rows by that count alone.
 ///
 /// The gateway's own selection answers the rows that state no rule as the
 /// pair's row says: its filter for such a request takes every worker
@@ -243,7 +247,7 @@ fn held(kind: Kind) {
 /// engine is told which workers that filter leaves out: where it leaves
 /// one out, the answer before the question is that selection's
 /// ([`an_items_shed_is_named_by_its_pass_beside_a_decode_that_pairs_with_nobody`]).
-const BEFORE: [(&str, &str, bool, Answer, usize); 24] = [
+const BEFORE: [(&str, &str, bool, Answer, usize); 25] = [
     ("o+", "v+ o+x", false, SATURATED, 0),
     ("o+", "v- o-x", true, ADMITS, 3),
     ("o+", "v- s-x", true, ADMITS, 3),
@@ -258,6 +262,7 @@ const BEFORE: [(&str, &str, bool, Answer, usize); 24] = [
     ("w+", "o+", false, HEALTHY, 0),
     ("v+ o+x", "o+", false, PARTNERED, 0),
     ("o- v+", "v- o-x", true, ADMITS, 4),
+    ("o- v+", "o-", true, ADMITS, 5),
     ("o+", "v+ o+x", true, SATURATED, 3),
     ("v+ s+", "u+", true, SATURATED, 3),
     ("o+", "o- v+x", true, PARTNERED, 5),
@@ -435,6 +440,50 @@ fn an_encode_requests_rule_that_takes_a_worker_of_each_list_is_answered_by_the_n
 #[test]
 fn an_encode_requests_shed_with_no_endpoint_stands_where_the_rule_takes_no_worker_of_a_list() {
     held(Kind::Keeps);
+}
+
+/// An encode request with no item is its pair's. Its rule that takes only
+/// prefills over their thresholds and no decode is judged by one decision
+/// more, as a pair's is: held to the rule's prefills with no decode lent,
+/// it sheds the request as saturated over them, and that shed is the
+/// answer, for the prefill side.
+#[test]
+fn a_rule_of_prefills_over_their_thresholds_alone_is_judged_for_a_request_with_no_item() {
+    held(Kind::Judged);
+    let engine = shedding();
+    for row in ROWS.iter().filter(|row| row.kind == Kind::Judged) {
+        let beside = Beside {
+            encode_classes: &served(row.prefills),
+            sees: None,
+        };
+        let lists = (row.prefills, row.decodes);
+        let lone = (&[PLAIN][..], None);
+        let (placed, _) = answered_with(engine, lists, true, beside, lone, &[]);
+        assert_eq!(sided(&placed).1, Some(PairSide::Prefill), "{}", row.name);
+    }
+}
+
+/// A request the encode pass is laid for is asked no such decision: it
+/// keeps the answer it had. The first prefill is open and the second over
+/// its thresholds; the rule takes the second alone, and no decode. With no
+/// item the request is its pair's, and one decision more sheds it as
+/// saturated over the rule's prefill. With an item it is shed under the
+/// rule's name as before, where the encoder serves every prefill and
+/// where a third prefill hands to no encoder.
+#[test]
+fn a_laid_request_is_asked_no_decision_more_behind_a_rule_of_prefills_alone() {
+    let engine = shedding();
+    let asked = |prefills: &str, encode_classes: &[u32], keys: &[Identity<'static>]| {
+        let beside = Beside {
+            encode_classes,
+            sees: None,
+        };
+        let (lists, lone) = ((prefills, "o-"), (&[PLAIN][..], None));
+        shed_said(answered_with(engine, lists, true, beside, lone, keys)).0
+    };
+    assert_eq!(asked("o- v+", &[1, 1], &[]), SATURATED);
+    assert_eq!(asked("o- v+", &[1, 1], &KEYS), ADMITS);
+    assert_eq!(asked("o- v+ o-", &[1, 1, 2], &KEYS), ADMITS);
 }
 
 /// The rule of an encode request with no item is asked behind a first

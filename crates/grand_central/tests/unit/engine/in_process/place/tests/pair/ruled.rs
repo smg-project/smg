@@ -156,7 +156,9 @@ fn a_pair_is_placed_on_the_rules_prefill_though_an_earlier_attempt_tried_it() {
 /// A pair whose rule takes no worker of one list is shed with no endpoint
 /// under the rule's name, behind one decision that picked. The rule is
 /// asked of that decision's picks, then of every prefill, then of every
-/// decode, ready or not, and no second decision is made. Behind a first
+/// decode, ready or not, and of nobody more. One decision more is held
+/// to the rule's prefills, with no decode lent: it picks nobody, and its
+/// shed leaves that answer. Behind a first
 /// decision that sheds the request as saturated, that shed stands in two
 /// cases ([`rows`](super::rows)).
 ///
@@ -199,8 +201,60 @@ fn a_pair_whose_rule_takes_no_worker_of_a_list_is_shed_under_its_name() {
         "the picks, the prefills, the decodes"
     );
     let given_up = both_given_up(first, decodes[0]);
-    assert_eq!(said(&heard), given_up, "one decision");
+    assert_eq!(said(&heard), given_up, "one decision that picked");
     assert_eq!((engine.faults(), engine.unheard()), (0, 0));
+}
+
+/// A caller's admission that answers a count of reads of a prefill's limit
+/// and panics at the next: a decision reads each prefill's limit once.
+#[derive(Debug)]
+struct FailsBehind(Cell<usize>);
+
+impl PairAdmission for FailsBehind {
+    fn has_capacity(&self, _: usize) -> bool {
+        let left = self.0.get();
+        assert!(left > 0, "the caller's admission failed");
+        self.0.set(left - 1);
+        true
+    }
+
+    fn has_room(&self, _: usize) -> bool {
+        true
+    }
+}
+
+/// The one decision more that panics is refused as any decision is, and
+/// that refusal is the call's answer: not the shed under the rule's name
+/// that stood ahead of it. The first decision picked the one pair, and
+/// the rule takes the prefill alone: it was asked of both lists behind
+/// that decision, so the fault is the next decision's. It is counted once.
+#[test]
+fn a_decision_more_that_panics_is_the_calls_refusal() {
+    let (engine, _) = paired(false);
+    let lists = Lists::of(1, 1);
+    let classes = lists.every();
+    // The first decision reads the one prefill's limit, and the decision
+    // held to the rule's prefills reads it again.
+    let failing = FailsBehind(Cell::new(1));
+    let pair = lists.under(&classes, &failing);
+    let (prefill, decode) = (lists.prefill_id(0), lists.decode_id(0));
+    let asked = RefCell::new(Vec::new());
+    let admits = |worker: &dyn Worker| {
+        let id = worker_id(worker);
+        asked.borrow_mut().push(id);
+        id == prefill
+    };
+    let request = PlaceRequest {
+        admits: Some(&admits),
+        ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair))
+    };
+    assert_eq!(
+        engine.place(&request).err(),
+        Some(Unplaced::Refused(DecisionRefused::Faulted))
+    );
+    let asked = asked.borrow();
+    assert!(asked.ends_with(&[prefill, decode]), "both lists: {asked:?}");
+    assert_eq!(engine.faults(), 1);
 }
 
 /// A rule that takes a worker of each list is the decision's to answer
@@ -673,8 +727,10 @@ fn a_pair_shed_twice_does_not_wait_for_its_prefills_limit() {
 
 /// A pair shed with no endpoint by its first decision, whose rule takes no
 /// worker of one list, keeps that decision's shed. The rule is asked of
-/// the prefill and then of the two decodes, it takes neither decode, and
-/// no second decision is made. An idle decode that pairs with no prefill
+/// the prefill and then of the two decodes, and it takes neither decode.
+/// One decision more is held to the rule's prefill, with no decode lent:
+/// it picks nobody, and its shed leaves that answer. An idle decode that
+/// pairs with no prefill
 /// keeps the decode list from being wholly over its thresholds: the first
 /// decision sheds the request with no endpoint under `partnered`, and
 /// that shed is the call's answer, with no side: the rule narrowed the

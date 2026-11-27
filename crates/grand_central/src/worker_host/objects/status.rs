@@ -61,8 +61,11 @@ use crate::{
 type Moved = Option<(ObjectStatus, ObjectStatus)>;
 
 /// The ids of the models `object` serves, in its cards' order, as the one
-/// shared list a status entry holds. Each id is copied, and no card.
-fn served(object: &dyn Worker) -> Arc<[String]> {
+/// shared list a status entry holds. Each id is copied, and no card. A
+/// status write of this module calls it under the object's mutation
+/// lock. A standby's applier calls it in the holder's turn, with no lock
+/// of the object.
+pub(super) fn served(object: &dyn Worker) -> Arc<[String]> {
     let mut ids = Vec::new();
     object.any_model(&mut |card| {
         ids.push(card.id.clone());

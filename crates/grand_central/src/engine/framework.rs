@@ -5751,7 +5751,7 @@ impl Engine {
     /// first heard behind this call stands once. A count none of whose
     /// readers is kept is this engine's own, and takes over what the
     /// standing counts hold ([`Self::succeed`]). A profile kept keeps the
-    /// generation its object was made under ([`Engine::hearing`]).
+    /// generation its object was made under ([`Engine::stood_by`]).
     ///
     /// Nothing is kept across two stage tables that may build another
     /// stage under one name: the stock table's number, or one table of a
@@ -5778,10 +5778,16 @@ impl Engine {
             let picker = (picker.name(), picker.needs(), picker.hears(), calls);
             filters.chain(scorers).chain([picker]).collect::<Vec<_>>()
         };
+        // The standing profiles' places by their names, read once: each
+        // profile finds its twin at one lookup. That search no longer grows
+        // by the profiles' square; the walk of the counts below still may.
+        let mut places = HashMap::with_capacity(standing.profiles.len());
+        for (at, stood) in standing.profiles.iter().enumerate() {
+            places.entry(stood.name.as_str()).or_insert(at);
+        }
         // Beside each profile, the place of the standing one it keeps.
         let twin = |(at, built): (usize, &Arc<Profile>)| {
-            let named = |p: &Arc<Profile>| p.name == built.name;
-            let stood = standing.profiles.iter().position(named)?;
+            let stood = *places.get(built.name.as_str())?;
             let like = same(&built.name)
                 && said(built) == said(&standing.profiles[stood])
                 && self.read_as(at, standing, stood);
@@ -5840,10 +5846,10 @@ impl Engine {
     /// An engine of no binding that holds this engine's profiles and
     /// counts of sends whose objects were made under a generation `made`
     /// passes, over the same session table. It decides nothing: a word
-    /// that is not for every stage of this engine is told to it. An older
-    /// request's dispatch, end and release go to the stages that stood
-    /// when its lease was issued, and the workers that stand at an apply
-    /// are told as joined to the stages built new.
+    /// that is not for every stage of this engine is told to it. The
+    /// workers that stand at an apply are told as joined to the stages
+    /// built new. An older request's words take no engine of this kind:
+    /// they are told by the generation of their lease ([`Self::stood_by`]).
     ///
     /// It is made with no profile and then handed four things of this
     /// engine: the profile objects, the generations they were made
@@ -5867,15 +5873,35 @@ impl Engine {
         hearing
     }
 
-    /// The generations below this engine's own under which a profile or a
-    /// count it kept was made, ascending, each once.
+    /// What this engine kept of the stages that stood by `generation`, an
+    /// earlier one than its own: its session table, and each profile whose
+    /// object was made under that generation or an earlier one. A word of
+    /// a lease issued under that generation is told to it: a stage built
+    /// since never heard the lease's issue, and hears no word of it.
+    ///
+    /// It is written for an earlier generation alone. Asked the engine's
+    /// own generation or one above it, it answers every stage the engine
+    /// kept and no stage its own build made.
     #[cfg(feature = "in-process")]
-    pub(crate) fn kept_since(&self) -> Vec<u64> {
-        let all = self.born.iter().chain(&self.sent_born);
-        let mut older: Vec<u64> = all.copied().filter(|&at| at < self.generation).collect();
-        older.sort_unstable();
-        older.dedup();
-        older
+    #[inline]
+    pub(crate) fn stood_by(&self, generation: u64) -> Stood<'_> {
+        Stood {
+            engine: self,
+            below: Some(generation.saturating_add(1).min(self.generation)),
+        }
+    }
+
+    /// This engine whole, as a hearer of a lease's words that is named as
+    /// [`Self::stood_by`] names one: its session table and every profile.
+    /// A host that tells leases of any generation off a file of its own
+    /// names the hearers of each in the one type.
+    #[cfg(feature = "controller")]
+    #[inline]
+    pub(crate) fn stands(&self) -> Stood<'_> {
+        Stood {
+            engine: self,
+            below: None,
+        }
     }
 
     /// The session table: the pins of the keys it holds, each placed by a
@@ -9810,12 +9836,7 @@ impl Engine {
     /// The stages' part of a release, behind the table's
     /// ([`Self::released_table`]).
     pub(crate) fn released_stages(&self, lease: &Lease, reason: ReleaseReason) {
-        for profile in &self.profiles {
-            for w in &profile.scorers {
-                w.scorer.on_released(lease, reason);
-            }
-            profile.picker.on_released(lease, reason);
-        }
+        tell_released(&self.profiles, lease, reason);
     }
 
     /// Records a dispatch in each profile tally that stages read. A tally
@@ -9869,15 +9890,214 @@ impl Engine {
         side: Side,
         since_decision_micros: u32,
     ) {
-        for profile in &self.profiles {
-            for w in &profile.scorers {
-                w.scorer
-                    .on_dispatched(lease, target, side, since_decision_micros);
-            }
-            profile
-                .picker
+        tell_dispatched(&self.profiles, lease, target, side, since_decision_micros);
+    }
+}
+
+/// A release told to the stages of `profiles`, in their order: each
+/// profile's scorers, then its picker.
+#[inline(always)]
+fn tell_released<'p>(
+    profiles: impl IntoIterator<Item = &'p Arc<Profile>>,
+    lease: &Lease,
+    reason: ReleaseReason,
+) {
+    for profile in profiles {
+        for w in &profile.scorers {
+            w.scorer.on_released(lease, reason);
+        }
+        profile.picker.on_released(lease, reason);
+    }
+}
+
+/// A dispatch told to the stages of `profiles`, in their order: each
+/// profile's scorers, then its picker.
+#[inline(always)]
+fn tell_dispatched<'p>(
+    profiles: impl IntoIterator<Item = &'p Arc<Profile>>,
+    lease: &Lease,
+    target: &Target,
+    side: Side,
+    since_decision_micros: u32,
+) {
+    for profile in profiles {
+        for w in &profile.scorers {
+            w.scorer
                 .on_dispatched(lease, target, side, since_decision_micros);
         }
+        profile
+            .picker
+            .on_dispatched(lease, target, side, since_decision_micros);
+    }
+}
+
+/// A lease's issue told to the stages of `profiles`, in their order: each
+/// profile's scorers, then its picker.
+#[inline(always)]
+fn tell_issued<'p>(
+    profiles: impl IntoIterator<Item = &'p Arc<Profile>>,
+    lease: &Lease,
+    decision: &Decision,
+) {
+    for profile in profiles {
+        for w in &profile.scorers {
+            w.scorer.on_decision_issued(lease, decision);
+        }
+        profile.picker.on_decision_issued(lease, decision);
+    }
+}
+
+/// An end told to the stages of `profiles`, in their order: each profile's
+/// scorers, then its picker.
+#[inline(always)]
+fn tell_completed<'p>(
+    profiles: impl IntoIterator<Item = &'p Arc<Profile>>,
+    lease: &Lease,
+    outcome: &Outcome,
+) {
+    for profile in profiles {
+        for w in &profile.scorers {
+            w.scorer.on_completed(lease, outcome);
+        }
+        profile.picker.on_completed(lease, outcome);
+    }
+}
+
+/// What an engine kept of the stages that stood by an earlier generation
+/// ([`Engine::stood_by`]): the engine's session table, and each of its
+/// profiles whose object was made below a generation. It hears the words
+/// of a lease issued under that earlier generation.
+///
+/// It holds nothing of its own. A word told to the stages walks the
+/// engine's profiles beside the generations they were made under, in the
+/// engine's order, and tells the ones that stood. So an engine keeps no
+/// list for an earlier generation, whatever the number of generations its
+/// profiles were made under: a document that gained one profile at each
+/// of a thousand applies holds a thousand profiles once.
+///
+/// A host that tells leases off a file of its own names the engine whole
+/// as one too (`Engine::stands`): every profile hears, under no
+/// generation's bound, so a profile made under the last generation a
+/// document can bear hears as any other.
+#[cfg(feature = "in-process")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Stood<'a> {
+    engine: &'a Engine,
+    /// A profile made under a generation below this one hears. With
+    /// none, every profile hears: the engine whole.
+    below: Option<u64>,
+}
+
+#[cfg(feature = "in-process")]
+impl<'a> Stood<'a> {
+    /// The profiles that stood, in the engine's order.
+    #[inline]
+    fn profiles(self) -> impl Iterator<Item = &'a Arc<Profile>> {
+        let made = self.engine.profiles.iter().zip(&self.engine.born);
+        made.filter(move |(_, born)| self.below.is_none_or(|below| **born < below))
+            .map(|(profile, _)| profile)
+    }
+}
+
+/// What hears a lease's words at the engine that issued it: that engine's
+/// session table, and its stages. An engine whole is one: the engine in
+/// force hears the leases of its own generation. What a later engine kept
+/// of the stages that stood by the lease's generation is the other
+/// ([`Stood`]): the same table, and no stage built since. The rule of a
+/// lease's words tells either in its one order
+/// ([`lease_events`](super::lease_events)).
+#[cfg(feature = "in-process")]
+pub(crate) trait Issuing: Copy {
+    /// The session table's part of a dispatch
+    /// ([`Engine::dispatched_table`]).
+    fn dispatched_table(self, lease: &Lease, target: &Target, side: Side);
+
+    /// The stages' part of a dispatch ([`Engine::dispatched_stages`]).
+    fn dispatched_stages(self, lease: &Lease, target: &Target, side: Side, since_micros: u32);
+
+    /// The session table's part of a release ([`Engine::released_table`]).
+    fn released_table(self, lease: &Lease, reason: ReleaseReason);
+
+    /// The stages' part of a release ([`Engine::released_stages`]).
+    fn released_stages(self, lease: &Lease, reason: ReleaseReason);
+
+    /// A lease's issue, told to the stages
+    /// ([`Lifecycle::on_decision_issued`]).
+    fn decision_issued(self, lease: &Lease, decision: &Decision);
+
+    /// A lease's end, told to the stages ([`Lifecycle::on_completed`]).
+    fn completed(self, lease: &Lease, outcome: &Outcome);
+
+    /// A release whole, as [`Lifecycle::on_released`] tells it: the
+    /// session table, then the stages.
+    #[inline(always)]
+    fn released(self, lease: &Lease, reason: ReleaseReason) {
+        self.released_table(lease, reason);
+        self.released_stages(lease, reason);
+    }
+}
+
+#[cfg(feature = "in-process")]
+impl Issuing for &Engine {
+    #[inline(always)]
+    fn dispatched_table(self, lease: &Lease, target: &Target, side: Side) {
+        Engine::dispatched_table(self, lease, target, side);
+    }
+
+    #[inline(always)]
+    fn dispatched_stages(self, lease: &Lease, target: &Target, side: Side, since_micros: u32) {
+        Engine::dispatched_stages(self, lease, target, side, since_micros);
+    }
+
+    #[inline(always)]
+    fn released_table(self, lease: &Lease, reason: ReleaseReason) {
+        Engine::released_table(self, lease, reason);
+    }
+
+    #[inline(always)]
+    fn released_stages(self, lease: &Lease, reason: ReleaseReason) {
+        Engine::released_stages(self, lease, reason);
+    }
+
+    #[inline(always)]
+    fn decision_issued(self, lease: &Lease, decision: &Decision) {
+        self.on_decision_issued(lease, decision);
+    }
+
+    #[inline(always)]
+    fn completed(self, lease: &Lease, outcome: &Outcome) {
+        self.on_completed(lease, outcome);
+    }
+}
+
+// The session table is the engine's own, whatever generation a lease is
+// of. A word's stages are the profiles that stood.
+#[cfg(feature = "in-process")]
+impl Issuing for Stood<'_> {
+    #[inline]
+    fn dispatched_table(self, lease: &Lease, target: &Target, side: Side) {
+        self.engine.dispatched_table(lease, target, side);
+    }
+
+    fn dispatched_stages(self, lease: &Lease, target: &Target, side: Side, since_micros: u32) {
+        tell_dispatched(self.profiles(), lease, target, side, since_micros);
+    }
+
+    #[inline]
+    fn released_table(self, lease: &Lease, reason: ReleaseReason) {
+        self.engine.released_table(lease, reason);
+    }
+
+    fn released_stages(self, lease: &Lease, reason: ReleaseReason) {
+        tell_released(self.profiles(), lease, reason);
+    }
+
+    fn decision_issued(self, lease: &Lease, decision: &Decision) {
+        tell_issued(self.profiles(), lease, decision);
+    }
+
+    fn completed(self, lease: &Lease, outcome: &Outcome) {
+        tell_completed(self.profiles(), lease, outcome);
     }
 }
 
@@ -9950,12 +10170,7 @@ impl Engine {
 
 impl Lifecycle for Engine {
     fn on_decision_issued(&self, lease: &Lease, decision: &Decision) {
-        for profile in &self.profiles {
-            for w in &profile.scorers {
-                w.scorer.on_decision_issued(lease, decision);
-            }
-            profile.picker.on_decision_issued(lease, decision);
-        }
+        tell_issued(&self.profiles, lease, decision);
     }
 
     #[inline(always)]
@@ -9972,12 +10187,7 @@ impl Lifecycle for Engine {
     }
 
     fn on_completed(&self, lease: &Lease, outcome: &Outcome) {
-        for profile in &self.profiles {
-            for w in &profile.scorers {
-                w.scorer.on_completed(lease, outcome);
-            }
-            profile.picker.on_completed(lease, outcome);
-        }
+        tell_completed(&self.profiles, lease, outcome);
     }
 
     fn on_released(&self, lease: &Lease, reason: ReleaseReason) {

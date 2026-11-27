@@ -16,11 +16,10 @@ use crate::{
     engine::{
         decision::Decision,
         decision_slot::DecisionSlot,
-        framework::{release, Engine},
+        framework::{release, Issuing, Stood},
         lease_events::{self, Hearers},
         view::WorkerId,
     },
-    stages::lifecycle::Lifecycle,
     store::{MemoryStore, Sides, StoreSnapshot},
     tracking::lease::{Lease, Said},
 };
@@ -59,7 +58,8 @@ use crate::{
 /// this replica booked it. A dispatch also enters the counts of sends of
 /// the generation in force, whichever generation issued the lease: a
 /// send is the host's, whatever document decided it
-/// ([`Engine::dispatched_sent`]). A count that does not know the rank
+/// ([`Engine::dispatched_sent`](crate::engine::Engine::dispatched_sent)).
+/// A count that does not know the rank
 /// the report names enters it only where `listed` says the worker
 /// stands at that rank. A served controller answers by its replica's
 /// worker objects, the lists its decisions read, so a late report
@@ -145,7 +145,7 @@ pub(crate) fn told(
 /// world's. On one replica none is on file: a run loads its world behind
 /// every issue on its file, and the store's generations only rise.
 #[inline]
-pub(crate) fn issuing<'a>(world: &'a StoreSnapshot, lease: &Lease) -> Option<&'a Engine> {
+pub(crate) fn issuing<'a>(world: &'a StoreSnapshot, lease: &Lease) -> Option<Stood<'a>> {
     world.front().hearing(lease.generation)
 }
 
@@ -194,7 +194,7 @@ fn tell(world: &StoreSnapshot, found: &Sides, said: Said, listed: &impl Fn(Worke
 /// date a gateway gives a dispatch.
 pub(crate) fn issued_later(
     world: &StoreSnapshot,
-    engine: &Engine,
+    engine: Stood<'_>,
     lease: &Lease,
     decision: &Decision,
     at: Instant,
@@ -203,5 +203,5 @@ pub(crate) fn issued_later(
         issued_micros: world.micros(at),
         ..*lease
     };
-    engine.on_decision_issued(&issued, decision);
+    engine.decision_issued(&issued, decision);
 }

@@ -1735,11 +1735,12 @@ refusal told late leaves it: the session's pins stay as that decision wrote them
 guard and a controller tell each dispatch and release of a pair under its first decision's lease,
 so a decode call there dates its claim by that lease.
 
-A dispatch, a move at the cap and a decode call's date write nothing into the session table when
-dated before every decision that read the key's current life.
+A dispatch and a move at the cap write nothing into the session table when dated before the oldest
+date a decision read the key's current life under. A pair's decode call reads under its lease's
+date. Neither does a decode call's date where the call's own instant is that old.
 
 The table keeps the low 32 bits of the instant. Two claims of one key on one worker that are
-dated alike read as one: at one microsecond, or 2^32 microseconds apart.
+dated alike read as one: at one microsecond, or a whole multiple of 2^32 microseconds apart.
 
 A decode call that panics behind its claim dates nothing. Its claim keeps the call's instant, and
 no event of the pair's lease reaches it. It ends at a dispatch on its worker or with the key's
@@ -1809,9 +1810,11 @@ field's name.
 Under the `epd` plan a rule runs on the pair's two sides the same way and places no item. An item
 is placed by its side's policy, and the encode phase takes none of the rule's needs. A host
 that decides in its own process names each side's count of the key's requests for an encode
-request as for a pair. A controller refuses every rule under `epd` by the plan's name, with a cap
-or with none. The rule is not in that build at all, and an encode frame's rows name no count of a
-key's requests.
+request as for a pair.
+
+A controller takes a rule under `epd` that tells its stages, with a cap or with none. Under a cap
+its encode request's rows name each side's count by the leases it holds. It refuses a document
+whose rule states `untold` under `epd`, by that field's name, as under `pd-pair`.
 
 An encode request's pick states each side's word as a pair's does, also where the encode pass
 numbered a side's rows anew. An item that is shed, queued or finds no encoder turns the request away
@@ -1827,8 +1830,9 @@ prefixes gets a bounded step of clean-up. A record leaves the engine's map once 
 holds it and it holds no worker's place.
 
 Under the follow of a host's registry a record no table holds leaves with its places too, once no
-worker that stands states its model as its own: the follow asks the registry behind its own step
-of the upkeep, and a record a table took during the ask stays.
+worker that stands states its model as its own or lists it by the id of a model card: the follow
+asks the registry behind its own step of the upkeep, and a record a table took during the ask
+stays.
 
 ## 7. The ten built-in policies **[built]**
 
@@ -2240,29 +2244,30 @@ to the ones that take images. The rule is asked behind such a request's shed as 
 So the rule's one worker of a long list is found, one
 over its overload thresholds is answered by the binding's rule for a list wholly over them, and
 one an earlier attempt tried is handed again where no other is left. A request whose rule takes
-no worker of a list is shed with no endpoint under `admits`, but for three cases of a pair and of
+no worker of a list is shed with no endpoint under `admits`, but for four cases of a pair and of
 an encode request's pair.
 
-The first of the three stands behind a first decision that shed the request with no endpoint. That
-shed is the answer, under the stage that decision names and with no side. That decision judged the
+The first of the four stands behind a first decision that shed the request with no endpoint. That
+shed is the answer, under the stage that decision names and with no side, but where the fourth
+case answers in its place. That decision judged the
 lists it was handed, as the gateway's own selection judges every worker of a list on its wire
 where its filter takes none of them. The rule's lists are the caller's to judge a role by.
 
-The two others stand behind a first decision that shed the request as saturated and said the list
-it shed over. They hold for a request that states no hard demand and whose host states no places
-of the prefills or the decodes. They hold under a binding that sheds a list wholly over its
+The second and the third stand behind a first decision that shed the request as saturated and said
+the list it shed over. They hold for a request that states no hard demand and whose host states no
+places of the prefills or the decodes. They hold under a binding that sheds a list wholly over its
 thresholds, and in both that shed is the answer.
 
 A prefill that pairs with no decode is no prefill of the rule's in either: the gateway's own
 selection holds no such prefill. So a rule that takes only such prefills is answered as one that
-takes none, by the one test the call holds of the rule's prefills. In the first the rule takes no
+takes none, by the one test the call holds of the rule's prefills. In the second the rule takes no
 prefill, and the decision shed over the prefills: the decodes are then not asked.
 
 A request the encode pass is laid for keeps the answer it had there. Behind a rule that takes only
 such prefills its decodes are asked too, and a decision among the rule's workers answers where the
 rule takes a decode.
 
-In the second the rule takes a prefill and no decode, and the
+In the third the rule takes a prefill and no decode, and the
 decision said a list. There the shed is the answer where one of the rule's prefills can take the
 request and the decision shed over the decodes, and where none can, one of them is ready and every
 ready one is over its thresholds.
@@ -2270,6 +2275,21 @@ ready one is over its thresholds.
 A shed that stands names the side of the list the gateway's own selection judges there. That is
 the decision's own side, but the prefill side where none of the rule's prefills can take the
 request, whichever list the decision said.
+
+The fourth case stands where the rule takes a prefill and no decode, and no shed as saturated
+stands. So it is behind a first decision that picked, behind one that shed the request with no
+endpoint, and behind a shed as saturated that does not stand. The
+request states no hard demand, its host states no places of the prefills or the decodes, and no
+encode pass is laid for it. One decision more is then held to the rule's prefills, with no decode
+lent.
+
+Under a binding that sheds a list wholly over its thresholds, that decision sheds the request as
+saturated where the rule's prefills that pair with a decode are so. That shed is the answer, for
+the prefill side. Any other
+shed of it leaves the answer as it was. A decision that panics there is answered as refused, as
+any is. The gateway's own selection judges the rule's prefills
+first there (`pair_pass` in `model_gateway/src/routers/common/placement.rs`, where no prefill is
+eligible).
 
 A pair's decision asks one question where its prefill side sheds, with no pair for its default and
 no prefill that waits on its admission limit alone. The question is the gateway's own selection's:
@@ -2344,18 +2364,10 @@ later decision is given what the call has left of the request's budget, and a re
 left when a decision is due is shed under `budget`. A pair's decisions are each given the whole
 budget.
 
-Two answers of a pair stand open there under rule 6. In each the engine's answer is of another
-kind than the gateway's own selection's: a shed as saturated beside anything but its overload
-shed, or a shed with no endpoint beside anything but its answer that it has no worker.
+One answer of a pair stands open there under rule 6. In it the engine's answer is of another kind
+than the gateway's own selection's: a shed as saturated beside anything but its overload shed, or
+a shed with no endpoint beside anything but its answer that it has no worker.
 
-- No decision said a list. The rule takes no decode, and its prefills are wholly over their
-  thresholds, behind a first decision that picked or one that shed the request with no endpoint.
-
-  The engine sheds the request with no endpoint, under `admits` or under the stage that first shed
-  names: no decision judged the rule's prefills. The gateway's own selection answers its overload
-  shed, since it judges the rule's prefills first (`pair_pass` in
-  `model_gateway/src/routers/common/placement.rs`, where no prefill is eligible). One decision
-  more, held to the rule's prefills, ends it: such a decision sheds as its count reads.
 - A part of a list. The encode pass is laid for a request that states an item, or holds its decode
   to the ones that take images. It hands the pair's decision the prefills an open encoder serves
   and the decodes that take the images.
@@ -2369,7 +2381,10 @@ shed, or a shed with no endpoint beside anything but its answer that it has no w
 
   Where the rule takes no worker of a list the engine sheds such a request with no endpoint. It
   does so under `admits` behind a first decision that picked or that shed it as saturated, as it
-  did before a shed stood behind a rule.
+  did before a shed stood behind a rule. No decision more is held to the rule's prefills for such
+  a request. So where no shed as saturated stands, one whose rule takes prefills wholly over their
+  thresholds and no decode keeps that shed. The gateway's own selection answers its overload shed
+  under a filter that takes those workers.
 
   Behind a first shed with no endpoint, a request whose host states places is shed under that
   shed's own stage. One that states a hard demand, or that the encode pass is laid for, keeps that
@@ -3198,9 +3213,26 @@ of the binding reads the number, and the gateway sends the decode the first deci
 call is judged by the policy spec in force at the call, whatever spec decided the first frame. A
 call whose frame leaves the number out is decided again as any pair's decode.
 
-Six things differ there from a gateway's own process (section 8.2). The first four are open
-under rule 6. The last two stand only behind a frame that states its later decode, which the
-crate's own client states for no request.
+Every frame states its request's demands from protocol 2 **[built]** (`DecideRequest.demands`), an
+encode request's too. The controller keeps the workers that meet them ahead of every stage, each
+side by its role's part. Where an encode request carries an item, its encoders meet its runtime and
+its media's parts, and its pair every part but the media's. With no item its pair is held as a
+pair's own. The controller's count passes over a worker a demand leaves out, as a gateway's own
+process does.
+
+A frame that demands vision is held to the workers that take images. A registration states that bit
+(`WorkerSpec.vision`) **[built]**, the log's row tells it, and the handle sends that part as it
+sends any other. A shed keeps its demand's stage through the handle, and any other stage reads
+`controller` there. So do the encode pass's own stages, which name the shed of an encode request
+whose demand no encoder meets. `wires` and `vision` also name the controller's own shed of a
+gateway's reach and of an encode request's media, as they do in process. What a worker states for
+the other demands crosses already **[built]**: a registration states it and the log's row tells it,
+so a standby and a watcher hold it. A worker whose row states none meets no demand for a runtime,
+for media by reference or for a way to decide a constraint. It takes a request of any size.
+
+Five things differ there from a gateway's own process (section 8.2). The first three are open under
+rule 6. The last two stand only behind a frame that states its later decode, which the crate's own
+client states for no request.
 
 - **The route's rule is not asked.** It is the gateway's own code and no frame states it yet, so
   the number counts a worker that rule refuses. It ends when the rule crosses as section 11 plans
@@ -3209,22 +3241,6 @@ crate's own client states for no request.
   with the controller (10.2), and a gateway's own process counts in the order of its own list. It
   ends when a gateway under a controller follows the controller's list and keeps its order
   (section 11) **[planned]**.
-- **An encode request's frame states no hard demand.** Every other frame states its request's
-  demands from protocol 2 **[built]** (`DecideRequest.demands`). Those are a single request's
-  frame, a pair's, a decode call's, a side's that stands alone and one that names its worker. The
-  controller keeps the workers that meet them ahead of every stage, each side by its role's part.
-  Its count passes over a worker a demand leaves out, as a gateway's own process does. An encode
-  request's frame that states one is refused by the field, and a host decides its request by
-  itself. It ends when that frame states a request's demands **[planned]**. A frame that demands
-  vision is held to the workers that take images. A registration states that bit
-  (`WorkerSpec.vision`) **[built]**, the log's row tells it, and the handle sends that part as it
-  sends any other. A shed keeps its demand's stage through the handle, and any
-  other stage reads `controller` there. `wires` and `vision` also name the controller's own shed
-  of a gateway's reach and of an encode request's media, as they do in process. What a worker
-  states for the other demands crosses already **[built]**: a registration states it and the
-  log's row tells it, so a standby and a watcher hold it. A worker whose row states none meets no
-  demand for a runtime, for media by reference or for a way to decide a constraint. It takes a
-  request of any size.
 - **A named prefill at its admission limit is not waited for.** A gateway's own process waits for
   the prefill a pair names where it stands at that gateway's admission limit (section 8.2). A
   controller keeps no gate: its count takes the prefill, and the gateway finds the limit. It ends
@@ -3328,7 +3344,7 @@ tells the data once more:
 |---|---|---|
 | the worker record | the store's table of records (`store/memory.rs`) | the code that keeps the objects, among its reads: a record's status where a leader's log tells it, and a first copy, for the status the log told of each record; and the store itself, for its published copy and the membership log's event |
 | the worker object | the worker-crate registry | the health checker, the follower of cache events, a decision, and a watcher's, a standby's and an operator's first copy |
-| the remainder: 17 of the 24 facts and one bit of an eighteenth, with the record's id and revision | beside each worker object (`worker_host/remainder.rs`) | a decision, for the record's id, whether the worker takes images, its wire modes and from where it is reached. A pair's classes read the worker's engine kind and its pairing descriptor too, and for a record that states no descriptor the pairing facts its worker object derives of its labels. What the worker states for a request's hard demands is lent with the list, and a frame that states a demand is held to it, every frame but an encode request's. The follower of cache events asks here whether a worker's events are indexed: its signals stand here and its models on the object (`worker_host/kv_feed.rs:191`, through `Objects::row_of`) |
+| the remainder: 17 of the 24 facts and one bit of an eighteenth, with the record's id and revision | beside each worker object (`worker_host/remainder.rs`) | a decision, for the record's id, whether the worker takes images, its wire modes and from where it is reached. A pair's classes read the worker's engine kind and its pairing descriptor too, and for a record that states no descriptor the pairing facts its worker object derives of its labels. What the worker states for a request's hard demands is lent with the list, and a frame that states a demand is held to it. The follower of cache events asks here whether a worker's events are indexed: its signals stand here and its models on the object (`worker_host/kv_feed.rs:191`, through `Objects::row_of`) |
 | the published copy: of a record its id alone, beside its slot in the counts and in a gateway's vetoes by pool; with them each pool's index by model and role, the generation and the clock | the store | a pick's booking and a gateway's vetoes; every other loader reads the generation; no row of a record stands in it and no request is decided over it |
 | the membership log's event | `service/replication/log.rs` | a watcher behind its first copy; a standby |
 
@@ -3405,24 +3421,38 @@ A fact leaves the remainder when the worker object gets a field that holds it as
    log last told of the record. A standby's applier hands its own log the record its applied
    change takes out the same way, read back from the object.
 
-   The table still gives an event six things until step 4. The status the log last told of a
-   record is the first: a handed record is told in it, and a status event names it as the
-   status its record left. It is the log's own word, which the table holds for the log. The
-   second is the instant a record changed in place was admitted at: the one body lays the
-   table's over every writer's record, and a keeper and a standby's applier hand that same
-   instant. The third is the models of a status a standby applies. A status event holds no
-   record: it names the models its record served at the write, the one fact a reader of a
-   status reads, for a watch that asked for some. A leader's keeper hands them off the worker
-   object, under the hold that reads the status **[built]**. A standby's applier hands none,
-   and its log is told the models of the table's record until the applier hands its object's
-   **[planned]**. No watch reads a standby's log: a watch of the leader it becomes reads those
-   entries. The fourth is the record taken out
-   by a decided change that a host hands the store itself (`MemoryStore::follow`), and the models of a status it hands so: no product code hands one so.
-   A keeper's status that hands no models is told the table's too: a keeper hands them wherever a log is told.
-   The fifth is the record a standby's applied change takes out where that record has no
-   object. The sixth is the kind of a change in place: the one body tells a resize where the
-   width of the table's record differs from the handed record's, whatever kind its writer
-   handed.
+   The table still gives an event five things until step 4:
+
+   - The first is the status the log last told of a record. A handed record is told in it,
+     and a status event names it as the status its record left. It is the log's own word,
+     which the table holds for the log.
+   - The second is the instant a record changed in place was admitted at. The one body lays
+     the table's over every writer's record. A keeper and a standby's applier hand that same
+     instant where the record has its object.
+   - The third is for a change that a host hands the store itself through
+     `MemoryStore::follow`: the record it takes out, and the models of a status. No product
+     code calls it. A keeper's status that hands none is told the table's: a keeper hands
+     them wherever a log is told.
+   - The fourth is the record a standby's applied change takes out, and the models of a
+     status it applies, where that record has no object.
+   - The fifth is the kind of a change in place. The one body tells a resize where the width
+     of the table's record differs from the handed record's, whatever kind its writer handed.
+
+   A status event holds no record. It names the models its writer handed, or the table's
+   record's where it handed none. They are the one fact a reader of a status reads, for a
+   watch that asked for some. A leader's keeper hands them off the worker object, under the
+   hold that reads the status, and a standby's applier in its turn **[built]**. No watch reads
+   a standby's log: a watch of the leader it becomes reads those entries.
+
+   While the table stands, a debug build holds the handed models to the table's record's, at
+   a status the store does not refuse first. In a controller they can differ in one window: a
+   cut is laid in two steps, the store's restore and then its objects, in one turn of the
+   keeper. A keeper's own status write takes no turn, so it can fall between the two. It then
+   names the standing object's models, where the cut's record is another history's under the
+   same id and revision.
+
+   A second writer is the other way to such a difference: of an object's facts, as said below,
+   or of the table around the keeper.
 
    Two more reads of the table in that body reach no event, and they end with the table too:
    the test whether a key's next life is the same worker, for its session pins, and the models

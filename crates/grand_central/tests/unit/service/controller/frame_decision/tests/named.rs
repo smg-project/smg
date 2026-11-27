@@ -15,7 +15,7 @@ use parking_lot::Mutex;
 
 use super::{
     alone_at, file, first, frame_for, holder, keyed, preset, served, served_alone, served_booked,
-    shed_of, side_member, staged, GATEWAY, OTHER, PAIRED,
+    shed_of, side_member, staged, Shed, GATEWAY, OTHER, PAIRED,
 };
 use crate::{
     document::spec::PolicySpec,
@@ -80,7 +80,7 @@ fn list_order(
 }
 
 /// The worker a decision names first, or the shed it answers.
-fn reached_by(answer: &Decision) -> Result<WorkerId, Option<(ShedReason, &'static str)>> {
+fn reached_by(answer: &Decision) -> Result<WorkerId, Shed> {
     first(answer).ok_or_else(|| shed_of(answer))
 }
 
@@ -566,4 +566,50 @@ fn a_frame_that_stands_alone_counts_by_what_its_phases_role_is_held_to() {
         assert_eq!(answer, Ok(worker), "the completion, {number}");
     }
     assert_eq!(reached(at_decode, 2, short), Err(MISSED), "two hold it");
+}
+
+/// The count judges the media a frame demands, as the frame's decision
+/// does: a worker that processes no media by reference takes no number of
+/// a frame that needs one that does. One of two workers states that it
+/// processes it. The number 0 reaches that worker, whichever place of the
+/// list it stands at, and the number 1 is shed under `target-worker`. A
+/// frame that states no demand counts both.
+///
+/// The worker that processes it is the first one written, then the second:
+/// in one of the two fleets it stands behind the other worker.
+#[test]
+fn the_number_passes_over_a_worker_that_takes_no_media_by_reference() {
+    use super::{demanding, stating_member};
+    use crate::engine::DemandFacts;
+
+    let now = Instant::now();
+    let none = proto::Demands::default();
+    let by_reference = proto::Demands {
+        references: proto::demands::References::Any.into(),
+        ..none
+    };
+    for takes in [0_usize, 1] {
+        let store = ring_store();
+        let objects = holder(&store);
+        let member = |name: &'static str, references| {
+            let stated = DemandFacts {
+                references,
+                ..DemandFacts::default()
+            };
+            let id = stating_member(&store, &objects, name, Role::Single, None, stated);
+            (name, id)
+        };
+        let members = [member("s0", takes == 0), member("s1", takes == 1)];
+        let order = list_order(&objects, Role::Single, &members);
+        let reached = |number: u32, demands: proto::Demands| {
+            let frame = demanding(naming(frame_for(PAIRED, 1, 3), number), demands);
+            reached_by(&served(&store, &objects, frame, GATEWAY, (now, now), None))
+        };
+        for (number, &worker) in (0..).zip(&order) {
+            assert_eq!(reached(number, none), Ok(worker), "no demand, {number}");
+        }
+        let one = Ok(members[takes].1);
+        assert_eq!(reached(0, by_reference), one, "worker {takes} takes it");
+        assert_eq!(reached(1, by_reference), Err(MISSED), "one is counted");
+    }
 }

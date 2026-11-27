@@ -30,11 +30,11 @@ thread_local! {
 }
 
 macro_rules! pool_impl {
-    ($take_cap:ident, $give:ident, $held:ident, $ty:ty, $local:ident) => {
-        /// Take an empty `Vec` with at least `cap` capacity: the smallest kept
-        /// buffer that holds it, or new storage when none does, so the kept
-        /// buffers stay for the takes they hold.
-        pub fn $take_cap(cap: usize) -> Vec<$ty> {
+    ($take_kept:ident, $take_cap:ident, $give:ident, $held:ident, $ty:ty, $local:ident) => {
+        /// The smallest kept buffer that holds `cap`, emptied, or a `Vec`
+        /// without storage when none does: the one selection every take
+        /// shares, so the kept buffers stay for the takes they hold.
+        pub(crate) fn $take_kept(cap: usize) -> Vec<$ty> {
             let kept = $local.with(|p| {
                 let mut p = p.borrow_mut();
                 let kept = p.get_or_insert_with(Vec::new);
@@ -51,8 +51,16 @@ macro_rules! pool_impl {
                     v.clear();
                     v
                 }
-                None => Vec::with_capacity(cap),
+                None => Vec::new(),
             }
+        }
+
+        /// Take an empty `Vec` with at least `cap` capacity: the smallest kept
+        /// buffer that holds it, or new storage when none does.
+        pub fn $take_cap(cap: usize) -> Vec<$ty> {
+            let mut v = $take_kept(cap);
+            v.reserve_exact(cap);
+            v
         }
 
         /// Return a buffer for reuse by a later same-thread take. Kept only on
@@ -89,7 +97,14 @@ macro_rules! pool_impl {
     };
 }
 
-pool_impl!(take_f32_cap, give_f32, held_f32, f32, F32_LOCAL);
+pool_impl!(
+    take_kept_f32,
+    take_f32_cap,
+    give_f32,
+    held_f32,
+    f32,
+    F32_LOCAL
+);
 
 /// Take a zero-filled `Vec<f32>` of exactly `len`, reusing pooled storage.
 pub fn take_f32(len: usize) -> Vec<f32> {
@@ -100,8 +115,9 @@ pub fn take_f32(len: usize) -> Vec<f32> {
 
 /// [`take_f32_cap`] for a producer that reports a refused allocation.
 pub(crate) fn try_take_f32_cap(cap: usize) -> Result<Vec<f32>, TryReserveError> {
-    // The thread's kept buffer, or a new one: no room is asked for yet.
-    let mut v = take_f32_cap(0);
+    // The kept buffer `take_f32_cap` would hand out, else a `Vec` without
+    // storage: reserving on it is one new allocation, never a regrowth.
+    let mut v = take_kept_f32(cap);
     v.try_reserve(cap)?;
     Ok(v)
 }
@@ -186,6 +202,22 @@ mod tests {
             assert_eq!(held_f32(), 1, "the largest buffer given back was kept");
             let _middle = take_f32_cap(2_000);
             assert_eq!(held_f32(), 0, "beside the next largest");
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn a_fallible_take_no_kept_buffer_holds_leaves_the_kept_buffers_kept() {
+        std::thread::spawn(|| {
+            give_f32(take_f32_cap(1_000));
+            let large = try_take_f32_cap(2_000).unwrap();
+            assert!(large.capacity() >= 2_000);
+            assert_eq!(held_f32(), 1, "the kept buffer waits for a take it holds");
+            give_f32(large);
+            let small = try_take_f32_cap(500).unwrap();
+            assert!(small.capacity() < 2_000, "the smallest that holds it");
+            assert_eq!(held_f32(), 1, "and leaves the large one");
         })
         .join()
         .unwrap();

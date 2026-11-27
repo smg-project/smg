@@ -11,7 +11,10 @@ use super::{
     host::{require_host, WorkflowHost},
 };
 use crate::{
-    identity::{basic::Worker, endpoint::Endpoint},
+    identity::{
+        basic::{BasicWorker, Worker},
+        endpoint::Endpoint,
+    },
     worker::WorkerStatus,
 };
 
@@ -19,14 +22,16 @@ use crate::{
 ///
 /// A pinned removal (`WorkerRemovalRequest::expected_revisions`) removes the
 /// incarnation it selected: an id pinned at a revision while the worker is
-/// at that revision or still reads `Draining` (a removal's own mark, this
-/// job's or an earlier one's that never completed, which a rebuild under the
-/// id inherits and nothing but an activation reverses),
+/// at that revision or still reads `Draining` under a mark entered at or
+/// below the pinned revision (this job's, or an earlier removal's that never
+/// completed; a rebuild under the id inherits it and nothing but an
+/// activation reverses it),
 /// an id pinned at no revision (a `DELETE`'s) as it stands. A replacement
-/// that stands on its own (activated to `Ready`, or never drained) and a
-/// registration under the URL since the selection are left standing and
-/// leave the job, so the policy step touches nothing of them. An unguarded
-/// removal removes whatever stands under each URL.
+/// that stands on its own (activated to `Ready`, never drained, or drained
+/// again by a later removal) and a registration under the URL since the
+/// selection are left standing and leave the job, so the policy step touches
+/// nothing of them. An unguarded removal removes whatever stands under each
+/// URL.
 pub struct RemoveFromWorkerRegistryStep;
 
 #[async_trait]
@@ -81,12 +86,18 @@ impl<H: WorkflowHost> StepExecutor<WorkerRemovalWorkflowData<H>> for RemoveFromW
                         // drain never marked (it was not `Ready`) that was
                         // replaced since, and a replacement activated since,
                         // read neither the revision nor the mark: they stand
-                        // on their own and keep their place.
+                        // on their own and keep their place. So does one a
+                        // later removal drains: a mark entered above the pin
+                        // is that removal's, and its window still runs.
                         Some(Some(pinned)) => {
                             let pinned = *pinned;
                             let removed = registry.remove_if(&worker_id, |worker| {
                                 worker.revision() == pinned
-                                    || worker.status() == WorkerStatus::Draining
+                                    || (worker.status() == WorkerStatus::Draining
+                                        && worker
+                                            .as_any()
+                                            .downcast_ref::<BasicWorker>()
+                                            .is_none_or(|basic| basic.drained_at() <= pinned))
                             });
                             if removed.is_none() && registry.get(&worker_id).is_some() {
                                 debug!(
@@ -339,15 +350,19 @@ mod tests {
 
     /// A replacement under a revision-pinned id that stands on its own is left
     /// standing and leaves the job: one a `PUT` activated during the drain
-    /// wait (`Ready` over the inherited `Draining`), and one of a worker the
-    /// drain never marked (it was not `Ready`, so nothing was written). Removed
-    /// by id at any revision, the step took a successful replacement for the
-    /// old worker's removal.
+    /// wait (`Ready` over the inherited `Draining`), one a later removal then
+    /// drains again, and one of a worker the drain never marked (it was not
+    /// `Ready`, so nothing was written). Removed by id at any revision, the
+    /// step took a successful replacement for the old worker's removal.
     #[tokio::test]
     async fn a_replacement_that_stands_on_its_own_survives_a_revision_pinned_removal() {
         for (drained, after) in [
-            (WorkerStatus::Draining, WorkerStatus::Ready),
-            (WorkerStatus::NotReady, WorkerStatus::NotReady),
+            (WorkerStatus::Draining, &[WorkerStatus::Ready][..]),
+            (
+                WorkerStatus::Draining,
+                &[WorkerStatus::Ready, WorkerStatus::Draining],
+            ),
+            (WorkerStatus::NotReady, &[WorkerStatus::NotReady]),
         ] {
             let url = "http://w1:8080";
             let registry = Arc::new(WorkerRegistry::new());
@@ -378,7 +393,9 @@ mod tests {
             );
             // The replacement's own workflow activates it (a PUT's), or it
             // was never drained: either way it stands on its own.
-            replacement.set_status(after);
+            for status in after {
+                replacement.set_status(*status);
+            }
 
             let result = RemoveFromWorkerRegistryStep
                 .execute(&mut ctx)

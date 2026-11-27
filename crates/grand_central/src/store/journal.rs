@@ -87,8 +87,8 @@ pub trait Journal: Send + Sync {
     /// models the row serves at the write, the one fact of its row a
     /// reader of a status reads: a watch that asked for some. They are the
     /// writer's where it handed them, as a holder of worker objects does
-    /// on a leader, and the table's row's otherwise: a standby's applied
-    /// status. `at`, `term` and the answer are as [`Journal::member`] has
+    /// on a leader and on a standby, and the table's row's otherwise.
+    /// `at`, `term` and the answer are as [`Journal::member`] has
     /// them. A status of the store's own is told ahead of the table's
     /// move, and the table takes the status behind a yes alone. A status
     /// the store follows names no term.
