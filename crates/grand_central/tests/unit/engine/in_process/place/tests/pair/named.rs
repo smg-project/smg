@@ -683,6 +683,132 @@ fn the_numbers_count_among_the_workers_that_meet_the_requests_demands() {
     assert_eq!(placed("0", unmet), Err(shed));
 }
 
+/// A pair that names its worker goes to the worker at that number on each
+/// side under each part of the hard demands its request states: none, a
+/// completion's bound, the way a constraint is decided, those two, the
+/// input's bound, and all three. A prefill is held to no completion's
+/// bound and to no way a constraint was decided ([`Demands::held_by`]),
+/// and the input's bound holds both roles. No worker here states a
+/// window, so each holds a request of any size, and every decode states
+/// the way asked for.
+///
+/// The classic router picks a pair that names its worker by each side's
+/// policy over its own workers (`P:2854-2855`, `P:2914-2920`;
+/// `CH:187-193`): the pair at the number.
+#[test]
+fn a_pair_that_names_its_worker_goes_to_that_worker_under_each_part_of_the_demands() {
+    let engine = rings();
+    let mut lists = Lists::of(3, 3);
+    lists.published[1] = PublishedList::with_facts(Arc::clone(&lists.decodes), |_| {
+        let mut facts = FixedFacts::default();
+        facts.demands.decoding = 3;
+        facts
+    });
+    let classes = lists.every();
+    // The pair a request that names the number 1 is placed on.
+    let answered = |demands: Demands| {
+        let headers = [(TARGET, "1")];
+        let request = PlaceRequest {
+            headers: &headers,
+            demands,
+            ..PlaceRequest::of(MODEL, WorkerLists::Pair(lists.under(&classes, &Open)))
+        };
+        let placement = engine.place(&request);
+        placement.map(|placement| lists.places(&placement))
+    };
+    let none = Demands::default();
+    assert_eq!(answered(none), Ok((1, 1)), "no demand");
+
+    // The decodes alone hold a completion's bound and the way.
+    let bound = Demands {
+        output_window: 256,
+        ..none
+    };
+    assert_eq!(answered(bound), Ok((1, 1)), "the completion's bound");
+    let decided = Demands {
+        decoding: 3,
+        ..none
+    };
+    assert_eq!(answered(decided), Ok((1, 1)), "the way");
+    let both = Demands {
+        decoding: 3,
+        ..bound
+    };
+    assert_eq!(answered(both), Ok((1, 1)), "the bound and the way");
+
+    // Both sides run the input: its bound holds a prefill too, alone and
+    // beside a demand the decodes alone hold.
+    let input = Demands {
+        input_window: 1_024,
+        ..none
+    };
+    assert_eq!(answered(input), Ok((1, 1)), "the input's bound");
+    let whole = Demands {
+        input_window: 1_024,
+        ..both
+    };
+    assert_eq!(answered(whole), Ok((1, 1)), "every bound and the way");
+}
+
+/// The count reads a side's list ahead of the test of that side's part of
+/// the demands, and a read that fills a list's cell holds the facts lent
+/// with it to one a worker. So a prefill list lent wrong on an empty cell
+/// is refused at the count under a demand that the decodes alone hold.
+/// Over one prefill and one decode, the prefills lent on an empty cell
+/// with facts of another count than their workers, the number 1 reaches
+/// no worker. A request that states no demand has no list read by its
+/// count, and is shed under `target-worker` with no fault. One that
+/// states a completion's bound alone, which holds no prefill, has the
+/// prefills' list read by its count all the same: that read starts the
+/// cell's fill, which refuses the list, so the request is answered a
+/// fault, and the fault is counted. No decision stands behind a number
+/// that reaches no worker, so the count's own read is the one that
+/// refuses the list.
+///
+/// The refusal is the engine's word to a host that lends it a list
+/// ([`LentList::facts`]): the classic router's pair selection takes no
+/// lent list, so the case answers as no line of it.
+#[test]
+fn a_prefill_list_lent_wrong_is_refused_at_the_count_under_a_demand_the_decodes_alone_hold() {
+    use crate::engine::list_cell::ListCell;
+
+    let engine = rings();
+    let lists = Lists::of(1, 1);
+    let classes = lists.every();
+    let cell = ListCell::default();
+    let short: [FixedFacts; 0] = [];
+    // What a request that names the number 1 is answered over the
+    // prefills lent wrong, and the faults the engine has counted by then.
+    let answered = |demands: Demands| {
+        let prefill = LentList {
+            workers: &lists.prefills,
+            cell: &cell,
+            facts: Some(&short),
+        };
+        let pair = PairLists {
+            prefill,
+            ..lists.under(&classes, &Open)
+        };
+        let headers = [(TARGET, "1")];
+        let request = PlaceRequest {
+            headers: &headers,
+            demands,
+            ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair))
+        };
+        (engine.place(&request).err(), engine.faults())
+    };
+    let none = Demands::default();
+    let missed = missed_on(PairSide::Prefill);
+    assert_eq!(answered(none), (Some(missed), 0), "no demand: no list read");
+
+    let bound = Demands {
+        output_window: 256,
+        ..none
+    };
+    let faulted = Unplaced::Refused(DecisionRefused::Faulted);
+    assert_eq!(answered(bound), (Some(faulted), 1), "the count's read");
+}
+
 /// A place a standing veto of the lists' host masks takes no number, on
 /// either side: a host whose worker objects do not carry its vetoes states
 /// them by place beside each list, and the numbers count as they do over
