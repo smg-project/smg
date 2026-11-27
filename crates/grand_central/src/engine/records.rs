@@ -1967,5 +1967,5 @@ fn with_buffers<T>(decide: impl FnOnce(&mut Buffers) -> T) -> T {
 }
 
 #[cfg(test)]
-#[path = "../../tests/unit/engine/records/tests.rs"]
+#[path = "../../tests/unit/engine/records/tests/mod.rs"]
 mod tests;
