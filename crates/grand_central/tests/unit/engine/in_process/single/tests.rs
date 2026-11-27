@@ -2716,6 +2716,102 @@ fn a_long_conversation_goes_back_to_its_worker_by_the_token_tree() {
     }
 }
 
+/// A conversation whose host lends no tree goes back to its worker by the
+/// engine's record of sent prefixes under an index of either kind: a model
+/// whose index is of the kind hash keeps the record as one of the kind
+/// tree does, so a turn is placed where the turn before it was sent,
+/// whatever its seed.
+#[test]
+fn a_conversation_goes_back_to_its_worker_under_an_index_of_either_kind() {
+    use crate::document::spec::{IndexKind, IndexSpec};
+    for kind in [IndexKind::Tree, IndexKind::Hash] {
+        let mut document = PolicySpec::preset("cache_aware").expect("a built-in preset");
+        document.generation = 1;
+        document.view.boundaries = vec![800, 1_000];
+        let index = IndexSpec {
+            kind,
+            ..IndexSpec::default()
+        };
+        document.index.insert("*".into(), index);
+        let spec = AppliedSpec::validate(&document).expect("the document validates");
+        let engine = InProcess::new(spec);
+        let members = PublishedList::new(pool(8));
+        let sent = |tokens: &[u32], seed: u64| {
+            let hashes = engine.prompt_hashes(MODEL, Some(tokens), None, HashSeeds::PLAIN);
+            let mut asked = request();
+            asked.facts.seed = seed;
+            hashes.write_to(&mut asked.facts);
+            let decision = decided(&engine, &Asks::of(asked, Some(&members))).decision;
+            let pick = decision.pick().expect("a pick");
+            pick.targets.first().expect("a target").position
+        };
+        let mut said: Vec<u32> = (0..1_024).collect();
+        let first = sent(&said, 0);
+        let mut back = 0;
+        for turn in 1..32 {
+            said.extend(turn * 1_000_000..turn * 1_000_000 + 16);
+            back += u32::from(sent(&said, u64::from(turn)) == first);
+        }
+        assert_eq!(back, 31, "the turns that went back under {kind:?}");
+    }
+}
+
+/// Under the settings of the classic hash index a conversation goes back
+/// to its worker however long its prompt: the document those settings
+/// become counts a holder at any boundary, so a first turn of 4,096 token
+/// ids against boundaries of 800 and 1,000 is placed where it was sent,
+/// whatever a turn's seed and whatever match threshold the settings name.
+#[test]
+fn a_long_conversation_goes_back_to_its_worker_under_the_hash_settings() {
+    use crate::document::{
+        routing_settings::{PolicySettings, RoutingSettings},
+        spec::IndexKind,
+    };
+    for threshold in [None, Some(0.9)] {
+        let mut policy = PolicySettings::of_label("cache_aware").expect("a policy of that name");
+        let PolicySettings::CacheAware {
+            cache_index,
+            cache_boundaries,
+            cache_threshold,
+            ..
+        } = &mut policy
+        else {
+            panic!("the cache-aware settings");
+        };
+        *cache_index = IndexKind::Hash;
+        *cache_boundaries = vec![800, 1_000];
+        if let Some(threshold) = threshold {
+            *cache_threshold = threshold;
+        }
+        let settings = RoutingSettings {
+            policy,
+            ..RoutingSettings::default()
+        };
+        let mut document = settings.policy_document().expect("the settings translate");
+        document.generation = 1;
+        let spec = AppliedSpec::validate(&document).expect("the document validates");
+        let engine = InProcess::new(spec);
+        let members = PublishedList::new(pool(8));
+        let sent = |tokens: &[u32], seed: u64| {
+            let hashes = engine.prompt_hashes(MODEL, Some(tokens), None, HashSeeds::PLAIN);
+            let mut asked = request();
+            asked.facts.seed = seed;
+            hashes.write_to(&mut asked.facts);
+            let decision = decided(&engine, &Asks::of(asked, Some(&members))).decision;
+            let pick = decision.pick().expect("a pick");
+            pick.targets.first().expect("a target").position
+        };
+        let mut said: Vec<u32> = (0..4_096).collect();
+        let first = sent(&said, 0);
+        let mut back = 0;
+        for turn in 1..32 {
+            said.extend(turn * 1_000_000..turn * 1_000_000 + 16);
+            back += u32::from(sent(&said, u64::from(turn)) == first);
+        }
+        assert_eq!(back, 31, "the turns that went back at {threshold:?}");
+    }
+}
+
 /// A conversation its host holds as text goes back to its worker by the
 /// host's string tree, however long it grows and whatever a turn's seed,
 /// as a tokenized one does by the token tree
@@ -4602,5 +4698,68 @@ fn a_stage_is_asked_what_it_needs_at_the_build_alone() {
     assert!(
         engine.spec().needs().active_sessions,
         "the build recorded the picker's declared need"
+    );
+}
+
+/// Under the settings of the classic hash index a worker admitted beside
+/// older ones takes no turn of a conversation: the classic hash index
+/// calls no warm-up slice, so the document those settings become names
+/// nobody as warming, whatever warm-up window the settings name, and a
+/// turn is placed where the turn before it was sent.
+#[test]
+fn a_conversation_stays_with_its_worker_beside_a_new_one_under_the_hash_settings() {
+    use crate::document::{
+        routing_settings::{PolicySettings, RoutingSettings},
+        spec::IndexKind,
+    };
+    let mut policy = PolicySettings::of_label("cache_aware").expect("a policy of that name");
+    let PolicySettings::CacheAware {
+        cache_index,
+        cache_boundaries,
+        ..
+    } = &mut policy
+    else {
+        panic!("the cache-aware settings");
+    };
+    *cache_index = IndexKind::Hash;
+    *cache_boundaries = vec![800, 1_000];
+    // A window of one second, so that seven workers are older than it
+    // within the case's own time.
+    let settings = RoutingSettings {
+        policy,
+        worker_warmup_secs: 1,
+        ..RoutingSettings::default()
+    };
+    let mut document = settings.policy_document().expect("the settings translate");
+    document.generation = 1;
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    let engine = InProcess::new(spec);
+    let sent = |members: &PublishedList, tokens: &[u32], seed: u64| {
+        let hashes = engine.prompt_hashes(MODEL, Some(tokens), None, HashSeeds::PLAIN);
+        let mut asked = request();
+        asked.facts.seed = seed;
+        hashes.write_to(&mut asked.facts);
+        let decision = decided(&engine, &Asks::of(asked, Some(members))).decision;
+        let pick = decision.pick().expect("a pick");
+        pick.targets.first().expect("a target").position
+    };
+    let mut list: Vec<Arc<dyn Worker>> = (0..7)
+        .map(|at| ready_worker(&format!("http://worker-{at}:8000"), MODEL))
+        .collect();
+    std::thread::sleep(Duration::from_millis(1_100));
+    let older = PublishedList::new(Arc::from(list.clone()));
+    let mut said: Vec<u32> = (0..4_096).collect();
+    let first = sent(&older, &said, 0);
+    // The eighth worker is admitted now, beside seven older than the window.
+    list.push(ready_worker("http://worker-7:8000", MODEL));
+    let members = PublishedList::new(Arc::from(list));
+    let mut back = 0;
+    for turn in 1..32 {
+        said.extend(turn * 1_000_000..turn * 1_000_000 + 16);
+        back += u32::from(sent(&members, &said, u64::from(turn)) == first);
+    }
+    assert_eq!(
+        back, 31,
+        "the turns that went back beside a worker admitted now"
     );
 }

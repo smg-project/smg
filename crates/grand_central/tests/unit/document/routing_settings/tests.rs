@@ -479,12 +479,18 @@ fn a_cache_aware_setting_lands_in_the_stage_that_reads_it() {
             "*": { "kind": "hash", "ttl_s": 300, "max_size": 16_777_216, "sweep_s": 60 }
         });
         let profile = &mut document["profiles"]["cache_aware"];
+        // The hash index calls no warm-up slice: its stage keeps nobody
+        // young and nobody thin.
         profile["score"][0] = json!({
-            "warmup-slice": { "weight": 8.0, "secs": 0, "blocks": 2048, "miss_share": 0.5 }
+            "warmup-slice": {
+                "weight": 8.0, "secs": 0, "blocks": 2048, "thin_ratio": 0.0, "miss_share": 0.5
+            }
         });
+        // The hash index reads no match threshold: its stage counts a
+        // holder at every share, and the slice alone keeps the setting.
         profile["score"][1] = json!({ "prefix-affinity": {
             "weight": 4.0,
-            "threshold": 0.5,
+            "threshold": 0.0,
             "decay": 0.5,
             "accounting_ttl_ms": 200,
             "spill": {
@@ -1469,6 +1475,34 @@ fn a_balance_threshold_past_the_documents_width_lands_as_its_largest_number() {
         assert_eq!(written.pointer(at), Some(&json!(u32::MAX)), "{at}");
         assert_eq!(validated(&document).err(), None, "{at}");
     }
+}
+
+#[test]
+fn a_hash_index_the_configuration_never_sweeps_keeps_its_size() {
+    // Under a hash index the controller keeps a record of sent prefixes
+    // and trims it at its own write, so the document keeps the configured
+    // size at an interval of zero and names its longest cadence alone.
+    let mut policy = cache_aware(0.3, 64, 1.5, 0, 67_108_864);
+    if let PolicySettings::CacheAware {
+        cache_index,
+        cache_boundaries,
+        ..
+    } = &mut policy
+    {
+        *cache_index = IndexKind::Hash;
+        *cache_boundaries = vec![512, 2048];
+    }
+    let document = config(policy).policy_document().expect("a document");
+    assert_eq!(
+        document.index.get("*"),
+        Some(&IndexSpec {
+            kind: IndexKind::Hash,
+            ttl_s: 180,
+            max_size: 67_108_864,
+            sweep_s: u32::MAX,
+        })
+    );
+    assert_eq!(validated(&document).err(), None);
 }
 
 #[test]
