@@ -482,6 +482,17 @@ fn a_seats_drop_is_its_sessions_end() {
     assert!(gateways.presence(A, dropped + GRACE).is_none());
 }
 
+/// A seat tells the grace period of the table it stands in, under the
+/// stock period and over it.
+#[test]
+fn a_seat_tells_the_grace_period_of_its_own_table() {
+    for grace in [Duration::from_millis(60), Duration::from_secs(3_600)] {
+        let (_elector, _store, gateways, t0) = leading(grace);
+        let seat = welcomed(&gateways, A, "gateway-a", TERM, t0);
+        assert_eq!(seat.grace(), grace);
+    }
+}
+
 /// A session's number is its alone for the table's life: the late end
 /// of a session that an earlier presence replaced is no end of the
 /// session that stands now. A replaced session reaches a later

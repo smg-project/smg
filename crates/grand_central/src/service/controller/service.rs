@@ -32,6 +32,7 @@
 //! turn is told to ask again.
 
 use std::{
+    future::Future,
     io,
     sync::Arc,
     task::{Context, Poll},
@@ -54,7 +55,7 @@ use super::{
     decision_slots::{self, DecisionSlots, Reads},
     election::{self, split_identity, ElectionObservation, LeasePlace, Running},
     floor::Floors,
-    gateways::Gateways,
+    gateways::{Gateways, Presence, Refused, SessionPlace},
     generations::{
         Format, Generations, SpecRejected, Unanswered, DRY_RUNS_WAITING, WRITES_WAITING,
     },
@@ -83,7 +84,7 @@ use crate::{
         replication::NotLeading,
     },
     stages::registry::StageRegistry,
-    store::MemoryStore,
+    store::{GatewayId, MemoryStore},
     worker_host::{Members, Objects},
 };
 
@@ -469,6 +470,53 @@ impl Shared {
             )
         };
         snapshot::in_turn(&self.readers, take).await?
+    }
+
+    /// `gateway`'s presence at `now`, as a decide stream holds it
+    /// ([`Gateways::presence`]). A stream asks at its open where this
+    /// replica leads, and at the first request that spends a credit under a
+    /// term the stream is not placed under, each time behind its own read
+    /// of the fence. The table reads the fence again under its lock, at the
+    /// same `now`, and then the row: the term a stream is placed under is
+    /// its own read's, and a write of the elector can fall between the two
+    /// reads.
+    ///
+    /// # Errors
+    ///
+    /// `FAILED_PRECONDITION` with [`decide::NO_SESSION`]: the gateway is not
+    /// present.
+    pub(crate) fn present(&self, gateway: GatewayId, now: Instant) -> Result<Presence, Status> {
+        self.gateways
+            .presence(gateway, now)
+            .ok_or_else(|| Status::failed_precondition(decide::NO_SESSION))
+    }
+
+    /// The seat of `gateway`'s session at `now` under `term`, the session's
+    /// own read of the fence, with `subject` the name its key stands for
+    /// ([`Gateways::welcome`]).
+    ///
+    /// # Errors
+    ///
+    /// The presence table's refusal of the seat.
+    pub(crate) fn welcome(
+        &self,
+        gateway: GatewayId,
+        subject: &str,
+        term: u64,
+        now: Instant,
+    ) -> Result<SessionPlace, Refused> {
+        self.gateways.welcome(gateway, subject, term, now)
+    }
+
+    /// The presence table's task until `stop`: the sweep, and what rides
+    /// its clock ([`Gateways::run`]). Of the shared state, the task holds
+    /// the table alone.
+    pub(crate) fn sweep(
+        &self,
+        stop: watch::Receiver<bool>,
+    ) -> impl Future<Output = ()> + Send + use<> {
+        let gateways = Arc::clone(&self.gateways);
+        async move { gateways.run(stop).await }
     }
 }
 
