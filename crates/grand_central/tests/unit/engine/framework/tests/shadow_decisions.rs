@@ -1252,6 +1252,10 @@ fn shadow_stages_count_live_dispatches_but_a_shadow_pick_sends_nothing() {
         fn on_dispatched(&self, _: &Lease, _: &Target, _: Side, _: u32) {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
+
+        fn hears(&self) -> EventSet {
+            EventSet::of([EventKind::Dispatched])
+        }
     }
 
     impl Scorer for Dispatches {

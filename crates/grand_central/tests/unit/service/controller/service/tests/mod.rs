@@ -1437,6 +1437,27 @@ async fn a_call_under_a_take_its_store_has_passed_is_told_to_retry() {
     );
 }
 
+/// The presence table's task runs on with no stop said, and ends at the
+/// stop it is handed: the shared state's own word is not said here.
+#[tokio::test]
+async fn the_presence_tables_task_ends_at_the_stop_it_is_handed() {
+    let (_elector, _standing, service) = service_alone(&[Scope::Gateway]);
+    let (stop, stopped) = watch::channel(false);
+    let mut task = JoinSet::new();
+    task.spawn(service.shared.sweep(stopped));
+    let early = tokio::time::timeout(Duration::from_millis(20), task.join_next()).await;
+    assert!(
+        early.is_err(),
+        "the task ended with no stop said: {early:?}"
+    );
+    stop.send(true).expect("the task holds the receiver");
+    tokio::time::timeout(Duration::from_secs(20), task.join_next())
+        .await
+        .expect("the task ends within 20 s of its stop")
+        .expect("one task")
+        .expect("it ended by itself");
+}
+
 /// [`electing`]'s service, its spec source a store over a new, empty
 /// directory, handed back beside it.
 fn stored(

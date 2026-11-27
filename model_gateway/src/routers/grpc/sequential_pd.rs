@@ -355,7 +355,12 @@ enum SequentialPdDecodeForm {
 /// language-model-only and the request is one that pairing cannot serve.
 /// Worker selection keeps such a request off such workers while the model
 /// pairs a decode worker with the vision encoder (`decode_needs_vision`), so
-/// a refusal here means none is paired.
+/// a refusal here means none is paired. `language_model_reads_grids` is the
+/// model's answer to whether its language model reads the grid tensors the
+/// request carries (`RoutingSnapshot::language_model_reads_grids`): when it
+/// does not, the grids feed only the vision tower, which runs on the side
+/// that encodes the media (the prefill side, or the encode workers in
+/// encode/prefill/decode mode), and the stripped side serves the request.
 // Always in line: the plan's decision ran this built in, on every sequential
 // request's path, before the check of its refusals called it too. With two
 // callers it stood alone, and a request read 32 instructions more.
@@ -364,6 +369,7 @@ fn sequential_pd_decode_form(
     request: &ProtoGenerateRequest,
     decode_language_model_only: bool,
     relay_kv_params: bool,
+    language_model_reads_grids: bool,
 ) -> Result<SequentialPdDecodeForm, Response> {
     if !decode_language_model_only {
         return Ok(if relay_kv_params {
@@ -372,7 +378,7 @@ fn sequential_pd_decode_form(
             SequentialPdDecodeForm::Full
         });
     }
-    if request.has_vllm_mrope_grids() {
+    if language_model_reads_grids && request.has_vllm_mrope_grids() {
         // Grid-dependent models (Qwen-VL family) derive decode-side positions
         // from the grid tensors: a language-model-only decode worker rejects
         // them and stripping them would mis-rotate every generated token, so
@@ -457,9 +463,12 @@ impl SequentialPlan {
     /// [`execute_sequential_pd`], so a refused request's prefill was never
     /// said to be sent. [`Self::refuses`] makes the same refusals without
     /// the plan: a refusal added here is added there.
+    /// `language_model_reads_grids` is the model's answer the routing
+    /// snapshot keeps (see [`sequential_pd_decode_form`]).
     pub(crate) fn decide(
         proto_request: &ProtoGenerateRequest,
         workers: &WorkerSelection,
+        language_model_reads_grids: bool,
     ) -> Result<Self, Response> {
         let mode = match workers.decode_worker() {
             // A MoRI-IO decode engine never recomputes the prompt, whatever the
@@ -526,8 +535,12 @@ impl SequentialPlan {
             && workers
                 .decode_worker()
                 .is_some_and(|worker| worker_language_model_only(worker.as_ref()));
-        let decode_form =
-            sequential_pd_decode_form(proto_request, decode_language_model_only, relay_kv_params)?;
+        let decode_form = sequential_pd_decode_form(
+            proto_request,
+            decode_language_model_only,
+            relay_kv_params,
+            language_model_reads_grids,
+        )?;
         let stripped_mm_decode = matches!(decode_form, SequentialPdDecodeForm::TextPlusHashes)
             && proto_request.has_mm_inputs();
         Ok(Self {
@@ -549,6 +562,7 @@ impl SequentialPlan {
     pub(crate) fn refuses(
         proto_request: &ProtoGenerateRequest,
         workers: &WorkerSelection,
+        language_model_reads_grids: bool,
     ) -> Result<(), Response> {
         // The plan's mode is MoRI-IO for a MoRI-IO decode, and else what the
         // prefill's connector says.
@@ -564,8 +578,13 @@ impl SequentialPlan {
             && workers
                 .decode_worker()
                 .is_some_and(|worker| worker_language_model_only(worker.as_ref()));
-        sequential_pd_decode_form(proto_request, decode_language_model_only, relay_kv_params)
-            .map(drop)
+        sequential_pd_decode_form(
+            proto_request,
+            decode_language_model_only,
+            relay_kv_params,
+            language_model_reads_grids,
+        )
+        .map(drop)
     }
 
     /// The prefill request carried KV params, so the servicer was asked for
@@ -1580,11 +1599,11 @@ mod tests {
 
         // Full-vision decode worker: today's forms, untouched.
         assert_eq!(
-            sequential_pd_decode_form(&mm_request, false, true).expect("vision decode"),
+            sequential_pd_decode_form(&mm_request, false, true, true).expect("vision decode"),
             SequentialPdDecodeForm::IdentityOnly
         );
         assert_eq!(
-            sequential_pd_decode_form(&mm_request, false, false).expect("vision decode n>1"),
+            sequential_pd_decode_form(&mm_request, false, false, true).expect("vision decode n>1"),
             SequentialPdDecodeForm::Full
         );
 
@@ -1601,17 +1620,52 @@ mod tests {
             .model_specific_tensors
             .clear();
         assert_eq!(
-            sequential_pd_decode_form(&stripable, true, true).expect("stripped side"),
+            sequential_pd_decode_form(&stripable, true, true, true).expect("stripped side"),
             SequentialPdDecodeForm::TextPlusHashes
         );
         let text = ProtoGenerateRequest::Vllm(Box::default());
         assert_eq!(
-            sequential_pd_decode_form(&text, true, true).expect("text request"),
+            sequential_pd_decode_form(&text, true, true, true).expect("text request"),
             SequentialPdDecodeForm::TextPlusHashes
         );
         assert_eq!(
-            sequential_pd_decode_form(&text, true, false).expect("text n>1"),
+            sequential_pd_decode_form(&text, true, false, true).expect("text n>1"),
             SequentialPdDecodeForm::TextPlusHashes
+        );
+    }
+
+    /// Grid tensors the model's language model does not read (MiniMax M3's
+    /// feed its vision tower alone) leave a language-model-only decode
+    /// worker the stripped side, as a request without grids does; a
+    /// full-vision decode worker keeps its forms.
+    #[test]
+    fn grids_the_language_model_does_not_read_take_the_stripped_side() {
+        let mut gridded = vllm_pd_mm_request();
+        let ProtoGenerateRequest::Vllm(req) = &mut gridded else {
+            panic!("expected vLLM request");
+        };
+        req.media_refs = None;
+        assert!(gridded.has_vllm_mrope_grids());
+
+        assert_eq!(
+            sequential_pd_decode_form(&gridded, true, true, false).expect("plain-RoPE grids"),
+            SequentialPdDecodeForm::TextPlusHashes
+        );
+        assert_eq!(
+            sequential_pd_decode_form(&gridded, false, true, false).expect("vision decode"),
+            SequentialPdDecodeForm::IdentityOnly
+        );
+        // n>1 recomputes the prompt on the decode side whatever the grids
+        // are: still refused there, for its samples.
+        let Err(refused) = sequential_pd_decode_form(&gridded, true, false, false) else {
+            panic!("n>1 cannot recompute on a pixel-less decode worker");
+        };
+        assert_eq!(
+            refused
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .unwrap(),
+            "pd_decode_language_model_only_n_samples"
         );
     }
 
@@ -1633,7 +1687,7 @@ mod tests {
         // M-RoPE grids + language-model-only decode: cannot strip (positions
         // would be wrong), cannot send (encoder-cache budget 0).
         let gridded = vllm_pd_mm_request();
-        let response = sequential_pd_decode_form(&gridded, true, true)
+        let response = sequential_pd_decode_form(&gridded, true, true, true)
             .expect_err("mRoPE grids need a vision-capable decode worker");
         assert!(refusal(response)
             .await
@@ -1647,7 +1701,7 @@ mod tests {
         };
         req.mm_inputs = None;
         req.extra_mm_inputs.clear();
-        let response = sequential_pd_decode_form(&refs_only, true, true)
+        let response = sequential_pd_decode_form(&refs_only, true, true, true)
             .expect_err("media refs need a processing decode worker");
         assert!(refusal(response)
             .await
@@ -1665,7 +1719,7 @@ mod tests {
             .unwrap()
             .model_specific_tensors
             .clear();
-        let response = sequential_pd_decode_form(&fanout, true, false)
+        let response = sequential_pd_decode_form(&fanout, true, false, true)
             .expect_err("n>1 cannot recompute on a pixel-less decode worker");
         assert!(refusal(response)
             .await
@@ -1775,8 +1829,14 @@ mod tests {
         };
 
         // A multimodal request in the three forms a language-model-only
-        // decode is refused, as the decode form's own case builds them.
-        let gridded = vllm_pd_mm_request();
+        // decode is refused, as the decode form's own case builds them: grid
+        // tensors (refused only while the model's language model reads
+        // them), media references, and samples of a multimodal prompt.
+        let mut gridded = vllm_pd_mm_request();
+        let ProtoGenerateRequest::Vllm(req) = &mut gridded else {
+            panic!("expected vLLM request");
+        };
+        req.media_refs = None;
         let mut refs_only = vllm_pd_mm_request();
         let ProtoGenerateRequest::Vllm(req) = &mut refs_only else {
             panic!("expected vLLM request");
@@ -1805,12 +1865,16 @@ mod tests {
 
         let nixl = Some(NIXL_CONNECTOR);
         let moriio = Some(MORIIO_CONNECTOR);
+        // Each row's code when the model's language model reads the grids,
+        // and when it reads none of them: only the grids row tells the two
+        // apart.
         let rows = [
-            ("a NIXL pair", pair(nixl, None, None), &text, None),
+            ("a NIXL pair", pair(nixl, None, None), &text, None, None),
             (
                 "a MoRI-IO decode",
                 pair(nixl, moriio, None),
                 &text,
+                Some("moriio_grpc_pd_unsupported"),
                 Some("moriio_grpc_pd_unsupported"),
             ),
             (
@@ -1818,17 +1882,20 @@ mod tests {
                 pair(moriio, None, None),
                 &text,
                 Some("moriio_grpc_pd_unsupported"),
+                Some("moriio_grpc_pd_unsupported"),
             ),
             (
                 "grids for a language-model-only decode",
                 pair(nixl, None, Some("false")),
                 &gridded,
                 Some("pd_decode_language_model_only_mrope"),
+                None,
             ),
             (
                 "media references for a language-model-only decode",
                 pair(nixl, None, Some("false")),
                 &refs_only,
+                Some("pd_decode_language_model_only_media_refs"),
                 Some("pd_decode_language_model_only_media_refs"),
             ),
             (
@@ -1836,11 +1903,13 @@ mod tests {
                 pair(nixl, None, Some("false")),
                 &fanout,
                 Some("pd_decode_language_model_only_n_samples"),
+                Some("pd_decode_language_model_only_n_samples"),
             ),
             (
                 "one sample of a multimodal prompt for a language-model-only decode",
                 pair(nixl, None, Some("false")),
                 &pixels,
+                None,
                 None,
             ),
             (
@@ -1848,22 +1917,33 @@ mod tests {
                 pair(nixl, None, Some("false")),
                 &text,
                 None,
+                None,
             ),
             (
                 "grids for a decode with the vision encoder",
                 pair(nixl, None, Some("true")),
                 &gridded,
                 None,
+                None,
             ),
         ];
-        for (name, workers, request, refused) in rows {
-            // A refusal is read as one whatever it bears: a refusal with no
-            // code is not a row's `None`.
-            let refused = refused.map(|code| Some(code.to_owned()));
-            let checked = SequentialPlan::refuses(request, &workers).err().map(code);
-            let decided = SequentialPlan::decide(request, &workers).err().map(code);
-            assert_eq!(checked, refused, "{name}: the check");
-            assert_eq!(decided, refused, "{name}: the plan's decision");
+        for (name, workers, request, if_read, if_not_read) in rows {
+            for (reads, refused) in [(true, if_read), (false, if_not_read)] {
+                // A refusal is read as one whatever it bears: a refusal with
+                // no code is not a row's `None`.
+                let refused = refused.map(|code| Some(code.to_owned()));
+                let checked = SequentialPlan::refuses(request, &workers, reads)
+                    .err()
+                    .map(code);
+                let decided = SequentialPlan::decide(request, &workers, reads)
+                    .err()
+                    .map(code);
+                assert_eq!(checked, refused, "{name}, grids read {reads}: the check");
+                assert_eq!(
+                    decided, refused,
+                    "{name}, grids read {reads}: the plan's decision"
+                );
+            }
         }
     }
 
@@ -1927,7 +2007,8 @@ mod tests {
     #[test]
     fn a_nixl_pair_is_sent_as_recorded() {
         let workers = connector_pair(NIXL_CONNECTOR, None);
-        let plan = SequentialPlan::decide(&recorded_request(1), &workers).expect("a NIXL pair");
+        let plan =
+            SequentialPlan::decide(&recorded_request(1), &workers, true).expect("a NIXL pair");
         assert_eq!(plan.mode, KvConnectorMode::Nixl);
         assert_eq!(
             sent_pair(&plan, recorded_request(1), &workers, Some(NIXL_RETURNED)),
@@ -1939,7 +2020,7 @@ mod tests {
     fn a_minted_mooncake_pair_is_sent_as_recorded() {
         let workers = connector_pair(MOONCAKE_CONNECTOR, Some("engine-a"));
         let mut plan =
-            SequentialPlan::decide(&recorded_request(1), &workers).expect("a Mooncake pair");
+            SequentialPlan::decide(&recorded_request(1), &workers, true).expect("a Mooncake pair");
         assert!(
             matches!(
                 plan.mode,
@@ -1966,7 +2047,8 @@ mod tests {
     #[test]
     fn a_legacy_mooncake_pair_is_sent_as_recorded() {
         let workers = connector_pair(MOONCAKE_CONNECTOR, None);
-        let plan = SequentialPlan::decide(&recorded_request(1), &workers).expect("a Mooncake pair");
+        let plan =
+            SequentialPlan::decide(&recorded_request(1), &workers, true).expect("a Mooncake pair");
         assert!(
             matches!(
                 plan.mode,
@@ -1994,7 +2076,8 @@ mod tests {
     #[test]
     fn an_n_greater_than_one_pair_is_sent_as_recorded() {
         let workers = connector_pair(NIXL_CONNECTOR, None);
-        let plan = SequentialPlan::decide(&recorded_request(2), &workers).expect("a NIXL pair");
+        let plan =
+            SequentialPlan::decide(&recorded_request(2), &workers, true).expect("a NIXL pair");
         assert!(!plan.relay_kv_params, "n>1 relays no handoff");
         assert_eq!(
             sent_pair(&plan, recorded_request(2), &workers, None),

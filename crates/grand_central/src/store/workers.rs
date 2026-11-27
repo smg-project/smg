@@ -174,8 +174,10 @@ pub struct WorkerFacts {
     pub overload: Overload,
     /// The seconds a removal waits behind a drain, where the row states a
     /// window: a control call's registration states any, and a found
-    /// worker's is a fact of its row where it is not the default. A host
-    /// that builds the worker's object from the row gives the object this
+    /// worker's is a fact of its row where it is not the default. At the
+    /// default a found worker's row keeps the number where the standing
+    /// row states it, and states none at a replacement by id. A host that
+    /// builds the worker's object from the row gives the object this
     /// window.
     pub drain_settle_secs: Option<u32>,
     /// What the worker states for a request's hard demands beside its
@@ -450,6 +452,10 @@ impl MembershipChange {
 /// decision reads a worker's status on its worker object, which the holder
 /// of the objects moves with the row's.
 pub trait WorkersStore: Send + Sync {
+    /// The row under `id`, copied whole. No product code of this
+    /// repository calls it: the holder of a host's worker objects reads
+    /// one row's told status by a read of the crate's own store
+    /// (`MemoryStore::told_status`).
     fn get(&self, id: WorkerId) -> Option<WorkerRow>;
 
     /// The row under a registration key, whatever its incarnation.

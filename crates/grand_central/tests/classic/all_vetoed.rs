@@ -107,10 +107,9 @@ impl Row {
     fn spec(&self) -> Result<PolicySpec, String> {
         let mut spec = PolicySpec::preset(&self.policy).map_err(|err| err.to_string())?;
         let binding = spec.bindings.first_mut().expect("the preset's binding");
-        binding.overload = Some(OverloadSpec {
-            shed_when_all_vetoed: self.shed,
-            ..OverloadSpec::default()
-        });
+        let mut overload = OverloadSpec::default();
+        overload.shed_when_all_vetoed = self.shed;
+        binding.overload = Some(overload);
         if let Some(sessions) = binding.sessions.as_mut() {
             sessions.assignment = Assignment::MinLoad;
         }

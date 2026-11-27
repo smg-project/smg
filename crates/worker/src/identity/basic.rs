@@ -159,9 +159,35 @@ pub fn merge_labels(
 /// Core worker abstraction that represents a backend service
 ///
 /// [`Any`] is a supertrait: a caller that must know the concrete type of a
-/// worker asks the object itself (`let object: &dyn Any = worker;`), where
-/// [`Worker::as_any`] is each implementation's own answer. Every `'static`
-/// type is [`Any`], so an implementation writes nothing for it.
+/// worker asks the object itself (`let object: &dyn Any = worker;` from a
+/// `&dyn Worker`), where [`Worker::as_any`] is each implementation's own
+/// answer. A handle (`Arc<dyn Worker>`) is [`Any`] too: from a reference to
+/// a handle (`&Arc<dyn Worker>`) the same line compiles and names the
+/// handle, never the worker, so deref down to the `dyn Worker` first:
+/// `&*worker` from a handle, `&**worker` from a reference to one. Every
+/// `'static` type is [`Any`], so an implementation writes nothing for it.
+///
+/// ```
+/// use std::{any::Any, sync::Arc};
+///
+/// use smg_worker::identity::{
+///     basic::{BasicWorker, Worker},
+///     builder::BasicWorkerBuilder,
+/// };
+///
+/// let builder: BasicWorkerBuilder = BasicWorkerBuilder::new("http://worker:8000");
+/// let worker: Arc<dyn Worker> = Arc::new(builder.build());
+///
+/// let object: &dyn Any = &*worker;
+/// assert!(object.is::<BasicWorker>());
+///
+/// let held: &Arc<dyn Worker> = &worker;
+/// let object: &dyn Any = &**held;
+/// assert!(object.is::<BasicWorker>());
+///
+/// let handle: &dyn Any = held;
+/// assert!(!handle.is::<BasicWorker>());
+/// ```
 #[async_trait]
 pub trait Worker: Any + Send + Sync + fmt::Debug + 'static {
     /// Downcast support for same-URL replace state sharing.
@@ -1150,6 +1176,11 @@ impl BasicWorker {
 
     fn shared_runtime(&self) -> Arc<WorkerRuntime> {
         self.runtime.load_full()
+    }
+
+    #[cfg(feature = "workflow")]
+    pub(crate) fn drained_at(&self) -> u64 {
+        self.runtime.load().drained_at()
     }
 
     /// Start the one-shot background ZMQ handshake driver for `cell` unless one

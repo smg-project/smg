@@ -38,10 +38,12 @@
 //! object takes the status its row holds, and where no row stands for it
 //! the status it left.
 //!
-//! From the table to an object there are two ways, both of a told status.
-//! A standby's applier and a gateway's watcher lay the status their
-//! leader's log tells ([`mod@super::standby`]). And a tell the store
-//! refuses gives the object the status its row holds, as said above.
+//! From the table to an object there are three ways, each of a told
+//! status. A standby's applier and a gateway's watcher lay the status
+//! their leader's log tells ([`mod@super::standby`]). A tell the store
+//! refuses gives the object the status its row holds, as said above. And
+//! a removal the store refuses for its term lays its object again in the
+//! status its row holds ([`mod@super::write`]).
 
 use std::sync::Arc;
 
@@ -61,8 +63,11 @@ use crate::{
 type Moved = Option<(ObjectStatus, ObjectStatus)>;
 
 /// The ids of the models `object` serves, in its cards' order, as the one
-/// shared list a status entry holds. Each id is copied, and no card.
-fn served(object: &dyn Worker) -> Arc<[String]> {
+/// shared list a status entry holds. Each id is copied, and no card. A
+/// status write of this module calls it under the object's mutation
+/// lock. A standby's applier calls it in the holder's turn, with no lock
+/// of the object.
+pub(super) fn served(object: &dyn Worker) -> Arc<[String]> {
     let mut ids = Vec::new();
     object.any_model(&mut |card| {
         ids.push(card.id.clone());
@@ -188,9 +193,21 @@ impl<G: Generation> Objects<G> {
 
     /// Tell `store` the status of the object that stands for `row`, behind
     /// a write that laid the object in another's place: it took the
-    /// standing object's status there, and the table holds its own.
-    pub(super) fn tell_row(&self, store: &MemoryStore, row: WorkerId, revision: u64) {
-        self.row_status(store, row, revision, LeadWord::FREE, Write::Tell(None));
+    /// standing object's status there, and the table holds its own. `term`
+    /// is the term of that write, where its caller named one: the status
+    /// goes to the store's journal under it, as the row's event did.
+    pub(super) fn tell_row(
+        &self,
+        store: &MemoryStore,
+        row: WorkerId,
+        revision: u64,
+        term: Option<u64>,
+    ) {
+        let word = LeadWord {
+            term,
+            ..LeadWord::FREE
+        };
+        self.row_status(store, row, revision, word, Write::Tell(None));
     }
 
     /// Settle the status of the object that stands for `row` with the
@@ -258,7 +275,9 @@ impl<G: Generation> Objects<G> {
     /// stood in, the move with it. What laid it settles the two. A door
     /// tells the store its object's status behind the put
     /// ([`Self::tell_row`]). A told row's put and a cut are followed by
-    /// the table's status ([`mod@super::standby`]).
+    /// the table's status ([`mod@super::standby`]). A removal the store
+    /// refused for its term laid a new object in the table's status
+    /// ([`mod@super::write`]): the move left with the old one.
     fn status_under(
         &self,
         store: &MemoryStore,

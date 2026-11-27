@@ -97,10 +97,9 @@ fn a_host_applies_its_start_document_and_serves_a_read_only_source() {
         store.follow(Position::default(), epoch, registered, Some(row));
     }
     assert_eq!(store.checkpoint().rows.len(), 3, "each row landed");
-    let asked = WorkerRowsQuery {
-        models: vec!["served".to_owned()],
-        limit: 1,
-    };
+    let mut asked = WorkerRowsQuery::default();
+    asked.models = vec!["served".to_owned()];
+    asked.limit = 1;
     // A lone read's answer: the first rows by key that serve the model, as
     // many as the limit, with the count that serve it.
     let mut rows = store.checkpoint().rows;
@@ -114,7 +113,7 @@ fn a_host_applies_its_start_document_and_serves_a_read_only_source() {
     assert_eq!(row.facts.key, "grpc://b:8000");
     assert!(page.truncated);
 
-    let asked = WorkerRowsQuery { limit: 2, ..asked };
+    asked.limit = 2;
     let page = worker_rows_page(
         &asked,
         Rows::Shared(Arc::new(store.checkpoint())),

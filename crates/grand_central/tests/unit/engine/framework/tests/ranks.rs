@@ -706,7 +706,7 @@ fn a_ranked_decision_is_the_weighted_sums_under_every_picker() {
     let catalog = StageRegistry::builtin();
     let build = |name: &str| match catalog.find_picker(name) {
         Some(Found::Built(picker)) => Some(picker),
-        Some(Found::Typed | Found::With(_)) => None,
+        Some(Found::Typed | Found::With(_) | Found::Kept) => None,
         None => Some(Box::new(Lowest) as Box<dyn Picker>),
     };
     let mut marked = Vec::new();

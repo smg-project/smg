@@ -6,7 +6,7 @@ use std::{io::Write, time::Duration};
 use smg_grand_central::{
     engine::Role,
     service::controller::{Controller, State},
-    store::{Registrant, WorkerFacts, WorkersStore},
+    store::{Registrant, WorkerFacts},
 };
 use tokio::sync::oneshot;
 
@@ -48,9 +48,11 @@ async fn rss_idle_and_with_a_thousand_workers_in_the_store() {
         // The fleet arrived inside one window: its one build, asked here so
         // the figure holds the world a decision reads.
         store.publish_now();
-        let (_, rows) = store.all_rows();
-        assert_eq!(rows.len(), 1_000);
+        // A copy of the rows is resident at the sampling: the holder's cut.
+        let cut = holder.checkpoint(&store);
+        assert_eq!(cut.rows.len(), 1_000);
         let fed = vm_rss_kib();
+        drop(cut);
         let mut out = std::io::stdout();
         writeln!(out, "RSS_IDLE_KIB {idle}").expect("stdout");
         writeln!(out, "RSS_1K_WORKERS_KIB {fed}").expect("stdout");

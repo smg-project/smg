@@ -27,6 +27,9 @@ use super::prefix::Prefix;
 pub struct Outline {
     /// The call's name, once its string has arrived whole.
     pub name: Option<String>,
+    /// One past the closing quote of the name's string, once the name is there: where the head
+    /// of a call that starts with its name ends.
+    pub name_end: usize,
     /// The arguments value's bytes, from its first byte to where it ends or to where the text ends.
     pub arguments: Option<Span>,
     /// An arguments member's key has arrived, whether or not its value began: an object whose
@@ -416,7 +419,10 @@ impl Scanner {
     /// closes, and the next member follows.
     fn value_ends(&mut self, text: &str, key: Member, start: usize, end: usize) {
         match key {
-            Member::Name => self.found.name = decode_string(&text[start..end]),
+            Member::Name => {
+                self.found.name = decode_string(&text[start..end]);
+                self.found.name_end = end;
+            }
             Member::Arguments => {
                 if let Some(span) = &mut self.found.arguments {
                     span.end = Some(end);

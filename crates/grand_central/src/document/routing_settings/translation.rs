@@ -163,10 +163,10 @@ pub(super) fn presets(config: &RoutingSettings) -> Result<Planned<'_>, RoutingSe
 pub(super) fn both_families(
     config: &RoutingSettings,
 ) -> Result<Option<Planned<'_>>, RoutingSettingsError> {
-    let mode = &config.mode;
+    let (mode, main) = (&config.mode, &config.policy);
     let (both, encode) = match mode {
         ModeSettings::Regular | ModeSettings::Provider(_) => {
-            (config.enable_igw && !manual_alone(config), None)
+            (config.enable_igw && !manual_alone(mode, main), None)
         }
         ModeSettings::PrefillDecode {
             prefill_policy: _,
@@ -184,7 +184,7 @@ pub(super) fn both_families(
     if !both {
         return Ok(None);
     }
-    families(config, encode).map(Some)
+    families(mode, main, encode).map(Some)
 }
 
 /// The document of a gateway of many routers outside the encode mode, with
@@ -205,37 +205,41 @@ pub(super) fn both_families(
 /// The manual policy on both sides of the pair is planned. Its rule places
 /// the pair's two sides, each by its own session, and the encode side
 /// places an item by its own policy.
-pub(super) fn three_sided(
-    config: &RoutingSettings,
-) -> Result<Option<Planned<'_>>, RoutingSettingsError> {
-    let encode_mode = matches!(config.mode, ModeSettings::EncodePrefillDecode { .. });
-    if !config.enable_igw || encode_mode || manual_alone(config) {
+///
+/// The plan reads three of the settings and takes them as they are: the
+/// mode, the main policy, and whether the gateway is one of many routers.
+pub(super) fn three_sided<'a>(
+    mode: &'a ModeSettings,
+    main: &'a PolicySettings,
+    many_routers: bool,
+) -> Result<Option<Planned<'a>>, RoutingSettingsError> {
+    let encode_mode = matches!(mode, ModeSettings::EncodePrefillDecode { .. });
+    if !many_routers || encode_mode || manual_alone(mode, main) {
         return Ok(None);
     }
-    families(config, Some(&ENCODE_DEFAULT)).map(Some)
+    families(mode, main, Some(&ENCODE_DEFAULT)).map(Some)
 }
 
 /// Whether the settings are a regular configuration under the manual
-/// policy. Its picker leaves the placement to the binding's session rule,
-/// and this module does not plan its pairs beside its single requests yet:
-/// such a gateway of many routers plans its single requests alone, under
-/// the plan of two families as under the plan of three sides.
-fn manual_alone(config: &RoutingSettings) -> bool {
-    let regular = matches!(
-        config.mode,
-        ModeSettings::Regular | ModeSettings::Provider(_)
-    );
-    regular && matches!(config.policy, PolicySettings::Manual { .. })
+/// policy, by their mode and their main policy. Its picker leaves the
+/// placement to the binding's session rule, and this module does not plan
+/// its pairs beside its single requests yet: such a gateway of many
+/// routers plans its single requests alone, under the plan of two families
+/// as under the plan of three sides.
+fn manual_alone(mode: &ModeSettings, main: &PolicySettings) -> bool {
+    let regular = matches!(mode, ModeSettings::Regular | ModeSettings::Provider(_));
+    regular && matches!(main, PolicySettings::Manual { .. })
 }
 
 /// The plan of two families: the pair's sides under one binding over their
 /// phases, with `encode` as a third side ahead of them where one is named,
-/// and the main policy's single binding behind it.
+/// and the main policy's single binding behind it. The sides' policies are
+/// the mode's own, or `main` where the mode names none.
 fn families<'a>(
-    config: &'a RoutingSettings,
+    mode: &'a ModeSettings,
+    main: &'a PolicySettings,
     encode: Option<&'a PolicySettings>,
 ) -> Result<Planned<'a>, RoutingSettingsError> {
-    let (mode, main) = (&config.mode, &config.policy);
     let (prefill, decode) = (mode.prefill_policy(main), mode.decode_policy(main));
     let mut sides = vec![("prefill", prefill), ("decode", decode)];
     let mut phases = vec![Phase::Prefill, Phase::Decode];
@@ -712,8 +716,16 @@ fn write_policy<'a>(
                 ),
                 uncached_credit: unless(*balance_uncached_credit, false),
             };
+            // The classic hash index reads no match threshold: a holder at
+            // any boundary is its hit, however small its share of the
+            // request. The record of the kind hash states a holder at its
+            // boundary, so its stage counts a holder at every share.
+            let match_threshold = match cache_index {
+                IndexKind::Hash => 0.0,
+                IndexKind::Tree => *cache_threshold,
+            };
             let affinity = PrefixAffinityParams {
-                threshold: unless(*cache_threshold, DEFAULT_THRESHOLD),
+                threshold: unless(match_threshold, DEFAULT_THRESHOLD),
                 decay: unless(*overlap_decay, 0.0),
                 accounting_ttl_ms: unless(*selection_accounting_ttl_ms, 0),
                 spill: unless(spill, SpillParams::default()),
@@ -740,20 +752,29 @@ fn write_policy<'a>(
                     ScoreStage::KvPressure(KvPressureParams { weight, ..pressure })
                 })?;
             }
+            // The classic hash index calls no warm-up slice: a worker
+            // admitted beside older ones takes no share of the requests,
+            // so a turn of a conversation stays with its holder. A window
+            // and a thin ratio of zero keep nobody young and nobody thin.
+            let (warmup_secs, warmup_thin_ratio) = match cache_index {
+                IndexKind::Hash => (0, 0.0),
+                IndexKind::Tree => (config.worker_warmup_secs, config.worker_warmup_thin_ratio),
+            };
             let warmup = WarmupSliceParams {
-                secs: unless(config.worker_warmup_secs, DEFAULT_WARMUP_SECS),
+                secs: unless(warmup_secs, DEFAULT_WARMUP_SECS),
                 share: unless(config.worker_warmup_share, DEFAULT_WARMUP_SHARE),
                 blocks: unless(
                     narrow("worker_warmup_blocks", config.worker_warmup_blocks)?,
                     DEFAULT_WARMUP_BLOCKS,
                 ),
-                thin_ratio: unless(config.worker_warmup_thin_ratio, DEFAULT_WARMUP_THIN_RATIO),
+                thin_ratio: unless(warmup_thin_ratio, DEFAULT_WARMUP_THIN_RATIO),
                 divert_every: unless(
                     config.worker_warmup_divert_every,
                     DEFAULT_WARMUP_DIVERT_EVERY,
                 ),
-                // The slice counts a hit as a miss by the affinity's own
-                // threshold: the one setting is written in both stages.
+                // The slice counts a hit as a miss by the settings' match
+                // threshold under an index of either kind: it judges what
+                // the cache events hold, which no boundary keys.
                 miss_share: unless(*cache_threshold, DEFAULT_THRESHOLD),
                 ..WarmupSliceParams::default()
             };
@@ -961,10 +982,13 @@ fn index_spec((kind, ttl_s, max_size, sweep_s): IndexNumbers) -> IndexSpec {
     // The document's cadence and size both start at one, so its longest
     // cadence and its largest size say it. No sweep falls inside a
     // process's life, and no write meets the bound.
-    let (max_size, sweep_s) = if sweep_s == 0 {
-        (u64::MAX, u32::MAX)
-    } else {
-        (max_size, sweep_s)
+    // An index of kind hash keeps its named size at that interval too: its
+    // record of sent prefixes is trimmed at its own write, the least used
+    // end first, and waits for no sweep.
+    let (max_size, sweep_s) = match (sweep_s, kind) {
+        (0, IndexKind::Hash) => (max_size, u32::MAX),
+        (0, _) => (u64::MAX, u32::MAX),
+        _ => (max_size, sweep_s),
     };
     IndexSpec {
         kind,

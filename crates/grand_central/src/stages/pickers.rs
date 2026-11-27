@@ -474,6 +474,17 @@ pub(crate) fn push_drawn(candidates: &[Candidate], kept: &[u32], out: &mut Targe
     }
 }
 
+/// The targets of a rotation's turn over `kept`, which holds one row or
+/// more: the row at `turn`, counted round the rows kept, then the rows kept
+/// behind it in their order, wrapping, as far as a decision names targets.
+pub(crate) fn push_turn(candidates: &[Candidate], kept: &[u32], turn: usize, out: &mut Targets) {
+    for k in 0..MAX_TARGETS.min(kept.len()) {
+        out.push(target_of(
+            &candidates[kept[(turn + k) % kept.len()] as usize],
+        ));
+    }
+}
+
 /// One uniform draw over the rows of the pool `keep` keeps, or over those
 /// but the row `except`: a row is drawn again while it is refused, and each
 /// refusal counts into `refused`. `None` once [`DRAW_BOUND`] rows were

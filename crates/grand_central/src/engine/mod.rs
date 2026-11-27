@@ -40,7 +40,8 @@ pub(crate) mod warm_up;
 
 pub use decision::{
     Decision, DecodePlacing, LiftedVeto, Overlap, OverlapSource, Pair, PairSide, Pick, PlacedBy,
-    Queue, ShadowKind, Shed, ShedReason, Survivors, Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
+    Queue, ShadowKind, Shed, ShedReason, Survivors, Target, Targets, Trace, BINDING, MAX_TARGETS,
+    TARGET_WORKER, TRACE_TOP,
 };
 pub use decision_engine::{
     AlonePick, DecideOutcome, Decided, DecisionEngine, DecisionRefused, DecodeRefused,

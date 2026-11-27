@@ -586,6 +586,10 @@ fn a_stage_that_unwinds_at_a_pairs_release_leaves_no_claim_behind() {
         fn on_released(&self, _: &Lease, _: ReleaseReason) {
             panic!("this stage unwinds at a release");
         }
+
+        fn hears(&self) -> EventSet {
+            EventSet::of([EventKind::Released])
+        }
     }
 
     impl Scorer for Unwinds {

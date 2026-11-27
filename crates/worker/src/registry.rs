@@ -116,6 +116,16 @@ pub trait Generation: std::fmt::Debug + Send + Sync + 'static {
     fn members(&self) -> &Arc<[Arc<dyn Worker>]>;
 }
 
+/// A model group's retry settings, as the registry keeps them.
+#[derive(Debug)]
+struct ModelRetry {
+    config: RetryConfig,
+    /// Whether the registry settled these on the group's workers
+    /// ([`WorkerRegistry::settle_model_retry`]); a host's own write
+    /// ([`WorkerRegistry::set_model_retry_config`]) is not.
+    derived: bool,
+}
+
 /// The global membership snapshot together with the epoch it was built at.
 ///
 /// Carrying the epoch inside the published object makes the read fast path
@@ -152,6 +162,9 @@ const MODEL_MAP_SHARDS: usize = 16;
 
 /// Model alias to canonical model ID.
 type ModelAliasIndex = Arc<DashMap<String, Arc<str>, FxBuildHasher>>;
+
+/// Per model, the members that entered as imports from a peer.
+type ModelImports = Arc<DashMap<String, Vec<Arc<dyn Worker>>, FxBuildHasher>>;
 
 /// The read a conditional removal makes of the worker as it stands, under its
 /// lock ([`WorkerRegistry::remove_if`]).
@@ -269,11 +282,22 @@ pub struct WorkerRegistry<G> {
     /// one add an edge, made under the lock above.
     overload_edges: Arc<AtomicU64>,
 
-    /// Per-model retry config (last write wins).
-    /// Updated when a worker with non-empty retry overrides registers.
+    /// Per-model retry settings.
+    /// Settled at every change of a model's workers, inside the guard of the
+    /// model's index entry ([`Self::settle_model_retry`]): the settings of
+    /// the newest worker registered on this node whose spec carries retry
+    /// overrides, no entry where none does. A host's own write
+    /// ([`Self::set_model_retry_config`]) stands beside them.
     /// Cleaned up when the last worker for a model is removed.
     /// When retries are disabled, max_retries is set to 1.
-    model_retry_configs: Arc<DashMap<String, RetryConfig, FxBuildHasher>>,
+    model_retry_configs: Arc<DashMap<String, ModelRetry, FxBuildHasher>>,
+
+    /// Per model, the members that entered as imports from a peer.
+    /// Written with the members themselves, inside the guard of the model's
+    /// index entry, so it names exactly the imports the entry holds. An
+    /// import is built without resolved resilience settings and gives its
+    /// model no retry settings ([`Self::settle_model_retry`]).
+    model_imports: ModelImports,
 
     /// Registration origin per worker (local vs mesh-imported). Written
     /// under the per-worker mutation lock before the `Registered` event,
@@ -358,6 +382,7 @@ impl<G: Generation> WorkerRegistry<G> {
             overload_shed: Arc::new(AtomicBool::new(false)),
             overload_transitions: Arc::new(parking_lot::Mutex::new(())),
             overload_edges: Arc::new(AtomicU64::new(0)),
+            model_imports: Arc::new(DashMap::default()),
             model_retry_configs: Arc::new(DashMap::with_hasher_and_shard_amount(
                 FxBuildHasher,
                 MODEL_MAP_SHARDS,
@@ -1148,15 +1173,20 @@ impl<G: Generation> WorkerRegistry<G> {
     // 4. Read — config
     // ───────────────────────────────────────────────────────────────────
 
-    /// Get the per-model retry config override, if any.
+    /// Get the retry config stored for a model, if any.
     ///
-    /// Returns `None` when no worker in this model group set a retry
-    /// override. When retries are disabled for the group, the stored
-    /// `max_retries` is always 1.
+    /// Returns `None` when the model group has none: no worker of the group
+    /// carries a retry override and no host wrote a config, and a reader
+    /// falls back to the router's own settings. Of several workers that
+    /// carry an override, the newest registration gives the config; it ends
+    /// with that worker's removal or with a replacement that carries none.
+    /// A worker imported from a peer gives none, whatever its spec carries.
+    /// When retries are disabled for the group, the stored `max_retries` is
+    /// always 1.
     pub fn get_retry_config(&self, model_id: &str) -> Option<RetryConfig> {
         self.model_retry_configs
             .get(model_id)
-            .map(|entry| entry.value().clone())
+            .map(|entry| entry.value().config.clone())
     }
 
     /// True when any per-model retry override still allows retries; the
@@ -1165,7 +1195,7 @@ impl<G: Generation> WorkerRegistry<G> {
     pub fn any_model_retry_override_enables_retries(&self) -> bool {
         self.model_retry_configs
             .iter()
-            .any(|entry| entry.value().max_retries > 1)
+            .any(|entry| entry.value().config.max_retries > 1)
     }
 
     // ───────────────────────────────────────────────────────────────────
@@ -1186,7 +1216,10 @@ impl<G: Generation> WorkerRegistry<G> {
     // writers interleave and no subscriber sees one worker's events out of
     // order. `demote_before_removal` is the one other write, the removal's
     // silent NotReady over Ready, a step of `remove_inner` under the same
-    // lock; it publishes nothing. The registry has no opinion on which
+    // lock; it publishes nothing. A registration's replacement
+    // (`register_or_replace_clearing_drain`) starts Pending where it
+    // inherited Draining: a silent step of `replace_as` under that lock,
+    // ahead of its `Replaced` event. The registry has no opinion on which
     // edges are legal: the callers own the rules (the registry enforces
     // none). A rule that depends on the worker's current status is decided
     // in the primitive's closure, under the lock, so the status it reads is
@@ -1201,7 +1234,7 @@ impl<G: Generation> WorkerRegistry<G> {
     //   health probes              Pending/NotReady/Failed -> Ready `apply_if_revision`
     //   (WorkerManager)            Pending/NotReady -> Failed       (decided under the lock)
     //                              Ready -> NotReady
-    //   connect signal             any -> Ready                     `transition_status_if_revision`
+    //   connect signal             any but Draining -> Ready        `apply_if_revision`
     //   (WorkerManager)            (a ZMQ handshake, or a worker
     //                              without health checks; a probed
     //                              worker's signal moves its probe)
@@ -1209,17 +1242,18 @@ impl<G: Generation> WorkerRegistry<G> {
     //   (`on_remote_worker_state`) Ready -> NotReady                (decided under the lock)
     //   drain step                 Ready -> Draining                `apply_if_revision`
     //   (removal workflow)                                          (decided under the lock)
-    //   activation step            not Ready -> Ready               `transition_status`
-    //   (registration workflow)
-    //   property update that       any -> Ready                     `transition_status`
-    //   turns health checks off
+    //   activation step            Pending/NotReady/Failed -> Ready `apply_if_revision`
+    //   (registration workflow)                                     (decided under the lock)
+    //   property update that       any but Draining -> Ready        `apply_if_revision`
+    //   turns health checks off                                     (decided under the lock)
     //   removal (`remove_inner`)   Ready -> NotReady, no event      `demote_before_removal`
+    //   registration               Draining -> Pending, no event    in `replace_as`
+    //   (`register_or_replace_clearing_drain`)
     //
-    // Two status writes are not transitions and stay outside: a mesh
-    // import's status is set at its construction, before registration, and
-    // the activation step writes directly to a worker the registry no
-    // longer holds. The revision-checked writers discard an outcome that
-    // lost a race with a same-URL `replace()`.
+    // One status write is not a transition and stays outside: a mesh
+    // import's status is set at its construction, before registration. The
+    // revision-checked writers discard an outcome that lost a race with a
+    // same-URL `replace()`.
     // ───────────────────────────────────────────────────────────────────
 
     /// Register a new worker (create-only).
@@ -1251,6 +1285,27 @@ impl<G: Generation> WorkerRegistry<G> {
     /// Holds the per-worker mutation lock for the duration of the
     /// underlying `register` or `replace` call.
     pub fn register_or_replace(&self, worker: Arc<dyn Worker>) -> WorkerId {
+        self.upsert(worker, false)
+    }
+
+    /// [`Self::register_or_replace`] for a registration of the URL: over a
+    /// worker that reads `Draining` the replacement reads `Pending`. The
+    /// mark is a removal's, written for the worker that stood there. It is
+    /// cleared under the per-worker mutation lock, ahead of the
+    /// [`WorkerEvent::Replaced`] event (the worker in it reads `Pending`),
+    /// and no `StatusChanged` is published. The worker is then admitted as
+    /// any new worker is, and a removal pinned to the worker it replaced
+    /// leaves it. Every other writer leaves a draining worker as it is: an
+    /// update, an import and [`Self::register_or_replace`] keep the mark and
+    /// go with the removal.
+    pub fn register_or_replace_clearing_drain(&self, worker: Arc<dyn Worker>) -> WorkerId {
+        self.upsert(worker, true)
+    }
+
+    /// The upsert behind [`Self::register_or_replace`] and
+    /// [`Self::register_or_replace_clearing_drain`], which alone passes
+    /// `clear_drain`.
+    fn upsert(&self, worker: Arc<dyn Worker>, clear_drain: bool) -> WorkerId {
         // Try to create first — succeeds for fresh URLs and pre-reserved IDs
         // (where url_to_id has an entry but workers does not).
         if let Some(id) = self.register(worker.clone()) {
@@ -1264,7 +1319,15 @@ impl<G: Generation> WorkerRegistry<G> {
         // tombstone could delete a locally-configured worker. The promotion
         // happens inside replace_inner, under the per-worker mutation lock.
         if let Some(existing_id) = self.url_to_id.get(worker.url()).map(|e| e.clone()) {
-            if !self.replace_inner(&existing_id, worker, Some(WorkerOrigin::Local), None, None) {
+            if !self.replace_as(
+                Replacement::Registration,
+                &existing_id,
+                worker,
+                Some(WorkerOrigin::Local),
+                None,
+                None,
+                clear_drain,
+            ) {
                 // replace() returned false — worker was removed concurrently.
                 // The mutation lock prevents stale indexes, so this is safe to ignore.
                 tracing::warn!(
@@ -1353,7 +1416,8 @@ impl<G: Generation> WorkerRegistry<G> {
         new_worker: Arc<dyn Worker>,
         expected_revision: u64,
     ) -> bool {
-        self.replace_inner(
+        self.replace_as(
+            Replacement::Registration,
             worker_id,
             new_worker,
             Some(WorkerOrigin::Local),
@@ -1362,6 +1426,28 @@ impl<G: Generation> WorkerRegistry<G> {
                 refuse_draining: true,
             }),
             None,
+            false,
+        )
+    }
+
+    /// [`Self::replace_as`] for a rebuild that carries the replaced worker's
+    /// settings on.
+    fn replace_inner(
+        &self,
+        worker_id: &WorkerId,
+        new_worker: Arc<dyn Worker>,
+        promote_origin: Option<WorkerOrigin>,
+        expected: Option<Expected>,
+        import: Option<ImportRecord>,
+    ) -> bool {
+        self.replace_as(
+            Replacement::Carry,
+            worker_id,
+            new_worker,
+            promote_origin,
+            expected,
+            import,
+            false,
         )
     }
 
@@ -1379,14 +1465,28 @@ impl<G: Generation> WorkerRegistry<G> {
     /// is written before the lock is released, so the compare and the write
     /// are one step. `expected` is what the caller asks of the worker it
     /// replaces ([`Expected`]), tested under the same lock: a miss aborts
-    /// the replacement.
-    fn replace_inner(
+    /// the replacement. `replacement` tells the settle of the models' retry
+    /// settings whether a registration resolved the worker: a rebuild that
+    /// carries an import on stays an import there, whatever origin it is
+    /// promoted to. `clear_drain` is
+    /// [`Self::register_or_replace_clearing_drain`]'s: every other
+    /// replacement (an update, an import, [`Self::register_or_replace`])
+    /// keeps a removal's `Draining` mark and goes with that removal, while a
+    /// registration of the URL starts `Pending` and is admitted as any new
+    /// worker is.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the one core of every replacement: each argument is one choice of its caller"
+    )]
+    fn replace_as(
         &self,
+        replacement: Replacement,
         worker_id: &WorkerId,
         new_worker: Arc<dyn Worker>,
         promote_origin: Option<WorkerOrigin>,
         expected: Option<Expected>,
         import: Option<ImportRecord>,
+        clear_drain: bool,
     ) -> bool {
         // Serialize concurrent replacements for the same worker ID.
         // Lock is held only during the in-memory diff (no I/O, microseconds).
@@ -1470,6 +1570,13 @@ impl<G: Generation> WorkerRegistry<G> {
                 "replace() did not preserve shared mutable worker state"
             );
         }
+        // The status is shared with the worker replaced. No event: the
+        // `Replaced` event that follows is the one subscribers act on, and
+        // the health manager schedules the replacement by the status it
+        // reads then.
+        if clear_drain && new_worker.status() == WorkerStatus::Draining {
+            new_worker.set_status(WorkerStatus::Pending);
+        }
 
         // Overwrite worker object atomically. The membership-order read
         // guard keeps the rebuild scan from interleaving with this write.
@@ -1500,29 +1607,41 @@ impl<G: Generation> WorkerRegistry<G> {
         old_worker.abort_background_tasks();
 
         // Diff model indexes: remove stale, add new.
+        // The origin the replacement enters the index under: the one this
+        // call promotes it to, else the one the worker holds. A rebuild that
+        // carries an import on enters as the import it replaces, whatever
+        // origin this call promotes it to: no registration resolved its
+        // settings, so it still gives its models none.
+        let carries_an_import =
+            replacement == Replacement::Carry && self.marked_as_import(&old_models, &old_worker);
+        let entered_origin = if carries_an_import {
+            WorkerOrigin::Mesh
+        } else {
+            promote_origin
+                .or_else(|| self.origin_of(worker_id))
+                .unwrap_or(WorkerOrigin::Local)
+        };
         let mut emptied = Vec::new();
         for removed_model in old_models.difference(&new_models) {
+            // The index write settles the model's retry settings on the
+            // workers it keeps, inside its guard: a model the replacement
+            // leaves with no worker keeps none.
             self.remove_worker_from_model_index(removed_model, &old_worker);
-            // Mirror `remove()`: drop any per-model retry override when
-            // the replacement leaves the model with no workers. Without
-            // this, `get_retry_config()` would keep returning a stale
-            // override for a model that is no longer served.
             let model_empty = self
                 .model_index
                 .get(removed_model)
                 .is_none_or(|workers| workers.members().is_empty());
             if model_empty {
-                self.model_retry_configs.remove(removed_model);
                 emptied.push(removed_model.clone());
             }
         }
         for added_model in new_models.difference(&old_models) {
-            self.add_worker_to_model_index(added_model, new_worker.clone());
+            self.add_worker_to_model_index(added_model, new_worker.clone(), entered_origin);
             self.drop_alias_shadowed_by_model(added_model);
         }
         // For models that stayed the same, update the worker reference in the index
         for kept_model in old_models.intersection(&new_models) {
-            self.add_worker_to_model_index(kept_model, new_worker.clone());
+            self.add_worker_to_model_index(kept_model, new_worker.clone(), entered_origin);
         }
 
         // Update aliases after canonical indexes so alias removal can inspect
@@ -1682,8 +1801,10 @@ impl<G: Generation> WorkerRegistry<G> {
     /// A caller whose target depends on the current status reads it in
     /// `f`, under the lock, never before the call: a status read outside
     /// the lock may be gone by the time the write lands.
-    /// The removal's [`Self::demote_before_removal`] is the only other
-    /// status write on a registered worker; it publishes nothing.
+    /// Two other status writes reach a registered worker, and neither
+    /// publishes anything: the removal's [`Self::demote_before_removal`], and
+    /// the mark [`Self::register_or_replace_clearing_drain`] clears in
+    /// `replace_as`.
     fn transition_under_lock<T, F>(
         &self,
         worker_id: &WorkerId,
@@ -1761,17 +1882,154 @@ impl<G: Generation> WorkerRegistry<G> {
     // 6. Update — config (no event)
     // ───────────────────────────────────────────────────────────────────
 
-    /// Update the retry config for a model group (last write wins).
+    /// Write a host's own retry config for a model group (last write wins).
     ///
-    /// Called during worker registration when the worker carries non-empty
-    /// retry overrides. If `enabled` is false, `max_retries` is normalised
-    /// to 1 before storage. Holds no registry locks. Emits no events.
+    /// No registration calls this: the registry settles a group's config on
+    /// the retry overrides its workers carry, at every change of them. A
+    /// config written here stands until a worker that carries an override
+    /// enters the group, or the group's last worker leaves.
+    /// If `enabled` is false, `max_retries` is normalised to 1 before
+    /// storage. Holds no registry locks. Emits no events.
     pub fn set_model_retry_config(&self, model_id: &str, mut config: RetryConfig, enabled: bool) {
         if !enabled {
             config.max_retries = 1;
         }
-        self.model_retry_configs
-            .insert(model_id.to_string(), config);
+        self.model_retry_configs.insert(
+            model_id.to_string(),
+            ModelRetry {
+                config,
+                derived: false,
+            },
+        );
+    }
+
+    /// Settle a model group's retry settings on `members`, the workers a
+    /// change of its index entry leaves; `entered` is the worker the change
+    /// added.
+    ///
+    /// The two writers of an entry's members call this inside the entry's
+    /// guard, so the settings and the workers they come from change as one
+    /// step: no registration, replacement or removal of another worker of
+    /// the group falls between them. The newest member whose spec carries a
+    /// retry override gives the settings (a replacement is the newest); where
+    /// no member carries one the settled entry goes, and a reader falls back
+    /// to the router's own settings.
+    ///
+    /// A host's own write ([`Self::set_model_retry_config`]) is replaced
+    /// only by a worker with an override that enters, and goes with the
+    /// group's last worker.
+    ///
+    /// A member imported from a peer gives no settings: an import is built
+    /// without resolved resilience settings, so the node keeps reading its
+    /// own until a worker registered on it carries an override. A rebuild
+    /// that carries an import on stays one; a registration at its address
+    /// does not.
+    ///
+    /// Lock order: an entry of `model_index`, and inside it one of
+    /// `model_imports`, then one of `model_retry_configs`; nothing takes
+    /// them the other way.
+    fn settle_model_retry(
+        &self,
+        model_id: &str,
+        members: &[Arc<dyn Worker>],
+        entered: Option<(&Arc<dyn Worker>, WorkerOrigin)>,
+    ) {
+        let imports = self.settle_model_imports(model_id, members, entered);
+        if members.is_empty() {
+            self.model_retry_configs.remove(model_id);
+            return;
+        }
+        let newest = members.iter().rev().find(|member| {
+            Self::carries_retry_override(member.as_ref())
+                && !imports.iter().any(|import| Arc::ptr_eq(import, member))
+        });
+        let Some(newest) = newest else {
+            self.model_retry_configs
+                .remove_if(model_id, |_, stored| stored.derived);
+            return;
+        };
+        let resolved = newest.resilience();
+        let mut config = resolved.retry.clone();
+        if !resolved.retry_enabled {
+            config.max_retries = 1;
+        }
+        let settled = ModelRetry {
+            config,
+            derived: true,
+        };
+        match self.model_retry_configs.entry(model_id.to_string()) {
+            Entry::Occupied(mut stored) => {
+                let entered_gives = entered.is_some_and(|(worker, origin)| {
+                    origin != WorkerOrigin::Mesh && Self::carries_retry_override(worker.as_ref())
+                });
+                if stored.get().derived || entered_gives {
+                    stored.insert(settled);
+                }
+            }
+            Entry::Vacant(vacant) => {
+                vacant.insert(settled);
+            }
+        }
+    }
+
+    /// Keep the model's imported members in step with `members`, the workers
+    /// a change of its index entry leaves, and return them. Called inside
+    /// the entry's guard; `entered` is the worker the change added, with
+    /// the origin it enters under. A model that never held an import costs
+    /// one probe.
+    fn settle_model_imports(
+        &self,
+        model_id: &str,
+        members: &[Arc<dyn Worker>],
+        entered: Option<(&Arc<dyn Worker>, WorkerOrigin)>,
+    ) -> Vec<Arc<dyn Worker>> {
+        let entered_import = match entered {
+            Some((worker, WorkerOrigin::Mesh)) => Some(worker),
+            _ => None,
+        };
+        if entered_import.is_none() && !self.model_imports.contains_key(model_id) {
+            return Vec::new();
+        }
+        let mut imports = self
+            .model_imports
+            .remove(model_id)
+            .map(|(_, imports)| imports)
+            .unwrap_or_default();
+        imports.retain(|import| members.iter().any(|member| Arc::ptr_eq(member, import)));
+        if let Some(worker) = entered_import {
+            if !imports.iter().any(|import| Arc::ptr_eq(import, worker)) {
+                imports.push(Arc::clone(worker));
+            }
+        }
+        if !imports.is_empty() {
+            self.model_imports
+                .insert(model_id.to_string(), imports.clone());
+        }
+        imports
+    }
+
+    /// Whether `worker` stands marked as an import of one of `models`. A
+    /// mark is read under the guard of its model's index entry, the guard
+    /// the settle writes it under.
+    fn marked_as_import(&self, models: &HashSet<String>, worker: &Arc<dyn Worker>) -> bool {
+        models.iter().any(|model_id| {
+            self.model_index.get(model_id).is_some_and(|_entry| {
+                self.model_imports
+                    .get(model_id)
+                    .is_some_and(|imports| imports.iter().any(|import| Arc::ptr_eq(import, worker)))
+            })
+        })
+    }
+
+    /// Whether a worker's spec carries a retry override.
+    fn carries_retry_override(worker: &dyn Worker) -> bool {
+        let overrides = &worker.metadata().spec.resilience;
+        overrides.max_retries.is_some()
+            || overrides.initial_backoff_ms.is_some()
+            || overrides.max_backoff_ms.is_some()
+            || overrides.backoff_multiplier.is_some()
+            || overrides.jitter_factor.is_some()
+            || overrides.disable_retry.is_some()
     }
 
     /// Write the model cards a refresh read for `worker`, on the same handle.
@@ -1956,9 +2214,10 @@ impl<G: Generation> WorkerRegistry<G> {
     /// Remove the worker only while `condition` reads true of the worker as
     /// it stands, the read and the removal under the same per-worker lock.
     /// The removal workflow's final step removes the incarnation it drained
-    /// (the pinned revision, or a rebuild of it that still reads `Draining`:
-    /// that state is the removal's own mark, inherited through a rebuild
-    /// nothing re-activated) and leaves a replacement that stands on its own.
+    /// (the pinned revision, or a rebuild of it that still reads `Draining`
+    /// under a mark entered at or below that revision, inherited through a
+    /// rebuild nothing re-activated) and leaves a replacement that stands on
+    /// its own.
     /// Returns `None` when the worker is gone or the condition reads false.
     pub fn remove_if<F>(&self, worker_id: &WorkerId, condition: F) -> Option<Arc<dyn Worker>>
     where
@@ -2052,14 +2311,15 @@ impl<G: Generation> WorkerRegistry<G> {
 
             let mut emptied = Vec::new();
             for model_id in self.models_left_by(&worker) {
+                // The index write settles the model's retry settings on the
+                // workers it keeps, inside its guard: none once the last
+                // worker leaves.
                 self.remove_worker_from_model_index(&model_id, &worker);
-                // Drop the per-model retry config when the last worker leaves.
                 let model_empty = self
                     .model_index
                     .get(&model_id)
                     .is_none_or(|w| w.members().is_empty());
                 if model_empty {
-                    self.model_retry_configs.remove(&model_id);
                     emptied.push(model_id);
                 }
             }
@@ -2315,7 +2575,7 @@ impl<G: Generation> WorkerRegistry<G> {
 
         // Update model index for O(1) lookups using copy-on-write.
         for model_id in worker_model_ids(&worker) {
-            self.add_worker_to_model_index(&model_id, worker.clone());
+            self.add_worker_to_model_index(&model_id, worker.clone(), origin);
             // Run after the model index so `add_model_alias` below sees the
             // model IDs this worker just contributed, and never while an index
             // entry is held (see the lock order on `model_alias_index`).
@@ -2352,8 +2612,15 @@ impl<G: Generation> WorkerRegistry<G> {
 
     /// Append `worker` to the copy-on-write model index slice for `model_id`.
     /// Replaces any existing entry with the same URL so updates via replace()
-    /// do not leave duplicate rows.
-    fn add_worker_to_model_index(&self, model_id: &str, worker: Arc<dyn Worker>) {
+    /// do not leave duplicate rows. The model's retry settings are settled on
+    /// the new slice inside the entry's guard ([`Self::settle_model_retry`]),
+    /// which reads `origin` to tell an import.
+    fn add_worker_to_model_index(
+        &self,
+        model_id: &str,
+        worker: Arc<dyn Worker>,
+        origin: WorkerOrigin,
+    ) {
         // The replaced snapshot (and its cached projections) must not drop
         // under the shard write guard: capture it and let it fall after the
         // entry expression releases the lock.
@@ -2368,6 +2635,7 @@ impl<G: Generation> WorkerRegistry<G> {
                     .cloned()
                     .collect();
                 new_workers.push(worker.clone());
+                self.settle_model_retry(model_id, &new_workers, Some((&worker, origin)));
                 let next = Arc::new(G::of(Arc::from(new_workers.into_boxed_slice())));
                 // An entry a removal emptied and has not evicted yet takes
                 // its first worker again.
@@ -2377,6 +2645,11 @@ impl<G: Generation> WorkerRegistry<G> {
                 previous = Some(std::mem::replace(existing, next));
             })
             .or_insert_with(|| {
+                self.settle_model_retry(
+                    model_id,
+                    std::slice::from_ref(&worker),
+                    Some((&worker, origin)),
+                );
                 let first = Arc::new(G::of(Arc::from(vec![worker].into_boxed_slice())));
                 self.served_models.fetch_add(1, Ordering::Relaxed);
                 first
@@ -2480,6 +2753,8 @@ impl<G: Generation> WorkerRegistry<G> {
                 .filter(|w| !Arc::ptr_eq(w, worker))
                 .cloned()
                 .collect();
+            // Inside the entry's guard, as in add_worker_to_model_index.
+            self.settle_model_retry(model_id, &new_workers, None);
 
             if new_workers.is_empty() {
                 let emptied = std::mem::replace(
@@ -2737,6 +3012,15 @@ impl<G: Generation> Default for WorkerRegistry<G> {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// What a replacement is to the settle of its models' retry settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Replacement {
+    /// A registration: the workflow resolved the worker's settings.
+    Registration,
+    /// A rebuild that carries the replaced worker's settings on.
+    Carry,
 }
 
 /// What a replacement asks of the worker it replaces, tested under the

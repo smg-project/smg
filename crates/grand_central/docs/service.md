@@ -2,7 +2,7 @@
 
 Grand Central's standalone service is one binary. A gateway you host asks it for a worker over gRPC. The stock gateway decides in its own process and does not call it. This page covers its flags, its worker discovery, the calls it serves and the client a host calls it with.
 
-The [README](../README.md#as-a-standalone-service) has the short start. [REFERENCE.md](../REFERENCE.md#run-it) covers a host that decides in its own process.
+The [README](../README.md#as-a-standalone-service) has the short start. [Embed the engine](embedding.md) covers a host that decides in its own process.
 
 ## Start the service
 

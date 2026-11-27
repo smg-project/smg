@@ -7,10 +7,11 @@ use crate::{
     stages::{
         pickers::{target_of, Best},
         scorers::{
-            tests::{candidate, kept, report, take_lane},
-            HeldCredit, SessionAffinity, RANK_CREDIT_KEPT,
+            tests::{candidate, kept, report},
+            SessionAffinity,
         },
     },
+    tracking::rank_credit::{tests::take_lane, HeldCredit, RANK_CREDIT_KEPT},
 };
 
 impl LeastLoad {

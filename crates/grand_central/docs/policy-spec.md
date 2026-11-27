@@ -136,14 +136,14 @@ Other readers follow their own rules:
 | Field | What it holds | Default |
 |---|---|---|
 | `kind` | `tree` or `hash`. | `tree` |
-| `ttl_s` | How many seconds a `hash` placement lives. | 180 |
-| `max_size` | The size bound of a `tree`. | 67108864 |
+| `ttl_s` | How many seconds a placement of the classic hash index lives. The crate's engine does not read it: no placement of its record expires. | 180 |
+| `max_size` | The size bound of a `tree`. The crate's engine bounds its record by it under either kind. | 67108864 |
 | `sweep_s` | How many seconds pass between sweeps. | 120 |
 
-Each number is above zero. `max_size` counts a tree in one of two ways:
+Each number is above zero. `max_size` counts a tree in one of two ways, summed over the workers, so a prefix that several workers hold counts once for each of them:
 
-- For text, it counts the characters, plus 1024 for each node a worker stands on.
-- Otherwise it counts the tokens.
+- For text, it counts the characters of the nodes each worker stands on, plus 1024 for each such node.
+- Otherwise it counts the tokens each worker holds.
 
 Where several patterns match one model, the most specific wins:
 
@@ -155,11 +155,15 @@ A spec that holds a `prefix*` and a `*suffix` of equal length is refused.
 
 A host can read these settings for an index of its own. The gateway does: at each sweep it trims each tree of a model toward `max_size`, each tree by itself. Writes take a tree past it until the next sweep. At a `sweep_s` of 4294967295 it starts no sweep, and a tree under that entry is held to no size. The engine's record keeps its bound at any cadence.
 
+The gateway's flags write an index they never sweep with that cadence. A `tree` then states the largest size, 18446744073709551615, and a `hash` keeps the size the flags name.
+
 The crate's engine reads `kind` and `max_size` alone, for a pool whose profile reads sent prefixes:
 
-- Under `tree`, the engine bounds the model's record of sent prefixes at `max_size` divided by the block size. The record holds one placement for each block a worker was sent.
+- Under `tree`, the engine bounds the model's record of sent prefixes at `max_size` divided by the block size, and at one placement at least. The record holds one placement for each block a worker was sent.
 - At the defaults that is 4,194,304 placements. The record takes about 55 bytes a block, so about 230 MB a model.
-- Under `hash`, the pool keeps no record.
+- Under `hash`, the engine keeps the same record under the same bound, keyed at `view.boundaries` alone. For a request of token ids it holds one placement at most for each boundary and each worker sent the request.
+- Under `hash`, a request that carries fewer block hashes than the first boundary has whole blocks, or one hashed by its text, is recorded nowhere.
+- A boundary of more whole blocks than `max_block_hashes` keys nothing. A key ends at the last whole block under its boundary, and a request that holds those blocks reaches it. As a rule every worker sent a head stays its holder until the bound takes the placement.
 - The entry read is the one for the model the request names, under the id by which the first worker of its list lists that model. A model that workers list behind their primary one keeps its own record under its own entry.
 - A record read for a model behind a first worker's primary one is bounded by the smallest block size any list asked with, for as long as it lives.
 - An id and an alias of one model share one record. A name no model of that worker answers to reads the record and the entry of the worker's primary model id.
@@ -179,7 +183,7 @@ The crate's engine reads `kind` and `max_size` alone, for a pool whose profile r
 - `across_ranks` says how one worker's value is made where its report holds several ranks.
 - A spec with no signals is unchanged, and so is its digest.
 
-See also [Signals a decision can read](../REFERENCE.md#signals-a-decision-can-read).
+See also [Signals a decision can read](embedding.md#signals-a-decision-can-read).
 
 ## Bindings
 
@@ -213,7 +217,7 @@ A binding matches a request on two fields:
 
 An empty `bindings` list works with one profile. That profile then serves every model under the plan `single`.
 
-A binding holds more than its match. The sections below cover `overload`, `sessions`, `routing_key`, `shadow` and the reserved fields.
+A binding holds more than its match. The sections below cover `overload`, `sessions`, `routing_key`, `shadow` and the reserved fields. A host's own calls for keys and shadows stand on [the embedding page](embedding.md#keys-and-shadows-a-hosts-calls).
 
 ### Overload
 
@@ -514,30 +518,6 @@ The validator checks each reserved field for shape and refuses its active use.
 | `admission.enabled` | `true`. | |
 | `sessions.issue_session_id` | `true`. | |
 
-### For a host that embeds the engine
-
-These calls belong to a host's own code, not to a spec.
-
-**Keys.**
-
-- The host resolves a key and supplies it as `RequestFacts::session_key`, or as `facts.session_key` on the wire.
-- The header fields say what the host reads. Sending the header in a `DecideRequest` alone creates no key.
-- A host reads a binding's sources with `AppliedSpec::key_sources_for` and derives a request's key with `KeySources::derive`.
-- A host in process does both inside `InProcess`: through `InProcess::place`, or with its own `engine::RequestMaker` through `InProcess::decide_under` or `DecisionGuard::decide_under`.
-- `InProcess` hands `RequestMaker::make` the applied spec of the world the decision is made under. So the key's sources and the rule that pins the key are of one generation, whatever is applied meanwhile.
-- A host derives the client's key with `KeySources::derive_client` and states it as `RequestFacts::client_key`.
-- The wire's request facts carry it to a standalone controller as `client_key`. So a controller at an address places a request with no session key on the plain ring by its client's key, as the host's own process does.
-- A plugin's frame carries zero in that field under every exposure.
-
-**Shadows.**
-
-- A host reads every shadow count in one call, `InProcess::shadow_counts`. The fault count is `DecisionEngine::faults`.
-- A host that drives the engine itself runs a single binding's shadow through `Engine::shadow`.
-- It makes the request's live decision through `Engine::decide_keeping`, and calls `Engine::shadow` with that decision's scratch.
-- Under a sessions rule the shadow then starts from the session pins that decision read, whether or not the decision is committed first.
-- With a scratch that holds no reading of that decision, it reads the pins as they stand.
-- A host that shadows a request decides it through `Engine::decide_keeping`, each time it decides it. A debug build can stop on a mix of the two entries on one request.
-
 ## Plans
 
 A binding's `plan` says which roles one decision fills. Each role is one *side* of the plan, with a profile of its own.
@@ -593,7 +573,7 @@ These rules stand beside the modes:
 - The store derives no compatibility. Whoever holds the worker objects derives it from them (`PairClasses::derive`), under the pairing mode of the spec in force.
 - An embedded host that uses the store can supply the runtime and a KV handoff descriptor.
 
-`plans.pd-pair.decode` says when the decode side is picked: `with-prefill` (the default) or `after-prefill`. See [A decode chosen after its prefill](../REFERENCE.md#a-decode-chosen-after-its-prefill).
+`plans.pd-pair.decode` says when the decode side is picked: `with-prefill` (the default) or `after-prefill`. See [A decode chosen after its prefill](embedding.md#a-decode-chosen-after-its-prefill).
 
 Workers of the standalone service pair by their labels:
 

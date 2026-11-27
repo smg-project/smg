@@ -611,10 +611,21 @@ pub(crate) async fn encode_prompt_blocking(
 /// kept; absent arguments are an empty object.
 pub(crate) fn process_tool_call_arguments(messages: &mut [Value]) {
     for msg in messages {
-        if msg.get("role").and_then(Value::as_str) != Some("assistant") {
+        // One walk of the turn's few fields finds its role and its tool
+        // calls: a keyed lookup hashes its key, and most turns of a
+        // conversation hold no call.
+        let Some(fields) = msg.as_object_mut() else {
             continue;
+        };
+        let (mut assistant, mut tool_calls) = (false, None);
+        for (key, value) in fields.iter_mut() {
+            match key.as_str() {
+                "role" => assistant = value.as_str() == Some("assistant"),
+                "tool_calls" => tool_calls = value.as_array_mut(),
+                _ => {}
+            }
         }
-        let Some(tool_calls) = msg.get_mut("tool_calls").and_then(Value::as_array_mut) else {
+        let (true, Some(tool_calls)) = (assistant, tool_calls) else {
             continue;
         };
         for call in tool_calls {
@@ -1013,8 +1024,14 @@ fn process_content_format_with_order(
                 // template from its content, tool calls, reasoning and name. A
                 // replayed refusal, audio reference or deprecated function call
                 // is kept for an upstream and left out here, so the prompt is
-                // the one the engine itself renders.
-                if obj.get("role").and_then(Value::as_str) == Some("assistant") {
+                // the one the engine itself renders. The message's own fields
+                // say what its JSON form holds, here and below: a turn of plain
+                // text pays no keyed lookup.
+                if matches!(
+                    message,
+                    ChatMessage::Assistant { refusal, audio, function_call, .. }
+                        if refusal.is_some() || audio.is_some() || function_call.is_some()
+                ) {
                     for key in ["refusal", "audio", "function_call"] {
                         obj.remove(key);
                     }
@@ -1028,20 +1045,36 @@ fn process_content_format_with_order(
                 // tests, splits or concatenates every message's content cannot
                 // take.
                 if matches!(
-                    obj.get("role").and_then(|v| v.as_str()),
-                    Some("assistant" | "function")
-                ) && obj.get("content").is_none_or(Value::is_null)
-                {
+                    message,
+                    ChatMessage::Assistant { content: None, .. }
+                        | ChatMessage::Function { content: None, .. }
+                ) {
                     obj.insert("content".to_string(), empty_content(content_format));
                 }
 
-                if let Some(content_value) = obj.get_mut("content") {
-                    transform_content_field(
-                        content_value,
-                        content_format,
-                        placeholder_tokens,
-                        media_order,
-                    )?;
+                // Only a list of parts is transformed.
+                let parts = match message {
+                    ChatMessage::System { content, .. }
+                    | ChatMessage::Root { content, .. }
+                    | ChatMessage::User { content, .. }
+                    | ChatMessage::Tool { content, .. }
+                    | ChatMessage::Developer { content, .. } => {
+                        matches!(content, MessageContent::Parts(_))
+                    }
+                    ChatMessage::Assistant { content, .. } => {
+                        matches!(content, Some(MessageContent::Parts(_)))
+                    }
+                    ChatMessage::Function { .. } => false,
+                };
+                if parts {
+                    if let Some(content_value) = obj.get_mut("content") {
+                        transform_content_field(
+                            content_value,
+                            content_format,
+                            placeholder_tokens,
+                            media_order,
+                        )?;
+                    }
                 }
             }
 
@@ -1864,4 +1897,5 @@ pub(crate) fn parse_finish_reason(
 }
 
 #[cfg(test)]
+#[path = "../../../../tests/unit/routers/grpc/utils/chat_utils/tests.rs"]
 mod tests;

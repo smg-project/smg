@@ -1,6 +1,6 @@
 //! Fields a policy can use in a sum, in the units of the row that holds them.
 
-use crate::{engine::view::LoadRow, tracking::dispatch_credit::DispatchCounts};
+use crate::{engine::view::LoadRow, tracking::rank_credit::DispatchCounts};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum CostTerm {
@@ -116,8 +116,8 @@ impl Coefficients {
 
     /// Whether a term prices the sends by their tokens (`sent.tokens`). A
     /// send of text alone is counted there by its text's bytes, which a
-    /// host that can send a request on without reading its prompt states
-    /// only where a stage asks for a request's size
+    /// host that can send a request on without reading its prompt may
+    /// leave unstated where no stage asks for a request's size
     /// ([`Needs::prompt_size`](crate::document::Needs::prompt_size)). So a
     /// stage that holds such a term asks for it.
     pub(crate) fn sizes_sends(&self) -> bool {

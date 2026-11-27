@@ -11,7 +11,7 @@ use crate::{
     },
     load::signals::{SignalColumn, SignalSums, SignalTerm},
     stages::cost_terms::{Coefficients, CostTerm},
-    tracking::dispatch_credit::{DispatchCounts, DispatchCredit},
+    tracking::{dispatch_credit::DispatchCredit, rank_credit::DispatchCounts},
 };
 
 /// Ready, breaker closed, not stalled, not draining.

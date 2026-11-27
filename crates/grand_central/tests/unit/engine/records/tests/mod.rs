@@ -27,6 +27,7 @@ mod claims;
 mod conversion;
 mod draws;
 mod standing_rows;
+mod turns;
 
 const MODEL: &str = "model-a";
 

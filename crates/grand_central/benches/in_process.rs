@@ -34,11 +34,20 @@
 //! its every decode over its thresholds under a binding that sheds such a
 //! list: each request is then shed as saturated. `--refused outage` takes
 //! its every decode out of service under such a binding: each request is
-//! then shed with no endpoint. `--shadow twin` names a
+//! then shed with no endpoint. `--no-room N` leaves the last `N` decodes of
+//! a pair's cell with no room at their host's gate: each pair then goes to
+//! a decode that has one. `--live-gates 1` has a pair's host read each
+//! place's worker at every answer of its gate. `--shadow twin` names a
 //! copy of the cell's profile as its binding's shadow, so each decision is
 //! followed by its shadow profile's. `--shadow other` names that shadow at
 //! a binding of another model: the cell's decisions then have no shadow,
-//! under a document that names one. `--runtimes N` has the host state a
+//! under a document that names one. `--other-models N` states `N` other
+//! models ahead of the cell's own, each bound to a copy of the cell's
+//! profile under a name of its own: the document then holds `N` more
+//! profiles, as one that gives each model a profile does. No request
+//! names one of them. A single request's cell alone takes the switch,
+//! and a run under it says `N` on its row.
+//! `--runtimes N` has the host state a
 //! fact of each worker beside its object: the number of one of `N` runtimes
 //! by the worker's place, as a gateway that dials several runtimes states
 //! it; `0`, the default, states nothing. The two cells named `on_runtime`
@@ -374,6 +383,15 @@ const CELLS: &[Cell] = &[
         document: || preset("least_load"),
         ..Cell::PLAIN
     },
+    // The hash ring's pair document with a request that carries no key
+    // and bounds its completion: a pair's decodes alone are held to that
+    // demand. `--entry place_named` counts the pair's numbers under it.
+    Cell {
+        name: "pair_consistent_hashing_bounded",
+        document: || pair::of("consistent_hashing"),
+        request: pair::bounded,
+        ..Cell::PLAIN
+    },
     // The hash ring's pair document with a request that carries no key:
     // through the one call (`--entry place`) a pair's headers are read for
     // the worker it may name, and `--entry place_named` names one.
@@ -420,6 +438,12 @@ const CELLS: &[Cell] = &[
     Cell {
         name: "pair_least_load",
         document: || pair::of("least_load"),
+        request: pair::request,
+        ..Cell::PLAIN
+    },
+    Cell {
+        name: "pair_power_of_two",
+        document: || pair::of("power_of_two"),
         request: pair::request,
         ..Cell::PLAIN
     },
@@ -740,6 +764,15 @@ struct Run {
     engines: u64,
     /// The entry asked for a request: the bench's `place` file reads it.
     entry: String,
+    /// Whether the host of a pair's cell reads each place's worker at every
+    /// answer of its gate: the bench's `pair` file reads it.
+    live_gates: bool,
+    /// How many decodes at the end of a pair's cell have no room at their
+    /// host's gate: the bench's `pair` file reads it.
+    no_room: usize,
+    /// How many other models the document states, each bound to a copy of
+    /// the cell's profile under a name of its own.
+    other_models: usize,
     overloaded: bool,
     publish_ms: u64,
     /// What refuses every pair of a pair's cell: the bench's `pair` file
@@ -764,6 +797,9 @@ fn run() -> Run {
         decisions: 1_000_000,
         engines: 1,
         entry: "decide_at".to_owned(),
+        live_gates: false,
+        no_room: 0,
+        other_models: 0,
         overloaded: false,
         publish_ms: 0,
         refused: pair::Refused::No,
@@ -792,6 +828,9 @@ fn run() -> Run {
             "--decisions" => run.decisions = number(),
             "--engines" => run.engines = number(),
             "--entry" => run.entry = place::named(&value),
+            "--live-gates" => run.live_gates = number() != 0,
+            "--no-room" => run.no_room = number() as usize,
+            "--other-models" => run.other_models = number() as usize,
             "--runtimes" => RUNTIMES.store(number() as u32, Ordering::Relaxed),
             "--overloaded" => run.overloaded = number() != 0,
             "--publish-ms" => run.publish_ms = number(),
@@ -1022,12 +1061,16 @@ fn warm_stack() {
 fn main() {
     let run = run();
     // A pair's cell hands two lists and an encode request's three: such a
-    // run is its file's. A pair's cell alone runs refused.
+    // run is its file's. A pair's cell alone runs refused or short of a
+    // room.
     if pair::runs(&run) {
         return;
     }
-    let open = run.refused == pair::Refused::No;
-    assert!(open, "a pair's cell alone runs refused");
+    let open = run.refused == pair::Refused::No && run.no_room == 0 && !run.live_gates;
+    assert!(
+        open,
+        "a pair's cell alone runs refused, short of a room or with live gates"
+    );
     if encode::runs(&run) {
         return;
     }
@@ -1076,6 +1119,24 @@ fn main() {
         } else {
             document.bindings[0].shadow = named;
         }
+    }
+    if run.other_models != 0 {
+        // The cell's own binding stands behind the one a shadow of another
+        // model put ahead of it. Each other model takes a copy of it and of
+        // the profile it names, ahead of the cell's.
+        let own = document.bindings[usize::from(run.shadow == Shadowed::Other)].clone();
+        let live = own.profile.as_ref().expect("a binding of one profile");
+        let profile = document.profiles[live].clone();
+        let others = (0..run.other_models).map(|at| {
+            let name = format!("other-model-{at:05}");
+            document.profiles.insert(name.clone(), profile.clone());
+            let mut other = own.clone();
+            name.clone_into(&mut other.matcher.model);
+            other.profile = Some(name);
+            other
+        });
+        let others: Vec<_> = others.collect();
+        document.bindings.splice(0..0, others);
     }
     let spec = AppliedSpec::validate(&document).expect("a valid document");
     let engine: &'static InProcess = Box::leak(Box::new(InProcess::new(spec)));
@@ -1268,6 +1329,11 @@ fn measure(
     // A run that walked says so on its row: its times hold the walk.
     if run.cold_kb > 0 {
         print!(" cold_kb={}", run.cold_kb);
+    }
+    // A run beside other models says so too: its times are of the
+    // document that holds them.
+    if run.other_models > 0 {
+        print!(" other_models={}", run.other_models);
     }
     // The words a file of its own adds, then the cell's, and the line's end.
     print!("{}", place::word());

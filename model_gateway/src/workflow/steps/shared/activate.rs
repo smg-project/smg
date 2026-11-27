@@ -34,6 +34,18 @@ fn activation_status(worker: &Arc<dyn Worker>) -> Option<WorkerStatus> {
     (worker.status() != WorkerStatus::Ready).then_some(WorkerStatus::Ready)
 }
 
+/// Whether `held`, the worker under the URL, is the worker this workflow
+/// `registered` or a successor of it. A replacement adopts the runtime state
+/// of the worker it replaces, so the two share one; a worker registered
+/// under the URL once a removal took the first has a state of its own.
+fn registered_or_successor(held: &Arc<dyn Worker>, registered: &Arc<dyn Worker>) -> bool {
+    Arc::ptr_eq(held, registered)
+        || matches!(
+            (held.runtime_state(), registered.runtime_state()),
+            (Some(theirs), Some(ours)) if Arc::ptr_eq(&theirs, &ours)
+        )
+}
+
 #[async_trait]
 impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for ActivateWorkersStep {
     async fn execute(&self, context: &mut WorkflowContext<D>) -> WorkflowResult<StepResult> {
@@ -49,8 +61,7 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for ActivateWorke
         // capacity on it (a worker flipped Ready directly was counted only
         // if the tracker's recompute for the `Registered` event happened to
         // run after the flip, so a second worker's slots were often never
-        // added), and so does every other subscriber. A worker the registry
-        // no longer holds is flipped directly, as before.
+        // added), and so does every other subscriber.
         let registry = &app_context.worker_registry;
         let mut activated = 0;
         for worker in workers {
@@ -98,19 +109,32 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for ActivateWorke
                 continue;
             }
             if let Some(status) = activation_status(worker) {
-                // Only the worker this workflow registered: an upsert of the
-                // same URL that raced it (discovery beside an API call) must
-                // not have its own worker flipped from here.
-                match registry
-                    .get_id_by_url(worker.url())
-                    .filter(|id| registry.get(id).is_some_and(|w| Arc::ptr_eq(&w, worker)))
+                // Through the registry, by the id that stands under the URL,
+                // where the worker there is this workflow's or a successor
+                // that shares its runtime state (an upsert that raced it, an
+                // update's rebuild): tested under the worker's lock. A worker
+                // registered under the URL once a removal took this one is
+                // another registration's and is left as it is. A worker a
+                // removal drains stays so, decided under the same lock: that
+                // mark was written behind this registration. A worker the
+                // registry no longer holds was removed. The revision is only
+                // the call's precondition and a mesh publication can raise it
+                // in place: it is read once more.
+                let activate = || {
+                    let id = registry.get_id_by_url(worker.url())?;
+                    let held = registry.get(&id)?;
+                    registry.apply_if_revision(&id, held.revision(), |held| {
+                        let mine = registered_or_successor(held, worker);
+                        let leaving = held.status() == WorkerStatus::Draining;
+                        ((), (mine && !leaving).then_some(status))
+                    })
+                };
+                if activate()
+                    .or_else(activate)
+                    .is_some_and(|((), moved)| moved.is_some())
                 {
-                    Some(worker_id) => {
-                        registry.transition_status(&worker_id, status);
-                    }
-                    None => worker.set_status(status),
+                    activated += 1;
                 }
-                activated += 1;
             }
         }
 
@@ -121,7 +145,7 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for ActivateWorke
         }
 
         info!(
-            "Activated {activated} of {} worker(s) (others left as-is: already ready, awaiting connect signal or replaced since)",
+            "Activated {activated} of {} worker(s) (others left as-is: already ready, awaiting connect signal, replaced or removed since, or being removed)",
             workers.len()
         );
 
@@ -134,116 +158,5 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for ActivateWorke
 }
 
 #[cfg(test)]
-mod tests {
-    use openai_protocol::worker::WorkerSpec;
-    use smg_worker::{jobs::WorkerJobAsker, registry::event::WorkerEvent};
-    use wfaas::WorkflowInstanceId;
-
-    use super::*;
-    use crate::{
-        app_context::{testing::app_context_for_tests, AppContext},
-        config::RouterConfig,
-        routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder},
-        workflow::steps::create_worker_workflow_data,
-    };
-
-    #[test]
-    fn http_pending_worker_is_activated() {
-        let worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("http://worker:8080")
-                .connection_mode(ConnectionMode::Http)
-                .build(),
-        );
-        assert_eq!(worker.status(), WorkerStatus::Pending);
-        assert_eq!(activation_status(&worker), Some(WorkerStatus::Ready));
-    }
-
-    #[test]
-    fn already_ready_worker_needs_no_transition() {
-        let worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("http://worker:8080")
-                .connection_mode(ConnectionMode::Http)
-                .status(WorkerStatus::Ready)
-                .build(),
-        );
-        assert_eq!(activation_status(&worker), None);
-    }
-
-    #[test]
-    fn zmq_worker_is_left_pending_for_the_connect_signal() {
-        // The whole point of PR B: a ZMQ worker must NOT be optimistically
-        // activated — it is promoted only when its handshake lands.
-        let worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("ipc:///tmp/w.ipc")
-                .connection_mode(ConnectionMode::Zmq)
-                .build(),
-        );
-        assert_eq!(worker.status(), WorkerStatus::Pending);
-        assert_eq!(
-            activation_status(&worker),
-            None,
-            "ZMQ workers must stay Pending until connected"
-        );
-    }
-
-    fn test_app_context() -> Arc<AppContext> {
-        app_context_for_tests(
-            RouterConfig::default(),
-            Arc::new(WorkerRegistry::new()),
-            None,
-        )
-    }
-
-    /// The activation is a registry transition, published as a
-    /// `StatusChanged` event: the capacity tracker recomputes the backend
-    /// capacity on it, as every other subscriber reacts to it. A direct
-    /// status flip left the capacity at whatever the `Registered` event's
-    /// recompute had seen, which raced the activation (a second worker's
-    /// slots were often never added).
-    #[tokio::test]
-    async fn activating_a_registered_worker_publishes_its_status_transition() {
-        let app_context = test_app_context();
-        let registry = Arc::clone(&app_context.worker_registry);
-        let mut events = registry.subscribe_events();
-        let url = "http://worker:8080";
-        let worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new(url)
-                .connection_mode(ConnectionMode::Http)
-                .build(),
-        );
-        registry.register(Arc::clone(&worker)).expect("registered");
-        // The registration's own event is not the one under test.
-        while let Ok(event) = events.try_recv() {
-            assert!(matches!(event, WorkerEvent::Registered { .. }));
-        }
-        let mut data = create_worker_workflow_data(
-            WorkerSpec::new(url),
-            WorkerRegistrationMode::Upsert,
-            Arc::clone(&app_context),
-            WorkerJobAsker::Api,
-        );
-        data.actual_workers = Some(vec![Arc::clone(&worker)]);
-        let mut context = WorkflowContext::new(WorkflowInstanceId::new(), data);
-
-        ActivateWorkersStep
-            .execute(&mut context)
-            .await
-            .expect("activation");
-
-        assert_eq!(worker.status(), WorkerStatus::Ready);
-        let transition =
-            std::iter::from_fn(|| events.try_recv().ok()).find_map(|event| match event {
-                WorkerEvent::StatusChanged {
-                    old_status,
-                    new_status,
-                    ..
-                } => Some((old_status, new_status)),
-                _ => None,
-            });
-        assert_eq!(
-            transition,
-            Some((WorkerStatus::Pending, WorkerStatus::Ready)),
-            "the activation is published as a status transition"
-        );
-    }
-}
+#[path = "../../../../tests/unit/workflow/steps/shared/activate/tests.rs"]
+mod tests;
