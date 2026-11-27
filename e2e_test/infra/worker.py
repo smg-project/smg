@@ -462,6 +462,36 @@ class Worker:
         features = spec.get("features", [])
 
         if self.engine == "sglang":
+            if (
+                self.model_id == "meta-llama/Llama-4-Scout-17B-16E-Instruct"
+                and os.environ.get("E2E_GPU_VENDOR") == "amd"
+                and os.environ.get("E2E_SGLANG_SCOUT_ROCM_ATTENTION_AUTO") == "1"
+            ):
+                if (
+                    self.mode != ConnectionMode.GRPC
+                    or self.worker_type != WorkerType.REGULAR
+                    or tp_size != 4
+                    or self.extra_engine_args
+                ):
+                    raise ValueError(
+                        "Scout ROCm attention profile requires the original TP4 gRPC worker"
+                    )
+                args = list(spec.get("sglang_args", []))
+                attention_options = {
+                    "--attention-backend",
+                    "--prefill-attention-backend",
+                    "--decode-attention-backend",
+                }
+                if [arg for arg in args if arg.split("=", 1)[0] in attention_options] != [
+                    "--attention-backend=fa3"
+                ]:
+                    raise ValueError(
+                        "Scout ROCm attention profile requires the reference FA3 override"
+                    )
+                # Exact 4420 SDK Llama4 overrides select aiter on HIP when unset.
+                # Keep the NVIDIA model spec and every other engine argument intact.
+                args.remove("--attention-backend=fa3")
+                spec = {**spec, "sglang_args": args}
             if self.mode == ConnectionMode.ZMQ:
                 # The launcher validates the complete engine argument list
                 # (it refuses a DP launch this wire does not carry yet), so

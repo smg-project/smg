@@ -2009,6 +2009,39 @@ jobs:
       min_selected: ${{ matrix.min_selected }}
     secrets: inherit
 
+  # The complete SGLang 4-GPU chat selection on AMD: Scout and GPT-OSS 120B
+  # each use one TP4 worker, sequentially, through the original frontdoors.
+  # Keep this opt-in separate from the existing one-GPU AMD chat lane.
+  e2e-4gpu-chat-sglang-amd:
+    name: e2e-4gpu-chat-sglang-amd
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_SGLANG_4GPU_CHAT == 'true'
+      && vars.SMG_RUNNER_AMD_GPU_4 != ''
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: sglang
+      gpu_tier: "4"
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_4 }}
+      # Same 30-minute job and 32-case floor as the NVIDIA SGLang 4-GPU row;
+      # 25 minutes is its inherited e2e-gpu-job.yml pytest-step default.
+      timeout: 30
+      test_timeout: 25
+      test_dirs: e2e_test/chat_completions
+      min_selected: 32
+      gpu_vendor: amd
+      sglang_scout_rocm_attention_auto: true
+      container_image: lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --ulimit memlock=-1:-1 --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+    secrets: inherit
+
   e2e-4gpu-gateway:
     name: e2e-4gpu-gateway
     needs: [e2e-1gpu-gateway, detect-changes]
@@ -2582,7 +2615,7 @@ jobs:
           path: benchmark_go_bindings/
 
   finish:
-    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-chat-python-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-cpu-mock, e2e-vendor, go-unit-tests, go-bindings-e2e]
+    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-chat-python-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-chat-sglang-amd, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-cpu-mock, e2e-vendor, go-unit-tests, go-bindings-e2e]
     if: always()
     # A hosted runner, never a self-hosted pool: this job runs on a cancelled
     # run too, and a cancelled run is complete only once it has run. Until
@@ -2673,6 +2706,7 @@ jobs:
                 "${{ needs.e2e-2gpu-pd.result }}" =~ $bad || \
                 "${{ needs.e2e-2gpu-pd-mm-worker.result }}" =~ $bad || \
                 "${{ needs.e2e-4gpu-chat.result }}" =~ $bad || \
+                "${{ needs.e2e-4gpu-chat-sglang-amd.result }}" =~ $bad || \
                 "${{ needs.e2e-4gpu-gateway.result }}" =~ $bad || \
                 "${{ needs.e2e-4gpu-epd.result }}" =~ $bad || \
                 "${{ needs.e2e-4gpu-pd.result }}" =~ $bad || \
