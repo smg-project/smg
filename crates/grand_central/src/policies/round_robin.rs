@@ -17,7 +17,7 @@ use crate::{
     policies::standard_filters,
     stages::{
         lifecycle::Lifecycle,
-        pickers::{push_drawn, target_of},
+        pickers::{push_drawn, push_turn},
     },
     Draw,
 };
@@ -115,10 +115,23 @@ impl RoundRobin {
     /// that differ by which ranks of a worker survive keep separate rotations.
     /// The rank rides the id's top bits, so a row costs one multiply as before
     /// (a second multiply per row cost the 512-row decision 7 %).
-    fn set_key(candidates: &[Candidate], kept: &[u32]) -> u64 {
+    pub(crate) fn set_key(candidates: &[Candidate], kept: &[u32]) -> u64 {
+        Self::key_of(kept.iter().map(|&i| &candidates[i as usize]))
+    }
+
+    /// [`Self::set_key`] of every row of `rows` in their order: the key of
+    /// a whole list. The list makes it once, and a whole pass that kept
+    /// every row of the list turns the set's rotation by it with no row
+    /// read ([`Picker::pick_among`]).
+    #[cfg(feature = "in-process")]
+    pub(crate) fn whole_key(rows: &[Candidate]) -> u64 {
+        Self::key_of(rows.iter())
+    }
+
+    #[inline(always)]
+    fn key_of<'a>(rows: impl Iterator<Item = &'a Candidate>) -> u64 {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for &i in kept {
-            let c = &candidates[i as usize];
+        for c in rows {
             h ^= c.id.0 ^ (u64::from(c.dp_rank) << 48);
             h = h.wrapping_mul(0x0000_0100_0000_01b3);
         }
@@ -350,12 +363,8 @@ impl Picker for RoundRobin {
         if kept.is_empty() {
             return;
         }
-        let position = self.advance(Self::set_key(candidates, kept)) as usize;
-        for k in 0..MAX_TARGETS.min(kept.len()) {
-            out.push(target_of(
-                &candidates[kept[(position + k) % kept.len()] as usize],
-            ));
-        }
+        let turn = self.advance(Self::set_key(candidates, kept)) as usize;
+        push_turn(candidates, kept, turn, out);
     }
 }
 
