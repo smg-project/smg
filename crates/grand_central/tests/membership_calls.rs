@@ -692,8 +692,8 @@ async fn the_store_holds_the_rows_the_door_answered() {
         // states none is told as taking none.
         assert_eq!(told.each_ref().map(|told| told.vision), [false, true]);
         assert_eq!([rows[0].facts.vision, rows[1].facts.vision], [false, true]);
-        // So does the worker's end of the encode handoff. A registration
-        // that states none is told no block.
+        // So does the worker's end of the encode handoff. A new worker's
+        // registration that states no block is told none.
         assert_eq!(
             told.each_ref().map(|told| told.encode.clone()),
             [None, offer]

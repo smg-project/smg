@@ -1814,6 +1814,21 @@ fn the_membership_fields_are_pinned() {
         assert_eq!(found, expected, "{message_name}: a membership field moved");
     }
 
+    // The offer's form by its own type: a field of another enum's type
+    // would read the same numbers by other names. A form keeps its number.
+    let offer = message(controller, "EncodeOffer").expect("EncodeOffer is in the controller file");
+    let typed: Vec<&str> = offer
+        .field
+        .iter()
+        .filter(|field| field.name() == "handoff")
+        .map(|field| field.type_name())
+        .collect();
+    assert_eq!(typed, [".smg.policy.v1.EncodeHandoff"]);
+    assert_eq!(
+        enum_values(controller, "EncodeHandoff"),
+        Some(proto_enum("ENCODE_HANDOFF", &["Push", "Rendezvous"]))
+    );
+
     // The two thresholds no judge read left the message: their numbers and
     // names stay reserved, so a reader brings one back under a new number.
     let overload = message(controller, "OverloadThresholds")

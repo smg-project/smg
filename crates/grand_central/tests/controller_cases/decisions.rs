@@ -1054,14 +1054,23 @@ async fn an_encode_frames_item_goes_to_the_encoder_whose_registration_states_its
 
         // The encoder states no end: no frame's item has an encoder. Frames
         // are asked until the served loop has paid the builds the three
-        // registrations owe, and each is shed with no endpoint.
+        // registrations owe. From the first frame the encode stage sheds,
+        // every frame is shed there with no endpoint, and by no other stage.
+        const ENCODERS: &str = "encoders";
         let mut asked = 0u32;
         let mut sheds = Vec::new();
         while sheds.len() < 8 {
             asked += 1;
-            assert!(asked < 4_096, "no frame is decided: {sheds:?}");
+            assert!(
+                asked < 4_096,
+                "no frame is shed at the encode stage: {sheds:?}"
+            );
             match encoded(&requests, &mut answers, asked, MODEL).await {
-                Ok(Err(stage)) => sheds.push(stage),
+                Ok(Err(stage)) if stage == ENCODERS => sheds.push(stage),
+                Ok(Err(stage)) => assert!(
+                    sheds.is_empty(),
+                    "frame {asked} is shed by {stage} behind {sheds:?}"
+                ),
                 Ok(Ok(encoders)) => panic!("an encoder with no end is named: {encoders:?}"),
                 Err(why) => panic!("{why}"),
             }
@@ -1081,6 +1090,13 @@ async fn an_encode_frames_item_goes_to_the_encoder_whose_registration_states_its
             panic!("a change in place: {:?}", again.event);
         };
         assert_eq!(encoder.encode, producing, "the answer tells the block");
+        // A change in place keeps the row's status: the encoder was ready
+        // while its frames were shed, so its missing end shed them.
+        assert_eq!(
+            encoder.status,
+            proto::WorkerStatus::Ready as i32,
+            "{encoder:?}"
+        );
 
         // The change is acknowledged, so each frame behind it reads the
         // fleet it left: its item goes to that encoder.

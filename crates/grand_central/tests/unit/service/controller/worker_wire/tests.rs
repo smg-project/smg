@@ -256,7 +256,7 @@ fn a_row_of_defaults_reads_any_gateway_and_no_scrape() {
     // A worker that states nothing for a request's hard demands tells
     // no block: its row is the row a build before the block told.
     assert_eq!(told.demand_facts, None);
-    // Neither does one that states no end of the encode handoff.
+    // Neither does one whose encode offer states nothing.
     assert_eq!(told.encode, None);
 }
 
@@ -765,7 +765,8 @@ fn a_descriptor_that_still_states_number_eleven_reads_as_one_that_states_none() 
 
 /// A worker's end of the encode handoff is its registration's block,
 /// whole. A block left out keeps what the row states, and an empty one
-/// states no end.
+/// states no end. Its connector is the store's text: no rule holds its
+/// words, and the row's bound is its one bound.
 #[test]
 fn a_block_of_an_encode_offer_is_the_rows_whole_and_one_left_out_keeps_the_rows() {
     let with = |block: proto::EncodeOffer| proto::WorkerSpec {
@@ -812,39 +813,52 @@ fn a_block_of_an_encode_offer_is_the_rows_whole_and_one_left_out_keeps_the_rows(
         Ok(EncodeOffer::default())
     );
 
-    // A connector is a name of the wire. At its bound it is taken. One byte
-    // over, or with a blank or a control character, it is refused by its
-    // path, and so is a form this build does not know.
-    let named = |connector: String| proto::EncodeOffer {
-        connector,
+    // A registration's connector is the store's text, and no rule holds its
+    // words. One past a name's bound, one that holds a blank and one that
+    // holds a control character are each taken as stated.
+    let named = |connector: &str| proto::EncodeOffer {
+        connector: connector.to_owned(),
         ..every.clone()
     };
+    let read = |connector: &str| stated(&with(named(connector)), None).map(|offer| offer.connector);
+    for taken in [
+        text(NAME_BYTES + 1),
+        "connector a".to_owned(),
+        "connector\u{7}".to_owned(),
+    ] {
+        assert_eq!(read(&taken), Ok(Some(taken.clone())));
+    }
+    // It is read as the store holds it: past the blanks around it, and a
+    // blank one states none. So a registration that states the row's offer
+    // with blanks around its connector states the row's own offer.
+    assert_eq!(read("  connector a\t"), Ok(Some("connector a".to_owned())));
+    assert_eq!(read(" \t "), Ok(None));
     assert_eq!(
-        stated(&with(named(text(NAME_BYTES))), None).map(|offer| offer.connector),
-        Ok(Some(text(NAME_BYTES)))
+        stated(&with(named(" connector-a ")), Some(&standing)),
+        Ok(standing.encode.clone())
     );
+    // The row's bound is the connector's one bound: one that carries the
+    // row past it is refused by the row's path.
+    assert_eq!(
+        read(&text(ROW_BYTES)).map_err(|refused| refused.path),
+        Err("spec")
+    );
+    // A form this build does not know is refused by its path.
     let unknown = proto::EncodeOffer {
         handoff: 3,
         ..every.clone()
     };
-    let refusals = [
-        (named(text(NAME_BYTES + 1)), "spec.encode.connector"),
-        (named("connector a".to_owned()), "spec.encode.connector"),
-        (named("connector\u{7}".to_owned()), "spec.encode.connector"),
-        (unknown, "spec.encode.handoff"),
-    ];
-    for (block, path) in refusals {
-        let Refused { path: found, why } =
-            stated(&with(block), None).expect_err("the block is refused");
-        assert_eq!(found, path);
-        assert!(!why.is_empty());
-    }
+    let Refused { path, why } = stated(&with(unknown), None).expect_err("the form is refused");
+    assert_eq!(path, "spec.encode.handoff");
+    assert!(!why.is_empty());
 }
 
 /// The wire's row tells its worker's end of the encode handoff, and its
-/// reader holds it. A row of a worker that states no end tells no byte of
-/// the block, so it is the row a build before the block told. Such a row
-/// reads as one that states no end.
+/// reader holds it. A row of a worker whose offer states nothing tells no
+/// byte of the block, so it is the row a build before the block told. Such
+/// a row reads as one that states no end. An offer that names no form and
+/// states something tells its block. A told row's connector is read as
+/// told.
 #[test]
 fn a_row_tells_its_workers_encode_offer_and_one_that_tells_none_reads_as_stating_no_end() {
     let offering = full();
@@ -889,20 +903,58 @@ fn a_row_tells_its_workers_encode_offer_and_one_that_tells_none_reads_as_stating
         );
     }
 
-    // A told row's connector and form are held to a registration's rules,
-    // by the row's paths.
+    // The writer tells each form by its own number, and the reader holds it:
+    // a rendezvous comes back a rendezvous. An offer that names no form and
+    // states references is no default one, so its block is told too.
+    let offers = [
+        EncodeOffer {
+            handoff: EncodeHandoff::Rendezvous,
+            ..EncodeOffer::default()
+        },
+        EncodeOffer {
+            references: true,
+            ..EncodeOffer::default()
+        },
+    ];
+    for (offer, form) in offers.into_iter().zip([
+        proto::EncodeHandoff::Rendezvous,
+        proto::EncodeHandoff::Unspecified,
+    ]) {
+        let stored = WorkerRow {
+            facts: WorkerFacts {
+                encode: offer.clone(),
+                ..full().facts
+            },
+            ..full()
+        };
+        let told = row(&stored);
+        let block = told.encode.as_ref().expect("the block is told");
+        assert_eq!(block.handoff, form as i32);
+        assert_eq!(read(&told), Ok(offer));
+    }
+
+    // A told row's connector is read as told. One that holds a blank and
+    // one past a registration's bound are texts a host's own write may
+    // state, and a standby holds the row its leader took. A form this build
+    // does not know is refused by the row's path.
     let told_as = |change: fn(&mut proto::EncodeOffer)| {
         let mut told = row(&offering);
         change(told.encode.as_mut().expect("the block"));
-        told_row(&told, Instant::now()).map_err(|refused| refused.path)
+        told_row(&told, Instant::now())
+            .map(|row| row.facts.encode.connector)
+            .map_err(|refused| refused.path)
     };
     assert_eq!(
-        told_as(|block| block.connector = "a b".to_owned()).err(),
-        Some("row.encode.connector")
+        told_as(|block| block.connector = "a b".to_owned()),
+        Ok(Some("a b".to_owned()))
     );
     assert_eq!(
-        told_as(|block| block.handoff = 3).err(),
-        Some("row.encode.handoff")
+        told_as(|block| block.connector = text(NAME_BYTES + 1)),
+        Ok(Some(text(NAME_BYTES + 1)))
+    );
+    assert_eq!(
+        told_as(|block| block.handoff = 3),
+        Err("row.encode.handoff")
     );
 }
 
@@ -1756,9 +1808,19 @@ fn the_stores_measure_is_never_under_the_wires_weight() {
     let charged = |facts: &WorkerFacts| facts.weight(&Registrant::Control);
     assert_eq!(charged(&seeing) - charged(&stating), WorkerFacts::VISION);
     // What it charges for an offer is the offer's block with no connector,
-    // and the measure adds it for a row that states an end.
+    // and the measure adds it for a row whose offer states anything.
     assert_eq!(numeric(&offering) - numeric(&seeing), WorkerFacts::ENCODE);
     assert_eq!(charged(&offering) - charged(&seeing), WorkerFacts::ENCODE);
+    // A connector is charged as any text is, beside the block: its bytes
+    // and a text's frame, and no byte more.
+    let on = WorkerFacts {
+        encode: EncodeOffer {
+            connector: Some(text(300)),
+            ..offering.encode.clone()
+        },
+        ..offering.clone()
+    };
+    assert_eq!(charged(&on) - charged(&offering), 300 + WorkerFacts::FRAME);
 
     let makers = [
         Registrant::Control,
