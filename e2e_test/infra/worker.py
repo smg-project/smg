@@ -14,6 +14,7 @@ import time
 from dataclasses import dataclass, field
 from typing import IO, Any
 
+import requests
 import yaml
 
 from .constants import (
@@ -142,6 +143,20 @@ class Worker:
     # Mock engine only: the port of the mock worker's admin API, where a test
     # states the answers the worker's next requests get.
     admin_port: int | None = None
+    # Host where this worker listens (defaults to DEFAULT_HOST for local workers;
+    # parsed from the endpoint URL for externally managed workers).
+    host: str = DEFAULT_HOST
+    # Externally managed worker (attached via E2E_EXTERNAL_WORKERS): never
+    # launched, signalled, stopped, or port-released by the harness.
+    external: bool = False
+    # Explicit endpoint URL for externally managed workers (preserves scheme
+    # such as http://, https://, or grpc://).
+    external_url: str | None = None
+    # Whether setup_backend should best-effort flush KV cache via the gateway
+    # after attaching this external worker.
+    flush_cache: bool = False
+    # Per-probe timeout (seconds) used for live health checks of external workers.
+    health_timeout: float = 5.0
     # Whether the harness picked ``admin_port`` (and releases it at stop).
     _admin_port_auto: bool = field(default=False, repr=False)
     process: subprocess.Popen | None = field(default=None, repr=False)
@@ -164,6 +179,8 @@ class Worker:
     @property
     def base_url(self) -> str:
         """Base URL for this worker."""
+        if self.external_url is not None:
+            return self.external_url.rstrip("/")
         if self.mode == ConnectionMode.ZMQ:
             # ipc:// worker URL the router binds; the engine dials the tcp
             # handshake port SMG derives from it. Reuse serve's helper so the
@@ -172,8 +189,8 @@ class Worker:
 
             return _zmq_ipc_url(self.port)
         if self.mode == ConnectionMode.GRPC:
-            return f"grpc://{host_port(DEFAULT_HOST, self.port)}"
-        return f"http://{host_port(DEFAULT_HOST, self.port)}"
+            return f"grpc://{host_port(self.host, self.port)}"
+        return f"http://{host_port(self.host, self.port)}"
 
     @property
     def worker_url(self) -> str:
@@ -183,7 +200,11 @@ class Worker:
     @property
     def http_url(self) -> str:
         """HTTP URL (used for health checks even on gRPC workers)."""
-        return f"http://{host_port(DEFAULT_HOST, self.port)}"
+        if self.external_url is not None and self.external_url.lower().startswith(
+            ("http://", "https://")
+        ):
+            return self.external_url.rstrip("/")
+        return f"http://{host_port(self.host, self.port)}"
 
     @property
     def admin_url(self) -> str | None:
@@ -204,6 +225,8 @@ class Worker:
             wait_ready: If True, block until the worker passes health checks.
                 If False, spawn the process and return immediately.
         """
+        if self.external:
+            raise RuntimeError(f"Cannot start externally managed worker {self.base_url}")
         # Every start arms its teardown, before anything is built or spawned for it.
         self._torn_down = False
         cmd = self._build_cmd()
@@ -243,6 +266,12 @@ class Worker:
         ``start(wait_ready=False)`` followed by this call lets a caller spawn
         several workers and wait for all of them afterwards.
         """
+        if self.external:
+            if self.is_healthy(timeout=min(float(timeout), self.health_timeout)):
+                return
+            raise TimeoutError(
+                f"External {self.mode.value} worker {self.model_id} at {self.base_url} is unhealthy"
+            )
         if self.process is None:
             raise RuntimeError(f"Worker {self.model_id} has not been started")
         if self.mode == ConnectionMode.ZMQ:
@@ -293,8 +322,16 @@ class Worker:
         spawned (its launch failed before the spawn) has nothing to wait for;
         its log handle and its ports are released all the same, so a restart
         opens one log file and the port pool keeps its size. A second call
-        finds nothing to do.
+        finds nothing to do. Externally managed workers are never stopped or
+        port-released by the harness.
         """
+        if self.external:
+            logger.debug(
+                "Skipping stop for externally managed worker %s at %s",
+                self.model_id,
+                self.base_url,
+            )
+            return
         if self._torn_down:
             return
         self._torn_down = True
@@ -405,6 +442,13 @@ class Worker:
         launcher, it has exited, or the engine runs inside it (the mock
         worker). :meth:`stop` then :meth:`start` bring the worker back.
         """
+        if self.external:
+            logger.warning(
+                "Refusing to signal externally managed worker %s at %s",
+                self.model_id,
+                self.base_url,
+            )
+            return []
         if self.process is None or self.process.poll() is not None:
             return []
         signalled: list[int] = []
@@ -423,14 +467,41 @@ class Worker:
         )
         return signalled
 
+    def http_serving(self, timeout: float = 5.0) -> bool:
+        """Probe an HTTP worker's ``/health`` endpoint once within ``timeout`` seconds."""
+        try:
+            resp = requests.get(f"{self.http_url}/health", timeout=timeout)
+            return resp.status_code == 200
+        except requests.RequestException:
+            return False
+
+    def is_healthy(self, timeout: float | None = None) -> bool:
+        """Verify live worker health over the worker's configured protocol."""
+        probe_timeout = self.health_timeout if timeout is None else timeout
+        if self.mode == ConnectionMode.GRPC:
+            return self.grpc_serving(timeout=probe_timeout)
+        if self.mode == ConnectionMode.HTTP:
+            return self.http_serving(timeout=probe_timeout)
+        if self.external:
+            return False
+        return self.is_alive()
+
     def is_alive(self) -> bool:
-        """Check if the worker process is still running."""
+        """Check if the worker process is still running (or reachable, if external)."""
+        if self.external:
+            return self.is_healthy()
         return self.process is not None and self.process.poll() is None
 
     def raise_if_exited(self) -> None:
         """End a start-up wait on this worker's exit: the death report (the
         exit status, what the log says, the log's path), raised at once
-        instead of the wait running to its bound."""
+        instead of the wait running to its bound.
+
+        No-op for externally managed workers, which have no local launcher
+        process to exit.
+        """
+        if self.external:
+            return
         if not self.is_alive():
             raise RuntimeError(self._death_report())
 
@@ -1205,7 +1276,7 @@ class Worker:
                 "gRPC health check requires grpcio and grpcio-health-checking packages"
             )
 
-        channel = grpc.insecure_channel(host_port(DEFAULT_HOST, self.port))
+        channel = grpc.insecure_channel(host_port(self.host, self.port))
         try:
             if native_trt:
                 try:

@@ -292,7 +292,7 @@ def _start_local_grpc_gateway_with_mcp(
     AMD worker startup failures propagate. Other environments retain the
     startup skip for suites run without GPUs.
     """
-    from infra import ConnectionMode, Gateway
+    from infra import ConnectionMode, ExternalWorkerAttachError, Gateway
     from infra.model_specs import get_model_spec
     from infra.worker_pool import get_pool
 
@@ -303,6 +303,8 @@ def _start_local_grpc_gateway_with_mcp(
             mode=ConnectionMode.GRPC,
             count=1,
         )
+    except ExternalWorkerAttachError:
+        raise
     except Exception as e:
         if get_gpu_vendor() == "amd":
             raise
@@ -325,6 +327,8 @@ def _start_local_grpc_gateway_with_mcp(
                 "memory",
             ],
         )
+        if any(getattr(w, "external", False) and getattr(w, "flush_cache", False) for w in workers):
+            gateway.flush_cache()
         client = openai.OpenAI(base_url=f"{gateway.base_url}/v1", api_key="not-used")
     except Exception:
         gateway.shutdown()

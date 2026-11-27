@@ -169,6 +169,12 @@ def _make_openai_client(gateway: Gateway) -> openai.OpenAI:
     return openai.OpenAI(base_url=f"{gateway.base_url}/v1", api_key="not-used")
 
 
+def _maybe_flush_external_cache(gateway: Gateway, workers: list) -> None:
+    """Flush KV cache via the gateway when attached to external workers configured to flush."""
+    if any(getattr(w, "external", False) and getattr(w, "flush_cache", False) for w in workers):
+        gateway.flush_cache()
+
+
 # Statuses a fresh gateway returns while it is still wiring up (no worker
 # routable yet, tokenizer not registered) rather than rejecting the request.
 _NOT_SERVING_YET = frozenset({404, 408, 425, 429, 500, 502, 503, 504})
@@ -535,15 +541,18 @@ def _setup_local(
             if is_zmq:
                 _worker_start_failures[engine] = _worker_start_failures.get(engine, 0) + 1
             raise
+        _maybe_flush_external_cache(gateway, workers)
         logger.info("%s backend ready at %s", backend_name, gateway.base_url)
         yield backend_name, model_path, _make_openai_client(gateway), gateway
     finally:
         clear_class_workers()
-        logger.info(
-            "Tearing down %s backend (%s)",
-            backend_name,
-            "stopping ZMQ workers" if is_zmq else "workers stay in pool",
+        has_external = any(getattr(w, "external", False) for w in workers)
+        teardown_note = (
+            "stopping ZMQ workers"
+            if is_zmq
+            else ("detaching external workers" if has_external else "workers stay in pool")
         )
+        logger.info("Tearing down %s backend (%s)", backend_name, teardown_note)
         gateway.shutdown()
         if is_zmq:
             stop_workers(workers)
@@ -989,6 +998,7 @@ def backend_router(request: pytest.FixtureRequest):
             # ZMQ loads the model inside the gateway's readiness gate; cover it.
             timeout=_gateway_readiness_timeout(connection_mode, model_id, DEFAULT_ROUTER_TIMEOUT),
         )
+        _maybe_flush_external_cache(gateway, workers)
         yield gateway
     finally:
         gateway.shutdown()
