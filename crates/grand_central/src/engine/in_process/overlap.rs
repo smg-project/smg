@@ -1663,12 +1663,13 @@ impl Table {
     /// are one a boundary of the view the request reaches, the fold through
     /// the boundary's last whole block ([`Self::depths`]), as a
     /// consistent-hash stage keys a prefix: the heads the classic policy
-    /// keys its placement map by. A boundary counts in whole blocks: a
-    /// request reaches it with the blocks under it, where the classic
-    /// policy asks for its every token. A request with fewer whole blocks
-    /// than the first boundary's has no key, and neither has one hashed by
+    /// keys its placement map by. A boundary counts in whole blocks, where
+    /// the classic policy asks for its every token. A request of token ids
+    /// reaches a boundary that holds a whole block where it carries a hash
+    /// for each block under it. A request that carries fewer hashes than
+    /// the first depth counts has no key, and neither has one hashed by
     /// windows of its text, since such an index keys token ids: the record
-    /// names it nobody and its pick writes nothing.
+    /// names it nobody and takes no placement for it.
     fn fold_keys(&self, keys: &mut Vec<u64>, facts: &RequestFacts<'_>) {
         let hashes = facts.block_hashes;
         let Some(boundaries) = self.boundaries.as_deref() else {
@@ -2525,8 +2526,8 @@ pub(super) fn column(
             table.fill(facts, table.side_alone, buffers, column)
         })
     });
-    // A place whose stages read no affinity keeps no table: every worker
-    // reads as holding nothing, just admitted.
+    // The table of a place whose stages read no affinity holds an empty
+    // column: every worker reads as holding nothing, just admitted.
     column.resize(workers.len(), AffinityFacts::default());
     read
 }

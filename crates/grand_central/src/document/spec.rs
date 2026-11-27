@@ -7,8 +7,9 @@
 //!
 //! The document has an `apiVersion` and no `kind`: its forms are a file and
 //! the API. An unknown field is refused by name, never ignored. The one
-//! exception is the parameters of a scorer or filter a host registers, which
-//! its factory's own type reads ([`crate::stages::StageBuild::params`]). A field this
+//! exception is the parameters of a scorer, a filter or a picker a host
+//! registers, which its factory's own type reads
+//! ([`crate::stages::StageBuild::params`]). A field this
 //! build cannot honour yet (a stage, a plan, a matcher or a binding rule of a
 //! later step) is checked in shape like every other field and then refused
 //! by name as not in this build, so a document written against the published
@@ -568,18 +569,21 @@ pub enum IndexKind {
     Tree,
     /// The record of sent prefixes keyed by the request's head at
     /// `view.boundaries` alone, as the classic hash index keys it. The
-    /// crate's engine reads and writes the record at the last whole block
-    /// under each boundary, where the request holds that many blocks: one
-    /// with fewer whole blocks than the first boundary's, or one hashed by
-    /// its text, reads and writes nothing. A
-    /// boundary past the first `view.max_block_hashes` blocks of a request
-    /// keys nothing either. A holder's depth is its boundary's, so a
+    /// crate's engine keys the record at the last whole block under each
+    /// boundary that holds one, where the request carries a block hash
+    /// for each block under the boundary. A request that carries
+    /// fewer block hashes than the first such boundary has whole
+    /// blocks, or one hashed by its text, has no key: the record
+    /// names no worker for it and takes no placement for it. A
+    /// boundary of more whole blocks than `view.max_block_hashes`
+    /// keys nothing either, for a request that carries no more
+    /// hashes than that. A holder's depth is its boundary's, so a
     /// `prefix-affinity` stage counts it only where that share of the
     /// request clears the stage's `threshold`. The settings of the classic
     /// hash index translate to a threshold of zero, which counts a holder
     /// at any boundary; a document written by hand writes `threshold: 0`
-    /// for the same. The engine keeps no clock an entry: a placement stays
-    /// until the record's size bound takes it.
+    /// for the same. No placement of the engine's record expires: the
+    /// index's `max_size` bounds the record instead.
     Hash,
 }
 
@@ -593,8 +597,8 @@ pub enum IndexKind {
 pub struct IndexSpec {
     pub kind: IndexKind,
     /// How long a placement of the classic hash index stays routable, in
-    /// seconds. The crate's engine keeps no clock an entry and does not
-    /// read it: a placement of its record stays until `max_size` takes it.
+    /// seconds. The crate's engine does not read it: no placement of its
+    /// record expires.
     #[schemars(range(min = 1))]
     pub ttl_s: u32,
     /// The size bound of a tree index, summed over the workers: on a text
