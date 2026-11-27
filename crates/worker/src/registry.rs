@@ -1216,7 +1216,10 @@ impl<G: Generation> WorkerRegistry<G> {
     // writers interleave and no subscriber sees one worker's events out of
     // order. `demote_before_removal` is the one other write, the removal's
     // silent NotReady over Ready, a step of `remove_inner` under the same
-    // lock; it publishes nothing. The registry has no opinion on which
+    // lock; it publishes nothing. A registration's replacement
+    // (`register_or_replace_clearing_drain`) starts Pending where it
+    // inherited Draining: a silent step of `replace_as` under that lock,
+    // ahead of its `Replaced` event. The registry has no opinion on which
     // edges are legal: the callers own the rules (the registry enforces
     // none). A rule that depends on the worker's current status is decided
     // in the primitive's closure, under the lock, so the status it reads is
@@ -1231,7 +1234,7 @@ impl<G: Generation> WorkerRegistry<G> {
     //   health probes              Pending/NotReady/Failed -> Ready `apply_if_revision`
     //   (WorkerManager)            Pending/NotReady -> Failed       (decided under the lock)
     //                              Ready -> NotReady
-    //   connect signal             any -> Ready                     `transition_status_if_revision`
+    //   connect signal             any but Draining -> Ready        `apply_if_revision`
     //   (WorkerManager)            (a ZMQ handshake, or a worker
     //                              without health checks; a probed
     //                              worker's signal moves its probe)
@@ -1239,17 +1242,18 @@ impl<G: Generation> WorkerRegistry<G> {
     //   (`on_remote_worker_state`) Ready -> NotReady                (decided under the lock)
     //   drain step                 Ready -> Draining                `apply_if_revision`
     //   (removal workflow)                                          (decided under the lock)
-    //   activation step            not Ready -> Ready               `transition_status`
-    //   (registration workflow)
-    //   property update that       any -> Ready                     `transition_status`
-    //   turns health checks off
+    //   activation step            Pending/NotReady/Failed -> Ready `apply_if_revision`
+    //   (registration workflow)                                     (decided under the lock)
+    //   property update that       any but Draining -> Ready        `apply_if_revision`
+    //   turns health checks off                                     (decided under the lock)
     //   removal (`remove_inner`)   Ready -> NotReady, no event      `demote_before_removal`
+    //   registration               Draining -> Pending, no event    in `replace_as`
+    //   (`register_or_replace_clearing_drain`)
     //
-    // Two status writes are not transitions and stay outside: a mesh
-    // import's status is set at its construction, before registration, and
-    // the activation step writes directly to a worker the registry no
-    // longer holds. The revision-checked writers discard an outcome that
-    // lost a race with a same-URL `replace()`.
+    // One status write is not a transition and stays outside: a mesh
+    // import's status is set at its construction, before registration. The
+    // revision-checked writers discard an outcome that lost a race with a
+    // same-URL `replace()`.
     // ───────────────────────────────────────────────────────────────────
 
     /// Register a new worker (create-only).
@@ -1281,6 +1285,27 @@ impl<G: Generation> WorkerRegistry<G> {
     /// Holds the per-worker mutation lock for the duration of the
     /// underlying `register` or `replace` call.
     pub fn register_or_replace(&self, worker: Arc<dyn Worker>) -> WorkerId {
+        self.upsert(worker, false)
+    }
+
+    /// [`Self::register_or_replace`] for a registration of the URL: over a
+    /// worker that reads `Draining` the replacement reads `Pending`. The
+    /// mark is a removal's, written for the worker that stood there. It is
+    /// cleared under the per-worker mutation lock, ahead of the
+    /// [`WorkerEvent::Replaced`] event (the worker in it reads `Pending`),
+    /// and no `StatusChanged` is published. The worker is then admitted as
+    /// any new worker is, and a removal pinned to the worker it replaced
+    /// leaves it. Every other writer leaves a draining worker as it is: an
+    /// update, an import and [`Self::register_or_replace`] keep the mark and
+    /// go with the removal.
+    pub fn register_or_replace_clearing_drain(&self, worker: Arc<dyn Worker>) -> WorkerId {
+        self.upsert(worker, true)
+    }
+
+    /// The upsert behind [`Self::register_or_replace`] and
+    /// [`Self::register_or_replace_clearing_drain`], which alone passes
+    /// `clear_drain`.
+    fn upsert(&self, worker: Arc<dyn Worker>, clear_drain: bool) -> WorkerId {
         // Try to create first — succeeds for fresh URLs and pre-reserved IDs
         // (where url_to_id has an entry but workers does not).
         if let Some(id) = self.register(worker.clone()) {
@@ -1301,6 +1326,7 @@ impl<G: Generation> WorkerRegistry<G> {
                 Some(WorkerOrigin::Local),
                 None,
                 None,
+                clear_drain,
             ) {
                 // replace() returned false — worker was removed concurrently.
                 // The mutation lock prevents stale indexes, so this is safe to ignore.
@@ -1400,6 +1426,7 @@ impl<G: Generation> WorkerRegistry<G> {
                 refuse_draining: true,
             }),
             None,
+            false,
         )
     }
 
@@ -1420,6 +1447,7 @@ impl<G: Generation> WorkerRegistry<G> {
             promote_origin,
             expected,
             import,
+            false,
         )
     }
 
@@ -1440,7 +1468,16 @@ impl<G: Generation> WorkerRegistry<G> {
     /// the replacement. `replacement` tells the settle of the models' retry
     /// settings whether a registration resolved the worker: a rebuild that
     /// carries an import on stays an import there, whatever origin it is
-    /// promoted to.
+    /// promoted to. `clear_drain` is
+    /// [`Self::register_or_replace_clearing_drain`]'s: every other
+    /// replacement (an update, an import, [`Self::register_or_replace`])
+    /// keeps a removal's `Draining` mark and goes with that removal, while a
+    /// registration of the URL starts `Pending` and is admitted as any new
+    /// worker is.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the one core of every replacement: each argument is one choice of its caller"
+    )]
     fn replace_as(
         &self,
         replacement: Replacement,
@@ -1449,6 +1486,7 @@ impl<G: Generation> WorkerRegistry<G> {
         promote_origin: Option<WorkerOrigin>,
         expected: Option<Expected>,
         import: Option<ImportRecord>,
+        clear_drain: bool,
     ) -> bool {
         // Serialize concurrent replacements for the same worker ID.
         // Lock is held only during the in-memory diff (no I/O, microseconds).
@@ -1531,6 +1569,13 @@ impl<G: Generation> WorkerRegistry<G> {
                 worker_url = old_worker.redacted_url(),
                 "replace() did not preserve shared mutable worker state"
             );
+        }
+        // The status is shared with the worker replaced. No event: the
+        // `Replaced` event that follows is the one subscribers act on, and
+        // the health manager schedules the replacement by the status it
+        // reads then.
+        if clear_drain && new_worker.status() == WorkerStatus::Draining {
+            new_worker.set_status(WorkerStatus::Pending);
         }
 
         // Overwrite worker object atomically. The membership-order read
@@ -1756,8 +1801,10 @@ impl<G: Generation> WorkerRegistry<G> {
     /// A caller whose target depends on the current status reads it in
     /// `f`, under the lock, never before the call: a status read outside
     /// the lock may be gone by the time the write lands.
-    /// The removal's [`Self::demote_before_removal`] is the only other
-    /// status write on a registered worker; it publishes nothing.
+    /// Two other status writes reach a registered worker, and neither
+    /// publishes anything: the removal's [`Self::demote_before_removal`], and
+    /// the mark [`Self::register_or_replace_clearing_drain`] clears in
+    /// `replace_as`.
     fn transition_under_lock<T, F>(
         &self,
         worker_id: &WorkerId,

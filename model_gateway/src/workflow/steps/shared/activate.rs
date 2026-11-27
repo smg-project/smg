@@ -34,6 +34,18 @@ fn activation_status(worker: &Arc<dyn Worker>) -> Option<WorkerStatus> {
     (worker.status() != WorkerStatus::Ready).then_some(WorkerStatus::Ready)
 }
 
+/// Whether `held`, the worker under the URL, is the worker this workflow
+/// `registered` or a successor of it. A replacement adopts the runtime state
+/// of the worker it replaces, so the two share one; a worker registered
+/// under the URL once a removal took the first has a state of its own.
+fn registered_or_successor(held: &Arc<dyn Worker>, registered: &Arc<dyn Worker>) -> bool {
+    Arc::ptr_eq(held, registered)
+        || matches!(
+            (held.runtime_state(), registered.runtime_state()),
+            (Some(theirs), Some(ours)) if Arc::ptr_eq(&theirs, &ours)
+        )
+}
+
 #[async_trait]
 impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for ActivateWorkersStep {
     async fn execute(&self, context: &mut WorkflowContext<D>) -> WorkflowResult<StepResult> {
@@ -49,8 +61,7 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for ActivateWorke
         // capacity on it (a worker flipped Ready directly was counted only
         // if the tracker's recompute for the `Registered` event happened to
         // run after the flip, so a second worker's slots were often never
-        // added), and so does every other subscriber. A worker the registry
-        // no longer holds is flipped directly, as before.
+        // added), and so does every other subscriber.
         let registry = &app_context.worker_registry;
         let mut activated = 0;
         for worker in workers {
@@ -98,19 +109,32 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for ActivateWorke
                 continue;
             }
             if let Some(status) = activation_status(worker) {
-                // Only the worker this workflow registered: an upsert of the
-                // same URL that raced it (discovery beside an API call) must
-                // not have its own worker flipped from here.
-                match registry
-                    .get_id_by_url(worker.url())
-                    .filter(|id| registry.get(id).is_some_and(|w| Arc::ptr_eq(&w, worker)))
+                // Through the registry, by the id that stands under the URL,
+                // where the worker there is this workflow's or a successor
+                // that shares its runtime state (an upsert that raced it, an
+                // update's rebuild): tested under the worker's lock. A worker
+                // registered under the URL once a removal took this one is
+                // another registration's and is left as it is. A worker a
+                // removal drains stays so, decided under the same lock: that
+                // mark was written behind this registration. A worker the
+                // registry no longer holds was removed. The revision is only
+                // the call's precondition and a mesh publication can raise it
+                // in place: it is read once more.
+                let activate = || {
+                    let id = registry.get_id_by_url(worker.url())?;
+                    let held = registry.get(&id)?;
+                    registry.apply_if_revision(&id, held.revision(), |held| {
+                        let mine = registered_or_successor(held, worker);
+                        let leaving = held.status() == WorkerStatus::Draining;
+                        ((), (mine && !leaving).then_some(status))
+                    })
+                };
+                if activate()
+                    .or_else(activate)
+                    .is_some_and(|((), moved)| moved.is_some())
                 {
-                    Some(worker_id) => {
-                        registry.transition_status(&worker_id, status);
-                    }
-                    None => worker.set_status(status),
+                    activated += 1;
                 }
-                activated += 1;
             }
         }
 
@@ -121,7 +145,7 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for ActivateWorke
         }
 
         info!(
-            "Activated {activated} of {} worker(s) (others left as-is: already ready, awaiting connect signal or replaced since)",
+            "Activated {activated} of {} worker(s) (others left as-is: already ready, awaiting connect signal, replaced or removed since, or being removed)",
             workers.len()
         );
 

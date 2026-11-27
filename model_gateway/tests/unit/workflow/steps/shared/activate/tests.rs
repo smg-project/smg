@@ -108,3 +108,56 @@ async fn activating_a_registered_worker_publishes_its_status_transition() {
         "the activation is published as a status transition"
     );
 }
+
+/// A registration's late activation writes the worker it registered or a
+/// successor of it, and no other. Once a removal took that worker, a worker
+/// registered under the URL is another registration's: it keeps the status
+/// it reads and nothing is published.
+#[tokio::test]
+async fn a_late_activation_leaves_a_worker_registered_under_its_url_since_a_removal() {
+    let app_context = test_app_context();
+    let registry = Arc::clone(&app_context.worker_registry);
+    let url = "http://worker:8080";
+    let build = |status: WorkerStatus| -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .connection_mode(ConnectionMode::Http)
+                .status(status)
+                .build(),
+        )
+    };
+    let registered = build(WorkerStatus::Pending);
+    let id = registry
+        .register(Arc::clone(&registered))
+        .expect("registered");
+    registry.remove(&id).expect("removed");
+    let since = build(WorkerStatus::NotReady);
+    registry
+        .register(Arc::clone(&since))
+        .expect("registered since");
+    let mut events = registry.subscribe_events();
+
+    let mut data = create_worker_workflow_data(
+        WorkerSpec::new(url),
+        WorkerRegistrationMode::Upsert,
+        Arc::clone(&app_context),
+        WorkerJobAsker::Api,
+    );
+    data.actual_workers = Some(vec![Arc::clone(&registered)]);
+    let mut context = WorkflowContext::new(WorkflowInstanceId::new(), data);
+    ActivateWorkersStep
+        .execute(&mut context)
+        .await
+        .expect("activation");
+
+    assert_eq!(
+        since.status(),
+        WorkerStatus::NotReady,
+        "the worker registered since keeps its status"
+    );
+    assert!(
+        std::iter::from_fn(|| events.try_recv().ok())
+            .all(|event| !matches!(event, WorkerEvent::StatusChanged { .. })),
+        "no status transition is published"
+    );
+}

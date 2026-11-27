@@ -720,9 +720,9 @@ fn apply_registry_event<G: Generation>(
         }
         // The loop's own transitions and a contact's promotion find their
         // deadline in place. Another writer's finds none when the worker last
-        // read a state without a slot: the activation of a replacement that
-        // inherited `Draining` puts back in service a worker the schedule no
-        // longer holds.
+        // read a state without a slot (`Draining`, or `Failed` with its
+        // removal due): a transition out of it puts back in service a worker
+        // the schedule no longer holds.
         Ok(WorkerEvent::StatusChanged { worker_id, .. })
             if !next_check.contains_key(&worker_id) =>
         {
@@ -1390,7 +1390,13 @@ impl<G: Generation> HealthSink for WorkerRegistry<G> {
         worker_id: &WorkerId,
         revision: u64,
     ) -> Option<(WorkerStatus, WorkerStatus)> {
-        self.transition_status_if_revision(worker_id, revision, WorkerStatus::Ready)
+        // Decided under the worker's lock: a worker its removal drains stays
+        // so, and a signal queued before the mark does not put it back.
+        self.apply_if_revision(worker_id, revision, |worker| {
+            let leaving = worker.status() == WorkerStatus::Draining;
+            ((), (!leaving).then_some(WorkerStatus::Ready))
+        })?
+        .1
     }
 }
 
