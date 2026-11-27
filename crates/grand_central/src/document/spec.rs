@@ -62,7 +62,8 @@ use crate::{
         filters::{has_room_rule, HasRoomRule, HasRoomSignals},
         pickers::SampledBest,
         registry::{
-            profile_sent, FilterFactory, Found, PickerFactory, SentSlot, StageBuild, StageRegistry,
+            profile_sent, FilterFactory, Found, PickerFactory, SentSlot, StageBuild, StageKind,
+            StageRegistry,
         },
         scorers::{
             with_load_report_age_limit, FewestSessions, LeastCost, LeastCostSignals,
@@ -2949,7 +2950,9 @@ pub enum SpecError {
         value: String,
         reason: &'static str,
     },
-    /// A factory's refusal or a stage whose name differs from its registration.
+    /// A factory's refusal, a stage whose name differs from its
+    /// registration, or a host's stage that the document names under a name
+    /// the engine refuses under.
     #[error("{path}: {reason}")]
     BadStage { path: String, reason: String },
     #[error("{path}: {what} is not in this build")]
@@ -3822,6 +3825,7 @@ fn picker_of(
     };
     match pick {
         PickSpec::Name(name) => match from.catalog.find_picker(name) {
+            Some(Found::Kept) => Err(kept_name(path(), StageKind::Picker, name)),
             Some(Found::Built(picker)) => {
                 // A picker the catalog built with no context.
                 no_cells_without_a_context(
@@ -3868,6 +3872,7 @@ fn picker_of(
                 value: name.clone(),
                 reason: "a picker added in code: a built-in's parameters are typed",
             }),
+            Some(Found::Kept) => Err(kept_name(path(), StageKind::Picker, name)),
             Some(Found::With(build)) => {
                 let params = written.as_object().ok_or_else(|| SpecError::BadField {
                     path: path(),
@@ -3887,6 +3892,22 @@ fn picker_of(
             // reader kept as read.
             None | Some(Found::Typed) => Err(unknown()),
         },
+    }
+}
+
+/// The refusal of a document that names a host's stage under one of the
+/// names the engine refuses under
+/// ([`KEPT`](crate::engine::decision::KEPT)): a shed under such a name
+/// reads as the engine's word, so no document runs a stage registered
+/// under one. The registry takes such a stage, and the catalog's lookup
+/// says so where a document names it ([`Found::Kept`]), ahead of any
+/// build. `path` is the stage's own, and names the profile.
+fn kept_name(path: String, kind: StageKind, name: &str) -> SpecError {
+    SpecError::BadStage {
+        path,
+        reason: format!(
+            "{kind} {name:?} bears a name the engine refuses requests under: register the stage under another name"
+        ),
     }
 }
 
@@ -3963,6 +3984,9 @@ fn filtered<'a>(
         Ok(Filtered::Built(filter))
     };
     match (from.catalog.find_filter(name), entry) {
+        // A host's filter under a name the engine keeps, whatever is
+        // written under it.
+        (Some(Found::Kept), _) => Err(kept_name(path(), StageKind::Filter, name)),
         // Only a document built in code: the parser reads the built-in's
         // key into its parameter struct. The catalog holds the name for
         // its bare form, and that arm's refusal would name the bare form.
@@ -4162,6 +4186,9 @@ fn scored(
         )?;
     }
     match (entry, found) {
+        // A host's scorer under a name the engine keeps, whatever is
+        // written under it.
+        (_, Found::Kept) => Err(kept_name(at.sub(name).0, StageKind::Scorer, name)),
         (ScoreSpec::Params(stage), _) => Ok(Scored::Typed(stage.clone())),
         (ScoreSpec::Name(_), Found::Typed) => match ScoreStage::by_name(name) {
             Some(stage) => Ok(Scored::Typed(stage)),
