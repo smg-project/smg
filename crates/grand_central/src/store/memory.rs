@@ -445,7 +445,9 @@ impl MemoryStore {
     /// It is the call of a store with no holder of worker objects, and of a
     /// fixture. A holder is told nothing of a change written here. The row
     /// such a change leaves has no object until a cut is laid whole, and the
-    /// holder's registration of its key is refused until then.
+    /// holder's registration of its key is refused until then. A standby's
+    /// applier and a watcher also lay the row at the next event that tells
+    /// it and that the store takes.
     ///
     /// The pools follow as at the leader's own write: a join, a refresh and
     /// a patch leave their build owed, which the replica's loop pays at the

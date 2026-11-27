@@ -37,8 +37,8 @@
 //! tell the store refuses ([`mod@super::status`]).
 //!
 //! A restore is the store's restore and the lay of the cut's own rows in
-//! one turn of the holder. No row is read back to lay an object: each
-//! row's status is read off the table. Nothing that takes the
+//! one turn of the holder. No row of the table is read back to lay an
+//! object: each row's status alone is read off it. Nothing that takes the
 //! turn finds the objects of one history beside the rows of another.
 //!
 //! A gateway's watcher hands the holder the same two: each change of its

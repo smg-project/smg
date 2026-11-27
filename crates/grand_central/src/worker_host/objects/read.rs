@@ -32,7 +32,9 @@
 //! status its log has not told yet between a driver's move and the tell,
 //! and a copy holds the log's word at the copy's place. A cut takes no
 //! object's mutation lock. A row a writer left with no turn of the holder
-//! is in no first copy until a cut laid whole lays it.
+//! is in no first copy until a cut laid whole lays it. A standby's applier
+//! and a watcher also lay it at the next event that tells the row and that
+//! the store takes.
 
 use parking_lot::MutexGuard;
 use smg_worker::registry::Generation;
@@ -173,7 +175,8 @@ impl<G: Generation> Objects<G> {
     /// the place in the hold that takes the statuses. A change handed to
     /// the store around the holder ([`MemoryStore::follow`]) takes none
     /// either: no product code hands one so. A row written so is in no
-    /// copy until a cut laid whole lays it.
+    /// copy until a cut laid whole lays it, or a standby's applier or a
+    /// watcher at its next event that the store takes.
     fn told_turn(&self, store: &MemoryStore) -> (MutexGuard<'_, ()>, Told) {
         let turn = self.turn.lock();
         let told = store.told();
