@@ -383,7 +383,7 @@ def actual_client_namespace(directory, hook=None):
         for node in publish.body
         if (
             isinstance(node, ast.FunctionDef)
-            and node.name in {"persist", "event", "command", "interrupted"}
+            and node.name in {"persist", "event", "command", "interrupted", "creation_ack"}
         )
         or (
             isinstance(node, ast.Assign)
@@ -726,6 +726,7 @@ def exercise_owned_cleanup_fault(
                 "command",
                 "inspect",
                 "verify_owned",
+                "bind_created_storage",
                 "registration_identity",
                 "interrupted",
             }
@@ -749,7 +750,16 @@ def exercise_owned_cleanup_fault(
         "public_pull_verified": True,
         "owned_builder_container_id": "a" * 64,
         "status": "candidate_published_requires_fresh_actual_GPU_qualification",
+        "registration_submitted": True,
+        "builder_endpoint": "docker-container://" + "a" * 64 + "?context=default",
     }
+    if not fault.startswith(("registration", "unwitnessed", "creation_lost_ack")):
+        state["container_creation_receipt"] = {"Id": "a" * 64}
+    if fault == "changed_state_mount":
+        state["created_anonymous_state_volume"] = "d" * 64
+    if fault == "creation_lost_ack":
+        state["clients"] = [{"phase": "container_create", "Popen_attempted": True}]
+        state["registration_submitted"] = False
     buildx_config = output / "buildx-config"
     buildx_config.mkdir(mode=0o700)
     config_stat = buildx_config.lstat()
@@ -760,12 +770,12 @@ def exercise_owned_cleanup_fault(
         json.dumps(
             {
                 "Name": "smg-moriio-123-1",
-                "Driver": "docker-container",
+                "Driver": "foreign" if foreign else "remote",
                 "Nodes": [
                     {
                         "Name": "smg-moriio-123-10",
-                        "Endpoint": "unix:///var/run/docker.sock",
-                        "DriverOpts": {"image": "foreign" if foreign else p.BUILDKIT},
+                        "Endpoint": state["builder_endpoint"],
+                        "DriverOpts": {},
                     }
                 ],
             }
@@ -790,7 +800,9 @@ def exercise_owned_cleanup_fault(
         deadline=time.monotonic() + 15,
         builder="smg-moriio-123-1",
         name="buildx_buildkit_smg-moriio-123-10",
-        owned_id=None if fault.startswith(("registration", "unwitnessed")) else "a" * 64,
+        owned_id=None
+        if fault.startswith(("registration", "unwitnessed", "creation_lost_ack"))
+        else "a" * 64,
         creation_submitted=True,
         docker=["docker"],
         failure=None,
@@ -866,27 +878,44 @@ def exercise_owned_cleanup_fault(
                         "Name": "/" + namespace["name"],
                         "Config": {"Image": "foreign" if foreign else p.BUILDKIT},
                         "State": {"Running": not stopped, "Pid": 0 if stopped else 123},
+                        "Mounts": [
+                            {
+                                "Destination": "/var/lib/buildkit",
+                                "Type": "volume",
+                                "Driver": "local",
+                                "RW": True,
+                                "Name": "c" * 64,
+                            },
+                            {
+                                "Destination": "/etc/buildkit/buildkitd.toml",
+                                "Type": "bind",
+                                "RW": False,
+                                "Source": str(output / "buildkitd.toml"),
+                            },
+                        ],
                     }
                 ]
             )
         elif argv[1] == "stop":
             assert argv == ["docker", "stop", "--time", "5", "a" * 64]
             payload = "stopped"
+        elif argv[1] == "rm":
+            assert argv == ["docker", "rm", "--volumes", "a" * 64]
+            payload = "removed exact owned container and anonymous state"
         elif argv[1:3] == ["buildx", "inspect"]:
             raise AssertionError("Buildx 0.21 inspect does not support --format")
         elif argv[1:3] == ["buildx", "ls"]:
             payload = ""
         elif argv[1:3] == ["buildx", "rm"]:
-            expected = (
-                ["docker", "buildx", "rm"]
-                + (["--keep-daemon"] if fault.startswith("registration") else [])
-                + [namespace["builder"]]
-            )
+            expected = ["docker", "buildx", "rm"] + ["--keep-daemon"] + [namespace["builder"]]
             assert argv == expected
             payload = "removed"
         elif argv[1] == "ps":
             assert "id=" + "a" * 64 in argv or "name=^/" + namespace["name"] + "$" in argv
             payload = "a" * 64 if fault.startswith("unwitnessed") else ""
+        elif argv[1:3] == ["volume", "ls"]:
+            assert "name=^" + "c" * 64 + "$" in argv
+            payload = ""
         else:
             raise AssertionError("No productive or unknown Docker command is allowed")
         code = "print(" + repr(payload) + ")"
@@ -1001,7 +1030,7 @@ class ReceiptFaultCleanup(unittest.TestCase):
             self.assertIsInstance(error, OSError)
             self.assertIn("original persistent receipt fault", str(error))
             self.assertTrue(ns["state"].get("cleanup_verified_absent"))
-            self.assertIn(["docker", "buildx", "rm", "smg-moriio-123-1"], calls)
+            self.assertIn(["docker", "rm", "--volumes", "a" * 64], calls)
             self.assertTrue(ns["state"].get("receipt_failures"))
             self.assertTrue(
                 all(c["reaped"] and c["PG_gone"] is True for c in ns["state"]["clients"])
@@ -1115,7 +1144,7 @@ class CleanupStderrDiagnostics(unittest.TestCase):
             self.assertTrue(ns["state"]["cleanup_verified_absent"])
             payload = json.loads(fallback.getvalue())
             self.assertTrue(payload["cleanup_verified_absent"])
-            self.assertIn(["docker", "buildx", "rm", "smg-moriio-123-1"], calls)
+            self.assertIn(["docker", "rm", "--volumes", "a" * 64], calls)
             self.assertTrue(all("stderr_tail" in c for c in payload["cleanup_clients"]))
             self.assertTrue(all(c["reaped"] and c["PG_gone"] for c in ns["state"]["clients"]))
 
@@ -1291,6 +1320,263 @@ class CurrentBoundaryControls(unittest.TestCase):
             self.assertEqual(saved["pending_signal"], signal.SIGTERM)
             self.assertEqual(saved["status"], "failed_or_published_incomplete_requires_readback")
             self.assertTrue(ns["state"]["cleanup_verified_absent"])
+
+
+class AttributableCreation(unittest.TestCase):
+    def run_create(self, directory, code, hook=None, namespace=None):
+        ns = namespace or actual_client_namespace(directory, hook)
+        ns["state"].update(
+            docker_daemon_id="qualified-test-daemon", container_create_argv=["docker", "create"]
+        )
+        value = ns["command"](
+            "container_create",
+            [sys.executable, "-I", "-S", "-B", "-c", code],
+            capture=True,
+            on_success=ns["creation_ack"],
+        )
+        return ns, value
+
+    def test_actual_successful_client_id_is_bound_before_return(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns, value = self.run_create(directory, "print('a'*64)")
+            receipt = ns["state"]["container_creation_receipt"]
+            self.assertEqual(value, b"a" * 64 + b"\n")
+            self.assertEqual(receipt["Id"], "a" * 64)
+            self.assertEqual(receipt["actual_exit"], 0)
+            self.assertEqual(receipt["endpoint"], "unix:///var/run/docker.sock")
+            self.assertEqual(receipt["client_handle"], ns["state"]["clients"][-1]["handle"])
+            self.assertTrue(ns["state"]["clients"][-1]["reaped"])
+            self.assertEqual(
+                json.loads((Path(directory) / "result.json").read_text())[
+                    "container_creation_receipt"
+                ],
+                receipt,
+            )
+
+    def test_nonzero_client_cannot_authorize_even_valid_id_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns = actual_client_namespace(directory)
+            with self.assertRaises(AssertionError):
+                self.run_create(directory, "print('a'*64); raise SystemExit(125)", namespace=ns)
+            self.assertNotIn("container_creation_receipt", ns["state"])
+            self.assertTrue(ns["state"]["clients"][-1]["reaped"])
+
+    def test_success_with_malformed_or_multiple_id_is_not_adopted(self):
+        for text in ["a" * 63, "z" * 64, "a" * 64 + "\n" + "b" * 64]:
+            with self.subTest(text=text), tempfile.TemporaryDirectory() as directory:
+                ns = actual_client_namespace(directory)
+                with self.assertRaises(AssertionError):
+                    self.run_create(directory, "print(" + repr(text) + ")", namespace=ns)
+                self.assertNotIn("container_creation_receipt", ns["state"])
+
+    def test_returned_event_failure_retains_successful_creation_identity(self):
+        def fail(phase, _extra, _ns):
+            if phase == "container_create_returned":
+                raise OSError("actual returned-receipt fault")
+
+        with tempfile.TemporaryDirectory() as directory:
+            ns = actual_client_namespace(directory, fail)
+            with self.assertRaisesRegex(OSError, "returned-receipt"):
+                self.run_create(directory, "print('a'*64)", namespace=ns)
+            self.assertEqual(ns["state"]["container_creation_receipt"]["Id"], "a" * 64)
+            self.assertTrue(ns["state"]["clients"][-1]["reaped"])
+
+    def test_cancellation_after_response_retains_id_before_delivery(self):
+        def cancel(phase, _extra, ns):
+            if phase == "container_create_returned":
+                ns["interrupted"](signal.SIGTERM, None)
+
+        with tempfile.TemporaryDirectory() as directory:
+            ns = actual_client_namespace(directory, cancel)
+            with self.assertRaisesRegex(RuntimeError, "cancellation pending"):
+                self.run_create(directory, "print('a'*64)", namespace=ns)
+            self.assertEqual(ns["state"]["container_creation_receipt"]["Id"], "a" * 64)
+            self.assertTrue(ns["state"]["clients"][-1]["pending_cancel_delivered"])
+
+    def test_lost_create_ack_stays_hold_even_when_name_scan_is_empty(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns, calls, error = exercise_owned_cleanup_fault(directory, "creation_lost_ack")
+            self.assertIsInstance(error, RuntimeError)
+            self.assertIsNone(ns["owned_id"])
+            self.assertTrue(ns["state"]["cleanup_unwitnessed_container"])
+            self.assertFalse(ns["state"].get("cleanup_verified_absent", False))
+            self.assertFalse(any(a[1] in {"start", "stop", "rm", "buildx"} for a in calls))
+
+    def test_failed_creation_receipt_retains_known_id_and_blocks_productive_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns = actual_client_namespace(directory)
+            original = ns["write_json"]
+
+            def fail_receipt(path, value):
+                if "container_creation_receipt" in value:
+                    raise OSError("creation receipt unavailable")
+                return original(path, value)
+
+            ns["write_json"] = fail_receipt
+            with self.assertRaisesRegex(OSError, "creation receipt"):
+                self.run_create(directory, "print('a'*64)", namespace=ns)
+            self.assertEqual(ns["state"]["container_creation_receipt"]["Id"], "a" * 64)
+            self.assertTrue(ns["client_control"]["receipt_failed"])
+            before = len(ns["state"]["clients"])
+            with self.assertRaises(Exception):
+                ns["command"]("later_productive", [sys.executable, "-c", "pass"])
+            self.assertTrue(all(not c["Popen_attempted"] for c in ns["state"]["clients"][before:]))
+
+    def flow(self, directory, fault=None):
+        """Exact productive creation statements with protocol responses, never Docker."""
+        pub = ast.parse(textwrap.dedent(inspect.getsource(p.publish))).body[0]
+        body = next(n for n in pub.body if isinstance(n, ast.Try)).body
+        first = next(
+            i
+            for i, n in enumerate(body)
+            if isinstance(n, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "create" for t in n.targets)
+        )
+        last = next(
+            i
+            for i, n in enumerate(body[first:], first)
+            if isinstance(n, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "actual" for t in n.targets)
+        )
+        out = Path(directory)
+        ns = dict(
+            p.__dict__,
+            state={"docker_daemon_id": "qualified-test-daemon"},
+            docker=["docker"],
+            output=out,
+            config=out / "buildkitd.toml",
+            builder="owned-builder",
+            name="owned-container",
+            owned_id=None,
+        )
+        ns["persist"] = lambda: p.write_json(out / "result.json", ns["state"])
+        ns["event"] = lambda *_a, **_k: None
+        selected = [
+            n
+            for n in pub.body
+            if isinstance(n, ast.FunctionDef)
+            and n.name in {"inspect", "verify_owned", "creation_ack", "bind_created_storage"}
+        ]
+        exec(
+            compile(
+                ast.fix_missing_locations(ast.Module(body=selected, type_ignores=[])),
+                "<actual creation closures>",
+                "exec",
+            ),
+            ns,
+        )
+        calls = []
+
+        def command(phase, argv, **kwargs):
+            calls.append((phase, argv))
+            if phase == "container_create":
+                if fault == "foreign_conflict":
+                    raise RuntimeError("create conflict; foreign matching container")
+                kwargs["on_success"](
+                    b"a" * 64 + b"\n", {"handle": {"pid": 123, "start_ticks": 456}}
+                )
+                return b"a" * 64 + b"\n"
+            if "inspect" in phase:
+                started = any(x[0] == "start" for x in calls)
+                return json.dumps(
+                    [
+                        {
+                            "Id": "b" * 64 if fault == "replaced_id" else "a" * 64,
+                            "Name": "/owned-container",
+                            "Config": {"Image": p.BUILDKIT},
+                            "State": {"Running": started, "Pid": 123 if started else 0},
+                            "HostConfig": {
+                                "CpuQuota": p.QUOTA,
+                                "CpuPeriod": p.PERIOD,
+                                "Memory": p.MEMORY,
+                                "MemorySwap": p.MEMORY,
+                                "NetworkMode": "bridge",
+                            },
+                            "Mounts": [
+                                {
+                                    "Destination": "/var/lib/buildkit",
+                                    "Type": "volume",
+                                    "Driver": "local",
+                                    "RW": True,
+                                    "Name": "c" * 64,
+                                },
+                                {
+                                    "Destination": "/etc/buildkit/buildkitd.toml",
+                                    "Type": "bind",
+                                    "RW": False,
+                                    "Source": "/foreign/config"
+                                    if fault == "wrong_config"
+                                    else str(ns["config"]),
+                                },
+                            ],
+                        }
+                    ]
+                ).encode()
+            return b""
+
+        ns["command"] = command
+        ns["registration_identity"] = lambda: (
+            None
+        )  # Registration byte identity has separate real-file tests.
+        error = None
+        try:
+            exec(
+                compile(
+                    ast.fix_missing_locations(ast.Module(body=body[first:last], type_ignores=[])),
+                    "<actual productive creation>",
+                    "exec",
+                ),
+                ns,
+            )
+        except Exception as exc:
+            error = exc
+        return ns, calls, error
+
+    def test_productive_path_uses_returned_id_and_readonly_remote_registration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns, calls, error = self.flow(directory)
+            self.assertIsNone(error)
+            self.assertEqual(ns["owned_id"], "a" * 64)
+            self.assertIn(("start", ["docker", "start", "a" * 64]), calls)
+            register = next(argv for phase, argv in calls if phase == "register")
+            self.assertEqual(
+                register[-3:],
+                ["--driver", "remote", "docker-container://" + "a" * 64 + "?context=default"],
+            )
+            self.assertTrue(
+                all(argv[-1] == "a" * 64 for phase, argv in calls if "inspect" in phase)
+            )
+            create = calls[0][1]
+            self.assertIn("type=volume,volume-driver=local,dst=/var/lib/buildkit", create)
+            self.assertFalse(any("src=" in arg for arg in create if "type=volume" in arg))
+
+    def test_conflict_does_not_adopt_matching_foreign_container_or_start_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns, calls, error = self.flow(directory, "foreign_conflict")
+            self.assertIsInstance(error, RuntimeError)
+            self.assertIsNone(ns["owned_id"])
+            self.assertEqual([phase for phase, _ in calls], ["container_create"])
+
+    def test_returned_id_replacement_stops_before_registration_start_or_build(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _ns, calls, error = self.flow(directory, "replaced_id")
+            self.assertIsInstance(error, AssertionError)
+            self.assertFalse(
+                any(phase in {"register", "start", "bootstrap", "full_build"} for phase, _ in calls)
+            )
+
+    def test_wrong_readonly_configuration_binding_cannot_start_builder(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _ns, calls, error = self.flow(directory, "wrong_config")
+            self.assertIsInstance(error, AssertionError)
+            self.assertFalse(any(phase == "start" for phase, _ in calls))
+
+    def test_changed_state_mount_cannot_authorize_container_or_volume_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns, calls, error = exercise_owned_cleanup_fault(directory, "changed_state_mount")
+            self.assertIsInstance(error, AssertionError)
+            self.assertFalse(ns["state"].get("cleanup_verified_absent", False))
+            self.assertFalse(any(a[1] in {"stop", "rm"} for a in calls))
 
 
 if __name__ == "__main__":

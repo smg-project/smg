@@ -66,6 +66,11 @@ def write_json(path, value):
             stream.flush()
             os.fsync(stream.fileno())
         temporary.replace(path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     except BaseException:
         try:
             temporary.unlink(missing_ok=True)
@@ -350,7 +355,14 @@ def publish(engine_checkout, output):
     name = "buildx_buildkit_" + builder + "0"
     owned_id = None
     creation_submitted = False
-    docker = ["docker", "--host", "unix:///var/run/docker.sock"]
+    docker_binary = shutil.which("docker")
+    assert docker_binary, "Docker CLI is required"
+    docker_binary = str(Path(docker_binary).resolve())
+    state["docker_cli_identity"] = {
+        "path": docker_binary,
+        "sha256": digest(Path(docker_binary).read_bytes()),
+    }
+    docker = [docker_binary, "--host", "unix:///var/run/docker.sock"]
     env = {
         k: v
         for k, v in os.environ.items()
@@ -409,7 +421,7 @@ def publish(engine_checkout, output):
         state["events"].append({"phase": phase, **extra})
         persist()
 
-    def command(phase, argv, until=None, capture=False, cwd=None):
+    def command(phase, argv, until=None, capture=False, cwd=None, on_success=None):
         until = deadline if until is None else until
         client = {
             "phase": phase,
@@ -527,6 +539,11 @@ def publish(engine_checkout, output):
                 )
                 if capture or cleaning:
                     assert len(stdout) <= 4 * 1024**2, "metadata output too large"
+                if on_success is not None:
+                    # Bind successful creation output while signals are deferred,
+                    # before the fallible returned-event write or cancellation handoff.
+                    assert capture and complete["stdout"] and not truncated["stdout"]
+                    on_success(stdout, client)
         except BaseException as exc:
             error = exc
         finally:
@@ -636,7 +653,8 @@ def publish(engine_checkout, output):
         return stdout
 
     def inspect(phase, until=None):
-        raw = command(phase, docker + ["inspect", name], until=until, capture=True)
+        selected = owned_id or state.get("container_creation_receipt", {}).get("Id") or name
+        raw = command(phase, docker + ["inspect", selected], until=until, capture=True)
         result = json.loads(raw)
         assert len(result) == 1 and result[0]["Name"] == "/" + name
         return result[0]
@@ -644,6 +662,38 @@ def publish(engine_checkout, output):
     def verify_owned(container):
         assert owned_id and container["Id"] == owned_id
         assert container["Config"]["Image"] == BUILDKIT and container["Name"] == "/" + name
+        assert state["container_creation_receipt"]["Id"] == owned_id
+
+    def bind_created_storage(container):
+        verify_owned(container)
+        mounts = container["Mounts"]
+        state_mount = [m for m in mounts if m["Destination"] == "/var/lib/buildkit"]
+        assert len(state_mount) == 1 and state_mount[0]["Type"] == "volume"
+        assert state_mount[0]["Driver"] == "local" and state_mount[0]["RW"]
+        assert re.fullmatch(r"[0-9a-f]{64}", state_mount[0]["Name"])
+        prior = state.get("created_anonymous_state_volume", state_mount[0]["Name"])
+        assert prior == state_mount[0]["Name"], "state mount changed after creation"
+        configs = [m for m in mounts if m["Destination"] == "/etc/buildkit/buildkitd.toml"]
+        assert len(configs) == 1 and configs[0]["Type"] == "bind" and not configs[0]["RW"]
+        assert configs[0]["Source"] == str(output / "buildkitd.toml")
+        assert len(mounts) == 2
+        state["created_anonymous_state_volume"] = state_mount[0]["Name"]
+
+    def creation_ack(stdout, client):
+        assert re.fullmatch(rb"[0-9a-f]{64}\n?", stdout), "invalid successful create ID"
+        created_id = stdout.decode().strip()
+        state["container_creation_receipt"] = {
+            "Id": created_id,
+            "endpoint": "unix:///var/run/docker.sock",
+            "daemon_id": state["docker_daemon_id"],
+            "client_handle": dict(client["handle"]),
+            "stdout_sha256": digest(stdout),
+            "actual_exit": 0,
+            "request": state["container_create_argv"],
+            "client_binary": state.get("docker_cli_identity"),
+        }
+        state["owned_builder_container_id"] = created_id
+        persist()
 
     def registration_identity():
         # Buildx store.NodeGroup is saved as JSON in BUILDX_CONFIG/instances/NAME.
@@ -676,11 +726,13 @@ def publish(engine_checkout, output):
         finally:
             os.close(config_dir)
         registration = json.loads(raw)
-        assert registration["Name"] == builder and registration["Driver"] == "docker-container"
+        assert registration["Name"] == builder and registration["Driver"] == "remote"
         nodes = registration["Nodes"]
         assert len(nodes) == 1 and nodes[0]["Name"] == builder + "0"
-        assert nodes[0]["Endpoint"] == "unix:///var/run/docker.sock"
-        assert nodes[0]["DriverOpts"]["image"] == BUILDKIT
+        assert nodes[0]["Endpoint"] == state["builder_endpoint"]
+        assert re.fullmatch(
+            r"docker-container://[0-9a-f]{64}\?context=default", nodes[0]["Endpoint"]
+        )
         event("cleanup_registration_identity", registration_sha256=digest(raw))
 
     def interrupted(signum, _frame):
@@ -728,6 +780,23 @@ def publish(engine_checkout, output):
         assert info["Name"].split(".")[0] == socket.gethostname().split(".")[0], "nonlocal daemon"
         assert info["NCPU"] >= 32 and info["MemTotal"] >= MEMORY
         assert info["OSType"] == "linux" and info["Architecture"] in ("x86_64", "amd64")
+        state["docker_daemon_id"] = info["ID"]
+        assert isinstance(info["ID"], str) and info["ID"]
+        state["docker_versions"] = json.loads(
+            command("docker_versions", docker + ["version", "--format", "{{json .}}"], capture=True)
+        )
+        state["buildx_version"] = command(
+            "buildx_version", docker + ["buildx", "version"], capture=True
+        ).decode()
+        default_context = json.loads(
+            command(
+                "default_context",
+                [docker_binary, "--context", "default", "context", "inspect", "default"],
+                capture=True,
+            )
+        )
+        assert len(default_context) == 1
+        assert default_context[0]["Endpoints"]["docker"]["Host"] == "unix:///var/run/docker.sock"
         assert (
             shutil.disk_usage(info["DockerRootDir"]).free >= DISK
             and shutil.disk_usage(output).free >= DISK
@@ -768,38 +837,65 @@ def publish(engine_checkout, output):
             write_json(output / (kind + "-material.json"), material)
         config = output / "buildkitd.toml"
         config.write_text("[worker.oci]\n  max-parallelism = 2\n")
-        event("create_intent", builder=builder, container_name=name)
-        creation_submitted = True
-        command(
-            "create",
-            docker
-            + [
-                "buildx",
-                "create",
-                "--name",
-                builder,
-                "--driver",
-                "docker-container",
-                "--driver-opt",
-                "image=" + BUILDKIT,
-                "--driver-opt",
-                "cpu-quota=3200000",
-                "--driver-opt",
-                "cpu-period=100000",
-                "--driver-opt",
-                "memory=128g",
-                "--driver-opt",
-                "memory-swap=128g",
-                "--buildkitd-config",
-                str(config),
-            ],
+        assert "," not in str(config), "ambiguous Docker mount source"
+        command("buildkit_pull", docker + ["pull", BUILDKIT])
+        image_config = json.loads(
+            command("buildkit_config", docker + ["image", "inspect", BUILDKIT], capture=True)
         )
+        assert len(image_config) == 1
+        assert image_config[0]["Config"]["Entrypoint"] in (["buildkitd"], ["/usr/bin/buildkitd"])
+        create = docker + [
+            "create",
+            "--pull=never",
+            "--name",
+            name,
+            "--privileged",
+            "--init",
+            "--restart=no",
+            "--cpu-quota=3200000",
+            "--cpu-period=100000",
+            "--memory=128g",
+            "--memory-swap=128g",
+            "--mount",
+            "type=volume,volume-driver=local,dst=/var/lib/buildkit",
+            "--mount",
+            "type=bind,src=" + str(config) + ",dst=/etc/buildkit/buildkitd.toml,readonly",
+            BUILDKIT,
+            "--config=/etc/buildkit/buildkitd.toml",
+        ]
+        state["container_create_argv"] = create
+        event("create_intent", builder=builder, container_name=name, argv=create)
+        creation_submitted = True
+        command("container_create", create, capture=True, on_success=creation_ack)
+        owned_id = state["container_creation_receipt"]["Id"]
+        container = inspect("created_container_inspect")
+        verify_owned(container)
+        assert not container["State"]["Running"] and container["State"]["Pid"] == 0
+        bind_created_storage(container)
+        created_limits = container["HostConfig"]
+        assert (
+            created_limits["CpuQuota"],
+            created_limits["CpuPeriod"],
+            created_limits["Memory"],
+            created_limits["MemorySwap"],
+        ) == (QUOTA, PERIOD, MEMORY, MEMORY)
+        assert not created_limits.get("Devices") and not created_limits.get("DeviceRequests")
+        assert (
+            created_limits.get("NetworkMode") != "host" and created_limits.get("PidMode") != "host"
+        )
+        endpoint = "docker-container://" + owned_id + "?context=default"
+        state["builder_endpoint"] = endpoint
+        command("start", docker + ["start", owned_id])
+        state["registration_submitted"] = True
+        command(
+            "register",
+            docker + ["buildx", "create", "--name", builder, "--driver", "remote", endpoint],
+        )
+        registration_identity()
         command("bootstrap", docker + ["buildx", "inspect", builder, "--bootstrap"])
         container = inspect("builder_inspect")
         assert container["Config"]["Image"] == BUILDKIT
-        owned_id = container["Id"]
-        state["owned_builder_container_id"] = owned_id
-        persist()
+        verify_owned(container)
         actual = container["HostConfig"]
         assert (
             actual["CpuQuota"],
@@ -968,6 +1064,8 @@ def publish(engine_checkout, output):
         signal.setitimer(signal.ITIMER_REAL, 60)
         try:
             if creation_submitted:
+                if owned_id is None:
+                    owned_id = state.get("container_creation_receipt", {}).get("Id")
                 # A failed create/bootstrap may still have made our exact container.
                 if owned_id is None:
                     remaining = command(
@@ -985,13 +1083,18 @@ def publish(engine_checkout, output):
                         cleanup_deadline - 10,
                         capture=True,
                     )
-                    if not remaining.strip():
-                        registration_identity()
-                        command(
-                            "cleanup_remove_registration",
-                            docker + ["buildx", "rm", "--keep-daemon", builder],
-                            cleanup_deadline - 5,
-                        )
+                    create_unknown = any(
+                        c["phase"] == "container_create" and c["Popen_attempted"]
+                        for c in state.get("clients", [])
+                    )
+                    if not remaining.strip() and not create_unknown:
+                        if state.get("registration_submitted"):
+                            registration_identity()
+                            command(
+                                "cleanup_remove_registration",
+                                docker + ["buildx", "rm", "--keep-daemon", builder],
+                                cleanup_deadline - 5,
+                            )
                         after = command(
                             "cleanup_registration_absence",
                             docker + ["buildx", "ls", "--format", "{{.Name}}"],
@@ -1051,6 +1154,7 @@ def publish(engine_checkout, output):
                 if owned_id is not None:
                     container = inspect("cleanup_identity", cleanup_deadline - 10)
                     verify_owned(container)
+                    bind_created_storage(container)
                     command(
                         "cleanup_stop",
                         docker + ["stop", "--time", "5", owned_id],
@@ -1060,12 +1164,20 @@ def publish(engine_checkout, output):
                     verify_owned(container)
                     assert not container["State"]["Running"] and container["State"]["Pid"] == 0
                     state["cleanup_verified_stopped_PID0"] = True
-                    # Only this newly created builder; no --all/prune/foreign removal.
+                    # ID came from this successful create. State was requested as a
+                    # new anonymous volume, never by a reusable external volume name.
                     command(
                         "cleanup_remove_builder",
-                        docker + ["buildx", "rm", builder],
+                        docker + ["rm", "--volumes", owned_id],
                         cleanup_deadline - 3,
                     )
+                    if state.get("registration_submitted"):
+                        registration_identity()
+                        command(
+                            "cleanup_remove_registration",
+                            docker + ["buildx", "rm", "--keep-daemon", builder],
+                            cleanup_deadline - 2,
+                        )
                     remaining = command(
                         "cleanup_final_absence",
                         docker
@@ -1082,6 +1194,23 @@ def publish(engine_checkout, output):
                         capture=True,
                     )
                     assert not remaining.strip()
+                    if state.get("created_anonymous_state_volume"):
+                        volumes = command(
+                            "cleanup_state_volume_absence",
+                            docker
+                            + [
+                                "volume",
+                                "ls",
+                                "--filter",
+                                "name=^" + state["created_anonymous_state_volume"] + "$",
+                                "--format",
+                                "{{.Name}}",
+                            ],
+                            cleanup_deadline,
+                            capture=True,
+                        )
+                        assert not volumes.strip()
+                        state["cleanup_verified_anonymous_state_absent"] = True
                     state["cleanup_verified_absent"] = True
             else:
                 state["cleanup_verified_stopped_PID0"] = True

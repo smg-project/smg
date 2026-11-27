@@ -130,7 +130,7 @@ disk-retention scope.
 
 Buildx registration uses a fresh invocation-private configuration directory.
 Registration-only cleanup requires its unchanged directory identity, the exact
-builder/driver/node/image/endpoint, and successful empty-container observations;
+builder/remote-driver/node/ID endpoint, and successful empty-container observations;
 it uses `--keep-daemon` and verifies registration absence. Unknown or foreign
 identity remains incomplete. Final cancellation and the first productive or
 cleanup exception remain failures even if the final receipt cannot be written.
@@ -154,9 +154,28 @@ If that receipt is missing, conflicting or ambiguous, retain HOLD and leave the
 container and its state volume untouched. This handoff does not authorize an
 automatic retry, adoption, `stop`, `rm`, volume removal or shared cleanup.
 
-The current Buildx CLI path does not expose an attributable creation ID to this
-publisher. Its post-bootstrap name/image checks therefore remain an open
-production ownership gap. Image publication admission stays HOLD until a
-supported creation-ID mechanism and its conflict/lost-response cases are
-independently qualified. This documentation and the CPU oracles do not close
-that gap or qualify a real builder/image.
+The publisher creates the pinned BuildKit container directly. Only successful
+`docker create` exit zero plus a complete single 64-hex ID response establishes
+ownership. It binds that response, client identity and local daemon endpoint
+before fallible receipt writes or deferred cancellation. Name conflicts,
+nonzero exit, malformed or missing responses cannot authorize adoption. A lost
+response remains HOLD even when a subsequent name scan is empty.
+
+The container receives the read-only BuildKit configuration, resource limits
+and a fresh anonymous local state volume. Before starting it, the publisher
+checks those mounts and limits against the returned container ID. It registers
+Buildx's remote driver at `docker-container://<full-ID>?context=default`, after
+confirming that context uses the same local Unix endpoint. Start, inspection,
+stop and container removal use the returned ID. The remote driver does not
+create or remove the daemon. Container removal includes its anonymous volume,
+whose absence is checked separately; private registration removal retains the
+daemon. A changed identity or storage binding retains an unresolved failure.
+
+This route follows [Buildx remote driver v0.21.3](https://github.com/docker/buildx/blob/v0.21.3/driver/remote/driver.go)
+and its [BuildKit v0.20.0 Docker connection helper](https://github.com/moby/buildkit/blob/v0.20.0/client/connhelper/dockercontainer/dockercontainer.go).
+Docker documents [anonymous volumes](https://docs.docker.com/engine/storage/volumes/)
+and [container removal with associated anonymous volumes](https://docs.docker.com/reference/cli/docker/container/rm/).
+CPU controls cover the real child-process response boundary and protocol
+positive/negative paths. They do not qualify the installed Docker/Buildx,
+physical daemon, image export, registry delivery or resource release. Those
+remain part of a separately admitted actual publication operation.
