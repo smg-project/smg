@@ -918,5 +918,5 @@ fn give_up(elector: &mut Elector) {
 }
 
 #[cfg(test)]
-#[path = "../../../tests/unit/service/controller/election/tests.rs"]
+#[path = "../../../tests/unit/service/controller/election/tests/mod.rs"]
 pub(super) mod tests;
