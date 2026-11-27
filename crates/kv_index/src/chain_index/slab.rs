@@ -165,8 +165,76 @@ impl Run {
 
 pub(super) struct RunChunk {
     pub(super) runs: Box<[Run]>,
-    /// `words` coverage words per run, run-major.
-    pub(super) coverage: Box<[AtomicU64]>,
+    /// Word 0 of every run's coverage (workers 0 to 63), made with the chunk.
+    first: Box<[AtomicU64]>,
+    /// Every further word of the runs' coverage, one array a word, made when a worker of
+    /// that word first holds a whole run of this chunk. A word whose array is missing reads
+    /// as zero, so a fleet that fits one word holds one word a run, not the index's ceiling.
+    more: Box<[OnceLock<Box<[AtomicU64]>>]>,
+}
+
+/// The coverage words of one run: the workers that hold the whole run.
+#[derive(Clone, Copy)]
+pub(super) struct Coverage<'a> {
+    chunk: &'a RunChunk,
+    slot: usize,
+}
+
+impl<'a> Coverage<'a> {
+    /// Words a run can hold: the index's ceiling of workers, in words.
+    #[inline]
+    pub(super) fn words(self) -> usize {
+        1 + self.chunk.more.len()
+    }
+
+    /// Word `index`; zero where no worker of that word ever held a run of the chunk.
+    #[inline]
+    pub(super) fn word(self, index: usize) -> u64 {
+        self.cell(index)
+            .map_or(0, |word| word.load(Ordering::Relaxed))
+    }
+
+    #[inline]
+    fn cell(self, index: usize) -> Option<&'a AtomicU64> {
+        if index == 0 {
+            return Some(&self.chunk.first[self.slot]);
+        }
+        self.chunk.more[index - 1]
+            .get()
+            .map(|words| &words[self.slot])
+    }
+
+    /// The cell of word `index`, its array made first where no worker of that word held a
+    /// run of the chunk yet.
+    #[inline]
+    fn cell_or_make(self, index: usize) -> &'a AtomicU64 {
+        if index == 0 {
+            return &self.chunk.first[self.slot];
+        }
+        &self.chunk.more[index - 1].get_or_init(zeroed_words)[self.slot]
+    }
+
+    /// Every word, in order.
+    pub(super) fn to_words(self) -> Vec<u64> {
+        (0..self.words()).map(|index| self.word(index)).collect()
+    }
+
+    /// Store the first `words` words of this run into `to`, a run not yet in the tree: past
+    /// the words a worker can hold a bit in, both sides read zero already.
+    pub(super) fn copy_into(self, to: Coverage<'_>, words: usize) {
+        for index in 0..words {
+            let value = self.word(index);
+            if value != 0 {
+                to.cell_or_make(index).store(value, Ordering::Relaxed);
+            } else if let Some(word) = to.cell(index) {
+                word.store(0, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+fn zeroed_words() -> Box<[AtomicU64]> {
+    (0..RUN_CHUNK).map(|_| AtomicU64::new(0)).collect()
 }
 
 /// Run storage: a directory of fixed-size chunks created on first use, with a free list of dead
@@ -192,9 +260,8 @@ impl RunSlab {
     pub(super) fn chunk(&self, index: usize) -> &RunChunk {
         self.dir[index].get_or_init(|| RunChunk {
             runs: (0..RUN_CHUNK).map(|_| Run::blank()).collect(),
-            coverage: (0..RUN_CHUNK * self.words)
-                .map(|_| AtomicU64::new(0))
-                .collect(),
+            first: zeroed_words(),
+            more: (1..self.words).map(|_| OnceLock::new()).collect(),
         })
     }
 
@@ -205,11 +272,12 @@ impl RunSlab {
     }
 
     #[inline]
-    pub(super) fn coverage(&self, id: u32) -> &[AtomicU64] {
+    pub(super) fn coverage(&self, id: u32) -> Coverage<'_> {
         let id = id as usize;
-        let chunk = self.chunk(id >> RUN_CHUNK_BITS);
-        let first = (id & (RUN_CHUNK - 1)) * self.words;
-        &chunk.coverage[first..first + self.words]
+        Coverage {
+            chunk: self.chunk(id >> RUN_CHUNK_BITS),
+            slot: id & (RUN_CHUNK - 1),
+        }
     }
 
     /// A run that is not yet reachable from the tree: a dead header given its next life, or a
@@ -218,7 +286,7 @@ impl RunSlab {
         if let Some(id) = self.free.pop() {
             let run = self.run(id);
             let mut meta = run.meta.lock();
-            debug_assert!(meta.dead && coverage_is_empty(self.coverage(id)));
+            debug_assert!(meta.dead && coverage_is_empty(self.coverage(id), self.words));
             meta.dead = false;
             run.reincarnate(start, parent, window);
             return id;
@@ -245,61 +313,74 @@ impl RunSlab {
         self.next.load(Ordering::Relaxed) as usize
     }
 
-    /// Bytes of chunks taken from the process allocator: headers and coverage words of every
-    /// slot, used or not.
+    /// Bytes of chunks taken from the process allocator: the headers and the first coverage
+    /// word of every slot, used or not, and every further word array a chunk has made.
     pub(super) fn chunk_bytes(&self) -> usize {
-        let chunks = self
-            .dir
+        let word_array = RUN_CHUNK * size_of::<AtomicU64>();
+        self.dir
             .iter()
-            .filter(|chunk| chunk.get().is_some())
-            .count();
-        chunks * RUN_CHUNK * (size_of::<Run>() + self.words * size_of::<AtomicU64>())
+            .filter_map(OnceLock::get)
+            .map(|chunk| {
+                let made = chunk
+                    .more
+                    .iter()
+                    .filter(|words| words.get().is_some())
+                    .count();
+                RUN_CHUNK * size_of::<Run>()
+                    + (1 + made) * word_array
+                    + chunk.more.len() * size_of::<OnceLock<Box<[AtomicU64]>>>()
+            })
+            .sum()
     }
 }
 
 #[inline]
-pub(super) fn has(coverage: &[AtomicU64], worker: u32) -> bool {
-    coverage[(worker / 64) as usize].load(Ordering::Relaxed) & (1u64 << (worker % 64)) != 0
+pub(super) fn has(coverage: Coverage<'_>, worker: u32) -> bool {
+    coverage.word((worker / 64) as usize) & (1u64 << (worker % 64)) != 0
 }
 
 /// By release, as [`clear`]: a later holder writes a word of a run it did not make, and a
 /// reader may still hold the run from the life before. One that reads the word and then
 /// passes its acquire fence reads, in its check of the version, the step that ended that
 /// life.
-pub(super) fn set(coverage: &[AtomicU64], worker: u32) {
-    coverage[(worker / 64) as usize].fetch_or(1u64 << (worker % 64), Ordering::Release);
-}
-
-pub(super) fn clear(coverage: &[AtomicU64], worker: u32) {
-    coverage[(worker / 64) as usize].fetch_and(!(1u64 << (worker % 64)), Ordering::Release);
-}
-
-pub(super) fn coverage_is_empty(coverage: &[AtomicU64]) -> bool {
+pub(super) fn set(coverage: Coverage<'_>, worker: u32) {
     coverage
-        .iter()
-        .all(|word| word.load(Ordering::Relaxed) == 0)
+        .cell_or_make((worker / 64) as usize)
+        .fetch_or(1u64 << (worker % 64), Ordering::Release);
 }
 
-/// Exactly `worker` and nobody else.
-pub(super) fn covered_only_by(coverage: &[AtomicU64], worker: u32) -> bool {
+/// A word whose array was never made holds no bit to clear, and none is made for it.
+pub(super) fn clear(coverage: Coverage<'_>, worker: u32) {
+    if let Some(word) = coverage.cell((worker / 64) as usize) {
+        word.fetch_and(!(1u64 << (worker % 64)), Ordering::Release);
+    }
+}
+
+/// Nobody, among the first `words` words: the words a worker can hold a bit in, or all of
+/// `coverage.words()`.
+pub(super) fn coverage_is_empty(coverage: Coverage<'_>, words: usize) -> bool {
+    (0..words).all(|index| coverage.word(index) == 0)
+}
+
+/// Exactly `worker` and nobody else, among the first `words` words.
+pub(super) fn covered_only_by(coverage: Coverage<'_>, worker: u32, words: usize) -> bool {
     let word = (worker / 64) as usize;
     let bit = 1u64 << (worker % 64);
-    coverage.iter().enumerate().all(|(index, slot)| {
-        let value = slot.load(Ordering::Relaxed);
-        if index == word {
-            value == bit
-        } else {
-            value == 0
-        }
-    })
+    word < words
+        && (0..words).all(|index| {
+            let value = coverage.word(index);
+            if index == word {
+                value == bit
+            } else {
+                value == 0
+            }
+        })
 }
 
-pub(super) fn workers(coverage: &[AtomicU64]) -> Vec<u32> {
-    coverage
-        .iter()
-        .enumerate()
-        .flat_map(|(index, word)| {
-            let value = word.load(Ordering::Relaxed);
+pub(super) fn workers(coverage: Coverage<'_>) -> Vec<u32> {
+    (0..coverage.words())
+        .flat_map(|index| {
+            let value = coverage.word(index);
             (0..64)
                 .filter(move |bit| value & (1u64 << bit) != 0)
                 .map(move |bit| (index * 64 + bit) as u32)

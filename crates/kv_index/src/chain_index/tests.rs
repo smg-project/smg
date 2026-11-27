@@ -1661,3 +1661,150 @@ fn the_deepest_read_keeps_only_the_workers_its_caller_names() {
     }
     assert_eq!(deepest(&index, &chain, &[], 16, 1).0, vec![]);
 }
+
+/// What one chunk of the run slab holds once `words` of its coverage word arrays are made.
+fn slab_chunk_bytes(words: usize) -> usize {
+    RUN_CHUNK * (size_of::<Run>() + words * size_of::<AtomicU64>())
+        + (MAX_WORDS - 1) * size_of::<OnceLock<Box<[AtomicU64]>>>()
+}
+
+/// A fleet that fits the first coverage word holds one word a run, however high the index's
+/// ceiling of workers is.
+#[test]
+fn a_fleet_within_one_word_holds_one_coverage_word_a_run() {
+    let index = ChainIndex::with_max_workers(MAX_WORDS * 64);
+    let held: Vec<ContentHash> = (0..4).map(|p| content(41, p)).collect();
+    let blocks = blocks_of(&held);
+    for name in 0..8 {
+        let worker = index.intern_worker(&format!("w{name}")).expect("id");
+        let mut map = ChainBlockMap::default();
+        index
+            .apply_stored(worker, &blocks, None, &mut map)
+            .expect("stored");
+    }
+    let stats = index.stats();
+    assert_eq!(stats.slab_bytes, slab_chunk_bytes(1));
+    assert_eq!(
+        stats.header_bytes,
+        stats.runs_allocated * (size_of::<Run>() + size_of::<AtomicU64>())
+    );
+    let mut holders = scores(&index, &held);
+    holders.sort_unstable();
+    assert_eq!(holders, (0..8u32).map(|w| (w, 4)).collect::<Vec<_>>());
+}
+
+/// The 65th worker of an index is the first of the second coverage word: its store gives the
+/// chunk that word's array, it is read as a holder beside the first 64, and its removal
+/// leaves them whole.
+#[test]
+fn the_sixty_fifth_worker_reads_and_writes_right() {
+    let index = ChainIndex::with_max_workers(MAX_WORDS * 64);
+    let held: Vec<ContentHash> = (0..4).map(|p| content(42, p)).collect();
+    let blocks = blocks_of(&held);
+    let mut maps = Vec::new();
+    for name in 0..65 {
+        let worker = index.intern_worker(&format!("w{name}")).expect("id");
+        let mut map = ChainBlockMap::default();
+        index
+            .apply_stored(worker, &blocks, None, &mut map)
+            .expect("stored");
+        if name == 63 {
+            assert_eq!(index.stats().slab_bytes, slab_chunk_bytes(1));
+        }
+        maps.push((worker, map));
+    }
+    assert_eq!(index.stats().slab_bytes, slab_chunk_bytes(2));
+    let mut holders = scores(&index, &held);
+    holders.sort_unstable();
+    assert_eq!(holders, (0..65u32).map(|w| (w, 4)).collect::<Vec<_>>());
+    let (last, map) = maps.pop().expect("the 65th");
+    assert_eq!(last, 64);
+    index.remove_worker(last, map);
+    let mut holders = scores(&index, &held);
+    holders.sort_unstable();
+    assert_eq!(holders, (0..64u32).map(|w| (w, 4)).collect::<Vec<_>>());
+}
+
+/// A split and a store read a run's coverage as far as a worker can hold a bit: a run only
+/// the 65th worker holds keeps that holder on both halves when a worker of the first word
+/// forks off it, and the 65th still grows its own leaf.
+#[test]
+fn a_split_and_a_store_read_a_holder_of_a_further_word() {
+    let index = ChainIndex::with_max_workers(MAX_WORDS * 64);
+    let near = index.intern_worker("w0").expect("id");
+    for name in 1..64 {
+        index.intern_worker(&format!("w{name}")).expect("id");
+    }
+    let far = index.intern_worker("w64").expect("id");
+    assert_eq!((near, far), (0, 64));
+    let (mut near_map, mut far_map) = (ChainBlockMap::default(), ChainBlockMap::default());
+    let base: Vec<ContentHash> = (0..6).map(|p| content(1, p)).collect();
+    let mut fork = base[..3].to_vec();
+    fork.extend((0..4).map(|p| content(2, p)));
+    let mut longer = base.clone();
+    longer.extend((6..8).map(|p| content(1, p)));
+    index
+        .apply_stored(far, &blocks_of(&base), None, &mut far_map)
+        .expect("store far");
+    index
+        .apply_stored(near, &blocks_of(&fork), None, &mut near_map)
+        .expect("store near");
+    assert_eq!(scores(&index, &base), vec![(near, 3), (far, 6)]);
+    assert_eq!(scores(&index, &fork), vec![(near, 7), (far, 3)]);
+    index
+        .apply_stored(far, &blocks_of(&longer), None, &mut far_map)
+        .expect("grow far");
+    assert_eq!(scores(&index, &longer), vec![(near, 3), (far, 8)]);
+    let mut reference = ReferenceIndexer::new();
+    reference
+        .apply_stored(far, &blocks_of(&base), None)
+        .expect("ref far");
+    reference
+        .apply_stored(near, &blocks_of(&fork), None)
+        .expect("ref near");
+    reference
+        .apply_stored(far, &blocks_of(&longer), None)
+        .expect("ref grow");
+    assert_eq!(index.debug_blocks(), reference.blocks());
+}
+
+/// A coverage word no worker reached reads as zero and stays unmade: neither a read nor a
+/// clear makes its array.
+#[test]
+fn a_missing_coverage_word_reads_as_zero() {
+    let slab = RunSlab::new(MAX_WORDS);
+    let coverage = slab.coverage(7);
+    set(coverage, 3);
+    assert!(has(coverage, 3));
+    assert!(!has(coverage, 64) && !has(coverage, 1023));
+    clear(coverage, 200);
+    assert_eq!(workers(coverage), vec![3]);
+    let words = coverage.words();
+    assert!(covered_only_by(coverage, 3, words) && !covered_only_by(coverage, 64, words));
+    assert!(!coverage_is_empty(coverage, words) && coverage_is_empty(slab.coverage(8), words));
+    assert_eq!(slab.chunk_bytes(), slab_chunk_bytes(1));
+    set(coverage, 200);
+    assert_eq!(workers(coverage), vec![3, 200]);
+    assert_eq!(slab.chunk_bytes(), slab_chunk_bytes(2));
+}
+
+/// Two stores that meet at the first bit of a word: the word's array is made once and both
+/// bits stand.
+#[test]
+fn two_stores_that_meet_at_the_first_bit_of_a_word_both_land() {
+    for round in 0..200u32 {
+        let slab = RunSlab::new(MAX_WORDS);
+        let gate = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for worker in [64u32, 65] {
+                let (slab, gate) = (&slab, &gate);
+                scope.spawn(move || {
+                    gate.wait();
+                    set(slab.coverage(round), worker);
+                });
+            }
+        });
+        assert_eq!(workers(slab.coverage(round)), vec![64, 65], "round {round}");
+        assert_eq!(slab.chunk_bytes(), slab_chunk_bytes(2));
+    }
+}
