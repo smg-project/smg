@@ -2072,6 +2072,85 @@ async fn an_engines_unattributed_report_on_a_constrained_request_keeps_its_shape
     );
 }
 
+#[tokio::test]
+async fn thinking_token_budget_requires_a_compatible_pair_to_retry_a_worker_failure() {
+    use smg_worker::labels::SUPPORTS_THINKING_TOKEN_BUDGET_LABEL;
+
+    use crate::routers::common::attempt_ledger::{mark_failed_side, mark_upstream_answer};
+
+    let registry = Arc::new(WorkerRegistry::new());
+    let register = |port, role, island, budget| {
+        register_worker_of_runtime(
+            &registry,
+            port,
+            role,
+            RuntimeType::Vllm,
+            &[
+                ("pairing_protocol", island),
+                (SUPPORTS_THINKING_TOKEN_BUDGET_LABEL, budget),
+            ],
+        )
+    };
+    register(9401, WorkerType::Prefill, "a", "true");
+    let first_decode = register(9402, WorkerType::Decode, "a", "true");
+    register(9403, WorkerType::Prefill, "b", "false");
+    register(9404, WorkerType::Decode, "b", "true");
+
+    let pipeline = completion_pipeline(&registry, Mode::PrefillDecode);
+    let request = serde_json::from_value(serde_json::json!({
+        "model": MODEL, "messages": [{"role": "user", "content": "hi"}], "thinking_token_budget": 0
+    }))
+    .unwrap();
+    let mut ctx = RequestContext::for_chat(
+        Arc::new(request),
+        None,
+        MODEL.into(),
+        components(Arc::clone(&registry)).await,
+    );
+    ctx.state.preparation = Some(PreparationOutput::Generate {
+        original_text: None,
+        token_ids: vec![1, 2, 3],
+    });
+    pipeline
+        .stages
+        .worker_selection
+        .execute(&mut ctx)
+        .await
+        .unwrap();
+    let ctx = Box::new(ctx).into_dispatch().unwrap();
+    assert_eq!(
+        ctx.workers.as_ref().unwrap().decode().unwrap().url(),
+        first_decode.url()
+    );
+
+    let failure = || {
+        let mut response = error::internal_error("engine_failure", "decode failed");
+        mark_upstream_answer(&mut response);
+        mark_failed_side(&mut response, first_decode.as_ref());
+        response
+    };
+
+    let mut original = failure();
+    pipeline.settle_attempt(&ctx, &mut original);
+    assert_eq!(original.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        error::extract_error_code_from_response(&original),
+        "engine_failure"
+    );
+    assert!(
+        !is_retryable_response(&original),
+        "the other decode has no capable partner"
+    );
+
+    register(9405, WorkerType::Prefill, "b", "true");
+    let mut replayable = failure();
+    pipeline.settle_attempt(&ctx, &mut replayable);
+    assert!(
+        is_retryable_response(&replayable),
+        "the other island can now serve this request"
+    );
+}
+
 /// A smaller engine is not an alternative to the engine that returned a
 /// definitive error: keep its 500, without a futile retry or a false 400.
 #[tokio::test]

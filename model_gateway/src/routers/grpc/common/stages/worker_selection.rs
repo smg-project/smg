@@ -96,6 +96,7 @@ const ACCEPTS_MEDIA_REFS: CandidateFilter<'static> = &accepts_media_refs;
 /// [`WorkerSelectionStage::selection_failure`].
 enum EpdSelectionFailure {
     Unavailable,
+    UnsupportedThinkingBudget,
     Placement(Box<PairFailure>),
     EcIncompatible,
     DecodeVisionUnsupported,
@@ -120,6 +121,7 @@ enum PdSelectionFailure {
     Placement(Box<PairFailure>),
     NoVisionCapablePrefill,
     Context(Box<Response>),
+    UnsupportedThinkingBudget,
 }
 
 impl From<Box<PairFailure>> for PdSelectionFailure {
@@ -197,7 +199,7 @@ pub(crate) enum WorkerSelectionMode {
     EncodePrefillDecode,
 }
 
-fn supports_thinking_budget(worker: &dyn Worker) -> bool {
+pub(crate) fn supports_thinking_budget(worker: &dyn Worker) -> bool {
     let spec = &worker.metadata().spec;
     matches!(spec.runtime_type, RuntimeType::Sglang | RuntimeType::Vllm)
         && spec
@@ -206,17 +208,24 @@ fn supports_thinking_budget(worker: &dyn Worker) -> bool {
             .is_some_and(|v| v == "true")
 }
 
-fn require_thinking_budget(workers: &WorkerSelection) -> Result<(), Response> {
-    for worker in workers.workers() {
-        if !supports_thinking_budget(worker.as_ref()) {
-            return Err(error::bad_request(
-                "unsupported_thinking_token_budget",
-                format!(
-                    "the selected {} worker does not advertise support for thinking_token_budget",
-                    worker.metadata().spec.runtime_type
-                ),
-            ));
-        }
+fn unsupported_thinking_budget(model_id: &str) -> Response {
+    error::bad_request(
+        "unsupported_thinking_token_budget",
+        format!("No compatible workers for model '{model_id}' advertise support for thinking_token_budget"),
+    )
+}
+
+fn check_selected_thinking_budget(
+    workers: &WorkerSelection,
+    model_id: &str,
+    required: bool,
+) -> Result<(), Response> {
+    if required
+        && workers
+            .workers()
+            .any(|w| !supports_thinking_budget(w.as_ref()))
+    {
+        return Err(unsupported_thinking_budget(model_id));
     }
     Ok(())
 }
@@ -467,12 +476,14 @@ impl<'a> SelectionInputs<'a> {
         } else {
             ContextRequirements::new(prep, &input.request_type)
         };
+        let needs_thinking_budget = matches!(&input.request_type, RequestType::Chat(chat) if chat.resolved_thinking_token_budget().ok().flatten().is_some());
         let demand = PairDemands::new(
             stage.prefill_side_needs_vision(needs_vision),
             stage.decode_side_needs_vision(&input.request_type, intermediate, media_refs),
         )
         .with_media_refs(media_refs, media_refs_pipeline)
-        .with_context(context_requirements);
+        .with_context(context_requirements)
+        .with_thinking_budget(needs_thinking_budget);
 
         let text = prep.routing_text();
 
@@ -528,7 +539,7 @@ impl<'a> SelectionInputs<'a> {
             media_refs,
             needs_vision,
             context_requirements,
-            needs_thinking_budget: matches!(&input.request_type, RequestType::Chat(chat) if chat.resolved_thinking_token_budget().ok().flatten().is_some()),
+            needs_thinking_budget,
             demand,
             text,
             ids,
@@ -639,6 +650,7 @@ impl WorkerSelectionStage {
                     model_id,
                     context_requirements,
                     media,
+                    inputs.needs_thinking_budget,
                     None,
                     inputs.text,
                     inputs.tokens(),
@@ -656,6 +668,7 @@ impl WorkerSelectionStage {
                             wire,
                             media,
                             context_requirements,
+                            inputs.needs_thinking_budget,
                         ));
                     }
                 }
@@ -721,6 +734,7 @@ impl WorkerSelectionStage {
                             sticky_key,
                             &encode_item_hashes,
                             EpdDemands {
+                                needs_thinking_budget: inputs.needs_thinking_budget,
                                 wire,
                                 encode: media,
                                 decode_vision: inputs.demand.decode,
@@ -791,9 +805,7 @@ impl WorkerSelectionStage {
             }
         }
 
-        if inputs.needs_thinking_budget {
-            require_thinking_budget(&workers)?;
-        }
+        check_selected_thinking_budget(&workers, model_id, inputs.needs_thinking_budget)?;
         ctx.state.workers = Some(workers);
         Ok(())
     }
@@ -880,6 +892,7 @@ impl WorkerSelectionStage {
                     model_id,
                     context_requirements,
                     media,
+                    ctx.routing.needs_thinking_budget,
                     Some(&admits),
                     text,
                     tokens,
@@ -897,6 +910,7 @@ impl WorkerSelectionStage {
                             wire,
                             media,
                             context_requirements,
+                            ctx.routing.needs_thinking_budget,
                         ))
                     }
                 }
@@ -944,7 +958,8 @@ impl WorkerSelectionStage {
                                         == Some(EncodeHandoff::Push)),
                         )
                         .with_media_refs(media_refs, ctx.wire.pipeline)
-                        .with_context(context_requirements),
+                        .with_context(context_requirements)
+                        .with_thinking_budget(ctx.routing.needs_thinking_budget),
                         restated,
                     )
                     .await?;
@@ -953,9 +968,7 @@ impl WorkerSelectionStage {
             }
         };
 
-        if ctx.routing.needs_thinking_budget {
-            require_thinking_budget(&workers)?;
-        }
+        check_selected_thinking_budget(&workers, model_id, ctx.routing.needs_thinking_budget)?;
         ctx.workers = Some(workers);
         Ok(())
     }
@@ -996,11 +1009,7 @@ impl WorkerSelectionStage {
         // The index the placement reads, kept for the rule: the rule is
         // asked behind that read.
         let read: OnceLock<Arc<PdPairIndex>> = OnceLock::new();
-        let pairs = || {
-            let snapshot = self.worker_registry.get_routing_snapshot(model_id);
-            let mode = self.policy_registry.pd_pairing_mode();
-            Arc::clone(read.get_or_init(|| snapshot.pd_pairs(PdWire::Grpc, mode)))
-        };
+        let pairs = || Arc::clone(read.get_or_init(|| self.retry_pd_pairs(model_id)));
         // What the decode the rule last said yes to brings with it. The
         // engine asks the rule once a decode, best first, and takes the
         // first it says yes to that is ready: that last yes is the decode
@@ -1205,6 +1214,9 @@ impl WorkerSelectionStage {
         .map_err(|error| {
             Self::acquire_failure(model_id, error, |failure| {
                 match failure {
+                    EpdSelectionFailure::UnsupportedThinkingBudget => {
+                        return unsupported_thinking_budget(model_id)
+                    }
                     EpdSelectionFailure::EncodeNotSupported => {
                         return multimodal::MmRefsError::EncodeNotSupported.into_response()
                     }
@@ -1408,6 +1420,7 @@ fn decode_needs_vision(
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct PairDemands {
     context: ContextRequirements,
+    needs_thinking_budget: bool,
     prefill: bool,
     decode: bool,
     /// The request forwards media references, which only a worker that
@@ -1428,6 +1441,7 @@ impl PairDemands {
     fn new(pixel_media: bool, decode: bool) -> Self {
         Self {
             context: ContextRequirements::default(),
+            needs_thinking_budget: false,
             prefill: pixel_media || decode,
             decode,
             refs: false,
@@ -1450,6 +1464,13 @@ impl PairDemands {
     /// Context bounds shared by both token-processing sides, never the encoder.
     fn with_context(self, context: ContextRequirements) -> Self {
         Self { context, ..self }
+    }
+
+    fn with_thinking_budget(self, needs_thinking_budget: bool) -> Self {
+        Self {
+            needs_thinking_budget,
+            ..self
+        }
     }
 
     /// The demand on the side `worker` serves.
@@ -1559,6 +1580,33 @@ fn pair_admitted_by(
                 .iter()
                 .any(|decode| admitted(decode) && decode.metadata().spec.runtime_type == runtime)
         })
+}
+
+/// A permanent budget mismatch requires an otherwise compatible pair on the
+/// request's wire. Ignore health, admission and retry exclusions here.
+fn pair_lacks_thinking_budget(
+    pairs: &PdPairIndex,
+    wire: Option<WireConstraint>,
+    eligible: &dyn Fn(&dyn Worker) -> bool,
+) -> bool {
+    let admitted =
+        |w: &Arc<dyn Worker>| WireConstraint::admits(wire, w.as_ref()) && eligible(w.as_ref());
+    let mut has_pair = false;
+    for (prefill, partners) in pairs.prefill.iter().zip(&pairs.partners) {
+        if !admitted(prefill) {
+            continue;
+        }
+        if supports_thinking_budget(prefill.as_ref())
+            && partners
+                .iter()
+                .any(|d| admitted(d) && supports_thinking_budget(d.as_ref()))
+        {
+            return false;
+        }
+        // The index can pair a known runtime with a legacy, unspecified one.
+        has_pair = has_pair || partners.iter().any(&admitted);
+    }
+    has_pair
 }
 
 /// What a retry's media demands of a candidate. The retained wire carries
@@ -1721,11 +1769,18 @@ impl WorkerSelectionStage {
         wire: Option<WireConstraint>,
         media: MediaDemands,
         context: ContextRequirements,
+        needs_thinking_budget: bool,
     ) -> Response {
         let media = media.with_wire(wire);
-        let capable = self.capable_regular(model_id, wire, media);
+        let mut capable = self.capable_regular(model_id, wire, media);
         if capable.is_empty() {
             return self.selection_failure(model_id, &[WorkerType::Regular], wire, media);
+        }
+        if needs_thinking_budget {
+            capable.retain(|worker| supports_thinking_budget(worker.as_ref()));
+            if capable.is_empty() {
+                return unsupported_thinking_budget(model_id);
+            }
         }
         if let Some(refusal) = unheld_by(&capable, context, model_id) {
             return refusal;
@@ -2048,6 +2103,7 @@ impl WorkerSelectionStage {
                 self.pd_pair_failure(model_id, *failure, media)
             }
             PdSelectionFailure::Context(response) => *response,
+            PdSelectionFailure::UnsupportedThinkingBudget => unsupported_thinking_budget(model_id),
             PdSelectionFailure::NoVisionCapablePrefill => {
                 self.vision_refusal(model_id, "prefill workers")
             }
@@ -2222,6 +2278,7 @@ impl WorkerSelectionStage {
         model_id: &str,
         context: ContextRequirements,
         media: MediaDemands,
+        needs_thinking_budget: bool,
         admits: Option<CandidateFilter<'_>>,
         text: Option<&str>,
         tokens: Option<&[u32]>,
@@ -2240,14 +2297,18 @@ impl WorkerSelectionStage {
         let accepts = |worker: &dyn Worker| {
             admits.is_none_or(|admits| admits(worker))
                 && media.accepts(worker)
+                && (!needs_thinking_budget || supports_thinking_budget(worker))
                 && left.admits(worker, model_id)
         };
-        let candidate_filter: Option<CandidateFilter<'_>> =
-            if admits.is_none() && media == MediaDemands::NONE && left.binds_nobody() {
-                None
-            } else {
-                Some(&accepts)
-            };
+        let candidate_filter: Option<CandidateFilter<'_>> = if admits.is_none()
+            && !needs_thinking_budget
+            && media == MediaDemands::NONE
+            && left.binds_nobody()
+        {
+            None
+        } else {
+            Some(&accepts)
+        };
         self.select_single_worker_for_attempt(
             &snapshot,
             model_id,
@@ -2422,6 +2483,12 @@ impl WorkerSelectionStage {
         self.pair_failure(model_id, failure)
     }
 
+    pub(crate) fn retry_pd_pairs(&self, model_id: &str) -> Arc<PdPairIndex> {
+        self.worker_registry
+            .get_routing_snapshot(model_id)
+            .pd_pairs(PdWire::Grpc, self.policy_registry.pd_pairing_mode())
+    }
+
     /// Apply media and context constraints within the existing compatible-pair
     /// index, then let the configured policies and admission choose the roles.
     ///
@@ -2552,7 +2619,11 @@ impl WorkerSelectionStage {
             return Err(PdSelectionFailure::NoVisionCapablePrefill);
         }
         let caller = inputs.candidate_filter;
-        let admitted = move |worker: &dyn Worker| caller.is_none_or(|accepts| accepts(worker));
+        let budget_capable =
+            |worker: &dyn Worker| !demand.needs_thinking_budget || supports_thinking_budget(worker);
+        let admitted = |worker: &dyn Worker| {
+            budget_capable(worker) && caller.is_none_or(|accepts| accepts(worker))
+        };
         let with_vision = move |worker: &dyn Worker| {
             (!demand.on(worker) || vision_capable(worker)) && admitted(worker)
         };
@@ -2563,6 +2634,8 @@ impl WorkerSelectionStage {
             Some(&with_vision)
         } else if demand.prefill {
             Some(&prefill_with_vision)
+        } else if demand.needs_thinking_budget {
+            Some(&admitted)
         } else {
             inputs.candidate_filter
         };
@@ -2580,15 +2653,26 @@ impl WorkerSelectionStage {
         // A request no pair holds is refused here, by membership. A demand
         // that binds nobody fits every pair there is.
         let binds = !demand.context.binds_nobody();
-        pair_unheld_by(pairs, wire, demand.context, model_id, &takes_media)
-            .map_err(|response| PdSelectionFailure::Context(Box::new(response)))?;
+        pair_unheld_by(pairs, wire, demand.context, model_id, &|worker| {
+            takes_media(worker) && budget_capable(worker)
+        })
+        .map_err(|response| PdSelectionFailure::Context(Box::new(response)))?;
         // The context demand adds its filter only while a window can refuse
         // it: otherwise the candidates reach the placement as they were.
         let inputs = PlacementInputs {
             candidate_filter: if binds { Some(&fits) } else { candidate_filter },
             ..inputs
         };
-        select(inputs).map_err(PdSelectionFailure::from)
+        select(inputs).map_err(|failure| {
+            if demand.needs_thinking_budget
+                && !matches!(failure.verdict, PlacementFailure::NoPlanBound(_))
+                && pair_lacks_thinking_budget(pairs, wire, &takes_media)
+            {
+                PdSelectionFailure::UnsupportedThinkingBudget
+            } else {
+                failure.into()
+            }
+        })
     }
 
     /// Select per-item encode workers + a prefill/decode pair for EPD routing.
@@ -2710,10 +2794,20 @@ impl WorkerSelectionStage {
         // Unknown reference identities may be grid-free. Prefer a vision D
         // when registered, but retain the stripped-hash path otherwise; the
         // post-encode dispatch check rejects actual grids before sending P/D.
+        let budget_capable =
+            |worker: &dyn Worker| !demand.needs_thinking_budget || supports_thinking_budget(worker);
         let prefer_vision = demand.decode_vision
-            || (demand.encode.media_refs && demand.encode.vision && vision_pair_exists);
+            || (demand.encode.media_refs
+                && demand.encode.vision
+                && vision_pair_exists
+                && (!demand.needs_thinking_budget
+                    || pair_admitted_by(&pairs, demand.wire, &|worker| {
+                        registered_ec(worker) && decode_vision(worker) && budget_capable(worker)
+                    })));
+        let takes_vision = |worker: &dyn Worker| !prefer_vision || decode_vision(worker);
         let eligible = |worker: &dyn Worker| {
-            (!prefer_vision || decode_vision(worker))
+            budget_capable(worker)
+                && takes_vision(worker)
                 && (!needs_encode || available_encode.iter().any(|e| compatible(e, worker)))
         };
         let pair = placement::select_pair(
@@ -2732,7 +2826,18 @@ impl WorkerSelectionStage {
             // carries no item, and refuses one that does (above).
             stated,
         )
-        .map_err(EpdSelectionFailure::Placement)?;
+        .map_err(|failure| {
+            if demand.needs_thinking_budget
+                && !matches!(failure.verdict, PlacementFailure::NoPlanBound(_))
+                && pair_lacks_thinking_budget(&pairs, demand.wire, &|worker| {
+                    registered_ec(worker) && takes_vision(worker)
+                })
+            {
+                EpdSelectionFailure::UnsupportedThinkingBudget
+            } else {
+                EpdSelectionFailure::Placement(failure)
+            }
+        })?;
         let handoff = PdProtocol::encode_handoff(pair.runtime);
         // The encoders that pair with the chosen prefill side: its runtime
         // and, under a push handoff, its EC roles and connector.
@@ -2806,6 +2911,7 @@ impl WorkerSelectionStage {
 /// E consumes the media; D may still need grids for positional embeddings.
 #[derive(Clone, Copy)]
 struct EpdDemands {
+    needs_thinking_budget: bool,
     wire: Option<WireConstraint>,
     encode: MediaDemands,
     decode_vision: bool,
@@ -2976,6 +3082,7 @@ impl SelectionBench {
                 &self.model,
                 self.context,
                 MediaDemands::NONE,
+                false,
                 None,
                 None,
                 tokens,
@@ -3008,6 +3115,7 @@ impl SelectionBench {
 mod tests {
     mod lora;
     mod rank;
+    mod thinking_budget;
 
     use std::{
         collections::HashMap,
@@ -3733,7 +3841,10 @@ mod tests {
             Err(PdSelectionFailure::Placement(_)) => {
                 panic!("a request no island holds is a 400 at selection, not a placement failure")
             }
-            Err(PdSelectionFailure::NoVisionCapablePrefill) => {
+            Err(
+                PdSelectionFailure::NoVisionCapablePrefill
+                | PdSelectionFailure::UnsupportedThinkingBudget,
+            ) => {
                 panic!("a request no island holds is a 400 at selection, not a vision refusal")
             }
         }
@@ -4055,6 +4166,7 @@ mod tests {
                 model_id,
                 ContextRequirements::default(),
                 MediaDemands::NONE,
+                false,
                 None,
                 None,
                 None,
@@ -4222,6 +4334,7 @@ mod tests {
                     model_id,
                     context,
                     MediaDemands::NONE,
+                    false,
                     None,
                     None,
                     None,
@@ -5438,6 +5551,7 @@ mod tests {
                     PlacementInputs::default(),
                     &[vec![1], vec![2]],
                     EpdDemands {
+                        needs_thinking_budget: false,
                         wire: None,
                         encode: MediaDemands {
                             media_refs: false,
@@ -5523,6 +5637,7 @@ mod tests {
             )
         };
         let demand = |items: bool| EpdDemands {
+            needs_thinking_budget: false,
             wire: None,
             encode: MediaDemands {
                 media_refs: false,
@@ -5742,6 +5857,7 @@ mod tests {
                     PlacementInputs::default(),
                     &[vec![1], vec![2]],
                     EpdDemands {
+                        needs_thinking_budget: false,
                         wire: None,
                         encode: MediaDemands {
                             media_refs: false,
@@ -5862,6 +5978,7 @@ mod tests {
                         },
                         &[vec![1], vec![2]],
                         EpdDemands {
+                            needs_thinking_budget: false,
                             wire: None,
                             encode: MediaDemands {
                                 media_refs,
@@ -5911,6 +6028,7 @@ mod tests {
                     },
                     &[vec![1]],
                     EpdDemands {
+                        needs_thinking_budget: false,
                         wire: None,
                         encode: MediaDemands {
                             media_refs,
@@ -6107,6 +6225,7 @@ mod tests {
                     PlacementInputs::default(),
                     &[vec![1]],
                     EpdDemands {
+                        needs_thinking_budget: false,
                         wire: None,
                         encode: MediaDemands {
                             media_refs: false,
@@ -6147,6 +6266,7 @@ mod tests {
                             PlacementInputs::default(),
                             &[vec![1]],
                             EpdDemands {
+                                needs_thinking_budget: false,
                                 wire: None,
                                 encode: MediaDemands {
                                     media_refs: false,
@@ -6163,6 +6283,7 @@ mod tests {
                 }
                 if runtime == RuntimeType::Vllm && allowed && !d_vision {
                     let refs = EpdDemands {
+                        needs_thinking_budget: false,
                         wire: None,
                         encode: MediaDemands {
                             media_refs: true,
@@ -7340,9 +7461,7 @@ mod tests {
             PairDemands {
                 prefill: true,
                 decode: false,
-                refs: false,
-                context: ContextRequirements::default(),
-                pipeline: PipelinePin::Any,
+                ..PairDemands::default()
             },
             "a single-sample image: the prefill side takes the pixels, the decode side is stripped"
         );
@@ -7351,9 +7470,7 @@ mod tests {
             PairDemands {
                 prefill: true,
                 decode: true,
-                refs: false,
-                context: ContextRequirements::default(),
-                pipeline: PipelinePin::Any,
+                ..PairDemands::default()
             },
             "what the decode side cannot run without the encoder, the prefill side cannot either"
         );
@@ -8125,34 +8242,6 @@ mod tests {
         &[(smg_worker::labels::SUPPORTS_VISION_LABEL, "false")];
     const VISION_ENCODER: &[(&str, &str)] = &[(smg_worker::labels::SUPPORTS_VISION_LABEL, "true")];
     const UNLABELED: &[(&str, &str)] = &[];
-
-    #[test]
-    fn thinking_token_budget_checks_the_selected_worker_capability() {
-        for (labels, expected) in [
-            (UNLABELED, false),
-            (&[(SUPPORTS_THINKING_TOKEN_BUDGET_LABEL, "true")][..], true),
-        ] {
-            let selection = WorkerSelection::Single {
-                worker: labeled_worker(
-                    "grpc://localhost:5000",
-                    "model",
-                    WorkerType::Regular,
-                    labels,
-                )
-                .into(),
-            };
-            assert_eq!(
-                require_thinking_budget(&selection)
-                    .err()
-                    .map(|r| r.status()),
-                if expected {
-                    None
-                } else {
-                    Some(StatusCode::BAD_REQUEST)
-                }
-            );
-        }
-    }
 
     /// A gRPC worker of `worker_type`, with `labels`.
     fn labeled_worker(

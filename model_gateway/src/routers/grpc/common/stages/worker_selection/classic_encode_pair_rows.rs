@@ -333,6 +333,9 @@ fn refusal(failure: EpdSelectionFailure) -> Answer {
         why: None,
     };
     match failure {
+        EpdSelectionFailure::UnsupportedThinkingBudget => {
+            named("unsupported_thinking_token_budget")
+        }
         EpdSelectionFailure::Unavailable => named("unavailable"),
         EpdSelectionFailure::EcIncompatible => named("ec_incompatible"),
         EpdSelectionFailure::DecodeVisionUnsupported => named("decode_vision_unsupported"),
@@ -576,6 +579,7 @@ impl Bed {
             PlacementInputs::default(),
             &request.items,
             EpdDemands {
+                needs_thinking_budget: false,
                 wire: None,
                 encode: MediaDemands {
                     media_refs: request.references,

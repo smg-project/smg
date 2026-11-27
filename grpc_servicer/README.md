@@ -78,7 +78,10 @@ reasoning block. Its GPT-OSS/Harmony path rejects finite budgets and accepts
 SGLang servicer advertising an active reasoning token filter or a vLLM
 servicer advertising a configured reasoning budget. TensorRT-LLM gRPC
 returns HTTP 400 for a finite budget. Omission, `null` and `-1` all use
-the worker default on gRPC.
+the worker default on gRPC. On a mixed pool, the gateway places finite
+budgets on capable workers. Standalone SGLang and vLLM workers registered
+over direct ZMQ currently lack this capability label, so the gateway
+returns HTTP 400 for a finite budget on those routes.
 
 ### vLLM
 

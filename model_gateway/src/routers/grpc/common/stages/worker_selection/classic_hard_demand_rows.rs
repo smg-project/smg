@@ -547,6 +547,7 @@ impl Bed {
                 MODEL,
                 context,
                 media,
+                false,
                 admits,
                 None,
                 None,
@@ -560,7 +561,7 @@ impl Bed {
                 assert!(placed.is_empty(), "a request placed once is placed again");
                 let refusal = self
                     .stage
-                    .context_selection_failure(MODEL, wire, media, context);
+                    .context_selection_failure(MODEL, wire, media, context, false);
                 return refused(refusal).await;
             };
             let at = self
