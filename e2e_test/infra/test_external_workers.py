@@ -24,6 +24,7 @@ from infra.constants import (
     host_port,
 )
 from infra.external_workers import (
+    ExternalWorkerAttachError,
     ExternalWorkerRegistry,
     load_external_workers,
     parse_external_worker_url,
@@ -148,6 +149,12 @@ def test_parse_external_worker_url_schemes_ports_and_ipv6() -> None:
         "engine.local",
         443,
     )
+    assert parse_external_worker_url("HTTPS://Engine.Local:443/") == (
+        "https://engine.local:443",
+        ConnectionMode.HTTP,
+        "engine.local",
+        443,
+    )
     assert parse_external_worker_url("grpc://[::1]:31234", ConnectionMode.GRPC) == (
         "grpc://[::1]:31234",
         ConnectionMode.GRPC,
@@ -222,24 +229,68 @@ def test_load_external_workers_inline_object_list_and_file(tmp_path) -> None:
 
 
 def test_load_external_workers_flush_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``E2E_EXTERNAL_WORKERS_FLUSH_CACHE`` overrides top-level flush_cache."""
-    raw = json.dumps(
-        {
-            "workers": [
-                {"engine": "vllm", "model_id": "m", "url": "grpc://127.0.0.1:30000"},
-            ],
-            "flush_cache": True,
-        }
-    )
-    monkeypatch.setenv(ENV_EXTERNAL_WORKERS_FLUSH_CACHE, "0")
-    assert load_external_workers(raw).flush_cache is False
+    """``E2E_EXTERNAL_WORKERS_FLUSH_CACHE`` overrides both top-level and per-entry flush_cache."""
+    with _http_server(health_status=200) as (url, _seen):
+        raw = json.dumps(
+            {
+                "workers": [
+                    {
+                        "engine": "vllm",
+                        "model_id": "m",
+                        "url": url,
+                        "flush_cache": True,
+                    },
+                ],
+                "flush_cache": True,
+            }
+        )
+        monkeypatch.setenv(ENV_EXTERNAL_WORKERS_FLUSH_CACHE, "0")
+        reg_off = load_external_workers(raw)
+        assert reg_off.flush_cache is False
+        attached_off = reg_off.attach(model_id="m", engine="vllm", mode=ConnectionMode.HTTP)
+        assert attached_off is not None and attached_off[0].flush_cache is False
 
-    monkeypatch.setenv(ENV_EXTERNAL_WORKERS_FLUSH_CACHE, "true")
-    assert load_external_workers(raw).flush_cache is True
+        monkeypatch.setenv(ENV_EXTERNAL_WORKERS_FLUSH_CACHE, "true")
+        reg_on = load_external_workers(raw)
+        assert reg_on.flush_cache is True
+        attached_on = reg_on.attach(model_id="m", engine="vllm", mode=ConnectionMode.HTTP)
+        assert attached_on is not None and attached_on[0].flush_cache is True
 
-    monkeypatch.setenv(ENV_EXTERNAL_WORKERS_FLUSH_CACHE, "maybe")
-    with pytest.raises(ValueError, match="not a valid boolean"):
+        monkeypatch.setenv(ENV_EXTERNAL_WORKERS_FLUSH_CACHE, "maybe")
+        with pytest.raises(ValueError, match="not a valid boolean"):
+            load_external_workers(raw)
+
+
+@pytest.mark.parametrize(
+    "urls",
+    [
+        ["http://127.0.0.1:30000", "http://127.0.0.1:30000", "http://127.0.0.1:30001"],
+        ["http://127.0.0.1:30000", "http://127.0.0.1:30000/", "http://127.0.0.1:30001"],
+        ["HTTP://LOCALHOST:30000", "http://localhost:30000/"],
+        ["http://engine.local", "http://engine.local:80/"],
+        ["https://engine.local:443", "HTTPS://ENGINE.LOCAL/"],
+    ],
+)
+def test_load_external_workers_rejects_duplicate_normalized_urls(urls: list[str]) -> None:
+    """Duplicate endpoints after scheme/host/slash/default-port normalization are rejected."""
+    raw = json.dumps([{"engine": "vllm", "model_id": "m", "urls": urls}])
+    with pytest.raises(ValueError, match="duplicate URL"):
         load_external_workers(raw)
+
+
+def test_external_worker_http_url_preserves_https_case_insensitively() -> None:
+    """``Worker.http_url`` preserves TLS even if constructed with an uppercase HTTPS scheme."""
+    worker = Worker(
+        model_id="org/model",
+        engine="vllm",
+        port=443,
+        gpu_ids=[],
+        mode=ConnectionMode.HTTP,
+        host="engine.local",
+        external=True,
+        external_url="HTTPS://engine.local:443/",
+    )
+    assert worker.http_url == "HTTPS://engine.local:443"
 
 
 @pytest.mark.parametrize(
@@ -374,7 +425,7 @@ def test_external_worker_grpc_health_live_server() -> None:
                 }
             )
         )
-        with pytest.raises(RuntimeError, match="failed health checks"):
+        with pytest.raises(ExternalWorkerAttachError, match="failed health checks"):
             reg.attach(model_id="org/model", engine="vllm", mode=ConnectionMode.GRPC, count=1)
 
 

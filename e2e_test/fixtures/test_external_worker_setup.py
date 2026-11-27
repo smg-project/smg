@@ -207,3 +207,35 @@ def test_pool_sort_key_keeps_custom_worker_topology_from_splitting_default_pool(
     ordered = sorted([default_c, custom_b, default_a, warmup], key=hooks._pool_sort_key)
     assert ordered[0] is warmup
     assert abs(ordered.index(default_a) - ordered.index(default_c)) == 1
+
+
+def test_mcp_fixture_reraises_strict_external_attach_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Strict external attach failures propagate instead of being turned into pytest.skip."""
+    from infra import ExternalWorkerAttachError, worker_pool
+
+    responses_conftest = importlib.import_module("responses.conftest")
+    monkeypatch.setattr(responses_conftest, "get_gpu_vendor", lambda: "nvidia")
+
+    def fail_attach(**_kwargs):
+        raise ExternalWorkerAttachError("strict external pool unhealthy")
+
+    monkeypatch.setattr(worker_pool, "get_pool", lambda: SimpleNamespace(acquire=fail_attach))
+    with pytest.raises(ExternalWorkerAttachError, match="strict external pool unhealthy"):
+        responses_conftest._start_local_grpc_gateway_with_mcp(
+            engine="vllm",
+            model_id="openai/gpt-oss-20b",
+            mcp_config_file="/tmp/unused.yaml",
+        )
+
+    def fail_local(**_kwargs):
+        raise RuntimeError("no local GPU")
+
+    monkeypatch.setattr(worker_pool, "get_pool", lambda: SimpleNamespace(acquire=fail_local))
+    with pytest.raises(pytest.skip.Exception, match="no local GPU"):
+        responses_conftest._start_local_grpc_gateway_with_mcp(
+            engine="vllm",
+            model_id="openai/gpt-oss-20b",
+            mcp_config_file="/tmp/unused.yaml",
+        )

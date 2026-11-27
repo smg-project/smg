@@ -38,6 +38,11 @@ ZMQ workers, disaggregated (PD/EPD) workers, and tests requesting unmatched
 topologies or ``extra_engine_args`` fall back cleanly to local launches.
 External workers are health-checked before attachment and are never stopped
 or signalled on eviction or session teardown.
+
+Note on same-host pools: when external engines already occupy GPUs on the same
+host as pytest, unmatched classes that fall back to local ``start_workers()``
+will contend for GPU 0 unless GPUs are partitioned via ``E2E_GPU_OFFSET`` or
+the lane's classes all match the configured external pool.
 """
 
 from __future__ import annotations
@@ -48,7 +53,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 from .constants import (
     ENV_EXTERNAL_WORKERS,
@@ -59,6 +64,7 @@ from .constants import (
     WorkerType,
     get_mm_processing,
     get_servicer_impl,
+    host_port,
 )
 from .worker import Worker
 
@@ -69,6 +75,10 @@ _SUPPORTED_EXTERNAL_MODES = frozenset({ConnectionMode.HTTP, ConnectionMode.GRPC}
 _MM_PROCESSING_VALUES = frozenset({MM_PROCESSING_WORKER, "router"})
 _TRUE_VALUES = frozenset({"1", "true", "yes"})
 _FALSE_VALUES = frozenset({"0", "false", "no"})
+
+
+class ExternalWorkerAttachError(RuntimeError):
+    """Raised when matched external workers fail health checks under ``fallback_to_local=False``."""
 
 
 @dataclass(frozen=True)
@@ -151,7 +161,24 @@ def parse_external_worker_url(
     if not (1 <= port <= 65535):
         raise ValueError(f"External worker URL {url!r} port {port} is out of range 1..65535")
 
-    return normalized, inferred, host, port
+    # Normalize scheme and hostname to lowercase so scheme checks and duplicate
+    # endpoint detection treat case variants identically, while preserving
+    # explicit vs implicit default ports and any non-empty path.
+    explicit_port = parsed.port is not None
+    if explicit_port:
+        netloc = host_port(host, port)
+    else:
+        netloc = f"[{host}]" if ":" in host else host
+    if parsed.username is not None:
+        userinfo = parsed.username
+        if parsed.password is not None:
+            userinfo = f"{userinfo}:{parsed.password}"
+        netloc = f"{userinfo}@{netloc}"
+    canonical = urlunparse(
+        (scheme, netloc, parsed.path.rstrip("/"), parsed.params, parsed.query, parsed.fragment)
+    ).rstrip("/")
+
+    return canonical, inferred, host, port
 
 
 def _parse_bool_env(var_name: str) -> bool | None:
@@ -246,11 +273,20 @@ def _parse_entry(raw: Any, index: int) -> ExternalWorkerEntry:
         raise ValueError(f"External worker entry [{index}] requires 'url' or 'urls'")
 
     normalized_urls: list[str] = []
+    seen_endpoints: set[tuple[str, str, int, str]] = set()
     resolved_mode = mode
     for url in raw_urls:
-        norm_url, inferred_mode, _host, _port = parse_external_worker_url(url, resolved_mode)
+        norm_url, inferred_mode, host, port = parse_external_worker_url(url, resolved_mode)
         if resolved_mode is None:
             resolved_mode = inferred_mode
+        parsed_norm = urlparse(norm_url)
+        endpoint_key = (parsed_norm.scheme, host, port, parsed_norm.path)
+        if endpoint_key in seen_endpoints:
+            raise ValueError(
+                f"External worker entry [{index}] contains duplicate URL {norm_url!r} "
+                "after normalization"
+            )
+        seen_endpoints.add(endpoint_key)
         normalized_urls.append(norm_url)
     assert resolved_mode is not None
 
@@ -327,6 +363,7 @@ class ExternalWorkerRegistry:
 
     entries: tuple[ExternalWorkerEntry, ...] = ()
     flush_cache: bool = True
+    flush_cache_override: bool | None = None
     health_timeout: float = DEFAULT_EXTERNAL_HEALTH_TIMEOUT
     fallback_to_local: bool = True
 
@@ -423,11 +460,23 @@ class ExternalWorkerRegistry:
             return None
 
         unhealthy_urls: list[str] = []
+        norm_engine = engine.strip().lower()
+        active_servicer = (
+            get_servicer_impl(norm_engine)
+            if norm_engine in ("vllm", "sglang", "tokenspeed", "trtllm")
+            else None
+        )
+        active_mm = get_mm_processing() or "router"
         for entry in candidates:
             probe_timeout = (
                 entry.health_timeout if entry.health_timeout is not None else self.health_timeout
             )
-            should_flush = entry.flush_cache if entry.flush_cache is not None else self.flush_cache
+            if self.flush_cache_override is not None:
+                should_flush = self.flush_cache_override
+            elif entry.flush_cache is not None:
+                should_flush = entry.flush_cache
+            else:
+                should_flush = self.flush_cache
             healthy: list[Worker] = []
             for url in entry.urls:
                 norm_url, resolved_mode, host, port = parse_external_worker_url(url, entry.mode)
@@ -449,11 +498,14 @@ class ExternalWorkerRegistry:
                     healthy.append(worker)
                     if len(healthy) == count:
                         logger.info(
-                            "WorkerPool: attached %d external %s %s worker(s) for %s: %s",
+                            "WorkerPool: attached %d external %s %s worker(s) for %s "
+                            "(servicer_impl=%s, mm_processing=%s): %s",
                             count,
                             engine,
                             mode.value,
                             model_id,
+                            active_servicer or "default",
+                            active_mm,
                             [w.base_url for w in healthy],
                         )
                         return healthy
@@ -467,7 +519,7 @@ class ExternalWorkerRegistry:
         if self.fallback_to_local:
             logger.warning("%s; falling back to local worker launch", detail)
             return None
-        raise RuntimeError(detail)
+        raise ExternalWorkerAttachError(detail)
 
 
 def load_external_workers(raw: str | None = None) -> ExternalWorkerRegistry:
@@ -549,6 +601,7 @@ def load_external_workers(raw: str | None = None) -> ExternalWorkerRegistry:
     return ExternalWorkerRegistry(
         entries=entries,
         flush_cache=flush_cache,
+        flush_cache_override=flush_override,
         health_timeout=health_timeout,
         fallback_to_local=fallback_to_local,
     )

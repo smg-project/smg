@@ -200,7 +200,9 @@ class Worker:
     @property
     def http_url(self) -> str:
         """HTTP URL (used for health checks even on gRPC workers)."""
-        if self.external_url is not None and self.external_url.startswith(("http://", "https://")):
+        if self.external_url is not None and self.external_url.lower().startswith(
+            ("http://", "https://")
+        ):
             return self.external_url.rstrip("/")
         return f"http://{host_port(self.host, self.port)}"
 

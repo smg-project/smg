@@ -634,7 +634,7 @@ class Gateway:
             if resp.status_code == 200:
                 logger.info("Flushed worker KV cache via gateway %s", self.base_url)
                 return True
-            logger.debug(
+            logger.warning(
                 "Gateway %s /flush_cache returned %d (%s); skipping cache flush",
                 self.base_url,
                 resp.status_code,

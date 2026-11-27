@@ -55,6 +55,7 @@ from .constants import (  # Enums; Convenience sets; Fixture parameters; Default
     is_vllm,
 )
 from .external_workers import (
+    ExternalWorkerAttachError,
     ExternalWorkerEntry,
     ExternalWorkerRegistry,
     load_external_workers,
@@ -173,6 +174,7 @@ __all__ = [
     "WorkerPool",
     "get_pool",
     "cleanup_pool",
+    "ExternalWorkerAttachError",
     "ExternalWorkerEntry",
     "ExternalWorkerRegistry",
     "load_external_workers",
