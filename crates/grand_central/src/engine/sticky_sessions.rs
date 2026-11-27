@@ -246,8 +246,9 @@ struct Entry {
     /// read while a claim stands. The word of a lease reaches the claim
     /// where the lease names the claim's id and this instant
     /// ([`Entry::reached_by`]): a later decision's claim on the same worker
-    /// is dated later. Two claims of one key on one worker a whole 2^32
-    /// microseconds apart read as one, the answer by the worker alone.
+    /// is dated later. Two claims of one key on one worker a whole multiple
+    /// of 2^32 microseconds apart read as one, the answer by the worker
+    /// alone.
     claimed_at: u32,
     /// The least date under which a decision that read this life of the
     /// key tells its words, on the decision clock. It never rises inside
@@ -301,6 +302,21 @@ impl Entry {
         self.recovery = rule.recovery;
     }
 
+    /// Whether `id` is one of the key's two slots as written. The empty id
+    /// is one where a slot is free: a write that names no worker asks so
+    /// ([`SessionTable::move_claim`]).
+    fn holds(&self, id: WorkerId) -> bool {
+        self.pins.contains(&id)
+    }
+
+    /// The worker a decision follows where it read `seen` and chose
+    /// `target`, by the claim's rule ([`Claim::standing`]). None where the
+    /// pins stand as it read them. The answer can be the decision's own
+    /// `target`: no pin came in.
+    fn newcomer(&self, seen: &SessionPins, target: WorkerId) -> Option<WorkerId> {
+        Claim::standing(&self.pins, seen, target)
+    }
+
     /// `target` becomes the preferred worker; the preferred one before it the
     /// failover.
     fn front(&mut self, target: WorkerId) {
@@ -309,10 +325,12 @@ impl Entry {
         }
     }
 
-    /// Writes the claim of record: `stands` is the pin a decision claimed,
-    /// `leased` the id its lease names, and `at` the instant that lease is
-    /// issued under.
+    /// A decision's claim: `stands` joins the pins by the key's recovery
+    /// ([`Entry::place`]) and is written as the claim of record. `leased`
+    /// is the id the claim's lease names, and `at` the instant that lease
+    /// is issued under.
     fn claimed(&mut self, stands: WorkerId, leased: WorkerId, at: u64) {
+        self.place(stands);
         self.claim = stands;
         self.leased = leased;
         // The low 32 bits: the map's slot keeps its size.
@@ -358,20 +376,67 @@ impl Entry {
     }
 
     /// Whether a word dated `at` comes from an older life of the key: it
-    /// is dated before every decision that read this one. A word that
-    /// states no instant (`0`) does not. Neither does any word in an entry
-    /// no decision has read.
+    /// is dated before the oldest date a decision read this one under. A
+    /// pair's decode call reads under its lease's date
+    /// ([`SessionTable::told_under`]). A word that states no instant (`0`)
+    /// does not. Neither does any word in an entry no decision has read.
     fn outlived(&self, at: u64) -> bool {
         at != 0 && at < self.oldest_reader_micros
     }
 
-    /// Withdraws `claim` from the pins (the pin behind it moves up): its
-    /// commit never came and another worker served the key.
-    fn withdraw(&mut self, claim: WorkerId) {
+    /// The id a dispatch on `id` asks the table by: the claim of record
+    /// where a claim stands and its lease names `id`, else `id` itself.
+    /// A claim's lease names the id its worker had when it claimed: a
+    /// dispatch on that id is one on the claimed worker, registered
+    /// again since or not.
+    fn of_record(&self, id: WorkerId) -> WorkerId {
+        if self.claim != WorkerId(0) && self.leased == id {
+            self.claim
+        } else {
+            id
+        }
+    }
+
+    /// A dispatch to `worker` confirms the claim on it: the mark goes and
+    /// its pin stands, a pin the key was served on.
+    fn confirm_claim(&mut self, worker: WorkerId) {
+        if self.claim != WorkerId(0) && self.claim == worker {
+            self.claim = WorkerId(0);
+        }
+    }
+
+    /// Withdraws the claim of record: the mark goes, and the claim's pin
+    /// leaves the pins (the pin behind it moves up). Its commit never came:
+    /// its decision moved the claim or gave it up, or the commit went to
+    /// another worker.
+    fn withdraw_claim(&mut self) {
+        let claim = std::mem::replace(&mut self.claim, WorkerId(0));
         if self.pins[0] == claim {
             self.pins = [self.pins[1], WorkerId(0)];
         } else if self.pins[1] == claim {
             self.pins[1] = WorkerId(0);
+        }
+    }
+
+    /// The key was served on `worker` under its decision's `verdict`. The
+    /// preferred pin, or the failover taken under no respill, leaves the
+    /// pins as they are. A respill fronts the worker; under no respill a
+    /// worker outside the pins joins them by the key's recovery
+    /// ([`Entry::place`]). The verdict's compare with a respill stands
+    /// behind the preferred pin's test, as the table held it: a request
+    /// that follows its pin does not make it.
+    fn served(&mut self, worker: WorkerId, verdict: SessionVerdict) {
+        if self.pins[0] == worker {
+            return;
+        }
+        let respill = verdict == SessionVerdict::Respill;
+        if !respill && self.pins.contains(&worker) {
+            return;
+        }
+        if respill {
+            self.front(worker);
+        } else {
+            self.place(worker);
         }
     }
 
@@ -419,6 +484,30 @@ impl Entry {
         } else {
             self.pins = [self.pins[1], target];
         }
+    }
+
+    /// `worker` joins the pins by the key's recovery: in front under
+    /// `latest`, behind the pins there under `original`.
+    fn place(&mut self, worker: WorkerId) {
+        match self.recovery {
+            Recovery::Latest => self.front(worker),
+            Recovery::Original => self.append(worker),
+        }
+    }
+
+    /// Takes the pins of `workers` off the key. False where that takes the
+    /// key's last pin: it leaves the table and is placed afresh. A key
+    /// that holds no pin stays: a decision read it and its claim follows
+    /// ([`SessionTable::lookup`]), and the idle keys' pass alone reclaims it.
+    fn unpin(&mut self, workers: &[WorkerId]) -> bool {
+        let held = self.pins[0] != WorkerId(0);
+        if workers.contains(&self.pins[1]) {
+            self.pins[1] = WorkerId(0);
+        }
+        if workers.contains(&self.pins[0]) {
+            self.pins = [self.pins[1], WorkerId(0)];
+        }
+        !held || self.pins[0] != WorkerId(0)
     }
 }
 
@@ -786,7 +875,7 @@ impl SessionTable {
         } else {
             target
         };
-        if (stood || entry.pins == seen) && entry.pins.contains(&stands) {
+        if (stood || entry.pins == seen) && entry.holds(stands) {
             // The pins stand as the decision read them, as written or
             // behind the step, and the worker is a pin among them: one
             // the decision read, or one under the id that stands. The
@@ -798,12 +887,8 @@ impl SessionTable {
         // The pins are not the ones the decision read: another
         // decision moved them, or the step renamed one. Their
         // newcomer is the pin to follow, by the id that stands.
-        if let Some(owner) = Claim::standing(&entry.pins, &seen, target) {
+        if let Some(owner) = entry.newcomer(&seen, target) {
             return Claim::Standing(owner, entry.pins);
-        }
-        match entry.recovery {
-            Recovery::Latest => entry.front(stands),
-            Recovery::Original => entry.append(stands),
         }
         entry.claimed(stands, target, at);
         Claim::Made(target)
@@ -904,14 +989,9 @@ impl SessionTable {
         if !entry.reached_by(claimed, at) {
             return SessionVerdict::Pinned;
         }
-        let pin = std::mem::replace(&mut entry.claim, WorkerId(0));
-        entry.withdraw(pin);
-        if target == WorkerId(0) || entry.pins.contains(&stands) {
+        entry.withdraw_claim();
+        if target == WorkerId(0) || entry.holds(stands) {
             return SessionVerdict::Pinned;
-        }
-        match entry.recovery {
-            Recovery::Latest => entry.front(stands),
-            Recovery::Original => entry.append(stands),
         }
         entry.claimed(stands, target, at);
         SessionVerdict::Claimed(target)
@@ -951,10 +1031,11 @@ impl SessionTable {
     /// The commit dispatched a decision for `key` to `target` under the
     /// decision's `verdict`: the pin follows the rule. The preferred pin
     /// taken, or the failover taken while the preferred one was unroutable,
-    /// leaves the pins as they are; a respill, and a worker outside the pins,
-    /// move them by the key's recovery rule. A dispatch to the claimed worker
-    /// confirms the claim first; the claiming decision's commit elsewhere
-    /// withdraws it. A dispatch on an id its worker had before it was
+    /// leaves the pins as they are; a respill fronts the worker, and under no
+    /// respill a worker outside the pins joins them by the key's recovery
+    /// rule. A dispatch to the claimed worker confirms the claim first; the
+    /// claiming decision's commit elsewhere withdraws it. A dispatch on an
+    /// id its worker had before it was
     /// registered again is one on that worker, under the id that stands
     /// ([`Self::stands`]). A dispatch on a claim's lease asks by the
     /// claim of record.
@@ -997,10 +1078,6 @@ impl SessionTable {
         // decision's commit elsewhere withdraws a claim still unconfirmed; an
         // older request's commit on the owner leaves a retry's claim standing
         // for the retries after it.
-        // A claim's lease names the id its worker had when it claimed: a
-        // dispatch on that id is one on the claimed worker, registered
-        // again since or not.
-        let claimed_here = entry.claim != WorkerId(0) && entry.leased == target;
         // A dispatch names the id its lease was issued on. In neither
         // pin, its worker may have been registered again since: the
         // table's renames say which id stands for it. A dispatch on a
@@ -1008,29 +1085,15 @@ impl SessionTable {
         // holds for that worker, so it asks too where a respill dropped
         // the claim's own pin: the key may hold the worker as a pin a
         // rename's walk has yet to reach.
-        let named = if claimed_here { entry.claim } else { target };
+        let named = entry.of_record(target);
         let target = self.stands(entry, named);
-        if entry.claim != WorkerId(0) && entry.claim == target {
-            entry.claim = WorkerId(0);
-        }
+        entry.confirm_claim(target);
         if let SessionVerdict::Claimed(claimed) = verdict {
             if claimed != WorkerId(0) && entry.reached_by(claimed, at) {
-                let pin = entry.claim;
-                entry.claim = WorkerId(0);
-                entry.withdraw(pin);
+                entry.withdraw_claim();
             }
         }
-        if entry.pins[0] == target {
-            return;
-        }
-        let respill = verdict == SessionVerdict::Respill;
-        if !respill && entry.pins.contains(&target) {
-            return;
-        }
-        match (respill, entry.recovery) {
-            (true, _) | (false, Recovery::Latest) => entry.front(target),
-            (false, Recovery::Original) => entry.append(target),
-        }
+        entry.served(target, verdict);
     }
 
     /// A worker left membership: its pins stand, and read as not routable
@@ -1163,7 +1226,7 @@ impl SessionTable {
     /// too, because its answer names a pin ([`Self::claim`]).
     #[inline]
     fn stands(&self, entry: &mut Entry, target: WorkerId) -> WorkerId {
-        if !entry.pins.contains(&target) && self.renamed_len.load(Ordering::Relaxed) != 0 {
+        if !entry.holds(target) && self.renamed_len.load(Ordering::Relaxed) != 0 {
             self.standing(entry, target)
         } else {
             target
@@ -1216,7 +1279,7 @@ impl SessionTable {
     /// The pins of `workers` leave every key, in one walk.
     fn drop_pins(&self, workers: &[WorkerId]) {
         for shard in &self.shards {
-            self.retain(shard, |entry| Self::unpinned(entry, workers));
+            self.retain(shard, |entry| entry.unpin(workers));
         }
     }
 
@@ -1236,21 +1299,6 @@ impl SessionTable {
                 keys.shrink_to(2 * kept);
             }
         }
-    }
-
-    /// Takes the pins of `workers` off `entry`. False where that takes the
-    /// key's last pin: it leaves the table and is placed afresh. A key
-    /// that holds no pin stays: a decision read it and its claim follows
-    /// ([`Self::lookup`]), and the idle keys' pass alone reclaims it.
-    fn unpinned(entry: &mut Entry, workers: &[WorkerId]) -> bool {
-        let held = entry.pins[0] != WorkerId(0);
-        if workers.contains(&entry.pins[1]) {
-            entry.pins[1] = WorkerId(0);
-        }
-        if workers.contains(&entry.pins[0]) {
-            entry.pins = [entry.pins[1], WorkerId(0)];
-        }
-        !held || entry.pins[0] != WorkerId(0)
     }
 
     /// The sweep that is due, for a host that calls it on a timer of its
@@ -1380,7 +1428,7 @@ impl SessionTable {
         for shard in &self.shards {
             self.retain(shard, |entry| {
                 let stays = !idle || entry.expires_at_micros > now_micros;
-                stays && Self::unpinned(entry, &ended)
+                stays && entry.unpin(&ended)
             });
         }
         drop(held);

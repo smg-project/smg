@@ -728,10 +728,6 @@ impl MemoryStore {
             self.pins_follow(old, new);
         }
         drop(workers);
-        // A case's hook runs here, once the workers lock is let go and before
-        // the gone keys' pins are forgotten.
-        #[cfg(test)]
-        seam::released();
         self.forget_gone(&ended);
         true
     }
@@ -3949,16 +3945,10 @@ impl LeasesStore for MemoryStore {
 #[path = "../../tests/unit/store/memory/tests.rs"]
 mod tests;
 
-/// A seam for the cases: a hook the writing thread runs once, where a write
-/// by the store's one body has let the workers lock go
-/// ([`MemoryStore::decided`]): a followed change, or a change the
-/// replica's worker objects decided. A told status runs none. A second
-/// hook runs inside an apply
-/// of a generation, between the engine's turn and the publication of the
-/// generation's world ([`MemoryStore::apply`]). No case reaches the
-/// second place from outside, and the first only where the store has a
-/// journal, which hears there that the write's locks are let go
-/// ([`Journal::released`]). In no build but the cases'.
+/// A seam for the cases: a hook the applying thread runs once inside an
+/// apply of a generation, between the engine's turn and the publication of
+/// the generation's world ([`MemoryStore::apply`]). No case reaches that
+/// place from outside. In no build but the cases'.
 #[cfg(test)]
 #[path = "../../tests/unit/store/memory/seam.rs"]
 pub(crate) mod seam;

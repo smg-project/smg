@@ -975,5 +975,5 @@ where
 }
 
 #[cfg(test)]
-#[path = "../../tests/unit/worker_host/kv/tests.rs"]
+#[path = "../../tests/unit/worker_host/kv/tests/mod.rs"]
 mod tests;

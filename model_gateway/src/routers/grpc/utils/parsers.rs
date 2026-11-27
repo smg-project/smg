@@ -23,7 +23,10 @@ use tool_parser::{
 };
 use tracing::warn;
 
-use crate::routers::{common::snapshot::WorkerRegistry, grpc::context::WorkerSelection};
+use crate::routers::{
+    common::snapshot::WorkerRegistry,
+    grpc::{context::WorkerSelection, regular::symphony::ByAlias},
+};
 
 /// Per-request parser-name resolution.
 ///
@@ -50,6 +53,9 @@ pub struct ParserResolver {
     /// parser of the kind has the name ([`Self::new`]); the flags themselves
     /// for the tests' `with_flags`.
     legacy_flags: Names,
+    /// The served models a `--model-alias` reads under Symphony, as the context of this
+    /// resolver read them at its start ([`Self::reading_by_alias`]); none until then.
+    by_alias: Arc<[ByAlias]>,
 }
 
 impl ParserResolver {
@@ -88,7 +94,24 @@ impl ParserResolver {
             worker_registry: Some(worker_registry),
             flags,
             legacy_flags,
+            by_alias: Arc::new([]),
         }
+    }
+
+    /// This resolver with the record of the served models an alias reads, as its context read
+    /// them at the start (`regular::symphony::read_by_alias`): the names it hands Symphony
+    /// ([`Self::names_of`], [`Self::names_for`]) carry that record, and no other context's.
+    #[must_use]
+    pub(crate) fn reading_by_alias(mut self, by_alias: Arc<[ByAlias]>) -> Self {
+        self.by_alias = by_alias;
+        self
+    }
+
+    /// The record [`Self::reading_by_alias`] gave, for what owns the names of a model past this
+    /// resolver's borrow (`regular::symphony::AutoTag`); `None` where no alias reads any served
+    /// model, so a request of such a gateway writes no shared count for it.
+    pub(crate) fn by_alias(&self) -> Option<Arc<[ByAlias]>> {
+        (!self.by_alias.is_empty()).then(|| Arc::clone(&self.by_alias))
     }
 
     /// A resolver whose configured names pass to the legacy parsers whole, the
@@ -108,6 +131,7 @@ impl ParserResolver {
             worker_registry: Some(worker_registry),
             legacy_flags: flags.clone(),
             flags,
+            by_alias: Arc::new([]),
         }
     }
 
@@ -118,6 +142,7 @@ impl ParserResolver {
             worker_registry: None,
             flags: Names::default(),
             legacy_flags: Names::default(),
+            by_alias: Arc::new([]),
         }
     }
 
@@ -152,6 +177,7 @@ impl ParserResolver {
         ModelNames {
             labels: self.card_names(model),
             flags: &self.flags,
+            by_alias: &self.by_alias,
         }
     }
 
@@ -174,6 +200,7 @@ impl ParserResolver {
                 Names::default()
             },
             flags: &self.flags,
+            by_alias: &self.by_alias,
         }
     }
 
@@ -184,6 +211,7 @@ impl ParserResolver {
         ModelNames {
             labels: resolved.map_or_else(|| self.card_names(model), Names::clone),
             flags: &self.flags,
+            by_alias: &self.by_alias,
         }
     }
 
@@ -367,6 +395,10 @@ static NO_NAMES: Names = Names {
 pub(crate) struct ModelNames<'a> {
     pub labels: Names,
     pub flags: &'a Names,
+    /// The served models a `--model-alias` reads, as the context of these names read them at
+    /// its start (`regular::symphony::read_by_alias`): Symphony reads a model by them where no
+    /// name is set for it. Empty where the context read none.
+    pub by_alias: &'a [ByAlias],
 }
 
 impl Default for ModelNames<'_> {
@@ -374,6 +406,7 @@ impl Default for ModelNames<'_> {
         Self {
             labels: Names::default(),
             flags: &NO_NAMES,
+            by_alias: &[],
         }
     }
 }
@@ -385,6 +418,7 @@ impl ModelNames<'_> {
         ModelNames {
             labels,
             flags: &NO_NAMES,
+            by_alias: &[],
         }
     }
 
@@ -393,6 +427,7 @@ impl ModelNames<'_> {
         ModelNames {
             labels: Names::default(),
             flags,
+            by_alias: &[],
         }
     }
 }

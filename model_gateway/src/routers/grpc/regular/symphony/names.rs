@@ -1,7 +1,7 @@
 //! Name resolution: which table reads a model's responses, from the parser names set for it and
 //! the registry, and the checks on those names at startup and at a worker's registration.
 
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
 
 use llm_tokenizer::traits::Tokenizer;
 use symphony::{
@@ -92,8 +92,10 @@ pub(crate) fn labels_select_nothing(names: &Names) -> bool {
 /// `legacy`, as before.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Fallback {
-    /// No table reads the model and no name is set for it: the registry does not know the model,
-    /// and neither its labels nor the flags name anything.
+    /// No table reads the model and no name is set for it: the registry does not know the
+    /// model's served name, no `--model-alias` it is served under reads it ([`read_by_alias`];
+    /// an alias declared on a worker's own card is not consulted), and neither its labels nor
+    /// the flags name anything.
     NoTable,
     /// A reasoning name alone that no table answers to (`deepseek_r1`, `qwen3_thinking`), in the
     /// labels or the flags, for a model the registry does not know: every table reads the thought
@@ -146,7 +148,10 @@ fn nothing_reason(names: &ModelNames<'_>) -> Fallback {
 /// set for the model ([`ModelNames`]) and the registry: the names of the model's card (its
 /// workers' labels), when they select anything; else the gateway's `--tool-call-parser` and
 /// `--reasoning-parser`, when they select anything; else the registry's table, for a model it
-/// knows (`symphony::formats::for_model`); else the legacy parsers, with their own detection, the
+/// knows (`symphony::formats::for_model`); else, where no name is set at all, the registry's table
+/// for a configured alias the model is served under (`--model-alias`), the first the registry
+/// knows in the aliases' sorted order, for a served name the legacy parsers' own detection reads
+/// nothing by ([`read_by_alias`]); else the legacy parsers, with their own detection, the
 /// reason named ([`Fallback`]). The flags' legacy tool-call name or `passthrough` keeps the legacy
 /// parsers for a model the registry knows too. A reasoning name alone in the flags does not come
 /// before the registry ([`flags_read_first`]): a table that answers to it reads only the models
@@ -157,7 +162,7 @@ fn nothing_reason(names: &ModelNames<'_>) -> Fallback {
 /// as before its table came, and its table reads the model where the legacy parsers would read
 /// with the name: neither source selects anything, and it is the reasoning name in force, the
 /// labels' before the flags'. The registry is asked once per path, as before the flags came
-/// apart.
+/// apart: the path that reaches the aliases reads what the start recorded of them.
 pub(super) fn decision(names: &ModelNames<'_>, model: &str) -> Decision {
     if let Some(decided) = decided_by(&names.labels, model) {
         return decided;
@@ -186,7 +191,16 @@ pub(super) fn decision(names: &ModelNames<'_>, model: &str) -> Decision {
                 .and_then(answering_to)
             {
                 Some(table) => Decision::Table(table.shared()),
-                None => Decision::Legacy(nothing_reason(names)),
+                None => match nothing_reason(names) {
+                    // No name is set, the registry does not know the served name and the
+                    // legacy parsers detect nothing by it: the registry's table for an
+                    // alias the model is served under reads the model.
+                    Fallback::NoTable => by_alias(names, model)
+                        .map_or(Decision::Legacy(Fallback::NoTable), |(_, format, _)| {
+                            Decision::Table(Arc::clone(format))
+                        }),
+                    why => Decision::Legacy(why),
+                },
             },
         },
     }
@@ -323,6 +337,72 @@ pub(crate) fn set_aside_by_the_registry(
         }
         _ => None,
     }
+}
+
+/// A served model an alias reads ([`read_by_alias`]): its served name, the table that reads it,
+/// and each `--model-alias` of it the registry knows with its table, in the aliases' sorted order.
+pub(crate) type ByAlias = (String, Arc<Format>, Vec<(String, Table)>);
+
+/// The served models an alias reads, sorted by served name, read once at the start: for each
+/// served name among `aliases` (`--model-alias`, the alias and the name it is served under) that
+/// the registry does not know and neither legacy registry detects a parser for, the registry's
+/// table for the first of its aliases the registry knows, in their sorted order. A served name a
+/// legacy registry detects a parser for keeps the legacy parsers, as before the aliases were
+/// read, whatever table an alias of it names; an absent registry detects nothing. The context
+/// that asked keeps the record and hands it on with the names of a model ([`ModelNames`]), and
+/// [`decision`] reads it where no name is set for the model: a request asks neither the aliases
+/// nor the legacy registries, and one context reads nothing another recorded.
+pub(crate) fn read_by_alias<'a>(
+    aliases: impl IntoIterator<Item = (&'a str, &'a str)>,
+    tools: Option<&tool_parser::ParserFactory>,
+    reasoning: Option<&reasoning_parser::ParserFactory>,
+) -> Vec<ByAlias> {
+    let mut of_served: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (alias, served) in aliases {
+        of_served.entry(served).or_default().push(alias);
+    }
+    // The map hands out the served names in their order, so the record is sorted by them.
+    let mut by_alias = Vec::new();
+    for (served, mut aliases) in of_served {
+        let read_by_its_name = table_for(served).is_some()
+            || tools.is_some_and(|tools| tools.registry().has_parser_for_model(served))
+            || reasoning.is_some_and(|reasoning| reasoning.registry().has_parser_for_model(served));
+        if read_by_its_name {
+            continue;
+        }
+        aliases.sort_unstable();
+        if let Some(format) = aliases.iter().find_map(|alias| for_model_shared(alias)) {
+            let tables = aliases
+                .iter()
+                .filter_map(|alias| Some(((*alias).to_string(), table_for(alias)?)))
+                .collect();
+            by_alias.push((served.to_string(), format, tables));
+        }
+    }
+    by_alias
+}
+
+/// The record of the served model `model` among those the context of `names` reads by an alias
+/// ([`read_by_alias`]), where one reads it. No lock is taken and no shared count written; where
+/// no alias reads any served model the search ends on the empty record.
+fn by_alias<'a>(names: &ModelNames<'a>, model: &str) -> Option<&'a ByAlias> {
+    let at = names
+        .by_alias
+        .binary_search_by(|(served, ..)| served.as_str().cmp(model))
+        .ok()?;
+    names.by_alias.get(at)
+}
+
+/// The `--model-alias` names of `model` the registry knows, each with its table, in the aliases'
+/// sorted order, where [`decision`] reads `model` by the first of them: no name is set for the
+/// model and an alias reads it ([`read_by_alias`]). Empty where the decision does not reach the
+/// aliases or none reads the model. Registration says the first once per model, and warns where
+/// a later one names another table (`workflow::steps::local::check_local_worker`).
+pub(crate) fn tables_by_alias(names: &ModelNames<'_>, model: &str) -> Vec<(String, Table)> {
+    if names.labels != Names::default() || *names.flags != Names::default() {
+        return Vec::new();
+    }
+    by_alias(names, model).map_or_else(Vec::new, |(_, _, tables)| tables.clone())
 }
 
 /// Whether the parser names set for a model (the flags, or one worker's labels) are names the
@@ -577,7 +657,7 @@ mod tests {
     use super::*;
     use crate::routers::grpc::{
         regular::symphony::testing::*,
-        utils::{ALIASES, UNANSWERED},
+        utils::{ParserResolver, ALIASES, UNANSWERED},
     };
 
     #[test]
@@ -1271,7 +1351,11 @@ mod tests {
         let v13 = pair(Some("mistral_v13"), None);
         let no_flags = Names::default();
         fn labeled<'a>(labels: Names, flags: &'a Names) -> ModelNames<'a> {
-            ModelNames { labels, flags }
+            ModelNames {
+                labels,
+                flags,
+                by_alias: &[],
+            }
         }
 
         // The labels over the registry: a table they name reads a model the registry reads with
@@ -1413,6 +1497,124 @@ mod tests {
         assert_eq!(read(&ModelNames::default(), unknown), Ok(None));
     }
 
+    /// A served name the registry does not know is read by the registry's table for a configured
+    /// alias it is served under, where no name is set for it at all: the first alias the registry
+    /// knows, in their sorted order; aliases the registry does not know leave the legacy parsers.
+    /// A name in either source reads as it does without an alias, and a served name the registry
+    /// knows keeps its own table whatever its aliases name. The registration check counts the
+    /// model under the same table.
+    #[test]
+    fn an_alias_the_registry_knows_reads_a_served_name_it_does_not() {
+        let served = "house-chat-01";
+        let known = "house-org/Qwen3-8B";
+        assert_eq!(table_for(served), None);
+        assert_eq!(table_for(known), Some(Table::Qwen3));
+        let by_alias = read_by_alias(
+            [
+                ("a-house-name", served),
+                ("by-alias/Qwen3-8B", served),
+                ("by-alias/Llama-4-Scout-17B-16E-Instruct", served),
+                ("another-house-name", "house-chat-02"),
+                ("also-by-alias/Llama-4-Scout-17B-16E-Instruct", known),
+            ],
+            Some(&tool_parser::ParserFactory::new()),
+            Some(&reasoning_parser::ParserFactory::new()),
+        );
+        let unnamed = ModelNames {
+            by_alias: &by_alias,
+            ..ModelNames::default()
+        };
+        let labeled = |labels| ModelNames {
+            labels,
+            ..unnamed.clone()
+        };
+        let flagged = |flags| ModelNames {
+            flags,
+            ..unnamed.clone()
+        };
+        let read = |names: &ModelNames<'_>, model: &str| {
+            reads(ParserChoice::Symphony, names, model, &templates())
+                .map(|format| format.map(|format| format.name().to_string()))
+        };
+        let table = |name: &str| Ok(Some(name.to_string()));
+
+        assert_eq!(read(&unnamed, served), table("llama4"));
+        let label = table_label_read(&unnamed, "meta-llama/Llama-4-Scout-17B-16E-Instruct");
+        assert!(label.is_some());
+        assert_eq!(table_label_read(&unnamed, served), label);
+        assert_eq!(read(&unnamed, "house-chat-02"), Ok(None));
+        assert_eq!(read(&unnamed, known), table("qwen3"));
+        let v13 = pair(Some("mistral_v13"), None);
+        assert_eq!(read(&labeled(v13.clone()), served), table("mistral_v13"));
+        assert_eq!(read(&flagged(&v13), served), table("mistral_v13"));
+        assert_eq!(
+            read(&labeled(pair(Some("pythonic"), None)), served),
+            Ok(None)
+        );
+        let reasoning_alone = pair(None, Some("deepseek_r1"));
+        assert_eq!(read(&flagged(&reasoning_alone), served), Ok(None));
+    }
+
+    /// A served name a legacy registry detects a parser for keeps the legacy parsers, as before
+    /// the aliases were read, whatever table an alias of it names: the parser its name selects
+    /// reads its tool calls or its thought, which the alias's table need not.
+    #[test]
+    fn a_served_name_the_legacy_parsers_detect_is_not_read_by_its_alias() {
+        let tools = tool_parser::ParserFactory::new();
+        let reasoning = reasoning_parser::ParserFactory::new();
+        let by_tools = "llama-house";
+        let by_reasoning = "house-nano-v3";
+        assert!(tools.registry().has_parser_for_model(by_tools));
+        assert!(!tools.registry().has_parser_for_model(by_reasoning));
+        assert!(reasoning.registry().has_parser_for_model(by_reasoning));
+        let aliases = [
+            ("legacy-detects/Qwen3-8B", by_tools),
+            ("legacy-detects-too/Qwen3-8B", by_reasoning),
+        ];
+        for (alias, served) in aliases {
+            assert_eq!(table_for(alias), Some(Table::Qwen3));
+            assert_eq!(table_for(served), None);
+        }
+        let by_alias = read_by_alias(aliases, Some(&tools), Some(&reasoning));
+        for (_, served) in aliases {
+            let names = ModelNames {
+                by_alias: &by_alias,
+                ..ModelNames::default()
+            };
+            assert_eq!(
+                reads(ParserChoice::Symphony, &names, served, &templates())
+                    .map(|format| format.map(|format| format.name().to_string())),
+                Ok(None)
+            );
+            assert!(tables_by_alias(&names, served).is_empty());
+        }
+    }
+
+    /// The record of the aliases is its context's own: a served name one context reads by an
+    /// alias is nothing to a context that configures no alias, and two contexts that name
+    /// different tables for one served name read it each by its own, whichever was built last.
+    #[test]
+    fn a_context_reads_by_its_own_aliases_and_by_no_other_contexts() {
+        let served = "house-chat-11";
+        assert_eq!(table_for(served), None);
+        let context = |aliases: &[(&str, &str)]| {
+            ParserResolver::disabled()
+                .reading_by_alias(read_by_alias(aliases.iter().copied(), None, None).into())
+        };
+        let one = context(&[("by-alias/Llama-4-Scout-17B-16E-Instruct", served)]);
+        let other = context(&[("by-alias/Qwen3-8B", served)]);
+        let none = context(&[]);
+        let read = |context: &ParserResolver| {
+            let names = context.names_of(Names::default());
+            let table = reads(ParserChoice::Symphony, &names, served, &templates())
+                .map(|format| format.map(|format| format.name().to_string()));
+            (table, tables_by_alias(&names, served).len())
+        };
+        assert_eq!(read(&one), (Ok(Some("llama4".to_string())), 1));
+        assert_eq!(read(&other), (Ok(Some("qwen3".to_string())), 1));
+        assert_eq!(read(&none), (Ok(None), 0));
+    }
+
     /// A reasoning name that gives way, alone in a source: the registry's table reads a model it
     /// knows and the table the flags' tool-call name selects reads another, as before the name's
     /// table came. The name's table reads where the legacy parsers would read with the name:
@@ -1451,7 +1653,11 @@ mod tests {
             let labels = labels.clone();
             reads(
                 ParserChoice::Symphony,
-                &ModelNames { labels, flags },
+                &ModelNames {
+                    labels,
+                    flags,
+                    by_alias: &[],
+                },
                 model,
                 &templates(),
             )
@@ -1479,7 +1685,11 @@ mod tests {
             Decision::Template | Decision::Table(_) => None,
         };
         fn labeled<'a>(labels: Names, flags: &'a Names) -> ModelNames<'a> {
-            ModelNames { labels, flags }
+            ModelNames {
+                labels,
+                flags,
+                by_alias: &[],
+            }
         }
 
         // The labels' way back, for a model the registry knows as for one it does not.
@@ -1672,6 +1882,7 @@ mod tests {
         let labeled = ModelNames {
             labels: pair(Some("qwen_xml"), None),
             flags: &step3,
+            by_alias: &[],
         };
         assert!(Arc::ptr_eq(
             &match decision(&labeled, step) {
@@ -1732,7 +1943,14 @@ mod tests {
         let no_flags = Names::default();
         let flags = pair(Some("mistral_v13"), None);
         let read = |labels: Names, flags: &Names, model: &str| {
-            table_label_read(&ModelNames { labels, flags }, model)
+            table_label_read(
+                &ModelNames {
+                    labels,
+                    flags,
+                    by_alias: &[],
+                },
+                model,
+            )
         };
         assert_eq!(
             read(Names::default(), &no_flags, "Qwen/Qwen3-8B"),

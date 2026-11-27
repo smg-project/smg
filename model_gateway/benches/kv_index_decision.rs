@@ -78,7 +78,7 @@ use smg_worker::{
 
 /// The exactness tests' stream generator, by path: the mock engine's streams
 /// through the relay's decoder and normalizer.
-#[path = "../src/policies/kv_index/index_backend/mock_streams.rs"]
+#[path = "../tests/unit/policies/kv_index/index_backend/mock_streams.rs"]
 #[expect(
     dead_code,
     reason = "the bench takes the payloads; the exactness tests the checkpoints and prompts too"

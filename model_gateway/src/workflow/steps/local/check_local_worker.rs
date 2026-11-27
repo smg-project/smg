@@ -12,7 +12,7 @@ use smg_worker::{
     },
     workflow::{require_host, WorkerKind},
 };
-use tracing::warn;
+use tracing::{info, warn};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
@@ -26,6 +26,7 @@ use crate::{
             },
             regular::symphony::{
                 check_names, labels_select_nothing, set_aside_by_the_registry, table_label_read,
+                tables_by_alias, ByAlias,
             },
             utils::{ModelNames, Names},
             zmq_client::zmq_handshake_address,
@@ -97,6 +98,19 @@ impl StepExecutor<WorkerWorkflowData> for CheckLocalWorkerStep {
         ) {
             warn!(model = %model_card.id, worker = %Endpoint::redacted_str(&config.url), "{message}");
         }
+        if let Some((read, set_aside)) = read_by_an_alias(
+            &model_card,
+            app_context.router_config.parser,
+            *connection_mode,
+            &flags,
+            &app_context.by_alias,
+            &app_context.worker_registry,
+        ) {
+            info!(model = %model_card.id, "{read}");
+            if let Some(set_aside) = set_aside {
+                warn!(model = %model_card.id, "{set_aside}");
+            }
+        }
 
         validate_zmq_handshake_address(
             &app_context.worker_registry,
@@ -115,6 +129,7 @@ impl StepExecutor<WorkerWorkflowData> for CheckLocalWorkerStep {
             app_context.router_config.parser,
             *connection_mode,
             &flags,
+            &app_context.by_alias,
         );
 
         if mm_settings().processing.value == MmProcessingMode::Worker {
@@ -272,12 +287,20 @@ fn symphony_table_of(
     parser: ParserChoice,
     connection_mode: ConnectionMode,
     flags: &Names,
+    by_alias: &[ByAlias],
 ) -> Option<&'static str> {
     if parser != ParserChoice::Symphony || connection_mode == ConnectionMode::Http {
         return None;
     }
     let labels = card_names(card);
-    table_label_read(&ModelNames { labels, flags }, &card.id)
+    table_label_read(
+        &ModelNames {
+            labels,
+            flags,
+            by_alias,
+        },
+        &card.id,
+    )
 }
 
 /// Under `--parser symphony`, the gateway's flags read a model ahead of the registry for every
@@ -315,6 +338,62 @@ fn registry_reads_over_the_flags(
         Endpoint::redacted_str(worker_url),
         flags.reasoning.as_deref().unwrap_or_default(),
     ))
+}
+
+/// Under `--parser symphony`, a gRPC or ZMQ model that no parser name is set for, the registry
+/// does not know and no legacy registry detects a parser for is read by the registry's table for a
+/// `--model-alias` of it that the registry knows, the first in sorted order
+/// (`regular::symphony::names::read_by_alias`). The registration of the
+/// model's first worker says which alias gives which table, and, where another such alias of the
+/// model names another table, a second message names each with its table: `None` for the model's
+/// later workers, a model read any other way, an HTTP worker and the legacy parser choice. Workers
+/// of one model registering at the same moment may each say it, as the checks above may.
+fn read_by_an_alias(
+    card: &ModelCard,
+    parser: ParserChoice,
+    connection_mode: ConnectionMode,
+    flags: &Names,
+    by_alias: &[ByAlias],
+    registry: &WorkerRegistry,
+) -> Option<(String, Option<String>)> {
+    if parser != ParserChoice::Symphony
+        || connection_mode == ConnectionMode::Http
+        || !registry.get_by_model(&card.id).is_empty()
+    {
+        return None;
+    }
+    let labels = card_names(card);
+    let tables = tables_by_alias(
+        &ModelNames {
+            labels,
+            flags,
+            by_alias,
+        },
+        &card.id,
+    );
+    let ((alias, table), rest) = tables.split_first()?;
+    let read = format!(
+        "the registry's table '{}' reads model '{}' by its --model-alias '{alias}': the registry \
+         does not know the served name and no parser name is set for the model",
+        table.name(),
+        card.id,
+    );
+    let others: Vec<String> = rest
+        .iter()
+        .filter(|(_, other)| other != table)
+        .map(|(alias, other)| format!("'{alias}' names '{}'", other.name()))
+        .collect();
+    let set_aside = (!others.is_empty()).then(|| {
+        format!(
+            "model '{}' has --model-alias names of more than one table: '{alias}', the first in \
+             sorted order, gives it '{}'; set aside: {} (a parser label on the model's workers \
+             names the table for this model; --tool-call-parser names it for every model)",
+            card.id,
+            table.name(),
+            others.join(", "),
+        )
+    });
+    Some((read, set_aside))
 }
 
 /// Reject a ZMQ worker whose TCP handshake address is unusable or already
@@ -497,7 +576,7 @@ mod tests {
     fn a_workers_registration_resolves_the_table_whose_failure_classes_are_published() {
         let known = ModelCard::new("Qwen/Qwen3-8B");
         let table = |card: &ModelCard, parser, connection_mode| {
-            symphony_table_of(card, parser, connection_mode, &Names::default())
+            symphony_table_of(card, parser, connection_mode, &Names::default(), &[])
         };
         assert_eq!(
             table(&known, ParserChoice::Legacy, ConnectionMode::Grpc),
@@ -730,12 +809,19 @@ mod tests {
                 &known,
                 ParserChoice::Symphony,
                 ConnectionMode::Grpc,
-                &tool_named
+                &tool_named,
+                &[]
             ),
             Some("mistral_v13")
         );
         assert_eq!(
-            symphony_table_of(&known, ParserChoice::Symphony, ConnectionMode::Grpc, &flags),
+            symphony_table_of(
+                &known,
+                ParserChoice::Symphony,
+                ConnectionMode::Grpc,
+                &flags,
+                &[]
+            ),
             Some("qwen3")
         );
         // A label that selects nothing (a reasoning name no table answers to) falls through to
@@ -771,6 +857,85 @@ mod tests {
             said(&known, "grpc://a:1", ParserChoice::Legacy, &flags, &fresh),
             None,
             "the legacy parsers"
+        );
+    }
+
+    /// Under `--parser symphony`, the registration of the first gRPC worker of a model that only a
+    /// `--model-alias` gives a table says which alias gives which table, and a second message
+    /// names every other alias of the model that names another table. The model's next worker, a
+    /// parser flag, a parser label, an HTTP worker, a model none of whose aliases the registry
+    /// knows and the legacy parser choice say nothing.
+    #[test]
+    fn the_alias_that_gives_a_models_table_is_said_once_per_model_at_registration() {
+        use crate::routers::grpc::regular::symphony::read_by_alias;
+
+        let by_alias = read_by_alias(
+            [
+                ("said-alias/Qwen3-8B", "house-said-01"),
+                ("said-alias/Llama-4-Scout-17B-16E-Instruct", "house-said-01"),
+                ("said-alias/a-house-name", "house-said-01"),
+                ("said-only/Qwen3-8B", "house-said-02"),
+                ("said-alias/another-house-name", "house-said-03"),
+            ],
+            None,
+            None,
+        );
+        let two = ModelCard::new("house-said-01");
+        let none = Names::default();
+        let registry = WorkerRegistry::new();
+        let grpc = ConnectionMode::Grpc;
+        let said = |card: &ModelCard, parser, mode, flags: &Names| {
+            read_by_an_alias(card, parser, mode, flags, &by_alias, &registry)
+        };
+
+        let (read, set_aside) = said(&two, ParserChoice::Symphony, grpc, &none)
+            .expect("the model's first worker says so");
+        assert!(
+            read.contains("table 'llama4' reads model 'house-said-01'")
+                && read.contains("--model-alias 'said-alias/Llama-4-Scout-17B-16E-Instruct'"),
+            "{read}"
+        );
+        let set_aside = set_aside.expect("two aliases, two tables");
+        assert!(
+            set_aside.contains("model 'house-said-01'")
+                && set_aside.contains("gives it 'llama4'")
+                && set_aside.contains("'said-alias/Qwen3-8B' names 'qwen3'")
+                && !set_aside.contains("a-house-name"),
+            "{set_aside}"
+        );
+        let one = ModelCard::new("house-said-02");
+        let (read, set_aside) = said(&one, ParserChoice::Symphony, grpc, &none).expect("one alias");
+        assert!(
+            read.contains("table 'qwen3' reads model 'house-said-02'"),
+            "{read}"
+        );
+        assert_eq!(set_aside, None);
+
+        let flag = Names {
+            tool: Some("mistral_v13".to_string()),
+            reasoning: None,
+        };
+        let mut labeled = two.clone();
+        labeled.tool_parser = Some("mistral_v13".to_string());
+        let unlisted = ModelCard::new("house-said-03");
+        let http = ConnectionMode::Http;
+        assert_eq!(said(&two, ParserChoice::Symphony, grpc, &flag), None);
+        assert_eq!(said(&labeled, ParserChoice::Symphony, grpc, &none), None);
+        assert_eq!(said(&two, ParserChoice::Symphony, http, &none), None);
+        assert_eq!(said(&unlisted, ParserChoice::Symphony, grpc, &none), None);
+        assert_eq!(said(&two, ParserChoice::Legacy, grpc, &none), None);
+
+        registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new("grpc://said:1")
+                    .model(two.clone())
+                    .build(),
+            ))
+            .expect("register");
+        assert_eq!(
+            said(&two, ParserChoice::Symphony, grpc, &none),
+            None,
+            "the model's second worker"
         );
     }
 
