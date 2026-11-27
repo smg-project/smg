@@ -1131,6 +1131,34 @@ async fn a_create_only_job_adds_a_row_and_fails_where_one_stands() {
     assert_eq!(f.store.all_rows().1.len(), 2);
 }
 
+/// The registration step's write of an add, tried again, reads each rank
+/// that stands as an upsert reads it. So a standing rank that states the
+/// default window's own number is the job's own rank: the write lays the
+/// rank that is left, and the rank that stood keeps its number.
+#[tokio::test]
+async fn an_add_tried_again_reads_a_standing_rank_as_an_upsert_does() {
+    let number = u32::try_from(HealthCheckConfig::default().drain_settle_secs)
+        .expect("the default window in a row's width");
+    let f = Fixture::new();
+    let ranks = ranked_workers(2);
+    let own = facts(ranks[1].as_ref(), None);
+    assert_eq!(own.drain_settle_secs, None);
+    let standing = WorkerFacts {
+        drain_settle_secs: Some(number),
+        ..own
+    };
+    f.laid(standing.clone());
+    let mut cx = f.registration(WorkerJobAsker::Api, ranks);
+    cx.data.registration_mode = WorkerRegistrationMode::CreateOnly;
+    f.write()
+        .execute(&mut cx)
+        .await
+        .expect("the first rank laid");
+    assert_eq!(f.store.all_rows().1.len(), 2);
+    let kept = f.store.by_key(&standing.key).expect("the rank that stood");
+    assert_eq!(kept.facts.drain_settle_secs, Some(number));
+}
+
 #[tokio::test]
 async fn a_replacement_by_id_is_laid_over_the_row_behind_that_worker() {
     let f = Fixture::new();
@@ -1292,9 +1320,10 @@ async fn a_replacement_by_id_clears_a_threshold_it_leaves_out_and_the_other_verb
 
 /// A row may state the drain window at the default's own number, as a
 /// control call's registration does, and a built worker that waits the
-/// default leaves the window out. An upsert and an update in place keep
-/// the row's number. A replacement by id is its maker's whole statement:
-/// the row states no window, or the one the replacement states.
+/// default states no window of its own. An upsert and an update in place
+/// keep the row's number. A replacement by id reads with no word of the
+/// row: the row states the window the replacement's worker waits, as wide
+/// as a row holds, or none at the default, whatever stood.
 #[tokio::test]
 async fn a_replacement_by_id_clears_a_window_at_the_default_and_the_other_verbs_keep_it() {
     let f = Fixture::new();
@@ -1347,22 +1376,35 @@ async fn a_replacement_by_id_clears_a_window_at_the_default_and_the_other_verbs_
         .expect("updated");
     assert_eq!(row().drain_settle_secs, Some(number));
 
-    // A replacement by id that waits the default states no window.
+    // A replacement by id that waits another window states it over the
+    // row's number.
     let (id, live) = standing();
     let by_id = |live: &Arc<dyn Worker>| WorkerRegistrationMode::ReplaceById {
         worker_id: id.as_str().to_owned(),
         expected_revision: live.revision(),
     };
-    let mut cx = f.registration(WorkerJobAsker::Api, vec![waiting(default)]);
-    cx.data.registration_mode = by_id(&live);
-    write.execute(&mut cx).await.expect("replaced");
-    assert_eq!(row().drain_settle_secs, None);
-    let (_, live) = standing();
-
-    // One that states another window sets it.
     let mut cx = f.registration(WorkerJobAsker::Api, vec![waiting(default + 40)]);
     cx.data.registration_mode = by_id(&live);
+    write.execute(&mut cx).await.expect("replaced");
+    assert_eq!(row().drain_settle_secs, Some(number + 40));
+
+    // One that waits the default states no window, whatever stood.
+    f.laid(WorkerFacts {
+        drain_settle_secs: Some(number),
+        ..row()
+    });
+    assert_eq!(row().drain_settle_secs, Some(number));
+    let (_, live) = standing();
+    let mut cx = f.registration(WorkerJobAsker::Api, vec![waiting(default)]);
+    cx.data.registration_mode = by_id(&live);
     write.execute(&mut cx).await.expect("replaced again");
+    assert_eq!(row().drain_settle_secs, None);
+
+    // Over a row that states none, one that waits another window sets it.
+    let (_, live) = standing();
+    let mut cx = f.registration(WorkerJobAsker::Api, vec![waiting(default + 40)]);
+    cx.data.registration_mode = by_id(&live);
+    write.execute(&mut cx).await.expect("replaced a third time");
     assert_eq!(row().drain_settle_secs, Some(number + 40));
 }
 

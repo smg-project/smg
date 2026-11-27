@@ -4369,6 +4369,118 @@ fn a_row_that_states_the_default_window_takes_a_label_refresh() {
     }
 }
 
+/// A registration may state a health policy with a part of a second, and a
+/// runtime the worker crate does not know or writes otherwise. The row
+/// keeps each as stated, and its object holds a narrower form: the object
+/// does not read back as the row. A refresh holds its worker against the
+/// row's own object, so the labels move and the row keeps its own word of
+/// every other fact.
+#[test]
+fn a_row_that_states_what_its_object_holds_narrower_takes_a_label_refresh() {
+    use smg_worker::worker::{HealthCheckConfig, RuntimeType};
+
+    let default = u32::try_from(HealthCheckConfig::default().drain_settle_secs)
+        .expect("the default window in a row's width");
+    let (store, door) = door();
+    let door = Arc::new(door);
+    let hosted = ReplicaMembershipWriter::new(Arc::clone(&door), operator(), under(TERM));
+    let policy = |timeout_ms: u32, check_interval_ms: u32| {
+        Some(proto::HealthPolicy {
+            disabled: true,
+            timeout_ms,
+            check_interval_ms,
+            ..Default::default()
+        })
+    };
+    let last = "grpc://10.0.2.6:8000";
+    // Each registration, and the runtime its row's object holds.
+    let rows: [(proto::WorkerSpec, RuntimeType); 6] = [
+        (
+            proto::WorkerSpec {
+                health_policy: policy(1_500, 0),
+                ..spec("grpc://10.0.2.1:8000")
+            },
+            RuntimeType::Unspecified,
+        ),
+        (
+            proto::WorkerSpec {
+                health_policy: policy(0, 2_500),
+                ..spec("grpc://10.0.2.2:8000")
+            },
+            RuntimeType::Unspecified,
+        ),
+        (
+            proto::WorkerSpec {
+                runtime: "custom-engine".to_owned(),
+                ..unchecked("grpc://10.0.2.3:8000")
+            },
+            RuntimeType::Unspecified,
+        ),
+        (
+            proto::WorkerSpec {
+                runtime: "VLLM".to_owned(),
+                ..unchecked("grpc://10.0.2.4:8000")
+            },
+            RuntimeType::Vllm,
+        ),
+        // The worker crate's own word for no runtime.
+        (
+            proto::WorkerSpec {
+                runtime: "unspecified".to_owned(),
+                ..unchecked("grpc://10.0.2.5:8000")
+            },
+            RuntimeType::Unspecified,
+        ),
+        // Each such fact at once, beside a window at the default's number.
+        (
+            proto::WorkerSpec {
+                runtime: "TensorRT-LLM".to_owned(),
+                health_policy: policy(1_500, 2_500),
+                drain_settle_secs: Some(default),
+                ..spec(last)
+            },
+            RuntimeType::Trtllm,
+        ),
+    ];
+    for (stated, runtime) in rows {
+        let url = stated.url.clone();
+        let named = stated.runtime.clone();
+        door.register(&operator(), under(TERM), &ask(stated, Mode::Add))
+            .expect("one row");
+        let row = store.by_key(&url).expect("the registered row");
+        assert_eq!(row.facts.engine_kind, named, "{url}");
+        // The row's object holds the runtime the worker crate reads the
+        // name as, and does not read back as the row.
+        let first = crate::worker_host::object(&row);
+        assert_eq!(first.metadata().spec.runtime_type, runtime, "{url}");
+        let read = crate::worker_host::facts(first.as_ref(), Some(&row.facts));
+        assert_ne!(read, row.facts, "{url}");
+        // What a refresh rebuilt: the row's object under another label.
+        let relabelled = WorkerRow {
+            facts: WorkerFacts {
+                labels: [("tier".to_owned(), "silver".to_owned())].into(),
+                ..row.facts.clone()
+            },
+            ..row.clone()
+        };
+        let built = crate::worker_host::object(&relabelled);
+        let wrote = hosted.refreshed(standing(&row), &built, &first);
+        assert_eq!(wrote, Ok(MembershipWriteOutcome::InPlace(row.id)), "{url}");
+        let refreshed = store.by_key(&url).expect("the refreshed row");
+        assert_eq!(refreshed.facts, relabelled.facts, "{url}");
+    }
+    let kept = store.by_key(last).expect("the last row").facts;
+    assert_eq!(
+        (
+            kept.engine_kind.as_str(),
+            kept.health.timeout_ms,
+            kept.health.check_interval_ms,
+            kept.drain_settle_secs
+        ),
+        ("TensorRT-LLM", 1_500, 2_500, Some(default))
+    );
+}
+
 #[test]
 fn every_write_of_a_provider_leaves_its_audit_line() {
     let lines = Logged::default();

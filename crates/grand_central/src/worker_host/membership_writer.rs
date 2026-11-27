@@ -15,7 +15,7 @@ use smg_worker::{
     settings::UnhealthyRemovalScope,
 };
 
-use super::{kv_feed::asks_events, RowRevision};
+use super::{kv_feed::asks_events, object::object, RowRevision};
 use crate::{
     engine::view::WorkerId,
     store::{
@@ -265,8 +265,10 @@ pub trait MembershipWriter: Send + Sync + 'static {
     /// provider's are served alike, and the row keeps the maker it has.
     ///
     /// The facts `built` states over the standing row ([`facts`]) may
-    /// differ from the row's in the labels and the descriptor alone. Any
-    /// other difference is refused
+    /// differ in the labels and the descriptor alone from the row's, or
+    /// from the facts the row's own object states ([`object`]): an object
+    /// holds some of a row's facts in a narrower form, and the row keeps
+    /// its own word of those. Any other difference is refused
     /// ([`MembershipWriteRefused::NotLabelsAlone`]), so a refresh starts no
     /// life. No row, another row or revision, and a draining row refuse it too.
     /// The stated facts' room is tested as a registration's is: the
@@ -284,6 +286,7 @@ pub trait MembershipWriter: Send + Sync + 'static {
     /// has nothing to hold the refresh against.
     ///
     /// [`facts`]: super::facts
+    /// [`object`]: super::object()
     fn refreshed(
         &self,
         seen: RowRevision,
@@ -840,18 +843,52 @@ pub(crate) fn take(
 /// registration, and a refresh leaves it as it stands. The worker is read
 /// as the door reads one (`read`), under no verb: a door whose log carries
 /// no descriptor keeps the standing one, so its refresh moves labels alone.
+///
+/// An object holds some of a row's facts in a narrower form: its checks in
+/// whole seconds, the runtime the worker crate reads a name as. A worker
+/// rebuilt from the row states them in that form, where the row may state
+/// a part of a second or a name as it was written. So a worker that does
+/// not state the row is held against the row's own object too
+/// ([`states_its_object`]). One that states that object is in scope: its
+/// labels and its descriptor may move, and the row keeps its own word of
+/// every other fact.
 pub(crate) fn refresh(
     turn: &impl Turn,
     seen: RowRevision,
     built: &dyn Worker,
     read: Reading,
 ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
-    refresh_stated(turn, seen, built.url(), &|standing| {
-        read(built, Some(standing), None)
-    })
+    refresh_stated(
+        turn,
+        seen,
+        built.url(),
+        &|standing| read(built, Some(standing), None),
+        &|row, stated| states_its_object(stated, row, read),
+    )
+}
+
+/// Whether `stated` is what the row's own object ([`object`]) states.
+/// `stated` is a refresh's worker as the door reads it (`read`), under the
+/// row's labels and its descriptor, the two a refresh may move. The object
+/// holds the row's labels as they are. A descriptor is the reading's to
+/// derive, so the row's stands in the object's reading too.
+///
+/// A worker states what the reading reads of it, here as at every other
+/// write. A reading holds a wait in milliseconds, up to the widest number
+/// a row's field holds: two workers that wait longer than that state the
+/// same fact.
+fn states_its_object(stated: &WorkerFacts, row: &WorkerRow, read: Reading) -> bool {
+    let mut own = read(object(row).as_ref(), Some(&row.facts), None);
+    own.pairing.clone_from(&row.facts.pairing);
+    *stated == own
 }
 
 /// [`refresh`] over the facts `state` makes of the guarded row.
+///
+/// Facts that are not the row's, its labels and its descriptor apart, are
+/// out of scope, save where `own` says they are those of the row's own
+/// object. Then the row's facts stand for them, and the stated labels and
+/// descriptor are held against the row's as over any other row.
 ///
 /// Labels are no part of a row's offer, and a patch writes them under the
 /// row's guard. A descriptor is part of it. Where it moved, the row takes
@@ -863,6 +900,7 @@ fn refresh_stated(
     seen: RowRevision,
     url: &str,
     state: &dyn Fn(&WorkerFacts) -> WorkerFacts,
+    own: &dyn Fn(&WorkerRow, &WorkerFacts) -> bool,
 ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
     let row = seen_row(turn, url, seen)?;
     // A draining row is leaving: its removal wins over a refresh, as over
@@ -874,7 +912,10 @@ fn refresh_stated(
     let labels = mem::replace(&mut stated.labels, row.facts.labels.clone());
     let mut pairing = mem::replace(&mut stated.pairing, row.facts.pairing.clone());
     if stated != row.facts {
-        return Err(MembershipWriteRefused::NotLabelsAlone);
+        if !own(&row, &stated) {
+            return Err(MembershipWriteRefused::NotLabelsAlone);
+        }
+        stated.clone_from(&row.facts);
     }
     // The row holds its descriptor as the pairing rule reads it. A stated
     // one that differs is read the same way before it counts as moved: its
