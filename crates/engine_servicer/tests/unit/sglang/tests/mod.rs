@@ -2860,7 +2860,20 @@ async fn hidden_states_pass_through_as_tick_rows_and_positions() {
 
 #[tokio::test]
 async fn thinking_token_budget_is_refused_by_a_scheduler_without_a_filter() {
-    let mut h = harness(model_info()).await;
+    let mut h = harness(SglangModelInfo {
+        server_args_json: r#"{"supports_thinking_token_budget":true}"#.into(),
+        ..model_info()
+    })
+    .await;
+    let args = h
+        .client
+        .get_server_info(sg::GetServerInfoRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .server_args
+        .expect("server_args");
+    assert!(!args.fields.contains_key("supports_thinking_token_budget"));
     let mut req = generate_request("budget", false, Vec::new());
     req.sampling_params
         .get_or_insert_default()
