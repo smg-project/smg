@@ -1020,6 +1020,31 @@ def publish(engine_checkout, output):
                         state["cleanup_verified_absent"] = True
                     else:
                         state["cleanup_unwitnessed_container"] = True
+                        state["unresolved_builder_handoff"] = {
+                            "builder": builder,
+                            "container_name": name,
+                            "docker_endpoint": "unix:///var/run/docker.sock",
+                            "observed_container_ids": remaining.decode(
+                                errors="replace"
+                            ).splitlines(),
+                            "reason": "Container creation cannot be attributed to this invocation",
+                            "creation_returned_id": None,
+                            "last_proof": "Name, image and private registration are not creation proof",
+                            "owner": "MoRI publisher steward / Root coordinator",
+                            "receipt": str(record),
+                            "manual_read_only_argv": docker
+                            + ["inspect", "--type", "container", name],
+                            "next_action": (
+                                "Obtain current host/daemon admission, then verify container identity "
+                                "and reconcile an attributable creation receipt. Keep HOLD and leave "
+                                "it untouched if ownership is unknown; never stop/remove by name alone. "
+                                "See docker/moriio-read/README.md#unresolved-builder-handoff"
+                            ),
+                        }
+                        event(
+                            "cleanup_unwitnessed_container_handoff",
+                            handoff=state["unresolved_builder_handoff"],
+                        )
                         raise RuntimeError(
                             "Builder container ownership is unconfirmed; leave untouched"
                         )

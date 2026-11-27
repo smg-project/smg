@@ -136,3 +136,27 @@ identity remains incomplete. Final cancellation and the first productive or
 cleanup exception remain failures even if the final receipt cannot be written.
 CPU protocol controls do not attest real BuildKit versions, daemon recovery,
 hardkill/host loss, future container appearance, or physical resource release.
+
+### Unresolved builder handoff
+
+`unresolved_builder_handoff` in the run's `result.json` identifies the builder,
+container name, observed IDs, Docker endpoint, unresolved reason and responsible
+steward. The matching `cleanup_unwitnessed_container_handoff` event preserves the
+same information. A missing creation ID is an unresolved ownership boundary;
+the expected name, matching image and private Buildx registration do not prove
+that this invocation created a container.
+
+The MoRI publisher steward / Root coordinator must first obtain current host
+and daemon resource admission. They can then use the recorded read-only inspect
+arguments to compare the actual ID and endpoint with an attributable successful
+container-creation receipt. Preserve the run receipt and actual observations.
+If that receipt is missing, conflicting or ambiguous, retain HOLD and leave the
+container and its state volume untouched. This handoff does not authorize an
+automatic retry, adoption, `stop`, `rm`, volume removal or shared cleanup.
+
+The current Buildx CLI path does not expose an attributable creation ID to this
+publisher. Its post-bootstrap name/image checks therefore remain an open
+production ownership gap. Image publication admission stays HOLD until a
+supported creation-ID mechanism and its conflict/lost-response cases are
+independently qualified. This documentation and the CPU oracles do not close
+that gap or qualify a real builder/image.

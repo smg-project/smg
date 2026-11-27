@@ -64,6 +64,13 @@ def exercise_bake_processes(source, directory):
     actual_popen = subprocess.Popen
 
     def fake_popen(argv, **kwargs):
+        assert not {
+            "DOCKER_CONTEXT",
+            "DOCKER_HOST",
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "MORIIO_PUBLISH_TOKEN",
+        }.intersection(kwargs["env"]), "Use the production token/context exclusions"
         if "bake" in argv:
             grants = {
                 Path(a.removeprefix("--allow=fs.read="))
@@ -88,14 +95,7 @@ def exercise_bake_processes(source, directory):
         p.__dict__,
         deadline=time.monotonic() + 30,
         output=output,
-        env={
-            "CONTEXT": str(context),
-            **(
-                {"LD_LIBRARY_PATH": os.environ["LD_LIBRARY_PATH"]}
-                if "LD_LIBRARY_PATH" in os.environ
-                else {}
-            ),
-        },
+        buildx_config=output / "buildx-config",
         event=lambda *_args, **_kwargs: None,
         state={"events": []},
         docker=["docker"],
@@ -109,7 +109,32 @@ def exercise_bake_processes(source, directory):
         if isinstance(n, ast.Assign)
         and any(isinstance(t, ast.Name) and t.id == "client_control" for t in n.targets)
     )
-    module = ast.Module(body=[control, command, bake_assignment], type_ignores=[])
+    environment = [
+        node
+        for node in publish.body
+        if (
+            isinstance(node, ast.Assign)
+            and any(
+                (isinstance(target, ast.Name) and target.id == "env")
+                or (
+                    isinstance(target, ast.Subscript)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "env"
+                )
+                for target in node.targets
+            )
+        )
+        or (
+            isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Attribute)
+            and isinstance(node.value.func.value, ast.Name)
+            and node.value.func.value.id == "env"
+            and node.value.func.attr == "update"
+        )
+    ]
+    assert len(environment) == 3
+    module = ast.Module(body=[*environment, control, command, bake_assignment], type_ignores=[])
     exec(
         compile(ast.fix_missing_locations(module), "<actual publisher command boundary>", "exec"),
         namespace,
@@ -138,6 +163,7 @@ class PublicationControls(unittest.TestCase):
 
     def test_bake_real_child_can_load_required_private_library(self):
         actual_popen = subprocess.Popen
+        children = []
         library = next(
             Path(line.split()[-1])
             for line in Path("/proc/self/maps").read_text().splitlines()
@@ -149,7 +175,7 @@ class PublicationControls(unittest.TestCase):
             (loader / "libmoriio_loader_fixture.so").symlink_to(library)
 
             def loading_child(_argv, **kwargs):
-                return actual_popen(
+                child = actual_popen(
                     [
                         sys.executable,
                         "-I",
@@ -160,6 +186,8 @@ class PublicationControls(unittest.TestCase):
                     ],
                     **kwargs,
                 )
+                children.append(child)
+                return child
 
             library_path = os.pathsep.join(
                 path for path in (str(loader), os.environ.get("LD_LIBRARY_PATH")) if path
@@ -168,7 +196,28 @@ class PublicationControls(unittest.TestCase):
                 mock.patch.dict(os.environ, {"LD_LIBRARY_PATH": library_path}),
                 mock.patch.object(subprocess, "Popen", side_effect=loading_child),
             ):
-                calls = exercise_bake_processes(inspect.getsource(p.publish), directory)
+                source = inspect.getsource(p.publish)
+                calls = exercise_bake_processes(source, directory)
+                missing_loader = source.replace(
+                    'not in ("DOCKER_CONTEXT",',
+                    'not in ("LD_LIBRARY_PATH", "DOCKER_CONTEXT",',
+                    1,
+                )
+                self.assertNotEqual(missing_loader, source)
+                negative = Path(directory) / "missing-production-loader"
+                negative.mkdir()
+                with self.assertRaises(AssertionError):
+                    exercise_bake_processes(missing_loader, negative)
+            self.assertEqual(len(calls), 5)
+            self.assertEqual(len(children), 6)
+            self.assertEqual([child.returncode for child in children[:5]], [0] * 5)
+            self.assertNotEqual(children[-1].returncode, 0)
+
+    def test_bake_processes_keep_production_token_exclusions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = inspect.getsource(p.publish)
+            with mock.patch.dict(os.environ, GH_TOKEN="private", GITHUB_TOKEN="private"):
+                calls = exercise_bake_processes(source, directory)
             self.assertEqual(len(calls), 5)
 
     def test_actual_recipe_manifest_and_material_pins(self):
@@ -656,13 +705,15 @@ class OwnedClientLifecycle(unittest.TestCase):
             self.assert_closed(ns)
 
 
-def exercise_owned_cleanup_fault(directory, fault, *, foreign=False, cleanup_stop_stderr=None):
+def exercise_owned_cleanup_fault(
+    directory, fault, *, foreign=False, cleanup_stop_stderr=None, source=None
+):
     """Run actual publisher teardown and real harmless clients, never Docker.
 
     Only the productive try-body is replaced by a fault after exact ownership
     binding. Command/identity/except/finally and final outcome stay production.
     """
-    publish = ast.parse(textwrap.dedent(inspect.getsource(p.publish))).body[0]
+    publish = ast.parse(textwrap.dedent(source or inspect.getsource(p.publish))).body[0]
     nodes = [
         copy.deepcopy(node)
         for node in publish.body
@@ -687,6 +738,8 @@ def exercise_owned_cleanup_fault(directory, fault, *, foreign=False, cleanup_sto
     operation = next(node for node in publish.body if isinstance(node, ast.Try))
     operation = copy.deepcopy(operation)
     operation.body = ast.parse("write_json(record, state)").body
+    if fault == "post_final_check_exception":
+        operation.body = ast.parse("raise RuntimeError('original exceptional publisher exit')").body
     tail = publish.body[
         publish.body.index(next(n for n in publish.body if isinstance(n, ast.Try))) + 1 :
     ]
@@ -852,17 +905,21 @@ def exercise_owned_cleanup_fault(directory, fault, *, foreign=False, cleanup_sto
     for sig in handlers:
         signal.signal(sig, namespace["interrupted"])
     prior_trace = sys.gettrace()
-    terminal_assert = next(node for node in reversed(tail) if isinstance(node, ast.Assert))
     namespace["final_signal_injections"] = 0
+    exceptional_frames = set()
 
     def final_return_signal(frame, event, _arg):
         nonlocal interrupted
+        if frame.f_code.co_filename != "<exact publisher finally and outcome>":
+            return final_return_signal
+        if event == "exception":
+            exceptional_frames.add(id(frame))
         if (
-            fault == "post_final_check_signal"
+            fault in ("post_final_check_signal", "post_final_check_exception")
             and not interrupted
-            and event == "line"
-            and frame.f_code.co_filename == "<exact publisher finally and outcome>"
-            and frame.f_lineno == terminal_assert.test.lineno
+            and event == "return"
+            and id(frame) not in exceptional_frames
+            and namespace.get("terminal_assert_completed", False)
         ):
             interrupted = True
             namespace["final_signal_injections"] += 1
@@ -870,7 +927,7 @@ def exercise_owned_cleanup_fault(directory, fault, *, foreign=False, cleanup_sto
         return final_return_signal
 
     try:
-        if fault == "post_final_check_signal":
+        if fault in ("post_final_check_signal", "post_final_check_exception"):
             sys.settrace(final_return_signal)
         with (
             mock.patch.object(p, "write_json", side_effect=record_write),
@@ -880,7 +937,16 @@ def exercise_owned_cleanup_fault(directory, fault, *, foreign=False, cleanup_sto
             namespace["write_json"] = p.write_json
             exec(
                 compile(
-                    ast.fix_missing_locations(ast.Module(body=[operation, *tail], type_ignores=[])),
+                    ast.fix_missing_locations(
+                        ast.Module(
+                            body=[
+                                operation,
+                                *tail,
+                                *ast.parse("terminal_assert_completed = True").body,
+                            ],
+                            type_ignores=[],
+                        )
+                    ),
                     "<exact publisher finally and outcome>",
                     "exec",
                 ),
@@ -1158,6 +1224,46 @@ class CurrentBoundaryControls(unittest.TestCase):
             self.assertTrue(ns["state"]["cleanup_verified_absent"])
             self.assertTrue(ns["state"]["fallback_receipt_unavailable"])
 
+    def test_exceptional_return_does_not_inject_a_late_signal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns, _calls, error = exercise_owned_cleanup_fault(
+                directory, "post_final_check_exception"
+            )
+            self.assertEqual(ns["final_signal_injections"], 0)
+            self.assertIsInstance(error, RuntimeError)
+            self.assertIn("original exceptional publisher exit", str(error))
+
+    def test_after_final_read_oracle_detects_missing_handler_receipt(self):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(p.publish)))
+        publish = tree.body[0]
+        interrupted = next(
+            node
+            for node in publish.body
+            if isinstance(node, ast.FunctionDef) and node.name == "interrupted"
+        )
+
+        class DropHandlerReceipt(ast.NodeTransformer):
+            def visit_Expr(self, node):
+                if (
+                    isinstance(node.value, ast.Call)
+                    and isinstance(node.value.func, ast.Name)
+                    and node.value.func.id == "persist"
+                ):
+                    return ast.copy_location(ast.Pass(), node)
+                return self.generic_visit(node)
+
+        DropHandlerReceipt().visit(interrupted)
+        with tempfile.TemporaryDirectory() as directory:
+            ns, _calls, error = exercise_owned_cleanup_fault(
+                directory, "post_final_check_signal", source=ast.unparse(tree)
+            )
+            self.assertEqual(ns["final_signal_injections"], 1)
+            self.assertIsInstance(error, RuntimeError)
+            self.assertEqual(ns["state"]["pending_signal"], signal.SIGTERM)
+            saved = json.loads((Path(directory) / "result.json").read_text())
+            self.assertIsNone(saved["pending_signal"])
+            self.assertNotEqual(saved["status"], "failed_or_published_incomplete_requires_readback")
+
     def test_unwitnessed_matching_container_is_not_adopted_or_stopped(self):
         with tempfile.TemporaryDirectory() as directory:
             ns, calls, error = exercise_owned_cleanup_fault(directory, "unwitnessed")
@@ -1167,6 +1273,14 @@ class CurrentBoundaryControls(unittest.TestCase):
             self.assertIsNone(ns["owned_id"])
             self.assertFalse(ns["state"].get("cleanup_verified_absent", False))
             self.assertFalse(any(a[1] == "stop" or a[1:3] == ["buildx", "rm"] for a in calls))
+            handoff = ns["state"]["unresolved_builder_handoff"]
+            self.assertEqual(handoff["builder"], ns["builder"])
+            self.assertEqual(handoff["container_name"], ns["name"])
+            self.assertEqual(handoff["observed_container_ids"], ["a" * 64])
+            self.assertIsNone(handoff["creation_returned_id"])
+            self.assertIn("verify", handoff["next_action"])
+            saved = json.loads((Path(directory) / "result.json").read_text())
+            self.assertEqual(saved["unresolved_builder_handoff"], handoff)
 
     def test_signal_after_final_pending_check_persists_failure_before_raising(self):
         with tempfile.TemporaryDirectory() as directory:
