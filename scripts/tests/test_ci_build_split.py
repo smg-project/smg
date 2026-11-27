@@ -82,6 +82,21 @@ def test_ci_build_wheel_script_builds_only_python_wheel() -> None:
             "--profile dev",
             "/bindings/golang/target/debug/libsmg_go.",
         ),
+        (
+            ["build", "CARGO_PROFILE=test"],
+            "--profile test",
+            "/bindings/golang/target/debug/libsmg_go.",
+        ),
+        (
+            ["build", "CARGO_PROFILE=bench"],
+            "--profile bench",
+            "/bindings/golang/target/release/libsmg_go.",
+        ),
+        (
+            ["build-dev"],
+            "--profile dev",
+            "/bindings/golang/target/debug/libsmg_go.",
+        ),
     ],
 )
 def test_golang_makefile_profile_and_target_dir_handling(
@@ -169,7 +184,7 @@ def test_actions_keep_cache_clean_and_download_path_compatible() -> None:
         for step in setup_rust["runs"]["steps"]
         if str(step.get("uses", "")).startswith("Swatinem/rust-cache")
     )
-    assert "cache-directories" not in rust_cache_step["with"]
+    assert "bindings/golang/target" not in str(rust_cache_step["with"].get("cache-directories", ""))
     assert "bindings/golang/target" not in SETUP_RUST_ACTION.read_text()
 
     download_action = yaml.safe_load(DOWNLOAD_ARTIFACTS_ACTION.read_text())

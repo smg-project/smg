@@ -6,7 +6,7 @@ CARGO_BUILD_DIR ?= $(shell pwd)/target
 BUILD_MODE ?= release
 CARGO_PROFILE ?= $(BUILD_MODE)
 CARGO_BUILD_FLAG := --profile $(if $(filter debug,$(CARGO_PROFILE)),dev,$(CARGO_PROFILE))
-CARGO_PROFILE_DIR := $(if $(filter debug dev,$(CARGO_PROFILE)),debug,$(CARGO_PROFILE))
+CARGO_PROFILE_DIR := $(if $(filter debug dev test,$(CARGO_PROFILE)),debug,$(if $(filter bench,$(CARGO_PROFILE)),release,$(CARGO_PROFILE)))
 LIB_NAME = libsmg_go
 
 # Detect OS
@@ -58,9 +58,7 @@ build:
 	@echo "Library built at: $(LIB_BUILD_PATH)"
 
 build-dev:
-	@echo "Building Rust FFI library (debug mode)..."
-	@CARGO_TARGET_DIR=$(CARGO_BUILD_DIR) cargo build --manifest-path Cargo.toml
-	@echo "Library built at: $(LIB_BUILD_DIR)/debug/$(LIB_NAME)$(LIB_EXT)"
+	@$(MAKE) build CARGO_PROFILE=dev
 
 lib: build
 	@echo "Copying library to ./lib directory..."
