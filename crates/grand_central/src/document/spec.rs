@@ -2634,8 +2634,9 @@ pub struct KeySourceSpec {
     /// that worker and to no other. Where the value is no number, or
     /// fewer workers can take the request, it is shed under
     /// `target-worker`. Where no worker at all can take it, it is placed
-    /// as a request that names none and carries no key. A header that is
-    /// absent, empty or not text names no worker. One entry a block,
+    /// as a request that names none: a single request then carries no
+    /// key, and a pair keeps its own. A header that is absent, empty or
+    /// not text names no worker. One entry a block,
     /// beside the eight and never without one of them: a header alone,
     /// so `rid`, `max_bytes` and `client` are refused beside it. It is
     /// read for a request a program places in process: a single request,
@@ -2644,7 +2645,11 @@ pub struct KeySourceSpec {
     /// prefill is counted among the prefills that have a decode to pair
     /// with. Its decode is counted among the partners of its prefill: the
     /// one the request names, or the one the prefill's own profile picks.
-    /// A request under the `epd` plan is not read for it. Default false.
+    /// A request under the `epd` plan names the workers of its pair so,
+    /// on each side that scores so, and no encoder. Where its decode's
+    /// side alone scores so, such a request is shed under `target-worker`
+    /// where it carries an item or needs a decode that takes images.
+    /// Default false.
     #[serde(skip_serializing_if = "is_default")]
     pub target: bool,
 }

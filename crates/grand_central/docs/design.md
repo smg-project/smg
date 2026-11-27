@@ -2721,10 +2721,66 @@ no places of its decode side is declined under `target-worker`, and so is an enc
 that states one. A controller's served decision is lent the same decodes and stated the number
 its pair's frame carries (section 10.1).
 
-One thing differs from classic there, by rule. **[planned]** The engine reads no encode
-request's header for a target yet. One limit is a supplied policy spec's own: a pair's target
-source holds a side only where that side's profile is the plain hash ring, because the spec has
-no word for a side.
+**[built]** An encode request can name its worker too: the number names its pair's workers, on
+each side that reads it, and no encoder. Classic takes such a request's pair by its pair
+selection, and picks an item's encoder under headers that hold the item's content hash alone
+(`assign_encode_workers` in `model_gateway/src/routers/grpc/common/stages/worker_selection.rs`).
+A request that names no worker is placed as under any other document, behind one lookup of the
+header its binding's target source names.
+
+A request the encode pass is not laid for is its pair's alone: it states no item and holds its
+decode to no images. Where it names a worker, it is answered as a pair that names that worker
+is, by the pair's own rule. The pair's entry answers it: that entry's refusals apply, and it is
+observed as a pair's request is.
+
+For any other request, where its prefill's side reads the number, the call counts the pair as
+it counts a pair's own, by the same lines. Those are the one read of the header for its number,
+the sides that read it, the demands, the masks and the count. A side is counted among the
+workers that meet its part of the hard demands. The media's part is the encoders' where the
+request carries an item. The call then asks as an encode request's call does, lent the three
+lists with the pair held to the places the number reached.
+
+The count asks no encoder. Classic's encode stage states which workers an encoder serves as the
+request's filter, and its pair selection counts the workers that filter takes (`eligible` in
+`worker_selection.rs`; `pair_pass`). That filter also keeps the decodes that take images, for a
+request that holds its decode to them. The engine's count asks the route's rule of each worker
+it counts, so a host states that rule for a request that names a worker. The cases state it as
+the stage does, and name its lines (`place/tests/encode/named.rs`).
+
+Under no rule the number counts as a pair's does. It can reach a prefill no encoder serves
+beside one that an encoder does. It can reach a decode that takes no images beside one that
+does, for a request that holds its decode to them. The decision held to that place names no
+worker, and the request is shed under `target-worker`: it takes the worker it names or none.
+Such a shed names no side where the encode pass made it.
+
+The number names no encoder, so what the call answers for its encoders stands as it does for a
+request that names no worker. A shed made for the encoders keeps its own name, and so does one
+by the places a host states for them. So does a gap the encode pass says over the lists whole:
+no pair that an encoder serves, or none whose decode takes images the request needs. A call
+whose last ask was given up for an encoder alone answers that it has no worker.
+
+Where a worker of the named pair cannot be sent to after all, the request is shed under
+`target-worker`, on no side. An encode request's walk of its targets names no side, where a
+pair's own names one.
+
+The count runs ahead of the call's decision, as a pair's does. So where a prefill is counted, a
+number that reaches no worker is said first, under `target-worker`. Classic's stage answers for
+its encoders first.
+
+Behind an encoder that cannot be sent to, the call decides again, held as it was: three
+decisions at most. A pair held on both sides books its decode with its prefill, as a pair's own
+does. It is asked again behind such an ask alone, and the route's rule is asked of no list there.
+
+Two parts of it are **[planned]**:
+
+- Where the decode's side alone is the plain hash ring, an encode request the pass is laid for
+  that names a worker is shed under `target-worker`, for the decode's side. An encode request's
+  decision counts no number.
+- A controller's served decision reads no number for an encode request's frame. The two doors
+  differ for such a request (section 10.1).
+
+One limit is a supplied policy spec's own. A pair's target source holds a side only where that
+side's profile is the plain hash ring: the spec has no word for a side.
 
 An encode request is placed over its three lists as a pair is over its two, each decision given the
 whole budget. Where it carries items its call makes three decisions at most. The later ones are
@@ -3349,7 +3405,8 @@ session key nor its client's key.
 
 A frame that states no number is decided as it was, and the
 frame of a host older than the field states none. No encode request's frame is read for the
-number.
+number **[planned]**. The one call of a host's own process holds an encode request to the
+worker it names (section 8.2), so the two doors differ for such a request.
 
 A pair's frame states one number for its two sides, as one header gives a gateway's own process
 one (section 8.2). The controller counts it as the one call counts a pair's, by the same
@@ -4104,7 +4161,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | Prefill-decode pairs on that engine | **[partly]** | the sheet of classic's pair choice (`pair_select`) replays through the pair's decision function, not through the engine; all 40 of its lines replay as recorded; the 8 lines behind the prefill admission's bound (`pair_bound`) and the 10 lines of a pair on one known runtime (`pair_runtime`) replay through that function as recorded, the 10 also over the classes a controller's pairing rule derives; the 23 lines of a pair that names its worker (`pair_named`) replay through the engine's one call for a host in process |
 | Encode-prefill-decode on that engine | **[partly]** | `InProcess::decide_encode_at` decides it over a host's three lists and issues the pair's lease, and `place` places it; the entry declines a request held to a wire that a worker of its pair's two lists is not dialed on, places its items on the encoders dialed on a wire it states, declines a request with items where the list holds encoders and none is, and declines one that states the later decode where its decode is held to the workers that take images, or where it carries items and demands vision or a way of processing its references: a decode asked again takes no items |
 | The lease and its events; the guard | **[built]** | |
-| The host contract of section 8.2 (`place`, `Placement`) | **[partly]** | `Placement` is built, with its call for a pair's decode decided again, and `place` for a single request, for a pair and for an encode request, with the route's rule and the decision made again, three decisions a call at most, and the later decisions of a single request, of a pair and of an encode request held to the workers the route's rule takes; an encode request's header for a target is not read |
+| The host contract of section 8.2 (`place`, `Placement`) | **[partly]** | `Placement` is built, with its call for a pair's decode decided again, and `place` for a single request, for a pair and for an encode request, with the route's rule and the decision made again, three decisions a call at most, and the later decisions of a single request, of a pair and of an encode request held to the workers the route's rule takes; an encode request's header for a target holds its pair, but under a binding whose decode side alone reads it for a request with an item or a decode held to images (section 8.2) |
 | The crate's bench of the kept engine | **[built]** | |
 | The gateway as a host | **[partly]** | section 9, behind `--grand-central on`, which is off by default: single requests and pairs on the HTTP and gRPC routes, a pair's decode asked again, a host's table of stages at the start; an encode request that carries an item is refused by name until the gateway hands the engine its three lists; every classic test of the gateway with the engine on (the bar's fourth point) is not met yet |
 | The controller: service, election, replication, document apply and roll back | **[partly]** | a session never pushes the document and refuses a gateway's replay; a standby serves neither the worker list nor the snapshot (section 10.1) |

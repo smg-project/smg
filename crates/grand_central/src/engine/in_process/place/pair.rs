@@ -288,8 +288,10 @@ pub(super) fn goes_to_the_rule(
 /// the call answers such a request as before a pair's decision asked
 /// its one question. The one spelling of it for the call: the test of a
 /// shed with no endpoint reads it here ([`goes_to_the_rule`]), and so
-/// does the routine behind an ask ([`again`]).
-fn laid(request: &PlaceRequest<'_>) -> bool {
+/// does the routine behind an ask ([`again`]). The call of an encode
+/// request that names its worker reads it too: a request the pass is not
+/// laid for is its pair's alone ([`super::target::encode`]).
+pub(super) fn laid(request: &PlaceRequest<'_>) -> bool {
     let pixels = request.media.holds_pixels();
     request
         .encode

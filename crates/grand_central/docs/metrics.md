@@ -143,7 +143,7 @@ Under the engine `smg_cache_aware_match_ratio` is observed from the overlap a pi
 - The gateway observes it from the placement the one call answers (`Placement::overlap`): once at most for each placement, a single request's or a pair's. A placement that states none observes nothing.
 - It does so where the placement's worker is the one its pick's first target names.
 - A pair's pick states what its prefill holds and nothing of its decode. So a pair's placement observes once at most, where a classic pair can observe each `cache_aware` side.
-- An encode request decided with its items states none yet, so it observes nothing.
+- An encode request decided with its items states none yet, so it observes nothing. One that names a worker and is answered as a pair states what a pair does.
 - Where a lent tree's match names the chosen worker to the decision, the pick states the tree's own two numbers, so the gateway divides what a classic tree decision divides.
 
 These still differ there, among others:

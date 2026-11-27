@@ -1026,7 +1026,7 @@ thread_local! {
 }
 
 /// Keeps the word of a decision made on buffers of its own, with `scratch`:
-/// the list it shed its request over as saturated, where it says one
+/// the list it shed its request over, where it says one
 /// ([`Scratch::shed_over`]). A stage asked for that decision from inside
 /// another of this thread, which holds the thread's buffers, and the
 /// scratch goes with the decision: its call reads the word here
@@ -1039,12 +1039,12 @@ pub(super) fn said_apart(scratch: &Scratch) {
 }
 
 /// The list the calling thread's last pair's decision or encode decision
-/// shed its request over as saturated, by that decision's own word
+/// shed its request over, by that decision's own word
 /// ([`Scratch::shed_over`]). The call that asked for the decision reads it
-/// behind that decision's shed as saturated and behind nothing else, ahead
-/// of anything else it asks on this thread ([`place`](super::place)): a
-/// request answered ahead of its decision leaves the word of the decision
-/// before.
+/// behind that decision's shed as saturated, behind an encode decision's
+/// shed under the places' name, and behind nothing else, ahead of anything
+/// else it asks on this thread ([`place`](super::place)): a request
+/// answered ahead of its decision leaves the word of the decision before.
 pub(super) fn shed_over() -> Option<ShedOver> {
     BUFFERS.with(|buffers| match buffers.try_borrow() {
         Ok(buffers) => buffers.scratch.shed_over(),

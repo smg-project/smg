@@ -120,10 +120,11 @@ use crate::{
 /// A request's headers, as its caller holds them.
 ///
 /// The engine reads the headers the document names: the sources of a
-/// request's routing value and of its client's value, and the headers its
-/// view shows a stage ([`AppliedSpec::view_headers`]). It reads one more
-/// where the request's host names it, for the id a kept decision is found
-/// by ([`PlaceRequest::explain_id_header`]), and no other.
+/// request's routing value and of its client's value, the header a
+/// request names its worker by, and the headers its view shows a stage
+/// ([`AppliedSpec::view_headers`]). It reads one more where the request's
+/// host names it, for the id a kept decision is found by
+/// ([`PlaceRequest::explain_id_header`]), and no other.
 pub trait HeaderRead {
     /// The value of the header `name`, where the request carries it. `name`
     /// is lowercase, as a document writes it.
@@ -1462,7 +1463,11 @@ pub enum Unplaced {
         /// decision was left with nobody on. Where no pair the call named
         /// could be sent to, that is the decode side where a target of
         /// the call's last ask lost its decode alone, its prefill being
-        /// one that could be sent to, and the prefill side otherwise. A
+        /// one that could be sent to, and the prefill side otherwise. An
+        /// encode request shed under that name names none where its
+        /// encode pass refused the place the number reached, nor where
+        /// the pass is laid for it and no pair its call named could be
+        /// sent to. A
         /// first decision's shed as saturated that stands behind a rule
         /// names the side of the list the gateway's own pair selection
         /// judges there.
@@ -1869,11 +1874,22 @@ pub(super) struct Call {
     /// over a veto.
     unkeyed: bool,
     /// Whether the call's pair is held to the two workers its request
-    /// names ([`target::pair`]). Such a call makes one decision: it books
-    /// the decode with its prefill under every document, and no ask
-    /// follows it ([`pair`]). The worker a request names is that
-    /// decision's, so no later one moves it.
+    /// names ([`target::pair`], and an encode request's pair by
+    /// [`target::encode`]). Such a pair stands on one pair of places: a
+    /// decision of it books the decode with its prefill under every
+    /// document, and no ask follows one a side of the pair could not be
+    /// sent to ([`pair`]). The workers a request names are that pair's, so
+    /// no later decision moves them. An encode request's call asks again
+    /// behind an encoder alone ([`Self::past_encoder`]), held to the same
+    /// two workers.
     named_pair: bool,
+    /// Whether the call's last ask was given up for an encoder alone: a
+    /// target's two sides could be sent to, and an item's encoder could
+    /// not. An encode request's ask says it ([`encode::ask`]), and the call
+    /// of a pair held on both sides reads it: the number names no encoder,
+    /// so that call asks again past one, and what it answers for its
+    /// encoders is no miss of the pair ([`target::encode`]).
+    past_encoder: bool,
     /// The number the call's pair names its decode by, where the decode's
     /// side alone reads the request's target source ([`target`]): the
     /// prefill is each decision's own pick, so each ask of the call states
@@ -2287,8 +2303,36 @@ impl InProcess {
     /// can be sent to itself or, under a profile that weighs load itself
     /// and a binding that steers, is over its thresholds alone.
     ///
-    /// An encode request is not read for a target: it is placed by the
-    /// rest of the document.
+    /// An encode request may name its worker too: the number names the
+    /// workers of its pair, on each side that reads it, and no encoder.
+    /// One that names no worker is placed as under any other document,
+    /// behind one lookup of that header. One that names a worker and that
+    /// the encode pass is not laid for, with no item and its decode held
+    /// to no images, is answered as a pair that names that worker is, by
+    /// the pair's own entry. For any other the pair is counted
+    /// as a pair's is, by the same lines, and the call then asks as an
+    /// encode request's does, lent its three lists with the pair held to
+    /// the places the number reached. Each side is counted among the
+    /// workers that meet its part of the request's hard demands: where
+    /// the request carries an item, the media's part is its encoders' to
+    /// meet. The count asks no encoder. The route's rule
+    /// ([`PlaceRequest::admits`]) says which workers an encoder serves,
+    /// and which decodes take the images a request holds its decode to.
+    /// Under no rule the number can reach a worker the encode pass
+    /// refuses beside one it takes: the decision held to its place names
+    /// no worker, and the request is shed under `target-worker`. Where a
+    /// prefill is counted, a number that reaches no worker is said so
+    /// ahead of that decision, whatever it would answer. Where the count
+    /// reaches a pair, what the call answers for its encoders stands as
+    /// it does for a request that names no worker: a shed made for them
+    /// or over the lists whole, and no worker where its last ask was
+    /// given up for an encoder alone. A pair held on both sides is asked
+    /// again behind such an ask alone, held as it was: the rule is asked
+    /// of no list there. It books its decode with its prefill, as a
+    /// pair's own does. Under a binding whose decode side alone is such a
+    /// ring, a request the pass is laid for is shed under `target-worker`
+    /// for the decode's side: an encode request's decision counts no
+    /// number.
     ///
     /// Declined by name ([`ShedReason::PolicyDeclined`]): a request that
     /// carries encode items over other lists than an encode request's
@@ -2350,7 +2394,7 @@ impl InProcess {
             // document was applied: under one that names none, a request
             // pays this test and no read of a header.
             WorkerLists::Pair(ref lists) if own.document.spec.names_target() => {
-                target::pair(own, request, lists)
+                target::pair(own, request, lists, None)
             }
             WorkerLists::Pair(ref lists) => pair::place(own, request, lists, &mut Call::default()),
             WorkerLists::Single(list) if own.document.spec.names_target() => {
@@ -2361,6 +2405,9 @@ impl InProcess {
             // A pair's lists and an encode request's are read where the
             // request holds them: a copy of either here costs every request
             // a larger frame.
+            WorkerLists::Encode(ref lists) if own.document.spec.names_target() => {
+                target::encode(own, request, lists)
+            }
             WorkerLists::Encode(ref lists) => encode::three(own, request, lists),
         }
     }

@@ -400,7 +400,7 @@ bindings:
 - A block holds one target entry at most. `rid: true`, `client: true` and any `max_bytes` are refused on it.
 - A block with no plain entry is refused, so a target entry stands beside one of the one to eight.
 - It is read for a request a program places in its own process: a single request, and each side of a pair whose profile scores by `consistent-hash` with no `prefix_tokens`.
-- The number is not read for a request placed with an encode side, under `epd`.
+- A request placed with an encode side, under `epd`, names its pair's workers by it, on each side that reads it, and no encoder.
 - A standalone controller counts the workers of its own lists, by its own tests of a worker. The asking gateway's rule for the route is not asked there.
 - The asking host reads the header and states the number in the request's frame. The count there also passes over a worker that fails a hard demand its role is held to.
 
@@ -420,6 +420,20 @@ bindings:
 - Where no prefill is counted, the pair is placed as one that names no worker. Unlike a single request it keeps its key.
 - Otherwise a number that reaches no worker on a side sheds the pair under `target-worker`, and so does a value that is no number. Where the decode's side alone reads the number, a pair can first wait for a prefill at its admission limit.
 - Where no decode can take the request and the binding does not shed, a decode that its overload thresholds alone hold back counts as a partner. The decode's number is then not read.
+
+**A request with an encode side that names a worker.**
+
+- Its pair is counted as a pair is, a side at a time. An item's encoder is picked for the item, among the encoders that serve the pair's prefill.
+- The count asks no encoder. The host's rule for the route says which workers an encoder serves, and which decodes take images.
+- Under no rule the number can reach a prefill that no encoder serves, beside one that an encoder does. It can reach a decode that takes no images beside one that takes the images the request needs. The request is then shed under `target-worker`.
+- A request that carries an item leaves the media's part of its hard demands to its encoders. Its pair is counted by the rest.
+- A request with no item, whose decode needs to take no images, is answered as a pair that names a worker is. It is a pair's request there: the pair's own refusals apply, and it is observed and shadowed as one.
+- The number names no encoder. A shed made for the encoders keeps its own name. So does one made where no pair of the lists has an encoder that serves it, or a decode that takes the images the request needs.
+- Where a prefill is counted, a number that reaches no worker is said first. The request is shed under `target-worker`, ahead of what its decision would say of its encoders.
+- Behind an encoder that could not take an item, the call decides again, held as it was. It makes three decisions at most.
+- A pair named on both sides books its decode with its prefill, as a pair does: its decode is not picked again behind the prefill.
+- Where the decode's side alone reads the number, a request with an item, or one whose decode needs to take images, is shed under `target-worker`. Its decision counts no number yet.
+- A standalone controller reads no number for such a request yet.
 
 **What a source may be.**
 
@@ -463,7 +477,7 @@ A `single` binding can name a second profile, as in `shadow: next`.
 - A shadow issues no lease and tells no stage.
 - A served controller asks the shadow of a single request's binding behind its live decision.
 - A pair's sides are shadowed where a host's own process decides the pair over its two lists and issues its lease. A pair a controller serves shadows no side.
-- A request placed with an encode side shadows no side at its first decision.
+- A request placed with an encode side shadows no side at its first decision. One that names a worker and is answered as a pair is shadowed as a pair.
 - Use native stages, and a profile that no binding uses live.
 
 **What the engine counts.** The engine counts what each shadow said, by the binding's position in its spec and one of four kinds:

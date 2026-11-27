@@ -1271,17 +1271,18 @@ pub struct Scratch {
     #[cfg(debug_assertions)]
     kept_last: bool,
     /// The list the last pair's decision or encode decision made with
-    /// this scratch shed its request over as saturated
+    /// this scratch shed its request over, where it says one
     /// ([`Self::shed_over`]).
     shed_over: Option<ShedOver>,
 }
 
-/// The list a decision shed its request over as saturated, by the
-/// decision's own word ([`Scratch::shed_over`]). A decision says one under
-/// a binding that sheds a list wholly over its thresholds, and under no
-/// other. A shed's trace does not say it: a pair's shed made over its
-/// decodes carries the prefill's trace, as one made over its prefills
-/// does.
+/// The list a decision shed its request over, by the decision's own word
+/// ([`Scratch::shed_over`]). A decision says one of its shed as
+/// saturated, under a binding that sheds a list wholly over its
+/// thresholds, and under no other. An encode decision says its encoders
+/// of one shed with no endpoint too ([`Self::Encoders`]). A shed's trace
+/// does not say it: a pair's shed made over its decodes carries the
+/// prefill's trace, as one made over its prefills does.
 ///
 /// A pair's decision that sheds behind its prefill side's shed is
 /// saturated exactly where the list the gateway's own pair selection
@@ -1297,8 +1298,13 @@ pub struct Scratch {
 /// each where wholly over its thresholds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ShedOver {
-    /// An encode request's encoders: the overload veto left none of them
-    /// open ([`Engine::decide_encode_pair`]).
+    /// An encode request's encoders ([`Engine::decide_encode_pair`]): the
+    /// overload veto left none of them open, and the shed is saturated.
+    /// Or the places their host states for them hold the request off
+    /// every encoder that takes it: that shed has no endpoint, under the
+    /// places' name. A side of the pair that its own places hold off is
+    /// shed under that name too, with no word, so a call that holds the
+    /// pair to places tells the two sheds by this one.
     Encoders,
     /// A pair's prefills: of the prefills at the request's places that
     /// pair with a decode of the pool none stands as it is, its limit
@@ -1527,16 +1533,17 @@ impl Scratch {
     }
 
     /// The list the last pair's decision or encode decision made with
-    /// this scratch shed its request over as saturated, where it says
-    /// one ([`ShedOver`]). Each such decision takes the word back where it
-    /// begins and writes it at the one place it makes that shed, so the
-    /// word is that decision's alone: `None` behind its every other
-    /// answer. An encode decision that hands its pair's decision a part
-    /// of a list says none of the pair's two: that decision judged the
-    /// part, or asked no question behind it ([`PairPools::part`]). A
-    /// caller reads the word behind a decision's shed as
-    /// saturated, and behind nothing else: a request that is answered
-    /// ahead of both decisions leaves the word of the one before.
+    /// this scratch shed its request over, where it says one
+    /// ([`ShedOver`]). Each such decision takes the word back where it
+    /// begins and writes it where it makes such a shed, so the word is
+    /// that decision's alone: `None` behind its every other answer. An
+    /// encode decision that hands its pair's decision a part of a list
+    /// says none of the pair's two: that decision judged the part, or
+    /// asked no question behind it ([`PairPools::part`]). A caller reads
+    /// the word behind a decision's shed as saturated, behind an encode
+    /// decision's shed under the places' name, and behind nothing else:
+    /// a request that is answered ahead of both decisions leaves the
+    /// word of the one before.
     #[cfg_attr(
         not(any(test, feature = "in-process")),
         expect(
