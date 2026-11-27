@@ -342,4 +342,5 @@ pub(crate) fn cut_mark(model: &str) -> &'static str {
 }
 
 #[cfg(test)]
+#[path = "../../tests/unit/policies/labels/tests.rs"]
 mod tests;
