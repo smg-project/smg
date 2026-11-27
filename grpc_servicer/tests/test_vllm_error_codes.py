@@ -175,6 +175,47 @@ def test_release_hierarchy_without_vllm_client_error_still_maps_validation_to_in
     assert errors.grpc_code_for(wrapped) is grpc.StatusCode.INVALID_ARGUMENT
 
 
+@pytest.mark.parametrize("wrapped", [False, True], ids=["raised", "wrapped"])
+def test_a_grammar_the_engine_core_failed_to_compile_is_a_refused_constraint(
+    split_hierarchy, wrapped
+):
+    # vLLM's engine core ends it with RequestError("validation_error"), raised in these words.
+    errors, classes = split_hierarchy
+    exc = classes["VLLMValidationError"](
+        "Invalid structured outputs: json_schema_converter.cc:4944: Invalid range"
+    )
+    if wrapped:
+        compile_failure, exc = exc, classes["EngineGenerateError"]()
+        exc.__cause__ = compile_failure
+    assert errors.grpc_code_for(exc) is grpc.StatusCode.INVALID_ARGUMENT
+    assert errors.grpc_trailer_for(exc) == (("smg-constraint-refused", "worker"),)
+
+
+def test_a_failed_compile_is_refused_in_words_naming_the_grammar(split_hierarchy):
+    # The refusal says the grammar failed to compile, not only that the outputs were invalid.
+    errors, _ = split_hierarchy
+    assert (
+        errors.grpc_refusal_message("Invalid structured outputs: Invalid range")
+        == "Invalid structured outputs: the grammar failed to compile: Invalid range"
+    )
+    # vLLM's VLLMError.message strips the space an empty reason leaves.
+    assert (
+        errors.grpc_refusal_message("Invalid structured outputs:")
+        == "Invalid structured outputs: the grammar failed to compile:"
+    )
+
+
+def test_any_other_failure_carries_no_trailer(split_hierarchy):
+    errors, classes = split_hierarchy
+    for exc in [
+        classes["VLLMValidationError"]("prompt plus max_tokens over the model length"),
+        classes["VLLMServerError"]("Invalid structured outputs: not a client error"),
+        classes["VLLMValidationError"]("x: Invalid structured outputs: y"),
+        RuntimeError("boom"),
+    ]:
+        assert errors.grpc_trailer_for(exc) == (), exc
+
+
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("the_python_vllm_servicer_chosen")
 async def test_generate_aborts_with_invalid_argument_for_vllm_validation_error():
@@ -209,4 +250,55 @@ async def test_generate_aborts_with_invalid_argument_for_vllm_validation_error()
             pass
     context.abort.assert_awaited_once_with(
         grpc.StatusCode.INVALID_ARGUMENT, "Invalid grammar specification"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("the_python_vllm_servicer_chosen")
+async def test_generate_refuses_a_grammar_the_engine_core_failed_to_compile():
+    pytest.importorskip("vllm")
+    outputs = pytest.importorskip("vllm.outputs")
+    from smg_grpc_proto import vllm_engine_pb2
+    from smg_grpc_servicer.vllm.servicer import VllmEngineServicer
+    from vllm.exceptions import VLLMValidationError
+
+    why = "Invalid structured outputs: Invalid range: minimum greater than maximum"
+    request_error = getattr(outputs, "RequestError", None)
+    if hasattr(request_error, "to_exception"):
+        # The exception AsyncLLM raises for the engine core's RequestError("validation_error").
+        error = request_error(code="validation_error", message=why).to_exception()
+    else:  # a vLLM without to_exception (CI's lane): the one to_exception gives
+        error = VLLMValidationError(why)
+
+    async def generate(**kwargs):
+        raise error
+        yield  # pragma: no cover
+
+    engine = SimpleNamespace(
+        generate=generate,
+        renderer=SimpleNamespace(process_for_engine=lambda prompt, **kwargs: prompt),
+    )
+    servicer = VllmEngineServicer(engine, start_time=0.0)
+    request = vllm_engine_pb2.GenerateRequest(
+        request_id="req-1",
+        tokenized=vllm_engine_pb2.TokenizedInput(input_ids=[1, 2, 3]),
+        sampling_params=vllm_engine_pb2.SamplingParams(),
+    )
+
+    class Aborted(Exception):
+        pass
+
+    context = SimpleNamespace(
+        abort=AsyncMock(side_effect=Aborted()),
+        send_initial_metadata=AsyncMock(),
+        invocation_metadata=lambda: (),
+    )
+    with pytest.raises(Aborted):
+        async for _ in servicer.Generate(request, context):
+            pass
+    context.abort.assert_awaited_once_with(
+        grpc.StatusCode.INVALID_ARGUMENT,
+        "Invalid structured outputs: the grammar failed to compile: "
+        "Invalid range: minimum greater than maximum",
+        trailing_metadata=(("smg-constraint-refused", "worker"),),
     )

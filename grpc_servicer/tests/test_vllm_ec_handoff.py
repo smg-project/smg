@@ -64,6 +64,8 @@ def _generate(**overrides):
             if isinstance(error, ValueError)
             else grpc.StatusCode.INTERNAL
         ),
+        "grpc_trailer_for": lambda error: (),
+        "grpc_refusal_message": lambda message: f"grammar: {message}",
         "MmProcessorUnavailable": type("MmProcessorUnavailable", (Exception,), {}),
         "VLLMClientError": type("VLLMClientError", (Exception,), {}),
         "GracefulHTTPError": type("GracefulHTTPError", (Exception,), {}),
@@ -339,3 +341,63 @@ async def test_grammar_from_first_token_reaches_engine_as_reasoning_ended(
     context = SimpleNamespace(abort=abort, invocation_metadata=lambda: ())
     assert [reply async for reply in handler(servicer, request, context)] == []
     assert seen == [True if handed else "unsaid"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("compile_failure", [False, True])
+async def test_a_failed_compile_is_not_notified_as_a_request_the_engine_never_held(compile_failure):
+    """The engine core held a request whose grammar it failed to compile; a frontend refusal it did not."""
+    client_error = type("VLLMClientError", (Exception,), {})
+    failure = client_error(
+        "Invalid structured outputs: Invalid range" if compile_failure else "bad"
+    )
+    trailer = (("smg-constraint-refused", "worker"),)
+    request = pb.GenerateRequest(
+        request_id="kv",
+        tokenized=pb.TokenizedInput(input_ids=[1, 2]),
+        kv_transfer_params_json='{"do_remote_prefill":true}',
+    )
+
+    class Engine:
+        """An engine whose generate() raises before any output."""
+
+        renderer = SimpleNamespace(process_for_engine=lambda prompt, arrival_time: prompt)
+        vllm_config = SimpleNamespace(ec_transfer_config=None)
+
+        async def generate(self, **kwargs):
+            """Raise the failure."""
+            raise failure
+            yield  # pragma: no cover
+
+    async def abort(code, message, trailing_metadata=()):
+        """End the RPC with an observable status."""
+        raise _Aborted(code, message, trailing_metadata)
+
+    servicer = SimpleNamespace(
+        engine=Engine(),
+        _takes_reasoning_ended=False,
+        _sampling_params_from_proto=lambda *args, **kwargs: SimpleNamespace(
+            extra_args=None, logprobs=None, prompt_logprobs=None
+        ),
+        _tokenization_kwargs_from_proto=lambda _: {},
+        _loads=Mock(),
+        _notify_kv_transfer_rejected=AsyncMock(),
+    )
+    context = SimpleNamespace(
+        abort=abort, invocation_metadata=lambda: (), send_initial_metadata=AsyncMock()
+    )
+    generate = _generate(
+        VLLMClientError=client_error,
+        grpc_code_for=lambda error: grpc.StatusCode.INVALID_ARGUMENT,
+        grpc_trailer_for=lambda error: (
+            trailer if str(error).startswith("Invalid structured") else ()
+        ),
+    )
+    with pytest.raises(_Aborted) as exc:
+        _ = [reply async for reply in generate(servicer, request, context)]
+    assert exc.value.args[1:] == (
+        (f"grammar: {failure}", trailer) if compile_failure else (str(failure), ())
+    )
+    servicer._notify_kv_transfer_rejected.assert_awaited_once_with(
+        "kv", {"do_remote_prefill": True}, compile_failure
+    )

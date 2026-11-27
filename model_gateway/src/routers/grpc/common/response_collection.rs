@@ -369,7 +369,7 @@ mod tests {
             proto_wrapper::{
                 FanoutStream, ProtoGenerateRequest, ProtoGenerateResponse, ENGINE_ERROR_MESSAGE,
             },
-            regular::streaming::tests::eof::{complete, scripted_stream},
+            regular::streaming::tests::eof::{complete, scripted_stream, status_stream},
             sequential_pd::sequential_prefill_side,
         },
     };
@@ -931,6 +931,82 @@ mod tests {
                 "the engine's own report on the sequential prefill drain charges no breaker \
                  unless the answer streams (streaming {streaming})"
             );
+        }
+    }
+
+    /// A collected stream's constraint refusal is a 400 in the worker's words, on any side.
+    #[tokio::test]
+    async fn a_collected_constraint_refusal_is_the_requests_400_in_the_workers_words() {
+        use crate::routers::{common::retry::is_retryable_response, error};
+
+        let why = "Invalid structured outputs: Invalid range: minimum greater than maximum";
+        let status = smg_grpc_client::constraint_refused_status(why);
+        for side in [None, Some(PdSide::Prefill), Some(PdSide::Decode)] {
+            let response = stream_failed(side, "Single", &status, None);
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{side:?}");
+            assert_eq!(
+                error::extract_error_code_from_response(&response),
+                "unsupported_constraint",
+                "{side:?}"
+            );
+            assert!(!is_retryable_response(&response), "{side:?}");
+            let body = axum::body::to_bytes(response.into_body(), 1 << 16)
+                .await
+                .expect("body");
+            let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            assert_eq!(body["error"]["message"], why, "{side:?}");
+        }
+    }
+
+    /// A constraint refusal on the sequential prefill drain is the request's 400, charging no breaker.
+    #[tokio::test]
+    async fn a_constraint_refusal_on_the_sequential_prefill_drain_is_the_requests_400() {
+        let why = "Invalid structured outputs: Invalid range: minimum greater than maximum";
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://prefill:30001")
+                .worker_type(WorkerType::Prefill)
+                .connection_mode(ConnectionMode::Grpc)
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold: 1,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        let workers = WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill: Arc::clone(&prefill),
+            decode: Arc::clone(&prefill).into(),
+            runtime_type: RuntimeType::Vllm,
+        };
+        let request = ProtoGenerateRequest::Vllm(Box::default());
+        for streaming in [false, true] {
+            let refusal = smg_grpc_client::constraint_refused_status(why);
+            let (stream, _server) = status_stream(&refusal).await;
+            let ledger = AttemptLedger::default();
+            let Err(response) = sequential_prefill_side(
+                &PdSides::of(&workers, &ledger, &request, streaming),
+                Box::pin(async move { Ok::<_, tonic::Status>(stream) }),
+                PrefillLoadGuard::Unbounded {
+                    _guard: WorkerLoadGuard::with_key(Arc::clone(&prefill), None),
+                },
+            )
+            .await
+            else {
+                panic!("the sequential prefill drain failed (streaming {streaming})");
+            };
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{streaming}");
+            assert_eq!(
+                error::extract_error_code_from_response(&response),
+                "unsupported_constraint",
+                "{streaming}"
+            );
+            assert!(!is_retryable_response(&response), "{streaming}");
+            let body = axum::body::to_bytes(response.into_body(), 1 << 16)
+                .await
+                .expect("body");
+            let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            assert_eq!(body["error"]["message"], why, "{streaming}");
+            assert!(prefill.circuit_breaker_can_execute(), "{streaming}");
         }
     }
 

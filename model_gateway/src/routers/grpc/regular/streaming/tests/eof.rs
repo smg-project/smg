@@ -117,6 +117,17 @@ pub(crate) async fn scripted_stream(
     (stream, server)
 }
 
+/// A stream the worker ends with `status`, its metadata in the trailers, before any response.
+pub(crate) async fn status_stream(status: &tonic::Status) -> (ProtoStream, JoinHandle<()>) {
+    let mut trailers = status.metadata().clone().into_headers();
+    trailers.insert("grpc-status", HeaderValue::from(status.code() as i32));
+    let message = HeaderValue::from_str(status.message()).expect("a header-safe message");
+    trailers.insert("grpc-message", message);
+    let (client, server) = mock_client().await;
+    let frames = stream::iter([Ok(Frame::trailers(trailers))]);
+    (response_stream(frames, client), server)
+}
+
 /// [`scripted_stream`] with the frames after `first` held back until `gate`
 /// fires: the processor sees the first engine output on its own.
 pub(crate) async fn gated_stream(

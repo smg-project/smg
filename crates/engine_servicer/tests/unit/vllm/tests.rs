@@ -22,7 +22,7 @@ use engine_zmq_client::{
             multimodal::MmKwargValue,
             output::{
                 EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, RequestBatchOutputs,
-                SpecDecodeMetrics, StopReason,
+                RequestError, SpecDecodeMetrics, StopReason,
             },
             pooling::{PoolingOutput, PoolingParams},
             request::{EngineCoreRequest, MmFeaturesPayload},
@@ -1045,6 +1045,89 @@ async fn an_engine_finish_on_the_matching_tick_keeps_the_engine_complete() {
         );
         assert!(stream.message().bounded().await.unwrap().is_none());
     }
+}
+
+/// vLLM's failed compile is refused under the constraint trailer, naming the grammar, without
+/// paths; any other error is not.
+#[tokio::test]
+async fn a_grammar_the_engine_fails_to_compile_is_a_refused_constraint() {
+    let mut h = harness(model_info(), None).await;
+    let compile = "Invalid structured outputs: [22:43:56] json_schema_converter.cc:4944: Invalid \
+                   range: minimum greater than maximum";
+    let refused = "Invalid structured outputs: the grammar failed to compile: [22:43:56] \
+                   json_schema_converter.cc:4944: Invalid range: minimum greater than maximum";
+    let backend = "Structured output processing only supports one backend per engine. The engine \
+                   is already using 'xgrammar'";
+    let engine_error = "engine finished the request with an error (see engine logs)";
+    for (id, code, message, retryable, expected) in [
+        (
+            "g1",
+            "validation_error",
+            compile,
+            false,
+            (Code::InvalidArgument, true, refused),
+        ),
+        (
+            "g2",
+            "validation_error",
+            "Invalid structured outputs: /project/cpp/json_schema_converter.cc:4944: Invalid range",
+            false,
+            (
+                Code::InvalidArgument,
+                true,
+                "Invalid structured outputs: the grammar failed to compile: <path>:4944: Invalid range",
+            ),
+        ),
+        (
+            "b1",
+            "validation_error",
+            backend,
+            false,
+            (Code::InvalidArgument, false, backend),
+        ),
+        (
+            "p1",
+            "engine_paused",
+            "Generation is paused.",
+            true,
+            (Code::Internal, false, engine_error),
+        ),
+    ] {
+        let mut stream = h
+            .client
+            .generate(generate_request(id, true, Vec::new()))
+            .await
+            .expect("generate")
+            .into_inner();
+        recv_add(&mut h.engine_in).await;
+        h.engine_out
+            .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+                outputs: vec![EngineCoreOutput {
+                    request_id: id.into(),
+                    finish_reason: Some(EngineCoreFinishReason::Error),
+                    error: Some(Box::new(RequestError {
+                        code: code.to_string(),
+                        message: message.to_string(),
+                        retryable,
+                    })),
+                    ..Default::default()
+                }],
+                finished_requests: Some(BTreeSet::from([id.to_string()])),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let status = stream.message().bounded().await.expect_err(id);
+        let (code, refused, message) = expected;
+        assert_eq!(status.code(), code, "{id}: {status:?}");
+        assert_eq!(
+            smg_grpc_client::is_constraint_refusal(&status),
+            refused,
+            "{id}"
+        );
+        assert_eq!(status.message(), message, "{id}");
+    }
+    h.server.stop(Duration::from_secs(5)).unwrap();
 }
 
 /// Without a tokenizer there is nothing to match string stops with, so such
