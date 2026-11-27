@@ -6,13 +6,8 @@ use std::{
 };
 
 use async_trait::async_trait;
-use smg_worker::{
-    health::bootstrap_probe,
-    identity::basic::Worker,
-    registry::{worker_model_ids, WorkerId},
-    settings::RetryConfig,
-};
-use tracing::{debug, warn};
+use smg_worker::{health::bootstrap_probe, identity::basic::Worker, registry::WorkerId};
+use tracing::debug;
 use wfaas::{
     StepExecutor, StepId, StepResult, StepStatus, WorkflowContext, WorkflowData, WorkflowError,
     WorkflowResult, WorkflowState,
@@ -201,7 +196,7 @@ fn write_batch(
         worker_ids.push(worker_id);
     }
 
-    after_write(app_context, workers, symphony_table);
+    after_write(workers, symphony_table);
 
     // WorkerMonitor subscribes to registry events directly (see
     // `smg_worker::load::monitor::WorkerMonitor::start_event_loop`), so this
@@ -221,13 +216,9 @@ fn write_batch(
 
 /// What a registration does beside the registry's write, once every worker
 /// of the batch stands in the registry: the parser series of
-/// `symphony_table`, the port probe and the retry settings of each model.
-/// The registry's own write moved the pool sizes.
-fn after_write(
-    app_context: &AppContext,
-    workers: &[Arc<dyn Worker>],
-    symphony_table: Option<&'static str>,
-) {
+/// `symphony_table` and the port probe. The registry's own write moved the
+/// pool sizes and settled the retry settings of each model.
+fn after_write(workers: &[Arc<dyn Worker>], symphony_table: Option<&'static str>) {
     // Under Symphony the failure classes of the table that reads these
     // workers' model exist at zero from here, once every worker of the
     // batch is in the registry: a registration refused before leaves no
@@ -246,146 +237,6 @@ fn after_write(
     if let Some(worker) = workers.first() {
         bootstrap_probe::spawn_bootstrap_port_probe(worker.as_ref());
     }
-
-    // Update per-model retry config (last write wins).
-    // A worker whose spec carries retry overrides writes them for its
-    // models. One whose spec carries none takes a model that still holds an
-    // entry back to the gateway's own retry settings, unless another worker
-    // of the model carries overrides. The entry is rewritten, not removed:
-    // every reader of a model without one falls back to these settings (the
-    // gateway's disable flag is inside them).
-    let registry = &app_context.worker_registry;
-    let gateway = app_context.router_config.effective_retry_config();
-    for worker in workers {
-        if overrides_retries(worker.as_ref()) {
-            let resolved = worker.resilience();
-            let retry_config = resolved.retry.clone();
-            for model_id in worker_model_ids(worker) {
-                registry.set_model_retry_config(
-                    &model_id,
-                    retry_config.clone(),
-                    resolved.retry_enabled,
-                );
-            }
-            continue;
-        }
-        for model_id in worker_model_ids(worker) {
-            // An entry that already reads the gateway's settings has
-            // nothing to take back: the model's workers are not read for it.
-            let left_behind = registry
-                .get_retry_config(&model_id)
-                .is_some_and(|stored| stored != gateway)
-                && standing_override(registry, &model_id).is_none();
-            if left_behind {
-                registry.set_model_retry_config(&model_id, gateway.clone(), true);
-                // Registrations run side by side: a worker with overrides
-                // that registered between the read and the write above had
-                // its settings written over.
-                let standing = standing_override(registry, &model_id);
-                keep_standing_override(registry, &model_id, &gateway, standing);
-            }
-        }
-    }
-}
-
-/// How many writes one call of [`keep_standing_override`] makes at most:
-/// each write past the first takes another registration of the model landing
-/// between a read and the write behind it.
-const KEEP_ROUNDS: usize = 4;
-
-/// The first worker of `model_id` whose spec carries retry overrides.
-fn standing_override(registry: &WorkerRegistry, model_id: &str) -> Option<Arc<dyn Worker>> {
-    registry
-        .get_by_model(model_id)
-        .iter()
-        .find(|member| overrides_retries(member.as_ref()))
-        .cloned()
-}
-
-/// Behind a write of the gateway's retry settings for `model_id`, writes the
-/// settings of `standing`: the worker with overrides a read of the model
-/// found, where one stands. A registration that replaces or removes that
-/// worker between the read and the write wrote its own settings first, and
-/// the write would put a retired worker's over them. So the model is read
-/// again behind every write, and the write is taken again from that read
-/// (the gateway's settings where no worker carries overrides any more) until
-/// a read names the worker last written. Where the writes run out before a
-/// read does, the model is left at the gateway's settings and a warning says
-/// so: the settings written last may be those of a worker that left.
-fn keep_standing_override(
-    registry: &WorkerRegistry,
-    model_id: &str,
-    gateway: &RetryConfig,
-    standing: Option<Arc<dyn Worker>>,
-) {
-    keep_override_read_by(registry, model_id, gateway, standing, || {
-        standing_override(registry, model_id)
-    });
-}
-
-/// [`keep_standing_override`] over `read`, the read of the model's worker
-/// with overrides: a parameter, so that a test can let registrations land
-/// between a read and the write behind it.
-fn keep_override_read_by(
-    registry: &WorkerRegistry,
-    model_id: &str,
-    gateway: &RetryConfig,
-    mut standing: Option<Arc<dyn Worker>>,
-    mut read: impl FnMut() -> Option<Arc<dyn Worker>>,
-) {
-    // The worker whose settings this call wrote last: none is the gateway's,
-    // which the caller wrote.
-    let mut written: Option<Arc<dyn Worker>> = None;
-    for _ in 0..KEEP_ROUNDS {
-        if same_worker(standing.as_ref(), written.as_ref()) {
-            return;
-        }
-        match &standing {
-            Some(worker) => {
-                let resolved = worker.resilience();
-                registry.set_model_retry_config(
-                    model_id,
-                    resolved.retry.clone(),
-                    resolved.retry_enabled,
-                );
-            }
-            None => registry.set_model_retry_config(model_id, gateway.clone(), true),
-        }
-        written = standing;
-        standing = read();
-    }
-    // Out of writes: the read behind the last write is compared too.
-    if !same_worker(standing.as_ref(), written.as_ref()) {
-        if written.is_some() {
-            registry.set_model_retry_config(model_id, gateway.clone(), true);
-        }
-        warn!(
-            model_id = %model_id,
-            writes = KEEP_ROUNDS,
-            "The model's workers kept changing under the retry write-back; the gateway's retry settings are left in force"
-        );
-    }
-}
-
-/// Whether two reads of a model's worker with overrides name one worker, or
-/// both none.
-fn same_worker(one: Option<&Arc<dyn Worker>>, other: Option<&Arc<dyn Worker>>) -> bool {
-    match (one, other) {
-        (Some(one), Some(other)) => Arc::ptr_eq(one, other),
-        (None, None) => true,
-        _ => false,
-    }
-}
-
-/// Whether the worker's spec carries a retry override of its own.
-fn overrides_retries(worker: &dyn Worker) -> bool {
-    let resilience_spec = &worker.metadata().spec.resilience;
-    resilience_spec.max_retries.is_some()
-        || resilience_spec.initial_backoff_ms.is_some()
-        || resilience_spec.max_backoff_ms.is_some()
-        || resilience_spec.backoff_multiplier.is_some()
-        || resilience_spec.jitter_factor.is_some()
-        || resilience_spec.disable_retry.is_some()
 }
 
 /// A test's hold on the registry step, between the engine's cancel read for
@@ -794,7 +645,7 @@ mod tests {
     fn worker_overriding_retries(
         url: &str,
         model_id: &str,
-        gateway: &RetryConfig,
+        gateway: &smg_worker::settings::RetryConfig,
         max_retries: u32,
     ) -> Arc<dyn Worker> {
         use openai_protocol::worker::{ResilienceUpdate, WorkerSpec};
@@ -916,7 +767,7 @@ mod tests {
 
     /// A model whose overriding worker was removed while another of its
     /// workers stayed reads the gateway's own retry settings again at the
-    /// next registration of one of its workers without an override.
+    /// removal.
     #[tokio::test]
     async fn a_model_reads_the_gateways_retries_once_its_overriding_worker_left() {
         use crate::{app_context::testing::app_context_for_tests, config::RouterConfig};
@@ -944,206 +795,12 @@ mod tests {
             .get_id_by_url("http://worker-a:8080")
             .expect("the overriding worker has an id");
         assert!(registry.remove(&id).is_some());
-
-        write_batch(
-            &app_context,
-            &[worker_at("http://worker-c:8080", "model")],
-            &WorkerRegistrationMode::CreateOnly,
-            None,
-        )
-        .expect("another worker of the model registers");
         assert_eq!(
             registry
                 .get_retry_config("model")
                 .unwrap_or_else(|| gateway.clone()),
             gateway,
             "no worker of the model carries the override any more"
-        );
-    }
-
-    /// A worker with an override that registered while another registration
-    /// took its model back to the gateway's settings keeps its override: the
-    /// settings written over it are written back.
-    #[tokio::test]
-    async fn an_override_a_side_by_side_registration_wrote_over_is_written_back() {
-        use crate::{app_context::testing::app_context_for_tests, config::RouterConfig};
-
-        let registry = Arc::new(WorkerRegistry::new());
-        let app_context =
-            app_context_for_tests(RouterConfig::default(), Arc::clone(&registry), None);
-        let gateway = app_context.router_config.effective_retry_config();
-        let overridden = gateway.max_retries + 3;
-        write_batch(
-            &app_context,
-            &[worker_overriding_retries(
-                "http://worker-a:8080",
-                "model",
-                &gateway,
-                overridden,
-            )],
-            &WorkerRegistrationMode::CreateOnly,
-            None,
-        )
-        .expect("the worker with the override registers");
-        // The losing order of two registrations side by side: the other one
-        // read the model's workers before this worker was among them and
-        // wrote the gateway's settings behind this worker's write.
-        registry.set_model_retry_config("model", gateway.clone(), true);
-
-        let standing = standing_override(&registry, "model");
-        keep_standing_override(&registry, "model", &gateway, standing);
-        assert_eq!(
-            registry
-                .get_retry_config("model")
-                .map(|retry| retry.max_retries),
-            Some(overridden),
-            "the standing worker's override is in force again"
-        );
-    }
-
-    /// A worker with an override that is replaced between a registration's
-    /// read of the model's workers and the write behind that read does not
-    /// have its settings written over its replacement's.
-    #[tokio::test]
-    async fn a_replaced_workers_override_is_not_written_over_its_replacements() {
-        use crate::{app_context::testing::app_context_for_tests, config::RouterConfig};
-
-        let url = "http://worker-a:8080";
-        let registry = Arc::new(WorkerRegistry::new());
-        let app_context =
-            app_context_for_tests(RouterConfig::default(), Arc::clone(&registry), None);
-        let gateway = app_context.router_config.effective_retry_config();
-        write_batch(
-            &app_context,
-            &[worker_overriding_retries(
-                url,
-                "model",
-                &gateway,
-                gateway.max_retries + 3,
-            )],
-            &WorkerRegistrationMode::CreateOnly,
-            None,
-        )
-        .expect("the worker with the override registers");
-        // Another registration reads the model's workers here, and the
-        // worker is replaced before that registration writes.
-        let read = standing_override(&registry, "model");
-        let replacement = gateway.max_retries + 1;
-        write_batch(
-            &app_context,
-            &[worker_overriding_retries(
-                url,
-                "model",
-                &gateway,
-                replacement,
-            )],
-            &WorkerRegistrationMode::Upsert,
-            None,
-        )
-        .expect("the replacement registers");
-
-        keep_standing_override(&registry, "model", &gateway, read);
-        assert_eq!(
-            registry
-                .get_retry_config("model")
-                .map(|retry| retry.max_retries),
-            Some(replacement),
-            "the replacement's override is in force, not the replaced worker's"
-        );
-    }
-
-    /// A worker with an override that leaves between a registration's read
-    /// of the model's workers and the write behind that read leaves the
-    /// model at the gateway's own retry settings.
-    #[tokio::test]
-    async fn an_override_whose_worker_left_is_not_written_back() {
-        use crate::{app_context::testing::app_context_for_tests, config::RouterConfig};
-
-        let registry = Arc::new(WorkerRegistry::new());
-        let app_context =
-            app_context_for_tests(RouterConfig::default(), Arc::clone(&registry), None);
-        let gateway = app_context.router_config.effective_retry_config();
-        let overriding = worker_overriding_retries(
-            "http://worker-a:8080",
-            "model",
-            &gateway,
-            gateway.max_retries + 3,
-        );
-        for worker in [overriding, worker_at("http://worker-b:8080", "model")] {
-            write_batch(
-                &app_context,
-                &[worker],
-                &WorkerRegistrationMode::CreateOnly,
-                None,
-            )
-            .expect("a worker of the model registers");
-        }
-        // Another registration reads the model's workers here, and the
-        // worker with the override leaves before that registration writes.
-        let read = standing_override(&registry, "model");
-        let id = registry
-            .get_id_by_url("http://worker-a:8080")
-            .expect("the overriding worker has an id");
-        assert!(registry.remove(&id).is_some());
-
-        keep_standing_override(&registry, "model", &gateway, read);
-        assert_eq!(
-            registry
-                .get_retry_config("model")
-                .unwrap_or_else(|| gateway.clone()),
-            gateway,
-            "no worker of the model carries the override any more"
-        );
-    }
-
-    /// Registrations of the model that land between every read of its
-    /// workers and the write behind that read run the write-back out of
-    /// writes. The model is then left at the gateway's own retry settings,
-    /// never at those of a worker that left.
-    #[tokio::test]
-    async fn a_write_back_out_of_writes_leaves_no_departed_workers_settings() {
-        use crate::{app_context::testing::app_context_for_tests, config::RouterConfig};
-
-        let url = "http://worker-a:8080";
-        let registry = Arc::new(WorkerRegistry::new());
-        let app_context =
-            app_context_for_tests(RouterConfig::default(), Arc::clone(&registry), None);
-        let gateway = app_context.router_config.effective_retry_config();
-        let mut retries = gateway.max_retries + 1;
-        write_batch(
-            &app_context,
-            &[worker_overriding_retries(url, "model", &gateway, retries)],
-            &WorkerRegistrationMode::CreateOnly,
-            None,
-        )
-        .expect("the first worker with an override registers");
-        // A third writer: behind each of the first reads, and before the
-        // write that read leads to, the worker the read names is replaced.
-        let mut reads = 0;
-        let mut read = || {
-            let seen = standing_override(&registry, "model");
-            reads += 1;
-            if reads <= KEEP_ROUNDS {
-                retries += 1;
-                write_batch(
-                    &app_context,
-                    &[worker_overriding_retries(url, "model", &gateway, retries)],
-                    &WorkerRegistrationMode::Upsert,
-                    None,
-                )
-                .expect("a replacement registers");
-            }
-            seen
-        };
-        let first = read();
-
-        keep_override_read_by(&registry, "model", &gateway, first, read);
-        assert_eq!(
-            registry
-                .get_retry_config("model")
-                .unwrap_or_else(|| gateway.clone()),
-            gateway,
-            "out of writes, no departed worker's settings stay written"
         );
     }
 }
