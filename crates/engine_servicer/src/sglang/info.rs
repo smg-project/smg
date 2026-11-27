@@ -182,6 +182,11 @@ pub(super) fn server_info(state: &State) -> sg::GetServerInfoResponse {
             );
         }
     }
+    // The servicer writes the key itself because the launcher's package has
+    // its own version.
+    server_args
+        .fields
+        .extend([engine_zmq_adapter::cache_partition_fields_arg()]);
     if state.media.is_some() {
         for (key, value) in [
             ("mm_processor", "smg"),

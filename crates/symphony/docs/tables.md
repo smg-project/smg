@@ -388,14 +388,37 @@ What this table says beyond the DSML one:
   then the separator the template writes before `<tool_call>`, optional, then the block; the
   block without the separator, which the grammar forced until now, stays valid. With the thought
   left open by the prompt, free text that may close it comes first instead (`docs/grammar.md`).
-  A JSON answer's tag (`response_format`) is led the same way. The thought-closed shape serves
-  both the adaptive default and `thinking_mode: disabled` (the generation prompt then ends with
-  `</mm:think>`): the thought, or a second close, is admitted in both, and an answer that writes
-  one with thinking off reads back as content, as the legacy parser's tag has it.
+  A JSON answer's tag (`response_format`) is led the same way. That shape serves the adaptive
+  default, whose generation prompt has no marker. Under `thinking_mode: disabled` the
+  generation prompt ends with `</mm:think>`: the template closed the thought in the model's
+  place (`Format::thought_closed`), and a forced or required call is written at once, the block
+  alone, with no thought and no second close before it. The `auto` tag and a JSON answer's tag
+  admit the thought, or a second close, in both, and an answer that writes one with thinking
+  off reads back as content, as the legacy parser's tag has it.
 - **Two states for the calls, as for DSML:** `calls` is the template's wrapping (a newline after
   `<tool_call>` and after `</invoke>`), `invoke` one call's arguments, read by the XML assembler
   (`tagged::xml`); a second invoke before the first closed ends the first,
   and the block's close ends an invoke still open.
+
+## Step 3 (`steptml`)
+
+The prompt opens the thought (`<|BOT|>assistant\n<think>\n`, whatever the request says: the template
+reads no thinking switch), and a turn opens with `<|BOT|>assistant\n`, so the prompt's replay starts
+there. The template's system text spells the calls to the model as `<｜tool_calls_begin｜>\n`, each
+call as `<｜tool_call_begin｜>\nfunction<｜tool_sep｜>`, one `<steptml:invoke name="NAME">` with each
+parameter as `<steptml:parameter name="KEY">`, the value and `</steptml:parameter>` on the same line,
+`</steptml:invoke><｜tool_call_end｜>\n`, and the block's close. The table reads a call's opener as
+one terminal up to the quote of the name, in the template's spelling and with `function` right
+behind `<｜tool_call_begin｜>`, as the tests of the older `step3` parser write it; white space between
+the tags and between the calls is the block's wrapping. A value is typed by what the request's tool
+declares, as MiniMax M2's is: the older parser typed a value by its look, so a declared string
+`75001` came out as a number.
+
+What it leaves open: bellwether records the group's renders and no output of the model, so the
+table stands on the template and on the older parser's tests, not on a recorded turn. The template
+renders an earlier call's opener as `<｜tool_call_begin>｜>`, a spelling the table does not read. The
+structural tag derived from the table writes no newline after a `<｜tool_call_end｜>`, between the
+calls or before `<｜tool_calls_end｜>`, where the template writes one after each.
 
 ## Kimi K3 (`kimi_k3`)
 

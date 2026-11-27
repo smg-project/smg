@@ -5,8 +5,10 @@
 //! reads the world the store publishes ([`MemoryStore::snapshot`]), not
 //! through these locks.
 
+// A case pauses a snapshot behind its copy of the rows: the store holds
+// that pause in a field, so the two ends of its channel are named here.
 #[cfg(test)]
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::{
     collections::{HashMap, VecDeque},
     mem,
@@ -24,6 +26,8 @@ use rustc_hash::FxHashMap;
 
 #[cfg(feature = "controller")]
 use crate::engine::CacheIndexes;
+#[cfg(any(test, feature = "worker-host"))]
+use crate::store::workers::WorkerStatus;
 use crate::{
     document::spec::AppliedSpec,
     engine::{
@@ -43,10 +47,7 @@ use crate::{
             left_models, micros, OutsideLists, StaleGeneration, StoreSnapshot, Writer,
             PUBLISH_WINDOW,
         },
-        workers::{
-            MembershipChange, Registrant, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus,
-            WorkersStore,
-        },
+        workers::{MembershipChange, WorkerFacts, WorkerRow, WorkersStore},
         GatewayId,
     },
     tracking::lease::{
@@ -430,7 +431,7 @@ impl MemoryStore {
 
     /// One of the leader's membership or status writes, applied as the
     /// replication stream tells it: a standby's side of a journaled write
-    /// of [`WorkersStore`] or [`HealthSink`]. `row` is the row as the
+    /// of a row or of [`HealthSink`]. `row` is the row as the
     /// leader's write left it, and none for a removal or a status change;
     /// a resize is told as a relabel and recorded as the leader recorded
     /// it, by the widths. Nothing is minted and no revision is guarded: the
@@ -501,10 +502,8 @@ impl MemoryStore {
     /// journal's telling, the member's count slot, the build
     /// the write owes or pays, the word to the stages and the session
     /// pins. One body for every writer that hands a change with the
-    /// row it leaves: [`Self::follow`] hands a leader's, the store's
-    /// own registration decides its own over the table's row
-    /// ([`WorkersStore::upsert_by`]), and where the replica keeps worker
-    /// objects their holder hands the ones it decided
+    /// row it leaves: [`Self::follow`] hands a leader's, and where the
+    /// replica keeps worker objects their holder hands the ones it decided
     /// (`MemoryStore::follow_objects`). `now` is the write's one read of the
     /// clock, behind the lock. Whether the change fit the tables, as
     /// [`Self::follow`] says it: one that does not writes nothing and tells
@@ -521,8 +520,8 @@ impl MemoryStore {
     /// it. A row changed in place is laid no status here: a standby's told
     /// row comes in its leader's status, and a leader's holder lays the
     /// table's in its own entry (`MemoryStore::follow_objects`). A writer
-    /// that hands none tells the row the table held: the store's own
-    /// entries, and a holder with no object under the row's id. A status
+    /// that hands none tells the row the table held: [`Self::follow`], and
+    /// a holder with no object under the row's id. A status
     /// change comes with no row, and its event tells the table's.
     fn decided(
         &self,
@@ -701,6 +700,8 @@ impl MemoryStore {
             self.pins_follow(old, new);
         }
         drop(workers);
+        // A case's hook runs here, once the workers lock is let go and before
+        // the gone keys' pins are forgotten.
         #[cfg(test)]
         seam::released();
         self.forget_gone(&ended);
@@ -800,13 +801,6 @@ impl MemoryStore {
         self.apply_at(None, spec, admit)
     }
 
-    /// Holds the loads' lock: a case keeps an entry waiting where the
-    /// store's entry waits last.
-    #[cfg(all(test, feature = "controller"))]
-    pub(crate) fn holding_loads(&self) -> impl Drop + '_ {
-        self.loads.lock()
-    }
-
     /// A leader's generation, applied as the replication stream tells it:
     /// [`MemoryStore::apply`] with the place of the leader's event, `at`,
     /// which the journal keeps for this write where the applier holds it.
@@ -888,6 +882,8 @@ impl MemoryStore {
             // the load lock alone waits for it.
             let writer = &mut loads.writer;
             let (world, before) = writer.apply(spec, workers.members())?;
+            // A case's hook runs here, under both locks, between the engine's
+            // turn and the publication of the generation's world.
             #[cfg(test)]
             seam::turned();
             // The pools are published as they stood: a build the membership
@@ -1188,14 +1184,6 @@ impl MemoryStore {
         self.show(&mut loads.writer, world);
     }
 
-    /// How many vetoes the health table holds, over every gateway: a case
-    /// asks it to show that a row or a gateway that left took its vetoes
-    /// out of the table.
-    #[cfg(test)]
-    pub(crate) fn health_entries(&self) -> usize {
-        self.health.lock().vetoes.len()
-    }
-
     /// The counts one scrape reports.
     pub fn stats(&self) -> StoreStats {
         let loads = self.loads.lock();
@@ -1212,31 +1200,6 @@ impl MemoryStore {
     /// a generation that declares no list counts none.
     pub fn outside_lists(&self) -> OutsideLists {
         self.stats().outside
-    }
-
-    /// How many members' reads under the standing generation's lists the
-    /// store keeps: one a member under lists that name an engine family or
-    /// a zone, and none under any other.
-    #[cfg(all(test, feature = "operator"))]
-    pub(crate) fn listed_members(&self) -> usize {
-        self.loads.lock().writer.listed()
-    }
-
-    /// How many members the table of the ones no world lists holds.
-    #[cfg(test)]
-    pub(super) fn filed_members(&self) -> usize {
-        self.joined.lock().len()
-    }
-
-    /// Whether no lock a journaled write takes is held at this instant:
-    /// the membership lock, the turn of the leases' file and the load lock,
-    /// each tried.
-    #[cfg(test)]
-    pub(crate) fn unlocked(&self) -> bool {
-        let free = |file: &turn::File| file.try_take().is_some();
-        self.workers.try_lock().is_some()
-            && self.files.iter().all(free)
-            && self.loads.try_lock().is_some()
     }
 
     /// A worker's row is gone (removed, or replaced by a new incarnation):
@@ -1502,7 +1465,9 @@ impl Workers {
         self.rows.values().map(|row| (&row.row, row.slot))
     }
 
-    /// The row under `id` when `revision` is still its revision.
+    /// The row under `id` when `revision` is still its revision. A status
+    /// a holder of worker objects tells is its one caller.
+    #[cfg(any(test, feature = "worker-host"))]
     fn guarded(&mut self, id: WorkerId, revision: u64) -> Option<&mut Row> {
         self.rows
             .get_mut(&id)
@@ -1578,7 +1543,7 @@ impl Writing<'_> {
     }
 
     /// Record a change that comes with no row of its writer's: a status
-    /// the store follows, and the store's own patch. The journal is told
+    /// the store follows. The journal is told
     /// the row as the table holds it, and the epoch steps behind the
     /// telling. Its writers name no term, so the journal takes it.
     fn record(&mut self, change: MembershipChange) -> MembershipChange {
@@ -1614,7 +1579,9 @@ impl Writing<'_> {
     /// gives. Where the journal refuses the hold's term, nothing has
     /// moved. Behind a yes stand two moves alone, and neither refuses:
     /// the field's write and the epoch's step. The row is looked up once,
-    /// and a store with no journal copies nothing.
+    /// and a store with no journal copies nothing. A status a holder of
+    /// worker objects tells is its one caller.
+    #[cfg(any(test, feature = "worker-host"))]
     fn set_status(&mut self, id: WorkerId, status: WorkerStatus) -> StatusSet {
         let (at, term) = (self.at, self.term);
         let workers = &mut *self.workers;
@@ -1645,15 +1612,16 @@ impl Writing<'_> {
         // the worker's health moves.
         held.row.status = status;
         workers.epoch += 1;
-        StatusSet::Moved(change)
+        StatusSet::Moved
     }
 }
 
 /// What a status write under a hold of the membership lock made
 /// ([`Writing::set_status`]).
+#[cfg(any(test, feature = "worker-host"))]
 enum StatusSet {
-    /// The status moved, by this change.
-    Moved(MembershipChange),
+    /// The status moved.
+    Moved,
     /// Nothing to write: the row holds the status already, or no row
     /// stands.
     Stood,
@@ -1662,23 +1630,6 @@ enum StatusSet {
 }
 
 impl MemoryStore {
-    #[cfg(test)]
-    pub(super) fn pause_snapshot_after_clone(&self) -> (Receiver<()>, SyncSender<()>) {
-        let (cloned_tx, cloned_rx) = mpsc::sync_channel(0);
-        let (resume_tx, resume_rx) = mpsc::sync_channel(0);
-        *self.snapshot_pause.lock() = Some((cloned_tx, resume_rx));
-        (cloned_rx, resume_tx)
-    }
-
-    #[cfg(test)]
-    fn pause_snapshot(&self) {
-        let pause = self.snapshot_pause.lock().take();
-        if let Some((cloned, resume)) = pause {
-            cloned.send(()).expect("snapshot test receives clone point");
-            resume.recv().expect("snapshot test resumes sorting");
-        }
-    }
-
     /// The word to the journal, at its drop, that a write's locks are let
     /// go.
     fn released(&self) -> Released<'_> {
@@ -1686,7 +1637,10 @@ impl MemoryStore {
     }
 
     /// The membership lock for a write the journal is told: every path
-    /// that records a change takes the lock here.
+    /// that records a change takes the lock here. A holder of worker
+    /// objects is its one caller: a change it decided, and a status it
+    /// tells.
+    #[cfg(any(test, feature = "worker-host"))]
     fn writing(&self) -> Writing<'_> {
         self.writing_at(None)
     }
@@ -1794,12 +1748,11 @@ impl MemoryStore {
     ///
     /// `seen` is the revision of the row the holder decided over, and none
     /// where it read no row under the key. The table's row must stand at
-    /// that revision still, under this hold of the membership lock: the
-    /// test the store's own patch and removal make there, and what its own
-    /// registration has by deciding under the lock. A writer outside the
+    /// that revision still, under this hold of the membership lock.
+    /// A writer outside the
     /// holder's turn can move the row between the holder's read and this
-    /// call: a caller of the store's own registration, patch or removal
-    /// takes no turn of the holder.
+    /// call: a change handed to the store around the holder
+    /// ([`Self::follow`]) takes no turn of the holder.
     ///
     /// `left` is the row the write takes out, as the holder read it back
     /// in its turn: a removal's row, a replacement's old life, and none
@@ -1898,7 +1851,7 @@ impl MemoryStore {
         }
         let from = row.row.status;
         match workers.set_status(id, status) {
-            StatusSet::Moved(_) => HealthWrite::Moved { from, to: status },
+            StatusSet::Moved => HealthWrite::Moved { from, to: status },
             StatusSet::Stood => HealthWrite::Stood(from),
             StatusSet::Refused => HealthWrite::Stale,
         }
@@ -1906,70 +1859,6 @@ impl MemoryStore {
 }
 
 impl WorkersStore for MemoryStore {
-    fn upsert_by(&self, facts: WorkerFacts, maker: Registrant) -> MembershipChange {
-        let workers = self.writing();
-        // The rule every writer of a row decides by, over the table's own
-        // row, and the body every decided change is written by.
-        let standing = workers.by_key.get(&facts.key);
-        let standing = standing.and_then(|id| workers.rows.get(id));
-        let standing = standing.map(|held| &held.row);
-        let now = Instant::now();
-        let (change, row) = WorkerRow::laid_over(facts, standing, maker, now);
-        let fits = self.decided(workers, now, change, Some(row), None);
-        debug_assert!(fits, "a change decided under the membership lock fits");
-        change
-    }
-
-    fn patch(&self, id: WorkerId, patch: WorkerPatch, revision: u64) -> Option<MembershipChange> {
-        let mut workers = self.writing();
-        let row = workers.guarded(id, revision)?;
-        patch.laid_on(&mut row.row.facts);
-        row.row.revision += 1;
-        let change = workers.record(MembershipChange::Relabelled { id });
-        self.owe(Instant::now());
-        self.tell_membership(change);
-        Some(change)
-    }
-
-    fn remove(&self, id: WorkerId, revision: u64) -> Option<MembershipChange> {
-        let mut workers = self.writing();
-        workers.guarded(id, revision)?;
-        let row = workers.rows.remove(&id)?;
-        self.counts.left(row.slot);
-        workers.by_key.remove(&row.row.facts.key);
-        // The worker's tables leave with its row, under the workers lock
-        // and before the removal is told: a veto keyed by an id that is
-        // gone would stay for good, the next incarnation having a new id.
-        self.forget_worker(id);
-        let change = workers.record_over(MembershipChange::Removed { id }, None, Some(&row.row));
-        let now = Instant::now();
-        self.pay_leave(&workers, now);
-        self.tell_membership(change);
-        // The key's session pins stand through its absence in the
-        // engine's table: the key is filed as gone, and the
-        // worker it was takes them back where it is registered again in
-        // time.
-        let ended = workers.file_gone(row.row.facts, id, now, self.pins_absence());
-        drop(workers);
-        self.forget_gone(&ended);
-        Some(change)
-    }
-
-    fn set_status(
-        &self,
-        id: WorkerId,
-        status: WorkerStatus,
-        revision: u64,
-    ) -> Option<MembershipChange> {
-        let mut workers = self.writing();
-        workers.guarded(id, revision)?;
-        match workers.set_status(id, status) {
-            StatusSet::Moved(change) => Some(change),
-            // A hold with no term is never refused.
-            StatusSet::Stood | StatusSet::Refused => None,
-        }
-    }
-
     fn get(&self, id: WorkerId) -> Option<WorkerRow> {
         self.workers.lock().rows.get(&id).map(|row| row.row.clone())
     }
@@ -2001,6 +1890,7 @@ impl WorkersStore for MemoryStore {
             let rows: Vec<WorkerRow> = workers.rows.values().map(|row| row.row.clone()).collect();
             (workers.epoch, rows)
         };
+        // A case's pause, between the copy of the rows and their sort.
         #[cfg(test)]
         self.pause_snapshot();
         rows.sort_by(|a, b| a.facts.key.cmp(&b.facts.key));
@@ -2120,6 +2010,7 @@ struct Leases {
     term: u64,
     #[cfg(not(test))]
     records: FxHashMap<Key, Held>,
+    // A case counts a lease's lookups through this hasher.
     #[cfg(test)]
     records: HashMap<Key, Held, super::tests::LeaseHashes>,
     /// The decode side of each pair's lease on file: a place for each
@@ -3150,58 +3041,6 @@ fn marked(
 }
 
 impl MemoryStore {
-    /// Spends the ids of the store's term but for the last `left`: no door
-    /// reaches a term's last ids in under 2^32 issues, and their cases
-    /// start here.
-    #[cfg(test)]
-    pub(crate) fn spend_ids(&self, left: u32) {
-        let mut leases = self.turn_of(0);
-        leases.minted = self.blocks.spend(leases.term, left, 0);
-    }
-
-    /// The terms whose tables the blocks keep, the newest first: no door
-    /// tells them.
-    #[cfg(test)]
-    pub(crate) fn kept_terms(&self) -> Vec<u64> {
-        self.blocks.kept_terms()
-    }
-
-    /// The places of the deadline queue: no door tells its length.
-    #[cfg(test)]
-    pub(crate) fn queued(&self) -> usize {
-        let files = 0..self.files.len();
-        files.map(|at| self.turn_of(at).due.len()).sum()
-    }
-
-    /// The length of the files' lists of places, summed: in each the most
-    /// pairs that stood at once.
-    #[cfg(test)]
-    pub(crate) fn places(&self) -> usize {
-        let files = 0..self.files.len();
-        files.map(|at| self.turn_of(at).decodes.places.len()).sum()
-    }
-
-    /// The leases whose decode side stands in a place of the file's list,
-    /// and the leases whose record carries the mark of a pair's lease,
-    /// each in order: one list twice while the records and the places
-    /// stand together.
-    #[cfg(test)]
-    pub(crate) fn paired(&self) -> [Vec<(GatewayId, u64)>; 2] {
-        let id = |key: &Key| (key.0, key.1 .0);
-        let marked = |(_, held): &(&Key, &Held)| held.record.decode.is_some();
-        let (mut sides, mut marks) = (Vec::new(), Vec::new());
-        for at in 0..self.files.len() {
-            let leases = self.turn_of(at);
-            let places = leases.decodes.places.iter().flatten();
-            sides.extend(places.map(|(key, _)| id(key)));
-            let records = leases.records.iter().filter(marked);
-            marks.extend(records.map(|(key, _)| id(key)));
-        }
-        sides.sort_unstable();
-        marks.sort_unstable();
-        [sides, marks]
-    }
-
     /// Issues the lease of one decision made under `record.term`, the
     /// store's own term: the store mints its id ([`Leases::mint`]), files
     /// the record under it and books `booked`, the slot of the record's
@@ -4010,12 +3849,14 @@ mod tests;
 
 /// A seam for the cases: a hook the writing thread runs once, where a write
 /// by the store's one body has let the workers lock go
-/// ([`MemoryStore::decided`]): a registration, a followed change, or a
-/// change the replica's worker objects decided. The store's own patch,
-/// removal and status write run none. A second hook runs inside an apply
+/// ([`MemoryStore::decided`]): a followed change, or a change the
+/// replica's worker objects decided. A told status runs none. A second
+/// hook runs inside an apply
 /// of a generation, between the engine's turn and the publication of the
-/// generation's world ([`MemoryStore::apply`]). No case reaches either
-/// place from outside. In no build but the cases'.
+/// generation's world ([`MemoryStore::apply`]). No case reaches the
+/// second place from outside, and the first only where the store has a
+/// journal, which hears there that the write's locks are let go
+/// ([`Journal::released`]). In no build but the cases'.
 #[cfg(test)]
 #[path = "../../tests/unit/store/memory/seam.rs"]
 pub(crate) mod seam;

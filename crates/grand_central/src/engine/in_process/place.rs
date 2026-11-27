@@ -537,8 +537,13 @@ pub(super) struct Made<'r, 'a> {
     heads: OnceCell<Places>,
     /// Where the request's heads stand on that ring for a pair's decode
     /// side, where the two sides cut a prompt by two rules
-    /// ([`Made::stated_apart`]): `heads` holds the prefill side's then.
+    /// ([`Made::stated_apart`]) or the two sides' shadows do (`shadow_heads`):
+    /// `heads` holds the prefill side's then.
     decode_heads: OnceCell<Places>,
+    /// The first shadow profile whose heads' places this maker was asked
+    /// for ([`RequestMaker::shadow_ring`]): its rule cut `heads`, and a
+    /// shadow of another rule is stated its own in `decode_heads`.
+    shadow_heads: OnceCell<u16>,
     /// The panic of the route's rule where it was asked inside a decision
     /// ([`RequestMaker::sends_to`]): kept for the call, which raises it
     /// again outside the decision ([`raise`]).
@@ -649,6 +654,7 @@ impl<'r, 'a> Made<'r, 'a> {
             place: OnceCell::new(),
             heads: OnceCell::new(),
             decode_heads: OnceCell::new(),
+            shadow_heads: OnceCell::new(),
             panicked: OnceCell::new(),
             sent: Cell::new(Sent::NONE),
             decodes: Cell::new(Sent::NONE),
@@ -814,7 +820,7 @@ impl<'r, 'a> Made<'r, 'a> {
                 lent.then_some(decode_places),
             );
         };
-        self.stated_heads::<false>(spec, ring, rule)
+        self.stated_heads::<false>(spec, ring, rule, &self.heads)
     }
 
     /// [`Self::stated`] by a stage that places a routing value by its own
@@ -835,14 +841,15 @@ impl<'r, 'a> Made<'r, 'a> {
     }
 
     /// [`Self::stated`] by the prefix form of the ring, which cuts the
-    /// request by `rule`: the places of its heads on `ring`. `SHADOW` as
-    /// in [`Self::stated_key`].
+    /// request by `rule`: the places of its heads on `ring`, kept in
+    /// `heads`. `SHADOW` as in [`Self::stated_key`].
     #[inline(always)]
     fn stated_heads<'w, const SHADOW: bool>(
         &'w self,
         spec: &AppliedSpec,
         ring: &'a dyn LentRing,
         rule: HeadRule<'_>,
+        heads: &'w OnceCell<Places>,
     ) -> Stated<'a, 'w> {
         let request = self.request;
         // A routing value a header handed leads the prompt: its text is the
@@ -850,14 +857,14 @@ impl<'r, 'a> Made<'r, 'a> {
         // neither does a value the request's own id handed: that request
         // is placed by its prompt's heads.
         let key_at = Cell::new(None);
-        let first = self.heads.get().is_none();
+        let first = heads.get().is_none();
         let keys = self.keys(spec, |text, source| {
             if first && source.is_some_and(leads_a_prompt) {
                 key_at.set(Some(ring.head_position(Head::Text(text))));
             }
             None
         });
-        let heads = self.heads.get_or_init(|| {
+        let heads = heads.get_or_init(|| {
             let prompt = (request.prompt.tokens, request.prompt.text);
             Places::of_heads::<SHADOW>(ring, rule, prompt, key_at.take())
         });
@@ -1229,7 +1236,22 @@ impl RequestMaker for Made<'_, '_> {
         let (_, ring, places, _) = if engine.key_place_of(profiles) {
             self.stated_key::<true>(spec, ring)
         } else {
-            self.stated_heads::<true>(spec, ring, engine.head_rule_of(profiles)?)
+            let rule = engine.head_rule_of(profiles)?;
+            // A pair's two sides' shadows may cut the request by two
+            // rules: two sides, so two rules at most. The first to ask
+            // fills `heads`; one of another rule fills the decode side's
+            // list, which no live side fills where a shadow asks. A
+            // routing value that leads the prompt is asked of the lender
+            // once a rule.
+            let first = usize::from(*self.shadow_heads.get_or_init(|| shadow));
+            let heads = match engine.head_rule_of((Some(first), profiles.0)) {
+                Some(_) => &self.heads,
+                // A lender that placed no head under the first rule is
+                // asked about none under the second.
+                None if self.heads.get().is_some_and(|heads| heads.unplaced) => return None,
+                None => &self.decode_heads,
+            };
+            self.stated_heads::<true>(spec, ring, rule, heads)
         };
         Some((ring?, places))
     }
@@ -1398,7 +1420,11 @@ pub enum Unplaced {
         /// (`target-worker`). Under [`ShedReason::PolicyDeclined`] the
         /// name `binding` says that the spec in force binds no plan of
         /// the request's kind for its model: a caller answers that no
-        /// retry changes it. A caller's refusal line names it.
+        /// retry changes it. Two sheds of a pair over whole lists name a
+        /// stage by the list judged, which may be another than the one
+        /// that ended a pass
+        /// ([`Shed::emptied_by`](crate::engine::decision::Shed::emptied_by)).
+        /// A caller's refusal line names it.
         emptied_by: &'static str,
         /// The seconds after which a retry may find room: a caller's
         /// retry hint.
@@ -1409,13 +1435,18 @@ pub enum Unplaced {
         /// pair's caller answers for that role. A decision's own side
         /// passes as it is. A pair shed under the worker it names
         /// (`target-worker`) names the side that worker was missed on. A
-        /// first decision's shed that stands behind a rule names the side
-        /// of the list the gateway's own pair selection judges there.
-        /// `None` for a single request, for a pair refused before either
-        /// side was read, and for a refusal the call itself makes of no
-        /// one list: under the route's rule (`admits`), whose lists its
-        /// caller judges, under the budget, and for what the call does
-        /// not place.
+        /// first decision's shed as saturated that stands behind a rule
+        /// names the side of the list the gateway's own pair selection
+        /// judges there. `None` for a single request, for a pair refused
+        /// before either side was read, and for a refusal behind the
+        /// route's rule that is made of no one list its caller holds: the
+        /// shed under the rule's name (`admits`), and a first decision's
+        /// shed with no endpoint that stands where the rule takes no
+        /// worker of a list, since the rule narrowed the lists that
+        /// decision judged. One made where no prefill of the lists pairs
+        /// with a decode keeps its side: the rule is not asked behind it.
+        /// `None` too under the budget, and for what the call does not
+        /// place.
         side: Option<PairSide>,
     },
     /// The engine queued the request. A caller that holds no request
@@ -1443,9 +1474,9 @@ pub enum Unplaced {
     /// For a single request, for a pair and for an encode request's pair,
     /// a rule that answers each worker one way within a call is not the
     /// cause: a request whose rule takes no worker of a list is shed,
-    /// under the rule's name (`admits`) or by its first decision's shed as
-    /// saturated where that stands, and one whose rule takes some is
-    /// decided among them. Under a profile that filters by health a list
+    /// under the rule's name (`admits`) or by its first decision's shed
+    /// where that stands, and one whose rule takes some is decided among
+    /// them. Under a profile that filters by health a list
     /// with no ready worker is shed by that filter. So this answer is left
     /// for a worker that stopped being ready between a decision's read of
     /// it and the send, for a profile that lists no such filter, and for a
@@ -1651,10 +1682,11 @@ pub(super) fn give_up(
 /// holds no decision: behind the call's first decision none of whose
 /// targets can be sent to, whether it refused them or they were not ready,
 /// and behind a pair's or an encode request's first decision that sheds
-/// the request as saturated. A request that states no rule keeps no
-/// places: its later asks are made over its lists whole. A rule that
-/// panics here leaves no lease behind. Out of line: a request whose first
-/// decision takes a target runs none of it.
+/// the request: as saturated, or with no endpoint where the pair's own
+/// test sends it to the rule ([`pair::goes_to_the_rule`]). A request that
+/// states no rule keeps no places: its later asks are made over its lists
+/// whole. A rule that panics here leaves no lease behind. Out of line: a
+/// request whose first decision takes a target runs none of it.
 ///
 /// A worker that is not ready is asked too. A rule that takes no worker
 /// is so told from a rule whose workers are not ready: the first is the
@@ -1669,8 +1701,8 @@ pub(super) fn give_up(
 ///
 /// The shed of a request whose rule takes no worker of the list
 /// ([`ShedReason::NoEndpoints`], under `admits`): no further decision is
-/// made. A pair's routine answers its first decision's shed as saturated
-/// in its place, where that shed stands ([`pair::again`]).
+/// made. A pair's routine answers its first decision's shed in its place,
+/// where that shed stands ([`pair::again`]).
 #[cold]
 #[inline(never)]
 fn hold_to_rule(
@@ -2003,7 +2035,15 @@ impl InProcess {
     /// attempt tried is handed again where no other is left. The call's
     /// two later decisions are made among them: three decisions a call.
     /// A request whose rule takes no worker of a list is shed
-    /// with no endpoint, under `admits`. A pair that states no hard demand,
+    /// with no endpoint, under `admits`. A pair whose first decision shed
+    /// it with no endpoint keeps that shed there, under the stage that
+    /// decision named and with no side; where no prefill of its lists
+    /// pairs with a decode, or the pair states a hard demand, that shed
+    /// answers with its side and the rule is not asked behind it. Behind
+    /// a hard demand a pair's decision is handed the workers that meet
+    /// it, a part of each list, and its shed is not judged by the count
+    /// of a list: it is saturated where the overload veto left a pass
+    /// nobody, and else has no endpoint. A pair that states no hard demand,
     /// and whose host states no places of the prefills or the decodes
     /// ([`PairLists::prefill_places`](crate::engine::PairLists::prefill_places),
     /// [`PairLists::decode_places`](crate::engine::PairLists::decode_places)),
@@ -2017,10 +2057,16 @@ impl InProcess {
     /// where none can, one is ready and every ready one is over its
     /// thresholds. One whose rule takes workers none of which is ready, or
     /// workers of a pair's two lists no two of which pair, is answered by
-    /// the decision held to them, which names what left nobody. An encode
+    /// the decision held to them, which names what left nobody. Behind a
+    /// shed made over the prefills, a rule whose every prefill pairs with
+    /// no decode is answered as one that takes no prefill. An encode
     /// request is held so over its pair's two lists, with the items it
     /// carries or with none: the rule is asked of no encoder, and the
-    /// encoders' list is decided as its caller lent it.
+    /// encoders' list is decided as its caller lent it. One that states an
+    /// item, or holds its decode to the ones that take images, is not
+    /// answered so behind a rule whose every prefill pairs with no decode:
+    /// its decodes are asked too, and where the rule takes one a decision
+    /// among the rule's workers answers.
     ///
     /// A decision that is given up has written what its stages write as
     /// they decide, and its release takes none of that back: the tokens a
@@ -2068,10 +2114,16 @@ impl InProcess {
     /// makes three decisions at most, each given the request's whole
     /// budget. Behind the first of them, and behind a first decision that
     /// sheds the request as saturated over a list of its pair, the rule
-    /// is asked of the pair's two lists, and the later decisions are made
-    /// among the workers it takes on each, as a pair's are. A shed made
-    /// over the encoders stands, and no rule is asked behind it: the rule
-    /// narrows nothing of them. An encoder is read by its state alone:
+    /// is asked of the pair's two lists, and the later decisions are
+    /// made among the workers it takes on each, as a pair's are. A
+    /// request with no item whose decode is held to no images is its
+    /// pair's alone: its first shed with no endpoint goes to the rule as
+    /// a pair's does. One that states an item, or holds its decode to
+    /// the ones that take images, keeps such a shed, and its pair's
+    /// decision asks no question of a shed: it is answered as it was
+    /// before the question stood. A shed made for the encoders
+    /// stands, and no rule is asked behind it: the rule narrows nothing of
+    /// them. An encoder is read by its state alone:
     /// the route's rule is asked of the pair's two workers and of its two
     /// lists. With no item the three lists are placed as their pair.
     ///

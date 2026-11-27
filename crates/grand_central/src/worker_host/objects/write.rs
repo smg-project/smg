@@ -38,9 +38,9 @@
 //! the registry's, leaves a row and its object apart too. No line of the
 //! holder between the two returns early or unwraps a result.
 //!
-//! A patch tells the store the whole row read back from the object, where
-//! the store's own patch wrote the patched facts alone. The two are one
-//! row while an object states what its row stated: what an object does not
+//! A patch tells the store the whole row read back from the object, and
+//! the store writes it whole. It is the table's row with the patch laid
+//! on it while an object states what its row stated: what an object does not
 //! hold as stated is kept beside it, and nothing in a controller sets a
 //! fact of an object behind its build, as a gateway's refresh of a
 //! worker's models does in a gateway. A change that sets one writes the

@@ -351,7 +351,8 @@ impl PluginBinding {
                 None => OwnTime::unread(watched, fuel_micros, charged),
             };
             // The charge is the decision's, however `init` ended: drawn
-            // here, ahead of the three ends, which ask what it left.
+            // here, ahead of the three ends. The clamp's end asks what it
+            // left.
             budget.draw(charged);
             match made {
                 Ok(instance) => {

@@ -455,12 +455,19 @@ fn a_frame_with_items_under_a_plan_with_no_encode_side_is_declined_by_its_bindin
 }
 
 /// A picker that leaves the placement to an assignment runs on the pair's
-/// two sides of the encode plan in a controller whose catalog holds no
-/// stage that needs the lifecycle's calls, where the binding names no
-/// sessions rule. Each side then takes the worker that holds the fewest
+/// two sides of the encode plan, where the binding names no sessions rule.
+/// It does so in a controller whose catalog holds no stage that needs the
+/// lifecycle's calls. Each side then takes the worker that holds the fewest
 /// requests, by the leases on file, and an item goes to its encoder beside
 /// the pair. A sessions rule under that plan stays refused in such a build,
 /// by the document's check.
+///
+/// The gateway's manual policy always keeps its table, so it has no twin of
+/// a binding with no rule. Its nearest answer is for a request that states
+/// no key, placed by the assignment mode: `select_new_worker`
+/// (`model_gateway/src/policies/manual.rs`). Under `MinLoad` and `Delegate`
+/// that is the least loaded worker, as in this case. Under `Random`, the
+/// mode's default, it is a random one.
 #[test]
 fn a_picker_by_assignment_places_an_encode_requests_pair_under_no_rule() {
     let catalog = StageRegistry::builtin().without_lifecycle();

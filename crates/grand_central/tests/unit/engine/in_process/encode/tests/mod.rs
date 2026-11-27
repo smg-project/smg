@@ -2477,13 +2477,15 @@ impl Filter for ReadsCounts {
 }
 
 /// Under a capped sessions rule each side of an encode request's pair reads
-/// the count of its key's requests on a worker's object under the name the
-/// request's maker states for that side's session, as a pair's own decision
-/// does. A maker that says nothing is of a host whose own guard counts: the
-/// key's text names both sides. A maker of a host that counts by the
-/// decisions it holds says the session's number, and each side keeps a
-/// session of its own. An encoder's row carries no count under any of those
-/// names: an item goes by its content, whatever the request's key.
+/// the count of its key's requests on a worker's object, as a pair's own
+/// decision does. It reads it under the name the request's maker states for
+/// that side's session. A maker that says nothing is of a host whose own
+/// guard counts: the key's text names both sides. A maker of a host that
+/// counts by the decisions it holds says the session's number, and each
+/// side keeps a session of its own.
+///
+/// An encoder's row carries no count under any of those names: an item goes
+/// by its side's policy, whatever the request's key.
 ///
 /// The entry of a host that files a pick's lease itself names no count
 /// ([`Loaded::decide_encode_without_lease`]): a controller refuses a rule

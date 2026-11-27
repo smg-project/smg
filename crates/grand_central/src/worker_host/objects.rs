@@ -212,10 +212,10 @@ impl Held {
 /// stays whole beside each. A status tell changes no row's facts, and a
 /// copy reads the told statuses with the place in one hold of the store's
 /// membership lock. A generation's apply and a term's start change no row.
-/// A caller of the store's own registration, patch or removal takes no
-/// turn either: no product code calls those, and they go with the store's
-/// table. A row written so has no object, and no copy holds it, until a
-/// cut is laid whole.
+/// A change handed to the store around the holder
+/// ([`MemoryStore::follow`]) takes no turn either: no product code hands
+/// one so. A row written so has no object,
+/// and no copy holds it, until a cut is laid whole.
 ///
 /// A row takes the place of its own object alone: an object another row
 /// holds under its URL is dropped first.
@@ -973,6 +973,11 @@ impl<G: Generation> Objects<G> {
     /// object another row holds under the URL is dropped first: a row takes
     /// the place of its own object alone. Where the registry holds nothing
     /// under the URL by then, the object is registered under a new id.
+    ///
+    /// A row holds one object. Where the row's own object stands under
+    /// another URL, that one is dropped first too. A cut that names an id
+    /// again under another address lays its rows in order: the first's
+    /// object ends, and the last stands, as the store keeps it.
     fn put<S: WorkersStore + ?Sized>(&self, store: &S, row: &WorkerRow, object: Arc<dyn Worker>) {
         // The id first, then the entry, then the registry's write: its
         // event finds the entry.
@@ -983,6 +988,10 @@ impl<G: Generation> Objects<G> {
         if let Some(other) = self.standing(&id).filter(others) {
             self.end(other.row);
             id = self.registry.reserve_id_for_url(&row.facts.key);
+        }
+        // The row's own object under another URL leaves first too.
+        if self.object(row.id).is_some_and(|own| own != id) {
+            self.end(row.id);
         }
         let standing = {
             let mut entries = self.held.write();

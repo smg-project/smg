@@ -917,7 +917,7 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
     /// that meet it. That takes a session whose welcome chose protocol 2,
     /// or a later version the link's hello offered.
     ///
-    /// Three requests that state a demand are answered
+    /// Two requests that state a demand are answered
     /// [`DecisionUnavailable::Unsent`] with [`Error::OutOfRange`] before
     /// anything is sent, and their host decides them itself:
     ///
@@ -925,8 +925,6 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
     ///   demand and would then pick among workers the demand rules out, or
     ///   on a version the hello did not offer
     /// - an encode request, which a controller holds to no demand yet
-    /// - a request that demands vision, by that part's name, since no
-    ///   registration over the wire states whether a worker takes images
     ///
     /// A shed keeps the stage of the demand that left nobody
     /// (`Shed::emptied_by`), as the door in process names it. Any other
@@ -1079,9 +1077,8 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
 
     /// Whether a request's hard demands go out in its frame. They do over
     /// a session whose welcome chose a protocol that states them, on every
-    /// frame but one that states the encode phase. The part that demands
-    /// vision never does. Out of line: a request that demands nothing reads
-    /// none of it.
+    /// frame but one that states the encode phase. Out of line: a request
+    /// that demands nothing reads none of it.
     #[cold]
     #[inline(never)]
     fn demands_sendable(
@@ -1097,12 +1094,6 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
         if !reads_demands(link.welcome().protocol) || encode || request.facts.phase == Phase::Encode
         {
             return unsent("constraints.demands");
-        }
-        // No registration over the wire states whether a worker takes
-        // images, so a controller sheds a request that demands it unless
-        // its own host laid such a worker.
-        if request.constraints.demands.vision {
-            return unsent("constraints.demands.vision");
         }
         Ok(())
     }

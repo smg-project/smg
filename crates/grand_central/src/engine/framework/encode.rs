@@ -65,7 +65,7 @@ use crate::{
 };
 
 #[cfg(test)]
-#[path = "../../../tests/unit/engine/framework/encode/tests.rs"]
+#[path = "../../../tests/unit/engine/framework/encode/tests/mod.rs"]
 mod tests;
 
 /// The stage named when no encoder is open for the request though one that
@@ -214,6 +214,16 @@ impl EncodeItems<'_> {
     #[must_use]
     pub const fn holds_decode_to_images(&self, pixels: bool) -> bool {
         self.decode_images || (self.references && pixels)
+    }
+
+    /// Whether the encode side lays its pass for the request: it carries
+    /// an item, or its decode is held to the decodes that take images
+    /// ([`Self::holds_decode_to_images`]). A request the pass is not laid
+    /// for is its pair's alone. The one test of it: the pass asks it, and
+    /// so does a call's test of a shed that goes to its route's rule.
+    #[must_use]
+    pub(crate) const fn lays_a_pass(&self, pixels: bool) -> bool {
+        !self.keys.is_empty() || self.holds_decode_to_images(pixels)
     }
 }
 
@@ -1178,7 +1188,7 @@ impl Engine {
         // A request with no item that asks no images of its decode is the
         // pair's alone: the pair entry answers it over the pools as handed,
         // and no pass of the encode side is laid for it.
-        if !needs && !images {
+        if !items.lays_a_pass(pixels) {
             return self.decide_pair(facts, pool, pools, cx, decode_cx, scratch);
         }
         let encode_facts = RequestFacts {
@@ -1351,6 +1361,19 @@ impl Engine {
         // a pool of their own and the targets are read back by where a row
         // stood.
         let mut admitted = pools;
+        // The pass is laid: the pools the pair is handed are a part
+        // ([`PairPools::part`]), whether a list is cut below or not. The
+        // gateway's own selection hands its pair selection such a request
+        // under a filter of its own
+        // (`placed_encode_prefill_decode_workers` in
+        // `model_gateway/src/routers/grpc/common/stages/worker_selection.rs`).
+        // This pass's cuts follow that filter in part. It also leaves out
+        // a decode where no available encoder is of its runtime, and its
+        // pair selection judges its paired workers with no filter where
+        // the filter takes none of them. So the pair's decision asks no
+        // question of its shed here: the request is answered as it was
+        // before the question stood.
+        admitted.part = true;
         let every_prefill = !needs || ahead.unwrap_or_else(&every_open);
         // A list handed on in a pool's stead is numbered anew. A mask and
         // the places a side's host holds the request to number the rows of

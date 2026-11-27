@@ -1321,5 +1321,5 @@ impl LeaseBackend for MemoryLease {
 }
 
 #[cfg(test)]
-#[path = "../../../tests/unit/service/elector/tests.rs"]
+#[path = "../../../tests/unit/service/elector/tests/mod.rs"]
 mod tests;

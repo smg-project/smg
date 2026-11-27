@@ -83,6 +83,15 @@ router routes by and workers that share a host do not collide; an explicit
 configuration is kept as given, its endpoint and off included, and
 `SMG_VLLM_SERVICER_KV_EVENTS=0` leaves the publisher off.
 
+`GenerateRequest.cache_salt` is the request's prefix-cache salt, under either
+implementation. Requests with different salts share no cached blocks. A salt
+has 1 to 128 characters and none of `@`, `/`, `\` and NUL. The prefix `mm:` is
+reserved. The servicer refuses any other salt with `INVALID_ARGUMENT`. The
+engine gets the salt verbatim, with one exception: a PD decode side that has
+media hashes and no tensors. There it gets `mm:` and a SHA-256 digest of the
+salt, if any, and the hashes. The worker advertises
+`cache_partition_fields=cache_salt` through `GetServerInfo`.
+
 #### Worker-side multimodal processing (media refs)
 
 By default the smg router fetches and preprocesses images itself and sends
@@ -109,14 +118,12 @@ documented setting and logs nothing. The startup
 line `VllmEngineServicer initialized (mm_processor=inprocess, source=flag)` and
 the `mm_processor_source` label name where the value came from.
 
-A model family whose reference image processor raises a short side below a
-floor before its own resize (MiniMax-M3: 112 px) gets the same raise on the
-worker: `inprocess` and the sidecar raise such an image to the floor, bicubic,
-before the engine's processor sizes it, as the router's own pipeline does, so
-a tiny image costs the same visual tokens whichever component preprocessed it
-(video frames are not raised, as there). An engine started with
-`--mm-processor-kwargs '{"do_resize": false}'` raises nothing, as the pipeline
-raises nothing then.
+A worker that prepares media itself (`inprocess` or the sidecar) hands a
+fetched image to the engine's processor unchanged, so the image costs the
+visual tokens the installed engine release counts. The router's own pipeline
+sizes an image by the rule of the newest release it follows; a worker on an
+older release whose processor sizes a small image by another rule counts that
+image differently.
 
 The worker then advertises `mm_processor=inprocess` and `mm_media_ref_schemes`
 through `GetServerInfo`; a router with media-reference support forwards
@@ -1325,6 +1332,17 @@ IDs use their own isolated routing partition but do not match name-keyed
 KV events; use adapter names for cache-aware placement.
 Media-bearing gateway EPD requests remain unsupported for SGLang and are
 refused rather than falling back to another runtime's base model.
+
+#### Cache partition
+
+Both SGLang gRPC servicers give `GenerateRequest.cache_partition` to the
+scheduler as its two separate fields, `cache_salt` and `extra_key`. Two
+requests share prefix-cache blocks only when both values are equal. An empty
+string is unset. Send the same two values to both sides of a prefill/decode
+pair. The servicers advertise the fields they read as the
+`cache_partition_fields` key of `server_args` (`cache_salt,extra_key`). The
+Python servicer does not write the key when the installed `smg-grpc-proto` does
+not have the field.
 
 #### KV-event recovery
 

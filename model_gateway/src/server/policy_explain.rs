@@ -4,9 +4,22 @@
 //! no other field.
 //!
 //! The engine keeps a sample of its picks and sheds where the policy spec
-//! sets `explain.sample`, each under the id its request states. An id that
-//! finds no record is answered 404 with the reason, in the control plane's
-//! error envelope.
+//! sets `explain.sample`. A kept decision stands under the id its route
+//! stated as the request's own, which is the id in the request's body where
+//! the route reads the body and hands that id on. Where the route stated
+//! none, it stands under the gateway's own id of the request: the one its
+//! response's `x-request-id` header shows. The gateway restates that id on
+//! the request under a policy spec that keeps a sample, and the placement
+//! reads it off the headers its route hands it
+//! (`middleware::request_id`). Of a request that states no id of its own
+//! and whose route hands its placement no headers, no decision is kept. An
+//! id that finds no record is answered 404 with the reason, in the control
+//! plane's error envelope.
+//!
+//! A decision kept under the gateway's own id may be one its route let go:
+//! a request forwarded unread that is handed back to the buffered path
+//! behind its pick is placed again, and where its body states an id the
+//! second decision stands under that id.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -68,6 +81,11 @@ fn addresses(workers: &[Arc<dyn Worker>]) -> HashMap<WorkerId, &str> {
 /// A worker is written with its address ([`addresses`]), read once from
 /// the registry. A worker that has left the registry since is written with
 /// its id and no address.
+///
+/// An id is no secret and no proof of who asked. A client may state any
+/// text as its request's id, in the body or in a request-id header the
+/// gateway reads, and of the records kept under one text the newest is
+/// read.
 pub(super) async fn get(
     State(state): State<Arc<AppState>>,
     AdminPath(request_id): AdminPath<String>,

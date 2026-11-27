@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{cell::RefCell, collections::BTreeMap, sync::Arc};
 
 use parking_lot::Mutex;
 use smg_worker::registry::{WorkerId as ObjectId, WorkerRegistry};
@@ -53,6 +53,28 @@ impl Journal for Told {
     fn restart(&self, _: Position) -> bool {
         true
     }
+
+    fn released(&self) {
+        let hook = LET_GO.with(|held| held.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
+/// What [`on_let_go`] keeps for the journal to run.
+type Hook = Box<dyn FnOnce()>;
+
+thread_local! {
+    static LET_GO: RefCell<Option<Hook>> = const { RefCell::new(None) };
+}
+
+/// `hook` runs once on this thread, where the next write of a
+/// [`Replica`]'s store has let its locks go: behind a cut's write too,
+/// ahead of the holder's lay. It is taken out first: a write the hook
+/// itself makes meets none.
+pub(crate) fn on_let_go(hook: impl FnOnce() + 'static) {
+    LET_GO.with(|held| *held.borrow_mut() = Some(Box::new(hook)));
 }
 
 /// A replica as a controller keeps one: a journaled store, and a holder
@@ -146,6 +168,75 @@ pub(crate) fn lay_standing<G: Generation>(objects: &Objects<G>, store: &MemorySt
     let _turn = objects.turn.lock();
     let (_, rows) = store.all_rows();
     objects.reconcile(store, &rows);
+}
+
+/// The cases' road to a store's table writes what the holder's write
+/// calls write. One registration, its refresh in place, a patch, a
+/// connect signal, the key's next life and a removal go through a
+/// holder. The same six go through the cases' road of a second store.
+/// The two tables hold the same rows, and the two journals were told
+/// the same.
+#[test]
+fn the_cases_road_writes_a_table_as_the_holders_write_calls_do() {
+    let replica = Replica::new();
+    let (held, objects) = (&replica.store, &replica.objects);
+    let told = Arc::new(Told::default());
+    let alone = MemoryStore::journaled(Arc::clone(&told) as _);
+    // A row but for the instant it was admitted at: each store reads
+    // its own clock.
+    let plain = |row: &WorkerRow| {
+        let row = row.clone();
+        (row.id, row.facts, row.status, row.revision, row.maker)
+    };
+    let words = |told: &Told| {
+        let told = told.0.lock();
+        let word = |(change, row, left): &Member| {
+            let (row, left) = (row.as_ref().map(plain), left.as_ref().map(plain));
+            (*change, row, left)
+        };
+        told.iter().map(word).collect::<Vec<_>>()
+    };
+    let same = || {
+        let rows = |store: &MemoryStore| store.all_rows().1.iter().map(plain).collect::<Vec<_>>();
+        assert_eq!(rows(held), rows(&alone), "the two tables");
+        assert_eq!(words(&replica.told), words(&told), "the two journals");
+    };
+    let maker = Registrant::Control;
+    // A new key, then its refresh in place.
+    for tier in ["gold", "iron"] {
+        let by_holder = objects.upsert(held, facts(1, tier), maker.clone());
+        let by_road = alone.upsert_by(facts(1, tier), maker.clone());
+        assert_eq!(by_holder, Some(by_road));
+        same();
+    }
+    // A patch at the row's revision.
+    let id = identity(A, 1);
+    let revision = held.get(id).expect("the row").revision;
+    let patch = WorkerPatch {
+        priority: Some(7),
+        ..WorkerPatch::default()
+    };
+    let by_holder = objects.patch(held, id, patch.clone(), revision);
+    assert_eq!(by_holder, alone.patch(id, patch, revision));
+    same();
+    // A status: the holder's connect signal, and the road's ready.
+    let revision = held.get(id).expect("the row").revision;
+    objects.connect_row(held, id, revision);
+    let by_road = alone.set_status(id, WorkerStatus::Ready, revision);
+    assert!(by_road.is_some(), "the status moved");
+    same();
+    // The key's next life, then its removal.
+    let by_holder = objects.upsert(held, facts(2, "iron"), maker.clone());
+    assert_eq!(by_holder, Some(alone.upsert_by(facts(2, "iron"), maker)));
+    same();
+    let next = identity(A, 2);
+    let revision = held.get(next).expect("the next life's row").revision;
+    assert_eq!(
+        objects.remove(held, next, revision),
+        alone.remove(next, revision)
+    );
+    same();
+    assert_eq!(told.0.lock().len(), 6, "each write was told once");
 }
 
 /// Each write of a row is decided over the objects: the object stands

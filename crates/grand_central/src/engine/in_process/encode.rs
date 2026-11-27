@@ -342,10 +342,10 @@ impl EncodeLists<'_> {
     ///
     /// `counted` says where a worker's object counts the requests of the
     /// request's session key ([`RequestMaker::session_counted_under`]). It
-    /// is asked under a document one of whose stages reads that count, and
-    /// each side of the pair then reads it under the name of the side's own
+    /// is asked under a document one of whose stages reads that count. Each
+    /// side of the pair then reads it under the name of the side's own
     /// session, as a pair's own decision does. The encoders' records read
-    /// it under no name: an item goes by its content, whatever the
+    /// it under no name: an item goes by its side's policy, whatever the
     /// request's key. An entry that hands `None` names no count, and every
     /// record of its request reads none: the entry of a host that files a
     /// pick's lease itself ([`Loaded::decide_encode_without_lease`]).
@@ -527,6 +527,8 @@ impl EncodeLists<'_> {
                 decode_affinity: decode_column.as_slice(),
                 table: pair.classes.table(),
                 first: pair.classes.first(),
+                // A demand left each side the workers that meet it.
+                part: demanded,
             };
             let encode = EncodePool {
                 encoders: rows,

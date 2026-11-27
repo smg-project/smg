@@ -1,5 +1,16 @@
 use super::{reaches_the_budget, Budget, OpenDecisions, Part};
 
+impl Budget {
+    /// A budget seeded with `micros`, for a case of a kind that closes a
+    /// decision under one.
+    #[cfg(feature = "controller")]
+    pub(in crate::plugins) fn seeded(micros: u32) -> Self {
+        let mut budget = Self::default();
+        budget.seed(micros);
+        budget
+    }
+}
+
 /// What is left of a budget, and the budget as seeded.
 fn left_and_seed(budget: &Budget) -> (u64, u64) {
     (budget.remaining_micros, budget.seed_micros)
@@ -68,8 +79,6 @@ fn the_widest_budget_is_read_whole_in_a_frames_width() {
         (u64::from(u32::MAX), u64::from(u32::MAX))
     );
     assert_eq!(budget.remaining_micros_u32(), u32::MAX);
-    #[cfg(feature = "controller")]
-    assert_eq!(budget.seed_micros_u32(), u32::MAX);
 }
 
 /// A budget no decision seeded holds its own bound and a seed of zero,
@@ -266,46 +275,38 @@ fn a_sample_is_read_over_the_frames_at_most_the_budget_as_seeded() {
 }
 
 /// A frame of the gRPC kind is sent with the plugin's own frame, or what
-/// is left where that is less, and with what is left. Its round trip is
-/// read against the plugin's whole frame under the budget as seeded.
+/// is left where that is less, and with what is left.
 #[cfg(feature = "controller")]
 #[test]
-fn a_frame_is_sent_with_its_grant_and_what_is_left_and_read_against_its_whole_frame() {
+fn a_frame_is_sent_with_its_grant_and_what_is_left() {
     use super::FrameBudget;
     let stated = |micros: u32| FrameBudget {
         micros,
         fuel_per_micro: 10,
     };
-    // What is left of a budget of 1,000, the plugin's stated frame, the
-    // two a frame is sent with (its grant, what is left), and the whole
-    // frame as seeded.
+    // What is left of a budget of 1,000, the plugin's stated frame, and
+    // the two a frame is sent with (its grant, what is left).
     let table = [
-        (1_000, 400, (400, 1_000), 400),
-        (400, 400, (400, 400), 400),
-        (399, 400, (399, 399), 400),
-        (0, 400, (0, 0), 400),
-        // A frame wider than the budget is whole at the budget.
-        (1_000, 5_000, (1_000, 1_000), 1_000),
-        (300, 5_000, (300, 300), 1_000),
+        (1_000, 400, (400, 1_000)),
+        (400, 400, (400, 400)),
+        (399, 400, (399, 399)),
+        (0, 400, (0, 0)),
+        // A frame wider than the budget is granted the budget at most.
+        (1_000, 5_000, (1_000, 1_000)),
+        (300, 5_000, (300, 300)),
     ];
-    for (left, frame, sent, whole) in table {
+    for (left, frame, sent) in table {
         let under = budget(1_000, left);
         assert_eq!(
-            (
-                under.grant_frame(stated(frame)),
-                under.whole_frame(stated(frame))
-            ),
-            (sent, whole),
+            under.grant_frame(stated(frame)),
+            sent,
             "a frame of {frame} under {left}"
         );
     }
     // A plugin that states no frame takes the default one.
     let default = FrameBudget::DEFAULT_MICROS;
     let widest = budget(u32::MAX, u64::from(default) + 5);
-    assert_eq!(
-        (widest.grant_frame(stated(0)), widest.whole_frame(stated(0))),
-        ((default, default + 5), default)
-    );
+    assert_eq!(widest.grant_frame(stated(0)), (default, default + 5));
 }
 
 /// A wait ends at its frame's deadline, or where what is left runs out

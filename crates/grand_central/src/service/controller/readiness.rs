@@ -192,11 +192,19 @@ impl Readiness {
     /// replica leads at the instant of the read, if it leads one, and the
     /// instant the clock alone next turns the state. The term is the one
     /// the state was read under, by one read of the fence.
+    ///
+    /// The term is the fence's from the first take on. A take lands ahead
+    /// of the serve's turn to serving, and the fence admits a watch and a
+    /// write from the take: a serve that is still [`State::Starting`]
+    /// leads the term its fence holds. A serve that is
+    /// [`State::Draining`] leads none, whatever its fence says: a leader
+    /// that leaves says so before its fence closes.
     pub(crate) fn led(&self) -> (Option<u64>, Option<Instant>) {
         let now = Instant::now();
         let term = self.fence.leader_term(now);
         let (sample, turn) = self.sample_under(term, now);
-        (term.filter(|_| sample.state == State::Leader), turn)
+        let leads = matches!(sample.state, State::Starting | State::Leader);
+        (term.filter(|_| leads), turn)
     }
 
     fn sample_at(&self, now: Instant) -> (Sample, Option<Instant>) {

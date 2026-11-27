@@ -690,8 +690,9 @@ pub struct RouterConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ReadinessRoleConfig {
-    /// Desired fleet size used as the stable percentage denominator. Has no
-    /// effect unless `min_healthy_percent` is also set.
+    /// Desired fleet size used as the stable percentage denominator. It
+    /// enables no percentage gate unless `min_healthy_percent` is also set.
+    /// `min_healthy_workers` may not exceed it.
     pub expected_workers: Option<usize>,
     /// Absolute safety floor, independent of the percentage threshold.
     pub min_healthy_workers: usize,

@@ -5,10 +5,6 @@
 //! `policy_store/remove_with_health`. The writer takes the workers lock
 //! before the health lock, so a write landing after the worker's removal
 //! lands nowhere.
-#![expect(
-    clippy::expect_used,
-    reason = "a bench's setup has no caller to answer; a store that refuses its own registration is a bug the unit tests catch"
-)]
 
 #[path = "common/filled.rs"]
 mod filled;
@@ -21,7 +17,10 @@ use std::{
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use smg_grand_central::{
     engine::{Role, WorkerId},
-    store::{GatewayId, HealthSink, MemoryStore, WorkerFacts, WorkersStore},
+    store::{
+        identity, GatewayId, HealthSink, MembershipChange, MemoryStore, Position, Registrant,
+        WorkerFacts, WorkerRow, WorkerStatus, WorkersStore,
+    },
 };
 
 const WORKERS: u64 = 64;
@@ -38,11 +37,29 @@ fn facts(key: &str, incarnation: u64) -> WorkerFacts {
     }
 }
 
-/// A store with `WORKERS` registered workers, and their ids in order.
+/// A store with `WORKERS` registered workers, and their ids in order. The
+/// store has no holder of worker objects: it takes each row as a decided
+/// change ([`MemoryStore::follow`]), stated as a registration leaves it.
 fn populated() -> (MemoryStore, Vec<WorkerId>) {
     let store = MemoryStore::new();
+    let now = Instant::now();
     let ids: Vec<WorkerId> = (0..WORKERS)
-        .map(|i| store.upsert(facts(&format!("http://w{i}:8000"), 1)).id())
+        .map(|i| {
+            let facts = facts(&format!("http://w{i}:8000"), 1);
+            let id = identity(&facts.key, facts.incarnation);
+            let row = WorkerRow {
+                id,
+                facts,
+                status: WorkerStatus::Pending,
+                revision: 1,
+                admitted_at: now,
+                maker: Registrant::Control,
+            };
+            let epoch = WorkersStore::epoch(&store) + 1;
+            let registered = MembershipChange::Registered { id };
+            store.follow(Position::default(), epoch, registered, Some(row));
+            id
+        })
         .collect();
     store.publish_now();
     filled::filled(&store, "m", Role::Single, ids.len());
@@ -91,11 +108,13 @@ fn remove(c: &mut Criterion) {
                     }
                 }
                 let id = ids[ids.len() / 2];
-                let revision = WorkersStore::get(&store, id).expect("the row").revision;
-                (store, id, revision)
+                assert!(WorkersStore::get(&store, id).is_some(), "the row stands");
+                let epoch = WorkersStore::epoch(&store) + 1;
+                (store, id, epoch)
             },
-            |(store, id, revision)| {
-                black_box(store.remove(black_box(id), revision).expect("removed"));
+            |(store, id, epoch)| {
+                let left = MembershipChange::Removed { id: black_box(id) };
+                store.follow(Position::default(), epoch, left, None);
                 store.publish_now();
                 // Returned, so criterion drops the store outside the timed section.
                 store

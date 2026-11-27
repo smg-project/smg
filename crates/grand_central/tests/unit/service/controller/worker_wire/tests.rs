@@ -7,9 +7,9 @@ use std::{
 use prost::Message as _;
 
 use super::{
-    event, member, page, patch, refused, registration, removed, replaced, replication, row,
-    start_again, status, status_changed, told_change, told_part, told_row, Refused, KEY_BYTES,
-    LABELS, NAME_BYTES, ROW_BYTES, URL_BYTES, VALUE_BYTES,
+    bootstrap_port, event, member, page, patch, refused, registration, removed, replaced,
+    replication, row, start_again, status, status_changed, told_change, told_part, told_row,
+    Refused, KEY_BYTES, LABELS, NAME_BYTES, ROW_BYTES, URL_BYTES, VALUE_BYTES,
 };
 use crate::{
     engine::{
@@ -119,6 +119,7 @@ fn full() -> WorkerRow {
             window: 32_768,
             decoding: 3,
         },
+        vision: true,
         ..WorkerFacts::default()
     };
     WorkerRow {
@@ -195,6 +196,7 @@ fn the_wires_row_tells_every_fact_of_the_stores_row() {
             window: 32_768,
             decoding: 3,
         }),
+        vision: true,
     };
     assert_eq!(told, expected);
 }
@@ -674,6 +676,77 @@ fn a_block_of_demand_facts_is_the_rows_whole_and_one_left_out_keeps_the_rows() {
     );
 }
 
+/// Whether a worker takes images is its registration's where it states
+/// it. A registration that states none keeps the row's, and a new row
+/// takes no images.
+#[test]
+fn a_registration_states_whether_its_worker_takes_images_and_one_that_states_none_keeps_the_rows() {
+    let with = |vision: bool| proto::WorkerSpec {
+        vision: Some(vision),
+        ..spec()
+    };
+    let stated = |stated: &proto::WorkerSpec, standing: Option<&WorkerFacts>| {
+        facts(stated, standing).map(|made| made.vision)
+    };
+    assert_eq!(stated(&spec(), None), Ok(false));
+    assert_eq!(stated(&with(true), None), Ok(true));
+    assert_eq!(stated(&with(false), None), Ok(false));
+
+    // Over a standing row: a registration that states none keeps the
+    // row's, and one that states it is the row's, either way.
+    let seeing = facts(&with(true), None).expect("a registration");
+    assert_eq!(stated(&spec(), Some(&seeing)), Ok(true));
+    assert_eq!(stated(&with(false), Some(&seeing)), Ok(false));
+    let blind = facts(&spec(), None).expect("a registration");
+    assert_eq!(stated(&with(true), Some(&blind)), Ok(true));
+}
+
+/// The wire's row tells whether its worker takes images, and its reader
+/// holds it. A row of a worker that takes none tells no byte of the
+/// field, so it is the row a build before the field told. Such a row
+/// reads as taking none.
+#[test]
+fn a_row_tells_whether_its_worker_takes_images_and_one_that_tells_none_reads_as_taking_none() {
+    let seeing = full();
+    let blind = WorkerRow {
+        facts: WorkerFacts {
+            vision: false,
+            ..full().facts
+        },
+        ..full()
+    };
+    let (told_seeing, told_blind) = (row(&seeing), row(&blind));
+    assert!(told_seeing.vision);
+    assert!(!told_blind.vision);
+    let read = |told: &proto::WorkerRow| told_row(told, Instant::now()).map(|row| row.facts.vision);
+    assert_eq!(read(&told_seeing), Ok(true));
+    assert_eq!(read(&told_blind), Ok(false));
+    // The bit is three bytes of the row that tells it, and none of the
+    // row that does not.
+    assert_eq!(told_seeing.encoded_len() - told_blind.encoded_len(), 3);
+    let bytes = told_blind.encode_to_vec();
+    let again = proto::WorkerRow::decode(bytes.as_slice()).expect("a row");
+    assert_eq!(read(&again), Ok(false));
+}
+
+/// The descriptor's number 11 left the contract: whether a worker takes
+/// images is the registration's own field. A registration that still
+/// states the number is read as one that states none, where a build
+/// before this one refused it by its path.
+#[test]
+fn a_descriptor_that_still_states_number_eleven_reads_as_one_that_states_none() {
+    let port_alone = proto::PairingDescriptor {
+        bootstrap_port: 7_000,
+        ..Default::default()
+    };
+    let mut bytes = port_alone.encode_to_vec();
+    // Field 11 as a varint: its key, then one.
+    bytes.extend_from_slice(&[11 << 3, 1]);
+    let read = proto::PairingDescriptor::decode(bytes.as_slice()).expect("a descriptor");
+    assert_eq!(read, port_alone);
+    assert_eq!(bootstrap_port(&read), Ok(Some(7_000)));
+}
+
 #[test]
 fn a_registration_over_a_standing_row_keeps_what_it_leaves_unsaid_save_its_labels_and_its_policy() {
     let standing = full().facts;
@@ -850,7 +923,7 @@ fn a_field_the_store_cannot_hold_is_refused_by_its_path() {
     // Of a pairing descriptor the store holds the bootstrap port alone:
     // every other field a caller states is refused by its own path.
     let named = |name: &str| name.to_owned();
-    let descriptors: [(proto::PairingDescriptor, &str); 13] = [
+    let descriptors: [(proto::PairingDescriptor, &str); 12] = [
         (
             proto::PairingDescriptor {
                 protocol: named("protocol-a"),
@@ -899,13 +972,6 @@ fn a_field_the_store_cannot_hold_is_refused_by_its_path() {
                 ..Default::default()
             },
             "spec.pairing.ec_consumer",
-        ),
-        (
-            proto::PairingDescriptor {
-                vision: true,
-                ..Default::default()
-            },
-            "spec.pairing.vision",
         ),
         (
             proto::PairingDescriptor {
@@ -1508,10 +1574,23 @@ fn the_stores_measure_is_never_under_the_wires_weight() {
         numbers.admitted_age_ms = u64::MAX;
         numbers.encoded_len()
     };
+    // The same row again where its worker takes images too: the store
+    // charges the wire's bit beside the block.
+    let seeing = WorkerFacts {
+        vision: true,
+        ..stating.clone()
+    };
     let (plain, block) = (numeric(&widest), numeric(&stating));
     assert!(plain <= WorkerFacts::NUMBERS, "{plain} numeric bytes");
     // What the store charges for the block is the block at its widest.
     assert_eq!(block - plain, WorkerFacts::DEMAND_FACTS);
+    // What it charges for the bit is the bit.
+    assert_eq!(numeric(&seeing) - block, WorkerFacts::VISION);
+    // The measure adds that charge for a row that takes images. A row's
+    // texts leave more room than the bit takes, so no row below needs
+    // the charge to fit its measure, and it is read here.
+    let charged = |facts: &WorkerFacts| facts.weight(&Registrant::Control);
+    assert_eq!(charged(&seeing) - charged(&stating), WorkerFacts::VISION);
 
     let makers = [
         Registrant::Control,
@@ -1520,12 +1599,15 @@ fn the_stores_measure_is_never_under_the_wires_weight() {
     ];
     for long in [false, true] {
         let sized = |least, most| text(if long { most } else { least });
-        // With a scrape and with none, the block stated and not.
+        // With a scrape and with none: the block stated and not, and
+        // the bit beside the block.
         let cells = [
             (false, &widest),
             (true, &widest),
             (false, &stating),
             (true, &stating),
+            (false, &seeing),
+            (true, &seeing),
         ];
         for (scrape, numbers) in cells {
             let facts = WorkerFacts {

@@ -104,7 +104,7 @@ fn handed(store: &MemoryStore, id: WorkerId) -> Arc<Kept> {
 /// Takes the row `id` out of the store.
 fn remove(store: &MemoryStore, id: WorkerId) {
     let revision = WorkersStore::get(store, id).expect("the row").revision;
-    WorkersStore::remove(store, id, revision).expect("removed");
+    store.remove(id, revision).expect("removed");
 }
 
 /// Three ready workers with a count handed for each, and the read of the

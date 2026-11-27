@@ -53,6 +53,27 @@ def test_server_info_carries_where_the_engine_starts_a_grammar(
     assert plain["model"] == "m", "the other server args are reported as before"
 
 
+def test_server_info_carries_the_structural_tag_vocabulary(tokenspeed_servicer_mod, monkeypatch):
+    labels = tokenspeed_servicer_mod.grammar_backend_entry.__globals__
+    # An xgrammar before 0.1.33 takes the older structural-tag nodes alone, so
+    # the Router spells this worker's tags in the older vocabulary.
+    monkeypatch.setitem(labels, "installed_xgrammar_version", lambda: "0.1.32")
+    older = _server_info(
+        tokenspeed_servicer_mod, monkeypatch, grammar_backend="xgrammar"
+    ).server_args
+    assert older["structural_tag_vocabulary"] == "older"
+    # The label follows the backend the scheduler runs: a worker that runs
+    # none reports nothing.
+    other = _server_info(tokenspeed_servicer_mod, monkeypatch, grammar_backend="none").server_args
+    assert "structural_tag_vocabulary" not in other
+
+    monkeypatch.setitem(labels, "installed_xgrammar_version", lambda: "0.1.33")
+    current = _server_info(
+        tokenspeed_servicer_mod, monkeypatch, grammar_backend="xgrammar"
+    ).server_args
+    assert "structural_tag_vocabulary" not in current
+
+
 def test_server_info_reports_the_engines_constrained_decoding_policy(
     tokenspeed_servicer_mod, monkeypatch
 ):

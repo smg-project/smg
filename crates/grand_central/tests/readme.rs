@@ -63,10 +63,10 @@ const PRESET: &str = "<!-- preset: ";
 const README_DOCUMENTS: usize = 2;
 
 /// The documents the reference shows running, counted as the README's are.
-const DOCUMENTS: usize = 13;
+const DOCUMENTS: usize = 12;
 
 /// The documents the policy spec's page shows running, counted the same way.
-const PAGE_DOCUMENTS: usize = 4;
+const PAGE_DOCUMENTS: usize = 5;
 
 /// The documents the stages' page shows running, counted the same way.
 const STAGES_DOCUMENTS: usize = 1;

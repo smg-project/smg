@@ -5,7 +5,7 @@ use tokio::task::JoinSet;
 use super::*;
 use crate::{
     engine::view::{Role, WireModes, WorkerId},
-    store::{WorkerFacts, WorkersStore},
+    store::WorkerFacts,
 };
 
 /// A store with the loop running over it, and the loop's stop.

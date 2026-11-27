@@ -368,10 +368,10 @@ impl MembershipCalls {
     /// `ADD` (and no mode) wants the URL absent; `REPLACE` wants it standing
     /// and makes its next incarnation; `UPSERT` registers an absent URL and
     /// lays the registration over a standing row: equal facts write no row
-    /// and answer the row unmoved, a change of role, wire, models or demand
-    /// facts is a new incarnation, any other change is made in place. Over a
-    /// draining row an `UPSERT` is the URL's next incarnation, whatever its
-    /// facts.
+    /// and answer the row unmoved, a change of role, wire, models, demand
+    /// facts or whether the worker takes images is a new incarnation, any
+    /// other change is made in place. Over a draining row an `UPSERT` is the
+    /// URL's next incarnation, whatever its facts.
     ///
     /// A registration whose checks are off ends with its row's connect
     /// signal, and so does an `UPSERT` of equal facts where the row waits

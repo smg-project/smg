@@ -3036,6 +3036,22 @@ fn the_manual_picker_on_the_encode_side_of_epd_is_not_in_this_build() {
             "{prefill} and {decode}"
         );
     }
+    // Each profile whose picker leaves the placement to the rule is
+    // refused there, the second of two by name as the first, beside the
+    // other on the prefill side.
+    for (encode, prefill) in [("held", "sticky"), ("sticky", "held")] {
+        let epd = doc(&format!(
+            r#"{{"apiVersion":"smg.policy/v1","profiles":{{"held":{{"pick":"manual"}},"q":{{"pick":"random"}},"sticky":{{"pick":"manual"}}}},"bindings":[{{"plan":"epd","profiles":{{"encode":"{encode}","prefill":"{prefill}","decode":"q"}}}}]}}"#
+        ));
+        assert_eq!(
+            not_in_build(&epd),
+            (
+                "bindings[0].profiles.encode".to_string(),
+                "a picker that places by the sessions rule on the encode side"
+            ),
+            "{encode} on the encode side"
+        );
+    }
     // On a side of a pair the same profile validates, and so it does
     // under the single plan, here with no rule; the preset is the
     // profile with one.

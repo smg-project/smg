@@ -369,6 +369,7 @@ pub(crate) fn vllm_frames(req: vllm::GenerateRequest) -> Result<Vec<Bytes>, Stat
         extra_mm_inputs,
         ec_transfer_params_json,
         chat_template_kwargs_json,
+        cache_salt,
     } = req;
     // Fields 1-6, in prost's order, moved.
     vllm::GenerateRequest {
@@ -398,10 +399,11 @@ pub(crate) fn vllm_frames(req: vllm::GenerateRequest) -> Result<Vec<Bytes>, Stat
         out.length_delimited(11, inputs.encoded_len());
         inputs_frames(inputs, &mut out);
     }
-    // Fields 12-13.
+    // Fields 12-14.
     vllm::GenerateRequest {
         ec_transfer_params_json,
         chat_template_kwargs_json,
+        cache_salt,
         ..Default::default()
     }
     .encode_raw(&mut out.scratch);
@@ -543,6 +545,7 @@ pub(crate) fn sglang_frames(req: sg::GenerateRequest) -> Result<Vec<Bytes>, Stat
         extra_mm_inputs,
         prepared_control,
         prepared_input,
+        cache_partition,
     } = req;
     // Fields 1-2, moved.
     sg::GenerateRequest {
@@ -578,14 +581,16 @@ pub(crate) fn sglang_frames(req: sg::GenerateRequest) -> Result<Vec<Bytes>, Stat
         ..Default::default()
     }
     .encode_raw(&mut out.scratch);
-    // Field 21, every element in order; prepared metadata follows.
+    // Field 21, every element in order.
     for inputs in extra_mm_inputs {
         out.length_delimited(21, inputs.encoded_len());
         sglang_inputs_frames(inputs, &mut out);
     }
+    // Fields 22-24.
     sg::GenerateRequest {
         prepared_control,
         prepared_input,
+        cache_partition,
         ..Default::default()
     }
     .encode_raw(&mut out.scratch);
@@ -1271,6 +1276,7 @@ mod tests {
                 data_parallel_rank: Some(1),
                 media_refs: Some(vllm::MediaRefs::default()),
                 chat_template_kwargs_json: Some("{}".into()),
+                cache_salt: Some("tenant-a".into()),
                 input: Some(vllm::generate_request::Input::Tokenized(
                     vllm::TokenizedInput {
                         original_text: "hi".into(),
@@ -1636,6 +1642,10 @@ mod tests {
                 extra_mm_inputs: vec![inputs_with_every_field(2), sg::MultimodalInputs::default()],
                 prepared_control: vec![7, 8],
                 prepared_input: vec![9, 10],
+                cache_partition: Some(Box::new(sg::CachePartition {
+                    cache_salt: Some("salt".into()),
+                    extra_key: Some("key".into()),
+                })),
             }
         }
 

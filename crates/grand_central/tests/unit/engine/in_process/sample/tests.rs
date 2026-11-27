@@ -3,6 +3,7 @@
 use std::{
     sync::{atomic::Ordering, Arc},
     thread,
+    time::Duration,
 };
 
 use smg_worker::{
@@ -27,6 +28,7 @@ use crate::{
         list_cell::PublishedList,
         records::worker_id,
     },
+    store::GatewayId,
     tracking::lease::EventSet,
 };
 
@@ -146,6 +148,23 @@ fn a_kept_place_is_the_pick_as_it_was_taken() {
         assert_eq!(named, ("single", "round_robin", "round-robin"));
     }
     assert_eq!(engine.leases.0.load(Ordering::Relaxed), 0, "no id taken");
+}
+
+/// A place kept for a caller that states an instant is dated at that
+/// instant, not at the moment it is kept. A host that took its request a
+/// millisecond ago hands that instant, and the record of the place holds it.
+#[test]
+fn a_kept_place_is_dated_at_the_instant_its_caller_states() {
+    let engine = hosted(&sampling("round_robin", 1));
+    let list = pool(4);
+    let members = PublishedList::new(Arc::clone(&list));
+    let asks = Asks::of(request(), Some(&members));
+    let taken = Instant::now().checked_sub(Duration::from_millis(1));
+    let taken = taken.expect("an instant a millisecond back");
+    let answered = engine.decide_under(GatewayId::LOCAL, &asks, taken);
+    assert!(matches!(answered, Ok(Decided::Alone(_))), "{answered:?}");
+    let record = engine.explained(b"request").expect("the place is kept");
+    assert_eq!(record.at, taken, "the instant its caller stated");
 }
 
 /// A kept place names its worker by the rank that worker's registration

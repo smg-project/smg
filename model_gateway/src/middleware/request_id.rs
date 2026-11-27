@@ -15,6 +15,21 @@
 //! response header, the access-log records or the worker's view of its
 //! request. The first configured header that is present decides, by its
 //! first value.
+//!
+//! Under a policy spec that keeps a sample of its decisions the gateway
+//! also restates the chosen id on the request, under the header
+//! `x-smg-request-id` (`restate`). The engine's side of a placement reads
+//! it there (`restated`) as the gateway's own id of the request. That
+//! write is no part of this layer: the server installs it as a layer of its
+//! own inside the edge layers, behind this one, and under no other
+//! configuration, so this layer is the same for every gateway. The write
+//! replaces whatever a client sent under that name, and no worker is sent
+//! the header: the routers forward an allow-list of request headers, and
+//! this name is not on it. Inside the gateway it is a request header like
+//! any other: a request plugin sees it and can change it, and a policy spec
+//! that names it as a header reads what stands there. Under a spec that
+//! keeps no sample, and in a gateway that places with its classic policies,
+//! nothing is written there, and a client's value stays as it came.
 
 use std::{
     future::Future,
@@ -45,6 +60,49 @@ const RANDOM_PART_LEN: usize = 24;
 static X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 /// The header the Messages API's SDKs read the request id from.
 pub(crate) static REQUEST_ID: HeaderName = HeaderName::from_static("request-id");
+/// The request header the gateway restates a request's chosen id under,
+/// where its policy spec keeps a sample ([`restate`]). No route sends it to
+/// a worker: the routers' allow-list of request headers passes the
+/// request-id headers by their names and by the prefix `x-request-id-`,
+/// and this name is neither.
+pub(crate) static OWN_REQUEST_ID: HeaderName = HeaderName::from_static("x-smg-request-id");
+
+/// The gateway's own id of the request `headers` belong to, where the
+/// gateway restated it on the request ([`restate`]): the id the response's
+/// `x-request-id` header shows. `None` where nothing restated one. The
+/// engine's side of a placement asks, and a classic placement never does.
+pub(crate) fn restated(headers: &http::HeaderMap) -> Option<&str> {
+    headers.get(&OWN_REQUEST_ID)?.to_str().ok()
+}
+
+/// Restates the id the layer chose for `request` on the request itself,
+/// under [`OWN_REQUEST_ID`], as the one value there: whatever a client sent
+/// under that name is replaced. A request that holds no chosen id, because
+/// no request-id layer ran in front of this, keeps no value under the name
+/// either: a client's value never stands behind this function.
+///
+/// The server installs it as a layer of its own inside the edge layers,
+/// and only where the gateway runs Grand Central under a policy spec that
+/// keeps a sample of its decisions (`own_request_id_layer` in `server.rs`):
+/// the engine reads a host's id of a request only where it keeps a
+/// decision. That choice is made once, where the applications are built. A
+/// policy spec put in force later on the running engine does not move it.
+pub(crate) fn restate(mut request: Request) -> Request {
+    let id = request
+        .extensions()
+        .get::<RequestId>()
+        .and_then(|id| HeaderValue::from_str(&id.0).ok());
+    let headers = request.headers_mut();
+    match id {
+        Some(id) => {
+            headers.insert(&OWN_REQUEST_ID, id);
+        }
+        None => {
+            headers.remove(&OWN_REQUEST_ID);
+        }
+    }
+    request
+}
 
 /// The longest inbound request id the gateway honours, in bytes. The ids
 /// proxies and clients commonly mint are 32 to 55 characters (a hex request
@@ -541,5 +599,127 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.headers()["x-request-id"], "ok-1");
+    }
+
+    /// The handler of [`own_for`]'s route: every value it received under
+    /// [`OWN_REQUEST_ID`], joined by `,`, and what [`restated`] reads of
+    /// the request's headers (`-` for none), as `values|read`.
+    async fn own_seen(request: Request) -> String {
+        let values: Vec<_> = request
+            .headers()
+            .get_all(&OWN_REQUEST_ID)
+            .iter()
+            .map(|value| value.to_str().unwrap_or("?"))
+            .collect();
+        let read = restated(request.headers()).unwrap_or("-");
+        format!("{}|{read}", values.join(","))
+    }
+
+    /// (the echoed `x-request-id`, what [`own_seen`] answered) for a request
+    /// carrying `headers`, behind the layer. Where `restating`, the write
+    /// stands between the layer and the route as a layer of its own, as the
+    /// server installs it under a policy spec that keeps a sample.
+    async fn own_for(restating: bool, headers: &[(&str, &str)]) -> (String, String) {
+        let route = Router::new().route("/v1/models", get(own_seen));
+        let route = if restating {
+            route.layer(tower::util::MapRequestLayer::new(restate))
+        } else {
+            route
+        };
+        let app = route.layer(RequestIdLayer::new(vec!["x-request-id".into()]));
+        let mut request = Request::builder().uri("/v1/models");
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let response = app
+            .oneshot(request.body(Body::empty()).expect("request"))
+            .await
+            .expect("response");
+        let echoed = response.headers()["x-request-id"]
+            .to_str()
+            .expect("visible ASCII")
+            .to_owned();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        (echoed, String::from_utf8(body.to_vec()).expect("utf-8"))
+    }
+
+    /// Behind the layer the write restates the id the layer chose on the
+    /// request, once: the id it made, and a client's own.
+    #[tokio::test]
+    async fn the_write_states_the_chosen_id_on_the_request() {
+        let (echoed, seen) = own_for(true, &[]).await;
+        assert!(echoed.starts_with("req-"), "a fresh id, got {echoed:?}");
+        assert_eq!(seen, format!("{echoed}|{echoed}"));
+
+        let (echoed, seen) = own_for(true, &[("x-request-id", "req_client_1")]).await;
+        assert_eq!(echoed, "req_client_1");
+        assert_eq!(seen, "req_client_1|req_client_1");
+    }
+
+    /// The write replaces whatever a client sent under the private name:
+    /// one value or several, with an id header of the client's or without.
+    #[tokio::test]
+    async fn the_write_replaces_what_a_client_sent_under_its_name() {
+        let own = OWN_REQUEST_ID.as_str();
+        let (echoed, seen) = own_for(true, &[(own, "forged")]).await;
+        assert!(echoed.starts_with("req-"), "a fresh id, got {echoed:?}");
+        assert_eq!(
+            seen,
+            format!("{echoed}|{echoed}"),
+            "one value, the gateway's"
+        );
+
+        let sent = [(own, "forged"), (own, "forged-too"), ("x-request-id", "ok")];
+        let (echoed, seen) = own_for(true, &sent).await;
+        assert_eq!(echoed, "ok");
+        assert_eq!(seen, "ok|ok", "one value, the chosen id");
+    }
+
+    /// The layer alone writes no such header and leaves a client's value of
+    /// that name as it came. So it is in a gateway that places with its
+    /// classic policies, and under a policy spec that keeps no sample:
+    /// nothing reads the value there.
+    #[tokio::test]
+    async fn the_layer_alone_writes_no_header_of_its_own() {
+        let (_, seen) = own_for(false, &[]).await;
+        assert_eq!(seen, "|-");
+
+        let (_, seen) = own_for(false, &[(OWN_REQUEST_ID.as_str(), "a-clients")]).await;
+        assert_eq!(seen, "a-clients|a-clients");
+    }
+
+    /// A request that holds no chosen id keeps no value under the private
+    /// name behind the write: what a client sent there is removed, every
+    /// value of it, and not left for the reader.
+    #[test]
+    fn the_write_removes_a_clients_value_where_the_request_holds_no_id() {
+        let own = OWN_REQUEST_ID.as_str();
+        let request = Request::builder()
+            .uri("/v1/models")
+            .header(own, "forged")
+            .header(own, "forged-too")
+            .body(Body::empty())
+            .expect("request");
+        let request = restate(request);
+        assert_eq!(restated(request.headers()), None);
+        assert_eq!(request.headers().get_all(&OWN_REQUEST_ID).iter().count(), 0);
+    }
+
+    /// No route sends the private header to a worker: the routers' one
+    /// allow-list of request headers refuses its name. The list passes the
+    /// request-id headers by name and by a prefix, which this name is not
+    /// under.
+    #[test]
+    fn the_private_header_is_not_on_the_allow_list_of_request_headers() {
+        use crate::routers::common::header_utils::should_forward_request_header;
+
+        assert!(!should_forward_request_header(OWN_REQUEST_ID.as_str()));
+        assert!(should_forward_request_header("x-request-id"));
+        assert!(should_forward_request_header("x-request-id-of-a-proxy"));
     }
 }

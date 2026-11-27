@@ -77,7 +77,7 @@ A *stage* is one filter, scorer or picker. The [stages page](docs/stages.md) has
 | `session-affinity` | The worker the request's session is pinned to. | None |
 | `prefix-affinity` | The deepest holders of the prompt's prefix, within its spill and pressure rules. | `threshold`, `source`, `spill` |
 | `kv-pressure` | No worker. It sets the KV pressure limits that the affinity stages read. | `spread`, `ceiling` |
-| `warmup-slice` | Young or thin-cache workers, for a share of the cache misses. | `secs`, `share`, `blocks`, `thin_ratio`, `divert_every`, `miss_share` |
+| `warmup-slice` | Young or thin-cache workers, for a share of the cache misses. A single request warms nobody while the model's index holds no block. | `secs`, `share`, `blocks`, `thin_ratio`, `divert_every`, `miss_share` |
 | `bucket` | The worker that owns the prompt's size range, at prefill. | `abs_threshold`, `rel_threshold`, `adjust_interval_s` |
 | `consistent-hash` | The routing key's owner on a hash ring, then its successors. | `prefix_tokens`, `bounded_load` |
 | `resident-work` | The least resident work. | `request_tokens` |
@@ -171,7 +171,7 @@ A host can add stages of its own in three ways:
 
 - [The policy spec](docs/policy-spec.md): its fields, [bindings](docs/policy-spec.md#bindings) and [plans](docs/policy-spec.md#plans)
 - [Prefill and decode pairs](docs/policy-spec.md#prefill-and-decode) and [encode with a pair](docs/policy-spec.md#encode-with-a-pair)
-- [Overload, shadows and reserved fields](REFERENCE.md#overload-shadows-and-reserved-fields) and [session keys](REFERENCE.md#session-keys)
+- [Overload](docs/policy-spec.md#overload), [sessions](docs/policy-spec.md#sessions), [a request's key](docs/policy-spec.md#the-requests-key), [shadows](docs/policy-spec.md#a-shadow-profile) and [reserved fields](docs/policy-spec.md#reserved-fields)
 - [Signals a decision can read](REFERENCE.md#signals-a-decision-can-read)
 - [Decisions and refusals](REFERENCE.md#decisions-and-refusals) and [updating a policy spec](REFERENCE.md#updating-a-document)
 - [Explain and metrics](REFERENCE.md#explain-and-metrics)

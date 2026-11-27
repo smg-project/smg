@@ -5507,7 +5507,8 @@ mod tests {
         };
 
         /// The encode policy behind a count of the items it is asked to
-        /// place.
+        /// place. The stage reads a policy's type to choose what it hands
+        /// it, so the wrapper answers with the type of the policy inside.
         #[derive(Debug)]
         struct Counted {
             inner: Arc<dyn LoadBalancingPolicy>,
@@ -5529,7 +5530,7 @@ mod tests {
             }
 
             fn as_any(&self) -> &dyn std::any::Any {
-                self
+                self.inner.as_any()
             }
         }
 
