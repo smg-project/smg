@@ -3588,6 +3588,52 @@ fn a_worker_that_reports_pairing_facts_is_laid_with_no_descriptor() {
     assert_eq!(version.map(String::as_str), Some("2"));
 }
 
+/// A registration may state the default's own window in so many words:
+/// its row keeps the number, and the object built from the row waits it.
+/// A refresh reads that object back as its row states it, so it moves the
+/// row's labels, as it does for a row that states another window or none.
+#[test]
+fn a_row_that_states_the_default_window_takes_a_label_refresh() {
+    use smg_worker::worker::HealthCheckConfig;
+
+    let default = u32::try_from(HealthCheckConfig::default().drain_settle_secs)
+        .expect("the default window in a row's width");
+    let (store, door) = door();
+    let door = Arc::new(door);
+    let hosted = ReplicaMembershipWriter::new(Arc::clone(&door), operator(), under(TERM));
+    for (host, window) in [(1, None), (2, Some(default + 40)), (3, Some(default))] {
+        let url = format!("grpc://10.0.1.{host}:8000");
+        let stated = proto::WorkerSpec {
+            drain_settle_secs: window,
+            ..unchecked(&url)
+        };
+        door.register(&operator(), under(TERM), &ask(stated, Mode::Add))
+            .expect("one row");
+        let row = store.by_key(&url).expect("the registered row");
+        assert_eq!(row.facts.drain_settle_secs, window);
+        // What a refresh rebuilt: the row's object under another label.
+        let first = crate::worker_host::object(&row);
+        let relabelled = WorkerRow {
+            facts: WorkerFacts {
+                labels: [("tier".to_owned(), "silver".to_owned())].into(),
+                ..row.facts.clone()
+            },
+            ..row.clone()
+        };
+        let built = crate::worker_host::object(&relabelled);
+        let wrote = hosted.refreshed(standing(&row), &built, &first);
+        assert_eq!(
+            wrote,
+            Ok(MembershipWriteOutcome::InPlace(row.id)),
+            "a row that states {window:?}"
+        );
+        let refreshed = store.by_key(&url).expect("the refreshed row");
+        assert_eq!(refreshed.facts.drain_settle_secs, window);
+        let tier = refreshed.facts.labels.get("tier");
+        assert_eq!(tier.map(String::as_str), Some("silver"));
+    }
+}
+
 #[test]
 fn every_write_of_a_provider_leaves_its_audit_line() {
     let lines = Logged::default();
