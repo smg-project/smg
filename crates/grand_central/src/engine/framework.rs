@@ -1178,8 +1178,10 @@ impl Drop for Opening<'_> {
     }
 }
 
-/// Runs `f` on a path that is already unwinding, where a second panic let
-/// out would end the process: a panic of `f` stops here, and its payload is
+/// Runs `f` where a panic of it is to stop: on a path that is already
+/// unwinding, where a second panic let out would end the process, and
+/// behind a caught panic its caller resumes, where one let out would take
+/// that panic's place. A panic of `f` stops here, and its payload is
 /// released.
 pub(crate) fn contained(f: impl FnOnce()) {
     if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {

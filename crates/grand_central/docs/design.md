@@ -3443,8 +3443,10 @@ A fact leaves the remainder when the worker object gets a field that holds it as
    over the worker objects, by the code that keeps them, in one turn of its own behind the
    door's. It reads the record back from the object that stands, decides by the registration
    rule, builds the object of the record the change leaves, tells the store the decided
-   change, and puts the object in the registry. A removal takes the object out first. So the
-   object stands when the write returns.
+   change, and puts the object in the registry. So the object stands when the write returns.
+   A removal tells the store first too, and takes the object out behind the store's yes.
+   Behind that yes, until the registry makes the worker not ready, a decision can still pick it:
+   its count reads zero, and the world the write published holds no gateway's veto on it.
 
    The table of records follows on a leader as it does
    on a standby, by one body. The membership log is told the record the write handed that
@@ -3512,10 +3514,13 @@ A fact leaves the remainder when the worker object gets a field that holds it as
    word: a drain and a connect signal write the object and tell the table, a key's next life
    starts in the status its worker object stood in, and a call's answer waits on no follow.
 
-   A change the store refuses lays nothing new: a refused write reads no record of the store, and a refused removal lays its record again. A
+   A change the store refuses lays nothing new: a refused write reads no record of the store, and a refused removal leaves its object as it stood. A
    record with no object waits for a cut laid whole, and its key's registration through the keeper is
    refused until then. It is one a store took as a decided change around the keeper, or one the store took and the registry did not get.
    A standby and a watcher also lay it at the next event that tells its record and that the store takes.
+
+   Where a removal unwinds, in the store's write or behind it, and the store holds the record no more, the
+   code that keeps the objects runs the object's end, a second time where it had begun, and the unwinding goes on.
 
    A change that moves a fact the object holds builds the object again: the
    new object takes the standing one's place under its id, with its running state, as the code
@@ -3572,7 +3577,7 @@ decided by the rule over the table's record, is deleted.
 membership event of its leader's log, and each restore, to the code that keeps the worker
 objects (the first part of step 2). For an event with a record that code builds the object,
 hands the store the event at its place in the log, and puts the object in the registry where
-the store took the event. A removal's object leaves the registry first. A record changed in
+the store took the event. A removal's object leaves the registry where the store took the removal. A record changed in
 place keeps the instant it was admitted at. A status the leader tells is written to the table and
 laid on the object in the same turn. A restore is the store's restore and the lay of the cut's own
 records in one turn of that code. No record of the table is read back to lay an object: each record's told status alone is read, by a read of the store's that copies no record. A record of a watch's snapshot whose
@@ -3615,12 +3620,11 @@ Three writes move the log's place outside the keeper's turn, and a
 copy stays whole beside each: a status tell changes no fact, and a generation's apply and a
 term's start change no record.
 
-The told status has seven readers: the next status event, for
+The told status has six readers: the next status event, for
 the status a record moved from, the event of a record changed in place, which carries it, the
 event of a record a write takes out, which is told in it where its writer handed the record, a
 first copy, a tell the store refused, whose object takes it back, and a standby's applier or
-a watcher, which lays it on the object. The seventh is a removal the store refused for its term:
-its record comes back in it, and its object is laid in it. No decision reads it. An operator's read of a few
+a watcher, which lays it on the object. No decision reads it. An operator's read of a few
 records is read as a first copy is cut, in the keeper's turn and with each record's told status,
 and the store's own read for it is deleted. The store's own
 cut of its table has no caller in the product and ends with step 4.
@@ -3651,8 +3655,8 @@ takes no event, and the store moves nothing.
 A call's write of a record goes with the call's term too: a registration's write, a patch
 and a removal. The store tells the journal first and moves its tables behind the journal's
 yes. Where the log has left the term, nothing moves, and the call answers that the replica
-does not lead that term. A removal's object left the registry ahead of the store's word, so
-it is laid again from the record read off it, in the status the table holds.
+does not lead that term. A removal's object leaves the registry behind the store's yes, so
+a removal that is refused leaves the object as it stood: the same object, under the same id.
 
 A probe's verdict, a health driver's connect signal and the settle behind an overload switch
 name no term. Each writer's lead is asked last under the membership lock. The journal stamps
@@ -3668,10 +3672,9 @@ The locks in their order: the object's own, then the store's membership lock. No
 holder of the store's lock takes an object's, and no decision takes one.
 
 From the table to an
-object there are three ways, each of a told status. A standby's applier and a gateway's watcher
+object there are two ways, each of a told status. A standby's applier and a gateway's watcher
 lay each status their leader tells, the status of each record it tells, and each status of a
-first copy. A tell the store refuses gives the object the status its record holds. A removal the
-store refuses for its term lays its object again in that status.
+first copy. A tell the store refuses gives the object the status its record holds.
 
 The code that keeps a
 controller's objects follows no log of its own store: if it did, two moves in

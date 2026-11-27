@@ -566,11 +566,8 @@ impl MemoryStore {
     /// objects read back from the object, on a leader and on a standby.
     /// The status the table held is laid over it here: the status the log
     /// last told of a row is the log's own word, which the table holds for
-    /// it. It stays on the handed row where the journal refuses the write.
-    /// A removal's holder lays its object again from that row, in the
-    /// status the log last told: a status a health driver moved on the
-    /// old object ahead of its telling leaves with that object. A key's
-    /// next life drops the row it handed, and its old object stands as it
+    /// it. It stays on the handed row where the journal refuses the write:
+    /// its holder reads that row no more, and the objects stand as they
     /// stood.
     /// A row changed in place is laid no status here: a standby's told
     /// row comes in its leader's status, and a leader's holder lays the
@@ -651,10 +648,9 @@ impl MemoryStore {
         let held = held.map(|held| &held.row);
         let goes_on = match (left, held) {
             (Some(left), Some(held)) => {
-                // The handed row keeps the table's status, behind a
-                // refusal too: a removal's holder lays its object again
-                // from it, and an object stands in the status the log
-                // last told. A key's next life drops the row it handed.
+                // The handed row takes the table's status: the log is
+                // told from it, in the status it last told of the row.
+                // Behind a refusal its holder drops the row it handed.
                 left.status = held.status;
                 // While the table stands, a debug build holds a handed row
                 // to the one the table held, where an entry is told: the
@@ -1051,7 +1047,8 @@ impl MemoryStore {
     /// writes in their order, and an apply, which takes the workers lock, moves no
     /// generation in between. A leave is told after the build that takes its
     /// worker out of its pools: the worker is in no pool when its write
-    /// returns, whoever wrote. A join is told when the store takes it, and
+    /// returns, whoever wrote. A list a holder of worker objects lent can
+    /// hold it still ([`Self::pay_leave`]). A join is told when the store takes it, and
     /// the world that lists its worker follows at its window's build. A
     /// decision takes neither lock and meets the call at a stage's own lock
     /// or at a record of sent prefixes' own, and nowhere else. One that
@@ -1162,7 +1159,9 @@ impl MemoryStore {
     /// pays it, with every write the window held. Called under the workers
     /// lock, before the leave is told: the worker is in no pool it left
     /// when its write returns, under every profile and stage and whoever
-    /// wrote, a served call or a followed change. A storm of removals so
+    /// wrote, a served call or a followed change. A holder of worker
+    /// objects writes its registry behind this write, and a list it lent
+    /// ahead of that holds the worker still. A storm of removals so
     /// builds once a removal. The window stands as it was, and the host is
     /// not woken: nothing is left owed.
     fn pay_leave(&self, workers: &Workers, at: Instant) {
@@ -1799,7 +1798,7 @@ impl MemoryStore {
     ///
     /// The told status is the log's own word, kept beside the epoch:
     /// no copy of what a decision reads. A decision reads a
-    /// worker's status on its object. The told status has seven readers:
+    /// worker's status on its object. The told status has six readers:
     ///
     /// - the next status event, which says the status its row moved from
     ///   ([`Self::status_told`]);
@@ -1813,9 +1812,7 @@ impl MemoryStore {
     /// - a tell the store refused, whose object takes the told status
     ///   back (`Objects::table_status`);
     /// - a holder that follows its leader's log, which lays on an object
-    ///   the status the log told of its row (`Objects::copy_status`);
-    /// - a removal the store refused for its term, whose holder lays the
-    ///   row's object again in it (`Objects::take_decided`).
+    ///   the status the log told of its row (`Objects::copy_status`).
     ///
     /// A tell the store refused and a holder that follows its leader's
     /// log read one row's told status ([`Self::told_status`]). What else
@@ -1877,8 +1874,7 @@ impl MemoryStore {
     /// for any other change. The journal is told it: of the rows such a
     /// write tells, the table gives a status alone. That status stays on
     /// `left` behind the call, where the store took the write and where it
-    /// refused the write's term: a removal's holder lays its object again
-    /// from that row.
+    /// refused the write's term. No holder reads `left` behind a refusal.
     ///
     /// A worker object's status leads its row's. The holder read `row`'s
     /// off the object, and the rule every writer decides by handed it on
@@ -3710,7 +3706,9 @@ impl MemoryStore {
     /// where its registration filed one ([`Slots::filed`]). A decision
     /// over worker objects can pick a member inside its registration
     /// window: the objects follow a registration as its write lands, a
-    /// build ahead of the world that lists it.
+    /// build ahead of the world that lists it. It can pick a worker whose
+    /// row a removal took too, until the object ends: the slot is found
+    /// here until the removal's build publishes.
     #[cfg(feature = "controller")]
     pub(crate) fn filed_slot(&self, target: WorkerId) -> Option<WorkerSlot> {
         self.slots().filed(target)

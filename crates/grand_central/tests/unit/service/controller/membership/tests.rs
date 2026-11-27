@@ -344,9 +344,10 @@ impl store::Journal for BehindAMembershipWrite {
 }
 
 /// A door's patch and removal are decided over the worker objects, as
-/// its registration is: each runs the store's one body, and a removal's
-/// object has left the registry when the store hears of it. So it is for
-/// a control call and for a removal by the replica's own writer.
+/// its registration is: each runs the store's one body. The store hears
+/// of a removal first: the row's object stands in the registry while the
+/// store writes, and has left when the write returns. So it is for a
+/// control call and for a removal by the replica's own writer.
 ///
 /// The store's journal is the witness. The one body alone tells it a
 /// membership change, so one change told with the release behind it is
@@ -373,19 +374,27 @@ fn a_doors_patch_and_removal_are_decided_over_the_worker_objects() {
     let door = Arc::new(calls);
     // The membership changes `write` told the journal, and whether the
     // first release behind one came with the object of the row `gone`
-    // out of the registry.
+    // in the registry still. The object is out of it behind the write.
     let decided = |gone: Option<WorkerId>, write: &dyn Fn()| {
         let ran = Rc::new(Cell::new(false));
-        let (released, objects) = (Rc::clone(&ran), Arc::clone(&objects));
+        let (released, within) = (Rc::clone(&ran), Arc::clone(&objects));
         let told = || std::mem::take(&mut *journal.told.lock().expect("the case's own lock"));
         // What was told ahead of `write` is another call's.
         drop(told());
+        // The id the object of the row `gone` stands under: the registry
+        // is asked by it, at the release and behind the write.
+        let under = gone.map(|gone| objects.object(gone).expect("the row's object"));
+        let listed = under.clone();
         BEHIND.set(Some(Box::new(move || {
-            let stands = gone.and_then(|gone| objects.object(gone));
-            assert_eq!(stands, None, "the object leaves first");
+            let stands = listed.map(|under| within.registry().get(&under).is_some());
+            assert_eq!(stands, gone.map(|_| true), "the store hears of it first");
             released.set(true);
         })));
         write();
+        let stands = under.and_then(|under| objects.registry().get(&under));
+        assert!(stands.is_none(), "the object left behind the store's yes");
+        let entry = gone.and_then(|gone| objects.object(gone));
+        assert_eq!(entry, None, "and the holder's entry with it");
         (told(), ran.get())
     };
     door.register(&operator(), under(TERM), &ask(spec(URL), Mode::Add))
@@ -3606,11 +3615,31 @@ fn a_patch_whose_term_a_followed_term_ends_at_its_telling_moves_nothing() {
     a_patch_whose_term_ends_at_its_telling(BY_A_FOLLOWED_TERM);
 }
 
+/// What a refused removal leaves as it stood, read now: the object of the
+/// row `id`, the id it stands under in the registry, and each event the
+/// registry tells from here on. The answer holds them to what stands when
+/// it is called: the same object under the same id, and no event told.
+fn object_kept(door: &MembershipCalls, id: WorkerId) -> impl FnOnce() + '_ {
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    let registry = door.objects.registry();
+    let under = door.objects.object(id).expect("the row's object");
+    let object = registry.get(&under).expect("it stands");
+    let mut events = registry.subscribe_events();
+    move || {
+        assert_eq!(door.objects.object(id).as_ref(), Some(&under));
+        let stands = registry.get(&under).expect("the object stands still");
+        assert!(Arc::ptr_eq(&stands, &object), "the object that stood");
+        let quiet = matches!(events.try_recv(), Err(TryRecvError::Empty));
+        assert!(quiet, "the registry told an event");
+    }
+}
+
 /// A removal whose term ends in its own telling takes no row out. The
-/// table holds the row as it stood. Its object left the registry ahead of
-/// the store's word, and it is laid again from the row read off it: the
-/// row reads off the objects as it stood. Under a term the store leads,
-/// the same removal takes the row.
+/// table holds the row as it stood, and its object stands as it stood:
+/// the same object under the same id, and the registry tells no event.
+/// The row reads off the objects as it stood. Under a term the store
+/// leads, the same removal takes the row.
 fn a_removal_whose_term_ends_at_its_telling(ends: usize) {
     let (store, door, journal) = leaving_at_a_row();
     let row = row_of(
@@ -3625,12 +3654,14 @@ fn a_removal_whose_term_ends_at_its_telling(ends: usize) {
         drain: false,
     };
     let stood = store.get(id);
+    let kept = object_kept(&door, id);
     let at = (store.epoch(), journal.log.head());
     journal.armed.store(ends, Ordering::Relaxed);
     let refused = door
         .deregister(&operator(), under(TERM), &removal)
         .expect_err("the term ended at the telling");
     left_at_its_telling((&store, &journal), &refused, at, &ends.to_string());
+    kept();
     assert_eq!(
         (store.get(id), store.by_key(URL), door.row(id)),
         (stood.clone(), stood.clone(), stood),
@@ -3766,18 +3797,17 @@ fn a_status_told_behind_a_change_in_place_is_written_under_a_term_that_holds() {
     assert_eq!(journal.log.head(), told);
 }
 
-/// A removal the store refuses for its term lays the row's object again
-/// in the status the table holds, whatever that status is. A verdict
-/// readied this row, and the table was told. A later verdict took the
-/// row's object out of the ready ones, and the table holds the row ready
+/// A removal the store refuses for its term leaves the row's object as
+/// it stood, with a status its table was not told yet. A verdict readied
+/// this row, and the table was told. A later verdict took the row's
+/// object out of the ready ones, and the table holds the row ready
 /// still: that verdict's telling had not come. The removal's term ends in
-/// its own telling. The store laid its table's status over the handed row
-/// for the log's event, and the row comes back in it: the object laid
-/// again stands ready, as its row does. The late verdict's telling then
-/// comes, for the object that left, and writes nothing. The next verdict
-/// moves the object laid again, and the table is told.
+/// its own telling. The same object stands under the same id, in the
+/// status the later verdict left it in, and the registry told no event.
+/// The late verdict's telling then comes, for the object that stands,
+/// and the table is told.
 #[test]
-fn a_removal_refused_for_its_term_lays_its_object_again_in_the_tables_status() {
+fn a_removal_refused_for_its_term_leaves_its_object_as_it_stood() {
     let (store, door, journal) = leaving_at_a_row();
     let row = row_of(
         &door
@@ -3792,6 +3822,7 @@ fn a_removal_refused_for_its_term_lays_its_object_again_in_the_tables_status() {
         moved(WorkerStatus::Pending, WorkerStatus::Ready)
     );
     let late = moved_alone(&door, id, ObjectStatus::NotReady);
+    let kept = object_kept(&door, id);
     let removal = proto::DeregisterWorkerRequest {
         worker_id: row.id,
         revision: row.revision,
@@ -3802,22 +3833,19 @@ fn a_removal_refused_for_its_term_lays_its_object_again_in_the_tables_status() {
         .deregister(&operator(), under(TERM), &removal)
         .expect_err("the term ended at the telling");
     assert_eq!(refused.code(), Code::Unavailable);
+    kept();
     let status = |row: Option<WorkerRow>| row.map(|row| row.status);
     let read = || (status(store.get(id)), status(door.row(id)));
-    let ready = Some(WorkerStatus::Ready);
-    assert_eq!(read(), (ready, ready));
-    // The late verdict's telling names the object that left the registry:
-    // no object stands under its id, and nothing is written.
-    assert_eq!(late(&store), store::HealthWrite::Stale);
-    assert_eq!(read(), (ready, ready));
-    // The next verdict moves the object laid again, and its telling lands
+    // The table holds the status it was told, and the object the one the
+    // later verdict left it in.
+    let (ready, out) = (Some(WorkerStatus::Ready), Some(WorkerStatus::NotReady));
+    assert_eq!(read(), (ready, out));
+    // The late verdict's telling names the object that stands: it lands,
     // under the term the log leads since.
-    let next = moved_alone(&door, id, ObjectStatus::NotReady);
     assert_eq!(
-        next(&store),
+        late(&store),
         moved(WorkerStatus::Ready, WorkerStatus::NotReady)
     );
-    let out = Some(WorkerStatus::NotReady);
     assert_eq!(read(), (out, out));
 }
 

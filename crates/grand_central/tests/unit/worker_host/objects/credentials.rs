@@ -423,8 +423,8 @@ fn a_cut_laid_whole_forgets_the_rows_that_left_and_a_refused_write_none() {
 /// A refused write forgets nothing, whatever it decided: a change in
 /// place, a new width, a key's next life, a removal. The row it was
 /// decided over left around the holder. Its object stands as it stood
-/// with its credential, and a removal's is laid again with it. A cut
-/// laid whole ends the object, and the keeper forgets the row.
+/// with its credential. A cut laid whole ends the object, and the keeper
+/// forgets the row.
 #[test]
 fn a_refused_write_of_each_kind_forgets_nothing_and_a_cut_forgets_the_row() {
     type Refused = fn(&Replica, WorkerId) -> Option<MembershipChange>;

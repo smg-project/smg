@@ -38,12 +38,10 @@
 //! object takes the status its row holds, and where no row stands for it
 //! the status it left.
 //!
-//! From the table to an object there are three ways, each of a told
+//! From the table to an object there are two ways, each of a told
 //! status. A standby's applier and a gateway's watcher lay the status
 //! their leader's log tells ([`mod@super::standby`]). A tell the store
-//! refuses gives the object the status its row holds, as said above. And
-//! a removal the store refuses for its term lays its object again in the
-//! status its row holds ([`mod@super::write`]).
+//! refuses gives the object the status its row holds, as said above.
 
 use std::sync::Arc;
 
@@ -275,9 +273,7 @@ impl<G: Generation> Objects<G> {
     /// stood in, the move with it. What laid it settles the two. A door
     /// tells the store its object's status behind the put
     /// ([`Self::tell_row`]). A told row's put and a cut are followed by
-    /// the table's status ([`mod@super::standby`]). A removal the store
-    /// refused for its term laid a new object in the table's status
-    /// ([`mod@super::write`]): the move left with the old one.
+    /// the table's status ([`mod@super::standby`]).
     fn status_under(
         &self,
         store: &MemoryStore,

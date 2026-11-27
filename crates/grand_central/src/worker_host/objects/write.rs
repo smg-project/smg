@@ -8,28 +8,42 @@
 //! writer of a row decides by. It builds the object of the row the change
 //! leaves, tells the store the decided change
 //! ([`MemoryStore::follow_objects`]), and puts the object in the registry.
-//! So the object stands when the write returns.
+//! So the object a write leaves stands when the write returns.
 //! No row of the store's table is read at the head of a write: every
 //! writer of a row holds the turn, so the object states the row.
 //! The store is handed the row a write takes out too, as it was read back:
 //! a removal's row, and the old life a key's next life replaces. The log
 //! is told from it, in the status the table holds.
 //!
-//! The store is told between the build and the registry's write: its write
-//! files the member's count slot, which a lease books the moment a decision
-//! picks the worker off the registry. A removal goes the other way round:
-//! the object leaves the registry, then the store is told. A build cannot
-//! fail, so the store is never told a change whose object was not built.
+//! The store is told first, and the registry is written behind its yes.
+//! A row's object is built ahead of the store's word and put behind it:
+//! the store's write files the member's count slot, which a lease books
+//! the moment a decision picks the worker off the registry. A removal's
+//! object leaves the registry behind the store's word too, as the old
+//! object of a key's next life does. A build cannot fail, so the store is
+//! never told a change whose object was not built.
 //!
-//! A write the store does not take answers `None`. A registration's and
-//! a patch's leave the objects as they stood: the object built for it is
-//! dropped. A removal's object left the registry ahead of the store's
-//! word: a new one is laid from the row read off it, under a new id, and
-//! a lane the row holds in the host's KV tables is made anew, empty.
-//! Where the store refused the removal for its term, that row comes back
-//! in the status the table holds, and the object is laid in it. The
-//! holder reads no row of the store behind a refusal: that status alone
-//! comes back, on the row the holder handed.
+//! So an object that leaves outlives its row for a moment. The moment
+//! opens inside the store's write, where the row leaves the table. The
+//! same write then has the row's count give up the leases it held, and
+//! pays the removal's own build: the world it publishes holds the worker
+//! in no pool, and no veto of a gateway on it. The moment lasts until
+//! the registry's removal makes a ready worker not ready, which it does
+//! under the worker's own lock and ahead of taking the object out. A
+//! status call can hold that lock. In the moment the worker stands in the
+//! lists a decision is lent, in the status its object states, and a
+//! decision can pick it. Behind the count's step the object counts no
+//! lease that stands on it. What a lease files on the worker from there
+//! on is on no host's count, until a row stands under the id again. A
+//! list lent ahead of the object's end holds the worker.
+//!
+//! A write the store does not take answers `None`. The object built for
+//! a registration or a patch is dropped, and the objects stand as they
+//! stood. A removal's object was not touched: the same object stands
+//! under the same id in the registry, with its running state, and the
+//! lane its row holds in the host's KV tables keeps what it holds. The
+//! registry tells no event. The holder reads no row of the store behind
+//! a refusal.
 //!
 //! The store takes a change that fits its table, over a row that stands
 //! at the revision the holder read. It tests both under its own lock.
@@ -48,8 +62,14 @@
 //! not take: nothing moved there. A host's own write names no term.
 //!
 //! A writer's thread that ends between its two writes, the store's and
-//! the registry's, leaves a row and its object apart too. No line of the
-//! holder between the two returns early or unwraps a result.
+//! the registry's, leaves a row and its object apart too, where the
+//! write lays an object: a registration's row then has no object, and no
+//! list lends it. A removal's two steps run under one catch
+//! ([`leave_whole`]). Where either unwinds and the store holds the row no
+//! more, the second step runs, a second time where it had begun. A fault
+//! of that run stops there, and the unwinding goes on. No line between
+//! the store's yes and the object's end returns early or unwraps a
+//! result.
 //!
 //! A patch tells the store the whole row read back from the object, and
 //! the store writes it whole. It is the table's row with the patch laid
@@ -69,7 +89,7 @@ use std::time::Instant;
 
 use smg_worker::registry::Generation;
 
-use super::Objects;
+use super::{leave_whole, Objects};
 use crate::{
     engine::view::WorkerId,
     store::{MembershipChange, MemoryStore, Registrant, WorkerFacts, WorkerPatch, WorkerRow},
@@ -152,10 +172,10 @@ impl<G: Generation> Objects<G> {
         self.lay_decided(store, change, &row, Some(revision), None, term)
     }
 
-    /// Remove the row `id` where its object was built at `revision`. The
-    /// object leaves the registry, then `store` is told. The change it
+    /// Remove the row `id` where its object was built at `revision`.
+    /// `store` is told, then the object leaves the registry. The change it
     /// made, or `None` where the row moved or left, or `store` did not take
-    /// the write.
+    /// the write: the object then stands as it stood.
     ///
     /// One of a host's write calls ([`Objects`]), under no term.
     pub fn remove(
@@ -168,8 +188,8 @@ impl<G: Generation> Objects<G> {
     }
 
     /// [`Self::remove`] under `term`, as [`Self::upsert_under`] takes one.
-    /// A removal the store refuses for its term lays the row again, in
-    /// the status the table holds ([`Self::take_decided`]).
+    /// A removal the store refuses for its term leaves its object as it
+    /// stood ([`Self::take_decided`]).
     pub(crate) fn remove_under(
         &self,
         store: &MemoryStore,
@@ -228,34 +248,33 @@ impl<G: Generation> Objects<G> {
         Some(change)
     }
 
-    /// The decided removal of `row`, read back in the holder's turn: its
-    /// object leaves the registry, then the store is told. Where the store
-    /// does not take it, the row is laid again: a new object under a new
-    /// id in the registry. Where the host handed the holder KV tables,
-    /// a lane the row holds there is new too, and holds nothing until its
-    /// first batch. The leases the store counts on the row are stated on the
-    /// new object. What the old object alone held is not, and what the
-    /// old lane held is not. The store is handed `row`, and tells the log
-    /// from it. `term` is the term the removal is made under, where its
-    /// caller names one. A removal the store refuses for that term hands
-    /// `row` back in the status the table holds, and the object is laid
-    /// in it: a status a health driver moved on the old object ahead of
-    /// its telling leaves with that object, and the table and the new
-    /// object read alike.
+    /// The decided removal of `row`, read back in the holder's turn: the
+    /// store is told, and the object leaves the registry behind its yes.
+    /// Where the store does not take the removal, the object is not
+    /// touched: the same object stands under the same id in the registry,
+    /// with its running state and its status, and the lane its row holds
+    /// in the host's KV tables keeps what it holds. Behind the store's
+    /// yes the removal's second step runs: the object's end, then the
+    /// keeper's forgetting of the row. Where a step unwinds and the store
+    /// holds the row no more, the second step runs on the way out
+    /// ([`leave_whole`]). The store is handed `row`, and tells
+    /// the log from it, in the status the table holds. `term` is the term
+    /// the removal is made under, where its caller names one: a removal
+    /// the store refuses for that term is one it does not take.
     fn take_decided(
         &self,
         store: &MemoryStore,
         row: &mut WorkerRow,
         term: Option<u64>,
     ) -> Option<MembershipChange> {
-        self.end(row.id);
-        let change = MembershipChange::Removed { id: row.id };
-        if !store.follow_objects(change, None, Some(row.revision), Some(&mut *row), term) {
-            self.lay(store, row);
-            return None;
-        }
-        self.forget_one(self.keeper_clock(), row.id);
-        Some(change)
+        let (id, seen) = (row.id, Some(row.revision));
+        let change = MembershipChange::Removed { id };
+        let told = || store.follow_objects(change, None, seen, Some(&mut *row), term);
+        let behind = || {
+            self.end(id);
+            self.forget_one(self.keeper_clock(), id);
+        };
+        leave_whole(store, id, told, behind).then_some(change)
     }
 }
 

@@ -14,7 +14,7 @@ use smg_worker::{
 use super::{
     super::{
         tests::stored_chain,
-        write::tests::{facts, on_let_go, refresh, Replica, A},
+        write::tests::{a_removal_unwinds, facts, on_let_go, refresh, Replica, A, B},
     },
     *,
 };
@@ -22,8 +22,6 @@ use crate::{
     store::{Signals, WorkerFacts, WorkerStatus, WorkersStore},
     worker_host::{KvTables, Members},
 };
-
-const B: &str = "http://b:8000";
 
 /// One of the two entries that lay a cut whole.
 type Lay = fn(&Objects<Members>, &MemoryStore, StoreCheckpoint) -> bool;
@@ -146,21 +144,38 @@ fn a_standbys_own_write_is_lost_at_its_leaders_next_snapshot() {
 /// The locks in their order. Behind the store's write of an event and
 /// ahead of the put, the holder's turn is held, the store's membership
 /// lock is free and its table holds the row, and the registry does not
-/// list the row's object yet. Behind the event the turn is free.
+/// list the row's object yet. Behind the event the turn is free. A
+/// removal is told to the store first too: behind the store's write the
+/// turn is held, the table holds the row no more, and the registry lists
+/// the row's object still. The object leaves behind that write.
 #[test]
 fn the_holders_turn_is_held_over_the_stores_write_and_no_lock_of_the_store_over_the_put() {
     let (leader, standby) = (Replica::new(), Rc::new(Replica::new()));
+    // What stands where the store's write of the next event lets its
+    // locks go: the turn, the table's row and the row's object.
+    let behind_the_write = || {
+        let seen = Rc::new(Cell::new(None));
+        let (within, read) = (Rc::clone(&standby), Rc::clone(&seen));
+        on_let_go(move || {
+            let turn = within.objects.turn.is_locked();
+            let table = within.store.by_key(A).is_some();
+            read.set(Some((turn, table, within.object(A).is_some())));
+        });
+        seen
+    };
     leader.upsert(facts(1, "gold"));
-    let seen = Rc::new(Cell::new(None));
-    let (within, read) = (Rc::clone(&standby), Rc::clone(&seen));
-    on_let_go(move || {
-        let turn = within.objects.turn.is_locked();
-        let table = within.store.by_key(A).is_some();
-        read.set(Some((turn, table, within.object(A).is_some())));
-    });
+    let seen = behind_the_write();
     follow(&standby, &leader);
     assert_eq!(seen.get(), Some((true, true, false)));
     assert!(standby.object(A).is_some(), "put behind the store's write");
+    assert!(!standby.objects.turn.is_locked(), "the turn is let go");
+    let row = leader.one_row(A);
+    let removed = leader.objects.remove(&leader.store, row.id, row.revision);
+    assert_eq!(removed, Some(MembershipChange::Removed { id: row.id }));
+    let seen = behind_the_write();
+    follow(&standby, &leader);
+    assert_eq!(seen.get(), Some((true, false, true)));
+    assert!(standby.object(A).is_none(), "out behind the store's write");
     assert!(!standby.objects.turn.is_locked(), "the turn is let go");
 }
 
@@ -349,29 +364,53 @@ fn an_event_the_store_does_not_take_lays_nothing() {
     assert_eq!(standby.objects.row_of(&object), Some(table));
 }
 
-/// A removal the store does not take: the object left the registry
-/// ahead of the store's word, so the row is laid again as it was read
-/// off the object, and has an object when the event's write returns.
+/// What a refused removal leaves as it stood, read now: the object of the
+/// row under [`A`], the id it stands under in the registry, and each
+/// event the registry tells from here on. The answer holds them to what
+/// stands when it is called: the same object under the same id, and no
+/// event told.
+fn object_kept(replica: &Replica) -> impl FnOnce() + '_ {
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    let registry = replica.objects.registry();
+    let under = replica.object(A).expect("the row's object");
+    let object = registry.get(&under).expect("it stands");
+    let mut events = registry.subscribe_events();
+    move || {
+        assert_eq!(replica.object(A).as_ref(), Some(&under));
+        let stands = registry.get(&under).expect("the object stands still");
+        assert!(Arc::ptr_eq(&stands, &object), "the object that stood");
+        let quiet = matches!(events.try_recv(), Err(TryRecvError::Empty));
+        assert!(quiet, "the registry told an event");
+    }
+}
+
+/// A removal the store does not take leaves its object as it stood: the
+/// same object stands under the same id, the registry tells no event,
+/// and the object states the row it stated.
 #[test]
-fn a_removal_the_store_does_not_take_leaves_the_row_an_object() {
+fn a_removal_the_store_does_not_take_leaves_its_object_as_it_stood() {
     let (leader, standby) = (Replica::new(), Replica::new());
     leader.upsert(facts(1, "gold"));
     follow(&standby, &leader);
     let row = standby.one_row(A);
-    hand(&standby, 2, MembershipChange::Removed { id: row.id }, None);
+    let kept = object_kept(&standby);
+    let removal = MembershipChange::Removed { id: row.id };
+    assert!(!hand(&standby, 2, removal, None), "out of place");
+    kept();
     let object = standby
         .object(A)
         .expect("the row that stands has an object");
     assert_eq!(standby.objects.row_of(&object), Some(row));
 }
 
-/// A removal the store does not take lays the row read off its object,
-/// and not the one the store holds under the id. The standby's table is
-/// handed a patch of the row around the holder, as a decided change, so
-/// the two rows differ. A removal out of place takes the object out and
-/// lays it again from the row it stated.
+/// A removal the store does not take reads no row of the store. The
+/// standby's table is handed a patch of the row around the holder, as a
+/// decided change, so the table's row and the object's differ. A removal
+/// out of place leaves the object as it stood: it states the row it
+/// stated, and not the one the store holds under the id.
 #[test]
-fn a_removal_the_store_does_not_take_lays_the_row_read_off_its_object() {
+fn a_removal_the_store_does_not_take_reads_no_row_of_the_store() {
     let (leader, standby) = (Replica::new(), Replica::new());
     leader.upsert(facts(1, "gold"));
     follow(&standby, &leader);
@@ -384,12 +423,36 @@ fn a_removal_the_store_does_not_take_lays_the_row_read_off_its_object() {
     standby.store.follow(at(epoch), epoch, patch, Some(around));
     let table = standby.store.get(row.id).expect("the row stands");
     assert_eq!(table.facts, facts(1, "iron"), "the table's row moved");
+    let kept = object_kept(&standby);
     let removal = MembershipChange::Removed { id: row.id };
     assert!(!hand(&standby, 2, removal, None), "out of place");
+    kept();
     let object = standby
         .object(A)
         .expect("the row that stands has an object");
     assert_eq!(standby.objects.row_of(&object), Some(row));
+}
+
+/// A followed removal whose journal unwinds, behind the row's leave and
+/// ahead of it: the second of two rows, whose object ends where the row
+/// left, and stands where it did not ([`a_removal_unwinds`]).
+#[test]
+fn a_followed_removal_whose_journal_unwinds_ends_its_object_where_the_row_left() {
+    for behind in [true, false] {
+        let (leader, standby) = (Replica::new(), Replica::new());
+        for key in [A, B] {
+            leader.upsert(WorkerFacts {
+                key: key.to_owned(),
+                engine: key.to_owned(),
+                ..facts(1, "gold")
+            });
+            follow(&standby, &leader);
+        }
+        a_removal_unwinds(&standby, B, behind, &|row| {
+            let removal = MembershipChange::Removed { id: row.id };
+            hand(&standby, 1, removal, None);
+        });
+    }
 }
 
 /// The holder answers whether the store took an event, by each kind: a
@@ -413,7 +476,10 @@ fn a_told_change_answers_whether_the_store_took_it() {
     assert!(!hand(&standby, 0, status, None), "a status told again");
     let removal = MembershipChange::Removed { id };
     assert!(!hand(&standby, 0, removal, None), "a removal out of place");
-    assert!(standby.object(A).is_some(), "the row stands, laid anew");
+    assert!(
+        standby.object(A).is_some(),
+        "the row stands, and its object"
+    );
     assert!(hand(&standby, 1, removal, None), "a removal");
     assert!(standby.objects.is_empty());
 }
@@ -1070,6 +1136,44 @@ fn a_standbys_holder_keeps_a_lane_for_each_told_row_that_asks_for_events() {
     follow(&standby, &leader);
     assert!(!lane(row), "told gone");
     assert_eq!(tables.lanes(), 0);
+}
+
+/// A removal the store does not take keeps the lane its row holds, with
+/// the block heard for it, and the overload verdict of the object that
+/// stands: a removal call over a row the table moved around the holder,
+/// and a followed removal out of place.
+#[test]
+fn a_removal_the_store_does_not_take_keeps_its_lane_and_its_verdict() {
+    type Removal = fn(&Replica, &WorkerRow) -> bool;
+    let removals: [(&str, Removal); 2] = [
+        ("a removal call", |replica, row| {
+            let mut around = row.clone();
+            around.facts.priority = 7;
+            around.revision += 1;
+            let epoch = replica.store.epoch() + 1;
+            let patch = MembershipChange::Relabelled { id: row.id };
+            replica.store.follow(at(epoch), epoch, patch, Some(around));
+            let (store, objects) = (&replica.store, &replica.objects);
+            objects.remove(store, row.id, row.revision).is_some()
+        }),
+        ("a followed removal", |replica, row| {
+            hand(replica, 2, MembershipChange::Removed { id: row.id }, None)
+        }),
+    ];
+    for (name, removal) in removals {
+        let (_, replica, tables) = tabled();
+        replica.upsert(asking(A, true)).expect("registered");
+        let row = replica.one_row(A);
+        let heard = stored_chain(&tables, row.id, 1, &[1]);
+        assert_eq!(heard, BatchOutcome::Applied, "{name}");
+        let registry = replica.objects.registry();
+        let object = registry.get_by_url(A).expect("the row's object");
+        assert!(registry.set_worker_overloaded(&object, true), "{name}");
+        assert!(!removal(&replica, &row), "{name}: refused");
+        assert_eq!(tables.indexed_blocks(row.id, 0), 1, "{name}: the block");
+        let stands = registry.get_by_url(A).expect("the object stands");
+        assert!(stands.is_overloaded(), "{name}: the verdict");
+    }
 }
 
 /// A cut laid whole leaves a lane for each of its rows that asks for

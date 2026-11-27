@@ -1,16 +1,24 @@
-use std::{cell::RefCell, collections::BTreeMap, sync::Arc};
+use std::{
+    cell::{Cell, RefCell},
+    collections::BTreeMap,
+    sync::Arc,
+};
 
 use parking_lot::Mutex;
-use smg_worker::registry::{WorkerId as ObjectId, WorkerRegistry};
+use smg_worker::{
+    identity::basic::Worker,
+    registry::{WorkerId as ObjectId, WorkerRegistry},
+};
 
 use super::*;
 use crate::{
     engine::view::Role,
     store::{identity, Journal, LeadWord, Position, WorkerStatus, WorkersStore},
-    worker_host::Members,
+    worker_host::{Credentials, Members},
 };
 
 pub(crate) const A: &str = "http://a:8000";
+pub(crate) const B: &str = "http://b:8000";
 
 /// What a journal was told of each membership write: the change, the
 /// row it left and the row it took out.
@@ -43,6 +51,10 @@ impl Journal for Told {
         row: Option<&WorkerRow>,
         left: Option<&WorkerRow>,
     ) -> bool {
+        let hook = TELLING.with(|held| held.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
         let word = Word::Member(Box::new((change, row.cloned(), left.cloned())));
         self.0.lock().push(word);
         *self.1.lock() = left.map(|left| std::ptr::from_ref(left).addr());
@@ -89,11 +101,12 @@ impl Journal for Told {
     }
 }
 
-/// What [`on_let_go`] keeps for the journal to run.
+/// What [`on_let_go`] and [`on_telling`] keep for the journal to run.
 type Hook = Box<dyn FnOnce()>;
 
 thread_local! {
     static LET_GO: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    static TELLING: RefCell<Option<Hook>> = const { RefCell::new(None) };
 }
 
 /// `hook` runs once on this thread, where the next write of a
@@ -102,6 +115,80 @@ thread_local! {
 /// itself makes meets none.
 pub(crate) fn on_let_go(hook: impl FnOnce() + 'static) {
     LET_GO.with(|held| *held.borrow_mut() = Some(Box::new(hook)));
+}
+
+/// `hook` runs once on this thread, where the journal of a [`Replica`]'s
+/// store is told its next membership write, ahead of the word it keeps.
+/// It is taken out first, as [`on_let_go`]'s is.
+pub(crate) fn on_telling(hook: impl FnOnce() + 'static) {
+    TELLING.with(|held| *held.borrow_mut() = Some(Box::new(hook)));
+}
+
+/// A removal of the row under `url` whose journal unwinds, and what the
+/// unwinding leaves. `removal` is handed the row. `behind` the row's
+/// leave, the journal unwinds where the store's write has let its locks
+/// go: the table holds the row no more, neither the registry nor the
+/// holder holds an object for it, and the registry told that one leave.
+/// Ahead of the leave, the journal unwinds at its telling: the table
+/// holds the row, the same object stands under the same id, and the
+/// registry told no event. Behind both, the fault that reaches the caller
+/// is the journal's, the holder's turn is free, and each other row's
+/// object stands as it stood: the store, the holder and the registry hold
+/// those and no other.
+pub(crate) fn a_removal_unwinds(
+    replica: &Replica,
+    url: &str,
+    behind: bool,
+    removal: &dyn Fn(&WorkerRow),
+) {
+    use std::panic::{catch_unwind, panic_any, AssertUnwindSafe};
+
+    use smg_worker::registry::event::WorkerEvent;
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    let (store, objects) = (&replica.store, &replica.objects);
+    let registry = objects.registry();
+    let row = replica.one_row(url);
+    let under = replica.object(url).expect("the object stands");
+    let object = registry.get(&under).expect("it stands");
+    let stood = registry.get_all_with_ids();
+    let mut events = registry.subscribe_events();
+    // The journal's fault is a number: 1 behind the leave, 0 ahead of it.
+    let fault = u8::from(behind);
+    if behind {
+        on_let_go(move || panic_any(fault));
+    } else {
+        on_telling(move || panic_any(fault));
+    }
+    let caught = catch_unwind(AssertUnwindSafe(|| removal(&row))).expect_err("it unwound");
+    assert_eq!(caught.downcast_ref(), Some(&fault), "the journal's fault");
+    assert!(!objects.turn.is_locked(), "the turn is let go");
+    let told = events.try_recv();
+    if behind {
+        assert_eq!(store.get(row.id), None, "the store took the row");
+        assert!(registry.get(&under).is_none(), "no object in the registry");
+        assert_eq!(objects.object(row.id), None, "and none in the holder");
+        let Ok(WorkerEvent::Removed { worker_id, worker }) = told else {
+            panic!("the registry told no leave");
+        };
+        assert_eq!(worker_id, under, "the leave of the row's object");
+        assert!(Arc::ptr_eq(&worker, &object), "the object that left");
+    } else {
+        assert_eq!(store.get(row.id).as_ref(), Some(&row), "the row stands");
+        assert_eq!(objects.object(row.id).as_ref(), Some(&under), "its entry");
+        assert!(matches!(told, Err(TryRecvError::Empty)), "no event told");
+    }
+    assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
+    // Every object but the one of a row that left stands as it stood.
+    let stand = stood.iter().filter(|(id, _)| !behind || *id != under);
+    let count = stand.clone().count();
+    for (id, stood) in stand {
+        let now = registry.get(id);
+        assert!(now.is_some_and(|now| Arc::ptr_eq(&now, stood)), "{url}");
+    }
+    assert_eq!(registry.len(), count, "the registry holds no other");
+    assert_eq!(objects.len(), count, "an entry an object");
+    assert_eq!(store.all_rows().1.len(), count, "a row an object");
 }
 
 /// A replica as a controller keeps one: a journaled store, and a holder
@@ -324,7 +411,7 @@ fn the_cases_road_writes_a_table_as_the_holders_write_calls_do() {
 /// and the object state one row. A row changed in place keeps its
 /// object's id in the registry, a patch moves the facts it names alone,
 /// a key's next life takes another id, and a removal takes the object
-/// out ahead of the store's word.
+/// out.
 #[test]
 fn a_write_of_a_row_leaves_its_object_standing_and_one_row_in_three_places() {
     let replica = Replica::new();
@@ -722,8 +809,8 @@ fn a_row_written_around_the_holder_has_no_object_until_a_cut_is_laid_whole() {
 ///
 /// Each answers `None`, which a door answers as a row that moved, and
 /// tells the journal nothing. The table holds what that writer left,
-/// and the registry holds the old row as it stood: nothing is laid. A
-/// removal took its object out first, and laid the row again.
+/// and the registry holds the old row as it stood, under the id it
+/// stood under: nothing is laid, and no object left.
 #[test]
 fn a_write_over_a_row_written_around_the_holder_is_refused_and_lays_nothing() {
     type Write = fn(&Replica, WorkerRow) -> Option<MembershipChange>;
@@ -797,13 +884,164 @@ fn a_write_over_a_row_written_around_the_holder_is_refused_and_lays_nothing() {
             assert_eq!(wrote, None, "{what}, {how}: refused");
             assert_eq!(tells, told, "{what}, {how}: nothing told");
             assert_eq!(table.as_ref(), Some(&left), "{what}, {how}: the table");
-            // The old row stands as it stood. A removal took its
-            // object out and laid the row again.
+            // The old row stands as it stood, under the id it stood
+            // under: a refused removal's too.
             assert_eq!(laid, Some(read), "{what}, {how}: the registry");
-            let anew = what == "a removal";
-            assert_eq!(object != stood, anew, "{what}, {how}: its object");
+            assert_eq!(object, stood, "{what}, {how}: its object");
         }
     }
+}
+
+/// A host's removal call whose journal unwinds, behind the row's leave
+/// and ahead of it, with a second row beside it: its object ends where
+/// the row left, and stands where it did not ([`a_removal_unwinds`]).
+#[test]
+fn a_removal_call_whose_journal_unwinds_ends_its_object_where_the_row_left() {
+    for behind in [true, false] {
+        let replica = Replica::new();
+        replica.upsert(facts(1, "gold")).expect("registered");
+        let beside = WorkerFacts {
+            key: B.to_owned(),
+            engine: B.to_owned(),
+            ..facts(1, "gold")
+        };
+        replica.upsert(beside).expect("a second row");
+        a_removal_unwinds(&replica, A, behind, &|row| {
+            let (store, objects) = (&replica.store, &replica.objects);
+            objects.remove(store, row.id, row.revision);
+        });
+    }
+}
+
+thread_local! {
+    /// Whether the next generation a registry publishes on this thread
+    /// unwinds ([`Faulty`]).
+    static PUBLISH_UNWINDS: Cell<bool> = const { Cell::new(false) };
+    /// Whether the next drop of a publish's fault on this thread, outside
+    /// an unwinding, unwinds in turn ([`PublishUnwound`]).
+    static DROP_UNWINDS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The fault of a [`Faulty`] generation's publish. Where a case armed it,
+/// its first drop outside an unwinding unwinds, with a number.
+struct PublishUnwound;
+
+impl Drop for PublishUnwound {
+    fn drop(&mut self) {
+        // Not inside a failed case's own unwinding: a second one there
+        // would end the test program.
+        if !std::thread::panicking() && DROP_UNWINDS.replace(false) {
+            std::panic::panic_any(2_u8);
+        }
+    }
+}
+
+/// A generation whose publish unwinds once, where a case armed it.
+#[derive(Debug)]
+struct Faulty(Arc<[Arc<dyn Worker>]>);
+
+impl Generation for Faulty {
+    fn of(members: Arc<[Arc<dyn Worker>]>) -> Self {
+        if PUBLISH_UNWINDS.replace(false) {
+            std::panic::panic_any(PublishUnwound);
+        }
+        Self(members)
+    }
+
+    fn members(&self) -> &Arc<[Arc<dyn Worker>]> {
+        &self.0
+    }
+}
+
+/// A holder over a registry of [`Faulty`] generations, and its keeper.
+/// The rows under [`A`] and [`B`] are written to `store` through it, each
+/// registered with its own address as its credential.
+fn faulty(store: &MemoryStore) -> (Objects<Faulty>, Arc<Credentials>) {
+    let credentials = Arc::new(Credentials::new());
+    let registry = Arc::new(WorkerRegistry::<Faulty>::new());
+    let objects = Objects::new(registry).with_credentials(Arc::clone(&credentials));
+    for key in [A, B] {
+        let facts = WorkerFacts {
+            key: key.to_owned(),
+            engine: key.to_owned(),
+            ..facts(1, "gold")
+        };
+        let kept = credentials.keep(&facts, Some(key.to_owned()));
+        let change = objects.upsert(store, facts.clone(), Registrant::Control);
+        let row = change.expect("registered").id();
+        if kept.expect("no registration in flight").accepted(row) {
+            objects.lay_again(store, &facts);
+        }
+    }
+    (objects, credentials)
+}
+
+/// A host's removal call whose object's end unwinds, at the registry's
+/// publish behind the store's yes: the store holds the row no more. On
+/// the way out the holder's entry leaves and the keeper forgets the row.
+/// The second row keeps its entry and its credential, and the fault that
+/// reaches the caller is the publish's. The registry's own removal is
+/// not made whole: its map holds the worker no more, its list of the
+/// model holds it still, and it told no leave.
+#[test]
+fn a_removal_call_whose_objects_end_unwinds_leaves_no_entry_and_no_kept_row() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    let store = MemoryStore::new();
+    let (objects, credentials) = faulty(&store);
+    let registry = objects.registry();
+    let (a, b) = (store.by_key(A), store.by_key(B));
+    let (a, b) = (a.expect("a row"), b.expect("a row"));
+    let under = objects.object(a.id).expect("its object");
+    let left = registry.get(&under).expect("it stands");
+    let mut events = registry.subscribe_events();
+    PUBLISH_UNWINDS.set(true);
+    let removal = || objects.remove(&store, a.id, a.revision);
+    let fault = catch_unwind(AssertUnwindSafe(removal)).expect_err("it unwound");
+    assert!(fault.is::<PublishUnwound>(), "the publish's own fault");
+    assert!(!objects.turn.is_locked(), "the turn is let go");
+    assert_eq!(store.get(a.id), None, "the store took the row");
+    assert_eq!(objects.object(a.id), None, "no entry of the holder");
+    assert_eq!(objects.len(), 1, "the second row's entry stands");
+    assert_eq!(credentials.of(A, a.id), None, "the keeper forgot the row");
+    assert_eq!(credentials.of(B, b.id).as_deref(), Some(B), "and no other");
+    assert_eq!(credentials.len(), 1, "one address holds a credential");
+    assert!(registry.get(&under).is_none(), "out of the registry's map");
+    let listed = registry.get_by_model("m");
+    let listed = listed.iter().any(|worker| Arc::ptr_eq(worker, &left));
+    assert!(listed, "the registry's list of the model holds it still");
+    let quiet = matches!(events.try_recv(), Err(TryRecvError::Empty));
+    assert!(quiet, "and the registry told no leave");
+}
+
+/// Three faults in one removal call: the journal unwinds at its release,
+/// behind the row's leave, the registry's publish unwinds inside the
+/// second step's run on the way out, and that fault's payload unwinds at
+/// its drop. The two on the way out stop there: the fault that reaches
+/// the caller is the journal's. The store holds the row no more, and what
+/// the run had not done stays undone: the holder's entry and the keeper's
+/// row stand.
+#[test]
+fn a_fault_of_the_second_steps_run_stops_there_and_the_journals_goes_on() {
+    use std::panic::{catch_unwind, panic_any, AssertUnwindSafe};
+
+    let store = MemoryStore::journaled(Arc::new(Told::default()) as _);
+    let (objects, credentials) = faulty(&store);
+    let a = store.by_key(A).expect("a row");
+    on_let_go(|| panic_any(1_u8));
+    PUBLISH_UNWINDS.set(true);
+    DROP_UNWINDS.set(true);
+    let removal = || objects.remove(&store, a.id, a.revision);
+    let fault = catch_unwind(AssertUnwindSafe(removal)).expect_err("it unwound");
+    assert_eq!(fault.downcast_ref(), Some(&1_u8), "the journal's fault");
+    assert!(!PUBLISH_UNWINDS.get(), "the publish unwound on the way out");
+    assert!(!DROP_UNWINDS.get(), "and its payload unwound at its drop");
+    assert!(!objects.turn.is_locked(), "the turn is let go");
+    assert_eq!(store.get(a.id), None, "the store took the row");
+    assert!(objects.object(a.id).is_some(), "the entry stands");
+    assert_eq!(credentials.of(A, a.id).as_deref(), Some(A), "and its row");
 }
 
 /// A bare address and the same address with its scheme are two keys, as
