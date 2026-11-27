@@ -4,6 +4,9 @@
 # Configuration
 CARGO_BUILD_DIR ?= $(shell pwd)/target
 BUILD_MODE ?= release
+CARGO_PROFILE ?= $(BUILD_MODE)
+CARGO_BUILD_FLAG := --profile $(if $(filter debug,$(CARGO_PROFILE)),dev,$(CARGO_PROFILE))
+CARGO_PROFILE_DIR := $(if $(filter debug dev,$(CARGO_PROFILE)),debug,$(CARGO_PROFILE))
 LIB_NAME = libsmg_go
 
 # Detect OS
@@ -20,7 +23,7 @@ endif
 # Paths
 ROOT_DIR := $(shell pwd)
 RUST_SRC_DIR := $(ROOT_DIR)/src
-LIB_BUILD_DIR := $(CARGO_BUILD_DIR)/$(BUILD_MODE)
+LIB_BUILD_DIR := $(CARGO_BUILD_DIR)/$(CARGO_PROFILE_DIR)
 LIB_BUILD_PATH := $(LIB_BUILD_DIR)/$(LIB_NAME)$(LIB_EXT)
 LIB_EXPORT_DIR := $(ROOT_DIR)/lib
 LIB_EXPORT_PATH := $(LIB_EXPORT_DIR)/$(LIB_NAME)$(LIB_EXT)
@@ -37,7 +40,7 @@ export $(LD_LIBRARY_PATH_VAR) := $(LIB_DIR):$($(LD_LIBRARY_PATH_VAR))
 
 help:
 	@echo "Available targets:"
-	@echo "  build           - Build release version of Rust FFI library"
+	@echo "  build           - Build Rust FFI library (CARGO_PROFILE/BUILD_MODE, default: release)"
 	@echo "  build-dev       - Build debug version of Rust FFI library"
 	@echo "  lib             - Copy built library to ./lib directory"
 	@echo "  lib-clean       - Clean ./lib directory"
@@ -50,8 +53,8 @@ help:
 all: build
 
 build:
-	@echo "Building Rust FFI library (release mode)..."
-	@CARGO_TARGET_DIR=$(CARGO_BUILD_DIR) cargo build --release --manifest-path Cargo.toml
+	@echo "Building Rust FFI library ($(CARGO_PROFILE) profile)..."
+	@CARGO_TARGET_DIR=$(CARGO_BUILD_DIR) cargo build $(CARGO_BUILD_FLAG) --manifest-path Cargo.toml
 	@echo "Library built at: $(LIB_BUILD_PATH)"
 
 build-dev:
