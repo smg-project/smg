@@ -5,6 +5,7 @@
 
 use std::{sync::Arc, time::Duration};
 
+use engine_zmq_adapter::ZmqEngineClient;
 use futures::StreamExt;
 use openai_protocol::worker::SchedulerLoadSnapshot;
 use prost_types::Timestamp;
@@ -161,6 +162,20 @@ pub(super) fn server_info(state: &State) -> sg::GetServerInfoResponse {
     let ready = state.shared.ready();
     let max_total_num_tokens = state.shared.kv_capacity_tokens();
     let mut server_args = struct_from_json(&model.server_args_json);
+    server_args.fields.remove("supports_thinking_token_budget");
+    if state
+        .shared
+        .engine()
+        .is_ok_and(ZmqEngineClient::sglang_supports_thinking_budget)
+    {
+        server_args.fields.insert(
+            "supports_thinking_token_budget".into(),
+            prost_types::Value {
+                kind: Some(prost_types::value::Kind::BoolValue(true)),
+            },
+        );
+    }
+
     if let Some(config) = &state.managed_config {
         let managed_ready = state.prepared.get().is_some_and(|runtime| runtime.ready());
         let capability = config.capabilities(managed_ready);

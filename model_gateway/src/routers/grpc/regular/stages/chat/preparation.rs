@@ -125,6 +125,14 @@ pub(crate) async fn prepare_chat_like(
         )
         .await?;
         let media_order = media.media_order;
+        if (media.media.is_some() || media_order == llm_multimodal::MediaPartOrder::Authored)
+            && request
+                .resolved_thinking_token_budget()
+                .is_ok_and(|budget| budget.is_some())
+        {
+            ctx.state.chat_budget_media =
+                Some(Box::new((media_order, media.placeholders().cloned())));
+        }
 
         // The model's provider profile, derived once for the request, before
         // the render that reads it (the thinking the prompt is rendered with);

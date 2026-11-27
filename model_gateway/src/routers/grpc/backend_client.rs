@@ -1112,6 +1112,7 @@ fn build_zmq_request<B>(
                     tool_call_constraint: options.tool_constraints,
                     format_set_aside: options.format_set_aside,
                     require_reasoning: options.require_reasoning && !options.first_token_grammar,
+                    thinking_disabled: options.thinking_disabled,
                 },
             )?;
             req.extra_mm_inputs = extras;

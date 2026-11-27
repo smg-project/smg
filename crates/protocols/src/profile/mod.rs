@@ -490,15 +490,11 @@ impl ProviderProfile {
         }
     }
 
-    /// Shape a chat request for an upstream server that renders the prompt
-    /// itself, the way the HTTP routers forward it: a field the gateway's own
-    /// renderer and the vendor's API read differently goes out as the vendor
-    /// reads it. DeepSeek V4.1's `medium` effort is the one such field (the
-    /// checkpoint template's level for the gateway's renderer, the vendor's
-    /// alias of `high` for an upstream; the table lives with the profile);
-    /// every other profile forwards the request [`Self::normalize_chat`]
-    /// produced as it is.
+    /// Prepare a chat request for an HTTP upstream. The two thinking-budget
+    /// spellings must agree even when the upstream's runtime is unknown.
+    /// DeepSeek also reads the V4.1 template's `medium` effort as `high`.
     pub fn normalize_chat_for_upstream(self, req: &mut ChatCompletionRequest) {
+        req.normalize_upstream_thinking_budget();
         match self {
             ProviderProfile::DeepSeek => deepseek::alias_effort_for_upstream(req),
             ProviderProfile::Kimi

@@ -236,6 +236,11 @@ pub trait GenerationRequest: Send + Sync {
         None
     }
 
+    /// The HTTP budget field, when this worker's request may need a wire edit.
+    fn thinking_token_budget(&self) -> Option<i64> {
+        None
+    }
+
     /// The fields that partition the backend's prefix cache for this request.
     /// Protocols without such fields are unpartitioned.
     fn cache_partition(&self) -> CachePartition<'_> {

@@ -49,6 +49,29 @@ pub fn grpc_worker(
     Arc::new(builder.build())
 }
 
+/// A gRPC worker whose engine reported `labels` during registration.
+#[cfg(test)]
+pub(crate) fn discovered_grpc_worker(
+    url: &str,
+    model: &str,
+    role: WorkerType,
+    runtime: RuntimeType,
+    labels: &[(&str, &str)],
+) -> Arc<dyn Worker> {
+    let labels = smg_worker::test_support::labels_of(labels);
+    Arc::new(
+        BasicWorkerBuilder::new(url)
+            .model(ModelCard::new(model))
+            .worker_type(role)
+            .runtime_type(runtime)
+            .connection_mode(ConnectionMode::Grpc)
+            .health_config(no_health_check())
+            .discovered_labels(labels.clone())
+            .labels(labels)
+            .build(),
+    )
+}
+
 /// A registry holding `workers`, each registered as the test built it.
 #[expect(
     clippy::expect_used,

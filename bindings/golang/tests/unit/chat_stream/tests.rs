@@ -49,3 +49,41 @@ fn a_request_that_does_not_parse_is_a_parsing_error() {
         );
     }
 }
+
+#[test]
+fn finite_json_budgets_require_the_selected_workers_confirmation() {
+    let cap = |value: i64| {
+        let raw = json!({"model":"m","messages":[],"custom_params":{"thinking_budget":value}});
+        serde_json::from_str::<ChatCompletionRequest>(&raw.to_string())
+            .unwrap()
+            .resolved_thinking_token_budget()
+    };
+    assert!(cap(-2).is_err());
+    assert!(cap(i64::from(u32::MAX) + 1).is_err());
+    let unavailable = || std::future::ready(Err::<_, ()>(()));
+    assert!(verify_thinking_budget(cap(-1).unwrap(), unavailable).is_ok());
+    assert_eq!(
+        verify_thinking_budget(cap(0).unwrap(), unavailable)
+            .unwrap_err()
+            .0,
+        SglErrorCode::UnknownError
+    );
+    for value in [0, u32::MAX] {
+        let budget = cap(i64::from(value)).unwrap();
+        assert_eq!(budget, Some(value));
+        for flag in [None, Some(false), Some(true)] {
+            let mut info = GetServerInfoResponse::default();
+            if let Some(value) = flag {
+                info.server_args
+                    .get_or_insert_default()
+                    .fields
+                    .insert(SUPPORTS_THINKING_TOKEN_BUDGET_LABEL.into(), value.into());
+            }
+            let lookup = || std::future::ready(Ok::<_, ()>(info));
+            assert_eq!(
+                verify_thinking_budget(budget, lookup).is_ok(),
+                flag == Some(true)
+            );
+        }
+    }
+}

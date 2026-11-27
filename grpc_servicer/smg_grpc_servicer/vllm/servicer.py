@@ -81,6 +81,7 @@ from smg_grpc_servicer.vllm.model_info import (
     mm_item_limits,
     model_facts,
     server_facts,
+    supports_thinking_token_budget,
 )
 from smg_grpc_servicer.vllm.scheduler_loads import build_loads_response, managed_ranks
 from smg_grpc_servicer.vllm.warmup import WARMUP_ENV, start_engine_warmup
@@ -258,6 +259,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         # configured logging by now, if it was going to).
         settle_logging()
         self.engine = async_llm
+        self._supports_thinking_token_budget = supports_thinking_token_budget(
+            getattr(async_llm, "vllm_config", None)
+        )
         self.start_time = start_time
         # Read once: the engine's signature does not change under a servicer.
         self._takes_reasoning_ended = _takes_reasoning_ended(async_llm)
@@ -769,7 +773,8 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             )
             await context.abort(code, str(e))
         finally:
-            self._loads.finished(request_id)
+            if handed_to_engine:
+                self._loads.finished(request_id)
 
     async def _notify_kv_transfer_rejected(
         self,
@@ -1063,6 +1068,8 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         # an older package.
         if self._mm_encoder_budget and "mm_encoder_budget" in info.DESCRIPTOR.fields_by_name:
             info.mm_encoder_budget = self._mm_encoder_budget
+        if "supports_thinking_token_budget" in info.DESCRIPTOR.fields_by_name:
+            info.supports_thinking_token_budget = self._supports_thinking_token_budget
         # The engine's reasoning parser and where it starts a grammar on a
         # thinking prompt, for the Router to shape a forced tool call's
         # grammar by; likewise absent from an older package.
@@ -1308,8 +1315,8 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             prompt=tokenized.original_text or None,
         )
 
-    @staticmethod
     def _sampling_params_from_proto(
+        self,
         params: vllm_engine_pb2.SamplingParams,
         stream: bool = True,
         kv_transfer_params: dict | None = None,
@@ -1351,7 +1358,17 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
 
         # Create SamplingParams
         # output_kind=DELTA: Return only new tokens in each chunk (for streaming)
+        budget_args = {}
+        if "thinking_token_budget" in params.DESCRIPTOR.fields_by_name and params.HasField(
+            "thinking_token_budget"
+        ):
+            if not self._supports_thinking_token_budget:
+                raise ValueError(
+                    "thinking_token_budget is unsupported by the configured vLLM sampler"
+                )
+            budget_args["thinking_token_budget"] = params.thinking_token_budget
         return SamplingParams(
+            **budget_args,
             temperature=params.temperature if params.HasField("temperature") else 1.0,
             top_p=params.top_p if params.top_p != 0.0 else 1.0,
             top_k=params.top_k,

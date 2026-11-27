@@ -54,6 +54,8 @@ pub struct SglangGenerateRequestOptions {
     /// answers, read as absent; a Messages body names none.
     pub format_set_aside: FormatSetAside,
     pub require_reasoning: bool,
+    /// The chat renderer confirmed that the prompt disables thinking.
+    pub thinking_disabled: bool,
 }
 
 crate::impl_abort_for_drop_with_reason!(SglangSchedulerClient);
@@ -238,6 +240,16 @@ impl SglangSchedulerClient {
             },
         )?;
 
+        if sampling_params.thinking_token_budget.is_some()
+            && !options.require_reasoning
+            && !options.thinking_disabled
+        {
+            return Err(
+                "thinking_token_budget requires an active reasoning grammar on this SGLang request"
+                    .into(),
+            );
+        }
+
         let grpc_request = proto::GenerateRequest {
             request_id,
             tokenized: Some(proto::TokenizedInput {
@@ -383,6 +395,9 @@ impl SglangSchedulerClient {
         let skip_special_tokens = true;
 
         Ok(proto::SamplingParams {
+            thinking_token_budget: request
+                .resolved_thinking_token_budget()
+                .map_err(|e| e.to_string())?,
             temperature: request.temperature.unwrap_or(1.0),
             top_p: request.top_p.unwrap_or(1.0),
             top_k: request.top_k.unwrap_or(-1),
@@ -1308,6 +1323,37 @@ mod tests {
         .expect("build request");
 
         assert!(proto.require_reasoning);
+    }
+
+    #[test]
+    fn thinking_token_budget_requires_a_grammar_or_a_rendered_off_switch() {
+        let chat = serde_json::from_value(json!({"model": "m", "messages": [],
+            "chat_template_kwargs": {"enable_thinking": false}, "thinking_token_budget": 0}))
+        .unwrap();
+        let build = |require_reasoning, thinking_disabled| {
+            SglangSchedulerClient::build_generate_request_from_chat_parts(
+                "budget".into(),
+                &chat,
+                "hello".into(),
+                vec![1],
+                SglangGenerateRequestOptions {
+                    require_reasoning,
+                    thinking_disabled,
+                    ..Default::default()
+                },
+            )
+        };
+        assert!(build(false, false)
+            .unwrap_err()
+            .contains("active reasoning grammar"));
+        for (require_reasoning, disabled) in [(true, false), (false, true)] {
+            let request = build(require_reasoning, disabled).unwrap();
+            assert_eq!(request.require_reasoning, require_reasoning);
+            assert_eq!(
+                request.sampling_params.unwrap().thinking_token_budget,
+                Some(0)
+            );
+        }
     }
 
     #[test]
