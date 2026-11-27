@@ -28,6 +28,11 @@ pub(crate) struct MediaPlan {
     parts: Vec<MediaContentPart>,
     modalities: Vec<Modality>,
     counts: HashMap<Modality, usize>,
+    /// The rate the request states for sampling its video clips: the default
+    /// of this plan's clips in the gateway's own pipeline, ahead of the
+    /// model's. It is no part's own rate, so it decides nothing about where
+    /// the media is processed.
+    request_video_fps: Option<f64>,
 }
 
 impl MediaPlan {
@@ -58,6 +63,21 @@ impl MediaPlan {
             plan.parts.push(part);
         }
         plan
+    }
+
+    /// Carry the rate the request states for sampling its video clips;
+    /// `rate` is read only for a plan that holds a video part.
+    pub(crate) fn with_request_video_fps(mut self, rate: impl FnOnce() -> Option<f64>) -> Self {
+        if self.modalities.contains(&Modality::Video) {
+            self.request_video_fps = rate();
+        }
+        self
+    }
+
+    /// The rate the request states for sampling its video clips, if it
+    /// states one in range and the plan holds a clip.
+    pub(crate) fn request_video_fps(&self) -> Option<f64> {
+        self.request_video_fps
     }
 
     /// The plan's items of `modality` per source (`url`, `data_url`,
