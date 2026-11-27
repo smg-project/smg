@@ -810,9 +810,10 @@ enum MisplacedToken {
     /// (vocab.json + merges.txt): the load fails, as it always has.
     RefusesTheLoad,
     /// tokenizer.json holds the model's added tokens; the configuration's
-    /// extras ride along where they fit, and one that does not is left out
-    /// with a warning, as every configured token was before this path read
-    /// the configuration.
+    /// special tokens ride along where they fit, and one that does not is
+    /// left out with a warning, as every configured token was before this
+    /// path read the configuration. A token declared `special: false` that
+    /// the file lacks is never added here: it stays text.
     IsLeftOut,
 }
 
@@ -1125,11 +1126,14 @@ impl HuggingFaceTokenizer {
     /// warning on the tokenizer.json path, where the file's tokens stand
     /// and the configuration's extras ride along where they fit (a
     /// checkpoint that declares `</think>` on an id the table holds for
-    /// another piece loads as it always did, that token as text). The
-    /// tokenizer.json path hands in the configuration's special tokens
-    /// alone: a token the configuration declares `special: false` and the
-    /// file lacks stays text there, as it was before this path read the
-    /// block. Returns how many tokens were added.
+    /// another piece loads as it always did, that token as text). On the
+    /// tokenizer.json path a token the configuration declares
+    /// `special: false` and the file lacks stays text, as it was before
+    /// this path read the block. It takes no id, and the pipeline fills
+    /// ids in order, so once such a token is skipped on the next free id
+    /// every special token declared past it is left out too, each with a
+    /// warning that names the text token. Returns how many tokens were
+    /// added.
     fn add_config_tokens<M: Model>(
         tokenizer: &mut TokenizerOf<M>,
         config_tokens: &[(u32, AddedToken)],
@@ -1148,6 +1152,9 @@ impl HuggingFaceTokenizer {
         // pipeline's add reads its own map token by token, so a content declared
         // twice is held on the first id by the time the second is added.
         let mut queued: HashMap<&str, u32> = HashMap::new();
+        // The text token the tokenizer.json path skipped on the next free id.
+        // That id stays empty, so no new token declared past it can be placed.
+        let mut text_on_next_id: Option<&str> = None;
         for (id, token) in config_tokens {
             match added.get_vocab().get(&token.content) {
                 Some(held) if held == id => {}
@@ -1165,7 +1172,16 @@ impl HuggingFaceTokenizer {
                     // the next one.
                     let table_id = tokenizer.token_to_id(&token.content);
                     let queued_id = queued.get(token.content.as_str()).copied();
+                    let is_new = table_id.is_none() && queued_id.is_none();
                     let lands_on = queued_id.or(table_id).unwrap_or(next_id);
+                    if !token.special && matches!(misplaced, MisplacedToken::IsLeftOut) {
+                        // Stays text; one the add would have put on the next
+                        // free id leaves that id empty.
+                        if is_new && lands_on == *id {
+                            text_on_next_id = Some(token.content.as_str());
+                        }
+                        continue;
+                    }
                     if lands_on != *id {
                         match misplaced {
                             MisplacedToken::RefusesTheLoad => {
@@ -1175,18 +1191,28 @@ impl HuggingFaceTokenizer {
                                 )));
                             }
                             MisplacedToken::IsLeftOut => {
-                                warn!(
-                                    token = %token.content,
-                                    config_id = id,
-                                    would_land_on = lands_on,
-                                    "tokenizer_config.json declares an added token on an id the pipeline cannot place; the token is left out, as tokenizer.json alone reads it"
-                                );
+                                match text_on_next_id.filter(|_| is_new) {
+                                    Some(text_token) => warn!(
+                                        token = %token.content,
+                                        config_id = id,
+                                        would_land_on = lands_on,
+                                        text_token = %text_token,
+                                        "tokenizer_config.json declares a special token past a `special: false` token that tokenizer.json lacks; the text token is not added, so its id stays empty and the special token is left out, as tokenizer.json alone reads it"
+                                    ),
+                                    None => warn!(
+                                        token = %token.content,
+                                        config_id = id,
+                                        would_land_on = lands_on,
+                                        "tokenizer_config.json declares an added token on an id the pipeline cannot place; the token is left out, as tokenizer.json alone reads it"
+                                    ),
+                                }
                                 continue;
                             }
                         }
                     }
-                    if table_id.is_none() && queued_id.is_none() {
+                    if is_new {
                         next_id += 1;
+                        text_on_next_id = None;
                     }
                     queued.insert(token.content.as_str(), lands_on);
                     missing.push((*id, token.clone()));
@@ -2037,13 +2063,12 @@ impl HuggingFaceTokenizer {
             // tokenizer.json holds the model's added tokens, so an entry of
             // the configuration that does not read is left out and the rest
             // of the block applies: the file loads as it did before this path
-            // read the block. Of the entries that read, the special ones are
-            // kept (the rule is on `add_config_tokens`).
-            let (mut added_tokens, unread) = Self::config_added_tokens(&config, &config_path);
+            // read the block. Which of the entries that read are added is on
+            // `add_config_tokens`.
+            let (added_tokens, unread) = Self::config_added_tokens(&config, &config_path);
             for unread in &unread {
                 warn!("{unread}; the entry is left out");
             }
-            added_tokens.retain(|(_, token)| token.special);
 
             Some(TokenizerConfigResult {
                 chat_template: templates.default,
@@ -2183,7 +2208,7 @@ struct TokenizerConfigResult {
     /// `add_prefix_space`, when the configuration sets it.
     add_prefix_space: Option<bool>,
     config_tokens: ConfigTokens,
-    /// The special tokens of the `added_tokens_decoder` block, by id (see
+    /// The tokens of the `added_tokens_decoder` block, by id (see
     /// `config_added_tokens`).
     added_tokens: Vec<(u32, AddedToken)>,
 }

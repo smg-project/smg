@@ -9,9 +9,12 @@
 //! token out with a warning and the rest load (the vocab.json + merges.txt
 //! path, where the configuration is the only source of the ids, refuses it
 //! instead). A token declared `special: false` that the file lacks stays
-//! text.
+//! text, and a special token declared past it is left out with a warning
+//! that names it.
 
 #![expect(clippy::expect_used, reason = "a test that stops on a broken setup")]
+
+use std::sync::{Arc, Mutex, PoisonError};
 
 use llm_tokenizer::{
     traits::{Decoder as _, Encoder as _, Tokenizer as _},
@@ -92,6 +95,51 @@ fn load(
 
 /// Two plain pieces (ids 0, 1), one special token in the file (id 2).
 const FILE_TOKENS: [&str; 1] = ["<|im_start|>"];
+
+/// The WARN events of the thread it is the default subscriber on, each as
+/// its fields in `name=value` form.
+struct Warnings(Arc<Mutex<Vec<Vec<String>>>>);
+
+impl tracing::Subscriber for Warnings {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        /// The fields of one event.
+        struct Fields(Vec<String>);
+        impl tracing::field::Visit for Fields {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.push(format!("{}={value:?}", field.name()));
+            }
+        }
+        if *event.metadata().level() != tracing::Level::WARN {
+            return;
+        }
+        let mut fields = Fields(Vec::new());
+        event.record(&mut fields);
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(fields.0);
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Runs `f` and returns its value with the warnings it logged.
+fn warnings_during<T>(f: impl FnOnce() -> T) -> (T, Vec<Vec<String>>) {
+    let warnings = Arc::new(Mutex::new(Vec::new()));
+    let guard = tracing::subscriber::set_default(Warnings(Arc::clone(&warnings)));
+    let out = f();
+    drop(guard);
+    let warnings = std::mem::take(&mut *warnings.lock().unwrap_or_else(PoisonError::into_inner));
+    (out, warnings)
+}
 
 #[test]
 fn a_token_only_the_configuration_declares_is_a_token_of_the_model() {
@@ -292,6 +340,44 @@ fn a_declared_token_that_is_not_special_stays_text() {
         load(&dir, &tokenizer_json(&[], &FILE_TOKENS), config).expect("the configuration loads");
     assert_eq!(tokenizer.token_to_id("<|audio_start|>"), Some(3));
     assert_eq!(tokenizer.token_to_id("<think>"), None);
+}
+
+#[test]
+fn a_special_token_after_a_text_token_the_file_lacks_is_left_out() {
+    // `<tool_call>` is declared `special: false` on the next free id (3) and
+    // the file lacks it: it stays text and takes no id, so the pipeline's
+    // next id stays 3 and neither special token declared past it (4, 5) can
+    // be placed. Both are left out, as tokenizer.json alone reads them, and
+    // the warning for each names the text token before it.
+    let dir = TempDir::new().expect("a temp dir");
+    let mut config = config(&[
+        (2, "<|im_start|>"),
+        (3, "<tool_call>"),
+        (4, "<|audio_start|>"),
+        (5, "<|audio_end|>"),
+    ]);
+    config["added_tokens_decoder"]["3"]["special"] = json!(false);
+    let (tokenizer, warnings) =
+        warnings_during(|| load(&dir, &tokenizer_json(&[], &FILE_TOKENS), config));
+    let tokenizer = tokenizer.expect("the configuration loads");
+
+    assert_eq!(tokenizer.token_to_id("<tool_call>"), None);
+    assert_eq!(tokenizer.token_to_id("<|audio_start|>"), None);
+    assert_eq!(tokenizer.token_to_id("<|audio_end|>"), None);
+    assert_eq!(tokenizer.tokenizers_pipeline().get_vocab_size(true), 3);
+    for token in ["<|audio_start|>", "<|audio_end|>"] {
+        let left_out: Vec<&Vec<String>> = warnings
+            .iter()
+            .filter(|fields| fields.contains(&format!("token={token}")))
+            .collect();
+        assert_eq!(left_out.len(), 1, "one warning for {token}: {warnings:?}");
+        assert!(
+            left_out
+                .iter()
+                .all(|fields| fields.contains(&"text_token=<tool_call>".to_string())),
+            "the warning for {token} names the text token before it: {warnings:?}"
+        );
+    }
 }
 
 #[test]
