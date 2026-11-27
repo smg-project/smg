@@ -752,6 +752,20 @@ impl Reader {
         self
     }
 
+    /// For a stream: a call starts at its name ([`Engine::starts_calls_at_name`]), so the
+    /// client reads which function is called before the arguments' key arrives. A whole
+    /// answer is read without it: an output cut behind a name holds no call there. Under a
+    /// choice that drops a call (`none`, a named function, an allowed list, and a `required`
+    /// list, which drops a call to a function the request does not declare) the engine stays
+    /// as built: a call that ends before its arguments is no call there and its bytes stay
+    /// the answer's content, where a call dropped at its name would take them with it.
+    pub(crate) fn starts_calls_at_name(mut self) -> Self {
+        if self.forbidden.forbids == Forbids::Nothing {
+            self.engine = self.engine.starts_calls_at_name();
+        }
+        self
+    }
+
     /// Reads `token_ids` through `decoder` as one delta: the text the decoder releases, with each
     /// token's span in it, zero-width for a token whose bytes it holds back, into `delta`, and
     /// the events into `out`, where they borrow the text. Says whether the decoder matched a
