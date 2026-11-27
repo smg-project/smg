@@ -136,7 +136,7 @@ Other readers follow their own rules:
 | Field | What it holds | Default |
 |---|---|---|
 | `kind` | `tree` or `hash`. | `tree` |
-| `ttl_s` | How many seconds a placement of the classic hash index lives. The crate's engine does not read it: its record keeps a placement until `max_size` takes it. | 180 |
+| `ttl_s` | How many seconds a placement of the classic hash index lives. The crate's engine does not read it: no placement of its record expires. | 180 |
 | `max_size` | The size bound of a `tree`. The crate's engine bounds its record by it under either kind. | 67108864 |
 | `sweep_s` | How many seconds pass between sweeps. | 120 |
 
@@ -161,8 +161,9 @@ The crate's engine reads `kind` and `max_size` alone, for a pool whose profile r
 
 - Under `tree`, the engine bounds the model's record of sent prefixes at `max_size` divided by the block size, and at one placement at least. The record holds one placement for each block a worker was sent.
 - At the defaults that is 4,194,304 placements. The record takes about 55 bytes a block, so about 230 MB a model.
-- Under `hash`, the engine keeps the same record under the same bound, keyed at `view.boundaries` alone. It holds one placement for each boundary a request of token ids reaches and each worker sent it. A request that reaches no boundary, or one hashed by its text, is recorded nowhere.
-- A boundary past the first `max_block_hashes` blocks of a request keys nothing. A key ends at the last whole block under its boundary, and a request that holds those blocks reaches it. Every worker sent a head stays its holder until the bound takes the placement.
+- Under `hash`, the engine keeps the same record under the same bound, keyed at `view.boundaries` alone. For a request of token ids it holds one placement at most for each boundary and each worker sent the request.
+- Under `hash`, a request that carries fewer block hashes than the first boundary has whole blocks, or one hashed by its text, is recorded nowhere.
+- A boundary of more whole blocks than `max_block_hashes` keys nothing. A key ends at the last whole block under its boundary, and a request that holds those blocks reaches it. As a rule every worker sent a head stays its holder until the bound takes the placement.
 - The entry read is the one for the model the request names, under the id by which the first worker of its list lists that model. A model that workers list behind their primary one keeps its own record under its own entry.
 - A record read for a model behind a first worker's primary one is bounded by the smallest block size any list asked with, for as long as it lives.
 - An id and an alias of one model share one record. A name no model of that worker answers to reads the record and the entry of the worker's primary model id.
