@@ -1007,6 +1007,40 @@ mod tests {
         );
     }
 
+    /// A list and an object an info patch sets reach a client of this wire
+    /// as a list and a struct in the server args, as an engine servicer's do.
+    #[tokio::test]
+    async fn a_patched_list_and_object_reach_the_server_args_in_their_kinds() {
+        use prost_types::value::Kind;
+
+        let (service, _stop) = MockScheduler::for_tests(Config::default(), 65_381);
+        let patch = json!({
+            "weight_version": ["a", "b"],
+            "kv_cache_dtype": {"bits": 8},
+        });
+        service.overrides.patch_info(patch.as_object().unwrap());
+        let info = service
+            .get_server_info(Request::new(sg::GetServerInfoRequest {}))
+            .await
+            .expect("info")
+            .into_inner();
+        let args = info.server_args.expect("server args").fields;
+        let kind = |key: &str| args.get(key).and_then(|value| value.kind.as_ref());
+        assert!(
+            matches!(kind("weight_version"), Some(Kind::ListValue(list)) if list.values.len() == 2),
+            "a list of two members: {:?}",
+            kind("weight_version")
+        );
+        assert!(
+            matches!(
+                kind("kv_cache_dtype"),
+                Some(Kind::StructValue(entry)) if entry.fields.contains_key("bits")
+            ),
+            "a struct with its member: {:?}",
+            kind("kv_cache_dtype")
+        );
+    }
+
     /// The admin fan-out's three RPCs on this wire call the core's answers:
     /// the flush succeeds, a profiling run starts and stops with one trace
     /// file in the requested directory, and a second stop is refused.
