@@ -21,6 +21,9 @@
 //!
 //! One pin reads frees: a decision that spans a write frees nothing on its
 //! thread. The allocator here counts each thread's frees for it.
+//!
+//! One pin is of the token index: its fused walk of one page allocates one
+//! list. It stands here because this target declares the counting allocator.
 
 #![expect(clippy::expect_used, reason = "tests that stop on a broken setup")]
 
@@ -870,6 +873,20 @@ fn index_keys_that_pass_add_no_allocation_to_a_validation() {
         allocations
     };
     assert_eq!(allocations(2_000), allocations(1_000));
+}
+
+/// The fused walk of the token tree keeps its path in one list: a prompt of
+/// one page that matches nothing in an empty tree allocates that list and
+/// nothing else.
+#[test]
+fn a_fused_walk_of_one_page_allocates_one_list_for_its_path() {
+    let tree = kv_index::TokenTree::new();
+    // One page of the tree, whatever its page size.
+    let page = vec![7u32; tree.page_size()];
+    let walk = || allocations_during(|| tree.match_and_insert_with(&page, |_| None)).1;
+    // The first call interns the tenant an empty tree answers with: unmeasured.
+    let _ = walk();
+    assert_eq!(walk(), 1);
 }
 
 /// The pin of a host in process: the engine over the host's own worker
