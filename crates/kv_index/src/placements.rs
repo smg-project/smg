@@ -50,18 +50,19 @@ pub fn hash_token_head(marker: Option<impl Into<[u32; 2]>>, head: &[u32]) -> u64
     }
 }
 
-/// The placement maps of one router, by model. A model's map is made when a
-/// placement of the model is first recorded and is never removed, so a
-/// handle on it stays the model's map, and a walk of it holds no guard of
-/// this store.
+/// The placement maps of one router, by model. A model's map is made at the
+/// model's first write ([`Self::record`]) and is never removed, so a handle
+/// on it stays the model's map, and a walk of it holds no guard of this
+/// store.
 ///
 /// The owner states a holder's lifetime at each call. It bounds the maps by
 /// its sweep ([`Self::sweep`]) and takes a worker that left out of them
 /// ([`Self::remove_worker`], [`Self::remove_workers_from_model`]).
 #[derive(Debug, Default)]
 pub struct ModelPlacements {
-    /// Keyed by the operator's model ids and read on every request: the Fx
-    /// hasher.
+    /// Keyed by the operator's model ids. Every call that names a model
+    /// looks it up here, a request's read of a head's holders and its
+    /// write among them: the Fx hasher.
     maps: DashMap<String, Arc<PlacementMap>, FxBuildHasher>,
 }
 
@@ -71,7 +72,7 @@ impl ModelPlacements {
         Self::default()
     }
 
-    /// `model_id`'s map, where a placement of the model was recorded.
+    /// `model_id`'s map, where a write named the model.
     pub fn get(&self, model_id: &str) -> Option<Arc<PlacementMap>> {
         self.maps
             .get(model_id)
@@ -86,8 +87,13 @@ impl ModelPlacements {
     /// Hands `with` the live holders of `key` in `model_id`'s map: those
     /// touched within `ttl` of `now`. Expired holders are pruned in place
     /// (lazy expiry on read). `with` runs under the key's guard, over the
-    /// holder cap at most, and this read allocates nothing. `None` where the
-    /// model has no map, or its map no such key.
+    /// holders the store's writes left, the cap at most, and the store's
+    /// own lines of this read allocate nothing. `None` where the model has
+    /// no map, or its map no such key.
+    ///
+    /// `with` asks nothing of any model's map: a read or a write from
+    /// inside `with` can wait for good on a guard a caller holds, its own
+    /// or another's.
     pub fn live_holders<R>(
         &self,
         model_id: &str,
@@ -103,9 +109,16 @@ impl ModelPlacements {
     }
 
     /// Record/touch `worker_url` at every boundary of `boundaries` for the
-    /// request of `tokens`, each of which reaches the request's end at most;
-    /// above the holder cap the stalest holder is evicted. `marker` is the
-    /// request's partition ([`hash_token_head`]).
+    /// request of `tokens`; above the holder cap the stalest holder is
+    /// evicted. `marker` is the request's partition ([`hash_token_head`]).
+    /// The model's map is made where it has none, ahead of the first
+    /// boundary: a write of no boundary makes it too.
+    ///
+    /// # Panics
+    ///
+    /// Where a boundary lies past the request's end: the caller hands the
+    /// boundaries the request reaches. Those ahead of it in `boundaries`
+    /// are written by then.
     #[expect(
         clippy::too_many_arguments,
         reason = "what the caller holds at the call, no state of the store"
