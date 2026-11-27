@@ -33,7 +33,7 @@ fn the_committed_schema_matches_the_spec_types() {
     assert!(
         committed == generated,
         "{} does not match the spec types: run \
-         `SMG_POLICY_SCHEMA_WRITE=1 cargo test -p smg-grand-central --test schema` \
+         `SMG_POLICY_SCHEMA_WRITE=1 cargo test -p smg-grand-central --test document schema::` \
          and commit the file",
         path.display()
     );
