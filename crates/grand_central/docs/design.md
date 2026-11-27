@@ -538,14 +538,15 @@ whether it is marked non-exhaustive and how code writes it:
 | the records a caller builds | `Needs`, `Outcome`, `Plain`, `TokenKey`, `TextKey`, `EncodeMember`, `PoolWord` | yes | a stage writes its `Needs` as one chain from `Needs::NONE`, a call a flag. A host makes an `Outcome` by `Outcome::reported`. Each of the other five is made by its call (`Plain::of`, `TokenKey::of`, `TextKey::of`, `EncodeMember::of`, `PoolWord::of`), which takes every field the record has today |
 | the records a stage answers with | `Shortlist`, `HeadRule` | yes | each is made by its call |
 | the view a stage only reads | `RequestFacts`, `Candidate`, `Constraints`, `PoolFacts`, `LoadRow`, `AffinityFacts`, `AffinityRows`, `AffinityHolder`, `Health`, `MediaCounts`, `Header`, `ZoneCapacity`, and its enums `HashKind`, `SignalSource`, `OverloadRegime` | yes | code outside the crate starts a record from its `Default`, or a `Candidate` from `Candidate::ready`, and assigns the fields it knows. It never matches one whole, and a `match` on one of the enums keeps an arm for the rest |
+| what a policy document states | `ProfileSpec`, `RoutingKeySpec`, `IndexSpec`, `BucketParams`, `CostMargin`, `Match`, `OverloadSpec`, `KeySourceSpec`, `BindingSpec`, `ResidentWorkParams`, `LeastCostParams`, `BestParams`, `BestWithTemperatureParams`, `HasRoomParams`, `Bounds`, `HeaderMatch`, `SessionsSpec`, `CanarySpec`, `SignalSpec`, and what a snapshot caller asks of the worker rows, `WorkerRowsQuery` | yes | ten of them have no start (`ResidentWorkParams`, `LeastCostParams`, `BestParams`, `BestWithTemperatureParams`, `HasRoomParams`, `Bounds`, `HeaderMatch`, `SessionsSpec`, `CanarySpec`, `SignalSpec`): code outside the crate builds none: it deserializes one, or takes one in a spec the crate made, and a start comes the day a caller needs one. It starts eight from their `Default` and assigns the fields it knows (`IndexSpec`, `BucketParams`, `CostMargin`, `Match`, `OverloadSpec`, `KeySourceSpec`, `BindingSpec`, `WorkerRowsQuery`). It makes a profile by `ProfileSpec::of` and a routing key by `RoutingKeySpec::of`, each from the one field a document must write. A pattern on one ends with `..`. The doc of the module `document` says this once for the nineteen a document states: the own doc of such a record is its description in the published schema. `WorkerRowsQuery` says it in its own doc |
 | the parts of a decision, of a lease and of a profile | `Target`, `Pair`, `Trace`, `Shed`, `Queue`, `LiftedVeto`, `DemandFacts`, `Lease`, `LeaseKind`, `Dispatch`, `WeightedScorer`, `Profile`, `Binding`, `PairPools`, `EncoderFacts`, `EncodePool`, `EncodeItems` | yes | code outside the crate starts a record from its `Default` or from its call (`Target::of`, `Pair::of`, `PairPools::of`, `WeightedScorer::of`, `Profile::of`, `Binding::of`) and assigns the fields it knows. A `Trace`, a `Shed` and a `Queue` are answers: a caller reads one and builds none. It never matches one whole, and a `match` on `LiftedVeto` or `LeaseKind` keeps an arm for the rest |
 | what a host states of a worker, of a store's history and of a signal | `EncodeOffer`, `PairingDescriptor`, `Position`, `SignalCell` | yes | code outside the crate starts an offer, a descriptor or a position from its `Default` and assigns the fields it knows. It makes a cell by `SignalCell::of`, which takes both of its fields, or starts from `SignalCell::NONE`. A pattern on one ends with `..` |
 | what a host starts a service or a plugin with | `Config`, `Listener`, `ElectionConfig`, `ElectionSettings`, `WorkerFollowerSettings`, `PemFile`, `ClientIdentity`, `Exposure`, `BreakerSpec`, `Abi`, the three records named `Tls`, and the elector's `LeaseRecord` | yes | code outside the crate starts an exposure, a breaker, an election's configuration, its timing or the elector's lease record from its `Default` and assigns the fields it knows. It makes each of the others by its call. `Config::of` takes the three fields a host must state. Each other call takes every field the record has: none has a neutral value, and a TLS left out by silence would be a plaintext listener or a plain dial. A pattern on one ends with `..` |
 | what no caller builds or matches whole | `Pick`, `Overlap`, `HeldDecision`, `HeldDecode`, `SessionRule`, and every other public enum or record that no program outside the crate builds or matches whole | yes | a caller reads one by its fields, and starts one from its `Default` or its call where it has one. A `match` on one keeps an arm for the rest, and a pattern on one ends with `..` |
-| what a caller builds or matches whole | the lists a request lends and its `Demands`, the routing settings, a store's checkpoint | not yet | each takes its mark with a call to start from, and its module or its own declaration says so |
+| what a caller builds or matches whole | the lists a request lends and its `Demands`, a store's checkpoint | not yet | each takes its mark with a call to start from, and its module or its own declaration says so |
 | the enums closed by design | `Decision`, `ShedReason`, `Side`, `Phase`, `Role`, `Said`, `Pairing`, `Head`, the elector's `TickOutcome`, and the client's `Answer` | no | a caller answers every case of them, and a new case must stop its build |
 | the records closed by their shape | a record of one value: `WorkerId`, `LeaseId`, `GatewayId`, `TieBand`. A record with no field, as the stage `Best` | no | its one value, or its name, is the whole record |
-| the records closed by their own doc | `DispatchCounts`, and a lease as a store holds it: `LeaseRecord`, `DecodeSide`, `Sides` | no | a further number goes on `CreditedDispatches`. A store's door takes a lease's record or its decode side whole, and a store answers both parts: a field that joins stops each writer's build until the writer states it |
+| the records closed by their own doc | `DispatchCounts`, a lease as a store holds it: `LeaseRecord`, `DecodeSide`, `Sides`, and a gateway's routing settings: `RoutingSettings`, `RoutingKeyOverrideSettings` | no | a further number goes on `CreditedDispatches`. A store's door takes a lease's record or its decode side whole, and a store answers both parts: a field that joins stops each writer's build until the writer states it. A gateway's literal of the routing settings with no rest stops its build at a setting that joins, until the gateway states it |
 | an enum with no case | `DiscoverySettings` in a build without discovery | no | it has no value, and a caller may match it with no arm |
 
 The crate's lint lines hold the table. `clippy::exhaustive_enums` and `clippy::exhaustive_structs` are
@@ -943,7 +944,9 @@ A controller keeps one engine object too, built at its store's start. The store 
 it applies in force on it, by `InProcess::apply`, the call of a host that keeps one engine (section
 8.1, step 6, and section 10.2).
 
-The session table and the record of sent prompts stand across the call. So do the stages of a
+The session table stands across the call. So does the record of sent prompts, as a rule: a
+document that keys a model's record another way can start that record anew, by another kind of
+the model's index or by other boundaries under a hash index (section 4.5). So do the stages of a
 profile whose name and text did not change, with what they remember, under the rules that follow.
 Nothing is kept unless both documents were validated over one stage table: the stock one, or one
 table of the host's own that took no stage between the two validations.
@@ -1509,6 +1512,15 @@ On main three pickers say so: round robin, `random` and `passthrough`.
    the whole pass hands out for that seed, in that order; a worker whose state moved since the
    list said so ends the draw at once where the draw asks about it, and the whole pass decides as
    if nothing had been drawn.
+   A prefill and decode pair whose two sides both pick of two is decided on a draw of each side:
+   the two records each side's draw names are written, and the pair is the one the whole pass
+   names for that seed. It is drawn so only where each list holds its side's floor of workers (8
+   or 16, as above) and no ranks of a data-parallel engine, and every worker of both lists
+   publishes its routing state available; where the request states nothing beside its two lists
+   (no session key, no worker tried or excluded, no place, no held decode, no veto of its host);
+   where each side holds one partner class and the host's admission refuses no place of either
+   list; and where the document names no shadow and reads neither signal cells nor affinity.
+   Every other pair has every record of both lists written.
    A request whose session key holds no pin is decided on a draw too, where its sessions rule
    leaves a new key to a profile whose picker takes turns and whose filters are one test of a
    worker's record. The worker the list's counter points at has its record written first, with no
@@ -3322,7 +3334,8 @@ The store keeps one engine object for its life and puts each document it applies
 on it, by `InProcess::apply`, the call of a host that keeps one engine (section 8.1, step 6). The
 session pins, the record of sent
 prompts and the stages of a profile whose name and text did not change stand, with what they hold,
-and the members that stand are told to the stages built new alone. A decision runs under the
+under the rules of section 5.1, and the members that stand are told to the stages built new alone.
+A decision runs under the
 document of the world it read: the list's value it asks, its lease, the stages told that issue and
 its shadow's count are that document's, whatever document is applied meanwhile. A word of a lease on
 file is told by the document in force at the word, which on a controller is the one its store's
@@ -3493,7 +3506,7 @@ A fact leaves the remainder when the worker object gets a field that holds it as
    word: a drain and a connect signal write the object and tell the table, a key's next life
    starts in the status its worker object stood in, and a call's answer waits on no follow.
 
-   A change the store refuses lays nothing new: a refused write reads no record of the store, and a refused removal lays its record again as it was read. A
+   A change the store refuses lays nothing new: a refused write reads no record of the store, and a refused removal lays its record again. A
    record with no object waits for a cut laid whole, and its key's registration through the keeper is
    refused until then. It is one a store took as a decided change around the keeper, or one the store took and the registry did not get.
    A standby and a watcher also lay it at the next event that tells its record and that the store takes.
@@ -3595,11 +3608,12 @@ Three writes move the log's place outside the keeper's turn, and a
 copy stays whole beside each: a status tell changes no fact, and a generation's apply and a
 term's start change no record.
 
-The told status has six readers: the next status event, for
+The told status has seven readers: the next status event, for
 the status a record moved from, the event of a record changed in place, which carries it, the
 event of a record a write takes out, which is told in it where its writer handed the record, a
 first copy, a tell the store refused, whose object takes it back, and a standby's applier or
-a watcher, which lays it on the object. No decision reads it. An operator's read of a few
+a watcher, which lays it on the object. The seventh is a removal the store refused for its term:
+its record comes back in it, and its object is laid in it. No decision reads it. An operator's read of a few
 records is read as a first copy is cut, in the keeper's turn and with each record's told status,
 and the store's own read for it is deleted. The store's own
 cut of its table has no caller in the product and ends with step 4.
@@ -3626,9 +3640,15 @@ status. The store tells the journal first, with the call's term. The journal com
 term in the same turn of its lock that stamps the event. Where the log has left the term, it
 takes no event, and the store moves nothing.
 
-A probe's verdict names no term. Its writer's lead is asked last under the membership lock.
-The journal stamps the status behind that ask, with the term its store leads then or with
-none.
+A call's write of a record goes with the call's term too: a registration's write, a patch
+and a removal. The store tells the journal first and moves its tables behind the journal's
+yes. Where the log has left the term, nothing moves, and the call answers that the replica
+does not lead that term. A removal's object left the registry ahead of the store's word, so
+it is laid again from the record read off it, in the status the table holds.
+
+A probe's verdict, a health driver's connect signal and the settle behind an overload switch
+name no term. Each writer's lead is asked last under the membership lock. The journal stamps
+the status behind that ask, with the term its store leads then or with none.
 
 The log's term is as fresh as the election's last word to it. A call whose term ended while
 its write waited writes no status, and its drain answers that the replica does not lead that
@@ -3640,10 +3660,12 @@ The locks in their order: the object's own, then the store's membership lock. No
 holder of the store's lock takes an object's, and no decision takes one.
 
 From the table to an
-object there are two ways, both of a told status. A standby's applier and a gateway's watcher
+object there are three ways, each of a told status. A standby's applier and a gateway's watcher
 lay each status their leader tells, the status of each record it tells, and each status of a
-first copy. A tell the store refuses gives the object the status its record holds. The
-code that keeps a
+first copy. A tell the store refuses gives the object the status its record holds. A removal the
+store refuses for its term lays its object again in that status.
+
+The code that keeps a
 controller's objects follows no log of its own store: if it did, two moves in
 a row could end with the object at the older one. The store judges no health outcome: its
 own machine for one is deleted.

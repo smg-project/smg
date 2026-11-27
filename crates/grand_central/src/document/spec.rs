@@ -15,28 +15,20 @@
 //! schema validates the day its stage lands. [`PolicySpec::schema`] is that
 //! schema; the field documentation of this module is its descriptions.
 
-#![expect(
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
-
 use std::{
     borrow::Cow,
-    cmp::Ordering,
     collections::{btree_map, BTreeMap, BTreeSet},
-    fmt, io,
+    fmt,
     marker::PhantomData,
     sync::{Arc, LazyLock},
 };
 
-use rustc_hash::FxHashMap;
 use schemars::{json_schema, JsonSchema, Schema, SchemaGenerator};
 use serde::{
     de::{self, MapAccess, SeqAccess, Visitor},
     ser::SerializeMap,
     Deserialize, Deserializer, Serialize, Serializer,
 };
-use sha2::{Digest as _, Sha256};
 
 // The crate's own paths through this module still name the type here.
 pub(crate) use crate::document::applied::AppliedSpec;
@@ -51,7 +43,6 @@ use crate::{
         signals::{column_named, SignalColumn},
     },
     policies::{
-        self,
         bucket::Bucket,
         cache_aware::{Gates, KvPressure, PrefixAffinity, WarmupSlice},
         consistent_hashing::ConsistentHash,
@@ -72,6 +63,16 @@ use crate::{
         },
     },
     tracking::dispatch_credit::{DispatchCredit, SentSettings},
+};
+
+mod digest;
+mod presets;
+mod view_lists;
+
+pub use self::{
+    digest::Digest,
+    presets::{MANUAL_SESSION_HEADER, PRESETS},
+    view_lists::{ViewListPositions, ViewLists},
 };
 
 pub const API_VERSION: &str = "smg.policy/v1";
@@ -586,6 +587,7 @@ pub enum IndexKind {
 /// [`PolicySpec::index_for`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
+#[non_exhaustive]
 pub struct IndexSpec {
     pub kind: IndexKind,
     /// How long a placement of the classic hash index stays routable, in
@@ -918,6 +920,7 @@ impl Default for WarmupSliceParams {
 /// more than a factor of two since the last cut or the listing changed.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct BucketParams {
     /// The scorer's weight in the profile's combined score.
     #[serde(default = "one")]
@@ -1021,6 +1024,7 @@ impl Default for ConsistentHashParams {
 /// and a price in tokens for every request it holds.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ResidentWorkParams {
     /// The scorer's weight in the profile's combined score.
     #[serde(default = "one")]
@@ -1040,6 +1044,7 @@ const RELATIVE_MARGIN_LIMIT: f64 = 1e6;
 /// in the document's units. Lower cost scores higher.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct LeastCostParams {
     /// The scorer's weight in the profile's combined score.
     #[serde(default = "one")]
@@ -1140,6 +1145,7 @@ impl From<Unreported> for UnreportedEntry {
 /// The sum of the absolute and relative margins. Both default to zero.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
+#[non_exhaustive]
 pub struct CostMargin {
     /// In cost units.
     #[schemars(extend("minimum" = 0, "maximum" = COST_PARAMETER_LIMIT))]
@@ -1215,6 +1221,7 @@ impl JsonSchema for AbsoluteOrParts {
 /// The `best` picker's parameters.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct BestParams {
     /// How many rows the picker draws where the host names the request's
     /// holders and the pool's warming rows: a pool of more than twice this
@@ -1227,6 +1234,7 @@ pub struct BestParams {
 /// The `best-with-temperature` picker's parameters.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct BestWithTemperatureParams {
     /// The softmax temperature over the combined scores; at or above zero,
     /// 0 picks the best.
@@ -1368,6 +1376,7 @@ impl FilterStage {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[serde(expecting = "a rule with `used` and `capacity`, or the bare name `has-room`")]
+#[non_exhaustive]
 pub struct HasRoomParams {
     /// What a worker holds: field names and their coefficients, summed. At
     /// least one is required. A name written `signal.<name>` reads a signal
@@ -2128,6 +2137,7 @@ impl JsonSchema for PickSpec {
 /// picker.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ProfileSpec {
     /// The hard filters, in order: each a name, or the name of a filter the
     /// catalog adds mapped to its parameters. Which workers the hard
@@ -2167,10 +2177,32 @@ pub struct ProfileSpec {
     pub sent_report_delay_ms: Option<u32>,
 }
 
+impl ProfileSpec {
+    /// A profile of `pick` alone: what a document that writes its picker and
+    /// nothing else gives. It takes the one field a document must write.
+    /// The filters and the scorers start empty and the two limits of a send
+    /// unset, each as the field's own read leaves it where a document
+    /// leaves it out. It checks nothing: a document's validation does. Code
+    /// outside this crate starts here and assigns what it states otherwise:
+    /// the record gains fields, so no literal of it builds there, and a
+    /// pattern of it ends with `..`.
+    #[must_use]
+    pub const fn of(pick: PickSpec) -> Self {
+        Self {
+            filter: Vec::new(),
+            score: Vec::new(),
+            pick,
+            sent_ttl_ms: None,
+            sent_report_delay_ms: None,
+        }
+    }
+}
+
 /// A closed range with one or both bounds.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(rename = "Bounds_for_{T}")]
+#[non_exhaustive]
 pub struct Bounds<T> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min: Option<T>,
@@ -2182,6 +2214,7 @@ pub struct Bounds<T> {
 /// values.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct HeaderMatch {
     /// The header's name, lowercase, listed in `view.headers`.
     pub name: String,
@@ -2193,6 +2226,7 @@ pub struct HeaderMatch {
 /// What a binding matches on. Bindings are ordered; the first match wins.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
+#[non_exhaustive]
 pub struct Match {
     /// The model id after aliasing: an exact id, `prefix*`, `*suffix` or
     /// `*`.
@@ -2260,6 +2294,7 @@ pub const OVERLOAD_TOKEN_USAGE: f32 = 0.8;
 /// does.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
+#[non_exhaustive]
 pub struct OverloadSpec {
     /// Whether the host's thresholds veto at all (a worker's own block still
     /// does).
@@ -2410,6 +2445,7 @@ pub enum RulePlaced {
 /// key was first placed on.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct SessionsSpec {
     /// The header whose value is the session key; listed in `view.headers`.
     /// Left out where the binding names its key's sources under
@@ -2488,6 +2524,7 @@ fn default_inflight_cap() -> u16 {
 /// enters a view, so the list is not held to `view.headers`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct RoutingKeySpec {
     /// The sources, read in order: one to eight, each named once, with up
     /// to four client sources and one target source beside them.
@@ -2500,9 +2537,27 @@ pub struct RoutingKeySpec {
     pub strip_lineage: bool,
 }
 
+impl RoutingKeySpec {
+    /// A routing key read from `sources` alone: what a document that writes
+    /// its sources and nothing else gives. It takes the one field a document
+    /// must write. `strip_lineage` starts false, as the field's own read
+    /// leaves it where a document leaves it out. It checks nothing: a
+    /// document's validation does. Code outside this crate starts here and
+    /// assigns what it states otherwise: the record gains fields, so no
+    /// literal of it builds there, and a pattern of it ends with `..`.
+    #[must_use]
+    pub const fn of(sources: Vec<KeySourceSpec>) -> Self {
+        Self {
+            sources,
+            strip_lineage: false,
+        }
+    }
+}
+
 /// One source of a routing key: exactly one of `header` and `rid`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
+#[non_exhaustive]
 pub struct KeySourceSpec {
     /// A request header, lowercase. A credential header is refused, as on
     /// `view.headers`; `cookie` is not. A key from a header `view.headers`
@@ -2563,6 +2618,7 @@ pub struct KeySourceSpec {
 /// `tenants` and `header` chooses the share.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct CanarySpec {
     /// The profile deciding the canary's share.
     pub profile: String,
@@ -2690,6 +2746,7 @@ impl<'de> Deserialize<'de> for ShadowSpec {
 /// and the rules around the decision.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
+#[non_exhaustive]
 pub struct BindingSpec {
     #[serde(rename = "match")]
     pub matcher: Match,
@@ -2758,6 +2815,7 @@ pub struct ExplainSpec {
 /// document's stages read beside the rows.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct SignalSpec {
     /// The unit a source states for its value to be taken: 1 to 31 ASCII
     /// characters with no space. It is compared byte for byte with the
@@ -2863,9 +2921,13 @@ pub struct PolicySpec {
         "propertyNames" = { "pattern": SIGNAL_NAME_PATTERN }
     ))]
     pub signals: BTreeMap<String, SignalSpec>,
-    /// The profiles by name, each of at least one character.
+    /// From 1 to 65535 profiles by name, each name of at least one character.
     #[serde(deserialize_with = "keyed_once")]
-    #[schemars(extend("propertyNames" = { "minLength": 1 }))]
+    #[schemars(extend(
+        "minProperties" = 1,
+        "maxProperties" = u16::MAX,
+        "propertyNames" = { "minLength": 1 }
+    ))]
     pub profiles: BTreeMap<String, ProfileSpec>,
     /// The plans' rules.
     #[serde(default, skip_serializing_if = "is_default")]
@@ -5260,145 +5322,7 @@ fn session_rule(
     })
 }
 
-/// The ten preset names of today, as whole profiles.
-pub const PRESETS: [&str; 10] = [
-    "random",
-    "round_robin",
-    "passthrough",
-    "power_of_two",
-    "least_load",
-    "consistent_hashing",
-    "prefix_hash",
-    "manual",
-    "cache_aware",
-    "bucket",
-];
-
-/// The header the `manual` preset names as its session key, the gateway's
-/// routing-key header; the host feeds the key it resolved under it.
-pub const MANUAL_SESSION_HEADER: &str = "x-smg-routing-key";
-
-/// The routing key sources of a preset whose ring places by the key, as
-/// the gateway's policy of that name reads them at its defaults: the
-/// routing key header, and for the hash ring, behind it, the two headers
-/// that tell one client from another, as client sources. `None` for every
-/// other preset: `manual` names its one header in its sessions rule, and no
-/// other preset's stage reads a key.
-fn preset_routing_key(name: &str) -> Option<RoutingKeySpec> {
-    let header = |name: &str, client| KeySourceSpec {
-        header: Some(name.to_string()),
-        client,
-        ..KeySourceSpec::default()
-    };
-    let sources = match name {
-        "prefix_hash" => policies::prefix_hash::key_sources(header),
-        "consistent_hashing" => policies::consistent_hashing::key_sources(header),
-        _ => return None,
-    };
-    Some(RoutingKeySpec {
-        sources,
-        strip_lineage: false,
-    })
-}
-
 impl PolicySpec {
-    /// A spec of one preset profile bound to every model and phase.
-    pub fn preset(name: &str) -> Result<Self, SpecError> {
-        let profile = match name {
-            "random" => policies::random::profile(),
-            "round_robin" => policies::round_robin::profile(),
-            "passthrough" => policies::passthrough::profile(),
-            "power_of_two" => policies::power_of_two::profile(),
-            "least_load" => policies::least_load::profile(),
-            "consistent_hashing" => policies::consistent_hashing::profile(),
-            "prefix_hash" => policies::prefix_hash::profile(),
-            "manual" => policies::manual::profile(),
-            "cache_aware" => policies::cache_aware::profile(),
-            "bucket" => policies::bucket::profile(),
-            other => return Err(SpecError::UnknownPreset(other.to_string())),
-        };
-        let manual = name == "manual";
-        let sessions = manual.then(policies::manual::sessions);
-        let view = ViewSpec {
-            headers: if manual {
-                policies::manual::view_headers()
-            } else {
-                vec![]
-            },
-            ..ViewSpec::default()
-        };
-        let mut profiles = BTreeMap::new();
-        profiles.insert(name.to_string(), profile);
-        Ok(Self {
-            api_version: API_VERSION.to_string(),
-            generation: 1,
-            kind: None,
-            view,
-            index: BTreeMap::new(),
-            signals: BTreeMap::new(),
-            profiles,
-            plans: PlansSpec::default(),
-            bindings: vec![BindingSpec {
-                profile: Some(name.to_string()),
-                routing_key: preset_routing_key(name),
-                sessions,
-                ..BindingSpec::default()
-            }],
-            explain: ExplainSpec::default(),
-        })
-    }
-
-    /// A pair spec: `prefill` and `decode` presets under the `pd-pair` plan,
-    /// with the capacity and room filters in front of each side.
-    pub fn pair_presets(prefill: &str, decode: &str) -> Result<Self, SpecError> {
-        let mut spec = Self::preset(prefill)?;
-        let decode_spec = Self::preset(decode)?;
-        let mut prefill_profile = spec.profiles.remove(prefill).ok_or(SpecError::Empty)?;
-        prefill_profile.filter.insert(2, "has-capacity".into());
-        let mut decode_profile = decode_spec
-            .profiles
-            .get(decode)
-            .cloned()
-            .ok_or(SpecError::Empty)?;
-        decode_profile.filter.insert(2, "has-room".into());
-        spec.profiles.clear();
-        spec.profiles.insert("prefill".into(), prefill_profile);
-        spec.profiles.insert("decode".into(), decode_profile);
-        let mut profiles = BTreeMap::new();
-        profiles.insert("prefill".to_string(), "prefill".to_string());
-        profiles.insert("decode".to_string(), "decode".to_string());
-        spec.bindings = vec![BindingSpec {
-            plan: Some(PlanName::PdPair),
-            profiles,
-            // One request, one key: the sides' session sources are the one
-            // header, and the hash ring's side adds its client sources.
-            routing_key: [prefill, decode]
-                .into_iter()
-                .filter_map(preset_routing_key)
-                .max_by_key(|key| key.sources.len()),
-            ..BindingSpec::default()
-        }];
-        Ok(spec)
-    }
-
-    /// An encode-prefill-decode spec: the `encode` preset over the encode
-    /// pool and the pair presets of [`PolicySpec::pair_presets`], under the
-    /// `epd` plan.
-    pub fn epd_presets(encode: &str, prefill: &str, decode: &str) -> Result<Self, SpecError> {
-        let mut spec = Self::pair_presets(prefill, decode)?;
-        let encode_profile = Self::preset(encode)?
-            .profiles
-            .remove(encode)
-            .ok_or(SpecError::Empty)?;
-        spec.profiles.insert("encode".into(), encode_profile);
-        let binding = spec.bindings.first_mut().ok_or(SpecError::Empty)?;
-        binding.plan = Some(PlanName::Epd);
-        binding
-            .profiles
-            .insert("encode".to_string(), "encode".to_string());
-        Ok(spec)
-    }
-
     /// Validate the document and build the engine; the needs summary comes
     /// with it. The built-in header deny-list applies; a host with a tenant
     /// header of its own uses [`PolicySpec::validate_with`].
@@ -5641,110 +5565,6 @@ impl PolicySpec {
         text.push('\n');
         Ok(text)
     }
-
-    /// The document's digest ([`Digest`]): a change of the file's form or of
-    /// the `generation` line leaves it as it was, and any other change to a
-    /// document the validator admits moves it. A `kind` line is in no
-    /// canonical form and so in no digest: the validator refuses it, and
-    /// equal digests say nothing of a document that was not validated.
-    pub fn digest(&self) -> Result<Digest, SpecError> {
-        let mut hash = Sha256::new();
-        serde_json::to_writer(HashWriter(&mut hash), &self.lineless())
-            .map_err(|error| SpecError::NoCanonicalForm(error.to_string()))?;
-        Ok(Digest(hash.finalize().into()))
-    }
-
-    /// The document's canonical form, borrowed: a digest copies none of the
-    /// document. Every field is named here, so a field the type gains does
-    /// not compile until this form takes it or leaves it out by name.
-    fn lineless(&self) -> Lineless<'_> {
-        let Self {
-            api_version,
-            generation: _,
-            kind: _,
-            view,
-            index,
-            signals,
-            profiles,
-            plans,
-            bindings,
-            explain,
-        } = self;
-        Lineless {
-            api_version,
-            generation: 0,
-            view,
-            index,
-            signals,
-            profiles,
-            plans,
-            bindings,
-            explain,
-        }
-    }
-}
-
-/// A document's canonical form ([`Digest`]) by reference: [`PolicySpec`]'s
-/// fields in its order and under its attributes, the `generation` line
-/// zeroed and no `kind` line. It serializes as the document itself does
-/// under a zeroed line, byte for byte.
-#[derive(Serialize)]
-struct Lineless<'a> {
-    #[serde(rename = "apiVersion")]
-    api_version: &'a str,
-    generation: u64,
-    #[serde(skip_serializing_if = "is_default::<ViewSpec>")]
-    view: &'a ViewSpec,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    index: &'a BTreeMap<String, IndexSpec>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    signals: &'a BTreeMap<String, SignalSpec>,
-    profiles: &'a BTreeMap<String, ProfileSpec>,
-    #[serde(skip_serializing_if = "is_default::<PlansSpec>")]
-    plans: &'a PlansSpec,
-    bindings: &'a [BindingSpec],
-    #[serde(skip_serializing_if = "is_default::<ExplainSpec>")]
-    explain: &'a ExplainSpec,
-}
-
-/// A document's digest: SHA-256 over its canonical bytes, which are the
-/// document's JSON as [`PolicySpec`] serializes (its maps ordered, its fields
-/// in the type's order) with the `generation` line zeroed. Two files that
-/// parse into one document share it whatever their form (YAML or JSON, the
-/// order of their keys, their comments), and a document applied again under
-/// a higher number keeps it. It is written `sha256:` and 64 hex digits.
-///
-/// The canonical bytes are this build's: two builds whose schema differs may
-/// print two digests for one file.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Digest([u8; 32]);
-
-impl fmt::Display for Digest {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("sha256:")?;
-        self.0.iter().try_for_each(|byte| write!(f, "{byte:02x}"))
-    }
-}
-
-impl fmt::Debug for Digest {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(self, f)
-    }
-}
-
-/// What a serializer writes, fed to a hash: the canonical bytes are never
-/// held whole.
-struct HashWriter<'a>(&'a mut Sha256);
-
-impl io::Write for HashWriter<'_> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.update(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
 }
 
 pub(super) fn index_matching<'a>(
@@ -5756,147 +5576,6 @@ pub(super) fn index_matching<'a>(
         .filter(|(pattern, _)| glob_matches(pattern, model))
         .max_by_key(|(pattern, _)| specificity(pattern))
         .map(|(pattern, spec)| (pattern.as_str(), spec))
-}
-
-/// The lists a generation declares, as the writer of a worker's candidate
-/// row ([`Candidate`](crate::engine::view::Candidate)) reads them: the row names its
-/// engine family and its zone by a position from 1, and holds one bit for
-/// each label selector the worker meets. Built once, at validation.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct ViewLists {
-    /// The label selectors in their keys' order, each with its bit: a
-    /// worker's labels are in their keys' order too, so one pass over the
-    /// two finds every selector the worker meets.
-    labels: Vec<LabelSelector>,
-    zones: FxHashMap<Box<str>, u16>,
-    engines: FxHashMap<Box<str>, u16>,
-}
-
-/// One label selector: its key, the value it asks for when it names one,
-/// and its bit, which is its place in the document's list.
-#[derive(Debug, PartialEq, Eq)]
-struct LabelSelector {
-    key: Box<str>,
-    value: Option<Box<str>>,
-    bit: u8,
-}
-
-/// What one worker's registration reads as under a generation's lists.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct ViewListPositions {
-    /// The position of the worker's engine family, from 1; `0` when the
-    /// list does not name it.
-    pub engine_kind: u16,
-    /// The position of the worker's zone, from 1; `0` for a worker with no
-    /// zone and for a zone the list does not name.
-    pub zone: u16,
-    /// One bit for each label selector the worker meets.
-    pub labels: u64,
-}
-
-impl ViewLists {
-    pub(super) fn of(view: &ViewSpec) -> Self {
-        let positions = |list: &[String]| {
-            let named = list.iter().zip(1u16..);
-            named.map(|(name, at)| (name.as_str().into(), at)).collect()
-        };
-        let sides = |(label, bit): (&String, u8)| {
-            let (key, value) = selector(label);
-            LabelSelector {
-                key: key.into(),
-                value: value.map(Into::into),
-                bit,
-            }
-        };
-        let mut labels: Vec<LabelSelector> = view.labels.iter().zip(0u8..).map(sides).collect();
-        // The sort is stable: selectors of one key keep the list's order.
-        labels.sort_by(|a, b| a.key.cmp(&b.key));
-        Self {
-            labels,
-            zones: positions(&view.zones),
-            engines: positions(&view.engines),
-        }
-    }
-
-    /// Whether the generation declares no list: every row reads 0 in the
-    /// three fields, and a store looks nothing up.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.labels.is_empty() && self.zones.is_empty() && self.engines.is_empty()
-    }
-
-    /// Whether these lists can leave a worker outside them: they name an
-    /// engine family or a zone. Label selectors alone leave none outside.
-    #[must_use]
-    pub(crate) fn names_a_family_or_zone(&self) -> bool {
-        !self.zones.is_empty() || !self.engines.is_empty()
-    }
-
-    /// A worker's three fields under these lists, from the engine family,
-    /// the zone and the labels of its registration.
-    #[must_use]
-    pub fn positions(
-        &self,
-        engine: &str,
-        zone: Option<&str>,
-        labels: &BTreeMap<String, String>,
-    ) -> ViewListPositions {
-        ViewListPositions {
-            engine_kind: self.engine(engine).0.unwrap_or(0),
-            zone: self.zone(zone).0.unwrap_or(0),
-            labels: self.met(labels),
-        }
-    }
-
-    /// Whether a worker's engine family and its zone stand outside these
-    /// lists, the family first: the worker names one, and its list holds
-    /// entries and not that one. No label is read.
-    #[must_use]
-    pub(crate) fn outside(&self, engine: &str, zone: Option<&str>) -> (bool, bool) {
-        (self.engine(engine).1, self.zone(zone).1)
-    }
-
-    /// The position of an engine family, and whether it stands outside the
-    /// list: the worker names one, and the list holds entries and not that
-    /// one.
-    fn engine(&self, engine: &str) -> (Option<u16>, bool) {
-        let at = self.engines.get(engine).copied();
-        let outside = at.is_none() && !engine.is_empty() && !self.engines.is_empty();
-        (at, outside)
-    }
-
-    /// The position of a zone and whether it stands outside the list, as
-    /// [`Self::engine`] reads a family. An empty zone is no zone.
-    fn zone(&self, zone: Option<&str>) -> (Option<u16>, bool) {
-        let zone = zone.filter(|zone| !zone.is_empty());
-        let at = zone.and_then(|zone| self.zones.get(zone).copied());
-        let outside = at.is_none() && zone.is_some() && !self.zones.is_empty();
-        (at, outside)
-    }
-
-    /// The bits of the selectors a worker's labels meet, in one pass over
-    /// the two, each in its keys' order.
-    fn met(&self, labels: &BTreeMap<String, String>) -> u64 {
-        let mut bits = 0;
-        let mut wanted = self.labels.iter().peekable();
-        'held: for (key, held) in labels {
-            while let Some(want) = wanted.peek() {
-                match (*want.key).cmp(key.as_str()) {
-                    Ordering::Less => {}
-                    Ordering::Greater => continue 'held,
-                    Ordering::Equal => {
-                        let value = want.value.as_deref();
-                        let met = value.is_none_or(|value| value == held.as_str());
-                        bits |= u64::from(met) << want.bit;
-                    }
-                }
-                wanted.next();
-            }
-            break;
-        }
-        bits
-    }
 }
 
 #[cfg(test)]

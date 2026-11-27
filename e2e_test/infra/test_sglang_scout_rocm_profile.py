@@ -1,7 +1,6 @@
 """Real Worker command construction and vendor contracts; never start an engine."""
 
 import copy
-from enum import StrEnum
 
 import pytest
 from infra import constants
@@ -41,10 +40,7 @@ def enable(monkeypatch, vendor="amd"):
 @pytest.mark.parametrize("vendor", ["amd", " AMD ", "AMD"])
 def test_amd_scout_uses_sdk_attention_default(monkeypatch, vendor):
     actual = worker()
-    assert isinstance(actual, Worker)
-    assert isinstance(actual.mode, StrEnum)
-    assert type(actual.mode) is ConnectionMode
-    assert type(actual.worker_type) is WorkerType
+    mode_before, role_before = actual.mode, actual.worker_type
     before_specs = copy.deepcopy(MODEL_SPECS)
     reference = actual._build_cmd()
     assert "--attention-backend=fa3" in reference
@@ -52,6 +48,8 @@ def test_amd_scout_uses_sdk_attention_default(monkeypatch, vendor):
     command = actual._build_cmd()
     assert command == [arg for arg in reference if arg != "--attention-backend=fa3"]
     assert MODEL_SPECS == before_specs
+    assert actual.mode is mode_before
+    assert actual.worker_type is role_before
     assert command[command.index("--tp-size") + 1] == "4"
     assert "--grpc-mode" in command
 
@@ -121,11 +119,17 @@ def test_profile_refuses_pd_roles(monkeypatch, role):
         worker(worker_type=role)._build_cmd()
 
 
-def test_profile_refuses_other_tp_and_extra_arguments(monkeypatch):
+@pytest.mark.parametrize(
+    "options",
+    [
+        pytest.param({"tp": 2}, id="tp"),
+        pytest.param({"extra_engine_args": ["--attention-backend", "fa3"]}, id="extra-arguments"),
+    ],
+)
+def test_profile_refuses_other_tp_and_extra_arguments(monkeypatch, options):
     enable(monkeypatch)
-    for options in ({"tp": 2}, {"extra_engine_args": ["--attention-backend", "fa3"]}):
-        with pytest.raises(ValueError, match="original TP4 gRPC"):
-            worker(**options)._build_cmd()
+    with pytest.raises(ValueError, match="original TP4 gRPC"):
+        worker(**options)._build_cmd()
 
 
 @pytest.mark.parametrize(

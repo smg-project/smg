@@ -264,7 +264,12 @@ impl<F> Opened<F> {
 impl Opened {
     /// Says `Hello` and takes the `Welcome`, which carries `term`.
     async fn welcomed(&mut self, term: u64) -> proto::Welcome {
-        self.send(hello(GATEWAY)).await;
+        self.welcomed_as(GATEWAY, term).await
+    }
+
+    /// The same, of the gateway `name`.
+    async fn welcomed_as(&mut self, name: &str, term: u64) -> proto::Welcome {
+        self.send(hello(name)).await;
         let answer = self.frame().await;
         assert_eq!(answer.term, term, "{answer:?}");
         match answer.frame {
@@ -824,6 +829,34 @@ async fn a_second_session_ends_the_first_and_the_last_streams_end_starts_the_gra
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
     assert!(bed.present(Instant::now()));
+}
+
+/// A session takes its seat under its principal's subject. A gateway whose
+/// row the table holds under that name is welcomed again and takes the
+/// earlier seat's place: under another name the table would refuse it as
+/// another subject's. Two gateways show it, each under its own name.
+#[tokio::test]
+async fn a_session_takes_its_seat_under_its_principals_subject() {
+    let mut bed = bed(PATIENT).await;
+    bed.leads(1);
+    for name in [GATEWAY, "gateway-b"] {
+        // The gateway's row as the table seats it itself, under its own
+        // name.
+        let gateway = told(name).gateway();
+        let earlier = bed
+            .shared
+            .gateways
+            .welcome(gateway, name, 1, Instant::now())
+            .expect("the table seats the gateway");
+        assert!(!earlier.replaced());
+
+        let mut session = open_as(bed.addr, name).await;
+        session.welcomed_as(name, 1).await;
+        assert!(
+            earlier.replaced(),
+            "the session of {name} took the earlier seat's place"
+        );
+    }
 }
 
 /// A `Hello` past the ceiling of present gateways is refused by name,

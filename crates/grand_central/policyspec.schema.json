@@ -38,11 +38,13 @@
       }
     },
     "profiles": {
-      "description": "The profiles by name, each of at least one character.",
+      "description": "From 1 to 65535 profiles by name, each name of at least one character.",
       "type": "object",
       "additionalProperties": {
         "$ref": "#/$defs/ProfileSpec"
       },
+      "minProperties": 1,
+      "maxProperties": 65535,
       "propertyNames": {
         "minLength": 1
       }

@@ -526,6 +526,26 @@ fn an_engines_ranks_are_answered_by_their_rows() {
     assert_eq!(objects.rank_row(alone, 1), None);
 }
 
+/// The rows of an engine's ranks are answered whole, asked of its rank 0
+/// row: its own and every other rank's. A row above rank 0 is answered
+/// none, a row that is its own engine itself alone, and a rank's row
+/// that left is in no answer.
+#[test]
+fn an_engines_rows_are_answered_whole_to_its_rank_0_row() {
+    let replica = Replica::new();
+    let lower = replica.write(rank_facts(A, C, 0));
+    let upper = replica.write(rank_facts(B, C, 1));
+    let alone = replica.write(facts(D, 1));
+    let objects = &replica.objects;
+    assert_eq!(objects.rank_rows(lower), [lower, upper]);
+    assert!(objects.rank_rows(upper).is_empty());
+    assert_eq!(objects.rank_rows(alone), [alone]);
+
+    replica.remove(B);
+    assert_eq!(objects.rank_rows(lower), [lower]);
+    assert!(objects.rank_rows(upper).is_empty());
+}
+
 /// An engine's address that ends in a slash is the address its ranks
 /// stand under, as its rows state it. A rank above 0 is answered by its
 /// row, and by none once that row left.

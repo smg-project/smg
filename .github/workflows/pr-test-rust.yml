@@ -128,7 +128,7 @@ jobs:
           pytest -q crates/grpc_client/python/tests
 
   build-wheel:
-    # CPU-only Rust/wheel/Go-FFI/WASM compile — no GPU needed. Runs on the CPU
+    # CPU-only Rust/wheel/WASM compile — no GPU needed. Runs on the CPU
     # runner pool (which also tolerates the nvidia.com/gpu taint, so it can use
     # the abundant stranded CPU on GPU nodes) instead of competing for scarce
     # GPU runners.
@@ -148,7 +148,7 @@ jobs:
       - name: Setup Rust
         uses: ./.github/actions/setup-rust
 
-      - name: Build Python wheel and Go FFI library
+      - name: Build Python wheel
         run: |
           rm -rf bindings/python/dist/
           bash scripts/ci_setup_python_venv.sh
@@ -185,13 +185,6 @@ jobs:
           path: bindings/python/dist/*.whl
           retention-days: 7
 
-      - name: Upload Go FFI library artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: go-ffi-library
-          path: bindings/golang/target/release/libsmg_go.*
-          retention-days: 1
-
       - name: Upload Python client types
         uses: actions/upload-artifact@v7
         with:
@@ -218,6 +211,35 @@ jobs:
           python3 -c "import smg; print('Python package: OK')"
           python3 -c "from smg.smg_rs import Router; print('Rust extension: OK')"
           python3 -m smg.launch_router --help > /dev/null && echo "Entry point: OK"
+
+  build-go-ffi:
+    # CPU-only Go FFI compile — runs in parallel with build-wheel so Go FFI
+    # does not contend with maturin or block Python/GPU E2E jobs that only
+    # need the wheel.
+    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          cache-key: go-ffi
+
+      - name: Build Go FFI library
+        run: |
+          source "$HOME/.cargo/env"
+          make -C bindings/golang build CARGO_BUILD_DIR="$PWD/target" CARGO_PROFILE=ci
+          ls -lh target/ci/libsmg_go.*
+
+      - name: Upload Go FFI library artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: go-ffi-library
+          path: target/ci/libsmg_go.*
+          retention-days: 1
+          if-no-files-found: error
 
   python-unit-tests:
     needs: build-wheel
@@ -2462,7 +2484,7 @@ jobs:
 
   go-unit-tests:
     name: go-unit-tests
-    needs: build-wheel
+    needs: build-go-ffi
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     timeout-minutes: 15
     permissions:
@@ -2498,11 +2520,12 @@ jobs:
 
   go-bindings-e2e:
     name: go-bindings-e2e
-    needs: [build-wheel, detect-changes]
+    needs: [build-wheel, build-go-ffi, detect-changes]
     if: >-
       always()
       && !cancelled()
       && needs.build-wheel.result == 'success'
+      && needs.build-go-ffi.result == 'success'
       && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
       && needs.detect-changes.outputs.skip-go-bindings != 'true'
     runs-on: ${{ vars.SMG_RUNNER_GPU_1 || '1-gpu-h100' }}
@@ -2563,7 +2586,7 @@ jobs:
 
   go-bindings-benchmark:
     name: go-bindings-benchmark
-    needs: build-wheel
+    needs: [build-wheel, build-go-ffi]
     if: false  # Disabled
     runs-on: ${{ vars.SMG_RUNNER_GPU || 'k8s-runner-gpu' }}
     container: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
@@ -2617,7 +2640,7 @@ jobs:
           path: benchmark_go_bindings/
 
   finish:
-    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-chat-python-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-chat-sglang-amd, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-cpu-mock, e2e-vendor, go-unit-tests, go-bindings-e2e]
+    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, build-go-ffi, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-chat-python-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-chat-sglang-amd, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-cpu-mock, e2e-vendor, go-unit-tests, go-bindings-e2e]
     if: always()
     # A hosted runner, never a self-hosted pool: this job runs on a cancelled
     # run too, and a cancelled run is complete only once it has run. Until
@@ -2689,6 +2712,7 @@ jobs:
                 "${{ needs.python-lint.result }}" =~ $bad || \
                 "${{ needs.grpc-proto-build-check.result }}" =~ $bad || \
                 "${{ needs.build-wheel.result }}" =~ $bad || \
+                "${{ needs.build-go-ffi.result }}" =~ $bad || \
                 "${{ needs.python-unit-tests.result }}" =~ $bad || \
                 "${{ needs.rust-lint.result }}" =~ $bad || \
                 "${{ needs.rust-tests.result }}" =~ $bad || \

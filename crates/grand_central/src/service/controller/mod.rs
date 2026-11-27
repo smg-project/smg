@@ -1032,11 +1032,12 @@ impl Controller {
             });
         }
         // The presence sweep: what a gateway held is let go once its grace
-        // period ended with no new `Hello`.
-        let gateways = Arc::clone(&shared.gateways);
-        let sweep_stop = stop.subscribe();
+        // period ended with no new `Hello`. The names that left, the leases
+        // past their dispatch deadline and the upkeep of the standing
+        // document's engine ride its task's clock (`Gateways::run`).
+        let sweep = shared.sweep(stop.subscribe());
         tasks.spawn(async move {
-            gateways.run(sweep_stop).await;
+            sweep.await;
             Ok(())
         });
         // The restores' clock: a leader lets go of a snapshot's cut whose

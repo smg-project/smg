@@ -19,6 +19,9 @@ import sys
 
 import pytest
 from infra import (
+    DEFAULT_MODEL,
+    ENV_MODEL,
+    THIRD_PARTY_MODELS,
     ConnectionMode,
     Gateway,
     cleanup_pool,
@@ -27,6 +30,7 @@ from infra import (
     get_servicer_impl,
     get_zmq_engine_count,
 )
+from infra.constants import get_startup_profile, validate_startup_profile_selection
 from infra.worker_pool import get_pool
 
 from .markers import model_id_for_engine, resolve_class_marker
@@ -66,7 +70,10 @@ def pytest_runtest_makereport(item: pytest.Item, call):
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    """Register custom markers."""
+    """Register custom markers and validate an opt-in startup selection."""
+    validate_startup_profile_selection(config)
+    if os.environ.get("E2E_STARTUP_PROFILE", "").strip():
+        get_startup_profile()
     config.addinivalue_line(
         "markers",
         "engine(*names): engines this test runs on (sglang, vllm, trtllm)",
@@ -543,6 +550,9 @@ class _SelectionReporter:
             # collection error that pytest reports after this hook. A floor
             # exit here would replace that error's own message and exit code.
             return
+        if os.environ.get("E2E_STARTUP_PROFILE", "").strip():
+            validate_startup_profile_selection(session.config, session.items)
+            get_startup_profile()
         _enforce_selection_floor(len(session.items))
 
 
@@ -760,9 +770,14 @@ def _pool_sort_key(item: pytest.Item) -> tuple:
     Primary: backend parametrize value — ``setup_backend`` for class-scope
     fixtures, falling back to ``backend_router`` for function-scope ones.
     Different backends mean different pool keys.
-    Secondary: ``@pytest.mark.model`` value if set, else empty — same
-    backend with the same model is the cache-hit case.
-    Tertiary: ``item.nodeid`` for stability across collections.
+    Secondary: resolved model id — ``@pytest.mark.model`` when set, or
+    ``E2E_MODEL`` / ``DEFAULT_MODEL`` for local backend items so unmarked
+    classes cluster with classes that explicitly name the default model.
+    Tertiary: worker topology ``(count, gpus, extra_engine_args)`` so classes
+    with custom engine flags or multi-worker counts do not interleave with and
+    evict default single-worker pools for the same model.
+    Quaternary: ZMQ reuse serving config (when applicable), then
+    ``item.nodeid`` for stability across collections.
     """
     backend = ""
     callspec = getattr(item, "callspec", None)
@@ -770,8 +785,22 @@ def _pool_sort_key(item: pytest.Item) -> tuple:
         params = getattr(callspec, "params", {}) or {}
         backend = str(params.get("setup_backend", params.get("backend_router", "")))
 
+    default_model = (
+        os.environ.get(ENV_MODEL, DEFAULT_MODEL)
+        if backend and backend not in THIRD_PARTY_MODELS
+        else ""
+    )
     model_marker = resolve_class_marker(item, "model")
-    model = str(model_id_for_engine(model_marker, get_runtime(), default=""))
+    model = str(model_id_for_engine(model_marker, get_runtime(), default=default_model))
+
+    workers = resolve_class_marker(item, "workers")
+    worker_kwargs = workers.kwargs if workers is not None else {}
+    raw_gpus = worker_kwargs.get("gpus")
+    worker_topology = (
+        int(worker_kwargs.get("count") or 1),
+        int(raw_gpus) if isinstance(raw_gpus, int) and not isinstance(raw_gpus, bool) else -1,
+        tuple(str(arg) for arg in (worker_kwargs.get("extra_engine_args") or ())),
+    )
 
     gateway = resolve_class_marker(item, "gateway")
     serving_config = ("", "")
@@ -780,14 +809,13 @@ def _pool_sort_key(item: pytest.Item) -> tuple:
         and gateway is not None
         and gateway.kwargs.get("reuse")
     ):
-        workers = resolve_class_marker(item, "workers")
         # Literal marker configuration only: do not fold defaults or reorder
         # CLI arguments to declare two serving instances compatible.
         serving_config = (
             repr(sorted(workers.kwargs.items())) if workers is not None else "",
             repr(sorted(gateway.kwargs.items())),
         )
-    return (backend, model, *serving_config, item.nodeid)
+    return (backend, model, worker_topology, *serving_config, item.nodeid)
 
 
 # ---------------------------------------------------------------------------

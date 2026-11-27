@@ -235,8 +235,13 @@ fn a_page_counts_its_json_to_the_byte() {
     use std::time::Duration;
 
     let admitted = Instant::now();
-    // An age of twenty digits, a number's longest.
-    let taken = admitted + Duration::from_secs(10_000_000_000_000_000);
+    // An age of twenty digits, a number's longest: the take stands 10^16
+    // seconds after the admission, more than a narrow instant holds.
+    let taken = admitted
+        .checked_add(Duration::from_secs(10_000_000_000_000_000))
+        .expect("an instant that holds 10^16 seconds more");
+    let aged = serde_json::to_value(RowJson::of(&short(1, admitted), taken)).expect("a row's JSON");
+    assert_eq!(aged["admitted_age_ms"], 10_000_000_000_000_000_000_u64);
     let mut provided = short(3, admitted);
     provided.facts.key = "grpc://user:secret@10.0.0.5:8000".to_owned();
     provided.facts.engine = provided.facts.key.clone();
@@ -278,11 +283,12 @@ fn a_page_counts_its_json_to_the_byte() {
     assert_eq!(bytes, written + 1);
 }
 
-/// A full page holds the rows whose JSON fits: it is cut, its count is
-/// its JSON's length and one, the count is inside the page's bytes, and
-/// the next row would have passed them. Short rows, rows that state every
-/// number at its longest, rows of a pair and rows of texts JSON escapes
-/// each fill a page so.
+/// A full page holds the rows whose JSON fits, but for a row that would
+/// end the cut page's JSON on the bound's last byte: the page is cut, its
+/// count is its JSON's length and one, the count is inside the page's
+/// bytes, and the next row would have passed them. Short rows, rows that
+/// state every number at its longest, rows of a pair and rows of texts
+/// JSON escapes each fill a page so.
 #[test]
 fn a_full_page_holds_the_rows_whose_json_fits() {
     let now = Instant::now();
@@ -316,6 +322,188 @@ fn a_full_page_holds_the_rows_whose_json_fits() {
             next.len()
         );
     }
+}
+
+/// A shared cut pages by the count and the rule a lone read's rows page
+/// by. The count is its page's JSON with `truncated` at its longer word,
+/// the commas and the page's own bytes with it. So a page that left no row
+/// out counts its JSON to the byte, with five rows, with four and with
+/// none, and a page that left a row out, at the call's limit or at the
+/// bound, writes one byte fewer than its count. A row told without its
+/// credential counts as it is told, and a row that serves no model of the
+/// call adds nothing. The first row must fit the bound too.
+#[test]
+fn a_shared_cut_counts_its_json_to_the_byte() {
+    use crate::store::Position;
+
+    let now = Instant::now();
+    // A row with a credential in its two addresses.
+    let mut secret = short(3, now);
+    secret.facts.key = "grpc://user:secret@10.0.0.5:8000".to_owned();
+    secret.facts.engine = secret.facts.key.clone();
+    let mut other = paired(4, now);
+    other.facts.models = vec!["other".to_owned()];
+    let shared = |rows| {
+        Arc::new(StoreCheckpoint {
+            at: Position::default(),
+            epoch: 1,
+            rows,
+        })
+    };
+    // Five rows by key, as a cut holds them.
+    let cut = shared(vec![
+        secret,
+        short(1, now),
+        paired(2, now),
+        other,
+        longest(5, now),
+    ]);
+    let counted = |cut: &Arc<StoreCheckpoint>, models: &[&str], limit: usize| {
+        let asked = WorkerRowsQuery {
+            models: models.iter().map(|&model| model.to_owned()).collect(),
+            limit,
+        };
+        let (page, bytes) = counted_page(&asked, Rows::Shared(Arc::clone(cut)), now);
+        let json = serde_json::to_vec(&page).expect("a page's JSON");
+        (page, bytes, json.len())
+    };
+
+    let (page, bytes, written) = counted(&cut, &[], usize::MAX);
+    assert!(page.rows.len() == 5 && !page.truncated);
+    assert_eq!(bytes, written);
+    // The first row is told, and so counted, without its credential.
+    let told = &page.rows[0].facts;
+    assert_eq!(
+        (told.key.as_str(), told.engine.as_str()),
+        ("grpc://10.0.0.5:8000", "grpc://10.0.0.5:8000")
+    );
+
+    // The fourth row serves another model: no byte and no comma for it.
+    let (page, bytes, written) = counted(&cut, &["m"], usize::MAX);
+    assert!(page.rows.len() == 4 && !page.truncated);
+    assert!(page.rows.iter().all(|row| row.facts.models == ["m"]));
+    assert_eq!(bytes, written);
+
+    // No row serves the model: the count is the page's own bytes.
+    let (page, bytes, written) = counted(&cut, &["none"], usize::MAX);
+    assert!(page.rows.is_empty() && !page.truncated);
+    assert_eq!(bytes, written);
+
+    // Two rows of the five: the page writes `true` where its count holds
+    // `false`.
+    let (page, bytes, written) = counted(&cut, &[], 2);
+    assert!(page.rows.len() == 2 && page.truncated);
+    assert_eq!(bytes, written + 1);
+
+    // A first row past the bound: the page is cut with no row, as a lone
+    // read's is.
+    let mut large = short(1, now);
+    large.facts.key = "x".repeat(2 * 1024 * 1024);
+    let (page, bytes, written) = counted(&shared(vec![large]), &[], usize::MAX);
+    assert!(page.rows.is_empty() && page.truncated);
+    assert_eq!(bytes, written + 1);
+}
+
+/// A page may take the bound, 2 MiB, to its last byte: three rows whose
+/// JSON ends on that byte are all held, and the page's JSON is the bound
+/// long. A cut page keeps that byte free, since its count holds
+/// `truncated` at its longer word: with a fourth row behind them the three
+/// are held still, in a page one byte short of the bound. One byte more in
+/// the third row leaves that row out, with a fourth row behind it or none,
+/// though a page cut behind the third would end on the bound's last byte.
+#[test]
+fn a_page_may_end_on_the_bounds_last_byte() {
+    // The bound by its number, and not by the constant the paging reads.
+    let bound = 2 * 1024 * 1024;
+    let now = Instant::now();
+    let asked = WorkerRowsQuery {
+        models: Vec::new(),
+        limit: usize::MAX,
+    };
+    // Two short rows and a third whose key holds a path too: a `/` and
+    // `pad` bytes.
+    let rows = |pad: usize| {
+        let mut last = short(3, now);
+        last.facts.key = format!("http://10.0.0.3:8000/{}", "x".repeat(pad));
+        vec![short(1, now), short(2, now), last]
+    };
+    // The ids of the rows a page holds and whether it is cut, then its
+    // count and its JSON's length.
+    let counted = |rows: Vec<WorkerRow>| {
+        let serving = rows.len();
+        let (page, bytes) = counted_page(&asked, Rows::Told(rows, serving), now);
+        let json = serde_json::to_vec(&page).expect("a page's JSON");
+        let held: Vec<u64> = page.rows.iter().map(|row| row.id.0).collect();
+        ((held, page.truncated), (bytes, json.len()))
+    };
+    let (_, (unpadded, _)) = counted(rows(0));
+    let pad = bound - unpadded;
+
+    let (held, lengths) = counted(rows(pad));
+    assert_eq!(held, (vec![1, 2, 3], false));
+    assert_eq!(lengths, (bound, bound));
+
+    // A fourth row behind them: the page is cut, a byte short of the bound.
+    let mut four = rows(pad);
+    four.push(short(4, now));
+    let (held, lengths) = counted(four);
+    assert_eq!(held, (vec![1, 2, 3], true));
+    assert_eq!(lengths, (bound, bound - 1));
+
+    // One byte more in the third row.
+    let (held, (bytes, written)) = counted(rows(pad + 1));
+    assert_eq!(held, (vec![1, 2], true));
+    assert_eq!(bytes, written + 1);
+
+    let mut four = rows(pad + 1);
+    four.push(short(4, now));
+    let (held, _) = counted(four);
+    assert_eq!(held, (vec![1, 2], true));
+    // The page cut behind the third row, as it would write itself.
+    let of_three = WorkerRowsPage {
+        rows: rows(pad + 1),
+        truncated: true,
+        taken: now,
+    };
+    let json = serde_json::to_vec(&of_three).expect("a page's JSON");
+    assert_eq!(json.len(), bound);
+}
+
+/// A count that failed reads as the largest number, past the page's
+/// bound. The JSON writer refuses a map keyed by a pair of numbers, and
+/// the count of one reads so. Where the first row must fit the bound too,
+/// as in an operator's page, a row measured so is left out: its page is
+/// cut there and counts nothing for it, and the rows ahead of it stay.
+#[test]
+fn a_count_that_failed_is_past_the_pages_bound() {
+    let refused: BTreeMap<(u8, u8), u8> = [((1, 2), 3)].into();
+    assert!(serde_json::to_vec(&refused).is_err());
+    assert_eq!(written(&refused), usize::MAX);
+
+    let now = Instant::now();
+    let asked = WorkerRowsQuery {
+        models: Vec::new(),
+        limit: usize::MAX,
+    };
+    let first = written(&RowJson::of(&short(1, now), now));
+    // Three rows under a host's measure whose count of one row fails: the
+    // ids of the rows the page holds, whether it is cut, and its count.
+    let paged_with = |failing: u64| {
+        let rows = vec![short(1, now), short(2, now), short(3, now)];
+        let framing = Framing::default();
+        paged(&asked, Rows::Told(rows, 3), now, false, framing, |row| {
+            let bytes = if row.id.0 == failing {
+                written(&refused)
+            } else {
+                written(&RowJson::of(&row, now))
+            };
+            (row.id.0, bytes)
+        })
+    };
+    // The second row's count fails: the first row stays, alone.
+    assert_eq!(paged_with(2), (vec![1], true, first));
+    // The first row's count fails: no row stays.
+    assert_eq!(paged_with(1), (Vec::new(), true, 0));
 }
 
 /// A page's JSON, literally: a row that states every fact, a

@@ -195,10 +195,9 @@ fn engine(row: &Row) -> Result<Engine, String> {
         .bindings
         .first_mut()
         .ok_or("the presets bind nothing")?;
-    binding.overload = Some(OverloadSpec {
-        shed_when_all_vetoed: row.shed,
-        ..OverloadSpec::default()
-    });
+    let mut overload = OverloadSpec::default();
+    overload.shed_when_all_vetoed = row.shed;
+    binding.overload = Some(overload);
     spec.validate().map_err(|err| err.to_string())
 }
 

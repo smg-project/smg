@@ -164,6 +164,18 @@ fn applies(follower: &Log, led: &[Entry]) {
     }
 }
 
+/// `log` with a listener that counts its tellings, and that count.
+fn counted(log: Log) -> (Log, Arc<AtomicUsize>) {
+    let told = Arc::new(AtomicUsize::new(0));
+    let log = {
+        let told = Arc::clone(&told);
+        log.on_watched(move || {
+            told.fetch_add(1, Ordering::Relaxed);
+        })
+    };
+    (log, told)
+}
+
 #[test]
 fn a_slot_is_at_most_120_bytes_and_a_membership_row_stands_apart() {
     // The log's bound in bytes is told from these: a ring's slots, and
@@ -389,13 +401,7 @@ fn writers_on_many_threads_leave_dense_positions_under_rising_terms() {
 
 #[test]
 fn the_log_tells_a_write_once_it_is_released() {
-    let told = Arc::new(AtomicUsize::new(0));
-    let log = {
-        let told = Arc::clone(&told);
-        Log::new(16).on_watched(move || {
-            told.fetch_add(1, Ordering::Relaxed);
-        })
-    };
+    let (log, told) = counted(Log::new(16));
     // How often the listener was told, beside the head it would read.
     let told = || (told.load(Ordering::Relaxed), log.head());
     // Nothing is told inside a write: the store that wrote says when
@@ -1309,13 +1315,7 @@ fn a_join_is_refused_once_the_log_holds_a_history_and_under_no_term() {
 #[test]
 fn a_joined_log_follows_its_leaders_term_and_a_take_of_it_again_starts_no_lead() {
     // The leader's run drew 1,000 and led term 1; this run drew 500.
-    let told = Arc::new(AtomicUsize::new(0));
-    let log = {
-        let told = Arc::clone(&told);
-        Log::new(16).starting_after(500).on_watched(move || {
-            told.fetch_add(1, Ordering::Relaxed);
-        })
-    };
+    let (log, told) = counted(Log::new(16).starting_after(500));
     log.join(at(1_001, 1)).expect("a log that holds nothing");
     assert_eq!((log.head(), log.followed()), (at(1_001, 1), Some(1)));
     // The listener is told at the join's end, as at a mark's.
@@ -1434,6 +1434,31 @@ fn a_store_that_follows_writes_under_no_term_until_it_takes_one() {
         status(&log, 3);
         assert_eq!(log.head(), at(6, 6), "{way}: it leads again");
     }
+}
+
+/// A write names an applier's place or a term of its own, never both:
+/// an applier's write goes by its leader's place. A membership write
+/// that names both stops a debug build where the log would stamp it. A
+/// status handed as a membership write is refused ahead of that, as it
+/// was.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "a write names an applier's place or a term, never both")]
+fn a_write_that_names_a_place_and_a_term_stops_a_debug_build() {
+    let log = Log::new(16);
+    log.term_rose(3);
+    let _ = log.member(Some(at(2, 4)), Some(3), 1, relabel(1), None, None);
+}
+
+/// A status's write that names both stops a debug build, as a
+/// membership write does.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "a write names an applier's place or a term, never both")]
+fn a_status_that_names_a_place_and_a_term_stops_a_debug_build() {
+    let log = Log::new(16);
+    log.term_rose(3);
+    let _ = drains(&log, Some(at(2, 4)), Some(3), 1);
 }
 
 #[test]
@@ -1571,21 +1596,17 @@ fn a_write_refused_for_its_term_ends_no_hold_of_an_applier() {
 }
 
 /// A status has its own call. One told as a membership change is
-/// refused, under a term the log leads and under none, with a record and
-/// with none: the log answers no and keeps no entry. A refusal is no
-/// move of the log and owes no telling: with no move untold, the release
-/// behind these tells the listener nothing. A refusal ends no applier's
-/// hold either: here the status handed by its own call behind one lands
-/// at the place the guard holds.
+/// refused, under a term the log leads, under one it does not lead and
+/// under none, with either record, with both and with none: the log
+/// answers no and keeps no entry. A refusal is no move of the log and
+/// owes no telling: with no move untold, the release behind these tells
+/// the listener nothing. A refusal ends no applier's hold either: here
+/// the status handed by its own call behind one lands at the place the
+/// guard holds. Refused at that held place, the call tells nothing of
+/// the followed write that stands untold.
 #[test]
 fn a_status_told_as_a_membership_change_is_refused_and_keeps_no_entry() {
-    let told = Arc::new(AtomicUsize::new(0));
-    let log = {
-        let told = Arc::clone(&told);
-        Log::new(16).on_watched(move || {
-            told.fetch_add(1, Ordering::Relaxed);
-        })
-    };
+    let (log, told) = counted(Log::new(16));
     // The term's start is told at its release.
     log.term_rose(3);
     log.released();
@@ -1599,12 +1620,31 @@ fn a_status_told_as_a_membership_change_is_refused_and_keeps_no_entry() {
         admitted_at: Instant::now(),
         maker: Registrant::default(),
     };
-    let records = [(None, None), (Some(&record), None), (None, Some(&record))];
-    for term in [None, Some(3)] {
+    // The row the write leaves and the row it took out: neither, each
+    // alone, and both. The row it took out comes under the status the
+    // change found and under the one it gives.
+    let before = WorkerRow {
+        status: from,
+        ..record.clone()
+    };
+    let records = [
+        (None, None),
+        (Some(&record), None),
+        (None, Some(&before)),
+        (None, Some(&record)),
+        (Some(&record), Some(&before)),
+        (Some(&record), Some(&record)),
+    ];
+    // No term, the term the log leads, one below it and one above it.
+    for term in [None, Some(3), Some(2), Some(4)] {
         for (row, left) in records {
             let took = log.member(None, term, 1, change, row, left);
-            let with = (row.is_some(), left.is_some());
-            assert!(!took, "under the term {term:?}, with a record {with:?}");
+            let (leaves, took_out) = (row.is_some(), left.is_some());
+            assert!(
+                !took,
+                "under the term {term:?}, with the row it leaves: {leaves}, \
+                 with the row it took out: {took_out}"
+            );
         }
     }
     assert_eq!(log.head(), at(1, 3), "the term's start alone");
@@ -1615,7 +1655,10 @@ fn a_status_told_as_a_membership_change_is_refused_and_keeps_no_entry() {
     // place for its leader's event.
     apply(&log, at(2, 4), 1);
     let adopting = log.adopt(at(3, 4)).expect("the next position");
+    // The followed write is untold: no release came behind it.
+    assert_eq!(told.load(Ordering::Relaxed), 1, "told ahead of the call");
     assert!(!log.member(Some(at(3, 4)), None, 2, change, None, None));
+    assert_eq!(told.load(Ordering::Relaxed), 1, "told at the held place");
     assert!(!adopting.landed(), "nothing landed at the held place");
     status_at(&log, at(3, 4), 2);
     assert!(
@@ -1623,6 +1666,25 @@ fn a_status_told_as_a_membership_change_is_refused_and_keeps_no_entry() {
         "the hold stood through the refused write"
     );
     assert_eq!(marks(&all(&log)), [TERM, 1, 2]);
+}
+
+/// A status refused at the membership call tells the listener nothing,
+/// whatever move stands untold. Here the term's start is untold when
+/// the status comes: the listener hears nothing inside the refused
+/// call, and of the term's start at the release behind it
+/// ([`Journal::released`]).
+#[test]
+fn a_status_refused_at_the_membership_call_tells_nothing_inside_it() {
+    let (log, told) = counted(Log::new(16));
+    // The term's start is a move that no release has told yet.
+    log.term_rose(3);
+    assert_eq!(told.load(Ordering::Relaxed), 0, "told at the term's start");
+    let (id, from, to) = (WorkerId(7), WorkerStatus::Ready, WorkerStatus::Draining);
+    let change = MembershipChange::StatusChanged { id, from, to };
+    assert!(!log.member(None, Some(3), 1, change, None, None));
+    assert_eq!(told.load(Ordering::Relaxed), 0, "told inside the call");
+    log.released();
+    assert_eq!(told.load(Ordering::Relaxed), 1, "the term's start");
 }
 
 /// A status entry holds the very list of models the log was handed: the

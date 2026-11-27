@@ -1001,12 +1001,13 @@ impl Harness {
         Ok((client, operator))
     }
 
-    /// How many of the fleet's ranks `standby`'s own store holds ready:
-    /// what a controller that follows has of its leader's log. A row no
-    /// registration made is an error, and so is a load report: a leader
-    /// sends a standby none, and a standby polls nobody.
+    /// How many of the fleet's ranks `standby` holds ready in a first copy:
+    /// the rows its worker objects state, each in the status its own store
+    /// was told. It is what a controller that follows has of its leader's
+    /// log. A row no registration made is an error, and so is a load
+    /// report: a leader sends a standby none, and a standby polls nobody.
     pub fn followed(&self, standby: &Replica) -> Result<usize, String> {
-        let cut = standby.store.checkpoint();
+        let cut = standby.workers.checkpoint(&standby.store);
         let reports = standby.loads.borrow();
         let mut held = 0;
         for row in &cut.rows {
@@ -1321,16 +1322,18 @@ impl Harness {
         })
     }
 
-    /// The pool serving `model` in `role` as the store holds it at this
-    /// instant, each row named by its engine: the rows of the workers'
-    /// table that serve the model in that role. A row is healthy where its
-    /// status is ready, and its load is the load monitor's newest report
-    /// of it, as a decision's record states it. The rows come in the
-    /// table's order, by registration key: no case reads their order. The
-    /// overload verdict is no part of a row here: a case reads a veto in
-    /// the picks the service answers.
+    /// The pool serving `model` in `role` at this instant, each row named
+    /// by its engine: the rows of the replica's first copy that serve the
+    /// model in that role. A row's models are the ones its worker object
+    /// serves, and its status is the one the store was told.
+    ///
+    /// A row is healthy where its status is ready, and its load is the
+    /// load monitor's newest report of it, as a decision's record states
+    /// it. The rows come in the copy's order, by registration key: no case
+    /// reads their order. The overload verdict is no part of a row here: a
+    /// case reads a veto in the picks the service answers.
     pub fn pool(&self, model: &str, role: Role) -> Result<Vec<Seen>, String> {
-        let (_, mut rows) = self.store.all_rows();
+        let mut rows = self.replica.workers.checkpoint(&self.store).rows;
         rows.retain(|row| {
             row.facts.role == role && row.facts.models.iter().any(|served| served == model)
         });

@@ -5,6 +5,7 @@
 
 use std::{
     any::Any,
+    cell::OnceCell,
     collections::HashMap,
     fmt::Debug,
     sync::{atomic::AtomicU64, Arc},
@@ -102,8 +103,15 @@ pub trait Filter: Any + Send + Sync + Debug {
     /// ([`RequestFacts::ring`]) declares [`Needs::ring`], and a live
     /// profile one of whose scorers places by the ring shows it the ring
     /// and the request's place on it. A pair side's shadow that reads a
-    /// ring where neither live side does is lent that ring for its
-    /// scoring half alone: its filters are shown no ring and no place.
+    /// ring where neither live side does is lent that ring. Where one of
+    /// its filters declares the need, every stage of the shadow's own run
+    /// is shown what its lender answers: the ring and the shadow's place
+    /// on it, or the facts as they stand where it answers none. So are
+    /// the hard filters a prefill's shadow asks once more at its admission
+    /// limit's test. Where no filter declares it, the scoring half alone
+    /// is: the filters are shown no ring and no place. Neither are they in
+    /// the steps of the pair's default that a side's shadow follows,
+    /// whatever they declare.
     ///
     /// Asked only while the stage's generation is built, perhaps more than
     /// once there. The answer stands for that generation: no decision and
@@ -2753,17 +2761,35 @@ fn run_side(
     score_survivors(profile, index, facts, pool, candidates, buf, first)
 }
 
+/// `facts` with the ring and the places a lender answered, where it
+/// answered any. A shadow's run ([`run_side_lent`]) and the admission
+/// limit's test behind it (`shadow_side`) both state the request through
+/// this, so the test judges on the facts the run showed its filters.
+fn with_lent<'f>(
+    facts: &RequestFacts<'f>,
+    lent: Option<(&'f dyn LentRing, &'f [u64])>,
+) -> Option<RequestFacts<'f>> {
+    lent.map(|(ring, places)| RequestFacts {
+        ring: Some(ring),
+        ring_positions: places,
+        ..*facts
+    })
+}
+
 /// [`run_side`] for a pair side's shadow, which may be stated a place of
-/// its own on the ring its request lends ([`Engine::side_ring_profile`]):
-/// `lent` is asked between the two halves, behind the filter half. A set
-/// the filters emptied ends where every side's does ([`single_emptied`]),
-/// in the all-vetoed rule's pick or in a shed, and asks nothing: no stage
-/// would read the place. The filter half reads `facts` as they stand: a
-/// filter is shown no ring and no place here, one of the host's own that
-/// declares the ring need ([`Filter::needs`]) too, which a live profile
-/// shows both. The scoring half reads them with the ring and the places
-/// `lent` answers, where it answers any. Out of line: a shadow's run
-/// alone enters here.
+/// its own on the ring its request lends ([`Engine::side_ring_profile`]).
+/// Under a profile none of whose filters declares the ring need
+/// ([`Filter::needs`]), `lent` is asked between the two halves, behind the
+/// filter half. A set the filters emptied ends where every side's does
+/// ([`single_emptied`]), in the all-vetoed rule's pick or in a shed, and
+/// asks nothing: no stage would read the place. The filter half reads
+/// `facts` as they stand, with no ring and no place, and the scoring half
+/// reads them with the ring and the places `lent` answers, where it
+/// answers any. Under a profile with such a filter (`ahead`), `lent` is
+/// asked ahead of the filter half and both halves read what it answers,
+/// as the stages of a live profile do, or `facts` as they stand where it
+/// answers none: the lender is then asked for a set the filters may
+/// empty. Out of line: a shadow's run alone enters here.
 #[expect(
     clippy::too_many_arguments,
     reason = "a side's run, beside what its shadow is lent"
@@ -2777,17 +2803,17 @@ fn run_side_lent<'l>(
     cx: &Constraints<'_>,
     buf: &mut Buffers,
     first: Option<(WorkerId, u16)>,
+    ahead: bool,
     lent: &dyn Fn() -> Option<(&'l dyn LentRing, &'l [u64])>,
 ) -> Decision {
     let candidates = set.candidates;
-    if let Some(emptied_by) = filter(profile, facts, cx, buf, set) {
-        return single_emptied(index, facts, pool, candidates, emptied_by, buf);
+    let state = || with_lent(facts, lent());
+    let stated = if ahead { state() } else { None };
+    let shown = stated.as_ref().unwrap_or(facts);
+    if let Some(emptied_by) = filter(profile, shown, cx, buf, set) {
+        return single_emptied(index, shown, pool, candidates, emptied_by, buf);
     }
-    let stated = lent().map(|(ring, places)| RequestFacts {
-        ring: Some(ring),
-        ring_positions: places,
-        ..*facts
-    });
+    let stated = if ahead { stated } else { state() };
     let facts = stated.as_ref().unwrap_or(facts);
     score_survivors(profile, index, facts, pool, candidates, buf, first)
 }
@@ -3293,6 +3319,23 @@ const PICKS_BY_NO_COUNT: [&str; 2] = ["random", "round-robin"];
 #[cfg(feature = "in-process")]
 const DRAWS_TWO: [&str; 2] = ["power-of-two", "power-of-two-count-first"];
 
+/// One side of a pair asked by its draw: the
+/// fixed rows of its list, the buffer a record is written into, and the
+/// writer of one record.
+#[cfg(feature = "in-process")]
+pub(crate) type DrawnSide<'a> = (
+    &'a [Candidate],
+    &'a mut [Candidate],
+    &'a mut dyn FnMut(&Candidate, &mut Candidate),
+);
+
+/// What [`Engine::pair_drawn_for`] answers: the pair's two profiles.
+#[cfg(feature = "in-process")]
+#[derive(Clone, Copy)]
+pub(crate) struct PairDrawn {
+    profiles: [u16; 2],
+}
+
 /// The smallest pool over which a picker that draws two rows
 /// ([`DRAWS_TWO`]) is asked to draw before the pool's records are written
 /// ([`Engine::drawn_for`]), in a document whose every profile draws first
@@ -3526,6 +3569,95 @@ fn run_drawn_written(
         Decision::Queue(queue) => queue.trace.seed = facts.seed,
     }
     decision
+}
+
+/// One side of a pair by its draw ([`Engine::decide_pair_drawn`]): the two
+/// rows the seed's stream draws over `fixed`, each written at its place
+/// (`write`) and put to the profile's tests, then scored and ordered as
+/// [`run_drawn_written`] orders a single's.
+///
+/// The whole pass decides a pair's side at every pool size, so the draw
+/// keeps the pass's rule at every size, as a single's does under
+/// [`DRAW_FROM`] rows alone: the request's seed is read as it came, so two
+/// rows that tie are ordered by it, and the first row a test refuses ends
+/// the draw. `None` where the draw names no pick: the caller decides the
+/// pair whole, by a stream nothing was drawn from.
+#[cfg(feature = "in-process")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the draw's inputs and the host's two halves of a row: the fixed rows, the buffer and the write"
+)]
+#[inline(never)]
+fn run_side_drawn_written(
+    engine: &Engine,
+    index: u16,
+    facts: &RequestFacts<'_>,
+    pool: &PoolFacts<'_>,
+    fixed: &[Candidate],
+    rows: &mut [Candidate],
+    write: &mut dyn FnMut(&Candidate, &mut Candidate),
+    cx: &Constraints<'_>,
+    buf: &mut Buffers,
+) -> Option<Pick> {
+    let at = usize::from(index);
+    let (profile, tests) = (&engine.profiles[at], engine.row_tests[at]);
+    debug_assert_eq!(fixed.len(), rows.len(), "one buffer row a fixed row");
+    #[cfg(debug_assertions)]
+    for (row, fixed) in rows.iter_mut().zip(fixed) {
+        *row = unwritten(fixed);
+    }
+    // A request held to places is the whole pass's.
+    if places::stated(cx) {
+        return None;
+    }
+    buf.reserve(fixed.len());
+    buf.kept.clear();
+    let masked = tests.is_some_and(|tests| tests.masked(cx));
+    let mut refused = false;
+    // The row a draw lands on, written at its place: the written record
+    // is the one the tests are asked about.
+    let mut ask = |fixed: &Candidate| {
+        let kept = rows.get_mut(fixed.position as usize).is_some_and(|row| {
+            write(fixed, row);
+            let row = &*row;
+            match tests {
+                Some(tests) => tests.keeps(facts, row, cx) && !(masked && cx.masks(row.position)),
+                None => profile.filters.iter().all(|f| f.keep(facts, row, cx)),
+            }
+        });
+        refused |= !kept;
+        kept
+    };
+    // The stream is the draw's own: the order below reads the seed of
+    // `facts`, which no draw moved.
+    let mut draw = Draw::new(facts.seed);
+    let drew = profile
+        .picker
+        .draw_first(facts, pool, fixed, &mut ask, &mut buf.kept, &mut draw);
+    if !drew || refused {
+        return None;
+    }
+    let band = combine(
+        profile,
+        facts,
+        rows,
+        &buf.kept,
+        &mut buf.scores,
+        &mut buf.stage,
+    );
+    let mut targets = Targets::new();
+    profile
+        .picker
+        .order_drawn(facts, rows, &buf.kept, &buf.scores, band, &mut targets);
+    if targets.is_empty() {
+        return None;
+    }
+    let trace = trace_drawn(index, facts, pool, rows, &buf.kept, buf.traced());
+    Some(Pick {
+        targets,
+        trace,
+        session_verdict: SessionVerdict::None,
+    })
 }
 
 /// The whole pass of an encode item of the `epd` plan: the plan's rules
@@ -4198,6 +4330,11 @@ pub struct Engine {
     /// request's binding is resolved.
     #[cfg(feature = "in-process")]
     written_least: usize,
+    /// Whether some binding's pair may be asked by its draw
+    /// ([`Entry::pair_drawn`]): a document with no such binding is told so
+    /// at one load, before a pair's decision asks anything of its request.
+    #[cfg(feature = "in-process")]
+    pairs_drawn: bool,
     /// Whether no stage of any profile and no sessions rule's assignment
     /// reads a count a worker object alone holds ([`Self::rows_stand`]).
     #[cfg(feature = "in-process")]
@@ -4537,6 +4674,11 @@ impl Marks {
     /// reads it for its prefill profile ([`Engine::weighs`]). No single
     /// decision does: each of its masked reads names other marks.
     const WEIGHS: u16 = 1 << 13;
+    /// A filter declares the ring need ([`Filter::needs`]). The run of a
+    /// pair side's shadow that is lent a ring reads it: it asks its
+    /// lender ahead of such a profile's filter half ([`run_side_lent`]).
+    /// No other decision reads it.
+    const RING_FILTER: u16 = 1 << 14;
 
     fn of(profile: &Profile, order: Order) -> Self {
         let scoped = if profile.scoped() { Self::SCOPED } else { 0 };
@@ -4614,11 +4756,18 @@ impl Marks {
         } else {
             0
         };
+        let ring_filter = if profile.filters.iter().any(|filter| filter.needs().ring) {
+            Self::RING_FILTER
+        } else {
+            0
+        };
         // The three marks no run of the engine reads.
         let for_hosts = by_reports | key_place | other_place;
         // What says when the profile draws, and how.
         let draws = draws_first | joined | turns;
-        Self(scoped | by_assignment | draws | ranked | engines | owns | for_hosts | weighs)
+        // The two marks a pair's decision alone reads.
+        let for_pairs = weighs | ring_filter;
+        Self(scoped | by_assignment | draws | ranked | engines | owns | for_hosts | for_pairs)
     }
 
     /// A profile whose requests take their list's own turn first.
@@ -4629,6 +4778,11 @@ impl Marks {
     /// A scorer that weighs load against affinity by a gate of its own.
     const fn weighs(self) -> bool {
         self.0 & Self::WEIGHS != 0
+    }
+
+    /// A filter that declares the ring need.
+    const fn ring_filter(self) -> bool {
+        self.0 & Self::RING_FILTER != 0
     }
 
     /// Whether no stage asks anything before the profile's run: no scope
@@ -4773,6 +4927,14 @@ struct Entry {
     /// pair's decision alone. A pair under no rule whose pickers pick
     /// tests this one byte a decision and runs its two profiles as it did.
     sides_placed: bool,
+    /// Whether each side of the binding's pair may be asked by its draw
+    /// ([`Engine::pair_drawn_for`]): the plan pairs, and each side's profile
+    /// is a pick of two that draws first, asks nothing ahead of its draw
+    /// and keeps a row by the engine's one folded test of it. Written once
+    /// when the engine is built: a pair's decision reads this one byte and
+    /// then asks of its request and its two lists alone.
+    #[cfg(feature = "in-process")]
+    pair_drawn: bool,
 }
 
 /// The sides of a pair that run under the pair's binding whatever binding
@@ -5784,6 +5946,8 @@ impl Engine {
         // delegate to: the assignment that places is written beside each
         // binding here, once, so no decision asks. The binding itself keeps
         // the rule as the spec declared it.
+        #[cfg(feature = "in-process")]
+        let mut pairs_drawn = false;
         let bindings = bindings
             .into_iter()
             .map(|binding| {
@@ -5815,11 +5979,39 @@ impl Engine {
                 let sides_placed = binding.sessions.is_some()
                     || assigned(binding.profile)
                     || binding.decode_profile.is_some_and(assigned);
+                // Each side of a pair may be asked by its draw where its
+                // profile is a pick of two that draws first, asks nothing
+                // ahead of the draw and folds its filters into one test.
+                #[cfg(feature = "in-process")]
+                let pair_drawn = matches!(binding.plan, Plan::PdPair | Plan::Epd { .. })
+                    && [
+                        binding.profile,
+                        binding.decode_profile.unwrap_or(binding.profile),
+                    ]
+                    .into_iter()
+                    .all(|index| {
+                        let at = usize::from(index);
+                        profiles
+                            .get(at)
+                            .is_some_and(|profile| DRAWS_TWO.contains(&profile.picker.name()))
+                            && row_tests.get(at).is_some_and(Option::is_some)
+                            && marks.get(at).is_some_and(|marks| {
+                                marks.asks_nothing_first()
+                                    && marks.ahead() == Marks::DRAWS_FIRST
+                                    && !marks.by_assignment()
+                            })
+                    });
+                #[cfg(feature = "in-process")]
+                {
+                    pairs_drawn |= pair_drawn;
+                }
                 Entry {
                     glob: binding.pattern().glob(),
                     placing: placed_by(declared, by_assignment),
                     vetoed: AllVetoed::default(),
                     sides_placed,
+                    #[cfg(feature = "in-process")]
+                    pair_drawn,
                     binding,
                 }
             })
@@ -5852,6 +6044,8 @@ impl Engine {
             written_from,
             #[cfg(feature = "in-process")]
             written_least,
+            #[cfg(feature = "in-process")]
+            pairs_drawn,
             #[cfg(feature = "in-process")]
             rows_stand,
             seat_flags: (u8::from(keeping) * KEEPS_SLOT_STATE) | (u8::from(shadows) * SHADOWS),
@@ -6388,8 +6582,9 @@ impl Engine {
     /// states no place when it is made, so the side's shadow is asked for
     /// its own inside its run, as a single binding's is
     /// ([`Self::shadow_ring_profile`]). A side's run asks behind its
-    /// filter half ([`run_side_lent`]): a shadow that says none ahead of
-    /// its profile ([`Self::shadow_side`]) and one whose set the filters
+    /// filter half where no filter of its profile declares the ring need
+    /// ([`run_side_lent`]): a shadow that says none ahead of its profile
+    /// ([`Self::shadow_side`]) and, there, one whose set the filters
     /// emptied are asked nothing. `None` under every other binding: beside
     /// a live side that reads the ring, a side's shadow reads the place
     /// the two live sides state, or none ([`Self::unlent`]). Each side's
@@ -7373,6 +7568,8 @@ impl Engine {
             placing,
             vetoed,
             sides_placed: _,
+            #[cfg(feature = "in-process")]
+                pair_drawn: _,
         } = entry;
         // The single plan's rows, under the binding's word for a pool the
         // overload veto empties: every path below filters this set.
@@ -9281,6 +9478,148 @@ impl Engine {
         .of_side(PairSide::Decode)
     }
 
+    /// Whether some binding's pair may be asked by its draw: what a pair's
+    /// decision asks first, at one load ([`Self::pair_drawn_for`] asks the
+    /// rest of the request's own binding).
+    #[cfg(feature = "in-process")]
+    pub(crate) const fn pairs_drawn(&self) -> bool {
+        self.pairs_drawn
+    }
+
+    /// Whether each side of a pair may be
+    /// asked by its draw ([`run_side_drawn_written`]), which writes the records
+    /// it asks about and no other. Both profiles are a pick of two whose
+    /// filters fold into one test of a row, each list holds its profile's
+    /// floor of rows, and the request states nothing the pair's whole
+    /// decision reads beside its two picks. Asked before a record is
+    /// written; answers the two profiles.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn pair_drawn_for(
+        &self,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        rows: [usize; 2],
+        cx: &Constraints<'_>,
+    ) -> Option<PairDrawn> {
+        if carries_a_column(facts) || counts_no_place(cx) || !facts.session_key.is_none() {
+            return None;
+        }
+        let entry = self.pair_entry(facts.model)?;
+        if !entry.pair_drawn {
+            return None;
+        }
+        let binding = &entry.binding;
+        let decode_index = binding.decode_profile.unwrap_or(binding.profile);
+        for (index, rows) in [(binding.profile, rows[0]), (decode_index, rows[1])] {
+            let at = usize::from(index);
+            if rows < self.written_from.get(at).copied().unwrap_or(usize::MAX)
+                || (self.marks[at].first() & (Marks::ENGINES | Marks::OWNS) != 0
+                    && !pool.engines.is_empty())
+            {
+                return None;
+            }
+        }
+        if self
+            .weighing_lift(binding.profile, entry.vetoed, cx)
+            .is_some()
+        {
+            return None;
+        }
+        Some(PairDrawn {
+            profiles: [binding.profile, decode_index],
+        })
+    }
+
+    /// A pair's decision where each side is
+    /// asked by its draw: [`Self::pair_drawn_for`] said yes, both lists
+    /// stand, and every row of a side pairs with every row of the other.
+    /// The prefill by the draw of its profile, then the decode by the draw
+    /// of its own, joined as [`Self::decide_pair`] joins its two picks.
+    /// `None` where a side's draw answers no pick: the caller then decides
+    /// whole, over records it writes itself.
+    #[cfg(feature = "in-process")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the pair's facts, each side's rows with its writer, and the engine's scratch"
+    )]
+    pub(crate) fn decide_pair_drawn(
+        &self,
+        drawn: PairDrawn,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        prefills: DrawnSide<'_>,
+        decodes: DrawnSide<'_>,
+        cx: &Constraints<'_>,
+        scratch: &mut Scratch,
+    ) -> Option<Decision> {
+        let PairDrawn {
+            profiles: [prefill_index, decode_index],
+        } = drawn;
+        scratch.shed_over = None;
+        scratch.single.lifted = LiftedVeto::None;
+        let prefill_facts = RequestFacts {
+            phase: Phase::Prefill,
+            named: None,
+            signal_cells: None,
+            decode_ring_positions: None,
+            ..*facts
+        };
+        let decode_facts = RequestFacts {
+            phase: Phase::Decode,
+            seed: Draw::new(facts.seed).next_u64(),
+            named: None,
+            signal_cells: None,
+            ring_positions: facts.decode_ring_positions.unwrap_or(facts.ring_positions),
+            decode_ring_positions: None,
+            ..*facts
+        };
+        let (fixed, rows, write) = prefills;
+        let prefill_rows = fixed.len();
+        let prefill = run_side_drawn_written(
+            self,
+            prefill_index,
+            &prefill_facts,
+            pool,
+            fixed,
+            rows,
+            write,
+            cx,
+            &mut scratch.single,
+        );
+        let prefill_pick = prefill?;
+        let prefill_target = prefill_pick.targets.iter().next()?;
+        let (fixed, rows, write) = decodes;
+        let mut decision = Decision::Pick(run_side_drawn_written(
+            self,
+            decode_index,
+            &decode_facts,
+            pool,
+            fixed,
+            rows,
+            write,
+            cx,
+            &mut scratch.decode,
+        )?);
+        let Decision::Pick(paired) = &mut decision else {
+            return None;
+        };
+        let Pick {
+            targets,
+            trace,
+            session_verdict,
+        } = paired;
+        let placed = prefill_pick.targets.placing();
+        targets.pair_under(prefill_target, *session_verdict, placed);
+        let lifted = trace.lifted;
+        *trace = prefill_pick.trace;
+        // The whole pass counts the prefills it keeps, and a pair that
+        // draws is asked only where it keeps every one of them.
+        trace.survivors = Survivors::counted(prefill_rows as u32);
+        trace.lifted = lifted;
+        *session_verdict = prefill_pick.session_verdict;
+        Some(decision)
+    }
+
     /// A pair's answer over two lists of which one holds no row: one side
     /// alone is no pair, and the engine answers over no candidate, under
     /// the request's own constraints `cx` for both sides. `pool` holds
@@ -9423,6 +9762,13 @@ impl Engine {
     /// Neither does the pair's default that a side's shadow follows: no
     /// step of it scores.
     ///
+    /// A shadow profile with a filter that declares the ring need
+    /// ([`Filter::needs`]) asks ahead of the filter half of its run,
+    /// whatever its filters then keep, and once a decision: a prefill's
+    /// shadow that runs again reads the answer of its first run. The
+    /// pair's default asks nothing there either, and its steps show the
+    /// shadow's filters no ring and no place.
+    ///
     /// The decode's shadow is put to the binding's all-vetoed rule by the
     /// binding's word, as its live side is ([`Set::ruled`]): where a veto
     /// leaves the live prefill's partners nobody, the rule steers the
@@ -9441,7 +9787,8 @@ impl Engine {
     ///
     /// - Among first partners, the admission limit's test of the prefills
     ///   shown. Where one of them waits on its limit, the shed is the
-    ///   limit's and names the prefill side.
+    ///   limit's and names the prefill side. The test reads the facts the
+    ///   shadow's run showed its filters.
     /// - Among first partners, its run over every open class.
     /// - The default's first step, which answers its prefill
     ///   ([`vetoed::shadow_prefill`]). The live decode profile stands on
@@ -9528,8 +9875,12 @@ impl Engine {
         let facts = unlent.as_ref().unwrap_or(facts);
         let (prefills, prefill_facts) = pools.side(PairSide::Prefill, facts)?;
         let (decodes, decode_facts) = pools.side(PairSide::Decode, facts)?;
-        // The shadow's own place, asked behind the filter half alone.
-        let lent = || self.side_ring_profile(at, side).and_then(lends);
+        // The shadow's own place, asked behind the filter half, or ahead
+        // of it where a filter of the profile declares the ring need. It
+        // is asked once: a run of the side that follows reads the answer.
+        let asked = OnceCell::new();
+        let lent = || *asked.get_or_init(|| self.side_ring_profile(at, side).and_then(lends));
+        let ahead = self.marks[usize::from(index)].ring_filter();
         // The mark the pair's decision left on the prefill's buffer: the
         // tier the pair's default paired in, and none beside a pair the
         // profiles made ([`Self::decide_pair`]).
@@ -9556,7 +9907,8 @@ impl Engine {
                     Decision::Pick(_) | Decision::Queue(_) => false,
                 };
                 // The shadow's own run over the prefills of `classes`. It asks
-                // for its place behind its filter half ([`run_side_lent`]).
+                // for its place behind its filter half, or ahead of it
+                // ([`run_side_lent`]).
                 let own = |classes: &[u32], buf: &mut Buffers| {
                     let set = Set::side(prefills, None, Some(classes));
                     run_side_lent(
@@ -9568,6 +9920,7 @@ impl Engine {
                         run_cx,
                         buf,
                         None,
+                        ahead,
                         &lent,
                     )
                 };
@@ -9577,10 +9930,17 @@ impl Engine {
                 // but for its admission limit keeps the request under the
                 // limit's stage. Else the side runs again over every open
                 // class, which stand in `firsts` behind that decision's
-                // swap.
-                let takes = Half::new(profile, index, &prefill_facts, prefills, run_cx);
+                // swap. The limit's test asks the hard filters on the facts
+                // the run showed them: with what the lender answered that
+                // run where one of them declares the ring need. The answer
+                // stands, and the lender is asked nothing more.
                 let firsts_shed = scratch.among_first && refused(&run);
-                let waits = firsts_shed && takes.waits_among(&scratch.classes);
+                let waits = firsts_shed && {
+                    let stated = with_lent(&prefill_facts, if ahead { lent() } else { None });
+                    let shown = stated.as_ref().unwrap_or(&prefill_facts);
+                    let takes = Half::new(profile, index, shown, prefills, run_cx);
+                    takes.waits_among(&scratch.classes)
+                };
                 if waits {
                     // The limit's shed names the prefill side, as the live
                     // decision's does.
@@ -9646,6 +10006,7 @@ impl Engine {
                         decode_cx,
                         &mut scratch.decode,
                         None,
+                        ahead,
                         &lent,
                     )
                 } else {
@@ -9690,7 +10051,8 @@ impl Engine {
     /// ([`Self::shadow_side`]): held against both live sides, or against
     /// the decode's own alone where each side is stated its own places
     /// ([`Self::unlent`]). And it is asked its own place of `lends` as a
-    /// side's is there: behind the filter half of its run.
+    /// side's is there: behind the filter half of its run, or ahead of it
+    /// where a filter of the profile declares the ring need.
     ///
     /// `first_decode` is the decode the pair's first decision named, as
     /// that call is handed it. A shadow profile that keeps such a decode
@@ -9768,6 +10130,7 @@ impl Engine {
             decode_cx,
             &mut scratch.decode,
             first_decode.filter(|_| keeps_its_first(profile)),
+            self.marks[usize::from(index)].ring_filter(),
             &|| self.side_ring_profile(at, side).and_then(lends),
         ))
     }

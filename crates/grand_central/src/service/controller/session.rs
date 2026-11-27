@@ -330,10 +330,7 @@ async fn session(
         return Some(status);
     }
     let gateway = principal.gateway();
-    let seat = match shared
-        .gateways
-        .welcome(gateway, &principal.subject, term, now)
-    {
+    let seat = match shared.welcome(gateway, &principal.subject, term, now) {
         Ok(seat) => seat,
         // The fence closed between this session's read and the table's.
         Err(Refused::Stepped { shown: None, .. }) => {
@@ -369,7 +366,7 @@ async fn session(
         decide_window: decide::WINDOW,
         max_decide_streams: decide::MAX_STREAMS,
         dispatch_ttl_ms: millis(DISPATCH_TTL),
-        grace_period_ms: millis(shared.gateways.grace()),
+        grace_period_ms: millis(seat.grace()),
         leader_poll_ms: millis(LEADER_POLL),
         // The design sends no page: no lease and no pin is restored.
         leases_restored: 0,

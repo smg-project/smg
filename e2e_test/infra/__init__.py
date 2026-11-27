@@ -12,6 +12,8 @@ from .constants import (  # Enums; Convenience sets; Fixture parameters; Default
     DEFAULT_STARTUP_TIMEOUT,
     ENV_BACKENDS,
     ENV_CONNECTION_MODE,
+    ENV_EXTERNAL_WORKERS,
+    ENV_EXTERNAL_WORKERS_FLUSH_CACHE,
     ENV_HOST,
     ENV_MODEL,
     ENV_MODELS,
@@ -51,6 +53,12 @@ from .constants import (  # Enums; Convenience sets; Fixture parameters; Default
     is_sglang,
     is_trtllm,
     is_vllm,
+)
+from .external_workers import (
+    ExternalWorkerAttachError,
+    ExternalWorkerEntry,
+    ExternalWorkerRegistry,
+    load_external_workers,
 )
 from .gateway import Gateway, WorkerInfo, launch_cloud_gateway
 from .gpu_monitor import GPUMonitor
@@ -120,6 +128,8 @@ __all__ = [
     "ENV_MODEL",
     "ENV_RUNTIME",
     "ENV_CONNECTION_MODE",
+    "ENV_EXTERNAL_WORKERS",
+    "ENV_EXTERNAL_WORKERS_FLUSH_CACHE",
     "ENV_HOST",
     "ENV_STARTUP_TIMEOUT",
     "ENV_SKIP_MODEL_POOL",
@@ -164,6 +174,10 @@ __all__ = [
     "WorkerPool",
     "get_pool",
     "cleanup_pool",
+    "ExternalWorkerAttachError",
+    "ExternalWorkerEntry",
+    "ExternalWorkerRegistry",
+    "load_external_workers",
     "MODEL_SPECS",
     # Gateway
     "Gateway",

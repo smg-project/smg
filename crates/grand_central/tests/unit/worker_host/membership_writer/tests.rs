@@ -195,11 +195,11 @@ impl Turn for HolderDoor {
     }
 
     fn row(&self, id: WorkerId) -> Option<WorkerRow> {
-        self.objects.record(id)
+        self.objects.read_row(id)
     }
 
     fn row_under(&self, url: &str) -> Option<WorkerRow> {
-        self.objects.record_under(url)
+        self.objects.read_row_under(url)
     }
 
     fn rows_of(&self, engine: &str) -> Vec<WorkerRow> {
@@ -1522,13 +1522,21 @@ fn a_refresh_lays_the_pairing_its_labels_derive() {
             ..PairingDescriptor::default()
         }))
     };
+    // A refresh whose facts are the row's own asks no word of the row's
+    // object. Each ask is counted, and answered no.
+    let asked = std::cell::Cell::new(0);
+    let no_object = |_: &WorkerRow, _: &WorkerFacts| {
+        asked.set(asked.get() + 1);
+        false
+    };
     let refresh = |seen: &WorkerRow, pairing: Option<Arc<PairingDescriptor>>, tier: &str| {
-        refresh_stated(&door, standing(seen), URL, &|standing| {
+        let state = |standing: &WorkerFacts| {
             let mut facts = standing.clone();
             facts.pairing.clone_from(&pairing);
             facts.labels.insert("tier".to_owned(), tier.to_owned());
             facts
-        })
+        };
+        refresh_stated(&door, standing(seen), URL, &state, &no_object)
     };
 
     // The descriptor and a label move together.
@@ -1577,14 +1585,18 @@ fn a_refresh_lays_the_pairing_its_labels_derive() {
         assert_eq!(store.by_key(URL).as_ref(), Some(&bare));
     }
 
-    // Another fact beside a moved descriptor is outside the scope.
-    let stray = refresh_stated(&door, standing(&bare), URL, &|standing| {
+    // Another fact beside a moved descriptor is outside the scope: the
+    // first of these refreshes to ask a word of the row's object.
+    assert_eq!(asked.get(), 0);
+    let other = |standing: &WorkerFacts| {
         let mut facts = standing.clone();
         facts.pairing = version("4");
         facts.priority += 1;
         facts
-    });
+    };
+    let stray = refresh_stated(&door, standing(&bare), URL, &other, &no_object);
     assert_eq!(stray, Err(MembershipWriteRefused::NotLabelsAlone));
+    assert_eq!(asked.get(), 1);
     assert_eq!(store.by_key(URL).as_ref(), Some(&bare));
 
     // A row may hold one that reports nothing, as a registration states
@@ -1601,6 +1613,308 @@ fn a_refresh_lays_the_pairing_its_labels_derive() {
         let unmoved = refresh(&held, nothing, "silver");
         assert_eq!(unmoved, Ok(MembershipWriteOutcome::Unmoved(row.id)));
         assert_eq!(store.by_key(URL).as_ref(), Some(&held));
+    }
+}
+
+/// A reading that states the worker's own descriptor, as a host that
+/// keeps one reads a worker: the door's reading, and the descriptor the
+/// worker's labels derive.
+fn with_its_descriptor(
+    worker: &dyn Worker,
+    standing: Option<&WorkerFacts>,
+    over: Option<Over<'_>>,
+) -> WorkerFacts {
+    WorkerFacts {
+        pairing: found::pairing_descriptor(worker),
+        ..found::stated(worker, standing, over)
+    }
+}
+
+/// A row may state a fact that its object holds in a narrower form: a
+/// part of a second, a threshold of zero, a runtime's name as it was
+/// written. A refresh's worker is rebuilt from the row, so it states the
+/// object's form. The door holds it against the row's own object: its
+/// labels and the descriptor they derive may move, and the row keeps its
+/// own word of every other fact. A worker that states a fact as neither the
+/// row nor its object holds it is refused. So is one that states the
+/// object's seconds beside the row's threshold, and one built with its
+/// checks off over a row that states probes. An upsert of the row's
+/// object still states the object's form.
+#[test]
+fn a_refresh_keeps_the_rows_word_of_a_fact_its_object_holds_narrower() {
+    use smg_worker::worker::RuntimeType;
+
+    use super::super::object::{builder, unchecked};
+
+    let (store, door) = door();
+    let version = |version: &str| {
+        Some(Arc::new(PairingDescriptor {
+            version: Some(version.to_owned()),
+            ..PairingDescriptor::default()
+        }))
+    };
+    let narrower = WorkerFacts {
+        engine_kind: "VLLM".to_owned(),
+        labels: [("tier".to_owned(), "gold".to_owned())].into(),
+        // A descriptor that no label of the row derives.
+        pairing: version("1"),
+        health: HealthPolicy {
+            failure_threshold: 0,
+            success_threshold: 0,
+            check_interval_ms: 2_500,
+            timeout_ms: 1_500,
+            probes: true,
+        },
+        ..stated()
+    };
+    let laid = door.found(&Registrant::Control, Precondition::Absent, URL, &|_| {
+        narrower.clone()
+    });
+    assert!(laid.is_ok(), "{laid:?}");
+    let row = store.by_key(URL).expect("the registered row");
+    assert_eq!(
+        (&row.facts.engine_kind, row.facts.health),
+        (&narrower.engine_kind, narrower.health)
+    );
+    // The row's own object: three seconds and two, a threshold of one
+    // twice, and the runtime the worker crate reads the name as.
+    let first = crate::worker_host::object(&row);
+    let held = first.metadata();
+    let checks = &held.health_config;
+    assert_eq!(
+        (
+            checks.check_interval_secs,
+            checks.timeout_secs,
+            checks.failure_threshold,
+            checks.success_threshold,
+            held.spec.runtime_type,
+        ),
+        (3, 2, 1, 1, RuntimeType::Vllm)
+    );
+    // What a refresh rebuilds: the row under other labels.
+    let relabelled = |seen: &WorkerRow, labels: &[(&str, &str)]| WorkerRow {
+        facts: WorkerFacts {
+            labels: labels
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect(),
+            ..seen.facts.clone()
+        },
+        ..seen.clone()
+    };
+
+    // The row's own object states nothing new.
+    let unmoved = door.refreshed(standing(&row), &first, &first);
+    assert_eq!(unmoved, Ok(MembershipWriteOutcome::Unmoved(row.id)));
+
+    // A label moves, and the row keeps its word.
+    let silver = relabelled(&row, &[("tier", "silver")]);
+    let built = crate::worker_host::object(&silver);
+    let wrote = door.refreshed(standing(&row), &built, &first);
+    assert_eq!(wrote, Ok(MembershipWriteOutcome::InPlace(row.id)));
+    let moved = store.by_key(URL).expect("the refreshed row");
+    assert_eq!(moved.facts, silver.facts);
+
+    // A label moves the descriptor it derives too, in place: the row
+    // keeps its word there as well. The row's own labels derive none, and
+    // the row's descriptor stands in its object's reading.
+    let versioned = relabelled(&moved, &[("tier", "silver"), ("version", "2")]);
+    let built = crate::worker_host::object(&versioned);
+    let wrote = refresh(&door, standing(&moved), built.as_ref(), with_its_descriptor);
+    assert_eq!(wrote, Ok(MembershipWriteOutcome::InPlace(row.id)));
+    let paired = store.by_key(URL).expect("the row of a moved descriptor");
+    assert_eq!(
+        paired.facts,
+        WorkerFacts {
+            pairing: version("2"),
+            ..versioned.facts.clone()
+        }
+    );
+
+    // A fact as neither the row nor its object holds it is outside the
+    // scope: a timeout of nine seconds, another runtime, the checks off.
+    // So is the object's form beside the row's threshold of zero.
+    let bronze = relabelled(&paired, &[("tier", "bronze")]);
+    let slower = HealthCheckConfig {
+        timeout_secs: 9,
+        ..checks.clone()
+    };
+    let mixed = HealthCheckConfig {
+        failure_threshold: 0,
+        ..checks.clone()
+    };
+    let other = WorkerRow {
+        facts: WorkerFacts {
+            engine_kind: "sglang".to_owned(),
+            ..bronze.facts.clone()
+        },
+        ..bronze.clone()
+    };
+    let strays: [Arc<dyn Worker>; 4] = [
+        Arc::new(builder(&bronze).health_config(slower).build()),
+        crate::worker_host::object(&other),
+        Arc::new(unchecked(&bronze).build()),
+        Arc::new(builder(&bronze).health_config(mixed).build()),
+    ];
+    for stray in strays {
+        let refused = door.refreshed(standing(&paired), &stray, &built);
+        assert_eq!(refused, Err(MembershipWriteRefused::NotLabelsAlone));
+        assert_eq!(store.by_key(URL).as_ref(), Some(&paired));
+    }
+
+    // An upsert of the row's own object states the object's form, under
+    // the row's labels.
+    let rebuilt = crate::worker_host::object(&paired);
+    let upserted = door.found_built(&Registrant::Control, Precondition::Any, &rebuilt, None);
+    assert!(upserted.is_ok(), "{upserted:?}");
+    let own = store.by_key(URL).expect("the upserted row").facts;
+    assert_eq!(
+        (own.engine_kind.as_str(), own.health, &own.labels),
+        (
+            "vllm",
+            HealthPolicy {
+                failure_threshold: 1,
+                success_threshold: 1,
+                check_interval_ms: 3_000,
+                timeout_ms: 2_000,
+                probes: true,
+            },
+            &paired.facts.labels
+        )
+    );
+}
+
+/// A row may state a threshold of zero, which its object holds as one. A
+/// worker that states the zero states the row itself, and one rebuilt from
+/// the row states the object's one. A refresh takes each under another
+/// label, and the row keeps its zero.
+#[test]
+fn a_refresh_takes_the_rows_own_word_where_its_object_holds_less() {
+    let (store, door) = door();
+    let zero = HealthCheckConfig {
+        failure_threshold: 0,
+        success_threshold: 0,
+        ..HealthCheckConfig::default()
+    };
+    let first: Arc<dyn Worker> = Arc::new(built("gold").health_config(zero.clone()).build());
+    let registered = door.found_built(&Registrant::Control, Precondition::Absent, &first, None);
+    assert!(registered.is_ok(), "{registered:?}");
+    let row = store.by_key(URL).expect("the registered row");
+    let thresholds = |row: &WorkerRow| {
+        let policy = row.facts.health;
+        (policy.failure_threshold, policy.success_threshold)
+    };
+    assert_eq!(thresholds(&row), (0, 0));
+    let own = crate::worker_host::object(&row);
+    let held = &own.metadata().health_config;
+    assert_eq!((held.failure_threshold, held.success_threshold), (1, 1));
+
+    // A worker that states the zero states the row.
+    let silver: Arc<dyn Worker> = Arc::new(built("silver").health_config(zero).build());
+    let wrote = door.refreshed(standing(&row), &silver, &first);
+    assert_eq!(wrote, Ok(MembershipWriteOutcome::InPlace(row.id)));
+    let moved = store.by_key(URL).expect("the refreshed row");
+    let tier = |row: &WorkerRow| row.facts.labels.get("tier").cloned();
+    assert_eq!(tier(&moved).as_deref(), Some("silver"));
+    assert_eq!(thresholds(&moved), (0, 0));
+
+    // One rebuilt from the row states the object's one.
+    let bronze = WorkerRow {
+        facts: WorkerFacts {
+            labels: [("tier".to_owned(), "bronze".to_owned())].into(),
+            ..moved.facts.clone()
+        },
+        ..moved.clone()
+    };
+    let rebuilt = crate::worker_host::object(&bronze);
+    let wrote = door.refreshed(standing(&moved), &rebuilt, &silver);
+    assert_eq!(wrote, Ok(MembershipWriteOutcome::InPlace(row.id)));
+    let again = store.by_key(URL).expect("the row refreshed again");
+    assert_eq!(again.facts, bronze.facts);
+}
+
+/// A wait wider than a row holds reads as the widest number a row holds.
+/// A row less than 295 milliseconds under that number builds an object
+/// that waits past it. A refresh takes that object under another label,
+/// and the row keeps its number. A worker that waits a second longer for
+/// either check reads as that object does, and passes as it.
+#[test]
+fn a_wait_past_a_rows_width_passes_a_refresh_as_the_rows_object() {
+    use super::super::object::builder;
+
+    let (store, door) = door();
+    let widest = WorkerFacts {
+        labels: [("tier".to_owned(), "gold".to_owned())].into(),
+        health: HealthPolicy {
+            failure_threshold: 3,
+            success_threshold: 2,
+            check_interval_ms: 4_294_967_001,
+            timeout_ms: 4_294_967_001,
+            probes: true,
+        },
+        ..stated()
+    };
+    let laid = door.found(&Registrant::Control, Precondition::Absent, URL, &|_| {
+        widest.clone()
+    });
+    assert!(laid.is_ok(), "{laid:?}");
+    let row = store.by_key(URL).expect("the registered row");
+    assert_eq!(row.facts.health, widest.health);
+    // The row's own object waits 4,294,968 seconds for each check: its
+    // reading stands at the widest number.
+    let first = crate::worker_host::object(&row);
+    let checks = first.metadata().health_config.clone();
+    assert_eq!(
+        (checks.check_interval_secs, checks.timeout_secs),
+        (4_294_968, 4_294_968)
+    );
+    let read = |worker: &dyn Worker| found::facts(worker, Some(&row.facts)).health;
+    let own = read(first.as_ref());
+    assert_eq!(
+        (own.check_interval_ms, own.timeout_ms),
+        (u32::MAX, u32::MAX)
+    );
+    let relabelled = |seen: &WorkerRow, tier: &str| WorkerRow {
+        facts: WorkerFacts {
+            labels: [("tier".to_owned(), tier.to_owned())].into(),
+            ..seen.facts.clone()
+        },
+        ..seen.clone()
+    };
+
+    // The row's object under another label moves the label, and the row
+    // keeps its number.
+    let silver = relabelled(&row, "silver");
+    let mut over = crate::worker_host::object(&silver);
+    let wrote = door.refreshed(standing(&row), &over, &first);
+    assert_eq!(wrote, Ok(MembershipWriteOutcome::InPlace(row.id)));
+    let mut seen = store.by_key(URL).expect("the refreshed row");
+    assert_eq!(seen.facts, silver.facts);
+
+    // A second longer for one check reads as the row's object does, and
+    // the refresh takes each: the label moves, and the number stays. Each
+    // worker is stated twice: the seconds it adds to the row's object's,
+    // the interval's then the timeout's, and the seconds it then waits.
+    let slower = [
+        ("bronze", (0, 1), (4_294_968, 4_294_969)),
+        ("copper", (1, 0), (4_294_969, 4_294_968)),
+    ];
+    for (tier, (interval, timeout), waited) in slower {
+        let next = relabelled(&seen, tier);
+        let waits = HealthCheckConfig {
+            check_interval_secs: checks.check_interval_secs + interval,
+            timeout_secs: checks.timeout_secs + timeout,
+            ..checks.clone()
+        };
+        let longer: Arc<dyn Worker> = Arc::new(builder(&next).health_config(waits).build());
+        let held = &longer.metadata().health_config;
+        assert_eq!((held.check_interval_secs, held.timeout_secs), waited);
+        assert_eq!(read(longer.as_ref()), own);
+        let wrote = door.refreshed(standing(&seen), &longer, &over);
+        assert_eq!(wrote, Ok(MembershipWriteOutcome::InPlace(row.id)));
+        seen = store.by_key(URL).expect("the row refreshed again");
+        assert_eq!(seen.facts, next.facts);
+        over = longer;
     }
 }
 
@@ -2037,13 +2351,18 @@ fn a_drain_marks_the_makers_row_once_and_a_removal_takes_it() {
     let stale = row.revision - 1;
     assert_eq!(
         changed(
+            &door,
             store.set_status(row.id, WorkerStatus::Draining, stale),
             MembershipWriteOutcome::Draining
         ),
         Err(MembershipWriteRefused::Moved)
     );
     assert_eq!(
-        changed(store.remove(row.id, stale), MembershipWriteOutcome::Removed),
+        changed(
+            &door,
+            store.remove(row.id, stale),
+            MembershipWriteOutcome::Removed
+        ),
         Err(MembershipWriteRefused::Moved)
     );
     assert_eq!(

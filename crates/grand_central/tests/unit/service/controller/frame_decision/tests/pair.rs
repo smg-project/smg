@@ -1,7 +1,7 @@
 //! The cases of a pair's frame at its prefill. A pair's ask [`decide_pair`]
 //! for a pair at its prefill, and the two that file its leases ask
-//! [`issue_pair`] behind it. One case holds the document's pairing at a
-//! pair's first decision and at its decode call.
+//! [`issue_pair`] behind it. Two cases go on to a decode call: one holds
+//! the document's pairing there too, and one a controller's pair classes.
 
 use super::*;
 

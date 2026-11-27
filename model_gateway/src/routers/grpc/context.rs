@@ -373,10 +373,11 @@ pub(crate) struct ProcessingState {
     pub response: ResponseState,
 }
 
-/// Worker-selection inputs that outlive the parsed request. The prompt's
-/// token ids are not kept: a retry reads them off the retained plan
+/// Worker-selection inputs that outlive the parsed request, and the media's
+/// answer a pair's dispatch reads for its decode side
+/// (`language_model_reads_grids`). The prompt's token ids are not kept: a
+/// retry reads them off the retained plan
 /// ([`ExecutionPlan::routing_token_ids`]).
-#[derive(Default)]
 pub(crate) struct RoutingSnapshot {
     /// Exact context checks retained for initial selection and retries.
     pub context_requirements: super::common::stages::ContextRequirements,
@@ -400,6 +401,16 @@ pub(crate) struct RoutingSnapshot {
     /// mode only), noted at first selection so a retry re-selects under the
     /// same demand.
     pub decode_needs_vision: bool,
+    /// The model's language model computes token positions from the grid
+    /// tensors (the spec's answer the preprocessed media carries,
+    /// `MultimodalIntermediate::language_model_reads_grids`), noted at first
+    /// selection so dispatch picks the decode side's form under the same
+    /// answer: a language-model-only decode worker takes a grid-bearing
+    /// request's decode side stripped only when it is `false`. `true` for a
+    /// request the gateway did not preprocess, the answer that keeps the
+    /// refusal. The snapshot has no default: worker selection writes every
+    /// field.
+    pub language_model_reads_grids: bool,
 }
 
 pub(crate) use crate::routers::common::placement::{PipelinePin, WireConstraint};
