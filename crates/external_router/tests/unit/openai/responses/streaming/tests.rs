@@ -886,6 +886,21 @@ const MESSAGE_ADDED: &str = "event: response.output_item.added\ndata: {\"type\":
 const MESSAGE_DELTA: &str = "event: response.output_text.delta\ndata: {\"type\":\
                              \"response.output_text.delta\",\"sequence_number\":5,\"item_id\":\
                              \"msg_2\",\"output_index\":1,\"content_index\":0,\"delta\":\"so f\"}";
+/// A call that opens behind the message of [`MESSAGE_ADDED`], at the next
+/// output index, while that message is still open.
+const LATER_CALL_ADDED: &str = "event: response.output_item.added\ndata: {\"type\":\
+                                \"response.output_item.added\",\"sequence_number\":6,\
+                                \"output_index\":2,\"item\":{\"type\":\"function_call\",\"id\":\
+                                \"fc_3\",\"call_id\":\"call_3\",\"name\":\"lookup\",\
+                                \"arguments\":\"\"}}";
+const LATER_CALL_DONE: &str = "event: response.function_call_arguments.done\ndata: {\"type\":\
+                               \"response.function_call_arguments.done\",\"sequence_number\":7,\
+                               \"item_id\":\"fc_3\",\"output_index\":2,\"arguments\":\"{}\"}";
+const LATER_CALL_ITEM_DONE: &str = "event: response.output_item.done\ndata: {\"type\":\
+                                    \"response.output_item.done\",\"sequence_number\":8,\
+                                    \"output_index\":2,\"item\":{\"type\":\"function_call\",\
+                                    \"id\":\"fc_3\",\"call_id\":\"call_3\",\"name\":\"lookup\",\
+                                    \"arguments\":\"{}\",\"status\":\"completed\"}}";
 const INCOMPLETE: &str = "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\
                           \"sequence_number\":5,\"response\":{\"id\":\"resp_1\",\"object\":\
                           \"response\",\"created_at\":1,\"model\":\"m\",\"status\":\
@@ -915,6 +930,12 @@ enum Cut {
     /// A message opens, part of its text is streamed and the connection
     /// breaks.
     Message,
+    /// A message opens, part of its text is streamed, a later call's item
+    /// opens and the connection breaks.
+    MessageThenOpenCall,
+    /// A message opens, part of its text is streamed, a later call is
+    /// streamed whole and the connection breaks.
+    MessageThenWholeCall,
 }
 
 /// Serves one streamed request from a stub upstream whose tool turn is cut
@@ -950,6 +971,22 @@ async fn a_turn_cut_behind_its_first_call(
         Cut::Break | Cut::End => [&first_call[..], &[SECOND_CALL_ADDED][..]].concat(),
         Cut::Terminal(event) => [&first_call[..], &[SECOND_CALL_ADDED, event][..]].concat(),
         Cut::Message => [&first_call[..], &[MESSAGE_ADDED, MESSAGE_DELTA][..]].concat(),
+        Cut::MessageThenOpenCall => [
+            &first_call[..],
+            &[MESSAGE_ADDED, MESSAGE_DELTA, LATER_CALL_ADDED][..],
+        ]
+        .concat(),
+        Cut::MessageThenWholeCall => [
+            &first_call[..],
+            &[
+                MESSAGE_ADDED,
+                MESSAGE_DELTA,
+                LATER_CALL_ADDED,
+                LATER_CALL_DONE,
+                LATER_CALL_ITEM_DONE,
+            ][..],
+        ]
+        .concat(),
         Cut::Stall => first_call.to_vec(),
     }
     .join("\n\n")
@@ -975,7 +1012,10 @@ async fn a_turn_cut_behind_its_first_call(
                 let head = stream::iter([Ok(Bytes::from(cut_turn.clone()))]);
                 match cut {
                     // The frames are on the wire before the connection breaks.
-                    Cut::Break | Cut::Message => head
+                    Cut::Break
+                    | Cut::Message
+                    | Cut::MessageThenOpenCall
+                    | Cut::MessageThenWholeCall => head
                         .chain(stream::once(async {
                             tokio::time::sleep(Duration::from_millis(200)).await;
                             Err(io::Error::other("the upstream broke"))
@@ -1179,6 +1219,87 @@ async fn a_message_a_cut_turn_left_half_open_is_closed_as_incomplete_and_kept() 
         .filter(|item| item["id"] == "msg_2")
         .collect();
     assert_eq!(kept, [&closed["item"]], "{text}");
+}
+
+/// The ids of the items the stream closed, in the order of the output
+/// indices the client read for them, and the ids of those items in the
+/// final response, in the response's order.
+fn closed_by_index_and_kept(text: &str) -> (Vec<String>, Vec<String>) {
+    let events: Vec<Value> = text
+        .split("\n\n")
+        .filter_map(|frame| frame.split_once("\ndata: "))
+        .filter_map(|(_, data)| serde_json::from_str(data).ok())
+        .collect();
+    let mut closed: Vec<(u64, String)> = events
+        .iter()
+        .filter(|event| event["type"] == "response.output_item.done")
+        .filter_map(|event| {
+            let index = event["output_index"].as_u64()?;
+            Some((index, event["item"]["id"].as_str()?.to_string()))
+        })
+        .collect();
+    closed.sort();
+    let closed: Vec<String> = closed.into_iter().map(|(_, id)| id).collect();
+    let kept = events
+        .iter()
+        .filter(|event| event["type"] == "response.completed")
+        .filter_map(|event| event["response"]["output"].as_array())
+        .flatten()
+        .filter_map(|item| item["id"].as_str())
+        .filter(|id| closed.iter().any(|closed| closed == id))
+        .map(str::to_string)
+        .collect();
+    (closed, kept)
+}
+
+/// The items a cut turn left half-open stand in the final response in the
+/// order of the output indices the client read for them: a message that
+/// opened before the call the cut left half-open stands before that call,
+/// though the call is closed first.
+#[tokio::test]
+async fn the_items_a_cut_turn_left_half_open_keep_the_order_of_their_indices() {
+    use crate::test_support::http_client;
+
+    let (requests, text) =
+        a_turn_cut_behind_its_first_call(Cut::MessageThenOpenCall, http_client()).await;
+    assert_served_from_the_first_call(&requests, &text);
+    assert_the_half_open_call_is_closed(&text);
+    let (closed, kept) = closed_by_index_and_kept(&text);
+    assert_eq!(
+        closed.len(),
+        3,
+        "the call that ran, the message and the half-open call: {text}"
+    );
+    assert_eq!(closed[1], "msg_2", "{text}");
+    assert_eq!(kept, closed, "{text}");
+}
+
+/// A message a cut turn left half-open stands in the final response before
+/// a later call of that turn that ran, as the stream numbered them.
+#[tokio::test]
+async fn a_half_open_message_stands_before_a_later_call_that_ran() {
+    use crate::test_support::http_client;
+
+    let (requests, text) =
+        a_turn_cut_behind_its_first_call(Cut::MessageThenWholeCall, http_client()).await;
+    assert_eq!(
+        requests.len(),
+        2,
+        "the cut turn, then one request with the outputs of both calls: {text}"
+    );
+    assert_eq!(
+        text.matches("event: response.output_item.added").count(),
+        text.matches("event: response.output_item.done").count(),
+        "no item the stream announced stays open: {text}"
+    );
+    let (closed, kept) = closed_by_index_and_kept(&text);
+    assert_eq!(
+        closed.len(),
+        3,
+        "the two calls that ran and the message between them: {text}"
+    );
+    assert_eq!(closed[1], "msg_2", "{text}");
+    assert_eq!(kept, closed, "{text}");
 }
 
 /// The same turn on a stream that stalls behind the call until the

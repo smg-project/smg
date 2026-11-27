@@ -48,6 +48,9 @@ pub(crate) struct ToolLoopState {
     pub existing_mcp_list_tools_labels: HashSet<String>,
     /// Transformed output items (mcp_call, web_search_call, etc.) - stored to avoid reconstruction
     pub mcp_call_items: Vec<Value>,
+    /// The output index the client read for each of `mcp_call_items`, kept
+    /// by the streamed loop alone (see [`Self::retain_streamed_item`]).
+    streamed_item_indices: Vec<usize>,
     /// The `mcp_list_tools` items this loop renders, built at their first use
     /// and kept (see [`Self::mcp_list_tools_items`]).
     mcp_list_tools_items: Option<Vec<Value>>,
@@ -68,6 +71,7 @@ impl ToolLoopState {
             conversation_history: Vec::new(),
             existing_mcp_list_tools_labels: known_labels,
             mcp_call_items: Vec::new(),
+            streamed_item_indices: Vec::new(),
             mcp_list_tools_items: None,
             history_in_payload: 0,
         }
@@ -153,6 +157,30 @@ impl ToolLoopState {
                 self.mcp_call_items.extend(openai_output_items);
             }
         }
+    }
+
+    /// Says that the items recorded since the last one placed are those of
+    /// the streamed call the client read at `output_index`: the call's own
+    /// item and the items its output carried.
+    fn streamed_call_recorded(&mut self, output_index: usize) {
+        self.streamed_item_indices
+            .resize(self.mcp_call_items.len(), output_index);
+    }
+
+    /// Keeps an item the streamed loop closed itself (a call that did not
+    /// run, an item a cut turn left half-open) for the final response, at
+    /// the place of `output_index`, the index the client read for it: before
+    /// the first kept item of a higher index. So the response lists a turn's
+    /// items in the order the stream numbered them, whatever the order they
+    /// were closed in.
+    pub fn retain_streamed_item(&mut self, output_index: usize, item: Value) {
+        let at = self
+            .streamed_item_indices
+            .iter()
+            .position(|&index| index > output_index)
+            .unwrap_or(self.streamed_item_indices.len());
+        self.streamed_item_indices.insert(at, output_index);
+        self.mcp_call_items.insert(at, item);
     }
 }
 
@@ -408,6 +436,7 @@ async fn close_streaming_call(
     {
         return false;
     }
+    let output_index = call.effective_output_index();
     state.record_call(
         dispatch.session.is_builtin_tool(&call.name),
         call.call_id,
@@ -416,6 +445,7 @@ async fn close_streaming_call(
         output_str,
         mcp_call_item,
     );
+    state.streamed_call_recorded(output_index);
     true
 }
 
@@ -429,9 +459,10 @@ async fn close_streaming_call(
 /// `response.mcp_call.failed` and then its `response.output_item.done`; a
 /// call in a hosted format gets its `response.output_item.done` alone (the
 /// API has no failed sub-event for those item types; the item's status says
-/// it). So no item the stream announced stays open, and each takes its place
-/// among the final response's items after the calls that ran. Returns false
-/// when the client left.
+/// it). So no item the stream announced stays open, and each takes the place
+/// of its output index among the final response's items (see
+/// [`ToolLoopState::retain_streamed_item`]). Returns false when the client
+/// left.
 pub(crate) async fn skip_streaming_tool_calls(
     skipped: Vec<FunctionCallInProgress>,
     error: &str,
@@ -498,7 +529,7 @@ pub(crate) async fn skip_streaming_tool_calls(
             return false;
         }
 
-        state.mcp_call_items.push(item);
+        state.retain_streamed_item(output_index, item);
     }
     true
 }
@@ -507,8 +538,9 @@ pub(crate) async fn skip_streaming_tool_calls(
 /// when it was cut behind a call that ran, as
 /// [`super::StreamingToolHandler::take_open_items`] hands them over: each gets the
 /// `response.output_item.done` the upstream did not write, with the item as
-/// closed there, and takes its place among the final response's items after
-/// the calls that ran. Returns false when the client left.
+/// closed there, and takes the place of its output index among the final
+/// response's items (see [`ToolLoopState::retain_streamed_item`]). Returns
+/// false when the client left.
 pub(crate) async fn close_streaming_open_items(
     open_items: Vec<(usize, Value)>,
     tx: &SseSender,
@@ -532,7 +564,7 @@ pub(crate) async fn close_streaming_open_items(
             return false;
         }
 
-        state.mcp_call_items.push(item);
+        state.retain_streamed_item(output_index, item);
     }
     true
 }
