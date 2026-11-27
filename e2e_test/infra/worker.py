@@ -62,6 +62,8 @@ from .process_utils import (
     wait_for_health,
     wait_for_process_group_exit,
 )
+from .sglang_gptoss import apply_environment as apply_gptoss_environment
+from .sglang_gptoss import prepare_launch as prepare_gptoss_launch
 
 logger = logging.getLogger(__name__)
 
@@ -462,6 +464,9 @@ class Worker:
         features = spec.get("features", [])
 
         if self.engine == "sglang":
+            model_path, spec = prepare_gptoss_launch(
+                self.engine, self.model_id, model_path, spec, self.extra_engine_args
+            )
             if self.mode == ConnectionMode.ZMQ:
                 # The launcher validates the complete engine argument list
                 # (it refuses a DP launch this wire does not carry yet), so
@@ -1094,6 +1099,7 @@ class Worker:
 
         if self.extra_env:
             env.update(self.extra_env)
+        apply_gptoss_environment(self.engine, self.model_id, env, self.extra_env)
         return env
 
     def read_log(self) -> str:
