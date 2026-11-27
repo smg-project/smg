@@ -248,6 +248,13 @@ pub(crate) trait CallAssembler: std::fmt::Debug + Send + Sync {
     /// the option pays nothing per piece for them.
     fn track_value(&mut self) {}
 
+    /// The engine starts its JSON calls at the name ([`Engine::starts_calls_at_name`]): said
+    /// once, when the call is made, so a request without the option pays one test per call for
+    /// it. Off by default: a syntax whose call is no JSON object that carries the name starts
+    /// as before, and a shaped call's envelope reads the word from the declared record it is
+    /// fed with, its reader being made where none stands.
+    fn start_at_name(&mut self) {}
+
     /// The table's ignored terminal arrived inside the call. Its bytes are the engine's to place
     /// ([`Region`]): dropped where it stands when the assembler holds nothing, else placed where
     /// it arrived once the bytes around it leave, spliced into a call event's source or split out
@@ -562,6 +569,28 @@ impl Engine {
             if let Some(call) = &mut self.call {
                 call.track_value();
             }
+        }
+        self
+    }
+
+    /// The engine that starts a JSON call at its name: `ToolCallStart` is said once the closing
+    /// quote of the name has arrived, so a client that streams learns which function is called
+    /// before the arguments' key comes, and every cut of the output starts the same call. The
+    /// bytes between the name and the arguments value (a comma, the key, the colon) then leave
+    /// with the value's first fragment, and an output that ends behind the name ends a call
+    /// that started, with a `Malformed` event of no bytes for the arguments that never came.
+    /// Without the option a call starts where its arguments value begins (or where its object
+    /// closes without one), and an output that ends before that holds no call: its bytes are
+    /// malformed text, as a reader of a whole output expects. A call whose syntax is not a
+    /// JSON object that carries the name starts as before. Without the option a request pays
+    /// one test per call and one per piece of a JSON call's arguments. Set per request, by a
+    /// host that streams.
+    #[must_use]
+    pub fn starts_calls_at_name(mut self) -> Self {
+        self.declared.start_calls_at_name();
+        // A table whose output starts inside a call opened it in `new`: told now.
+        if let Some(call) = &mut self.call {
+            call.start_at_name();
         }
         self
     }
@@ -1330,6 +1359,9 @@ impl Engine {
         );
         if self.json_answer && self.json_syntax() {
             call.track_value();
+        }
+        if self.declared.calls_start_at_name() {
+            call.start_at_name();
         }
         call
     }
@@ -3602,5 +3634,48 @@ mod tests {
             .map(|(at, c)| &TWO_CALLS[at..at + c.len_utf8()])
             .collect();
         assert_eq!(replay(characters), whole);
+    }
+
+    /// [`Engine::starts_calls_at_name`]: the start comes with the name, and without the option
+    /// it waits for the arguments. A call the engine opened when it was made, the output of its
+    /// table starting inside one, is told as a call a marker opens.
+    #[test]
+    fn an_engine_that_starts_calls_at_the_name_says_the_start_before_the_arguments_come() {
+        let started = |mut engine: Engine, text: &str| {
+            let mut out = Events::new();
+            engine
+                .feed(
+                    Input::Delta {
+                        token_ids: &[],
+                        text,
+                        spans: &[],
+                    },
+                    &mut out,
+                )
+                .expect("in order");
+            out.as_slice().iter().any(
+                |event| matches!(event, Event::ToolCallStart { name, .. } if name == "get_weather"),
+            )
+        };
+        let after_a_marker = "<tool_call>\n{\"name\": \"get_weather\"";
+        let engine = || Engine::new(qwen3(CallSyntax::Json), weather_declared());
+        assert!(
+            started(engine().starts_calls_at_name(), after_a_marker),
+            "the name is whole"
+        );
+        assert!(
+            !started(engine(), after_a_marker),
+            "by default the start waits for the arguments"
+        );
+        let in_a_bare_list = "[{\"name\": \"get_weather\"";
+        let engine = || Engine::new(xlam(), weather_declared());
+        assert!(
+            started(engine().starts_calls_at_name(), in_a_bare_list),
+            "the call that stood open when the option was set is told"
+        );
+        assert!(
+            !started(engine(), in_a_bare_list),
+            "by default the start waits for the arguments"
+        );
     }
 }

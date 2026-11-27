@@ -4155,7 +4155,8 @@ impl<'a> ChatStream<'a> {
                             self.spec.tools.clone().unwrap_or_default(),
                             &mut events,
                         )?
-                        .first_call_only(self.spec.first_tool_call_only),
+                        .first_call_only(self.spec.first_tool_call_only)
+                        .starts_calls_at_name(),
                     ),
                 };
                 let stopped =
@@ -4411,7 +4412,8 @@ impl<'a> ChatStream<'a> {
                     self.spec.tools.clone().unwrap_or_default(),
                     &mut events,
                 )?
-                .first_call_only(self.spec.first_tool_call_only),
+                .first_call_only(self.spec.first_tool_call_only)
+                .starts_calls_at_name(),
             ),
         };
         if let Some(text) = flushed {
@@ -5544,8 +5546,11 @@ impl<'a> MessagesStream<'a> {
             .symphony
             .as_ref()
             .map(|assignment| {
-                Reader::new(assignment, Arc::clone(&spec.chat_tools), &mut spare)
-                    .map(|reader| reader.first_call_only(spec.first_tool_call_only))
+                Reader::new(assignment, Arc::clone(&spec.chat_tools), &mut spare).map(|reader| {
+                    reader
+                        .first_call_only(spec.first_tool_call_only)
+                        .starts_calls_at_name()
+                })
             })
             .transpose()?
             .map(|reader| {

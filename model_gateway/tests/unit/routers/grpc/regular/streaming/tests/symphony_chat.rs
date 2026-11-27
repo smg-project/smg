@@ -639,6 +639,153 @@ async fn a_whole_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_finish
     }
 }
 
+/// A JSON call whose output ends before its arguments begin, streamed a character at a time: the
+/// stream road starts a call at its name, so the client holds the name while the arguments are
+/// still to come, where the call started at the first byte of its arguments and an output cut
+/// before them streamed no call. The call ends with no arguments and the engine's finish stands;
+/// what stood behind the name is the answer's content, as the tail of an object that never closed
+/// is. An output the model stopped behind the name starts its call the same way, and so does a
+/// call to a function the request does not declare, which that choice keeps. Under a choice that
+/// drops a call with its bytes (none, and a required list, which drops a call to a function the
+/// request does not declare) the start stays where it was: the bytes of a call that never began
+/// are still the answer's content, whichever function it named.
+#[tokio::test]
+async fn a_streamed_json_call_starts_at_its_name_before_its_arguments_come() {
+    let required = json!("required");
+    let marked = || {
+        assigned(
+            chat_spec(true),
+            qwen3(CallSyntax::Json),
+            "<|im_start|>assistant\n",
+        )
+    };
+    let mut forbidden = marked();
+    forbidden.symphony.as_mut().expect("assigned").forbids_calls = Forbids::Every;
+    let lookup = vec![("lookup".to_string(), String::new())];
+    for (spec, output, finish, calls, content, finished) in [
+        (
+            marked(),
+            "<tool_call>\n{\"name\": \"lookup\", \"argu",
+            "length",
+            lookup.clone(),
+            ", \"argu",
+            "length",
+        ),
+        (
+            forced_spec(Table::Qwen3, &required, "<|im_start|>assistant\n<think>\n"),
+            "plan</think>[{\"name\": \"lookup\", \"argu",
+            "length",
+            Vec::new(),
+            "[{\"name\": \"lookup\", \"argu",
+            "length",
+        ),
+        (
+            forced_spec(Table::Qwen3, &required, "<|im_start|>assistant\n"),
+            "[{\"name\": \"ghost\", \"argu",
+            "length",
+            Vec::new(),
+            "[{\"name\": \"ghost\", \"argu",
+            "length",
+        ),
+        (
+            marked(),
+            "<tool_call>\n{\"name\": \"lookup\"",
+            "stop",
+            lookup.clone(),
+            "",
+            "tool_calls",
+        ),
+        (
+            marked(),
+            "<tool_call>\n{\"name\": \"ghost\", \"argu",
+            "length",
+            vec![("ghost".to_string(), String::new())],
+            ", \"argu",
+            "length",
+        ),
+        (
+            forbidden,
+            "<tool_call>\n{\"name\": \"lookup\", \"argu",
+            "length",
+            Vec::new(),
+            "\n{\"name\": \"lookup\", \"argu",
+            "length",
+        ),
+    ] {
+        let mut frames: Vec<_> = output.chars().map(|ch| chunk(0, &ch.to_string())).collect();
+        frames.push(complete(0, finish));
+        let (result, events) = stream_events(frames, true, spec).await;
+        assert!(result.is_ok(), "{output}: {result:?}");
+        let said = format!(
+            "{output} ended by {finish}: calls {:?}, content {:?}, finish {:?}",
+            streamed_calls(&events),
+            chat_text(&events, 0, "content"),
+            streamed_finish(&events)
+        );
+        assert_eq!(streamed_calls(&events), calls, "{said}");
+        assert_eq!(chat_text(&events, 0, "content"), content, "{said}");
+        assert_eq!(streamed_finish(&events), finished, "{said}");
+    }
+}
+
+/// The Messages stream road starts a JSON call at its name too: an output cut before the call's
+/// arguments streams the `tool_use` block of the function it named, and the stop reason stands.
+#[tokio::test]
+async fn a_streamed_message_starts_a_json_call_at_its_name() {
+    let spec = assigned_message(qwen3(CallSyntax::Json), "<|im_start|>assistant\n", false);
+    let output = "<tool_call>\n{\"name\": \"lookup\", \"argu";
+    let mut responses: Vec<_> = output.chars().map(|ch| chunk(0, &ch.to_string())).collect();
+    responses.push(complete(0, "length"));
+    let (result, events) = message_events(responses, spec, None).await;
+    assert!(result.is_ok(), "{result:?}");
+    let called: Vec<&str> = events
+        .iter()
+        .filter(|event| {
+            event["type"] == "content_block_start" && event["content_block"]["type"] == "tool_use"
+        })
+        .filter_map(|event| event["content_block"]["name"].as_str())
+        .collect();
+    assert_eq!(called, ["lookup"], "{events:?}");
+    assert_eq!(
+        message_stop_reason(&events),
+        "model_context_window_exceeded",
+        "{events:?}"
+    );
+}
+
+/// The same outputs read whole: the unary road starts a call where it did, so an output that ends
+/// before a call's arguments begin is no call there and its bytes are the answer's content, cut
+/// inside the arguments' key and at the name's closing quote alike. The call marker is the table's
+/// framing, dropped as always.
+#[tokio::test]
+async fn a_whole_json_call_cut_before_its_arguments_stays_the_answers_content() {
+    let required = json!("required");
+    let listed = forced_spec(Table::Qwen3, &required, "<|im_start|>assistant\n<think>\n");
+    for cut in ["{\"name\": \"lookup\", \"argu", "{\"name\": \"lookup\""] {
+        let (marked, _) = fold_finished(
+            &format!("<tool_call>\n{cut}"),
+            qwen3(CallSyntax::Json),
+            "<|im_start|>assistant\n",
+            "length",
+        )
+        .await;
+        let in_a_list = forced_whole(&listed, &format!("plan</think>[{cut}"), "length").await;
+        for (choice, content) in [
+            (&marked, format!("\n{cut}")),
+            (&in_a_list, format!("[{cut}")),
+        ] {
+            let said = format!("{cut}: after a marker {marked:?}, in a list {in_a_list:?}");
+            assert!(choice.message.tool_calls.is_none(), "{said}");
+            assert_eq!(
+                choice.message.content.as_deref(),
+                Some(content.as_str()),
+                "{said}"
+            );
+            assert_eq!(choice.finish_reason.as_deref(), Some("length"), "{said}");
+        }
+    }
+}
+
 /// A DSML block the token limit cut before its invoke named a call, after a refusal inside it (a
 /// parameter tag where the name's quote should have come, and the text after it): no call, so the
 /// reader releases the output's own slice from the invoke's opener as the content at the end, the
