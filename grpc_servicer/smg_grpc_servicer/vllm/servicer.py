@@ -248,6 +248,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         # configured logging by now, if it was going to).
         settle_logging()
         self.engine = async_llm
+        self._supports_thinking_token_budget = supports_thinking_token_budget(
+            getattr(async_llm, "vllm_config", None)
+        )
         self.start_time = start_time
         # Whether the engine's generate() takes `reasoning_ended`, read once
         # off its signature rather than a version: an engine whose generate()
@@ -1059,9 +1062,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         if self._mm_encoder_budget and "mm_encoder_budget" in info.DESCRIPTOR.fields_by_name:
             info.mm_encoder_budget = self._mm_encoder_budget
         if "supports_thinking_token_budget" in info.DESCRIPTOR.fields_by_name:
-            info.supports_thinking_token_budget = supports_thinking_token_budget(
-                self.engine.vllm_config
-            )
+            info.supports_thinking_token_budget = self._supports_thinking_token_budget
         # The engine's reasoning parser and where it starts a grammar on a
         # thinking prompt, for the Router to shape a forced tool call's
         # grammar by; likewise absent from an older package.
@@ -1299,8 +1300,8 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             prompt=tokenized.original_text or None,
         )
 
-    @staticmethod
     def _sampling_params_from_proto(
+        self,
         params: vllm_engine_pb2.SamplingParams,
         stream: bool = True,
         kv_transfer_params: dict | None = None,
@@ -1342,12 +1343,15 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
 
         # Create SamplingParams
         # output_kind=DELTA: Return only new tokens in each chunk (for streaming)
-        budget_args = (
-            {"thinking_token_budget": params.thinking_token_budget}
-            if "thinking_token_budget" in params.DESCRIPTOR.fields_by_name
-            and params.HasField("thinking_token_budget")
-            else {}
-        )
+        budget_args = {}
+        if "thinking_token_budget" in params.DESCRIPTOR.fields_by_name and params.HasField(
+            "thinking_token_budget"
+        ):
+            if not self._supports_thinking_token_budget:
+                raise ValueError(
+                    "thinking_token_budget is unsupported by the configured vLLM sampler"
+                )
+            budget_args["thinking_token_budget"] = params.thinking_token_budget
         return SamplingParams(
             **budget_args,
             temperature=params.temperature if params.HasField("temperature") else 1.0,

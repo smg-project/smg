@@ -4343,6 +4343,49 @@ async fn server_info_advertises_the_engines_encoder_budget() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+#[tokio::test]
+async fn generate_enforces_the_advertised_thinking_token_budget_capability() {
+    for supported in [false, true] {
+        let mut model = model_info();
+        model.supports_thinking_token_budget = supported;
+        let mut h = harness(model, None).await;
+        for budget in [None, Some(0), Some(7)] {
+            let mut request = generate_request("budget", false, Vec::new());
+            request
+                .sampling_params
+                .as_mut()
+                .unwrap()
+                .thinking_token_budget = budget;
+            let response = h.client.generate(request).await;
+            if !supported && budget.is_some() {
+                let status = response.expect_err("the sampler cannot enforce this budget");
+                assert_eq!(status.code(), Code::InvalidArgument);
+                assert!(status.message().contains("thinking_token_budget"));
+                assert_engine_idle(&mut h.engine_in).await;
+                continue;
+            }
+            let mut stream = response.expect("generation accepted").into_inner();
+            let request = recv_add(&mut h.engine_in).await;
+            assert_eq!(
+                request.sampling_params.unwrap().thinking_token_budget,
+                budget.map(u64::from)
+            );
+            h.engine_out
+                .send_outputs(&batch(
+                    "budget",
+                    vec![7],
+                    Some(EngineCoreFinishReason::Length),
+                    None,
+                ))
+                .await
+                .unwrap();
+            assert!(stream.message().bounded().await.unwrap().is_some());
+            assert!(stream.message().bounded().await.unwrap().is_none());
+        }
+        h.server.stop(Duration::from_secs(5)).expect("clean stop");
+    }
+}
+
 /// Where the engine starts a request's grammar on a thinking prompt is a fact
 /// of its config the launcher read: advertised with the reasoning parser's
 /// name so the Router shapes a forced tool call's grammar as the engine's own

@@ -35,7 +35,6 @@ def _server_info_method(response_type):
         "managed_ranks": managed_ranks,
         "mm_device_do_normalize": model_info.mm_device_do_normalize,
         "mm_item_limits": model_info.mm_item_limits,
-        "supports_thinking_token_budget": model_info.supports_thinking_token_budget,
         "engine_reasoning_parser": model_info.engine_reasoning_parser,
         "constrained_decoding_start": model_info.constrained_decoding_start,
     }
@@ -91,7 +90,10 @@ def test_get_server_info_reports_encoder_dtype_with_current_and_legacy_protos(
         model_config=model_config, parallel_config=SimpleNamespace(data_parallel_size=1)
     )
     servicer = SimpleNamespace(
-        engine=SimpleNamespace(vllm_config=config), _mm_processor=None, _mm_encoder_budget=0
+        _supports_thinking_token_budget=False,
+        engine=SimpleNamespace(vllm_config=config),
+        _mm_processor=None,
+        _mm_encoder_budget=0,
     )
     info = asyncio.run(_server_info_method(response_type)(servicer, None, None))
     assert info.model_dtype == (dtype or "")
@@ -130,7 +132,10 @@ def test_get_server_info_reports_thinking_token_budget(enabled, legacy):
         use_v2_model_runner=False,
     )
     servicer = SimpleNamespace(
-        engine=SimpleNamespace(vllm_config=config), _mm_processor=None, _mm_encoder_budget=0
+        _supports_thinking_token_budget=enabled,
+        engine=SimpleNamespace(vllm_config=config),
+        _mm_processor=None,
+        _mm_encoder_budget=0,
     )
     info = asyncio.run(_server_info_method(response_type)(servicer, None, None))
     if legacy:
@@ -157,7 +162,10 @@ def test_get_server_info_reports_where_the_engine_starts_a_grammar(legacy):
         ),
     )
     servicer = SimpleNamespace(
-        engine=SimpleNamespace(vllm_config=config), _mm_processor=None, _mm_encoder_budget=0
+        _supports_thinking_token_budget=False,
+        engine=SimpleNamespace(vllm_config=config),
+        _mm_processor=None,
+        _mm_encoder_budget=0,
     )
     info = asyncio.run(_server_info_method(response_type)(servicer, None, None))
     if legacy:
@@ -178,7 +186,10 @@ def test_get_server_info_reports_the_engines_encoder_budget(legacy):
         model_config=model_config, parallel_config=SimpleNamespace(data_parallel_size=1)
     )
     servicer = SimpleNamespace(
-        engine=SimpleNamespace(vllm_config=config), _mm_processor=None, _mm_encoder_budget=192000
+        _supports_thinking_token_budget=False,
+        engine=SimpleNamespace(vllm_config=config),
+        _mm_processor=None,
+        _mm_encoder_budget=192000,
     )
     info = asyncio.run(_server_info_method(response_type)(servicer, None, None))
     if legacy:
@@ -199,7 +210,10 @@ def test_get_server_info_reports_the_cache_partition_fields(legacy):
         parallel_config=SimpleNamespace(data_parallel_size=1),
     )
     servicer = SimpleNamespace(
-        engine=SimpleNamespace(vllm_config=config), _mm_processor=None, _mm_encoder_budget=0
+        _supports_thinking_token_budget=False,
+        engine=SimpleNamespace(vllm_config=config),
+        _mm_processor=None,
+        _mm_encoder_budget=0,
     )
     handler = _server_info_method(_response_type_without(*missing))
     info = asyncio.run(handler(servicer, None, None))
@@ -226,6 +240,7 @@ def test_ec_addresses_preserve_managed_global_rank_slots(monkeypatch, ranks):
         ),
     )
     servicer = SimpleNamespace(
+        _supports_thinking_token_budget=False,
         engine=SimpleNamespace(
             vllm_config=config, logger_manager=SimpleNamespace(engine_indexes=ranks)
         ),
