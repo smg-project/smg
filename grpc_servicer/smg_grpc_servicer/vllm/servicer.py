@@ -138,6 +138,16 @@ def _takes_reasoning_ended(engine) -> bool:
     return generate is not None and "reasoning_ended" in inspect.signature(generate).parameters
 
 
+def _structured_outputs_backend(engine) -> str:
+    """The structured-outputs backend the engine was started with.
+
+    Read off its config rather than a version: an engine whose config names
+    none runs its default ("auto").
+    """
+    section = EngineConfigView(getattr(engine, "vllm_config", None)).structured_outputs
+    return str(section.backend or "auto")
+
+
 def _managed_ranks(engine) -> list[int]:
     """The data-parallel ranks this servicer serves, in order: the engine
     client's managed ranks (a slice of all the ranks under external or
@@ -267,10 +277,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         self._takes_reasoning_ended = _takes_reasoning_ended(async_llm)
         # Read once: the structured-outputs backend the engine was started
         # with, which decides how an answer's structural tag is sent.
-        self._structured_outputs_backend = str(
-            EngineConfigView(getattr(async_llm, "vllm_config", None)).structured_outputs.backend
-            or "auto"
-        )
+        self._structured_outputs_backend = _structured_outputs_backend(async_llm)
         # Resolve KV-event publishing config from the engine. Non-None only when
         # vLLM was started with --kv-events-config enabling the ZMQ publisher.
         self._kv_events_config = resolve_kv_events_config(async_llm)

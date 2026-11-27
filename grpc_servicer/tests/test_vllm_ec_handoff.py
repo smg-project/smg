@@ -14,6 +14,7 @@ import grpc
 import pytest
 from smg_grpc_proto import vllm_engine_pb2 as pb
 from smg_grpc_servicer import constrained_decoding
+from smg_grpc_servicer.vllm.config_view import EngineConfigView
 from smg_grpc_servicer.vllm.mm_keys import batches_missing_pixels, mm_batches
 from smg_grpc_servicer.vllm.mm_salt import has_preprocessed_mm_payload, request_cache_salt
 
@@ -30,7 +31,8 @@ def _generate(**overrides):
         n
         for n in module.body
         if isinstance(n, ast.FunctionDef)
-        and n.name in ("_valid_cpu_ec_handle", "_takes_reasoning_ended")
+        and n.name
+        in ("_valid_cpu_ec_handle", "_takes_reasoning_ended", "_structured_outputs_backend")
     ]
     cls = next(
         n for n in module.body if isinstance(n, ast.ClassDef) and n.name == "VllmEngineServicer"
@@ -46,6 +48,7 @@ def _generate(**overrides):
         "json": json,
         "asyncio": asyncio,
         "build_media_identity": Mock(),
+        "EngineConfigView": EngineConfigView,
         "time": time,
         "logger": logging.getLogger(__name__),
         "grpc": grpc,
@@ -404,19 +407,24 @@ async def test_an_answer_tag_reaches_another_backend_as_its_schema(backend, sent
         """Make gRPC validation failures observable to the test."""
         raise _Aborted(code, message)
 
+    handler = _generate()
     engine = SimpleNamespace(
         generate=generate,
         renderer=SimpleNamespace(process_for_engine=lambda prompt, **kwargs: prompt),
-        vllm_config=SimpleNamespace(ec_transfer_config=None),
+        vllm_config=SimpleNamespace(
+            ec_transfer_config=None,
+            structured_outputs_config=SimpleNamespace(backend=backend),
+        ),
     )
     servicer = SimpleNamespace(
         engine=engine,
-        _structured_outputs_backend=backend,
+        # The servicer's own read, the one its constructor makes once.
+        _structured_outputs_backend=handler.__globals__["_structured_outputs_backend"](engine),
         _sampling_params_from_proto=_converter(),
         _tokenization_kwargs_from_proto=lambda _: {},
         _loads=Mock(),
         _notify_kv_transfer_rejected=AsyncMock(),
     )
     context = SimpleNamespace(abort=abort, invocation_metadata=lambda: ())
-    assert [reply async for reply in _generate()(servicer, request, context)] == []
+    assert [reply async for reply in handler(servicer, request, context)] == []
     assert seen == [{sent_as: schema if sent_as == "json" else tag}]

@@ -78,13 +78,18 @@ def test_an_answer_tag_reaches_another_backend_as_its_schema(monkeypatch, servic
     schema = '{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"integer"}}}'
     tag = '{"format":{"type":"json_schema","json_schema":' + schema + ',"max_whitespace_cnt":32}}'
     sent = pb.SamplingParams(temperature=0.0, structural_tag=tag)
+
+    def started_with(server_args):
+        # The servicer's own read, the one its constructor makes once.
+        return SimpleNamespace(_grammar_backend=servicer_mod.sglang_grammar_backend(server_args))
+
     for backend in ("llguidance", "outlines"):
-        servicer = SimpleNamespace(server_args=SimpleNamespace(grammar_backend=backend))
+        servicer = started_with(SimpleNamespace(grammar_backend=backend))
         params = convert(servicer, sent)
         assert (params.json_schema, params.structural_tag) == (schema, None), backend
     for backend in ("xgrammar", None, "a-plugin"):
-        servicer = SimpleNamespace(server_args=SimpleNamespace(grammar_backend=backend))
+        servicer = started_with(SimpleNamespace(grammar_backend=backend))
         params = convert(servicer, sent)
         assert (params.json_schema, params.structural_tag) == (None, tag), backend
-    params = convert(SimpleNamespace(server_args=None), sent)
+    params = convert(started_with(None), sent)
     assert (params.json_schema, params.structural_tag) == (None, tag)
