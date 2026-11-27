@@ -268,6 +268,7 @@ Over the wire these rules hold:
 
 - Cache events are token blocks, so the index of cache events is never asked for a text request.
 - The record of sent prefixes speaks for every worker of a text request's list, whatever the index holds for the worker.
+- Under an index of the kind `hash` the record keys no text request: [Index](policy-spec.md#index) has the rule.
 - A text request under a cache partition is hashed under the partition's whole identity, the extra key included. So it shares no window with a request of another partition.
 
 ## Pickers
