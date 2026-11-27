@@ -467,8 +467,8 @@ impl Log {
     /// turn: the service's guard, the replication's check, the door's check
     /// of its term and the door's word for a status it writes. The check
     /// runs ahead of a life's mint, of each row a registration writes or
-    /// removes and of a refresh's write, and once more behind a drain that
-    /// wrote nothing. The word is asked under an object's lock and under
+    /// removes and of a refresh's write, and once more behind a write the
+    /// store did not take. The word is asked under an object's lock and under
     /// the store's membership lock: this read takes the log's lock alone,
     /// and no holder of the log's lock takes one of those two. A write
     /// that names its term meets the same test once more, in the take of
@@ -615,6 +615,12 @@ impl Log {
     /// answers yes, one that is let go too: its store moves its tables as
     /// it did.
     fn push(&self, by: Option<Position>, under: Option<u64>, event: Event) -> bool {
+        // An applier's write goes by its leader's place: it names no term
+        // of the store's own.
+        debug_assert!(
+            by.is_none() || under.is_none(),
+            "a write names an applier's place or a term, never both"
+        );
         let mut ring = self.ring.lock();
         if under.is_some_and(|term| self.leads_in(&ring, term).is_err()) {
             return false;
