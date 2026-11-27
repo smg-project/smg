@@ -209,9 +209,6 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                 .as_ref()
                 .filter(|_| refresh)
                 .and_then(|fresh| refresh_left_no_grammar_start(worker, &updated_labels, fresh));
-            if let Some(warning) = lost_start {
-                warn!("{warning}");
-            }
             if !card_fields.is_empty() {
                 info!(
                     worker_url = %worker.redacted_url(),
@@ -360,6 +357,12 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                     });
                 }
             };
+
+            // Said only of a refresh the registry took: one dropped above
+            // leaves the worker as a newer registration holds it.
+            if let Some(warning) = lost_start {
+                warn!("{warning}");
+            }
 
             // Same-URL replace preserves the existing shared runtime. If the
             // update disables health checks, force the lifecycle to Ready so
