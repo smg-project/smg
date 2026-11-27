@@ -440,12 +440,26 @@ impl WorkerSeries {
             }
             series.sort_by(|a, b| a.0.cmp(&b.0));
             write_family(out, &name, kind, descriptions.get(&name));
-            for (labels, folded) in series {
+            let mut series = series.into_iter().peekable();
+            while let Some((labels, folded)) = series.next() {
                 let (sum, count) = match folded {
                     Folded::Cells(cells) => {
+                        // The keys that clean to this family and these labels
+                        // are one series, as the exporter folds them: their
+                        // cells add up. They share the family's bounds.
+                        let mut alike = Vec::new();
+                        while let Some((_, Folded::Cells(more))) = series.next_if(|(next, more)| {
+                            *next == labels && matches!(more, Folded::Cells(_))
+                        }) {
+                            alike.push(more);
+                        }
+                        let in_cell = |cell: usize| {
+                            cells.count(cell)
+                                + alike.iter().map(|more| more.count(cell)).sum::<u64>()
+                        };
                         let mut count = 0_u64;
                         for (cell, le) in cells.bounds.iter().enumerate() {
-                            count += cells.count(cell);
+                            count += in_cell(cell);
                             write_sample(
                                 out,
                                 &name,
@@ -455,7 +469,7 @@ impl WorkerSeries {
                                 &count,
                             );
                         }
-                        count += cells.count(cells.bounds.len());
+                        count += in_cell(cells.bounds.len());
                         write_sample(
                             out,
                             &name,
@@ -464,7 +478,8 @@ impl WorkerSeries {
                             Some(("le", &"+Inf")),
                             &count,
                         );
-                        (cells.sum(), count)
+                        let sum = cells.sum() + alike.iter().map(|more| more.sum()).sum::<f64>();
+                        (sum, count)
                     }
                     Folded::Kept(Distribution::Summary(summary, quantiles, sum)) => {
                         let snapshot = summary.snapshot(Instant::now());
@@ -1197,6 +1212,55 @@ mod tests {
                 "{samples:?}: {stored}"
             );
         }
+    }
+
+    #[test]
+    fn two_names_that_clean_to_one_family_read_as_one_series() {
+        // Sums of powers of two: exact in whatever order they are added.
+        let (under, between, over) = (0.000_244_140_625, 0.007_812_5, 0.5);
+        let series = store();
+        assert!(series.keep_histograms());
+        let (exporter, stored) = scrape(&series, || {
+            metrics::describe_histogram!("apply_seconds", "Time of an apply");
+            histogram!("apply.seconds", "model" => "m").record(under);
+            let cleaned = histogram!("apply_seconds", "model" => "m");
+            cleaned.record(between);
+            cleaned.record(over);
+        });
+        assert!(!exporter.contains("apply_seconds"), "{exporter}");
+        assert_eq!(
+            family(&stored, "apply_seconds"),
+            family(&exporter_alone(&[under, between, over]), "apply_seconds"),
+            "{stored}"
+        );
+        assert_eq!(
+            line(&stored, "apply_seconds_count"),
+            Some("apply_seconds_count{model=\"m\"} 3")
+        );
+    }
+
+    #[test]
+    fn two_names_under_one_worker_label_read_as_one_series() {
+        let series = store();
+        let (_, stored) = scrape(&series, || {
+            histogram!("apply.seconds", "worker" => WORKER_A).record(0.007_812_5);
+            let cleaned = histogram!("apply_seconds", "worker" => WORKER_A);
+            cleaned.record(0.007_812_5);
+            cleaned.record(0.5);
+        });
+        let expected = format!(
+            "# TYPE apply_seconds histogram\n\
+             apply_seconds_bucket{{worker=\"{WORKER_A}\",le=\"0.001\"}} 0\n\
+             apply_seconds_bucket{{worker=\"{WORKER_A}\",le=\"0.01\"}} 2\n\
+             apply_seconds_bucket{{worker=\"{WORKER_A}\",le=\"+Inf\"}} 3\n\
+             apply_seconds_sum{{worker=\"{WORKER_A}\"}} 0.515625\n\
+             apply_seconds_count{{worker=\"{WORKER_A}\"}} 3"
+        );
+        assert_eq!(
+            family(&stored, "apply_seconds"),
+            expected.lines().collect::<Vec<_>>(),
+            "{stored}"
+        );
     }
 
     #[test]
