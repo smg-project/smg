@@ -161,8 +161,11 @@ class PublicationControls(unittest.TestCase):
                     **kwargs,
                 )
 
+            library_path = os.pathsep.join(
+                path for path in (str(loader), os.environ.get("LD_LIBRARY_PATH")) if path
+            )
             with (
-                mock.patch.dict(os.environ, {"LD_LIBRARY_PATH": str(loader)}),
+                mock.patch.dict(os.environ, {"LD_LIBRARY_PATH": library_path}),
                 mock.patch.object(subprocess, "Popen", side_effect=loading_child),
             ):
                 calls = exercise_bake_processes(inspect.getsource(p.publish), directory)
