@@ -5,6 +5,7 @@
 
 use std::{sync::Arc, time::Duration};
 
+use engine_zmq_adapter::ZmqEngineClient;
 use futures::StreamExt;
 use openai_protocol::worker::SchedulerLoadSnapshot;
 use prost_types::Timestamp;
@@ -164,7 +165,7 @@ pub(super) fn server_info(state: &State) -> sg::GetServerInfoResponse {
     if state
         .shared
         .engine()
-        .is_ok_and(generate::supports_thinking_token_budget)
+        .is_ok_and(ZmqEngineClient::sglang_supports_thinking_budget)
     {
         server_args.fields.insert(
             "supports_thinking_token_budget".into(),
