@@ -1233,13 +1233,28 @@ impl LoadGuards {
     /// ([`RequestEnd::of`]), asked of its guard under whatever rides with
     /// it. A batch's sub-requests are one placement: the first guard made
     /// from its answer keeps Grand Central's side of it, and that guard
-    /// is asked. A pair's guards hand the empty handle.
+    /// is asked. A pair's guards hand the empty handle here: its decode's
+    /// is asked apart ([`Self::decode_end`]).
     pub(crate) fn end(&self) -> RequestEnd {
         match self {
             Self::Single { _guard } => RequestEnd::of(_guard),
             Self::Batch { _guards } => _guards.first().map_or_else(RequestEnd::default, Self::end),
             Self::Admitted { _guards, .. } | Self::Traced { _guards, .. } => _guards.end(),
             Self::Disaggregated { .. } => RequestEnd::default(),
+        }
+    }
+
+    /// [`Self::end`] for a pair: the handle on the end of the decode these
+    /// guards count. The pair's prefill tells its own end through its load.
+    /// A single request's guards hand the empty handle here.
+    pub(crate) fn decode_end(&self) -> RequestEnd {
+        match self {
+            Self::Disaggregated { _decode } => RequestEnd::of(_decode),
+            Self::Batch { _guards } => _guards
+                .first()
+                .map_or_else(RequestEnd::default, Self::decode_end),
+            Self::Admitted { _guards, .. } | Self::Traced { _guards, .. } => _guards.decode_end(),
+            Self::Single { .. } => RequestEnd::default(),
         }
     }
 }
@@ -1701,7 +1716,8 @@ impl WorkerSelection {
     /// ([`Placed::end_of`]): a request the classic policies placed walks no
     /// guards and takes the empty handle. Every sub-request of a batch
     /// takes the handle of the batch's one placement. A pair takes the
-    /// empty handle: nobody tells the engine a pair's end yet.
+    /// empty handle here: its decode's is asked apart
+    /// ([`Self::decode_end`]).
     #[inline]
     pub(crate) fn end(&self, guards: Option<&LoadGuards>) -> RequestEnd {
         match self {
@@ -1712,16 +1728,44 @@ impl WorkerSelection {
         }
     }
 
-    /// Whether this selection's request tells Grand Central its end:
-    /// the test [`Self::end`] makes ahead of its guards, for a place that
-    /// holds no guards or would make something for the report alone. True
-    /// for a single request whose answer says so ([`Placed::tells_end`]). A
-    /// request the classic policies placed and a pair tell none.
+    /// Whether this selection's single request tells Grand Central its
+    /// end. It is the test [`Self::end`] makes ahead of its guards, for a
+    /// place that holds no guards or would make something for the report
+    /// alone. True for a single request whose answer says so
+    /// ([`Placed::tells_end`]). A request the classic policies placed tells
+    /// none. A pair answers no here: its decode is asked apart
+    /// ([`Self::decode_tells_end`]), so a single request's test reads one
+    /// worker's word and no more.
     #[inline]
     pub(crate) fn tells_end(&self) -> bool {
         match self {
             Self::Single { worker } => worker.tells_end(),
             Self::Disaggregated { .. } => false,
+        }
+    }
+
+    /// [`Self::tells_end`] for a pair: whether its decode tells Grand
+    /// Central its end, by the one word of the decode's answer. The pair's
+    /// prefill tells its own end through its load. A single request answers
+    /// no here.
+    #[inline]
+    pub(crate) fn decode_tells_end(&self) -> bool {
+        match self {
+            Self::Single { .. } => false,
+            Self::Disaggregated { decode, .. } => decode.tells_end(),
+        }
+    }
+
+    /// [`Self::end`] for a pair: the handle its decode tells its end
+    /// through, asked of `guards` ([`LoadGuards::decode_end`]). The plan's
+    /// teller for a pair asks it, behind the plan's test of the decode's
+    /// word: a pair the classic policies placed never comes here.
+    pub(crate) fn decode_end(&self, guards: Option<&LoadGuards>) -> RequestEnd {
+        match self {
+            Self::Single { .. } => RequestEnd::default(),
+            Self::Disaggregated { decode, .. } => {
+                decode.end_of(|| guards.map_or_else(RequestEnd::default, LoadGuards::decode_end))
+            }
         }
     }
 
@@ -2028,22 +2072,23 @@ impl ExecutionResult {
         }
     }
 
-    /// From here on the result tells Grand Central its request's end
-    /// through `end`, the handle the execution plan asked of the attempt's
-    /// guards ([`WorkerSelection::end`]). The one worker's stream tells its
-    /// own end ([`ProtoStream::report_through`]). The streams of a batch
-    /// share its one placement's end ([`SharedEnd`]): the first failure one
-    /// of them meets stands, and the worker's 200 is told once every stream
-    /// ended well. An embedding is its answers, in hand
-    /// and all good: the worker's 200 is told here, the status the circuit
-    /// breaker sampled for them, and nothing for an embedding of no answer,
-    /// which the breaker took no sample of.
+    /// From here on the result tells Grand Central its request's end through
+    /// `end`, the handle the execution plan asked of the attempt's guards
+    /// ([`WorkerSelection::end`]). The one worker's stream tells its own end
+    /// ([`ProtoStream::report_through`]). A pair's decode stream tells the
+    /// decode's end the same way: the handle is the decode's
+    /// ([`WorkerSelection::decode_end`]). The pair's prefill tells its own end
+    /// through its load. The streams of a batch share
+    /// its one placement's end ([`SharedEnd`]): the first failure one of them
+    /// meets stands, and the worker's 200 is told once every stream ended well.
+    /// A batch of pairs shares it among its decode streams. An embedding is its
+    /// answers, in hand and all good. The worker's 200 is told here, the status
+    /// the circuit breaker sampled for them. An embedding of no answer tells
+    /// nothing: the breaker took no sample of it.
     pub(crate) fn report_through(&mut self, end: RequestEnd) {
         match self {
             Self::Single { stream, .. } => stream.report_through(end),
-            // Nobody tells the engine a pair's end yet. The change that
-            // makes a pair's two sides tell theirs turns this arm on.
-            Self::PrefillDecode { .. } => {}
+            Self::PrefillDecode { decode, .. } => decode.report_through(end),
             Self::Embedding { responses } => {
                 if !responses.is_empty() {
                     end.report(200, || true);
@@ -2051,17 +2096,26 @@ impl ExecutionResult {
             }
             Self::Batch { results } if !end.is_empty() => {
                 let shared = SharedEnd::among(end);
+                // Every reader takes its share before a layer is put. A
+                // layer may meet its stream's end where it is put, and a
+                // good end is the batch's only behind every reader's.
+                let streams = results.iter().filter(|result| {
+                    matches!(result, Self::Single { .. } | Self::PrefillDecode { .. })
+                });
+                let mut shares: Vec<_> = streams.map(|_| shared.reader()).collect();
                 for result in results {
                     match result {
                         Self::Single { stream, .. } => {
-                            stream.put_report_layer(RequestEnd::default(), Some(shared.reader()));
+                            stream.put_report_layer(RequestEnd::default(), shares.pop());
                         }
-                        // A single request's batch holds its streams alone.
-                        // A result of another kind takes no share of the
-                        // end: the batch's good end does not wait on it.
-                        Self::PrefillDecode { .. }
-                        | Self::Embedding { .. }
-                        | Self::Batch { .. } => {}
+                        Self::PrefillDecode { decode, .. } => {
+                            decode.put_report_layer(RequestEnd::default(), shares.pop());
+                        }
+                        // A batch holds the streams of its sub-requests
+                        // alone. A result of another kind takes no share
+                        // of the end: the batch's good end does not wait
+                        // on it.
+                        Self::Embedding { .. } | Self::Batch { .. } => {}
                     }
                 }
             }

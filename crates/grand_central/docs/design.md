@@ -2717,6 +2717,9 @@ impl PlacementSide {
 }
 impl SideEnd {
     pub fn reported(&self, outcome: Outcome); // the side ended with this outcome
+    // the same for a side several readers tell: a failure reported before stands against a
+    // good outcome
+    pub fn reported_unless_failed(&self, outcome: Outcome);
     pub fn is_empty(&self) -> bool;           // a report through it reaches nobody
 }
 ```
@@ -2731,6 +2734,9 @@ outcome last reported or, where none was, in the words of a dropped side: a rele
 class cancelled. Into a reported outcome the side writes its own name, the worker that served
 and the span from its dispatch to the report. A host that asks no handle, and a handle dropped
 with no report, change nothing.
+
+A side whose answer several readers tell is reported through `reported_unless_failed`. A failure
+then stands against a good outcome reported behind it.
 
 Under a document none of whose stages takes an end, a handle is empty and costs nothing: no
 allocation and no lock. Under one that does, a side shares its placement with its handles: one
@@ -2916,19 +2922,28 @@ request ──> route (HTTP or gRPC, any family)
 
   The route tells a side through that side's own guard, where the guard stands, and keeps no
   handle on a prefill's end, which waits for no reader. The streamed decode's relay holds the
-  route's one handle, asked of the decode's guard. A side the gateway dropped is told by
-  nobody: the partner of a side that failed first, a prefill a fan-out never sends, a decode
-  never sent. The route's count request, placed on one worker, is told as a single request is.
+  route's one handle, asked of the decode's guard.
 
-  Two events of a pair sent both sides at once, its prefill read whole, are told otherwise than
-  the circuit breaker records them. In the first, the decode fails behind a prefill that had
-  answered. The engine hears the prefill's own good answer and the decode's failure. The
-  breaker records that failure on the decode alone and nothing on the prefill.
+  A side the gateway dropped is told by nobody: the partner of a side that failed first, a
+  prefill a fan-out never sends, a decode never sent. So is a decode already sent on the
+  concurrent write, where the route refuses its prefill's handoff: the prefill was told its
+  good answer. The route's count request, placed on one worker, is told as a single request is.
+
+  Three events are told otherwise than the circuit breaker records them. The first two are of
+  a pair sent both sides at once, its prefill read whole. In the first, the decode fails behind
+  a prefill that had answered. The engine hears the prefill's own good answer and the decode's
+  failure. The breaker records that failure on the decode alone and nothing on the prefill.
 
   In the second, the request's own timeout ends the pair. The breaker records the timeout on
-  both workers. The engine hears it on the decode and on a prefill whose own call met it. A
-  prefill that had answered is told its own answer. A prefill still in flight is told no
+  both workers, but for a prefill whose body was cut while it was only consumed: the cut's 502
+  stands on it. The engine hears the timeout on the decode and on a prefill whose own call met
+  it. A prefill that had answered is told its own answer. A prefill still in flight is told no
   outcome: that side ends as a cancelled completion, as any end nobody reported does.
+
+  The third is of the two other shapes. There a prefill's refusal is recorded on its worker at
+  its head, and told behind the read of its body. A request that ends otherwise during that
+  read tells the prefill nothing: a client that leaves then, or a decode that refuses then on
+  the concurrent write.
 
   A single request on the gRPC wire tells its end through its stream, an answer read whole too:
   every answer of that wire is read through one stream. The execution stage asks the attempt's
@@ -2944,11 +2959,52 @@ request ──> route (HTTP or gRPC, any family)
   media, a constraint the engine could not continue under, a constraint the worker refused. This
   wire states no time to first token and no tokens yet.
 
-  A route tells every answer of its workers or none. The other routes tell no outcome yet
-  **[planned]**: the transcription route and the gRPC pair route. There, and for an end
-  nobody reported, a stage hears the end of a request that was sent as a cancelled completion,
-  with the time since its dispatch and no other measure. So a plugin stage that learns from
-  outcomes reads those requests as cancelled.
+  A pair on the gRPC wire tells each side its own end, however its two sides are sent. The
+  decode is told as a single request is: by its stream, or by the stage where its dispatch
+  opened none. A failed dispatch's answer bears the decode's end only where the breaker charges
+  the decode. A decode sent behind its prefill is told once it was sent, on the worker the
+  request went to.
+
+  A decode counts as sent once its send is said, and a deadline that passes then is the
+  decode's timeout, as the breaker charges it. One request sent one side behind the other says
+  the send once its prefill answered. A batch of prompts on that shape says it with the
+  dispatch, as before, and so does a pair sent at once whose decode waits on its prefill's
+  media identity. Their deadline is told as the decode's timeout though its call was held back.
+
+  The prefill is told through its load. Its dispatch tells a failure where it records one, and
+  its good answer once. That is at its drain where it goes out first, and at its first response
+  where both sides go out at once. With the prefill's silence bound off the route reads nothing
+  there: the good answer is told where the call returned, as the breaker samples it.
+
+  A reader that meets a failure on the prefill's stream tells it as that reader charges the
+  breaker. A streamed answer tells the engine's own report of a failed request, and a collected
+  answer does not. A collected answer reads the prefill's stream first: a deadline that passes
+  under that reader is the prefill's timeout, and the unread decode is told nothing.
+
+  A request of several samples and a batch of prompts place each side once. Every child tells
+  the pair's one prefill side: a replica of the prefill's load keeps the handle of the load it
+  was made of. A child's failure stands against a sibling's good answer, whichever is told
+  last. Their decode streams tell one end between them, and each takes its share of that end
+  before any of them is read. A side the gateway dropped is told by nobody: the partner of a
+  side that failed first, a decode never sent.
+
+  Three ends of such a pair are told otherwise than the breaker records them. A partner retired
+  off the request path is told nothing, while the breaker still takes its late failure. A
+  prefill told its good answer keeps it where its reader is dropped: a client that left, a
+  decode that failed. A collected answer's failed prefill stream is one charge of its request
+  on the breaker, and one end of each attempt for the engine.
+
+  Three more follow from where an end is told. A fan-out's prefill stream that fails behind
+  every sample's last message is told to no load, and the prefill keeps its good answer. Each
+  sample let its load go at that message. A request of over thirty children hands on the answer
+  of its first failed child in their order, so a decode's end another child's answer bore is
+  told by nobody. A decode that ends clean with no message is told the worker's 200, as a
+  single request's stream is.
+
+  A route tells every answer of its workers or none. One route tells no outcome yet
+  **[planned]**: the transcription route. A stage hears a request sent there, like an end
+  nobody reported, as a cancelled completion. It carries the time since its dispatch and no
+  other measure. So a plugin stage that learns from outcomes reads those requests as cancelled.
 
 - **Membership.** The gateway's value for a model's workers gets one cell for each list, which
   the engine fills.
@@ -2980,7 +3036,9 @@ The bar for that change:
 
    With the engine off, neither pair route makes the one call of the second point. Each route asks the pair's first answer once, where it decides how the pair is sent, and builds no ask for a decode the classic policies picked. A classic pair sent prefill first still pays that test, the holder of its decode ahead of the send, and on the HTTP route the cell a moved decode is written to. The decision bench runs no route's attempt, so it does not count that cost. It was counted once by a program built for the count, under Callgrind, on the lines the second point added.
 
-   With the engine off, an outcome's report through the answer returns at its first test, of the answer's engine side. A streamed answer pays the route's ask of its guard and its reader's test of an empty handle. A report on a side of a pair through its guard returns at its first test, of what that guard keeps. A pair's streamed decode pays what a streamed answer pays. On the gRPC wire the stage's ask returns at the answer's first test, and the request's stream is left as it is. The decision bench's `--end` flag counts each against a cell that reports nothing.
+   With the engine off, an outcome's report through the answer returns at its first test, of the answer's engine side. The HTTP pair route's count request pays that test. A streamed answer pays the route's ask of its guard and its reader's test of an empty handle. A report on a side of a pair through its guard returns at its first test, of what that guard keeps. A pair's streamed decode pays what a streamed answer pays.
+
+   On the gRPC wire the stage's ask returns at the answer's first test, a pair's at its decode's answer, and the request's stream is left as it is. A pair's prefill load returns at its first test of what it keeps, where its dispatch tells its good answer. A replica of a classic load keeps nothing, and allocates nothing it did not before. The decision bench's `--end` flag counts a report against a cell that reports nothing. A pair of release builds counts what no cell runs: the gRPC pair and the count request.
 4. With the engine on, every classic test of the gateway passes under the settings' own document.
 
 ### 9.3 The options
@@ -3572,8 +3630,8 @@ gateway                                           controller (leader)
   flight: its dispatch names no worker (decision 6). Its completion names the worker that served
   it. Nothing counts it toward that worker's health yet **[planned]**. In process these tell the
   gateway's own engine the outcome: the regular HTTP router's typed and pass-through routes, the
-  HTTP pair route and a single request on the gRPC wire. The other routes do not yet (section
-  9.2).
+  HTTP pair route, and a single request and a pair on the gRPC wire. The transcription route
+  does not yet (section 9.2).
 - When no answer comes in time (no credit on the stream, a change of leader, the controller
   gone), the gateway decides by itself with the same engine, under the document the controller
   pushed, over the worker list it follows (decision 6). That list stops changing while the

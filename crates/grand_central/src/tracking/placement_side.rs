@@ -74,7 +74,7 @@ use parking_lot::Mutex;
 use smg_worker::identity::basic::Worker;
 
 use super::{
-    lease::{Outcome, ReleaseReason, Side},
+    lease::{Outcome, ReleaseReason, Side, TransportClass},
     placement::Placement,
 };
 use crate::engine::{
@@ -549,6 +549,30 @@ impl SideEnd {
         };
         let at = Instant::now();
         told.lock().reported = Some(End {
+            at,
+            outcome: Some(outcome),
+        });
+    }
+
+    /// [`Self::reported`] for a side whose answer several readers tell. A
+    /// failure reported before stands against `outcome` where its class is
+    /// [`TransportClass::Ok`]: the side failed once one of its readers met
+    /// a failure, whichever of them reports last. A failure is a report of
+    /// any other class, and a later failure writes an earlier one over.
+    pub fn reported_unless_failed(&self, outcome: Outcome) {
+        let Some(told) = &self.0 else {
+            return;
+        };
+        let at = Instant::now();
+        let mut told = told.lock();
+        let failed = told
+            .reported
+            .and_then(|end| end.outcome)
+            .is_some_and(|kept| kept.class != TransportClass::Ok);
+        if failed && outcome.class == TransportClass::Ok {
+            return;
+        }
+        told.reported = Some(End {
             at,
             outcome: Some(outcome),
         });
