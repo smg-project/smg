@@ -334,13 +334,12 @@ fn each_build_checks_the_scorers_name() {
     let error = document
         .validate_in(&catalog, &[])
         .expect_err("the name disagrees");
-    let SpecError::BadStage { path, reason } = error else {
-        panic!("{error}");
-    };
-    assert_eq!(path, "profiles.default.score[0].high-id");
-    assert!(
-        reason.contains("high-id") && reason.contains("low-id"),
-        "{reason}"
+    assert_eq!(
+        error,
+        SpecError::BadStage {
+            path: "profiles.default.score[0].high-id".into(),
+            reason: r#"scorer registered as "high-id" answers the name "low-id""#.into(),
+        }
     );
 }
 

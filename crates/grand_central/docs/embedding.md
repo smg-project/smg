@@ -82,7 +82,7 @@ A host that keeps one `InProcess` for its life gives it a later spec with `InPro
 - The record of sent prefixes stands as a rule: [The record of sent prefixes](#the-record-of-sent-prefixes) names the new specs that can start one anew.
 - The stages of a profile whose name and text did not change stand too, with what they hold.
 - That holds where the new spec changes no `signals`, and its `view` is the same or differs in its header list alone.
-- A profile is built anew too where one of its stages, built again, describes itself otherwise than the standing one. A host's own factory may build such a stage.
+- A profile is built anew too where one of its stages, built again, describes itself otherwise than the standing one. A host's own factory may build such a stage. A stage built again under another name is refused at validation.
 - A host with a stage table of its own validates both specs over the one table. A table built anew for each spec keeps no stage.
 - [What a new spec keeps](guarantees.md#what-a-new-spec-keeps) has the rules, a tally of sends among them.
 

@@ -308,9 +308,10 @@ A profile's tally of sends holds the host's sends to each row that still count (
 **A profile built anew.**
 
 - A profile is built anew too where one of its stages, built again, says otherwise of itself than the standing one.
-- That is another name, other words of a request's life to hear, or anything else the engine reads of a stage when it builds a profile.
+- That is other words of a request's life to hear, or anything else the engine reads of a stage when it builds a profile.
 - The words to hear and `Lifecycle::keeps_loads` are compared as the two stages answer at the apply, and as each answered at its own build.
 - A factory of the host's own may build such a stage: build the same stage from the same text.
+- A stage built again under another name is refused: validation holds every build to the name the stage is registered under.
 
 **The tally of sends.**
 

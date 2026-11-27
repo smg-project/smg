@@ -3934,10 +3934,7 @@ fn picker_of(
         .map_err(|error| error.at(&path()))?;
         let answers = picker.name();
         if answers != named {
-            return Err(SpecError::BadStage {
-                path: path(),
-                reason: format!("picker registered as {named:?} answers the name {answers:?}"),
-            });
+            return Err(misnamed(path(), StageKind::Picker, named, answers));
         }
         Ok(Resolved::Built(picker))
     };
@@ -3948,6 +3945,9 @@ fn picker_of(
     match pick {
         PickSpec::Name(name) => match from.catalog.find_picker(name) {
             Some(Found::Kept) => Err(kept_name(path(), StageKind::Picker, name)),
+            Some(Found::Misnamed(answers)) => {
+                Err(misnamed(path(), StageKind::Picker, name, answers))
+            }
             Some(Found::Built(picker)) => {
                 // A picker the catalog built with no context.
                 no_cells_without_a_context(
@@ -3995,6 +3995,9 @@ fn picker_of(
                 reason: "a picker added in code: a built-in's parameters are typed",
             }),
             Some(Found::Kept) => Err(kept_name(path(), StageKind::Picker, name)),
+            Some(Found::Misnamed(answers)) => {
+                Err(misnamed(path(), StageKind::Picker, name, answers))
+            }
             Some(Found::With(build)) => {
                 let params = written.as_object().ok_or_else(|| SpecError::BadField {
                     path: path(),
@@ -4030,6 +4033,19 @@ fn kept_name(path: String, kind: StageKind, name: &str) -> SpecError {
         reason: format!(
             "{kind} {name:?} bears a name the engine refuses requests under: register the stage under another name"
         ),
+    }
+}
+
+/// The refusal of a document that names a stage whose build answers
+/// another name than the one it is registered under: a factory that
+/// reads the document's map, and a plain factory, whose stage the
+/// catalog's lookup dropped ([`Found::Misnamed`]). So the name a document
+/// writes is the name its stage answers at that build. `path` is the
+/// stage's own, and names the profile.
+fn misnamed(path: String, kind: StageKind, named: &str, answers: &str) -> SpecError {
+    SpecError::BadStage {
+        path,
+        reason: format!("{kind} registered as {named:?} answers the name {answers:?}"),
     }
 }
 
@@ -4098,10 +4114,7 @@ fn filtered<'a>(
         .map_err(|error| error.at(&path()))?;
         let answers = filter.name();
         if answers != name {
-            return Err(SpecError::BadStage {
-                path: path(),
-                reason: format!("filter registered as {name:?} answers the name {answers:?}"),
-            });
+            return Err(misnamed(path(), StageKind::Filter, name, answers));
         }
         Ok(Filtered::Built(filter))
     };
@@ -4109,6 +4122,11 @@ fn filtered<'a>(
         // A host's filter under a name the engine keeps, whatever is
         // written under it.
         (Some(Found::Kept), _) => Err(kept_name(path(), StageKind::Filter, name)),
+        // A plain filter whose build answers another name, whatever is
+        // written under it.
+        (Some(Found::Misnamed(answers)), _) => {
+            Err(misnamed(path(), StageKind::Filter, name, answers))
+        }
         // Only a document built in code: the parser reads the built-in's
         // key into its parameter struct. The catalog holds the name for
         // its bare form, and that arm's refusal would name the bare form.
@@ -4311,6 +4329,11 @@ fn scored(
         // A host's scorer under a name the engine keeps, whatever is
         // written under it.
         (_, Found::Kept) => Err(kept_name(at.sub(name).0, StageKind::Scorer, name)),
+        // A plain scorer whose build answers another name, whatever is
+        // written under it.
+        (_, Found::Misnamed(answers)) => {
+            Err(misnamed(at.sub(name).0, StageKind::Scorer, name, answers))
+        }
         (ScoreSpec::Params(stage), _) => Ok(Scored::Typed(stage.clone())),
         (ScoreSpec::Name(_), Found::Typed) => match ScoreStage::by_name(name) {
             Some(stage) => Ok(Scored::Typed(stage)),
@@ -4360,10 +4383,7 @@ fn scored(
             .map_err(|error| error.at(&at.0))?;
             let answers = scorer.name();
             if answers != name {
-                return Err(SpecError::BadStage {
-                    path: at.0,
-                    reason: format!("scorer registered as {name:?} answers the name {answers:?}"),
-                });
+                return Err(misnamed(at.0, StageKind::Scorer, name, answers));
             }
             Ok(Scored::Built(WeightedScorer { scorer, weight }))
         }

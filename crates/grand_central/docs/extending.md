@@ -27,7 +27,7 @@ Implement `Filter`, `Scorer` or `Picker`. Add a factory to `StageRegistry::built
 - Under one of the engine's own refusal names, such as `binding`, such a factory runs at registration alone: validation refuses a spec that names the stage.
 - A factory handed to `scorer_with`, `filter_with` or `picker_with` does not run at registration. [A stage with parameters](#a-stage-with-parameters) says when it runs.
 - Keep a factory's effects inside the stage it returns.
-- A stage's `name()` must return the name it is registered under. `scorer`, `filter` and `picker` refuse another name at registration. Validation refuses it for the other three calls.
+- A stage's `name()` must return the name it is registered under. `scorer`, `filter` and `picker` refuse another name at registration. Validation refuses it at every build, for all six calls.
 
 ### The example program
 

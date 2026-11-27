@@ -69,6 +69,10 @@ use vetoed::{AllVetoed, Count, Half};
 /// decision that draws first asks a profile made of them alone about a row
 /// in one test, with no call a filter.
 pub trait Filter: Any + Send + Sync + Debug {
+    /// The filter's one name for its whole life. The registry asks it of a
+    /// factory that takes no parameter, once, and the validator of each
+    /// filter it takes from a factory. The engine asks it at a shed, of
+    /// the filter that left a request no row.
     fn name(&self) -> &'static str;
 
     fn keep(&self, facts: &RequestFacts<'_>, candidate: &Candidate, cx: &Constraints<'_>) -> bool;
@@ -275,6 +279,9 @@ impl ScoreFront {
 /// what the guest takes from a candidate outside them is the guest's own.
 /// The returned [`TieBand`] is the band of the written values.
 pub trait Scorer: Lifecycle + Debug {
+    /// The scorer's one name for its whole life. The registry asks it of a
+    /// factory that takes no parameter, once, and the validator of each
+    /// scorer it takes from a factory.
     fn name(&self) -> &'static str;
 
     fn score(
@@ -632,6 +639,11 @@ pub enum DrawUnit {
 /// belongs to `kept[i]` and `band` is the profile's tie band; the picker
 /// pushes its pick first and its alternates after it, and allocates nothing.
 pub trait Picker: Lifecycle + Debug {
+    /// The picker's one name for its whole life. The registry asks it of a
+    /// factory that takes no parameter, once, and the validator of each
+    /// picker it takes from a factory. The engine asks it where it is
+    /// built, to tell the crate's own pickers, and at a shed: a request
+    /// the picker gave no target is declined under it.
     fn name(&self) -> &'static str;
 
     /// Names the set the picker compares, before the scorers run: it moves
@@ -931,7 +943,8 @@ pub struct WeightedScorer {
 impl WeightedScorer {
     /// A scorer with its weight: the record's two fields, so nothing is left
     /// for a caller to assign today. Code outside this crate starts here:
-    /// the record gains fields, so no literal of it builds there.
+    /// the record gains fields, so no literal of it builds there. The
+    /// scorer's name is not checked here ([`Engine::new`]).
     #[must_use]
     pub fn of(scorer: Box<dyn Scorer>, weight: f32) -> Self {
         Self { scorer, weight }
@@ -962,7 +975,8 @@ pub struct Profile {
 impl Profile {
     /// A profile of one picker, with no filter and no scorer: a caller
     /// assigns the two lists over it. Code outside this crate starts here:
-    /// the record gains fields, so no literal of it builds there.
+    /// the record gains fields, so no literal of it builds there. The
+    /// stages' names are not checked here ([`Engine::new`]).
     #[must_use]
     pub fn of(name: String, picker: Box<dyn Picker>) -> Self {
         Self {
@@ -3236,9 +3250,11 @@ fn run_drawn(
 /// The crate's own picker that keys a rotation by the rows a whole pass
 /// kept, by name: its `pick` takes the turn of the set of those rows
 /// ([`Picker::pick_among`]) and hands out the row at the turn and the rows
-/// kept behind it. In a document a host's stage takes no built-in's name
-/// and states its own ([`StageRegistry`](crate::stages::StageRegistry)), so
-/// there a picker of this name is the crate's. An engine built in code
+/// kept behind it. In an engine built from a document a host's stage takes
+/// no built-in's name and states its own at every build
+/// ([`StageRegistry`](crate::stages::StageRegistry)), so there a picker
+/// that answers one name for its life ([`Picker::name`]) and bears this
+/// name is the crate's. An engine built in code
 /// holds whatever picker its host handed it, and no word a picker says of
 /// itself tells that its turn among a set is the turn its `pick` takes: so
 /// the name is read only for an engine whose builder says a catalog made
@@ -3277,10 +3293,13 @@ impl Engine {
 /// a row of the pool through the test it is handed and in no other way: it
 /// reads the pool's size, draws places, and asks the test about the row at
 /// each. So its draw may be asked over rows whose records are not written
-/// yet ([`run_drawn_written`]). A host's stage takes no built-in's name and
-/// states its own ([`StageRegistry`](crate::stages::StageRegistry)), so a
-/// picker of one of these names is the crate's, and a host's own picker
-/// that draws first is handed every record written.
+/// yet ([`run_drawn_written`]). In an engine built from a document a host's
+/// stage takes no built-in's name and states its own at every build
+/// ([`StageRegistry`](crate::stages::StageRegistry)). So there a picker
+/// that answers one name for its life ([`Picker::name`]) and bears one of
+/// these names is the crate's, and a host's own picker that draws first is
+/// handed every record written. An engine built in code is read by the
+/// same names, and nothing holds its pickers off them ([`Engine::new`]).
 #[cfg(feature = "in-process")]
 const DRAWS_BY_ITS_TEST: [&str; 6] = [
     "power-of-two",
@@ -3296,7 +3315,8 @@ const DRAWS_BY_ITS_TEST: [&str; 6] = [
 /// sessions. A profile of the engine's own filters, no scorer and one of
 /// these reads a row's fixed half, its report and its vetoes, and nothing
 /// else of it ([`Engine::rows_stand`]). A picker of one of these names is
-/// the crate's, as one of [`DRAWS_BY_ITS_TEST`] is.
+/// the crate's where one of [`DRAWS_BY_ITS_TEST`] is, under that list's
+/// bound.
 #[cfg(feature = "in-process")]
 const PICKS_BY_NO_COUNT: [&str; 2] = ["random", "round-robin"];
 
@@ -5322,6 +5342,13 @@ impl Engine {
     /// a decision scope under the single plan. An engine holds at most
     /// 65,535 profiles: the position past them marks a decision made ahead
     /// of every profile ([`Trace::NO_PROFILE`]).
+    ///
+    /// The stages are taken as handed: no name is checked here. A host that
+    /// builds its engine in code keeps its stages off the names the engine
+    /// refuses under ([`refuses_under`](crate::engine::refuses_under)) and
+    /// off the stock stages' names, which the engine reads as its own. A
+    /// document's validation holds what a stage answers at its build to
+    /// both.
     pub fn new(
         profiles: Vec<Profile>,
         bindings: Vec<Binding>,

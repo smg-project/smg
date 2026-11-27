@@ -661,15 +661,20 @@ fn an_entry_of_a_scorer_in_code_is_written_as_it_was_read() {
     );
 }
 
+/// Every plain factory of the stock table builds a stage that answers the
+/// name the table holds it under: each stock filter, and each stock picker
+/// but the one the validator builds. The lookup drops a stage that answers
+/// another name, so no document could name a stock stage held so.
 #[test]
 fn each_stock_stage_answers_the_name_it_is_held_under() {
     let stock = StageRegistry::builtin();
     for name in FILTERS {
-        // Every stock filter is built by its factory.
-        let Some(Found::Built(filter)) = stock.find_filter(name) else {
-            panic!("{name}: a stock filter takes no parameter");
-        };
-        assert_eq!(filter.name(), name);
+        match stock.find_filter(name).expect("a stock filter") {
+            // Every stock filter is built by its factory.
+            Found::Built(filter) => assert_eq!(filter.name(), name),
+            Found::Misnamed(answers) => panic!("{name}: its factory answers {answers}"),
+            _ => panic!("{name}: a stock filter takes no parameter"),
+        }
     }
     for name in PICKERS {
         match stock.find_picker(name).expect("a stock picker") {
@@ -678,6 +683,7 @@ fn each_stock_stage_answers_the_name_it_is_held_under() {
             Found::Typed => assert_eq!(name, "best-with-temperature"),
             Found::With(_) => panic!("{name}: no stock picker reads a map of its own"),
             Found::Kept => panic!("{name}: no stock picker bears a name the engine keeps"),
+            Found::Misnamed(answers) => panic!("{name}: its factory answers {answers}"),
         }
     }
     // Every scorer is the validator's to build.

@@ -451,10 +451,11 @@ impl InProcess {
     /// the new list.
     ///
     /// A profile is built anew too where one of its stages, built again,
-    /// says otherwise of itself than the standing one. That is another
-    /// name, other words of a request's life to hear, or anything else the
-    /// engine reads of a stage when it builds a profile. A factory of the
-    /// host's own may build such a stage.
+    /// says otherwise of itself than the standing one. That is other words
+    /// of a request's life to hear, or anything else the engine reads of a
+    /// stage when it builds a profile. A factory of the host's own may
+    /// build such a stage. A stage built again under another name is no
+    /// such stage: the validation refuses its document.
     ///
     /// A count of sends stands where a profile that reads it is kept,
     /// whichever of its other readers changed, left or came. A profile
