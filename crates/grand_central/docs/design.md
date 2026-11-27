@@ -747,14 +747,14 @@ none of the three: it keeps a table of placements with a time to live for reques
 ids, and balances a text request by load. The engine follows it there by its record of sent
 prefixes: under an index of the kind `hash` the record is keyed at `view.boundaries` alone, and
 the settings translate to a `prefix-affinity` threshold of zero and a `warmup-slice` that names
-nobody. So a request of token ids goes back to the worker its head at a boundary was sent to,
-and a request with fewer whole blocks than the first boundary's, or one hashed by its text, is
-recorded nowhere. Five
-things differ from classic. The engine keeps no time to live: a placement stays until the
-record's size bound takes it. It keeps every worker sent a head as its holder, where classic
-keeps three. A key ends at the last whole block under its boundary and keys every request that
-holds those blocks, where classic asks for the boundary's every token. A boundary past the first
-`view.max_block_hashes` blocks of a request keys nothing, where classic keys every boundary the
+nobody. So a request of token ids can go back to the worker its head at a boundary was sent to.
+A request that carries fewer block hashes than its first boundary has whole blocks, or one hashed
+by its text, is recorded nowhere. Several
+things differ from classic. The engine keeps no time to live: as a rule a placement stays until
+the record's size bound takes it. As a rule it keeps every worker sent a head as its holder,
+where classic keeps three. A key ends at the last whole block under its boundary and keys every
+request that holds those blocks, where classic asks for the boundary's every token. A boundary of
+more whole blocks than `view.max_block_hashes` keys nothing, where classic keys every boundary the
 prompt reaches. And where the model's index of cache events holds a block, the engine reads
 record A for a request of token ids, which classic under `hash` does not read. The routing
 settings never raise `view.max_block_hashes`, so a gateway whose settings state a boundary past
@@ -771,6 +771,12 @@ Between two passes it grows past the bound.
 
 A request's prompt is stored under its **cache partition** (cache salt, extra value, adapter), so
 that two tenants' prompts never match. The gateway derives the partition once for each request.
+
+The rest of this section describes the engine under an index of the kind `tree`. Under `hash` it
+asks its host for no tree, and its record keys a request as said above: one given as text has no
+key there. The record's second fault below stands under `hash` too. So does the first rule of its
+third: on a request of token ids, a profile that reads cache events neither reads nor writes the
+record for a worker the index holds a block for.
 
 **The engine today [built].** It reads record A through two small traits that the host
 implements over its own index (`CacheIndexes`, `CacheIndex`, in `engine/in_process/overlap.rs`).
@@ -2812,7 +2818,7 @@ The design adds no second mechanism where one exists.
 | load reports | the load monitor's `LoadSnapshot` | the last report of a worker whose load call fails, kept beside the snapshot's entries, and the one read that gives it (decision 12) |
 | which worker holds a prompt, by cache events | the kv-index crate's index, through two traits | the gateway's two readers of its index for those traits (section 9.2) |
 | which prefill pairs with which decode | the gateway's pair index (`PdPairIndex`) | the pair classes read from it, one file (section 9.2) |
-| which worker was sent a prompt | the host's own trees, of the kv-index crate's two tree types | one more question on the trait the host already answers for cache events |
+| which worker was sent a prompt | the host's own trees, of the kv-index crate's two tree types, under an index of the kind `tree` | one more question on the trait the host already answers for cache events |
 | a request's lifetime on a worker | the load guard every route keeps | one optional field (decision 4) |
 | the place where a worker is chosen | classic's four placement functions | one call in each |
 | the rank a request is sent with | the worker object's own rank, where its registration states one | nothing: no rank choice runs behind the pick of a worker registered rank by rank, and the classic rank option is refused at the start beside the engine (section 9.2 names the two places a rank is still chosen) |
@@ -3945,7 +3951,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | The stage interfaces and a builder's own stages | **[built]** | |
 | The engine over worker lists (`InProcess`) | **[partly]** | refuses a subset hint, and a request that states protocols where a worker of its list is dialed over one it does not state; of the recorded lines only the three hard-demand sheets, `sticky_rank`, `encode_pair`, `pair_named` and 23 lines of `pair_sticky` (132), and 31 lines of `prefix_hash`, replay through it |
 | `round_robin`, `random`, `passthrough`, `least_load`, `power_of_two` on that engine | **[partly]** | no sheet over a healthy pool for four of them |
-| `cache_aware` on that engine | **[partly]** | a single request whose maker names its entry by token ids (`RequestMaker::token_key`) is decided in the host's token tree, where the host lends it, the model has no index of cache events and the profile reads sent prefixes and names the holders' rows, as the preset does: the record's first two faults do not reach it. A single request of token ids under a model whose index of cache events holds a block reads the index alone, as classic does, unless its profile reads the record alone. Every other request the engine names the holders of reads the engine's own record, with its three faults, the third being that a request with token ids reads it for no worker the index holds a block for, unless its profile reads the record alone: a request of text whose caller names no entry is one. A request its host holds as text is decided the same way in a lent string tree (`RequestMaker::text_key`), with or without an index. The gateway lends its string trees, and names the entry by classic's own key |
+| `cache_aware` on that engine | **[partly]** | a single request whose maker names its entry by token ids (`RequestMaker::token_key`) is decided in the host's token tree, where the host lends it, the model has no index of cache events and the profile reads sent prefixes and names the holders' rows, as the preset does: the record's first two faults do not reach it. A single request of token ids under a model whose index of cache events holds a block reads the index alone, as classic does, unless its profile reads the record alone. Every other request the engine names the holders of reads the engine's own record, with its three faults, the third being that a request with token ids reads it for no worker the index holds a block for, unless its profile reads the record alone: a request of text whose caller names no entry is one. A request its host holds as text is decided the same way in a lent string tree (`RequestMaker::text_key`), with or without an index of cache events. The gateway lends its string trees, and names the entry by classic's own key. This row describes an index of the kind `tree`; section 4.5 speaks of the kind `hash` |
 | `consistent_hashing`, `prefix_hash` on that engine | **[partly]** | placed on the ring the host lends (decision 3): through `place` the plain ring at the place the engine reads with the request's keys, and `prefix_hash` at the places the host's ring answers for the request's heads, where it answers for a head; that both are classic's is proven at stage 3; a host that lends none is placed on the crate's ring, which may be another worker than classic's |
 | `manual` and sticky sessions on that engine | **[partly]** | the sheets of `manual` and of the sticky override's single requests (`sticky_override`) replay through the decision function, not through the engine; the override's sheet of pairs (`pair_sticky`) replays through the engine's one call for a host in process, under the document the routing settings give for each line: 23 of its 25 lines as recorded, and the settings refuse the other 2 by name, a pair with one side under `consistent_hashing` |
 | `bucket` on that engine | **[partly]** | the same |
