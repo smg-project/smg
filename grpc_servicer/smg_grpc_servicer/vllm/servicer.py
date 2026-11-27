@@ -36,6 +36,7 @@ from vllm.sampling_params import RequestOutputKind, StructuredOutputsParams
 from smg_grpc_servicer.constrained_decoding import (
     VLLM_SCHEMA_BACKENDS,
     answer_schema_in_place_of_tag,
+    answer_schema_the_engine_judges,
     structural_tag_vocabulary,
 )
 from smg_grpc_servicer.kv_relay import Engine, relay
@@ -107,6 +108,15 @@ try:
     from vllm.version import __version__ as VLLM_VERSION
 except Exception:  # pragma: no cover - version lookup is best-effort
     VLLM_VERSION = ""
+# The engine's own judge of a JSON schema xgrammar cannot enforce whole: a
+# pinned xgrammar refuses by it and `auto` falls back by it; None on a
+# release that has none.
+try:
+    from vllm.v1.structured_output.backend_xgrammar import (
+        has_xgrammar_unsupported_json_features as _XGRAMMAR_LACKS_A_FEATURE,
+    )
+except Exception:  # pragma: no cover - a release without the judge still starts
+    _XGRAMMAR_LACKS_A_FEATURE = None
 
 
 def _valid_cpu_ec_handle(handle) -> bool:
@@ -1365,6 +1375,10 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 schema = answer_schema_in_place_of_tag(
                     params.structural_tag, structured_outputs_backend, VLLM_SCHEMA_BACKENDS
                 )
+                if schema is None:
+                    schema = answer_schema_the_engine_judges(
+                        params.structural_tag, structured_outputs_backend, _XGRAMMAR_LACKS_A_FEATURE
+                    )
                 if schema is not None:
                     logger.debug(
                         "a structural tag that is a JSON answer's schema alone goes to the "

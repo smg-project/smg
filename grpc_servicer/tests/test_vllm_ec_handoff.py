@@ -368,6 +368,8 @@ def _converter():
         "StructuredOutputsParams": dict,
         "RequestOutputKind": SimpleNamespace(DELTA="delta", FINAL_ONLY="final_only"),
         "logger": logging.getLogger(__name__),
+        # In place of the engine's own judge of a schema xgrammar cannot enforce whole.
+        "_XGRAMMAR_LACKS_A_FEATURE": lambda schema: "uniqueItems" in schema,
     }
     exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)
     return namespace["_sampling_params_from_proto"]
@@ -375,20 +377,27 @@ def _converter():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("backend", "sent_as"),
+    ("backend", "unique", "sent_as"),
     [
-        ("guidance", "json"),
-        ("outlines", "json"),
-        ("lm-format-enforcer", "json"),
-        ("xgrammar", "structural_tag"),
-        ("auto", "structural_tag"),
+        ("guidance", False, "json"),
+        ("outlines", False, "json"),
+        ("lm-format-enforcer", False, "json"),
+        ("xgrammar", False, "structural_tag"),
+        ("auto", False, "structural_tag"),
+        ("xgrammar", True, "json"),
+        ("auto", True, "json"),
     ],
 )
-async def test_an_answer_tag_reaches_another_backend_as_its_schema(backend, sent_as):
+async def test_an_answer_tag_reaches_another_backend_as_its_schema(backend, unique, sent_as):
     """A structural tag is spelled for xgrammar: one that is a JSON answer's
     schema alone reaches an engine started with another backend as that
-    schema, and stays a tag under xgrammar and the engine's default."""
+    schema, and stays a tag under xgrammar and the engine's default. There
+    the engine judges a plain schema alone: one with a feature xgrammar
+    lacks is refused under a pinned xgrammar and falls back under the
+    default, so such a schema goes as the schema and is answered as before."""
     schema = '{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"integer"}}}'
+    if unique:
+        schema = '{"type":"array","items":{"type":"string"},"uniqueItems":true}'
     tag = '{"format":{"type":"json_schema","json_schema":' + schema + ',"max_whitespace_cnt":32}}'
     request = pb.GenerateRequest(
         request_id="tag-test",
@@ -428,3 +437,15 @@ async def test_an_answer_tag_reaches_another_backend_as_its_schema(backend, sent
     context = SimpleNamespace(abort=abort, invocation_metadata=lambda: ())
     assert [reply async for reply in handler(servicer, request, context)] == []
     assert seen == [{sent_as: schema if sent_as == "json" else tag}]
+
+
+def test_an_engine_without_the_judge_gets_the_schema_for_an_answer_tag():
+    """An engine release that holds no judge of a schema keeps the reading it
+    had before a tag carried the bound: under xgrammar, pinned or the
+    engine's default, every tag that is a JSON answer's schema alone goes as
+    that schema; another backend is not this function's."""
+    schema = '{"type":"object"}'
+    tag = '{"format":{"type":"json_schema","json_schema":' + schema + ',"max_whitespace_cnt":32}}'
+    for backend in ("auto", "xgrammar"):
+        assert constrained_decoding.answer_schema_the_engine_judges(tag, backend, None) == schema
+    assert constrained_decoding.answer_schema_the_engine_judges(tag, "guidance", None) is None

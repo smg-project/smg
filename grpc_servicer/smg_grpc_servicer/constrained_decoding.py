@@ -37,6 +37,7 @@ from __future__ import annotations
 import importlib.metadata
 import json
 import re
+from collections.abc import Callable
 from typing import Any
 
 # The `server_args` keys (SGLang, TokenSpeed) and the `GetServerInfo` fields
@@ -301,3 +302,29 @@ def answer_schema_in_place_of_tag(
     if "json_schema" not in node:
         return None
     return json.dumps(node["json_schema"], separators=(",", ":"), ensure_ascii=False)
+
+
+def answer_schema_the_engine_judges(
+    structural_tag: str,
+    grammar_backend: str,
+    lacks_a_feature: Callable[[dict[str, Any]], bool] | None,
+) -> str | None:
+    """The JSON schema to send in place of a structural tag that is a JSON
+    answer's schema alone (:func:`answer_schema_in_place_of_tag`) where vLLM
+    runs xgrammar, pinned or as the first backend of ``auto``, and the engine
+    judges xgrammar to lack a feature of that schema; None under every other
+    backend, for every other tag, and where xgrammar compiles the schema
+    whole, which leaves the tag.
+
+    The engine judges a plain schema alone: one with a feature xgrammar lacks
+    is refused under a pinned xgrammar and falls to the second backend under
+    ``auto``, while inside a tag it goes to xgrammar unjudged, with the
+    feature dropped. Such a schema goes as the schema, so the engine answers
+    it as it did before a tag carried the bound. ``lacks_a_feature`` is the
+    engine's own judge of a schema, so no rule of the engine is kept here; an
+    engine that has none (None) gets the schema for every such tag."""
+    schema = answer_schema_in_place_of_tag(structural_tag, grammar_backend, ("auto", "xgrammar"))
+    if schema is None or lacks_a_feature is None:
+        return schema
+    parsed = json.loads(schema)
+    return schema if isinstance(parsed, dict) and lacks_a_feature(parsed) else None

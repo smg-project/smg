@@ -1062,9 +1062,11 @@ impl From<Option<ToolConstraint>> for Prepared {
 /// ([`worker_constraint`]), and the attempt stamp for the worker each retry takes, whose start may
 /// differ (`helpers::ToolConstraintStamp`). It owns what [`answer_tag`] reads, since the request
 /// is gone from the pipeline once the plan is built: the table (shared), the request's schema, and
-/// where the prompt leaves the model. Where the tag is the schema alone, the request's own schema
-/// is the engine's constraint ([`TagForStart::schema`], serialized only when a retry's worker takes
-/// it), and the worker a retry takes gets the one in the other's place.
+/// where the prompt leaves the model. Where the answer is the schema alone and the table leaves
+/// its whitespace free, the request's own schema is the engine's constraint
+/// ([`TagForStart::schema`], serialized only when a retry's worker takes it), and the worker a
+/// retry takes gets the one in the other's place; a table that bounds the whitespace sends the
+/// schema alone as the tag of its node, which carries the bound.
 pub(crate) struct AnswerTag {
     format: Arc<Format>,
     /// The table is the response template's, which takes its tag either way and refuses what it
@@ -1084,9 +1086,9 @@ pub(crate) struct AnswerTag {
 
 impl AnswerTag {
     /// The tag for an engine whose grammar starts at `start`, in the `vocabulary` its compiler
-    /// takes; `None` where the answer is the schema alone, the engine's own constraint, or the
-    /// table has no tag for it; an error where the response template's table cannot constrain
-    /// the answer.
+    /// takes; `None` where the answer is the schema alone with its whitespace free, the engine's
+    /// own constraint, or the table has no tag for it; an error where the response template's
+    /// table cannot constrain the answer.
     pub(crate) fn for_start(
         &self,
         start: GrammarStart,
@@ -2585,7 +2587,13 @@ mod tests {
                     .chain([&of_messages])
                 {
                     // The schema alone, in a tag of its node alone: the table of these cases
-                    // bounds the answer's whitespace, and the node carries the bound.
+                    // bounds the answer's whitespace, and the node carries the bound with the
+                    // schema that was asked (any object for `json_object`).
+                    let asked = match ask["response_format"]["type"].as_str() {
+                        Some("json_object") => json!({"type": "object"}),
+                        Some(_) => ask["response_format"]["json_schema"]["schema"].clone(),
+                        None => ask["output_config"]["format"]["schema"].clone(),
+                    };
                     let found = found_where_the_thought_is_the_models(
                         ask,
                         TURN_THAT_CLOSED_THE_THOUGHT,
@@ -2596,6 +2604,7 @@ mod tests {
                         Ok(Some(ToolConstraint::StructuralTag(tag))) => {
                             serde_json::from_str::<Value>(tag).is_ok_and(|tag| {
                                 tag["format"]["type"] == "json_schema"
+                                    && tag["format"]["json_schema"] == asked
                                     && tag["format"]["max_whitespace_cnt"] == 32
                             })
                         }

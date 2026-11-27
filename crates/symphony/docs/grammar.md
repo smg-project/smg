@@ -184,7 +184,8 @@ second time; the gateway reads it from the rendered prompt as it reads `reasonin
 (`Format::thought_closed`, `Options::thought_closed`), and a thought the model writes anyway carries
 its own. GLM 4.6's thinking-off prompt ends with the bare `<think></think>`, so its newline stays the
 tag's to write. An answer's tag keeps the schema alone after the close, the engine's own constraint,
-which the registry's tables leave to it.
+which the registry's tables leave to it unless they bound the answer's whitespace: such a table
+sends the schema alone as the tag of its node, where the bound is written.
 
 A marker that is one token of the model's vocabulary (`Format::marker_tokens`: a terminal, a
 structural token, one of the syntax's own tags (`CallSyntax::tag_texts`), or a token inside one) is
