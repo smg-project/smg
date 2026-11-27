@@ -119,7 +119,7 @@ pub(crate) async fn prepare_chat_like(
             model_id,
             &*tokenizer,
             "ChatPreparationStage::execute",
-            || multimodal::media_plan_chat(&request.messages),
+            || multimodal::media_plan_chat(&request.messages, &request.other),
             true,
             body_ref.tools.is_some(),
         )

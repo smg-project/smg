@@ -386,6 +386,42 @@ fn a_model_without_a_spec_goes_to_a_capable_worker_or_is_refused() {
     }
 }
 
+/// A request that states a sampling rate for its clips
+/// (`media_io_kwargs.video.fps`) is routed as it is without the key: the
+/// rate is no part's own, so a model without a spec, whose clip nothing
+/// but a worker processes, is still forwarded, under worker placement
+/// and under the automatic one.
+#[test]
+fn a_request_that_states_a_video_rate_is_still_forwarded() {
+    let request: openai_protocol::chat::ChatCompletionRequest =
+        serde_json::from_value(serde_json::json!({
+            "model": MODEL,
+            "media_io_kwargs": {"video": {"fps": 2}},
+            "messages": [{"role": "user", "content": [
+                {"type": "video_url", "video_url": {"url": "https://a/1.mp4"}}
+            ]}]
+        }))
+        .unwrap();
+    let plan = super::super::media_plan_chat(&request.messages, &request.other);
+    assert_eq!(plan.request_video_fps(), Some(2.0));
+    let registry = registry_with(vec![capable("grpc://127.0.0.1:9452")]);
+
+    for mode in [MmProcessingMode::Worker, MmProcessingMode::Auto] {
+        assert_eq!(
+            resolve_mm_processing(
+                &components(mode),
+                &registry,
+                MODEL,
+                &plan,
+                &PlaceholderTokens::worker_only()
+            )
+            .expect("a stated rate refuses no request"),
+            MmProcessing::Worker,
+            "{mode:?}"
+        );
+    }
+}
+
 #[test]
 fn router_mode_never_forwards() {
     let registry = registry_with(vec![capable("grpc://127.0.0.1:9300")]);

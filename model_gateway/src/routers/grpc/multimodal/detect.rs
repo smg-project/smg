@@ -12,6 +12,7 @@ use openai_protocol::{
     common::ContentPart,
     messages::{ImageBlock, ImageSource, InputContent, InputContentBlock, InputMessage, Role},
 };
+use serde_json::{Map, Value};
 
 use super::plan::MediaPlan;
 use crate::routers::grpc::utils::message_utils::tool_result_image_blocks;
@@ -87,9 +88,27 @@ fn extract_media_parts(messages: &[ChatMessage]) -> Vec<MediaContentPart> {
     parts
 }
 
-/// Build the canonical ordered media plan for Chat Completions input.
-pub(crate) fn media_plan_chat(messages: &[ChatMessage]) -> MediaPlan {
+/// The rate a chat request states for sampling its video clips, in frames per
+/// second: `media_io_kwargs.video.fps`, an engine extension carried in the
+/// request's passthrough fields. A value that is no number inside the range a
+/// part's own rate is held to is no rate: the clips are sampled as if the key
+/// were absent, and the request is not refused for it.
+fn request_video_sample_fps(other: &Map<String, Value>) -> Option<f64> {
+    other
+        .get("media_io_kwargs")?
+        .get("video")?
+        .get("fps")?
+        .as_f64()
+        .filter(|fps| llm_multimodal::sample_fps_in_range(*fps))
+}
+
+/// Build the canonical ordered media plan for Chat Completions input, from
+/// the request's messages and its passthrough fields: a plan that holds a
+/// video part carries the rate the request states for its clips
+/// ([`request_video_sample_fps`]), and no other plan reads the key.
+pub(crate) fn media_plan_chat(messages: &[ChatMessage], other: &Map<String, Value>) -> MediaPlan {
     MediaPlan::new(extract_media_parts(messages))
+        .with_request_video_fps(|| request_video_sample_fps(other))
 }
 
 /// Parse OpenAI detail string to multimodal ImageDetail enum.
