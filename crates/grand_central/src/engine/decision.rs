@@ -941,10 +941,16 @@ pub struct Shed {
     /// parts from it too where a pair stands only among the workers the
     /// demand left out.
     /// The decode side too where the prefill was picked and the decode's
-    /// run refused. A decode decided again names the decode side, and the
-    /// prefill side where the held prefill left its list. A pair whose
+    /// run refused. A decode decided again names the decode side where
+    /// its own run refused, and the prefill side where the held prefill
+    /// left its list. A pair whose
     /// named worker's number reaches nobody (`target-worker`) names the
-    /// side it reaches nobody on, the prefills' first. A call's shed as
+    /// side it reaches nobody on, the prefills' first. A pair whose named
+    /// workers cannot be sent to after all names the decode side where a
+    /// pair of the call's last decision lost its decode alone, and the
+    /// prefill side otherwise: that selection asks the prefill first. It
+    /// names none where the route's rule is asked then and takes no worker
+    /// of a list: the call ends on the rule's refusal. A call's shed as
     /// saturated that stands behind a route's rule names the side of the
     /// list that selection judges among the rule's workers: the prefill
     /// side where none of the rule's prefills can take the request,
