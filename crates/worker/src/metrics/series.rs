@@ -20,10 +20,11 @@
 
 use std::{
     borrow::Cow,
+    cell::Cell,
     collections::{BTreeMap, HashMap},
     fmt::{Display, Write as _},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
         Arc, OnceLock, Weak,
     },
 };
@@ -96,6 +97,20 @@ pub fn render_into(out: &mut String) {
     }
 }
 
+/// Have the installed store keep the histogram families with no `worker`
+/// label too: a series of such a family that registers from this call on
+/// records into the store's fixed cells and renders with [`render_into`],
+/// not in the exporter's text. It is for a host whose scrape appends
+/// [`render_into`] to the exporter's text. A host that renders the
+/// exporter's handle alone does not call it, and reads every such family
+/// there as before. No family is split between the two texts: the call takes
+/// only while no such series has registered with the exporter.
+pub fn keep_histograms() {
+    if let Some(series) = INSTALLED.get() {
+        series.keep_histograms();
+    }
+}
+
 /// Fold the installed store's histogram samples, as the exporter's upkeep does.
 pub fn run_upkeep() {
     if let Some(series) = INSTALLED.get() {
@@ -133,21 +148,41 @@ pub struct WorkerSeries {
     registry: Registry<Key, WorkerStorage>,
     /// Descriptions by sanitized metric name, for the `# HELP` lines.
     descriptions: RwLock<HashMap<String, SharedString>>,
-    distribution_builder: DistributionBuilder,
+    distribution_builder: Arc<DistributionBuilder>,
     /// Histogram samples aggregated per series, the exporter's way.
     distributions: Mutex<HashMap<Key, Distribution>>,
+    /// Whether a family renders as a histogram, by its name as a caller
+    /// writes it: the bucket configuration is asked once a name.
+    bucketed: RwLock<HashMap<String, bool>>,
+    /// Who keeps the histogram families keyed to no worker: [`UNSETTLED`],
+    /// [`WITH_EXPORTER`] or [`IN_CELLS`].
+    unkeyed_histograms: AtomicU8,
 }
+
+/// No histogram series with no `worker` label has registered yet, and the
+/// host has not asked the store to keep them.
+const UNSETTLED: u8 = 0;
+/// Such a series registered with the exporter before the host asked: every
+/// family of them stays with the exporter, so none is split between the
+/// exporter's text and the store's.
+const WITH_EXPORTER: u8 = 1;
+/// The host asked first ([`keep_histograms`]): such a family records in the
+/// store's cells where the bucket configuration renders it as a histogram.
+const IN_CELLS: u8 = 2;
 
 impl WorkerSeries {
     /// A store whose histograms take the exporter's bucket configuration.
     pub fn new(distribution_builder: DistributionBuilder) -> Self {
+        let distribution_builder = Arc::new(distribution_builder);
         Self {
             addresses: RwLock::new(HashMap::new()),
             forgot_retired: AtomicBool::new(false),
-            registry: Registry::new(WorkerStorage),
+            registry: Registry::new(WorkerStorage(Arc::clone(&distribution_builder))),
             descriptions: RwLock::new(HashMap::new()),
             distribution_builder,
             distributions: Mutex::new(HashMap::new()),
+            bucketed: RwLock::new(HashMap::new()),
+            unkeyed_histograms: AtomicU8::new(UNSETTLED),
         }
     }
 
@@ -228,8 +263,55 @@ impl WorkerSeries {
         if addresses.get(url).is_some_and(|address| address.retired) {
             return Histogram::noop();
         }
-        self.registry
-            .get_or_create_histogram(key, |samples| Histogram::from_arc(Arc::clone(samples)))
+        self.registry.get_or_create_histogram(key, Samples::handle)
+    }
+
+    /// Keep the histogram families with no worker label too, unless a series
+    /// of one has registered with the exporter (see [`keep_histograms`]).
+    fn keep_histograms(&self) {
+        let _ = self.unkeyed_histograms.compare_exchange(
+            UNSETTLED,
+            IN_CELLS,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// The handle of `key`, a series with no worker label, where the host
+    /// asked the store to keep such families and the bucket configuration
+    /// renders this one as a histogram: the series records into the store's
+    /// fixed cells. `None` for a family that stays with the exporter: every
+    /// one until the host asks, every one for good once a series registered
+    /// before the host asked, and a family that renders as a summary.
+    fn bucketed(&self, key: &Key) -> Option<Histogram> {
+        match self.unkeyed_histograms.load(Ordering::Relaxed) {
+            IN_CELLS => {}
+            WITH_EXPORTER => return None,
+            _ => {
+                // The first series to register settles it for them all.
+                let settled = self.unkeyed_histograms.compare_exchange(
+                    UNSETTLED,
+                    WITH_EXPORTER,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+                if settled != Err(IN_CELLS) {
+                    return None;
+                }
+            }
+        }
+        let known = self.bucketed.read().get(key.name()).copied();
+        let bucketed = known.unwrap_or_else(|| {
+            let kind = self
+                .distribution_builder
+                .get_distribution_type(&sanitize_metric_name(key.name()));
+            let bucketed = kind == "histogram";
+            self.bucketed
+                .write()
+                .insert(key.name().to_owned(), bucketed);
+            bucketed
+        });
+        bucketed.then(|| self.registry.get_or_create_histogram(key, Samples::handle))
     }
 
     /// The retired addresses, for the tests.
@@ -269,6 +351,10 @@ impl WorkerSeries {
         });
         let mut distributions = self.distributions.lock();
         self.registry.visit_histograms(|key, samples| {
+            let Samples::Timed(samples) = samples else {
+                // Fixed cells hold no sample to fold.
+                return;
+            };
             let distribution = distributions.entry(key.clone()).or_insert_with(|| {
                 self.distribution_builder
                     .get_distribution(&sanitize_metric_name(key.name()))
@@ -317,10 +403,17 @@ impl WorkerSeries {
 
         self.run_upkeep();
         let distributions = self.distributions.lock();
-        let mut by_name: BTreeMap<String, Vec<(String, &Distribution)>> = BTreeMap::new();
+        let mut by_name: BTreeMap<String, Vec<(String, Folded<'_>)>> = BTreeMap::new();
         for (key, distribution) in distributions.iter() {
-            gather(&mut by_name, key.name(), (label_text(key), distribution));
+            let series = (label_text(key), Folded::Kept(distribution));
+            gather(&mut by_name, key.name(), series);
         }
+        self.registry.visit_histograms(|key, samples| {
+            if let Samples::Cells(cells) = samples {
+                let series = (label_text(key), Folded::Cells(Arc::clone(cells)));
+                gather(&mut by_name, key.name(), series);
+            }
+        });
         for (name, mut series) in by_name {
             let kind = self.distribution_builder.get_distribution_type(&name);
             if kind == "native_histogram" {
@@ -329,9 +422,33 @@ impl WorkerSeries {
             }
             series.sort_by(|a, b| a.0.cmp(&b.0));
             write_family(out, &name, kind, descriptions.get(&name));
-            for (labels, distribution) in series {
-                let (sum, count) = match distribution {
-                    Distribution::Summary(summary, quantiles, sum) => {
+            for (labels, folded) in series {
+                let (sum, count) = match folded {
+                    Folded::Cells(cells) => {
+                        let mut count = 0_u64;
+                        for (cell, le) in cells.bounds.iter().enumerate() {
+                            count += cells.count(cell);
+                            write_sample(
+                                out,
+                                &name,
+                                Some("bucket"),
+                                &labels,
+                                Some(("le", le)),
+                                &count,
+                            );
+                        }
+                        count += cells.count(cells.bounds.len());
+                        write_sample(
+                            out,
+                            &name,
+                            Some("bucket"),
+                            &labels,
+                            Some(("le", &"+Inf")),
+                            &count,
+                        );
+                        (cells.sum(), count)
+                    }
+                    Folded::Kept(Distribution::Summary(summary, quantiles, sum)) => {
                         let snapshot = summary.snapshot(Instant::now());
                         for quantile in quantiles.iter() {
                             let value = snapshot.quantile(quantile.value()).unwrap_or(0.0);
@@ -347,7 +464,7 @@ impl WorkerSeries {
                         }
                         (*sum, u64::try_from(summary.count()).unwrap_or(u64::MAX))
                     }
-                    Distribution::Histogram(histogram) => {
+                    Folded::Kept(Distribution::Histogram(histogram)) => {
                         for (le, count) in histogram.buckets() {
                             write_sample(
                                 out,
@@ -368,7 +485,7 @@ impl WorkerSeries {
                         );
                         (histogram.sum(), histogram.count())
                     }
-                    Distribution::NativeHistogram(_) => continue,
+                    Folded::Kept(Distribution::NativeHistogram(_)) => continue,
                 };
                 write_sample(out, &name, Some("sum"), &labels, None, &sum);
                 write_sample(out, &name, Some("count"), &labels, None, &count);
@@ -424,33 +541,81 @@ impl<R: Recorder> Recorder for WorkerSeriesRecorder<R> {
     fn register_histogram(&self, key: &Key, metadata: &Metadata<'_>) -> Histogram {
         match worker_url(key) {
             Some(url) => self.series.histogram(key, url),
-            None => self.inner.register_histogram(key, metadata),
+            None => match self.series.bucketed(key) {
+                Some(histogram) => histogram,
+                None => self.inner.register_histogram(key, metadata),
+            },
         }
     }
 }
 
-/// Storage of the per-worker registry: the exporter's atomic counters and
-/// gauges, and histogram samples stamped with their time of recording so the
-/// exporter's rolling summaries age them as the exporter's own.
+/// Storage of the store's registry: the exporter's atomic counters and
+/// gauges; a histogram series in fixed cells where the bucket configuration
+/// renders its family as a histogram, and else its samples stamped with
+/// their time of recording so the exporter's rolling summaries age them as
+/// the exporter's own.
 #[derive(Debug)]
-struct WorkerStorage;
+struct WorkerStorage(Arc<DistributionBuilder>);
 
-impl<K> Storage<K> for WorkerStorage {
+impl Storage<Key> for WorkerStorage {
     type Counter = Arc<AtomicU64>;
     type Gauge = Arc<AtomicU64>;
-    type Histogram = Arc<TimedSamples>;
+    type Histogram = Samples;
 
-    fn counter(&self, _: &K) -> Self::Counter {
+    fn counter(&self, _: &Key) -> Self::Counter {
         Arc::new(AtomicU64::new(0))
     }
 
-    fn gauge(&self, _: &K) -> Self::Gauge {
+    fn gauge(&self, _: &Key) -> Self::Gauge {
         Arc::new(AtomicU64::new(0))
     }
 
-    fn histogram(&self, _: &K) -> Self::Histogram {
-        Arc::new(TimedSamples(AtomicBucket::new()))
+    fn histogram(&self, key: &Key) -> Self::Histogram {
+        match self.0.get_distribution(&sanitize_metric_name(key.name())) {
+            Distribution::Histogram(histogram) => Samples::Cells(Arc::new(BucketCells::new(
+                histogram.buckets().into_iter().map(|(bound, _)| bound),
+                STRIPES,
+            ))),
+            Distribution::Summary(..) | Distribution::NativeHistogram(_) => {
+                Samples::Timed(Arc::new(TimedSamples(AtomicBucket::new())))
+            }
+        }
     }
+}
+
+/// What a histogram series of the store records into.
+#[derive(Clone, Debug)]
+enum Samples {
+    /// The samples, kept until the upkeep folds them.
+    Timed(Arc<TimedSamples>),
+    /// One count a bucket and a sum; no sample is kept.
+    Cells(Arc<BucketCells>),
+}
+
+impl Samples {
+    /// A handle that records straight into what the series keeps.
+    fn handle(&self) -> Histogram {
+        match self {
+            Self::Timed(samples) => Histogram::from_arc(Arc::clone(samples)),
+            Self::Cells(cells) => Histogram::from_arc(Arc::clone(cells)),
+        }
+    }
+}
+
+impl HistogramFn for Samples {
+    fn record(&self, value: f64) {
+        match self {
+            Self::Timed(samples) => samples.record(value),
+            Self::Cells(cells) => cells.record(value),
+        }
+    }
+}
+
+/// A series as a scrape reads it: a distribution the upkeep folded, or the
+/// series' cells.
+enum Folded<'d> {
+    Kept(&'d Distribution),
+    Cells(Arc<BucketCells>),
 }
 
 /// Histogram samples with their time of recording.
@@ -460,6 +625,125 @@ struct TimedSamples(AtomicBucket<(f64, Instant)>);
 impl HistogramFn for TimedSamples {
     fn record(&self, value: f64) {
         self.0.push((value, Instant::now()));
+    }
+}
+
+/// The stripes of a series in cells. A thread records into the stripe of its
+/// number, so callers on different threads meet on no word until there are
+/// more threads than stripes. A power of two.
+const STRIPES: usize = 8;
+
+/// The words of a cache line.
+const LINE_WORDS: usize = 8;
+
+/// One cache line of a stripe's words. A stripe is whole lines, so two
+/// stripes share none.
+#[derive(Debug, Default)]
+#[repr(align(64))]
+struct Line([AtomicU64; LINE_WORDS]);
+
+thread_local! {
+    /// The calling thread's number among the threads that recorded into
+    /// cells; `usize::MAX` until it takes one.
+    static THREAD_NUMBER: Cell<usize> = const { Cell::new(usize::MAX) };
+}
+
+/// The threads that took a number.
+static THREADS: AtomicUsize = AtomicUsize::new(0);
+
+/// The calling thread's number: how many threads took theirs before it.
+fn thread_number() -> usize {
+    THREAD_NUMBER
+        .try_with(|number| {
+            if number.get() == usize::MAX {
+                number.set(THREADS.fetch_add(1, Ordering::Relaxed));
+            }
+            number.get()
+        })
+        .unwrap_or(0)
+}
+
+/// A histogram series in fixed cells. A sample counts in the cell of the
+/// first bound, in the order the configuration lists them, that it is no
+/// greater than, as the exporter's fold places it; a sample over every bound,
+/// and a NaN, counts in the last cell, which only the `+Inf` line and the
+/// count read. The cells stand once a stripe, and a scrape adds the stripes
+/// up bound by bound.
+#[derive(Debug)]
+struct BucketCells {
+    bounds: Box<[f64]>,
+    /// The stripes, one behind the other. The first word of a stripe is the
+    /// sum of its samples, as the bits of an `f64`; behind it stand one count
+    /// a bound and one more for the samples over every bound.
+    lines: Box<[Line]>,
+    /// The lines of one stripe.
+    stripe_lines: usize,
+    /// The number of the last stripe.
+    last_stripe: usize,
+}
+
+impl BucketCells {
+    fn new(bounds: impl Iterator<Item = f64>, stripes: usize) -> Self {
+        let bounds: Box<[f64]> = bounds.collect();
+        let stripes = stripes.max(1).next_power_of_two();
+        let stripe_lines = (bounds.len() + 2).div_ceil(LINE_WORDS);
+        Self {
+            bounds,
+            lines: (0..stripes * stripe_lines)
+                .map(|_| Line::default())
+                .collect(),
+            stripe_lines,
+            last_stripe: stripes - 1,
+        }
+    }
+
+    /// The `word`th word of `stripe`.
+    fn word(&self, stripe: usize, word: usize) -> Option<&AtomicU64> {
+        self.lines
+            .get(stripe * self.stripe_lines + word / LINE_WORDS)?
+            .0
+            .get(word % LINE_WORDS)
+    }
+
+    /// The samples counted in `cell`, over every stripe.
+    fn count(&self, cell: usize) -> u64 {
+        (0..=self.last_stripe)
+            .filter_map(|stripe| self.word(stripe, 1 + cell))
+            .map(|count| count.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    /// The sum of the samples, over every stripe.
+    fn sum(&self) -> f64 {
+        (0..=self.last_stripe)
+            .filter_map(|stripe| self.word(stripe, 0))
+            .map(|sum| f64::from_bits(sum.load(Ordering::Relaxed)))
+            .fold(0.0, |sum, stripe| sum + stripe)
+    }
+}
+
+impl HistogramFn for BucketCells {
+    fn record(&self, value: f64) {
+        let cell = self
+            .bounds
+            .iter()
+            .position(|bound| value <= *bound)
+            .unwrap_or(self.bounds.len());
+        let stripe = thread_number() & self.last_stripe;
+        if let Some(count) = self.word(stripe, 1 + cell) {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+        let Some(sum) = self.word(stripe, 0) else {
+            return;
+        };
+        let mut seen = sum.load(Ordering::Relaxed);
+        loop {
+            let next = (f64::from_bits(seen) + value).to_bits();
+            match sum.compare_exchange_weak(seen, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(now) => seen = now,
+            }
+        }
     }
 }
 
@@ -821,5 +1105,150 @@ mod tests {
         }
         expected.push('\n');
         assert_eq!(workers, expected);
+    }
+
+    /// The lines of the family `name` in a scrape: its `# HELP`, its `# TYPE`
+    /// and its samples.
+    fn family<'t>(rendered: &'t str, name: &str) -> Vec<&'t str> {
+        rendered
+            .lines()
+            .filter(|line| {
+                let line = line
+                    .strip_prefix("# HELP ")
+                    .or_else(|| line.strip_prefix("# TYPE "))
+                    .unwrap_or(line);
+                line.strip_prefix(name)
+                    .is_some_and(|rest| rest.starts_with(['_', '{', ' ']))
+            })
+            .collect()
+    }
+
+    /// What the exporter alone writes for `samples` of `apply_seconds`,
+    /// under the store's buckets.
+    fn exporter_alone(samples: &[f64]) -> String {
+        let recorder = PrometheusBuilder::new()
+            .set_buckets_for_metric(Matcher::Full(String::from("apply_seconds")), &[0.001, 0.01])
+            .unwrap_or_else(|error| panic!("the buckets: {error}"))
+            .build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            metrics::describe_histogram!("apply_seconds", "Time of an apply");
+            let series = histogram!("apply_seconds", "model" => "m");
+            for sample in samples {
+                series.record(*sample);
+            }
+        });
+        handle.render()
+    }
+
+    #[test]
+    fn a_bucketed_family_reads_in_the_store_as_the_exporter_writes_it() {
+        let lists: [&[f64]; 5] = [
+            // Under the first bound, on a bound, between two, on the last
+            // and over it.
+            &[0.0005, 0.001, 0.005, 0.01, 0.5, 2.0],
+            &[0.25, f64::NAN, 0.001],
+            &[f64::INFINITY, 0.01],
+            &[f64::NEG_INFINITY, -1.0],
+            &[],
+        ];
+        for samples in lists {
+            let series = store();
+            series.keep_histograms();
+            let (exporter, stored) = scrape(&series, || {
+                metrics::describe_histogram!("apply_seconds", "Time of an apply");
+                let series = histogram!("apply_seconds", "model" => "m");
+                for sample in samples {
+                    series.record(*sample);
+                }
+            });
+            assert!(!exporter.contains("apply_seconds"), "{exporter}");
+            let alone = exporter_alone(samples);
+            assert_eq!(
+                family(&stored, "apply_seconds"),
+                family(&alone, "apply_seconds"),
+                "{samples:?}"
+            );
+            assert_eq!(
+                family(&stored, "apply_seconds").len(),
+                7,
+                "{samples:?}: {stored}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_family_with_no_worker_label_stays_with_the_exporter_until_the_host_asks() {
+        let series = store();
+        let (exporter, stored) = scrape(&series, || {
+            let series = histogram!("apply_seconds", "model" => "m");
+            for sample in [0.0005, 0.005, 0.5] {
+                series.record(sample);
+            }
+        });
+        assert!(!stored.contains("apply_seconds"), "{stored}");
+        let count = "apply_seconds_count{model=\"m\"} 3";
+        assert!(exporter.lines().any(|line| line == count), "{exporter}");
+    }
+
+    #[test]
+    fn asking_after_a_series_reached_the_exporter_moves_no_family() {
+        let series = store();
+        let (exporter, stored) = scrape(&series, || {
+            histogram!("apply_seconds", "model" => "m").record(0.005);
+            series.keep_histograms();
+            histogram!("apply_seconds", "model" => "n").record(0.005);
+        });
+        assert!(!stored.contains("apply_seconds"), "{stored}");
+        for count in [
+            "apply_seconds_count{model=\"m\"} 1",
+            "apply_seconds_count{model=\"n\"} 1",
+        ] {
+            assert!(exporter.lines().any(|line| line == count), "{exporter}");
+        }
+    }
+
+    #[test]
+    fn a_summary_with_no_worker_label_stays_with_the_exporter_when_the_host_asked() {
+        let series = store();
+        series.keep_histograms();
+        let (exporter, stored) = scrape(&series, || {
+            histogram!("lag_seconds").record(0.005);
+        });
+        assert!(!stored.contains("lag_seconds"), "{stored}");
+        let count = "lag_seconds_count 1";
+        assert!(exporter.lines().any(|line| line == count), "{exporter}");
+    }
+
+    #[test]
+    fn the_samples_of_many_threads_add_up_in_a_scrape() {
+        // Sums of powers of two are exact in any order: the first is under
+        // the first bound, the second under the last, the third over it.
+        let samples = [0.000_976_562_5, 0.007_812_5, 0.5];
+        // More threads than a series has stripes, so some share one.
+        let threads = 3 * STRIPES;
+        let series = store();
+        series.keep_histograms();
+        let (_, stored) = scrape(&series, || {
+            metrics::describe_histogram!("apply_seconds", "Time of an apply");
+            let histogram = histogram!("apply_seconds", "model" => "m");
+            std::thread::scope(|scope| {
+                for _ in 0..threads {
+                    scope.spawn(|| {
+                        for sample in samples {
+                            histogram.record(sample);
+                        }
+                    });
+                }
+            });
+        });
+        let alone = exporter_alone(&samples.repeat(threads));
+        assert_eq!(
+            family(&stored, "apply_seconds"),
+            family(&alone, "apply_seconds"),
+            "{stored}"
+        );
+        let count = format!("apply_seconds_count{{model=\"m\"}} {}", 3 * threads);
+        assert!(stored.lines().any(|line| line == count), "{stored}");
     }
 }
