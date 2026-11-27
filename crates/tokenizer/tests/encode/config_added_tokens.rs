@@ -380,6 +380,74 @@ fn a_special_token_after_a_text_token_the_file_lacks_is_left_out() {
     }
 }
 
+/// A `tokenizer.json` whose model table holds `pieces` on the ids given and
+/// no added token: a table with holes where the ids skip.
+fn table_json(pieces: &[(&str, u32)]) -> String {
+    let vocab: Map<String, Value> = pieces
+        .iter()
+        .map(|(piece, id)| ((*piece).to_string(), json!(id)))
+        .collect();
+    json!({
+        "version": "1.0",
+        "truncation": null,
+        "padding": null,
+        "added_tokens": [],
+        "normalizer": null,
+        "pre_tokenizer": {"type": "Whitespace"},
+        "post_processor": null,
+        "decoder": null,
+        "model": {"type": "BPE", "vocab": vocab, "merges": []},
+    })
+    .to_string()
+}
+
+#[test]
+fn a_special_token_declared_on_an_id_the_table_holds_is_left_out() {
+    // The table has a hole: two entries, `b` on id 2. The pipeline's next
+    // free id is its entry count, 2, so a special token declared on 2 would
+    // be added on the id of `b` and take its decode. It is left out, as
+    // tokenizer.json alone reads the checkpoint, and the warning names both.
+    let dir = TempDir::new().expect("a temp dir");
+    let (tokenizer, warnings) = warnings_during(|| {
+        load(
+            &dir,
+            &table_json(&[("a", 0), ("b", 2)]),
+            config(&[(2, "<x>")]),
+        )
+    });
+    let tokenizer = tokenizer.expect("the checkpoint loads");
+
+    assert_eq!(tokenizer.token_to_id("<x>"), None);
+    assert_eq!(tokenizer.id_to_token(2).as_deref(), Some("b"));
+    let encoded = tokenizer.encode("b", false).expect("the piece encodes");
+    assert_eq!(encoded.token_ids(), &[2]);
+    assert_eq!(tokenizer.decode(&[2], true).expect("the id decodes"), "b");
+    assert!(
+        warnings.iter().any(|fields| {
+            fields.contains(&"token=<x>".to_string())
+                && fields.contains(&"table_piece=b".to_string())
+        }),
+        "the warning names the token and the piece: {warnings:?}"
+    );
+}
+
+#[test]
+fn a_special_token_declared_on_a_free_id_of_a_table_with_holes_is_added() {
+    // The same hole, but the table holds nothing on its entry count: the
+    // token is added there, as on a table without holes.
+    let dir = TempDir::new().expect("a temp dir");
+    let tokenizer = load(
+        &dir,
+        &table_json(&[("a", 0), ("b", 5)]),
+        config(&[(2, "<x>")]),
+    )
+    .expect("the checkpoint loads");
+
+    assert_eq!(tokenizer.token_to_id("<x>"), Some(2));
+    assert_eq!(tokenizer.id_to_token(2).as_deref(), Some("<x>"));
+    assert_eq!(tokenizer.decode(&[5], true).expect("the id decodes"), "b");
+}
+
 #[test]
 fn a_configuration_without_the_block_changes_nothing() {
     let dir = TempDir::new().expect("a temp dir");

@@ -1126,7 +1126,10 @@ impl HuggingFaceTokenizer {
     /// warning on the tokenizer.json path, where the file's tokens stand
     /// and the configuration's extras ride along where they fit (a
     /// checkpoint that declares `</think>` on an id the table holds for
-    /// another piece loads as it always did, that token as text). On the
+    /// another piece loads as it always did, that token as text). A table
+    /// with holes can hold a piece on the next free id itself: on the
+    /// tokenizer.json path a token that would land there is left out the
+    /// same way, with a warning that names the piece. On the
     /// tokenizer.json path a token the configuration declares
     /// `special: false` and the file lacks stays text, as it was before
     /// this path read the block. It takes no id, and the pipeline fills
@@ -1208,6 +1211,19 @@ impl HuggingFaceTokenizer {
                                 }
                                 continue;
                             }
+                        }
+                    }
+                    // A table with holes can hold another piece on the next free
+                    // id: a token added there would take that piece's decode.
+                    if is_new && matches!(misplaced, MisplacedToken::IsLeftOut) {
+                        if let Some(piece) = tokenizer.get_model().id_to_token(lands_on) {
+                            warn!(
+                                token = %token.content,
+                                config_id = id,
+                                table_piece = %piece,
+                                "tokenizer_config.json declares a special token on an id the model's table holds for another piece; the token is left out, as tokenizer.json alone reads it"
+                            );
+                            continue;
                         }
                     }
                     if is_new {
