@@ -215,6 +215,46 @@ fn arguments_done_triggers_execute_tools_with_forwarding() {
     }
 }
 
+/// The relay reads a turn on after the loop took a call: the upstream's
+/// own `output_item.done` of that call is dropped (the loop writes the
+/// call's umbrella itself) and does not kick the loop again.
+#[test]
+fn the_upstreams_done_of_a_call_the_loop_took_is_dropped() {
+    let mut handler = StreamingToolHandler::with_starting_index(0);
+    bootstrap_function_call_added(&mut handler);
+    let args_done = r#"{
+      "type": "response.function_call_arguments.done",
+      "output_index": 0,
+      "item_id": "fc_test",
+      "arguments": "{}"
+    }"#;
+    let action = handler.process_event(Some("response.function_call_arguments.done"), args_done);
+    assert!(
+        matches!(action, StreamAction::ExecuteTools { .. }),
+        "{action:?}"
+    );
+    assert_eq!(handler.take_pending_calls().len(), 1);
+
+    let item_done = r#"{
+      "type": "response.output_item.done",
+      "output_index": 0,
+      "item": {
+        "type": "function_call",
+        "id": "fc_test",
+        "call_id": "call_test",
+        "name": "image_generation",
+        "arguments": "{}",
+        "status": "completed"
+      }
+    }"#;
+    let action = handler.process_event(Some("response.output_item.done"), item_done);
+    assert!(
+        matches!(action, StreamAction::Drop),
+        "expected Drop for the umbrella of a call the loop took, got {action:?}"
+    );
+    assert!(handler.take_pending_calls().is_empty());
+}
+
 #[test]
 fn output_item_done_for_unrelated_item_forwards_even_with_pending_call() {
     // Regression for PR #1369 review (chatgpt-codex-connector P1):

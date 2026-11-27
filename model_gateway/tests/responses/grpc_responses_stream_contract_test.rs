@@ -9,15 +9,20 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode},
 };
 use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
-use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
+use openai_protocol::{
+    model_card::ModelCard, responses::ResponsesRequest, worker::HealthCheckConfig,
+};
 use serde_json::{json, Value};
 use smg::{
     config::{RouterConfig, RoutingMode},
     middleware::TenantRequestMeta,
     routers::{grpc::backend_client::BasicWorkerBuilder, RouterFactory},
-    tenant::TenantKey,
+    tenant::{RouteRequestMeta, TenantKey},
 };
-use smg_test_harness::scripted_tokenizer;
+use smg_test_harness::{
+    mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType as MockWorkerType},
+    scripted_tokenizer,
+};
 use smg_worker::identity::basic::{ConnectionMode, RuntimeType, WorkerType};
 use tokio::{net::TcpListener, time::timeout};
 
@@ -627,6 +632,182 @@ async fn mcp_cap_executes_allowed_prefix_of_parallel_batch() {
         assert!(response["error"].is_null());
         assert_executed_mcp_queries(&response, &["query-0", "query-1"]);
     }
+}
+
+/// The anchor events of the calls on a Responses stream, each with its
+/// call's ordinal (0 for the first call the stream opens): the call's item
+/// opened, its arguments complete, its result, its item closed.
+fn call_anchor_events(events: &[Value]) -> Vec<(usize, &'static str)> {
+    let mut opened: Vec<u64> = Vec::new();
+    let mut anchors = Vec::new();
+    for event in events {
+        let is_call_item = event["item"]["type"] == "mcp_call";
+        let anchor = match event["type"].as_str() {
+            Some("response.output_item.added") if is_call_item => "opened",
+            Some("response.mcp_call_arguments.done") => "arguments",
+            Some("response.mcp_call.completed" | "response.mcp_call.failed") => "result",
+            Some("response.output_item.done") if is_call_item => "closed",
+            _ => continue,
+        };
+        let Some(index) = event["output_index"].as_u64() else {
+            continue;
+        };
+        let seen = opened.iter().position(|open| *open == index);
+        let ordinal = seen.unwrap_or_else(|| {
+            opened.push(index);
+            opened.len() - 1
+        });
+        anchors.push((ordinal, anchor));
+    }
+    anchors
+}
+
+/// The stream of the OpenAI-mode route for a turn in which the upstream asks
+/// for two tools at once (the mock worker's two-call turn), over a mock MCP
+/// server that runs both.
+async fn openai_mode_two_call_events(
+    max_tool_calls: Option<u32>,
+) -> Result<Vec<Value>, Box<dyn Error + Send + Sync>> {
+    let mut mcp = common::mock_mcp_server::MockMCPServer::start().await?;
+    let dir = tempfile::tempdir()?;
+    let mcp_config = dir.path().join("mcp.yaml");
+    std::fs::write(
+        &mcp_config,
+        format!(
+            "servers:\n  - name: mock\n    protocol: streamable\n    url: {}\n",
+            mcp.url()
+        ),
+    )?;
+    let mut worker = MockWorker::new(MockWorkerConfig {
+        port: 0,
+        worker_type: MockWorkerType::Regular,
+        health_status: HealthStatus::Healthy,
+        response_delay_ms: 0,
+        fail_rate: 0.0,
+    });
+    let worker_url = worker.start().await.map_err(|e| e.to_string())?;
+    let config = RouterConfig::builder()
+        .openai_mode(vec![worker_url])
+        .random_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .max_payload_size(8 * 1024 * 1024)
+        .request_timeout_secs(60)
+        .worker_startup_check_interval_secs(1)
+        .worker_startup_timeout_secs(5)
+        .max_concurrent_requests(32)
+        .queue_timeout_secs(5)
+        .build_unchecked();
+    let mcp_config = mcp_config.to_str().ok_or("the config path is UTF-8")?;
+    let context = common::create_test_context_with_mcp_config(config, mcp_config).await;
+    let router = RouterFactory::create_router(&context).await?;
+    let request: ResponsesRequest = serde_json::from_value(json!({
+        "model": "mock-model",
+        "input": "search for two things",
+        "instructions": "ask for two tools in one turn",
+        "stream": true,
+        "store": false,
+        "max_tool_calls": max_tool_calls,
+        "tools": [{
+            "type": "mcp", "server_label": "mock", "server_url": mcp.url(),
+            "require_approval": "never",
+        }],
+    }))?;
+    let meta = RouteRequestMeta::new(TenantKey::from("test-tenant"));
+    let response = router
+        .route_responses(None, &meta, request.clone(), request.model.as_str())
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), usize::MAX).await?;
+    let events = std::str::from_utf8(&bytes)?
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str(data).ok())
+        .collect();
+    worker.stop().await;
+    mcp.stop().await;
+    Ok(events)
+}
+
+/// The gateway's two streamed tool loops write a turn of two calls in one
+/// order: each call whole (its item opened, its arguments, its result, its
+/// item closed) before the next call opens. The gRPC route's loop and the
+/// OpenAI-mode route's loop are read here side by side on such a turn, so
+/// neither can move to another order alone. A loop that left the upstream's
+/// turn at its first call would write one call here, not two.
+#[tokio::test]
+async fn both_streamed_tool_loops_write_a_turn_of_two_calls_call_by_call() {
+    let mut mcp = common::mock_mcp_server::MockMCPServer::start()
+        .await
+        .unwrap();
+    let output: String = ["query-0", "query-1"]
+        .iter()
+        .map(|query| {
+            let call = json!({"name": "brave_web_search", "arguments": {"query": query}});
+            format!("<tool_call>\n{call}\n</tool_call>\n")
+        })
+        .collect();
+    let (_, grpc) = responses_result_with_final_answer(
+        json!([{"type":"mcp","server_label":"test-tools","server_url":mcp.url(),"require_approval":"never"}]),
+        Some(&output), None, "completed", true, Some(1),
+    ).await;
+    mcp.stop().await;
+    let openai_mode = openai_mode_two_call_events(None).await.unwrap();
+
+    let call_by_call = [
+        (0, "opened"),
+        (0, "arguments"),
+        (0, "result"),
+        (0, "closed"),
+        (1, "opened"),
+        (1, "arguments"),
+        (1, "result"),
+        (1, "closed"),
+    ];
+    assert_eq!(
+        call_anchor_events(&grpc),
+        call_by_call,
+        "the gRPC route: {grpc:?}"
+    );
+    assert_eq!(
+        call_anchor_events(&openai_mode),
+        call_by_call,
+        "the OpenAI-mode route: {openai_mode:?}"
+    );
+}
+
+/// The same turn of two calls on the OpenAI-mode route against an allowance
+/// of one call. The first call runs. The second, which the loop meets at its
+/// second hand-over of the one upstream stream, is closed as not executed,
+/// and the terminal says why.
+#[tokio::test]
+async fn the_openai_mode_loop_stops_a_turn_of_two_calls_at_an_allowance_of_one() {
+    let events = openai_mode_two_call_events(Some(1)).await.unwrap();
+    let types: Vec<&str> = events
+        .iter()
+        .filter_map(|event| event["type"].as_str())
+        .collect();
+    let count = |kind: &str| types.iter().filter(|name| **name == kind).count();
+    assert_eq!(count("response.mcp_call.completed"), 1, "{types:?}");
+    assert_eq!(count("response.mcp_call.failed"), 1, "{types:?}");
+    let failed_at = types
+        .iter()
+        .position(|name| *name == "response.mcp_call.failed")
+        .unwrap();
+    assert_eq!(
+        &types[failed_at..],
+        [
+            "response.mcp_call.failed",
+            "response.output_item.done",
+            "response.completed"
+        ],
+        "{types:?}"
+    );
+    let terminal = events.last().unwrap();
+    assert_eq!(
+        terminal["response"]["incomplete_details"]["reason"], "max_tool_calls",
+        "{terminal}"
+    );
 }
 
 #[tokio::test]
