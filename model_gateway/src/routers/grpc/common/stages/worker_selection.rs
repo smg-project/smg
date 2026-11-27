@@ -2642,11 +2642,7 @@ impl WorkerSelectionStage {
                     .iter()
                     .any(|e| capable(e) && compatible(e, worker))
         };
-        let decode_vision = |worker: &dyn Worker| {
-            worker.metadata().spec.runtime_type != RuntimeType::Vllm
-                || worker.worker_type() != &WorkerType::Decode
-                || vision_capable(worker)
-        };
+        let decode_vision = decode_takes_vision;
         let pairs = snapshot.pd_pairs(PdWire::Grpc, self.policy_registry.pd_pairing_mode());
         let ec_pair_exists = pair_admitted_by(&pairs, demand.wire, &registered_ec);
         if !ec_pair_exists && pair_admitted_by(&pairs, demand.wire, &|_| true) {
@@ -2790,6 +2786,16 @@ pub(crate) fn encodes_for(encoder: &dyn Worker, worker: &dyn Worker) -> bool {
             Some(EncodeHandoff::Rendezvous) => true,
             None => false,
         }
+}
+
+/// Whether `worker` can take the decode side of a request whose media
+/// carries mRoPE grids: a vLLM decode worker needs a vision encoder, and
+/// every other worker takes it. The EPD selection uses this rule, and so
+/// does the gateway's family draw.
+pub(crate) fn decode_takes_vision(worker: &dyn Worker) -> bool {
+    worker.metadata().spec.runtime_type != RuntimeType::Vllm
+        || worker.worker_type() != &WorkerType::Decode
+        || vision_capable(worker)
 }
 
 /// EC producers and consumers must speak the same transfer protocol.

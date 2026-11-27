@@ -104,6 +104,13 @@ impl Gateway {
                 .count()
         };
         let registered = self.family_weights(size);
+        // Every family of this draw is a gRPC family. A request that the gRPC
+        // routers refuse still goes to one of them, which answers the
+        // refusal, as before.
+        let epd = match epd {
+            EpdDemand::GrpcRefused => EpdDemand::Pair,
+            epd => epd,
+        };
         self.draw_family(&snapshot, &registered, epd, |_, worker| sglang_grpc(worker))
             .or_else(|| {
                 self.incomplete_disaggregated_router(

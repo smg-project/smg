@@ -394,3 +394,29 @@ fn an_adapter_request_with_media_needs_an_encode_worker_the_epd_router_can_use()
         "the EPD family took no text: {text:?}"
     );
 }
+
+/// Every family of the adapter draw is a gRPC family. A generate request with
+/// media still goes to one of them, which refuses it with its own `400`, as
+/// before.
+#[test]
+fn an_adapter_generate_request_with_media_still_goes_to_a_grpc_family() {
+    let registry = Arc::new(WorkerRegistry::new());
+    registry
+        .register(Arc::new(
+            BasicWorkerBuilder::new("http://127.0.0.1:9660")
+                .model(ModelCard::new("base"))
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Grpc)
+                .runtime_type(RuntimeType::Sglang)
+                .status(WorkerStatus::Ready)
+                .build(),
+        ))
+        .unwrap();
+    let mut gateway = Gateway::new(registry);
+    gateway.enable_igw = true;
+    gateway.register_router(router_ids::GRPC_REGULAR, Arc::new(Capture("grpc")));
+    let router = gateway
+        .select_router_for_adapter("base", Some("adapter"), EpdDemand::GrpcRefused)
+        .expect("the gRPC family answers the refusal");
+    assert_eq!(router.router_type(), "grpc");
+}

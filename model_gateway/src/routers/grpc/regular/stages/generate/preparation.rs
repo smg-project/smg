@@ -25,6 +25,13 @@ pub(crate) struct GeneratePreparationStage;
 
 const FUNCTION: &str = "GeneratePreparationStage::prepare_generate";
 
+/// Whether this pipeline refuses `request`. It sends text and token ids
+/// only, so it refuses a request that names media. The gateway's family
+/// draw asks the same, so it draws no gRPC family for such a request.
+pub(crate) fn refuses_media(request: &GenerateRequest) -> bool {
+    request.carries_media()
+}
+
 impl GeneratePreparationStage {
     /// The stage's work. The chat+generate dispatcher calls this directly, so
     /// the stage's future lives inline in the dispatcher's: one box per stage
@@ -47,8 +54,8 @@ impl GeneratePreparationStage {
         // and token ids only. A request that names media is refused as the
         // chat route refuses media no worker takes, instead of being served
         // without it.
-        let media = request.media_fields();
-        if !media.is_empty() {
+        if refuses_media(request) {
+            let media = request.media_fields();
             return Err(error::bad_request(
                 "multimodal_not_supported",
                 format!(
