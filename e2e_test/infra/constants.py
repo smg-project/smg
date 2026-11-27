@@ -485,6 +485,8 @@ class StartupProfile:
 _STARTUP_PROFILES = MappingProxyType(
     {
         "vllm-mooncake-pd2": StartupProfile(
+            # This explicit total worker-health budget includes SERVING warm-up.
+            # It is an engineering contract, not a measured ROCm startup time.
             models=MappingProxyType(
                 {
                     "meta-llama/Llama-3.1-8B-Instruct": (300, 1),
@@ -620,9 +622,10 @@ def startup_profile_definition() -> StartupProfile | None:
 
 
 def profile_startup_timeout(model_id: str, tp: int) -> int | None:
-    """The frozen model bound shared by worker health and ZMQ gateway waits.
+    """The frozen total bound used by worker startup and its profile validation.
 
-    Native warm-up remains inside SERVING. Unknown models/TP never fall back
+    Native warm-up remains inside SERVING and consumes this budget. This gRPC
+    profile does not set ordinary ZMQ gateway waits. Unknown models/TP never fall back
     to ordinary bounds; a profile cannot add env or gateway headroom.
     """
     profile = get_startup_profile()

@@ -1258,7 +1258,7 @@ class Worker:
 
     def _wait_grpc_healthy(self, timeout: float) -> None:
         """Wait for a gRPC worker to become healthy."""
-        if self.engine == "trtllm":
+        if self.engine == "trtllm" or get_startup_profile() is not None:
             self._last_trt_model_identity = None
             deadline = time.monotonic() + timeout
             while (remaining := deadline - time.monotonic()) > 0:
@@ -1386,7 +1386,8 @@ def validate_startup_profile_worker(
         ) or option.startswith(("-tp", "-dp")):
             raise ValueError(f"{profile} forbids an appended model/TP/DP/KV override")
     if extra_env and any(
-        key.startswith("E2E_") or key in ("SMG_VLLM_SERVICER_WARMUP", "SMG_VLLM_MM_PROCESSOR")
+        key.startswith("E2E_")
+        or key in ("SMG_VLLM_SERVICER_WARMUP", "SMG_VLLM_MM_PROCESSOR", "SMG_VLLM_SERVICER_IMPL")
         for key in extra_env
     ):
         raise ValueError(f"{profile} forbids a worker environment override")

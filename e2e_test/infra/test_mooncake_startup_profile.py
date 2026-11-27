@@ -65,6 +65,30 @@ def test_original_four_models_and_grpc_roles_remain_supported(monkeypatch, model
     assert backend._gateway_readiness_timeout(ConnectionMode.GRPC, model, 60) == 60
 
 
+def test_profile_does_not_accept_a_grpc_probe_after_its_deadline(monkeypatch):
+    bind(monkeypatch)
+    clock = [0.0]
+    calls = []
+
+    def probe(**kwargs):
+        calls.append(kwargs)
+        clock[0] += 0.2
+        return True
+
+    monkeypatch.setattr(worker.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(worker.time, "perf_counter", lambda: clock[0])
+    instance = SimpleNamespace(
+        engine="vllm",
+        model_id=MODELS[0],
+        port=1,
+        raise_if_exited=lambda: None,
+        grpc_serving=probe,
+    )
+    with pytest.raises(TimeoutError):
+        worker.Worker._wait_grpc_healthy(instance, timeout=0.125)
+    assert calls == [{"timeout": 0.125, "_deadline": 0.125}]
+
+
 def test_original_dp2_rank_pinning_shape_remains_supported(monkeypatch):
     bind(monkeypatch)
     worker.validate_startup_profile_worker(
@@ -94,6 +118,9 @@ def test_original_dp2_rank_pinning_shape_remains_supported(monkeypatch):
         {"extra_engine_args": ["-tp", "2"]},
         {"extra_env": {"E2E_VLLM_KV_BACKEND": "nixl"}},
         {"extra_env": {"SMG_VLLM_SERVICER_WARMUP": "off"}},
+        {"extra_env": {"SMG_VLLM_SERVICER_IMPL": "python"}},
+        {"extra_env": {"SMG_VLLM_SERVICER_IMPL": "rust"}},
+        {"extra_env": {"SMG_VLLM_SERVICER_IMPL": ""}},
     ],
 )
 def test_changed_worker_contract_fails_before_allocation(monkeypatch, override):
@@ -131,6 +158,34 @@ def test_pd_pool_counts_fail_before_starting_any_worker(monkeypatch, role, count
         log_dir=None,
     )
     with pytest.raises(ValueError, match="one prefill and one decode"):
+        next(setup)
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"decode_env": {"SMG_VLLM_SERVICER_WARMUP": "off"}},
+        {"decode_env": {"SMG_VLLM_SERVICER_IMPL": "python"}},
+        {"decode_args": ["--model=other"]},
+        {"extra_engine_args": ["--tensor-parallel-size", "2"]},
+    ],
+)
+def test_pd_role_overrides_fail_before_starting_either_pool(monkeypatch, config):
+    bind(monkeypatch)
+    monkeypatch.setattr(
+        backend, "_start_pd_pool", lambda **kwargs: pytest.fail("pool start reached")
+    )
+    setup = backend._setup_pd(
+        model_id=MODELS[0],
+        model_path=MODELS[0],
+        engine="vllm",
+        connection_mode=ConnectionMode.GRPC,
+        workers_config=config,
+        gateway_config={"timeout": 60},
+        gateway=None,
+        log_dir=None,
+    )
+    with pytest.raises(ValueError, match="vllm-mooncake-pd2"):
         next(setup)
 
 

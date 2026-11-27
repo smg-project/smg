@@ -2,6 +2,7 @@
 
 import importlib.util
 import os
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -20,6 +21,11 @@ class StartupProfileNamesTest(unittest.TestCase):
     def declaration(self, value):
         with patch.dict(os.environ, {"E2E_STARTUP_PROFILE": value}):
             return self.constants._startup_profile_declaration()
+
+    def test_workflow_guards_cover_exactly_the_registered_names(self):
+        workflow = Path(__file__).resolve().parents[2] / ".github/workflows/e2e-gpu-job.yml"
+        guarded = set(re.findall(r"inputs\.startup_profile\s*==\s*'([^']+)'", workflow.read_text()))
+        self.assertEqual(guarded, set(self.constants._STARTUP_PROFILES))
 
     def test_blank_profile_keeps_ordinary_behavior(self):
         for value in ("", " ", "\t\n"):

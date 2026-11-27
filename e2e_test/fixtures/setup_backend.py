@@ -697,11 +697,23 @@ def _setup_pd(
     decode_tp = workers_config.get("decode_tp")
     prefill_kv = _per_worker_kv(workers_config.get("prefill_kv"), num_prefill, "prefill")
     decode_kv = _per_worker_kv(workers_config.get("decode_kv"), num_decode, "decode")
+    extra_engine_args = workers_config.get("extra_engine_args")
+    prefill_engine_args = _merge_engine_args(extra_engine_args, workers_config.get("prefill_args"))
+    decode_engine_args = _merge_engine_args(extra_engine_args, workers_config.get("decode_args"))
+    prefill_env = workers_config.get("prefill_env")
+    decode_env = workers_config.get("decode_env")
     mooncake_pd2 = get_startup_profile() == "vllm-mooncake-pd2"
     if mooncake_pd2:
-        for role, worker_type, tp, backends in (
-            ("prefill", WorkerType.PREFILL, prefill_tp, prefill_kv),
-            ("decode", WorkerType.DECODE, decode_tp, decode_kv),
+        for role, worker_type, tp, backends, role_args, role_env in (
+            (
+                "prefill",
+                WorkerType.PREFILL,
+                prefill_tp,
+                prefill_kv,
+                prefill_engine_args,
+                prefill_env,
+            ),
+            ("decode", WorkerType.DECODE, decode_tp, decode_kv, decode_engine_args, decode_env),
         ):
             requested = workers_config.get(role)
             if requested is not None and (type(requested) is not int or requested != 1):
@@ -713,6 +725,8 @@ def _setup_pd(
                 worker_type=worker_type,
                 tp=tp,
                 kv_backend=backends[0] if backends else None,
+                extra_engine_args=role_args,
+                extra_env=role_env,
             )
         _gateway_readiness_timeout(connection_mode, model_id, gateway_config["timeout"])
     moriio = _moriio_fleet(engine, prefill_kv, decode_kv)
@@ -740,9 +754,6 @@ def _setup_pd(
     # reach every pool, as they do for regular workers. The ``prefill_args`` /
     # ``decode_args`` pool options add flags to one pool only (a
     # ``--language-model-only`` decode pool, say).
-    extra_engine_args = workers_config.get("extra_engine_args")
-    prefill_engine_args = _merge_engine_args(extra_engine_args, workers_config.get("prefill_args"))
-    decode_engine_args = _merge_engine_args(extra_engine_args, workers_config.get("decode_args"))
     all_workers: list = []
     try:
         prefill_workers = _start_pd_pool(
@@ -757,7 +768,7 @@ def _setup_pd(
             tp=prefill_tp,
             kv_backends=prefill_kv,
             extra_engine_args=prefill_engine_args,
-            extra_env=workers_config.get("prefill_env"),
+            extra_env=prefill_env,
         )
         all_workers.extend(prefill_workers)
 
@@ -775,7 +786,7 @@ def _setup_pd(
             tp=decode_tp,
             kv_backends=decode_kv,
             extra_engine_args=decode_engine_args,
-            extra_env=workers_config.get("decode_env"),
+            extra_env=decode_env,
         )
         all_workers.extend(decode_workers)
         if parallel_start:
@@ -787,11 +798,7 @@ def _setup_pd(
             # the session's fail-fast budget as it does on the sequential path.
             # Evicting the previous pool and staggering new launches must not
             # consume the replacement fleet's readiness budget.
-            readiness_bound = (
-                worker_startup_timeout(model_id)
-                if mooncake_pd2
-                else effective_startup_timeout(spec.get("startup_timeout", DEFAULT_STARTUP_TIMEOUT))
-            )
+            readiness_bound = worker_startup_timeout(model_id)
             deadline = time.monotonic() + readiness_bound
             try:
                 for worker in all_workers:
