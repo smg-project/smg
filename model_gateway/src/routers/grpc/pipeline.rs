@@ -1168,15 +1168,6 @@ impl RequestPipeline {
         retry_config: Option<&RetryConfig>,
         stream_start: Option<StreamStartupSender>,
     ) -> Response {
-        if request
-            .resolved_thinking_token_budget()
-            .is_ok_and(|budget| budget.is_some())
-        {
-            return error::bad_request(
-                "unsupported_thinking_token_budget",
-                "This gRPC route cannot enforce a finite thinking_token_budget",
-            );
-        }
         const ENDPOINT: &str = metrics_labels::ENDPOINT_CHAT;
         let run = {
             let mut ctx = Box::new(RequestContext::for_chat(

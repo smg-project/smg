@@ -155,6 +155,7 @@ impl ServerInfo {
 
 /// Keys worth extracting from SGLang gRPC `server_args` (which contains the full config).
 const SGLANG_GRPC_KEYS: &[&str] = &[
+    smg_worker::labels::SUPPORTS_THINKING_TOKEN_BUDGET_LABEL,
     "multimodal_encoder_dtype",
     media_contract::LABEL,
     "mm_processor",

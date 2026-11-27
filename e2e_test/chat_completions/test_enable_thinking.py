@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import logging
 
+import openai
 import pytest
+from infra import ConnectionMode, get_connection_mode_override
 
 logger = logging.getLogger(__name__)
 
@@ -115,3 +117,53 @@ class TestEnableThinking:
             "The reasoning content should not be included in the stream response"
         )
         assert has_content, "The stream response does not contain normal content"
+
+
+@pytest.mark.gpu(1)
+@pytest.mark.model("Qwen/Qwen3-30B-A3B")
+@pytest.mark.gateway(extra_args=["--reasoning-parser", "qwen3"])
+@pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
+class _ThinkingTokenBudget:
+    zero_budget: dict
+
+    @pytest.mark.parametrize("use_zero_budget", [False, True], ids=["worker-default", "zero"])
+    def test_thinking_budget_limits_only_reasoning(self, model, api_client, use_zero_budget):
+        options = {"chat_template_kwargs": {"enable_thinking": True}}
+        if use_zero_budget:
+            options.update(self.zero_budget)
+        request = dict(
+            model=model,
+            messages=[{"role": "user", "content": "What is 17 times 23?"}],
+            temperature=0,
+            max_tokens=256,
+            extra_body=options,
+        )
+        # The direct ZMQ lanes reuse these gRPC cases. Their registered workers
+        # do not advertise a reasoning budget to placement.
+        if use_zero_budget and get_connection_mode_override() == ConnectionMode.ZMQ:
+            with pytest.raises(openai.BadRequestError) as exc:
+                api_client.chat.completions.create(**request)
+            assert exc.value.code == "unsupported_thinking_token_budget"
+            return
+
+        response = api_client.chat.completions.create(**request)
+        message = response.choices[0].message
+        reasoning = (getattr(message, "reasoning_content", None) or "").strip()
+        if not use_zero_budget:
+            assert reasoning, "The control request should produce reasoning on this model."
+        else:
+            assert not reasoning
+            assert (message.content or "").strip(), "The final answer still has its token budget."
+
+
+@pytest.mark.engine("vllm")
+@pytest.mark.workers(
+    extra_engine_args=[
+        "--reasoning-config",
+        '{"reasoning_start_str":"<think>","reasoning_end_str":"</think>"}',
+    ]
+)
+class TestVllmThinkingTokenBudget(_ThinkingTokenBudget):
+    """The worker's sampler enforces the budget between Qwen3's reasoning markers."""
+
+    zero_budget = {"thinking_token_budget": 0}
