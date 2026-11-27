@@ -43,10 +43,16 @@ from infra import (
     launch_cloud_gateway,
 )
 from infra.cloud_credentials import resolve_cloud_credentials
-from infra.constants import vllm_kv_backend, zmq_backend
+from infra.constants import (
+    ENV_STARTUP_PROFILE,
+    get_startup_profile,
+    startup_profile_definition,
+    vllm_kv_backend,
+    zmq_backend,
+)
 from infra.model_specs import get_model_spec
 from infra.process_utils import ProcessExitedError
-from infra.worker import stop_workers
+from infra.worker import stop_workers, validate_startup_profile_worker, worker_startup_timeout
 from infra.worker_pool import get_pool
 
 from .hooks import FINALIZED_ZMQ_GATEWAY_KEY, SERVING_CLASS_FAILED_KEY
@@ -121,6 +127,8 @@ def _start_workers_tracked(**kwargs) -> list:
     owns teardown of those.
     """
     engine = kwargs.get("engine") or get_runtime()
+    if os.environ.get(ENV_STARTUP_PROFILE, "").strip():
+        validate_startup_profile_worker(**kwargs)
     try:
         return get_pool().acquire(**kwargs)
     except (TimeoutError, RuntimeError):
@@ -157,6 +165,16 @@ def _gateway_readiness_timeout(
     worker gate would have applied), never shrinking an explicitly larger
     gateway timeout.
     """
+    profile = get_startup_profile()
+    if profile is not None:
+        definition = startup_profile_definition()
+        if connection_mode not in definition.modes:
+            raise ValueError(f"{profile} does not permit gateway wire {connection_mode!r}")
+        if base_timeout > definition.max_floor:
+            raise ValueError(
+                f"{profile} gateway timeout {base_timeout!r} exceeds frozen wait "
+                f"{definition.max_floor}"
+            )
     if connection_mode != ConnectionMode.ZMQ:
         return effective_startup_timeout(base_timeout)
     startup_timeout = effective_startup_timeout(
@@ -310,6 +328,8 @@ def setup_backend(request: pytest.FixtureRequest):
         connection_mode = mode_override
     engine = get_runtime()
     _validate_connection_mode(connection_mode, engine)
+    if get_startup_profile() is not None:
+        _gateway_readiness_timeout(connection_mode, model_id, gateway_config["timeout"])
     model_path = get_model_spec(model_id)["model"]
     workers_config = get_marker_kwargs(request, "workers", defaults=_WORKER_DEFAULTS)
     if is_pd and pool_counts is not None:
@@ -677,6 +697,24 @@ def _setup_pd(
     decode_tp = workers_config.get("decode_tp")
     prefill_kv = _per_worker_kv(workers_config.get("prefill_kv"), num_prefill, "prefill")
     decode_kv = _per_worker_kv(workers_config.get("decode_kv"), num_decode, "decode")
+    mooncake_pd2 = get_startup_profile() == "vllm-mooncake-pd2"
+    if mooncake_pd2:
+        for role, worker_type, tp, backends in (
+            ("prefill", WorkerType.PREFILL, prefill_tp, prefill_kv),
+            ("decode", WorkerType.DECODE, decode_tp, decode_kv),
+        ):
+            requested = workers_config.get(role)
+            if requested is not None and (type(requested) is not int or requested != 1):
+                raise ValueError("vllm-mooncake-pd2 requires one prefill and one decode worker")
+            validate_startup_profile_worker(
+                model_id=model_id,
+                engine=engine,
+                mode=connection_mode,
+                worker_type=worker_type,
+                tp=tp,
+                kv_backend=backends[0] if backends else None,
+            )
+        _gateway_readiness_timeout(connection_mode, model_id, gateway_config["timeout"])
     moriio = _moriio_fleet(engine, prefill_kv, decode_kv)
     if moriio:
         # SMG speaks the MoRI-IO handoff only on its HTTP PD router (the gRPC
@@ -749,9 +787,12 @@ def _setup_pd(
             # the session's fail-fast budget as it does on the sequential path.
             # Evicting the previous pool and staggering new launches must not
             # consume the replacement fleet's readiness budget.
-            deadline = time.monotonic() + effective_startup_timeout(
-                spec.get("startup_timeout", DEFAULT_STARTUP_TIMEOUT)
+            readiness_bound = (
+                worker_startup_timeout(model_id)
+                if mooncake_pd2
+                else effective_startup_timeout(spec.get("startup_timeout", DEFAULT_STARTUP_TIMEOUT))
             )
+            deadline = time.monotonic() + readiness_bound
             try:
                 for worker in all_workers:
                     remaining = deadline - time.monotonic()
