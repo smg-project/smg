@@ -773,7 +773,14 @@ def run_with_interrupt_handoff(command, hard_exit):
             hard_exit(130)
             raise  # A controlled exit replacement can return in offline tests.
     finally:
-        signal.signal(signal.SIGINT, previous)
+        try:
+            signal.signal(signal.SIGINT, previous)
+        except BaseException:
+            # A pending first interrupt can run inside the restore, install
+            # SIG_IGN and raise through the previous handler. Complete that
+            # interrupted restore once, then preserve the original exception.
+            signal.signal(signal.SIGINT, previous)
+            raise
 
 
 def main(argv=None):

@@ -2247,9 +2247,12 @@ threading.Thread(target=interrupt, daemon=True).start()
 def actual_run():
     return batch.run_tasks(types.SimpleNamespace(log_level="ERROR", num_trials=1,
         workers=0, max_concurrency=1), [task])
+def handoff_fallback(code):
+    Path(sys.argv[6] + ".handoff-fallback").write_text("handoff fallback delegated to adapter")
+    batch.os._exit(code)
 try:
     if hasattr(gc, "run_with_interrupt_handoff"):
-        gc.run_with_interrupt_handoff(actual_run, batch.os._exit)
+        gc.run_with_interrupt_handoff(actual_run, handoff_fallback)
     else:
         actual_run()  # Previous production's direct CLI/SDK call, for causal control.
 except KeyboardInterrupt:
@@ -2334,6 +2337,9 @@ else:
     assert ledger.audit()["pending"] == 1
     assert Path(str(witness) + ".before-adapter-second").exists()
     assert not Path(str(witness) + ".escaped-before-adapter").exists()
+    assert not Path(str(witness) + ".handoff-fallback").exists(), (
+        "second SIGINT escaped the runner into the handoff fallback"
+    )
 
 
 def test_hard_exit_worker_bootstrap_failure_is_bounded(tmp_path):
@@ -2367,7 +2373,7 @@ raise AssertionError("original hard exit returned")
     )
     timed_out = False
     try:
-        out, error = child.communicate(timeout=2)
+        out, error = child.communicate(timeout=5)
     except subprocess.TimeoutExpired:
         timed_out = True
         os.killpg(child.pid, signal.SIGKILL)
@@ -2388,6 +2394,102 @@ raise AssertionError("original hard exit returned")
     assert not timed_out, "Thread.start waited forever for failed bootstrap acknowledgement"
     assert child.returncode == 130, error.decode(errors="replace")
     assert marker.read_text() == "halt callback completed"
+
+
+def test_hard_exit_native_launch_without_callback_waits_for_completion(
+    configured, monkeypatch, capsys
+):
+    import signal
+    import time
+
+    from tau2.runner import batch
+
+    _, _, _, ledger, contexts = configured
+    original_signal, previous = signal.signal, signal.getsignal(signal.SIGINT)
+    global_exit = os._exit
+    exits, callbacks, launches, waits, elapsed = [], [], [], [], []
+    fake_os = types.SimpleNamespace(_exit=exits.append)
+    monkeypatch.setattr(batch, "os", fake_os)
+    guard = gc.Guard(
+        ledger,
+        contexts,
+        arm="vllm",
+        domain="retail",
+        invocation_id="offline-no-native-callback",
+        local_model="local-model",
+        local_url="http://127.0.0.1:8000",
+    )
+    guard.install()
+    monkeypatch.setattr(guard, "stop_paid", lambda: callbacks.append("stop"))
+    completed = gc.threading.Event()
+
+    class Completion:
+        def set(self):
+            completed.set()
+
+        def wait(self, timeout):
+            waits.append(timeout)
+            started = time.monotonic()
+            try:
+                return completed.wait(timeout)
+            finally:
+                elapsed.append(time.monotonic() - started)
+
+    def launch_without_callback(callback, args):
+        launches.append((callback, args))
+        return 123  # OS launch returned, but Python never invokes the callback.
+
+    monkeypatch.setattr(gc.threading, "Event", Completion)
+    monkeypatch.setattr(gc._thread, "start_new_thread", launch_without_callback)
+    try:
+        batch.os._exit(130)
+        after = signal.getsignal(signal.SIGINT)
+    finally:
+        original_signal(signal.SIGINT, previous)
+        guard.close()
+    assert len(launches) == 1 and launches[0][1] == ()
+    assert waits == [10] and elapsed[0] >= 9
+    assert not callbacks and not completed.is_set()
+    assert exits == [130] and after is previous
+    assert os._exit is global_exit and batch.os is fake_os
+    assert "NOT_ATTESTED: ordering-or-IO-timeout" in capsys.readouterr().err
+    assert not ledger.summary()["halted"]
+
+
+@pytest.mark.parametrize("error_type", [KeyboardInterrupt, RuntimeError])
+def test_interrupt_handoff_restores_handler_when_first_signal_arrives_during_restore(
+    monkeypatch, error_type
+):
+    import signal
+
+    original_signal, original_getsignal = signal.signal, signal.getsignal
+    before = original_getsignal(signal.SIGINT)
+    exits, restoration_attempts = [], []
+    error = error_type("controlled first interrupt during restoration")
+
+    def previous(signum, frame):
+        raise error
+
+    def restore_with_pending_interrupt(signum, handler):
+        if handler is previous:
+            restoration_attempts.append(handler)
+            if len(restoration_attempts) == 1:
+                # Dispatch the real installed handler before the restore takes
+                # effect, as CPython can do inside signal.signal().
+                os.kill(os.getpid(), signal.SIGINT)
+        return original_signal(signum, handler)
+
+    original_signal(signal.SIGINT, previous)
+    monkeypatch.setattr(gc.signal, "signal", restore_with_pending_interrupt)
+    try:
+        with pytest.raises(error_type) as observed:
+            gc.run_with_interrupt_handoff(lambda: "command already returned", exits.append)
+        assert observed.value is error
+        assert original_getsignal(signal.SIGINT) is previous
+        assert len(restoration_attempts) == 2
+        assert not exits, "a post-command restore exception is not a runner hard-exit handoff"
+    finally:
+        original_signal(signal.SIGINT, before)
 
 
 @pytest.mark.parametrize("outcome", ["normal", "interrupt", "ignored"])

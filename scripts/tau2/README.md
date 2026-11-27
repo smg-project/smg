@@ -270,3 +270,6 @@ handshake; its explicit completion wait remains bounded to 10 seconds. Thread
 creation/setup or completion failure still reports `NOT_ATTESTED`. Explicitly
 ignored/default-termination signal dispositions, SIGKILL, host loss, and blocking
 stderr/OS shutdown retain their existing unqualified limits.
+If a pending first interrupt runs during restoration after the command returns,
+the prior signal disposition is restored before its exception is propagated.
+This is a signal-state repair, not evidence of paid work continuing after return.
