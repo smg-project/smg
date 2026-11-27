@@ -951,7 +951,9 @@ fn each_list_turns_its_own_rotation_for_every_request() {
 /// The gateway's classic policy asks the list's turn by place and lets
 /// a refused place fall to its set's rotation
 /// (`model_gateway/src/policies/round_robin.rs:151-153`, `:164-167`),
-/// and its own case holds these shares over four workers (`:430-441`).
+/// and its own case holds these shares over four workers
+/// (`a_refused_row_falls_to_the_admitted_set_and_the_spread_stays_even` in
+/// `model_gateway/tests/unit/policies/round_robin/tests.rs`).
 #[test]
 fn a_refused_turn_falls_to_the_kept_workers_rotation_at_every_size() {
     let mut document = PolicySpec::preset("round_robin").expect("a built-in preset");

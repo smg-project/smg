@@ -441,7 +441,8 @@ fn each_pool_turns_its_own_word() {
 /// (`model_gateway/src/policies/round_robin.rs:151-153`, `:164-167`):
 /// the turn is not handed to the list's next worker. Its own case of
 /// four workers holds the shares
-/// (`model_gateway/src/policies/round_robin.rs:430-441`).
+/// (`a_refused_row_falls_to_the_admitted_set_and_the_spread_stays_even` in
+/// `model_gateway/tests/unit/policies/round_robin/tests.rs`).
 #[test]
 fn a_pick_keeps_exact_shares_past_workers_not_ready() {
     let engine = preset("round_robin");
