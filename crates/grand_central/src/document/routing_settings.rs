@@ -146,9 +146,10 @@ use crate::{
 /// of the cache boundaries at the top of the configuration decides nothing
 /// either: each policy reads its own.
 ///
-/// The record is closed: a gateway names every setting, so a setting that
-/// joins stops its build until the gateway states it. Left out by silence, it
-/// would decide by this crate's default with no word.
+/// The record is closed, so a gateway can name every setting in one literal:
+/// a setting that joins then stops its build until the gateway states it. A
+/// literal that takes the rest from the default leaves a new setting out by
+/// silence, and it decides by this crate's default with no word.
 #[derive(Clone, Debug, PartialEq)]
 #[expect(
     clippy::exhaustive_structs,
@@ -274,8 +275,8 @@ pub enum ConnectionModeSetting {
 
 /// The settings of the sticky override this module reads.
 ///
-/// The record is closed, as the settings that hold it are: a gateway names
-/// each of its fields, and one that joins stops its build.
+/// The record is closed, as the settings that hold it are: a gateway that
+/// names each of its fields in a literal stops its build at one that joins.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[expect(
     clippy::exhaustive_structs,

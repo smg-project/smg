@@ -1,10 +1,10 @@
-//! The records a policy document states, as a crate outside this one comes
-//! to them. Ten have no start: each of their cases reads one from a
-//! document's text, a road to it, and reads its fields back by a pattern
-//! that ends open. Eight start from their default and take a field
-//! by assignment. Two are made by a call that takes the one field a
-//! document must write, and each call is held to a document that writes
-//! that field and nothing else.
+//! The records a policy document states, and what a snapshot caller asks
+//! of the worker rows, as a crate outside this one comes to them. Ten have
+//! no start: each of their cases reads one from a document's text, a road
+//! to it, and reads its fields back by a pattern that ends open. Eight
+//! start from their default and take a field by assignment. Two are made
+//! by a call that takes the one field a document must write, and each call
+//! is held to a document that writes that field and nothing else.
 
 #![expect(clippy::expect_used, reason = "cases that stop on a broken setup")]
 
