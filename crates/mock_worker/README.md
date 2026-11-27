@@ -840,7 +840,12 @@ what the engine says; the file replays later with no engine behind it.
   scores of a request that also generates (a row for each output token) are
   not kept either: such a request replays without them.
 - A replay states the tokenizer a gateway reads from its worker:
-  `--tokenizer` names the model's tokenizer files.
+  `--tokenizer` names the model's tokenizer files. The info file keeps the
+  tokenizer path the engine stated, a folder of the engine's host where the
+  engine reads local files, and on the wire of the recording a replay
+  started without `--tokenizer`, or with one equal to `--model`, hands that
+  path to the gateway: a recording that leaves its host is replayed with a
+  `--tokenizer` other than `--model`.
 
 ```bash
 # record: gateway -> this worker -> the engine
