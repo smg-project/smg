@@ -360,7 +360,7 @@ impl Host {
                     placed,
                     |_| true,
                     noted,
-                    Some(SessionCountedUnder::default),
+                    SessionCountedUnder::default,
                 )
             }
         };
@@ -2487,9 +2487,10 @@ impl Filter for ReadsCounts {
 /// An encoder's row carries no count under any of those names: an item goes
 /// by its side's policy, whatever the request's key.
 ///
-/// The entry of a host that files a pick's lease itself names no count
-/// ([`Loaded::decide_encode_without_lease`]): a controller refuses a rule
-/// under `epd`, and each row of its encode request carries none, as it did.
+/// The entry of a host that files a pick's lease itself hands its maker's
+/// word too ([`Loaded::decide_encode_without_lease`]). Each side reads its
+/// count under the name that maker states, and an encoder's row carries
+/// none.
 ///
 /// The classic gateway's sticky map reads the count for the role it pins,
 /// under the key's own text, and never for an encoder
@@ -2605,13 +2606,18 @@ fn an_encode_requests_sides_read_their_keys_count_and_its_encoders_none() {
     // Each side under its own session's number: the other side's is no
     // count of its key.
     assert_eq!(read(number, [decode, prefill], true), neither, "crossed");
-    // The entry of a host that files a pick's lease itself names no count:
-    // its rows carry none under either word, whatever is counted there.
-    assert_eq!(read(text, [TALK; 2], false), neither, "unleased, a guard's");
+    // The entry of a host that files a pick's lease itself reads the same
+    // counts, under the name its maker states and under no other.
+    assert_eq!(read(text, [TALK; 2], false), both, "unleased, a guard's");
     assert_eq!(
         read(number, [prefill, decode], false),
-        neither,
+        both,
         "unleased, the held decisions'"
+    );
+    assert_eq!(
+        read(number, [TALK; 2], false),
+        neither,
+        "unleased, no held decision's count"
     );
 }
 

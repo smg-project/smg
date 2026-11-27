@@ -306,9 +306,10 @@ pub(crate) fn preprocess(
         images,
         transparent_bg,
         |elements| {
-            // Not `scratch::try_take_f32_cap(..).map_err(..)`: mapped with the
-            // buffer inside, the writer takes up to 1.1 % more instructions.
-            let mut out = scratch::take_f32_cap(0);
+            // `scratch::try_take_f32_cap`'s two steps, written out: with its
+            // result mapped (`.map_err(..)`, the buffer inside), the writer
+            // takes about 1 % more instructions.
+            let mut out = scratch::take_kept_f32(elements);
             out.try_reserve(elements).map_err(refused)?;
             Ok(out)
         },

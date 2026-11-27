@@ -24,8 +24,10 @@ pub(crate) mod sequential_pd;
 pub(crate) mod sglang_epd;
 pub(crate) mod spec;
 #[cfg(test)]
+#[path = "../../../tests/unit/routers/grpc/test_engine.rs"]
 pub(crate) mod test_engine;
 #[cfg(test)]
+#[path = "../../../tests/unit/routers/grpc/testing.rs"]
 pub(crate) mod testing;
 #[cfg(any(test, feature = "test-util"))]
 pub mod tokenizer_cache;
@@ -37,6 +39,7 @@ pub mod utils; // Used by routers/http and bindings/golang
 pub use regular::streaming::bench::{EngineScript, ForcedChat, StreamBench};
 pub(crate) mod wire;
 #[cfg(test)]
+#[path = "../../../tests/unit/routers/grpc/worker_identity_tests/mod.rs"]
 mod worker_identity_tests;
 /// The worker selection stage's benchmark seam: what
 /// `benches/policy_selection.rs` drives for the stage's own placements,
@@ -106,43 +109,5 @@ pub struct ProcessedMessages {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::routers::error::extract_error_code_from_response;
-
-    #[test]
-    fn validates_grpc_text_only_output() {
-        for modalities in [
-            None,
-            Some(vec![]),
-            Some(vec!["text".to_string()]),
-            Some(vec!["text".to_string(), "text".to_string()]),
-        ] {
-            let request = ChatCompletionRequest {
-                modalities,
-                ..Default::default()
-            };
-            assert!(validate_text_only_output(&request).is_ok());
-        }
-
-        let audio_request = ChatCompletionRequest {
-            return_audio: Some(true),
-            ..Default::default()
-        };
-        let response = validate_text_only_output(&audio_request).unwrap_err();
-        assert_eq!(
-            extract_error_code_from_response(&response),
-            "audio_output_not_supported"
-        );
-
-        let modality_request = ChatCompletionRequest {
-            modalities: Some(vec!["text".to_string(), "audio".to_string()]),
-            ..Default::default()
-        };
-        let response = validate_text_only_output(&modality_request).unwrap_err();
-        assert_eq!(
-            extract_error_code_from_response(&response),
-            "unsupported_output_modality"
-        );
-    }
-}
+#[path = "../../../tests/unit/routers/grpc/tests.rs"]
+mod tests;

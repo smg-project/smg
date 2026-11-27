@@ -31,7 +31,10 @@
 //! takes every `--refused` but `limit`. `--entry place_ruled` and
 //! `--entry place_held` state a route's rule with it (the bench's `ruled`
 //! file). `--entry place_named` asks the one call with a pair that names
-//! its worker ([`NAMED`]).
+//! its worker ([`NAMED`]). `--entry place_alone` states a rule that takes
+//! every prefill behind the first and no decode, over a cell whose every
+//! such prefill is over its thresholds under a binding that sheds a list
+//! wholly over them: each request is shed, and a turn counts the shed.
 //!
 //! Every worker has a load report, and a prefill states its rate as its
 //! measured input rate too: the one drain a prefill's record reads. Under
@@ -267,6 +270,9 @@ struct Decodes {
     /// rule's idle time and its sweep interval together. The pair's key has
     /// ended by then, at the rule's first sweep past its idle time.
     idle_out: Option<Duration>,
+    /// Whether the run's rule takes the prefills behind the first alone
+    /// ([`ruled::ALONE`]): each request is then shed behind the rule.
+    alone: bool,
 }
 
 /// One turn's pair request as its host states it: the request of
@@ -345,6 +351,12 @@ impl Decodes {
             request.headers = &NUMBER;
         }
         let mut answer = host.engine.place(&request);
+        // A rule that takes prefills over their thresholds alone: the turn
+        // is a shed, as saturated behind the one decision more that is held
+        // to them, and with no endpoint where no such decision is made.
+        if self.alone {
+            return matches!(answer, Err(Unplaced::Shed { .. })).then_some(0);
+        }
         // A run whose every decode is over its thresholds counts the turns
         // shed as saturated, and one whose every decode is out of service
         // the turns shed with no endpoint.
@@ -476,6 +488,19 @@ pub(super) fn runs(run: &Run) -> bool {
     };
     let prefills = side("prefill", WorkerType::Prefill);
     let decodes = side("decode", WorkerType::Decode);
+    // The rule of `place_alone` takes every prefill behind the first: the
+    // cell puts those over their thresholds beside the open first one.
+    let alone = run.entry == ruled::ALONE;
+    if alone {
+        let own = run.refused == Refused::No && !run.overloaded && run.workers > 1;
+        assert!(
+            own,
+            "place_alone states its own lists, of two workers or more"
+        );
+        for worker in prefills.iter().skip(1) {
+            worker.set_overloaded(true);
+        }
+    }
     if run.overloaded {
         // A pair's prefill side is put to no rule: the cell puts its decodes
         // over their thresholds and leaves its prefills open.
@@ -497,7 +522,7 @@ pub(super) fn runs(run: &Run) -> bool {
             worker.set_overloaded(true);
         }
     }
-    if matches!(run.refused, Refused::Overload | Refused::Outage) {
+    if alone || matches!(run.refused, Refused::Overload | Refused::Outage) {
         // Each binding sheds a list wholly over its thresholds.
         for binding in &mut document.bindings {
             let mut overload = binding.overload.take().unwrap_or_default();
@@ -527,6 +552,7 @@ pub(super) fn runs(run: &Run) -> bool {
             let ends = u64::from(rule.ttl_s) + u64::from(rule.sweep_s);
             Duration::from_secs(ends + 1)
         }),
+        alone,
     };
     let mut receiver = None;
     let feed = TestFeed::attached_to(|loads| receiver = loads);

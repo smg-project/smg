@@ -11,9 +11,10 @@
 //! worker's own for `s`, and a standing veto of its host beside the list
 //! for `m`. `w` is ready, over its thresholds and under a doubt of its
 //! own. `h` is ready and under its thresholds, under a hold of its host
-//! beside the list, which no rule lifts. `+` says that the rule takes the
-//! worker, and `-` that it refuses it. A worker marked `x` pairs with
-//! nobody, and every other prefill pairs with every other decode.
+//! beside the list, which no rule lifts, and `k` is such a worker over its
+//! thresholds. `+` says that the rule takes the worker, and `-` that it
+//! refuses it. A worker marked `x` pairs with nobody, and every other
+//! prefill pairs with every other decode.
 //!
 //! The gateway's own pair selection judges one list where it finds no pair
 //! (`pair_pass`, `model_gateway/src/routers/common/placement.rs:2763`, on
@@ -30,10 +31,9 @@
 //! breaker is not ready there, as one under a hold is not here. It holds
 //! the prefills that pair with a decode and no other
 //! (`model_gateway/src/routers/common/pair_index.rs:158-161`).
-//! Each row's answer here is that selection's by its kind, a shed as
-//! saturated for its overload shed and a shed with no endpoint for no
-//! worker, but for the rows that stand under the one answer of a rule
-//! left open, where it answers its overload shed ([`parted`], [`Parted`]).
+//! Each row's answer here is that selection's by its kind: a shed as
+//! saturated for its overload shed, and a shed with no endpoint for no
+//! worker.
 //!
 //! [`again`]: super::super::super::pair::again
 
@@ -75,29 +75,17 @@ pub(in super::super) enum Kind {
     /// The rule takes a worker of each list, and a decision among them
     /// answers.
     Among,
+    /// The rule takes only prefills over their thresholds and no decode,
+    /// behind a first decision that picked or that shed the request with
+    /// no endpoint: one decision more, held to the rule's prefills, sheds
+    /// the request as saturated.
+    Judged,
     /// The request states no rule.
     Unruled,
 }
 
-/// The answer of a pair that stands open in these rows: the engine sheds
-/// the request with no endpoint where the gateway's own selection answers
-/// its overload shed. A row that parts from that selection says so.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in super::super) enum Parted {
-    /// No decision said a list the rule's prefills could be judged by.
-    /// The rule takes only prefills over their thresholds and no decode,
-    /// behind a first decision that picked or that shed the request with
-    /// no endpoint: the request is shed with no endpoint, under the rule's
-    /// name or under the stage that first shed names. That selection
-    /// judges the rule's prefills and answers its overload shed
-    /// (`model_gateway/src/routers/common/placement.rs:2866-2884`).
-    NoWord,
-}
-
 /// One row: its two lists, whether the request states a rule, the call's
-/// answer, and the times the rule is asked. A row whose answer is not the
-/// gateway's own selection's by its kind says the open answer it stands
-/// under.
+/// answer, and the times the rule is asked.
 #[derive(Debug)]
 pub(in super::super) struct Row {
     pub(in super::super) name: &'static str,
@@ -106,10 +94,9 @@ pub(in super::super) struct Row {
     pub(in super::super) kind: Kind,
     pub(in super::super) answer: Answer,
     pub(in super::super) asked: usize,
-    pub(in super::super) parted: Option<Parted>,
 }
 
-/// A row whose answer is the gateway's own selection's by its kind.
+/// A row: its answer is the gateway's own selection's by its kind.
 const fn row(
     name: &'static str,
     prefills: &'static str,
@@ -125,30 +112,16 @@ const fn row(
         kind,
         answer,
         asked,
-        parted: None,
-    }
-}
-
-/// `row` where the gateway's own selection answers its overload shed and
-/// the row sheds with no endpoint: it stands under the open answer
-/// `under`. A row that sheds as saturated does not build.
-const fn parted(row: Row, under: Parted) -> Row {
-    let sheds = matches!(row.answer.0, ShedReason::Saturated);
-    assert!(!sheds, "the gateway's answer is of the row's kind");
-    Row {
-        parted: Some(under),
-        ..row
     }
 }
 
 /// The rows. The gateway's own selection answers by the row's kind in
-/// each but the ones made by [`parted`], where it answers its overload
-/// shed. Each of its answers was run, by a run of that selection over the
+/// each. Each of its answers was run, by a run of that selection over the
 /// row's state which this crate holds no case of: a worker `m` is an `s`
 /// there, since that selection has one liveness doubt, the worker's own.
-/// It was read and not run for the three rows that state a hold, which
+/// It was read and not run for the four rows that state a hold, which
 /// say so.
-pub(in super::super) const ROWS: [Row; 57] = [
+pub(in super::super) const ROWS: [Row; 58] = [
     // The first decision sheds over the prefills.
     row(
         "the prefills over; one of each taken",
@@ -239,17 +212,16 @@ pub(in super::super) const ROWS: [Row; 57] = [
         ADMITS,
         3,
     ),
-    // The first decision picks, and the rule refuses its picks.
-    parted(
-        row(
-            "a pick refused; an over prefill alone, no decode",
-            "o- v+",
-            "o-",
-            Kind::Told,
-            ADMITS,
-            5,
-        ),
-        Parted::NoWord,
+    // The first decision picks, and the rule refuses its picks. Where the
+    // rule takes only a prefill over its thresholds and no decode, no
+    // decision judged the rule's prefills: one more does.
+    row(
+        "a pick refused; an over prefill alone, no decode",
+        "o- v+",
+        "o-",
+        Kind::Judged,
+        SATURATED,
+        5,
     ),
     row(
         "a pick refused; an over prefill alone, and a decode",
@@ -475,7 +447,7 @@ pub(in super::super) const ROWS: [Row; 57] = [
     // list's count, no prefill of the rule's that could let a shed
     // stand, and none that keeps the rule's prefills from being wholly
     // over their thresholds. The gateway's own selection has no hold,
-    // and a gateway hands the engine none. Its answer for these three
+    // and a gateway hands the engine none. Its answer for these four
     // rows was read and not run: what it answers where that worker is
     // not ready, as one behind an open breaker is not.
     row(
@@ -489,6 +461,17 @@ pub(in super::super) const ROWS: [Row; 57] = [
     row(
         "the decodes over; the rule's one prefill is under its host's hold",
         "o- h+",
+        "v-",
+        Kind::Told,
+        ADMITS,
+        3,
+    ),
+    // Over its thresholds too, a held prefill is not ready: the hold is
+    // read ahead of the thresholds, so the rule's prefills hold no ready
+    // worker, and no shed stands by them.
+    row(
+        "the decodes over; the rule's one prefill is under its host's hold and over its thresholds",
+        "o- k+",
         "v-",
         Kind::Told,
         ADMITS,
@@ -568,17 +551,15 @@ pub(in super::super) const ROWS: [Row; 57] = [
         0,
     ),
     // Behind a first decision that shed with no endpoint, as behind one
-    // that picked: no decision judged the rule's prefills.
-    parted(
-        row(
-            "the partners over beside an idle decode apart; an over prefill alone, no decode",
-            "o- v+",
-            "v- o-x",
-            Kind::Keeps,
-            PARTNERED,
-            4,
-        ),
-        Parted::NoWord,
+    // that picked: no decision judged the rule's prefills, and one more
+    // does.
+    row(
+        "the partners over beside an idle decode apart; an over prefill alone, no decode",
+        "o- v+",
+        "v- o-x",
+        Kind::Judged,
+        SATURATED,
+        4,
     ),
     // A decision among the rule's workers of each list asks the one
     // question a first decision asks, over those workers.
@@ -657,7 +638,7 @@ pub(in super::super) const ROWS: [Row; 57] = [
 /// One worker of a row.
 #[derive(Clone, Copy, Debug)]
 pub(in super::super) struct Stated {
-    /// `o`, `v`, `u`, `s`, `m`, `w` or `h`.
+    /// `o`, `v`, `u`, `s`, `m`, `w`, `h` or `k`.
     state: char,
     /// Whether the route's rule takes the worker.
     pub(in super::super) taken: bool,
@@ -670,7 +651,7 @@ impl Stated {
     /// host is no state of the worker, and nor is its hold: they stand
     /// beside the list ([`masked`], [`holds`]).
     pub(in super::super) fn set(self, worker: &dyn Worker) {
-        if matches!(self.state, 'v' | 'w') {
+        if matches!(self.state, 'v' | 'w' | 'k') {
             worker.set_overloaded(true);
         }
         if self.state == 'u' {
@@ -688,7 +669,7 @@ pub(in super::super) fn stated(list: &str) -> Vec<Stated> {
         let mut chars = token.chars();
         let (state, rule, apart) = (chars.next(), chars.next(), chars.next());
         assert!(
-            matches!(state, Some('o' | 'v' | 'u' | 's' | 'm' | 'w' | 'h'))
+            matches!(state, Some('o' | 'v' | 'u' | 's' | 'm' | 'w' | 'h' | 'k'))
                 && matches!(rule, Some('+' | '-'))
                 && matches!(apart, None | Some('x'))
                 && chars.next().is_none(),
@@ -718,14 +699,16 @@ pub(in super::super) fn partners(prefills: &[Stated], decodes: &[Stated]) -> Par
 pub(in super::super) fn masked(list: &[Stated]) -> Vec<u32> {
     let masked = (0..)
         .zip(list)
-        .filter(|(_, worker)| matches!(worker.state, 'm' | 'h'));
+        .filter(|(_, worker)| matches!(worker.state, 'm' | 'h' | 'k'));
     masked.map(|(place, _)| place).collect()
 }
 
 /// The places of a list's workers that a hold of their host stands on, as
 /// the host states them beside the list.
 pub(in super::super) fn holds(list: &[Stated]) -> Vec<u32> {
-    let held = (0..).zip(list).filter(|(_, worker)| worker.state == 'h');
+    let held = (0..)
+        .zip(list)
+        .filter(|(_, worker)| matches!(worker.state, 'h' | 'k'));
     held.map(|(place, _)| place).collect()
 }
 
@@ -938,9 +921,7 @@ fn a_shed_that_stands_names_the_side_of_the_list_it_stands_for() {
 /// under a liveness doubt.
 ///
 /// The gateway's own selection answers that it has no worker in these
-/// rows, but for one. The rule takes only a prefill over its thresholds
-/// and no decode, behind a first decision that picked: that selection
-/// answers its overload shed ([`Parted::NoWord`]).
+/// rows.
 #[test]
 fn a_rule_that_takes_no_worker_of_a_list_is_told_where_no_shed_stands() {
     held(Kind::Told);
@@ -955,9 +936,7 @@ fn a_rule_that_takes_no_worker_of_a_list_is_told_where_no_shed_stands() {
 /// an idle decode that pairs with no prefill.
 ///
 /// The gateway's own selection answers that it has no worker in these
-/// rows, but for one. The rule takes only a prefill over its thresholds
-/// and no decode: that selection judges the rule's prefills, and answers
-/// its overload shed ([`Parted::NoWord`]).
+/// rows.
 #[test]
 fn a_shed_with_no_endpoint_stands_where_the_rule_takes_no_worker_of_a_list() {
     held(Kind::Keeps);
@@ -1044,6 +1023,47 @@ fn an_empty_decode_list_answers_ahead_of_the_rule_whatever_its_classes_say() {
     }
 }
 
+/// A rule that takes only prefills over their thresholds and no decode
+/// is judged by one decision more, where no decision judged the rule's
+/// prefills: the first picked workers the rule refuses, or shed the
+/// request with no endpoint over the lists whole. The call holds one
+/// decision to the rule's prefills, with no decode lent: under a binding
+/// that sheds it sheds the request as saturated over the prefills, and
+/// that shed is the answer, for the prefill side. The rule is asked no
+/// more for it.
+///
+/// The gateway's own selection judges the rule's prefills first where
+/// none of them can take the request, and answers its overload shed for
+/// the prefill's role (`pair_pass` in
+/// `model_gateway/src/routers/common/placement.rs`, where no prefill is
+/// eligible).
+#[test]
+fn a_rule_of_prefills_over_their_thresholds_alone_is_judged_by_one_decision_more() {
+    held(Kind::Judged);
+    let engine = round_robin(true);
+    for row in ROWS.iter().filter(|row| row.kind == Kind::Judged) {
+        let (unplaced, _) = unplaced_under(engine, row.prefills, row.decodes, true);
+        let side = match unplaced {
+            Unplaced::Shed { side, .. } => side,
+            other => panic!("{}: a shed, and not {other:?}", row.name),
+        };
+        assert_eq!(side, Some(PairSide::Prefill), "{}", row.name);
+    }
+}
+
+/// Under a binding that steers, the decision held to the rule's prefills
+/// sheds no request as saturated, and the answer stays what it was: the
+/// shed under the rule's name behind a first decision that picked, and
+/// the first decision's own shed behind one that shed the request with no
+/// endpoint. The gateway's own selection sheds for overload under its shed
+/// option alone.
+#[test]
+fn a_rule_of_prefills_over_their_thresholds_alone_keeps_its_answer_under_a_binding_that_steers() {
+    let engine = round_robin(false);
+    assert_eq!(asked_under(engine, "o- v+", "o-", true), (ADMITS, 5));
+    assert_eq!(asked_under(engine, "o- v+", "v- o-x", true), (PARTNERED, 4));
+}
+
 /// A rule that takes a worker of each list is answered by the call's next
 /// decision, made among them, by the one question a first decision asks:
 /// its shed as saturated where the list judged among them is wholly over
@@ -1062,24 +1082,6 @@ fn a_rule_that_takes_a_worker_of_each_list_is_answered_by_the_next_decision() {
 #[test]
 fn a_pair_with_no_rule_keeps_the_shed_of_its_first_decision() {
     held(Kind::Unruled);
-}
-
-/// The table's word of a row that parts from the gateway's own selection
-/// is held to the row's kind. A row parts only where its rule takes no
-/// worker of a list and no shed as saturated stands: told under the
-/// rule's name, or left its first decision's shed with no endpoint, where
-/// that selection sheds for overload and no decision judged the rule's
-/// prefills ([`Parted::NoWord`]). What that selection answers is the
-/// table's word, run outside this crate ([`ROWS`]): a row that says
-/// nothing of it is not held here.
-#[test]
-fn a_row_parts_from_the_gateway_under_the_open_answer_of_its_kind() {
-    let fits = |row: &Row| match (row.kind, row.parted) {
-        (_, None) | (Kind::Told | Kind::Keeps, Some(Parted::NoWord)) => true,
-        (Kind::Stands | Kind::Among | Kind::Unruled, Some(Parted::NoWord)) => false,
-    };
-    let misplaced: Vec<_> = ROWS.iter().filter(|row| !fits(row)).collect();
-    assert!(misplaced.is_empty(), "{misplaced:#?}");
 }
 
 /// A first decision that sheds the request with no endpoint has the rule
@@ -1611,6 +1613,43 @@ fn a_request_held_to_places_of_a_list_keeps_the_rules_name() {
     assert_eq!(decodes(true, false), ADMITS);
     assert_eq!(decodes(true, true), ADMITS, "the list wholly over");
     assert_eq!(decodes(false, true), SATURATED, "no places: the shed");
+    assert_eq!((engine.faults(), engine.unheard()), (0, 0));
+}
+
+/// A request held to a part of a list is asked no decision more for its
+/// rule's prefills: the answer stays under the rule's name. The first
+/// prefill is open and the second over its thresholds; the rule takes the
+/// second alone, and no decode. The first decision picks the first
+/// prefill, which the rule refuses. Where the host states places of the
+/// prefills, every one of them here, the call judges no list for such a
+/// request, as behind a first shed as saturated. With no places stated,
+/// one decision more is held to the rule's prefill and sheds the request
+/// as saturated.
+///
+/// The gateway's own selection states no places: it holds such a need in
+/// its filter.
+#[test]
+fn a_request_held_to_a_part_of_a_list_is_asked_no_decision_more() {
+    let engine = round_robin(true);
+    // The places a list's host states: every one.
+    let every: &[u32] = &[0, 1];
+    let asked = |held: bool| {
+        let lists = Lists::of(2, 1);
+        let classes = lists.every();
+        lists.prefills[1].set_overloaded(true);
+        let admits = |worker: &dyn Worker| worker_id(worker) == lists.prefill_id(1);
+        let pair = PairLists {
+            prefill_places: held.then_some(every),
+            ..lists.under(&classes, &Open)
+        };
+        let request = PlaceRequest {
+            admits: Some(&admits),
+            ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair))
+        };
+        shed_of(engine.place(&request))
+    };
+    assert_eq!(asked(true), ADMITS);
+    assert_eq!(asked(false), SATURATED, "no places: one decision more");
     assert_eq!((engine.faults(), engine.unheard()), (0, 0));
 }
 

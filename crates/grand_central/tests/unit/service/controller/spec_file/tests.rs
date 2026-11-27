@@ -242,6 +242,49 @@ fn a_start_refuses_a_file_it_cannot_run() {
     assert_eq!((bed.generation(), bed.rejected()), (0, 0));
 }
 
+/// A start takes the policy spec a gateway writes for the manual policy on
+/// a pair's two sides of its encode mode. The start checks it as a
+/// controller does: in the stock catalog with no stage that needs the
+/// lifecycle's calls. The spec binds three sides under the manual preset's
+/// rule, which tells its stages.
+///
+/// Under a rule that keeps what it places from the profile the same spec
+/// is refused by that field's name, and the first start's generation
+/// stands.
+///
+/// The settings write that spec:
+/// `the_manual_policy_on_both_sides_of_a_pair_runs_under_three_sides` in
+/// `crates/grand_central/tests/unit/document/routing_settings/tests.rs`.
+#[test]
+fn a_start_takes_a_sessions_rule_under_three_sides_as_a_controller_checks_it() {
+    let mut bed = bed(b"");
+    let catalog = Arc::new(StageRegistry::builtin().without_lifecycle());
+    let store = Arc::new(MemoryStore::new());
+    let validate = AppliedSpec::validate_digested;
+    bed.generations = Arc::new(Generations::validating(store, catalog, validate, None));
+    let manual = PolicySpec::preset("manual").expect("a preset of this build");
+    let mut spec = PolicySpec::epd_presets("consistent_hashing", "manual", "manual")
+        .expect("the mode's presets");
+    spec.bindings[0]
+        .sessions
+        .clone_from(&manual.bindings[0].sessions);
+    let path = bed.dir.path().join("policy.json");
+    let mut document = serde_json::to_value(&spec).expect("the spec serializes");
+    fs::write(&path, document.to_string()).expect("the file");
+    assert_eq!(bed.start_on(&path), Ok(1));
+
+    document["generation"] = 2.into();
+    document["bindings"][0]["sessions"]["rule_placed"] = "untold".into();
+    fs::write(&path, document.to_string()).expect("the file");
+    match bed.start_on(&path) {
+        Err(SpecRejected::Invalid(refused)) => {
+            assert_eq!(refused.field_path(), "bindings[0].sessions.rule_placed");
+        }
+        other => panic!("started as {other:?}"),
+    }
+    assert_eq!(bed.generation(), 1, "the first start's generation stands");
+}
+
 /// A start on `other` is refused as no regular file, and so is the
 /// watched file once its name turns to `other`: one rejected state, the
 /// running generation kept. The start and the looks run on a thread of

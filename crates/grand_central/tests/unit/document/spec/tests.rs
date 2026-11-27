@@ -3065,18 +3065,16 @@ fn the_manual_picker_on_the_encode_side_of_epd_is_not_in_this_build() {
     assert!(single.validate().is_ok());
 }
 
-/// The manual picker runs on the prefill and the decode side of `epd`,
-/// as on the two sides of a pair: on both, and on either one beside a
-/// picker of its own. With no rule on its binding such a side is placed
-/// by its assignment, in the build of a host that makes the
-/// lifecycle's calls and in the build of one that makes some only.
-/// Under a rule it follows its key in the first build. The second
-/// refuses a rule under `epd` by the plan's name, whatever its sides'
-/// pickers.
+/// The manual picker runs on the prefill and the decode side of `epd`, as
+/// on the two sides of a pair. It runs on both, and on either one beside a
+/// picker of its own. With no rule on its binding such a side is placed by
+/// its assignment. Under a rule that tells its stages it follows its key.
+/// Both hold in the build of a host that makes the lifecycle's calls and
+/// in the build of one that makes some only.
 ///
-/// A gateway's own check takes any policy on the prefill and the
-/// decode side of its encode mode, `manual` among them
-/// (`model_gateway/src/config/validation.rs:1005-1010`).
+/// A gateway's own check takes any policy on the prefill and the decode
+/// side of its encode mode, the manual one among them: `validate_mode` in
+/// `model_gateway/src/config/validation.rs`.
 #[test]
 fn the_manual_picker_runs_on_the_pairs_two_sides_of_epd() {
     let rule = r#","sessions":{"sticky_header":"x-session-id","inflight_cap":65535}"#;
@@ -3093,18 +3091,7 @@ fn the_manual_picker_runs_on_the_pairs_two_sides_of_epd() {
         assert!(bare.validate_in(&some, &[]).is_ok(), "{sides}");
         let ruled = epd(prefill, decode, rule);
         assert!(ruled.validate().is_ok(), "{sides}");
-        let refused = ruled.validate_in(&some, &[]).err();
-        assert!(
-            matches!(
-                refused,
-                Some(SpecError::BadSessions {
-                    index: 0,
-                    name: "plan",
-                    ..
-                })
-            ),
-            "{sides}: {refused:?}"
-        );
+        assert!(ruled.validate_in(&some, &[]).is_ok(), "{sides}");
     }
 }
 
@@ -3135,11 +3122,12 @@ fn a_pairs_sessions_rule_is_in_the_build_of_a_host_that_makes_some_lifecycle_cal
 /// tells a lease's words off a file, which keeps no word of a pair's
 /// side.
 ///
-/// Under `epd` the rule runs on the pair's two sides in the build of a
-/// host that makes the lifecycle's calls, under either word, and a cap
-/// makes the document's engine read a key's count as under a pair. The
-/// build of a host that makes some only refuses the rule by the plan's
-/// name, whatever its word.
+/// Under `epd` the rule runs on the pair's two sides, under either word,
+/// in the build of a host that makes the lifecycle's calls. A cap makes
+/// the document's engine read a key's count as under a pair. The build of
+/// a host that makes some only takes the rule that tells its stages, with
+/// a cap or with none. It refuses the one that keeps what it places from
+/// the profile, by that field's name, and its reason names the `epd` plan.
 ///
 /// A gateway's sticky map places each role of a pair under that role's
 /// own key, and hands its policy no request it placed
@@ -3203,26 +3191,47 @@ fn a_sessions_rule_runs_under_a_pair_and_under_epd_by_its_hosts_calls() {
     let capped = r#"{"sticky_header":"x-session-id"}"#;
     for rule in [uncapped, untold, capped] {
         assert_eq!(under("epd", epd, rule), None, "{rule}");
-        let refused = spec_with_binding(&format!(
-            r#"{{"plan":"epd","profiles":{epd},"sessions":{rule}}}"#
+    }
+    // The build of a host that tells a lease's words off a file: whether
+    // its engine reads the count of a key's requests under `epd`.
+    let epd_on_file = |sessions: &str| {
+        spec_with_binding(&format!(
+            r#"{{"plan":"epd","profiles":{epd},"sessions":{sessions}}}"#
         ))
         .validate_in(&some, &[])
-        .err();
-        assert_eq!(
-            refused,
-            Some(SpecError::BadSessions {
-                index: 0,
-                name: "plan",
-                reason: "`single` or `pd-pair`",
-            }),
-            "{rule}"
-        );
-        assert_eq!(
-            refused.map(|err| err.to_string()),
-            Some("binding 0: sessions plan is not `single` or `pd-pair`".to_string()),
-            "{rule}"
-        );
-    }
+        .map(|built| built.needs().session_in_flight)
+    };
+    assert_eq!(
+        epd_on_file(uncapped),
+        Ok(false),
+        "a rule that tells its stages"
+    );
+    assert_eq!(epd_on_file(capped), Ok(true), "a cap reads the count");
+    let refused = epd_on_file(untold).err();
+    assert_eq!(
+        refused,
+        Some(SpecError::BadSessions {
+            index: 0,
+            name: "rule_placed",
+            reason: UNTOLD_ON_FILE_EPD,
+        })
+    );
+    let path = refused.as_ref().map(SpecError::field_path);
+    assert_eq!(path.as_deref(), Some("bindings[0].sessions.rule_placed"));
+    // Each plan's refusal as an operator reads it: the pair's words stand
+    // as they stood, and the other names its own plan.
+    assert_eq!(
+        refused.map(|err| err.to_string()),
+        Some(
+            "binding 0: sessions rule_placed is not `told` under the epd plan in this build: \
+             a file of leases keeps no side's word"
+                .to_string()
+        )
+    );
+    assert_eq!(
+        UNTOLD_ON_FILE,
+        "`told` under the pd-pair plan in this build: a file of leases keeps no side's word"
+    );
     let counts =
         |sessions: &str| built("epd", epd, sessions).map(|built| built.needs().session_in_flight);
     assert_eq!((counts(uncapped), counts(capped)), (Ok(false), Ok(true)));
@@ -4465,14 +4474,6 @@ fn every_refusal_names_its_field() {
                 model: word(),
             },
             "bindings[2].match.model",
-        ),
-        (
-            SpecError::BadSessions {
-                index: 2,
-                name: "plan",
-                reason: "so",
-            },
-            "bindings[2].plan",
         ),
         (
             SpecError::BadSessions {

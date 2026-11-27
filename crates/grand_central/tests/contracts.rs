@@ -1705,6 +1705,8 @@ const MEMBERSHIP_FIELDS: &[(&str, &[ResumeField])] = &[
             ("demand_facts", 28, Type::Message),
             ("vision", 29, Type::Bool),
             ("encode", 30, Type::Message),
+            ("priority", 31, Type::Sint32),
+            ("drain_settle_secs", 32, Type::Uint32),
         ],
     ),
     (
@@ -1738,6 +1740,8 @@ const MEMBERSHIP_FIELDS: &[(&str, &[ResumeField])] = &[
             ("demand_facts", 15, Type::Message),
             ("vision", 16, Type::Bool),
             ("encode", 17, Type::Message),
+            ("priority", 18, Type::Sint32),
+            ("drain_settle_secs", 19, Type::Uint32),
         ],
     ),
 ];

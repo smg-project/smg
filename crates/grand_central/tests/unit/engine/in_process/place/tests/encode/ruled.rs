@@ -189,8 +189,9 @@ fn an_encode_request_is_placed_on_the_rules_prefill_though_an_earlier_attempt_tr
 /// is shed with no endpoint under the rule's name, behind one decision
 /// that picked. The rule is asked of that decision's picks, then of every
 /// prefill, then of every decode, ready or not, and no second decision is
-/// made. Behind a first decision that sheds the request as saturated, that
-/// shed stands in two cases ([`rows`](super::rows)).
+/// made: the pass is laid for the request, which is asked no decision more
+/// over its rule's prefills. Behind a first decision that sheds the request
+/// as saturated, that shed stands in two cases ([`rows`](super::rows)).
 ///
 /// The classic router answers such a request that it has no worker: its
 /// pass finds nobody open on a side none of whose workers the filter takes
