@@ -1,18 +1,29 @@
-use super::*;
+use super::{
+    RuntimeType::{Sglang, Unspecified, Vllm},
+    WorkerType::{Decode, Encode, Prefill, Regular},
+    *,
+};
 
 const MODEL: &str = "test-model";
 const CAPABLE: &[(&str, &str)] = &[(SUPPORTS_THINKING_TOKEN_BUDGET_LABEL, "true")];
-const MODES: [WorkerSelectionMode; 3] = [
-    WorkerSelectionMode::Regular,
-    WorkerSelectionMode::PrefillDecode,
-    WorkerSelectionMode::EncodePrefillDecode,
+const DISABLED: &[(&str, &str)] = &[(SUPPORTS_THINKING_TOKEN_BUDGET_LABEL, "false")];
+const MODES: &[(WorkerSelectionMode, &[WorkerType])] = &[
+    (WorkerSelectionMode::Regular, &[Regular]),
+    (WorkerSelectionMode::PrefillDecode, &[Prefill, Decode]),
+    (WorkerSelectionMode::EncodePrefillDecode, &[Prefill, Decode]),
 ];
 
-fn generation_roles(mode: WorkerSelectionMode) -> &'static [WorkerType] {
-    match mode {
-        WorkerSelectionMode::Regular => &[WorkerType::Regular],
-        _ => &[WorkerType::Prefill, WorkerType::Decode],
-    }
+fn register(
+    registry: &WorkerRegistry,
+    port: usize,
+    role: WorkerType,
+    runtime: RuntimeType,
+    labels: &[(&str, &str)],
+) -> Arc<dyn Worker> {
+    let url = format!("grpc://127.0.0.1:{port}");
+    let worker = discovered_grpc_worker(&url, MODEL, role, runtime, labels);
+    registry.register(Arc::clone(&worker)).unwrap();
+    worker
 }
 
 fn stage_for(registry: &Arc<WorkerRegistry>, mode: WorkerSelectionMode) -> WorkerSelectionStage {
@@ -36,41 +47,45 @@ fn chat_context(registry: &Arc<WorkerRegistry>, budget: i32) -> RequestContext {
     ctx
 }
 
+#[test]
+fn thinking_token_budget_requires_a_worker_declaration_and_an_enabled_label() {
+    for (discovered, effective) in [(UNLABELED, "true"), (DISABLED, "true"), (CAPABLE, "false")] {
+        let worker = BasicWorkerBuilder::new("grpc://127.0.0.1:9100")
+            .runtime_type(Vllm)
+            .connection_mode(ConnectionMode::Grpc)
+            .discovered_labels(smg_worker::test_support::labels_of(discovered))
+            .label(SUPPORTS_THINKING_TOKEN_BUDGET_LABEL, effective)
+            .build();
+        assert!(!supports_thinking_budget(&worker));
+    }
+}
+
 #[tokio::test]
 async fn thinking_token_budget_selects_capable_workers_on_first_and_retry_attempts() {
-    for mode in MODES {
+    for &(mode, roles) in MODES {
         let registry = Arc::new(WorkerRegistry::new());
         let stage = stage_for(&registry, mode);
-        for (i, &role) in generation_roles(mode).iter().enumerate() {
+        for (i, &role) in roles.iter().enumerate() {
             for (j, labels) in [UNLABELED, CAPABLE].into_iter().enumerate() {
-                let url = format!("grpc://127.0.0.1:{}", 9100 + 2 * i + j);
-                registry
-                    .register(labeled_worker(&url, MODEL, role, labels))
-                    .unwrap();
+                register(&registry, 9100 + 2 * i + j, role, Vllm, labels);
             }
         }
+        let assert_capable = |selection: &WorkerSelection| {
+            assert!(selection
+                .workers()
+                .all(|w| supports_thinking_budget(w.as_ref())));
+        };
         for _ in 0..4 {
             let mut ctx = chat_context(&registry, 0);
             stage.execute(&mut ctx).await.unwrap();
-            assert!(ctx
-                .state
-                .workers
-                .as_ref()
-                .unwrap()
-                .workers()
-                .all(|w| supports_thinking_budget(w.as_ref())));
+            assert_capable(ctx.state.workers.as_ref().unwrap());
             let mut dispatch = Box::new(ctx).into_dispatch().unwrap();
             assert!(dispatch.routing.needs_thinking_budget);
             stage
                 .reselect(&mut dispatch, &retained_plan(&[1, 2, 3]))
                 .await
                 .unwrap();
-            assert!(dispatch
-                .workers
-                .as_ref()
-                .unwrap()
-                .workers()
-                .all(|w| supports_thinking_budget(w.as_ref())));
+            assert_capable(dispatch.workers.as_ref().unwrap());
         }
     }
 }
@@ -79,8 +94,8 @@ async fn thinking_token_budget_selects_capable_workers_on_first_and_retry_attemp
 async fn thinking_token_budget_distinguishes_unsupported_and_unavailable_workers() {
     use openai_protocol::worker::WorkerStatus;
 
-    for mode in MODES {
-        for &missing in generation_roles(mode) {
+    for &(mode, roles) in MODES {
+        for &missing in roles {
             let registry = Arc::new(WorkerRegistry::new());
             let stage = stage_for(&registry, mode);
             let mut budget = chat_context(&registry, 8);
@@ -89,12 +104,9 @@ async fn thinking_token_budget_distinguishes_unsupported_and_unavailable_workers
                 StatusCode::NOT_FOUND
             );
 
-            for (index, &role) in generation_roles(mode).iter().enumerate() {
-                let url = format!("grpc://127.0.0.1:{}", 9200 + index);
+            for (index, &role) in roles.iter().enumerate() {
                 let labels = if role == missing { UNLABELED } else { CAPABLE };
-                registry
-                    .register(labeled_worker(&url, MODEL, role, labels))
-                    .unwrap();
+                register(&registry, 9200 + index, role, Vllm, labels);
             }
 
             let refusal = stage.execute(&mut budget).await.unwrap_err();
@@ -106,8 +118,7 @@ async fn thinking_token_budget_distinguishes_unsupported_and_unavailable_workers
             let mut default_budget = chat_context(&registry, -1);
             stage.execute(&mut default_budget).await.unwrap();
 
-            let capable = labeled_worker("grpc://127.0.0.1:9210", MODEL, missing, CAPABLE);
-            registry.register(Arc::clone(&capable)).unwrap();
+            let capable = register(&registry, 9210, missing, Vllm, CAPABLE);
             capable.set_status(WorkerStatus::NotReady);
             let refusal = stage.execute(&mut budget).await.unwrap_err();
             assert_eq!(refusal.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -120,30 +131,20 @@ fn thinking_token_budget_on_epd_only_requires_the_generation_workers_to_advertis
     let registry = ec_registry(
         MODEL,
         &[
-            (9300, WorkerType::Encode, "ECCPUConnector"),
-            (9301, WorkerType::Prefill, "ECCPUConnector"),
-            (9302, WorkerType::Decode, "ECCPUConnector"),
+            (9300, Encode, "ECCPUConnector"),
+            (9301, Prefill, "ECCPUConnector"),
+            (9302, Decode, "ECCPUConnector"),
         ],
     );
-    for (url, role) in [
-        ("grpc://127.0.0.1:9303", WorkerType::Prefill),
-        ("grpc://127.0.0.1:9304", WorkerType::Decode),
-    ] {
-        registry
-            .register(labeled_worker(
-                url,
-                MODEL,
-                role,
-                &[
-                    (SUPPORTS_THINKING_TOKEN_BUDGET_LABEL, "true"),
-                    ("supports_ec_transfer", "true"),
-                    ("ec_role", "ec_consumer"),
-                    ("ec_connector", "ECCPUConnector"),
-                    ("kv_connector", "NixlConnector"),
-                ],
-            ))
-            .unwrap();
-    }
+    let consumer = &[
+        (SUPPORTS_THINKING_TOKEN_BUDGET_LABEL, "true"),
+        ("supports_ec_transfer", "true"),
+        ("ec_role", "ec_consumer"),
+        ("ec_connector", "ECCPUConnector"),
+        ("kv_connector", "NixlConnector"),
+    ];
+    register(&registry, 9303, Prefill, Vllm, consumer);
+    register(&registry, 9304, Decode, Vllm, consumer);
     let stage = stage_for(&registry, WorkerSelectionMode::EncodePrefillDecode);
     let (encoders, prefill, decode, _) = stage
         .select_encode_prefill_decode_workers(
@@ -169,17 +170,9 @@ fn thinking_token_budget_on_epd_only_requires_the_generation_workers_to_advertis
 #[tokio::test]
 async fn thinking_token_budget_keeps_prefill_admission_on_the_capable_pool() {
     let registry = Arc::new(WorkerRegistry::new());
-    let prefill = labeled_worker("grpc://127.0.0.1:9400", MODEL, WorkerType::Prefill, CAPABLE);
-    let legacy = labeled_worker(
-        "grpc://127.0.0.1:9401",
-        MODEL,
-        WorkerType::Prefill,
-        UNLABELED,
-    );
-    let decode = labeled_worker("grpc://127.0.0.1:9402", MODEL, WorkerType::Decode, CAPABLE);
-    for worker in [&prefill, &legacy, &decode] {
-        registry.register(Arc::clone(worker)).unwrap();
-    }
+    let prefill = register(&registry, 9400, Prefill, Vllm, CAPABLE);
+    let legacy = register(&registry, 9401, Prefill, Vllm, UNLABELED);
+    register(&registry, 9402, Decode, Vllm, CAPABLE);
     let admission = Arc::new(PrefillAdmission::new(1, 0, Duration::from_secs(1)));
     let occupied = occupy(&admission, &prefill).await;
     let stage = pd_stage(
@@ -205,32 +198,8 @@ async fn thinking_token_budget_keeps_prefill_admission_on_the_capable_pool() {
 async fn thinking_token_budget_requires_both_capable_workers_to_form_a_pair() {
     let registry = Arc::new(WorkerRegistry::new());
     let stage = stage_for(&registry, WorkerSelectionMode::PrefillDecode);
-    let register = |url, role, runtime, supports| {
-        registry
-            .register(Arc::new(
-                BasicWorkerBuilder::new(url)
-                    .model(ModelCard::new(MODEL))
-                    .worker_type(role)
-                    .runtime_type(runtime)
-                    .connection_mode(ConnectionMode::Grpc)
-                    .health_config(no_health_check())
-                    .label(SUPPORTS_THINKING_TOKEN_BUDGET_LABEL, supports)
-                    .build(),
-            ))
-            .unwrap();
-    };
-    register(
-        "grpc://127.0.0.1:9501",
-        WorkerType::Prefill,
-        RuntimeType::Sglang,
-        "true",
-    );
-    register(
-        "grpc://127.0.0.1:9502",
-        WorkerType::Decode,
-        RuntimeType::Vllm,
-        "true",
-    );
+    register(&registry, 9501, Prefill, Sglang, CAPABLE);
+    register(&registry, 9502, Decode, Vllm, CAPABLE);
     let mut ctx = chat_context(&registry, 32);
     let refusal = stage.execute(&mut ctx).await.unwrap_err();
     assert_eq!(
@@ -238,22 +207,12 @@ async fn thinking_token_budget_requires_both_capable_workers_to_form_a_pair() {
         "no_compatible_pd_pair"
     );
 
-    register(
-        "grpc://127.0.0.1:9503",
-        WorkerType::Decode,
-        RuntimeType::Unspecified,
-        "false",
-    );
+    register(&registry, 9503, Decode, Unspecified, DISABLED);
     let refusal = stage.execute(&mut ctx).await.unwrap_err();
     assert_eq!(
         error::extract_error_code_from_response(&refusal),
         "unsupported_thinking_token_budget"
     );
-    register(
-        "grpc://127.0.0.1:9504",
-        WorkerType::Prefill,
-        RuntimeType::Vllm,
-        "true",
-    );
+    register(&registry, 9504, Prefill, Vllm, CAPABLE);
     stage.execute(&mut ctx).await.unwrap();
 }

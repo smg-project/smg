@@ -200,12 +200,20 @@ pub(crate) enum WorkerSelectionMode {
 }
 
 pub(crate) fn supports_thinking_budget(worker: &dyn Worker) -> bool {
-    let spec = &worker.metadata().spec;
-    matches!(spec.runtime_type, RuntimeType::Sglang | RuntimeType::Vllm)
-        && spec
+    let metadata = worker.metadata();
+    // An operator label cannot enable a capability the worker never reported.
+    matches!(
+        metadata.spec.runtime_type,
+        RuntimeType::Sglang | RuntimeType::Vllm
+    ) && metadata
+        .discovered_labels
+        .get(SUPPORTS_THINKING_TOKEN_BUDGET_LABEL)
+        .is_some_and(|value| value == "true")
+        && metadata
+            .spec
             .labels
             .get(SUPPORTS_THINKING_TOKEN_BUDGET_LABEL)
-            .is_some_and(|v| v == "true")
+            .is_some_and(|value| value == "true")
 }
 
 fn unsupported_thinking_budget(model_id: &str) -> Response {
@@ -213,21 +221,6 @@ fn unsupported_thinking_budget(model_id: &str) -> Response {
         "unsupported_thinking_token_budget",
         format!("No compatible workers for model '{model_id}' advertise support for thinking_token_budget"),
     )
-}
-
-fn check_selected_thinking_budget(
-    workers: &WorkerSelection,
-    model_id: &str,
-    required: bool,
-) -> Result<(), Response> {
-    if required
-        && workers
-            .workers()
-            .any(|w| !supports_thinking_budget(w.as_ref()))
-    {
-        return Err(unsupported_thinking_budget(model_id));
-    }
-    Ok(())
 }
 
 impl WorkerSelectionStage {
@@ -433,7 +426,6 @@ struct SelectionInputs<'a> {
     /// and the disaggregated sides their shares of it (see `PairDemands`).
     needs_vision: bool,
     context_requirements: ContextRequirements,
-    needs_thinking_budget: bool,
     demand: PairDemands,
     text: Option<&'a str>,
     /// The prepared request's token ids, for PrefixHash policy support.
@@ -539,7 +531,6 @@ impl<'a> SelectionInputs<'a> {
             media_refs,
             needs_vision,
             context_requirements,
-            needs_thinking_budget,
             demand,
             text,
             ids,
@@ -569,7 +560,7 @@ impl<'a> SelectionInputs<'a> {
     fn snapshot(&self) -> RoutingSnapshot {
         RoutingSnapshot {
             context_requirements: self.context_requirements,
-            needs_thinking_budget: self.needs_thinking_budget,
+            needs_thinking_budget: self.demand.needs_thinking_budget,
             routing_text: self
                 .keep_text
                 .then(|| self.text.map(str::to_string))
@@ -650,7 +641,7 @@ impl WorkerSelectionStage {
                     model_id,
                     context_requirements,
                     media,
-                    inputs.needs_thinking_budget,
+                    inputs.demand.needs_thinking_budget,
                     None,
                     inputs.text,
                     inputs.tokens(),
@@ -668,7 +659,7 @@ impl WorkerSelectionStage {
                             wire,
                             media,
                             context_requirements,
-                            inputs.needs_thinking_budget,
+                            inputs.demand.needs_thinking_budget,
                         ));
                     }
                 }
@@ -734,7 +725,7 @@ impl WorkerSelectionStage {
                             sticky_key,
                             &encode_item_hashes,
                             EpdDemands {
-                                needs_thinking_budget: inputs.needs_thinking_budget,
+                                needs_thinking_budget: inputs.demand.needs_thinking_budget,
                                 wire,
                                 encode: media,
                                 decode_vision: inputs.demand.decode,
@@ -805,7 +796,6 @@ impl WorkerSelectionStage {
             }
         }
 
-        check_selected_thinking_budget(&workers, model_id, inputs.needs_thinking_budget)?;
         ctx.state.workers = Some(workers);
         Ok(())
     }
@@ -968,7 +958,6 @@ impl WorkerSelectionStage {
             }
         };
 
-        check_selected_thinking_budget(&workers, model_id, ctx.routing.needs_thinking_budget)?;
         ctx.workers = Some(workers);
         Ok(())
     }
@@ -2483,7 +2472,7 @@ impl WorkerSelectionStage {
         self.pair_failure(model_id, failure)
     }
 
-    pub(crate) fn retry_pd_pairs(&self, model_id: &str) -> Arc<PdPairIndex> {
+    fn retry_pd_pairs(&self, model_id: &str) -> Arc<PdPairIndex> {
         self.worker_registry
             .get_routing_snapshot(model_id)
             .pd_pairs(PdWire::Grpc, self.policy_registry.pd_pairing_mode())
@@ -2785,25 +2774,22 @@ impl WorkerSelectionStage {
         if !ec_pair_exists && pair_admitted_by(&pairs, demand.wire, &|_| true) {
             return Err(EpdSelectionFailure::EcIncompatible);
         }
-        let vision_pair_exists = pair_admitted_by(&pairs, demand.wire, &|worker| {
-            registered_ec(worker) && decode_vision(worker)
-        });
+        let budget_capable =
+            |worker: &dyn Worker| !demand.needs_thinking_budget || supports_thinking_budget(worker);
+        // A hard vision demand has its own refusal. For unknown reference identities,
+        // prefer a budget-capable vision pair. Post-encode dispatch checks actual grids.
+        let seek_vision =
+            demand.decode_vision || (demand.encode.media_refs && demand.encode.vision);
+        let vision_pair_exists = seek_vision
+            && pair_admitted_by(&pairs, demand.wire, &|worker| {
+                registered_ec(worker)
+                    && decode_vision(worker)
+                    && (demand.decode_vision || budget_capable(worker))
+            });
         if demand.decode_vision && ec_pair_exists && !vision_pair_exists {
             return Err(EpdSelectionFailure::DecodeVisionUnsupported);
         }
-        // Unknown reference identities may be grid-free. Prefer a vision D
-        // when registered, but retain the stripped-hash path otherwise; the
-        // post-encode dispatch check rejects actual grids before sending P/D.
-        let budget_capable =
-            |worker: &dyn Worker| !demand.needs_thinking_budget || supports_thinking_budget(worker);
-        let prefer_vision = demand.decode_vision
-            || (demand.encode.media_refs
-                && demand.encode.vision
-                && vision_pair_exists
-                && (!demand.needs_thinking_budget
-                    || pair_admitted_by(&pairs, demand.wire, &|worker| {
-                        registered_ec(worker) && decode_vision(worker) && budget_capable(worker)
-                    })));
+        let prefer_vision = demand.decode_vision || vision_pair_exists;
         let takes_vision = |worker: &dyn Worker| !prefer_vision || decode_vision(worker);
         let eligible = |worker: &dyn Worker| {
             budget_capable(worker)
@@ -3148,6 +3134,7 @@ mod tests {
                     test_support::select_worker, PrefillLoadGuard, PrefillReservation,
                 },
                 retry::is_retryable_response,
+                snapshot::test_support::discovered_grpc_worker,
             },
             grpc::{
                 backend_client::BasicWorkerBuilder,
@@ -8251,16 +8238,7 @@ mod tests {
         worker_type: WorkerType,
         labels: &[(&str, &str)],
     ) -> Arc<dyn Worker> {
-        let mut builder = BasicWorkerBuilder::new(url)
-            .model(ModelCard::new(model_id))
-            .worker_type(worker_type)
-            .runtime_type(RuntimeType::Vllm)
-            .connection_mode(ConnectionMode::Grpc)
-            .health_config(no_health_check());
-        for (key, value) in labels {
-            builder = builder.label(*key, *value);
-        }
-        Arc::new(builder.build())
+        discovered_grpc_worker(url, model_id, worker_type, RuntimeType::Vllm, labels)
     }
 
     /// A prefill/decode stage over `worker_registry` with independent round-robin
@@ -9639,6 +9617,10 @@ mod tests {
                 if advertised {
                     worker
                         .label(SUPPORTS_THINKING_TOKEN_BUDGET_LABEL, "true")
+                        .discovered_labels(smg_worker::test_support::labels_of(&[(
+                            SUPPORTS_THINKING_TOKEN_BUDGET_LABEL,
+                            "true",
+                        )]))
                         .build()
                 } else {
                     worker.build()

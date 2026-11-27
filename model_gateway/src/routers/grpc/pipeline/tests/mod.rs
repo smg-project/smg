@@ -141,6 +141,7 @@ struct GatedScheduler {
     fail_first: bool,
     fail_always: bool,
     fail_internal: bool,
+    fail_first_internal: bool,
     fail_mid_stream: bool,
     /// The call of this place, counted from zero, ends its stream with the
     /// engine's own error a pace behind its first frame: the calls beside
@@ -331,7 +332,7 @@ impl TokenSpeedScheduler for GatedScheduler {
         {
             return Err(Status::unavailable("release-test induced failure"));
         }
-        if self.fail_internal {
+        if self.fail_internal || (self.fail_first_internal && place == 0) {
             return Err(Status::internal("release-test induced engine failure"));
         }
         if self.fail_constraint {
@@ -555,19 +556,13 @@ fn register_worker_of_runtime(
     runtime: RuntimeType,
     labels: &[(&str, &str)],
 ) -> Arc<dyn Worker> {
-    let mut builder = BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
-        .worker_type(worker_type)
-        .connection_mode(ConnectionMode::Grpc)
-        .runtime_type(runtime)
-        .model(ModelCard::new(MODEL))
-        .health_config(HealthCheckConfig {
-            disable_health_check: true,
-            ..Default::default()
-        });
-    for (key, value) in labels {
-        builder = builder.label(*key, *value);
-    }
-    let worker: Arc<dyn Worker> = Arc::new(builder.build());
+    let worker = crate::routers::common::snapshot::test_support::discovered_grpc_worker(
+        &format!("grpc://127.0.0.1:{port}"),
+        MODEL,
+        worker_type,
+        runtime,
+        labels,
+    );
     registry
         .register(Arc::clone(&worker))
         .expect("register release-test worker");
@@ -839,6 +834,15 @@ async fn chat_response(
     components: Arc<SharedComponents>,
     request: serde_json::Value,
 ) -> Response {
+    chat_response_with_retries(pipeline, components, request, None).await
+}
+
+async fn chat_response_with_retries(
+    pipeline: &RequestPipeline,
+    components: Arc<SharedComponents>,
+    request: serde_json::Value,
+    retry: Option<&RetryConfig>,
+) -> Response {
     let request: Arc<ChatCompletionRequest> =
         Arc::new(serde_json::from_value(request).expect("chat request"));
     tokio::time::timeout(
@@ -850,7 +854,7 @@ async fn chat_response(
             components,
             None,
             None,
-            None,
+            retry,
             None,
         ),
     )
@@ -866,13 +870,17 @@ async fn chat_error_body(
     request: serde_json::Value,
 ) -> (http::StatusCode, serde_json::Value) {
     let response = chat_response(pipeline, components, request).await;
+    chat_body(response).await
+}
+
+async fn chat_body(response: Response) -> (http::StatusCode, serde_json::Value) {
     let status = response.status();
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("drain body");
     (
         status,
-        serde_json::from_slice(&body).expect("json error body"),
+        serde_json::from_slice(&body).expect("chat response JSON"),
     )
 }
 
@@ -2104,85 +2112,6 @@ async fn an_engines_unattributed_report_on_a_constrained_request_keeps_its_shape
     assert_eq!(
         constrained, plain,
         "a constraint changes nothing about the engine's own report"
-    );
-}
-
-#[tokio::test]
-async fn thinking_token_budget_requires_a_compatible_pair_to_retry_a_worker_failure() {
-    use smg_worker::labels::SUPPORTS_THINKING_TOKEN_BUDGET_LABEL;
-
-    use crate::routers::common::attempt_ledger::{mark_failed_side, mark_upstream_answer};
-
-    let registry = Arc::new(WorkerRegistry::new());
-    let register = |port, role, island, budget| {
-        register_worker_of_runtime(
-            &registry,
-            port,
-            role,
-            RuntimeType::Vllm,
-            &[
-                ("pairing_protocol", island),
-                (SUPPORTS_THINKING_TOKEN_BUDGET_LABEL, budget),
-            ],
-        )
-    };
-    register(9401, WorkerType::Prefill, "a", "true");
-    let first_decode = register(9402, WorkerType::Decode, "a", "true");
-    register(9403, WorkerType::Prefill, "b", "false");
-    register(9404, WorkerType::Decode, "b", "true");
-
-    let pipeline = completion_pipeline(&registry, Mode::PrefillDecode);
-    let request = serde_json::from_value(serde_json::json!({
-        "model": MODEL, "messages": [{"role": "user", "content": "hi"}], "thinking_token_budget": 0
-    }))
-    .unwrap();
-    let mut ctx = RequestContext::for_chat(
-        Arc::new(request),
-        None,
-        MODEL.into(),
-        components(Arc::clone(&registry)).await,
-    );
-    ctx.state.preparation = Some(PreparationOutput::Generate {
-        original_text: None,
-        token_ids: vec![1, 2, 3],
-    });
-    pipeline
-        .stages
-        .worker_selection
-        .execute(&mut ctx)
-        .await
-        .unwrap();
-    let ctx = Box::new(ctx).into_dispatch().unwrap();
-    assert_eq!(
-        ctx.workers.as_ref().unwrap().decode().unwrap().url(),
-        first_decode.url()
-    );
-
-    let failure = || {
-        let mut response = error::internal_error("engine_failure", "decode failed");
-        mark_upstream_answer(&mut response);
-        mark_failed_side(&mut response, first_decode.as_ref());
-        response
-    };
-
-    let mut original = failure();
-    pipeline.settle_attempt(&ctx, &mut original);
-    assert_eq!(original.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(
-        error::extract_error_code_from_response(&original),
-        "engine_failure"
-    );
-    assert!(
-        !is_retryable_response(&original),
-        "the other decode has no capable partner"
-    );
-
-    register(9405, WorkerType::Prefill, "b", "true");
-    let mut replayable = failure();
-    pipeline.settle_attempt(&ctx, &mut replayable);
-    assert!(
-        is_retryable_response(&replayable),
-        "the other island can now serve this request"
     );
 }
 
