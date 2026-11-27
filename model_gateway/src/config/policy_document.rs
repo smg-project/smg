@@ -243,6 +243,10 @@ impl RouterConfig {
     /// from one spec to the next only where both were validated over the
     /// stock table or over one table of the host's own.
     ///
+    /// The document is answered beside its checked spec, so a caller that
+    /// reads both builds it once. The trees the engine is lent are sized by
+    /// that document.
+    ///
     /// A refusal is answered in its own words and no spec. A label's
     /// refusal is answered by its reason alone: the caller names the model
     /// and the policy.
@@ -251,15 +255,17 @@ impl RouterConfig {
         labels: &BTreeMap<String, String>,
         generation: u64,
         stages: &StageRegistry,
-    ) -> Result<AppliedSpec, String> {
+    ) -> Result<(PolicySpec, AppliedSpec), String> {
         let mut document = match self.policy_document_with_labels(labels) {
             Ok(document) => document,
             Err(RoutingSettingsError::Label { reason, .. }) => return Err(reason),
             Err(refused) => return Err(refused.to_string()),
         };
         document.generation = generation;
-        self.hosted_policy(&document, stages)
-            .map_err(|refused| refused.to_string())
+        let spec = self
+            .hosted_policy(&document, stages)
+            .map_err(|refused| refused.to_string())?;
+        Ok((document, spec))
     }
 
     /// The header names this gateway denies the view of a document it
@@ -705,7 +711,7 @@ mod tests {
             settings.policy_document_with_labels(&labels(&[])),
             settings.policy_document()
         );
-        let checked = settings
+        let (_, checked) = settings
             .hosted_policy_with_labels(&labels(&[("llama", "cache_aware")]), 7, &stock)
             .expect("a label that builds");
         assert_eq!(checked.generation(), 7);
@@ -721,6 +727,24 @@ mod tests {
             .expect_err("a model's id that holds a `*` names no binding");
         assert!(refused.starts_with("a binding reads a `*`"), "{refused}");
         assert!(!refused.contains("llama"), "{refused}");
+    }
+
+    /// The document answered beside a checked spec is the one the spec was
+    /// checked from: the builder's own with the same labels, under the
+    /// spec's number. A caller that reads both builds it once.
+    #[test]
+    fn a_checked_spec_is_answered_with_the_document_it_was_checked_from() {
+        let labels = BTreeMap::from([("llama".to_owned(), "cache_aware".to_owned())]);
+        let settings = config(PolicyConfig::RoundRobin);
+        let (document, checked) = settings
+            .hosted_policy_with_labels(&labels, 7, &StageRegistry::builtin())
+            .expect("a label that builds");
+        let mut built = settings
+            .policy_document_with_labels(&labels)
+            .expect("the same label builds");
+        built.generation = 7;
+        assert_eq!(document, built);
+        assert_eq!(checked.generation(), document.generation);
     }
 
     /// The comparison with a supplied document reads the gateway's own

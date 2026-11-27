@@ -92,7 +92,14 @@ pub(crate) fn unnamed(models: &[String]) -> Option<&'static str> {
 /// searched in a sorted list (the `rows_serving` of its worker objects'
 /// holder): the two change together.
 pub(crate) fn serves(models: &[String], row: &WorkerRow) -> bool {
-    models.is_empty() || row.facts.models.iter().any(|model| models.contains(model))
+    serves_models(models, &row.facts.models)
+}
+
+/// The rule of [`serves`] over the models a row serves, `served`: the one
+/// fact of a row the rule reads. A status entry of the membership log holds
+/// that list in its row's place, and a watch reads it by this rule.
+pub(crate) fn serves_models(models: &[String], served: &[String]) -> bool {
+    models.is_empty() || served.iter().any(|model| models.contains(model))
 }
 
 /// The store rows read for a snapshot.
@@ -182,8 +189,11 @@ enum ReachableJson {
     GatewayId(String),
 }
 
-/// What a row states of a pair and of an encode handoff, under the names
-/// of the contract's pairing descriptor.
+/// What a row states of a pair and of an encode handoff, in one object. A
+/// pair's fields stand under the names of the contract's pairing
+/// descriptor. `vision` and the encode offer's five fields keep the names
+/// the descriptor reserves: the contract states them on the registration
+/// and on the row themselves.
 #[derive(Serialize)]
 struct PairingJson<'a> {
     protocol: Option<&'a str>,

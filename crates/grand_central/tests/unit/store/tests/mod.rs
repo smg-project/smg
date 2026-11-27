@@ -279,8 +279,9 @@ fn a_told_status_says_what_happened_and_the_status_that_stands() {
     let store = MemoryStore::new();
     let id = store.upsert(facts("http://w:8000", 1)).id();
     let revision = || WorkersStore::get(&store, id).expect("the row").revision;
+    // The store has no journal: its holder hands it no models.
     let told = |status, revision, leads: bool| {
-        store.status_told(id, status, revision, LeadWord::of(&|| leads))
+        store.status_told(id, status, revision, LeadWord::of(&|| leads), None)
     };
     // A status the row holds already stands, and nothing is written.
     let epoch = store.epoch();
@@ -315,7 +316,7 @@ fn a_told_status_says_what_happened_and_the_status_that_stands() {
 
 /// A status told under a term goes to the journal ahead of the table's
 /// move. Under the term the log leads, the event tells the epoch the
-/// table then takes, and the row with its new status. Under a term the
+/// table then takes, and the status the row takes. Under a term the
 /// log left, the journal takes no event and nothing moved: the status,
 /// the table's epoch and the log's head stand. A word that names no term
 /// writes there, as before.
@@ -339,7 +340,8 @@ fn a_status_under_a_term_is_journaled_under_it_or_moves_nothing() {
             leads: &|| true,
             term: Some(term),
         };
-        store.status_told(id, status, revision, word)
+        // This writer hands no models: the event names the table's row's.
+        store.status_told(id, status, revision, word, None)
     };
     let stands = || WorkersStore::get(&store, id).expect("the row").status;
     // Under the term the log leads.
@@ -353,20 +355,21 @@ fn a_status_under_a_term_is_journaled_under_it_or_moves_nothing() {
     log.read(before, 2, &mut told).expect("the place stands");
     let [Entry {
         at,
-        event:
-            Event::Member {
-                epoch,
-                row: Some(row),
-                ..
-            },
+        event: Event::Status {
+            epoch, from, to, ..
+        },
     }] = told.as_slice()
     else {
         panic!("one status event: {told:?}");
     };
     assert_eq!((at.term, *epoch), (3, store.epoch()));
     assert_eq!(
-        (row.status, stands()),
-        (WorkerStatus::Ready, WorkerStatus::Ready)
+        (*from, *to, stands()),
+        (
+            WorkerStatus::Pending,
+            WorkerStatus::Ready,
+            WorkerStatus::Ready
+        )
     );
     // The log leaves the term by a later take.
     store.set_term(4);
@@ -377,7 +380,7 @@ fn a_status_under_a_term_is_journaled_under_it_or_moves_nothing() {
         (WorkerStatus::Ready, epoch, head)
     );
     // A word that names no term is journaled as the store's own.
-    let told = store.status_told(id, WorkerStatus::NotReady, revision, LeadWord::FREE);
+    let told = store.status_told(id, WorkerStatus::NotReady, revision, LeadWord::FREE, None);
     assert!(told.moved().is_some());
     assert_eq!(
         (stands(), store.epoch()),
@@ -2669,6 +2672,19 @@ impl Journal for WaitsAtRestart {
         _: MembershipChange,
         _: Option<&WorkerRow>,
         _: Option<&WorkerRow>,
+    ) -> bool {
+        true
+    }
+
+    fn status(
+        &self,
+        _: Option<Position>,
+        _: Option<u64>,
+        _: u64,
+        _: WorkerId,
+        _: WorkerStatus,
+        _: WorkerStatus,
+        _: Arc<[String]>,
     ) -> bool {
         true
     }
@@ -6081,6 +6097,19 @@ fn an_applys_time_under_the_stores_locks_measured() {
             _: MembershipChange,
             _: Option<&WorkerRow>,
             _: Option<&WorkerRow>,
+        ) -> bool {
+            true
+        }
+
+        fn status(
+            &self,
+            _: Option<Position>,
+            _: Option<u64>,
+            _: u64,
+            _: WorkerId,
+            _: WorkerStatus,
+            _: WorkerStatus,
+            _: Arc<[String]>,
         ) -> bool {
             true
         }

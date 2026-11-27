@@ -412,6 +412,47 @@ pub(crate) fn column_named<'a>(
 /// and its coefficient.
 pub(crate) type SignalTerm = (SignalColumn, f64);
 
+/// The most terms of a short sum. A stage seldom sums more signals, and
+/// a pass over a short sum makes this many places for its instants, not
+/// one a signal a document may declare ([`MAX_SIGNALS`]).
+const SHORT_SUM: usize = 8;
+
+/// Each term's oldest instant still read, in the terms' order. A pass
+/// writes every place it makes, so it makes the fewer: a short sum's
+/// ([`SHORT_SUM`]), or one a signal a document may declare for a longer
+/// sum.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a short sum leaves the long one's room unwritten, and a box would allocate in a decision"
+)]
+enum OldestInstants {
+    Short([u64; SHORT_SUM]),
+    Long([u64; MAX_SIGNALS]),
+}
+
+impl OldestInstants {
+    /// `N` places: each of `terms`' oldest instants still read at the
+    /// facts' instant in its term's place, and zero in a place past the
+    /// terms, which no term reads.
+    #[inline(always)]
+    fn places<const N: usize>(facts: &RequestFacts<'_>, terms: &[SignalTerm]) -> [u64; N] {
+        let mut oldest = [0; N];
+        for (oldest, (signal, _)) in oldest.iter_mut().zip(terms) {
+            *oldest = signal.oldest(facts);
+        }
+        oldest
+    }
+
+    /// The places, in the terms' order.
+    #[inline(always)]
+    fn as_slice(&self) -> &[u64] {
+        match self {
+            Self::Short(oldest) => oldest,
+            Self::Long(oldest) => oldest,
+        }
+    }
+}
+
 /// One pass's reads of the signals a stage sums. Once a pass: the facts'
 /// cells, and each term's oldest instant still read. Once a row: the
 /// row's cells ([`Self::row`]). A term is then an index, a test and a
@@ -419,8 +460,7 @@ pub(crate) type SignalTerm = (SignalColumn, f64);
 pub(crate) struct SignalSums<'a> {
     cells: Option<&'a SignalCells>,
     terms: &'a [SignalTerm],
-    /// Each term's oldest instant still read, in the terms' order.
-    oldest: [u64; MAX_SIGNALS],
+    oldest: OldestInstants,
 }
 
 impl<'a> SignalSums<'a> {
@@ -430,14 +470,24 @@ impl<'a> SignalSums<'a> {
             terms.len() <= MAX_SIGNALS,
             "a sum names a declared signal once"
         );
-        let mut oldest = [0; MAX_SIGNALS];
-        for (oldest, (signal, _)) in oldest.iter_mut().zip(terms) {
-            *oldest = signal.oldest(facts);
-        }
-        Self {
-            cells: facts.signal_cells,
-            terms,
-            oldest,
+        let cells = facts.signal_cells;
+        // Each size makes the whole value where it stands: one made in
+        // either size and moved behind that would copy the long sum's
+        // room for a short sum too.
+        if terms.len() <= SHORT_SUM {
+            let oldest = OldestInstants::Short(OldestInstants::places(facts, terms));
+            Self {
+                cells,
+                terms,
+                oldest,
+            }
+        } else {
+            let oldest = OldestInstants::Long(OldestInstants::places(facts, terms));
+            Self {
+                cells,
+                terms,
+                oldest,
+            }
         }
     }
 
@@ -457,7 +507,7 @@ impl<'a> SignalSums<'a> {
             return (sum, self.terms.is_empty());
         };
         let mut whole = true;
-        for ((signal, coefficient), &oldest) in self.terms.iter().zip(&self.oldest) {
+        for ((signal, coefficient), &oldest) in self.terms.iter().zip(self.oldest.as_slice()) {
             match signal.among(cells, oldest) {
                 Some(value) => sum += value * coefficient,
                 None => whole = false,

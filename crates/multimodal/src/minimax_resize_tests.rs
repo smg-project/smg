@@ -455,3 +455,40 @@ fn a_resized_frame_returns_the_decoders_buffer() {
         assert_eq!(MINE.held(), 0);
     });
 }
+
+/// A clip's identity carries the size its frames take: a cap that gives
+/// another size is another identity, and one that gives the same size is not.
+#[test]
+fn a_clip_identity_carries_its_aligned_size() {
+    let identity = |cap: Option<u32>| {
+        let mut video = VideoClip::new(
+            vec![DynamicImage::new_rgb8(816, 720); 2],
+            bytes::Bytes::new(),
+            crate::VideoSource::InlineBytes,
+            "source".to_string(),
+        );
+        clip(&mut video, cap);
+        video.hash
+    };
+    // 816x720 takes 672x588 under the default cap and 840x728 under 1008.
+    assert_ne!(identity(None), "source");
+    assert_ne!(identity(None), identity(Some(1008)));
+    // 672 is the default cap, and 2016 leaves the 840x728 of 1008.
+    assert_eq!(identity(None), identity(Some(672)));
+    assert_eq!(identity(Some(1008)), identity(Some(2016)));
+    // Frames a decoder left in its shared buffer give the same identity.
+    let frame = crate::types::DecodedRgbFrame {
+        width: 816,
+        height: 720,
+        offset: 0,
+        len: 816 * 720 * 3,
+    };
+    let mut shared = VideoClip::new_rgb(
+        crate::types::DecodedRgbVideo::new(vec![0; frame.len].into(), vec![frame]),
+        bytes::Bytes::new(),
+        crate::VideoSource::InlineBytes,
+        "source".to_string(),
+    );
+    clip(&mut shared, None);
+    assert_eq!(shared.hash, identity(None));
+}

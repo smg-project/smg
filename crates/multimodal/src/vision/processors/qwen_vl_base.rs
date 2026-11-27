@@ -363,6 +363,9 @@ pub struct QwenVLProcessorBase {
     allow_video_dimensions_below_factor: bool,
     raise_rounded_sides_to_factor: bool,
     video_timing: QwenVideoTiming,
+    /// A frame size `(height, width)` the family planned for one clip, taken
+    /// in place of the size `smart_resize_video` gives.
+    video_frame_target: Option<(usize, usize)>,
     transforms: QwenTransforms,
 }
 
@@ -415,6 +418,7 @@ impl QwenVLProcessorBase {
             allow_video_dimensions_below_factor: false,
             raise_rounded_sides_to_factor: false,
             video_timing: QwenVideoTiming::SampledRate,
+            video_frame_target: None,
         }
     }
 
@@ -446,6 +450,14 @@ impl QwenVLProcessorBase {
     /// This processor with a per-frame video budget of `video_max_pixels`.
     pub(super) fn with_video_max_pixels(mut self, video_max_pixels: usize) -> Self {
         self.config.video_max_pixels = video_max_pixels;
+        self
+    }
+
+    /// This processor for one clip whose frames are resized to `height` by
+    /// `width`, a size on the patch grid. The clip still passes the checks of
+    /// `smart_resize_video`.
+    pub(super) fn with_video_frame_target(mut self, height: usize, width: usize) -> Self {
+        self.video_frame_target = Some((height, width));
         self
     }
 
@@ -552,8 +564,8 @@ impl QwenVLProcessorBase {
     ) -> Result<QwenVideoPlan, TransformError> {
         let temporal_patch_size = self.config.temporal_patch_size;
         let padded_frames = frame_count.div_ceil(temporal_patch_size) * temporal_patch_size;
-        let (target_height, target_width) =
-            self.smart_resize_video(frame_count, height as usize, width as usize)?;
+        let sized = self.smart_resize_video(frame_count, height as usize, width as usize)?;
+        let (target_height, target_width) = self.video_frame_target.unwrap_or(sized);
         let (grid_t, grid_h, grid_w) =
             self.calculate_grid_thw(target_height, target_width, padded_frames);
         let patch_features =

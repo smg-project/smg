@@ -3,11 +3,6 @@
 //! `max_candidates`) deserializes into these; until that row lands a host
 //! builds them directly.
 
-#![expect(
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
-
 use std::fmt;
 
 use crate::document::spec::Needs;
@@ -23,7 +18,12 @@ pub(crate) use crate::{
 /// carries the world a shape changes in place under the next minor, and the
 /// floor rises with it: a module built against the older shape is another
 /// type to the host, so it is refused by its version.
+///
+/// The record gains fields: code outside this crate makes one by
+/// [`Abi::of`] or names a constant of it, and a pattern of it ends with
+/// `..`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub struct Abi {
     pub major: u32,
     pub minor: u32,
@@ -41,6 +41,17 @@ impl Abi {
     pub const V1_1: Self = Self { major: 1, minor: 1 };
     /// The one committed version today.
     pub const V1_2: Self = Self { major: 1, minor: 2 };
+
+    /// The version `major.minor`. It takes both fields: a version is its
+    /// two numbers, and neither has a neutral value. It checks nothing:
+    /// [`Self::accepted`] says whether this host runs a module of it. Code
+    /// outside this crate starts here: the record gains fields, so no
+    /// literal of it builds there.
+    #[inline]
+    #[must_use]
+    pub const fn of(major: u32, minor: u32) -> Self {
+        Self { major, minor }
+    }
 
     /// Whether a module of this version runs on this host: the major must
     /// match and the minor lie within the supported range.

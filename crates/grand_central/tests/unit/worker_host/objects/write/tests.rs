@@ -6,7 +6,7 @@ use smg_worker::registry::{WorkerId as ObjectId, WorkerRegistry};
 use super::*;
 use crate::{
     engine::view::Role,
-    store::{identity, Journal, Position, WorkerStatus, WorkersStore},
+    store::{identity, Journal, LeadWord, Position, WorkerStatus, WorkersStore},
     worker_host::Members,
 };
 
@@ -16,10 +16,22 @@ pub(crate) const A: &str = "http://a:8000";
 /// row it left and the row it took out.
 pub(crate) type Member = (MembershipChange, Option<WorkerRow>, Option<WorkerRow>);
 
-/// A journal that keeps what it was told of the membership, and where
-/// the row its last write took out stood when it was told.
+/// What a journal was told of each status write: the row's id, the
+/// status it left, the one it took and the models it serves.
+type Status = (WorkerId, WorkerStatus, WorkerStatus, Arc<[String]>);
+
+/// One word of a journal: a membership write or a status write.
+#[derive(Clone)]
+enum Word {
+    Member(Box<Member>),
+    Status(Status),
+}
+
+/// A journal that keeps what it was told of the membership, in the
+/// order it was told, and where the row its last membership write took
+/// out stood when it was told.
 #[derive(Default)]
-struct Told(Mutex<Vec<Member>>, Mutex<Option<usize>>);
+struct Told(Mutex<Vec<Word>>, Mutex<Option<usize>>);
 
 impl Journal for Told {
     fn member(
@@ -31,8 +43,23 @@ impl Journal for Told {
         row: Option<&WorkerRow>,
         left: Option<&WorkerRow>,
     ) -> bool {
-        self.0.lock().push((change, row.cloned(), left.cloned()));
+        let word = Word::Member(Box::new((change, row.cloned(), left.cloned())));
+        self.0.lock().push(word);
         *self.1.lock() = left.map(|left| std::ptr::from_ref(left).addr());
+        true
+    }
+
+    fn status(
+        &self,
+        _: Option<Position>,
+        _: Option<u64>,
+        _: u64,
+        id: WorkerId,
+        from: WorkerStatus,
+        to: WorkerStatus,
+        models: Arc<[String]>,
+    ) -> bool {
+        self.0.lock().push(Word::Status((id, from, to, models)));
         true
     }
 
@@ -108,14 +135,59 @@ impl Replica {
         self.objects.upsert(&self.store, facts, Registrant::Control)
     }
 
-    /// The last membership write as the journal was told it.
+    /// The last membership write as the journal was told it: a status
+    /// write is another word ([`Self::statuses`]).
     pub(crate) fn last(&self) -> Member {
-        self.told
-            .0
-            .lock()
-            .last()
-            .cloned()
-            .expect("a write was told")
+        let told = self.told.0.lock();
+        let last = told.iter().rev().find_map(|word| match word {
+            Word::Member(member) => Some(Member::clone(member)),
+            Word::Status(_) => None,
+        });
+        last.expect("a membership write was told")
+    }
+
+    /// Each status write as the journal was told it, in its order.
+    fn statuses(&self) -> Vec<Status> {
+        let told = self.told.0.lock();
+        let statuses = told.iter().filter_map(|word| match word {
+            Word::Status(status) => Some(status.clone()),
+            Word::Member(_) => None,
+        });
+        statuses.collect()
+    }
+
+    /// The row the journal's words state last of the row `id`: the row
+    /// the last membership write about it left, with each status told
+    /// of it since laid over it. A write about another row says nothing
+    /// of this one. A status write tells no row: it names the status
+    /// the row left, which is the one the journal last told of it, and
+    /// the models the row serves.
+    fn stated(&self, id: WorkerId) -> Option<WorkerRow> {
+        let mut stated: Option<WorkerRow> = None;
+        for word in self.told.0.lock().iter() {
+            match word {
+                Word::Member(member) => match member.0 {
+                    // The key's next life took this row out.
+                    MembershipChange::Replaced { old, .. } if old == id => stated = None,
+                    change if change.id() == id => stated.clone_from(&member.1),
+                    _ => {}
+                },
+                Word::Status((told, from, to, models)) if *told == id => {
+                    let Some(row) = stated.as_mut() else {
+                        continue;
+                    };
+                    assert_eq!(row.status, *from, "the status the journal last told");
+                    assert_eq!(
+                        row.facts.models[..],
+                        models[..],
+                        "a status names its models"
+                    );
+                    row.status = *to;
+                }
+                Word::Status(_) => {}
+            }
+        }
+        stated
     }
 
     /// Where the row the last membership write took out stood when the
@@ -128,13 +200,14 @@ impl Replica {
         self.objects.registry().get_id_by_url(url)
     }
 
-    /// The row under `url` where the journal's last word, the object
+    /// The row under `url` where the journal's last word of it, the object
     /// and the table agree on it, each fact and the status. The journal
     /// is told the row the write handed, which the object read back
-    /// states, and the table takes it.
+    /// states, and the table takes it. A status told since is the
+    /// journal's word of the row's status ([`Self::stated`]).
     pub(crate) fn one_row(&self, url: &str) -> WorkerRow {
-        let (_, told, _) = self.last();
         let table = self.store.by_key(url).expect("the table holds the row");
+        let told = self.stated(table.id);
         let object = self.object(url).expect("the object stands");
         let read = self.objects.row_of(&object).expect("the object's row");
         assert_eq!(told.as_ref(), Some(&read), "the journal against the object");
@@ -188,11 +261,18 @@ fn the_cases_road_writes_a_table_as_the_holders_write_calls_do() {
         let row = row.clone();
         (row.id, row.facts, row.status, row.revision, row.maker)
     };
+    // A membership word by its change and its two rows, and a status
+    // word as it was told: the holder hands its object's models, the
+    // road hands none, and both journals are told one list.
     let words = |told: &Told| {
         let told = told.0.lock();
-        let word = |(change, row, left): &Member| {
-            let (row, left) = (row.as_ref().map(plain), left.as_ref().map(plain));
-            (*change, row, left)
+        let word = |word: &Word| match word {
+            Word::Member(member) => {
+                let (change, row, left) = &**member;
+                let (row, left) = (row.as_ref().map(plain), left.as_ref().map(plain));
+                (Some((*change, row, left)), None)
+            }
+            Word::Status(status) => (None, Some(status.clone())),
         };
         told.iter().map(word).collect::<Vec<_>>()
     };
@@ -470,6 +550,86 @@ fn a_host_that_tells_no_entry_takes_a_handed_row_its_table_does_not_hold() {
     let removed = MembershipChange::Removed { id: second };
     assert_eq!(objects.remove(store, second, 1), Some(removed));
     assert_eq!((replica.object(A), store.by_key(A)), (None, None));
+}
+
+/// A status is told with the models its object serves and with no row:
+/// the holder reads them off the object under the hold that reads the
+/// status. A row whose models change in place tells its next status
+/// with the new ones, and the status told before it stands as it was
+/// told.
+#[test]
+fn a_status_is_told_with_the_models_its_object_serves_at_the_write() {
+    let replica = Replica::new();
+    let (store, objects) = (&replica.store, &replica.objects);
+    let id = replica.upsert(facts(1, "gold")).expect("registered").id();
+    objects.connect_row(store, id, 1);
+    let (pending, ready) = (WorkerStatus::Pending, WorkerStatus::Ready);
+    let served: Arc<[String]> = facts(1, "gold").models.into();
+    let first = (id, pending, ready, served);
+    assert_eq!(replica.statuses(), std::slice::from_ref(&first));
+    // The row's models change in place: its object serves the new ones.
+    let narrower = WorkerFacts {
+        models: vec!["m".to_owned()],
+        ..facts(1, "gold")
+    };
+    let change = replica.upsert(narrower);
+    assert_eq!(change, Some(MembershipChange::Relabelled { id }));
+    assert!(objects.drain_row(store, id, 2), "the row drains");
+    let second = (id, ready, WorkerStatus::Draining, ["m".to_owned()].into());
+    assert_eq!(replica.statuses(), [first, second]);
+    assert_eq!(replica.one_row(A).status, WorkerStatus::Draining);
+}
+
+/// The list a holder hands with a status is the very list the journal
+/// is told: where one is handed, the store copies no model under its
+/// lock.
+#[test]
+fn a_status_tells_the_journal_the_very_list_its_holder_handed() {
+    let replica = Replica::new();
+    let id = replica.upsert(facts(1, "gold")).expect("registered").id();
+    let handed: Arc<[String]> = facts(1, "gold").models.into();
+    let (ready, word) = (WorkerStatus::Ready, LeadWord::FREE);
+    let told = replica
+        .store
+        .status_told(id, ready, 1, word, Some(Arc::clone(&handed)));
+    assert!(told.moved().is_some(), "the store took the status");
+    let statuses = replica.statuses();
+    let [(.., models)] = statuses.as_slice() else {
+        panic!("one status was told: {statuses:?}");
+    };
+    assert!(Arc::ptr_eq(models, &handed), "the handed list itself");
+}
+
+/// While the table stands, a debug build holds the models a holder
+/// hands with a status to the ones the table's row serves. Here another
+/// writer set the object's models behind its build, as a gateway's
+/// refresh does: the status that hands the object's models stops.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(
+    expected = "the models a holder read off its object are the ones the table's row serves"
+)]
+fn a_status_that_hands_models_the_table_does_not_hold_stops_a_debug_build() {
+    let replica = Replica::new();
+    let id = replica.upsert(facts(1, "gold")).expect("registered").id();
+    refresh(&replica);
+    replica.objects.connect_row(&replica.store, id, 1);
+}
+
+/// A host with no journal tells no entry: its holder hands its store no
+/// models with a status, and none is held to the table's row. A status
+/// behind a refresh of the worker's models is taken, in a debug build
+/// too.
+#[test]
+fn a_host_that_tells_no_entry_takes_a_status_behind_a_refresh() {
+    let replica = Replica::untold();
+    let (store, objects) = (&replica.store, &replica.objects);
+    let id = replica.upsert(facts(1, "gold")).expect("registered").id();
+    refresh(&replica);
+    objects.connect_row(store, id, 1);
+    let status = store.by_key(A).map(|row| row.status);
+    assert_eq!(status, Some(WorkerStatus::Ready));
+    assert!(replica.told.0.lock().is_empty(), "no entry is told");
 }
 
 /// Another writer of the registry sets the models of the object under

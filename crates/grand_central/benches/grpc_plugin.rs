@@ -246,11 +246,10 @@ fn bypassed(c: &mut Criterion) {
     let served = serve();
     served.behave(Behaviour::ScoreNan);
     let mut spec = spec(&served, "bypassed");
-    spec.breaker = BreakerSpec {
-        failures: 1,
-        window_micros: 3_600_000_000,
-        cooldown_micros: 3_600_000_000,
-    };
+    spec.breaker = BreakerSpec::default();
+    spec.breaker.failures = 1;
+    spec.breaker.window_micros = 3_600_000_000;
+    spec.breaker.cooldown_micros = 3_600_000_000;
     let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
     let bound = plugin.bind();
     let filters: Vec<Box<dyn Filter>> = vec![Box::new(GrpcFilter::new(

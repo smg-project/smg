@@ -1675,7 +1675,8 @@ fn the_demands_fields_are_pinned() {
 /// prober's settings (one message for the registration and the row), the
 /// row's rank and engine, the two thresholds a row is judged by, what a
 /// worker states for a request's hard demands (one message for the two),
-/// and whether it takes images.
+/// whether it takes images, and its end of the encode handoff (one message
+/// for the two).
 const MEMBERSHIP_FIELDS: &[(&str, &[ResumeField])] = &[
     (
         "HealthPolicy",
@@ -1703,6 +1704,17 @@ const MEMBERSHIP_FIELDS: &[(&str, &[ResumeField])] = &[
             ("maker", 27, Type::Message),
             ("demand_facts", 28, Type::Message),
             ("vision", 29, Type::Bool),
+            ("encode", 30, Type::Message),
+        ],
+    ),
+    (
+        "EncodeOffer",
+        &[
+            ("handoff", 1, Type::Enum),
+            ("producer", 2, Type::Bool),
+            ("consumer", 3, Type::Bool),
+            ("connector", 4, Type::String),
+            ("references", 5, Type::Bool),
         ],
     ),
     (
@@ -1725,6 +1737,7 @@ const MEMBERSHIP_FIELDS: &[(&str, &[ResumeField])] = &[
             ("health_policy", 14, Type::Message),
             ("demand_facts", 15, Type::Message),
             ("vision", 16, Type::Bool),
+            ("encode", 17, Type::Message),
         ],
     ),
 ];
@@ -1778,11 +1791,11 @@ fn the_membership_fields_are_pinned() {
     for (message_name, expected) in MEMBERSHIP_FIELDS {
         let compiled = message(controller, message_name)
             .unwrap_or_else(|| panic!("{message_name} is missing from {CONTROLLER_PROTO}"));
-        // The three small messages are pinned whole, the two rows by the
+        // The four small messages are pinned whole, the two rows by the
         // fields named here.
         let whole = matches!(
             *message_name,
-            "HealthPolicy" | "OverloadThresholds" | "DemandFacts"
+            "HealthPolicy" | "OverloadThresholds" | "DemandFacts" | "EncodeOffer"
         );
         let found: Vec<(String, i32, Type)> = fields(compiled)
             .into_iter()
@@ -1800,6 +1813,21 @@ fn the_membership_fields_are_pinned() {
             .collect();
         assert_eq!(found, expected, "{message_name}: a membership field moved");
     }
+
+    // The offer's form by its own type: a field of another enum's type
+    // would read the same numbers by other names. A form keeps its number.
+    let offer = message(controller, "EncodeOffer").expect("EncodeOffer is in the controller file");
+    let typed: Vec<&str> = offer
+        .field
+        .iter()
+        .filter(|field| field.name() == "handoff")
+        .map(|field| field.type_name())
+        .collect();
+    assert_eq!(typed, [".smg.policy.v1.EncodeHandoff"]);
+    assert_eq!(
+        enum_values(controller, "EncodeHandoff"),
+        Some(proto_enum("ENCODE_HANDOFF", &["Push", "Rendezvous"]))
+    );
 
     // The two thresholds no judge read left the message: their numbers and
     // names stay reserved, so a reader brings one back under a new number.
@@ -1857,16 +1885,29 @@ fn the_principals_scopes_keep_the_ingestion_scopes_number_and_name_reserved() {
 /// A pair's class left the pairing descriptor, and a snapshot's pair rows
 /// left with their message: no writer filled either. Whether a worker takes
 /// images left the descriptor for a field of the registration and of the
-/// row: no build took or told it there. The numbers and names stay
-/// reserved, so a later field takes none of them, and no message takes the
-/// name of the one that left.
+/// row: no build took or told it there. So did a worker's end of the encode
+/// handoff, five numbers, for a message of its own. The numbers and names
+/// stay reserved, so a later field takes none of them, and no message takes
+/// the name of the one that left.
 #[test]
 fn the_pair_class_and_the_pair_rows_keep_their_numbers_and_names_reserved() {
     let set = compile_protocol().expect("protoc compiles the two protocol files");
     let controller =
         file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
     let left: [(&str, &[i32], &[&str]); 2] = [
-        ("PairingDescriptor", &[8, 11], &["pair_class", "vision"]),
+        (
+            "PairingDescriptor",
+            &[8, 11, 9, 10, 12, 13, 14],
+            &[
+                "pair_class",
+                "vision",
+                "ec_producer",
+                "ec_consumer",
+                "encode_handoff",
+                "ec_connector",
+                "encode_references",
+            ],
+        ),
         ("Snapshot", &[9], &["pairs"]),
     ];
     for (message_name, numbers, names) in left {

@@ -40,8 +40,9 @@ const SINGLE_PORT_CONSTRUCTORS: [&str; 6] =
 const RANGE_CONSTRUCTORS: [&str; 2] = ["healthy_workers", "slow_workers"];
 
 /// The directories under `tests/` no binary declares: shared modules taken by
-/// `#[path]` and the fixtures.
-const SHARED_DIRECTORIES: [&str; 2] = ["common", "fixtures"];
+/// `#[path]`, the fixtures, and the library's unit tests, which `src` takes by
+/// `#[path]`.
+const SHARED_DIRECTORIES: [&str; 3] = ["common", "fixtures", "unit"];
 
 /// The directory of the gateway's integration test binaries.
 fn tests_dir() -> PathBuf {

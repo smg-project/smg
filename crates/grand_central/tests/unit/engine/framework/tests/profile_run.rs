@@ -532,6 +532,22 @@ fn bindings_match_globs_and_phases_in_order() {
     assert!(!suffix.matches("x-code", Phase::Single));
 }
 
+/// A binding's model pattern is read once, when the engine is built: a
+/// request is matched by what the engine read then, and neither the lookup
+/// of a binding nor the one of its position reads the stars of a pattern's
+/// text again.
+#[test]
+fn a_request_is_matched_by_the_pattern_the_engine_read_at_its_build() {
+    let binding = Binding::of("left-*".into(), 0);
+    let mut engine = Engine::new(vec![manual_profile()], vec![binding], 1, Needs::default());
+    assert!(engine.binding("left-1", Phase::Single).is_some());
+    // The star leaves the text behind the build: a walk that read a
+    // pattern's stars for every request would read one id, `left-0`.
+    engine.bindings[0].binding.model = "left-0".into();
+    assert!(engine.binding("left-1", Phase::Single).is_some());
+    assert_eq!(engine.binding_position("left-1", Phase::Single), Some(0));
+}
+
 #[test]
 fn a_profile_band_is_the_weighted_sum_of_its_scorers_bands() {
     /// A scorer that writes equal scores and publishes a wide band.

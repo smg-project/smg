@@ -18,7 +18,7 @@
 //!
 //! - `none`: no encoder at all, what a model with no encode stage pays;
 //! - `silent`: nobody states an end of the encode handoff, as a store holds
-//!   its workers until a handshake fills one: no class;
+//!   its workers until a registration or a handshake states one: no class;
 //! - `meeting`: every encoder and prefill meets at a rendezvous: one class;
 //! - `connectors`: every encoder and prefill pushes on one of eight
 //!   connectors: a class a connector that has an encoder;

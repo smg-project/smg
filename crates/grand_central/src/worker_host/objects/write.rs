@@ -32,7 +32,9 @@
 //! standby's applier and a watcher's. So the store refuses a change where
 //! its table was written around the holder, through an entry of the
 //! store's own ([`MemoryStore::follow`]). The row and the object then
-//! stand apart until a cut is laid whole ([`mod@super::standby`]).
+//! stand apart until a cut is laid whole ([`mod@super::standby`]). A
+//! standby's applier and a watcher also lay the row at the next event
+//! that tells it and that the store takes.
 //!
 //! A writer's thread that ends between its two writes, the store's and
 //! the registry's, leaves a row and its object apart too. No line of the

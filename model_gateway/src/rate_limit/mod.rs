@@ -18,6 +18,7 @@ mod policy;
 mod rejection;
 mod reservation;
 #[cfg(test)]
+#[path = "../../tests/unit/rate_limit/test_support.rs"]
 pub(crate) mod test_support;
 
 pub use backend::{RateLimitBackend, ReserveOutcome, ReserveRequest, UsageSettlement};

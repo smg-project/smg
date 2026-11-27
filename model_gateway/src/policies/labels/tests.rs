@@ -549,7 +549,7 @@ async fn a_refused_apply_puts_the_trees_back_under_the_document_they_followed() 
 
     // The start's own spec again, under the largest number: applied by hand,
     // so the trees still follow the start's document.
-    let last = config
+    let (_, last) = config
         .hosted_policy_with_labels(&BTreeMap::new(), u64::MAX, &StageRegistry::builtin())
         .expect("the settings' own spec");
     let engine = policies.engine().expect("an engine");

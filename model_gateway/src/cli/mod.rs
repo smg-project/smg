@@ -536,11 +536,13 @@ struct RoutingArgs {
     eviction_interval: u64,
 
     /// Maximum total size of each model's approximation tree for cache-aware
-    /// routing, shared across all workers: for requests routed by text the
-    /// chars of its texts plus 1024 for each node a worker stands on, for
-    /// requests routed by token ids (gRPC, and HTTP requests that carry
-    /// them) tokens; each eviction cycle trims every tree back toward this
-    /// bound, and writes take a tree past it until the next cycle
+    /// routing, summed over all workers: for requests routed by text the
+    /// chars of the nodes each worker stands on plus 1024 for each such
+    /// node, for requests routed by token ids (gRPC, and HTTP requests that
+    /// carry them) the tokens each worker holds, so a prefix that several
+    /// workers hold counts once for each of them; each eviction cycle trims
+    /// every tree back toward this bound, and writes take a tree past it
+    /// until the next cycle
     #[arg(long, default_value_t = 67108864, help_heading = "Routing Policy")]
     max_tree_size: usize,
 
@@ -906,8 +908,8 @@ struct WorkerArgs {
     // ==================== Multimodal ====================
     /// Multimodal tensor transport mode: `inline` (default), `shm` (same-host
     /// /dev/shm), `auto` (shm only when the worker shares /dev/shm), or `rdma`
-    /// (the NIXL lane; needs the `mm-rdma` build and falls back to inline
-    /// where the lane is unavailable). A per-worker
+    /// (the NIXL lane; needs the `mm-rdma` build and `--rdma-listen-ip`, and
+    /// falls back to inline where the lane is unavailable). A per-worker
     /// `WorkerSpec.multimodal_tensor_transport` overrides this.
     #[arg(long, value_parser = parse_transport_mode, help_heading = "Multimodal")]
     multimodal_tensor_transport: Option<TransportMode>,

@@ -2060,13 +2060,21 @@ impl ProtoStream {
 
     /// [`Self::report_through`] behind its test of the handle: the layer is
     /// made whatever `end` holds. It goes under the stream's tracked layer,
-    /// where it has one. The decision bench counts the layer through this,
-    /// on an empty handle. One of a batch's streams takes `among`, the end
-    /// the batch shares, and tells through it.
+    /// where it has one. A pair's decode side may come stamped
+    /// ([`Self::decode_side`]): the layer goes under the stamp too, so it
+    /// lies in one place whichever shape sent the pair. The decision bench
+    /// counts the layer through this, on an empty handle. One of a batch's
+    /// streams takes `among`, the end the batch shares, and tells through
+    /// it.
     ///
     /// The stage puts the layer before a reader watches the stream for its
     /// client: over a watch the layer would read a client's leaving as the
     /// worker's end. A debug build stops at a stream watched already.
+    ///
+    /// The tracked layer may hold the stream's first item already, read
+    /// ahead of the layer: a decode sent behind its prefill is waited for
+    /// within its bound. No read hands that item down, so the layer meets
+    /// it here.
     #[inline(never)]
     pub(crate) fn put_report_layer(&mut self, end: RequestEnd, among: Option<Arc<SharedEnd>>) {
         debug_assert!(
@@ -2074,13 +2082,24 @@ impl ProtoStream {
             "the layer is put before the stream is watched"
         );
         let over = match self {
-            Self::Tracked(tracked) => &mut tracked.inner,
+            Self::DecodeSide(side) => &mut side.inner,
             stream => stream,
+        };
+        let (over, held) = match over {
+            Self::Tracked(tracked) => {
+                let TrackedStream { inner, replay, .. } = &mut **tracked;
+                (inner, replay.as_ref())
+            }
+            stream => (stream, None),
         };
         // Nothing unwinds between the take and the write that follows it.
         let empty = Self::Fanout(FanoutStream::new(Vec::new()));
         let inner = std::mem::replace(over, empty);
-        *over = Self::Reported(Box::new(ReportedStream { inner, end, among }));
+        let mut layer = ReportedStream { inner, end, among };
+        if let Some(held) = held {
+            layer.met(held.as_ref());
+        }
+        *over = Self::Reported(Box::new(layer));
     }
 
     /// The reader's own stop ended the generation while the engine streamed
@@ -2691,7 +2710,10 @@ mod fanout_tests {
         common::prefill_admission::{
             test_support::select_worker, PrefillAdmission, PrefillLoadGuard,
         },
-        grpc::{backend_client::BasicWorkerBuilder, common::response_collection::drain_prefill},
+        grpc::{
+            backend_client::BasicWorkerBuilder,
+            common::response_collection::{drain_prefill, StreamedAnswer},
+        },
     };
 
     /// A child that yields a script, then ends.
@@ -2832,10 +2854,16 @@ mod fanout_tests {
                 let (second, _) = child(vec![complete()]);
                 let mut stream = FanoutStream::new(vec![first, second]);
                 let mut indices = Vec::new();
-                drain_prefill(&mut stream, guards, finish_at_complete, |complete| {
-                    indices.push(complete.index());
-                    assert_eq!(worker.load(), if complete.index() == 0 { 1 } else { 0 });
-                })
+                drain_prefill(
+                    &mut stream,
+                    guards,
+                    finish_at_complete,
+                    StreamedAnswer,
+                    |complete| {
+                        indices.push(complete.index());
+                        assert_eq!(worker.load(), if complete.index() == 0 { 1 } else { 0 });
+                    },
+                )
                 .await
                 .unwrap();
                 assert_eq!(indices, vec![0, 1]);
@@ -3549,7 +3577,9 @@ mod watched_tests {
         common::sse::{sse_channel, SseReceiver},
         grpc::{
             backend_client::BasicWorkerBuilder,
-            regular::streaming::tests::eof::{chunk, complete, gated_stream, staged_stream},
+            regular::streaming::tests::eof::{
+                chunk, complete, gated_stream, scripted_stream, staged_stream,
+            },
         },
     };
 
@@ -3885,6 +3915,80 @@ mod watched_tests {
             *heard.lock().expect("the stage heard"),
             ["issued", "dispatched Single", "completed Ok 200"]
         );
+    }
+
+    /// A pair's decode stream comes to the stage stamped where its prefill
+    /// reported a prefix-cache hit, and with no stamp where the readers
+    /// stamp it behind the stage. The layer lies in one place for both:
+    /// under the stamp, and under the tracked layer.
+    #[tokio::test]
+    async fn the_layer_goes_under_a_decode_sides_stamp_too() {
+        use super::FanoutStream;
+        use crate::routers::common::placement::tests::heard_request;
+
+        let mut prefill = PrefillCachedTokens::default();
+        prefill.note(&ProtoGenerateComplete::Vllm(Box::new(
+            vllm::GenerateComplete {
+                cached_tokens: 2,
+                ..Default::default()
+            },
+        )));
+        let (heard, guard, end) = heard_request();
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("grpc://d:30000").build());
+        let mut stream = ProtoStream::Fanout(FanoutStream::new(Vec::new()))
+            .tracked_decode_side(worker)
+            .decode_side(prefill);
+        stream.report_through(end);
+        let ProtoStream::DecodeSide(side) = &stream else {
+            panic!("the stamp stays the outermost layer");
+        };
+        let ProtoStream::Tracked(tracked) = &side.inner else {
+            panic!("the tracked layer stays under the stamp");
+        };
+        assert!(
+            matches!(tracked.inner, ProtoStream::Reported(_)),
+            "the layer lies under the tracked layer"
+        );
+        assert!(stream.next().await.is_none());
+
+        drop((stream, guard));
+        assert_eq!(
+            *heard.lock().expect("the stage heard"),
+            ["issued", "dispatched Single", "completed Ok 200"]
+        );
+    }
+
+    /// A tracked stream may hold its first item before the layer is put: a
+    /// decode sent behind its prefill is waited for within its bound. The layer
+    /// meets that item where it is put. A failure is told by its status, and an
+    /// end with nothing on the stream as a clean end, each once. The item is
+    /// still handed to the stream's reader.
+    #[tokio::test]
+    async fn the_layer_meets_a_first_item_the_tracked_layer_read_ahead_of_it() {
+        use super::FirstItem;
+        use crate::routers::common::placement::tests::heard_request;
+
+        for (status, first, end_heard) in [
+            ("13", FirstItem::Failure, "completed ServerError 500"),
+            ("0", FirstItem::End, "completed Ok 200"),
+        ] {
+            let (heard, guard, end) = heard_request();
+            let (stream, _server) = scripted_stream(Vec::new(), status).await;
+            let worker: Arc<dyn Worker> =
+                Arc::new(BasicWorkerBuilder::new("grpc://d:30000").build());
+            let mut stream = stream.tracked_decode_side(worker);
+            assert_eq!(stream.first_response().await, first, "{status}");
+
+            stream.report_through(end);
+            let read = stream.next().await;
+            assert_eq!(read.is_some(), status == "13", "{status}");
+            drop((stream, guard));
+            assert_eq!(
+                *heard.lock().expect("the stage heard"),
+                ["issued", "dispatched Single", end_heard],
+                "{status}"
+            );
+        }
     }
 
     /// The stage puts the layer before a reader watches the stream: a debug

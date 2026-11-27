@@ -26,6 +26,7 @@ pub mod token_bucket;
 pub mod wasm;
 
 #[cfg(test)]
+#[path = "../../tests/unit/middleware/test_support.rs"]
 pub(crate) mod test_support;
 
 pub use auth::{auth_middleware, deny_all_middleware, key_fingerprint, AuthConfig};
