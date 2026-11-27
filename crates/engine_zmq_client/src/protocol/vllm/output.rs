@@ -54,8 +54,7 @@ pub enum EngineCoreFinishReason {
     Abort = 2,
     /// A request-level error occurred. The engine calls it retryable; from
     /// 0.33 on it may name a cause that says whether this one is (the decoder
-    /// logs a cause it is sent and nothing where none is sent;
-    /// [`EngineCoreOutput`] does not carry it).
+    /// logs a cause it is sent, and [`EngineCoreOutput::error`] carries it).
     Error = 3,
     /// A repetitive token pattern was detected.
     Repetition = 4,
@@ -123,6 +122,9 @@ pub struct EngineCoreOutput {
     /// Per-request speculative-decoding counters, on the final output only
     /// (vLLM `--per-request-spec-decode-metrics`).
     pub spec_decode_metrics: Option<Box<SpecDecodeMetrics>>,
+    /// Set, with an `error` finish, when the engine rejected the request (a
+    /// paused engine, a grammar it failed to compile): nothing of it ran.
+    pub error: Option<Box<RequestError>>,
 }
 
 /// vLLM's `RequestSpecDecodeMetrics` (a dataclass, so a msgpack map): the
@@ -146,16 +148,16 @@ pub struct SpecDecodeMetrics {
 /// a msgpack map), sent from 0.33 on. Informational, so the wire decodes it
 /// leniently, like [`SpecDecodeMetrics`]; a map that lacks the code or the
 /// message is not this cause and reads as absent.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-struct RequestError {
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RequestError {
     /// The engine's class of the failure (`validation_error`,
     /// `engine_paused`).
-    code: String,
-    message: String,
+    pub code: String,
+    pub message: String,
     /// Whether the engine marks the request as one to send again; `false`
     /// where the map has no mark, as the engine's own default is.
     #[serde(default)]
-    retryable: bool,
+    pub retryable: bool,
 }
 
 /// Decode an informational column without failing the frame: an explicit
@@ -215,6 +217,8 @@ impl Serialize for EngineCoreOutput {
             mm_cache_miss_hashes: self.mm_cache_miss_hashes.as_deref(),
             new_sampling_mask: self.new_sampling_mask.as_deref(),
             spec_decode_metrics: self.spec_decode_metrics.as_deref(),
+            prompt_token_id_logprobs: None,
+            error: self.error.as_deref(),
         }
         .serialize(serializer)
     }
@@ -283,8 +287,7 @@ impl WireEngineCoreOutput {
     /// Resolve the wire-format logprobs using the aux frames.
     fn resolve(self, frames: &[Bytes]) -> Result<EngineCoreOutput> {
         // A vLLM release from 0.33 on names the cause of an error finish in
-        // this column. The request's status does not carry it, so it goes to
-        // the log.
+        // this column; it goes to the log and rides the output.
         if let Some(error) = &self.error {
             tracing::warn!(
                 request_id = self.request_id.as_str(),
@@ -322,6 +325,7 @@ impl WireEngineCoreOutput {
             mm_cache_miss_hashes: self.mm_cache_miss_hashes,
             new_sampling_mask: self.new_sampling_mask,
             spec_decode_metrics: self.spec_decode_metrics,
+            error: self.error,
         })
     }
 }
@@ -347,6 +351,9 @@ struct WireEngineCoreOutputRef<'a> {
     mm_cache_miss_hashes: Option<&'a [String]>,
     new_sampling_mask: Option<&'a OpaqueValue>,
     spec_decode_metrics: Option<&'a SpecDecodeMetrics>,
+    /// Always nil: this client never sends prompt-token logprobs.
+    prompt_token_id_logprobs: Option<()>,
+    error: Option<&'a RequestError>,
 }
 
 /// Raw Python/msgpack engine-core output envelope. Mirrors Python
@@ -885,7 +892,8 @@ mod tests {
             let Value::Array(fields) = &mut items[0] else {
                 panic!("output")
             };
-            let Value::Map(map) = fields.last_mut().unwrap() else {
+            // `spec_decode_metrics` is index 16; the two after it are nil.
+            let Value::Map(map) = &mut fields[16] else {
                 panic!("metrics map")
             };
             edit(map);
@@ -1227,7 +1235,7 @@ mod tests {
                 finish_reason: Some(EngineCoreFinishReason::Error),
                 ..Default::default()
             });
-            output.extend([rmpv::Value::Nil, error]);
+            output[18] = error;
             let frame = Bytes::from(encode_value(&rmpv::Value::Array(output)));
             decode_within_frame(&frame, || {
                 decode_msgpack::<TrailingTolerant<WireEngineCoreOutput>>(&frame)
@@ -1478,12 +1486,12 @@ mod tests {
     /// The per-request output channel stores outputs 32 to a block and every
     /// token batch is moved several times on its way to its stream, so the
     /// payloads most outputs do not carry stay boxed: an output's inline size
-    /// is what every token batch pays.
+    /// is what every token batch pays. (The boxed rejection `error` is 8 of it.)
     #[test]
     fn an_output_keeps_its_rare_payloads_boxed() {
         let inline = size_of::<EngineCoreOutput>();
         assert!(
-            inline <= 288,
+            inline <= 296,
             "EngineCoreOutput is {inline} bytes inline; a payload most outputs do not carry belongs in a box"
         );
     }
