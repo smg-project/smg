@@ -8,7 +8,8 @@ use std::{collections::BTreeSet, fs, path::Path};
 use serde_json::Value;
 use smg_grand_central::{
     document::{
-        PolicySpec, MAX_BLOCK_HASHES, MAX_ENGINES, MAX_HEADERS, MAX_LABELS, MAX_SIGNALS, MAX_ZONES,
+        PolicySpec, ProfileSpec, SpecError, MAX_BLOCK_HASHES, MAX_ENGINES, MAX_HEADERS, MAX_LABELS,
+        MAX_SIGNALS, MAX_ZONES,
     },
     stages::StageRegistry,
 };
@@ -388,4 +389,33 @@ fn the_schema_names_every_section_and_refuses_unknown_properties() {
         signals["propertyNames"]["pattern"],
         "^[a-z][a-z0-9_]{0,62}$"
     );
+}
+
+/// The count of profiles, as the validator takes it: it refuses a spec with
+/// no profile and a spec with more profiles than a binding can address, and
+/// the schema refuses both on shape.
+#[test]
+fn the_schema_bounds_the_count_of_profiles_as_the_validator_does() {
+    let mut spec: PolicySpec =
+        serde_json::from_str(r#"{ "apiVersion": "smg.policy/v1", "profiles": {} }"#)
+            .expect("a document with no profile parses");
+    assert_eq!(spec.validate().err(), Some(SpecError::Empty));
+    let profile: ProfileSpec =
+        serde_json::from_str(r#"{ "filter": ["healthy"], "pick": "passthrough" }"#)
+            .expect("a profile");
+    for i in 0..=u16::MAX {
+        spec.profiles.insert(format!("p{i}"), profile.clone());
+    }
+    assert_eq!(
+        spec.validate().err(),
+        Some(SpecError::TooManyProfiles {
+            count: usize::from(u16::MAX) + 1,
+            max: u16::MAX,
+        })
+    );
+
+    let schema = serde_json::to_value(PolicySpec::schema()).expect("a JSON value");
+    let profiles = &schema["properties"]["profiles"];
+    assert_eq!(profiles["minProperties"], 1);
+    assert_eq!(profiles["maxProperties"], u16::MAX);
 }
