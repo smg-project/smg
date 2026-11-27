@@ -148,8 +148,9 @@ pub async fn serve_with_listener_until(
     // One simulated engine per listener (i.e. per virtual worker), registered
     // in the process fleet under `http:<port>` for the oracle and admin API.
     let name = format!("http:{port}");
-    script::register(&name);
+    // The count before the name: a fleet list that names the worker finds it.
     let ops = AdminOps::register(&name);
+    script::register(&name);
     let engine = cfg
         .realistic
         .then(|| Engine::spawn_named(cfg.engine_for(&name), name.clone(), true));
@@ -212,6 +213,9 @@ async fn models(State(state): State<Arc<AppState>>) -> Response {
 }
 
 async fn loads(State(state): State<Arc<AppState>>) -> Response {
+    if let Some(status) = state.engine.as_ref().and_then(|e| e.load_refused()) {
+        return injected_error(status);
+    }
     let load = state
         .engine
         .as_ref()
@@ -608,6 +612,7 @@ async fn handle(route: Route, state: Arc<AppState>, body: Bytes) -> Response {
     // done, so a shutdown knows what it waits for and this worker's load
     // report counts it.
     let in_flight = InFlight::enter_on(&state.in_flight);
+    state.ops.record_request();
     let Incoming {
         parsed,
         stream_requested,
@@ -715,6 +720,7 @@ async fn handle(route: Route, state: Arc<AppState>, body: Bytes) -> Response {
 /// Messages form, so one answer is taken and none are read.
 async fn handle_messages(state: Arc<AppState>, body: Bytes) -> Response {
     let in_flight = InFlight::enter_on(&state.in_flight);
+    state.ops.record_request();
     let Incoming {
         parsed,
         stream_requested,
@@ -1914,6 +1920,38 @@ mod tests {
             ])
         );
         assert!(entry("http:65202").await.get("values").is_none());
+    }
+
+    /// A worker under the load-fail hook answers `/v1/loads` with the hook's
+    /// status and the fault body, and a cleared hook has it report again.
+    #[tokio::test]
+    async fn a_load_fail_answers_the_loads_list_with_its_status() {
+        let engine = Engine::spawn(engine::EngineParams::default());
+        let state = Arc::new(AppState {
+            cfg: Arc::new(Config::default()),
+            name: "http:65203".to_string(),
+            engine: Some(engine.clone()),
+            in_flight: WorkerInFlight::default(),
+            ops: AdminOps::register("http:65203"),
+            bootstrap_port: None,
+        });
+        let poll = || async {
+            let answer = loads(State(Arc::clone(&state))).await;
+            let status = answer.status();
+            let bytes = axum::body::to_bytes(answer.into_body(), usize::MAX)
+                .await
+                .expect("a body");
+            let body: Value = serde_json::from_slice(&bytes).expect("json");
+            (status, body)
+        };
+        engine.fault_load_fail(501);
+        let (status, body) = poll().await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(body["error"]["type"], "fault");
+        engine.fault_load_fail(0);
+        let (status, body) = poll().await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["loads"][0]["dp_rank"], 0);
     }
 
     fn token() -> engine::GenEvent {

@@ -460,7 +460,7 @@ pub async fn create_tokenizer_async_with_chat_template(
     }
 
     // Check if it's a GPT model name that should use Tiktoken
-    if is_likely_openai_model(model_name_or_path) {
+    if !starts_as_a_path(model_name_or_path) && is_likely_openai_model(model_name_or_path) {
         // Try tiktoken first, but fall back to HuggingFace if it fails
         match TiktokenTokenizer::from_model_name(model_name_or_path) {
             Ok(tokenizer) => return Ok(Arc::new(tokenizer)),
@@ -473,6 +473,11 @@ pub async fn create_tokenizer_async_with_chat_template(
         }
     }
 
+    // A path that is not on this host fails here: the Hub is never asked for it.
+    if names_a_path(model_name_or_path) {
+        return Err(Error::msg(format!("File not found: {model_name_or_path}")));
+    }
+
     // Try to download tokenizer files from HuggingFace
     match download_tokenizer_from_hf(model_name_or_path).await {
         Ok(cache_dir) => {
@@ -482,6 +487,21 @@ pub async fn create_tokenizer_async_with_chat_template(
             "Failed to download tokenizer from HuggingFace: {e}"
         ))),
     }
+}
+
+/// Whether `name` can only be a path, never a repository id (`owner/name`):
+/// absolute, relative to `.` or `~`, or more than one separator. The Python
+/// binding's loader holds the same rule; the gateway's `names_a_local_path`
+/// is close to it.
+fn names_a_path(name: &str) -> bool {
+    starts_as_a_path(name) || name.matches('/').count() > 1
+}
+
+/// Whether `name` starts as only a path does: absolute, or relative to `.`
+/// or `~`. No repository id and no model name starts so, and the guess of an
+/// OpenAI model reads the last segment alone: such a name is not guessed.
+fn starts_as_a_path(name: &str) -> bool {
+    Path::new(name).is_absolute() || name.starts_with(['.', '~'])
 }
 
 /// The tokenizer of a checkpoint downloaded from the Hub, from the files in
@@ -555,7 +575,7 @@ pub fn create_tokenizer_with_chat_template_blocking(
 
     // Check if it's a GPT model name that should use Tiktoken
     // Try tiktoken first, but fall back to HuggingFace if it fails
-    if is_likely_openai_model(model_name_or_path) {
+    if !starts_as_a_path(model_name_or_path) && is_likely_openai_model(model_name_or_path) {
         match TiktokenTokenizer::from_model_name(model_name_or_path) {
             Ok(tokenizer) => return Ok(Arc::new(tokenizer)),
             Err(e) => {
@@ -927,6 +947,37 @@ mod tests {
         let encoding = tokenizer.encode(text, false).unwrap();
         let decoded = tokenizer.decode(encoding.token_ids(), false).unwrap();
         assert_eq!(decoded, text);
+    }
+
+    /// A path that is not on this host is no repository id: the load fails
+    /// as a missing file, and the Hub is not asked for it.
+    #[tokio::test]
+    async fn a_path_that_does_not_exist_is_not_asked_of_the_hub() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        for name in [missing.to_str().unwrap(), "./owner/name"] {
+            let error = create_tokenizer_async(name)
+                .await
+                .err()
+                .expect("nothing to load")
+                .to_string();
+            assert_eq!(error, format!("File not found: {name}"));
+        }
+    }
+
+    /// A path that is not on this host is no model name either: its last
+    /// segment picks no built-in vocabulary. The blocking factory hands the
+    /// name on to the async one, so one load holds both to the rule.
+    #[test]
+    fn a_path_that_does_not_exist_is_not_read_as_an_openai_model_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("gpt-4o");
+        let name = missing.to_str().unwrap();
+        let error = create_tokenizer(name)
+            .err()
+            .expect("nothing to load")
+            .to_string();
+        assert_eq!(error, format!("File not found: {name}"));
     }
 
     #[tokio::test]

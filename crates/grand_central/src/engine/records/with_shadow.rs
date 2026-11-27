@@ -1,0 +1,166 @@
+//! One single decision over a gateway's own data, followed by the decision
+//! of its binding's shadow profile.
+//!
+//! The live decision is the one [`super::decide`] makes, at the engine's
+//! entry that keeps its working state ([`Engine::decide_keeping`]). The
+//! binding's shadow profile then decides over the same records and the same
+//! scratch ([`Engine::shadow`]), before the live decision is returned: the
+//! rows, the counts and the session reading are those the live decision
+//! read, and no stage has heard of the request. The shadow writes its own
+//! stages and the scratch, and nothing else: it issues no lease, sends no
+//! event to a stage, moves no session pin and reads no worker a second
+//! time. What is returned is the live decision's value.
+
+use std::{
+    panic::{catch_unwind, AssertUnwindSafe},
+    sync::Arc,
+};
+
+use smg_worker::identity::basic::Worker;
+
+use super::{with_buffers, Buffers, Live, PoolRecords};
+use crate::{
+    engine::{
+        decision::{Decision, ShadowKind},
+        framework::{release, Engine, ShadowRows},
+        shadow::{budget_left, Shadow, Shadowed, SHADOW_FLOOR},
+        view::{Constraints, RequestFacts},
+    },
+    policies::consistent_hashing::LentRing,
+};
+
+/// What a request lends its binding's shadow profile alone, asked with
+/// that profile's index: the ring and the request's places on it
+/// ([`RequestMaker::shadow_ring`](crate::engine::decision_engine::RequestMaker::shadow_ring)).
+pub(crate) type Lends<'a> = &'a dyn Fn(u16) -> Option<(&'a dyn LentRing, &'a [u64])>;
+
+/// [`super::decide`] for a request whose binding names a shadow profile:
+/// the live decision, and the shadow's outcome. `shadow` is what the engine
+/// says of the binding ([`Engine::shadow_for`]): its position, and how its
+/// shadow profile reads the affinity rows the live decision is handed; and
+/// what the request lends that profile alone ([`Lends`]).
+///
+/// Every worker's record is written, once ([`PoolRecords::write`]), for the
+/// two decisions: the shadow profile reads the pool, so a live profile that
+/// draws is not handed the drawn workers' records alone. Its draw is made
+/// over the whole write, which gives the pick the short write gives.
+///
+/// A standing veto stated beside the records is written into them where
+/// the live profile shows its rows to a plugin, as [`super::decide`]
+/// writes it ([`super::vetoes::written`]). Both decisions then read the
+/// same records under the same constraints.
+///
+/// A shadow profile is not run in two cases, and its decision is counted
+/// as skipped ([`ShadowKind::Skipped`]). A request with less than
+/// [`SHADOW_FLOOR`] of its stated budget left keeps that for its answer.
+/// And the affinity rows the live decision was handed are not the shadow
+/// profile's where that profile would be handed others: rows of another
+/// warm-up ruling or another record ([`ShadowRows::Apart`]), or rows of
+/// its own ([`ShadowRows::Own`]), which no caller builds for a shadow
+/// here. A shadow profile that reads no affinity column runs without the
+/// rows named for the live one ([`ShadowRows::Unnamed`]).
+///
+/// A shadow profile that reads a ring beside a live profile that reads
+/// none is stated its own place on the ring the request is lent
+/// ([`Engine::shadow_ring_profile`]). It is stated here, inside the
+/// shadow's run: behind the live decision, behind the floor, and under the
+/// catch, so a lender that panics is the shadow's fault.
+///
+/// A shadow profile that panics is caught here: the live decision stands
+/// as decided. The thread's buffers are kept, as behind a live decision
+/// that panics: each entry writes the scratch it reads, and the keeping
+/// entry forgets the kept session reading first. The word on a trace's
+/// best rows alone is shared: the live decision's stands for its shadow.
+pub(crate) fn decide(
+    engine: &Engine,
+    pool: &PoolRecords,
+    workers: &[Arc<dyn Worker>],
+    live: &Live<'_>,
+    facts: &mut RequestFacts<'_>,
+    cx: &Constraints<'_>,
+    shadow: (u32, ShadowRows, Lends<'_>),
+) -> (Decision, Shadow) {
+    facts.now_micros = live.now_micros;
+    let facts = &*facts;
+    let (binding, reads, lends) = shadow;
+    let counted = |kind, first| {
+        Shadow::Said(Shadowed {
+            binding,
+            kind,
+            first,
+        })
+    };
+    with_buffers(|buffers: &mut Buffers| {
+        if live.unread {
+            buffers.scratch.unread(true);
+        }
+        let Buffers {
+            whole,
+            stands,
+            scratch,
+            ..
+        } = buffers;
+        let (rows, pool_facts) = pool.write_over::<true, false>(workers, live, whole, stands);
+        let written;
+        let cx = if cx.stalled.is_empty() {
+            cx
+        } else {
+            written = super::vetoes::written(engine, facts.model, facts.phase, rows, cx);
+            &written
+        };
+        let decided = engine.decide_keeping(facts, &pool_facts, rows, cx, scratch);
+        let left = budget_left(facts);
+        let reads = match reads {
+            ShadowRows::Same | ShadowRows::Unnamed if left >= SHADOW_FLOOR => reads,
+            ShadowRows::Same | ShadowRows::Unnamed | ShadowRows::Own | ShadowRows::Apart => {
+                return (decided, counted(ShadowKind::Skipped, None));
+            }
+            // A pair's sides are no single's shadow.
+            ShadowRows::Sides => return (decided, Shadow::NotDue),
+        };
+        let ran = catch_unwind(AssertUnwindSafe(|| {
+            let lent = engine.shadow_ring_profile(binding, facts, rows);
+            let stated;
+            let facts = match lent.and_then(lends) {
+                Some((ring, places)) => {
+                    stated = RequestFacts {
+                        ring: Some(ring),
+                        ring_positions: places,
+                        ..*facts
+                    };
+                    &stated
+                }
+                None => facts,
+            };
+            if reads == ShadowRows::Unnamed {
+                // A profile that reads no affinity column is named no row,
+                // live or as a shadow: the names would turn its pick to a
+                // draw.
+                let unnamed = RequestFacts {
+                    named: None,
+                    ..*facts
+                };
+                engine.shadow(&unnamed, &pool_facts, rows, cx, scratch)
+            } else {
+                engine.shadow(facts, &pool_facts, rows, cx, scratch)
+            }
+        }));
+        let outcome = match ran {
+            Ok(Some(decision)) => {
+                let first = decision.pick().and_then(|pick| pick.targets.first());
+                counted(
+                    ShadowKind::of(&decided, &decision),
+                    first.map(|target| target.id),
+                )
+            }
+            Ok(None) => Shadow::NotDue,
+            Err(payload) => {
+                // A payload's own drop can panic: the engine's helper
+                // frees it under a catch of its own.
+                release(payload);
+                Shadow::Faulted
+            }
+        };
+        (decided, outcome)
+    })
+}

@@ -553,6 +553,595 @@ fn kv_transfer_params_prefer_json_then_the_legacy_pair() {
         .contains("remote_host"));
 }
 
+/// Out-of-vocab ids fault the GPU (a `logit_bias` key of 999999999 indexes
+/// past the logits tensor and raises a CUDA illegal-address error on the
+/// rank), so they are refused with vLLM's own messages; in-vocab ids pass.
+#[test]
+fn out_of_vocab_token_ids_are_refused() {
+    const VOCAB: u32 = 1000;
+    let check = |req: &vllm::GenerateRequest| {
+        validate_token_ids(req, &[], VocabBounds::new(VOCAB, None), None)
+    };
+    let ok = tokenized_req(vllm::SamplingParams {
+        stop_token_ids: vec![0, 999],
+        logit_bias: [(0, 1.0), (999, -5.0)].into_iter().collect(),
+        ..Default::default()
+    });
+    assert_eq!(check(&ok), Ok(()));
+
+    let bias = tokenized_req(vllm::SamplingParams {
+        logit_bias: [(5, 1.0), (999_999_999, 5.0)].into_iter().collect(),
+        ..Default::default()
+    });
+    let error = check(&bias).unwrap_err();
+    assert!(error.contains("[999999999] in logit_bias"), "{error}");
+    assert!(error.contains("Vocabulary size: 1000"), "{error}");
+
+    let negative = tokenized_req(vllm::SamplingParams {
+        logit_bias: [(-1, 1.0)].into_iter().collect(),
+        ..Default::default()
+    });
+    assert!(check(&negative).unwrap_err().contains("[-1] in logit_bias"));
+
+    let stop = tokenized_req(vllm::SamplingParams {
+        stop_token_ids: vec![1000, 7, 1000],
+        ..Default::default()
+    });
+    assert!(check(&stop)
+        .unwrap_err()
+        .contains("[1000] in stop_token_ids"));
+
+    let mut prompt = tokenized_req(vllm::SamplingParams::default());
+    if let Some(vllm::generate_request::Input::Tokenized(t)) = prompt.input.as_mut() {
+        t.input_ids = vec![1, 4000, 2];
+    }
+    assert_eq!(
+        check(&prompt).unwrap_err(),
+        "Token id 4000 is out of vocabulary"
+    );
+    assert_eq!(validate_prompt_ids(&[0, 999], &[], VOCAB, VOCAB), Ok(()));
+    assert_eq!(validate_prompt_ids(&[], &[], VOCAB, VOCAB), Ok(()));
+}
+
+/// The outer bound is the larger of the model's vocabulary and the
+/// tokenizer's (its largest id plus one); an unknown tokenizer leaves the
+/// model's.
+#[test]
+fn the_outer_bound_is_the_larger_vocabulary() {
+    assert_eq!(
+        VocabBounds::new(1000, Some(1004)),
+        VocabBounds {
+            model: 1000,
+            outer: 1005
+        }
+    );
+    assert_eq!(VocabBounds::new(1000, Some(500)).outer, 1000);
+    assert_eq!(VocabBounds::new(1000, None).outer, 1000);
+    assert_eq!(VocabBounds::new(1000, Some(u32::MAX)).outer, u32::MAX);
+}
+
+/// Embed-position runs from `(start, end)` pairs.
+fn runs(pairs: &[(usize, usize)]) -> Vec<Range<usize>> {
+    pairs.iter().map(|&(start, end)| start..end).collect()
+}
+
+/// A request whose prompt is `prompt` with one image batch: an item over
+/// `placeholder` (offset, length), its pixels inline, and `im_token_id` the
+/// placeholder token.
+fn image_req(
+    prompt: Vec<u32>,
+    placeholder: (u32, u32),
+    im_token_id: Option<u32>,
+) -> vllm::GenerateRequest {
+    let mut req = tokenized_req(vllm::SamplingParams::default());
+    if let Some(vllm::generate_request::Input::Tokenized(t)) = req.input.as_mut() {
+        t.input_ids = prompt;
+    }
+    req.mm_inputs = Some(vllm::MultimodalInputs {
+        pixel_values: Some(vllm::TensorData {
+            shape: vec![1, 4],
+            dtype: "float32".to_string(),
+            payload: Some(vllm::tensor_data::Payload::Inline(
+                [0.0f32, 1.0, 2.0, 3.0]
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect::<Vec<u8>>()
+                    .into(),
+            )),
+        }),
+        im_token_id,
+        mm_placeholders: vec![vllm::PlaceholderRange {
+            offset: placeholder.0,
+            length: placeholder.1,
+        }],
+        mm_hashes: vec!["h0".to_string()],
+        batched_keys: vec!["pixel_values".to_string()],
+        modality: smg_grpc_client::common_proto::Modality::Image as i32,
+        ..Default::default()
+    });
+    req
+}
+
+/// The prompt-id bound is per position: a placeholder id past the model's
+/// vocabulary (some multimodal models' image token is) passes where the
+/// image's embedding replaces it, up to the tokenizer's bound, and the same
+/// id at a text position, or at a structural position inside the placeholder
+/// range that `is_embed` leaves to the table, is refused.
+#[test]
+fn an_out_of_vocab_id_passes_at_an_image_position_only() {
+    // The model's 1000 rows; the tokenizer's ids reach 1000, the image token.
+    let check_within = |mut req: vllm::GenerateRequest, bounds| {
+        let media = translate_media(&mut req, ModelDtype::BFloat16).expect("translated");
+        validate_token_ids(&req, &media.embed_positions, bounds, None)
+            .map(|()| media.embed_positions)
+    };
+    let check = |req| check_within(req, VocabBounds::new(1000, Some(1000)));
+
+    // The image token 1000 at the image's positions 1..4.
+    let accepted = check(image_req(vec![5, 1000, 1000, 1000, 6], (1, 3), Some(1000)));
+    assert_eq!(accepted, Ok(runs(&[(1, 4)])));
+    // No `im_token_id`: the whole range takes the embedding.
+    let accepted = check(image_req(vec![5, 1000, 1000, 1000, 6], (1, 3), None));
+    assert_eq!(accepted, Ok(runs(&[(1, 4)])));
+
+    // The same id at text position 0.
+    assert_eq!(
+        check(image_req(
+            vec![1000, 1000, 1000, 1000, 6],
+            (1, 3),
+            Some(1000)
+        )),
+        Err("Token id 1000 is out of vocabulary".to_string())
+    );
+    // At text position 4, past the range.
+    assert_eq!(
+        check(image_req(
+            vec![5, 1000, 1000, 1000, 1000],
+            (1, 3),
+            Some(1000)
+        )),
+        Err("Token id 1000 is out of vocabulary".to_string())
+    );
+    // Inside the range but not the image token: the table embeds it, so it
+    // keeps the model's bound even where the tokenizer's ids reach it.
+    assert_eq!(
+        check_within(
+            image_req(vec![5, 1000, 1001, 1000, 6], (1, 3), Some(1000)),
+            VocabBounds::new(1000, Some(1001))
+        ),
+        Err("Token id 1001 is out of vocabulary".to_string())
+    );
+    // An image position is held to the tokenizer's bound: a caller naming
+    // an id past it as the image token is refused there too.
+    assert_eq!(
+        check(image_req(
+            vec![5, 999_999_999, 999_999_999, 6],
+            (1, 2),
+            Some(999_999_999)
+        )),
+        Err("Token id 999999999 is out of vocabulary".to_string())
+    );
+    // Without a known tokenizer the outer bound is the model's.
+    let mut req = image_req(vec![5, 1000, 1000, 6], (1, 2), Some(1000));
+    let media = translate_media(&mut req, ModelDtype::BFloat16).expect("translated");
+    assert_eq!(
+        validate_token_ids(
+            &req,
+            &media.embed_positions,
+            VocabBounds::new(1000, None),
+            None
+        ),
+        Err("Token id 1000 is out of vocabulary".to_string())
+    );
+    // `prompt_logprobs` scores each prompt id after the first against the
+    // model's logits, the image's own included.
+    let scored = |prompt: Vec<u32>, placeholder| {
+        let mut req = image_req(prompt, placeholder, Some(1000));
+        req.sampling_params = Some(vllm::SamplingParams {
+            prompt_logprobs: Some(0),
+            ..Default::default()
+        });
+        req
+    };
+    assert_eq!(
+        check(scored(vec![5, 1000, 1000, 6], (1, 2))),
+        Err(
+            "prompt_logprobs cannot score token id 1000: it lies past the model's \
+             vocabulary (size 1000)"
+                .to_string()
+        )
+    );
+    // The first position is never a target.
+    assert_eq!(check(scored(vec![1000, 5, 6], (0, 1))), Ok(runs(&[(0, 1)])));
+    // And a text-only request gets no exemption at all.
+    let mut text = tokenized_req(vllm::SamplingParams::default());
+    if let Some(vllm::generate_request::Input::Tokenized(t)) = text.input.as_mut() {
+        t.input_ids = vec![5, 1000, 6];
+    }
+    assert_eq!(
+        check(text),
+        Err("Token id 1000 is out of vocabulary".to_string())
+    );
+
+    // Outside a PD decode side, a tensor-less identity batch sends the engine
+    // no feature, so its placeholders stay text positions, bounded like any:
+    // alone (a caller naming any id its `im_token_id`), under a prefill
+    // side's KV params, or beside a batch that does carry an image.
+    let identity = |prompt: Vec<u32>, placeholder, im_token_id| {
+        let mut req = image_req(prompt, placeholder, im_token_id);
+        if let Some(mm) = req.mm_inputs.as_mut() {
+            mm.pixel_values = None;
+            mm.batched_keys.clear();
+        }
+        req
+    };
+    let spoof = identity(vec![5, 999_999_999, 6], (1, 1), Some(999_999_999));
+    assert_eq!(
+        check(spoof),
+        Err("Token id 999999999 is out of vocabulary".to_string())
+    );
+    let mut prefill_side = identity(vec![5, 1000, 1000, 1000, 6], (1, 3), Some(1000));
+    prefill_side.kv_transfer_params_json =
+        Some(r#"{"do_remote_decode": true, "do_remote_prefill": false}"#.to_string());
+    assert_eq!(
+        check(prefill_side),
+        Err("Token id 1000 is out of vocabulary".to_string())
+    );
+    let mut mixed = image_req(vec![5, 1000, 1000, 1000, 6, 1000, 7], (1, 3), Some(1000));
+    mixed.extra_mm_inputs = identity(vec![], (5, 1), Some(1000))
+        .mm_inputs
+        .into_iter()
+        .collect();
+    assert_eq!(
+        check(mixed),
+        Err("Token id 1000 is out of vocabulary".to_string())
+    );
+    // The image's own positions still pass in that mix.
+    let mut mixed = image_req(vec![5, 1000, 1000, 1000, 6, 8, 7], (1, 3), Some(1000));
+    mixed.extra_mm_inputs = identity(vec![], (5, 1), Some(1000))
+        .mm_inputs
+        .into_iter()
+        .collect();
+    assert_eq!(check(mixed), Ok(runs(&[(1, 4)])));
+}
+
+/// The decode side of a PD pair (`do_remote_prefill = true`) gets the
+/// prefill side's expanded prompt, its image-token run included, with the
+/// media stripped (the KV it pulls supplies those positions): on an engine
+/// whose connector pulls on the claim, its prompt is held to the tokenizer's
+/// bound at every position but its local tail (computed on this engine, so
+/// held to the model's), and its `stop_token_ids` and `logit_bias` to the
+/// model's. The same prompt without the decode-side params, at `n > 1`,
+/// asking `prompt_logprobs`, on an engine that does not pull on the claim,
+/// or with an unknown tail is refused.
+#[test]
+fn a_pd_decode_side_is_held_to_the_outer_bound() {
+    let bounds = VocabBounds::new(1000, Some(1000));
+    let check_on = |mut req: vllm::GenerateRequest, tail: Option<usize>| {
+        let media = translate_media(&mut req, ModelDtype::BFloat16).expect("translated");
+        let tail = tail.and_then(NonZeroUsize::new);
+        validate_token_ids(&req, &media.embed_positions, bounds, tail)
+    };
+    let check = |req| check_on(req, Some(1));
+    // The gateway's language-model-only decode leg: the expanded ids, the
+    // per-image hashes only, the KV handoff.
+    let decode = |sampling: vllm::SamplingParams, params: Option<&str>| {
+        let mut req = tokenized_req(sampling);
+        if let Some(vllm::generate_request::Input::Tokenized(t)) = req.input.as_mut() {
+            t.input_ids = vec![5, 1000, 1000, 1000, 6];
+        }
+        req.mm_inputs = Some(vllm::MultimodalInputs {
+            mm_hashes: vec!["h0".to_string()],
+            modality: smg_grpc_client::common_proto::Modality::Image as i32,
+            ..Default::default()
+        });
+        req.kv_transfer_params_json = params.map(str::to_string);
+        req
+    };
+    const DECODE: Option<&str> = Some(r#"{"do_remote_prefill": true, "do_remote_decode": false}"#);
+    let refused = Err("Token id 1000 is out of vocabulary".to_string());
+
+    assert_eq!(
+        check(decode(vllm::SamplingParams::default(), DECODE)),
+        Ok(())
+    );
+    // Without media at all, as well.
+    let mut bare = decode(vllm::SamplingParams::default(), DECODE);
+    bare.mm_inputs = None;
+    assert_eq!(check(bare), Ok(()));
+    assert!(consumes_remote_prefill(&decode(
+        vllm::SamplingParams::default(),
+        DECODE
+    )));
+    // An id past the tokenizer's ids too is refused there.
+    let mut forged = decode(vllm::SamplingParams::default(), DECODE);
+    if let Some(vllm::generate_request::Input::Tokenized(t)) = forged.input.as_mut() {
+        t.input_ids = vec![5, 999_999_999, 6];
+    }
+    assert_eq!(
+        check(forged),
+        Err("Token id 999999999 is out of vocabulary".to_string())
+    );
+
+    // A forged claim on an engine with no KV connector changes nothing, nor
+    // does a claim on one whose local tail is unknown.
+    assert_eq!(
+        check_on(decode(vllm::SamplingParams::default(), DECODE), None),
+        refused
+    );
+
+    // The last prompt token is computed on the decode side whether the KV
+    // is pulled or not, so it keeps the model's bound: at the end of a
+    // longer prompt, and as a prompt's only token.
+    for input_ids in [vec![5, 1000, 1000, 1000], vec![1000]] {
+        let mut tail = decode(vllm::SamplingParams::default(), DECODE);
+        if let Some(vllm::generate_request::Input::Tokenized(t)) = tail.input.as_mut() {
+            t.input_ids = input_ids.clone();
+        }
+        assert_eq!(check(tail), refused, "{input_ids:?}");
+    }
+    // Where the engine computes a longer tail itself (NIXL pulls short of a
+    // multi-module MTP drafter's prefill lookahead), every position of it
+    // keeps the model's bound, and the positions ahead of it do not.
+    let with_prompt = |input_ids: Vec<u32>| {
+        let mut req = decode(vllm::SamplingParams::default(), DECODE);
+        if let Some(vllm::generate_request::Input::Tokenized(t)) = req.input.as_mut() {
+            t.input_ids = input_ids;
+        }
+        req
+    };
+    assert_eq!(
+        check_on(with_prompt(vec![5, 1000, 1000, 1000, 6, 7, 8]), Some(3)),
+        Ok(())
+    );
+    assert_eq!(
+        check_on(with_prompt(vec![5, 1000, 1000, 1000, 1000, 7, 8]), Some(3)),
+        refused
+    );
+    assert_eq!(
+        check(with_prompt(vec![5, 1000, 1000, 1000, 1000, 7, 8])),
+        Ok(())
+    );
+
+    // `prompt_logprobs` makes the engine skip reading any cached prefix, the
+    // pulled KV included, so it computes the whole prompt: the first
+    // position, which the scoring check leaves alone, keeps the model's bound.
+    let scored = |input_ids: Vec<u32>| {
+        let mut req = decode(
+            vllm::SamplingParams {
+                prompt_logprobs: Some(0),
+                ..Default::default()
+            },
+            DECODE,
+        );
+        if let Some(vllm::generate_request::Input::Tokenized(t)) = req.input.as_mut() {
+            t.input_ids = input_ids;
+        }
+        req
+    };
+    assert_eq!(check(scored(vec![1000, 5, 6])), refused);
+    assert_eq!(check(with_prompt(vec![1000, 5, 6])), Ok(()));
+
+    // Not a decode side: no params, a prefill side's, a malformed field.
+    for params in [
+        None,
+        Some(r#"{"do_remote_prefill": false}"#),
+        Some(r#"{"do_remote_prefill": "true"}"#),
+    ] {
+        assert_eq!(
+            check(decode(vllm::SamplingParams::default(), params)),
+            refused,
+            "{params:?}"
+        );
+    }
+    // Nor at `n > 1`, where the gateway relays no handoff.
+    let fan_out = vllm::SamplingParams {
+        n: 2,
+        ..Default::default()
+    };
+    assert!(!consumes_remote_prefill(&decode(fan_out.clone(), DECODE)));
+    assert_eq!(check(decode(fan_out, DECODE)), refused);
+
+    // The sampling ids index the logits on every leg.
+    let bias = vllm::SamplingParams {
+        logit_bias: [(999_999_999, 5.0)].into_iter().collect(),
+        ..Default::default()
+    };
+    assert!(check(decode(bias, DECODE))
+        .unwrap_err()
+        .contains("[999999999] in logit_bias"));
+    let stop = vllm::SamplingParams {
+        stop_token_ids: vec![1000],
+        ..Default::default()
+    };
+    assert!(check(decode(stop, DECODE))
+        .unwrap_err()
+        .contains("[1000] in stop_token_ids"));
+}
+
+/// The legacy typed host/port pair alone is no handoff claim: every PD
+/// connector in vLLM pulls only on `do_remote_prefill`, so an engine handed
+/// the pair computes the prompt itself, and its prompt keeps the model's
+/// bound even on a NIXL consumer (the mismatched form). JSON params beside
+/// the pair decide alone, either way.
+#[test]
+fn a_legacy_host_port_pair_alone_is_no_handoff() {
+    // A NIXL `kv_both` engine: model vocabulary 1000, tokenizer ids to 1500.
+    let pulls = pulls_on_do_remote_prefill("NixlConnector", "kv_both");
+    assert!(pulls);
+    let check = |mut req: vllm::GenerateRequest| {
+        let media = translate_media(&mut req, ModelDtype::BFloat16).expect("translated");
+        validate_token_ids(
+            &req,
+            &media.embed_positions,
+            VocabBounds::new(1000, Some(1500)),
+            pulls.then_some(NonZeroUsize::MIN),
+        )
+    };
+    let legacy = |input_ids: Vec<u32>, sampling: vllm::SamplingParams| {
+        let mut req = tokenized_req(sampling);
+        if let Some(vllm::generate_request::Input::Tokenized(t)) = req.input.as_mut() {
+            t.input_ids = input_ids;
+        }
+        req.kv_transfer_params = Some(vllm::KvTransferParams {
+            remote_host: "10.0.0.1".to_string(),
+            remote_port: 8998,
+        });
+        req
+    };
+
+    let forged = legacy(vec![1, 1500], vllm::SamplingParams::default());
+    assert!(!consumes_remote_prefill(&forged));
+    assert_eq!(
+        check(forged),
+        Err("Token id 1500 is out of vocabulary".to_string())
+    );
+    let single = vllm::SamplingParams {
+        n: 1,
+        ..Default::default()
+    };
+    assert_eq!(
+        check(legacy(vec![5, 1000, 6], single)),
+        Err("Token id 1000 is out of vocabulary".to_string())
+    );
+    // In-vocabulary prompts pass as on any request.
+    assert_eq!(
+        check(legacy(vec![5, 999, 6], vllm::SamplingParams::default())),
+        Ok(())
+    );
+
+    // JSON params beside the pair decide alone, either way (the id past the
+    // model's vocabulary off the last position, which is always local).
+    let mut prefill_json = legacy(vec![1500, 1], vllm::SamplingParams::default());
+    prefill_json.kv_transfer_params_json = Some(r#"{"do_remote_prefill": false}"#.to_string());
+    assert_eq!(
+        check(prefill_json),
+        Err("Token id 1500 is out of vocabulary".to_string())
+    );
+    let mut decode_json = legacy(vec![1500, 1], vllm::SamplingParams::default());
+    decode_json.kv_transfer_params_json = Some(r#"{"do_remote_prefill": true}"#.to_string());
+    assert_eq!(check(decode_json), Ok(()));
+}
+
+/// Only a consumer of a connector that pulls on `do_remote_prefill` lets the
+/// claim loosen the bound: NIXL, Mooncake and MoRIIO as `kv_consumer` or
+/// `kv_both`, a `MultiConnector` as the P2P child it is reported as. A
+/// producer, a store or offloading connector, an unprojected wrapper, an
+/// unknown connector or none do not.
+#[test]
+fn only_a_consumer_of_a_pulling_connector_honours_the_claim() {
+    for (connector, role) in [
+        ("NixlConnector", "kv_consumer"),
+        ("NixlConnector", "kv_both"),
+        ("MooncakeConnector", "kv_consumer"),
+        ("MoRIIOConnector", "kv_both"),
+    ] {
+        assert!(
+            pulls_on_do_remote_prefill(connector, role),
+            "{connector} {role}"
+        );
+    }
+    for (connector, role) in [
+        ("NixlConnector", "kv_producer"),
+        ("MooncakeConnector", ""),
+        ("MultiConnector", "kv_both"),
+        ("LMCacheConnectorV1", "kv_both"),
+        ("OffloadingConnector", "kv_both"),
+        ("SomeOtherConnector", "kv_consumer"),
+        ("", "kv_consumer"),
+        ("", ""),
+    ] {
+        assert!(
+            !pulls_on_do_remote_prefill(connector, role),
+            "{connector:?} {role:?}"
+        );
+    }
+}
+
+/// Worker-processed media in vLLM's own encoding: the exempt positions are
+/// read from each item's `mm_position`, narrowed by its `is_embed` mask
+/// whether inline or in an aux frame; a mask that cannot be read counts the
+/// whole range.
+#[test]
+fn encoded_media_embed_positions_follow_mm_position_and_is_embed() {
+    use engine_zmq_client::{
+        codec::{
+            encode_msgpack,
+            tensor::{WireArrayData, WireTensor},
+        },
+        protocol::vllm::multimodal::{MmFeatureSpec, PlaceholderRange},
+    };
+
+    let feature = |offset: usize, length: usize, is_embed: Option<WireTensor>| MmFeatureSpec {
+        data: None,
+        modality: "image".to_string(),
+        identifier: format!("h{offset}"),
+        mm_position: PlaceholderRange {
+            offset,
+            length,
+            is_embed,
+        },
+        mm_hash: None,
+    };
+    let positions = |features: Vec<MmFeatureSpec>, aux_frames: Vec<Bytes>| {
+        let mut req = tokenized_req(vllm::SamplingParams::default());
+        if let Some(vllm::generate_request::Input::Tokenized(t)) = req.input.as_mut() {
+            t.input_ids = vec![1000; 10];
+        }
+        let processed = ProcessedMedia::Encoded {
+            mm_features: Some(Bytes::from(encode_msgpack(&features).unwrap())),
+            aux_frames,
+            cache_salt: None,
+        };
+        translated_from_processed(&req, processed, ModelDtype::BFloat16)
+            .expect("translated")
+            .embed_positions
+    };
+
+    // No mask: whole ranges, sorted and clipped to the 10-token prompt.
+    assert_eq!(
+        positions(vec![feature(7, 5, None), feature(1, 3, None)], vec![]),
+        vec![1..4, 7..10]
+    );
+    // An inline mask leaves its structural position (3) out.
+    let inline = WireTensor::from_bool(vec![4], vec![true, true, false, true]).unwrap();
+    assert_eq!(
+        positions(vec![feature(1, 4, Some(inline))], vec![]),
+        vec![1..3, 4..5]
+    );
+    // A mask in aux frame 1.
+    let mut in_aux = WireTensor::from_bool(vec![3], vec![false; 3]).unwrap();
+    in_aux.data = WireArrayData::AuxIndex(1);
+    assert_eq!(
+        positions(
+            vec![feature(2, 3, Some(in_aux))],
+            vec![Bytes::from_static(&[0, 1, 1])]
+        ),
+        runs(&[(3, 5)])
+    );
+    // A mask of the wrong length (or dtype) is not trusted: the whole range.
+    let short = WireTensor::from_bool(vec![2], vec![true, false]).unwrap();
+    assert_eq!(
+        positions(vec![feature(1, 3, Some(short))], vec![]),
+        runs(&[(1, 4)])
+    );
+
+    // So an id past the vocabulary passes at 1..3 and 4, not at 3.
+    let runs = vec![1..3, 4..5];
+    assert_eq!(
+        validate_prompt_ids(&[5, 1000, 1000, 7, 1000], &runs, 1000, 1001),
+        Ok(())
+    );
+    assert_eq!(
+        validate_prompt_ids(&[5, 1000, 1000, 1000, 1000], &runs, 1000, 1001),
+        Err("Token id 1000 is out of vocabulary".to_string())
+    );
+    assert_eq!(
+        validate_prompt_ids(&[5, 1000, 1001, 7, 1000], &runs, 1000, 1001),
+        Err("Token id 1001 is out of vocabulary".to_string())
+    );
+}
+
 #[test]
 fn kv_transfer_params_ride_the_sampling_extra_args() {
     let mut req = tokenized_req(vllm::SamplingParams::default());
@@ -1123,6 +1712,7 @@ fn fan_out_splits_n_into_single_sample_requests() {
         ..Default::default()
     });
     req.request_id = "r1".to_string();
+    req.cache_salt = Some("tenant-a".to_string());
 
     let subs = fan_out_requests(req);
     assert_eq!(subs.len(), 3);
@@ -1133,6 +1723,7 @@ fn fan_out_splits_n_into_single_sample_requests() {
         assert_eq!(sp.n, 1);
         assert_eq!(sp.seed, Some(7 + i as i32));
         // Everything else is shared verbatim.
+        assert_eq!(sub.cache_salt.as_deref(), Some("tenant-a"));
         assert_eq!(
             sub.input,
             Some(vllm::generate_request::Input::Tokenized(
@@ -1677,6 +2268,56 @@ fn malformed_reasoning_template_kwargs_are_rejected() {
             error.starts_with("invalid chat_template_kwargs_json:"),
             "{error}"
         );
+    }
+}
+
+/// Only a tensor-less identity payload changes the request salt. A side with
+/// pixels or a grid has its identity in `mm_features`.
+#[test]
+fn the_engine_keeps_the_request_salt_beside_the_media_identity() {
+    let tensor = |shape: &[u32], dtype: &str| vllm::TensorData {
+        shape: shape.to_vec(),
+        dtype: dtype.to_string(),
+        payload: Some(vllm::tensor_data::Payload::Inline(Bytes::from(vec![0; 24]))),
+    };
+    let no_hashes = vllm::MultimodalInputs::default();
+    let identity = vllm::MultimodalInputs {
+        mm_hashes: vec!["h1".to_string()],
+        ..Default::default()
+    };
+    let grid = vllm::MultimodalInputs {
+        mm_placeholders: vec![vllm::PlaceholderRange {
+            offset: 1,
+            length: 2,
+        }],
+        model_specific_tensors: HashMap::from([(
+            "image_grid_thw".to_string(),
+            tensor(&[1, 3], "int64"),
+        )]),
+        ..identity.clone()
+    };
+    let pixels = vllm::MultimodalInputs {
+        pixel_values: Some(tensor(&[1, 6], "float32")),
+        ..grid.clone()
+    };
+    for salt in [None, Some("tenant-a".to_string())] {
+        let composed = engine_cache_salt(salt.clone(), &identity.mm_hashes).expect("a salt");
+        assert_ne!(composed, salt);
+        for (media, expected) in [
+            (&no_hashes, &salt),
+            (&identity, &composed),
+            (&grid, &salt),
+            (&pixels, &salt),
+        ] {
+            let mut req = tokenized_req(vllm::SamplingParams::default());
+            req.cache_salt.clone_from(&salt);
+            req.mm_inputs = Some(media.clone());
+            req.kv_transfer_params_json = Some("{}".to_string());
+            let request =
+                translate_request(req, 4096, ModelDtype::BFloat16, &EosTokenIds::default())
+                    .expect("translated");
+            assert_eq!(&request.cache_salt, expected, "{salt:?} {media:?}");
+        }
     }
 }
 

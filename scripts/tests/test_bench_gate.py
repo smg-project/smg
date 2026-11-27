@@ -964,7 +964,7 @@ def test_the_repository_gate_files_load(mod):
     root = Path(__file__).resolve().parents[2]
     files = sorted((root / ".github" / "bench-gates").glob("*.toml"))
     counting = [path.name for path in files if mod.load_gates(path).count]
-    assert "policy-engine.toml" in counting
+    assert "grand-central-engine.toml" in counting
 
 
 def test_a_profile_is_read_for_the_harness_timed_calls(mod, tmp_path):
@@ -1463,7 +1463,7 @@ def test_a_counting_gate_ends_its_count_before_its_gate_step_does(mod):
         if mod.load_gates(path).count
     )
     assert sorted(set(checked)) == counting
-    assert "policy-engine.toml" in checked
+    assert "grand-central-engine.toml" in checked
 
 
 def test_the_ids_are_counted_in_name_order(mod, tmp_path, monkeypatch):
@@ -1801,35 +1801,35 @@ def test_a_run_places_a_marked_id_on_a_level_count_and_fails_one_that_moved(
 def test_the_repository_gate_files_mark_the_rows_that_time_a_whole_decision(mod):
     root = Path(__file__).resolve().parents[2] / ".github" / "bench-gates"
     marked = {
-        "policy-engine.toml": {
-            "policy_engine/decide/cache_aware/8": True,
-            "policy_engine/decide/least_load_credited/8": True,
-            "policy_engine/decide/cache_aware/512": True,
-            "policy_engine/decide/passthrough/8": True,
-            "policy_engine/decide/manual_keyed_miss/8": True,
-            "policy_engine/decide/manual_keyed_hit/8": False,
-            "policy_engine/decide/passthrough/64": False,
-            "policy_engine/decide/power_of_two/512": False,
-            "policy_engine/decide/random/64": False,
-            "policy_engine/decide/round_robin/512": False,
-            "policy_engine/decide/passthrough/512": False,
-            "policy_engine/decide/power_of_two/64": False,
-            "policy_engine/decide/random/512": False,
-            "policy_engine/decide/round_robin/64": False,
-            "policy_engine/view_build/64": False,
-            "policy_engine/spec/parse_validate": False,
+        "grand-central-engine.toml": {
+            "engine/decide/cache_aware/8": True,
+            "engine/decide/least_load_credited/8": True,
+            "engine/decide/cache_aware/512": True,
+            "engine/decide/passthrough/8": True,
+            "engine/decide/manual_keyed_miss/8": True,
+            "engine/decide/manual_keyed_hit/8": False,
+            "engine/decide/passthrough/64": False,
+            "engine/decide/power_of_two/512": False,
+            "engine/decide/random/64": False,
+            "engine/decide/round_robin/512": False,
+            "engine/decide/passthrough/512": False,
+            "engine/decide/power_of_two/64": False,
+            "engine/decide/random/512": False,
+            "engine/decide/round_robin/64": False,
+            "engine/view_build/64": False,
+            "engine/spec/parse_validate": False,
         },
-        "policy-engine-affinity.toml": {
+        "grand-central-engine-affinity.toml": {
             "policy_affinity/decide/cache_aware/8": True,
             "policy_affinity/decide/cache_aware/512": True,
             "policy_affinity/view_build/64": False,
         },
-        "policy-engine-prefix-hash.toml": {
-            "policy_engine/prefix_hash/owner/512": True,
-            "policy_engine/prefix_hash/levels_owner/512": True,
-            "policy_engine/prefix_hash/levels_owner/64": True,
-            "policy_engine/prefix_hash/passed_over/8": True,
-            "policy_engine/prefix_hash/levels_passed_over/8": True,
+        "grand-central-engine-prefix-hash.toml": {
+            "engine/prefix_hash/owner/512": True,
+            "engine/prefix_hash/levels_owner/512": True,
+            "engine/prefix_hash/levels_owner/64": True,
+            "engine/prefix_hash/passed_over/8": True,
+            "engine/prefix_hash/levels_passed_over/8": True,
         },
     }
     for name, ids in marked.items():
@@ -1837,19 +1837,17 @@ def test_the_repository_gate_files_mark_the_rows_that_time_a_whole_decision(mod)
         for bench_id, whole in ids.items():
             assert gates.threshold_for(bench_id).whole_pass is whole, f"{name}: {bench_id}"
     # The thresholds of the marked ids are the ones they had.
-    engine = mod.load_gates(root / "policy-engine.toml")
-    assert engine.threshold_for("policy_engine/decide/least_load_credited/8").threshold == 0.15
-    assert engine.threshold_for("policy_engine/decide/cache_aware/8").threshold == 0.10
-    assert engine.threshold_for("policy_engine/decide/random/64").threshold == 0.10
-    prefix = mod.load_gates(root / "policy-engine-prefix-hash.toml")
+    engine = mod.load_gates(root / "grand-central-engine.toml")
+    assert engine.threshold_for("engine/decide/least_load_credited/8").threshold == 0.15
+    assert engine.threshold_for("engine/decide/cache_aware/8").threshold == 0.10
+    assert engine.threshold_for("engine/decide/random/64").threshold == 0.10
+    prefix = mod.load_gates(root / "grand-central-engine-prefix-hash.toml")
     # The 512-row ids read above 5 % on the hosted runner and take 15 %.
     for path in ("owner", "passed_over", "levels_owner", "levels_passed_over"):
-        assert prefix.threshold_for(f"policy_engine/prefix_hash/{path}/512").threshold == 0.15, path
+        assert prefix.threshold_for(f"engine/prefix_hash/{path}/512").threshold == 0.15, path
     for bench_id in ("owner/64", "passed_over/64", "levels_owner/64", "passed_over/8"):
-        assert prefix.threshold_for(f"policy_engine/prefix_hash/{bench_id}").threshold == 0.10, (
-            bench_id
-        )
-    for name in ("policy-engine-power-of-two.toml", "policy-store.toml"):
+        assert prefix.threshold_for(f"engine/prefix_hash/{bench_id}").threshold == 0.10, bench_id
+    for name in ("grand-central-engine-power-of-two.toml", "policy-store.toml"):
         assert not any(gate.whole_pass for gate in mod.load_gates(root / name).gates), name
 
 
@@ -1860,22 +1858,22 @@ def test_the_repository_gate_files_mark_the_rows_that_time_a_whole_decision(mod)
 # at the same address, the re-measured round agreeing. Per id: the base's runs, the pull
 # request's, the re-measured round and the count of the last batch.
 TIME_ONLY = {
-    "policy_engine/decide/random/512": (
+    "engine/decide/random/512": (
         ([130.705, 130.803, 131.189], [152.681, 153.359, 151.732]),
         (130.953, 158.896),
         154_134_765,
     ),
-    "policy_engine/decide/round_robin/512": (
+    "engine/decide/round_robin/512": (
         ([240.053, 245.549, 241.447], [273.386, 272.947, 273.457]),
         (244.616, 274.436),
         177_145_736,
     ),
-    "policy_engine/power_of_two/least_requests/8": (
+    "engine/power_of_two/least_requests/8": (
         ([111.903, 105.382, 107.504], [119.716, 120.697, 119.123]),
         (107.17, 121.202),
         303_081_870,
     ),
-    "policy_engine/decide/random/64": (
+    "engine/decide/random/64": (
         ([131.147, 129.616, 134.482], [152.831, 154.061, 147.547]),
         (132.948, 146.643),
         153_733_589,
@@ -1887,7 +1885,7 @@ def time_only(mod, bench_id, second=None):
     runs, recheck, count = TIME_ONLY[bench_id]
     side = {"batches": [count // 4 + 9, count // 2, count], "unit": "decide", "address": 0x3E5FC0}
     counts = {"base": dict(side), "pr": dict(side)}
-    gate = mod.Gate("^policy_engine/", 0.10)
+    gate = mod.Gate("^engine/", 0.10)
     row = mod.Row(bench_id, *runs, gate, rechecks=[recheck], counts=counts, second=second)
     row.verdict = mod.judge(row)
     return row
@@ -1904,7 +1902,7 @@ def test_four_jobs_red_by_time_on_the_same_count_ask_for_a_second_measurement(mo
 
 
 def test_a_second_measurement_decides_an_id_on_a_level_count(mod):
-    bench_id = "policy_engine/power_of_two/least_requests/8"
+    bench_id = "engine/power_of_two/least_requests/8"
     # The runs of the job's second attempt: +4.7 %, within the threshold.
     again = {"base": [150.575, 151.854, 150.691], "pr": [157.623, 157.849, 166.08]}
     row = time_only(mod, bench_id, again)
@@ -1922,8 +1920,8 @@ def test_a_count_unsteady_on_one_executable_alone_reads_level_within_the_level(m
     first, rest = [44_198_696, 88_397_128, 176_793_992], [44_188_328, 88_376_392, 176_752_520]
     counts = {"base": {"batches": first, "again": rest}, "pr": {"batches": rest, "again": rest}}
     runs = [240.542, 237.072, 245.485], [271.799, 271.623, 265.3]
-    gate = mod.Gate("^policy_engine/", 0.10)
-    row = mod.Row("policy_engine/decide/round_robin/512", *runs, gate, counts=counts)
+    gate = mod.Gate("^engine/", 0.10)
+    row = mod.Row("engine/decide/round_robin/512", *runs, gate, counts=counts)
     assert row.counted.state == "unsteady" and not row.level_count and row.reads_level
     # Further apart than the level, it tells nothing and asks for nothing.
     counts["base"]["batches"] = [44_198_696, 88_397_128, 178_000_000]
@@ -2086,7 +2084,7 @@ def test_a_count_that_ended_a_batch_early_hides_no_other_from_the_level(mod):
 
 
 def test_a_second_measurement_short_of_its_runs_leaves_the_first_to_decide(mod):
-    bench_id = "policy_engine/power_of_two/least_requests/8"
+    bench_id = "engine/power_of_two/least_requests/8"
     row = time_only(mod, bench_id, {"base": [100, 101, 102], "pr": [100, 101]})
     assert row.measured_again is None and row.repeated is None
     assert row.verdict == "regression"

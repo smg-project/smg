@@ -398,6 +398,10 @@ impl GenerationRequest for CreateMessageRequest {
         self.rid.as_deref()
     }
 
+    fn max_output_tokens(&self) -> Option<u32> {
+        Some(self.max_tokens)
+    }
+
     fn is_stream(&self) -> bool {
         self.stream.unwrap_or(false)
     }
@@ -2595,6 +2599,7 @@ pub struct McpToolset {
     pub default_config: Option<McpToolDefaultConfig>,
 
     /// Configuration overrides for specific tools
+    #[serde(serialize_with = "crate::common::serialize_with_sorted_keys")]
     pub configs: Option<HashMap<String, McpToolConfig>>,
 
     /// Cache control for this toolset

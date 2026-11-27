@@ -172,8 +172,7 @@ impl<G: Generation> ClassicLoadSink<G> {
         // that counts more ranks than it lists says ranks exist that it
         // does not list, so it retracts none. A count of zero says nothing
         // against the list.
-        let lists_ranks = load.has_absolute_token_data()
-            && load.loads.len() >= usize::try_from(load.dp_rank_count).unwrap_or(0);
+        let lists_ranks = load.has_absolute_token_data() && load.lists_every_rank();
         // Every rank on file: one that pushed since the poll began keeps its
         // row and hands it to the publish, whether the poll's answer names
         // the rank or not; any other takes the answer's entry for it, and
@@ -238,8 +237,8 @@ impl<G: Generation> ClassicLoadSink<G> {
     }
 
     /// One polled member of an engine's answer: rows are merged, an answer
-    /// without a row retracts, and either that or a failed fetch clears the
-    /// overload veto, since absent means no opinion.
+    /// without a row retracts unless it counts ranks, and either that or a
+    /// failed fetch clears the overload veto, since absent means no opinion.
     fn member(&self, member: &PolledMember<'_>, polled_at: Instant, ranks: &mut PolledRanks) {
         let worker = member.worker;
         let url = worker.url();
@@ -247,19 +246,23 @@ impl<G: Generation> ClassicLoadSink<G> {
             Some(load) if !load.loads.is_empty() => {
                 self.merge(url, load, member.on_file, polled_at, ranks);
             }
-            Some(_) => {
+            Some(load) => {
                 self.apply_overload_verdict(worker, None, "poll");
                 // A successful native poll can retract a rank. A failed poll
                 // leaves the last-known DP cache alone; an explicit omission
                 // of a rank that pushed nothing since the tick began must not
                 // keep that rank selectable or be published as an idle load.
-                self.retract(
-                    url,
-                    worker.dp_rank(),
-                    member.on_file,
-                    polled_at,
-                    &mut ranks.leaving,
-                );
+                // An answer that counts ranks and lists none is short by its
+                // own count, as in `merge`: it retracts no rank from the file.
+                if load.dp_rank_count <= 0 {
+                    self.retract(
+                        url,
+                        worker.dp_rank(),
+                        member.on_file,
+                        polled_at,
+                        &mut ranks.leaving,
+                    );
+                }
                 if let Some(rank) = worker.dp_rank() {
                     self.worker_load_manager.remove_rank(url, rank);
                 } else {
@@ -270,6 +273,16 @@ impl<G: Generation> ClassicLoadSink<G> {
             None => self.apply_overload_verdict(worker, None, "poll"),
         }
     }
+}
+
+/// Whether two handles count their requests on one runtime: a same-URL
+/// `replace()` hands the worker that comes the runtime of the handle that
+/// leaves, and a worker registered anew counts on its own.
+fn counts_on_one_runtime(a: &dyn Worker, b: &dyn Worker) -> bool {
+    matches!(
+        (a.runtime_state(), b.runtime_state()),
+        (Some(one), Some(other)) if Arc::ptr_eq(&one, &other)
+    )
 }
 
 impl<G: Generation> LoadSink for ClassicLoadSink<G> {
@@ -356,6 +369,10 @@ impl<G: Generation> LoadSink for ClassicLoadSink<G> {
         self.load_consumer.needs_loads()
     }
 
+    fn polls(&self, worker: &dyn Worker) -> bool {
+        self.load_consumer.polls(worker)
+    }
+
     fn tick(&self, tick: &GroupTick<'_>) {
         // The overload predicate runs exactly here, once per report, never
         // on a request path, against the worker's effective thresholds
@@ -367,8 +384,27 @@ impl<G: Generation> LoadSink for ClassicLoadSink<G> {
         // booked on a worker to the requests the router still holds there,
         // the safety net behind the load guard's completion report. It runs
         // for every worker, polled or served by its stream, whether or not a
-        // fetch succeeded; the live count is the router's.
+        // fetch succeeded; the live count is the router's. A handle that
+        // left a URL where another worker counts on its own now is the one
+        // it skips.
         for worker in tick.workers {
+            // What is booked is kept by URL. Where the registry holds
+            // another worker at this URL, the count of the handle that left
+            // need not be that worker's. One registered anew counts on a
+            // runtime of its own and is trimmed at its own tick: the handle
+            // is skipped. A `replace()` hands the worker that comes the
+            // runtime of the handle that leaves: the handle's count is the
+            // live one, and it trims as before.
+            if self
+                .worker_registry
+                .get_by_url(worker.url())
+                .is_some_and(|held| {
+                    !Arc::ptr_eq(&held, worker)
+                        && !counts_on_one_runtime(held.as_ref(), worker.as_ref())
+                })
+            {
+                continue;
+            }
             self.load_consumer.reconcile_in_flight(worker.as_ref());
         }
         // The DP cache deliberately keeps last-known-good entries so routing
@@ -380,6 +416,15 @@ impl<G: Generation> LoadSink for ClassicLoadSink<G> {
         let mut group_dp_loads: HashMap<String, HashMap<isize, isize>> = HashMap::new();
         let mut dp_evict: Vec<String> = Vec::new();
         for polled in tick.reports {
+            // The rank counts are laid by URL. A worker the registry no
+            // longer holds at its URL lays none there: its eviction clears
+            // them, and the next worker registered at the URL would read
+            // what is laid behind it. A removal that lands between this
+            // test and `update_dp_loads` below is not covered: this road
+            // holds no lock the eviction takes.
+            if !self.worker_registry.is_current_handle(polled.worker) {
+                continue;
+            }
             let url = polled.worker.url().to_string();
             // Only feed the DP-rank cache from responses that carry real
             // absolute per-rank token counts. Ratio-only snapshots,

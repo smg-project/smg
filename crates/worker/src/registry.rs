@@ -11,7 +11,7 @@ use std::sync::mpsc as test_mpsc;
 use std::{
     collections::{BTreeSet, HashSet},
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
 };
@@ -143,7 +143,7 @@ type ModelIndex<G> = Arc<DashMap<String, Arc<G>, FxBuildHasher>>;
 
 /// Shards of the maps that hold one entry a model and are iterated on
 /// request paths, on any host: the model index
-/// ([`WorkerRegistry::model_count`]) and the per-model retry overrides
+/// ([`WorkerRegistry::get_models`]) and the per-model retry overrides
 /// ([`WorkerRegistry::any_model_retry_override_enables_retries`]). Iterating
 /// a map costs one lock and one allocation a shard, whether the shard holds
 /// an entry or not: the count must not follow the CPUs the process sees, as
@@ -176,6 +176,14 @@ pub struct WorkerRegistry<G> {
     /// Model index for O(1) lookups using immutable snapshots.
     /// Uses `Arc<[T]>` instead of `Arc<RwLock<Vec<T>>>` for lock-free reads.
     model_index: ModelIndex<G>,
+
+    /// The models of `model_index` that hold a worker
+    /// ([`Self::model_count`]). The two writers of an entry's members keep
+    /// it under the entry's shard lock: one more ahead of an entry's first
+    /// worker, one less behind its last, so a read never falls under the
+    /// models the index holds. Nothing that can fail stands between a move
+    /// of the count and the write it belongs to.
+    served_models: AtomicUsize,
 
     /// Immutable snapshot spanning every registered worker, tagged with the
     /// `global_epoch` it was built at. Model-less routes use its lazy route
@@ -257,6 +265,10 @@ pub struct WorkerRegistry<G> {
     /// never taken on a request path.
     overload_transitions: Arc<parking_lot::Mutex<()>>,
 
+    /// How many overload edges the registry applied ([`Self::overload_edges`]):
+    /// one add an edge, made under the lock above.
+    overload_edges: Arc<AtomicU64>,
+
     /// Per-model retry config (last write wins).
     /// Updated when a worker with non-empty retry overrides registers.
     /// Cleaned up when the last worker for a model is removed.
@@ -325,6 +337,7 @@ impl<G: Generation> WorkerRegistry<G> {
                 FxBuildHasher,
                 MODEL_MAP_SHARDS,
             )),
+            served_models: AtomicUsize::new(0),
             global_routing_snapshot: ArcSwap::from_pointee(GlobalRoutingSnapshot {
                 epoch: 0,
                 snapshot: Arc::clone(&empty_generation),
@@ -344,6 +357,7 @@ impl<G: Generation> WorkerRegistry<G> {
             pool_sizes: pool::PoolSizes::default(),
             overload_shed: Arc::new(AtomicBool::new(false)),
             overload_transitions: Arc::new(parking_lot::Mutex::new(())),
+            overload_edges: Arc::new(AtomicU64::new(0)),
             model_retry_configs: Arc::new(DashMap::with_hasher_and_shard_amount(
                 FxBuildHasher,
                 MODEL_MAP_SHARDS,
@@ -674,6 +688,7 @@ impl<G: Generation> WorkerRegistry<G> {
             if !worker.set_overloaded(overloaded) {
                 return false;
             }
+            self.overload_edges.fetch_add(1, Ordering::Relaxed);
             for model_id in model_ids {
                 let updated = self.adjust_model_overloaded(&model_id, overloaded);
                 Metrics::set_workers_overloaded(&model_id, updated);
@@ -687,6 +702,17 @@ impl<G: Generation> WorkerRegistry<G> {
             }
         }
         true
+    }
+
+    /// How many times the overload veto of a worker changed since the
+    /// registry was built, either way: one an edge
+    /// ([`Self::set_worker_overloaded`]). A clear of every flag
+    /// ([`Self::clear_all_overload_flags`]) counts each flag it lowers, and
+    /// the removal or the replacement of an overloaded worker lowers its
+    /// flag and counts that edge. A verdict that is said again counts
+    /// nothing. For a host that renders series of its own.
+    pub fn overload_edges(&self) -> u64 {
+        self.overload_edges.load(Ordering::Relaxed)
     }
 
     /// Whether `worker` is the `Arc` the registry currently holds for its URL.
@@ -974,11 +1000,14 @@ impl<G: Generation> WorkerRegistry<G> {
 
     /// Distinct canonical models with at least one worker serving them.
     /// Wildcard workers carry no model and contribute nothing.
+    ///
+    /// A kept count: the registry moves it where a model takes its first
+    /// worker and where it loses its last, so a request reads one word and
+    /// no shard of the model index. It goes up ahead of a model's first
+    /// worker and down behind its last: a read never falls under the models
+    /// the index holds.
     pub fn model_count(&self) -> usize {
-        self.model_index
-            .iter()
-            .filter(|entry| !entry.value().members().is_empty())
-            .count()
+        self.served_models.load(Ordering::Relaxed)
     }
 
     /// Whether at least one worker serves this name, as a canonical model ID
@@ -1037,12 +1066,7 @@ impl<G: Generation> WorkerRegistry<G> {
     /// `/v1/stats` and monitoring dashboards.
     pub fn stats(&self) -> WorkerRegistryStats {
         let total_workers = self.workers.len();
-        // Count models directly instead of allocating Vec via get_models() (lock-free)
-        let total_models = self
-            .model_index
-            .iter()
-            .filter(|entry| !entry.value().members().is_empty())
-            .count();
+        let total_models = self.model_count();
 
         let mut healthy_count = 0;
         let mut total_load = 0;
@@ -1287,8 +1311,10 @@ impl<G: Generation> WorkerRegistry<G> {
     /// worker on this node, so the worker must be published to the mesh and
     /// must not be deleted by a peer tombstone.
     ///
-    /// Used by `PUT /workers/{worker_id}`, which answers 202 and registers
-    /// later, so other writes for the same URL can land in between. Both
+    /// Used by a metadata update of `/workers/{worker_id}`, which answers 202
+    /// and registers later, so other writes for the same URL can land in
+    /// between (a `PUT` goes through
+    /// [`Self::replace_claiming_local_unless_draining`]). Both
     /// preconditions are checked under the per-worker mutation lock and the
     /// call returns `false` if either fails:
     ///
@@ -1308,7 +1334,33 @@ impl<G: Generation> WorkerRegistry<G> {
             worker_id,
             new_worker,
             Some(WorkerOrigin::Local),
-            Some(expected_revision),
+            Some(Expected {
+                revision: expected_revision,
+                refuse_draining: false,
+            }),
+            None,
+        )
+    }
+
+    /// [`Self::replace_claiming_local`] for `PUT /workers/{worker_id}`: it
+    /// also returns `false` when the worker reads `Draining`, checked under
+    /// the same lock. A removal's mark leaves the revision as it is, so a
+    /// `PUT` answered before the mark would otherwise write its replacement
+    /// onto a worker that is leaving.
+    pub fn replace_claiming_local_unless_draining(
+        &self,
+        worker_id: &WorkerId,
+        new_worker: Arc<dyn Worker>,
+        expected_revision: u64,
+    ) -> bool {
+        self.replace_inner(
+            worker_id,
+            new_worker,
+            Some(WorkerOrigin::Local),
+            Some(Expected {
+                revision: expected_revision,
+                refuse_draining: true,
+            }),
             None,
         )
     }
@@ -1325,13 +1377,15 @@ impl<G: Generation> WorkerRegistry<G> {
     /// the replacement, as a removal does for `remove_inner`; a replacement
     /// without a usable spec keeps an import built from one), and the record
     /// is written before the lock is released, so the compare and the write
-    /// are one step.
+    /// are one step. `expected` is what the caller asks of the worker it
+    /// replaces ([`Expected`]), tested under the same lock: a miss aborts
+    /// the replacement.
     fn replace_inner(
         &self,
         worker_id: &WorkerId,
         new_worker: Arc<dyn Worker>,
         promote_origin: Option<WorkerOrigin>,
-        expected_revision: Option<u64>,
+        expected: Option<Expected>,
         import: Option<ImportRecord>,
     ) -> bool {
         // Serialize concurrent replacements for the same worker ID.
@@ -1345,19 +1399,29 @@ impl<G: Generation> WorkerRegistry<G> {
 
         if let Some(record) = import {
             if !self.import_rebuild_wanted(worker_id, record) {
+                drop(_guard);
+                self.forget_lock_of_missing(worker_id, lock);
                 return false;
             }
         }
 
         let old_worker = match self.workers.get(worker_id) {
             Some(entry) => entry.clone(),
-            None => return false,
+            None => {
+                drop(_guard);
+                self.forget_lock_of_missing(worker_id, lock);
+                return false;
+            }
         };
 
         // Each replacement bumps the revision (see `inherit_shared_state_from`
         // below), so a caller that captured the revision before it started can
         // detect that another replacement landed first and give up.
-        if let Some(expected) = expected_revision {
+        if let Some(Expected {
+            revision: expected,
+            refuse_draining,
+        }) = expected
+        {
             let current = old_worker.revision();
             if current != expected {
                 tracing::warn!(
@@ -1366,6 +1430,15 @@ impl<G: Generation> WorkerRegistry<G> {
                     expected,
                     current,
                     "Aborting replacement: worker was replaced before the lock was acquired"
+                );
+                return false;
+            }
+            // Under the lock the removal's drain writes its mark under.
+            if refuse_draining && old_worker.status() == WorkerStatus::Draining {
+                tracing::warn!(
+                    worker_id = %worker_id.as_str(),
+                    worker_url = old_worker.redacted_url(),
+                    "Aborting replacement: a removal is draining the worker"
                 );
                 return false;
             }
@@ -1643,7 +1716,11 @@ impl<G: Generation> WorkerRegistry<G> {
 
         let _guard = lock.lock();
 
-        let worker = self.workers.get(worker_id)?.clone();
+        let Some(worker) = self.workers.get(worker_id).map(|entry| entry.clone()) else {
+            drop(_guard);
+            self.forget_lock_of_missing(worker_id, lock);
+            return None;
+        };
         if expected_revision.is_some_and(|revision| worker.revision() != revision) {
             return None;
         }
@@ -1723,14 +1800,45 @@ impl<G: Generation> WorkerRegistry<G> {
         let mut previous = Vec::with_capacity(holding.len());
         for model_id in &holding {
             if let Some(mut entry) = self.model_index.get_mut(model_id) {
-                let members = Arc::clone(entry.members());
-                previous.push(std::mem::replace(&mut *entry, Arc::new(G::of(members))));
+                previous.push(Self::published_again(&mut entry));
             }
         }
         drop(previous);
         let _order = self.global_membership_order.read();
         self.bump_global_routing_epoch();
         true
+    }
+
+    /// Publishes every model's snapshot again over the same list, with the
+    /// global one: what a host's value of a generation keeps beside its
+    /// lists starts anew, and the next request reads it again. No worker is
+    /// written and no list changes.
+    ///
+    /// For a host that changes what its values keep, with no membership
+    /// change at hand. The cost is the host's value built again for every
+    /// model a worker serves, so a host calls it at such a change of its
+    /// own and at no request. The generation without a member is built once
+    /// with the registry and is not published again.
+    ///
+    /// Emits no events.
+    pub fn publish_again(&self) {
+        // As in add_worker_to_model_index: a replaced snapshot drops after
+        // its shard guard, not under it.
+        let mut previous = Vec::with_capacity(self.model_index.len());
+        for mut entry in self.model_index.iter_mut() {
+            previous.push(Self::published_again(&mut entry));
+        }
+        drop(previous);
+        let _order = self.global_membership_order.read();
+        self.bump_global_routing_epoch();
+    }
+
+    /// One model's snapshot published again over the list it holds. Answers
+    /// the snapshot it replaced, for its caller to drop behind the shard
+    /// guard.
+    fn published_again(entry: &mut Arc<G>) -> Arc<G> {
+        let members = Arc::clone(entry.members());
+        std::mem::replace(entry, Arc::new(G::of(members)))
     }
 
     /// The models whose index entry holds `worker`, by its handle.
@@ -1889,6 +1997,8 @@ impl<G: Generation> WorkerRegistry<G> {
                 .get(worker_id)
                 .map(|entry| condition(entry.value()));
             if holds != Some(true) {
+                drop(_guard);
+                self.forget_lock_of_missing(worker_id, lock);
                 return None;
             }
         }
@@ -1899,6 +2009,8 @@ impl<G: Generation> WorkerRegistry<G> {
                     worker_id = %worker_id.as_str(),
                     "Aborting removal: worker origin changed before the lock was acquired"
                 );
+                drop(_guard);
+                self.forget_lock_of_missing(worker_id, lock);
                 return None;
             }
         }
@@ -1979,8 +2091,27 @@ impl<G: Generation> WorkerRegistry<G> {
 
             Some(worker)
         } else {
+            drop(_guard);
+            self.forget_lock_of_missing(worker_id, lock);
             None
         }
+    }
+
+    /// Gives up `lock`, the mutation lock of `worker_id` that a call has
+    /// released, and takes its entry out of the map when no worker stands
+    /// under the id and no other call holds it. Only the removal that finds
+    /// a worker drops its entry, so one a later call makes would stay.
+    fn forget_lock_of_missing(&self, worker_id: &WorkerId, lock: Arc<parking_lot::Mutex<()>>) {
+        // Dropped first: of several late calls the last one out then finds
+        // the map's reference alone.
+        drop(lock);
+        if self.workers.contains_key(worker_id) {
+            return;
+        }
+        // References are made under the map's entry lock only, so the map's
+        // alone means no call holds this lock or waits on it.
+        self.worker_mutation_locks
+            .remove_if(worker_id, |_, current| Arc::strong_count(current) == 1);
     }
 
     /// Remove a worker by URL.
@@ -2237,12 +2368,19 @@ impl<G: Generation> WorkerRegistry<G> {
                     .cloned()
                     .collect();
                 new_workers.push(worker.clone());
-                previous = Some(std::mem::replace(
-                    existing,
-                    Arc::new(G::of(Arc::from(new_workers.into_boxed_slice()))),
-                ));
+                let next = Arc::new(G::of(Arc::from(new_workers.into_boxed_slice())));
+                // An entry a removal emptied and has not evicted yet takes
+                // its first worker again.
+                if existing.members().is_empty() {
+                    self.served_models.fetch_add(1, Ordering::Relaxed);
+                }
+                previous = Some(std::mem::replace(existing, next));
             })
-            .or_insert_with(|| Arc::new(G::of(Arc::from(vec![worker].into_boxed_slice()))));
+            .or_insert_with(|| {
+                let first = Arc::new(G::of(Arc::from(vec![worker].into_boxed_slice())));
+                self.served_models.fetch_add(1, Ordering::Relaxed);
+                first
+            });
         drop(previous);
     }
 
@@ -2344,12 +2482,18 @@ impl<G: Generation> WorkerRegistry<G> {
                 .collect();
 
             if new_workers.is_empty() {
-                previous = Some(std::mem::replace(
+                let emptied = std::mem::replace(
                     &mut *entry,
                     Arc::new(G::of(Arc::from(
                         Vec::<Arc<dyn Worker>>::new().into_boxed_slice(),
                     ))),
-                ));
+                );
+                // The entry lost its last worker here, unless another
+                // removal emptied it already.
+                if !emptied.members().is_empty() {
+                    self.served_models.fetch_sub(1, Ordering::Relaxed);
+                }
+                previous = Some(emptied);
                 should_remove_entry = true;
             } else {
                 previous = Some(std::mem::replace(
@@ -2593,6 +2737,15 @@ impl<G: Generation> Default for WorkerRegistry<G> {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// What a replacement asks of the worker it replaces, tested under the
+/// worker's mutation lock.
+struct Expected {
+    /// The revision the caller read: it moves when another replacement lands.
+    revision: u64,
+    /// Whether a worker that reads `Draining` is refused too (a `PUT`).
+    refuse_draining: bool,
 }
 
 /// What a mesh import was last built from: its owner's publication

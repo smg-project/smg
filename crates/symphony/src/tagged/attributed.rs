@@ -59,7 +59,7 @@ use std::borrow::Cow;
 use super::object::{Mode, Object};
 use crate::{
     engine::part,
-    event::{runs, DropReason, Event, Events, MalformedReason, Text},
+    event::{runs, CallEnd, DropReason, Event, Events, MalformedReason, Text},
     json::named_arguments,
     markers::Scanner,
     tagged::{
@@ -178,6 +178,25 @@ impl Tags {
         block_per_call: false,
         typing: Typing::Declared,
         before_block: "\n",
+        tag_end: TagEnd::Angle,
+        indexed_calls: false,
+        structural_tokens: &[],
+        stuttered_marker: None,
+        json_arguments: false,
+    };
+    /// Step 3's: `<steptml:parameter name="…">` and `</steptml:parameter>`, the call's end the
+    /// invoke's closing tag with `<｜tool_call_end｜>` behind it, every tag of a call on one line,
+    /// nothing before the block; otherwise MiniMax M2's.
+    pub const STEPTML: Self = Self {
+        parameter_open: "<steptml:parameter name=\"",
+        parameter_close: "</steptml:parameter>",
+        invoke_close: "</steptml:invoke><｜tool_call_end｜>",
+        cdata: false,
+        value_on_its_own_line: false,
+        tags_on_their_own_lines: false,
+        block_per_call: false,
+        typing: Typing::Declared,
+        before_block: "",
         tag_end: TagEnd::Angle,
         indexed_calls: false,
         structural_tokens: &[],
@@ -531,6 +550,7 @@ impl Assembler {
         out.push(Event::ToolCallEnd {
             index: self.object.index,
             source: Text::uncounted(terminal.to_owned()),
+            ended: CallEnd::Closed,
         });
         self.done = true;
     }
@@ -1054,6 +1074,7 @@ impl Assembler {
         out.push(Event::ToolCallEnd {
             index: self.object.index,
             source: Text::uncounted(terminal.to_owned()),
+            ended: CallEnd::Closed,
         });
         self.done = true;
     }

@@ -1,0 +1,507 @@
+{
+  "recorded_from": "adf621bcfd7c1a7921435a008a58fc297eff6747",
+  "policy": "pair-runtime",
+  "rows": [
+    {
+      "name": "runtime-a-pair-on-one-known-runtime-goes-first",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": false,
+      "wire": "grpc",
+      "prefills": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null,
+          "runtime": "unknown"
+        },
+        {
+          "in_flight": 3,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null,
+          "runtime": "unknown"
+        },
+        {
+          "in_flight": 3,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              1,
+              1
+            ]
+          },
+          {
+            "pair": [
+              1,
+              1
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "runtime-the-known-prefill-at-its-bound-keeps-the-request",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": false,
+      "prefill_bound": 4,
+      "wire": "grpc",
+      "prefills": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null,
+          "runtime": "unknown"
+        },
+        {
+          "in_flight": 4,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null,
+          "runtime": "unknown"
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "none": {
+              "role": "prefill",
+              "why": "at_capacity"
+            }
+          },
+          {
+            "none": {
+              "role": "prefill",
+              "why": "at_capacity"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "runtime-the-known-prefill-not-ready-leaves-every-pair",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": false,
+      "wire": "grpc",
+      "prefills": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null,
+          "runtime": "unknown"
+        },
+        {
+          "in_flight": 0,
+          "state": "down",
+          "transport": null
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null,
+          "runtime": "unknown"
+        },
+        {
+          "in_flight": 3,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              0,
+              0
+            ]
+          },
+          {
+            "pair": [
+              0,
+              0
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "runtime-the-known-prefill-over-leaves-every-pair",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": false,
+      "wire": "grpc",
+      "prefills": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null,
+          "runtime": "unknown"
+        },
+        {
+          "in_flight": 0,
+          "state": "over",
+          "transport": null
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null,
+          "runtime": "unknown"
+        },
+        {
+          "in_flight": 3,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              0,
+              0
+            ]
+          },
+          {
+            "pair": [
+              0,
+              0
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "runtime-the-known-decode-not-ready-pairs-with-any-partner",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": false,
+      "wire": "grpc",
+      "prefills": [
+        {
+          "in_flight": 5,
+          "state": "free",
+          "transport": null,
+          "runtime": "unknown"
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null,
+          "runtime": "unknown"
+        },
+        {
+          "in_flight": 0,
+          "state": "down",
+          "transport": null
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              1,
+              0
+            ]
+          },
+          {
+            "pair": [
+              1,
+              0
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "runtime-every-decode-over-keeps-the-known-pair",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": false,
+      "wire": "grpc",
+      "prefills": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null,
+          "runtime": "unknown"
+        },
+        {
+          "in_flight": 3,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 0,
+          "state": "over",
+          "transport": null,
+          "runtime": "unknown"
+        },
+        {
+          "in_flight": 3,
+          "state": "over",
+          "transport": null
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              1,
+              1
+            ]
+          },
+          {
+            "pair": [
+              1,
+              1
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "runtime-every-decode-over-under-shedding",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": true,
+      "wire": "grpc",
+      "prefills": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null,
+          "runtime": "unknown"
+        },
+        {
+          "in_flight": 3,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 0,
+          "state": "over",
+          "transport": null,
+          "runtime": "unknown"
+        },
+        {
+          "in_flight": 3,
+          "state": "over",
+          "transport": null
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "none": {
+              "role": "decode",
+              "why": "overloaded"
+            }
+          },
+          {
+            "none": {
+              "role": "decode",
+              "why": "overloaded"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "runtime-every-prefill-over-pairs-by-load-with-any-partner",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": false,
+      "wire": "grpc",
+      "prefills": [
+        {
+          "in_flight": 5,
+          "state": "over",
+          "transport": null,
+          "runtime": "unknown"
+        },
+        {
+          "in_flight": 0,
+          "state": "over",
+          "transport": null
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null,
+          "runtime": "unknown"
+        },
+        {
+          "in_flight": 3,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              1,
+              0
+            ]
+          },
+          {
+            "pair": [
+              1,
+              0
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "runtime-two-known-runtimes-pair-apart",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": false,
+      "wire": "grpc",
+      "prefills": [
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null,
+          "runtime": "other"
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null,
+          "runtime": "other"
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              1,
+              0
+            ]
+          },
+          {
+            "pair": [
+              1,
+              0
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "runtime-a-known-prefill-with-no-partner-on-its-runtime-stands-behind",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": false,
+      "wire": "grpc",
+      "prefills": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null,
+          "runtime": "other"
+        },
+        {
+          "in_flight": 3,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null,
+          "runtime": "unknown"
+        },
+        {
+          "in_flight": 3,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              1,
+              1
+            ]
+          },
+          {
+            "pair": [
+              1,
+              1
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

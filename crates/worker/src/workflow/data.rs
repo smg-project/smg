@@ -161,7 +161,7 @@ pub struct WorkerRegistrationWorkflowData<H: WorkflowHost> {
     /// handshake, a step of the host's own writes what the host knows.
     pub discovered_labels: HashMap<String, String>,
     /// The worker's data-parallel shape. The DP read writes it, where the
-    /// host's settings turn that read on and the worker reports a shape.
+    /// worker reports a shape.
     pub dp_info: Option<DpInfo>,
     /// What the host's own steps keep on this registration between them
     /// (transient). No step of this crate reads or writes it.

@@ -1300,6 +1300,8 @@ class TestParseRouterArgs:
             "example.com/connector",
             "--kv-engine-id-annotation",
             "example.com/engine-id",
+            "--pairing-protocol-label",
+            "example.com/rollout",
         ]
         args_b = [
             "--service-discovery",
@@ -1314,6 +1316,8 @@ class TestParseRouterArgs:
             "example.com/connector",
             "--kv-engine-id-annotation",
             "example.com/engine-id",
+            "--pairing-protocol-label",
+            "example.com/rollout",
         ]
 
         for args in [args_a, args_b]:
@@ -1325,12 +1329,14 @@ class TestParseRouterArgs:
             assert router_args.service_discovery_namespace == "default"
             assert router_args.kv_connector_annotation == "example.com/connector"
             assert router_args.kv_engine_id_annotation == "example.com/engine-id"
+            assert router_args.pairing_protocol_label == "example.com/rollout"
 
         parser = argparse.ArgumentParser()
         RouterArgs.add_cli_args(parser)
         defaults = parser.parse_args([])
         assert defaults.kv_connector_annotation == RouterArgs.kv_connector_annotation
         assert defaults.kv_engine_id_annotation == RouterArgs.kv_engine_id_annotation
+        assert defaults.pairing_protocol_label == RouterArgs.pairing_protocol_label
 
     def test_repeated_list_flags_accumulate(self):
         """Repeated occurrences of list flags append, matching the Rust CLI."""
@@ -2071,8 +2077,8 @@ class TestParserFlag:
 
 class TestParserNames:
     """--tool-call-parser and --reasoning-parser take the legacy parsers' names, Symphony's tables'
-    names, and a name a table answers to that no legacy parser has, which a launcher passes for a
-    model family whose table has no older parser."""
+    names, and every name a table answers to: a legacy parser's of either kind, and one a
+    launcher passes for a model family whose table has no older parser."""
 
     def test_a_tables_name_without_a_legacy_parser_is_a_choice_of_both_flags(self):
         for choices in (get_available_tool_call_parsers(), get_available_reasoning_parsers()):
@@ -2080,9 +2086,13 @@ class TestParserNames:
             assert "muse" in choices
             assert "muse_spark" in choices
             assert "hf" in choices
-        # A legacy parser's name stays a choice of its own flag only.
+        # A legacy parser's name a table answers to is a choice of both flags; one no table
+        # answers to stays a choice of its own flag only.
         assert "qwen_xml" in get_available_tool_call_parsers()
-        assert "qwen_xml" not in get_available_reasoning_parsers()
+        assert "qwen_xml" in get_available_reasoning_parsers()
+        assert "minimax" in get_available_tool_call_parsers()
+        assert "pythonic" in get_available_tool_call_parsers()
+        assert "pythonic" not in get_available_reasoning_parsers()
         parser = argparse.ArgumentParser()
         RouterArgs.add_cli_args(parser)
         args = RouterArgs.from_cli_args(
@@ -2736,45 +2746,29 @@ class TestPdPairingMode:
         assert _rust_router_kwargs(pd_pairing_mode="strict")["pd_pairing_mode"] == "strict"
 
 
-class TestPolicyController:
+class TestGrandCentral:
     def test_the_switch_and_document_have_defaults(self):
         for args in (RouterArgs(), parse_router_args([])):
-            assert args.policy_controller == "off"
+            assert args.grand_central == "off"
             assert args.policy_spec is None
 
     @pytest.mark.parametrize("value", ["on", "off"])
     def test_the_switch_parses_each_choice(self, value):
-        assert parse_router_args(["--policy-controller", value]).policy_controller == value
-        assert _prefixed(["--router-policy-controller", value]).policy_controller == value
+        assert parse_router_args(["--grand-central", value]).grand_central == value
+        assert _prefixed(["--router-grand-central", value]).grand_central == value
 
     def test_an_unknown_switch_value_is_refused(self):
         with pytest.raises(SystemExit):
-            parse_router_args(["--policy-controller", "other"])
+            parse_router_args(["--grand-central", "other"])
 
     def test_the_document_path_survives_parsing(self):
         assert parse_router_args(["--policy-spec", "routing.yaml"]).policy_spec == "routing.yaml"
         assert _prefixed(["--router-policy-spec", "routing.yaml"]).policy_spec == "routing.yaml"
 
     def test_the_switch_and_document_reach_the_native_constructor(self):
-        keywords = _rust_router_kwargs(policy_controller="on", policy_spec="routing.yaml")
-        assert keywords["policy_controller"] == "on"
+        keywords = _rust_router_kwargs(grand_central="on", policy_spec="routing.yaml")
+        assert keywords["grand_central"] == "on"
         assert keywords["policy_spec"] == "routing.yaml"
-
-    @pytest.mark.parametrize(
-        ("field", "value"),
-        [
-            ("policy_controller_address", "controller:30100"),
-            ("policy_controller_tls_ca_cert", "ca.pem"),
-            ("policy_controller_tls_cert", "cert.pem"),
-            ("policy_controller_tls_key", "key.pem"),
-        ],
-    )
-    def test_a_controller_link_option_parses_and_reaches_the_native_constructor(self, field, value):
-        flag = field.replace("_", "-")
-        assert getattr(RouterArgs(), field) is None
-        assert getattr(parse_router_args([f"--{flag}", value]), field) == value
-        assert getattr(_prefixed([f"--router-{flag}", value]), field) == value
-        assert _rust_router_kwargs(**{field: value})[field] == value
 
     def test_an_omitted_policy_stays_unset_through_parsing_and_keyword_conversion(self):
         assert parse_router_args([]).policy is None
@@ -2814,7 +2808,7 @@ class TestPolicyController:
         ("flags", "policy"),
         [
             ([], "passthrough"),
-            (["--router-policy-controller", "on", "--router-policy-spec", "routing.yaml"], None),
+            (["--router-grand-central", "on", "--router-policy-spec", "routing.yaml"], None),
         ],
     )
     def test_single_worker_serve_preserves_the_policy_when_given_a_document(self, flags, policy):

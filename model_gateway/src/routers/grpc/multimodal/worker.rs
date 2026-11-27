@@ -13,14 +13,18 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use anyhow::Context;
 use llm_multimodal::{
     configure_parallelism, data_url::data_url_payload_bytes, jpeg_turbo::TurboJpegPolicy,
-    registry::modality_limit_override, vision::PreProcessorConfig, FrameSampling, MediaConnector,
-    MediaConnectorConfig, MediaConnectorError, MediaContentPart, MediaErrorCode, MediaFault,
-    Modality, ModelMetadata, ModelRegistry, MultiModalError, Parallelism, POOL_THREADS_ENV,
+    registry::modality_limit_override, vision::PreProcessorConfig, EncoderDtype, FrameSampling,
+    ImageDetail, MediaConnector, MediaConnectorConfig, MediaConnectorError, MediaContentPart,
+    MediaErrorCode, MediaFault, Modality, ModelMetadata, ModelRegistry, MultiModalError,
+    Parallelism, POOL_THREADS_ENV,
 };
 use llm_tokenizer::TokenizerTrait;
 use openai_protocol::worker::MmProcessingMode;
 use smg_grpc_client::{sglang_proto as sglang, vllm_proto as vllm, WorkerMediaFault};
-use smg_worker::{connection::http_client::build_with, identity::basic::RuntimeType};
+use smg_worker::{
+    connection::http_client::build_with,
+    identity::basic::{RuntimeType, WorkerType},
+};
 use tracing::{info, warn};
 
 use super::{
@@ -333,7 +337,26 @@ fn check_item_counts(
 pub struct WorkerMediaItem {
     pub modality: Modality,
     pub url: String,
+    pub detail: Option<ImageDetail>,
 }
+
+impl WorkerMediaItem {
+    /// Construct a plain item without per-item image detail overrides.
+    pub fn new(modality: Modality, url: String) -> Self {
+        Self {
+            modality,
+            url,
+            detail: None,
+        }
+    }
+}
+
+/// Expanded prompt, primary SGLang inputs and additional modality batches.
+pub type SglangMediaOutput = (
+    Vec<u32>,
+    sglang::MultimodalInputs,
+    Vec<sglang::MultimodalInputs>,
+);
 
 /// What the pipeline produced: the prompt with its anchors expanded, the
 /// request's multimodal batches (the first is `mm_inputs`, the rest
@@ -655,6 +678,9 @@ impl WorkerMediaPipeline {
             drain_fetches_on_error: true,
             inflight: None,
             video_frame_budget: settings.video_frame_budget,
+            // The worker processes its own requests' media: no router's
+            // mode applies.
+            pixels_go_to: WorkerType::Regular,
         };
         // Only processors with a pixel-less Decode metadata contract advertise reuse.
         let sglang_identity_key = if spec_name == "glm53_flash"
@@ -777,7 +803,12 @@ impl WorkerMediaPipeline {
         want_identity: bool,
     ) -> Result<WorkerMediaOutput, WorkerMediaError> {
         let output = self
-            .process_inputs(prompt_token_ids, items, RuntimeType::Vllm)
+            .process_inputs(
+                prompt_token_ids,
+                items,
+                RuntimeType::Vllm,
+                self.assembly.image_wire_dtype(),
+            )
             .await?;
         let data = assemble_vllm_batches_with(output.intermediate, &self.assembly)
             .map_err(classify_assembly)?;
@@ -803,16 +834,35 @@ impl WorkerMediaPipeline {
         &self,
         prompt_token_ids: Vec<u32>,
         items: Vec<WorkerMediaItem>,
-    ) -> Result<
-        (
-            Vec<u32>,
-            sglang::MultimodalInputs,
-            Vec<sglang::MultimodalInputs>,
-        ),
-        WorkerMediaError,
-    > {
+    ) -> Result<SglangMediaOutput, WorkerMediaError> {
+        self.process_sglang_with_wire_dtype(Some(prompt_token_ids), items, None)
+            .await
+    }
+
+    /// Preprocess single- or multi-modality items for Managed E using the visual
+    /// model dtype directly and resolving anchor tokens from the model spec.
+    pub async fn process_sglang_encoder_items(
+        &self,
+        items: Vec<WorkerMediaItem>,
+    ) -> Result<SglangMediaOutput, WorkerMediaError> {
+        self.process_sglang_with_wire_dtype(None, items, self.assembly.image_wire_dtype())
+            .await
+    }
+
+    /// Share SGLang assembly while applying a visual dtype only when explicitly supplied.
+    async fn process_sglang_with_wire_dtype(
+        &self,
+        prompt_token_ids: Option<Vec<u32>>,
+        items: Vec<WorkerMediaItem>,
+        image_wire_dtype: Option<EncoderDtype>,
+    ) -> Result<SglangMediaOutput, WorkerMediaError> {
         let output = self
-            .process_inputs(prompt_token_ids, items, RuntimeType::Sglang)
+            .process_inputs_inner(
+                prompt_token_ids,
+                items,
+                RuntimeType::Sglang,
+                image_wire_dtype,
+            )
             .await?;
         let dtype = self.assembly.encoder_dtype.clone();
         let span = tracing::Span::current();
@@ -832,6 +882,19 @@ impl WorkerMediaPipeline {
         prompt_token_ids: Vec<u32>,
         items: Vec<WorkerMediaItem>,
         runtime: RuntimeType,
+        image_wire_dtype: Option<EncoderDtype>,
+    ) -> Result<super::MultimodalOutput, WorkerMediaError> {
+        self.process_inputs_inner(Some(prompt_token_ids), items, runtime, image_wire_dtype)
+            .await
+    }
+
+    /// Shared fetch, placeholder synthesis/validation, and preprocessing core.
+    async fn process_inputs_inner(
+        &self,
+        prompt_token_ids: Option<Vec<u32>>,
+        items: Vec<WorkerMediaItem>,
+        runtime: RuntimeType,
+        image_wire_dtype: Option<EncoderDtype>,
     ) -> Result<super::MultimodalOutput, WorkerMediaError> {
         if items.is_empty() {
             return Err(WorkerMediaError::Invalid(
@@ -860,6 +923,10 @@ impl WorkerMediaPipeline {
         )
         .await
         .map_err(|error| WorkerMediaError::Invalid(format!("{error:#}")))?;
+        let prompt_token_ids = match prompt_token_ids {
+            Some(ids) => ids,
+            None => synthesize_anchor_token_ids(&plan, &placeholders, tokenizer)?,
+        };
         validate_rendered_media_anchors(&plan, &placeholders, tokenizer, &prompt_token_ids)
             .map_err(|error| WorkerMediaError::Invalid(format!("{error:#}")))?;
         // Follow the destination engine's image loader. SGLang drops alpha,
@@ -872,11 +939,7 @@ impl WorkerMediaPipeline {
             &self.components,
             CONFIG_KEY,
             &self.model_dir,
-            if runtime == RuntimeType::Vllm {
-                self.assembly.image_wire_dtype()
-            } else {
-                None
-            },
+            image_wire_dtype,
             // In-process: the tensors ride no gRPC message of this worker's
             // own; the framing of the hop that carries them answers.
             None,
@@ -921,7 +984,7 @@ impl WorkerMediaPipeline {
         Ok(match item.modality {
             Modality::Image => MediaContentPart::ImageUrl {
                 url: Arc::new(item.url),
-                detail: None,
+                detail: item.detail,
                 max_long_side_pixel: None,
                 uuid: None,
             },
@@ -938,6 +1001,46 @@ impl WorkerMediaPipeline {
             }
         })
     }
+}
+
+/// Synthesize one anchor token per media item in `plan` using the model spec's
+/// resolved placeholder tokens so Managed E does not depend on `hf_config` heuristics.
+fn synthesize_anchor_token_ids(
+    plan: &MediaPlan,
+    placeholders: &super::plan::PlaceholderTokens,
+    tokenizer: &dyn TokenizerTrait,
+) -> Result<Vec<u32>, WorkerMediaError> {
+    if placeholders.is_worker_only() {
+        return Err(WorkerMediaError::Invalid(
+            "managed encoder requires a registered multimodal model spec".to_string(),
+        ));
+    }
+    let mut token_ids = Vec::with_capacity(plan.parts().len());
+    for part in plan.parts() {
+        let modality = match part {
+            MediaContentPart::ImageUrl { .. }
+            | MediaContentPart::ImageBase64 { .. }
+            | MediaContentPart::ImageData { .. } => Modality::Image,
+            MediaContentPart::VideoUrl { .. } | MediaContentPart::VideoData { .. } => {
+                Modality::Video
+            }
+            _ => {
+                return Err(WorkerMediaError::Invalid(
+                    "managed encoder supports images and videos only".to_string(),
+                ))
+            }
+        };
+        let anchor = placeholders.get(modality).ok_or_else(|| {
+            WorkerMediaError::Invalid(format!("missing resolved {modality} placeholder token"))
+        })?;
+        let token_id = tokenizer.token_to_id(anchor).ok_or_else(|| {
+            WorkerMediaError::Invalid(format!(
+                "{modality} placeholder token '{anchor}' is missing from the tokenizer vocabulary"
+            ))
+        })?;
+        token_ids.push(token_id);
+    }
+    Ok(token_ids)
 }
 
 /// The model's configs with `kwargs` laid over each preprocessor config, or
@@ -991,7 +1094,8 @@ fn apply_processor_kwargs(
 /// fetch or decode failure is the media's, by the connector's own reading of
 /// it (the request's, or its host's for now) and under the connector's code
 /// (the verdict the router-side pipeline answers directly, see
-/// `multimodal::processing_failed_response`); a bad part or a prompt the
+/// `multimodal::processing_failed_response`); an image size the processor's
+/// rule refuses is the request's media too; a bad part or a prompt the
 /// anchors do not fit or an item above the engine's encoder budget the
 /// caller's; anything else ours.
 fn classify(error: anyhow::Error) -> WorkerMediaError {
@@ -1004,6 +1108,14 @@ fn classify(error: anyhow::Error) -> WorkerMediaError {
     }
     if let Some(fetch) = media_verdict(&error) {
         return classify_fetch(fetch, message);
+    }
+    // The request's media, as a decoder's refusal of it is.
+    if super::process::ImageSizeRefused::is(&error) {
+        return WorkerMediaError::Media {
+            fault: WorkerMediaFault::Client,
+            code: MediaErrorCode::InvalidRequest,
+            message,
+        };
     }
     match error
         .chain()
@@ -1095,13 +1207,7 @@ mod tests {
     }
 
     fn image_items(count: usize) -> Vec<WorkerMediaItem> {
-        vec![
-            WorkerMediaItem {
-                modality: Modality::Image,
-                url: "data:image/png;base64,AAAA".to_string(),
-            };
-            count
-        ]
+        vec![WorkerMediaItem::new(Modality::Image, "data:image/png;base64,AAAA".to_string()); count]
     }
 
     /// The settings every pipeline test starts from: a model at `model_dir`
@@ -1203,13 +1309,11 @@ mod tests {
         );
         assert!(check_item_counts(&image_items(1), &limits).is_ok());
         // A modality without a limit here is the spec's to validate.
-        let videos = vec![
-            WorkerMediaItem {
-                modality: Modality::Video,
-                url: "data:video/mp4;base64,AAAA".to_string(),
-            };
-            3
-        ];
+        let videos =
+            vec![
+                WorkerMediaItem::new(Modality::Video, "data:video/mp4;base64,AAAA".to_string());
+                3
+            ];
         assert!(check_item_counts(&videos, &limits).is_ok());
     }
 
@@ -1293,10 +1397,7 @@ mod tests {
             ..pipeline_settings(&path)
         };
         let tokenizer = || Arc::new(MockTokenizer::new().with_tokens(&[("<image>", 32000)]));
-        let items = [WorkerMediaItem {
-            modality: Modality::Image,
-            url: PIXEL.to_string(),
-        }];
+        let items = [WorkerMediaItem::new(Modality::Image, PIXEL.to_string())];
 
         let pipeline = WorkerMediaPipeline::new(settings(Some(575)), tokenizer())
             .await
@@ -1431,13 +1532,13 @@ mod tests {
         image::DynamicImage::ImageRgb8(image::RgbImage::new(56, 56))
             .write_to(&mut png, image::ImageFormat::Png)
             .unwrap();
-        WorkerMediaItem {
-            modality: Modality::Image,
-            url: format!(
+        WorkerMediaItem::new(
+            Modality::Image,
+            format!(
                 "data:image/png;base64,{}",
                 STANDARD.encode(png.into_inner())
             ),
-        }
+        )
     }
 
     /// The one-second test clip as a video item.
@@ -1447,10 +1548,10 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../crates/multimodal/tests/fixtures/videos/testsrc_128x96_8fps_1s.mp4"
         ));
-        WorkerMediaItem {
-            modality: Modality::Video,
-            url: format!("data:video/mp4;base64,{}", STANDARD.encode(video)),
-        }
+        WorkerMediaItem::new(
+            Modality::Video,
+            format!("data:video/mp4;base64,{}", STANDARD.encode(video)),
+        )
     }
 
     #[tokio::test]
@@ -1473,13 +1574,13 @@ mod tests {
         image::DynamicImage::ImageRgb8(image)
             .write_to(&mut bytes, image::ImageFormat::Png)
             .unwrap();
-        let items = [WorkerMediaItem {
-            modality: Modality::Image,
-            url: format!(
+        let items = [WorkerMediaItem::new(
+            Modality::Image,
+            format!(
                 "data:image/png;base64,{}",
                 STANDARD.encode(bytes.into_inner())
             ),
-        }];
+        )];
         let (float_tokens, float, _) = pipeline
             .process_sglang(vec![1, 32000, 2], items.to_vec())
             .await
@@ -1597,7 +1698,7 @@ mod tests {
                 .await
                 .unwrap();
             let expected = pipeline
-                .process_inputs(prompt, items.to_vec(), RuntimeType::Sglang)
+                .process_inputs(prompt, items.to_vec(), RuntimeType::Sglang, None)
                 .await
                 .unwrap();
             assert_eq!(tokens, expected.expanded_token_ids);
@@ -1858,22 +1959,22 @@ mod tests {
         ]));
         let pipeline = WorkerMediaPipeline::new(settings, tokenizer).await.unwrap();
         for (width, height, tokens, router_tokens) in [
-            (1000, 1000, 1296, 1296),
-            (2200, 100, 216, 72),
-            (1000, 50, 320, 320),
-            (224, 112, 32, 32),
+            (1000, 1000, 1296, 1225),
+            (2200, 100, 288, 70),
+            (1000, 50, 288, 70),
+            (224, 112, 72, 72),
         ] {
             let mut bytes = std::io::Cursor::new(Vec::new());
             image::DynamicImage::new_rgb8(width, height)
                 .write_to(&mut bytes, image::ImageFormat::Png)
                 .unwrap();
-            let item = WorkerMediaItem {
-                modality: Modality::Image,
-                url: format!(
+            let item = WorkerMediaItem::new(
+                Modality::Image,
+                format!(
                     "data:image/png;base64,{}",
                     STANDARD.encode(bytes.into_inner())
                 ),
-            };
+            );
             let output = pipeline
                 .process(vec![1, 32000, 2], vec![item.clone()], false)
                 .await
@@ -1954,10 +2055,7 @@ mod tests {
             "data:image/png;base64,AAAAAAAA",
             "DATA:image/png;base64,AAAAAAAA",
         ] {
-            let items = [WorkerMediaItem {
-                modality: Modality::Image,
-                url: url.to_string(),
-            }];
+            let items = [WorkerMediaItem::new(Modality::Image, url.to_string())];
             let error = pipeline
                 .process(vec![1, 2, 3], items.to_vec(), false)
                 .await
@@ -2082,6 +2180,17 @@ mod tests {
                 if message.contains("192001 feature tokens (900 sampled frames)")
                     && message.contains("192000-token encoder budget")
         ));
+        // A size the processor's rule refuses is the request's media.
+        let size = anyhow::Error::new(super::super::process::ImageSizeRefused("thin".into()))
+            .context("Failed to process the plan");
+        assert!(matches!(
+            classify(size),
+            WorkerMediaError::Media {
+                fault: WorkerMediaFault::Client,
+                code: MediaErrorCode::InvalidRequest,
+                ..
+            }
+        ));
     }
     /// SGLang follows its day-0 source geometry and advertises pixel-less Decode reuse.
     #[tokio::test]
@@ -2144,13 +2253,13 @@ mod tests {
             image::DynamicImage::new_rgb8(width, height)
                 .write_to(&mut bytes, image::ImageFormat::Png)
                 .unwrap();
-            let item = WorkerMediaItem {
-                modality: Modality::Image,
-                url: format!(
+            let item = WorkerMediaItem::new(
+                Modality::Image,
+                format!(
                     "data:image/png;base64,{}",
                     STANDARD.encode(bytes.into_inner())
                 ),
-            };
+            );
             let (ids, mm, _) = pipeline
                 .process_sglang(vec![1, 32000, 2], vec![item])
                 .await

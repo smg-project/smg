@@ -107,6 +107,7 @@ pub struct GenerateRequest {
 
     /// Session parameters for continual prompting
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(serialize_with = "crate::common::serialize_with_sorted_keys")]
     pub session_params: Option<HashMap<String, Value>>,
 
     /// Path to LoRA adapter(s) for model customization
@@ -165,6 +166,7 @@ pub struct GenerateRequest {
 
     /// Custom metric labels
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(serialize_with = "crate::common::serialize_with_sorted_keys")]
     pub custom_labels: Option<HashMap<String, String>>,
 
     /// Whether to return bytes for image generation
@@ -303,6 +305,12 @@ impl GenerateRequest {
 impl GenerationRequest for GenerateRequest {
     fn rid(&self) -> Option<&str> {
         self.rid.as_deref()
+    }
+
+    fn max_output_tokens(&self) -> Option<u32> {
+        self.sampling_params
+            .as_ref()
+            .and_then(|params| params.max_new_tokens)
     }
 
     fn is_stream(&self) -> bool {
@@ -581,7 +589,7 @@ mod tests {
     }
 
     /// The rules of `sampling_params` run on the request as the chat route's
-    /// run on its fields, with the chat route's lower bound on `n`, and an
+    /// run on its fields, with the chat route's bounds on `n`, and an
     /// empty `input_ids` is refused as the chat route refuses an empty
     /// `messages`; a request within the rules passes.
     #[test]
@@ -594,7 +602,7 @@ mod tests {
         let within = request(serde_json::json!({
             "model": "m",
             "text": "hi",
-            "sampling_params": {"temperature": 0.5, "top_p": 0.9, "n": 1, "max_new_tokens": 4}
+            "sampling_params": {"temperature": 0.5, "top_p": 0.9, "n": 128, "max_new_tokens": 4}
         }));
         assert!(
             within.validate().is_ok(),
@@ -605,6 +613,7 @@ mod tests {
             ("temperature", serde_json::json!(-1), "range"),
             ("top_p", serde_json::json!(2), "decimal_above_max_value"),
             ("n", serde_json::json!(0), "range"),
+            ("n", serde_json::json!(129), "range"),
         ] {
             let refused = request(serde_json::json!({
                 "model": "m",

@@ -427,7 +427,7 @@ jobs:
 
       # The example policy plugin, built with the line a user runs (its
       # build.sh: the bare wasm32 target of the pinned toolchain, then one
-      # wasm-tools command, here the pinned release). The policy crate's
+      # wasm-tools command, here the pinned release). The Grand Central crate's
       # tests load the component that line wrote. The guest is a workspace
       # of its own, which the repository's fmt and clippy do not reach, so
       # the copy a user starts from is checked here: the repository's
@@ -441,11 +441,11 @@ jobs:
           # build.sh adds a missing target by one attempt; added here first,
           # behind the retry helper, it is not missing.
           bash scripts/ci_retry.sh 5 10 timeout 180 rustup target add wasm32-unknown-unknown
-          # The policy crate's `operator` feature builds for a target that has
+          # The Grand Central crate's `operator` feature builds for a target that has
           # no spec store: the store's file calls are Linux's and macOS's, and a
           # host's door elsewhere has no store to bind. This target stands for
           # every such one, since it is installed here already.
-          cargo check --locked -p smg-policy-controller --no-default-features --features operator --target wasm32-unknown-unknown
+          cargo check --locked -p smg-grand-central --no-default-features --features operator --target wasm32-unknown-unknown
           bash examples/wasm/wasm-guest-policy/build.sh
           cd examples/wasm/wasm-guest-policy
           bash "$GITHUB_WORKSPACE/scripts/ci_retry.sh" 5 10 timeout 180 rustup toolchain install nightly --profile minimal --component rustfmt
@@ -462,8 +462,8 @@ jobs:
         id: vision-golden
         continue-on-error: true
         run: |
-          python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install "transformers==5.20.2" pillow numpy scipy
+          python -m pip install "torch==2.15.0" "torchvision==0.29.2" --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install "transformers==5.20.2" "pillow==13.0.0" "numpy==2.5.4" "scipy==1.18.1"
           python crates/multimodal/scripts/generate_vision_golden.py --strict
 
       - name: Create isolated Postgres test database
@@ -526,7 +526,7 @@ jobs:
         timeout-minutes: 20
         run: |
           source "$HOME/.cargo/env"
-          bash examples/policy-controller/own-repository.sh "${RUNNER_TEMP}/own-controller" --snapshot
+          bash examples/grand-central/own-repository.sh "${RUNNER_TEMP}/own-controller" --snapshot
           cd "${RUNNER_TEMP}/own-controller"
           cargo test
 
@@ -889,6 +889,7 @@ jobs:
               - 'bindings/python/src/**'
               - 'bindings/golang/Cargo.toml'
               - 'bindings/golang/src/**'
+              - 'bindings/golang/tests/**/*.rs'
               - 'clients/rust/**'
               - 'clients/openapi-gen/**'
               - '.cargo/**'
@@ -904,7 +905,7 @@ jobs:
               - 'scripts/ci_rust_tests.sh'
               - 'examples/wasm/wasm-guest-storage-hook/**'
               - 'examples/wasm/wasm-guest-storage-hook-passthrough/**'
-              - 'examples/policy-controller/**'
+              - 'examples/grand-central/**'
             # --- The Rust test shards (scripts/ci_rust_tests.sh) ---
             # A shard of rust-tests runs on a pull request that touches a crate
             # of its dependency closure (the directories below: every
@@ -942,6 +943,7 @@ jobs:
               - 'clients/openapi-gen/**'
               - 'bindings/python/src/**/*.rs'
               - 'bindings/golang/src/**/*.rs'
+              - 'bindings/golang/tests/**/*.rs'
               - 'clients/**/*.rs'
               - 'examples/**/*.rs'
               - 'deploy/helm/smg/templates/grafana-dashboard.yaml'
@@ -1013,13 +1015,13 @@ jobs:
               - 'crates/kv_index/**'
               - 'crates/mesh/**'
               - 'crates/mm_rdma/**'
-              - 'crates/policy_controller/**'
+              - 'crates/grand_central/**'
               # The controller runs worker discovery behind its `discovery` feature.
               - 'crates/service_discovery/**'
               # The controller binary's allocator settings are held to the
               # gateway's constant, which the crate's test reads from this file.
               - 'model_gateway/src/observability/metrics.rs'
-              - 'examples/policy-controller/**'
+              - 'examples/grand-central/**'
               - 'examples/wasm/wasm-guest-policy/**'
               - 'scripts/ci_install_wasm_tools.sh'
               - 'crates/radix_tree/**'
@@ -1331,9 +1333,9 @@ jobs:
               ("crates/mock_worker/**",                          NONE),
               ("crates/gateway_perf/**",                         NONE),
               ("crates/radix_tree/**",                           NONE),
-              # the policy controller crate: linked by no binary yet (its gateway host is
+              # the Grand Central crate: linked by no binary yet (its gateway host is
               # a later change, which moves this row to the core)
-              ("crates/policy_controller/**",                    NONE),
+              ("crates/grand_central/**",                        NONE),
               ("crates/tokenizer/**",                            "go-bindings"),
               # Symphony and the response templates it compiles: the default
               # parser, read on every lane's chat, messages and responses path
@@ -1709,11 +1711,12 @@ jobs:
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
       && needs.detect-changes.outputs.skip-chat-completions != 'true'
-    # The 1-GPU ZMQ suite with grouped workers: each ZMQ worker launches two
-    # DP engines on one socket set (tp=1 models, one GPU per engine), so the
-    # gateway's handshake, the connector's least-loaded selection, and
-    # per-rank output attribution all run against a real dp=2 group. The wave
-    # protocol is vLLM-only (TokenSpeed ranks run independently).
+    # The 1-GPU ZMQ suite with an engine count of two: each ZMQ worker launches
+    # two DP engines on one socket set (tp=1 models, one GPU per engine), and
+    # the gateway registers one worker per engine. So the gateway's handshake,
+    # the routing policy's pick of a rank, the rank pin and per-rank output
+    # attribution all run against a real dp=2 group. The wave protocol is
+    # vLLM-only (TokenSpeed ranks run independently).
     strategy:
       fail-fast: false
       matrix:

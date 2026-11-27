@@ -38,7 +38,7 @@ use crate::{
         resilience::ResolvedResilience,
     },
     identity::error::{WorkerError, WorkerResult},
-    metrics::writers::Metrics,
+    metrics::writers::{Metrics, WorkerHandles},
     model_card::ModelCard,
     pd::pairing::PdPairing,
     registry::event::{WorkerConnected, WorkerSignal},
@@ -101,6 +101,20 @@ fn context_length_from(models: &WorkerModels, model_id: &str) -> Option<u32> {
 /// (`Worker::max_running_requests`) prefers them.
 pub const WINDOW_LABELS: [&str; 2] = ["max_num_seqs", "max_running_requests"];
 
+/// The running window `labels` name. Whoever builds a worker's metadata
+/// reads it here once, into [`WorkerMetadata::running_window`].
+pub fn running_window(labels: &HashMap<String, String>) -> Option<u16> {
+    WINDOW_LABELS
+        .iter()
+        .find_map(|key| labels.get(*key))
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        // A figure wider than the count (an explicit flag above 65535 on
+        // a large engine) saturates: a window that wide is the widest the
+        // gate and the capacity sum can use, not no window at all.
+        .map(|n| u16::try_from(n).unwrap_or(u16::MAX))
+}
+
 /// The labels that name a model's context window (one spelling per engine
 /// family's model info), in the order the card's read
 /// (`create_worker::card_from_labels`) prefers them.
@@ -143,8 +157,13 @@ pub fn merge_labels(
 }
 
 /// Core worker abstraction that represents a backend service
+///
+/// [`Any`] is a supertrait: a caller that must know the concrete type of a
+/// worker asks the object itself (`let object: &dyn Any = worker;`), where
+/// [`Worker::as_any`] is each implementation's own answer. Every `'static`
+/// type is [`Any`], so an implementation writes nothing for it.
 #[async_trait]
-pub trait Worker: Send + Sync + fmt::Debug + 'static {
+pub trait Worker: Any + Send + Sync + fmt::Debug + 'static {
     /// Downcast support for same-URL replace state sharing.
     fn as_any(&self) -> &dyn Any;
 
@@ -381,10 +400,11 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
 
     /// Worker-reported in-flight capacity, if available.
     ///
-    /// Reads the running-window label populated by the metadata discovery
-    /// pipeline (Step 4 of the worker lifecycle). Returns `None` when the
-    /// worker hasn't reported a value or reports zero (zero is meaningless
-    /// for capacity accounting).
+    /// Reads the window parsed once at construction from the running-window
+    /// label ([`WorkerMetadata::running_window`]), which the metadata
+    /// discovery pipeline populates (Step 4 of the worker lifecycle).
+    /// Returns `None` when the worker hasn't reported a value or reports
+    /// zero (zero is meaningless for capacity accounting).
     ///
     /// Engines spell the same window two ways, `max_num_seqs` and
     /// `max_running_requests`, and both are the count of requests the
@@ -400,16 +420,7 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// estimate otherwise. The PD admission gate uses it as the decode
     /// side's admission bound.
     fn max_running_requests(&self) -> Option<u16> {
-        let labels = &self.metadata().spec.labels;
-        WINDOW_LABELS
-            .iter()
-            .find_map(|key| labels.get(*key))
-            .and_then(|s| s.parse::<u64>().ok())
-            .filter(|n| *n > 0)
-            // A figure wider than the count (an explicit flag above 65535 on
-            // a large engine) saturates: a window that wide is the widest the
-            // gate and the capacity sum can use, not no window at all.
-            .map(|n| u16::try_from(n).unwrap_or(u16::MAX))
+        self.metadata().running_window
     }
 
     /// Whether this worker can serve the Realtime API (WS/WebRTC/REST
@@ -465,6 +476,13 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// dropped and come back (a registration): the current pair of state and
     /// reason is set whether or not it was the one published before.
     fn republish_state(&self) {}
+
+    /// The handles this worker's request and engine-load records go
+    /// through. A worker that holds none answers `None`, and each of its
+    /// records builds its key.
+    fn metric_handles(&self) -> Option<&WorkerHandles> {
+        None
+    }
 
     /// Whether the absolute overload guard currently vetoes this worker.
     ///
@@ -601,6 +619,23 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
             overloaded: self.is_overloaded(),
             stalled: self.stall_reason().is_some(),
         }
+    }
+
+    /// Whether the routing state this worker published last says that no
+    /// routing veto holds: the one case [`Self::routing_state`] answers
+    /// without a read of the worker's facts. Every write that changes a
+    /// published state moves the process's word
+    /// ([`published_word`](crate::runtime::published_word)), so a caller
+    /// that read the word before it asked, and reads the same value later,
+    /// knows the answer still stands.
+    ///
+    /// `false` for a worker that publishes no routing state, the default:
+    /// what such a worker says is read from its facts at every decision.
+    /// A worker type that answers `true` moves the process's word at every
+    /// change of this answer, behind the change: a caller keeps a `true`
+    /// for as long as the word stands.
+    fn published_available(&self) -> bool {
+        false
     }
 
     /// Record the outcome of a request based on the HTTP status code.
@@ -1051,6 +1086,9 @@ pub struct BasicWorker {
     /// Request-completion observer, installed by the policy registry; shared
     /// by clones so a DP-rank view reports to the same sink.
     pub completion_sink: Arc<std::sync::RwLock<Option<Arc<dyn RequestCompletionSink>>>>,
+    /// The handles of the series this worker writes for its requests and
+    /// its engine load; shared by clones, which write the same series.
+    pub metric_handles: Arc<WorkerHandles>,
 }
 
 impl Clone for BasicWorker {
@@ -1058,6 +1096,7 @@ impl Clone for BasicWorker {
         Self {
             metadata: self.metadata.clone(),
             completion_sink: Arc::clone(&self.completion_sink),
+            metric_handles: Arc::clone(&self.metric_handles),
             runtime: ArcSwap::from(self.runtime.load_full()),
             circuit_breaker: ArcSwap::from(self.circuit_breaker.load_full()),
             engine_connection: Arc::clone(&self.engine_connection),
@@ -1106,7 +1145,7 @@ impl BasicWorker {
 
     fn update_running_requests_metrics(&self) {
         let load = self.load();
-        Metrics::set_worker_requests_active(self.url(), load);
+        Metrics::set_worker_requests_active(&self.metric_handles, load);
     }
 
     fn shared_runtime(&self) -> Arc<WorkerRuntime> {
@@ -1486,6 +1525,10 @@ impl Worker for BasicWorker {
         self
     }
 
+    fn metric_handles(&self) -> Option<&WorkerHandles> {
+        Some(&self.metric_handles)
+    }
+
     fn url(&self) -> &str {
         &self.metadata.spec.url
     }
@@ -1830,6 +1873,10 @@ impl Worker for BasicWorker {
             overloaded: rt.is_overloaded(),
             stalled: rt.stall_reason().is_some(),
         }
+    }
+
+    fn published_available(&self) -> bool {
+        self.runtime.load().published_state() == AVAILABLE_CODE
     }
 
     fn record_circuit_breaker_outcome(&self, success: bool) {

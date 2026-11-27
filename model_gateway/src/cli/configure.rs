@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 use rand::{distr::Alphanumeric, RngExt};
 use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role};
+use smg_grand_central::stages::StageRegistry;
 use smg_mesh::{MTLSConfig, MeshServerConfig};
 use smg_service_discovery::RuntimeDiscoveryConfig;
 use smg_worker::identity::{
@@ -38,7 +39,6 @@ use crate::{
     mesh::discovery::MeshDiscoveryConfig,
     observability::metrics::PrometheusConfig,
     policies::cost::DEFAULT_POLICY as DEFAULT_SELECTION_POLICY,
-    policy_controller,
     secrets::SecretFiles,
     server::{
         posture::{SecretSource, SecretSources},
@@ -972,6 +972,7 @@ impl CliArgs {
                     worker_ports_annotation: "smg.ai/worker-ports".to_string(),
                     kv_connector_annotation: self.discovery.kv_connector_annotation.clone(),
                     kv_engine_id_annotation: self.discovery.kv_engine_id_annotation.clone(),
+                    pairing_protocol_label: self.discovery.pairing_protocol_label.clone(),
                     router_selector: Self::parse_label_selector(&self.discovery.router_selector),
                     router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
                     model_id_source: self.discovery.model_id_from.clone(),
@@ -1119,12 +1120,15 @@ impl CliArgs {
     /// The routing part of the configuration: what a policy document reads,
     /// the multi-router mode with it, and what the validator's routing rules
     /// read beside it (the workers' discovery and the data-parallel
-    /// setting). A start's assembly builds on it and `--print-policy-spec`
-    /// converts it alone, so the two read one routing part. No file is read
-    /// here.
+    /// setting). The connection mode belongs to it: the worker urls decide
+    /// it, and a pair's document follows it. A start's assembly builds on
+    /// the routing part and `--print-policy-spec` converts it alone, so the
+    /// two read one routing part. No file is read here.
     fn routing_part(&self, mode: RoutingMode) -> ConfigResult<RouterConfigBuilder> {
+        let connection_mode = Self::determine_connection_mode(&Self::startup_worker_urls(&mode));
         Ok(RouterConfig::builder()
             .mode(mode)
+            .connection_mode(connection_mode)
             .policy(self.routing_policy())
             .cache_boundaries(self.routing.cache_boundaries.clone())
             .maybe_discovery(self.discovery_config()?)
@@ -1163,31 +1167,16 @@ impl CliArgs {
     }
 
     /// The router configuration of the flags. A refusal is raised in this
-    /// order: flag shapes, controller and worker sources, discovery flags,
-    /// the schema file, tenant keys, the history store, model aliases, and
-    /// the shared validator over the built configuration.
+    /// order: the flag shapes, the discovery flags, the schema file, the
+    /// tenant keys, the history store, the model aliases, and last the
+    /// shared validator over the built configuration, which the builder
+    /// runs.
     pub(crate) fn to_router_config(
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
         encode_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
         self.validate_flag_formats()?;
-        if self.routing.policy_controller_address.is_some() {
-            if !self.routing.worker_urls.is_empty()
-                || !encode_urls.is_empty()
-                || !prefill_urls.is_empty()
-                || !self.workers.decode.is_empty()
-            {
-                return Err(ConfigError::IncompatibleConfig {
-                    reason: "--policy-controller-address supplies the workers and conflicts with --worker-urls, --encode, --prefill and --decode".to_owned(),
-                });
-            }
-            if self.selected_discovery_provider().is_some() {
-                return Err(ConfigError::IncompatibleConfig {
-                    reason: "--policy-controller-address supplies the workers and conflicts with --service-discovery and --discovery-provider".to_owned(),
-                });
-            }
-        }
         self.warn_ignored_companions(&prefill_urls, &encode_urls);
 
         let mode = self.routing_mode(prefill_urls, encode_urls);
@@ -1225,7 +1214,6 @@ impl CliArgs {
         let model_aliases = Self::model_aliases(&self.discovery.model_alias)?;
 
         let builder = routing
-            .connection_mode(connection_mode)
             .startup_worker_runtime_type(startup_worker_runtime_type)
             .zmq_engine_count(self.routing.zmq_engine_count)
             .zmq_startup_timeout_secs(self.routing.zmq_startup_timeout_secs)
@@ -1254,6 +1242,7 @@ impl CliArgs {
             .job_queue_capacity(self.routing.job_queue_capacity)
             .job_queue_concurrency(self.routing.job_queue_concurrency)
             .load_monitor_interval_secs(self.workers.load_monitor_interval)
+            .load_monitor_interval_ms(self.workers.load_monitor_interval_ms)
             .worker_stall_secs(self.workers.worker_stall_secs)
             .worker_wedge_secs(self.workers.worker_wedge_secs)
             .worker_stale_secs(self.workers.worker_stale_secs)
@@ -1364,7 +1353,7 @@ impl CliArgs {
             .maybe_reasoning_parser(self.model.reasoning_parser.as_ref())
             .maybe_tool_call_parser(self.model.tool_call_parser.as_ref())
             .maybe_mcp_config_path(self.model.mcp_config_path.as_ref())
-            .policy_controller(self.routing.policy_controller == "on")
+            .grand_central(self.routing.grand_central == "on")
             .maybe_policy_spec_path(self.routing.policy_spec.as_ref())
             .retries(!self.serving.disable_retries)
             .upstream_http2(self.routing.upstream_http2)
@@ -1386,15 +1375,7 @@ impl CliArgs {
                 self.integrations.tls_key_path.as_ref(),
             );
 
-        let config = RouterConfig {
-            policy_controller_address: self.routing.policy_controller_address.clone(),
-            policy_controller_tls_ca_cert: self.routing.policy_controller_tls_ca_cert.clone(),
-            policy_controller_tls_cert: self.routing.policy_controller_tls_cert.clone(),
-            policy_controller_tls_key: self.routing.policy_controller_tls_key.clone(),
-            ..builder.build_with_validation(false)?
-        };
-        config.validate()?;
-        Ok(config)
+        builder.build()
     }
 
     /// Combine validated router settings with listener, discovery, and authentication flags.
@@ -1552,10 +1533,11 @@ impl CliArgs {
         lines
     }
 
-    /// Phase 3, configure: assemble the validated router configuration and
-    /// wrap it in the server configuration. A refusal names the flag before
-    /// any listener binds or task starts. Startup also validates configurations
-    /// built by library callers.
+    /// Phase 3, configure: the router configuration, validated once by the
+    /// builder's `build()`, wrapped in the server configuration. Every
+    /// refusal is a [`ConfigError`] naming the flag; nothing has been bound
+    /// or spawned when one is raised. (`startup` validates once more, for a
+    /// library caller that never went through the builder.)
     pub(crate) fn configure(
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
@@ -1582,10 +1564,14 @@ impl CliArgs {
     }
 
     /// The answer of `--print-policy-spec`: the policy document this command
-    /// line means, as YAML, checked by the function a start hands its own
-    /// document to ([`policy_controller::hosted`]): the operators' door over
-    /// the stock stages. The routing part of the line is read alone
-    /// ([`Self::routing_config`]). Nothing is bound or spawned.
+    /// line means, as YAML, checked as the gateway checks a document it
+    /// hosts ([`RouterConfig::hosted_policy`]), over the stock stages. The
+    /// document is the one the routing flags mean, which names stock
+    /// stages alone: a supplied document is refused beside the print. A
+    /// host's table holds every stock stage beside the host's own, so it
+    /// answers this document as the stock table does. The routing part of
+    /// the line is read alone ([`Self::routing_config`]). Nothing is bound
+    /// or spawned.
     pub(crate) fn policy_spec_print(
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
@@ -1605,7 +1591,7 @@ impl CliArgs {
         };
         // A document this gateway's check refuses is still the one the flags
         // mean: it prints, with the check's word for what it refuses.
-        match policy_controller::hosted(&config, None, &yaml) {
+        match config.hosted_policy(&document, &StageRegistry::builtin()) {
             Ok(_) => PolicySpecPrint::Document(yaml),
             Err(refusal) => PolicySpecPrint::DocumentRefused {
                 document: yaml,

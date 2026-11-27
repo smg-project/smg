@@ -35,6 +35,7 @@ pub mod upstream_body;
 pub mod worker;
 
 #[cfg(test)]
+#[path = "../tests/unit/test_support.rs"]
 pub(crate) mod test_support;
 
 pub use context::ExternalContext;

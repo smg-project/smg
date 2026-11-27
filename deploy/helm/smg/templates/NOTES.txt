@@ -3,17 +3,17 @@
 Router:
   Endpoint: http://{{ $fullname }}-router:{{ .Values.router.service.port }}
   Metrics:  http://{{ $fullname }}-router:{{ .Values.router.metrics.port }}/metrics
-  Policy:   {{ include "smg.routerPolicyArg" . | default "the policy document" }}
+  Policy:   {{ .Values.router.policy }}
 
-{{- if (.Values.policyController).enabled }}
+{{- if (.Values.grandCentral).enabled }}
 
-Policy controller:
-  gRPC:     {{ $fullname }}-policy-controller:{{ .Values.policyController.ports.gateway }}
-  Metrics:  http://{{ $fullname }}-policy-controller:{{ .Values.policyController.ports.admin }}/metrics
-{{- if include "smg.policyControllerElection" . }}
-{{- if not (include "smg.policyControllerReplicationAsTold" .) }}
-  Standby:  follows no leader and takes over with no worker and no load: policyController.identityAsTold does not name replication (the chart's README, Standby)
-{{- else if include "smg.policyControllerServesTls" . }}
+Grand Central:
+  gRPC:     {{ $fullname }}-grand-central:{{ .Values.grandCentral.ports.gateway }}
+  Metrics:  http://{{ $fullname }}-grand-central:{{ .Values.grandCentral.ports.admin }}/metrics
+{{- if include "smg.grandCentralElection" . }}
+{{- if not (include "smg.grandCentralReplicationAsTold" .) }}
+  Standby:  follows no leader and takes over with no worker and no load: grandCentral.identityAsTold does not name replication (the chart's README, Standby)
+{{- else if include "smg.grandCentralServesTls" . }}
   Standby:  follows no leader and takes over with no worker and no load: the controller's listeners serve TLS, and a standby's dial has no credential yet (the chart's README, Standby)
 {{- end }}
 {{- end }}

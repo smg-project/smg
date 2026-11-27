@@ -296,13 +296,20 @@ fn known_to_exceed(response: &Response, max_body_size: usize) -> bool {
 }
 
 /// Whether `response` streams: an event stream, newline-delimited JSON or a
-/// chunked transfer, none of which the response hook may buffer.
+/// chunked transfer, none of which the response hook may buffer. An event
+/// stream is one in any spelling of its media type, as the routes that relay
+/// it read it: a relayed stream carries no length and no transfer encoding,
+/// so its type is all this hook has to go on.
 fn is_streaming(response: &Response) -> bool {
     response
         .headers()
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|ct| ct.contains("text/event-stream") || ct.contains("application/x-ndjson"))
+        .is_some_and(|ct| {
+            super::sse_keepalive::names_event_stream(ct)
+                || ct.contains("text/event-stream")
+                || ct.contains("application/x-ndjson")
+        })
         || response
             .headers()
             .get(header::TRANSFER_ENCODING)
@@ -519,6 +526,36 @@ mod tests {
                 b"data: x\n\n",
                 "{value}"
             );
+        }
+    }
+
+    /// A body of `len` bytes with no length ahead of it, as a relayed stream
+    /// carries.
+    fn unsized_body(len: usize) -> Body {
+        let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(1);
+        tx.try_send(Ok(Bytes::from(vec![b'x'; len])))
+            .expect("the channel takes one item");
+        drop(tx);
+        Body::from_stream(ReceiverStream::new(rx))
+    }
+
+    /// An event stream passes the response hook untouched however its media
+    /// type is spelled. A relayed stream carries no length and no transfer
+    /// encoding: one the hook does not know by its type is read into memory,
+    /// and over the cap it is answered with the hook's own error.
+    #[tokio::test]
+    async fn the_response_hook_leaves_an_event_stream_alone_however_its_type_is_spelled() {
+        let manager = manager_with_an_inert_module_under(small_cap());
+        for value in ["Text/Event-Stream", "TEXT/EVENT-STREAM; charset=utf-8"] {
+            let response = Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, value)
+                .body(unsized_body(2048))
+                .expect("a response");
+            let response = run_response_hook(&manager, response).await;
+            assert_eq!(manager.get_metrics().0, 0, "{value}: no module ran");
+            assert_eq!(response.status(), StatusCode::OK, "{value}");
+            assert_eq!(body_of(response.into_body()).await.len(), 2048, "{value}");
         }
     }
 

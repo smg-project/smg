@@ -48,7 +48,7 @@ impl ChatResponseProcessingStage {
         ctx: &mut DispatchContext,
         spec: ResponseSpec,
     ) -> Result<Option<Response>, Response> {
-        let ResponseSpec::Chat(chat_request) = spec else {
+        let ResponseSpec::Chat(mut chat_request) = spec else {
             return Err(wrong_response_spec(FUNCTION));
         };
 
@@ -75,8 +75,10 @@ impl ChatResponseProcessingStage {
                 ctx.workers.as_ref(),
                 &dispatch,
                 metrics_labels::ENDPOINT_CHAT,
-            )
-            .with_placement(ctx.placement().cloned());
+            );
+            // The rendered prompt the request asked for rides into the
+            // stream, whose first opening chunk carries it.
+            chat_request.prompt_text = ctx.response.prompt_text.take();
             let response = self
                 .streaming_processor
                 .clone()
@@ -100,7 +102,7 @@ impl ChatResponseProcessingStage {
 
         let stop_decoder = stage_output(ctx.response.stop_decoder.as_mut(), FUNCTION)?;
 
-        let (response, counts) = self
+        let (mut response, counts) = self
             .processor
             .process_non_streaming_chat_response(
                 execution_result,
@@ -111,6 +113,8 @@ impl ChatResponseProcessingStage {
                 request_logprobs,
             )
             .await?;
+        // The rendered prompt the request asked for moves into the answer.
+        response.prompt_text = ctx.response.prompt_text.take();
 
         // Store the final response, and the engine's counters for the settlement
         ctx.response.final_response = Some(FinalResponse::Chat(response));

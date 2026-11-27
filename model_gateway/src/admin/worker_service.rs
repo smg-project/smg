@@ -12,8 +12,8 @@ use axum::{
     Json,
 };
 use openai_protocol::worker::{
-    HealthCheckUpdate, RuntimeType, WorkerErrorResponse, WorkerInfo, WorkerListOrigin, WorkerSpec,
-    WorkerStatus, WorkerUpdateRequest,
+    HealthCheckUpdate, WorkerErrorResponse, WorkerInfo, WorkerListOrigin, WorkerSpec, WorkerStatus,
+    WorkerUpdateRequest,
 };
 use serde_json::json;
 use smg_auth::AuditResource;
@@ -24,18 +24,22 @@ use smg_worker::{
         basic::{merge_labels, worker_to_info, Worker, WorkerType},
         endpoint::Endpoint,
     },
-    jobs::WorkerJobAsker,
+    jobs::{queue::QueueJob, WorkerJobAsker},
     labels::has_control_character,
     registry::WorkerId,
-    workflow::{find_workers_by_url, WorkerKind},
+    workflow::find_workers_by_url,
 };
 use tracing::warn;
 
 use crate::{
-    config::{unused_credentials_warning, validate_worker_url, RouterConfig},
+    config::{
+        unused_credentials_warning, validate_worker_url, validation::ConfigValidator,
+        CircuitBreakerConfig, RouterConfig,
+    },
     routers::{common::snapshot::WorkerRegistry, provider_support},
     workflow::{
-        job_queue::cancel_registration, steps::stated_kind, Job, JobQueue, WorkerRegistrationMode,
+        job_queue::{add_worker_in_flight, cancel_registration},
+        Job, JobQueue, WorkerRegistrationMode,
     },
 };
 
@@ -77,6 +81,39 @@ fn bad_request(message: String) -> WorkerServiceError {
     WorkerServiceError::BadRequest { message }
 }
 
+/// A worker's view with its address as a read shows it: a plain address
+/// exactly as registered, any other in the form of the log lines
+/// ([`WorkerSpec::redacted_url`]). Applied where the answer is written: the
+/// engine load and the manifest export read the registered address.
+fn redacted(mut info: WorkerInfo) -> WorkerInfo {
+    let url = info.spec.redacted_url();
+    // A rank's address is its group's base and `@rank`; a base that is no
+    // part of the url is shown by its own value.
+    let base = info
+        .spec
+        .dp_base_url
+        .as_deref()
+        .map(|base| match url.rsplit_once('@') {
+            Some((shown, _)) if info.spec.url_is_ranked() => shown.to_string(),
+            _ => WorkerSpec::new(base).redacted_url(),
+        });
+    // A status kept under another registration's key shows that one's
+    // address, by its own value.
+    if let Some(status) = &mut info.job_status {
+        if status.worker_url == info.spec.url {
+            status.worker_url.clone_from(&url);
+        } else {
+            status.worker_url = WorkerSpec::new(status.worker_url.as_str()).redacted_url();
+        }
+    }
+    if url != info.spec.url || base != info.spec.dp_base_url {
+        let spec = Arc::make_mut(&mut info.spec);
+        spec.dp_base_url = base;
+        spec.url = url;
+    }
+    info
+}
+
 /// The strings of a model card that log lines and a failed job's text write
 /// as they came, each under its field's name in a registration body.
 pub(crate) fn logged_strings(
@@ -109,8 +146,9 @@ pub(crate) fn control_character_refusal<'a>(
 /// reserved for discovery; the fields the routers rely on (a positive,
 /// finite cost; a KV block size and a data-parallel size of at least 1; a
 /// rank only with a size and below it; a bootstrap port that is a port); a
-/// probe interval and a probe timeout the health schedule can hold. A
-/// violation is a `400 Bad Request` naming the field.
+/// probe interval and a probe timeout the health schedule can hold; breaker
+/// overrides at the floors of the global settings. A violation is a
+/// `400 Bad Request` naming the field.
 fn validate_spec(spec: &WorkerSpec) -> Result<(), WorkerServiceError> {
     if spec.url.len() > MAX_WORKER_URL_BYTES {
         return Err(bad_request(format!(
@@ -128,6 +166,24 @@ fn validate_spec(spec: &WorkerSpec) -> Result<(), WorkerServiceError> {
     validate_labels(&spec.labels)?;
     validate_cost(spec.cost)?;
     validate_health(&spec.health)?;
+    // The start checks the effective settings; here a given zero is refused
+    // whatever the breaker's switches say, and an override left out passes.
+    let breaker = &spec.resilience;
+    ConfigValidator::validate_circuit_breaker(
+        [
+            "resilience.cb_failure_threshold",
+            "resilience.cb_success_threshold",
+            "resilience.cb_timeout_secs",
+            "resilience.cb_window_secs",
+        ],
+        &CircuitBreakerConfig {
+            failure_threshold: breaker.cb_failure_threshold.unwrap_or(1),
+            success_threshold: breaker.cb_success_threshold.unwrap_or(1),
+            timeout_duration_secs: breaker.cb_timeout_secs.unwrap_or(1),
+            window_duration_secs: breaker.cb_window_secs.unwrap_or(1),
+        },
+    )
+    .map_err(|e| bad_request(e.to_string()))?;
     if spec.kv_block_size == Some(0) {
         return Err(bad_request(
             "kv_block_size must be at least 1 (tokens per KV block)".to_string(),
@@ -291,14 +347,11 @@ fn validate_labels(labels: &HashMap<String, String>) -> Result<(), WorkerService
 /// worker and overwrites the edit. What no provider publishes (priority,
 /// cost, API key, health checks) is still a PATCH's to change, and a DELETE
 /// stays allowed; the provider adds the worker back while it still
-/// publishes it. Where a local worker is a row, the worker API writes no
-/// provider's row: a PATCH of any field and a DELETE are refused as well
-/// ([`WorkerServiceError::DiscoveryUpdates`],
-/// [`WorkerServiceError::DiscoveryRemoves`]).
+/// publishes it.
 fn refuse_discovery_owned(worker: &dyn Worker) -> Result<(), WorkerServiceError> {
     match discovery_provider(worker) {
         Some(provider) => Err(WorkerServiceError::DiscoveryOwned {
-            url: worker.url().to_string(),
+            url: worker.redacted_url().to_string(),
             provider: provider.clone(),
         }),
         None => Ok(()),
@@ -309,19 +362,6 @@ fn refuse_discovery_owned(worker: &dyn Worker) -> Result<(), WorkerServiceError>
 /// reconciler writes; `None` for a worker registered locally.
 fn discovery_provider(worker: &dyn Worker) -> Option<&String> {
     worker.metadata().spec.labels.get(DISCOVERY_PROVIDER_LABEL)
-}
-
-/// Whether `worker` is a row where a local worker is one: every worker but
-/// a provider's, which stays outside the store.
-fn stands_as_row(worker: &dyn Worker) -> bool {
-    worker.metadata().spec.runtime_type != RuntimeType::External
-}
-
-/// The provider of the first discovered worker among `workers`.
-fn provider_among(workers: &[Arc<dyn Worker>]) -> Option<String> {
-    workers
-        .iter()
-        .find_map(|worker| discovery_provider(worker.as_ref()).cloned())
 }
 
 /// Error types for worker service operations
@@ -336,7 +376,8 @@ pub enum WorkerServiceError {
     /// Worker with this URL already exists (duplicate POST)
     Conflict { url: String, worker_id: WorkerId },
     /// A worker at this URL is being removed: its removal drains it for
-    /// `drain_secs` before the URL is free (a POST inside that window)
+    /// `drain_secs` before the URL is free (a POST of the URL or a PUT of
+    /// the worker inside that window)
     RemovalInProgress {
         url: String,
         worker_id: WorkerId,
@@ -353,14 +394,6 @@ pub enum WorkerServiceError {
     /// A discovery provider owns the worker (a PUT, or a PATCH of labels, of a
     /// discovered worker)
     DiscoveryOwned { url: String, provider: String },
-    /// A PUT or a PATCH of a discovered worker, on a gateway whose local
-    /// workers are rows of the policy controller's store: the worker API
-    /// changes no provider's row
-    DiscoveryUpdates { url: String, provider: String },
-    /// A DELETE of a discovered worker, on a gateway whose local workers are
-    /// rows of the policy controller's store: the worker API removes no
-    /// provider's row
-    DiscoveryRemoves { url: String, provider: String },
     /// The spec targets a provider whose router this build does not carry
     ProviderNotCompiled {
         url: String,
@@ -384,9 +417,7 @@ impl WorkerServiceError {
             // code the window answered before; the message says what holds.
             Self::RemovalInProgress { .. } => "WORKER_ALREADY_EXISTS",
             Self::CreateInProgress { .. } => "WORKER_CREATE_IN_PROGRESS",
-            Self::DiscoveryOwned { .. }
-            | Self::DiscoveryUpdates { .. }
-            | Self::DiscoveryRemoves { .. } => "WORKER_DISCOVERY_OWNED",
+            Self::DiscoveryOwned { .. } => "WORKER_DISCOVERY_OWNED",
             Self::ProviderNotCompiled { .. } => "PROVIDER_NOT_COMPILED",
             Self::QueueNotInitialized => "INTERNAL_SERVER_ERROR",
             Self::QueueSubmitFailed { .. } => "INTERNAL_SERVER_ERROR",
@@ -402,8 +433,6 @@ impl WorkerServiceError {
             Self::RemovalInProgress { .. } => StatusCode::CONFLICT,
             Self::CreateInProgress { .. } => StatusCode::CONFLICT,
             Self::DiscoveryOwned { .. } => StatusCode::CONFLICT,
-            Self::DiscoveryUpdates { .. } => StatusCode::CONFLICT,
-            Self::DiscoveryRemoves { .. } => StatusCode::CONFLICT,
             Self::ProviderNotCompiled { .. } => StatusCode::BAD_REQUEST,
             Self::QueueNotInitialized => StatusCode::INTERNAL_SERVER_ERROR,
             Self::QueueSubmitFailed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
@@ -440,7 +469,8 @@ impl std::fmt::Display for WorkerServiceError {
                     f,
                     "Worker at URL '{url}' with ID {id} is being removed; its removal drains \
                     it for {drain_secs}s, the worker's configured drain, before the URL is \
-                    free. Retry once GET /workers/{id} answers 404."
+                    free. Retry once GET /workers/{id} answers 404 or its job status reads \
+                    failed."
                 )
             }
             Self::CreateInProgress {
@@ -467,18 +497,6 @@ impl std::fmt::Display for WorkerServiceError {
                 "Worker '{url}' is owned by the '{provider}' discovery provider. \
                 Its spec and labels come from its discovery source: change them there, \
                 not with a PUT or a PATCH of labels."
-            ),
-            Self::DiscoveryUpdates { url, provider } => write!(
-                f,
-                "Worker '{url}' is owned by the '{provider}' discovery provider, and under \
-                the policy controller the worker API changes no provider's worker. Change \
-                it at its discovery source, not with a PUT or a PATCH."
-            ),
-            Self::DiscoveryRemoves { url, provider } => write!(
-                f,
-                "Worker '{url}' is owned by the '{provider}' discovery provider, and under \
-                the policy controller the worker API removes no provider's worker. Take \
-                it out of its discovery source."
             ),
             Self::ProviderNotCompiled {
                 url,
@@ -619,7 +637,7 @@ impl IntoResponse for ListWorkersResult {
             regular_count: usize,
         }
         Json(Body {
-            workers: self.workers,
+            workers: self.workers.into_iter().map(redacted).collect(),
             total: self.total,
             stats: Stats {
                 prefill_count: self.prefill_count,
@@ -636,7 +654,7 @@ pub struct GetWorkerResponse(pub WorkerInfo);
 
 impl IntoResponse for GetWorkerResponse {
     fn into_response(self) -> Response {
-        Json(self.0).into_response()
+        Json(redacted(self.0)).into_response()
     }
 }
 
@@ -649,8 +667,6 @@ pub struct WorkerService {
     worker_registry: Arc<WorkerRegistry>,
     job_queue: Arc<std::sync::OnceLock<Arc<JobQueue>>>,
     router_config: RouterConfig,
-    /// Whether a local worker is a row of the policy controller's store.
-    local_workers_are_rows: bool,
 }
 
 impl WorkerService {
@@ -664,34 +680,7 @@ impl WorkerService {
             worker_registry,
             job_queue,
             router_config,
-            local_workers_are_rows: false,
         }
-    }
-
-    /// The service of a gateway whose local workers are rows of the policy
-    /// controller's store: it refuses a change of a discovered worker,
-    /// since it writes no provider's row.
-    #[must_use]
-    pub(crate) fn with_local_workers_as_rows(mut self) -> Self {
-        self.local_workers_are_rows = true;
-        self
-    }
-
-    /// Whether `worker` is a row of the policy controller's store here.
-    fn is_row(&self, worker: &dyn Worker) -> bool {
-        self.local_workers_are_rows && stands_as_row(worker)
-    }
-
-    /// The workers `url` selects that are rows here. An address selects
-    /// every rank registered under it, each a row under its own URL.
-    fn rows_at(&self, url: &str) -> Vec<Arc<dyn Worker>> {
-        if !self.local_workers_are_rows {
-            return Vec::new();
-        }
-        find_workers_by_url(&self.worker_registry, url)
-            .into_iter()
-            .filter(|worker| stands_as_row(worker.as_ref()))
-            .collect()
     }
 
     /// Parse and validate a worker ID string
@@ -735,23 +724,48 @@ impl WorkerService {
         // A URL with a worker behind its mapping is a 409. A worker its
         // removal is draining holds the URL for the drain window; that answer
         // says so and when to retry, instead of offering a PUT or a PATCH of
-        // a worker that is leaving.
-        let live = self
+        // a worker that is leaving. A data-parallel group stands under its
+        // rank URLs, none under the id its POST answered: a rank that stays
+        // answers for the group, else the rank whose drain its removal waits
+        // for, the longest. Not while a registration of the URL is in flight:
+        // its id may never reach the ranks found (ranks registered at startup
+        // fail it, and its end releases the id). That POST is told to poll
+        // here, not at the claim below: a registration that ended before the
+        // claim would have this POST admitted over the ranks it registered.
+        let live = match self
             .worker_registry
             .get_id_by_url_or_reservation(&worker_url)
-            .and_then(|id| self.worker_registry.get(&id).map(|worker| (id, worker)));
+        {
+            Some(id) => match self.worker_registry.get(&id) {
+                Some(worker) => Some((id, worker)),
+                None if add_worker_in_flight(queue, &worker_url) => {
+                    return Err(WorkerServiceError::CreateInProgress {
+                        url: worker_url,
+                        worker_id: Some(id),
+                    });
+                }
+                None => find_workers_by_url(&self.worker_registry, &worker_url)
+                    .into_iter()
+                    .max_by_key(|rank| {
+                        (
+                            rank.status() != WorkerStatus::Draining,
+                            rank.metadata().health_config.drain_settle_secs,
+                        )
+                    })
+                    .map(|rank| (id, rank)),
+            },
+            None => None,
+        };
         if let Some((worker_id, existing)) = live {
+            let url = config.redacted_url();
             return Err(if existing.status() == WorkerStatus::Draining {
                 WorkerServiceError::RemovalInProgress {
-                    url: worker_url,
+                    url,
                     worker_id,
                     drain_secs: existing.metadata().health_config.drain_settle_secs,
                 }
             } else {
-                WorkerServiceError::Conflict {
-                    url: worker_url,
-                    worker_id,
-                }
+                WorkerServiceError::Conflict { url, worker_id }
             });
         }
 
@@ -775,7 +789,7 @@ impl WorkerService {
                 .worker_registry
                 .get_id_by_url_or_reservation(&worker_url);
             return Err(WorkerServiceError::CreateInProgress {
-                url: worker_url,
+                url: WorkerSpec::new(worker_url).redacted_url(),
                 worker_id,
             });
         }
@@ -808,7 +822,7 @@ impl WorkerService {
     fn require_provider_router(config: &WorkerSpec) -> Result<(), WorkerServiceError> {
         match provider_support::missing_router(config) {
             Some(missing) => Err(WorkerServiceError::ProviderNotCompiled {
-                url: config.url.clone(),
+                url: config.redacted_url(),
                 family: missing.label,
                 feature: missing.feature,
             }),
@@ -832,43 +846,21 @@ impl WorkerService {
                 })?;
         // Before the body is read: a discovered worker's own spec, sent back,
         // carries the reserved labels, and the useful answer is where to make
-        // the change, not which labels to strip. Where a local worker is a
-        // row, the worker API changes no provider's row.
-        let url = existing.url().to_string();
-        let is_row = self.is_row(existing.as_ref());
-        if let (true, Some(provider)) = (is_row, discovery_provider(existing.as_ref())) {
-            return Err(WorkerServiceError::DiscoveryUpdates {
-                url,
-                provider: provider.clone(),
-            });
-        }
+        // the change, not which labels to strip.
         refuse_discovery_owned(existing.as_ref())?;
+        let url = existing.url().to_string();
+        let shown_url = existing.redacted_url();
         validate_spec(&config)?;
         Self::require_provider_router(&config)?;
-        // A PUT keeps a worker on its side of the store. A row's worker
-        // restated as a provider's would be accepted and then fail at the
-        // row that holds its URL, and a provider's worker restated as
-        // self-hosted would find no row to replace. The side is asked ahead
-        // of the fields, so the first answer names what stands in the way.
-        let stays_row = stated_kind(&config) != Some(WorkerKind::External);
-        if self.local_workers_are_rows && is_row != stays_row {
-            return Err(WorkerServiceError::BadRequest {
-                message: format!(
-                    "Worker '{url}' would change between a self-hosted worker and a \
-                    provider's. Under the policy controller a PUT keeps it as it is. \
-                    Use DELETE + POST instead."
-                ),
-            });
-        }
 
-        // A data-parallel router expands one spec into one worker per rank,
-        // each registered under a rank-suffixed URL. Re-running registration
-        // for a single ID cannot express that, so refuse here instead of
-        // answering 202 and failing in the background.
-        if self.router_config.dp_aware {
+        // A data-parallel engine registers as one worker per rank, each
+        // under a rank-suffixed URL. Re-running registration for the ID of
+        // one rank cannot express that, so refuse here instead of answering
+        // 202 and failing in the background.
+        if existing.is_dp_aware() {
             return Err(WorkerServiceError::BadRequest {
                 message: format!(
-                    "Worker '{url}' belongs to a data-parallel group. \
+                    "Worker '{shown_url}' belongs to a data-parallel group. \
                     PUT is not supported for data-parallel workers. \
                     Use DELETE + POST instead."
                 ),
@@ -879,11 +871,21 @@ impl WorkerService {
         // URL changes are not supported via replace — use DELETE + POST instead.
         if config.url != url {
             return Err(WorkerServiceError::BadRequest {
-                message: format!(
-                    "URL mismatch: worker has URL '{url}' but request body has '{}'. \
-                    URL changes are not supported via PUT. Use DELETE + POST instead.",
-                    config.url
-                ),
+                message: "URL mismatch: a PUT carries the worker's URL exactly as it was \
+                    registered (a read may show it shortened). URL changes are not \
+                    supported via PUT. Use DELETE + POST instead."
+                    .to_string(),
+            });
+        }
+
+        // A worker that a removal is draining is leaving: a PUT gets the
+        // answer a POST of its URL gets. A replacement would share the
+        // Draining status and be served again inside the drain.
+        if existing.status() == WorkerStatus::Draining {
+            return Err(WorkerServiceError::RemovalInProgress {
+                url: shown_url.to_string(),
+                worker_id,
+                drain_secs: existing.metadata().health_config.drain_settle_secs,
             });
         }
 
@@ -977,14 +979,40 @@ impl WorkerService {
             return Ok(GetWorkerResponse(worker_info));
         }
 
-        if let Some(worker_url) = self.worker_registry.get_url_by_id(&worker_id) {
-            if let Some(status) = job_queue.get_status(&worker_url) {
-                return Ok(GetWorkerResponse(WorkerInfo::pending(
-                    worker_id.as_str(),
-                    worker_url,
-                    Some(status),
-                )));
-            }
+        // A registration in flight holds its id. One that failed has released
+        // it: the queue keeps its failed status under the id until its
+        // finished statuses age out.
+        let url = self.worker_registry.get_url_by_id(&worker_id);
+        let in_flight = url
+            .as_deref()
+            .and_then(|worker_url| job_queue.get_status(worker_url));
+        let failed = || {
+            job_queue
+                .get_status(worker_id.as_str())
+                .filter(|status| status.job_type == Job::REGISTRATION_TYPE)
+        };
+        if let Some(status) = in_flight.or_else(failed) {
+            return Ok(GetWorkerResponse(WorkerInfo::pending(
+                worker_id.as_str(),
+                status.worker_url.clone(),
+                Some(status),
+            )));
+        }
+
+        // A registered data-parallel group stands under its rank URLs, none
+        // under the id its POST answered. The read of that id answers with
+        // the least ready rank, so a client that polls it reads healthy once
+        // every rank is. Each rank is read once, into its view, so the
+        // health compared is the health answered.
+        let group = url.and_then(|url| {
+            find_workers_by_url(&self.worker_registry, &url)
+                .iter()
+                .map(worker_to_info)
+                .min_by_key(|rank| rank.is_healthy)
+        });
+        if let Some(mut worker_info) = group {
+            worker_info.id = worker_id.as_str().to_string();
+            return Ok(GetWorkerResponse(worker_info));
         }
 
         Err(WorkerServiceError::NotFound {
@@ -1005,13 +1033,6 @@ impl WorkerService {
             .ok_or_else(|| WorkerServiceError::NotFound {
                 worker_id: worker_id_raw.to_string(),
             })?;
-        // Where a local worker is a row, its maker alone removes it at the
-        // store's door, and the API removes as the control maker. A
-        // discovered worker is its provider's row: the removal would be
-        // accepted and then leave it. Refuse here rather than after the 202.
-        if let Some(provider) = provider_among(&self.rows_at(&url)) {
-            return Err(WorkerServiceError::DiscoveryRemoves { url, provider });
-        }
         let job_queue = self.get_job_queue()?;
 
         // An id with no worker behind it is a POST's registration still in
@@ -1092,12 +1113,6 @@ impl WorkerService {
                 worker_id: worker_id_raw.to_string(),
             })?;
         let worker = self.worker_registry.get_by_url(&url);
-        // Where a local worker is a row, a discovered worker is its
-        // provider's row whatever the PATCH names.
-        let rows = self.rows_at(&url);
-        if let Some(provider) = provider_among(&rows) {
-            return Err(WorkerServiceError::DiscoveryUpdates { url, provider });
-        }
         // Only a PATCH of labels edits what a provider publishes. Decided
         // before the body is validated, as for a PUT, so reserved labels sent
         // to a discovered worker are told where to make the change.
@@ -1137,7 +1152,7 @@ impl WorkerService {
                 .map_err(|message| WorkerServiceError::QueueSubmitFailed { message })?;
             if !admitted {
                 return Err(WorkerServiceError::CreateInProgress {
-                    url,
+                    url: WorkerSpec::new(url).redacted_url(),
                     worker_id: Some(worker_id),
                 });
             }
@@ -1148,1408 +1163,5 @@ impl WorkerService {
 }
 
 #[cfg(test)]
-mod tests {
-    use openai_protocol::model_card::ModelCard;
-    use smg_worker::{identity::basic::WorkerType, jobs::queue::testing::QueueTest};
-
-    use super::*;
-    use crate::{
-        app_context::testing::app_context_for_tests,
-        routers::grpc::backend_client::BasicWorkerBuilder,
-        workflow::{job_queue::recording_for_tests, JobQueueConfig},
-    };
-
-    fn make_service(registry: Arc<WorkerRegistry>) -> WorkerService {
-        WorkerService::new(
-            registry,
-            Arc::new(std::sync::OnceLock::new()),
-            RouterConfig::default(),
-        )
-    }
-
-    fn register_worker(registry: &WorkerRegistry, url: &str, model: Option<&str>) {
-        let mut builder = BasicWorkerBuilder::new(url).worker_type(WorkerType::Regular);
-        if let Some(model) = model {
-            builder = builder.model(ModelCard::new(model));
-        }
-        registry.register(Arc::new(builder.build())).unwrap();
-    }
-
-    #[test]
-    fn test_list_workers_unfiltered_returns_all() {
-        let registry = Arc::new(WorkerRegistry::new());
-        register_worker(&registry, "http://kimi:30000", Some("moonshotai/Kimi-K2.5"));
-        register_worker(
-            &registry,
-            "http://llama:30000",
-            Some("meta-llama/Llama-3.1-8B"),
-        );
-        let service = make_service(registry);
-
-        let result = service.list_workers(None, None);
-        assert_eq!(result.workers.len(), 2);
-        assert_eq!(result.total, 2);
-        assert_eq!(result.regular_count, 2);
-    }
-
-    #[test]
-    fn test_list_workers_filters_by_model() {
-        let registry = Arc::new(WorkerRegistry::new());
-        register_worker(&registry, "http://kimi:30000", Some("moonshotai/Kimi-K2.5"));
-        register_worker(
-            &registry,
-            "http://llama:30000",
-            Some("meta-llama/Llama-3.1-8B"),
-        );
-        let service = make_service(registry);
-
-        let result = service.list_workers(Some("moonshotai/Kimi-K2.5"), None);
-        assert_eq!(result.workers.len(), 1);
-        assert_eq!(
-            result.workers[0].model_id.as_deref(),
-            Some("moonshotai/Kimi-K2.5")
-        );
-        assert_eq!(result.total, 1);
-        assert_eq!(result.regular_count, 1);
-
-        let result = service.list_workers(Some("no-such-model"), None);
-        assert!(result.workers.is_empty());
-        assert_eq!(result.total, 0);
-        assert_eq!(result.regular_count, 0);
-    }
-
-    #[test]
-    fn test_list_workers_wildcard_worker_matches_any_model() {
-        let registry = Arc::new(WorkerRegistry::new());
-        register_worker(&registry, "http://wildcard:30000", None);
-        let service = make_service(registry);
-
-        let result = service.list_workers(Some("moonshotai/Kimi-K2.5"), None);
-        assert_eq!(result.workers.len(), 1);
-        assert_eq!(result.total, 1);
-    }
-
-    fn worker_spec(url: &str) -> WorkerSpec {
-        serde_json::from_value(json!({ "url": url })).expect("worker spec")
-    }
-
-    #[tokio::test]
-    async fn the_worker_api_asks_as_api() {
-        use crate::app_context::testing::create_test_app_context;
-
-        let context = create_test_app_context();
-        let (queue, mut next_job) = recording_for_tests(&context);
-        context.worker_job_queue.set(queue).unwrap();
-        let registry = &context.worker_registry;
-        let registered = |url| {
-            register_worker(registry, url, Some("served"));
-            registry.get_id_by_url(url).unwrap()
-        };
-        let replace_url = "http://replace:8000";
-        let replace = registered(replace_url);
-        let update = registered("http://update:8000");
-        let delete = registered("http://delete:8000");
-        let service = &context.worker_service;
-
-        service
-            .create_worker(worker_spec("http://create:8000"))
-            .await
-            .unwrap();
-        assert!(matches!(
-            next_job(),
-            Job::AddWorker {
-                registration_mode: WorkerRegistrationMode::CreateOnly,
-                asker: WorkerJobAsker::Api,
-                ..
-            }
-        ));
-        service
-            .replace_worker(replace.as_str(), worker_spec(replace_url))
-            .await
-            .unwrap();
-        assert!(matches!(
-            next_job(),
-            Job::AddWorker {
-                registration_mode: WorkerRegistrationMode::ReplaceById { .. },
-                asker: WorkerJobAsker::Api,
-                ..
-            }
-        ));
-        let request = serde_json::from_value(json!({"priority": 2})).unwrap();
-        service
-            .update_worker(update.as_str(), request)
-            .await
-            .unwrap();
-        assert!(matches!(
-            next_job(),
-            Job::UpdateWorker {
-                asker: WorkerJobAsker::Api,
-                ..
-            }
-        ));
-        service.delete_worker(delete.as_str()).await.unwrap();
-        assert!(matches!(
-            next_job(),
-            Job::RemoveWorker {
-                asker: WorkerJobAsker::Api,
-                ..
-            }
-        ));
-    }
-
-    /// A gateway whose local workers are rows writes a POST's add and a
-    /// PUT's replacement at the store's door. The holder keeps the object
-    /// the registration builds, so a worker that states an API key, a
-    /// priority or a cost passes as on the classic line. A PUT that would
-    /// move a worker between the rows and the providers is a bad request.
-    /// Nothing is reserved.
-    #[tokio::test]
-    async fn where_a_local_worker_is_a_row_the_api_takes_a_key_a_priority_and_a_cost() {
-        let spec = |url: &str, runtime: &str, stated: serde_json::Value| -> WorkerSpec {
-            let mut spec = json!({"url": url, "runtime": runtime});
-            for (field, value) in stated.as_object().into_iter().flatten() {
-                spec[field] = value.clone();
-            }
-            serde_json::from_value(spec).expect("worker spec")
-        };
-        let registry = Arc::new(WorkerRegistry::new());
-        let replaced = "http://replace:8000";
-        register_worker(&registry, replaced, Some("served"));
-        let id = registry.get_id_by_url(replaced).unwrap();
-        let service = make_service(Arc::clone(&registry)).with_local_workers_as_rows();
-
-        // Each passes the row's checks and ends at the queue this service
-        // lacks, as a plain POST and a plain PUT do.
-        let created = "http://create:8000";
-        for stated in [
-            json!({}),
-            json!({"api_key": "secret-key"}),
-            json!({"priority": 7}),
-            json!({"cost": 2.5}),
-        ] {
-            for passed in [
-                service
-                    .create_worker(spec(created, "sglang", stated.clone()))
-                    .await
-                    .map(drop),
-                service
-                    .replace_worker(id.as_str(), spec(replaced, "sglang", stated.clone()))
-                    .await
-                    .map(drop),
-            ] {
-                assert!(
-                    matches!(passed, Err(WorkerServiceError::QueueNotInitialized)),
-                    "{stated}"
-                );
-            }
-        }
-        assert!(registry.get_id_by_url_or_reservation(created).is_none());
-
-        // A PUT keeps a worker on its side of the store.
-        let restated = service
-            .replace_worker(id.as_str(), spec(replaced, "external", json!({})))
-            .await;
-        let (answered, body, _) = answer(restated.map(drop).unwrap_err()).await;
-        assert_eq!(answered, StatusCode::BAD_REQUEST);
-        let sentence = body["error"].as_str().unwrap();
-        assert!(sentence.contains("Use DELETE + POST instead"), "{sentence}");
-
-        // The side is asked first. A provider's worker restated with no
-        // runtime is told of its side, not to drop a field it may keep.
-        let private = "http://litellm:4000";
-        let hosted = BasicWorkerBuilder::new(private)
-            .runtime_type(RuntimeType::External)
-            .model(ModelCard::new("hosted"))
-            .build();
-        registry.register(Arc::new(hosted)).unwrap();
-        let hosted_id = registry.get_id_by_url(private).unwrap();
-        let unstated: WorkerSpec =
-            serde_json::from_value(json!({"url": private, "priority": 7})).expect("worker spec");
-        let restated = service.replace_worker(hosted_id.as_str(), unstated).await;
-        let (answered, body, _) = answer(restated.map(drop).unwrap_err()).await;
-        assert_eq!(answered, StatusCode::BAD_REQUEST);
-        let sentence = body["error"].as_str().unwrap();
-        assert!(sentence.contains("Use DELETE + POST instead"), "{sentence}");
-    }
-
-    /// Where a local worker is a row, its maker alone removes it at the
-    /// store's door, and the API is not a discovered worker's maker. Its
-    /// DELETE is refused by name before the 202 and queues nothing. A
-    /// worker the gateway registered itself, a discovered provider's worker
-    /// and a service with no rows take the DELETE.
-    #[tokio::test]
-    async fn a_delete_of_a_discovered_rows_worker_is_refused_by_name() {
-        let registry = Arc::new(WorkerRegistry::new());
-        let ours = "http://ours:8000";
-        register_worker(&registry, ours, Some("served"));
-        let discovered = "http://discovered:8000";
-        let provider = "https://provider.example/v1";
-        for (url, runtime) in [
-            (discovered, RuntimeType::default()),
-            (provider, RuntimeType::External),
-        ] {
-            let found = BasicWorkerBuilder::new(url)
-                .runtime_type(runtime)
-                .model(ModelCard::new("served"))
-                .label(DISCOVERY_PROVIDER_LABEL, "kubernetes")
-                .build();
-            registry.register(Arc::new(found)).unwrap();
-        }
-        let id = |url: &str| registry.get_id_by_url(url).unwrap();
-        let service = make_service(Arc::clone(&registry)).with_local_workers_as_rows();
-
-        let refused = service.delete_worker(id(discovered).as_str()).await;
-        let (answered, body, _) = answer(refused.map(drop).unwrap_err()).await;
-        assert_eq!(answered, StatusCode::CONFLICT);
-        assert_eq!(body["code"], "WORKER_DISCOVERY_OWNED");
-        let sentence = body["error"].as_str().unwrap();
-        assert!(
-            sentence.contains("'kubernetes' discovery provider")
-                && sentence.contains("the worker API removes no provider's worker"),
-            "{sentence}"
-        );
-
-        // Each of these passes the check and ends at the queue this service
-        // lacks.
-        for passed in [
-            service.delete_worker(id(ours).as_str()).await,
-            service.delete_worker(id(provider).as_str()).await,
-            make_service(Arc::clone(&registry))
-                .delete_worker(id(discovered).as_str())
-                .await,
-        ] {
-            assert!(matches!(
-                passed,
-                Err(WorkerServiceError::QueueNotInitialized)
-            ));
-        }
-    }
-
-    /// A PATCH of a row's worker passes whatever it states: its labels and
-    /// its health checks move the row at the store's door, and an API key,
-    /// a priority or a cost moves the object the holder keeps. A
-    /// provider's worker takes each PATCH, and so does a worker of a
-    /// service with no rows.
-    #[tokio::test]
-    async fn a_patch_of_a_rows_worker_takes_a_key_a_priority_and_a_cost() {
-        let registry = Arc::new(WorkerRegistry::new());
-        let row = "http://row:8000";
-        register_worker(&registry, row, Some("served"));
-        let provider = "https://provider.example/v1";
-        let hosted = BasicWorkerBuilder::new(provider)
-            .runtime_type(RuntimeType::External)
-            .model(ModelCard::new("hosted"))
-            .build();
-        registry.register(Arc::new(hosted)).unwrap();
-        let id = |url: &str| registry.get_id_by_url(url).unwrap();
-        let update = |body: &serde_json::Value| -> WorkerUpdateRequest {
-            serde_json::from_value(body.clone()).expect("an update")
-        };
-        let service = make_service(Arc::clone(&registry)).with_local_workers_as_rows();
-
-        // Each PATCH passes the checks on each side and ends at the queue
-        // this service lacks.
-        let patches = [
-            json!({"labels": {"tier": "a"}}),
-            json!({"health": {"timeout_secs": 7}}),
-            json!({"api_key": "secret-key"}),
-            json!({"priority": 7}),
-            json!({"cost": 2.5}),
-            json!({"api_key": "secret-key", "priority": 7, "labels": {"tier": "a"}}),
-        ];
-        let classic = make_service(Arc::clone(&registry));
-        let mut passed = Vec::new();
-        for patch in &patches {
-            passed.push(service.update_worker(id(row).as_str(), update(patch)).await);
-            passed.push(
-                service
-                    .update_worker(id(provider).as_str(), update(patch))
-                    .await,
-            );
-            passed.push(classic.update_worker(id(row).as_str(), update(patch)).await);
-        }
-        for passed in passed {
-            assert!(matches!(
-                passed,
-                Err(WorkerServiceError::QueueNotInitialized)
-            ));
-        }
-    }
-
-    /// Where a local worker is a row, its maker alone changes it at the
-    /// store's door, and the API is not a discovered worker's maker. Its
-    /// PUT, and its PATCH of any field, are refused by the classic code
-    /// before the 202, in a sentence that names both calls. A discovered
-    /// provider's worker, and a discovered worker of a service with no
-    /// rows, take a PATCH of what no provider publishes.
-    #[tokio::test]
-    async fn a_put_or_a_patch_of_a_discovered_rows_worker_is_refused_by_name() {
-        let registry = Arc::new(WorkerRegistry::new());
-        let discovered = "http://discovered:8000";
-        let provider = "https://provider.example/v1";
-        for (url, runtime) in [
-            (discovered, RuntimeType::default()),
-            (provider, RuntimeType::External),
-        ] {
-            let found = BasicWorkerBuilder::new(url)
-                .runtime_type(runtime)
-                .model(ModelCard::new("served"))
-                .label(DISCOVERY_PROVIDER_LABEL, "kubernetes")
-                .build();
-            registry.register(Arc::new(found)).unwrap();
-        }
-        let id = |url: &str| registry.get_id_by_url(url).unwrap();
-        let update = |body: serde_json::Value| -> WorkerUpdateRequest {
-            serde_json::from_value(body).expect("an update")
-        };
-        let health = || update(json!({"health": {"timeout_secs": 7}}));
-        let service = make_service(Arc::clone(&registry)).with_local_workers_as_rows();
-
-        let ours = id(discovered);
-        for refused in [
-            service
-                .replace_worker(ours.as_str(), worker_spec(discovered))
-                .await
-                .map(drop),
-            service
-                .update_worker(ours.as_str(), health())
-                .await
-                .map(drop),
-            service
-                .update_worker(ours.as_str(), update(json!({"priority": 7})))
-                .await
-                .map(drop),
-            service
-                .update_worker(ours.as_str(), update(json!({"labels": {"tier": "a"}})))
-                .await
-                .map(drop),
-        ] {
-            let (answered, body, _) = answer(refused.unwrap_err()).await;
-            assert_eq!(answered, StatusCode::CONFLICT);
-            assert_eq!(body["code"], "WORKER_DISCOVERY_OWNED");
-            let sentence = body["error"].as_str().unwrap();
-            assert!(
-                sentence.contains("'kubernetes' discovery provider")
-                    && sentence.contains("the worker API changes no provider's worker")
-                    && sentence.contains("not with a PUT or a PATCH."),
-                "{sentence}"
-            );
-        }
-
-        // Each of these passes the check and ends at the queue this service
-        // lacks.
-        for passed in [
-            service.update_worker(id(provider).as_str(), health()).await,
-            make_service(Arc::clone(&registry))
-                .update_worker(ours.as_str(), health())
-                .await,
-        ] {
-            assert!(matches!(
-                passed,
-                Err(WorkerServiceError::QueueNotInitialized)
-            ));
-        }
-    }
-
-    #[tokio::test]
-    async fn create_worker_rejects_schemeless_url_before_reserving() {
-        let registry = Arc::new(WorkerRegistry::new());
-        let service = make_service(registry);
-
-        let err = service
-            .create_worker(worker_spec("10.0.0.5:8000"))
-            .await
-            .expect_err("schemeless URL must be rejected at the boundary");
-
-        assert!(matches!(err, WorkerServiceError::BadRequest { .. }));
-        assert_eq!(err.error_code(), "BAD_REQUEST");
-        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn create_worker_rejects_mixed_case_scheme() {
-        let registry = Arc::new(WorkerRegistry::new());
-        let service = make_service(registry);
-
-        let err = service
-            .create_worker(worker_spec("HTTP://10.0.0.5:8000"))
-            .await
-            .expect_err("mixed-case scheme must be rejected at the boundary");
-
-        assert!(matches!(err, WorkerServiceError::BadRequest { .. }));
-    }
-
-    /// A worker URL that ends in `@` and digits is refused with a 400 and
-    /// its reason: every line would name a rank of the host before the
-    /// digits while the probe dialled the digits as the host. The answer
-    /// shows the scheme of the address and no other part: the last two are
-    /// a token alone, and a user with a password of digits, which the
-    /// gateway's own rendering reads as a host and writes whole.
-    #[tokio::test]
-    async fn create_worker_refuses_an_address_read_two_ways() {
-        let registry = Arc::new(WorkerRegistry::new());
-        let service = make_service(registry);
-        for url in [
-            "http://127.0.0.1:35099@2130706433",
-            "http://user:s3cret@127.0.0.1:52605@2130706433",
-            "grpc://127.0.0.1:61845@2130706433",
-            "http://s3cret-token@8080",
-            "http://s3cret-user:8080@2130706433",
-        ] {
-            let err = service
-                .create_worker(worker_spec(url))
-                .await
-                .expect_err(url);
-            assert_eq!(err.status_code(), StatusCode::BAD_REQUEST, "{url}");
-            let WorkerServiceError::BadRequest { message } = err else {
-                panic!("expected a bad request, got {err}");
-            };
-            assert!(
-                message.contains("cannot end in '@' and digits"),
-                "{url}: {message}"
-            );
-            assert!(!message.contains("s3cret"), "{url}: {message}");
-        }
-    }
-
-    #[tokio::test]
-    async fn create_worker_accepts_schemed_url() {
-        let registry = Arc::new(WorkerRegistry::new());
-        let service = make_service(registry);
-
-        // The harness leaves the job queue uninitialized, so a valid URL
-        // passes boundary validation and stops at queue submission —
-        // proving validation did not reject it.
-        let err = service
-            .create_worker(worker_spec("grpc://10.0.0.5:8000"))
-            .await
-            .expect_err("queue is uninitialized in the test harness");
-
-        assert!(matches!(err, WorkerServiceError::QueueNotInitialized));
-    }
-
-    #[tokio::test]
-    async fn create_worker_releases_reservation_when_submission_fails() {
-        let registry = Arc::new(WorkerRegistry::new());
-        // A queue whose AppContext is gone rejects every submission.
-        let queue = Arc::new(std::sync::OnceLock::new());
-        queue
-            .set(JobQueue::new(
-                JobQueueConfig::default(),
-                std::sync::Weak::new(),
-            ))
-            .ok();
-        let service = WorkerService::new(Arc::clone(&registry), queue, RouterConfig::default());
-        // Idempotent, so this is the id create_worker will hand out.
-        let reserved = registry.reserve_id_for_url("grpc://10.0.0.5:8000");
-
-        let err = service
-            .create_worker(worker_spec("grpc://10.0.0.5:8000"))
-            .await
-            .expect_err("submission must fail without an AppContext");
-        assert!(matches!(err, WorkerServiceError::QueueSubmitFailed { .. }));
-
-        // The 202 was never sent, so nothing may keep the URL reserved (#1533).
-        assert!(registry.get_url_by_id(&reserved).is_none());
-    }
-
-    /// The job a `POST` of `url` claims the queue with (the claim reads the
-    /// job's type and URL, not its registration mode).
-    fn registration(url: &str) -> Job {
-        Job::AddWorker {
-            config: Box::new(worker_spec(url)),
-            registration_mode: WorkerRegistrationMode::CreateOnly,
-            asker: WorkerJobAsker::Api,
-        }
-    }
-
-    /// A registration in flight holds the queue's claim for its URL, and a
-    /// POST's has reserved the id its 202 named: a POST refused by that claim
-    /// is told to poll that id and leaves the mapping and the queue alone (a
-    /// queue with no context behind it fails any submission, so reaching it
-    /// would show).
-    #[tokio::test]
-    async fn a_post_under_a_posts_registration_in_flight_is_told_to_poll_its_id_and_leaves_it() {
-        let registry = Arc::new(WorkerRegistry::new());
-        let url = "grpc://10.0.0.5:8000";
-        let queue = JobQueue::new(JobQueueConfig::default(), std::sync::Weak::new());
-        // The first POST's claim, then its reservation: create_worker's order.
-        assert!(queue.claim_if_idle(&registration(url)));
-        let reserved = registry.reserve_id_for_url(url);
-        let held = Arc::new(std::sync::OnceLock::new());
-        held.set(queue).ok();
-        let service = WorkerService::new(Arc::clone(&registry), held, RouterConfig::default());
-        let err = service
-            .create_worker(worker_spec(url))
-            .await
-            .expect_err("another POST's registration is in flight");
-        let WorkerServiceError::CreateInProgress { worker_id, .. } = err else {
-            panic!("expected CreateInProgress, got {err:?}");
-        };
-        assert_eq!(
-            worker_id,
-            Some(reserved.clone()),
-            "the id in flight is the one to poll"
-        );
-        assert_eq!(
-            registry.get_id_by_url_or_reservation(url),
-            Some(reserved),
-            "the refused POST released a mapping that is not its own"
-        );
-    }
-
-    /// A POST refused by the queue's claim reserves nothing: the registration
-    /// in flight here is a startup or discovery one, which reserves no id, so
-    /// there is none to poll, and none outlives the refusal for a DELETE to
-    /// find.
-    #[tokio::test]
-    async fn a_post_refused_for_a_registration_of_another_kind_leaves_no_reservation() {
-        let registry = Arc::new(WorkerRegistry::new());
-        let url = "grpc://10.0.0.5:8000";
-        let queue = JobQueue::new(JobQueueConfig::default(), std::sync::Weak::new());
-        // The discovery registration's claim, with no reservation behind it.
-        assert!(queue.claim_if_idle(&registration(url)));
-        let held = Arc::new(std::sync::OnceLock::new());
-        held.set(queue).ok();
-        let service = WorkerService::new(Arc::clone(&registry), held, RouterConfig::default());
-        let err = service
-            .create_worker(worker_spec(url))
-            .await
-            .expect_err("the discovery registration is in flight");
-        let WorkerServiceError::CreateInProgress { worker_id, .. } = err else {
-            panic!("expected CreateInProgress, got {err:?}");
-        };
-        assert_eq!(worker_id, None, "no id of a POST's is in flight to poll");
-        assert_eq!(
-            registry.get_id_by_url_or_reservation(url),
-            None,
-            "the refused POST's reservation outlived the refusal"
-        );
-    }
-
-    /// A mapping with no job behind it is a reservation left over (a
-    /// data-parallel registration leaves its base URL's once its ranks are
-    /// registered under their own URLs, and nothing releases it): the next
-    /// POST adopts it and is admitted under that id, as it was before the
-    /// queue's claim moved in front of the reservation.
-    #[tokio::test]
-    async fn a_leftover_reservation_with_no_job_in_flight_is_admitted_under_its_id() {
-        let registry = Arc::new(WorkerRegistry::new());
-        let url = "grpc://10.0.0.5:8000";
-        let reserved = registry.reserve_id_for_url(url);
-        let context = app_context_for_tests(RouterConfig::default(), Arc::clone(&registry), None);
-        // A queue that accepts a job and never runs it: no slot to run one in.
-        let queue = JobQueue::new(
-            JobQueueConfig {
-                max_concurrent_jobs: 0,
-                ..JobQueueConfig::default()
-            },
-            Arc::downgrade(&context),
-        );
-        let held = Arc::new(std::sync::OnceLock::new());
-        held.set(queue).ok();
-        let service = WorkerService::new(Arc::clone(&registry), held, RouterConfig::default());
-        let admitted = service
-            .create_worker(worker_spec(url))
-            .await
-            .expect("a leftover reservation is no registration in flight");
-        assert_eq!(admitted.worker_id, reserved, "the 202 names the adopted id");
-        assert_eq!(registry.get_id_by_url_or_reservation(url), Some(reserved));
-    }
-
-    /// An id with no worker behind it is a registration in flight: a PATCH
-    /// of it is told to poll the id and submits nothing, so the registration's
-    /// entry in the job queue, and with it the claim that keeps a second POST
-    /// off its id, stay its own. Before this, the update job's status took
-    /// the entry and the second POST was admitted under the same id; a DELETE
-    /// then cancelled the first registration alone, whose end released the
-    /// shared reservation, and the second registered under a fresh id.
-    #[tokio::test]
-    async fn a_patch_of_a_registration_in_flight_is_told_to_poll_it_and_leaves_its_claim() {
-        let registry = Arc::new(WorkerRegistry::new());
-        let url = "grpc://10.0.0.5:8000";
-        let context = app_context_for_tests(RouterConfig::default(), Arc::clone(&registry), None);
-        // A queue that accepts jobs and never runs one: no slot to run one in.
-        let queue = JobQueue::new(
-            JobQueueConfig {
-                max_concurrent_jobs: 0,
-                ..JobQueueConfig::default()
-            },
-            Arc::downgrade(&context),
-        );
-        let held = Arc::new(std::sync::OnceLock::new());
-        held.set(queue).ok();
-        let service = WorkerService::new(Arc::clone(&registry), held, RouterConfig::default());
-        let id = service
-            .create_worker(worker_spec(url))
-            .await
-            .expect("the first POST is admitted")
-            .worker_id;
-        let patch: WorkerUpdateRequest =
-            serde_json::from_value(json!({"labels": {"tier": "a"}})).expect("an update");
-        let err = service
-            .update_worker(id.as_str(), patch)
-            .await
-            .expect_err("the registration is in flight");
-        assert!(
-            matches!(&err, WorkerServiceError::CreateInProgress { worker_id: Some(in_flight), .. } if *in_flight == id),
-            "{err:?}"
-        );
-        let err = service
-            .create_worker(worker_spec(url))
-            .await
-            .expect_err("the registration still holds the URL");
-        assert!(
-            matches!(&err, WorkerServiceError::CreateInProgress { worker_id: Some(in_flight), .. } if *in_flight == id),
-            "a second POST was admitted beside the registration: {err:?}"
-        );
-    }
-
-    /// A successful data-parallel POST leaves its id mapped to the base URL,
-    /// the ranks registered under the rank URLs and no job in flight: a PATCH
-    /// by that id is admitted and reaches every rank, as before the in-flight
-    /// guard, which read the empty base as a registration in flight and
-    /// refused the group's PATCH on every try.
-    #[tokio::test]
-    async fn a_patch_of_a_completed_data_parallel_group_by_its_post_id_reaches_every_rank() {
-        use crate::workflow::WorkflowEngines;
-
-        let registry = Arc::new(WorkerRegistry::new());
-        let url = "http://10.0.0.6:8000";
-        let router_config = RouterConfig::default();
-        let context = app_context_for_tests(router_config.clone(), Arc::clone(&registry), None);
-        assert!(
-            context
-                .workflow_engines
-                .set(WorkflowEngines::new(&router_config))
-                .is_ok(),
-            "the engines are set once"
-        );
-        let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
-        assert!(
-            context.worker_job_queue.set(Arc::clone(&queue)).is_ok(),
-            "the queue is set once"
-        );
-        // The group as its POST leaves it: the id reserved for the base URL,
-        // the ranks registered under the rank URLs, the job over.
-        let id = registry.reserve_id_for_url(url);
-        for rank in 0..2 {
-            let worker = BasicWorkerBuilder::new(url)
-                .worker_type(WorkerType::Regular)
-                .model(ModelCard::new("served"))
-                .dp_config(rank, 2)
-                .build();
-            registry
-                .register(Arc::new(worker))
-                .expect("a rank registers");
-        }
-        assert!(
-            registry.get_by_url(url).is_none(),
-            "nothing stands under the base URL itself"
-        );
-        assert_eq!(find_workers_by_url(&registry, url).len(), 2);
-
-        let patch: WorkerUpdateRequest =
-            serde_json::from_value(json!({"labels": {"tier": "a"}})).expect("an update");
-        let updated = context
-            .worker_service
-            .update_worker(id.as_str(), patch)
-            .await
-            .expect("the group's PATCH is admitted");
-        assert_eq!(updated.worker_id, id);
-
-        // The update job reaches both ranks.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            let ranks = find_workers_by_url(&registry, url);
-            if ranks.len() == 2
-                && ranks.iter().all(|worker| {
-                    worker
-                        .metadata()
-                        .spec
-                        .labels
-                        .get("tier")
-                        .map(String::as_str)
-                        == Some("a")
-                })
-            {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the update did not reach every rank: {:?}",
-                queue.get_status(url)
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    }
-
-    /// A DELETE behind a removal in flight for its URL keeps its removal for
-    /// that removal's end (`run_kept`), where before it was answered by the
-    /// removal in flight alone: a guarded cleanup (the entries a
-    /// registration's end saw) skips a worker replaced since its snapshot,
-    /// and a DELETE answered by it removed nothing.
-    #[tokio::test]
-    async fn a_delete_behind_a_removal_in_flight_keeps_its_removal() {
-        let registry = Arc::new(WorkerRegistry::new());
-        let url = "http://10.0.0.7:8000";
-        let context = app_context_for_tests(RouterConfig::default(), Arc::clone(&registry), None);
-        // A queue that accepts jobs and never runs one: no slot to run one in.
-        let queue = JobQueue::new(
-            JobQueueConfig {
-                max_concurrent_jobs: 0,
-                ..JobQueueConfig::default()
-            },
-            Arc::downgrade(&context),
-        );
-        let held = Arc::new(std::sync::OnceLock::new());
-        held.set(Arc::clone(&queue)).ok();
-        let service = WorkerService::new(Arc::clone(&registry), held, RouterConfig::default());
-        let worker = BasicWorkerBuilder::new(url)
-            .worker_type(WorkerType::Regular)
-            .model(ModelCard::new("served"))
-            .build();
-        let id = registry
-            .register(Arc::new(worker))
-            .expect("the worker registers");
-        // The cleanup removal of a registration's end, pinned to the entry it
-        // saw, holds the URL.
-        let cleanup = Job::RemoveWorker {
-            url: url.to_string(),
-            expected_revisions: Some(HashMap::from([(id.as_str().to_string(), Some(1))])),
-            asker: WorkerJobAsker::Api,
-        };
-        assert!(queue.claim_if_idle(&cleanup), "the cleanup holds the URL");
-        let deleted = service
-            .delete_worker(id.as_str())
-            .await
-            .expect("the DELETE is admitted");
-        assert_eq!(deleted.worker_id, id);
-        assert!(
-            QueueTest::kept_for(&queue, url),
-            "the DELETE's removal is kept for the removal in flight to run on its heels"
-        );
-    }
-
-    /// The status, the body and the Retry-After header of an error's answer.
-    async fn answer(err: WorkerServiceError) -> (StatusCode, serde_json::Value, Option<String>) {
-        let response = err.into_response();
-        let status = response.status();
-        let retry_after = response
-            .headers()
-            .get(http::header::RETRY_AFTER)
-            .map(|value| value.to_str().expect("a visible header").to_string());
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("a body");
-        (
-            status,
-            serde_json::from_slice(&bytes).expect("a JSON body"),
-            retry_after,
-        )
-    }
-
-    /// A registration of a URL whose worker is being removed is refused for
-    /// the drain window under the code it had, with an answer that says what
-    /// holds: the removal in progress, the drain, when to retry, and a
-    /// Retry-After of the drain. A live worker's refusal keeps its hint to
-    /// replace or update it.
-    #[tokio::test]
-    async fn create_worker_names_the_removal_in_progress_of_a_draining_worker() {
-        use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
-
-        let registry = Arc::new(WorkerRegistry::new());
-        let queue = Arc::new(std::sync::OnceLock::new());
-        queue
-            .set(JobQueue::new(
-                JobQueueConfig::default(),
-                std::sync::Weak::new(),
-            ))
-            .ok();
-        let service = WorkerService::new(Arc::clone(&registry), queue, RouterConfig::default());
-        let url = "grpc://10.0.0.8:8000";
-        let worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new(url)
-                .worker_type(WorkerType::Regular)
-                .model(ModelCard::new("m"))
-                .health_config(HealthCheckConfig {
-                    drain_settle_secs: 7,
-                    ..Default::default()
-                })
-                .build(),
-        );
-        registry.register(Arc::clone(&worker)).unwrap();
-        let id = registry.reserve_id_for_url(url);
-
-        let (status, body, retry_after) = answer(
-            service
-                .create_worker(worker_spec(url))
-                .await
-                .expect_err("a live worker holds the URL"),
-        )
-        .await;
-        assert_eq!(status, StatusCode::CONFLICT, "{body}");
-        assert_eq!(body["code"], "WORKER_ALREADY_EXISTS", "{body}");
-        let message = body["error"].as_str().expect("a message");
-        assert!(
-            message.contains(&format!("Use PUT /workers/{}", id.as_str())),
-            "a live worker's refusal hints at the replacement: {message}"
-        );
-        assert_eq!(retry_after, None, "a live worker's refusal has no retry");
-
-        worker.set_status(WorkerStatus::Draining);
-        let (status, body, retry_after) = answer(
-            service
-                .create_worker(worker_spec(url))
-                .await
-                .expect_err("a draining worker holds the URL for its drain"),
-        )
-        .await;
-        assert_eq!(status, StatusCode::CONFLICT, "{body}");
-        assert_eq!(body["code"], "WORKER_ALREADY_EXISTS", "{body}");
-        let message = body["error"].as_str().expect("a message");
-        assert!(
-            message.contains("is being removed")
-                && message.contains("for 7s, the worker's configured drain"),
-            "the refusal names the removal and its drain: {message}"
-        );
-        assert!(
-            message.contains(&format!("GET /workers/{} answers 404", id.as_str())),
-            "the refusal says when to retry: {message}"
-        );
-        assert!(
-            !message.contains("PUT"),
-            "no replacement of a worker that is leaving: {message}"
-        );
-        assert_eq!(
-            retry_after.as_deref(),
-            Some("7"),
-            "Retry-After carries the drain window"
-        );
-    }
-
-    /// A control character in a string the log writes as it came is refused
-    /// at the door, on POST and PUT: the URL, a model's id, a parser's name.
-    #[tokio::test]
-    async fn a_control_character_in_a_string_the_log_writes_is_refused_on_post_and_put() {
-        let registry = Arc::new(WorkerRegistry::new());
-        register_worker(&registry, "grpc://10.0.0.8:8000", Some("m"));
-        let id = registry.reserve_id_for_url("grpc://10.0.0.8:8000");
-        let service = make_service(Arc::clone(&registry));
-        let url = "grpc://10.0.0.9:8000";
-        let refused = [
-            (
-                "url",
-                json!({"url": "grpc://10.0.0.9:8000/\nINJECTED level=ERROR forged"}),
-            ),
-            ("url", json!({"url": "grpc://10.0.0.9:8000/\rINJECTED"})),
-            (
-                "models[].id",
-                json!({"url": url, "models": [{"id": "m\nINJECTED"}]}),
-            ),
-            (
-                "models[].reasoning_parser",
-                json!({"url": url, "models": [{"id": "m", "reasoning_parser": "p\nINJECTED"}]}),
-            ),
-            (
-                "models[].tool_parser",
-                json!({"url": url, "models": [{"id": "m", "tool_parser": "p\nINJECTED"}]}),
-            ),
-        ];
-        for (field, body) in refused {
-            let wanted = format!("{field} must not contain control characters");
-            let spec = || serde_json::from_value::<WorkerSpec>(body.clone()).expect("a spec");
-            let post = service.create_worker(spec()).await.expect_err("POST");
-            let put = service
-                .replace_worker(id.as_str(), spec())
-                .await
-                .expect_err("PUT");
-            for (verb, err) in [("POST", post), ("PUT", put)] {
-                assert!(
-                    matches!(&err, WorkerServiceError::BadRequest { message } if *message == wanted),
-                    "{verb} {field}: {err}"
-                );
-            }
-        }
-        let taken: WorkerSpec = serde_json::from_value(json!({
-            "url": url,
-            "models": [{"id": "m", "reasoning_parser": "p", "tool_parser": "p"}]
-        }))
-        .expect("a spec");
-        assert!(matches!(
-            service
-                .create_worker(taken)
-                .await
-                .expect_err("queue is uninitialized"),
-            WorkerServiceError::QueueNotInitialized
-        ));
-    }
-
-    /// A registration whose labels or fields the routers could not read is
-    /// refused at the boundary with a 400 naming the field, before any job
-    /// is queued; one they can read passes the boundary (and stops at the
-    /// uninitialized queue of this harness).
-    #[tokio::test]
-    async fn create_worker_refuses_labels_and_fields_the_routers_cannot_read() {
-        let service = make_service(Arc::new(WorkerRegistry::new()));
-        let url = "grpc://10.0.0.5:8000";
-        let thousand: serde_json::Map<String, serde_json::Value> =
-            (0..1000).map(|i| (format!("k{i}"), json!("v"))).collect();
-        let refused = [
-            (
-                json!({"url": url, "labels": {"max_running_requests": "abc"}}),
-                "max_running_requests",
-            ),
-            (
-                json!({"url": url, "labels": {"max_running_requests": "0"}}),
-                "max_running_requests",
-            ),
-            (
-                json!({"url": url, "labels": {"dp_size": "zero"}}),
-                "dp_size",
-            ),
-            (
-                json!({"url": url, "labels": {"supports_vision": "maybe"}}),
-                "supports_vision",
-            ),
-            (
-                json!({"url": url, "labels": {"note": "x".repeat(4097)}}),
-                "note",
-            ),
-            (json!({"url": url, "labels": thousand}), "labels"),
-            (
-                json!({"url": url, "labels": {"key with space\nnewline": "v"}}),
-                "label key",
-            ),
-            (json!({"url": url, "cost": 0}), "cost"),
-            (json!({"url": url, "cost": -1.0}), "cost"),
-            (json!({"url": url, "kv_block_size": 0}), "kv_block_size"),
-            (json!({"url": url, "dp_rank": 1}), "dp_rank"),
-            (json!({"url": url, "dp_rank": 2, "dp_size": 2}), "dp_rank"),
-            (json!({"url": url, "bootstrap_port": 0}), "bootstrap_port"),
-            (
-                json!({"url": format!("grpc://{}:1", "a".repeat(2049))}),
-                "url",
-            ),
-        ];
-        for (body, field) in refused {
-            let spec: WorkerSpec =
-                serde_json::from_value(body.clone()).expect("a spec the type takes");
-            let err = service
-                .create_worker(spec)
-                .await
-                .expect_err(&body.to_string());
-            assert!(
-                matches!(err, WorkerServiceError::BadRequest { .. }),
-                "{body}: {err}"
-            );
-            assert!(err.to_string().contains(field), "{body}: {err}");
-        }
-        // A window wider than 65535 passes the boundary: the routers saturate
-        // it. A window set here is the worker's only window, kept as set on
-        // every dp-aware rank worker; only a discovered one is divided per rank.
-        let spec: WorkerSpec = serde_json::from_value(json!({
-            "url": url, "cost": 2.5, "kv_block_size": 16, "dp_rank": 1, "dp_size": 2,
-            "labels": {
-                "max_running_requests": "256", "max_num_seqs": "70000",
-                "supports_vision": "true", "served_model_name": "m"
-            }
-        }))
-        .expect("a valid spec");
-        assert!(matches!(
-            service
-                .create_worker(spec)
-                .await
-                .expect_err("queue is uninitialized"),
-            WorkerServiceError::QueueNotInitialized
-        ));
-    }
-
-    /// An update is held to the same rules for the fields it may change.
-    #[tokio::test]
-    async fn update_worker_refuses_a_cost_or_labels_the_routers_cannot_read() {
-        let registry = Arc::new(WorkerRegistry::new());
-        register_worker(&registry, "grpc://10.0.0.5:8000", Some("m"));
-        let id = registry.reserve_id_for_url("grpc://10.0.0.5:8000");
-        let service = make_service(Arc::clone(&registry));
-        for body in [
-            json!({"cost": 0}),
-            json!({"cost": -2.0}),
-            json!({"labels": {"supports_vision": "yes"}}),
-            json!({"labels": {"max_running_requests": "many"}}),
-        ] {
-            let update: WorkerUpdateRequest =
-                serde_json::from_value(body.clone()).expect("an update the type takes");
-            let err = service
-                .update_worker(id.as_str(), update)
-                .await
-                .expect_err(&body.to_string());
-            assert!(
-                matches!(err, WorkerServiceError::BadRequest { .. }),
-                "{body}: {err}"
-            );
-        }
-        let update: WorkerUpdateRequest =
-            serde_json::from_value(json!({"cost": 1.5, "labels": {"max_running_requests": "64"}}))
-                .expect("a valid update");
-        assert!(matches!(
-            service
-                .update_worker(id.as_str(), update)
-                .await
-                .expect_err("queue is uninitialized"),
-            WorkerServiceError::QueueNotInitialized
-        ));
-    }
-
-    /// The early check counts the labels the merge leaves: a window set by
-    /// the update replaces a discovered one under the other name, so swapping
-    /// the window's name on a full worker passes (as the step would take it),
-    /// while a new key on a full worker is refused.
-    #[test]
-    fn the_early_cap_check_counts_the_labels_the_merge_leaves() {
-        let mut full: HashMap<String, String> = (1..MAX_WORKER_LABELS)
-            .map(|i| (format!("k{i}"), "v".to_string()))
-            .collect();
-        full.insert("max_num_seqs".to_string(), "256".to_string());
-        assert_eq!(full.len(), MAX_WORKER_LABELS);
-        let swap = HashMap::from([("max_running_requests".to_string(), "512".to_string())]);
-        assert!(validate_merged_labels(&full, &swap).is_ok());
-        assert_eq!(merge_labels(&full, &swap).len(), MAX_WORKER_LABELS);
-        let new_key = HashMap::from([("k_new".to_string(), "v".to_string())]);
-        let message = validate_merged_labels(&full, &new_key)
-            .expect_err("a 129th label")
-            .to_string();
-        assert!(
-            message.contains("129 labels on the worker after this update (128 now, 1 new)"),
-            "{message}"
-        );
-        assert!(
-            message.contains("new); at most 128 are accepted"),
-            "{message}"
-        );
-    }
-
-    /// The label cap holds for the worker, not the request: a PATCH merges
-    /// its labels into the existing ones, so one that would leave more than
-    /// the cap on the worker is refused, while one that only rewrites keys
-    /// the worker has is taken.
-    #[tokio::test]
-    async fn update_worker_holds_the_label_cap_over_the_merged_labels() {
-        let registry = Arc::new(WorkerRegistry::new());
-        let full: HashMap<String, String> = (0..MAX_WORKER_LABELS)
-            .map(|i| (format!("k{i}"), "v".to_string()))
-            .collect();
-        let worker = BasicWorkerBuilder::new("grpc://10.0.0.6:8000")
-            .worker_type(WorkerType::Regular)
-            .model(ModelCard::new("m"))
-            .labels(full)
-            .build();
-        registry.register(Arc::new(worker)).unwrap();
-        let id = registry.reserve_id_for_url("grpc://10.0.0.6:8000");
-        let service = make_service(Arc::clone(&registry));
-        let one_more: WorkerUpdateRequest =
-            serde_json::from_value(json!({"labels": {"k_new": "v"}})).expect("an update");
-        let err = service
-            .update_worker(id.as_str(), one_more)
-            .await
-            .expect_err("a 129th label");
-        assert!(
-            matches!(&err, WorkerServiceError::BadRequest { message } if message.contains("129 labels on the worker")),
-            "{err}"
-        );
-        let rewrite: WorkerUpdateRequest =
-            serde_json::from_value(json!({"labels": {"k0": "w", "k1": "w"}})).expect("an update");
-        assert!(matches!(
-            service
-                .update_worker(id.as_str(), rewrite)
-                .await
-                .expect_err("queue is uninitialized"),
-            WorkerServiceError::QueueNotInitialized
-        ));
-    }
-
-    /// A worker over the cap through the labels discovered at registration
-    /// still takes an update that adds no key through the endpoint: a rewrite
-    /// of keys it has reaches the queue, a new key is refused by name.
-    #[tokio::test]
-    async fn update_worker_over_the_cap_takes_a_rewrite_through_the_endpoint() {
-        let registry = Arc::new(WorkerRegistry::new());
-        let over: HashMap<String, String> = (0..MAX_WORKER_LABELS + 20)
-            .map(|i| (format!("k{i}"), "v".to_string()))
-            .collect();
-        let worker = BasicWorkerBuilder::new("grpc://10.0.0.7:8000")
-            .worker_type(WorkerType::Regular)
-            .model(ModelCard::new("m"))
-            .labels(over)
-            .build();
-        registry.register(Arc::new(worker)).unwrap();
-        let id = registry.reserve_id_for_url("grpc://10.0.0.7:8000");
-        let service = make_service(Arc::clone(&registry));
-        let rewrite: WorkerUpdateRequest =
-            serde_json::from_value(json!({"labels": {"k3": "w"}})).expect("an update");
-        assert!(matches!(
-            service
-                .update_worker(id.as_str(), rewrite)
-                .await
-                .expect_err("queue is uninitialized"),
-            WorkerServiceError::QueueNotInitialized
-        ));
-        let adds: WorkerUpdateRequest =
-            serde_json::from_value(json!({"labels": {"k_new": "v"}})).expect("an update");
-        let err = service
-            .update_worker(id.as_str(), adds)
-            .await
-            .expect_err("a new key on a worker over the cap");
-        assert!(
-            matches!(&err, WorkerServiceError::BadRequest { message } if message.contains("149 labels on the worker") && message.contains("1 new")),
-            "{err}"
-        );
-    }
-
-    /// No request can write the labels discovery reads ownership from: a
-    /// key under the reserved prefix is a 400 naming it on a POST, on a PUT
-    /// and on a PATCH of a manual worker, before any job is queued; a key
-    /// that only resembles the prefix passes.
-    #[tokio::test]
-    async fn a_label_under_the_discovery_prefix_is_refused_on_post_put_and_patch() {
-        let registry = Arc::new(WorkerRegistry::new());
-        register_worker(&registry, "grpc://10.0.0.8:8000", Some("m"));
-        let id = registry.reserve_id_for_url("grpc://10.0.0.8:8000");
-        let service = make_service(Arc::clone(&registry));
-        let refused = |err: WorkerServiceError, key: &str| {
-            assert!(
-                matches!(&err, WorkerServiceError::BadRequest { message }
-                    if message.contains(&format!("'{key}'"))
-                        && message.contains("reserved for worker discovery")),
-                "{key}: {err}"
-            );
-        };
-        for key in [
-            "smg.ai/discovery-provider",
-            "smg.ai/discovery-id",
-            "smg.ai/discovery-spec-hash",
-            "smg.ai/discovery-anything",
-        ] {
-            let labels = json!({ key: "file" });
-            let post: WorkerSpec =
-                serde_json::from_value(json!({"url": "grpc://10.0.0.9:8000", "labels": labels}))
-                    .expect("a spec");
-            refused(service.create_worker(post).await.expect_err("POST"), key);
-            let put: WorkerSpec =
-                serde_json::from_value(json!({"url": "grpc://10.0.0.8:8000", "labels": labels}))
-                    .expect("a spec");
-            refused(
-                service
-                    .replace_worker(id.as_str(), put)
-                    .await
-                    .expect_err("PUT"),
-                key,
-            );
-            let patch: WorkerUpdateRequest =
-                serde_json::from_value(json!({ "labels": labels })).expect("an update");
-            refused(
-                service
-                    .update_worker(id.as_str(), patch)
-                    .await
-                    .expect_err("PATCH"),
-                key,
-            );
-        }
-        let lookalikes = json!({
-            "smg.ai/discovery": "v",
-            "smg.ai/discoveryid": "v",
-            "x/smg.ai/discovery-id": "v",
-        });
-        let post: WorkerSpec =
-            serde_json::from_value(json!({"url": "grpc://10.0.0.9:8000", "labels": lookalikes}))
-                .expect("a spec");
-        assert!(matches!(
-            service
-                .create_worker(post)
-                .await
-                .expect_err("queue is uninitialized"),
-            WorkerServiceError::QueueNotInitialized
-        ));
-    }
-
-    /// A probe interval or timeout the health schedule cannot hold is refused
-    /// at the door, on POST, PUT and PATCH; the longest it can hold is taken.
-    #[tokio::test]
-    async fn a_probe_delay_past_the_schedules_bound_is_refused_on_post_put_and_patch() {
-        let registry = Arc::new(WorkerRegistry::new());
-        register_worker(&registry, "grpc://10.0.0.8:8000", Some("m"));
-        let id = registry.reserve_id_for_url("grpc://10.0.0.8:8000");
-        let service = make_service(Arc::clone(&registry));
-        for field in ["check_interval_secs", "timeout_secs"] {
-            let refused = |err: WorkerServiceError, verb: &str| {
-                assert!(
-                    matches!(&err, WorkerServiceError::BadRequest { message }
-                        if message.contains(&format!("health.{field} is"))),
-                    "{verb} {field}: {err}"
-                );
-            };
-            for secs in [946_080_001, u64::MAX] {
-                let health = json!({ field: secs });
-                let post: WorkerSpec = serde_json::from_value(
-                    json!({"url": "grpc://10.0.0.9:8000", "health": health}),
-                )
-                .expect("a spec");
-                refused(service.create_worker(post).await.expect_err("POST"), "POST");
-                let put: WorkerSpec = serde_json::from_value(
-                    json!({"url": "grpc://10.0.0.8:8000", "health": health}),
-                )
-                .expect("a spec");
-                refused(
-                    service
-                        .replace_worker(id.as_str(), put)
-                        .await
-                        .expect_err("PUT"),
-                    "PUT",
-                );
-                let patch: WorkerUpdateRequest =
-                    serde_json::from_value(json!({ "health": health })).expect("an update");
-                refused(
-                    service
-                        .update_worker(id.as_str(), patch)
-                        .await
-                        .expect_err("PATCH"),
-                    "PATCH",
-                );
-            }
-            let longest: WorkerSpec = serde_json::from_value(json!({
-                "url": "grpc://10.0.0.9:8000",
-                "health": { field: 946_080_000_u64 }
-            }))
-            .expect("a spec");
-            assert!(matches!(
-                service
-                    .create_worker(longest)
-                    .await
-                    .expect_err("queue is uninitialized"),
-                WorkerServiceError::QueueNotInitialized
-            ));
-        }
-    }
-
-    /// A discovered worker's spec and labels are changed at its discovery
-    /// source: a PUT of it is a 409 naming its provider, whatever the body —
-    /// the worker's own spec sent back included — and so is a PATCH that
-    /// carries labels, reserved ones included. A PATCH of what no provider
-    /// publishes, and a DELETE, are taken (the provider adds a deleted
-    /// worker back while it still publishes it).
-    #[tokio::test]
-    async fn put_and_a_label_patch_of_a_discovered_worker_are_refused_naming_its_provider() {
-        let registry = Arc::new(WorkerRegistry::new());
-        let url = "grpc://10.0.0.10:8000";
-        let worker = BasicWorkerBuilder::new(url)
-            .worker_type(WorkerType::Regular)
-            .model(ModelCard::new("m"))
-            .label(DISCOVERY_PROVIDER_LABEL, "consul")
-            .label("smg.ai/discovery-id", "node-1:8000")
-            .build();
-        registry.register(Arc::new(worker)).unwrap();
-        let id = registry.reserve_id_for_url(url);
-        let service = make_service(Arc::clone(&registry));
-        let owned = |err: WorkerServiceError| {
-            assert_eq!(err.status_code(), StatusCode::CONFLICT, "{err}");
-            assert_eq!(err.error_code(), "WORKER_DISCOVERY_OWNED");
-            let message = err.to_string();
-            assert!(message.contains("'consul' discovery provider"), "{message}");
-            assert!(message.contains("discovery source"), "{message}");
-        };
-        let own_spec = (*registry.get(&id).expect("registered").metadata().spec).clone();
-        for put in [worker_spec(url), own_spec] {
-            owned(
-                service
-                    .replace_worker(id.as_str(), put)
-                    .await
-                    .expect_err("PUT"),
-            );
-        }
-        for body in [
-            json!({"labels": {"env": "prod"}}),
-            json!({"priority": 5, "labels": {"env": "prod"}}),
-            json!({"labels": {DISCOVERY_PROVIDER_LABEL: "file"}}),
-        ] {
-            let patch: WorkerUpdateRequest = serde_json::from_value(body).expect("an update");
-            owned(
-                service
-                    .update_worker(id.as_str(), patch)
-                    .await
-                    .expect_err("PATCH"),
-            );
-        }
-        for body in [
-            json!({"priority": 5}),
-            json!({"cost": 2.0}),
-            json!({"api_key": "rotated"}),
-            json!({"health": {"timeout_secs": 9}}),
-        ] {
-            let patch: WorkerUpdateRequest =
-                serde_json::from_value(body.clone()).expect("an update");
-            assert!(
-                matches!(
-                    service.update_worker(id.as_str(), patch).await,
-                    Err(WorkerServiceError::QueueNotInitialized)
-                ),
-                "{body} reaches the queue"
-            );
-        }
-        assert!(matches!(
-            service
-                .delete_worker(id.as_str())
-                .await
-                .expect_err("queue is uninitialized"),
-            WorkerServiceError::QueueNotInitialized
-        ));
-    }
-
-    /// A rejected key is not echoed whole: a key the size of the payload
-    /// limit comes back as its first characters and its length.
-    #[test]
-    fn a_rejected_label_key_is_shown_truncated() {
-        let long = "k".repeat(1 << 20);
-        let labels: HashMap<String, String> = [(long.clone(), "v".to_string())].into();
-        let err = validate_labels(&labels).expect_err("a key over the cap");
-        let WorkerServiceError::BadRequest { message } = err else {
-            panic!("expected a bad request, got {err}");
-        };
-        assert!(message.len() < 512, "{} bytes", message.len());
-        assert!(
-            message.contains(&format!("({} bytes)", long.len())),
-            "{message}"
-        );
-        let short: HashMap<String, String> = [("has space".to_string(), "v".to_string())].into();
-        let err = validate_labels(&short).expect_err("a key with a space");
-        assert!(err.to_string().contains("\"has space\""), "{err}");
-    }
-
-    #[test]
-    fn list_workers_by_origin_tells_local_from_discovered() {
-        let registry = Arc::new(WorkerRegistry::new());
-        register_worker(&registry, "http://local:30000", None);
-        let discovered: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("http://discovered:30000")
-                .worker_type(WorkerType::Regular)
-                .label(DISCOVERY_PROVIDER_LABEL, "file")
-                .build(),
-        );
-        registry.register(discovered).unwrap();
-        let service = make_service(registry);
-        let urls = |result: ListWorkersResult| -> Vec<String> {
-            result.workers.iter().map(|w| w.spec.url.clone()).collect()
-        };
-
-        assert_eq!(
-            urls(service.list_workers(None, Some(WorkerListOrigin::Local))),
-            ["http://local:30000"],
-            "local: the worker the API registered"
-        );
-        assert_eq!(
-            urls(service.list_workers(None, Some(WorkerListOrigin::Discovery))),
-            ["http://discovered:30000"],
-            "discovery: the worker a provider owns"
-        );
-        assert_eq!(service.list_workers(None, None).total, 2, "no origin: both");
-    }
-}
+#[path = "../../tests/unit/admin/worker_service/tests.rs"]
+mod tests;

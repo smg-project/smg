@@ -22,7 +22,8 @@ use engine_zmq_client::{
 };
 use futures::StreamExt;
 use mock_worker::{
-    config::{Config, ReplayConfig},
+    config::{Config, ReplayConfig, Role},
+    engine::{EngineParams, TimingModel},
     grpc, http, script, zmq,
 };
 use serde_json::{json, Value};
@@ -298,6 +299,56 @@ async fn grpc_encodes_a_scripted_text_with_the_workers_tokenizer() {
     ));
 }
 
+/// A realistic worker whose `--tokenizer` names local files streams only ids
+/// that tokenizer decodes: 300 words (ids 0 to 299) and a special
+/// end-of-sequence token (300), where the engine draws from 100 up.
+#[tokio::test]
+async fn grpc_streams_engine_output_the_workers_tokenizer_decodes() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let vocab: Vec<String> = (0..300).map(|id| format!(r#""w{id}":{id}"#)).collect();
+    let special = r#"{"id":300,"content":"</s>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}"#;
+    let model = format!(
+        r#"{{"type":"WordLevel","vocab":{{{}}},"unk_token":"w0"}}"#,
+        vocab.join(",")
+    );
+    let json = format!(
+        r#"{{"version":"1.0","truncation":null,"padding":null,"added_tokens":[{special}],"normalizer":null,"pre_tokenizer":{{"type":"Whitespace"}},"post_processor":null,"decoder":null,"model":{model}}}"#
+    );
+    std::fs::write(dir.path().join("tokenizer.json"), json).expect("write the tokenizer");
+    let cfg = Config {
+        realistic: true,
+        tokenizer_path: dir.path().display().to_string(),
+        output_tokens: 48,
+        engine: EngineParams {
+            timing: TimingModel::Linear {
+                prefill_tps: 8000.0,
+                decode_base_ms: 1.0,
+                decode_per_req_ms: 0.0,
+            },
+            ..EngineParams::default()
+        },
+        ..config(None)
+    };
+    let (client, _worker) = start_grpc(cfg).await.expect("the worker starts");
+
+    let frames = generate(&client, grpc_request("t", &[7, 7], true, false))
+        .await
+        .expect("the worker answers");
+    let ids: Vec<u32> = frames
+        .iter()
+        .filter_map(|f| match &f.response {
+            Some(GenResp::Chunk(chunk)) => Some(chunk.token_ids.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(ids.len(), 48, "the worker's output tokens, streamed");
+    assert!(
+        ids.iter().all(|id| (100..300).contains(id)),
+        "only ids the worker's tokenizer decodes: {ids:?}"
+    );
+}
+
 #[tokio::test]
 async fn grpc_fails_a_text_answer_it_cannot_encode_instead_of_answering_canned() {
     let cfg = Config {
@@ -487,6 +538,93 @@ fn sse_data(body: &str) -> anyhow::Result<Vec<String>> {
                 .with_context(|| format!("not a data frame: {frame:?}"))
         })
         .collect()
+}
+
+/// A canned worker has no engine that counts its requests: the worker counts
+/// the generation requests it received, on either wire, and the admin API
+/// reads the count on its row of the fleet list and in its ops status.
+#[tokio::test]
+async fn the_admin_api_counts_the_requests_a_canned_worker_received() {
+    let (client, grpc_worker) = start_grpc(config(None)).await.expect("the gRPC worker");
+    let (base, http_worker) = start_http(config(None)).await.expect("the HTTP worker");
+    let decode = Config {
+        role: Some(Role::Decode),
+        ..config(None)
+    };
+    let (decode_base, decode_worker) = start_http(decode).await.expect("the decode worker");
+    let admin_port = common::start_admin(config(None))
+        .await
+        .expect("the admin API starts");
+    let http = common::http_client();
+    let admin = format!("http://127.0.0.1:{admin_port}/admin");
+
+    // The counts are read against the list as the workers started: a name
+    // (a port) an earlier worker of this process had keeps that worker's count.
+    let list = || async {
+        http.get(format!("{admin}/fleet"))
+            .send()
+            .await
+            .expect("the fleet list")
+            .json::<Value>()
+            .await
+            .expect("the fleet list is JSON")
+    };
+    let received = |fleet: &Value, worker: &str| {
+        fleet["workers"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["worker"] == worker))
+            .and_then(|row| row["requests"].as_u64())
+    };
+    let before = list().await;
+
+    for id in ["count-1", "count-2"] {
+        generate(&client, grpc_request(id, &[5, 6, 7], false, false))
+            .await
+            .expect("the gRPC worker answers");
+    }
+    // Each of the HTTP wire's two entries, then a request a decode worker
+    // refuses for its missing rendezvous: it was sent to that worker all the
+    // same.
+    let asks =
+        json!({"model": MODEL, "max_tokens": 4, "messages": [{"role": "user", "content": "hi"}]});
+    for (url, status) in [
+        (format!("{base}/v1/chat/completions"), 200),
+        (format!("{base}/v1/messages"), 200),
+        (format!("{decode_base}/v1/chat/completions"), 400),
+    ] {
+        let answer = http
+            .post(&url)
+            .json(&asks)
+            .send()
+            .await
+            .expect("the HTTP worker answers");
+        assert_eq!(answer.status(), status, "{url}");
+    }
+
+    let after = list().await;
+    for (worker, sent) in [(&grpc_worker, 2), (&http_worker, 2), (&decode_worker, 1)] {
+        let counted = received(&after, worker)
+            .zip(received(&before, worker))
+            .map(|(is, was)| is - was);
+        assert_eq!(
+            counted,
+            Some(sent),
+            "{worker} counts the requests it received on its row: {after}"
+        );
+    }
+    let ops: Value = http
+        .get(format!("{admin}/ops/{http_worker}"))
+        .send()
+        .await
+        .expect("the ops status")
+        .json()
+        .await
+        .expect("the ops status is JSON");
+    assert_eq!(
+        ops["requests"].as_u64(),
+        received(&after, &http_worker),
+        "the ops status reads the same count"
+    );
 }
 
 #[tokio::test]

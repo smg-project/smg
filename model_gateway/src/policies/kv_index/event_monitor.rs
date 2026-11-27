@@ -29,6 +29,7 @@
 use std::{fmt, sync::Arc};
 
 use dashmap::{mapref::entry::Entry, DashMap};
+use smg_grand_central::engine::{CacheIndex, CacheIndexes};
 use smg_worker::{
     identity::{basic::Worker, endpoint::Endpoint},
     load::monitor::WorkerMonitor,
@@ -39,6 +40,7 @@ use smg_worker::{
 use tracing::{error, warn};
 
 use super::index_backend::KvIndex;
+use crate::policies::normalize_model_key;
 
 mod admission;
 #[cfg(test)]
@@ -331,6 +333,30 @@ impl KvEventMonitor {
                 tokens: block_size,
                 from_events: false,
             });
+    }
+}
+
+/// Grand Central's reads of the monitor, where it decides in the
+/// gateway's own process: a model's index and its block size, each read
+/// where the engine reads a list of workers, never once a request.
+impl CacheIndexes for KvEventMonitor {
+    /// The model's index, whenever the model has one: while it holds no
+    /// block too, from the enrolment of the model's first worker to its
+    /// first event, and again once its last holder left. The index says
+    /// itself whether it holds a block ([`CacheIndex::holds_a_block`]),
+    /// and the engine reads one that holds none as no index: it decides
+    /// the request in the token tree the gateway lends it, as the classic
+    /// policy does in its own (`CacheAwarePolicy::event_index_for`). The
+    /// engine asks that word at each decision, so a model's first event
+    /// and its last holder's leaving decide its next request.
+    fn index(&self, model: &str) -> Option<Arc<dyn CacheIndex>> {
+        let index = self.get_indexer(normalize_model_key(model))?;
+        Some(index as Arc<dyn CacheIndex>)
+    }
+
+    fn block_size(&self, model: &str) -> Option<u32> {
+        let tokens = Self::block_size(self, normalize_model_key(model))?;
+        u32::try_from(tokens).ok().filter(|&tokens| tokens > 0)
     }
 }
 
@@ -770,6 +796,105 @@ mod tests {
     async fn an_unknown_model_has_no_index() {
         let monitor = KvEventMonitor::new();
         assert!(monitor.get_indexer("nonexistent").is_none());
+    }
+
+    /// Grand Central's reads of the monitor. A block that a worker's
+    /// event stored in a model's index is what the engine's lookup answers,
+    /// under the index's own number of the worker, and the model's block
+    /// size is the one the monitor holds. The index the engine is handed is
+    /// the monitor's own, not a copy. A model with no index answers none.
+    #[test]
+    fn the_engine_reads_the_index_an_event_wrote() {
+        use kv_index::compute_request_content_hashes;
+        use smg_grpc_client::common_proto::{
+            kv_cache_event::Data, KvBlock, KvBlocksStored, KvCacheEvent, KvEventBatch,
+        };
+
+        let monitor = KvEventMonitor::new();
+        let index = Arc::new(KvIndex::chain());
+        monitor.set_index("llama", Arc::clone(&index));
+        monitor.set_block_size("llama", 4);
+        let tokens = [10, 20, 30, 40];
+        let stored = KvBlocksStored {
+            blocks: vec![KvBlock {
+                block_hash: 1,
+                token_ids: tokens.to_vec(),
+                block_size: 4,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let batch = KvEventBatch {
+            events: vec![KvCacheEvent {
+                event_id: 1,
+                data: Some(Data::Stored(stored)),
+            }],
+            ..Default::default()
+        };
+        let mut feed = bench_support::IndexFeed::new(&index, "grpc://w1:9000").unwrap();
+        feed.apply(&index, &batch);
+
+        let read: &dyn CacheIndexes = &monitor;
+        assert_eq!(read.block_size("llama"), Some(4));
+        let lent = read.index("llama").expect("the model's index");
+        assert!(
+            std::ptr::addr_eq(Arc::as_ptr(&lent), Arc::as_ptr(&index)),
+            "the monitor's own index"
+        );
+        let number = feed.worker_id();
+        assert_eq!(lent.worker_number("grpc://w1:9000"), Some(number));
+        assert_eq!(lent.worker_blocks(number), 1);
+        let hashes = compute_request_content_hashes(&tokens, 4);
+        let request: Vec<u64> = hashes.iter().map(|hash| hash.0).collect();
+        let mut kept = Vec::new();
+        lent.deepest_into(&request, 4, &[1 << number], 16, &mut |_| 0, &mut kept);
+        assert_eq!(kept, [(number, 1)]);
+
+        assert!(read.index("nonexistent").is_none());
+        assert_eq!(read.block_size("nonexistent"), None);
+    }
+
+    /// The engine is lent the model's index whenever the model has one,
+    /// and the index says itself that it holds no block: from the
+    /// enrolment of the model's first worker to its first event, and again
+    /// once the last holder left with its blocks. The engine reads such an
+    /// index as none, and its request is then decided by the token tree
+    /// the gateway lends. An index lent before the first event says the
+    /// event's block. The block size is answered whatever the index holds.
+    ///
+    /// The classic policy reads an index that holds no block as no index
+    /// too (`model_gateway/src/policies/cache_aware.rs:1800`,
+    /// `event_index_for`).
+    #[test]
+    fn the_engine_is_lent_an_index_that_says_whether_it_holds_a_block() {
+        let monitor = KvEventMonitor::new();
+        let index = Arc::new(KvIndex::chain());
+        monitor.set_index("llama", Arc::clone(&index));
+        monitor.set_block_size("llama", 4);
+        let read: &dyn CacheIndexes = &monitor;
+        let empty = read.index("llama").expect("the model's index");
+        assert!(!empty.holds_a_block(), "no event yet");
+        assert_eq!(read.block_size("llama"), Some(4));
+
+        let worker = index.intern_worker("grpc://w1:9000").unwrap();
+        let mut held = WorkerBlocks::default();
+        let block = StoredBlock {
+            seq_hash: SequenceHash(1),
+            content_hash: ContentHash(101),
+        };
+        index
+            .apply_stored(worker, &[block], None, &mut held)
+            .unwrap();
+        let lent = read.index("llama").expect("the index holds a block");
+        assert!(
+            std::ptr::addr_eq(Arc::as_ptr(&lent), Arc::as_ptr(&index)),
+            "the monitor's own index"
+        );
+        assert!(lent.holds_a_block() && empty.holds_a_block());
+
+        index.remove_worker(worker, held);
+        assert!(!lent.holds_a_block(), "the last holder left");
+        assert_eq!(read.block_size("llama"), Some(4));
     }
 
     #[test]

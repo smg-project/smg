@@ -31,10 +31,11 @@ use std::{
 use rustc_hash::FxBuildHasher;
 
 use super::{
-    deepseek_v3, deepseek_v3_1, deepseek_v3_2, deepseek_v4, deepseek_v4_1, dots3, function_gemma,
-    gemma4, glm, glm4, hy4, hy_v3, inkling, inkling2, iquest, json, k2_horizon, kimi_k2, kimi_k3,
-    lfm2_5, ling, llama4, llama_nemotron, longcat, minicpm5, minimax_m2, minimax_m3, mistral,
-    mistral_v13, muse_spark, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
+    command, deepseek_v3, deepseek_v3_1, deepseek_v3_2, deepseek_v4, deepseek_v4_1, dots3,
+    function_gemma, gemma4, glm, glm4, hy4, hy_v3, inkling, inkling2, iquest, json, k2_horizon,
+    kimi, kimi_k2, kimi_k3, lfm2_5, ling, llama4, llama_nemotron, longcat, minicpm5, minimax_m2,
+    minimax_m3, mistral, mistral_v13, muse_spark, olmo3, plain, qwen2_5, qwen3, seed_oss, steptml,
+    xlam,
 };
 use crate::{
     format::{CallSyntax, Format},
@@ -106,10 +107,14 @@ tables! {
     MinimaxM2 => "minimax_m2", minimax_m2;
     /// [`minimax_m3()`].
     MinimaxM3 => "minimax_m3", minimax_m3;
+    /// [`steptml()`].
+    Steptml => "steptml", steptml;
     /// [`mistral_v13()`].
     MistralV13 => "mistral_v13", mistral_v13;
     /// [`llama_nemotron()`].
     LlamaNemotron => "llama_nemotron", llama_nemotron;
+    /// [`command()`].
+    Command => "command", command;
     /// [`kimi_k3()`].
     KimiK3 => "kimi_k3", kimi_k3;
     /// [`inkling()`].
@@ -148,6 +153,8 @@ tables! {
     Mistral => "mistral", mistral;
     /// [`kimi_k2()`].
     KimiK2 => "kimi_k2", kimi_k2;
+    /// [`kimi()`].
+    Kimi => "kimi", kimi;
 }
 
 /// A table's row in the registry: the table, its name and the function that builds it. The rows
@@ -635,6 +642,29 @@ mod tests {
         ] {
             assert_eq!(table_for(model), Some(table), "{model}");
             assert!(for_model(model).is_some(), "{model}");
+        }
+    }
+
+    /// A checkpoint that bellwether records with the parse cases or the chat template of a group
+    /// the registry already reads has a row of its own on that group's table, with the group's
+    /// turn opener and text after the thought's close, or stands under the group's `also`. One of
+    /// each, with the group it reads like; the README test holds every row to the registry.
+    #[test]
+    fn a_checkpoint_recorded_like_a_group_reads_like_that_group() {
+        for (model, group) in [
+            (
+                "RedHatAI/Llama-3.2-1B-Instruct-FP8",
+                "meta-llama/Llama-3.2-1B-Instruct",
+            ),
+            ("arcee-ai/arcee-blitz-caller-beta", "arcee-ai/Caller"),
+            (
+                "fixie-ai/turntaking-pretraining-it-multilingual-3c",
+                "meta-llama/Llama-3.1-8B-Instruct",
+            ),
+        ] {
+            let format = for_model(group);
+            assert!(format.is_some(), "{group}: not in the registry");
+            assert_eq!(for_model(model), format, "{model}: {group}");
         }
     }
 

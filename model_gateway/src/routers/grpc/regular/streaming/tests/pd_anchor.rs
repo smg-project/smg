@@ -10,6 +10,12 @@
 //! Each case drives the route's `PrefillDecode` arm over scripted sides whose
 //! dispatch instants lie a known time before the stream, under a thread-local
 //! Prometheus recorder, and reads the rendered families.
+//!
+//! The request's wait ahead of that dispatch is recorded with the route's
+//! time to first token. Each case's entry point runs under an entry stamp
+//! taken a known time before the dispatch, as the edge runs a request; the
+//! body is read outside it, as the connection reads it. A collected answer
+//! records the same wait with no first token.
 use std::{future::Future, time::Duration};
 
 use openai_protocol::{
@@ -21,11 +27,13 @@ use tokio::task::JoinHandle;
 use super::{
     super::*,
     eof::{
-        chunk, complete, messages_spec, processor, runtime, scripted_stream, CharacterTokenizer,
+        chunk, complete, messages_spec, processor, response_processor, runtime, scripted_stream,
+        CharacterTokenizer,
     },
 };
 use crate::{
-    observability::metrics::test_support::render_with_recorder,
+    middleware::RequestStarted,
+    observability::metrics::{test_support::render_with_recorder, DISPATCH_WAIT_SECONDS},
     routers::grpc::{
         common::responses::streaming::ResponseStreamEventEmitter,
         context::ExecutionResult,
@@ -38,6 +46,42 @@ const MODEL: &str = "pd-anchor-test";
 const PREFILL_OFFSET: Duration = Duration::from_millis(300);
 /// How long before the stream task the decode side was dispatched.
 const DECODE_OFFSET: Duration = Duration::from_millis(100);
+/// How long before its dispatch a case's request came in at the edge.
+const DISPATCH_WAIT: Duration = Duration::from_millis(40);
+
+/// The instant a case's stream clocks start at: the one worker's dispatch,
+/// or the prefill dispatch of a pair. Read off the result's own fields, not
+/// through the gateway's helper for it; a batch's case names its earliest
+/// member itself.
+fn dispatched_at(result: &ExecutionResult) -> Instant {
+    match result {
+        ExecutionResult::Single { dispatch_start, .. } => *dispatch_start,
+        ExecutionResult::PrefillDecode { pd_timing, .. } => pd_timing.prefill_start,
+        ExecutionResult::Batch { .. } | ExecutionResult::Embedding { .. } => {
+            panic!("a case stamps one dispatch or one pair")
+        }
+    }
+}
+
+/// The entry stamp of a request that came in `DISPATCH_WAIT` before the
+/// dispatch at `dispatched`: the stamp is taken off the dispatch instant
+/// itself, so the wait is `DISPATCH_WAIT` to the nanosecond.
+fn entered_before(dispatched: Instant) -> RequestStarted {
+    let entered = dispatched
+        .checked_sub(DISPATCH_WAIT)
+        .expect("the process is older than the wait");
+    RequestStarted::at(entered)
+}
+
+/// A route's entry point run under an entry stamp, as the edge runs a
+/// request's handler.
+trait Entered: Future + Sized {
+    fn entered(self, at: RequestStarted) -> impl Future<Output = Self::Output> {
+        at.scope(self)
+    }
+}
+
+impl<F: Future> Entered for F {}
 
 fn dispatch() -> context::DispatchMetadata {
     context::DispatchMetadata {
@@ -193,9 +237,22 @@ fn sample(rendered: &str, family: &str, field: &str, label: &str) -> Option<f64>
         .and_then(|value| value.parse().ok())
 }
 
+/// The label set of `family`'s `_count` line that carries `label`.
+fn count_labels<'a>(rendered: &'a str, family: &str, label: &str) -> Option<&'a str> {
+    let prefix = format!("{family}_count{{");
+    rendered
+        .lines()
+        .find(|line| line.starts_with(&prefix) && line.contains(label))
+        .and_then(|line| line.strip_prefix(&prefix))
+        .and_then(|rest| rest.split('}').next())
+}
+
 /// The route's stream metrics anchor at dispatch: one record, a
 /// TTFT of at least the dispatch offset (a clock the task started itself
 /// would read milliseconds) and a generation duration on the same base.
+/// The request's wait ahead of that dispatch is recorded with the TTFT:
+/// once, under the TTFT's labels, and it is the time from the entry stamp to
+/// the dispatch.
 fn assert_stream_anchor(rendered: &str, route: &str, endpoint: &'static str) {
     let label = format!("endpoint=\"{endpoint}\"");
     let count = sample(rendered, "smg_router_ttft_seconds", "count", &label);
@@ -222,6 +279,27 @@ fn assert_stream_anchor(rendered: &str, route: &str, endpoint: &'static str) {
     assert!(
         generation >= ttft,
         "{endpoint}: generation duration {generation} s shares the TTFT's base ({ttft} s)"
+    );
+    let waits = sample(rendered, DISPATCH_WAIT_SECONDS, "count", &label);
+    let wait = sample(rendered, DISPATCH_WAIT_SECONDS, "sum", &label);
+    report(
+        route,
+        &format!("dispatch wait={wait:?} s records={waits:?}"),
+    );
+    assert_eq!(
+        waits,
+        Some(1.0),
+        "{endpoint}: one dispatch wait, as there is one TTFT:\n{rendered}"
+    );
+    assert_eq!(
+        count_labels(rendered, DISPATCH_WAIT_SECONDS, &label),
+        count_labels(rendered, "smg_router_ttft_seconds", &label),
+        "{endpoint}: the dispatch wait carries the TTFT's labels:\n{rendered}"
+    );
+    let wait = wait.expect("the dispatch wait");
+    assert!(
+        (wait - DISPATCH_WAIT.as_secs_f64()).abs() < 1e-9,
+        "{endpoint}: dispatch wait {wait} s is the time from the entry stamp to the dispatch ({DISPATCH_WAIT:?})"
     );
 }
 
@@ -273,6 +351,7 @@ fn assert_pd_pair(rendered: &str, route: &str, records: f64, prefill_offsets: Du
 fn a_pd_chat_stream_anchors_at_the_prefill_dispatch() {
     let rendered = render_after(|| async {
         let (result, servers) = pd_result(text_frames(), PREFILL_OFFSET).await;
+        let entered = entered_before(dispatched_at(&result));
         let response = Arc::new(processor(false))
             .process_streaming_response(
                 result,
@@ -284,6 +363,7 @@ fn a_pd_chat_stream_anchors_at_the_prefill_dispatch() {
                 None,
                 source(metrics_labels::ENDPOINT_CHAT),
             )
+            .entered(entered)
             .await;
         read_to_end(response).await;
         servers
@@ -296,6 +376,7 @@ fn a_pd_chat_stream_anchors_at_the_prefill_dispatch() {
 fn a_pd_messages_stream_anchors_at_the_prefill_dispatch() {
     let rendered = render_after(|| async {
         let (result, servers) = pd_result(text_frames(), PREFILL_OFFSET).await;
+        let entered = entered_before(dispatched_at(&result));
         let response = Arc::new(processor(false))
             .process_messages_streaming_response(
                 result,
@@ -307,6 +388,7 @@ fn a_pd_messages_stream_anchors_at_the_prefill_dispatch() {
                 None,
                 source(metrics_labels::ENDPOINT_MESSAGES),
             )
+            .entered(entered)
             .await;
         read_to_end(response).await;
         servers
@@ -319,6 +401,7 @@ fn a_pd_messages_stream_anchors_at_the_prefill_dispatch() {
 fn a_pd_completion_stream_anchors_at_the_prefill_dispatch() {
     let rendered = render_after(|| async {
         let (result, servers) = pd_result(text_frames(), PREFILL_OFFSET).await;
+        let entered = entered_before(dispatched_at(&result));
         let response = Arc::new(processor(false))
             .process_completion_streaming_response(
                 result,
@@ -329,6 +412,7 @@ fn a_pd_completion_stream_anchors_at_the_prefill_dispatch() {
                 None,
                 source(metrics_labels::ENDPOINT_COMPLETIONS),
             )
+            .entered(entered)
             .await;
         read_to_end(response).await;
         servers
@@ -351,6 +435,8 @@ fn a_batched_pd_completion_stream_anchors_at_its_earliest_prefill_dispatch() {
         let (first, mut servers) = pd_result(text_frames(), PREFILL_OFFSET).await;
         let (second, more) = pd_result(text_frames(), later).await;
         servers.extend(more);
+        // The first pair's prefill is the earliest of the batch.
+        let entered = entered_before(dispatched_at(&first));
         let response = Arc::new(processor(false))
             .process_completion_streaming_response(
                 ExecutionResult::Batch {
@@ -363,6 +449,7 @@ fn a_batched_pd_completion_stream_anchors_at_its_earliest_prefill_dispatch() {
                 None,
                 source(metrics_labels::ENDPOINT_COMPLETIONS),
             )
+            .entered(entered)
             .await;
         read_to_end(response).await;
         servers
@@ -388,6 +475,7 @@ fn a_batched_pd_completion_stream_anchors_at_its_earliest_prefill_dispatch() {
 fn a_pd_generate_stream_anchors_at_the_prefill_dispatch() {
     let rendered = render_after(|| async {
         let (result, servers) = pd_result(text_frames(), PREFILL_OFFSET).await;
+        let entered = entered_before(dispatched_at(&result));
         let response = Arc::new(processor(false))
             .process_streaming_generate(
                 result,
@@ -398,6 +486,7 @@ fn a_pd_generate_stream_anchors_at_the_prefill_dispatch() {
                 None,
                 source(metrics_labels::ENDPOINT_GENERATE),
             )
+            .entered(entered)
             .await;
         read_to_end(response).await;
         servers
@@ -411,6 +500,7 @@ fn a_pd_generate_stream_anchors_at_the_prefill_dispatch() {
 fn a_pd_harmony_chat_stream_anchors_at_the_prefill_dispatch() {
     let rendered = render_after(|| async {
         let (result, servers) = pd_result(harmony_frames(), PREFILL_OFFSET).await;
+        let entered = entered_before(dispatched_at(&result));
         let response = Arc::new(HarmonyStreamingProcessor::new())
             .process_streaming_chat_response(
                 result,
@@ -421,6 +511,7 @@ fn a_pd_harmony_chat_stream_anchors_at_the_prefill_dispatch() {
                 None,
                 source(metrics_labels::ENDPOINT_CHAT),
             )
+            .entered(entered)
             .await;
         read_to_end(response).await;
         servers
@@ -431,11 +522,13 @@ fn a_pd_harmony_chat_stream_anchors_at_the_prefill_dispatch() {
 
 /// The openai-harmony pipeline's Responses iteration records no stream timing
 /// of its own; through a pair it records the PD first-token pair at its first
-/// decode frame.
+/// decode frame. With no time to first token there is no dispatch wait either,
+/// though the iteration runs under an entry stamp.
 #[test]
 fn a_pd_harmony_responses_iteration_records_the_pd_pair_at_its_first_decode_frame() {
     let rendered = render_after(|| async {
         let (result, servers) = pd_result(harmony_frames(), PREFILL_OFFSET).await;
+        let entered = entered_before(dispatched_at(&result));
         let mut emitter =
             ResponseStreamEventEmitter::new("resp_pd-anchor".to_string(), MODEL.to_string(), 1);
         let (tx, mut rx) = sse_channel();
@@ -456,11 +549,18 @@ fn a_pd_harmony_responses_iteration_records_the_pd_pair_at_its_first_decode_fram
             drop(tx);
             result
         };
-        let (iteration, ()) = tokio::join!(iteration, drain);
+        let (iteration, ()) = tokio::join!(iteration.entered(entered), drain);
         iteration.expect("the streamed iteration");
         servers
     });
     assert_pd_pair(&rendered, "harmony responses", 1.0, PREFILL_OFFSET);
+    for family in ["smg_router_ttft_seconds", DISPATCH_WAIT_SECONDS] {
+        assert_eq!(
+            sample(&rendered, family, "count", "endpoint="),
+            None,
+            "{family}:\n{rendered}"
+        );
+    }
 }
 
 /// A Single RPC can have its first chunk buffered when the stream starts.
@@ -468,11 +568,13 @@ fn a_pd_harmony_responses_iteration_records_the_pd_pair_at_its_first_decode_fram
 fn a_single_harmony_chat_stream_anchors_at_dispatch() {
     let rendered = render_after(|| async {
         let (stream, server) = scripted_stream(harmony_frames(), "0").await;
+        let dispatch_start = pd_timing(PREFILL_OFFSET).prefill_start;
+        let entered = entered_before(dispatch_start);
         let response = Arc::new(HarmonyStreamingProcessor::new())
             .process_streaming_chat_response(
                 ExecutionResult::Single {
                     stream,
-                    dispatch_start: pd_timing(PREFILL_OFFSET).prefill_start,
+                    dispatch_start,
                 },
                 Arc::new(chat_request()),
                 dispatch(),
@@ -481,6 +583,7 @@ fn a_single_harmony_chat_stream_anchors_at_dispatch() {
                 None,
                 source(metrics_labels::ENDPOINT_CHAT),
             )
+            .entered(entered)
             .await;
         read_to_end(response).await;
         vec![server]
@@ -499,6 +602,7 @@ fn a_batched_single_completion_stream_anchors_at_its_earliest_dispatch() {
         let (first, first_server) = scripted_stream(text_frames(), "0").await;
         let (second, second_server) = scripted_stream(text_frames(), "0").await;
         let timing = pd_timing(PREFILL_OFFSET);
+        let entered = entered_before(timing.prefill_start);
         let response = Arc::new(processor(false))
             .process_completion_streaming_response(
                 ExecutionResult::Batch {
@@ -520,6 +624,7 @@ fn a_batched_single_completion_stream_anchors_at_its_earliest_dispatch() {
                 None,
                 source(metrics_labels::ENDPOINT_COMPLETIONS),
             )
+            .entered(entered)
             .await;
         read_to_end(response).await;
         vec![first_server, second_server]
@@ -528,5 +633,281 @@ fn a_batched_single_completion_stream_anchors_at_its_earliest_dispatch() {
         &rendered,
         "batched single completions",
         metrics_labels::ENDPOINT_COMPLETIONS,
+    );
+}
+
+/// A single dispatch's result: one stream of `frames`, dispatched
+/// `PREFILL_OFFSET` ago.
+async fn single_result(
+    frames: Vec<proto::GenerateResponse>,
+) -> (ExecutionResult, Vec<JoinHandle<()>>) {
+    let (stream, server) = scripted_stream(frames, "0").await;
+    let result = ExecutionResult::Single {
+        stream,
+        dispatch_start: pd_timing(PREFILL_OFFSET).prefill_start,
+    };
+    (result, vec![server])
+}
+
+/// One worker's chat stream records the request's wait ahead of its dispatch
+/// with its TTFT, as a pair's does.
+#[test]
+fn a_single_chat_stream_records_its_dispatch_wait_with_its_ttft() {
+    let rendered = render_after(|| async {
+        let (result, servers) = single_result(text_frames()).await;
+        let entered = entered_before(dispatched_at(&result));
+        let response = Arc::new(processor(false))
+            .process_streaming_response(
+                result,
+                ChatResponseSpec::from(&chat_request()),
+                dispatch(),
+                Arc::new(CharacterTokenizer::default()),
+                false,
+                None,
+                None,
+                source(metrics_labels::ENDPOINT_CHAT),
+            )
+            .entered(entered)
+            .await;
+        read_to_end(response).await;
+        servers
+    });
+    assert_stream_anchor(&rendered, "single chat", metrics_labels::ENDPOINT_CHAT);
+}
+
+#[test]
+fn a_single_messages_stream_records_its_dispatch_wait_with_its_ttft() {
+    let rendered = render_after(|| async {
+        let (result, servers) = single_result(text_frames()).await;
+        let entered = entered_before(dispatched_at(&result));
+        let response = Arc::new(processor(false))
+            .process_messages_streaming_response(
+                result,
+                messages_spec(false),
+                dispatch(),
+                Arc::new(CharacterTokenizer::default()),
+                false,
+                None,
+                None,
+                source(metrics_labels::ENDPOINT_MESSAGES),
+            )
+            .entered(entered)
+            .await;
+        read_to_end(response).await;
+        servers
+    });
+    assert_stream_anchor(
+        &rendered,
+        "single messages",
+        metrics_labels::ENDPOINT_MESSAGES,
+    );
+}
+
+#[test]
+fn a_single_generate_stream_records_its_dispatch_wait_with_its_ttft() {
+    let rendered = render_after(|| async {
+        let (result, servers) = single_result(text_frames()).await;
+        let entered = entered_before(dispatched_at(&result));
+        let response = Arc::new(processor(false))
+            .process_streaming_generate(
+                result,
+                generate_spec(),
+                dispatch(),
+                Arc::new(CharacterTokenizer::default()),
+                None,
+                None,
+                source(metrics_labels::ENDPOINT_GENERATE),
+            )
+            .entered(entered)
+            .await;
+        read_to_end(response).await;
+        servers
+    });
+    assert_stream_anchor(
+        &rendered,
+        "single generate",
+        metrics_labels::ENDPOINT_GENERATE,
+    );
+}
+
+/// A stream whose entry point runs outside any entry stamp, as a pipeline run
+/// bare does, has no entry to count from: it records its TTFT and no dispatch
+/// wait.
+#[test]
+fn a_stream_outside_an_entry_stamp_records_its_ttft_and_no_dispatch_wait() {
+    let rendered = render_after(|| async {
+        let (result, servers) = single_result(text_frames()).await;
+        let response = Arc::new(processor(false))
+            .process_streaming_response(
+                result,
+                ChatResponseSpec::from(&chat_request()),
+                dispatch(),
+                Arc::new(CharacterTokenizer::default()),
+                false,
+                None,
+                None,
+                source(metrics_labels::ENDPOINT_CHAT),
+            )
+            .await;
+        read_to_end(response).await;
+        servers
+    });
+    let label = format!("endpoint=\"{}\"", metrics_labels::ENDPOINT_CHAT);
+    assert_eq!(
+        sample(&rendered, "smg_router_ttft_seconds", "count", &label),
+        Some(1.0),
+        "{rendered}"
+    );
+    assert_eq!(
+        sample(&rendered, DISPATCH_WAIT_SECONDS, "count", &label),
+        None,
+        "{rendered}"
+    );
+}
+
+/// The stamp is read where the stream's entry point runs, not where its
+/// first token is recorded: a body read under a later stamp of its own
+/// changes nothing. The wait stays the time from the entry point's stamp to
+/// the dispatch; one read at the record would count from the later stamp and
+/// read zero.
+#[test]
+fn the_dispatch_wait_is_read_at_the_stream_s_entry_not_where_it_is_recorded() {
+    let rendered = render_after(|| async {
+        let (result, servers) = single_result(text_frames()).await;
+        let entered = entered_before(dispatched_at(&result));
+        let response = Arc::new(processor(false))
+            .process_streaming_response(
+                result,
+                ChatResponseSpec::from(&chat_request()),
+                dispatch(),
+                Arc::new(CharacterTokenizer::default()),
+                false,
+                None,
+                None,
+                source(metrics_labels::ENDPOINT_CHAT),
+            )
+            .entered(entered)
+            .await;
+        read_to_end(response).entered(RequestStarted::now()).await;
+        servers
+    });
+    assert_stream_anchor(&rendered, "single chat", metrics_labels::ENDPOINT_CHAT);
+}
+
+/// The collected chat answer of `result`, built by the non-streaming
+/// processor.
+async fn collected_chat(result: ExecutionResult) {
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+    let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
+    response_processor()
+        .process_non_streaming_chat_response(
+            result,
+            ChatResponseSpec::from(&chat_request()),
+            dispatch(),
+            tokenizer,
+            &mut decoder,
+            false,
+        )
+        .await
+        .unwrap_or_else(|response| panic!("{}", response.status()));
+}
+
+/// A collected chat answer's records: one generation duration anchored at
+/// the dispatch and no first token. Its dispatch wait needs none: it is
+/// recorded once, under the generation record's labels, and it is the time
+/// from the entry stamp to the dispatch. A wait counted to a pair's decode
+/// dispatch reads `PREFILL_OFFSET - DECODE_OFFSET` more, and one counted to
+/// where the answer is built at least `PREFILL_OFFSET` more.
+fn assert_collected_anchor(rendered: &str, route: &str) {
+    let label = format!("endpoint=\"{}\"", metrics_labels::ENDPOINT_CHAT);
+    let generation_family = "smg_router_generation_duration_seconds";
+    let generation = sample(rendered, generation_family, "sum", &label);
+    let waits = sample(rendered, DISPATCH_WAIT_SECONDS, "count", &label);
+    let wait = sample(rendered, DISPATCH_WAIT_SECONDS, "sum", &label);
+    report(
+        route,
+        &format!("generation={generation:?} s dispatch wait={wait:?} s records={waits:?}"),
+    );
+    assert_eq!(
+        sample(rendered, generation_family, "count", &label),
+        Some(1.0),
+        "one generation record:\n{rendered}"
+    );
+    let generation = generation.expect("the generation duration");
+    let floor = PREFILL_OFFSET.as_secs_f64();
+    assert!(
+        generation >= floor,
+        "generation duration {generation} s anchors at the dispatch ({floor} s before)"
+    );
+    assert_eq!(
+        sample(rendered, "smg_router_ttft_seconds", "count", &label),
+        None,
+        "a collected answer shows no first token:\n{rendered}"
+    );
+    assert_eq!(waits, Some(1.0), "one dispatch wait:\n{rendered}");
+    assert_eq!(
+        count_labels(rendered, DISPATCH_WAIT_SECONDS, &label),
+        count_labels(rendered, generation_family, &label),
+        "the dispatch wait carries the generation record's labels:\n{rendered}"
+    );
+    let wait = wait.expect("the dispatch wait");
+    assert!(
+        (wait - DISPATCH_WAIT.as_secs_f64()).abs() < 1e-9,
+        "dispatch wait {wait} s is the time from the entry stamp to the dispatch ({DISPATCH_WAIT:?})"
+    );
+}
+
+/// One worker's collected chat answer records the request's wait ahead of its
+/// dispatch, though it has no first token to record it with.
+#[test]
+fn a_collected_chat_answer_records_its_dispatch_wait_and_no_ttft() {
+    let rendered = render_after(|| async {
+        let (result, servers) = single_result(text_frames()).await;
+        let entered = entered_before(dispatched_at(&result));
+        collected_chat(result).entered(entered).await;
+        servers
+    });
+    assert_collected_anchor(&rendered, "single collected chat");
+}
+
+/// A pair's collected chat answer records the wait ahead of its prefill
+/// dispatch: the decode side was dispatched later, and the answer is built
+/// later still.
+#[test]
+fn a_pd_collected_chat_answer_records_its_wait_ahead_of_the_prefill_dispatch() {
+    let rendered = render_after(|| async {
+        let (result, servers) = pd_result(text_frames(), PREFILL_OFFSET).await;
+        let entered = entered_before(dispatched_at(&result));
+        collected_chat(result).entered(entered).await;
+        servers
+    });
+    assert_collected_anchor(&rendered, "collected chat");
+}
+
+/// A collected answer built outside any entry stamp, as a pipeline run bare
+/// builds it, has no entry to count from: it records its generation and no
+/// dispatch wait.
+#[test]
+fn a_collected_answer_outside_an_entry_stamp_records_no_dispatch_wait() {
+    let rendered = render_after(|| async {
+        let (result, servers) = single_result(text_frames()).await;
+        collected_chat(result).await;
+        servers
+    });
+    let label = format!("endpoint=\"{}\"", metrics_labels::ENDPOINT_CHAT);
+    assert_eq!(
+        sample(
+            &rendered,
+            "smg_router_generation_duration_seconds",
+            "count",
+            &label
+        ),
+        Some(1.0),
+        "{rendered}"
+    );
+    assert_eq!(
+        sample(&rendered, DISPATCH_WAIT_SECONDS, "count", &label),
+        None,
+        "{rendered}"
     );
 }

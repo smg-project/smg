@@ -18,10 +18,6 @@ use smg_grpc_client::{
         VllmEngineClient,
     },
 };
-use smg_policy_controller::{
-    store::{GatewayId, LeasesStore, MemoryStore},
-    tracking::TransportClass,
-};
 use smg_worker::{
     health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
     identity::basic::Worker,
@@ -35,18 +31,7 @@ use super::super::*;
 use crate::routers::{
     common::{snapshot::WorkerRegistry, sse::SseReceiver},
     grpc::{
-        backend_client::BasicWorkerBuilder,
-        common::stages::ProcessStage,
-        context::test_support::{assert_end, dispatch_context, dispatched, place_worker},
-        regular::{
-            processor::ResponseProcessor,
-            stages::{
-                chat::ChatResponseProcessingStage, completion::CompletionResponseProcessingStage,
-                generate::GenerateResponseProcessingStage,
-                messages::MessageResponseProcessingStage,
-            },
-        },
-        spec::ResponseSpec,
+        backend_client::BasicWorkerBuilder, regular::processor::ResponseProcessor,
         test_engine::mock_engine,
     },
 };
@@ -1562,6 +1547,154 @@ async fn chat_lone_complete_opens_its_choice_among_others() {
     assert_eq!(trail.iter().filter(|(role, _)| role.is_some()).count(), 1);
     assert_eq!(chat_text(&events, 0, "content"), "hi");
     assert_eq!(chat_text(&events, 1, "content"), "");
+}
+
+#[tokio::test]
+async fn the_rendered_prompt_rides_the_first_opening_chunk_alone() {
+    // Two choices open, the second one first: the chunk that opens it is the
+    // stream's first and carries the prompt the request asked back; the chunk
+    // that opens the other choice carries none, and no later chunk does.
+    let mut spec = chat_spec(false);
+    spec.prompt_text = Some("user: hi\nassistant: ".to_string());
+    let (result, events) = chat_events_with_spec(
+        vec![
+            chunk(1, "b"),
+            chunk(0, "a"),
+            complete(1, "stop"),
+            complete(0, "stop"),
+        ],
+        false,
+        spec,
+        "0",
+    )
+    .await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        events[0]["prompt_text"], "user: hi\nassistant: ",
+        "{events:?}"
+    );
+    assert_eq!(events[0]["choices"][0]["index"], 1, "{events:?}");
+    assert_eq!(
+        choice_trail(&events, 0).first(),
+        Some(&(Some("assistant"), None)),
+        "{events:?}"
+    );
+    assert!(
+        events[1..]
+            .iter()
+            .all(|event| event.get("prompt_text").is_none()),
+        "{events:?}"
+    );
+    // The chunk with the prompt opens its choice with the whole opening
+    // delta, as the chunk that opens the other choice does.
+    let plain_opener = events[1..]
+        .iter()
+        .find(|event| event["choices"][0]["index"] == 0)
+        .expect("the other choice opens");
+    assert_eq!(
+        events[0]["choices"][0]["delta"], plain_opener["choices"][0]["delta"],
+        "{events:?}"
+    );
+}
+
+/// The rendered prompt's chunk is a frame of its own, the body's first, and
+/// the first token's frame behind it still reaches the connection before the
+/// reading runs on into a burst: the body yields for its first frame alone,
+/// so the reading yields twice at the first token's hand-off and the
+/// connection's next pull is pending. With one yield that pull would run the
+/// reading on through the engine messages ready behind the first token and
+/// return the burst's frame instead. A first token's frame that reaches the
+/// flush bound leaves from inside its turn, and is handed off as the small
+/// one is. Behind a first output that writes no byte the prompt's frame has
+/// left where it was sent, so it does not pass for the first token's frame.
+#[tokio::test]
+async fn the_first_tokens_frame_behind_the_prompts_is_pending_before_the_burst_is_read() {
+    for mut script in [
+        vec![chunk(0, "a")],
+        vec![chunk(0, &"a".repeat(CHUNK_FLUSH_BYTES))],
+        vec![chunk_of_ids(0, Vec::new()), chunk(0, "a")],
+    ] {
+        // The chunks are ready at once: the first token, then a burst
+        // behind it.
+        script.extend([
+            chunk(0, "b"),
+            chunk(0, "c"),
+            chunk(0, "d"),
+            complete(0, "stop"),
+        ]);
+        let (stream, server) = scripted_stream(script, "0").await;
+        let (tx, rx) = driven_channel();
+        let processor = processor(false);
+        let mut spec = chat_spec(false);
+        spec.prompt_text = Some("user: hi\nassistant: ".to_string());
+        let reading = async move {
+            let result = processor
+                .process_streaming_chunks(
+                    stream,
+                    dispatch(),
+                    Arc::new(CharacterTokenizer::default()),
+                    (None, None, false, false, false),
+                    spec,
+                    &tx,
+                    None,
+                )
+                .await;
+            assert!(result.is_ok(), "{result:?}");
+            ReadingEnd::Complete
+        };
+        let mut body = DrivenBody::new(Box::pin(reading), rx);
+        // The prompt's chunk (the body's own yield follows it), then the first
+        // token's frame.
+        let mut frames = Vec::new();
+        loop {
+            let frame = body
+                .next()
+                .await
+                .expect("the body ends only after the first token")
+                .expect("a write");
+            let text = String::from_utf8(frame.to_vec()).expect("text");
+            let first_token = text.contains(r#""content":"a"#);
+            frames.push(text);
+            if first_token {
+                break;
+            }
+        }
+        assert_eq!(
+            frames.len(),
+            2,
+            "the prompt's chunk, then the first token's frame: {frames:?}"
+        );
+        assert!(
+            frames[0].contains(r#""prompt_text":"user: hi\nassistant: ""#)
+                && frames[0].contains(r#""role":"assistant""#),
+            "the body's first frame opens the choice with the prompt: {frames:?}"
+        );
+        assert!(
+            !frames[1].contains("prompt_text"),
+            "the first token's frame carries no prompt: {frames:?}"
+        );
+        // The pull after it: pending, so the connection writes the first
+        // token's frame before the reading runs on. With one yield at the
+        // hand-off it is the burst's frame.
+        let next = pull(&mut body).await;
+        assert!(
+            next.is_pending(),
+            "the pull after the first token's frame must be pending, not a frame: {next:?}"
+        );
+        let rest: Vec<String> = body
+            .map(|frame| String::from_utf8(frame.expect("a write").to_vec()).expect("text"))
+            .collect()
+            .await;
+        server.abort();
+        assert!(
+            rest.iter().any(|frame| frame.contains(r#""content":"b""#)),
+            "the burst follows: {rest:?}"
+        );
+        assert!(
+            rest.iter().all(|frame| !frame.contains("prompt_text")),
+            "no later frame carries the prompt: {rest:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -3631,7 +3764,7 @@ async fn frames_of_a_chat_stream_cut_with(status: tonic::Status) -> (Vec<String>
     let (stream, server) = cut_stream(vec![chunk(0, "Hi")], status).await;
     let worker = breaker_worker();
     let selection = context::WorkerSelection::Single {
-        worker: Arc::clone(&worker),
+        worker: Arc::clone(&worker).into(),
     };
     let source =
         utils::StreamSource::new(Some(&selection), &dispatch(), metrics_labels::ENDPOINT_CHAT);
@@ -3723,7 +3856,7 @@ async fn the_load_guards_of_a_chat_stream_go_with_its_body() {
             scripted_stream(vec![chunk(0, "Hi"), complete(0, "stop")], "0").await;
         let worker = breaker_worker();
         let selection = context::WorkerSelection::Single {
-            worker: Arc::clone(&worker),
+            worker: Arc::clone(&worker).into(),
         };
         let guards = context::LoadGuards::new(&selection, None);
         assert_eq!(worker.load(), 1, "the dispatch loaded the worker");
@@ -3769,136 +3902,13 @@ async fn the_load_guards_of_a_chat_stream_go_with_its_body() {
     }
 }
 
-pub(in crate::routers::grpc) async fn placed_stream_context(
-    stream: ProtoStream,
-    dispatch: context::DispatchMetadata,
-) -> (context::DispatchContext, Arc<MemoryStore>) {
-    let (placed, store) = place_worker().await;
-    let mut ctx = dispatch_context(placed);
-    let sent = Instant::now();
-    ctx.load_guards = Some(dispatched(ctx.placed.take().expect("a placement"), sent));
-    ctx.dispatch = Some(dispatch);
-    ctx.streaming = true;
-    ctx.tokenizer = Some(Arc::new(CharacterTokenizer::default()));
-    ctx.response.execution_result = Some(context::ExecutionResult::Single {
-        stream,
-        dispatch_start: sent,
-    });
-    (ctx, store)
-}
-
-/// A placed stream of `spec`, which asks `choices` choices, says its tokens
-/// when every choice closed and nothing when none did: the prompt once, the
-/// completion summed over the choices.
-async fn check_placed_stream(spec: ResponseSpec, choices: u32) {
-    for complete in [true, false] {
-        let mut frames: Vec<_> = (0..choices).map(|index| chunk(index, "Hi")).collect();
-        if complete {
-            frames.extend((0..choices).map(|index| complete_with_prompt(index, "stop", 11)));
-        }
-        let (stream, server) = scripted_stream(frames, "0").await;
-        let (mut ctx, store) = placed_stream_context(stream, dispatch()).await;
-        let placement = ctx
-            .load_guards
-            .as_ref()
-            .and_then(context::LoadGuards::placement)
-            .expect("the placement")
-            .clone();
-        let streaming = Arc::new(processor(false));
-        let processor = response_processor();
-        let response = match &spec {
-            ResponseSpec::Chat(_) => {
-                ChatResponseProcessingStage::new(processor, streaming)
-                    .process_result(&mut ctx, spec.clone())
-                    .await
-            }
-            ResponseSpec::Completion(_) => {
-                CompletionResponseProcessingStage::new(processor, streaming)
-                    .process(&mut ctx, spec.clone())
-                    .await
-            }
-            ResponseSpec::Generate(_) => {
-                GenerateResponseProcessingStage::new(processor, streaming)
-                    .process_result(&mut ctx, spec.clone())
-                    .await
-            }
-            ResponseSpec::Messages(_) => {
-                MessageResponseProcessingStage::new(processor, streaming)
-                    .process(&mut ctx, spec.clone())
-                    .await
-            }
-            _ => panic!("a regular streaming spec"),
-        }
-        .expect("the stage succeeded")
-        .expect("a streaming response");
-        assert_eq!(response.status(), StatusCode::OK);
-        axum::body::to_bytes(response.into_body(), 1 << 20)
-            .await
-            .expect("the stream's body");
-        if complete {
-            assert_end(
-                &placement.ends(),
-                &store,
-                200,
-                TransportClass::Ok,
-                11,
-                2 * choices,
-            );
-        } else {
-            assert!(placement.ends().lock().is_empty());
-            assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 1);
-        }
-        drop(placement);
-        assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
-        server.abort();
-    }
-}
-
-#[tokio::test]
-async fn a_placed_chat_stream_says_its_tokens_only_when_it_completes() {
-    // The chat spec of this file asks two choices.
-    check_placed_stream(ResponseSpec::Chat(Box::new(chat_spec(false))), 2).await;
-}
-
-#[tokio::test]
-async fn a_placed_completion_stream_says_its_tokens_only_when_it_completes() {
-    use openai_protocol::completion::CompletionRequest;
-
-    let request: CompletionRequest = serde_json::from_value(
-        serde_json::json!({"model":"eof-test", "prompt":"test", "stream":true}),
-    )
-    .expect("a completion request");
-    check_placed_stream(
-        ResponseSpec::Completion(CompletionResponseSpec::new(&request, Vec::new())),
-        1,
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn a_placed_generate_stream_says_its_tokens_only_when_it_completes() {
-    check_placed_stream(
-        ResponseSpec::Generate(GenerateResponseSpec {
-            return_logprob: false,
-            expected_choices: 1,
-        }),
-        1,
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn a_placed_messages_stream_says_its_tokens_only_when_it_completes() {
-    check_placed_stream(ResponseSpec::Messages(Box::new(messages_spec(false))), 1).await;
-}
-
 /// A completion stream refused before its first frame (the execution result
 /// is no stream) carries its load guards on the refusal's body all the same.
 #[tokio::test]
 async fn the_load_guards_of_a_completion_stream_refused_before_its_first_frame_go_with_its_body() {
     let worker = breaker_worker();
     let selection = context::WorkerSelection::Single {
-        worker: Arc::clone(&worker),
+        worker: Arc::clone(&worker).into(),
     };
     let guards = context::LoadGuards::new(&selection, None);
     let request: openai_protocol::completion::CompletionRequest = serde_json::from_value(

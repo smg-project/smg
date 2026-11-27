@@ -23,10 +23,12 @@
 //! packed patch rows and mel frames. The `Reference` (`nemotron_vl`) and
 //! `ReferenceTiled` (`nemotron_vl_tiled`) instances serve the family's
 //! architectures (`ARCHITECTURES`) from their config in the engine's own
-//! tensors, without audio: `pixel_values_flat` (one image per item with
-//! `imgs_sizes` and `num_tokens_per_image`, or tiles with
-//! `image_num_patches`; the two lay their pixels out differently, so each
-//! takes an instance) and `pixel_values_flat_video` with `video_num_patches`,
+//! tensors, without audio: `pixel_values_flat` (dynamic-resolution
+//! `(patches, 3 * p * p)` rows or tiled `(tiles, 3, S, S)` pixels with
+//! `image_num_patches`, dynamic-resolution images additionally carrying
+//! `imgs_sizes` and `num_tokens_per_image`; the two resize their images
+//! differently, so each takes an instance) and `pixel_values_flat_video` with
+//! `video_num_patches`,
 //! `frames_indices` and `frame_duration_ms`. Their tubelets hold
 //! `video_temporal_patch_size` frames, and the engine embeds a video's whole
 //! replacement (it embeds the separators itself), so the whole replacement
@@ -303,9 +305,11 @@ impl NemotronOmniSpec {
         modality: Modality,
     ) -> Option<(&'static str, &'static [&'static str], Option<&'static str>)> {
         Some(match (self, modality) {
-            (Self::Reference, Modality::Image) => {
-                ("pixel_values_flat", &DYNAMIC_IMAGE_SIDE_TENSORS, None)
-            }
+            (Self::Reference, Modality::Image) => (
+                "pixel_values_flat",
+                &DYNAMIC_IMAGE_SIDE_TENSORS,
+                Some("image_num_patches"),
+            ),
             (Self::ReferenceTiled, Modality::Image) => (
                 "pixel_values_flat",
                 &["image_num_patches"],
@@ -1043,7 +1047,7 @@ mod tests {
             dynamic
                 .encoder_field_layouts_for(Modality::Image)
                 .encoder_input,
-            FieldLayout::Batched
+            FieldLayout::flat("image_num_patches")
         );
         assert_eq!(
             dynamic.keep_on_cpu_keys_for(Modality::Video),

@@ -65,7 +65,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdatePoliciesForWorkerStep {
             // lands after the model's last worker was removed must not leave
             // the model one for its next registration to inherit.
             for worker in workers.iter() {
-                worker.set_completion_sink(Some(app_context.policy_registry.completion_sink()));
+                worker.set_completion_sink(app_context.policy_registry.worker_completion_sink());
             }
         }
 

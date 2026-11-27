@@ -48,6 +48,7 @@ pub struct CompletionRequest {
     /// Modify the likelihood of specified tokens appearing in the completion:
     /// token id to a bias in -100..=100, applied by the engine's sampler
     #[validate(custom(function = "validate_logit_bias"))]
+    #[serde(serialize_with = "crate::common::serialize_with_sorted_keys")]
     pub logit_bias: Option<HashMap<String, f32>>,
 
     /// Include the log probabilities on the `logprobs` most likely tokens
@@ -160,6 +161,7 @@ pub struct CompletionRequest {
     pub lora_path: Option<String>,
 
     /// Session parameters for continual prompting
+    #[serde(serialize_with = "crate::common::serialize_with_sorted_keys")]
     pub session_params: Option<HashMap<String, Value>>,
 
     /// Return model hidden states
@@ -265,6 +267,10 @@ impl CompletionRequest {
 impl GenerationRequest for CompletionRequest {
     fn rid(&self) -> Option<&str> {
         self.rid.as_deref()
+    }
+
+    fn max_output_tokens(&self) -> Option<u32> {
+        self.max_tokens
     }
 
     fn is_stream(&self) -> bool {

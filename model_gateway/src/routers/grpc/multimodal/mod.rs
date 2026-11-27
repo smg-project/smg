@@ -5,6 +5,8 @@
 //!
 //! - [`detect`]: find modalities and extract content parts from chat/messages.
 //! - [`config`]: model config-file registry and per-router component bundle.
+//! - [`resolve`]: what a request's media needs before the template renders:
+//!   the placeholder tokens for its plan and the model's media-part order.
 //! - [`process`]: fetch media → preprocess → expand placeholder tokens →
 //!   build the lightweight [`MultimodalIntermediate`].
 //! - [`assemble`]: turn the intermediate into backend-specific `MultimodalData`
@@ -15,20 +17,18 @@
 //! - [`refs`]: router-vs-worker processing resolution and the media-reference
 //!   payload for workers that process media themselves.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, fmt::Display, sync::Arc};
 
 use axum::response::Response;
 use llm_multimodal::{
     hub::HubFetchError, AudioClip, EncoderFieldLayouts, EncoderInputFormat, ImageFrame,
-    MediaConnectorError, MediaFault, Modality, MultiModalError, PlaceholderRange,
+    MediaConnectorError, MediaErrorCode, MediaFault, Modality, MultiModalError, PlaceholderRange,
     PreprocessedEncoderInputs, VideoClip,
 };
 use llm_tokenizer::{Encoding, TokenizerTrait};
 
 use crate::routers::{
-    common::retry::mark_non_retryable,
-    error,
-    grpc::{proto_wrapper::VLLM_MROPE_GRID_KEYS, utils::message_utils::invalid_multimodal_request},
+    common::retry::mark_non_retryable, error, grpc::proto_wrapper::VLLM_MROPE_GRID_KEYS,
 };
 
 /// Bridges the gateway's tokenizer to the model registry's local tokenizer
@@ -65,6 +65,7 @@ mod pixel_cache;
 mod plan;
 mod process;
 mod refs;
+mod resolve;
 mod serialize;
 mod settings;
 mod transparency;
@@ -79,7 +80,7 @@ pub(crate) use assemble::{
 };
 pub(crate) use capability::{
     ensure_backend_supports_modalities, ensure_model_accepts_media, fleet_reads_format,
-    request_needs_vision, worker_language_model_only,
+    request_needs_vision, worker_language_model_only, MediaFacts,
 };
 #[cfg(test)]
 pub(crate) use config::tests::{hub_answering, HubEnv};
@@ -107,6 +108,7 @@ pub(crate) use refs::{
     worker_runs_gateway_pipeline, worker_supports_ec_transfer, MmProcessing, MmRefsError,
     GATEWAY_PIPELINE_PROCESSOR,
 };
+pub(crate) use resolve::{resolve_media, MediaContext, ResolvedMedia};
 pub(crate) use serialize::WireMismatch;
 pub(crate) use settings::{init_mm_settings, mm_settings, MultimodalSettings};
 pub(crate) use transparency::engine_transparency_policy;
@@ -187,7 +189,9 @@ pub(crate) fn media_verdict(error: &anyhow::Error) -> Option<&MediaConnectorErro
 /// fetch or a decode that failed. A video part on a process without a video
 /// decoder ([`process::VideoDecoderUnavailable`], known at start-up) is the
 /// media stage's own refusal, `400 invalid_multimodal_request` in the words
-/// of a modality the model does not take. A configuration file the model's
+/// of a modality the model does not take. An image size the processor's
+/// rule refuses ([`process::ImageSizeRefused`]) is a 400 under the same code,
+/// in the preprocessing's words. A configuration file the model's
 /// hub failed to serve is answered by [`config_unavailable_response`].
 pub(crate) fn processing_failed_response(error: &anyhow::Error) -> Response {
     let message = processing_failed_message(error);
@@ -196,6 +200,9 @@ pub(crate) fn processing_failed_response(error: &anyhow::Error) -> Response {
     }
     if process::VideoDecoderUnavailable::is(error) {
         return invalid_multimodal_request(format!("{error:#}"));
+    }
+    if process::ImageSizeRefused::is(error) {
+        return error::bad_request(MediaErrorCode::InvalidRequest.as_str(), message);
     }
     if let Some(response) = config_unavailable_response(error) {
         return response;
@@ -226,13 +233,15 @@ pub(crate) fn processing_failed_response(error: &anyhow::Error) -> Response {
 
 /// Whether `error` carries an explicit verdict that the request's own media
 /// is at fault: the connector's client verdict, an item over the encoder's
-/// budget, or a video part on a process that cannot decode video. A failure
-/// with no verdict in its chain does not, though [`processing_failed_response`]
+/// budget, a video part on a process that cannot decode video, or an image
+/// size the processor's rule refuses. A failure with no verdict in its chain
+/// does not, though [`processing_failed_response`]
 /// answers it 400 too: that class also holds a model configuration this host
 /// could not load and a processor's own fault, which the client cannot fix.
 pub(crate) fn is_request_media_fault(error: &anyhow::Error) -> bool {
     encoder_budget::ItemOverEncoderBudget::is(error)
         || process::VideoDecoderUnavailable::is(error)
+        || process::ImageSizeRefused::is(error)
         || (!HubFetchError::is(error)
             && media_verdict(error).is_some_and(|media| media.fault() == MediaFault::Client))
 }
@@ -274,6 +283,16 @@ pub(crate) fn preparation_fault_response() -> Response {
         PIPELINE_CODE,
         "The gateway could not prepare media processing for this model; \
          the request is not at fault",
+    )
+}
+
+/// The 400 for media the request carries that cannot be prepared, under the
+/// media stage's code (`MediaErrorCode::InvalidRequest`, the one the media
+/// pipeline answers media refused as the request sent it under).
+pub(crate) fn invalid_multimodal_request(error: impl Display) -> Response {
+    error::bad_request(
+        MediaErrorCode::InvalidRequest.as_str(),
+        format!("Invalid multimodal request: {error}"),
     )
 }
 
@@ -532,8 +551,8 @@ mod tests {
 
     use super::{
         config_unavailable_response, encoder_budget::ItemOverEncoderBudget,
-        processing_failed_message, processing_failed_response, record_decoder_availability,
-        report_jpeg_decoder, Response,
+        invalid_multimodal_request, processing_failed_message, processing_failed_response,
+        record_decoder_availability, report_jpeg_decoder, Response,
     };
     use crate::{middleware::test_support::json_of, routers::common::retry::NonRetryable};
 
@@ -695,6 +714,22 @@ mod tests {
             .expect("the answer's body");
         let body = serde_json::from_slice(&bytes).expect("a JSON envelope");
         (status, header, body)
+    }
+
+    /// Media that could not be prepared is the request's to fix: a 400 under
+    /// the media request code, with the cause after the route's lead.
+    #[tokio::test]
+    async fn invalid_multimodal_input_maps_to_bad_request() {
+        let (status, code, body) =
+            answer(invalid_multimodal_request("unsupported audio modality")).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(code, "invalid_multimodal_request");
+        assert_eq!(body["error"]["type"], "invalid_request_error", "{body}");
+        assert_eq!(
+            body["error"]["message"],
+            "Invalid multimodal request: unsupported audio modality"
+        );
     }
 
     /// A fetch that ran out of its budget and an origin that answered 5xx are

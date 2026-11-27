@@ -184,12 +184,30 @@ def model_info_from_config(
         # lists): the servicer withholds a PD decode side's KV-transfer rejection
         # notice there, whatever connector the projection above reports.
         "runs_mooncake": runs_mooncake(vllm_config),
+        # How many trailing prompt tokens a PD decode side computes itself
+        # after its KV pull; the servicer holds those to the model's
+        # vocabulary even when the request's handoff is honoured.
+        "pd_local_tail": pd_local_tail(vllm_config),
         # Encoder-cache disaggregation, off `ec_transfer_config` as the Python
         # servicer reads it; the Rust servicer refuses a request that names a
         # connector when none runs.
         **ec_transfer_facts(vllm_config),
         "log_stats": log_stats,
     }
+
+
+def pd_local_tail(vllm_config: Any) -> int:
+    """How many trailing prompt tokens a PD decode side still computes on
+    this engine after pulling the prompt's KV: the last one, which the
+    scheduler recomputes to sample the next, or the speculative drafter's
+    prefill lookahead where that is longer. vLLM 0.31 and later read it as
+    ``num_prefill_lookahead_tokens``, and NIXL pulls short of it so that the
+    decoder computes the drafter's window itself (``_prefill_backoff``, one
+    token less than the lookahead; the whole lookahead is a safe upper
+    bound). An older vLLM has no such lookahead: its connectors pull the
+    whole prompt, or all but the last token."""
+    lookahead = getattr(vllm_config, "num_prefill_lookahead_tokens", 0)
+    return max(1, int(lookahead or 0))
 
 
 def ec_transfer_facts(vllm_config: Any) -> dict[str, Any]:

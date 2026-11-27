@@ -5,6 +5,7 @@ use serde_json::Value;
 use crate::{
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
     media::FrameSampling,
+    minimax_resize::SGLANG_RESIZE_KEY,
     registry::{
         layouts::grid_patch_layouts_for, MediaItemInfo, ModelMetadata, ModelProcessorSpec,
         ModelRegistryError, RegistryResult,
@@ -439,6 +440,12 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
         }
     }
 
+    /// A clip is stamped only where its preprocessor config carries
+    /// [`SGLANG_RESIZE_KEY`]: the worker that sets it follows a processor that
+    /// stamps every clip it decodes. Everywhere else the frame blocks stand
+    /// bare: the reference writes a stamp only for a clip whose frame rate and
+    /// sampled frame indices it is handed, and the serving engine, started with
+    /// its defaults, hands it neither.
     fn prompt_replacements_with_media(
         &self,
         metadata: &ModelMetadata,
@@ -448,7 +455,11 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
         preprocessor_config: &PreProcessorConfig,
     ) -> RegistryResult<Vec<PromptReplacement>> {
         match modality {
-            Modality::Video => {
+            Modality::Video
+                if preprocessor_config
+                    .get_extra::<bool>(SGLANG_RESIZE_KEY)
+                    .unwrap_or(false) =>
+            {
                 let placeholder_token = self.placeholder_token_for(metadata, Modality::Video)?;
                 let temporal_patch_size =
                     MiniMaxM3VisionProcessor::temporal_patch_size_from(preprocessor_config)
@@ -785,7 +796,15 @@ mod tests {
         PlaceholderRange { offset, length }
     }
 
-    /// The video replacements for `counts` clips, given their media info and the preprocessor config.
+    /// `config` as the worker whose clips are stamped hands it to the spec.
+    fn stamping(mut config: PreProcessorConfig) -> PreProcessorConfig {
+        config
+            .extra
+            .insert(SGLANG_RESIZE_KEY.to_string(), true.into());
+        config
+    }
+
+    /// The video replacements for `counts` clips where clips are stamped, given their media info and the preprocessor config.
     fn video_replacements_with(
         meta: &ModelMetadata,
         counts: Vec<usize>,
@@ -799,12 +818,12 @@ mod tests {
                 &preprocessed_video(counts, grid_t),
                 Modality::Video,
                 media,
-                config,
+                &stamping(config.clone()),
             )
             .unwrap()
     }
 
-    /// The video replacement for the request's one clip under the default preprocessor config.
+    /// The stamped video replacement for the request's one clip under the default preprocessor config.
     fn video_replacement(
         meta: &ModelMetadata,
         counts: Vec<usize>,
@@ -835,6 +854,34 @@ mod tests {
             }
         }
         stamps
+    }
+
+    #[test]
+    fn sampled_video_carries_no_time_stamp() {
+        // The serving engine, started with its defaults, hands its processor
+        // neither a clip's frame rate nor its sampled frame indices, so the
+        // prompt it builds holds the frame blocks alone. The test tokenizer
+        // encodes any text, so a stamp laid between the blocks would show in
+        // the sequence.
+        //
+        // Five sampled frames pair into three temporal frames; a lone frame stays one block.
+        for (frame_indices, frames, grid_t) in [(vec![0, 15, 30, 45, 60], 3, 3), (vec![7], 1, 1)] {
+            let replacements = MiniMaxM3VisionSpec
+                .prompt_replacements_with_media(
+                    &metadata(),
+                    &preprocessed_video(vec![4 * frames], grid_t),
+                    Modality::Video,
+                    &[sampled(&frame_indices, 30.0)],
+                    &PreProcessorConfig::default(),
+                )
+                .unwrap();
+
+            assert_eq!(
+                replacements[0].tokens,
+                frame_block(4).repeat(frames),
+                "{frames} temporal frames"
+            );
+        }
     }
 
     #[test]
@@ -1050,7 +1097,7 @@ mod tests {
                 &preprocessed_video(vec![12], 3),
                 Modality::Video,
                 &[sampled(&[0, 15, 30, 45, 60], 30.0)],
-                &PreProcessorConfig::default(),
+                &stamping(PreProcessorConfig::default()),
             )
             .unwrap_err();
 
@@ -1069,7 +1116,7 @@ mod tests {
         // the stamp path reports the same configuration error instead of
         // pairing the frames by the default.
         let meta = metadata();
-        let mut config = PreProcessorConfig::default();
+        let mut config = stamping(PreProcessorConfig::default());
         config.extra.insert(
             "img_token_compression_config".to_string(),
             json!({ "temporal_patch_size": "two" }),

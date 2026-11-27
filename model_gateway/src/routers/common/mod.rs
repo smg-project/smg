@@ -18,6 +18,8 @@
 //!   session registry) shared by the OpenAI and HTTP routers
 //! - [`overload`] — shed responses for the absolute worker-overload
 //!   guard, shared by the HTTP and gRPC selection paths
+//! - `pair_classes` — a pair index's partner lists as Grand Central
+//!   reads them: a class on each worker and the table of classes that pair
 //! - `pair_index` — the prefill and decode workers that may pair, decided
 //!   once for a membership generation and read by every placement
 //! - [`pd_admission`] — the disaggregated dispatch's admission gate: never
@@ -63,15 +65,18 @@ pub use smg_external_router::header_utils;
 pub(crate) mod kv_transfer;
 pub use smg_external_router::{mcp_utils, openai_bridge};
 pub mod overload;
+pub(crate) mod pair_classes;
 pub(crate) mod pair_index;
 pub mod pd_admission;
 pub(crate) mod pd_failure;
 pub use smg_external_router::persistence_utils;
+pub(crate) mod place_request;
 pub(crate) mod placement;
 pub mod prefill_admission;
 pub(crate) mod rate_limit_cell;
 pub use smg_external_router::realtime;
 pub mod request_lease;
+pub(crate) mod responses_compat;
 pub(crate) use smg_external_router::sglang_fields;
 pub use smg_external_router::{retry, sse};
 pub mod snapshot;
@@ -223,22 +228,494 @@ pub(crate) fn attach_sized_body(
 /// and whether the process captures every request's cache trace.
 #[cfg(any(test, feature = "test-util"))]
 pub mod bench_support {
-    use std::sync::Arc;
+    use std::{hint::black_box, sync::Arc};
 
-    use smg_worker::identity::basic::Worker;
+    use axum::http::HeaderMap;
+    use smg_worker::{identity::basic::Worker, load::state::LoadReceiver};
 
     use super::{
         attempt_ledger::AttemptLedger,
-        placement::{select_pair, select_single, PlacementInputs},
+        overload,
+        placement::{
+            select_pair, select_single, Placed, PlacedPair, PlacementInputs, RequestEnd, Stated,
+        },
+        prefill_admission::hold_unbounded,
+        sse::sse_channel,
     };
     use crate::{
+        config::RouterConfig,
         observability::cache_trace,
-        policies::PolicyRegistry,
-        routers::common::{
-            pair_index::{PdPairIndex, PdWire},
-            snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt},
+        policies::{PolicyRegistry, Side},
+        routers::{
+            common::{
+                pair_index::{PdPairIndex, PdWire},
+                snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt},
+            },
+            grpc::{
+                context::{LoadGuards, WorkerSelection},
+                proto_wrapper::{FanoutStream, ProtoStream},
+            },
         },
     };
+
+    /// The route a request is placed on: the pool its router places over.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Route {
+        /// The regular HTTP router.
+        Http,
+        /// The gRPC pipeline's regular selection stage.
+        Grpc,
+    }
+
+    impl Route {
+        /// The pool the route's router places a single request over.
+        fn pool(self) -> RoutingPool {
+            match self {
+                Self::Http => RoutingPool::HttpRegular,
+                Self::Grpc => RoutingPool::GrpcPipelineRegular,
+            }
+        }
+    }
+
+    /// What a bench route does with its request's end where its route tells
+    /// that end ([`route_classic_ended`], [`route_pair_ended`]). A form that
+    /// reports is counted against the form named with it, which holds the
+    /// guard or the answer as it does and reports nothing: the difference
+    /// is the report alone. Each shows what it holds to an opaque reader,
+    /// as a route hands it to another function or task. A pair route
+    /// tells each side through that side's own guard and keeps no answer:
+    /// both of its reporting forms are counted against [`Self::Passed`].
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Ended {
+        /// The guard is shown to an opaque reader and nobody reports: what
+        /// [`Self::Streamed`] is counted against.
+        Passed,
+        /// A streamed answer: its route asks the guard a handle on the
+        /// request's end, and the stream's reader reports through it while
+        /// the guard stands. On a pair route that reader is the decode's,
+        /// and the prefill is told through its guard.
+        Streamed,
+        /// The route keeps its answer past the guard and nobody reports:
+        /// what [`Self::Answer`] is counted against.
+        Kept,
+        /// An answer read whole: the route keeps its answer and reports
+        /// through it. A pair route tells each side through its guard.
+        Answer,
+        /// The gRPC execution stage's steps behind a placement, and what the
+        /// stage's plan does behind a dispatch that answered: it asks the
+        /// selection whether the request tells its end, the answer's word,
+        /// and behind a yes asks its guards the handle and hands it to the
+        /// request's stream. A classic request pays that test, and its
+        /// stream is left as it is.
+        Told,
+        /// The same with the guards asked whatever the answer's word says:
+        /// the walk a request Grand Central placed makes, counted here
+        /// on a classic guard.
+        Walked,
+        /// The stage's steps with nobody asking: the selection keeps the
+        /// answer, the attempt's guards are made from it and a tracked
+        /// stream stands for the call's. What the gRPC forms are counted
+        /// against. It stands among them in this list, so that the choice
+        /// among the forms costs it what it costs them: a form at the
+        /// list's edge is told apart by a range test, the others by a jump.
+        Dispatched,
+        /// The same as [`Self::Dispatched`], and the stream is read once, to
+        /// its end: one walk of a classic request's stream through its
+        /// layers, where no layer of Grand Central's lies.
+        Read,
+        /// The same as [`Self::Dispatched`], and the stream is watched for
+        /// a client, as a streaming reader's stream is. What
+        /// [`Self::Stopped`] is counted against.
+        Watched,
+        /// The same as [`Self::Watched`], and the stream is let go as a
+        /// reader lets it go at its own stop: asked for the layer that
+        /// tells its end, which a classic request's stream has not.
+        Stopped,
+        /// The same as [`Self::Dispatched`], and the stream takes the layer
+        /// that tells its end, as under a policy document one of whose
+        /// stages takes an end. The handle in it is empty: the report itself
+        /// is not in this count.
+        Layered,
+        /// The same as [`Self::Layered`], and the stream is read once, to
+        /// its end, through the layer. Counted against [`Self::Layered`],
+        /// and less what [`Self::Read`] pays, it is what the layer costs a
+        /// read.
+        LayeredRead,
+    }
+
+    /// The gRPC execution stage's steps behind a placement: the selection
+    /// that keeps the answer, the attempt's guards made from it, and a
+    /// stream that stands for the call's, tracked on its worker as the
+    /// stage tracks it.
+    #[inline]
+    fn dispatched(worker: Placed, key: Option<&str>) -> (WorkerSelection, LoadGuards, ProtoStream) {
+        let selection = black_box(WorkerSelection::Single { worker });
+        let guards = LoadGuards::new(&selection, key);
+        let stream = ProtoStream::Fanout(FanoutStream::new(Vec::new()));
+        let stream = match selection.single() {
+            Some(worker) => stream.tracked(Arc::clone(worker), 0, false),
+            None => stream,
+        };
+        (selection, guards, stream)
+    }
+
+    /// `stream` watched for a client whose channel is made here, out of
+    /// line: the two forms that watch run the same code for it.
+    #[inline(never)]
+    fn watched(stream: ProtoStream) -> ProtoStream {
+        let (client, _body) = sse_channel();
+        stream.until_client_gone(&client, "")
+    }
+
+    /// One read of `stream`, out of line, so that both executables of a
+    /// count run the same code around the read: whether it handed an item.
+    #[inline(never)]
+    fn read_once(stream: &mut ProtoStream) -> bool {
+        let item = futures::FutureExt::now_or_never(stream.next());
+        matches!(item, Some(Some(_)))
+    }
+
+    /// Bytes the calling thread has allocated since it started, by the
+    /// allocator's own count of the thread: a free does not subtract.
+    /// `None` in a build that links no such count.
+    pub fn thread_allocated_bytes() -> Option<u64> {
+        #[cfg(all(
+            feature = "jemalloc-stats",
+            not(target_env = "msvc"),
+            not(target_env = "musl")
+        ))]
+        {
+            tikv_jemalloc_ctl::thread::allocatedp::read()
+                .ok()
+                .map(|allocated| allocated.get())
+        }
+        #[cfg(not(all(
+            feature = "jemalloc-stats",
+            not(target_env = "msvc"),
+            not(target_env = "musl")
+        )))]
+        {
+            None
+        }
+    }
+
+    /// The worker a route placed a request on, as a number a bench compares
+    /// with another request's: the place of the worker's object in memory,
+    /// which stands for as long as the worker is registered. Nothing else is
+    /// read of it.
+    fn placed_on(worker: &Arc<dyn Worker>) -> usize {
+        Arc::as_ptr(worker).addr()
+    }
+
+    /// Hands the classic policies the load feed the monitor would publish.
+    pub fn attach_loads(policies: &PolicyRegistry, loads: Option<LoadReceiver>) {
+        policies.set_load_receiver(loads);
+    }
+
+    /// Sets a pair gateway's side policies on `policies` as the router
+    /// factory sets them at the start: each side's own policy of `config`,
+    /// or its main policy.
+    pub fn set_pair_sides(policies: &PolicyRegistry, config: &RouterConfig) {
+        let main = &config.policy;
+        policies.set_side_policy(Side::Prefill, config.mode.get_prefill_policy(main));
+        policies.set_side_policy(Side::Decode, config.mode.get_decode_policy(main));
+    }
+
+    /// One request's routing under the classic policies on `route`: the
+    /// placement over the route's own pool, the dispatch-time read of the
+    /// chosen worker's overload veto, and the worker's load guard from the
+    /// send to the request's end, whose drop tells the model's policy.
+    /// `headers` are the request's, where it carries any: a routing key is
+    /// read from them as a router reads it, for the placement and for the
+    /// load guard. The worker the request went to (`placed_on`), and
+    /// `None` where it had no worker.
+    pub fn route_classic(
+        registry: &WorkerRegistry,
+        policies: &PolicyRegistry,
+        model: &str,
+        route: Route,
+        tokens: Option<&[u32]>,
+        headers: Option<&HeaderMap>,
+    ) -> Option<usize> {
+        let pool = route.pool();
+        let inputs = PlacementInputs {
+            tokens,
+            headers,
+            ..Default::default()
+        };
+        let worker = select_single(
+            registry,
+            policies,
+            model,
+            pool,
+            None,
+            inputs,
+            Stated::nothing,
+        )?;
+        let shed =
+            overload::shed_if_worker_overloaded(&*worker, model, registry.overload_shed_enabled());
+        if shed.is_some() {
+            return None;
+        }
+        let went = placed_on(worker.worker());
+        let guard = worker.into_guard(policies.sticky_key(headers, None));
+        drop(guard);
+        Some(went)
+    }
+
+    /// [`route_classic`] for a request that holds its prompt as text and no
+    /// token ids, as a request the HTTP router did not tokenize does. A
+    /// function of its own, so that a request of token ids runs the code it
+    /// ran before this one.
+    pub fn route_text(
+        registry: &WorkerRegistry,
+        policies: &PolicyRegistry,
+        model: &str,
+        route: Route,
+        text: &str,
+        headers: Option<&HeaderMap>,
+    ) -> Option<usize> {
+        let pool = route.pool();
+        let inputs = PlacementInputs {
+            text: Some(text),
+            headers,
+            ..Default::default()
+        };
+        let worker = select_single(
+            registry,
+            policies,
+            model,
+            pool,
+            None,
+            inputs,
+            Stated::nothing,
+        )?;
+        let shed =
+            overload::shed_if_worker_overloaded(&*worker, model, registry.overload_shed_enabled());
+        if shed.is_some() {
+            return None;
+        }
+        let went = placed_on(worker.worker());
+        let guard = worker.into_guard(policies.sticky_key(headers, None));
+        drop(guard);
+        Some(went)
+    }
+
+    /// One request's routing through a pair gateway's classic placement
+    /// on the gRPC wire: the pair index of the model's snapshot, the pair
+    /// placed over it by the registry's two side policies, and each side's
+    /// load guard from the send to the request's end. The prefill worker
+    /// the request went to (`placed_on`), and `None` where it had no
+    /// pair.
+    pub fn route_pair(
+        registry: &WorkerRegistry,
+        policies: &PolicyRegistry,
+        model: &str,
+        tokens: Option<&[u32]>,
+    ) -> Option<usize> {
+        let pairs = registry
+            .get_routing_snapshot(model)
+            .pd_pairs(PdWire::Grpc, policies.pd_pairing_mode());
+        let inputs = PlacementInputs {
+            tokens,
+            ..Default::default()
+        };
+        let pair = select_pair(
+            registry,
+            policies,
+            model,
+            &pairs,
+            None,
+            None,
+            inputs,
+            Stated::nothing,
+        )
+        .ok()?;
+        let went = placed_on(pair.prefill.worker());
+        let key = policies.sticky_key(None, None);
+        // The prefill's load as a pair route holds it with admission
+        // disabled: a plain guard of its worker under the route's key, made
+        // ahead of the send, and the send said where the prefill goes out.
+        let handed_on = |pair: PlacedPair| {
+            let (prefill, unsent) = pair.prefill.unsent();
+            ((prefill, pair.decode), unsent)
+        };
+        let ((_prefill, decode), ahead) =
+            hold_unbounded(pair, key, |pair| &pair.prefill, handed_on);
+        let prefill = ahead.sent();
+        // The decode's guard as a pair route makes it: ahead of the decode's
+        // send, and sent behind the prefill.
+        let decode_guard = decode.ahead(key);
+        let decode_guard = decode.sent(decode_guard);
+        drop((prefill, decode_guard));
+        Some(went)
+    }
+
+    /// [`route_classic`] on a route that tells the request's end: the same
+    /// placement and overload read, and then `end`'s form of the request's
+    /// end where [`route_classic`] drops its guard at once.
+    pub fn route_classic_ended(
+        registry: &WorkerRegistry,
+        policies: &PolicyRegistry,
+        model: &str,
+        route: Route,
+        tokens: Option<&[u32]>,
+        headers: Option<&HeaderMap>,
+        end: Ended,
+    ) -> Option<usize> {
+        let pool = route.pool();
+        let inputs = PlacementInputs {
+            tokens,
+            headers,
+            ..Default::default()
+        };
+        let worker = select_single(
+            registry,
+            policies,
+            model,
+            pool,
+            None,
+            inputs,
+            Stated::nothing,
+        )?;
+        let shed =
+            overload::shed_if_worker_overloaded(&*worker, model, registry.overload_shed_enabled());
+        if shed.is_some() {
+            return None;
+        }
+        let went = placed_on(worker.worker());
+        let key = policies.sticky_key(headers, None);
+        match end {
+            Ended::Passed => {
+                let guard = worker.into_guard(key);
+                black_box(&guard);
+                drop(guard);
+            }
+            Ended::Streamed => {
+                let guard = worker.into_guard(key);
+                let reader = black_box(RequestEnd::of(black_box(&guard)));
+                reader.report(200, || true);
+                drop(reader);
+                drop(guard);
+            }
+            Ended::Kept | Ended::Answer => {
+                let guard = worker.guard_keeping_end(key);
+                black_box(&guard);
+                drop(guard);
+                let worker = black_box(&worker);
+                if end == Ended::Answer {
+                    worker.ended(200, || true);
+                }
+            }
+            // Every other form is the gRPC execution stage's. They run one
+            // body, so that a form and its control differ by the form's own
+            // calls alone: the stream and the guards stand in the same
+            // places for each.
+            _ => {
+                let (selection, guards, mut stream) = dispatched(worker, key);
+                // The stage's plan reads the selection's address out of its
+                // future's frame behind the dispatch. Here it stands in
+                // memory as well, and the form that asks it loads it.
+                let mut held = &selection;
+                black_box(&mut held);
+                // Whether the stream was read stands in memory from here. In a
+                // register it is set again at the head of a form's own block,
+                // and the form's cell would count that beside its own calls.
+                let mut read = false;
+                let read = black_box(&mut read);
+                match end {
+                    Ended::Told => {
+                        if held.tells_end() {
+                            stream.report_through(held.end(Some(&guards)));
+                        }
+                    }
+                    Ended::Walked => stream.report_through(guards.end()),
+                    Ended::Layered | Ended::LayeredRead => {
+                        stream.put_report_layer(RequestEnd::default(), None);
+                    }
+                    _ => {}
+                }
+                if matches!(end, Ended::Watched | Ended::Stopped) {
+                    stream = watched(stream);
+                }
+                if matches!(end, Ended::Read | Ended::LayeredRead) {
+                    *read = read_once(&mut stream);
+                }
+                black_box((&guards, &stream, *read));
+                if end == Ended::Stopped {
+                    stream.abort_past_stop();
+                } else {
+                    drop(stream);
+                }
+                drop((guards, selection));
+            }
+        }
+        Some(went)
+    }
+
+    /// [`route_pair`] on a route that tells each side's end. Both loads
+    /// stand where they are, shown to an opaque reader: the prefill's as a
+    /// pair route holds it with no admission bound (`hold_unbounded`),
+    /// the decode's as its guard. Under [`Ended::Answer`] each side is told
+    /// through its guard, as a pair read whole. Under [`Ended::Streamed`]
+    /// the prefill is told through its guard, and the decode's reader
+    /// reports through the handle asked of the decode's guard. A pair route
+    /// keeps no answer, and the gRPC stage's forms are a single request's:
+    /// every other form ends as [`Ended::Passed`] does.
+    pub fn route_pair_ended(
+        registry: &WorkerRegistry,
+        policies: &PolicyRegistry,
+        model: &str,
+        tokens: Option<&[u32]>,
+        end: Ended,
+    ) -> Option<usize> {
+        let pairs = registry
+            .get_routing_snapshot(model)
+            .pd_pairs(PdWire::Grpc, policies.pd_pairing_mode());
+        let inputs = PlacementInputs {
+            tokens,
+            ..Default::default()
+        };
+        let pair = select_pair(
+            registry,
+            policies,
+            model,
+            &pairs,
+            None,
+            None,
+            inputs,
+            Stated::nothing,
+        )
+        .ok()?;
+        let went = placed_on(pair.prefill.worker());
+        let key = policies.sticky_key(None, None);
+        // The two loads as [`route_pair`] holds them.
+        let handed_on = |pair: PlacedPair| {
+            let (prefill, unsent) = pair.prefill.unsent();
+            ((prefill, pair.decode), unsent)
+        };
+        let ((_prefill, decode), ahead) =
+            hold_unbounded(pair, key, |pair| &pair.prefill, handed_on);
+        let prefill = ahead.sent();
+        let decode_guard = decode.ahead(key);
+        let decode_guard = decode.sent(decode_guard);
+        black_box((&prefill, &decode_guard));
+        match end {
+            Ended::Answer => {
+                prefill.end().report(200, || true);
+                RequestEnd::of(&decode_guard).report(200, || false);
+            }
+            Ended::Streamed => {
+                prefill.end().report(200, || true);
+                let reader = black_box(RequestEnd::of(&decode_guard));
+                reader.report(200, || true);
+            }
+            // A pair route keeps no answer, and every other form is a
+            // single request's: each ends as `Passed` does.
+            _ => {}
+        }
+        Some(went)
+    }
 
     /// Whether a process switch captures every request's cache trace
     /// (`SMG_CACHE_TRACE=1` or `SMG_CACHE_TRACE_HEADER=1`). A benchmark cell
@@ -314,7 +791,9 @@ pub mod bench_support {
                 RoutingPool::GrpcPipelineRegular,
                 None,
                 inputs,
+                Stated::nothing,
             )
+            .map(Placed::into_worker)
         }
     }
 
@@ -366,9 +845,10 @@ pub mod bench_support {
                     None,
                     None,
                     inputs,
+                    Stated::nothing,
                 )
                 .ok()
-                .map(|pair| (pair.prefill, pair.decode))
+                .map(|pair| (pair.prefill.into_worker(), pair.decode.into_worker()))
             })
             .await
         }

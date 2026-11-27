@@ -16,7 +16,7 @@ use serde_json::Value;
 // are different algorithms and texts and stay here.
 use super::{
     deepseek_common::{
-        after_last_user, at_or_after_last_user, find_last_user_index,
+        after_last_user, at_or_after_last_user, drop_thinking_messages, find_last_user_index,
         push_tools_and_response_format, render_system_message, to_json, tool_schemas, Turn,
         ASSISTANT, BOS, DSML, EOS, THINKING_END, THINKING_START, USER,
     },
@@ -413,37 +413,6 @@ fn render_assistant(
 }
 
 // ---------------------------------------------------------------------------
-// drop_thinking_messages
-// ---------------------------------------------------------------------------
-
-fn drop_thinking_messages(messages: &[Value]) -> Vec<Value> {
-    let last_user_idx = find_last_user_index(messages);
-    let mut out: Vec<Value> = Vec::with_capacity(messages.len());
-
-    for (idx, msg) in messages.iter().enumerate() {
-        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
-        let always_keep =
-            matches!(role, "user" | "system" | "tool") || at_or_after_last_user(idx, last_user_idx);
-
-        if always_keep {
-            out.push(msg.clone());
-            continue;
-        }
-
-        if role == "assistant" {
-            let mut cloned = msg.clone();
-            if let Some(obj) = cloned.as_object_mut() {
-                obj.remove("reasoning_content");
-            }
-            out.push(cloned);
-        }
-        // Other roles before last_user_idx are dropped, matching Python.
-    }
-
-    out
-}
-
-// ---------------------------------------------------------------------------
 // encode_messages — public entry point
 // ---------------------------------------------------------------------------
 
@@ -490,7 +459,9 @@ pub(crate) fn render_messages(
     };
 
     if thinking_mode.is_thinking() && params.drop_thinking {
-        full_messages = drop_thinking_messages(&full_messages);
+        let last_user_idx = find_last_user_index(&full_messages);
+        full_messages =
+            drop_thinking_messages(&full_messages, last_user_idx, &["user", "system", "tool"]);
     }
 
     for idx in 0..full_messages.len() {

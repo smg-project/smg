@@ -211,71 +211,6 @@ it cannot start without. Renders nothing.
 {{- end -}}
 {{- end }}
 
-{{/* The ConfigMap that supplies the router's policy document, if given. */}}
-{{- define "smg.routerPolicyConfigMapName" -}}
-{{- if .Values.router.policySpec -}}
-{{- printf "%s-policy-spec" (include "smg.fullname" .) -}}
-{{- else -}}
-{{- .Values.router.policySpecConfigMap | default "" -}}
-{{- end -}}
-{{- end }}
-
-{{/* The gateway's policy controller switch as the launcher reads it. YAML reads a bare on or off as a boolean: both forms mean the same. */}}
-{{- define "smg.routerPolicyController" -}}
-{{- $switch := .Values.router.policyController -}}
-{{- if kindIs "bool" $switch -}}
-{{- ternary "on" "off" $switch -}}
-{{- else -}}
-{{- $switch | default "off" -}}
-{{- end -}}
-{{- end }}
-
-{{/* The value for --policy, empty when a document is given. */}}
-{{- define "smg.routerPolicyArg" -}}
-{{- if .Values.router.policy -}}
-{{- .Values.router.policy -}}
-{{- else if not (include "smg.routerPolicyConfigMapName" .) -}}
-cache_aware
-{{- end -}}
-{{- end }}
-
-{{/* The policy document's file in the router pod. */}}
-{{- define "smg.routerPolicySpecPath" -}}
-/etc/smg/policy/spec.yaml
-{{- end }}
-
-{{/* The inline policy file, with its final newline, for the ConfigMap and checksum. */}}
-{{- define "smg.routerPolicySpec" -}}
-{{- toYaml .Values.router.policySpec | printf "%s\n" -}}
-{{- end }}
-
-{{/* A policy document needs the gateway's controller and one source, and no value beside it that the document replaces:
-     both launchers refuse the flag of one, and the command line refuses it at its default too. */}}
-{{- define "smg.validatePolicy" -}}
-{{- $router := .Values.router -}}
-{{- if and $router.policySpec $router.policySpecConfigMap -}}
-{{- fail "router.policySpec and router.policySpecConfigMap each supply a policy document. Use one source." -}}
-{{- end -}}
-{{- if include "smg.routerPolicyConfigMapName" . -}}
-{{- if ne (include "smg.routerPolicyController" .) "on" -}}
-{{- fail "router.policySpec and router.policySpecConfigMap require router.policyController to be on." -}}
-{{- end -}}
-{{- if $router.policy -}}
-{{- fail "router.policy is set beside a policy document. The document names the policy: set router.policy to \"\". An upgrade with --reuse-values keeps an older chart's cache_aware." -}}
-{{- end -}}
-{{- range $role := list "prefillPolicy" "decodePolicy" "encodePolicy" -}}
-{{- if index ($router.disaggregation | default dict) $role -}}
-{{- fail (printf "router.disaggregation.%s is set beside a policy document. The document names the policy of each side: leave it empty." $role) -}}
-{{- end -}}
-{{- end -}}
-{{- range $name, $default := dict "cacheThreshold" 0.3 "balanceAbsThreshold" 64 "balanceRelThreshold" 1.5 "evictionIntervalSecs" 120 "maxTreeSize" 67108864 "blockSize" 16 -}}
-{{- if ne (float64 (index $router $name)) (float64 $default) -}}
-{{- fail (printf "router.%s is set beside a policy document. The document holds the cache tuning: leave router.%s at its default, %v." $name $name $default) -}}
-{{- end -}}
-{{- end -}}
-{{- end -}}
-{{- end }}
-
 {{/*
 Consul TLS files -- the files of router.discovery.consul.tls.existingSecret
 the router pod mounts under /etc/smg/consul-tls, as a JSON list for
@@ -333,18 +268,8 @@ Called from the router Deployment template.
 - {{ . | quote }}
 {{- end }}
 {{- end }}
-{{- with include "smg.routerPolicyArg" . }}
 - "--policy"
-- {{ . | quote }}
-{{- end }}
-{{- if eq (include "smg.routerPolicyController" .) "on" }}
-- "--policy-controller"
-- "on"
-{{- end }}
-{{- if include "smg.routerPolicyConfigMapName" . }}
-- "--policy-spec"
-- {{ include "smg.routerPolicySpecPath" . | quote }}
-{{- end }}
+- {{ .Values.router.policy | quote }}
 {{- with .Values.router.disaggregation }}
 {{- $mode := .mode | default "" }}
 {{- /* The role flags of disaggregated serving, typed: a role given without
@@ -611,7 +536,6 @@ Called from the router Deployment template.
 - "--chat-template"
 - {{ .Values.router.chatTemplate | quote }}
 {{- end }}
-{{- if not (include "smg.routerPolicyConfigMapName" .) }}
 - "--cache-threshold"
 - {{ .Values.router.cacheThreshold | quote }}
 - "--balance-abs-threshold"
@@ -624,7 +548,6 @@ Called from the router Deployment template.
 - {{ int .Values.router.maxTreeSize | quote }}
 - "--block-size"
 - {{ .Values.router.blockSize | quote }}
-{{- end }}
 - "--max-payload-size"
 - {{ int .Values.router.maxPayloadSize | quote }}
 - "--request-timeout-secs"
@@ -1061,44 +984,44 @@ Used by smg.routerArgs when workers are defined but workerUrls is empty.
 {{- end }}
 
 {{/*
-Policy controller name -- its Deployment, its Service, its budget and its
+Grand Central name -- its Deployment, its Service, its budget and its
 ServiceMonitor.
 */}}
-{{- define "smg.policyControllerName" -}}
-{{- printf "%s-policy-controller" (include "smg.fullname" .) -}}
+{{- define "smg.grandCentralName" -}}
+{{- printf "%s-grand-central" (include "smg.fullname" .) -}}
 {{- end }}
 
 {{/*
-Policy controller election -- "true" when policyController.election.enabled
+Grand Central election -- "true" when grandCentral.election.enabled
 is set; empty when it is not, and over values that hold no election block.
 */}}
-{{- define "smg.policyControllerElection" -}}
-{{- if ((.Values.policyController).election).enabled -}}true{{- end -}}
+{{- define "smg.grandCentralElection" -}}
+{{- if ((.Values.grandCentral).election).enabled -}}true{{- end -}}
 {{- end }}
 
 {{/*
-Policy controller Lease name -- policyController.election.leaseName, or the
+Grand Central Lease name -- grandCentral.election.leaseName, or the
 controller's full name when it is empty: two releases in one namespace never
 share a Lease. No revision is in it: a name that moved at an upgrade would
 elect a second leader beside the first.
 */}}
-{{- define "smg.policyControllerLeaseName" -}}
-{{- default (include "smg.policyControllerName" .) ((.Values.policyController).election).leaseName -}}
+{{- define "smg.grandCentralLeaseName" -}}
+{{- default (include "smg.grandCentralName" .) ((.Values.grandCentral).election).leaseName -}}
 {{- end }}
 
 {{/*
-Policy controller replica count -- the count as a reader of the rendered
+Grand Central replica count -- the count as a reader of the rendered
 manifest takes it, a whole number: a count given as text that reads there
 as a number (2e0, or a 2 after a blank) counts as that number. Zero for a
 null and for a text that reads as no number. Every place that judges the
 count asks here.
 */}}
-{{- define "smg.policyControllerReplicaCount" -}}
-{{- int (fromYaml (printf "count: %v" .Values.policyController.replicas)).count -}}
+{{- define "smg.grandCentralReplicaCount" -}}
+{{- int (fromYaml (printf "count: %v" .Values.grandCentral.replicas)).count -}}
 {{- end }}
 
 {{/*
-Policy controller replicas -- more than one only with the election on. With
+Grand Central replicas -- more than one only with the election on. With
 it off every replica is a controller of its own, and two would each lead
 alone: the render refuses them. The count is compared as a reader of the
 rendered manifest takes it: a text that reads there as a number above one
@@ -1106,31 +1029,31 @@ rendered manifest takes it: a text that reads there as a number above one
 the values hold it: a null stays the API's default. Beside a spec store the
 refusal says one way out, not two: a store takes no election.
 */}}
-{{- define "smg.policyControllerReplicas" -}}
-{{- $replicas := .Values.policyController.replicas -}}
-{{- $read := include "smg.policyControllerReplicaCount" . -}}
-{{- if and (gt (int $read) 1) (not (include "smg.policyControllerElection" .)) -}}
-{{- if include "smg.policyControllerSpecStore" . -}}
-{{- fail (printf "policyController.replicas is %v beside policyController.specStoreClaim: each replica would lead alone, and a spec store holds one controller's generations. Keep one replica" $replicas) -}}
+{{- define "smg.grandCentralReplicas" -}}
+{{- $replicas := .Values.grandCentral.replicas -}}
+{{- $read := include "smg.grandCentralReplicaCount" . -}}
+{{- if and (gt (int $read) 1) (not (include "smg.grandCentralElection" .)) -}}
+{{- if include "smg.grandCentralSpecStore" . -}}
+{{- fail (printf "grandCentral.replicas is %v beside grandCentral.specStoreClaim: each replica would lead alone, and a spec store holds one controller's generations. Keep one replica" $replicas) -}}
 {{- end -}}
-{{- fail (printf "policyController.replicas is %v with policyController.election.enabled off: each replica would lead alone. Turn the election on, or keep one replica" $replicas) -}}
+{{- fail (printf "grandCentral.replicas is %v with grandCentral.election.enabled off: each replica would lead alone. Turn the election on, or keep one replica" $replicas) -}}
 {{- end -}}
 {{- $replicas -}}
 {{- end }}
 
 {{/*
-Policy controller selector labels -- the release's selector labels with the
+Grand Central selector labels -- the release's selector labels with the
 controller's own component, so no router or worker selector takes its pods.
 */}}
-{{- define "smg.policyControllerSelectorLabels" -}}
+{{- define "smg.grandCentralSelectorLabels" -}}
 {{ include "smg.selectorLabels" . }}
-app.kubernetes.io/component: policy-controller
+app.kubernetes.io/component: grand-central
 {{- end }}
 
 {{/*
-Policy controller image -- policyController.image, each part falling back to
+Grand Central image -- grandCentral.image, each part falling back to
 the router's image: the global registry, the global repository, and the
-router's tag with -policy-controller appended, the tag a release publishes
+router's tag with -grand-central appended, the tag a release publishes
 the controller under. One version names both images: a release publishes one
 controller image, so the router's -slurm or -ol9 variant takes it too, its
 own suffix cut first. The default tag belongs to the router's repository and
@@ -1141,30 +1064,30 @@ that names such a release is refused too. Only the three numbers a release
 tag starts with are compared, each of nine digits at most, a number the
 comparer can hold: any other tag takes the default.
 */}}
-{{- define "smg.policyControllerImage" -}}
-{{- $image := .Values.policyController.image -}}
+{{- define "smg.grandCentralImage" -}}
+{{- $image := .Values.grandCentral.image -}}
 {{- $routerTag := .Values.global.image.tag | default .Chart.AppVersion -}}
 {{- if and $image.repository (not $image.tag) -}}
-{{- fail "policyController.image.repository needs policyController.image.tag: the default tag is the router's with -policy-controller appended, and it belongs to the router's repository" -}}
+{{- fail "grandCentral.image.repository needs grandCentral.image.tag: the default tag is the router's with -grand-central appended, and it belongs to the router's repository" -}}
 {{- end -}}
 {{- if and (not $image.tag) (contains "@" $routerTag) -}}
-{{- fail "policyController.image.tag is needed: global.image.tag names the router's image by a digest, and the controller's default tag is the router's tag with -policy-controller appended" -}}
+{{- fail "grandCentral.image.tag is needed: global.image.tag names the router's image by a digest, and the controller's default tag is the router's tag with -grand-central appended" -}}
 {{- end -}}
 {{- $firstRelease := "1.16.0" -}}
 {{- $release := regexFind "^[0-9]{1,9}\\.[0-9]{1,9}\\.[0-9]{1,9}(-|$)" $routerTag | trimSuffix "-" -}}
 {{- if and (not $image.tag) $release -}}
 {{- if semverCompare (printf "<%s" $firstRelease) $release -}}
-{{- fail (printf "policyController.image.tag is needed: global.image.tag %s is older than %s, the first release that publishes a policy controller image" $routerTag $firstRelease) -}}
+{{- fail (printf "grandCentral.image.tag is needed: global.image.tag %s is older than %s, the first release that publishes a Grand Central image" $routerTag $firstRelease) -}}
 {{- end -}}
 {{- end -}}
 {{- $registry := $image.registry | default .Values.global.image.registry -}}
 {{- $repository := $image.repository | default .Values.global.image.repository -}}
-{{- $tag := $image.tag | default (printf "%s-policy-controller" ($routerTag | trimSuffix "-slurm" | trimSuffix "-ol9")) -}}
+{{- $tag := $image.tag | default (printf "%s-grand-central" ($routerTag | trimSuffix "-slurm" | trimSuffix "-ol9")) -}}
 {{- printf "%s/%s:%s" $registry $repository $tag -}}
 {{- end }}
 
 {{/*
-Policy controller spec document -- policyController.spec as the bytes of the
+Grand Central spec document -- grandCentral.spec as the bytes of the
 file the controller reads. The controller refuses a start that names no
 source of its spec, so values that hold no document are refused here, by
 name: a null, an empty map, or values with no such key. A value that is no
@@ -1174,51 +1097,51 @@ schema's check is skipped. The chart reads no line of the document and
 writes none: whether it runs is the controller's word, and a generation
 line is the document's own.
 */}}
-{{- define "smg.policyControllerSpec" -}}
-{{- $spec := (.Values.policyController).spec -}}
+{{- define "smg.grandCentralSpec" -}}
+{{- $spec := (.Values.grandCentral).spec -}}
 {{- if not (or (kindIs "invalid" $spec) (kindIs "map" $spec)) -}}
-{{- fail (printf "policyController.spec is %s: the policy spec document as a map" (toJson $spec)) -}}
+{{- fail (printf "grandCentral.spec is %s: the policy spec document as a map" (toJson $spec)) -}}
 {{- end -}}
 {{- if not $spec -}}
-{{- fail "policyController.spec holds no document: the controller refuses a start that names no source of its policy spec" -}}
+{{- fail "grandCentral.spec holds no document: the controller refuses a start that names no source of its policy spec" -}}
 {{- end -}}
 {{- toYaml $spec -}}
 {{- end }}
 
 {{/*
-Policy controller spec store -- the claim named in
-policyController.specStoreClaim, and empty when none is named: the
-controller then runs the document of policyController.spec from its file. A
+Grand Central spec store -- the claim named in
+grandCentral.specStoreClaim, and empty when none is named: the
+controller then runs the document of grandCentral.spec from its file. A
 store is the other source of the controller's spec. The controller is
 passed --spec-store on the claim's mount: it starts on the newest
 generation on file, and writes each generation an operator applies there.
 What the controller refuses at start beside a store is refused here, in
-its reasons: a document in policyController.spec, since a start names one
+its reasons: a document in grandCentral.spec, since a start names one
 source of its spec, and the election, since a standby does not follow an
 applied generation yet and the controller takes no store beside a lease
 another replica can take. More than one replica is refused where the count
 is judged. A value that is no text is refused as written, where the
 schema's check is skipped.
 */}}
-{{- define "smg.policyControllerSpecStore" -}}
-{{- $claim := (.Values.policyController).specStoreClaim -}}
+{{- define "smg.grandCentralSpecStore" -}}
+{{- $claim := (.Values.grandCentral).specStoreClaim -}}
 {{- if not (or (kindIs "invalid" $claim) (kindIs "string" $claim)) -}}
-{{- fail (printf "policyController.specStoreClaim is %s: the name of a PersistentVolumeClaim, as text" (toJson $claim)) -}}
+{{- fail (printf "grandCentral.specStoreClaim is %s: the name of a PersistentVolumeClaim, as text" (toJson $claim)) -}}
 {{- end -}}
 {{- if $claim -}}
-{{- if (.Values.policyController).spec -}}
-{{- fail (printf "policyController.specStoreClaim names %s and policyController.spec holds a document: the controller refuses a start that names two sources of its policy spec. Set policyController.spec to null and upgrade with --reset-then-reuse-values or --reset-values, which drops the release's other overrides: give them again (an empty map does not clear a reused document, and under --reuse-values a null does not either), or leave the claim unnamed" $claim) -}}
+{{- if (.Values.grandCentral).spec -}}
+{{- fail (printf "grandCentral.specStoreClaim names %s and grandCentral.spec holds a document: the controller refuses a start that names two sources of its policy spec. Set grandCentral.spec to null and upgrade with --reset-then-reuse-values or --reset-values, which drops the release's other overrides: give them again (an empty map does not clear a reused document, and under --reuse-values a null does not either), or leave the claim unnamed" $claim) -}}
 {{- end -}}
-{{- if include "smg.policyControllerElection" . -}}
-{{- fail (printf "policyController.specStoreClaim names %s with policyController.election.enabled on: another replica can take the controller's lease, and a standby does not follow an applied generation in this build. Turn the election off, or keep the spec document" $claim) -}}
+{{- if include "smg.grandCentralElection" . -}}
+{{- fail (printf "grandCentral.specStoreClaim names %s with grandCentral.election.enabled on: another replica can take the controller's lease, and a standby does not follow an applied generation in this build. Turn the election off, or keep the spec document" $claim) -}}
 {{- end -}}
 {{- $claim -}}
 {{- end -}}
 {{- end }}
 
 {{/*
-Policy controller CLI arguments -- every argument is a flag of
-smg-policy-controller, each from a value. The controller's id is not here:
+Grand Central CLI arguments -- every argument is a flag of
+smg-grand-central, each from a value. The controller's id is not here:
 the flag reads HOSTNAME, the pod's name. What the controller refuses at
 start is refused at render: two listeners on one port, a settle window
 over half the grace period (the controller's own default of 5 seconds when
@@ -1236,13 +1159,13 @@ key of the document's ConfigMap, under the mount's directory. Where a spec
 store's claim is named the store's directory is passed in the file's
 place: the claim's mount.
 */}}
-{{- define "smg.policyControllerArgs" -}}
-{{- $controller := .Values.policyController -}}
+{{- define "smg.grandCentralArgs" -}}
+{{- $controller := .Values.grandCentral -}}
 {{- $seen := dict -}}
 {{- range $listener := list "gateway" "control" "replication" "admin" -}}
 {{- $port := index $controller.ports $listener | int | toString -}}
 {{- with index $seen $port -}}
-{{- fail (printf "policyController.ports.%s %s equals policyController.ports.%s: the controller refuses two listeners on one port" $listener $port .) -}}
+{{- fail (printf "grandCentral.ports.%s %s equals grandCentral.ports.%s: the controller refuses two listeners on one port" $listener $port .) -}}
 {{- end -}}
 {{- $_ := set $seen $port $listener -}}
 {{- end -}}
@@ -1251,18 +1174,18 @@ place: the claim's mount.
 {{- if not (kindIs "invalid" $controller.shutdownSettleSeconds) -}}
 {{- $settle = int $controller.shutdownSettleSeconds -}}
 {{- end -}}
-{{- $elected := include "smg.policyControllerElection" . -}}
+{{- $elected := include "smg.grandCentralElection" . -}}
 {{- $told := list -}}
 {{- $named := list -}}
 {{- if not (kindIs "invalid" $controller.identityAsTold) -}}
 {{- $named = $controller.identityAsTold -}}
 {{- end -}}
 {{- if not (kindIs "slice" $named) -}}
-{{- fail (printf "policyController.identityAsTold is %s: a list of listeners' names (gateway, control, replication)" (toJson $named)) -}}
+{{- fail (printf "grandCentral.identityAsTold is %s: a list of listeners' names (gateway, control, replication)" (toJson $named)) -}}
 {{- end -}}
 {{- range $name := $named -}}
 {{- if not (has $name (list "gateway" "control" "replication")) -}}
-{{- fail (printf "policyController.identityAsTold names %v, none of the chart's listeners (gateway, control, replication)" $name) -}}
+{{- fail (printf "grandCentral.identityAsTold names %v, none of the chart's listeners (gateway, control, replication)" $name) -}}
 {{- end -}}
 {{- end -}}
 {{- range $listener := list "gateway" "control" "replication" -}}
@@ -1271,7 +1194,7 @@ place: the claim's mount.
 {{- end -}}
 {{- end -}}
 {{- if gt (mul $settle 2) $grace -}}
-{{- fail (printf "policyController: a settle window of %d s is over half the grace period of %d s (shutdownSettleSeconds, 5 when null, and shutdownGracePeriodSeconds): the controller refuses it" $settle $grace) -}}
+{{- fail (printf "grandCentral: a settle window of %d s is over half the grace period of %d s (shutdownSettleSeconds, 5 when null, and shutdownGracePeriodSeconds): the controller refuses it" $settle $grace) -}}
 {{- end -}}
 - "--gateway-listen"
 - {{ printf "0.0.0.0:%d" (int $controller.ports.gateway) | quote }}
@@ -1302,11 +1225,11 @@ place: the claim's mount.
 {{- end }}
 {{- if $elected }}
 - "--lease-name"
-- {{ include "smg.policyControllerLeaseName" . | quote }}
+- {{ include "smg.grandCentralLeaseName" . | quote }}
 - "--advertise-address"
 - "$(POD_IP)"
 {{- end }}
-{{- if include "smg.policyControllerSpecStore" . }}
+{{- if include "smg.grandCentralSpecStore" . }}
 - "--spec-store"
 - "/var/lib/smg/spec"
 {{- else }}
@@ -1319,19 +1242,19 @@ place: the claim's mount.
 {{- end }}
 
 {{/*
-Policy controller replication as told -- "true" when the controller's
+Grand Central replication as told -- "true" when the controller's
 arguments name the replication listener among those that take identities as
 told; empty when they do not. A replica that does not lead follows its
 leader only where they do. The arguments are read whole, as the controller
-reads them: policyController.identityAsTold and an --identity-as-told flag
-of policyController.extraArgs name alike. The flag's value is the next
+reads them: grandCentral.identityAsTold and an --identity-as-told flag
+of grandCentral.extraArgs name alike. The flag's value is the next
 argument or stands behind an equals sign, one name or several between
 commas.
 */}}
-{{- define "smg.policyControllerReplicationAsTold" -}}
+{{- define "smg.grandCentralReplicationAsTold" -}}
 {{- $told := list -}}
 {{- $value := false -}}
-{{- range $argument := include "smg.policyControllerArgs" . | fromYamlArray -}}
+{{- range $argument := include "smg.grandCentralArgs" . | fromYamlArray -}}
 {{- if $value -}}
 {{- $told = concat $told (splitList "," $argument) -}}
 {{- else if hasPrefix "--identity-as-told=" $argument -}}
@@ -1343,14 +1266,14 @@ commas.
 {{- end }}
 
 {{/*
-Policy controller TLS -- "true" when the controller's arguments hand its
+Grand Central TLS -- "true" when the controller's arguments hand its
 gRPC listeners a server certificate (--tls-cert, its value the next
 argument or behind an equals sign); empty when they do not. A standby's
 dial has no credential yet, so a replica whose replication listener serves
 TLS follows no leader.
 */}}
-{{- define "smg.policyControllerServesTls" -}}
-{{- range $argument := include "smg.policyControllerArgs" . | fromYamlArray -}}
+{{- define "smg.grandCentralServesTls" -}}
+{{- range $argument := include "smg.grandCentralArgs" . | fromYamlArray -}}
 {{- if or (eq $argument "--tls-cert") (hasPrefix "--tls-cert=" $argument) -}}true{{- end -}}
 {{- end -}}
 {{- end }}

@@ -1,0 +1,286 @@
+//! The probes that tie each WIT record to the engine's Rust struct: an
+//! exhaustive destructuring per record (a struct that gains, loses or renames
+//! a field fails to compile) and, per field, the WIT spelling of its Rust type
+//! against the descriptor in [`super::types`] (a retyped field fails the WIT
+//! test; the WIT order is the descriptor's, held by the byte-for-byte test,
+//! a struct's declaration order binding nothing). The host-only fields (a load row's
+//! resident-count flag, a candidate's position, sample instant and engine's place,
+//! a request's host clock, affinity column and model fingerprint, a lease's
+//! issue instant and session verdict, a target's and a pair's positions, a pair's decode
+//! verdict) are named as such.
+//! A `candidate` is tied to two structs, the engine's row and its entry of
+//! the request's affinity column: each is destructured whole, and the
+//! record's order, which neither struct holds, is named beside them.
+//! `dispatched` has no struct of its own: the host composes it from a lease,
+//! a target and a side.
+
+use std::sync::atomic::AtomicU64;
+
+use crate::{
+    engine::{
+        decision::{DecodePlacing, Pair, Target},
+        sticky_sessions::{DecodeVerdict, SessionVerdict},
+        view::{
+            AffinityFacts, AffinityRows, Candidate, Engines, HashKind, Header, Health, Identity,
+            LoadRow, MediaCounts, ModelFingerprint, OverloadRegime, Phase, PoolFacts, RequestFacts,
+            Role, Session, SignalSource, WireModes, WorkerId, ZoneCapacity,
+        },
+    },
+    policies::consistent_hashing::LentRing,
+    tracking::lease::{Lease, LeaseId, LeaseKind, Outcome, Side, TransportClass},
+};
+
+/// The WIT spelling of a Rust type a record carries.
+pub(crate) trait Wit {
+    const TY: &'static str;
+}
+
+macro_rules! wit {
+    ($($t:ty => $s:literal),+ $(,)?) => {
+        $(impl Wit for $t {
+            const TY: &'static str = $s;
+        })+
+    };
+}
+
+wit! {
+    u8 => "u8",
+    u16 => "u16",
+    u32 => "u32",
+    u64 => "u64",
+    i32 => "s32",
+    bool => "bool",
+    &str => "string",
+    WorkerId => "u64",
+    LeaseId => "u64",
+    Role => "role",
+    Phase => "phase",
+    Side => "side",
+    HashKind => "hash-kind",
+    SignalSource => "signal-source",
+    OverloadRegime => "overload-regime",
+    LeaseKind => "lease-kind",
+    TransportClass => "transport-class",
+    Health => "health",
+    WireModes => "wire-modes",
+    Identity<'_> => "identity",
+    LoadRow => "load",
+    MediaCounts => "media",
+    ZoneCapacity => "zone-capacity",
+    Pair => "pair",
+    &[u64] => "list<u64>",
+    &[WorkerId] => "list<u64>",
+    &[Header<'_>] => "list<tuple<u8, string>>",
+    &[ZoneCapacity] => "list<zone-capacity>",
+    Option<LoadRow> => "option<load>",
+    Option<Pair> => "option<pair>",
+    // A session crosses as its value.
+    Session => "u64",
+    // Host-only: a lease's session verdict and a pair's decode side's never
+    // reach a guest, nor does who placed that side, and a request's model
+    // crosses as its name, never as the host's fingerprint.
+    SessionVerdict => "host-only",
+    DecodeVerdict => "host-only",
+    DecodePlacing => "host-only",
+    ModelFingerprint => "host-only",
+    // Host-only: a guest reads the request's affinity column as five fields
+    // of each candidate.
+    &[AffinityFacts] => "host-only",
+    // Host-only: the rows a host names in that column's place stay in
+    // process, as the column does.
+    Option<AffinityRows<'_>> => "host-only",
+    // Host-only: the signal cells stand beside the rows of the host that
+    // decides, and no contract carries them yet.
+    Option<&crate::load::SignalCells> => "host-only",
+    // Host-only: the word a host keeps beside its own list of workers
+    // counts that list's turns, and a guest is shown rows.
+    Option<&AtomicU64> => "host-only",
+    // Host-only: the engines a host lists beside its rows name the rows by
+    // position, and a guest is shown rows.
+    Engines<'_> => "host-only",
+    // Host-only: the ring a caller lends names its workers by address,
+    // and a guest is shown rows.
+    Option<&dyn LentRing> => "host-only",
+    // Host-only: a pair's decode side's own places on that ring stay
+    // with the ring, in process.
+    Option<&[u64]> => "host-only",
+}
+
+// The spellings above that look inside a type, tied to it: an inner width that
+// moves stops the build here, the table being typed by hand.
+const _: fn(WorkerId) -> u64 = |id| id.0;
+const _: fn(LeaseId) -> u64 = |id| id.0;
+const _: fn(Session) -> u64 = Session::get;
+const _: fn(Header<'_>) -> (u8, &str) = |Header { name, value }| (name, value);
+
+fn ty<T: Wit>(_: &T) -> &'static str {
+    T::TY
+}
+
+/// What one probe found: the record's WIT name and the struct's fields in
+/// the struct's order as (WIT name, WIT type), the host-only ones left out,
+/// and the WIT-only fields the host composes in front (`completed` carries
+/// the lease its outcome belongs to).
+pub(crate) struct Probe {
+    pub(crate) record: &'static str,
+    pub(crate) before: &'static [(&'static str, &'static str)],
+    pub(crate) fields: Vec<(&'static str, &'static str)>,
+}
+
+/// The WIT name of a Rust field: kebab-case.
+fn kebab(field: &'static str) -> String {
+    field.replace('_', "-")
+}
+
+macro_rules! probe {
+    (@spelled $field:ident) => { stringify!($field) };
+    (@spelled $field:ident $spelled:literal) => { $spelled };
+    ($record:literal, before [$($bn:literal: $bt:literal),*], $ty:ident { $($field:ident $(as $spelled:literal)?),+ $(,)? } host [$($host:ident),*], $value:expr) => {{
+        // The pattern names every field without `..`: the exhaustiveness
+        // proof, and the bindings each field's type for its WIT spelling. A
+        // field written `name as "wit-name"` is held to the name the WIT
+        // spells, the pattern still naming the struct's own: a pair, both
+        // sides checked.
+        let $ty { $($field),+ } = $value;
+        $(let _ = $host;)*
+        let host: &[&str] = &[$(stringify!($host)),*];
+        // The struct's name (the host-only list is by it), the WIT's, the type.
+        let fields: Vec<(&'static str, &'static str, &'static str)> =
+            vec![$((stringify!($field), probe!(@spelled $field $($spelled)?), ty($field))),+];
+        let fields = fields
+            .into_iter()
+            .filter(|(name, _, _)| !host.contains(name))
+            .map(|(_, spelled, ty)| (spelled, ty))
+            .collect();
+        Probe { record: $record, before: &[$(($bn, $bt)),*], fields }
+    }};
+    // A record tied to two structs. Each pattern names every field of its
+    // struct without `..`, as above; `order` names the record's fields in
+    // the record's order, which neither struct holds. A field of either
+    // struct that `order` and `host` both leave out is not dropped: it
+    // follows the order, where the descriptor's test names it.
+    ($record:literal, before [$($bn:literal: $bt:literal),*],
+     $ty:ident { $($field:ident),+ $(,)? } = $value:expr,
+     $ty2:ident { $($field2:ident),+ $(,)? } = $value2:expr,
+     order [$($ordered:ident),+ $(,)?] host [$($host:ident),*]) => {{
+        let $ty { $($field),+ } = $value;
+        let $ty2 { $($field2),+ } = $value2;
+        $(let _ = $host;)*
+        let named: &[&str] = &[$(stringify!($ordered),)+ $(stringify!($host)),*];
+        let bound: Vec<(&'static str, &'static str)> = vec![
+            $((stringify!($field), ty($field)),)+
+            $((stringify!($field2), ty($field2))),+
+        ];
+        let mut fields: Vec<(&'static str, &'static str)> =
+            vec![$((stringify!($ordered), ty($ordered))),+];
+        fields.extend(bound.into_iter().filter(|(name, _)| !named.contains(name)));
+        Probe { record: $record, before: &[$(($bn, $bt)),*], fields }
+    }};
+}
+
+/// Every record's probe, over a default value of its struct.
+pub(crate) fn all() -> Vec<Probe> {
+    let candidate = Candidate::default();
+    let affinity = AffinityFacts::default();
+    let load = LoadRow::default();
+    let media = MediaCounts::default();
+    let request = RequestFacts::default();
+    let zone = ZoneCapacity::default();
+    let pool = PoolFacts::default();
+    let lease = Lease::default();
+    let pair = Pair::default();
+    let target = Target::default();
+    let outcome = Outcome::reported(0, TransportClass::Ok);
+    vec![
+        probe!("load", before [], LoadRow {
+            running, queued, waiting_uncached_tokens, kv_usage_permille, active_kv_permille,
+            live_rate, resident_tokens, resident_counted, report_age_ms, source, max_running,
+        } host [resident_counted], &load),
+        probe!("candidate", before [],
+            Candidate {
+                position, id, role, dp_rank, dp_size, health, wire_modes, engine_kind, connector,
+                in_flight, load, load_sampled_at_micros, session_hit, session_in_flight,
+                pair_class, has_capacity, has_room, zone, labels, ec_compatible, vision,
+                host_local, active_sessions, key, engine,
+            } = &candidate,
+            AffinityFacts {
+                overlap_blocks, predicted_blocks, admitted_age_ms, indexed_growth, indexed_blocks,
+            } = &affinity,
+            order [
+                id, role, dp_rank, dp_size, health, wire_modes, engine_kind, connector, in_flight,
+                load, overlap_blocks, predicted_blocks, session_hit, session_in_flight,
+                pair_class, has_capacity, has_room, admitted_age_ms, indexed_growth, zone,
+                labels, ec_compatible, vision, host_local, active_sessions, key, indexed_blocks,
+            ] host [position, load_sampled_at_micros, engine]),
+        probe!("media", before [], MediaCounts { images, audio, video, bytes } host [], &media),
+        probe!("request", before [], RequestFacts {
+            model, namespace_seed, tenant, priority, streaming, max_output_tokens,
+            prompt_tokens, block_hashes, hash_kind, session_key, phase, attempt, tried,
+            budget_micros, headers, media, seed, block_size, prompt_chars, prompt_bytes, now_micros,
+            session_counted, affinity, named,
+            model_fingerprint, signal_cells, client_key, ring, ring_positions,
+            decode_ring_positions, session_key_from_rid,
+        } host [
+            prompt_chars, prompt_bytes, now_micros,
+            session_counted,
+            affinity, named, model_fingerprint, signal_cells, client_key, ring, ring_positions,
+            decode_ring_positions, session_key_from_rid
+        ],
+        &request),
+        probe!("zone-capacity", before [], ZoneCapacity { zone, healthy, total } host [], &zone),
+        probe!("pool", before [], PoolFacts {
+            pool_size, membership_epoch, ring_epoch, regime, generation, zones, reach,
+            reported, engines, word,
+        } host [reach, reported, engines, word], &pool),
+        // The lease's session crosses under the name both contracts still
+        // spell, `session-key`. A gateway's client reads it under that name.
+        // A change that renames the field renames it in both contracts and
+        // takes this pair out.
+        probe!("lease", before [], Lease {
+            id, kind, side, target_index, booked, generation, session as "session-key",
+            session_verdict, issued_micros, tokens, chars, bytes,
+        } host [booked, session_verdict, issued_micros, chars, bytes], &lease),
+        probe!("pair", before [], Pair {
+            decode_position, decode_id, decode_dp_rank, decode_verdict, decode_placing,
+        } host [decode_position, decode_verdict, decode_placing], &pair),
+        probe!("target", before [], Target { position, id, dp_rank, pair } host [position], &target),
+        probe!("completed", before ["lease": "lease"], Outcome {
+            side, served, status, class, ttft_micros, tokens_in, tokens_out, duration_micros,
+        } host [], &outcome),
+    ]
+}
+
+/// Each probe against its descriptor: the same fields, in the same order,
+/// with the same types, the WIT-only ones in front. Empty when the engine's
+/// types and the WIT agree; each line names a record that drifted.
+pub fn drift() -> Vec<String> {
+    let mut drift = Vec::new();
+    for probe in all() {
+        let Some(item) = super::record(probe.record) else {
+            drift.push(format!("{}: no record in the descriptors", probe.record));
+            continue;
+        };
+        let expected: Vec<(String, &str)> = probe
+            .before
+            .iter()
+            .map(|(n, t)| ((*n).to_string(), *t))
+            .chain(probe.fields.iter().map(|(n, t)| (kebab(n), *t)))
+            .collect();
+        let actual: Vec<(String, &str)> = item
+            .fields()
+            .iter()
+            .map(|f| (f.name.to_string(), f.ty))
+            .collect();
+        if expected != actual {
+            drift.push(format!(
+                "{}: the struct reads {expected:?}, the descriptor {actual:?}",
+                probe.record
+            ));
+        }
+    }
+    drift
+}
+
+#[cfg(test)]
+#[path = "../../../tests/unit/plugins/wit/probes/tests.rs"]
+mod tests;

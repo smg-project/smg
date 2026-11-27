@@ -820,8 +820,8 @@ async fn selection_and_release_race_without_deadlocking() {
             std::thread::spawn(move || {
                 for iteration in 0..ITERATIONS {
                     let request_id = format!("race-{thread}-{iteration}");
-                    let engine_id = inner.select_engine(None, &request_id).unwrap();
-                    inner.release_one(&engine_id, &request_id);
+                    let position = inner.select_engine(None, &request_id).unwrap();
+                    inner.release_one(&inner.engines[position].engine_id, &request_id);
                 }
                 completed.fetch_add(1, Ordering::Release);
             })
@@ -4013,7 +4013,7 @@ fn a_routed_output_keeps_its_request_id_and_frees_the_step_frame() {
             ..Default::default()
         },
     );
-    let decoded = VllmProtocol::decode_batch(&frames, &()).expect("decode");
+    let decoded = VllmProtocol::decode_batch(&frames, &Default::default()).expect("decode");
     let output = decoded.outputs.into_iter().next().expect("one output");
     assert!(
         lies_within(&frames[0], output.request_id().as_bytes()),
@@ -4107,21 +4107,20 @@ fn the_default_prefill_allowance_is_500_s_per_million_tokens() {
 fn a_disagreeing_rank_in_the_middle_of_the_group_fails_the_agreement() {
     use crate::protocol::sglang::{SglangLayout, SglangProtocol};
 
-    let engine = |index: u32, tensor_aux_frames: bool| ConnectedEngine {
-        engine_id: EngineId::from_engine_index(index),
-        ready_response: EngineCoreReadyResponse {
+    let engine = |tensor_aux_frames: bool| {
+        SglangProtocol::read_layout(&EngineCoreReadyResponse {
             tensor_aux_frames,
             ..default_ready_response()
-        },
+        })
     };
-    let agreeing = [engine(0, true), engine(1, true), engine(2, true)];
+    let agreeing = [engine(true), engine(true), engine(true)];
     assert_eq!(
         connection_layout::<SglangProtocol>(&agreeing),
         SglangLayout {
             tensor_aux_frames: true
         }
     );
-    let middle_rank_behind = [engine(0, true), engine(1, false), engine(2, true)];
+    let middle_rank_behind = [engine(true), engine(false), engine(true)];
     assert_eq!(
         connection_layout::<SglangProtocol>(&middle_rank_behind),
         SglangLayout::default()
@@ -4130,6 +4129,137 @@ fn a_disagreeing_rank_in_the_middle_of_the_group_fails_the_agreement() {
         connection_layout::<SglangProtocol>(&[]),
         SglangLayout::default()
     );
+}
+
+/// An add-request is framed for the rank it goes to: in a group whose ranks
+/// report releases on both sides of 0.34, the older rank is sent the list of
+/// token ids and the newer one the array, whatever its peer reads.
+#[tokio::test]
+async fn each_rank_of_a_group_is_sent_the_add_request_its_own_release_reads() {
+    use crate::protocol::vllm::{VllmLayout, VllmProtocol};
+
+    let ranks = [
+        ("0.33.2", VllmLayout::TokenList),
+        ("0.34.0", VllmLayout::TokenArray),
+    ];
+    let (client, mut engines, _ns) =
+        connect_declaring::<VllmProtocol>(ranks.map(|(version, _)| EngineCoreReadyResponse {
+            vllm_version: version.to_string(),
+            ..default_ready_response()
+        }))
+        .await;
+
+    let mut streams = Vec::new();
+    for ((rank, (version, layout)), engine) in (0u32..).zip(ranks).zip(&mut engines) {
+        let request = request_for(version, rank);
+        let (expected, _) = VllmProtocol::encode_add(&request, &layout).unwrap();
+        streams.push(client.submit(request).await.unwrap());
+        let frames = tokio::time::timeout(TIMEOUT, engine.recv_request())
+            .await
+            .expect("the add-request should reach its rank")
+            .unwrap();
+        assert_eq!(
+            frames[1][..],
+            expected[..],
+            "the add-request sent to the rank on {version}"
+        );
+    }
+}
+
+/// The same on the SGLang wire: of two schedulers behind one transport that
+/// disagree on auxiliary tensor frames, the one that declared them is sent a
+/// large tensor as a frame behind the payload, and its peer is sent it inline.
+#[tokio::test]
+async fn each_scheduler_of_a_group_is_sent_a_large_tensor_as_it_declared() {
+    use crate::{
+        codec::tensor::TENSOR_AUX_MIN_BYTES,
+        protocol::sglang::{
+            multimodal::{
+                SglangWireMmInputs, SglangWireMmItem, SglangWireModality, SglangWireTensor,
+            },
+            request::{SglangRequest, TokenizedGenerateReqInput},
+            SglangLayout, SglangProtocol,
+        },
+    };
+
+    let declared = [false, true];
+    let (client, mut engines, _ns) =
+        connect_declaring::<SglangProtocol>(declared.map(|tensor_aux_frames| {
+            EngineCoreReadyResponse {
+                tensor_aux_frames,
+                ..default_ready_response()
+            }
+        }))
+        .await;
+
+    let mut streams = Vec::new();
+    for ((rank, tensor_aux_frames), engine) in (0u32..).zip(declared).zip(&mut engines) {
+        let feature = Bytes::from(vec![9u8; TENSOR_AUX_MIN_BYTES]);
+        let request = SglangRequest::Generate(TokenizedGenerateReqInput {
+            rid: format!("to-{rank}"),
+            input_ids: vec![1, 7, 2],
+            routed_dp_rank: Some(rank),
+            mm_inputs: Some(SglangWireMmInputs {
+                mm_items: vec![SglangWireMmItem {
+                    modality: SglangWireModality::Image,
+                    hash: None,
+                    offsets: Some(vec![(1, 1)]),
+                    feature: Some(
+                        SglangWireTensor::new("uint8", vec![feature.len() as u64], feature)
+                            .unwrap(),
+                    ),
+                    model_specific_data: std::collections::BTreeMap::new(),
+                }],
+                im_token_id: Some(7),
+                video_token_id: None,
+            }),
+            ..TokenizedGenerateReqInput::default()
+        });
+        let layout = SglangLayout { tensor_aux_frames };
+        let (payload, aux) = SglangProtocol::encode_add(&request, &layout).unwrap();
+        assert_eq!(aux.is_empty(), !tensor_aux_frames);
+        streams.push(client.submit(request).await.unwrap());
+        let frames = tokio::time::timeout(TIMEOUT, engine.recv_request())
+            .await
+            .expect("the add-request should reach its scheduler")
+            .unwrap();
+        assert_eq!(
+            frames.len() - 2,
+            aux.len(),
+            "the auxiliary frames sent to the scheduler that declared {tensor_aux_frames}"
+        );
+        assert!(
+            frames[1][..] == payload[..] && frames[2..] == aux[..],
+            "the add-request sent to the scheduler that declared {tensor_aux_frames}"
+        );
+    }
+}
+
+/// One mock rank for each ready response behind one transport: a group whose
+/// ranks declare at the handshake what the caller gives each.
+async fn connect_declaring<P: EngineProtocol>(
+    ready: [EngineCoreReadyResponse; 2],
+) -> (Client<P>, Vec<MockEngine>, IpcNamespace) {
+    let ns = IpcNamespace::new().unwrap();
+    let (handshake, input, output) = (
+        ns.handshake_endpoint(),
+        ns.input_endpoint(),
+        ns.output_endpoint(),
+    );
+    let count = ready.len();
+    let engines = (0u32..).zip(ready).map(|(rank, ready)| {
+        let ready = EngineCoreReadyResponse {
+            data_parallel_rank: rank,
+            ..ready
+        };
+        connect_to_frontend(&handshake, EngineId::from_engine_index(rank), ready)
+    });
+    let (transport, engines) = tokio::join!(
+        connect_handshake(&handshake, count, &input, &output, TIMEOUT),
+        futures::future::join_all(engines),
+    );
+    let engines = engines.into_iter().map(Result::unwrap).collect();
+    (Client::new(transport.unwrap()), engines, ns)
 }
 
 /// A connector's transfer samples are kept for a taker only, fold per rank
@@ -4320,6 +4450,7 @@ async fn retained_input_releases_on_send_and_enqueue_failure() {
     })
     .await
     .unwrap();
+    inner.admit_add(4).unwrap();
     assert!(matches!(
         inner.queue_frame(
             &missing,
@@ -4332,6 +4463,30 @@ async fn retained_input_releases_on_send_and_enqueue_failure() {
         Err(Error::ClientClosed { .. })
     ));
     assert_eq!(inner.retained_input_bytes.load(Ordering::Relaxed), 0);
+    assert_eq!(inner.waiting_adds.load(Ordering::Relaxed), 0);
+    assert_eq!(inner.waiting_add_bytes.load(Ordering::Relaxed), 0);
+    // The owned submission uses the same failure boundary, retaining neither
+    // a native registration nor a routing slot when enqueue was impossible.
+    let client = EngineCoreClient {
+        inner: Arc::clone(&inner),
+        tasks: Vec::new(),
+    };
+    assert!(matches!(
+        client
+            .submit_inner(request_for("owned-closed", 0), Vec::new(), true)
+            .await,
+        Err(Error::ClientClosed { .. })
+    ));
+    assert_eq!(inner.retained_input_bytes.load(Ordering::Relaxed), 0);
+    assert_eq!(inner.waiting_adds.load(Ordering::Relaxed), 0);
+    assert_eq!(inner.waiting_add_bytes.load(Ordering::Relaxed), 0);
+    assert!(inner
+        .routing
+        .lock()
+        .inflight
+        .values()
+        .all(HashSet::is_empty));
+    assert!(inner.registry.lock().requests.is_empty());
 }
 
 /// Successful local admission releases the writer allowance independently of

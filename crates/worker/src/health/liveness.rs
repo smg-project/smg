@@ -127,7 +127,10 @@
 //!   cleared by the first contact like any other. Workers that never pushed
 //!   a record (HTTP workers, older servicers, a stream still connecting)
 //!   are not judged by their silence: a poll every ten seconds and a probe
-//!   every minute is all that is expected of them. Tokens are contact too,
+//!   every minute is all that is expected of them. Nor is a worker whose
+//!   load monitor stopped, until its stream's next record: the stop takes
+//!   the mark of a stream that pushes off its workers, since a stopped
+//!   monitor polls nothing and may be handed no record. Tokens are contact too,
 //!   so a worker that still streams is never stale. A zero threshold turns
 //!   the rule off.
 //!
@@ -736,6 +739,12 @@ pub fn is_connection_code(code: tonic::Code) -> bool {
     )
 }
 
+/// The worker's veto, read off the runtime state in hand when it has one
+/// (the worker's own read loads that state again).
+fn stall_reason_of(worker: &Arc<dyn Worker>, state: Option<&WorkerRuntime>) -> Option<StallReason> {
+    state.map_or_else(|| worker.stall_reason(), WorkerRuntime::stall_reason)
+}
+
 /// A successful interaction over the transport (a poll answered, an event
 /// batch, a response): the worker is reachable, so an unreachable veto ends
 /// here. A worker the health checker demoted while it was gone (its probes
@@ -754,7 +763,7 @@ pub fn on_contact(worker: &Arc<dyn Worker>) {
     if let Some(state) = state {
         state.note_contact();
     }
-    if worker.stall_reason() != Some(StallReason::Unreachable) {
+    if stall_reason_of(worker, state) != Some(StallReason::Unreachable) {
         return;
     }
     set(worker, state, None, "contact");
@@ -826,7 +835,12 @@ pub(crate) fn sweep(worker: &Arc<dyn Worker>) {
 }
 
 /// [`sweep`] at the given thresholds.
-fn sweep_with(worker: &Arc<dyn Worker>, stall: Duration, wedge: Duration, stale: Duration) {
+pub(crate) fn sweep_with(
+    worker: &Arc<dyn Worker>,
+    stall: Duration,
+    wedge: Duration,
+    stale: Duration,
+) {
     let state = worker.runtime_state();
     let state = state.as_deref();
     let load = state.map_or(0, WorkerRuntime::tracked_load);
@@ -951,17 +965,20 @@ pub fn on_token_progress_on(runtime: &WorkerRuntime, worker: &Arc<dyn Worker>, n
 /// the worker has shown no rate and a token-batch wire only once it has.
 /// A standing veto is judged at the threshold on either wire, whatever
 /// the servicer reports pending: the allowance lifts no veto, as the
-/// cold-shape grace lifts none.
+/// cold-shape grace lifts none. `state` is the worker's runtime state as
+/// the caller loaded it: the apply of a pushed record holds it already.
 pub(crate) fn on_load_report(
     worker: &Arc<dyn Worker>,
+    state: Option<&WorkerRuntime>,
     waiting: i64,
     engine_silence: Option<Duration>,
     engine_reports_steps: bool,
     engine_prefill_pending: Option<u64>,
 ) {
     let (_, wedge, _) = thresholds();
-    on_load_report_with(
+    on_load_report_on(
         worker,
+        state,
         waiting,
         engine_silence,
         engine_reports_steps,
@@ -970,7 +987,8 @@ pub(crate) fn on_load_report(
     );
 }
 
-/// [`on_load_report`] at the given wedge threshold.
+/// [`on_load_report`] at the given wedge threshold, the state loaded here.
+#[cfg(test)]
 fn on_load_report_with(
     worker: &Arc<dyn Worker>,
     waiting: i64,
@@ -980,12 +998,33 @@ fn on_load_report_with(
     wedge: Duration,
 ) {
     let state = worker.runtime_state();
-    let state = state.as_deref();
+    on_load_report_on(
+        worker,
+        state.as_deref(),
+        waiting,
+        engine_silence,
+        engine_reports_steps,
+        engine_prefill_pending,
+        wedge,
+    );
+}
+
+/// [`on_load_report`] at the given wedge threshold, on the runtime state
+/// its caller loaded.
+fn on_load_report_on(
+    worker: &Arc<dyn Worker>,
+    state: Option<&WorkerRuntime>,
+    waiting: i64,
+    engine_silence: Option<Duration>,
+    engine_reports_steps: bool,
+    engine_prefill_pending: Option<u64>,
+    wedge: Duration,
+) {
     let previous = state.map_or(0, |state| state.swap_waiting_reqs(waiting));
     // The grace of a cold shape arms no veto and lifts none: a worker vetoed
     // before the longer prompt reached it is judged as before until it
     // produces, so the grace never reads as the engine producing again.
-    let standing = worker.stall_reason().is_some();
+    let standing = stall_reason_of(worker, state).is_some();
     let grace = if standing {
         Duration::ZERO
     } else {
@@ -1013,7 +1052,7 @@ fn on_load_report_with(
     if let Some(state) = state {
         state.note_engine_stall(engine_stalled);
     }
-    match worker.stall_reason() {
+    match stall_reason_of(worker, state) {
         Some(StallReason::Wedged) => {
             // A clock that restarted with this gateway's first dispatch is
             // not progress while the engine still reports silence: a token
@@ -1417,7 +1456,7 @@ mod tests {
         );
         sweep(&w);
         assert!(w.stall_reason().is_none());
-        on_load_report(&w, 3, None, false, None);
+        on_load_report(&w, w.runtime_state().as_deref(), 3, None, false, None);
         assert!(w.stall_reason().is_none());
         // The same pile with a clock that had run from registration would be
         // the false positive.

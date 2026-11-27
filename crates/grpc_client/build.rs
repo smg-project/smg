@@ -6,6 +6,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     // Rebuild triggers
+    println!("cargo:rerun-if-changed=proto/sglang_epd.proto");
+    println!("cargo:rerun-if-changed=proto/sglang_encoder.proto");
     println!("cargo:rerun-if-changed={wire}/common.proto");
     println!("cargo:rerun-if-changed=proto/sglang_scheduler.proto");
     println!("cargo:rerun-if-changed=proto/tokenspeed_scheduler.proto");
@@ -37,9 +39,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // The encoder's Encode RPC carries the same pixel tensor as the
         // scheduler's Generate: the same sized codec (see `crate::codec`).
         .codec_path("crate::codec::SizedProstCodec")
+        .type_attribute(
+            ".smg.sglang.managed.v1.Capabilities",
+            "#[derive(serde::Serialize, serde::Deserialize)] #[serde(default)]",
+        )
         .protoc_arg("--experimental_allow_proto3_optional")
         .compile_protos(
-            &["proto/tokenspeed_encoder.proto"],
+            &[
+                "proto/tokenspeed_encoder.proto",
+                "proto/sglang_encoder.proto",
+                "proto/sglang_epd.proto",
+            ],
             &["proto", wire.as_str()],
         )?;
 
@@ -68,6 +78,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // once.
         .boxed(".sglang.grpc.scheduler.GenerateRequest.mm_inputs")
         .boxed(".sglang.grpc.scheduler.GenerateRequest.media_identity")
+        // Boxed, the cache partition is 8 bytes of the request. Its two
+        // strings would be 48, and most requests leave it unset.
+        .boxed(".sglang.grpc.scheduler.GenerateRequest.cache_partition")
         // Each message is encoded into a buffer reserved to its length once
         // (see `crate::codec`), not into one that doubles under a tensor.
         .codec_path("crate::codec::SizedProstCodec")

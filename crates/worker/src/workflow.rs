@@ -49,8 +49,8 @@ mod select;
 
 pub use create_worker::{
     build_model_card, kv_transfer_value, labels_for_rank, model_card_for_labels, report_for_rank,
-    resolve_model_id, validate_constrained_decoding_label, CreateLocalWorkerStep,
-    CREATE_LOCAL_WORKER_STEP, DP_WIDTH_LABELS,
+    resolve_model_id, unnamed_grammar_start_warning, validate_constrained_decoding_label,
+    CreateLocalWorkerStep, CREATE_LOCAL_WORKER_STEP, DP_WIDTH_LABELS,
 };
 pub use data::{
     DpInfo, WorkerKind, WorkerList, WorkerRegistrationWorkflowData, WorkerRemovalWorkflowData,

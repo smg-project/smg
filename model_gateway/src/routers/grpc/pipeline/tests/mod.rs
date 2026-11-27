@@ -5,6 +5,8 @@ mod embeddings;
 mod generate_body;
 mod glm53;
 mod model_label;
+mod outcome;
+mod pair_outcome;
 mod pretokenized;
 mod rate_limit_reserve;
 mod refusal_lines;
@@ -38,11 +40,6 @@ use smg_grpc_client::{
     tokenspeed_proto as ts, vllm_proto,
 };
 use smg_mcp::{McpConfig, McpOrchestrator};
-use smg_policy_controller::{
-    engine::WorkerId,
-    store::{GatewayId, HealthSink, LeasesStore, MemoryStore, WorkersStore},
-    tracking::TransportClass,
-};
 use smg_worker::{
     health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
     identity::basic::{
@@ -60,7 +57,6 @@ use ts::token_speed_scheduler_server::{TokenSpeedScheduler, TokenSpeedSchedulerS
 use super::*;
 use crate::{
     config::types::PolicyConfig,
-    policy_controller::engine::testing as engine_testing,
     routers::{
         common::{
             openai_bridge::FormatRegistry, prefill_admission::test_support::select_worker,
@@ -72,7 +68,6 @@ use crate::{
                 background::{queued_response, store_record},
                 BackgroundResponses, BackgroundStream,
             },
-            context::test_support::{assert_end, dispatch_context, dispatched, place_worker},
             harmony::serve_harmony_responses_stream,
             multimodal::{MultimodalComponents, MultimodalConfigRegistry, MultimodalSettings},
             proto_wrapper::ENGINE_ERROR_MESSAGE,
@@ -83,102 +78,13 @@ use crate::{
             test_engine::serve_on_loopback,
             testing::unreadable_model_dir,
             tokenizer_cache,
-            utils::{tonic_ext::TonicStatusExt, WorkerDecoding},
+            utils::tonic_ext::TonicStatusExt,
         },
     },
     tenant::TenantKey,
 };
 
 const MODEL: &str = "request-release-test-model";
-
-#[tokio::test]
-async fn a_placed_answer_settles_with_its_tokens() {
-    let (placed, store) = place_worker().await;
-    let mut ctx = dispatch_context(placed);
-    let guards = dispatched(ctx.placed.take().expect("a placement"), Instant::now());
-    let ends = guards.placement().expect("a dispatched placement").ends();
-    ctx.load_guards = Some(guards);
-    RequestPipeline::settle_success(
-        &ctx,
-        UsageSettlement {
-            actual_input_tokens: 23,
-            completion_tokens: 7,
-            cached_input_tokens: 11,
-            reasoning_tokens: 3,
-        },
-    )
-    .await;
-    assert_end(&ends, &store, 200, TransportClass::Ok, 23, 7);
-}
-
-#[tokio::test]
-async fn a_failed_attempt_ends_its_lease_before_its_guards_go() {
-    use smg_grpc_client::h2::{Error, Reason};
-
-    // The answers a collected stream's reader makes of the worker's own
-    // failure and of its connection failing under the call.
-    for (status, http, class) in [
-        (
-            Status::internal("worker failed"),
-            500,
-            TransportClass::ServerError,
-        ),
-        (
-            Status::from_error(Box::new(Error::from(Reason::PROTOCOL_ERROR))),
-            502,
-            TransportClass::ConnectFailed,
-        ),
-    ] {
-        let (placed, store) = place_worker().await;
-        let row = placed.id();
-        let worker = Arc::clone(placed.worker());
-        let mut ctx = dispatch_context(placed);
-        let guards = dispatched(ctx.placed.take().expect("a placement"), Instant::now());
-        let ends = guards.placement().expect("a dispatched placement").ends();
-        ctx.load_guards = Some(guards);
-        let failure = status.to_http_error("stream_failed", String::new());
-        assert_eq!(worker.load(), 1);
-        ctx.release_attempt(&failure, Instant::now());
-        assert_eq!(*ctx.tried_rows, [row]);
-        assert_end(&ends, &store, http, class, 0, 0);
-        assert!(ctx.load_guards.is_none());
-        assert_eq!(worker.load(), 0);
-    }
-}
-
-#[tokio::test]
-async fn a_retry_the_selection_cannot_place_does_not_follow() {
-    let pipeline_over = |policy_engine| {
-        let deps = PipelineDeps::pair(
-            Arc::new(WorkerRegistry::new()),
-            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
-            None,
-            None,
-            Duration::from_secs(60),
-        )
-        .with_policy_engine(policy_engine);
-        RequestPipeline::build(Endpoint::Completion, Mode::Regular, &deps)
-            .expect("completion pipeline")
-    };
-    let (policy_engine, _, _) = engine_testing::bed(&[]);
-    let hosted = pipeline_over(Some(Arc::new(policy_engine)));
-
-    let (placed, _store) = place_worker().await;
-    let plain = dispatch_context(placed);
-    assert!(hosted.retry_follows(false, &plain));
-    assert!(!hosted.retry_follows(true, &plain));
-
-    // A retry under a decoding rule would be refused by name: no next
-    // attempt, so the failed attempt's own answer stands.
-    let (placed, _store) = place_worker().await;
-    let mut under_rule = dispatch_context(placed);
-    under_rule.constraint_decided_on = Some(WorkerDecoding::of(None));
-    assert!(!hosted.retry_follows(false, &under_rule));
-
-    // The classic selection answers every retry itself.
-    assert!(pipeline_over(None).retry_follows(false, &under_rule));
-}
-
 /// A valid 1x1 PNG, as a client sends an inline image.
 const ONE_PIXEL_PNG_DATA_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
 /// The worker label of an engine without a vision encoder (vLLM
@@ -236,6 +142,27 @@ struct GatedScheduler {
     fail_always: bool,
     fail_internal: bool,
     fail_mid_stream: bool,
+    /// The call of this place, counted from zero, ends its stream with the
+    /// engine's own error a pace behind its first frame: the calls beside
+    /// it have ended by then.
+    fail_late: Option<usize>,
+    /// The call of this place, counted from zero, is refused as
+    /// `fail_first` refuses the first: UNAVAILABLE, and no stream.
+    fail_call: Option<usize>,
+    /// The call of the fan-out's sample of this index is refused the same
+    /// way, whenever it arrives: its request's id ends with the index.
+    fail_sample: Option<u32>,
+    /// The call of the fan-out's sample of this index ends its stream with
+    /// UNAVAILABLE a pace behind its last message: every sample's last
+    /// message has been read by then.
+    fail_behind_last: Option<u32>,
+    /// Every call is refused as `fail_always` refuses it, behind this wait:
+    /// a refusal that lands behind the answer of a call sent beside it.
+    fail_after: Option<Duration>,
+    /// Every call waits where it arrived until the flag is set, then
+    /// answers: a call whose answer the test times itself.
+    call_gate: Option<Arc<AtomicBool>>,
+    started: Arc<AtomicUsize>,
     fail_constraint: bool,
     fail_engine_report: bool,
     /// Send the first frame, then hold the stream open with nothing on
@@ -381,7 +308,27 @@ impl TokenSpeedScheduler for GatedScheduler {
                     })
                     .unwrap_or_default(),
             );
-        if self.fail_always || (self.fail_first && self.calls.fetch_add(1, Ordering::SeqCst) == 0) {
+        let place = self.started.fetch_add(1, Ordering::SeqCst);
+        // A fan-out names each sample's request by the sample's index.
+        let of_sample = |index: Option<u32>| {
+            index.is_some_and(|index| request.request_id.ends_with(&format!("-{index}")))
+        };
+        let fail_sample = of_sample(self.fail_sample);
+        let fail_behind_last = of_sample(self.fail_behind_last);
+        if let Some(wait) = self.fail_after {
+            tokio::time::sleep(wait).await;
+            return Err(Status::unavailable("release-test induced late failure"));
+        }
+        if let Some(gate) = &self.call_gate {
+            while !gate.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        if self.fail_always
+            || self.fail_call == Some(place)
+            || fail_sample
+            || (self.fail_first && self.calls.fetch_add(1, Ordering::SeqCst) == 0)
+        {
             return Err(Status::unavailable("release-test induced failure"));
         }
         if self.fail_internal {
@@ -417,7 +364,8 @@ impl TokenSpeedScheduler for GatedScheduler {
         let probe = (!self.gate_rpc).then(|| self.probe.clone()).flatten();
         let released = Arc::clone(&self.released);
         let frame_gap = self.frame_gap;
-        let fail_mid_stream = self.fail_mid_stream;
+        let fail_late = self.fail_late == Some(place);
+        let fail_mid_stream = self.fail_mid_stream || fail_late;
         let hold_after_first = self.hold_after_first;
         let gate_after_first = self.gate_after_first.clone();
         tokio::spawn(async move {
@@ -430,6 +378,9 @@ impl TokenSpeedScheduler for GatedScheduler {
             {
                 if let Some(gap) = frame_gap {
                     tokio::time::sleep(gap).await;
+                }
+                if fail_late && index == 1 {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
                 }
                 let frame = if fail_mid_stream && index == 1 {
                     Err(Status::internal(ENGINE_ERROR_MESSAGE))
@@ -450,6 +401,11 @@ impl TokenSpeedScheduler for GatedScheduler {
                         tokio::time::sleep(Duration::from_millis(5)).await;
                     }
                 }
+            }
+            if fail_behind_last {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                let failure = Status::unavailable("release-test induced failure behind the end");
+                let _ = tx.send(Err(failure)).await;
             }
         });
         Ok(TonicResponse::new(Box::pin(ReceiverStream::new(rx))))
@@ -1161,6 +1117,81 @@ async fn a_pinned_retry_moves_to_another_engine_after_an_unavailable_start() {
 
     // Keys hash to either engine; the first one owned by the refusing
     // engine is the case under test (the others succeed in one call).
+    for key in (0..64).map(|i| format!("session-{i}")) {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-smg-routing-key", key.parse().unwrap());
+        let refused_before = calls(&seen_refusing);
+        let served_before = calls(&seen_serving);
+        let response = pipeline
+            .execute_completion(
+                completion_request(false),
+                Some(headers),
+                MODEL.to_string(),
+                Arc::clone(&components),
+                None,
+                None,
+                Some(&retry),
+            )
+            .await;
+        assert_eq!(response.status(), http::StatusCode::OK, "key {key}");
+        let refused_now = calls(&seen_refusing) - refused_before;
+        let served_now = calls(&seen_serving) - served_before;
+        if refused_now == 0 {
+            assert_eq!(served_now, 1, "a key owned by the serving engine: one call");
+            continue;
+        }
+        assert_eq!(
+            refused_now, 1,
+            "the refusing engine sees the request once, not once per retry"
+        );
+        assert_eq!(served_now, 1, "the retry landed on the other engine");
+        return;
+    }
+    panic!("no key hashed to the refusing engine");
+}
+
+/// PD twin: a request pinned by a routing key whose prefill engine cannot
+/// start it (UNAVAILABLE) is retried on another prefill engine, not replayed
+/// on the one that just refused: one call there, one on the other prefill,
+/// 200.
+#[tokio::test]
+async fn a_pinned_pd_retry_moves_to_another_prefill_after_an_unavailable_start() {
+    let seen_refusing = Arc::new(Mutex::new(Vec::new()));
+    let seen_serving = Arc::new(Mutex::new(Vec::new()));
+    let refusing_port = spawn_stub(GatedScheduler {
+        fail_always: true,
+        seen_request_ids: Arc::clone(&seen_refusing),
+        ..Default::default()
+    })
+    .await;
+    let serving_port = spawn_stub(GatedScheduler {
+        seen_request_ids: Arc::clone(&seen_serving),
+        ..Default::default()
+    })
+    .await;
+    let decode_port = spawn_stub(GatedScheduler::default()).await;
+    let calls =
+        |seen: &Mutex<Vec<String>>| seen.lock().unwrap_or_else(PoisonError::into_inner).len();
+
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    register_worker(&worker_registry, refusing_port, WorkerType::Prefill);
+    register_worker(&worker_registry, serving_port, WorkerType::Prefill);
+    register_worker(&worker_registry, decode_port, WorkerType::Decode);
+    let deps = PipelineDeps::pair(
+        worker_registry.clone(),
+        Arc::new(PolicyRegistry::new(PolicyConfig::ConsistentHashing)),
+        None,
+        None,
+        Duration::from_secs(60),
+    );
+    let pipeline = RequestPipeline::build(Endpoint::Completion, Mode::PrefillDecode, &deps)
+        .expect("completion pipeline");
+    let components = components(worker_registry).await;
+    let retry = fast_retry_config(3);
+
+    // Keys hash to either prefill engine; the first one owned by the
+    // refusing engine is the case under test (the others succeed in one
+    // call).
     for key in (0..64).map(|i| format!("session-{i}")) {
         let mut headers = http::HeaderMap::new();
         headers.insert("x-smg-routing-key", key.parse().unwrap());
@@ -2941,354 +2972,6 @@ async fn a_streaming_harmony_responses_iteration_releases_its_share_once_its_str
     );
 }
 
-/// A pair gateway serves a request under the policy controller. The store
-/// is the one such a gateway starts: the document its configuration makes,
-/// over rows as the store builds them. Both sides go out to engines, the
-/// answer is whole, the decode worker is the routed one, and the pair's
-/// lease ends with the answer.
-#[tokio::test]
-async fn a_pair_gateway_serves_a_pair_under_the_policy_controller() {
-    let prefill_port = spawn_stub(GatedScheduler::default()).await;
-    let decode_port = spawn_stub(GatedScheduler::default()).await;
-    let registry = Arc::new(WorkerRegistry::new());
-    let prefill = register_worker(&registry, prefill_port, WorkerType::Prefill);
-    let decode = register_worker(&registry, decode_port, WorkerType::Decode);
-    let (_, store, _) = engine_testing::pair_bed_started(MODEL, &[prefill.url()], &[decode.url()]);
-    let policy_engine = PolicyEngine::at_keys(Arc::clone(&store), Arc::clone(&registry));
-    let deps = PipelineDeps::pair(
-        Arc::clone(&registry),
-        Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
-        None,
-        None,
-        Duration::from_secs(60),
-    )
-    .with_policy_engine(Some(Arc::new(policy_engine)));
-    let pipeline = RequestPipeline::build(Endpoint::Completion, Mode::PrefillDecode, &deps)
-        .expect("completion pipeline");
-    let components = components(registry).await;
-    let started = Instant::now();
-
-    let response = pipeline
-        .execute_completion(
-            completion_request(false),
-            None,
-            MODEL.to_string(),
-            components,
-            None,
-            None,
-            None,
-        )
-        .await;
-
-    assert_eq!(response.status(), http::StatusCode::OK);
-    assert_eq!(
-        response.headers()["x-smg-routed-worker-id"],
-        format!("grpc://127.0.0.1:{decode_port}")
-    );
-    drop(response);
-    // Each side ended whole on its own worker, and no lease is left.
-    for url in [prefill.url(), decode.url()] {
-        let row = store.by_key(url).expect("the side's row").id;
-        assert!(
-            store.completed_ok_since(GatewayId::LOCAL, row, started),
-            "{url}"
-        );
-    }
-    assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
-}
-
-/// The router the factory builds for a pair gateway under the policy
-/// controller serves a pair. The factory mounts the pair router over the
-/// context's policy engine, the router's selection stage asks it, and each side
-/// ends whole on its own worker.
-///
-/// The router also tells that stage what the pair's settings keep. Here the
-/// role policies keep an explicit target and the main policy does not, so a
-/// request that names its worker is refused by name.
-#[tokio::test]
-async fn the_factory_builds_a_pair_router_that_serves_under_the_policy_controller() {
-    use crate::{
-        config::{test_support::pd_routing_mode, RoutingMode},
-        routers::{
-            grpc::testing::{grpc_config, grpc_ctx_from, mcp_orchestrator},
-            RouterFactory,
-        },
-    };
-
-    let prefill_port = spawn_stub(GatedScheduler::default()).await;
-    let decode_port = spawn_stub(GatedScheduler::default()).await;
-    let mut config = grpc_config(pd_routing_mode()).build_unchecked();
-    config.policy_controller = true;
-    config.policy = PolicyConfig::RoundRobin;
-    if let RoutingMode::PrefillDecode {
-        prefill_policy,
-        decode_policy,
-        ..
-    } = &mut config.mode
-    {
-        *prefill_policy = Some(PolicyConfig::ConsistentHashing);
-        *decode_policy = Some(PolicyConfig::ConsistentHashing);
-    }
-    let mut ctx = grpc_ctx_from(&config, mcp_orchestrator().await);
-    let prefill = register_worker(&ctx.worker_registry, prefill_port, WorkerType::Prefill);
-    let decode = register_worker(&ctx.worker_registry, decode_port, WorkerType::Decode);
-    let (_, store, _) = engine_testing::pair_bed_started(MODEL, &[prefill.url()], &[decode.url()]);
-    let policy_engine = PolicyEngine::at_keys(Arc::clone(&store), Arc::clone(&ctx.worker_registry));
-    let context = Arc::get_mut(&mut ctx).expect("the context's one hold");
-    context.policy_store = Some(Arc::clone(&store));
-    context.policy_engine = Some(Arc::new(policy_engine));
-    let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
-    ctx.tokenizer_registry
-        .load(
-            "tokenizer-id",
-            MODEL,
-            "test",
-            || async move { Ok(tokenizer) },
-        )
-        .await
-        .expect("load mock tokenizer");
-
-    let router = RouterFactory::create_router(&ctx)
-        .await
-        .expect("the pair router");
-    assert_eq!(router.router_type(), "grpc_pd");
-    let request = || -> CompletionRequest {
-        serde_json::from_value(serde_json::json!({
-            "model": MODEL,
-            "prompt": "Hello world",
-            "stream": false,
-        }))
-        .expect("completion request")
-    };
-    let started = Instant::now();
-    let response = router
-        .route_completion(None, &anonymous(), request(), MODEL)
-        .await;
-
-    assert_eq!(response.status(), http::StatusCode::OK);
-    drop(response);
-    for url in [prefill.url(), decode.url()] {
-        let row = store.by_key(url).expect("the side's row").id;
-        assert!(
-            store.completed_ok_since(GatewayId::LOCAL, row, started),
-            "{url}"
-        );
-    }
-    assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
-
-    let mut headers = http::HeaderMap::new();
-    headers.insert("x-smg-target-worker", http::HeaderValue::from_static("0"));
-    let refused = router
-        .route_completion(Some(&headers), &anonymous(), request(), MODEL)
-        .await;
-    assert_eq!(refused.status(), http::StatusCode::NOT_IMPLEMENTED);
-    let body = axum::body::to_bytes(refused.into_body(), 4096)
-        .await
-        .expect("the refusal's body");
-    let body = String::from_utf8_lossy(&body);
-    assert!(
-        body.contains("not_decided_by_policy_controller")
-            && body.contains("an explicit target worker"),
-        "{body}"
-    );
-    assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
-}
-
-/// A harmony responses context whose requests the controller places: the
-/// store, the row of its one worker, the registry and the worker's object.
-struct PlacedRig {
-    ctx: ResponsesContext,
-    store: Arc<MemoryStore>,
-    row: WorkerId,
-    registry: Arc<WorkerRegistry>,
-    worker: Arc<dyn Worker>,
-}
-
-async fn placed_harmony_responses_context() -> (ResponsesContext, Arc<MemoryStore>, WorkerId) {
-    let rig = placed_harmony_responses_rig().await;
-    (rig.ctx, rig.store, rig.row)
-}
-
-/// A published store with one ready row for each of `workers`, each
-/// serving [`MODEL`], and the pipeline's deps under a policy engine that places
-/// over those rows.
-fn placed_deps(
-    registry: &Arc<WorkerRegistry>,
-    workers: &[Arc<dyn Worker>],
-) -> (PipelineDeps, Arc<MemoryStore>) {
-    let urls: Vec<&str> = workers.iter().map(|worker| worker.url()).collect();
-    let (_, store, _) = engine_testing::bed(&urls);
-    for url in urls {
-        let mut facts = store.by_key(url).expect("the worker's row").facts;
-        facts.models = vec![MODEL.to_string()];
-        store.upsert(facts);
-    }
-    store.publish_now();
-    let deps = PipelineDeps::pair(
-        Arc::clone(registry),
-        Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
-        None,
-        None,
-        Duration::from_secs(60),
-    )
-    .with_policy_engine(Some(Arc::new(PolicyEngine::at_keys(
-        Arc::clone(&store),
-        Arc::clone(registry),
-    ))));
-    (deps, store)
-}
-
-async fn placed_harmony_responses_rig() -> PlacedRig {
-    let port = spawn_stub(GatedScheduler::default()).await;
-    let registry = Arc::new(WorkerRegistry::new());
-    let worker = register_worker(&registry, port, WorkerType::Regular);
-    let (deps, store) = placed_deps(&registry, std::slice::from_ref(&worker));
-    let row = store.by_key(worker.url()).expect("the worker's row").id;
-    let ctx = responses_context_with_deps(Endpoint::Harmony, Mode::Regular, &deps, 0).await;
-    PlacedRig {
-        ctx,
-        store,
-        row,
-        registry,
-        worker,
-    }
-}
-
-/// Under `--worker-overload-shed` client acquisition re-checks the overload
-/// flag of a worker the classic policies chose. A worker the controller
-/// placed is not re-checked: the veto is the controller's, read from its
-/// rows, and the flag on the object mirrors it for the gateway's other
-/// readers.
-#[tokio::test]
-async fn a_placed_iteration_is_not_shed_by_the_workers_overload_flag() {
-    let rig = placed_harmony_responses_rig().await;
-    rig.registry.set_overload_shed(true);
-    assert!(rig.registry.set_worker_overloaded(&rig.worker, true));
-    let mut request = responses_request(false);
-    Arc::make_mut(&mut request).stream = Some(false);
-    let started = Instant::now();
-    rig.ctx
-        .pipeline
-        .execute_harmony_responses(&request, &rig.ctx, None)
-        .await
-        .expect("the controller's placement is sent");
-    assert!(rig
-        .store
-        .completed_ok_since(GatewayId::LOCAL, rig.row, started));
-}
-
-/// A retry the controller places is not re-checked either. Two engines
-/// share one count of starts, and the first start either of them sees is
-/// refused: the first attempt fails on the worker the controller chose, and
-/// the retry lands on the other. Both objects read overloaded with shedding
-/// on, and each engine sees the request once.
-#[tokio::test]
-async fn a_placed_retry_is_not_shed_by_the_workers_overload_flag() {
-    let starts = Arc::new(AtomicUsize::new(0));
-    let registry = Arc::new(WorkerRegistry::new());
-    let mut workers = Vec::new();
-    let mut seen = Vec::new();
-    for _ in 0..2 {
-        let ids = Arc::new(Mutex::new(Vec::new()));
-        let port = spawn_stub(GatedScheduler {
-            fail_first: true,
-            calls: Arc::clone(&starts),
-            seen_request_ids: Arc::clone(&ids),
-            ..Default::default()
-        })
-        .await;
-        workers.push(register_worker(&registry, port, WorkerType::Regular));
-        seen.push(ids);
-    }
-    let (deps, _store) = placed_deps(&registry, &workers);
-    registry.set_overload_shed(true);
-    for worker in &workers {
-        assert!(registry.set_worker_overloaded(worker, true));
-    }
-
-    let pipeline = RequestPipeline::build(Endpoint::Completion, Mode::Regular, &deps)
-        .expect("completion pipeline");
-    let components = components(registry).await;
-    let response = run_completion(pipeline, components, &fast_retry_config(3)).await;
-
-    assert_eq!(response.status(), http::StatusCode::OK);
-    for ids in &seen {
-        assert_eq!(calls_seen(ids), 1, "each engine sees one start");
-    }
-}
-
-/// A placed request's definitive failure still moves to the other worker
-/// where that worker's object reads overloaded. Under a policy engine the retry
-/// window reads a worker's status and breaker, and the retry's placement
-/// answers for the veto. Each engine sees the request once, and the second
-/// answer stands.
-#[tokio::test]
-async fn a_placed_requests_definitive_failure_moves_on_past_the_overload_flag() {
-    let registry = Arc::new(WorkerRegistry::new());
-    let mut workers = Vec::new();
-    let mut seen = Vec::new();
-    for _ in 0..2 {
-        let ids = Arc::new(Mutex::new(Vec::new()));
-        let port = spawn_stub(GatedScheduler {
-            fail_internal: true,
-            seen_request_ids: Arc::clone(&ids),
-            ..Default::default()
-        })
-        .await;
-        workers.push(register_worker_with_breaker(&registry, port, 5));
-        seen.push(ids);
-    }
-    let (deps, _store) = placed_deps(&registry, &workers);
-    for worker in &workers {
-        assert!(registry.set_worker_overloaded(worker, true));
-    }
-
-    let pipeline = RequestPipeline::build(Endpoint::Completion, Mode::Regular, &deps)
-        .expect("completion pipeline");
-    let components = components(registry).await;
-    let response = run_completion(pipeline, components, &fast_retry_config(5)).await;
-
-    assert_eq!(response.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
-    for ids in &seen {
-        assert_eq!(calls_seen(ids), 1, "each engine sees the request once");
-    }
-}
-
-#[tokio::test]
-async fn a_placed_harmony_responses_iteration_completes_its_lease() {
-    let (ctx, store, row) = placed_harmony_responses_context().await;
-    let mut request = responses_request(false);
-    Arc::make_mut(&mut request).stream = Some(false);
-    let started = Instant::now();
-    ctx.pipeline
-        .execute_harmony_responses(&request, &ctx, None)
-        .await
-        .expect("the iteration answered");
-    assert!(store.completed_ok_since(GatewayId::LOCAL, row, started));
-    assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
-}
-
-#[tokio::test]
-async fn a_placed_harmony_responses_stream_completes_its_lease() {
-    let (ctx, store, row) = placed_harmony_responses_context().await;
-    let started = Instant::now();
-    let response = serve_harmony_responses_stream(
-        &ctx,
-        Arc::unwrap_or_clone(responses_request(false)),
-        anonymous(),
-        None,
-    )
-    .await;
-    assert_eq!(response.status(), http::StatusCode::OK);
-    let body = axum::body::to_bytes(response.into_body(), 1 << 20)
-        .await
-        .expect("the stream's body");
-    let text = std::str::from_utf8(&body).expect("UTF-8 SSE");
-    assert!(text.contains("event: response.completed"), "{text}");
-    assert!(store.completed_ok_since(GatewayId::LOCAL, row, started));
-    assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
-}
-
 /// Harmony Responses over the gRPC PD path: the same client leaves while
 /// the decode side wedged after its first token. The decode engine receives
 /// the abort at once and both sides end with their load released.
@@ -4406,6 +4089,37 @@ async fn a_call_the_worker_never_answers_is_the_504_at_the_request_timeout() {
     assert_eq!(worker.load(), 0, "the slot goes with the answer");
 }
 
+/// A worker that takes every call and answers nothing is taken out at its
+/// breaker's threshold when the requests come one after another: the call
+/// it took is no success for it, so the cut requests are failures in a row.
+#[tokio::test]
+async fn streamed_requests_one_after_another_to_a_silent_worker_open_its_breaker() {
+    let (pipeline, worker, _scheduler, components) =
+        silent_worker_pipeline(SilentShape::Stream, REQUEST_TIMEOUT).await;
+    for _ in 0..CircuitBreakerConfig::default().failure_threshold {
+        let response = pipeline
+            .execute_completion(
+                completion(true),
+                None,
+                MODEL.to_string(),
+                Arc::clone(&components),
+                None,
+                None,
+                None,
+            )
+            .await;
+        // A streamed answer fails inside its body: it is read to its end.
+        tokio::time::timeout(
+            CASE_CAP,
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("the request timeout ends the body")
+        .expect("drain body");
+    }
+    assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
+}
+
 /// A worker that answers within the timeout is not touched by it: the
 /// completion arrives whole, the engine sees no abort.
 #[tokio::test]
@@ -4455,6 +4169,49 @@ async fn a_request_that_completes_before_the_request_timeout_is_unchanged() {
         "a completed request sends no abort"
     );
     assert_eq!(worker.load(), 0);
+}
+
+/// A streamed Harmony Responses request to a silent worker ends at the
+/// deadline with an `error` event under the timeout's code, the one the 504
+/// and the other streams name.
+#[tokio::test]
+async fn a_harmony_responses_stream_to_a_silent_worker_names_the_request_timeout() {
+    let port = spawn_stub(GatedScheduler {
+        frame_gap: Some(Duration::from_secs(3600)),
+        ..Default::default()
+    })
+    .await;
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    register_worker(&worker_registry, port, WorkerType::Regular);
+    let deps = PipelineDeps::pair(
+        worker_registry.clone(),
+        Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+        None,
+        None,
+        Duration::from_secs(60),
+    )
+    .with_request_timeout(REQUEST_TIMEOUT);
+    let ctx = responses_context_with_deps(Endpoint::Harmony, Mode::Regular, &deps, 0).await;
+    let response = serve_harmony_responses_stream(
+        &ctx,
+        Arc::unwrap_or_clone(responses_request(false)),
+        anonymous(),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let body = tokio::time::timeout(
+        CASE_CAP,
+        axum::body::to_bytes(response.into_body(), usize::MAX),
+    )
+    .await
+    .expect("the request timeout ends the body")
+    .expect("drain body");
+    let body = String::from_utf8_lossy(&body);
+    assert!(
+        body.contains("\"code\":\"call_upstream_timeout\""),
+        "the event names the timeout as the 504 does: {body}"
+    );
 }
 
 /// A worker whose process is gone refuses the dial under the next call. The

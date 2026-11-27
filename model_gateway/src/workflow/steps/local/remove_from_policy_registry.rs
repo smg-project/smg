@@ -7,6 +7,7 @@ use std::{
 
 use async_trait::async_trait;
 use futures::future::join_all;
+use smg_grpc_client::tokenspeed_encoder::TokenSpeedEncoderClient;
 use tokio::sync::Semaphore;
 use tracing::{debug, error};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
@@ -88,6 +89,9 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromPolicyRegistryStep {
             app_context
                 .policy_registry
                 .remove_worker_from_policies(worker.url());
+            // Its pooled encode connections go too: the pool is keyed by
+            // this URL and outlived the worker otherwise.
+            TokenSpeedEncoderClient::forget_cached(worker.url());
         }
 
         // The removed workers' URLs leave their models' trees too, those of

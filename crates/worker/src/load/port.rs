@@ -78,7 +78,7 @@ pub struct PolledRanks {
     pub leaving: Vec<i32>,
 }
 
-/// One polled member's report at the end of a group's tick.
+/// One polled member's report in a batch of its group's answers.
 #[derive(Clone, Copy)]
 pub struct PolledReport<'a> {
     /// The polled worker the report is of.
@@ -93,13 +93,16 @@ pub struct PolledReport<'a> {
     pub carries_rank_capacity: bool,
 }
 
-/// What a group's tick leaves, once every polled engine has answered and the
-/// collector has laid the stream's rows over each answer.
+/// What a batch of a group's answers leaves, once the collector has laid the
+/// stream's rows over each answer. The engines of a tick that answer
+/// together are one batch, an engine that answers later is a batch of its
+/// own, and a tick that no answer came in ends with a batch of no report.
 #[derive(Clone, Copy)]
 pub struct GroupTick<'a> {
-    /// Every `Ready` worker of the group, polled or served by its stream.
+    /// Every `Ready` worker of the group the sink says yes of
+    /// ([`LoadSink::polls`]), polled or served by its stream.
     pub workers: &'a [Arc<dyn Worker>],
-    /// The polled members that answered with rows.
+    /// The batch's polled members that answered with rows.
     pub reports: &'a [PolledReport<'a>],
 }
 
@@ -118,9 +121,10 @@ pub struct GroupTick<'a> {
 /// sink that judges an engine reads the answer whole.
 ///
 /// Seven calls have no default: each is a fact a sink takes or a question it
-/// answers. Two have one, where doing nothing is a true answer: a sink
-/// whose readers always read loads says yes at [`Self::needs_loads`], and a
-/// sink that keeps no rank cache and trims nothing has no work at
+/// answers. Three have one, where doing nothing is a true answer: a sink
+/// whose readers always read loads says yes at [`Self::needs_loads`], one
+/// whose host asks every worker for its load says yes at [`Self::polls`],
+/// and a sink that keeps no rank cache and trims nothing has no work at
 /// [`Self::tick`].
 pub trait LoadSink: Send + Sync {
     /// A record pushed on the worker's stream for `rank`, received at
@@ -159,7 +163,9 @@ pub trait LoadSink: Send + Sync {
     /// The worker's loads are forgotten: it left the registry, was
     /// replaced, or its status left `Ready`. It is also said for a worker
     /// whose pushed report a record of the registry's worker at the URL
-    /// replaced. It is not said at the eviction of a worker whose URL holds
+    /// replaced, and for every worker whose pushed report the collector
+    /// holds where its host stops it, whatever the worker's status. It is
+    /// not said at the eviction of a worker whose URL holds
     /// another worker's report: what the sink holds at the URL is that
     /// worker's since its first record. A worker that never pushed is then
     /// not said at all: a sink that keys its rows by the worker and not by
@@ -167,18 +173,20 @@ pub trait LoadSink: Send + Sync {
     fn forget(&self, worker: &Arc<dyn Worker>);
 
     /// The collector reset itself: it stopped its groups and dropped every
-    /// load it published. It does so on two paths: at its start and after
-    /// it lost registry events. What the sink derived from loads and
-    /// cannot tie to a standing worker by itself is void: its verdicts and
-    /// its rows. Just before this call the collector says [`Self::forget`]
-    /// for every worker whose pushed report it held and that is no longer
-    /// the registry's `Ready` worker at its URL. So a sink may keep what it
-    /// knows of a stream, as the collector keeps the report of a pusher
-    /// that stays. A polled worker that left while events were lost is
-    /// never said: in a sink that keeps rows of its own, nothing of a
-    /// polled worker outlives this call. A sink whose rows end with the
-    /// write that removes their worker keeps them: no row of a worker that
-    /// left stands there.
+    /// load it published. It does so on three paths: at its start, after
+    /// it lost registry events, and when its host stops it. What the sink
+    /// derived from loads and cannot tie to a standing worker by itself is
+    /// void: its verdicts and its rows. Just before this call the collector
+    /// says [`Self::forget`] for every worker whose pushed report it held
+    /// and that is no longer the registry's `Ready` worker at its URL. So a
+    /// sink may keep what it knows of a stream, as the collector keeps the
+    /// report of a pusher that stays. A stop says it for every worker whose
+    /// pushed report the collector held, ahead of this call: no pusher's
+    /// report outlives a stop. A polled worker that left while
+    /// events were lost is never said: in a sink that keeps rows of its
+    /// own, nothing of a polled worker outlives this call. A sink whose
+    /// rows end with the write that removes their worker keeps them: no row
+    /// of a worker that left stands there.
     ///
     /// A dropped collector says nothing: its drop stops its tasks and calls
     /// no sink. The host that drops a collector owns the sink too: it voids
@@ -193,7 +201,21 @@ pub trait LoadSink: Send + Sync {
         true
     }
 
-    /// The end of a group's tick. A sink that keeps rows of its own took
-    /// them at [`Self::report`] and needs nothing here.
+    /// Whether the collector asks `worker` for its load. A worker the sink
+    /// says no of is no member of a tick: it is not polled, no load stream
+    /// is wanted for it, and [`Self::tick`] does not name it. A sink whose
+    /// host can dial every worker keeps this answer.
+    ///
+    /// The collector says nothing where a worker's answer turns from yes to
+    /// no: the worker keeps its last published report, and the sink what it
+    /// judged of it, until [`Self::forget`] or [`Self::reset`]. A record
+    /// pushed for a worker the sink says no of still reaches
+    /// [`Self::record`]: the push asks nothing here.
+    fn polls(&self, _worker: &dyn Worker) -> bool {
+        true
+    }
+
+    /// A batch of a group's answers ([`GroupTick`]). A sink that keeps rows
+    /// of its own took them at [`Self::report`] and needs nothing here.
     fn tick(&self, _tick: &GroupTick<'_>) {}
 }

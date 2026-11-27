@@ -21,6 +21,7 @@ pub mod media_identity;
 pub mod mlx_engine;
 pub mod request_deadline;
 mod request_fields;
+pub mod sglang_managed;
 pub mod sglang_scheduler;
 pub mod tokenizer_bundle;
 pub mod tokenspeed_encoder;
@@ -384,6 +385,16 @@ pub(crate) const fn service_name_eq(a: &str, b: &str) -> bool {
 /// specific RPCs (`abort_request`, `embed`, etc.) below.
 macro_rules! impl_engine_client_basics {
     ($proto:ident, $proto_client:path, $display_name:literal, $service:literal, $generated_service:expr) => {
+        $crate::impl_engine_client_basics!(
+            $proto,
+            $proto_client,
+            $display_name,
+            $service,
+            $generated_service,
+            None::<usize>
+        );
+    };
+    ($proto:ident, $proto_client:path, $display_name:literal, $service:literal, $generated_service:expr, $receive_limit:expr) => {
         /// Create a new client and connect to the backend.
         pub async fn connect(
             endpoint: &str,
@@ -451,6 +462,9 @@ macro_rules! impl_engine_client_basics {
         ) -> impl std::future::Future<Output = Result<AbortOnDropStream, tonic::Status>> + '_ {
             let request_id = req.request_id.clone();
             let mut grpc = tonic::client::Grpc::new(self.channel.clone());
+            if let Some(limit) = $receive_limit {
+                grpc = grpc.max_decoding_message_size(limit);
+            }
             let mut request = tonic::Request::new(req);
             async move {
                 // W3C trace context into the gRPC metadata for distributed tracing,
@@ -631,3 +645,13 @@ macro_rules! impl_rank_load_conversions {
     };
 }
 pub(crate) use impl_rank_load_conversions;
+
+/// Native SGLang encoder control protocol, without tensor payload adaptation.
+#[expect(
+    clippy::allow_attributes,
+    reason = "the generator decides which lints fire, so these allows cannot be expects"
+)]
+pub mod sglang_encoder_proto {
+    #![allow(clippy::all, clippy::absolute_paths, unused_qualifications)]
+    tonic::include_proto!("sglang.grpc.encoder");
+}

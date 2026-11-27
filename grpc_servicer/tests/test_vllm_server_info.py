@@ -10,7 +10,9 @@ import pytest
 from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
 from smg_grpc_proto import vllm_engine_pb2
 from smg_grpc_proto.generated import common_pb2
+from smg_grpc_servicer import constrained_decoding
 from smg_grpc_servicer.vllm import model_info
+from smg_grpc_servicer.vllm.config_view import EngineConfigView
 from smg_grpc_servicer.vllm.scheduler_loads import managed_ranks
 
 _SERVICER = Path(__file__).parents[1] / "smg_grpc_servicer" / "vllm" / "servicer.py"
@@ -37,6 +39,8 @@ def _server_info_method(response_type):
         "mm_item_limits": model_info.mm_item_limits,
         "engine_reasoning_parser": model_info.engine_reasoning_parser,
         "constrained_decoding_start": model_info.constrained_decoding_start,
+        "EngineConfigView": EngineConfigView,
+        "structural_tag_vocabulary": constrained_decoding.structural_tag_vocabulary,
     }
     exec(compile(ast.Module(body=[method], type_ignores=[]), str(_SERVICER), "exec"), namespace)
     return namespace["GetServerInfo"]
@@ -146,6 +150,30 @@ def test_get_server_info_reports_where_the_engine_starts_a_grammar(legacy):
         assert info.constrained_decoding_start == "after_reasoning"
 
 
+@pytest.mark.parametrize(
+    ("backend", "installed", "label"),
+    [("xgrammar", "0.1.32", "older"), ("xgrammar", "0.1.33", ""), ("guidance", "0.1.32", "")],
+)
+def test_get_server_info_reports_the_structural_tag_vocabulary(
+    monkeypatch, backend, installed, label
+):
+    """The handler reports the vocabulary the engine's xgrammar takes, as the Rust launcher does,
+    and nothing for a backend that runs no xgrammar."""
+    monkeypatch.setattr(constrained_decoding, "installed_xgrammar_version", lambda: installed)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(dtype="torch.bfloat16", is_multimodal_model=False),
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        structured_outputs_config=SimpleNamespace(
+            backend=backend, reasoning_parser="", enable_in_reasoning=False
+        ),
+    )
+    servicer = SimpleNamespace(
+        engine=SimpleNamespace(vllm_config=config), _mm_processor=None, _mm_encoder_budget=0
+    )
+    info = asyncio.run(_server_info_method(_response_type(False))(servicer, None, None))
+    assert info.structural_tag_vocabulary == label
+
+
 @pytest.mark.parametrize("legacy", [False, True])
 def test_get_server_info_reports_the_engines_encoder_budget(legacy):
     """The handler advertises the encoder budget the servicer derived at start when the
@@ -167,6 +195,22 @@ def test_get_server_info_reports_the_engines_encoder_budget(legacy):
     servicer._mm_encoder_budget = 0
     info = asyncio.run(_server_info_method(response_type)(servicer, None, None))
     assert info.mm_encoder_budget == 0
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_get_server_info_reports_the_cache_partition_fields(legacy):
+    """The handler names the field Generate reads, and leaves an older schema alone."""
+    missing = ("cache_partition_fields",) if legacy else ()
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(dtype="torch.bfloat16", is_multimodal_model=False),
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+    )
+    servicer = SimpleNamespace(
+        engine=SimpleNamespace(vllm_config=config), _mm_processor=None, _mm_encoder_budget=0
+    )
+    handler = _server_info_method(_response_type_without(*missing))
+    info = asyncio.run(handler(servicer, None, None))
+    assert getattr(info, "cache_partition_fields", None) == (None if legacy else "cache_salt")
 
 
 @pytest.mark.parametrize("ranks", [[0], [1], [0, 1], []])

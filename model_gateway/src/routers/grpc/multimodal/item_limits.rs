@@ -11,12 +11,12 @@
 //! a model whose workers advertise different limits gets the smallest and a
 //! request never depends on which worker is picked.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use llm_multimodal::Modality;
 use smg_worker::identity::basic::{RuntimeType, Worker};
 
-use super::plan::MediaPlan;
+use super::{capability::media_facts, plan::MediaPlan};
 use crate::routers::common::snapshot::WorkerRegistry;
 
 /// Worker label carrying the engine's per-request media limits as
@@ -65,13 +65,19 @@ fn worker_item_limits(worker: &dyn Worker) -> HashMap<Modality, usize> {
 
 /// Per modality, the smallest limit any registered worker of `model_id`
 /// advertises (healthy or not: a health flap must not move a model's limit
-/// request to request). Empty when none advertises one.
+/// request to request). Empty when none advertises one. The model's
+/// membership snapshot keeps the answer ([`media_facts`]).
 pub(crate) fn engine_item_limits(
     registry: &WorkerRegistry,
     model_id: &str,
 ) -> HashMap<Modality, EngineItemLimit> {
+    media_facts(registry, model_id, |facts| facts.item_limits.clone())
+}
+
+/// The rule of [`engine_item_limits`] over the members of one snapshot.
+pub(super) fn item_limits_over(workers: &[Arc<dyn Worker>]) -> HashMap<Modality, EngineItemLimit> {
     let mut limits: HashMap<Modality, EngineItemLimit> = HashMap::new();
-    for worker in registry.get_by_model(model_id).iter() {
+    for worker in workers {
         let runtime = worker.metadata().spec.runtime_type;
         for (modality, limit) in worker_item_limits(worker.as_ref()) {
             let candidate = EngineItemLimit { limit, runtime };

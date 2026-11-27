@@ -179,6 +179,15 @@ fn test_validate_invalid_kv_annotation_names() {
             bad,
             reason,
         );
+        assert_invalid(
+            KubernetesDiscoveryConfig {
+                pairing_protocol_label: bad.into(),
+                ..kubernetes()
+            },
+            "discovery.pairing_protocol_label",
+            bad,
+            "Label name must not be empty or padded with whitespace",
+        );
     }
 }
 

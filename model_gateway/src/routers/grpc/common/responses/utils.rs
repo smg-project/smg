@@ -14,9 +14,8 @@ use openai_protocol::{
 };
 use serde_json::{json, to_value, Value};
 use smg_data_connector::{
-    is_unstored, visible_chain, ConversationItemStorage, ConversationStorage,
-    RequestContext as StorageRequestContext, ResponseId, ResponseStorage, ResponseStorageError,
-    StoredResponse,
+    ConversationItemStorage, ConversationStorage, RequestContext as StorageRequestContext,
+    ResponseId, ResponseStorage, ResponseStorageError, StoredResponse,
 };
 use smg_mcp::{McpOrchestrator, McpServerBinding};
 use tracing::{debug, error, warn};
@@ -29,7 +28,7 @@ use crate::{
             mcp_utils::{ensure_request_mcp_routing, DEFAULT_MAX_ITERATIONS},
             openai_bridge,
             persistence_utils::{
-                persist_conversation_items, persist_conversation_items_if_open, PersistError,
+                persist_conversation_items_if_open, persist_conversation_items_owned, PersistError,
                 PersistStep,
             },
             snapshot::WorkerRegistry,
@@ -249,17 +248,12 @@ pub(crate) async fn ensure_mcp_connection(
     Ok((false, Vec::new()))
 }
 
-/// Refuse a Responses request with a function or custom tool, alone or in a
-/// namespace, that only code may call (`allowed_callers` without `direct`).
-/// This router runs no programmatic tool calls, and its chat template offers
-/// the model every function tool it is handed, so it could serve such a tool
-/// only as one the model calls directly, which the request forbids.
+/// Refuse tools that disallow direct calls, including namespace members.
+/// This router can offer tools to the model only for direct calls.
 pub(crate) fn refuse_tools_without_a_direct_caller(
     tools: Option<&[ResponseTool]>,
 ) -> Option<Response> {
     let refused_at = |idx: usize, tool: &ResponseTool| match tool {
-        ResponseTool::Function(ft) => (!ft.allows_direct_calls()).then(|| format!("tools[{idx}]")),
-        ResponseTool::Custom(ct) => (!ct.allows_direct_calls()).then(|| format!("tools[{idx}]")),
         ResponseTool::Namespace(namespace) => {
             namespace
                 .tools
@@ -273,7 +267,7 @@ pub(crate) fn refuse_tools_without_a_direct_caller(
                     (!direct).then(|| format!("tools[{idx}].tools[{member_idx}]"))
                 })
         }
-        _ => None,
+        _ => (!tool.allows_direct_calls()).then(|| format!("tools[{idx}]")),
     };
     let at = tools
         .unwrap_or_default()
@@ -380,12 +374,13 @@ pub(crate) fn custom_tool_as_function(ct: &CustomTool) -> openai_protocol::commo
 }
 
 /// Recover a custom tool's raw `input` from the `{"input": "..."}` arguments
-/// of its downgraded function call.
+/// of its downgraded function call, preserving the raw `arguments` string if
+/// the model emitted plain text or another JSON shape instead.
 pub(crate) fn custom_tool_input(arguments: &str) -> String {
     serde_json::from_str::<Value>(arguments)
         .ok()
         .and_then(|v| v.get("input")?.as_str().map(str::to_owned))
-        .unwrap_or_default()
+        .unwrap_or_else(|| arguments.to_owned())
 }
 
 /// Collect the names of all declared custom tools (top-level and namespaced),
@@ -447,17 +442,20 @@ pub(crate) fn resolve_function_identity(
     name: &str,
 ) -> (String, Option<String>) {
     let tools = tools.unwrap_or_default();
-    if !tools
-        .iter()
-        .any(|tool| matches!(tool, ResponseTool::Function(ft) if ft.function.name == name))
-    {
+    if !tools.iter().any(|tool| match tool {
+        ResponseTool::Function(ft) => ft.function.name == name,
+        ResponseTool::Custom(ct) => ct.name == name,
+        _ => false,
+    }) {
         for tool in tools {
             if let ResponseTool::Namespace(namespace) = tool {
                 for member in &namespace.tools {
-                    if let NamespaceTool::Function(ft) = member {
-                        if is_namespaced(name, &namespace.name, &ft.function.name) {
-                            return (ft.function.name.clone(), Some(namespace.name.clone()));
-                        }
+                    let member_name = match member {
+                        NamespaceTool::Function(ft) => &ft.function.name,
+                        NamespaceTool::Custom(ct) => &ct.name,
+                    };
+                    if is_namespaced(name, &namespace.name, member_name) {
+                        return (member_name.clone(), Some(namespace.name.clone()));
                     }
                 }
             }
@@ -577,23 +575,8 @@ pub(crate) async fn previous_response_chain(
     tenant: Option<&str>,
 ) -> Result<Vec<Arc<StoredResponse>>, Response> {
     let prev_id = ResponseId::from(prev_id_str);
-    match storage.get_response_chain(&prev_id, None).await {
-        Ok(chain)
-            if !chain.responses.is_empty()
-                && !chain
-                    .responses
-                    .last()
-                    .is_some_and(|response| is_unstored(response)) =>
-        {
-            let responses = visible_chain(chain.responses, tenant);
-            if responses.is_empty() {
-                return Err(error::not_found(
-                    "previous_response_not_found",
-                    format!("Previous response with id '{prev_id_str}' not found."),
-                ));
-            }
-            Ok(responses)
-        }
+    match storage.get_response_chain_for(&prev_id, tenant).await {
+        Ok(chain) if !chain.responses.is_empty() => Ok(chain.responses),
         Ok(_) | Err(ResponseStorageError::ResponseNotFound(_)) => Err(error::not_found(
             "previous_response_not_found",
             format!("Previous response with id '{prev_id_str}' not found."),
@@ -659,8 +642,11 @@ pub(crate) async fn persist_response_if_needed(
     } else {
         "foreground"
     };
-    let response_json = match to_value(response) {
-        Ok(json) => json,
+    let mut response_json = match to_value(response) {
+        Ok(mut json) => {
+            exact_sampling_numbers(&mut json, response);
+            json
+        }
         Err(e) => {
             warn!(response_id = %response.id, error = %e, "Failed to serialize the response for storage");
             Metrics::record_response_not_stored(mode, "record");
@@ -702,11 +688,16 @@ pub(crate) async fn persist_response_if_needed(
             )
             .await
         } else {
-            persist_conversation_items(
+            // Only a background persist comes round again: the store takes the tree.
+            debug_assert!(
+                !response_json.is_null(),
+                "a foreground persist runs once; its tree is taken"
+            );
+            persist_conversation_items_owned(
                 conversation_storage.clone(),
                 conversation_item_storage.clone(),
                 response_storage.clone(),
-                &response_json,
+                std::mem::take(&mut response_json),
                 original_request,
                 tenant,
                 request_context.clone(),
@@ -775,6 +766,38 @@ pub(crate) async fn persist_response_if_needed(
 fn not_stored(error: &PersistError) -> NotStored {
     NotStored::new(error.retryable, error)
 }
+
+/// `value` as a JSON number the way the `f32` prints (`0.7`), not widened
+/// to 64 bits (`0.699999988079071`); the text is written on the stack.
+pub(crate) fn exact_f32(value: f32) -> Value {
+    let mut text = [0u8; 32];
+    let mut rest = &mut text[..];
+    let exact = match serde_json::to_writer(&mut rest, &value) {
+        Ok(()) => {
+            let left = rest.len();
+            serde_json::from_slice(&text[..text.len() - left]).ok()
+        }
+        Err(_) => None,
+    };
+    // An f32 prints in at most 16 bytes, so this never falls back in
+    // practice; if it did, the widened number is kept.
+    exact.unwrap_or_else(|| Value::from(value))
+}
+
+/// Writes `temperature` and `top_p` into the JSON tree of a response as
+/// the response holds them: the plain conversion widens the two 32-bit
+/// numbers to 64 bits.
+pub(crate) fn exact_sampling_numbers(raw: &mut Value, response: &ResponsesResponse) {
+    for (key, value) in [
+        ("temperature", response.temperature),
+        ("top_p", response.top_p),
+    ] {
+        if let (Some(slot), Some(value)) = (raw.get_mut(key), value) {
+            *slot = exact_f32(value);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -825,6 +848,61 @@ mod tests {
             .await
             .expect_err("an unknown id is refused");
         assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A store read one record at a time (the trait's own chain walk), counted.
+    struct CountedReads {
+        inner: MemoryResponseStorage,
+        reads: AtomicUsize,
+    }
+
+    response_storage_over! {
+        CountedReads.inner;
+        passes store_response, delete_response, list_identifier_responses, delete_identifier_responses;
+        async fn get_response(
+            &self,
+            response_id: &ResponseId,
+        ) -> Result<Option<StoredResponse>, ResponseStorageError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.inner.get_response(response_id).await
+        }
+    }
+
+    /// A previous response the caller may not read is refused after one read
+    /// of the store; a chain is walked no further than the first such record.
+    #[tokio::test]
+    async fn a_previous_response_the_caller_may_not_read_is_refused_after_one_read() {
+        let counted = Arc::new(CountedReads {
+            inner: MemoryResponseStorage::new(),
+            reads: AtomicUsize::new(0),
+        });
+        let storage: Arc<dyn ResponseStorage> = counted.clone();
+        let mut previous = None;
+        for id in ["a1", "a2", "a3", "b4"] {
+            let mut response = StoredResponse::new(previous.replace(ResponseId::from(id)));
+            response.id = ResponseId::from(id);
+            response.tenant = Some(id[..1].to_string()); // the letter of its id
+            storage.store_response(response).await.unwrap();
+        }
+
+        let mut loads = Vec::new();
+        for (named, tenant) in [("a3", "a"), ("a3", "b"), ("b4", "b")] {
+            let chain = previous_response_chain(&storage, named, Some(tenant)).await;
+            let ids: Vec<&str> = chain.iter().flatten().map(|r| r.id.0.as_str()).collect();
+            loads.push((
+                chain.as_ref().err().map(|refused| refused.status()),
+                ids.join(" "),
+                counted.reads.swap(0, Ordering::SeqCst),
+            ));
+        }
+        assert_eq!(
+            loads,
+            [
+                (None, "a1 a2 a3".to_string(), 3),
+                (Some(StatusCode::NOT_FOUND), String::new(), 1),
+                (None, "b4".to_string(), 2),
+            ]
+        );
     }
 
     /// `background: true` with `store: false`, the public API's probe: the
@@ -1041,6 +1119,72 @@ mod tests {
         )
         .await
         .expect("nothing to store, nothing to report");
+    }
+
+    /// A stored response gives its `temperature` and `top_p` to a `GET` of
+    /// its id as the answer itself gave them, not widened to 64 bits: the
+    /// record of a stored response, the queued record of a background one
+    /// and the record an unstored background run ends in.
+    #[tokio::test]
+    async fn a_get_of_a_stored_response_reads_the_sampling_numbers_unwidened() {
+        use crate::endpoints::responses::get_response;
+
+        let storage: Arc<dyn ResponseStorage> = Arc::new(MemoryResponseStorage::new());
+        let read = |id: &'static str| {
+            let storage = storage.clone();
+            async move {
+                let answer = get_response(&storage, None, id, None).await;
+                let body = axum::body::to_bytes(answer.into_body(), 1 << 20).await;
+                let read: Value = serde_json::from_slice(&body.unwrap()).unwrap();
+                (read["temperature"].clone(), read["top_p"].clone())
+            }
+        };
+        let exact = (json!(0.7), json!(0.9));
+        let mut request = json!({
+            "model": "m",
+            "input": "hi",
+            "temperature": 0.7,
+            "top_p": 0.9
+        });
+        let stored: ResponsesRequest = serde_json::from_value(request.clone()).unwrap();
+        persist_response_if_needed(
+            Arc::new(MemoryConversationStorage::new()),
+            Arc::new(MemoryConversationItemStorage::new()),
+            storage.clone(),
+            &completed_response("resp_g", &stored),
+            &stored,
+            None,
+            None,
+        )
+        .await
+        .expect("the record is written");
+        assert_eq!(read("resp_g").await, exact);
+
+        request["background"] = json!(true);
+        request["store"] = json!(false);
+        let unstored: ResponsesRequest = serde_json::from_value(request).unwrap();
+        background::store_record(
+            &storage,
+            &background::queued_response("resp_q", &unstored),
+            &unstored,
+            None,
+            None,
+        )
+        .await
+        .expect("the queued record is written");
+        assert_eq!(read("resp_q").await, exact);
+        persist_response_if_needed(
+            Arc::new(MemoryConversationStorage::new()),
+            Arc::new(MemoryConversationItemStorage::new()),
+            storage.clone(),
+            &completed_response("resp_q", &unstored),
+            &unstored,
+            None,
+            None,
+        )
+        .await
+        .expect("the unstored end is written");
+        assert_eq!(read("resp_q").await, exact);
     }
 
     /// A background response deleted while its work ran (its record is gone
@@ -1312,6 +1456,23 @@ mod tests {
             (json!([function(json!(["programmatic"]))]), "tools[0]"),
             (json!([function(json!([]))]), "tools[0]"),
             (
+                json!([{"type": "mcp", "server_label": "docs", "server_url": "https://example.com/mcp",
+                         "allowed_callers": ["programmatic"]}]),
+                "tools[0]",
+            ),
+            (
+                json!([{"type": "code_interpreter", "allowed_callers": ["programmatic"]}]),
+                "tools[0]",
+            ),
+            (
+                json!([{"type": "shell", "allowed_callers": ["programmatic"]}]),
+                "tools[0]",
+            ),
+            (
+                json!([{"type": "apply_patch", "allowed_callers": ["programmatic"]}]),
+                "tools[0]",
+            ),
+            (
                 json!([{"type": "function", "name": "a", "parameters": {}}, custom(json!(["programmatic"]))]),
                 "tools[1]",
             ),
@@ -1521,5 +1682,19 @@ mod tests {
             tool_call_overflow(Some(DEFAULT_MAX_ITERATIONS + 5), DEFAULT_MAX_ITERATIONS, 1),
             Some((McpToolCallLimit::Safety, 0))
         );
+    }
+
+    #[test]
+    fn custom_tool_input_extracts_input_or_preserves_raw_arguments() {
+        assert_eq!(
+            custom_tool_input(r#"{"input":"*** Begin Patch"}"#),
+            "*** Begin Patch"
+        );
+        assert_eq!(
+            custom_tool_input(r#"{"patch":"raw"}"#),
+            r#"{"patch":"raw"}"#
+        );
+        assert_eq!(custom_tool_input("*** Begin Patch"), "*** Begin Patch");
+        assert_eq!(custom_tool_input(""), "");
     }
 }

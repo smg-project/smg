@@ -67,6 +67,8 @@ fn build_messages_backed_plan(
             id_prefix: "msg_",
             model: &messages_request.model,
             processed_text,
+            // A Messages answer has no field for the prompt.
+            return_prompt_text: false,
             token_ids,
             tool_constraints,
             // A Messages body names no format of its own.

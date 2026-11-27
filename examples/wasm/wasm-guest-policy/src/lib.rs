@@ -1,4 +1,4 @@
-//! An example policy plugin for the policy controller: a filter, a scorer and
+//! An example policy plugin for Grand Central: a filter, a scorer and
 //! a picker in one WebAssembly component of the `smg:policy` record world.
 //!
 //! The policy: among the healthy workers that have capacity, prefer the one
@@ -10,7 +10,7 @@
 //! `init` read: a plugin that keeps state across decisions is another example.
 
 wit_bindgen::generate!({
-    path: "../../../crates/policy_controller/contracts/smg-policy.wit",
+    path: "../../../crates/grand_central/contracts/smg-policy.wit",
     world: "policy",
 });
 

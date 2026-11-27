@@ -83,6 +83,11 @@ pub struct WorkerMetadata {
     /// of the model on every request, so nothing on a request path looks a
     /// label up.
     pub decoding: DecodingLabels,
+    /// The running window the labels name (`basic::running_window`), parsed
+    /// once at construction: a pair placement asks the decode workers of the
+    /// model for it on every request, so nothing on a request path looks a
+    /// label up.
+    pub running_window: Option<u16>,
 }
 
 /// A worker's constrained-decoding labels as the routers read them, parsed
@@ -174,9 +179,9 @@ impl WorkerMetadata {
     /// socket set, N engines dialing in (the connector balances across them
     /// and drives the wave protocol for lockstep groups). `None` for a worker
     /// given no count, which awaits as many engines as the first to dial
-    /// declares (one, from an engine that declares none). The rank workers of
-    /// a group expanded under dp-aware routing carry the group's `dp_size`
-    /// too, and await the same engines over the connection they share.
+    /// declares (one, from an engine that declares none). The rank workers a
+    /// group given a count registers as carry the group's `dp_size` too, and
+    /// await the same engines over the connection they share.
     pub fn zmq_engine_count(&self) -> Option<usize> {
         self.spec.dp_size.map(|count| count.max(1))
     }

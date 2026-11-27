@@ -74,9 +74,8 @@ the name its `name()` returns, with the processors it builds:
 
 Which of a family's modalities one model serves is read from its config: most families
 take video or audio only where the config declares the modality's tokens or its tower.
-`Phi4VisionProcessor` is a public processor no family builds, and `QwenVLProcessorBase` is
-the base that `Qwen2VLProcessor`, `Qwen3VLProcessor`, `Qwen3OmniVisionProcessor` and
-`MiniMaxM3VisionProcessor` wrap.
+`QwenVLProcessorBase` is the base that `Qwen2VLProcessor`, `Qwen3VLProcessor`,
+`Qwen3OmniVisionProcessor` and `MiniMaxM3VisionProcessor` wrap.
 
 `ModelRegistry::for_format` keeps the families whose processors emit one
 `EncoderInputFormat`. For `Reference` it also registers `nemotron_vl_tiled` and
@@ -106,6 +105,33 @@ Preprocessing is CPU-bound, and the crate never touches rayon's global pool. A h
 `configure_parallelism` once at start-up and chooses a dedicated pool of the size it names
 or inline execution on the calling thread. A host that configures nothing gets a small
 dedicated pool on first use, sized by `SMG_MM_THREADS` where that is set.
+
+## Environment variables
+
+The crate reads fifteen variables. Each is read once, on first use, and kept for the life
+of the process, so a change takes a restart. A number that is unset, unreadable or zero
+falls back to its default.
+
+| Variable | Default | What it sets |
+|---|---|---|
+| `SMG_IMAGE_MAX_INPUT_BYTES` | 256 MiB | The most bytes one image may have as it arrives (fetched, read from a file or decoded from base64), before it is decoded. |
+| `SMG_VIDEO_MAX_INPUT_BYTES` | 256 MiB | The same for one video. |
+| `SMG_AUDIO_MAX_INPUT_BYTES` | 256 MiB | The same for one audio clip. |
+| `SMG_IMAGE_MAX_COUNT`, `SMG_VIDEO_MAX_COUNT`, `SMG_AUDIO_MAX_COUNT` | the model family's own limit | How many images, videos or audio clips one request may carry. It replaces the family's limit, up or down, and never enables a modality the family does not serve. |
+| `SMG_VIDEO_DECODE_BACKEND` | `auto` | The video decoder: `auto`, `opencv` or `ffmpeg` (see Media decoding). `opencv` needs the `opencv-video` feature. Any other value fails every video decode with an error that names it. |
+| `SMG_VIDEO_PROCESS_TIMEOUT_SECS` | 30 | The time one decoder run may spend on a clip, in seconds; a fraction is allowed. With the `opencv-video` feature, a clip the buffered OpenCV pass fails on, a timeout included, gets the same budget again in OpenCV from a temporary file, and under `auto` once more in `ffmpeg`. |
+| `SMG_VIDEO_MAX_DECODED_BYTES` | 1 GiB | The most bytes the decoded frames of one clip may take. |
+| `SMG_VIDEO_MAX_DECODE_PIXELS` | 10^12 | The most pixels one video decode may run through: the source frames it has to decode, times the clip's width and height. A decode past it is refused before a decoder starts. |
+| `SMG_AUDIO_DECODE_BACKEND` | `auto` | The audio decoder: `auto` (the in-process decoder first, then `ffmpeg`), `symphonia` or `ffmpeg`. Any other value fails every audio decode with an error that names it. |
+| `SMG_AUDIO_PROCESS_TIMEOUT_SECS` | 30 | The time one decoder may spend on a clip, in seconds; a fraction is allowed. Under `auto` a clip the in-process decoder fails on, a timeout included, gets the same budget again in `ffmpeg`. |
+| `SMG_AUDIO_MAX_DECODED_BYTES` | 256 MiB | The most bytes the decoded samples of one clip may take. |
+| `SMG_MM_THREADS` | the machine's parallelism, at most 8 | The threads of the dedicated pool where the host names no size (see Parallelism). |
+| `SMG_LOG_MM_TIMING` | off | `1`, `true`, `yes` or `on` logs how long each video decode took. A host that calls `init_log_video_decode_timing` before the first decode decides instead. |
+
+The gateway is such a host: its `--log-mm-timing` flag wins over `SMG_LOG_MM_TIMING`, and
+the media pipeline it runs worker-side preprocesses inline unless `SMG_MM_THREADS` is set.
+The test run has two settings of its own (`SMG_REQUIRE_TURBOJPEG` and
+`SMG_REQUIRE_VIDEO_TOOLS`, see Testing), and so has the concurrency bench (see Benchmarks).
 
 ## Cargo features
 
@@ -197,7 +223,7 @@ PCM, float and A-law, 8 to 96 kHz, one, two and six channels, 0.1 s to 600 s.
 Configurations: 20, from 16 of the families above. `llava` runs once with each of its two
 processors, `qwen3_vl` and `qwen_vl` with the configs of two checkpoints each, and
 `step3_vl` with each of its two model types. The image processors of `inkling` and
-`inkling2` and the public `Phi4VisionProcessor` are not in the tables.
+`inkling2` are not in the tables.
 
 Setup: One x86-64 core, release builds, one harness source on both releases (the gateway's allocator with its options, the decoded frame borrowed, the consuming write on another thread as the gateway does it), the bf16 wire, alpha composited over white, 10 timed repeats per class, 15 interleaved rounds per build with the order swapped (medians). 1.16.0 = `322350993`, 1.15.0 = `82c0f1fcd`. "Same bytes" compares the SHA-256 of the decoded pixels, of the float32 write and of the wire bytes. The reference column runs the processor class each checkpoint's config names (transformers 5.17.0, torch 2.13.0+cpu, Pillow 12.3.0, numpy 2.2.6), one compute thread, its decode and preprocess stages; this release's figure beside it also carries the write of the wire bytes.
 

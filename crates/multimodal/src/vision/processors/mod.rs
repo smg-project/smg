@@ -20,7 +20,6 @@
 //! - **Kimi-K3** (`kimi_k3`): Same MoonViT stack with a 4x patch budget and
 //!   chessboard alpha compositing
 //! - **Phi3-Vision** (`phi3_vision`): Dynamic HD transform with 336x336 tiles
-//! - **Phi4-Vision** (`phi4_vision`): Dynamic HD transform with 448x448 tiles and SiGLIP encoder
 //! - **LLaMA 4 Vision** (`llama4_vision`): Tile-based processing with 336x336 tiles and global tile
 //! - **Pixtral/Mistral3** (`pixtral`): CLIP-based preprocessing with dynamic resolution
 //! - **Nemotron VL / Omni** (`nemotron_omni`): C-RADIO tiled or dynamic-resolution images and video frames, geometry
@@ -28,24 +27,23 @@
 //! - **Step3-VL** (`step3_vl`): a 728px global view and 504px sliding-window crops with CLIP normalization
 
 pub mod deepseek_v41;
-pub mod gemma4;
-pub mod glm53_flash;
+pub(crate) mod gemma4;
+pub(crate) mod glm53_flash;
 pub mod inkling;
-pub mod inkling2;
-pub mod kimi_k25;
-pub mod kimi_k3;
-pub mod llama4_vision;
-pub mod llava;
-pub mod minimax_m3;
-pub mod moonvit;
-pub mod muse_spark;
+pub(crate) mod inkling2;
+pub(crate) mod kimi_k25;
+pub(crate) mod kimi_k3;
+pub(crate) mod llama4_vision;
+pub(crate) mod llava;
+pub(crate) mod minimax_m3;
+pub(crate) mod moonvit;
+pub(crate) mod muse_spark;
 pub mod nemotron_omni;
 pub mod phi3_vision;
-pub mod phi4_vision;
-pub mod pixtral;
-pub mod qwen2_vl;
-pub mod qwen3_omni_vision;
-pub mod qwen3_vl;
+pub(crate) mod pixtral;
+pub(crate) mod qwen2_vl;
+pub(crate) mod qwen3_omni_vision;
+pub(crate) mod qwen3_vl;
 pub mod qwen_vl_base;
 pub mod step3_vl;
 
@@ -62,7 +60,6 @@ pub use minimax_m3::MiniMaxM3VisionProcessor;
 pub use muse_spark::MuseSparkVisionProcessor;
 pub use nemotron_omni::NemotronOmniProcessor;
 pub use phi3_vision::Phi3VisionProcessor;
-pub use phi4_vision::Phi4VisionProcessor;
 pub use pixtral::PixtralProcessor;
 pub use qwen2_vl::Qwen2VLProcessor;
 pub use qwen3_omni_vision::Qwen3OmniVisionProcessor;

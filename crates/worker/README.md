@@ -35,8 +35,8 @@ What it holds:
   `proto/common.proto`: the messages every engine's gRPC service shares.
 
 What it does not hold: **routing**. No routing policy lives here. Choosing a
-worker for a request is the job of the gateway and of the policy controller
-(`crates/policy_controller`).
+worker for a request is the job of the gateway and of Grand Central
+(`crates/grand_central`).
 
 On this page:
 
@@ -305,9 +305,9 @@ A port is a trait this crate calls and a host implements.
 | `ConnectorDefault` | `connection::engine` | The connector a builder uses when it is handed none. | The same connector. |
 | `WorkerJobs` | `jobs` | How to remove workers at an address, how to read a worker's labels again, how to register a worker, and whether a job of an address is in flight. | Nothing to write: the crate's `JobQueue` implements it over the host's `JobHost`, for a job type that accepts a `WorkerJob`. |
 | `JobHost` | `jobs::queue` | What jobs the queue takes and how they run. | Its application context. |
-| `LoadSink` | `load::port` | What a pushed record or a poll's answer means for routing: the receipts and the poll decision, the overload verdict, what its readers cache. | Under the classic policies nothing to write: `WorkerMonitor::new` builds the crate's own sink over the registry and the routing side. Where the gateway decides under the policy controller in its own process, the sink of the gateway's feed: the controller crate's load adapter, which writes the store's rows, and a loop of the feed that publishes what waits for the store's window. Under a controller's address the gateway runs no load collector. A host with a load store of its own writes this trait and hands it to `WorkerMonitor::with_sink`. |
+| `LoadSink` | `load::port` | What a pushed record or a poll's answer means for routing: the receipts and the poll decision, the overload verdict, what its readers cache. | Nothing to write: `WorkerMonitor::new` builds the crate's own sink over the registry and the routing side. A host with a load store of its own writes this trait and hands it to `WorkerMonitor::with_sink`. |
 | `LoadConsumer` | `load::monitor` | Whether a reader wants loads, and how to trim what readers booked on a worker. | Its policy registry. |
-| `HealthSink` | `health::port` | What a probe's outcome or a connect signal does to a worker's status, and that a worker's liveness veto moved. | Under the classic policies nothing to write: the crate's registry is the sink, and `WorkerManager::start` hands it. Where the gateway decides under the policy controller in its own process, the sink of the gateway's feed: the store keeps the health of a worker that has a row, and the registry keeps the rest. Under a controller's address the gateway runs no health checks. The collector calls `liveness_moved` when a worker's liveness veto may have moved. A host that keeps the veto outside the worker object implements it, and the default does nothing. |
+| `HealthSink` | `health::port` | What a probe's outcome or a connect signal does to a worker's status, and that a worker's liveness veto moved. | Nothing to write: the crate's registry is the sink, and `WorkerManager::start` hands it. The collector calls `liveness_moved` when a worker's liveness veto may have moved. A host that keeps the veto outside the worker object implements it, and the default does nothing. |
 | `RequestCompletionSink` | `identity::basic` | What to do when a request on a worker ends. | The sink its policy registry installs. |
 | `KvEventSink` | `kv_events::port` | What to do with the KV cache events a worker's stream brings: keep each rank's cursor, apply what it admits, and drop a worker's blocks when it leaves. | The sink over its KV indexes. |
 | `KvEventHost` | `kv_events` | What a worker's events subscription feeds: the sink its task opens, and what goes when a model's last events subscription is gone. | Its index side: the models' KV indexes. |
@@ -330,6 +330,59 @@ subscription feeds: `enroll` when the subscription is added, `open` when its
 task opens the worker's place in the sink, and `model_left` when a model's
 last events subscription is gone. A subscription for the pushed load records
 alone (`SubscriptionKind::Loads`) calls none of the three.
+
+## The constrained decoding labels
+
+A gateway that shapes a request's grammar itself reads three labels of a
+worker, parsed once when the worker is built (`WorkerMetadata::decoding`). An
+engine's servicer reports them in its server info, and a label set on the
+worker's spec wins over the report.
+
+| Label | Values | A worker without it |
+|---|---|---|
+| `constrained_decoding` | `requested`, `always` | Reads as `requested`: a grammar only when the request asks for one. Another value fails the registration. |
+| `constrained_decoding_start` | `first_token`, `after_reasoning` | Names no start. Another value reads the same. |
+| `structural_tag_vocabulary` | `older` | Takes the current vocabulary. |
+
+`constrained_decoding_start` says where the engine starts a grammar on a
+prompt that leaves the model inside its thought. A forced tool call or a JSON
+answer on such a prompt is shaped by it:
+
+| The label | A forced tool call | A JSON answer |
+|---|---|---|
+| `first_token` | The thought, its close, then the calls. | The closed thought, then the schema. |
+| `after_reasoning` | The bare calls. | The schema alone. |
+| none | The call's JSON schema alone. | The schema alone. |
+
+The shapes of a worker that names no start fit an engine of either kind. They
+cost an engine that starts at the first token the thought: it is held to the
+JSON at once. A forced call is shaped before a worker is selected, by the
+start the model's workers name together, so one worker without the label
+holds every forced call of its model to the schema on such a prompt. On a
+prompt that ends outside a thought, a worker without the label is sent the
+grammar a worker labelled `first_token` is sent, except for a JSON answer on a
+table whose thought is a message of its own: there it is sent the grammar of a
+worker labelled `after_reasoning`, whose way into the answer is optional.
+
+A registration warns once of a worker that names no start, where a
+gateway-shaped grammar reaches it: a worker on the gRPC pipeline, of a role
+that generates tokens, on a runtime whose request carries a constraint. It
+says nothing where the read of a gRPC engine found nothing (its connection or
+its model info failed): the engine has named nothing yet, and the label
+refresh of the worker's first transition into service reads it again. A read
+whose server info alone failed keeps the model info and still warns. A label
+refresh says the same, once, of a worker it leaves without a start: the
+engine named one before and names none now, or the worker was registered on
+a read that found nothing and its first refresh names none either. A ZMQ
+engine names no start at its handshake: its host writes what it knows ahead
+of the handshake, and a gateway writes `first_token`. In the worker list a
+worker that names no start is an entry whose `labels` hold neither value of
+`constrained_decoding_start`. To set the label by hand, put it among the
+labels of the worker's spec:
+
+```json
+{"url": "grpc://worker:9000", "labels": {"constrained_decoding_start": "first_token"}}
+```
 
 ## Versioning
 

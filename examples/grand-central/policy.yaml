@@ -1,0 +1,10 @@
+# The example's routing policy: the scorer this controller adds in code is
+# named as a built-in is. `not-overloaded` is where `pack` stops filling a
+# worker: it drops one whose engine's load reports stand at or over an
+# overload threshold, and the next worker opens.
+apiVersion: smg.policy/v1
+profiles:
+  default:
+    filter: [healthy, not-overloaded]
+    score: [pack]
+    pick: best

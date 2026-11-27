@@ -29,7 +29,10 @@ use wfaas::{
     WorkflowContext, WorkflowDefinition, WorkflowError, WorkflowResult,
 };
 
-use super::data::{require_app_context, TokenizerWorkflowData};
+use super::{
+    data::{require_app_context, TokenizerWorkflowData},
+    tokenizer_shares::{self, FilesRead},
+};
 use crate::{
     app_context::AppContext,
     config::{TokenizerCacheConfig, TEMPLATE_PARSER},
@@ -380,12 +383,7 @@ async fn load_tokenizer(
     chat_template: Option<&str>,
     cache_cfg: Option<TokenizerCacheConfig>,
 ) -> Result<Arc<dyn Tokenizer>, String> {
-    let base_tokenizer = match factory::create_tokenizer_async_with_chat_template(
-        source,
-        chat_template,
-    )
-    .await
-    {
+    let base_tokenizer = match load_from_source(source, chat_template).await {
         Ok(tok) => tok,
         Err(local_err) => {
             debug!(
@@ -404,6 +402,25 @@ async fn load_tokenizer(
     };
 
     Ok(with_optional_cache(base_tokenizer, cache_cfg))
+}
+
+/// The tokenizer the factory makes of `source` and `chat_template`, or the
+/// one another name handed the same source already holds for the same files
+/// (see [`tokenizer_shares`]): a name over files a tokenizer was loaded from
+/// reads them once more to know that, and parses nothing.
+async fn load_from_source(
+    source: &str,
+    chat_template: Option<&str>,
+) -> anyhow::Result<Arc<dyn Tokenizer>> {
+    let read = {
+        let (source, chat_template) = (source.to_owned(), chat_template.map(str::to_owned));
+        move || FilesRead::of(&source, chat_template.as_deref())
+    };
+    tokenizer_shares::shares()
+        .load(read, || {
+            factory::create_tokenizer_async_with_chat_template(source, chat_template)
+        })
+        .await
 }
 
 /// What a load that ended means for the step: a tokenizer loaded is logged
@@ -563,7 +580,19 @@ async fn fetch_tokenizer_from_worker(
         ));
     }
 
-    let mut failures = Vec::new();
+    // A failed job keeps this error, so it names the first failure alone: a
+    // fleet that cannot serve the tokenizer would name every worker in each.
+    // For the same reason a fetch warns of its first bundle that fails to
+    // load, not of each.
+    let mut first_failure: Option<String> = None;
+    let mut load_warned = false;
+    let mut keep_first = |failure: String| {
+        if first_failure.is_none() {
+            first_failure = Some(failure);
+        } else {
+            debug!("Tokenizer fetch for model '{model_id}' failed on a further worker: {failure}");
+        }
+    };
     let worker_count = workers.len();
 
     for worker in workers {
@@ -577,7 +606,7 @@ async fn fetch_tokenizer_from_worker(
         let bundle = match fetch_bundle(worker.as_ref()).await {
             Ok(bundle) => bundle,
             Err(failure) => {
-                failures.push(failure);
+                keep_first(failure);
                 continue;
             }
         };
@@ -590,16 +619,20 @@ async fn fetch_tokenizer_from_worker(
             chat_template_path,
         ) {
             Ok(tokenizer) => return Ok(tokenizer),
-            Err(e) => failures.push(format!(
-                "worker {} (runtime: {runtime}) bundle extraction/load failed: {e}",
-                worker.redacted_url(),
-            )),
+            Err(e) => {
+                let failure = format!("worker {} (runtime: {runtime}) {e}", worker.redacted_url());
+                if !load_warned {
+                    load_warned = true;
+                    warn!("Tokenizer fetch for model '{model_id}': {failure}");
+                }
+                keep_first(failure);
+            }
         };
     }
 
-    let failures_summary = failures.join("; ");
+    let first_failure = first_failure.unwrap_or_default();
     Err(format!(
-        "Failed to fetch tokenizer for model '{model_id}' from {worker_count} ready or pending gRPC worker(s): {failures_summary}"
+        "Failed to fetch tokenizer for model '{model_id}' from {worker_count} ready or pending gRPC worker(s), first failure: {first_failure}"
     ))
 }
 
@@ -1193,5 +1226,295 @@ mod tests {
         assert!(app_context.tokenizer_registry.get_by_name("m").is_none());
         assert_eq!(app_context.tokenizer_registry.len(), 0);
         assert!(!app_context.worker_loaded_tokenizers.contains("t1"));
+    }
+
+    /// A failed job keeps the fetch error: it names the first failure, not
+    /// one for every worker tried.
+    #[tokio::test]
+    async fn a_failed_fetch_names_its_first_failure_alone() {
+        let workers = WorkerRegistry::new();
+        // The ready worker is tried first, though it registers second.
+        for (url, status) in [
+            ("grpc://127.0.0.1:9", WorkerStatus::Pending),
+            ("grpc://127.0.0.1:11", WorkerStatus::Ready),
+        ] {
+            workers
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .worker_type(WorkerType::Regular)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .model(ModelCard::new("m"))
+                        .health_config(no_health_check())
+                        .status(status)
+                        .build(),
+                ))
+                .expect("register worker");
+        }
+        let error = fetch_tokenizer_from_worker(&app_context(workers), "t", "m", None)
+            .await
+            .err()
+            .expect("no worker serves a tokenizer");
+        assert!(
+            error.contains("from 2 ready or pending gRPC worker(s), first failure: "),
+            "{error}"
+        );
+        assert!(error.contains("grpc://127.0.0.1:11 (runtime"), "{error}");
+        assert!(!error.contains("grpc://127.0.0.1:9 (runtime"), "{error}");
+    }
+
+    /// A request for the tokenizer of `source` under `name`, nothing set
+    /// beside it.
+    fn request(name: &str, source: &std::path::Path) -> TokenizerConfigRequest {
+        TokenizerConfigRequest {
+            id: TokenizerRegistry::generate_id(),
+            name: name.to_string(),
+            source: source.to_str().unwrap().to_string(),
+            chat_template_path: None,
+            cache_config: None,
+            fail_on_duplicate: false,
+            for_worker: false,
+        }
+    }
+
+    /// The registration step run for `request`; the entry it left.
+    async fn registered(
+        app_context: &Arc<AppContext>,
+        request: TokenizerConfigRequest,
+    ) -> llm_tokenizer::registry::TokenizerEntry {
+        let name = request.name.clone();
+        let mut context = WorkflowContext::new(
+            WorkflowInstanceId::new(),
+            create_tokenizer_workflow_data(request, Arc::clone(app_context)),
+        );
+        let result = LoadTokenizerStep
+            .execute(&mut context)
+            .await
+            .expect("the step runs");
+        assert_eq!(result, StepResult::Success);
+        app_context.tokenizer_registry.get_by_name(&name).unwrap()
+    }
+
+    /// What the tokenizer of `entry` renders of one user message, `hi`.
+    fn rendered(entry: &llm_tokenizer::registry::TokenizerEntry) -> String {
+        use llm_tokenizer::chat_template::ChatTemplateParams;
+
+        let messages = [serde_json::json!({"role": "user", "content": "hi"})];
+        entry
+            .tokenizer
+            .apply_chat_template(&messages, ChatTemplateParams::default())
+            .unwrap()
+    }
+
+    /// Two names over one tokenizer directory hold one tokenizer, each
+    /// under its own entry and id.
+    #[tokio::test]
+    async fn two_names_over_one_tokenizer_directory_hold_one_tokenizer() {
+        let dir = test_support::tokenizer_dir();
+        let app_context = app_context(WorkerRegistry::new());
+
+        let first = registered(&app_context, request("first", dir.path())).await;
+        let second = registered(&app_context, request("second", dir.path())).await;
+
+        assert!(Arc::ptr_eq(&first.tokenizer, &second.tokenizer));
+        assert_ne!(first.id, second.id);
+        assert_eq!(app_context.tokenizer_registry.len(), 2);
+    }
+
+    /// Two spellings of one directory are two sources: each name holds its
+    /// own tokenizer.
+    #[tokio::test]
+    async fn two_spellings_of_one_directory_hold_two_tokenizers() {
+        let dir = test_support::tokenizer_dir();
+        let app_context = app_context(WorkerRegistry::new());
+
+        let first = registered(&app_context, request("first", dir.path())).await;
+        let second = registered(&app_context, request("second", &dir.path().join("."))).await;
+
+        assert!(!Arc::ptr_eq(&first.tokenizer, &second.tokenizer));
+    }
+
+    /// Two names registered at once over one directory end with one
+    /// tokenizer: the second load waits for the first and takes its
+    /// tokenizer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_names_loading_one_directory_at_once_hold_one_tokenizer() {
+        for _ in 0..8 {
+            let dir = test_support::tokenizer_dir();
+            let app_context = app_context(WorkerRegistry::new());
+            let loads = ["first", "second", "third"].map(|name| {
+                let (app_context, request) = (app_context.clone(), request(name, dir.path()));
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "the test awaits the task it spawns"
+                )]
+                tokio::spawn(async move { registered(&app_context, request).await })
+            });
+
+            let mut entries = Vec::new();
+            for load in loads {
+                entries.push(load.await.unwrap());
+            }
+            assert!(entries
+                .iter()
+                .all(|entry| Arc::ptr_eq(&entry.tokenizer, &entries[0].tokenizer)));
+        }
+    }
+
+    /// A tokenizer file rewritten between two loads is read anew: the later
+    /// name gets the new vocabulary, the earlier one keeps what it loaded.
+    #[tokio::test]
+    async fn a_tokenizer_file_rewritten_between_two_loads_is_read_anew() {
+        let dir = test_support::tokenizer_dir();
+        let app_context = app_context(WorkerRegistry::new());
+        let first = registered(&app_context, request("first", dir.path())).await;
+
+        let file = dir.path().join("tokenizer.json");
+        let rewritten = std::fs::read_to_string(&file)
+            .unwrap()
+            .replace(r#""<unk>": 1}"#, r#""<unk>": 1, "world": 2}"#);
+        std::fs::write(&file, rewritten).unwrap();
+        let second = registered(&app_context, request("second", dir.path())).await;
+
+        assert!(!Arc::ptr_eq(&first.tokenizer, &second.tokenizer));
+        assert_eq!(first.tokenizer.token_to_id("world"), None);
+        assert_eq!(second.tokenizer.token_to_id("world"), Some(2));
+    }
+
+    /// A load reads below the tokenizer's directory too: a file one
+    /// directory down rewritten between two loads is read anew, and the
+    /// names behind it share again.
+    #[tokio::test]
+    async fn a_file_one_directory_down_rewritten_between_two_loads_is_read_anew() {
+        let dir = test_support::tokenizer_dir();
+        let below = dir.path().join("below");
+        std::fs::create_dir(&below).unwrap();
+        std::fs::write(below.join("table"), "one").unwrap();
+        let app_context = app_context(WorkerRegistry::new());
+        let first = registered(&app_context, request("first", dir.path())).await;
+
+        std::fs::write(below.join("table"), "two").unwrap();
+        let second = registered(&app_context, request("second", dir.path())).await;
+        let third = registered(&app_context, request("third", dir.path())).await;
+
+        assert!(!Arc::ptr_eq(&first.tokenizer, &second.tokenizer));
+        assert!(Arc::ptr_eq(&second.tokenizer, &third.tokenizer));
+    }
+
+    /// Two links to one tokenizer file, each beside a `tokenizer_config.json`
+    /// of its own, are two tokenizers: a load reads beside the path it is
+    /// pointed at, so each name renders the template of its own directory.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn two_links_to_one_tokenizer_file_each_render_the_template_beside_them() {
+        use std::os::unix::fs::symlink;
+
+        let shared = test_support::tokenizer_dir();
+        let linked = |template: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            symlink(
+                shared.path().join("tokenizer.json"),
+                dir.path().join("tokenizer.json"),
+            )
+            .unwrap();
+            std::fs::write(
+                dir.path().join("tokenizer_config.json"),
+                serde_json::json!({ "chat_template": template }).to_string(),
+            )
+            .unwrap();
+            dir
+        };
+        let formal = linked("formal: {{ messages[0]['content'] }}");
+        let casual = linked("casual: {{ messages[0]['content'] }}");
+        let app_context = app_context(WorkerRegistry::new());
+
+        let first = formal.path().join("tokenizer.json");
+        let first = registered(&app_context, request("first", &first)).await;
+        let second = casual.path().join("tokenizer.json");
+        let second = registered(&app_context, request("second", &second)).await;
+
+        assert_eq!(rendered(&first), "formal: hi");
+        assert_eq!(rendered(&second), "casual: hi");
+    }
+
+    /// A name removed leaves the tokenizer to the name that shares it, and
+    /// the tokenizer goes with its last name: nothing else keeps it.
+    #[tokio::test]
+    async fn a_name_removed_leaves_the_shared_tokenizer_to_the_other_name() {
+        let dir = test_support::tokenizer_dir();
+        let app_context = app_context(WorkerRegistry::new());
+        let registry = &app_context.tokenizer_registry;
+        registered(&app_context, request("first", dir.path())).await;
+        registered(&app_context, request("second", dir.path())).await;
+
+        drop(registry.remove("first"));
+        let second = registry.get("second").unwrap();
+        assert_eq!(second.token_to_id("hello"), Some(0));
+
+        let tokenizer = Arc::downgrade(&second);
+        drop(second);
+        drop(registry.remove("second"));
+        assert!(tokenizer.upgrade().is_none());
+
+        // A name registered after the last holder went loads afresh.
+        let third = registered(&app_context, request("third", dir.path())).await;
+        assert_eq!(third.tokenizer.token_to_id("hello"), Some(0));
+    }
+
+    /// What a name sets beside the vocabulary stays its own: a chat
+    /// template file makes a tokenizer of its own for the names that hand
+    /// it in, and a cache wraps the shared tokenizer for its name alone.
+    #[tokio::test]
+    async fn a_names_chat_template_and_cache_stay_its_own() {
+        let dir = test_support::tokenizer_dir();
+        let templates = tempfile::tempdir().unwrap();
+        let template = |name: &str, text: &str| {
+            let path = templates.path().join(name);
+            std::fs::write(&path, text).unwrap();
+            Some(path.to_str().unwrap().to_string())
+        };
+        let formal = template("formal.jinja", "formal: {{ messages[0]['content'] }}");
+        let casual = template("casual.jinja", "casual: {{ messages[0]['content'] }}");
+        let app_context = app_context(WorkerRegistry::new());
+        let with = |name: &str, chat_template_path: &Option<String>| TokenizerConfigRequest {
+            chat_template_path: chat_template_path.clone(),
+            ..request(name, dir.path())
+        };
+
+        let plain = registered(&app_context, with("plain", &None)).await;
+        let first = registered(&app_context, with("first", &formal)).await;
+        let second = registered(&app_context, with("second", &casual)).await;
+        let third = registered(&app_context, with("third", &formal)).await;
+
+        assert_eq!(rendered(&first), "formal: hi");
+        assert_eq!(rendered(&second), "casual: hi");
+        assert_eq!(rendered(&third), "formal: hi");
+        assert!(Arc::ptr_eq(&first.tokenizer, &third.tokenizer));
+        assert!(!Arc::ptr_eq(&first.tokenizer, &second.tokenizer));
+        assert!(!Arc::ptr_eq(&first.tokenizer, &plain.tokenizer));
+
+        // A name with a cache holds its own wrapper around the tokenizer
+        // the plain name holds.
+        let cached = TokenizerConfigRequest {
+            cache_config: Some(TokenizerCacheConfig {
+                enable_l0: true,
+                l0_max_entries: 16,
+                l0_max_memory: 1 << 20,
+                enable_l1: false,
+                l1_max_memory: 0,
+            }),
+            ..request("cached", dir.path())
+        };
+        let cached = registered(&app_context, cached).await;
+        let wrapper = cached
+            .tokenizer
+            .as_any()
+            .downcast_ref::<CachedTokenizer>()
+            .expect("the name asked for a cache");
+        assert!(Arc::ptr_eq(wrapper.inner(), &plain.tokenizer));
+        assert!(plain
+            .tokenizer
+            .as_any()
+            .downcast_ref::<CachedTokenizer>()
+            .is_none());
     }
 }

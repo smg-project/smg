@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use clap::ValueEnum;
 pub use llm_multimodal::jpeg_turbo::TurboJpegPolicy;
@@ -9,7 +9,7 @@ use serde::{de, Deserialize, Deserializer, Serialize};
 pub use smg_data_connector::{
     HistoryBackend, MemoryConfig, OracleConfig, PostgresConfig, RedisConfig, SchemaConfig,
 };
-use smg_policy_controller::document::PolicySpec;
+use smg_grand_central::document::PolicySpec;
 use smg_service_discovery::Roles;
 pub use smg_service_discovery::{
     deserialize_discovery, ConsulDiscoveryConfig, DiscoveryConfig, FileDiscoveryConfig,
@@ -49,9 +49,11 @@ pub enum ParserChoice {
     Legacy,
     /// Symphony's tables, the default, by one precedence per model
     /// (`routers::grpc::regular::symphony::names::reads`):
-    /// the table its worker labels select, when they select anything; else the registry's table
-    /// for a model it knows; else the one the `--tool-call-parser` and `--reasoning-parser` flags
-    /// select, for a model the registry does not know. Names select a table when it answers to
+    /// the table its worker labels select, when they select anything; else the one the
+    /// `--tool-call-parser` and `--reasoning-parser` flags select, when they select anything; else
+    /// the registry's table for a model it knows. A reasoning name alone in the flags that a table
+    /// answers to comes after the registry: its table reads only the models the registry does not
+    /// know. Names select a table when it answers to
     /// them: its own name, a legacy parser's that reads its format (`qwen` for `qwen3`, `qwen_xml`
     /// for `qwen3_tagged`), or a launcher's for a family whose table has no older parser (`muse`
     /// for `muse_spark`); `hf` selects the model's response template's table; a reasoning name
@@ -94,10 +96,11 @@ pub struct RouterConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_worker_runtime_type: Option<RuntimeType>,
     /// DP engines per startup ZMQ worker: each `--worker-urls` ZMQ worker
-    /// becomes a grouped worker whose handshake awaits this many engines on
-    /// one socket set (`dp_size` on the worker spec, no rank), or, under
-    /// `dp_aware`, one worker per engine sharing that socket set. `None`/1
-    /// keeps today's one-engine workers; HTTP/gRPC workers ignore this field.
+    /// given a count above one registers as one worker per engine, which
+    /// share one socket set whose handshake awaits that many engines
+    /// (`dp_size` on the worker spec). `None`/1 keeps one worker per URL: a
+    /// one-engine worker, or a grouped worker where its engines declare
+    /// several at the handshake. HTTP/gRPC workers ignore this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zmq_engine_count: Option<usize>,
     pub policy: PolicyConfig,
@@ -163,9 +166,10 @@ pub struct RouterConfig {
     pub max_payload_size: usize,
     /// Most bytes the router may hold for a request it buffers only to keep
     /// it retryable; a larger eligible request streams to the worker verbatim
-    /// and forfeits router-level retries. `0` never buffers for retries.
-    /// Requests the router must parse buffer regardless, bounded by
-    /// `max_payload_size`.
+    /// and forfeits router-level retries. Requests the router must parse buffer
+    /// regardless, bounded by `max_payload_size`. This also bounds the
+    /// transcription audio held for one resend after a pre-response connection
+    /// failure; `0` disables both kinds of buffering.
     #[serde(default = "default_max_buffered_request_bytes")]
     pub max_buffered_request_bytes: u64,
     /// Abort a streamed request body once the upstream sender has waited on
@@ -236,6 +240,10 @@ pub struct RouterConfig {
     /// backend HTTP server's keep-alive timeout (the engines default to
     /// 5s), or the pool hands out connections the server has already closed
     /// and non-idempotent sends fail. `0` keeps idle connections forever.
+    /// While a nonzero value is below `load_monitor_interval_secs`, an idle
+    /// HTTP worker is connected anew for every load poll; where the server's
+    /// keep-alive can be raised above that interval, a value between the two
+    /// keeps the connection.
     #[serde(default = "default_upstream_pool_idle_timeout_secs")]
     pub upstream_pool_idle_timeout_secs: u64,
     pub worker_startup_timeout_secs: u64,
@@ -265,6 +273,12 @@ pub struct RouterConfig {
     pub job_queue_concurrency: usize,
     #[serde(default = "default_load_monitor_interval_secs")]
     pub load_monitor_interval_secs: u64,
+    /// The load monitor's interval in milliseconds, 100 at the least. When
+    /// set it is the interval, and `load_monitor_interval_secs` is not read
+    /// for it. The overload shed's Retry-After stays whole seconds: this
+    /// value raised to the next one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_monitor_interval_ms: Option<u64>,
     /// Seconds without any contact from a worker (a load poll, a health probe,
     /// a KV event, a response) after which a transport failure excludes it
     /// from routing; the first successful contact re-admits it.
@@ -364,8 +378,7 @@ pub struct RouterConfig {
     /// places by its routing key, placing it by its policy). Off by
     /// default: a fleet that is uniformly over the thresholds is still a
     /// fleet, and the dispatch-time re-check that sheds a worker flagged
-    /// between selection and dispatch is part of the same opt-in. A request
-    /// the policy controller placed is not re-checked.
+    /// between selection and dispatch is part of the same opt-in.
     #[serde(default)]
     pub worker_overload_shed: bool,
     /// Force `GetLoads` polling for `smg_engine_*` gauges even when no
@@ -451,6 +464,10 @@ pub struct RouterConfig {
     /// `SMG_LOG_MM_TIMING`.
     #[serde(default)]
     pub log_mm_timing: bool,
+    /// Deprecated, accepted and ignored: every registration reads an
+    /// engine's data-parallel size and registers one worker per rank, with
+    /// this set or not. Start-up warns when it is set.
+    #[serde(default)]
     pub dp_aware: bool,
     #[serde(default)]
     pub dp_minimum_tokens_scheduler: bool,
@@ -657,30 +674,17 @@ pub struct RouterConfig {
     /// When set, wraps all storage backends with hook-based interceptors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_hook_wasm_path: Option<String>,
-    /// Select the policy controller for this process. The classic policies
-    /// are the default. Written where it is on, so a configuration under a
-    /// controller's address reads back with the setting the address needs.
+    /// Select Grand Central for this process. The classic policies
+    /// are the default. Written where it is on.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub policy_controller: bool,
-    /// Address of the controller's gateway listener, as `host:port`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub policy_controller_address: Option<String>,
-    /// PEM certificate authority file for the controller connection.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub policy_controller_tls_ca_cert: Option<String>,
-    /// PEM client certificate file for the controller connection.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub policy_controller_tls_cert: Option<String>,
-    /// PEM client private key file for the controller connection.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub policy_controller_tls_key: Option<String>,
+    pub grand_central: bool,
     /// Path to the policy document the controller runs in place of the one
-    /// the routing settings mean. Requires the policy controller.
+    /// the routing settings mean. Requires Grand Central.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_spec_path: Option<String>,
     /// The policy document the controller runs. The builder loads it from
-    /// `policy_spec_path`; a host may set it directly. Requires the policy
-    /// controller.
+    /// `policy_spec_path`; a host may set it directly. Requires Grand
+    /// Central.
     #[serde(skip)]
     pub policy_spec: Option<PolicySpec>,
 }
@@ -689,8 +693,9 @@ pub struct RouterConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ReadinessRoleConfig {
-    /// Desired fleet size used as the stable percentage denominator. Has no
-    /// effect unless `min_healthy_percent` is also set.
+    /// Desired fleet size used as the stable percentage denominator. It
+    /// enables no percentage gate unless `min_healthy_percent` is also set.
+    /// `min_healthy_workers` may not exceed it.
     pub expected_workers: Option<usize>,
     /// Absolute safety floor, independent of the percentage threshold.
     pub min_healthy_workers: usize,
@@ -1325,11 +1330,11 @@ impl Default for RoutingKeyOverrideConfig {
 
 /// How a request with a sticky key is placed on the engines (data-parallel
 /// ranks) of a grouped worker: one worker URL whose socket set several
-/// engines dial (as many as `--zmq-engine-count` above one or `dp_size` on
-/// its spec says, or, given no count, as its engines declare at the
-/// handshake). A group that `dp_aware` expanded into rank workers is not a
-/// grouped worker: there the routing policy's pick is the rank, and this
-/// setting does nothing. Routing policies see the group as one worker, and its
+/// engines dial, as many as they declare at the handshake. A group given a
+/// count (`--zmq-engine-count` above one, or `dp_size` on its spec) is
+/// registered as one worker per engine and is not a grouped worker: there
+/// the routing policy's pick is the rank, and this setting does nothing.
+/// Routing policies see the group as one worker, and its
 /// connection otherwise sends each request to its least-loaded engine,
 /// which scatters one conversation's turns over the engines' separate
 /// prefix caches. The key is the one sticky routing reads: the first valid
@@ -1545,7 +1550,7 @@ pub enum PolicyConfig {
     /// with the lower expected wait, scored like `least_load`
     /// (`(queued_tokens + inflight_tokens) / throughput + kv_pressure_weight * k/(1-k)`).
     /// The worker loads it reads are polled at the gateway's one cadence,
-    /// `load_monitor_interval_secs`.
+    /// `load_monitor_interval_secs`, or `load_monitor_interval_ms` where set.
     #[serde(rename = "power_of_two")]
     PowerOfTwo {
         #[serde(default)]
@@ -1727,8 +1732,9 @@ fn default_least_load_throughput() -> f64 {
 }
 
 /// The per-policy poll interval of earlier releases. The load monitor has one
-/// cadence, `load_monitor_interval_secs`; a policy configuration that still
-/// sets this key is refused with that knob named, never silently ignored.
+/// cadence, `load_monitor_interval_secs` or `load_monitor_interval_ms` where
+/// set; a policy configuration that still sets this key is refused with the
+/// seconds knob named, never silently ignored.
 pub const RETIRED_POLICY_INTERVAL_KEY: &str = "load_check_interval_secs";
 
 /// least_load's per-worker waiting-queue cap of earlier releases. The router's
@@ -2011,6 +2017,7 @@ impl Default for RouterConfig {
             job_queue_capacity: default_job_queue_capacity(),
             job_queue_concurrency: default_job_queue_concurrency(),
             load_monitor_interval_secs: 10,
+            load_monitor_interval_ms: None,
             worker_stall_secs: default_worker_stall_secs(),
             worker_wedge_secs: default_worker_wedge_secs(),
             worker_stale_secs: default_worker_stale_secs(),
@@ -2101,11 +2108,7 @@ impl Default for RouterConfig {
             mcp_config: None,
             enable_wasm: false,
             storage_hook_wasm_path: None,
-            policy_controller: false,
-            policy_controller_address: None,
-            policy_controller_tls_ca_cert: None,
-            policy_controller_tls_cert: None,
-            policy_controller_tls_key: None,
+            grand_central: false,
             policy_spec_path: None,
             policy_spec: None,
             server_cert: None,
@@ -2129,6 +2132,15 @@ impl RouterConfig {
     /// Validate the configuration
     pub fn validate(&self) -> ConfigResult<()> {
         ConfigValidator::validate(self)
+    }
+
+    /// The load monitor's interval: `load_monitor_interval_ms` where it is
+    /// set, `load_monitor_interval_secs` where it is not.
+    pub fn load_monitor_interval(&self) -> Duration {
+        match self.load_monitor_interval_ms {
+            Some(millis) => Duration::from_millis(millis),
+            None => Duration::from_secs(self.load_monitor_interval_secs),
+        }
     }
 
     /// Connection attempts per health-check success stamped on a worker
@@ -2179,23 +2191,6 @@ impl RouterConfig {
         }
     }
 
-    /// The provider's name, where every router of the gateway is that
-    /// provider's: a provider mode without the multi-router setting
-    /// (`enable_igw`). Such a gateway places its requests by no routing
-    /// policy. A multi-router gateway mounts the routers of self-hosted
-    /// workers beside the provider's, and reads `None` here.
-    pub(crate) fn provider_alone(&self) -> Option<&'static str> {
-        let provider = match self.mode {
-            RoutingMode::OpenAI { .. }
-            | RoutingMode::Anthropic { .. }
-            | RoutingMode::Gemini { .. } => true,
-            RoutingMode::Regular { .. }
-            | RoutingMode::PrefillDecode { .. }
-            | RoutingMode::EncodePrefillDecode { .. } => false,
-        };
-        (provider && !self.enable_igw).then(|| self.mode_type())
-    }
-
     /// Check if service discovery is enabled
     pub fn has_service_discovery(&self) -> bool {
         self.discovery.is_some()
@@ -2235,43 +2230,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_controller_options_round_trip_and_unset_options_are_omitted() {
-        let default = serde_json::to_value(RouterConfig::default()).unwrap();
-        let paths = [
-            ("policy_controller_address", "controller:30100"),
-            ("policy_controller_tls_ca_cert", "ca.pem"),
-            ("policy_controller_tls_cert", "cert.pem"),
-            ("policy_controller_tls_key", "key.pem"),
-        ];
-        let mut configured = default.clone();
-        for (name, value) in paths {
-            assert!(default.get(name).is_none(), "{name}");
-            configured[name] = value.into();
-        }
-        // The setting the address needs is written where it is on, and
-        // nowhere else.
-        assert!(default.get("policy_controller").is_none());
-        configured["policy_controller"] = true.into();
-        let config: RouterConfig = serde_json::from_value(configured).unwrap();
-        assert!(config.policy_controller);
-        assert_eq!(
-            config.policy_controller_address.as_deref(),
-            Some("controller:30100")
-        );
-        assert_eq!(
-            config.policy_controller_tls_ca_cert.as_deref(),
-            Some("ca.pem")
-        );
-        assert_eq!(
-            config.policy_controller_tls_cert.as_deref(),
-            Some("cert.pem")
-        );
-        assert_eq!(config.policy_controller_tls_key.as_deref(), Some("key.pem"));
-        let serialized = serde_json::to_value(config).unwrap();
-        for (name, value) in paths {
-            assert_eq!(serialized[name], value);
-        }
-        assert_eq!(serialized["policy_controller"], true);
+    fn the_switch_is_written_where_it_is_on() {
+        let config = RouterConfig::default();
+        let form = serde_json::to_value(&config).expect("a config serializes");
+        assert!(form.get("grand_central").is_none());
+        let restored: RouterConfig = serde_json::from_value(form).expect("a config reads back");
+        assert!(!restored.grand_central);
+
+        let config = RouterConfig {
+            grand_central: true,
+            ..config
+        };
+        let form = serde_json::to_value(&config).expect("a config serializes");
+        assert_eq!(form["grand_central"], true);
+        let restored: RouterConfig = serde_json::from_value(form).expect("a config reads back");
+        assert!(restored.grand_central);
     }
 
     #[test]
@@ -2283,7 +2256,7 @@ mod tests {
         assert!(restored.policy_spec_path.is_none());
 
         let config = RouterConfig {
-            policy_controller: true,
+            grand_central: true,
             policy_spec_path: Some("routing.yaml".to_owned()),
             policy_spec: Some(config.policy_document().expect("the default document")),
             ..config
@@ -2504,6 +2477,42 @@ mod tests {
         assert!(json.contains("health_check_port"));
         let with: RouterConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(with.health_check_port, Some(8081));
+    }
+
+    /// The load monitor's interval in milliseconds is unset by default and
+    /// stays out of a serialized configuration, and a configuration written
+    /// before the key reads as unset. Where it is set it is the interval
+    /// over the seconds, which stand beside it. Where it is not, the
+    /// seconds are the interval.
+    #[test]
+    fn the_load_monitor_interval_in_milliseconds_wins_over_the_seconds() {
+        let config = RouterConfig::default();
+        assert_eq!(config.load_monitor_interval_ms, None);
+        assert_eq!(config.load_monitor_interval(), Duration::from_secs(10));
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(!json.contains("load_monitor_interval_ms"));
+        let without: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(without.load_monitor_interval_ms, None);
+
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .load_monitor_interval_secs(5)
+            .load_monitor_interval_ms(Some(250))
+            .build_unchecked();
+        assert_eq!(config.load_monitor_interval(), Duration::from_millis(250));
+        let json = serde_json::to_string(&config).unwrap();
+        let with: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(with.load_monitor_interval_secs, 5);
+        assert_eq!(with.load_monitor_interval_ms, Some(250));
+
+        let seconds_alone = RouterConfig {
+            load_monitor_interval_secs: 5,
+            ..RouterConfig::default()
+        };
+        assert_eq!(
+            seconds_alone.load_monitor_interval(),
+            Duration::from_secs(5)
+        );
     }
 
     #[test]
@@ -3372,6 +3381,7 @@ mod tests {
         assert_eq!(config.bootstrap_port_annotation, "sglang.ai/bootstrap-port");
         assert_eq!(config.kv_connector_annotation, "smg.ai/kv-connector");
         assert_eq!(config.kv_engine_id_annotation, "smg.ai/kv-engine-id");
+        assert_eq!(config.pairing_protocol_label, "smg.ai/pairing-protocol");
     }
 
     #[test]
@@ -3392,6 +3402,7 @@ mod tests {
             worker_ports_annotation: "smg.ai/worker-ports".to_string(),
             kv_connector_annotation: "custom.io/kv-connector".to_string(),
             kv_engine_id_annotation: "custom.io/kv-engine-id".to_string(),
+            pairing_protocol_label: "custom.io/pairing-protocol".to_string(),
             router_selector: HashMap::new(),
             router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
             model_id_source: None,
@@ -3871,6 +3882,7 @@ discovery:
                     worker_ports_annotation: "smg.ai/worker-ports".to_string(),
                     kv_connector_annotation: "smg.ai/kv-connector".to_string(),
                     kv_engine_id_annotation: "smg.ai/kv-engine-id".to_string(),
+                    pairing_protocol_label: "smg.ai/pairing-protocol".to_string(),
                     router_selector: HashMap::new(),
                     router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
                     model_id_source: None,

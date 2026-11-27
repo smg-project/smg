@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use axum::response::Response;
+use smg_grpc_client::is_request_timeout;
 use smg_worker::identity::basic::Worker;
 use tracing::error as trace_error;
 
@@ -15,9 +16,11 @@ use crate::{
             attempt_ledger::mark_pending_charge,
             pd_failure::{PdSide, SidePhase},
             prefill_admission::PrefillLoadGuard,
+            retry::mark_non_retryable,
         },
         error,
         grpc::{
+            common::stages::request_execution::tell_prefill_failure,
             context::ExecutionResult,
             proto_wrapper::{
                 FanoutChild, PrefillCachedTokens, ProtoGenerateComplete, ProtoResponseVariant,
@@ -26,12 +29,45 @@ use crate::{
             utils::{
                 account_pd_side_failure, dead_rendezvous_of, mark_error_reason,
                 stream_failure::UpstreamClass,
-                tonic_ext::{is_the_engines_own_report, TonicStatusExt},
+                tonic_ext::{is_receive_bound_refusal, is_the_engines_own_report, TonicStatusExt},
                 DeadRendezvous,
             },
         },
     },
 };
+
+/// Which reader drains a pair's prefill stream: what the circuit breaker
+/// samples where the stream fails under it, and so what Grand Central is
+/// told there. A collected answer does not charge the engine's own report
+/// of a failed request. A streamed answer charges every sample. A reader
+/// is a type of no size: the drain holds nothing for it.
+pub(crate) trait PrefillReader: Copy + Send {
+    /// Whether the circuit breaker samples the failure `e` under this
+    /// reader.
+    fn samples(self, e: &tonic::Status) -> bool;
+}
+
+/// The reader of a collected answer.
+#[derive(Clone, Copy)]
+pub(crate) struct CollectedAnswer;
+
+/// The reader of a streamed answer.
+#[derive(Clone, Copy)]
+pub(crate) struct StreamedAnswer;
+
+impl PrefillReader for CollectedAnswer {
+    #[inline]
+    fn samples(self, e: &tonic::Status) -> bool {
+        !is_the_engines_own_report(e)
+    }
+}
+
+impl PrefillReader for StreamedAnswer {
+    #[inline]
+    fn samples(self, _e: &tonic::Status) -> bool {
+        true
+    }
+}
 
 /// Drain each Prefill sample through its terminal response, releasing only that
 /// sample's guard. A fan-out's first `Complete` does not finish its siblings.
@@ -42,10 +78,16 @@ use crate::{
 /// prompt-side usage, which the decode side's responses are restamped with
 /// (`ProtoStream::decode_side`); empty for a stream the execution stage
 /// drained itself.
+///
+/// Grand Central hears a failure here and nothing else: each load still
+/// held is told the failure as `reader` samples it. A sample's `Complete`
+/// tells nothing: the dispatch told the prefill's good answer at its first
+/// response.
 pub(crate) async fn drain_prefill<S: FanoutChild>(
     stream: &mut S,
     mut guards: Vec<Option<PrefillLoadGuard>>,
     finish_at_complete: bool,
+    reader: impl PrefillReader,
     mut on_complete: impl FnMut(ProtoGenerateComplete) + Send,
 ) -> Result<PrefillCachedTokens, tonic::Status> {
     let mut remaining = guards.len();
@@ -56,6 +98,11 @@ pub(crate) async fn drain_prefill<S: FanoutChild>(
         // counted under the rendezvous family before the failure propagates.
         let response = response.inspect_err(|status| {
             account_pd_side_failure(metrics_labels::WORKER_PREFILL, status);
+            if reader.samples(status) {
+                for guard in guards.iter().flatten() {
+                    tell_prefill_failure(guard, status);
+                }
+            }
         })?;
         if let ProtoResponseVariant::Complete(complete) = response.into_response() {
             // Fan-out responses are restamped with their dispatch positions.
@@ -145,22 +192,34 @@ async fn collect_prefill_decode(
 ) -> Result<Vec<ProtoGenerateComplete>, Response> {
     // The side's worker, when its stream is tracked (the parallel dispatch
     // books the side on it and leaves the side's breaker sample to its reader):
-    // a failure met here is the worker's, sampled on its breaker and counted
-    // once, as a streamed answer's reader does it.
+    // a failure met here is the worker's, counted once; its breaker sample is
+    // the dispatch loop's to take through the request's ledger, so a replayed
+    // request charges the worker once. The engine's own report is not
+    // charged, as on the decode side.
     let prefill_worker = prefill.worker().cloned();
     let mut prefill_responses = Vec::new();
-    let prefill_cached_tokens = drain_prefill(&mut prefill, prefill_guards, false, |complete| {
-        prefill_responses.push(complete);
-    })
+    let prefill_cached_tokens = drain_prefill(
+        &mut prefill,
+        prefill_guards,
+        false,
+        CollectedAnswer,
+        |complete| {
+            prefill_responses.push(complete);
+        },
+    )
     .await
     .map_err(|status| {
+        let mut failure = stream_failed(Some(PdSide::Prefill), "Prefill", &status, None);
         if let Some(worker) = &prefill_worker {
-            if let Some(sample) = UpstreamClass::of(&status).breaker_sample {
-                worker.record_outcome(sample);
+            if let Some(sample) = status
+                .breaker_status()
+                .filter(|_| !is_the_engines_own_report(&status))
+            {
+                mark_pending_charge(&mut failure, worker, sample);
             }
             UpstreamClass::account_collected_failure(worker.as_ref(), &status);
         }
-        stream_failed(Some(PdSide::Prefill), "Prefill", &status, None)
+        failure
     })?;
 
     // The client's prompt-side usage is the prefill side's.
@@ -209,6 +268,8 @@ fn merge_prefill_logprobs(
 /// HTTP prefill-decode router answers for the same failure; for a single
 /// worker the code clients know. A worker's report that the engine could not
 /// continue the request under its constraint is answered for the constraint.
+/// The gateway's own request timeout, on any stream, is the timeout's one
+/// answer (`to_http_error`), final for the retry layer.
 fn stream_failed(
     side: Option<PdSide>,
     worker_name: &str,
@@ -229,13 +290,20 @@ fn stream_failed(
                 status.message()
             ),
         ),
-        (None, Some(side)) => {
+        (None, Some(side)) if !is_request_timeout(status) => {
             let mut response =
                 side.answer(SidePhase::Stream, status.http_status(), status.message());
+            // An answer above the receive bound is as large from any
+            // worker: final, as `to_http_error` makes it for a single one.
+            if is_receive_bound_refusal(status) {
+                mark_non_retryable(&mut response);
+            }
             mark_error_reason(&mut response, status.error_reason());
             response
         }
-        (None, None) => status.to_http_error(
+        // A single worker's stream, or a side's the gateway's own request
+        // timeout cut: `to_http_error` gives that timeout its one answer.
+        (None, _) => status.to_http_error(
             "worker_stream_failed",
             format!("{worker_name} stream failed: {}", status.message()),
         ),
@@ -340,17 +408,30 @@ mod tests {
     };
 
     use axum::http::StatusCode;
-    use smg_grpc_client::sglang_proto as sglang;
+    use smg_grpc_client::{sglang_proto as sglang, RequestDeadline};
     use smg_worker::{
-        identity::basic::{ConnectionMode, WorkerType},
+        health::circuit_breaker::CircuitBreakerConfig,
+        identity::basic::{ConnectionMode, RuntimeType, WorkerLoadGuard, WorkerType},
         test_support::RefusedAddress,
     };
     use tracing_test::traced_test;
 
     use super::*;
-    use crate::routers::grpc::{
-        backend_client::BasicWorkerBuilder,
-        proto_wrapper::{ProtoGenerateResponse, ENGINE_ERROR_MESSAGE},
+    use crate::routers::{
+        common::{
+            attempt_ledger::AttemptLedger, placement::tests::heard_request,
+            retry::is_retryable_response,
+        },
+        grpc::{
+            backend_client::BasicWorkerBuilder,
+            common::stages::request_execution::PdSides,
+            context::WorkerSelection,
+            proto_wrapper::{
+                FanoutStream, ProtoGenerateRequest, ProtoGenerateResponse, ENGINE_ERROR_MESSAGE,
+            },
+            regular::streaming::tests::eof::{complete, scripted_stream},
+            sequential_pd::sequential_prefill_side,
+        },
     };
 
     /// A stream that is already at EOF, as sequential PD hands to the
@@ -463,6 +544,7 @@ mod tests {
                 &mut FailingStream(Some(status)),
                 vec![None],
                 true,
+                StreamedAnswer,
                 |_complete| {},
             )
             .await
@@ -730,6 +812,57 @@ mod tests {
         );
     }
 
+    /// A stream a worker's message above the receive bound ended, a single
+    /// worker's or a side's: a 502 under the code each failure has, and
+    /// never replayed, since another worker's answer would be as large.
+    #[test]
+    fn a_stream_the_receive_bound_ended_is_an_upstream_fault_and_final() {
+        let code = |response: &Response| {
+            let header = response.headers().get(error::HEADER_X_SMG_ERROR_CODE);
+            header.and_then(|v| v.to_str().ok()).map(str::to_owned)
+        };
+        let refused = tonic::Status::out_of_range(
+            "Error, decoded message length too large: found 9886731 bytes, the limit is: 4194304 bytes",
+        );
+        let single = stream_failed(None, "worker", &refused, None);
+        assert_eq!(single.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(code(&single).as_deref(), Some("worker_stream_failed"));
+        assert!(!is_retryable_response(&single));
+        for side in [PdSide::Prefill, PdSide::Decode] {
+            let response = stream_failed(Some(side), side.name(), &refused, None);
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(
+                code(&response).as_deref(),
+                Some(side.code(SidePhase::Stream))
+            );
+            assert!(!is_retryable_response(&response));
+        }
+    }
+
+    /// A side's stream the request timeout cut is answered as on every other
+    /// path: under the timeout's code, and never replayed. A worker's own
+    /// deadline is still the side's failure: its code, and a replay.
+    #[test]
+    fn a_side_stream_the_request_timeout_cut_is_the_timeouts_answer_and_final() {
+        let code = |response: &Response| {
+            let header = response.headers().get(error::HEADER_X_SMG_ERROR_CODE);
+            header.and_then(|v| v.to_str().ok()).map(str::to_owned)
+        };
+        let cut = RequestDeadline::after(Duration::from_secs(3)).status();
+        let workers_own = tonic::Status::deadline_exceeded("engine deadline");
+        for side in [PdSide::Prefill, PdSide::Decode] {
+            let response = stream_failed(Some(side), side.name(), &cut, None);
+            assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+            assert_eq!(code(&response).as_deref(), Some("call_upstream_timeout"));
+            assert!(!is_retryable_response(&response));
+
+            let response = stream_failed(Some(side), side.name(), &workers_own, None);
+            let sides_own = side.code(SidePhase::Stream);
+            assert_eq!(code(&response).as_deref(), Some(sides_own));
+            assert!(is_retryable_response(&response));
+        }
+    }
+
     /// A side's stream failure read into a non-streamed answer is counted
     /// under the side's own labels, and only when it is the worker's failure.
     #[test]
@@ -781,13 +914,242 @@ mod tests {
         }
     }
 
+    /// Two attempts of one request each lose the prefill side's stream while
+    /// it is drained: the failures are that request's one word on the prefill
+    /// worker, so a breaker set to two stays closed.
+    #[tokio::test]
+    async fn the_prefill_streams_one_request_loses_charge_one_breaker_failure() {
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://prefill:30001")
+                .worker_type(WorkerType::Prefill)
+                .connection_mode(ConnectionMode::Grpc)
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold: 2,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        let ledger = AttemptLedger::default();
+        for _attempt in 0..2 {
+            // The stream opens and ends UNAVAILABLE before any response.
+            let (stream, _server) = scripted_stream(Vec::new(), "14").await;
+            let Err(failure) = collect_prefill_decode(
+                stream.tracked_prefill_side_booked(Arc::clone(&prefill), None),
+                ProtoStream::Fanout(FanoutStream::new(Vec::new())),
+                vec![None],
+                false,
+            )
+            .await
+            else {
+                panic!("the prefill stream failed");
+            };
+            // The dispatch loop charges an attempt's failure before its retry.
+            ledger.charge_pending(&failure);
+        }
+        assert!(
+            prefill.circuit_breaker_can_execute(),
+            "one request charges the prefill worker once, however many attempts lost its stream"
+        );
+        // ...and it did charge it: the next request's failure is the second
+        // one the breaker counts, and opens it.
+        AttemptLedger::default().record_outcome(prefill.as_ref(), 503);
+        assert!(
+            !prefill.circuit_breaker_can_execute(),
+            "the request's one charge reached the prefill worker's breaker"
+        );
+    }
+
+    /// The engine's own report (a `Complete` finished with reason `error`)
+    /// that ends the prefill side's stream charges no breaker, as on the
+    /// decode side: a breaker set to one stays closed, whichever dispatch
+    /// shape drains the side, unless the answer streams.
+    #[tokio::test]
+    async fn the_engines_own_report_on_the_prefill_stream_charges_no_breaker() {
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://prefill:30001")
+                .worker_type(WorkerType::Prefill)
+                .connection_mode(ConnectionMode::Grpc)
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold: 1,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        let (stream, _server) = scripted_stream(vec![complete(0, "error")], "0").await;
+        let Err(failure) = collect_prefill_decode(
+            stream.tracked_prefill_side_booked(Arc::clone(&prefill), None),
+            ProtoStream::Fanout(FanoutStream::new(Vec::new())),
+            vec![None],
+            false,
+        )
+        .await
+        else {
+            panic!("the prefill stream failed");
+        };
+        AttemptLedger::default().charge_pending(&failure);
+        assert!(
+            prefill.circuit_breaker_can_execute(),
+            "the engine's own report on the prefill stream charges no breaker"
+        );
+
+        // The sequential shape drains the side in its execution stage; there
+        // a streamed answer charges the report.
+        let workers = WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill: Arc::clone(&prefill),
+            decode: Arc::clone(&prefill).into(),
+            runtime_type: RuntimeType::Vllm,
+        };
+        let request = ProtoGenerateRequest::Vllm(Box::default());
+        for streaming in [false, true] {
+            let (stream, _server) = scripted_stream(vec![complete(0, "error")], "0").await;
+            let ledger = AttemptLedger::default();
+            let drained = sequential_prefill_side(
+                &PdSides::of(&workers, &ledger, &request, streaming),
+                Box::pin(async move { Ok::<_, tonic::Status>(stream) }),
+                PrefillLoadGuard::Unbounded {
+                    _guard: WorkerLoadGuard::with_key(Arc::clone(&prefill), None),
+                },
+            )
+            .await;
+            assert!(drained.is_err(), "the sequential prefill drain failed");
+            assert_eq!(
+                prefill.circuit_breaker_can_execute(),
+                !streaming,
+                "the engine's own report on the sequential prefill drain charges no breaker \
+                 unless the answer streams (streaming {streaming})"
+            );
+        }
+    }
+
+    /// A prefill stream that fails under its reader tells Grand Central
+    /// what the circuit breaker samples of it there, through the load its
+    /// reader holds. A collected answer does not charge the engine's own
+    /// report and tells nothing of it. A streamed answer charges it and
+    /// tells it. Both tell a failure that is not the engine's own report. A
+    /// stream read to its end tells nothing here: the prefill's good answer
+    /// was its dispatch's to tell.
+    #[tokio::test]
+    async fn a_prefill_stream_that_fails_under_its_reader_is_told_as_that_reader_samples_it() {
+        const UNTOLD: &str = "completed Cancelled";
+        const LOST: &str = "completed ServerError 503";
+        /// What the stage hears of the end of a prefill load whose stream
+        /// `reader` drains to `failure`, or to its end.
+        async fn heard_under(reader: impl PrefillReader, failure: Option<tonic::Status>) -> String {
+            let (heard, guard, end) = heard_request();
+            drop(end);
+            let load = PrefillLoadGuard::Unbounded { _guard: guard };
+            let failed = failure.is_some();
+            let mut stream = FailingStream(failure);
+            let drained = drain_prefill(&mut stream, vec![Some(load)], false, reader, |_| {});
+            assert_eq!(drained.await.is_err(), failed);
+            let heard = heard.lock().expect("the stage heard");
+            assert_eq!(heard[..2], ["issued", "dispatched Single"]);
+            heard[2..].join(", ")
+        }
+        let own_report = || Some(tonic::Status::internal(ENGINE_ERROR_MESSAGE));
+        let lost = || Some(tonic::Status::unavailable("the worker went away"));
+
+        assert_eq!(heard_under(CollectedAnswer, own_report()).await, UNTOLD);
+        let streamed = heard_under(StreamedAnswer, own_report()).await;
+        assert_eq!(streamed, "completed ServerError 500");
+        assert_eq!(heard_under(CollectedAnswer, lost()).await, LOST);
+        assert_eq!(heard_under(StreamedAnswer, lost()).await, LOST);
+        assert_eq!(heard_under(CollectedAnswer, None).await, UNTOLD);
+        assert_eq!(heard_under(StreamedAnswer, None).await, UNTOLD);
+    }
+
+    /// A collected answer's failed prefill stream is one charge of its
+    /// request on the worker's breaker, however many attempts lost the
+    /// stream. Grand Central hears each attempt's failure: each attempt
+    /// is a placement of its own.
+    #[tokio::test]
+    async fn each_attempt_that_loses_its_prefill_stream_is_told_its_own_failure() {
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://prefill:30001")
+                .worker_type(WorkerType::Prefill)
+                .connection_mode(ConnectionMode::Grpc)
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold: 2,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        let ledger = AttemptLedger::default();
+        for _attempt in 0..2 {
+            let (heard, guard, end) = heard_request();
+            drop(end);
+            let load = PrefillLoadGuard::Unbounded { _guard: guard };
+            // The stream opens and ends UNAVAILABLE before any response.
+            let (stream, _server) = scripted_stream(Vec::new(), "14").await;
+            let Err(failure) = collect_prefill_decode(
+                stream.tracked_prefill_side_booked(Arc::clone(&prefill), None),
+                ProtoStream::Fanout(FanoutStream::new(Vec::new())),
+                vec![Some(load)],
+                false,
+            )
+            .await
+            else {
+                panic!("the prefill stream failed");
+            };
+            ledger.charge_pending(&failure);
+            assert_eq!(
+                heard.lock().expect("the stage heard")[2..],
+                ["completed ServerError 503"],
+                "each attempt's failure is heard"
+            );
+        }
+        assert!(
+            prefill.circuit_breaker_can_execute(),
+            "one request charges the prefill worker once"
+        );
+    }
+
+    /// A prefill message above the receive bound ends the sequential drain
+    /// as it ends the collector's: a 502 that is never replayed, since
+    /// another prefill worker's answer would be as large.
+    #[tokio::test]
+    async fn a_prefill_message_above_the_receive_bound_ends_the_sequential_drain_for_good() {
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://prefill:30001")
+                .worker_type(WorkerType::Prefill)
+                .connection_mode(ConnectionMode::Grpc)
+                .build(),
+        );
+        let workers = WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill: Arc::clone(&prefill),
+            decode: Arc::clone(&prefill).into(),
+            runtime_type: RuntimeType::Vllm,
+        };
+        let request = ProtoGenerateRequest::Vllm(Box::default());
+        // A finish reason of five million bytes: one message above the 4 MiB
+        // the stream's decoder reads by default.
+        let oversized = complete(0, &"e".repeat(5_000_000));
+        let (stream, _server) = scripted_stream(vec![oversized], "0").await;
+        let ledger = AttemptLedger::default();
+        let Err(failure) = sequential_prefill_side(
+            &PdSides::of(&workers, &ledger, &request, false),
+            Box::pin(async move { Ok::<_, tonic::Status>(stream) }),
+            PrefillLoadGuard::Unbounded {
+                _guard: WorkerLoadGuard::with_key(Arc::clone(&prefill), None),
+            },
+        )
+        .await
+        else {
+            panic!("the drain met a message above the receive bound");
+        };
+        assert_eq!(failure.status(), StatusCode::BAD_GATEWAY);
+        assert!(!is_retryable_response(&failure));
+    }
+
     #[tokio::test]
     async fn drain_prefill_accepts_exhausted_stream_with_released_guard() {
         // Sequential PD releases the prefill guard in the execution stage, so
         // the streaming layer receives an exhausted stream with `vec![None]`.
         let mut stream = ExhaustedStream;
         let completions = AtomicUsize::new(0);
-        let result = drain_prefill(&mut stream, vec![None], true, |_complete| {
+        let result = drain_prefill(&mut stream, vec![None], true, StreamedAnswer, |_complete| {
             completions.fetch_add(1, Ordering::SeqCst);
         })
         .await;

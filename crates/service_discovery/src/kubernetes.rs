@@ -14,6 +14,10 @@
 //!   the configured port), identified as `{pod uid}:{port}`, so a Pod
 //!   recreated at the same address is a new instance and a container restart
 //!   inside it is not.
+//! - Its pairing-protocol label, where it carries one, is the explicit
+//!   prefill/decode pairing protocol of each of its workers: an operator
+//!   that rolls both roles stamps one value on the Pods of one rollout, so a
+//!   prefill of one rollout does not pair with a decode of another.
 //!
 //! Ownership, the registry diff and the job submissions belong to the shared
 //! reconciler; nothing here reads the registry.
@@ -139,6 +143,10 @@ pub struct ServiceDiscoveryConfig {
     /// Editing the KV annotations on a live Pod updates its worker in place.
     pub kv_connector_annotation: String,
     pub kv_engine_id_annotation: String,
+    /// Pod label holding the prefill/decode pairing protocol. Trimmed; an
+    /// absent or empty label states none. Relabelling a live Pod updates its
+    /// workers in place.
+    pub pairing_protocol_label: String,
     /// Per-worker model_id override source from pod metadata.
     pub model_id_source: Option<ModelIdSource>,
 }
@@ -224,6 +232,27 @@ pub fn build_watcher_config(kind: &str, label_selector: &str) -> Config {
     }
 }
 
+/// How long a read on a watch's client may stay silent before it ends in an
+/// error. The client library gave every client this bound until its 4.0
+/// release left a client with none, and a list call has no other.
+const WATCH_READ_TIMEOUT: Duration = Duration::from_secs(295);
+
+/// The client a watch runs on, from the configuration `inferred` for this
+/// process. A read that stays silent for 295 seconds ends in an error. An
+/// answer that says try later (429, 503, 504) comes back as it is: the
+/// watcher's own backoff spaces the next call, and the client sends none again
+/// by itself. Shared with the mesh's router-peer watcher.
+pub fn watch_client(inferred: kube::Config) -> Result<Client, kube::Error> {
+    Client::try_from(watch_config(inferred))
+}
+
+/// `inferred` with the two settings of a watch's client.
+fn watch_config(mut inferred: kube::Config) -> kube::Config {
+    inferred.read_timeout = Some(WATCH_READ_TIMEOUT);
+    inferred.default_retry = false;
+    inferred
+}
+
 impl Default for ServiceDiscoveryConfig {
     fn default() -> Self {
         ServiceDiscoveryConfig {
@@ -239,6 +268,7 @@ impl Default for ServiceDiscoveryConfig {
             worker_ports_annotation: "smg.ai/worker-ports".to_string(),
             kv_connector_annotation: "smg.ai/kv-connector".to_string(),
             kv_engine_id_annotation: "smg.ai/kv-engine-id".to_string(),
+            pairing_protocol_label: "smg.ai/pairing-protocol".to_string(),
             model_id_source: None,
         }
     }
@@ -279,6 +309,10 @@ pub struct PodInfo {
     pub bootstrap_ports: Vec<Option<u16>>,
     pub kv_connector: Option<String>,
     pub kv_engine_ids: Vec<Option<String>>,
+    /// The Pod's explicit pairing protocol: the value of the label
+    /// [`ServiceDiscoveryConfig::pairing_protocol_label`] names, trimmed.
+    /// `None` when the label is absent or empty.
+    pub pairing_protocol: Option<String>,
     pub model_id_override: Option<String>,
 }
 
@@ -354,6 +388,8 @@ impl PodInfo {
         let kv_engine_ids = config
             .map(|config| resolve_kv_engine_ids(&name, pod, config, ports.len()))
             .unwrap_or_else(|| vec![None; ports.len()]);
+        let pairing_protocol =
+            config.and_then(|config| label_value(pod, &config.pairing_protocol_label));
         let model_id_override = config
             .and_then(|config| config.model_id_source.as_ref())
             .and_then(|source| source.extract(pod));
@@ -369,6 +405,7 @@ impl PodInfo {
             bootstrap_ports,
             kv_connector,
             kv_engine_ids,
+            pairing_protocol,
             model_id_override,
         })
     }
@@ -453,6 +490,18 @@ fn annotation_value<'a>(pod: &'a Pod, key: &str) -> Option<&'a str> {
         .filter(|value| !value.is_empty())
 }
 
+/// The trimmed value of the Pod's label `key`; `None` when the label is
+/// absent or empty.
+fn label_value(pod: &Pod, key: &str) -> Option<String> {
+    pod.metadata
+        .labels
+        .as_ref()?
+        .get(key)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 /// Resolve one unique KV engine ID per worker port; unlike bootstrap ports,
 /// one ID cannot be broadcast because each engine core owns a distinct ID.
 fn resolve_kv_engine_ids(
@@ -513,30 +562,25 @@ pub(super) async fn start_kubernetes_discovery(
     config: ServiceDiscoveryConfig,
     host: Arc<dyn DiscoveryHost>,
 ) -> Result<task::JoinHandle<()>, kube::Error> {
-    let _ = ring::default_provider().install_default();
-
-    let client = Client::try_default().await?;
-
-    Ok(run_service_discovery(client, config, host))
+    let inferred = kube::Config::infer()
+        .await
+        .map_err(kube::Error::InferConfig)?;
+    start_service_discovery_on(inferred, config, host)
 }
 
-/// Run discovery against an injected client. Compiled only for this crate's
-/// own integration tests, which point it at a scripted API server.
-#[cfg(feature = "test-util")]
-pub fn start_service_discovery_with_client(
-    client: Client,
+/// Run discovery on the client configuration `inferred`: the one start of the
+/// watch, so nothing runs it on a client with the client library's defaults.
+/// The crate exports it only under `test-util`, for a host's integration
+/// tests: they hand it the configuration of a scripted API server, and the
+/// watch they start runs on the client a served host's watch runs on.
+pub fn start_service_discovery_on(
+    inferred: kube::Config,
     config: ServiceDiscoveryConfig,
     host: Arc<dyn DiscoveryHost>,
-) -> task::JoinHandle<()> {
+) -> Result<task::JoinHandle<()>, kube::Error> {
     let _ = ring::default_provider().install_default();
-    run_service_discovery(client, config, host)
-}
+    let client = watch_client(inferred)?;
 
-fn run_service_discovery(
-    client: Client,
-    config: ServiceDiscoveryConfig,
-    host: Arc<dyn DiscoveryHost>,
-) -> task::JoinHandle<()> {
     if config.disaggregated_mode {
         info!(
             "Starting K8s service discovery | disaggregated mode | encode: '{}' | prefill: '{}' | decode: '{}'",
@@ -586,7 +630,7 @@ fn run_service_discovery(
         );
     });
 
-    handle
+    Ok(handle)
 }
 
 /// Wake the reconcile loop when the store changes. The initial list wakes the
@@ -709,6 +753,7 @@ fn compute_desired_state(pods: &[Arc<Pod>], config: &ServiceDiscoveryConfig) -> 
                 // registration workflow's existing label fallback.
                 kv_role: None,
                 kv_engine_id: info.kv_engine_ids.get(index).cloned().flatten(),
+                pairing_protocol: info.pairing_protocol.clone(),
                 compat_labels: BTreeMap::from([
                     (POD_NAME_LABEL.to_string(), info.name.clone()),
                     (POD_UID_LABEL.to_string(), info.uid.clone()),

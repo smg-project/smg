@@ -20,6 +20,7 @@ use kv_index::{
     GroupViews, OverlapScores, SequenceHash, ShardedChainIndex, StoredBlock, WorkerGroups,
     WorkerIdExhausted,
 };
+use smg_grand_central::engine::{overlap, CacheIndex};
 use smg_worker::kv_events::apply::{BlockIndex, HeldBlocks};
 
 /// Workers one chain index interns at once: the index's own ceiling per shard.
@@ -460,6 +461,90 @@ impl fmt::Debug for KvIndex {
     }
 }
 
+// Grand Central's capped lookup reads the chain index's one shard, whose
+// ids are the index's own.
+const _: () = assert!(CHAIN_INDEX_SHARDS == 1);
+
+/// Grand Central's reads of the index, where it decides in the
+/// gateway's own process: a worker's id and its block count once a list of
+/// workers is read, and one lookup a request. The count of ids handed out
+/// again is read beside both: ahead of a list's ids, and by a request
+/// where it takes the list's table and behind its lookup.
+impl CacheIndex for KvIndex {
+    fn worker_number(&self, address: &str) -> Option<u32> {
+        self.worker_id(address)
+    }
+
+    /// The chain index's one shard counts them; the reference index of the
+    /// tests hands no id out twice.
+    fn numbers_reused(&self) -> u64 {
+        match self {
+            Self::Chain(chain) => chain.index.shard(0).ids_reused(),
+            #[cfg(test)]
+            Self::Reference(_) => 0,
+        }
+    }
+
+    /// The index's own test, the one the classic policy asks before every
+    /// request ([`Self::is_empty`]): the engine asks it where a decision
+    /// takes its list's table.
+    fn holds_a_block(&self) -> bool {
+        !self.is_empty()
+    }
+
+    fn worker_blocks(&self, number: u32) -> usize {
+        self.worker_block_count(number)
+    }
+
+    /// On a fleet with no hybrid worker the chain index keeps the deepest
+    /// holders itself, and nothing is allocated. Where a worker keeps cache
+    /// groups, every holder's depth is first lowered to what its groups can
+    /// serve ([`Self::cap_by_groups`]'s rule), as the classic decision
+    /// lowers it, and the deepest are kept after. The lookup is the Grand
+    /// Central crate's ([`overlap::deepest_within_groups`]).
+    fn deepest_into(
+        &self,
+        block_hashes: &[u64],
+        block_size: u32,
+        within: &[u64],
+        cap: usize,
+        below: &mut dyn FnMut(u32) -> u32,
+        kept: &mut Vec<(u32, u32)>,
+    ) {
+        match self {
+            Self::Chain(chain) => {
+                let (index, groups) = (chain.index.shard(0), &chain.groups);
+                overlap::deepest_within_groups(
+                    index,
+                    groups,
+                    block_hashes,
+                    block_size,
+                    within,
+                    cap,
+                    below,
+                    kept,
+                );
+            }
+            #[cfg(test)]
+            Self::Reference(reference) => {
+                let contents: Vec<ContentHash> =
+                    block_hashes.iter().map(|&hash| ContentHash(hash)).collect();
+                let scores = self.find_matches(&contents, false).scores;
+                overlap::deepest_of_within_groups(
+                    scores,
+                    &reference.groups,
+                    block_hashes,
+                    block_size,
+                    within,
+                    cap,
+                    below,
+                    kept,
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod apply_tests;
 
@@ -745,5 +830,68 @@ mod tests {
             format!("{:?}", KvIndex::chain()),
             "KvIndex { kind: \"chain\", blocks: 0 }"
         );
+    }
+
+    /// A mask that names `ids`, a bit an id.
+    fn naming(ids: &[u32]) -> Vec<u64> {
+        let mut mask = vec![0u64; 1];
+        for &id in ids {
+            let word = (id / 64) as usize;
+            if mask.len() <= word {
+                mask.resize(word + 1, 0);
+            }
+            mask[word] |= 1 << (id % 64);
+        }
+        mask
+    }
+
+    /// Grand Central's lookup: the holders of a request among the
+    /// workers its mask names, the deepest first under a cap, and the depth
+    /// the cap cuts drawn from. Both backends answer alike.
+    #[test]
+    fn the_engines_lookup_keeps_the_deepest_holders_its_mask_names() {
+        let blocks = chain(&[&[1, 2, 3, 4], &[5, 6, 7, 8], &[9, 10, 11, 12]]);
+        let request: Vec<u64> = blocks.iter().map(|b| b.content_hash.0).collect();
+        for index in backends() {
+            let name = index.name();
+            let ids: Vec<u32> = (0..4)
+                .map(|at| index.intern_worker(&format!("grpc://w{at}")).unwrap())
+                .collect();
+            // Three blocks, two, two and one.
+            for (&id, depth) in ids.iter().zip([3, 2, 2, 1]) {
+                let mut held = WorkerBlocks::default();
+                index
+                    .apply_stored(id, &blocks[..depth], None, &mut held)
+                    .unwrap();
+            }
+            assert_eq!(index.worker_number("grpc://w2"), Some(ids[2]), "{name}");
+            assert_eq!(index.worker_number("grpc://nobody"), None, "{name}");
+            assert_eq!(index.worker_blocks(ids[0]), 3, "{name}");
+            let lookup = |within: &[u32], cap: usize, drawn: u32| {
+                let mut kept = vec![(u32::MAX, 0)];
+                index.deepest_into(&request, 4, &naming(within), cap, &mut |_| drawn, &mut kept);
+                kept.sort_unstable();
+                kept
+            };
+            let whole = [(ids[0], 3), (ids[1], 2), (ids[2], 2), (ids[3], 1)];
+            assert_eq!(lookup(&ids, 16, 0), whole, "{name}");
+            // The deepest fits, and the cap cuts the two of the next depth:
+            // one of them stands, by the draw.
+            let cut: Vec<_> = (0..2).map(|drawn| lookup(&ids, 2, drawn)).collect();
+            for kept in &cut {
+                assert_eq!(kept.len(), 2, "{name}");
+                assert!(kept.contains(&whole[0]), "{name}: {kept:?}");
+                assert!(
+                    kept.iter().all(|&(_, depth)| depth >= 2),
+                    "{name}: {kept:?}"
+                );
+            }
+            assert_ne!(cut[0], cut[1], "{name}: the draw chooses");
+            assert_eq!(lookup(&ids, 1, 0), [whole[0]], "{name}");
+            // A worker the mask does not name is no holder, whatever it holds.
+            assert_eq!(lookup(&ids[1..], 16, 0), whole[1..], "{name}");
+            assert!(lookup(&ids, 0, 0).is_empty(), "{name}");
+            assert!(lookup(&[], 16, 0).is_empty(), "{name}");
+        }
     }
 }

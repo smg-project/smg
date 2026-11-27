@@ -18,8 +18,8 @@ use crate::routers::{
     error,
     grpc::{
         context::RequestContext,
-        multimodal::{self, MediaPlan, MultimodalIntermediate},
-        utils::{self, MediaContext},
+        multimodal::{self, MediaContext, MediaPlan, MultimodalIntermediate},
+        utils,
     },
 };
 
@@ -130,6 +130,7 @@ pub(crate) async fn prepare_rendered_prompt(
                     model_id,
                     &media_plan,
                     true,
+                    mm_components.pixels_go_to,
                 )?;
             }
             // The dtype every worker the selection can pick reads image
@@ -261,13 +262,12 @@ mod tests {
                 backend_client::BasicWorkerBuilder,
                 context::RequestContext,
                 multimodal::{
-                    ensure_model_accepts_media, media_refs_pipeline_pin, MediaPlan,
+                    ensure_model_accepts_media, media_refs_pipeline_pin, MediaContext, MediaPlan,
                     MultimodalComponents, MultimodalConfigRegistry, MultimodalSettings,
                     PlaceholderTokens, GATEWAY_PIPELINE_PROCESSOR, MM_PROCESSOR_LABEL,
                 },
                 regular::stages::testing::components_over,
                 testing::unreadable_model_dir,
-                utils::MediaContext,
             },
         },
     };
@@ -630,7 +630,8 @@ mod tests {
         ] {
             let registry = registry_with(workers);
             assert!(
-                ensure_model_accepts_media(&registry, "m", &plan, false).is_ok(),
+                ensure_model_accepts_media(&registry, "m", &plan, false, WorkerType::Regular)
+                    .is_ok(),
                 "{name}: preparation's check passes"
             );
             let (mut ctx, tokenizer) = context_over(registry).await;

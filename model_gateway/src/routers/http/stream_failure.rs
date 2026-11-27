@@ -14,13 +14,7 @@
 //! router-error families count it under one `error_type`, and one WARN names
 //! the worker, the route and the cause.
 
-use std::{
-    error::Error as _,
-    sync::{
-        atomic::{AtomicU16, Ordering},
-        Arc,
-    },
-};
+use std::{error::Error as _, sync::Arc};
 
 use axum::{http::StatusCode, response::Response};
 use bytes::Bytes;
@@ -40,21 +34,24 @@ use crate::{
 /// The route whose streams end with the Messages API's own error event.
 const MESSAGES_ROUTE: &str = "/v1/messages";
 
-/// Response extension: the successful head of a streamed response was
-/// recorded on the worker's circuit breaker before the relay task was
-/// spawned, so the caller does not record it again (a second success sample
-/// would count twice toward closing a half-open breaker).
+/// Response extension: the worker's circuit breaker takes its sample of a
+/// streamed response with a successful head from the relay (the head's
+/// success before the relay task is spawned where the breaker is not closed,
+/// the stream's one sample at its end where it is), so the caller does not
+/// record the head (a second success sample would count twice toward closing
+/// a half-open breaker, and a closed breaker's would erase the failures a
+/// cut counts into).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HeadSuccessRecorded;
 
-/// Mark `response` as a streamed response whose successful head was recorded
-/// before its relay was spawned (see [`HeadSuccessRecorded`]).
+/// Mark `response` as a streamed response whose successful head its relay
+/// samples (see [`HeadSuccessRecorded`]).
 pub(crate) fn mark_head_success_recorded(response: &mut Response) {
     response.extensions_mut().insert(HeadSuccessRecorded);
 }
 
-/// Whether the successful head of `response` was recorded before its relay
-/// was spawned, so its caller must not record it again.
+/// Whether the successful head of `response` is its relay's to sample, so
+/// its caller must not record it.
 pub(crate) fn head_success_recorded(response: &Response) -> bool {
     response.extensions().get::<HeadSuccessRecorded>().is_some()
 }
@@ -86,6 +83,11 @@ impl UpstreamCut {
             cause: cause(error),
             code: is_request_timeout(error).then_some(REQUEST_TIMEOUT_CODE),
         }
+    }
+
+    /// The status the cut is accounted and answered under.
+    pub(crate) fn status(&self) -> StatusCode {
+        self.status
     }
 }
 
@@ -124,9 +126,6 @@ pub(crate) struct RelaySource {
     worker: Arc<dyn Worker>,
     worker_type: &'static str,
     backend: &'static str,
-    /// Where a reader outside the relay task learns of a cut: the status of
-    /// the cut's class, written before the body's end. Zero while it stands.
-    mark: Option<Arc<AtomicU16>>,
 }
 
 impl RelaySource {
@@ -168,14 +167,7 @@ impl RelaySource {
             worker,
             worker_type,
             backend,
-            mark: None,
         }
-    }
-
-    /// The same source, writing a cut's status on `mark`.
-    pub(crate) fn marking(mut self, mark: Arc<AtomicU16>) -> Self {
-        self.mark = Some(mark);
-        self
     }
 
     /// The worker the response is read from.
@@ -194,11 +186,13 @@ impl RelaySource {
     ///
     /// The breaker sample sits outside the request's attempt ledger on
     /// purpose: the relay task outlives the attempt that produced the head.
-    /// The shared relay (`routers::http::stream_relay`) records a
-    /// successful head before it spawns its task, for the regular router and
-    /// the PD router's decode side alike, so the cut is sampled after the
-    /// head's success and never erased by it. A request retried onto the same worker
-    /// after a failed head is charged for that head and for the cut.
+    /// The shared relay (`routers::http::stream_relay`) samples a closed
+    /// breaker once a stream, so the cut is that stream's one sample; on a
+    /// breaker that is not closed it records a successful head before it
+    /// spawns its task. Both hold for the regular router and the PD router's
+    /// decode side alike, so the cut is never erased by the head's success.
+    /// A request retried onto the same worker after a failed head is charged
+    /// for that head and for the cut.
     pub(crate) fn account(&self, cut: &UpstreamCut, bytes_relayed: u64) {
         let error_type = error_type_from_status(cut.status);
         let reason = error_reason_from_status(cut.status);
@@ -214,9 +208,6 @@ impl RelaySource {
             cut.cause
         );
         self.worker.record_outcome(cut.status.as_u16());
-        if let Some(mark) = &self.mark {
-            mark.store(cut.status.as_u16(), Ordering::Relaxed);
-        }
         Metrics::record_worker_error(
             self.worker_type,
             metrics_labels::CONNECTION_HTTP,

@@ -70,7 +70,6 @@ pub(crate) mod testing {
             startup_timeout_secs: 1,
             startup_delay_secs: 0,
             startup_check_interval_secs: 1,
-            dp_aware: false,
             model_path: None,
             model_aliases: Default::default(),
             retry: Default::default(),
@@ -138,17 +137,6 @@ pub(crate) mod testing {
             Self::with_settings(
                 RegistrationSettings {
                     upstream_http2,
-                    ..registration_settings()
-                },
-                connector,
-            )
-        }
-
-        /// A host whose settings turn the DP read on.
-        pub(crate) fn reading_dp(connector: ScriptedConnector) -> Arc<Self> {
-            Self::with_settings(
-                RegistrationSettings {
-                    dp_aware: true,
                     ..registration_settings()
                 },
                 connector,
@@ -227,6 +215,13 @@ pub(crate) mod testing {
                 }),
             );
         }
+        serve_router(router).await
+    }
+
+    /// `router` served on a loopback port of the system's choice, any path
+    /// it does not route a 404. Returns the base URL; the stub serves for as
+    /// long as the runtime that spawned it runs.
+    pub(crate) async fn serve_router(router: axum::Router) -> String {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("a loopback port of the system's choice");

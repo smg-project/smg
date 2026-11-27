@@ -3,7 +3,7 @@
 //! This module provides a unified abstraction for routing policies that work
 //! across both regular and prefill-decode (PD) routing modes.
 
-use std::{fmt::Debug, sync::Arc};
+use std::{any::TypeId, fmt::Debug, sync::Arc};
 
 use openai_protocol::UNKNOWN_MODEL_ID;
 use rand::RngExt as _;
@@ -40,7 +40,9 @@ mod factory;
 pub mod hash_ring;
 mod kept_rings;
 pub mod kv_index;
+mod labels;
 mod least_load;
+mod lent_trees;
 mod manual;
 mod passthrough;
 mod power_of_two;
@@ -61,13 +63,15 @@ pub use cache_namespace::{CacheNamespace, TEXT_MARKER_LEN, TOKEN_MARKER_LEN};
 pub use consistent_hashing::ConsistentHashingPolicy;
 pub use dp_min_token::MinimumTokensPolicy;
 pub use factory::PolicyFactory;
+pub(crate) use labels::{cut_mark, Respec};
 pub use least_load::LeastLoadPolicy;
+pub(crate) use lent_trees::{EngineCaches, LentTrees};
 pub use manual::{ManualConfig, ManualPolicy};
 pub use passthrough::PassthroughPolicy;
 pub use power_of_two::PowerOfTwoPolicy;
 pub use prefix_hash::{PrefixHashConfig, PrefixHashPolicy};
 pub use random::RandomPolicy;
-pub use registry::PolicyRegistry;
+pub use registry::{PolicyRegistry, Side};
 pub use round_robin::RoundRobinPolicy;
 // The periodic task lives beside the worker runtime. The path it had here is
 // kept: the policies name it.
@@ -159,8 +163,19 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// owner. Single-worker placement over regular workers then leaves the
     /// absolute overload veto off the selection instead of moving the session
     /// off the worker holding its cache each time that worker crosses a
-    /// threshold (see `placement::select_from`).
+    /// threshold (see `placement::select_single`).
     fn routes_by_session_key(&self, _info: &SelectWorkerInfo) -> bool {
+        false
+    }
+
+    /// Whether this policy places a request that carries a routing key by
+    /// that key itself, reading the header ahead of the key derived from
+    /// the request id as the sticky routing-key override does (`manual`,
+    /// `consistent_hashing`). The override leaves such a policy its own
+    /// handling and places a keyed request of every other policy. The
+    /// registry asks the policy, and never reads its name for it: a name is
+    /// a label. A constant for the policy's lifetime.
+    fn honors_routing_key(&self) -> bool {
         false
     }
 
@@ -177,8 +192,9 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     ///
     /// Every request end reaches [`Self::on_request_complete`] through the
     /// worker's load guard; this is the safety net behind it. The worker
-    /// monitor calls it once per load poll with the requests the router still
-    /// holds on the worker. A dispatch books once and a completion releases
+    /// monitor calls it at every batch of a group's load answers, for every
+    /// worker of the group, with the requests the router still holds on the
+    /// worker. A dispatch books once and a completion releases
     /// once, so whatever a policy holds beyond `in_flight` is a completion
     /// that never arrived (a worker that moved under another policy, a sink
     /// never installed) and is released here rather than kept for good.
@@ -218,15 +234,19 @@ pub(crate) fn as_bucket(policy: &dyn LoadBalancingPolicy) -> Option<&BucketPolic
 
 /// Whether a built-in policy applies the complete [`Worker::is_available`]
 /// predicate before selecting. Other policies keep the caller-side filter.
+///
+/// The policy says its type once and the types are compared as values, so
+/// a type late in the list costs a compare for each type ahead of it and
+/// no call.
 pub(crate) fn policy_filters_unavailable_workers(policy: &dyn LoadBalancingPolicy) -> bool {
-    let policy = policy.as_any();
-    policy.is::<RandomPolicy>()
-        || policy.is::<RoundRobinPolicy>()
-        || policy.is::<LeastLoadPolicy>()
-        || policy.is::<PowerOfTwoPolicy>()
-        || policy.is::<CacheAwarePolicy>()
-        || policy.is::<ManualPolicy>()
-        || policy.is::<PassthroughPolicy>()
+    let policy = policy.as_any().type_id();
+    policy == TypeId::of::<RandomPolicy>()
+        || policy == TypeId::of::<RoundRobinPolicy>()
+        || policy == TypeId::of::<LeastLoadPolicy>()
+        || policy == TypeId::of::<PowerOfTwoPolicy>()
+        || policy == TypeId::of::<CacheAwarePolicy>()
+        || policy == TypeId::of::<ManualPolicy>()
+        || policy == TypeId::of::<PassthroughPolicy>()
 }
 
 /// Whether a built-in policy reads the model's hash ring

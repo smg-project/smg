@@ -1089,6 +1089,7 @@ fn test_worker_metadata_empty_models_accepts_all() {
         spec: Arc::new(WorkerSpec::new("http://test:8080")),
         redacted_url: "http://test:8080".to_string(),
         decoding: DecodingLabels::default(),
+        running_window: None,
         health_config: HealthCheckConfig::default(),
         health_endpoint: "/health".to_string(),
         zmq_startup_timeout: Duration::from_secs(600),
@@ -1120,6 +1121,7 @@ fn test_worker_metadata_find_model() {
         spec: Arc::new(spec),
         redacted_url: "http://test:8080".to_string(),
         decoding: DecodingLabels::default(),
+        running_window: None,
         health_config: HealthCheckConfig::default(),
         health_endpoint: "/health".to_string(),
         zmq_startup_timeout: Duration::from_secs(600),
@@ -1514,6 +1516,54 @@ fn the_routing_reads_follow_every_veto_through_the_published_code() {
     assert!(worker.routing_state().can_execute);
     assert_eq!(worker.circuit_breaker_state(), CircuitState::HalfOpen);
     agree(&worker, true);
+}
+
+/// Every write that changes a worker's published state moves the process's
+/// word, and the published answer follows the write: a status change, a
+/// drain, the overload and the liveness veto on and off, a breaker that
+/// opens, its step to half-open made by a routing read, and the stale mark
+/// of a retired instance. The word is the whole process's and only grows.
+#[test]
+fn every_write_of_a_published_state_moves_the_process_word() {
+    use crate::runtime::published_word;
+
+    let worker = BasicWorkerBuilder::new("http://worker:8000")
+        .health_config(no_health_check())
+        .circuit_breaker_config(CircuitBreakerConfig {
+            failure_threshold: 1,
+            timeout_duration: Duration::from_millis(50),
+            ..CircuitBreakerConfig::default()
+        })
+        .build();
+    // Nothing is published yet: the worker's facts are read.
+    assert!(!worker.published_available());
+    let moves = |write: &dyn Fn(), available: bool| {
+        let before = published_word();
+        write();
+        assert!(published_word() > before, "the word moved");
+        assert_eq!(worker.published_available(), available);
+    };
+    moves(&|| worker.set_status(WorkerStatus::Ready), true);
+    moves(&|| worker.set_status(WorkerStatus::NotReady), false);
+    moves(&|| worker.set_status(WorkerStatus::Ready), true);
+    moves(&|| worker.set_status(WorkerStatus::Draining), false);
+    moves(&|| worker.set_status(WorkerStatus::Ready), true);
+    moves(&|| assert!(worker.set_overloaded(true)), false);
+    moves(&|| assert!(worker.set_overloaded(false)), true);
+    moves(
+        &|| assert!(worker.set_stall(Some(StallReason::Unreachable))),
+        false,
+    );
+    moves(&|| assert!(worker.set_stall(None)), true);
+    moves(&|| worker.record_circuit_breaker_outcome(false), false);
+    // Past the breaker's timeout the routing read makes the step to
+    // half-open and publishes it.
+    thread::sleep(Duration::from_millis(60));
+    moves(&|| assert!(worker.routing_state().can_execute), true);
+    // A retired instance asserts no state: a fact it still writes marks
+    // the published code stale, and the next routing read publishes again.
+    worker.abort_background_tasks();
+    moves(&|| assert!(worker.set_overloaded(true)), false);
 }
 
 /// The code is a shortcut for `available` alone. A veto written past the

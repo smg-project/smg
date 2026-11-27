@@ -82,14 +82,34 @@ pub(super) fn serialize_tokenspeed_encoder_input_owned(
     shm_min_bytes: usize,
 ) -> anyhow::Result<TokenSpeedTensor> {
     let view = input.view();
-    let (dtype, shape) = tokenspeed_wire_shape(&view, dtype)?;
+    let (dtype, shape) = match tokenspeed_wire_shape(&view, dtype) {
+        Ok(wire) => wire,
+        Err(error) => {
+            recycle_encoder_input(input);
+            return Err(error);
+        }
+    };
     if let Some(tensor) = tokenspeed_shm_tensor(&view, dtype, &shape, shm_enabled, shm_min_bytes) {
+        recycle_encoder_input(input);
         return Ok(tensor);
     }
     let bytes = input
         .into_wire_bytes_as(dtype)
         .map_err(|message| anyhow::Error::new(WireMismatch(message)))?;
     Ok(TokenSpeedTensor::inline(bytes, shape, dtype.to_string()))
+}
+
+/// An encoder input whose bytes went elsewhere (written from a view, or into
+/// shared memory) or are left out of the request: its wire bytes or patches
+/// go back to the buffer pool, where a drop would free them.
+pub(super) fn recycle_encoder_input(input: EncoderInput) {
+    match input {
+        EncoderInput::Wire { bytes, .. } => llm_multimodal::buffer_pool::recycle(bytes),
+        EncoderInput::U8 { patches, .. } => {
+            llm_multimodal::buffer_pool::recycle(patches.into_raw_vec_and_offset().0);
+        }
+        EncoderInput::F32(_) | EncoderInput::SharedWire { .. } => {}
+    }
 }
 
 /// The dtype TokenSpeed reads for `dtype` and the input's shape in it,

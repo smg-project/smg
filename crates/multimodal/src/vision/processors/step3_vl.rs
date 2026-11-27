@@ -77,9 +77,9 @@ use crate::vision::{
 };
 
 /// The global view's side after the tensor resize.
-pub const IMAGE_SIZE: u32 = 728;
+pub(crate) const IMAGE_SIZE: u32 = 728;
 /// A crop's side after the tensor resize.
-pub const PATCH_SIZE: u32 = 504;
+pub(crate) const PATCH_SIZE: u32 = 504;
 /// The longest side a decoded image is scaled down to before anything else.
 const MAX_IMAGE_SIZE: u32 = 3024;
 /// The feature tokens of the global view.
@@ -89,7 +89,7 @@ pub const PATCH_FEATURE_TOKENS: usize = 81;
 /// The per-image maximum the serving engine publishes for the family: the
 /// prompt layout of a 3024 x 3024 image (36 crops, five newlines, the view),
 /// structural tokens included. A plan past it is refused; see the module doc.
-pub const MAX_IMAGE_TOKENS: usize = 3164;
+pub(crate) const MAX_IMAGE_TOKENS: usize = 3164;
 
 /// The crops, flat across the batch: `[P, 3, 504, 504]`.
 pub const PATCH_PIXEL_VALUES: &str = "patch_pixel_values";
@@ -132,7 +132,7 @@ impl CropPlan {
     }
 
     /// The newline tokens between the crop rows.
-    pub fn num_newlines(&self) -> usize {
+    pub(crate) fn num_newlines(&self) -> usize {
         self.crops.map_or(0, |grid| grid.rows - 1)
     }
 
@@ -149,7 +149,7 @@ impl CropPlan {
     /// The positions of that expansion that carry an encoder feature: the
     /// image tokens of every crop and of the view. The start, end and newline
     /// tokens around them are prompt text with no feature behind them.
-    pub fn num_features(&self) -> usize {
+    pub(crate) fn num_features(&self) -> usize {
         self.num_patches() * PATCH_FEATURE_TOKENS + IMAGE_FEATURE_TOKENS
     }
 }
@@ -245,7 +245,7 @@ impl Step3VLProcessor {
     }
 
     /// The processor with crops on or off.
-    pub fn with_crops(enable_patch: bool) -> Self {
+    pub(crate) fn with_crops(enable_patch: bool) -> Self {
         Self {
             enable_patch,
             table: transforms::to_tensor_then_normalize_table(&CLIP_MEAN, &CLIP_STD),
@@ -256,18 +256,13 @@ impl Step3VLProcessor {
     /// constants, and `vision_config.enable_patch` from the model config
     /// (crops on when the config says nothing). The family ships no
     /// preprocessor config, and the reference reads none.
-    pub fn from_model_config(config: &Value) -> Self {
+    pub(crate) fn from_model_config(config: &Value) -> Self {
         let enable_patch = config
             .get("vision_config")
             .and_then(|vision| vision.get("enable_patch"))
             .and_then(Value::as_bool)
             .unwrap_or(true);
         Self::with_crops(enable_patch)
-    }
-
-    /// Whether images take crops beside their global view.
-    pub fn crops_enabled(&self) -> bool {
-        self.enable_patch
     }
 
     /// The plan of a `width` x `height` image: the pad, the view and the crop
@@ -709,12 +704,12 @@ mod tests {
     fn the_model_config_switches_the_crops_off() {
         let processor =
             Step3VLProcessor::from_model_config(&json!({"vision_config": {"enable_patch": false}}));
-        assert!(!processor.crops_enabled());
+        assert!(!processor.enable_patch);
         let plan = processor.plan(1920, 1080);
         assert_eq!(plan.crops, None);
         assert_eq!(plan.num_tokens(), 171);
         assert_eq!(plan.num_features(), IMAGE_FEATURE_TOKENS);
-        assert!(Step3VLProcessor::from_model_config(&json!({"vision_config": {}})).crops_enabled());
+        assert!(Step3VLProcessor::from_model_config(&json!({"vision_config": {}})).enable_patch);
     }
 
     /// The tensors of a 1000x300 image: one view, two crops of which the

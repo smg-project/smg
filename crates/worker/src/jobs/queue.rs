@@ -4,7 +4,7 @@
 use std::{
     collections::VecDeque,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Weak,
     },
     time::{Duration, SystemTime},
@@ -74,6 +74,8 @@ pub struct JobRun<'a> {
     pub cancelled_before_start: &'a DashSet<WorkerId>,
     /// The id whose mark this job may take.
     pub own_id: Option<&'a WorkerId>,
+    /// Set by the job when a `DELETE` ended it: its id keeps no failed status.
+    pub ended_by_delete: &'a AtomicBool,
 }
 
 /// The queue capacity and the number of dispatcher permits.
@@ -116,6 +118,10 @@ pub struct JobQueue<H: JobHost> {
     kept: Arc<DashMap<String, Kept<H::Job>>>,
     /// Cancel marks by id. A job reads and clears only the mark it owns.
     cancelled_before_start: Arc<DashSet<WorkerId>>,
+    /// How many `DELETE`s hold the mark of an id: one that takes its own
+    /// mark back leaves it while another holds it. A count ends with its
+    /// mark: the next mark set drops the count of a mark that is gone.
+    mark_holders: DashMap<WorkerId, usize>,
 }
 
 /// A job handed to the dispatcher with the id of the waiter for its outcome,
@@ -297,6 +303,7 @@ impl<H: JobHost> JobQueue<H> {
             next_waiter_id: AtomicU64::new(1),
             kept: kept.clone(),
             cancelled_before_start: cancelled_before_start.clone(),
+            mark_holders: DashMap::new(),
         });
 
         // Single dispatcher task
@@ -518,17 +525,30 @@ impl<H: JobHost> JobQueue<H> {
             );
             let start = std::time::Instant::now();
             let own_id = host.mark_id(&job);
+            let ended_by_delete = AtomicBool::new(false);
             let run = JobRun {
                 cancelled_before_start,
                 own_id: own_id.as_ref(),
+                ended_by_delete: &ended_by_delete,
             };
             let result = host.execute(&job, &run).await;
+            if let (Some(id), Err(error)) = (&own_id, &result) {
+                Self::keep_own_failure(
+                    status_map,
+                    cancelled_before_start,
+                    id,
+                    ended_by_delete.load(Ordering::Relaxed),
+                    job_type,
+                    worker_url,
+                    error,
+                );
+            }
             if result.is_err() {
                 host.failed(&job);
             }
             Self::record_job_completion(job_type, worker_url, start.elapsed(), &result, status_map);
             if let Some(id) = own_id {
-                cancelled_before_start.remove(&id);
+                Self::end_mark(status_map, cancelled_before_start, &id);
             }
         }
     }
@@ -682,12 +702,28 @@ impl<H: JobHost> JobQueue<H> {
 
     /// Sets the cancel mark a job of this id reads when it starts.
     pub fn set_cancel_mark(&self, id: &WorkerId) {
-        self.cancelled_before_start.insert(id.clone());
+        let marks = &self.cancelled_before_start;
+        // A mark its job or the job's end took leaves its count behind.
+        self.mark_holders.retain(|held, _| marks.contains(held));
+        // The set changes under the count's lock, here and in a take-back.
+        let mut count = self.mark_holders.entry(id.clone()).or_insert(0);
+        *count = if marks.insert(id.clone()) {
+            1
+        } else {
+            *count + 1
+        };
     }
 
-    /// Clears the cancel mark for this id.
+    /// Takes back the mark one `DELETE` set for this id. The mark stays
+    /// while another `DELETE` holds it.
     pub fn clear_cancel_mark(&self, id: &WorkerId) {
-        self.cancelled_before_start.remove(id);
+        if let Entry::Occupied(mut count) = self.mark_holders.entry(id.clone()) {
+            *count.get_mut() -= 1;
+            if *count.get() == 0 {
+                self.cancelled_before_start.remove(id);
+                count.remove();
+            }
+        }
     }
 
     /// Process a single job with status tracking and error handling
@@ -731,19 +767,31 @@ impl<H: JobHost> JobQueue<H> {
             Some(host) => {
                 // Read the id first. The host can release it when the job fails.
                 let own_id = host.mark_id(&job);
+                let ended_by_delete = AtomicBool::new(false);
                 let run = JobRun {
                     cancelled_before_start: &cancelled_before_start,
                     own_id: own_id.as_ref(),
+                    ended_by_delete: &ended_by_delete,
                 };
                 let result = host.execute(&job, &run).await;
                 let duration = start.elapsed();
+                if let (Some(id), Err(error)) = (&own_id, &result) {
+                    Self::keep_own_failure(
+                        &status_map,
+                        &cancelled_before_start,
+                        id,
+                        ended_by_delete.load(Ordering::Relaxed),
+                        job_type,
+                        &worker_url,
+                        error,
+                    );
+                }
                 if result.is_err() {
                     host.failed(&job);
                 }
                 Self::record_job_completion(job_type, &worker_url, duration, &result, &status_map);
-                // A mark set for this job after its reads is over with it.
                 if let Some(id) = own_id {
-                    cancelled_before_start.remove(&id);
+                    Self::end_mark(&status_map, &cancelled_before_start, &id);
                 }
                 Self::deliver_outcome(&outcomes, &worker_url, waiter, result);
                 Self::run_kept(
@@ -769,6 +817,38 @@ impl<H: JobHost> JobQueue<H> {
                     H::Job::shown_key(job_type, &worker_url)
                 );
             }
+        }
+    }
+
+    /// Keeps the failure of a job that owned an id under that id as well as
+    /// under its URL, before the host releases the id: a reader of the id
+    /// meets no gap between pending and failed. A URL keeps one such failure:
+    /// a later one replaces it. A job a `DELETE` ended (its own word, or a
+    /// mark still set) keeps none: its id reads no status.
+    fn keep_own_failure(
+        status_map: &DashMap<String, JobStatus>,
+        marks: &DashSet<WorkerId>,
+        id: &WorkerId,
+        ended_by_delete: bool,
+        job_type: &'static str,
+        worker_url: &str,
+        error: &str,
+    ) {
+        if !ended_by_delete && !marks.contains(id) {
+            status_map.retain(|key, kept| key == worker_url || kept.worker_url != worker_url);
+            status_map.insert(
+                id.as_str().to_string(),
+                JobStatus::failed(job_type, worker_url, error.to_string()),
+            );
+        }
+    }
+
+    /// Ends the mark of a job's id with the job. A mark still set was set
+    /// after the job's reads, by a `DELETE` that was told it ended the
+    /// registration: the failure kept under the id goes with the mark.
+    fn end_mark(status_map: &DashMap<String, JobStatus>, marks: &DashSet<WorkerId>, id: &WorkerId) {
+        if marks.remove(id).is_some() {
+            status_map.remove(id.as_str());
         }
     }
 

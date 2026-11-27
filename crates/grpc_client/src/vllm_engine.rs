@@ -546,6 +546,7 @@ impl VllmEngineClient {
                 "/vllm.grpc.engine.VllmEngine/Generate",
                 metadata.into_headers(),
                 frames,
+                None,
             )
             .await?;
             Ok(AbortOnDropStream::new(stream, request_id, self.clone()))

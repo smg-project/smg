@@ -1,4 +1,4 @@
-"""Unit tests for the multimodal identity cache salt (engine-free, no vLLM required).
+"""Unit tests for the cache salt and the media identity in it (engine-free, no vLLM required).
 
 Run with: pytest grpc_servicer/tests/test_vllm_mm_salt.py
 """
@@ -36,25 +36,79 @@ def test_gate_rejects_identity_only_payloads():
     assert not mm_salt.has_preprocessed_mm_payload(mm)
 
 
-def test_empty_hashes_produce_no_salt():
-    assert mm_salt.mm_identity_cache_salt([]) is None
+def test_empty_hashes_keep_the_request_salt():
+    assert mm_salt.engine_cache_salt(None, []) is None
+    assert mm_salt.engine_cache_salt("tenant-a", []) == "tenant-a"
 
 
-def test_salt_is_deterministic_per_content():
-    salt = mm_salt.mm_identity_cache_salt(["h1", "h2"])
-    assert salt == "mm:h1,h2"
-    assert salt == mm_salt.mm_identity_cache_salt(["h1", "h2"])
+# The same vectors are in `crates/engine_zmq_adapter/src/vllm_cache_salt.rs`.
+@pytest.mark.parametrize(
+    ("request_salt", "hashes", "digest"),
+    [
+        (None, ["h1", "h2"], "c67efe1de6d4c5ef289ccdfd6953f085e29da935ac501db9cd8512e6a39f185a"),
+        (
+            "tenant-a",
+            ["h1", "h2"],
+            "662beced721917156bf4b76f866d2c307d82dd3bcfa95262ec7104fa2ba0fa3f",
+        ),
+        (
+            "tenant-b",
+            ["h1", "h2"],
+            "905c55f34a7ed6802bd075bbf00211abf77cab562139443433b6edb664a9ec54",
+        ),
+        ("tenant-a", ["h1h2"], "54ce43702e479ec4a01a1298d1077d8907e957821dc5a80b97ceea5bbc25f978"),
+    ],
+)
+def test_hashes_give_the_digest_of_the_salt_and_the_hashes(request_salt, hashes, digest):
+    assert mm_salt.engine_cache_salt(request_salt, hashes) == f"mm:{digest}"
 
 
 def test_different_images_get_different_salts():
-    assert mm_salt.mm_identity_cache_salt(["dog"]) != mm_salt.mm_identity_cache_salt(["passport"])
+    assert mm_salt.engine_cache_salt(None, ["dog"]) != mm_salt.engine_cache_salt(None, ["passport"])
 
 
 def test_salt_is_order_sensitive():
     # Same images in a different order occupy different placeholder positions.
-    assert mm_salt.mm_identity_cache_salt(["h1", "h2"]) != mm_salt.mm_identity_cache_salt(
-        ["h2", "h1"]
+    assert mm_salt.engine_cache_salt(None, ["h1", "h2"]) != mm_salt.engine_cache_salt(
+        None, ["h2", "h1"]
     )
+
+
+@pytest.mark.parametrize("images", range(1, 9))
+def test_the_engine_salt_stays_inside_vllms_limits(images):
+    salt = mm_salt.engine_cache_salt("s" * 128, ["a" * 64] * images)
+    assert len(salt) == 67
+    assert not set(salt) & set("@/\\\0")
+
+
+@pytest.mark.parametrize("salt", [None, "tenant-a", "s" * 128, "é" * 128])
+def test_request_salt_is_read_verbatim(salt):
+    request = vllm_engine_pb2.GenerateRequest(cache_salt=salt)
+    assert mm_salt.request_cache_salt(request) == salt
+
+
+@pytest.mark.parametrize(
+    ("salt", "reason"),
+    [
+        ("", "empty"),
+        ("s" * 129, "at most 128 characters"),
+        ("secret@", "not contain"),
+        ("secret/", "not contain"),
+        ("secret\\", "not contain"),
+        ("secret\0", "not contain"),
+        ("mm:secret", "reserved prefix 'mm:'"),
+    ],
+)
+def test_a_bad_request_salt_is_refused_without_its_value(salt, reason):
+    request = vllm_engine_pb2.GenerateRequest(cache_salt=salt)
+    with pytest.raises(ValueError, match=f"^cache_salt must .*{reason}") as refused:
+        mm_salt.request_cache_salt(request)
+    assert "secret" not in str(refused.value)
+
+
+def test_an_older_proto_package_has_no_request_salt():
+    # EmbedRequest stands in for a request message without the field.
+    assert mm_salt.request_cache_salt(vllm_engine_pb2.EmbedRequest()) is None
 
 
 class _MmConfig:

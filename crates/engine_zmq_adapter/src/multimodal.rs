@@ -308,21 +308,11 @@ fn has_preprocessed_payload(mm: &vllm::MultimodalInputs) -> bool {
     mm.pixel_values.is_some() || !mm.model_specific_tensors.is_empty()
 }
 
-/// The cache salt a tensor-less identity payload folds its media hashes
-/// into, as the Python servicer does (`mm_identity_cache_salt`): same-image
-/// reuse still hits the decode prefix cache, different images behind the same
-/// text no longer alias.
-fn identity_cache_salt(batches: &[vllm::MultimodalInputs]) -> Option<String> {
-    let hashes: Vec<&str> = batches
-        .iter()
-        .flat_map(|batch| batch.mm_hashes.iter().map(String::as_str))
-        .collect();
-    (!hashes.is_empty()).then(|| format!("mm:{}", hashes.join(",")))
-}
-
 /// What the request's multimodal batches (`mm_inputs` plus `extra_mm_inputs`)
 /// become on the wire: per-item `mm_features` in prompt order, or, for a
-/// tensor-less identity payload, the `cache_salt` carrying the hashes. The
+/// tensor-less identity payload, the media hashes that the engine's salt
+/// carries instead (`vllm_cache_salt`): same-image reuse still hits the decode
+/// prefix cache, different images behind the same text no longer alias. The
 /// rules are the Python servicer's: a pixel-less (grid-only) batch is a PD
 /// decode side's or an encoder-cache consumer's and needs a remote transfer
 /// (KV or encoder cache), or the engine would run the encoder with nothing to
@@ -332,12 +322,13 @@ pub(crate) fn translate_batches(
     prompt_token_ids: &[u32],
     model_dtype: ModelDtype,
     has_remote_transfer: bool,
-) -> Result<(Option<MmFeatures>, Option<String>), String> {
+) -> Result<(Option<MmFeatures>, Vec<String>), String> {
     if batches.is_empty() {
-        return Ok((None, None));
+        return Ok((None, Vec::new()));
     }
     if !batches.iter().any(has_preprocessed_payload) {
-        return Ok((None, identity_cache_salt(&batches)));
+        let hashes = batches.into_iter().flat_map(|batch| batch.mm_hashes);
+        return Ok((None, hashes.collect()));
     }
     if !has_remote_transfer
         && batches
@@ -356,7 +347,7 @@ pub(crate) fn translate_batches(
         features.extend(build_mm_features(batch, prompt_token_ids, model_dtype)?);
     }
     features.sort_by_key(|feature| feature.mm_position.offset);
-    Ok(((!features.is_empty()).then_some(features), None))
+    Ok(((!features.is_empty()).then_some(features), Vec::new()))
 }
 
 /// Build per-item `mm_features` from batched proto multimodal inputs.
@@ -981,16 +972,16 @@ mod tests {
     }
 
     /// `translate_batches` is the request-level rule set: extra modality
-    /// batches merge in prompt order, a tensor-less identity payload becomes a
-    /// cache salt, and a grid-only (pixel-less) batch needs remote KV.
+    /// batches merge in prompt order, a tensor-less identity payload becomes
+    /// its media hashes, and a grid-only (pixel-less) batch needs remote KV.
     #[test]
-    fn translate_batches_merges_salts_and_gates_pixel_less_sides() {
+    fn translate_batches_merges_identifies_and_gates_pixel_less_sides() {
         // Two batches: the second one's placeholders sit before the first's.
         let mut second = base_inputs();
         second.mm_placeholders = placeholders(&[(0, 1), (12, 1)]);
         second.pixel_values = Some(inline_tensor(vec![2, 4], "float32", f32_bytes(&[1.0; 8])));
         second.mm_hashes = vec!["h2".to_string(), "h3".to_string()];
-        let (features, salt) = translate_batches(
+        let (features, identity) = translate_batches(
             vec![base_inputs(), second],
             &[0; 13],
             ModelDtype::BFloat16,
@@ -998,7 +989,7 @@ mod tests {
         )
         .expect("translated");
         let features = features.expect("features");
-        assert!(salt.is_none());
+        assert!(identity.is_empty());
         assert_eq!(
             features
                 .iter()
@@ -1015,14 +1006,19 @@ mod tests {
         );
 
         // Hashes only: nothing to attach, identity rides the cache salt.
-        let identity = vllm::MultimodalInputs {
-            mm_hashes: vec!["h0".to_string(), "h1".to_string()],
+        let batch = |hash: &str| vllm::MultimodalInputs {
+            mm_hashes: vec![hash.to_string()],
             ..Default::default()
         };
-        let (features, salt) =
-            translate_batches(vec![identity], &[], ModelDtype::BFloat16, false).expect("salted");
+        let (features, identity) = translate_batches(
+            vec![batch("h0"), batch("h1")],
+            &[],
+            ModelDtype::BFloat16,
+            false,
+        )
+        .expect("identity");
         assert!(features.is_none());
-        assert_eq!(salt.as_deref(), Some("mm:h0,h1"));
+        assert_eq!(identity, ["h0", "h1"]);
 
         // Grid only (a PD decode side): refused without remote KV, built with it.
         let grid_only = || {
@@ -1038,9 +1034,10 @@ mod tests {
         let err = translate_batches(vec![grid_only()], &[0; 9], ModelDtype::BFloat16, false)
             .expect_err("needs remote KV");
         assert!(err.contains("requires a handoff"), "{err}");
-        let (features, _) =
+        let (features, identity) =
             translate_batches(vec![grid_only()], &[0; 9], ModelDtype::BFloat16, true)
                 .expect("decode side");
+        assert!(identity.is_empty());
         let features = features.expect("grid features");
         assert_eq!(features.len(), 2);
         let item = features[0].data.as_ref().expect("item");

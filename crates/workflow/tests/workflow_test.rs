@@ -1207,8 +1207,10 @@ async fn test_dag_dependency_failure_blocks_dependents() {
 #[tokio::test]
 async fn test_dag_failed_step_leaves_its_independent_sibling_running() {
     // A root, then two steps that depend on the root alone: step B fails under
-    // FailWorkflow, step C runs. The failure neither cancels nor skips the
-    // sibling: C ran once, and the workflow ends Failed.
+    // FailWorkflow, step C runs. The failure does not skip the sibling: C ran
+    // once, and the workflow ends Failed. B and C launch together when A ends,
+    // and C ends at once, so this does not show what a failure does to a step
+    // that becomes ready after it, or to one still under way.
     let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
 
     let c_executed = Arc::new(AtomicU32::new(0));

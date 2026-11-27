@@ -599,6 +599,13 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ),
     // A bare JSON list of calls, or content; no thought.
     ("llama-xlam-2-8b-fc-r", GenerationPrompt::Plain),
+    // Command: the prompt ends at the turn opener and the model writes each part's markers itself;
+    // Command R v01's template has none of them, and its answer stands bare.
+    (
+        "command-a-reasoning-08-2025",
+        GenerationPrompt::ModelDecides,
+    ),
+    ("c4ai-command-r-v01", GenerationPrompt::Plain),
     // The Mistral list behind `[TOOL_CALLS]`; Mistral Small 3's template renders no tool call,
     // so its recorded sets hold content alone, and no thought.
     ("mistral-small-24b-instruct-2501", GenerationPrompt::Plain),
@@ -905,6 +912,7 @@ impl Recorded for Table {
             Self::Gemma4 => ("<|channel>thought\n", "<channel|>"),
             Self::K2Horizon => ("<ifm|think>", "</ifm|think>"),
             Self::LongCat => ("<longcat_think>", "</longcat_think>"),
+            Self::Command => ("<|START_THINKING|>", "<|END_THINKING|>"),
             Self::MistralV13 => ("[THINK]", "[/THINK]"),
             _ => ("<think>", "</think>"),
         }
@@ -964,6 +972,7 @@ impl Recorded for Table {
             | Self::Inkling2
             | Self::Gemma4
             | Self::FunctionGemma
+            | Self::Command
             | Self::Mistral
             | Self::MistralV13
             | Self::LongCat
@@ -971,7 +980,7 @@ impl Recorded for Table {
             // Ling and GLM read `<tool_call>` and `</think>`, so their two probes are the
             // tagged ones' (no call comes of the fence); IQuest, Hy V3 (whose `<tool_call>` opens a
             // call inside its block alone), the DSML tables, Kimi K2, LFM2.5,
-            // MiniMax M2, MiniCPM5, dots3 and Llama Nemotron read `</think>` but not
+            // MiniMax M2, Step 3, MiniCPM5, dots3 and Llama Nemotron read `</think>` but not
             // `<tool_call>`.
             Self::Ling | Self::Glm | Self::Glm4 => KNOWN_TAGGED_DIFFERENCES,
             Self::IQuest
@@ -982,8 +991,10 @@ impl Recorded for Table {
             | Self::DeepSeekV4
             | Self::DeepSeekV4_1
             | Self::KimiK2
+            | Self::Kimi
             | Self::Lfm2_5
             | Self::MinimaxM2
+            | Self::Steptml
             | Self::MiniCpm5
             | Self::Dots3
             | Self::LlamaNemotron => KNOWN_REASONING_PROBE,

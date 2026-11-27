@@ -291,8 +291,9 @@ impl AsyncMultiModalTracker {
         self
     }
 
-    /// Plan M3 image geometry from source headers and resize once at lazy decode.
-    /// Video fetching and other model families retain their existing policy.
+    /// Plan M3 image geometry from source headers and resize once at lazy decode,
+    /// and carry the aligned size of a clip's frames in its identity. Video
+    /// fetching and other model families retain their existing policy.
     pub fn with_minimax_image_resize(mut self, enabled: bool) -> Self {
         self.minimax_image_resize = enabled;
         self
@@ -555,6 +556,7 @@ impl AsyncMultiModalTracker {
             self.video_frame_sampling,
         )?;
         let sglang = self.minimax_sglang_resize;
+        let aligned = self.minimax_image_resize;
         let key = FetchSettings::video(&cfg, sglang);
         if sglang {
             // Native MiniMax applies Pillow once, after source-resolution decode.
@@ -577,6 +579,10 @@ impl AsyncMultiModalTracker {
                     hash.update(clip.hash.as_bytes());
                     hash.update(&max_long_side_pixel.unwrap_or(0).to_le_bytes());
                     clip.hash = hash.finalize().to_hex().to_string();
+                } else if aligned {
+                    // The processor sizes this family's frames by the aligned
+                    // rule: the identity carries that size, as an image's does.
+                    minimax_resize::clip(Arc::make_mut(&mut clip), max_long_side_pixel);
                 }
                 Ok(TrackedMedia::Video(clip))
             },
@@ -712,15 +718,15 @@ fn video_fetch_config(
 }
 
 /// Lowest sampling rate MiniMax-M3 accepts for a video clip.
-pub const MIN_SAMPLE_FPS: f64 = 0.2;
+pub(crate) const MIN_SAMPLE_FPS: f64 = 0.2;
 /// Highest sampling rate MiniMax-M3 accepts for a video clip.
-pub const MAX_SAMPLE_FPS: f64 = 5.0;
+pub(crate) const MAX_SAMPLE_FPS: f64 = 5.0;
 /// Smallest per-frame long-side cap MiniMax-M3 accepts.
-pub const MIN_VIDEO_LONG_SIDE: u32 = 150;
+pub(crate) const MIN_VIDEO_LONG_SIDE: u32 = 150;
 /// Largest per-frame long-side cap MiniMax-M3 accepts.
-pub const MAX_VIDEO_LONG_SIDE: u32 = 3584;
+pub(crate) const MAX_VIDEO_LONG_SIDE: u32 = 3584;
 /// Vision patch factor the per-frame cap must align to.
-pub const VIDEO_LONG_SIDE_FACTOR: u32 = 28;
+pub(crate) const VIDEO_LONG_SIDE_FACTOR: u32 = 28;
 
 /// Reject a sampling rate outside M3's accepted range.
 fn validate_sample_fps(value: f64) -> MultiModalResult<f64> {
@@ -1031,7 +1037,8 @@ mod repeat_tests {
     }
 
     /// Only native SGLang defers the cap to its Pillow processor; vLLM still
-    /// receives decoder-scaled frames. Explicit caps survive both paths. Runs
+    /// receives decoder-scaled frames, and the aligned resize makes their size
+    /// part of the clip's identity. Explicit caps survive every path. Runs
     /// where ffmpeg and ffprobe are installed, skips elsewhere.
     #[tokio::test]
     async fn minimax_video_cap_is_deferred_only_for_sglang() {
@@ -1064,9 +1071,11 @@ mod repeat_tests {
         assert!(status.success());
         let bytes = std::fs::read(path).unwrap();
         let mut identities = std::collections::HashSet::new();
-        for sglang in [false, true] {
+        for (sglang, aligned) in [(false, false), (true, false), (false, true)] {
             for cap in [None, Some(168), Some(224)] {
-                let mut tracker = tracker().with_minimax_sglang_resize(sglang);
+                let mut tracker = tracker()
+                    .with_minimax_sglang_resize(sglang)
+                    .with_minimax_image_resize(aligned);
                 tracker
                     .push_part(MediaContentPart::VideoUrl {
                         url: format!("data:video/mp4;base64,{}", STANDARD.encode(&bytes)).into(),
@@ -1084,7 +1093,7 @@ mod repeat_tests {
                     identities.insert(clip.hash.clone()),
                     "runtime and cap identify different pixels"
                 );
-                if !sglang {
+                if !sglang && !aligned {
                     assert_eq!(
                         clip.hash,
                         hash_video_with_sampling(&bytes, 1.0, cap, FrameSampling::default())

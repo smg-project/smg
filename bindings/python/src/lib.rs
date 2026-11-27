@@ -590,6 +590,7 @@ struct Router {
     engine_metrics: bool,
     epd_disaggregation: bool,
     eviction_interval_secs: u64,
+    grand_central: String,
     grouped_dp_sticky: String,
     grpc_request_timeout_secs: u64,
     header_read_timeout_secs: u64,
@@ -613,6 +614,7 @@ struct Router {
     least_load_kv_pressure_weight: f64,
     least_load_mean_prefill_tokens: u32,
     load_monitor_interval: u64,
+    load_monitor_interval_ms: Option<u64>,
     log_dir: Option<String>,
     log_json: bool,
     log_level: Option<String>,
@@ -654,18 +656,12 @@ struct Router {
     otlp_traces_endpoint: String,
     overlap_decay: f32,
     overload_token_usage_threshold: f32,
+    pairing_protocol_label: String,
     /// `symphony` (the default) or `legacy`: which parser reads a chat completion's output.
     parser: String,
     pd_admission_wait_secs: u64,
     pd_disaggregation: bool,
     pd_pairing_mode: String,
-    policy_controller: String,
-    /// The controller this gateway follows, as `host:port`, and the PEM files
-    /// of the connection to it.
-    policy_controller_address: Option<String>,
-    policy_controller_tls_ca_cert: Option<String>,
-    policy_controller_tls_cert: Option<String>,
-    policy_controller_tls_key: Option<String>,
     policy_spec: Option<String>,
     postgres_config: Option<PyPostgresConfig>,
     power_of_two_load_metric: String,
@@ -1058,12 +1054,12 @@ impl Router {
             })
     }
 
-    fn parse_policy_controller(&self) -> Result<bool, config::ConfigError> {
-        match self.policy_controller.as_str() {
+    fn parse_grand_central(&self) -> Result<bool, config::ConfigError> {
+        match self.grand_central.as_str() {
             "on" => Ok(true),
             "off" => Ok(false),
             other => Err(config::ConfigError::invalid_value(
-                "policy_controller",
+                "grand_central",
                 other,
                 "expected 'on' or 'off'",
             )),
@@ -1323,6 +1319,7 @@ impl Router {
                 worker_ports_annotation: self.worker_ports_annotation.clone(),
                 kv_connector_annotation: self.kv_connector_annotation.clone(),
                 kv_engine_id_annotation: self.kv_engine_id_annotation.clone(),
+                pairing_protocol_label: self.pairing_protocol_label.clone(),
                 router_selector: self.router_selector.clone(),
                 router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
                 model_id_source: self.model_id_from.clone(),
@@ -1420,9 +1417,9 @@ impl Router {
 
         let pd_pairing_mode = self.parse_pd_pairing_mode()?;
         let grouped_dp_sticky = self.parse_grouped_dp_sticky()?;
-        let policy_controller = self.parse_policy_controller()?;
+        let grand_central = self.parse_grand_central()?;
 
-        let builder = config::RouterConfig::builder()
+        config::RouterConfig::builder()
             .mode(mode)
             .policy(policy)
             .cache_boundaries(self.cache_boundaries.clone())
@@ -1460,6 +1457,7 @@ impl Router {
             )
             .disable_load_monitoring(self.disable_load_monitoring)
             .load_monitor_interval_secs(self.load_monitor_interval)
+            .load_monitor_interval_ms(self.load_monitor_interval_ms)
             .pd_admission_wait_secs(self.pd_admission_wait_secs)
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
@@ -1551,7 +1549,7 @@ impl Router {
             .maybe_reasoning_parser(self.reasoning_parser.as_ref())
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())
-            .policy_controller(policy_controller)
+            .grand_central(grand_central)
             .maybe_policy_spec_path(self.policy_spec.as_ref())
             .maybe_storage_hook_wasm_path(self.storage_hook_wasm_path.as_deref())
             .enable_responses_websocket(self.enable_responses_websocket)
@@ -1610,20 +1608,8 @@ impl Router {
                 self.server_cert_path.as_ref(),
                 self.server_key_path.as_ref(),
             )
-            .dp_minimum_tokens_scheduler(self.dp_minimum_tokens_scheduler);
-
-        // The controller's address and its files have no builder step. The
-        // command line sets the same four fields on the built configuration,
-        // and the shared validator reads them there.
-        let config = config::RouterConfig {
-            policy_controller_address: self.policy_controller_address.clone(),
-            policy_controller_tls_ca_cert: self.policy_controller_tls_ca_cert.clone(),
-            policy_controller_tls_cert: self.policy_controller_tls_cert.clone(),
-            policy_controller_tls_key: self.policy_controller_tls_key.clone(),
-            ..builder.build_with_validation(false)?
-        };
-        config.validate()?;
-        Ok(config)
+            .dp_minimum_tokens_scheduler(self.dp_minimum_tokens_scheduler)
+            .build()
     }
 }
 
@@ -1697,6 +1683,7 @@ impl Router {
         engine_metrics = false,
         epd_disaggregation = false,
         eviction_interval_secs = 120,
+        grand_central = String::from("off"),
         grouped_dp_sticky = String::from("off"),
         grpc_request_timeout_secs = 0,
         header_read_timeout_secs = 30,
@@ -1720,6 +1707,7 @@ impl Router {
         least_load_kv_pressure_weight = 0.15,
         least_load_mean_prefill_tokens = 1024,
         load_monitor_interval = 10,
+        load_monitor_interval_ms = None,
         log_dir = None,
         log_json = false,
         log_level = None,
@@ -1759,15 +1747,11 @@ impl Router {
         otlp_traces_endpoint = String::from("localhost:4317"),
         overlap_decay = 0.0,
         overload_token_usage_threshold = 1.0,
+        pairing_protocol_label = String::from("smg.ai/pairing-protocol"),
         parser = String::from("symphony"),
         pd_admission_wait_secs = 30,
         pd_disaggregation = false,
         pd_pairing_mode = String::from("lenient"),
-        policy_controller = String::from("off"),
-        policy_controller_address = None,
-        policy_controller_tls_ca_cert = None,
-        policy_controller_tls_cert = None,
-        policy_controller_tls_key = None,
         policy_spec = None,
         postgres_config = None,
         power_of_two_load_metric = String::from("expected_wait"),
@@ -1931,6 +1915,7 @@ impl Router {
         engine_metrics: bool,
         epd_disaggregation: bool,
         eviction_interval_secs: u64,
+        grand_central: String,
         grouped_dp_sticky: String,
         grpc_request_timeout_secs: u64,
         header_read_timeout_secs: u64,
@@ -1954,6 +1939,7 @@ impl Router {
         least_load_kv_pressure_weight: f64,
         least_load_mean_prefill_tokens: u32,
         load_monitor_interval: u64,
+        load_monitor_interval_ms: Option<u64>,
         log_dir: Option<String>,
         log_json: bool,
         log_level: Option<String>,
@@ -1993,15 +1979,11 @@ impl Router {
         otlp_traces_endpoint: String,
         overlap_decay: f32,
         overload_token_usage_threshold: f32,
+        pairing_protocol_label: String,
         parser: String,
         pd_admission_wait_secs: u64,
         pd_disaggregation: bool,
         pd_pairing_mode: String,
-        policy_controller: String,
-        policy_controller_address: Option<String>,
-        policy_controller_tls_ca_cert: Option<String>,
-        policy_controller_tls_cert: Option<String>,
-        policy_controller_tls_key: Option<String>,
         policy_spec: Option<String>,
         postgres_config: Option<PyPostgresConfig>,
         power_of_two_load_metric: String,
@@ -2216,6 +2198,7 @@ impl Router {
             engine_metrics,
             epd_disaggregation,
             eviction_interval_secs,
+            grand_central,
             grouped_dp_sticky,
             grpc_request_timeout_secs,
             header_read_timeout_secs,
@@ -2239,6 +2222,7 @@ impl Router {
             least_load_kv_pressure_weight,
             least_load_mean_prefill_tokens,
             load_monitor_interval,
+            load_monitor_interval_ms,
             log_dir,
             log_json,
             log_level,
@@ -2278,15 +2262,11 @@ impl Router {
             otlp_traces_endpoint,
             overlap_decay,
             overload_token_usage_threshold,
+            pairing_protocol_label,
             parser,
             pd_admission_wait_secs,
             pd_disaggregation,
             pd_pairing_mode,
-            policy_controller,
-            policy_controller_address,
-            policy_controller_tls_ca_cert,
-            policy_controller_tls_cert,
-            policy_controller_tls_key,
             policy_spec,
             postgres_config,
             power_of_two_load_metric,
@@ -2425,8 +2405,6 @@ impl Router {
                 balance_token_usage_threshold,
                 overload_token_usage_threshold,
                 worker_overload_protection,
-                worker_overload_waiting_requests,
-                worker_overload_token_usage,
                 worker_overload_shed,
                 overlap_decay,
                 selection_temperature,
@@ -2662,10 +2640,10 @@ fn get_available_tool_call_parsers() -> Vec<String> {
 
 /// The choices of one parser flag: the names `legacy` picks from the two legacy registries (the
 /// flag's own kind), Symphony's tables' (`symphony::formats::Table::name`), which `--parser
-/// symphony` reads with when both flags name one, the names a table answers to that no legacy
-/// parser of either kind has (the gateway's `utils::ALIASES`: an engine's exact parser name for a
-/// family, or a launcher's name for one whose table has no older parser, which the gateway takes
-/// in either flag), and `hf`,
+/// symphony` reads with when both flags name one, the names a table answers to (the gateway's
+/// `utils::ALIASES`: a legacy parser's name of either kind, an engine's exact parser name for a
+/// family, or a launcher's name for one whose table has no older parser, each of which the
+/// gateway takes in either flag), and `hf`,
 /// the table a model's response template compiles into, sorted, each once.
 fn parser_choices(
     legacy: impl FnOnce(&tool_parser::ParserFactory, &reasoning_parser::ParserFactory) -> Vec<String>,
@@ -2681,9 +2659,7 @@ fn parser_choices(
     names.extend(
         routers::grpc::utils::ALIASES
             .iter()
-            .map(|(alias, _)| *alias)
-            .filter(|alias| !tools.has_parser(alias) && !reasoning.registry().has_parser(alias))
-            .map(str::to_string),
+            .map(|(alias, _)| (*alias).to_string()),
     );
     names.push(config::TEMPLATE_PARSER.to_string());
     names.sort();
@@ -2721,6 +2697,7 @@ fn smg_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyVllmGrpcServer>()?;
     m.add_class::<PyTokenSpeedGrpcServer>()?;
     m.add_class::<PySglangGrpcServer>()?;
+    m.add_class::<servicer::PyManagedEncoderServer>()?;
     m.add_class::<PyTrtllmGrpcServer>()?;
     m.add_class::<PyTokenizer>()?;
     m.add_function(wrap_pyfunction!(get_version_string, m)?)?;

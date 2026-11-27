@@ -11,6 +11,7 @@ use super::{
     data::{DpInfo, WorkerKind, WorkerRegistrationWorkflowData},
     host::{require_host, WorkflowHost},
     runtimes::{zmq_runtime, zmq_runtime_names, DEFAULT_RUNTIME},
+    select::find_workers_by_url,
 };
 use crate::{
     connection::engine::EngineConnectionCache,
@@ -26,7 +27,8 @@ use crate::{
     labels::{has_control_character, SUPPORTS_VISION_LABEL},
     model_card::ModelCard,
     model_type::ModelType,
-    worker::{ConstrainedDecoding, HealthCheckConfig, WorkerSpec, WorkerType},
+    registry::WorkerOrigin,
+    worker::{ConstrainedDecoding, GrammarStart, HealthCheckConfig, WorkerSpec, WorkerType},
     UNKNOWN_MODEL_ID,
 };
 
@@ -134,12 +136,6 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>> for Create
             &config.url,
         )?;
 
-        // A ZMQ worker that is not expanded into rank workers serves every
-        // rank over one set of sockets, as one grouped worker.
-        let zmq_engine_group = config
-            .dp_size
-            .filter(|&n| n > 1 && *connection_mode == ConnectionMode::Zmq);
-
         let url = normalize_url(&config.url, *connection_mode);
 
         let (resolved_resilience, circuit_breaker) = resolve_resilience(
@@ -160,19 +156,14 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>> for Create
         );
         let health_endpoint = &settings.health_endpoint;
 
-        let dp_ranks: Vec<Option<(usize, usize)>> = if settings.dp_aware {
-            dp_rank_expansion(context.data.dp_info.as_ref())
-        } else {
-            vec![None] // single worker, no DP
-        };
-        // Rank workers register at `{base}@{rank}`, which the base address
-        // checked above does not find.
-        if create_only
-            && dp_ranks
-                .iter()
-                .flatten()
-                .any(|(rank, _)| registry.get_by_url(&format!("{url}@{rank}")).is_some())
-        {
+        let dp_ranks = dp_rank_expansion(context.data.dp_info.as_ref());
+        // The workers that stand for this address, read from the registry:
+        // the plain one, and the rank workers at `{base}@{rank}`, which the
+        // base address checked above does not find.
+        let standing = find_workers_by_url(registry, &url);
+        // A create is refused by any of them, whatever shape this
+        // registration read.
+        if create_only && !standing.is_empty() {
             return Err(already_exists(&config.url));
         }
 
@@ -236,9 +227,6 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>> for Create
                 if let Some(ref address) = config.zmq_handshake_address {
                     builder = builder.zmq_handshake_address(address.clone());
                 }
-                if let (None, Some(group_size)) = (dp, zmq_engine_group) {
-                    builder = builder.zmq_engine_group(group_size);
-                }
                 if let Some(ref slot) = zmq_rank_connection {
                     builder = builder.shared_engine_connection(Arc::clone(slot));
                 }
@@ -248,6 +236,86 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>> for Create
                 Arc::new(builder.build()) as Arc<dyn Worker>
             })
             .collect();
+
+        // Any other registration replaces every worker of this node that
+        // stands, or changes nothing. The registry step replaces a worker
+        // under its own address alone, so a standing worker is replaced where
+        // one was built at its address, whatever rank either states. A
+        // registration that read another shape would leave a worker beside
+        // its own, and the registry would hold the engine twice: a plain
+        // worker beside rank workers, where a server info failed to read on
+        // either registration, or a rank above the size read now.
+        //
+        // A peer's worker, imported from its published state, holds nothing
+        // back: this node takes the addresses it is configured with, where
+        // the registry step claims an import, and a peer's worker of another
+        // shape stays the import's to settle. The engine can then stand
+        // twice on this node until the peer's state changes.
+        let own: Vec<&Arc<dyn Worker>> = standing
+            .iter()
+            .filter(|stands| {
+                registry
+                    .get_id_by_url(stands.url())
+                    .is_some_and(|id| registry.origin_of(&id) == Some(WorkerOrigin::Local))
+            })
+            .collect();
+        let kept: Vec<&Arc<dyn Worker>> = own
+            .iter()
+            .copied()
+            .filter(|stands| workers.iter().all(|built| built.url() != stands.url()))
+            .collect();
+        // The refusal names one of them, the first by its address.
+        if let Some(first) = kept.iter().min_by_key(|stands| stands.url()) {
+            // A rank worker is one whose address ends in a rank, as the
+            // finder selected it.
+            let standing_ranks = own
+                .iter()
+                .filter(|stands| {
+                    Endpoint::parse_with_rank(stands.url()).is_ok_and(|(_, rank)| rank.is_some())
+                })
+                .count();
+            let stands = match (own.len() - standing_ranks, standing_ranks) {
+                (1, 0) => "one worker".to_string(),
+                (plain, 0) => format!("{plain} workers"),
+                (0, 1) => "one rank worker".to_string(),
+                (0, ranks) => format!("{ranks} rank workers"),
+                (plain, ranks) => format!("{plain} plain and {ranks} rank workers"),
+            };
+            let built_ranks = workers
+                .iter()
+                .filter(|built| built.dp_rank().is_some())
+                .count();
+            let read = match built_ranks {
+                0 => "no data-parallel ranks".to_string(),
+                ranks => format!("{ranks} data-parallel ranks"),
+            };
+            let others = match kept.len() - 1 {
+                0 => String::new(),
+                more => format!(" and {more} more"),
+            };
+            return Err(WorkflowError::StepFailed {
+                step_id: StepId::new("create_worker"),
+                message: format!(
+                    "Worker {} stands as {stands} and this registration read {read}: it would \
+                     leave {}{others} beside its own, so nothing is changed (remove what stands \
+                     at the address to register it again)",
+                    Endpoint::redacted_str(&config.url),
+                    // As it is registered, so that another spelling shows.
+                    Endpoint::redacted_url(first.url()),
+                ),
+            });
+        }
+
+        if let Some(warning) = unnamed_grammar_start_warning(
+            &url,
+            *connection_mode,
+            runtime_type,
+            config.worker_type,
+            &context.data.discovered_labels,
+            &labels,
+        ) {
+            warn!("{warning}");
+        }
 
         debug!(
             "Created {} worker(s) for {} ({:?}, {} labels)",
@@ -296,6 +364,60 @@ pub fn validate_constrained_decoding_label(
         }
         None => Ok(()),
     }
+}
+
+/// What a registration says, once, of a worker whose labels name no grammar
+/// start: its `constrained_decoding_start` label is neither `first_token` nor
+/// `after_reasoning`, so it is sent the grammars that fit an engine of either
+/// start ([`GrammarStart::Unknown`]) and nothing else tells its operator so.
+/// `None` for a worker that names its start, and for one no grammar of a
+/// gateway's shaping reaches: a worker off the gRPC pipeline (its engine's own
+/// server shapes the grammar), one of a role that generates no token, and one
+/// of a runtime whose request carries no constraint. The roles and the
+/// runtimes that owe the warning are allow-listed, so one added later owes
+/// none until it is named.
+///
+/// `None` too for a gRPC worker whose `report` is empty: the read of its
+/// engine failed (`DiscoverMetadataStep` leaves no label behind one), so the
+/// engine has named nothing yet. The label refresh of the worker's first
+/// transition into service reads it again, and a label set by hand on this
+/// line's advice would stand over the start the engine names then.
+///
+/// A label refresh says the same of a worker it leaves without a start: its
+/// step calls this with the report it read and the labels it wrote.
+pub fn unnamed_grammar_start_warning(
+    url: &str,
+    connection_mode: ConnectionMode,
+    runtime_type: RuntimeType,
+    worker_type: WorkerType,
+    report: &HashMap<String, String>,
+    labels: &HashMap<String, String>,
+) -> Option<String> {
+    let generates = matches!(worker_type, WorkerType::Regular | WorkerType::Decode);
+    let carries_a_constraint = matches!(
+        runtime_type,
+        RuntimeType::Vllm | RuntimeType::Sglang | RuntimeType::Trtllm | RuntimeType::TokenSpeed
+    );
+    let start = GrammarStart::from_label(labels.get(GrammarStart::LABEL).map(String::as_str));
+    let unread = matches!(connection_mode, ConnectionMode::Grpc) && report.is_empty();
+    if !connection_mode.uses_grpc_pipeline()
+        || !generates
+        || !carries_a_constraint
+        || unread
+        || start != GrammarStart::Unknown
+    {
+        return None;
+    }
+    Some(format!(
+        "Worker {} names no {} label ({} or {}): on a prompt that leaves the model inside its \
+         thought, a forced tool call or a JSON answer is held to its JSON schema alone, which an \
+         engine that starts a grammar at the first token applies before the model thinks; set \
+         the label on the worker to shape the grammar for its engine",
+        Endpoint::redacted_str(url),
+        GrammarStart::LABEL,
+        GrammarStart::FIRST_TOKEN,
+        GrammarStart::AFTER_REASONING,
+    ))
 }
 
 /// Treat an empty KV transfer value as unset, so a later report can fill it.
@@ -703,12 +825,11 @@ fn already_exists(url: &str) -> WorkflowError {
     }
 }
 
-/// Ranks to register for a dp-aware worker. A width above one expands into
-/// one dp-annotated worker per rank. A width-1 advertisement (older
-/// servicers emit it as a capability signal) and a missing one both
-/// register a plain worker: there is no placement to choose, and pinning
-/// rank 0 anyway still alters engine-side scheduling. The DP read already
-/// logged the degradation for the missing-label case.
+/// Ranks to register for a worker, from the shape the DP read left. A width
+/// above one expands into one dp-annotated worker per rank. A width-1
+/// advertisement (older servicers emit it as a capability signal) and a
+/// missing one both register a plain worker: there is no placement to
+/// choose, and pinning rank 0 anyway still alters engine-side scheduling.
 fn dp_rank_expansion(dp_info: Option<&DpInfo>) -> Vec<Option<(usize, usize)>> {
     match dp_info {
         Some(dp_info) if dp_info.dp_size > 1 => (0..dp_info.dp_size)

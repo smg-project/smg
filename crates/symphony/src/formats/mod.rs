@@ -13,6 +13,7 @@
 
 use crate::shape::{Layout, Message};
 
+pub mod command;
 pub mod deepseek_v3;
 pub mod deepseek_v3_1;
 pub mod deepseek_v3_2;
@@ -24,6 +25,7 @@ pub mod function_gemma;
 pub mod gemma4;
 pub mod glm;
 pub mod glm4;
+pub mod gpt_oss;
 pub mod hy4;
 pub mod hy_v3;
 pub mod inkling;
@@ -50,8 +52,10 @@ pub mod qwen2_5;
 pub mod qwen3;
 pub mod registry;
 pub mod seed_oss;
+pub mod steptml;
 pub mod xlam;
 
+pub use command::command;
 pub use deepseek_v3::deepseek_v3;
 pub use deepseek_v3_1::deepseek_v3_1;
 pub use deepseek_v3_2::deepseek_v3_2;
@@ -63,6 +67,7 @@ pub use function_gemma::function_gemma;
 pub use gemma4::gemma4;
 pub use glm::glm;
 pub use glm4::glm4;
+pub use gpt_oss::gpt_oss;
 pub use hy4::hy4;
 pub use hy_v3::hy_v3;
 pub use inkling::inkling;
@@ -70,7 +75,7 @@ pub use inkling2::inkling2;
 pub use iquest::iquest;
 pub use json::json;
 pub use k2_horizon::k2_horizon;
-pub use kimi_k2::kimi_k2;
+pub use kimi_k2::{kimi, kimi_k2};
 pub use kimi_k3::kimi_k3;
 pub use lfm2_5::lfm2_5;
 pub use ling::ling;
@@ -89,6 +94,7 @@ pub use qwen2_5::qwen2_5;
 pub use qwen3::qwen3;
 pub use registry::{for_model, for_model_shared, groups, table_for, Table};
 pub use seed_oss::seed_oss;
+pub use steptml::steptml;
 pub use xlam::xlam;
 
 /// The one part of its chat template's layout a registry table that thinks carries: the thought

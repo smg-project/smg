@@ -29,7 +29,7 @@ use crate::{
         error,
         grpc::{
             common::{response_collection, response_formatting},
-            context::{DispatchMetadata, ExecutionResult},
+            context::{self, DispatchMetadata, ExecutionResult},
             proto_wrapper::ProtoGenerateComplete,
             regular::symphony::{
                 engine_finish, finished,
@@ -510,12 +510,15 @@ impl ResponseProcessor {
             .build();
         // The answer's token and generation records, the ones a streamed
         // answer makes at its end; a collected answer shows no first token.
+        // Its dispatch wait needs none: it is read here, inside the request's
+        // future, against the dispatch the generation clock starts at.
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: self.backend_type,
             model_id: &dispatch.model,
             endpoint: metrics_labels::ENDPOINT_CHAT,
             ttft: None,
+            dispatch_wait: context::dispatch_wait(started),
             generation_duration: started.elapsed(),
             input_tokens: Some(u64::from(counts.prompt)),
             cached_tokens: Some(u64::from(counts.cached)),
@@ -765,7 +768,8 @@ impl ResponseProcessor {
 
         // The records a streamed generate answer makes at its end, from the
         // counters the settlement reads: the prompt and its cache hit once
-        // per request, the completion tokens of every choice.
+        // per request, the completion tokens of every choice. No first
+        // token, and the dispatch wait, as the collected chat answer.
         let counts = response_formatting::TokenCounts::of_generated(&result_array);
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
@@ -773,6 +777,7 @@ impl ResponseProcessor {
             model_id: &dispatch.model,
             endpoint: metrics_endpoint,
             ttft: None,
+            dispatch_wait: context::dispatch_wait(started),
             generation_duration: started.elapsed(),
             input_tokens: Some(u64::from(counts.prompt)),
             cached_tokens: Some(u64::from(counts.cached)),
@@ -838,7 +843,8 @@ impl ResponseProcessor {
         // The engine's counters, for the settlement, whichever reader builds the message.
         let counts = response_formatting::TokenCounts::of(std::slice::from_ref(&complete));
         // The records a streamed message makes at its end; a collected one
-        // shows no first token. Made once the read succeeded, on either path.
+        // shows no first token and records its dispatch wait, as the
+        // collected chat answer. Made once the read succeeded, on either path.
         let record = || {
             Metrics::record_streaming_metrics(StreamingMetricsParams {
                 router_type: metrics_labels::ROUTER_GRPC,
@@ -846,6 +852,7 @@ impl ResponseProcessor {
                 model_id: &dispatch.model,
                 endpoint: metrics_labels::ENDPOINT_MESSAGES,
                 ttft: None,
+                dispatch_wait: context::dispatch_wait(started),
                 generation_duration: started.elapsed(),
                 input_tokens: Some(u64::from(counts.prompt)),
                 cached_tokens: Some(u64::from(counts.cached)),
@@ -1257,13 +1264,15 @@ impl ResponseProcessor {
         }
 
         // The records a streamed completion makes at its end; a collected
-        // one shows no first token.
+        // one shows no first token and records its dispatch wait, as the
+        // collected chat answer (a batch's ends at its earliest dispatch).
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: self.backend_type,
             model_id: &dispatch.model,
             endpoint: metrics_labels::ENDPOINT_COMPLETIONS,
             ttft: None,
+            dispatch_wait: context::dispatch_wait(started),
             generation_duration: started.elapsed(),
             input_tokens: Some(u64::from(total_prompt)),
             cached_tokens: Some(u64::from(total_cached)),
@@ -1299,7 +1308,8 @@ impl ResponseProcessor {
 /// single RPC's dispatch. A batch uses its earliest member. The shapes
 /// that carry no dispatch instant (an embedding answer, an empty batch)
 /// read the clock here, so a generated answer reads it once, at the
-/// dispatch.
+/// dispatch. A collected answer's dispatch wait ends at the same instant
+/// (see [`context::dispatch_wait`]).
 pub(crate) fn generation_start(execution_result: &ExecutionResult) -> Instant {
     match execution_result {
         ExecutionResult::Single { dispatch_start, .. } => *dispatch_start,
@@ -1700,7 +1710,7 @@ fn object_inputs(content: &mut [messages::ContentBlock], function: &'static str)
 #[cfg(test)]
 mod tool_use_input_tests {
     use serde_json::json;
-    use symphony::{adapt, Event, Events, FinishReason, Text};
+    use symphony::{adapt, CallEnd, Event, Events, FinishReason, Text};
 
     use super::{messages, object_inputs, tool_use_input};
 
@@ -1760,6 +1770,7 @@ mod tool_use_input_tests {
             events.push(Event::ToolCallEnd {
                 index: 0,
                 source: Text::new("", 0),
+                ended: CallEnd::Closed,
             });
             events.push(Event::Finish {
                 reason: FinishReason::ToolCalls,

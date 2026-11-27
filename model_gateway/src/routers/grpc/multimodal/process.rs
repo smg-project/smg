@@ -12,7 +12,7 @@ use llm_multimodal::{
     AsyncMultiModalTracker, AudioClip, EncoderDtype, EncoderFieldLayouts, FrameSampling,
     ImageFrame, MediaItemInfo, Modality, ModelMetadata, ModelProcessorSpec, PlaceholderRange,
     PreProcessorConfig, PreprocessedEncoderInputs, PromptReplacement, TrackedMedia, TrackerOutput,
-    TransparencyPolicy, VideoClip, VideoClipOptions, VisionPreProcessor,
+    TransformError, TransparencyPolicy, VideoClip, VideoClipOptions, VisionPreProcessor,
 };
 use llm_tokenizer::TokenizerTrait;
 use rayon::prelude::*;
@@ -80,6 +80,23 @@ struct Timings {
     media_fetch_decode_ms: f64,
     preprocess_ms: f64,
     token_expand_ms: f64,
+}
+
+/// The refusal of an image whose size the processor's own size rule
+/// refuses, found on its header before any decode: the request's own media,
+/// refused as sent on both pipelines (a 400 under the media stage's code;
+/// from a worker, a media fault of the client's).
+#[derive(Debug, thiserror::Error)]
+#[error("Image preprocessing failed: {0}")]
+pub(crate) struct ImageSizeRefused(pub(crate) String);
+
+impl ImageSizeRefused {
+    /// Whether `error` is this refusal, at any depth of its chain.
+    pub(crate) fn is(error: &anyhow::Error) -> bool {
+        error
+            .chain()
+            .any(|cause| cause.downcast_ref::<Self>().is_some())
+    }
 }
 
 /// The refusal of a video part by a process that cannot decode video
@@ -625,14 +642,17 @@ fn image_prompt_tokens<'a>(
 /// the same budget in [`prepared_part`]. A batch whose pixel tensors could
 /// not ride in one message to the engine is refused at the same point, on
 /// the same sizes, as the request's own, where the caller knows they ride
-/// inline in the gateway's own message ([`check_image_wire_cap`]).
+/// inline in the gateway's own message ([`check_image_wire_cap`]). A size
+/// the processor's rule refuses is refused there too, in the preprocessing's
+/// words ([`ImageSizeRefused`]).
 async fn preprocess_modality(
     media: &MediaBatch,
     ctx: &PlanContext<'_>,
 ) -> Result<PreprocessedEncoderInputs> {
     if let MediaBatch::Images(images) = media {
         if let Ok(processor) = ctx.vision_processors.image() {
-            check_image_size_feature_budget(processor.as_ref(), images, ctx.encoder_budget)?;
+            let refused =
+                check_image_size_feature_budget(processor.as_ref(), images, ctx.encoder_budget)?;
             check_image_wire_cap(
                 processor.as_ref(),
                 images,
@@ -640,6 +660,9 @@ async fn preprocess_modality(
                 ctx.image_wire_cap,
             )
             .map_err(llm_multimodal::MultiModalError::Media)?;
+            if let Some(refused) = refused {
+                return Err(ImageSizeRefused(refused.to_string()).into());
+            }
         }
     }
     if let Some(preprocessed) = cached_images(media, ctx).await? {
@@ -823,25 +846,7 @@ async fn preprocess_batch(
         .encoder_field_layouts_for(Modality::Video)
         .model_specific;
     let audio_processor = if media.modality() == Modality::Audio {
-        Some(
-            ctx.spec
-                .audio_processor(
-                    &ctx.model_config.config,
-                    &ctx.model_config.preprocessor_config,
-                )
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "The audio processor of model spec {} cannot be built: {error}",
-                        ctx.spec.name()
-                    )
-                })?
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "No audio processor registered for model spec: {}",
-                        ctx.spec.name()
-                    )
-                })?,
-        )
+        Some(ctx.model_config.audio_processor(ctx.spec)?)
     } else {
         None
     };
@@ -855,57 +860,20 @@ async fn preprocess_batch(
             let processor = vision_processors.video()?;
             // The processor takes one decoded clip at a time; the clips are
             // joined into one batch afterwards, laid out as if processed together.
-            let preprocess_clip = |video: &VideoClip| -> Result<PreprocessedEncoderInputs> {
-                let clip = video_clip_options(video);
-
-                if !video.frames().is_empty() {
-                    return processor
-                        .preprocess_video(video.frames(), &clip)
-                        .map_err(|e| anyhow::anyhow!("Video preprocessing failed: {e}"));
-                }
-
-                if let Some(rgb_video) = video.rgb_video() {
-                    match rgb_video.frame_refs() {
-                        Ok(frame_refs) => match processor.preprocess_video_rgb(&frame_refs, &clip) {
-                            Ok(preprocessed) => return Ok(preprocessed),
-                            Err(error) => {
-                                warn!(
-                                    error = %error,
-                                    "RGB video preprocessing fast path failed; falling back to materialized frames"
-                                );
-                            }
-                        },
-                        Err(error) => {
-                            warn!(
-                                error = %error,
-                                "RGB video frame refs are invalid; falling back to materialized frames"
-                            );
-                        }
-                    }
-                }
-
-                let frames = video
-                    .materialized_frames()
-                    .map_err(|e| anyhow::anyhow!("Video frame materialization failed: {e}"))?;
-                processor
-                    .preprocess_video(&frames, &clip)
-                    .map_err(|e| anyhow::anyhow!("Video preprocessing failed: {e}"))
-            };
 
             // Clips are independent until the concat below, and each one is
             // frames' worth of work, so they go wide the way the image batch
             // does. `collect` keeps request order, which the concat relies on.
             let parts = videos
                 .par_iter()
-                .map(|video| preprocess_clip(video))
+                .map(|video| preprocess_clip(processor.as_ref(), video))
                 .collect::<Result<Vec<_>>>()?;
             PreprocessedEncoderInputs::concat(parts, &video_layouts)
                 .map_err(|e| anyhow::anyhow!("Video batch assembly failed: {e}"))
         }
         MediaBatch::Audios(audios) => {
-            let processor = audio_processor.ok_or_else(|| {
-                anyhow::anyhow!("Model did not provide an audio processor")
-            })?;
+            let processor = audio_processor
+                .ok_or_else(|| anyhow::anyhow!("Model did not provide an audio processor"))?;
             processor
                 .preprocess(&audios)
                 .map_err(|e| anyhow::anyhow!("Audio preprocessing failed: {e}"))
@@ -913,6 +881,52 @@ async fn preprocess_batch(
     })
     .await
     .map_err(|e| anyhow::Error::new(e).context("Preprocessing task panicked"))?
+}
+
+/// One decoded clip through the processor: the frames it holds, else its RGB
+/// buffers by the fast path, else the frames materialized from them.
+fn preprocess_clip(
+    processor: &dyn VisionPreProcessor,
+    video: &VideoClip,
+) -> Result<PreprocessedEncoderInputs> {
+    let clip = video_clip_options(video);
+
+    if !video.frames().is_empty() {
+        return processor
+            .preprocess_video(video.frames(), &clip)
+            .map_err(|e| anyhow::anyhow!("Video preprocessing failed: {e}"));
+    }
+
+    if let Some(rgb_video) = video.rgb_video() {
+        match rgb_video.frame_refs() {
+            Ok(frame_refs) => match processor.preprocess_video_rgb(&frame_refs, &clip) {
+                Ok(preprocessed) => return Ok(preprocessed),
+                // The frame path would ask for the same output again.
+                Err(error @ TransformError::ReserveRefused(_)) => {
+                    return Err(anyhow::anyhow!("Video preprocessing failed: {error}"));
+                }
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "RGB video preprocessing fast path failed; falling back to materialized frames"
+                    );
+                }
+            },
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "RGB video frame refs are invalid; falling back to materialized frames"
+                );
+            }
+        }
+    }
+
+    let frames = video
+        .materialized_frames()
+        .map_err(|e| anyhow::anyhow!("Video frame materialization failed: {e}"))?;
+    processor
+        .preprocess_video(&frames, &clip)
+        .map_err(|e| anyhow::anyhow!("Video preprocessing failed: {e}"))
 }
 
 /// What the processor reads about one clip besides its frames: its sampled
@@ -1413,6 +1427,68 @@ mod tests {
         assert!(
             counted,
             "no pool_queue count under the model in:\n{rendered}"
+        );
+    }
+
+    /// A processor whose RGB path is refused its output; its frame path
+    /// must not run.
+    struct RefusedRgb;
+
+    impl VisionPreProcessor for RefusedRgb {
+        fn default_mean(&self) -> [f64; 3] {
+            [0.0; 3]
+        }
+        fn default_std(&self) -> [f64; 3] {
+            [1.0; 3]
+        }
+        fn calculate_num_tokens(&self, _: u32, _: u32) -> Result<usize, TransformError> {
+            Ok(1)
+        }
+        fn model_name(&self) -> &'static str {
+            "refused"
+        }
+        fn preprocess(
+            &self,
+            _: &[&image::DynamicImage],
+        ) -> Result<PreprocessedEncoderInputs, TransformError> {
+            Err(TransformError::ShapeError("images".to_string()))
+        }
+        fn preprocess_video(
+            &self,
+            _: &[image::DynamicImage],
+            _: &VideoClipOptions,
+        ) -> Result<PreprocessedEncoderInputs, TransformError> {
+            panic!("the frame path ran")
+        }
+        fn preprocess_video_rgb(
+            &self,
+            _: &[llm_multimodal::RgbFrameRef<'_>],
+            _: &VideoClipOptions,
+        ) -> Result<PreprocessedEncoderInputs, TransformError> {
+            Err(TransformError::ReserveRefused("no room".to_string()))
+        }
+    }
+
+    #[test]
+    fn a_refused_rgb_clip_is_answered_without_the_frame_path() {
+        let frame = llm_multimodal::types::DecodedRgbFrame {
+            width: 1,
+            height: 1,
+            offset: 0,
+            len: 3,
+        };
+        let video = VideoClip::new_rgb(
+            llm_multimodal::types::DecodedRgbVideo::new(Bytes::from_static(&[0; 3]), vec![frame]),
+            Bytes::new(),
+            VideoSource::InlineBytes,
+            "video-hash".to_string(),
+        );
+
+        let error = preprocess_clip(&RefusedRgb, &video).expect_err("refused");
+
+        assert_eq!(
+            error.to_string(),
+            "Video preprocessing failed: Shape error: no room"
         );
     }
 

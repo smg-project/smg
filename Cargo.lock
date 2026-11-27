@@ -107,6 +107,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4b46cbb362ab8752921c97e041f5e366ee6297bd428a31275b9fcf1e380f7299"
 
 [[package]]
+name = "annotate-snippets"
+version = "0.12.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0258346f92c78dbc5b336b9a5b27c64447aa10643bc64e651db2edb145361564"
+dependencies = [
+ "anstyle",
+ "memchr",
+ "unicode-width",
+]
+
+[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -205,6 +216,12 @@ name = "array-init"
 version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d62b7694a562cdf5a74227903507c56ab2cc8bdd1f781ed5cb4cf9c9f810bfc"
+
+[[package]]
+name = "arraydeque"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d902e3d592a523def97af8f317b08ce16b7ab854c1985a0c671e6f15cebc236"
 
 [[package]]
 name = "arrayvec"
@@ -2178,6 +2195,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "encoding_rs_io"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fba3fe847045ecff794b9c138293a80db914678c453ad63fbf0c6a9eb6e00b22"
+dependencies = [
+ "encoding_rs",
+]
+
+[[package]]
 name = "engine-servicer"
 version = "0.4.0"
 dependencies = [
@@ -2224,6 +2250,7 @@ dependencies = [
  "half",
  "llm-tokenizer",
  "openai-protocol",
+ "prost",
  "prost-types",
  "rustix",
  "serde_json",
@@ -2524,9 +2551,9 @@ checksum = "00b0228411908ca8685dba7fc2cdd70ec9990a6e753e89b6ac91a84c40fbaf4b"
 
 [[package]]
 name = "form_urlencoded"
-version = "1.2.2"
+version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
+checksum = "afa489199eaffb1211795df1c6236ce1ad0d41a6fa45250add73e3b02420f06e"
 dependencies = [
  "percent-encoding",
 ]
@@ -2764,9 +2791,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -2821,6 +2850,30 @@ dependencies = [
  "futures-core",
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "grand-central-example"
+version = "0.1.0"
+dependencies = [
+ "mock-worker",
+ "serde_yaml",
+ "smg-grand-central",
+ "smg-grpc-client",
+ "smg-worker",
+ "tikv-jemallocator",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
+name = "granit-parser"
+version = "0.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d03f81ad4732830d85cfd417a9f62cde6dadda4354d37d078a6084a19560aa2d"
+dependencies = [
+ "arraydeque",
+ "smallvec",
 ]
 
 [[package]]
@@ -3728,9 +3781,9 @@ dependencies = [
 
 [[package]]
 name = "k8s-openapi"
-version = "0.27.1"
+version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51b326f5219dd55872a72c1b6ddd1b830b8334996c667449c29391d657d78d5e"
+checksum = "d9c6922f6afe80418dd6019818af5d0d34584c371780ff09b9752370c25b4abb"
 dependencies = [
  "base64 0.22.1",
  "jiff",
@@ -3760,9 +3813,9 @@ dependencies = [
 
 [[package]]
 name = "kube"
-version = "3.1.0"
+version = "4.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "acc5a6a69da2975ed9925d56b5dcfc9cc739b66f37add06785b7c9f6d1e88741"
+checksum = "e0a034a7cb6141527e9225e660e48565305b8557f9fb71946d5436aee929d82f"
 dependencies = [
  "k8s-openapi",
  "kube-client",
@@ -3773,9 +3826,9 @@ dependencies = [
 
 [[package]]
 name = "kube-client"
-version = "3.1.0"
+version = "4.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0fcaf2d1f1a91e1805d4cd82e8333c022767ae8ffd65909bbef6802733a7dd40"
+checksum = "0dd59e09518478bda46674fb056103318e443a000089b342d32e440a52afe552"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -3794,10 +3847,11 @@ dependencies = [
  "kube-core",
  "pem 3.0.6",
  "rustls",
+ "rustls-platform-verifier",
  "secrecy",
  "serde",
+ "serde-saphyr",
  "serde_json",
- "serde_yaml",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
@@ -3808,9 +3862,9 @@ dependencies = [
 
 [[package]]
 name = "kube-core"
-version = "3.1.0"
+version = "4.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f126d2db7a8b532ec1d839ece2a71e2485dc3bbca6cc3c3f929becaa810e719e"
+checksum = "10b14df286fa701cd30920fa5251f26d8fcbd0fc54b50e02281cafe0a4505743"
 dependencies = [
  "derive_more 2.1.1",
  "form_urlencoded",
@@ -3827,9 +3881,9 @@ dependencies = [
 
 [[package]]
 name = "kube-derive"
-version = "3.1.0"
+version = "4.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d6b9b97e121fce957f9cafc6da534abc4276983ab03190b76c09361e2df849fa"
+checksum = "765bfab0ab9f36780fc2d99b53f28d5594df530bb9c1164a82028276a3669b61"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",
@@ -3841,9 +3895,9 @@ dependencies = [
 
 [[package]]
 name = "kube-runtime"
-version = "3.1.0"
+version = "4.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c072737075826ee74d3e615e80334e41e617ca3d14fb46ef7cdfda822d6f15f2"
+checksum = "5733225dce4bcc855a689f57b741423d27e593631987724067bc0c3ac5e10342"
 dependencies = [
  "ahash",
  "async-broadcast",
@@ -3873,6 +3927,7 @@ dependencies = [
  "anyhow",
  "bincode",
  "blake3",
+ "bytemuck",
  "clap",
  "criterion",
  "crossbeam-queue",
@@ -3888,6 +3943,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "tracing-test",
  "xxhash-rust",
 ]
 
@@ -4066,6 +4122,7 @@ dependencies = [
  "foldhash 0.2.0",
  "hf-hub",
  "http",
+ "memchr",
  "minijinja",
  "minijinja-contrib",
  "openai-protocol",
@@ -4648,6 +4705,12 @@ checksum = "418abd1b6d34fbf6cae440dc874771b0525a604428704c76e48b29a5e67b8003"
 dependencies = [
  "memchr",
 ]
+
+[[package]]
+name = "nohash-hasher"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
 
 [[package]]
 name = "nom"
@@ -5791,19 +5854,6 @@ dependencies = [
  "fdeflate",
  "flate2",
  "miniz_oxide",
-]
-
-[[package]]
-name = "policy-controller-example"
-version = "0.1.0"
-dependencies = [
- "mock-worker",
- "serde_yaml",
- "smg-grpc-client",
- "smg-policy-controller",
- "tikv-jemallocator",
- "tokio",
- "tonic",
 ]
 
 [[package]]
@@ -7386,6 +7436,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde-saphyr"
+version = "0.0.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7bd22781911de0ca6debda95f073c8f18bec65d1a94f1fa9573f3102e514cea4"
+dependencies = [
+ "ahash",
+ "annotate-snippets",
+ "base64 0.22.1",
+ "encoding_rs_io",
+ "getrandom 0.3.4",
+ "granit-parser",
+ "nohash-hasher",
+ "num-traits",
+ "serde_core",
+ "smallvec",
+ "zmij",
+]
+
+[[package]]
 name = "serde-value"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7847,11 +7916,11 @@ dependencies = [
  "smg",
  "smg-auth",
  "smg-external-router",
+ "smg-grand-central",
  "smg-grpc-client",
  "smg-mcp",
  "smg-mesh",
  "smg-mm-rdma",
- "smg-policy-controller",
  "smg-response-template",
  "smg-rl",
  "smg-service-discovery",
@@ -8001,6 +8070,65 @@ dependencies = [
 ]
 
 [[package]]
+name = "smg-grand-central"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "axum",
+ "clap",
+ "criterion",
+ "crossbeam-queue",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper-util",
+ "k8s-openapi",
+ "kube",
+ "kv-index",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "mock-worker",
+ "openai-protocol",
+ "parking_lot 0.13.0",
+ "prost",
+ "prost-build",
+ "prost-types",
+ "rcgen",
+ "rustc-hash 2.1.3",
+ "rustix",
+ "rustls",
+ "schemars 1.2.2",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "serde_yaml",
+ "sha2 0.11.0",
+ "smg-grand-central",
+ "smg-grpc-client",
+ "smg-service-discovery",
+ "smg-worker",
+ "tempfile",
+ "thiserror 2.0.21",
+ "thread_local",
+ "tikv-jemallocator",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-health",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "wasmtime",
+ "wat",
+ "wfaas",
+ "wit-component",
+ "wit-parser",
+]
+
+[[package]]
 name = "smg-grpc-client"
 version = "1.17.0"
 dependencies = [
@@ -8094,64 +8222,6 @@ dependencies = [
  "nixl-sys",
  "parking_lot 0.13.0",
  "tracing",
-]
-
-[[package]]
-name = "smg-policy-controller"
-version = "0.1.0"
-dependencies = [
- "arc-swap",
- "async-trait",
- "axum",
- "clap",
- "criterion",
- "crossbeam-queue",
- "http",
- "hyper-util",
- "k8s-openapi",
- "kube",
- "kv-index",
- "metrics",
- "metrics-exporter-prometheus",
- "mock-worker",
- "openai-protocol",
- "parking_lot 0.13.0",
- "prost",
- "prost-build",
- "prost-types",
- "rcgen",
- "reqwest 0.13.4",
- "rustc-hash 2.1.3",
- "rustix",
- "rustls",
- "schemars 1.2.2",
- "serde",
- "serde_json",
- "serde_path_to_error",
- "serde_yaml",
- "sha2 0.11.0",
- "smg-grpc-client",
- "smg-policy-controller",
- "smg-service-discovery",
- "smg-worker",
- "tempfile",
- "thiserror 2.0.21",
- "thread_local",
- "tikv-jemallocator",
- "tokio",
- "tokio-stream",
- "tonic",
- "tonic-health",
- "tonic-prost",
- "tonic-prost-build",
- "tower",
- "tracing",
- "tracing-subscriber",
- "wasmtime",
- "wat",
- "wfaas",
- "wit-component",
- "wit-parser",
 ]
 
 [[package]]
@@ -8294,7 +8364,6 @@ dependencies = [
  "openai-protocol",
  "openssl",
  "rand 0.10.2",
- "reasoning-parser",
  "reqwest 0.13.4",
  "rmcp",
  "rustls",
@@ -8302,6 +8371,7 @@ dependencies = [
  "serde_json",
  "smg",
  "smg-auth",
+ "smg-grand-central",
  "smg-grpc-client",
  "smg-mcp",
  "smg-worker",
@@ -8309,7 +8379,6 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
- "tool-parser",
  "tower",
  "uuid",
 ]
@@ -9858,9 +9927,9 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "url"
-version = "2.5.8"
+version = "2.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed"
+checksum = "f00cd2407bb42c0ef17be88d4cf020f5cceffd121665bac9b8b9493a369b3b1a"
 dependencies = [
  "form_urlencoded",
  "idna",

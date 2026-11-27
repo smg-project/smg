@@ -9,7 +9,7 @@ use openai_protocol::{
     common::{ResponseFormat, Tool, ToolChoice, ToolChoiceValue, ToolReference},
     messages::{CreateMessageRequest, ToolChoice as MessagesToolChoice},
     profile::ProviderProfile,
-    worker::ConstrainedDecoding,
+    worker::{ConstrainedDecoding, GrammarStart as WorkerGrammarStart},
 };
 use serde_json::{json, Value};
 use smg_worker::identity::basic::{Worker, WorkerType};
@@ -17,7 +17,6 @@ use symphony::{
     grammar::{GrammarStart, Options},
     Format, Grammar, GrammarBackend, OutputAnswer, OutputChoice, Spelling, Turn, Unspelled,
 };
-use tool_parser::{GrammarStart as WorkerGrammarStart, ToolConstraint};
 
 #[cfg(test)]
 use super::names::reading;
@@ -129,8 +128,8 @@ pub(super) fn tagged(
 /// worker's grammar compiler takes ([`tagged`]). A registry table's tag that opens with free
 /// text, the prefix an open thought takes on workers that name no one start for the grammar
 /// ([`opens_with_free_text`]), comes marked ([`Prepared::OpensWithFreeText`]): text that owes
-/// nothing at its end does not hold the model to the call, so preparation gives the older
-/// registry's schema in the tag's place where that schema can be built ([`Prepared::held_by`]).
+/// nothing at its end does not hold the model to the call, so preparation gives the call's
+/// JSON schema in the tag's place where that schema can be built ([`Prepared::held_by`]).
 #[expect(
     clippy::too_many_arguments,
     reason = "the table, the request's ask, where the prompt and the engine leave the model, \
@@ -194,14 +193,14 @@ fn opens_with_free_text(grammar: &Grammar) -> bool {
     }
 }
 
-/// Whether `schema`, the older registry's JSON schema for a forced call to `tools`, keeps what
+/// Whether `schema`, the JSON schema preparation builds for a forced call to `tools`, keeps what
 /// every reference in the tools' parameters points at: each is a local one (`#` and a JSON
-/// pointer) whose target in `schema` is its target in the tool's own parameters. The registry
+/// pointer) whose target in `schema` is its target in the tool's own parameters. Preparation
 /// writes a named function's parameters as they are, and for a list of tools one schema that
 /// nests each tool's parameters and lifts their `$defs` to its root, where a reference to
 /// anything else (an entry of `definitions`, the tool's own root) points nowhere or at another
 /// value. A schema that loses a target is not sent in a tag's place ([`Prepared::held_by`]).
-/// A constraint of another kind, which the registry does not give with no parser named, is
+/// A constraint of another kind, which preparation's `forced_call_schema` never gives, is
 /// taken as it is.
 pub(crate) fn keeps_references(schema: &ToolConstraint, tools: &[Tool]) -> bool {
     let ToolConstraint::JsonSchema(schema) = schema else {
@@ -328,7 +327,7 @@ pub(crate) fn grammar_start_from(start: WorkerGrammarStart) -> GrammarStart {
 /// token stands beside one that does not, since no one tag fits both (the answer keeps the
 /// prefix a forced call takes: [`Format::answer_grammar_for`]); unknown when none says, and
 /// when workers that start after their reasoning parser stand beside ones that do not say,
-/// since the unknown start's tags fit both (a forced call's tag, or the older registry's schema
+/// since the unknown start's tags fit both (a forced call's tag, or the call's JSON schema
 /// where the table's tag would open with free text; an answer's schema alone).
 pub(crate) fn grammar_start_of(workers: &[Arc<dyn Worker>]) -> GrammarStart {
     let mut starts = workers
@@ -889,10 +888,49 @@ pub(super) fn auto_tag(
         .and_then(|grammar| structural_tag(grammar, vocabulary).ok())
 }
 
+/// A constraint an engine decodes under: a JSON schema, or a structural tag. The request builders
+/// take it as its wire pair ([`Self::to_tuple`]).
+#[derive(Debug, Clone)]
+pub(crate) enum ToolConstraint {
+    /// A JSON schema the engine holds the output to, from the first token or once the model's
+    /// thought is over, by where the worker starts the grammar. The kind does not pick the
+    /// reader: a table reads a schema it built, and a forced call's schema it did not build
+    /// where it reads the response; the generic JSON parser reads one only on the legacy path
+    /// (`regular::stages::reading::Prepared::json_schema`, `regular::symphony::assign_for`).
+    JsonSchema(String),
+    /// A structural tag: the answer carries the model's own framing, read by the model's parser.
+    StructuralTag(String),
+}
+
+impl ToolConstraint {
+    /// The kind and the text, as the request builders take them.
+    pub(crate) fn to_tuple(&self) -> (String, String) {
+        match self {
+            Self::JsonSchema(schema) => ("json_schema".to_string(), schema.clone()),
+            Self::StructuralTag(tag) => ("structural_tag".to_string(), tag.clone()),
+        }
+    }
+
+    pub(crate) fn is_json_schema(&self) -> bool {
+        matches!(self, Self::JsonSchema(_))
+    }
+}
+
+impl From<tool_parser::ToolConstraint> for ToolConstraint {
+    /// The older registry's constraint, kind for kind.
+    fn from(constraint: tool_parser::ToolConstraint) -> Self {
+        match constraint {
+            tool_parser::ToolConstraint::JsonSchema(schema) => Self::JsonSchema(schema),
+            tool_parser::ToolConstraint::StructuralTag(tag) => Self::StructuralTag(tag),
+        }
+    }
+}
+
 /// The constraint preparation finds for what a request asks, before its worker is known
-/// ([`constraint_for`]): a forced call's tag, the table's or the older registry's; a JSON answer's
-/// tag as it derives for a worker's start; or why the table cannot constrain the request. Request
-/// building decides on the selected worker ([`worker_constraint`]).
+/// ([`constraint_for`]): a forced call's tag, the table's or the older registry's, or the call's
+/// JSON schema where the table's tag opens with free text; a JSON answer's tag as it derives for
+/// a worker's start; or why the table cannot constrain the request. Request building decides on
+/// the selected worker ([`worker_constraint`]).
 pub(crate) type PreparedConstraint = Result<Prepared, SymphonyError>;
 
 /// What preparation found for a request's constraint, before its worker is known.
@@ -902,22 +940,24 @@ pub(crate) enum Prepared {
     None,
     /// A constraint every worker takes as it is: a forced call's tag, the table's built for the
     /// start the model's workers name together ([`grammar_start_of`]) or the older registry's,
-    /// which request building shapes for the worker (`utils::tool_constraints_for_worker`).
+    /// which request building shapes for the worker (`utils::tool_constraints_for_worker`), or
+    /// the call's JSON schema where the table's tag opens with free text ([`Self::held_by`]).
     Constraint {
         constraint: ToolConstraint,
         /// The table built it for an engine that starts the grammar at the first token (the
         /// thought, closed, ahead of the calls), the start the model's workers name together.
-        /// The older registry's is shaped for the worker at request building, which says then
+        /// One no table built is shaped for the worker at request building, which says then
         /// whether it led the tag; here it is `false` ([`WorkerConstraint::first_token`]).
         first_token: bool,
         /// The table built it (its tag for the forced call, `calls_tag`), so the table reads
         /// the response with its own markers whatever the constraint's kind; `false` for the
-        /// older registry's, whose JSON the table reads with its forced call, and for the
-        /// request's own schema where no table reads ([`WorkerConstraint::table`]).
+        /// older registry's and the forced call's JSON schema, whose JSON the table reads with its
+        /// forced call, and for the request's own schema where no table reads
+        /// ([`WorkerConstraint::table`]).
         table: bool,
     },
     /// A forced call's tag a registry table built that opens with free text ([`calls_tag`]),
-    /// which does not hold the model to the call. Preparation gives the older registry's schema
+    /// which does not hold the model to the call. Preparation gives the call's JSON schema
     /// in its place, or keeps the tag as the table's own where that schema cannot be built
     /// ([`Self::held_by`]).
     OpensWithFreeText {
@@ -936,7 +976,7 @@ pub(crate) enum Prepared {
 
 impl Prepared {
     /// What holds a forced call where the table's tag opens with free text
-    /// ([`Self::OpensWithFreeText`]): the constraint `schema` gives, the older registry's JSON
+    /// ([`Self::OpensWithFreeText`]): the constraint `schema` gives, the forced call's JSON
     /// schema, which holds the model to the call wherever the engine starts the grammar; or the
     /// table's own tag where `schema` gives none, so that a request that schema cannot spell is
     /// served, not refused. Anything else stays as found, and `schema` is not asked.
@@ -978,9 +1018,9 @@ impl Prepared {
 }
 
 impl From<Option<ToolConstraint>> for Prepared {
-    /// The older registry's constraint, as it built it (or the request's own schema where no
-    /// table reads): request building shapes it for the worker and says whether it led the
-    /// tag; no table built it.
+    /// The older registry's constraint, as it built it (or a forced call's JSON schema in a
+    /// tag's place, or the request's own schema where no table reads): request building shapes
+    /// it for the worker and says whether it led the tag; no table built it.
     fn from(constraint: Option<ToolConstraint>) -> Self {
         constraint.map_or(Self::None, |constraint| Self::Constraint {
             constraint,
@@ -1094,15 +1134,15 @@ pub(crate) struct WorkerConstraint {
     /// for a pool that starts there ([`Prepared::Constraint`]). The engine's request says so
     /// where its dialect has a switch for the gate behind a reasoning parser, so an engine that
     /// gates its grammars there starts this one at once; a constraint shaped for another start,
-    /// or none, starts where the engine does. Never the older registry's constraint: request
+    /// or none, starts where the engine does. Never a constraint no table built: request
     /// building shapes that one for the worker and says whether it led the tag.
     pub first_token: bool,
     /// The table built the constraint (the whole turn's grammar, the `auto` tag, a JSON
     /// answer's tag, a forced call's), so the table reads the response whatever the
-    /// constraint's kind, which a backend's spelling may change; `false` for the older
-    /// registry's forced call, which the table reads with its forced call, and where nothing
-    /// constrains.
-    /// Symphony's assignment reads the older registry's by its kind alone
+    /// constraint's kind, which a backend's spelling may change; `false` for a forced call's
+    /// constraint no table built (the older registry's, or the call's JSON schema in a tag's
+    /// place), which the table reads with its forced call, and where nothing constrains.
+    /// Symphony's assignment reads one no table built by its kind alone
     /// (`regular::symphony::assign_for`).
     pub table: bool,
 }
@@ -1271,7 +1311,7 @@ pub(crate) fn worker_constraint(
     let start = grammar_start_from(decoding.start);
     let vocabulary = decoding.vocabulary;
     // A tag derived here is shaped for the selected worker's start; a prepared constraint says
-    // for itself whether the table built it for the first token, and the older registry's is
+    // for itself whether the table built it for the first token, and one no table built is
     // shaped and spoken for at request building (`utils::tool_constraints_for_worker`).
     let derived_for_first_token =
         |tag: &Option<ToolConstraint>| tag.is_some() && start == GrammarStart::FirstToken;
@@ -1403,7 +1443,7 @@ pub(super) fn whole_turn(
 
 #[cfg(test)]
 mod tests {
-    use tool_parser::GrammarStart;
+    use openai_protocol::worker::GrammarStart;
 
     use super::*;
     use crate::routers::grpc::regular::symphony::testing::{assign, constraint, *};
@@ -1544,7 +1584,7 @@ mod tests {
     /// the thought closed first from the first token, the schema alone (the request's own, no
     /// tag) when the worker does not say, and for the calls the free-text prefix, marked as
     /// such, when the model's workers name different starts or none: free text owes the call
-    /// nothing, so preparation gives the older registry's schema in the tag's place. The
+    /// nothing, so preparation gives the call's JSON schema in the tag's place. The
     /// answer's tag derives for the selected worker, whatever start the pool names.
     #[test]
     fn the_workers_grammar_start_shapes_what_precedes_a_tables_answer_and_calls() {
@@ -1747,7 +1787,7 @@ mod tests {
         );
     }
 
-    /// The older registry's schema keeps a reference when its target there is its target in the
+    /// A forced call's JSON schema keeps a reference when its target there is its target in the
     /// tool's own parameters: any local reference of a named function, whose parameters are the
     /// schema; a `$defs` entry under the one schema for a list of tools, which lifts those and
     /// nothing else. A reference to an entry of `definitions` or to the tool's own root under
@@ -2211,6 +2251,250 @@ mod tests {
             answer(closed, symphony::GrammarStart::FirstToken),
             Ok(None)
         ));
+    }
+
+    /// The four places the workers of a model may start a grammar at.
+    const STARTS: [symphony::GrammarStart; 4] = [
+        symphony::GrammarStart::Unknown,
+        symphony::GrammarStart::Either,
+        symphony::GrammarStart::AfterReasoning,
+        symphony::GrammarStart::FirstToken,
+    ];
+
+    /// The generation prompt of a table whose template leaves the thought to the model (MiniMax
+    /// M3's) with no marker, and the one that ends with the thought's close: the template closed
+    /// the thought in the model's place, as it does with thinking switched off.
+    const TURN_WITH_NO_MARKER: &str = "]~b]user\nhi[e~[\n]~b]ai\n";
+    const TURN_THAT_CLOSED_THE_THOUGHT: &str = "]~b]user\nhi[e~[\n]~b]ai\n</mm:think>";
+
+    /// What a request (`ask`, over the `lookup` tool unless it asks for a JSON answer) takes on
+    /// `prompt` from the table that reads `MiniMaxAI/MiniMax-M3`, for workers that start the
+    /// grammar at `start`, the request's thinking switch saying `switch`: the table's replay of
+    /// the prompt decides with it as preparation does (`PromptThought::or_switch`).
+    fn found_where_the_thought_is_the_models(
+        ask: &Value,
+        prompt: &str,
+        switch: bool,
+        start: symphony::GrammarStart,
+    ) -> Result<Option<ToolConstraint>, SymphonyError> {
+        let model = "MiniMaxAI/MiniMax-M3";
+        let mut body = ask.clone();
+        body["model"] = json!(model);
+        let request = request(body);
+        let thought = reasoning_open(
+            ParserChoice::Symphony,
+            &names(None, None),
+            model,
+            &templates(),
+            prompt,
+        )
+        .expect("a table reads");
+        let (open, closed) = (thought.or_switch(|| switch), thought.closed);
+        let tools = if ask["response_format"].is_null() {
+            tools()
+        } else {
+            Vec::new()
+        };
+        if ask["tool_choice"] == "auto" {
+            auto_constraint(
+                ParserChoice::Symphony,
+                &names(None, None),
+                Asks::Chat(&request),
+                &tools,
+                open,
+                closed,
+                start,
+                TagVocabulary::Current,
+                &templates(),
+            )
+        } else {
+            super::constraint(
+                ParserChoice::Symphony,
+                &names(None, None),
+                Asks::Chat(&request),
+                &tools,
+                open,
+                closed,
+                start,
+                TagVocabulary::Current,
+                &templates(),
+            )
+            .and_then(|prepared| prepared.for_start(start, TagVocabulary::Current))
+        }
+    }
+
+    /// The structural tag [`found_where_the_thought_is_the_models`] finds.
+    fn tag_where_the_thought_is_the_models(
+        ask: &Value,
+        prompt: &str,
+        switch: bool,
+        start: symphony::GrammarStart,
+    ) -> Value {
+        tag_of(found_where_the_thought_is_the_models(
+            ask, prompt, switch, start,
+        ))
+    }
+
+    /// A forced call by name and by `required`, the `auto` choice, and a JSON answer by
+    /// `json_object` and by `json_schema`: every ask that takes a tag from the table.
+    fn asks_that_take_a_tag() -> [Value; 5] {
+        [
+            json!({"tool_choice": {"type": "function", "function": {"name": "lookup"}}}),
+            json!({"tool_choice": "required"}),
+            json!({"tool_choice": "auto"}),
+            json!({"response_format": {"type": "json_object"}}),
+            json!({"response_format": {"type": "json_schema", "json_schema": {
+                "name": "city",
+                "schema": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"]
+                }
+            }}}),
+        ]
+    }
+
+    /// A prompt that ends with the thought's close, of a table whose template leaves the thought
+    /// to the model, is past the thought whatever the request's thinking switch says, and a
+    /// forced call, named or required, takes the block alone wherever the workers start the
+    /// grammar: no thought and no second close stand before it. A tag that offered the thought
+    /// again could hold the model there until its tokens ran out.
+    #[test]
+    fn a_forced_call_takes_the_block_alone_on_a_prompt_that_closed_the_thought() {
+        let thought = reasoning_open(
+            ParserChoice::Symphony,
+            &names(None, None),
+            "MiniMaxAI/MiniMax-M3",
+            &templates(),
+            TURN_THAT_CLOSED_THE_THOUGHT,
+        )
+        .expect("a table reads");
+        assert!(thought.closed && !thought.open && !thought.alone);
+        assert!(!thought.or_switch(|| true));
+        assert!(!thought.or_switch(|| false));
+        let named = json!({"tool_choice": {"type": "function", "function": {"name": "lookup"}}});
+        let required = json!({"tool_choice": "required"});
+        for start in STARTS {
+            for ask in [&named, &required] {
+                let unmarked =
+                    tag_where_the_thought_is_the_models(ask, TURN_WITH_NO_MARKER, false, start);
+                assert_eq!(
+                    unmarked["format"]["elements"][0]["type"], "optional",
+                    "{start:?}: {unmarked}"
+                );
+                for switch in [false, true] {
+                    let closed = tag_where_the_thought_is_the_models(
+                        ask,
+                        TURN_THAT_CLOSED_THE_THOUGHT,
+                        switch,
+                        start,
+                    );
+                    assert_eq!(
+                        closed["format"], unmarked["format"]["elements"][1],
+                        "{start:?}, switch {switch}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The bound of the rule above, which holds before it too. A prompt with no marker hears the
+    /// request's thinking switch and admits the thought the model may write before a forced
+    /// call. For a request that switched thinking off, a JSON answer's tag (`json_object` and
+    /// `json_schema`) and the `auto` tag are the same on a prompt that closed the thought as on
+    /// one with no marker, wherever the workers start the grammar: only the forced call reads
+    /// the closed thought.
+    #[test]
+    fn a_json_answer_and_the_auto_tag_keep_their_thought_on_a_prompt_that_closed_it() {
+        let unmarked = reasoning_open(
+            ParserChoice::Symphony,
+            &names(None, None),
+            "MiniMaxAI/MiniMax-M3",
+            &templates(),
+            TURN_WITH_NO_MARKER,
+        )
+        .expect("a table reads");
+        assert!(!unmarked.closed && !unmarked.open && !unmarked.alone);
+        assert!(unmarked.or_switch(|| true));
+        assert!(!unmarked.or_switch(|| false));
+        let the_models_thought = json!({
+            "type": "optional",
+            "content": {"type": "or", "elements": [
+                {
+                    "type": "tag",
+                    "begin": "<mm:think>",
+                    "content": {"type": "any_text", "excludes": [
+                        "<mm:think>", "</mm:think>", "<tool_call>", "</tool_call>",
+                        "<invoke name=\"", "</invoke>", "]<]minimax[>["
+                    ]},
+                    "end": "</mm:think>"
+                },
+                {"type": "const_string", "value": "</mm:think>"}
+            ]}
+        });
+        let asks = asks_that_take_a_tag();
+        for start in STARTS {
+            for ask in &asks {
+                let unmarked =
+                    tag_where_the_thought_is_the_models(ask, TURN_WITH_NO_MARKER, false, start);
+                assert_eq!(
+                    unmarked["format"]["elements"][0], the_models_thought,
+                    "{start:?}: {ask}"
+                );
+                if ask["tool_choice"].is_null() || ask["tool_choice"] == "auto" {
+                    assert_eq!(
+                        tag_where_the_thought_is_the_models(
+                            ask,
+                            TURN_THAT_CLOSED_THE_THOUGHT,
+                            false,
+                            start
+                        ),
+                        unmarked,
+                        "{start:?}: {ask}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The corner of the two rules above: the request's thinking switch says the model thinks
+    /// while the prompt ends with the thought's close (a template closes the thought for a
+    /// request whose word the switch does not hear). The prompt decides, as it does for every
+    /// table whose template writes text after the close: a forced call, the `auto` tag and a
+    /// JSON answer take what the same prompt takes with the switch off, wherever the workers
+    /// start the grammar. Before, the switch decided and each was built as inside an open
+    /// thought.
+    #[test]
+    fn a_prompt_that_closed_the_thought_takes_the_tags_of_the_switch_off_under_any_switch() {
+        let asks = asks_that_take_a_tag();
+        let mut turned = Vec::new();
+        for start in STARTS {
+            for ask in &asks {
+                let [off, on] = [false, true].map(|switch| {
+                    match found_where_the_thought_is_the_models(
+                        ask,
+                        TURN_THAT_CLOSED_THE_THOUGHT,
+                        switch,
+                        start,
+                    ) {
+                        Ok(Some(ToolConstraint::StructuralTag(tag))) => tag,
+                        other => format!("{other:?}"),
+                    }
+                });
+                if on != off {
+                    turned.push(format!(
+                        "{start:?}: {ask}\n  the switch off: {off}\n  the switch on: {on}"
+                    ));
+                }
+            }
+        }
+        assert!(
+            turned.is_empty(),
+            "{} of {} differ:\n{}",
+            turned.len(),
+            STARTS.len() * asks.len(),
+            turned.join("\n")
+        );
     }
 
     #[test]

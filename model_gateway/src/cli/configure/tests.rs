@@ -1,7 +1,7 @@
-//! The configuration a command line assembles, as a policy document: the
-//! policy controller's corpus through the command-line parser.
+//! The configuration a command line assembles, as a policy document:
+//! Grand Central's corpus through the command-line parser.
 //!
-//! The corpus (`crates/policy_controller/tests/corpus`) holds one item a
+//! The corpus (`crates/grand_central/tests/corpus`) holds one item a
 //! routing configuration of the gateway: its input, and under `## Expected
 //! spec` the document that says the same. An item is read as the binary
 //! reads a command line, assembled into a `RouterConfig` and converted.
@@ -9,13 +9,13 @@
 use std::{borrow::Cow, fs, path::Path};
 
 use clap::Parser;
-use smg_policy_controller::document::{PolicySpec, SpecError, PRESETS};
+use smg_grand_central::document::{PolicySpec, RoutingSettingsError, SpecError, PRESETS};
 
 use super::{
     super::{url_port::CommandLine, Cli, CliArgs, Commands},
     PolicySpecPrint,
 };
-use crate::config::{PolicyDocumentError, RouterConfig, RoutingMode};
+use crate::config::{RouterConfig, RoutingMode};
 
 /// The urls of a side that the binary reads ahead of clap, each with its
 /// bootstrap port.
@@ -151,8 +151,7 @@ fn one_routing_part(argv: &[String], whole: &Converted) -> Result<(), String> {
 
 /// The corpus's items by file name, in order.
 fn corpus() -> Vec<(String, String)> {
-    let dir =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../crates/policy_controller/tests/corpus");
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../crates/grand_central/tests/corpus");
     let mut items: Vec<(String, String)> = fs::read_dir(&dir)
         .expect("the corpus directory is readable")
         .map(|entry| entry.expect("a corpus entry").path())
@@ -233,6 +232,9 @@ enum Verdict {
     LauncherSpelling(Cow<'static, str>),
     /// Its configuration is refused, this setting named.
     Refused(&'static str),
+    /// Its configuration converts to a document the controller takes, and
+    /// the item's block says another one.
+    AnotherDocument,
 }
 
 /// The items that do not convert to their document, each with why.
@@ -242,9 +244,12 @@ const OTHERS: &[(&str, Verdict)] = &[
         "21-launcher-second-spellings-sticky.md",
         Verdict::LauncherSpelling(Cow::Borrowed("--eviction-interval-secs")),
     ),
+    // The conversion writes the sticky override's rule in another form than
+    // this item's block. The corpus is the Grand Central crate's. Where the block
+    // comes to say the conversion's document this entry fails, and leaves.
     (
         "22-cli-least-load-sticky-custom-headers.md",
-        Verdict::Refused("routing_key_override.enabled"),
+        Verdict::AnotherDocument,
     ),
 ];
 
@@ -276,13 +281,24 @@ fn verdict(name: &str, item: &str) -> Result<Verdict, String> {
     one_routing_part(&argv, &whole)?;
     let document = match whole {
         Ok(document) => document,
-        Err(PolicyDocumentError::Unsaid { setting, .. }) => return Ok(Verdict::Refused(setting)),
+        Err(RoutingSettingsError::UnsupportedSetting { setting, .. }) => {
+            return Ok(Verdict::Refused(setting))
+        }
         Err(other) => return Err(format!("no document: {other}")),
     };
     let (_, expected) = fenced(item, "## Expected spec");
     let expected: PolicySpec =
         serde_yaml::from_str(expected).map_err(|err| format!("the expected document: {err}"))?;
     if document != expected {
+        let another = OTHERS
+            .iter()
+            .any(|(listed, verdict)| *listed == name && *verdict == Verdict::AnotherDocument);
+        if another {
+            return match document.validate() {
+                Ok(_) => Ok(Verdict::AnotherDocument),
+                Err(refused) => Err(format!("the controller refuses the document: {refused}")),
+            };
+        }
         return Err(format!(
             "the document differs from the expected one:\n  got      {}\n  expected {}",
             serde_json::to_string(&document).unwrap_or_default(),
@@ -461,6 +477,7 @@ const HEADINGS: [&str; 2] = ["Routing Policy", "PD Disaggregation"];
 
 const POOLS: &str = "the pools and their addresses are the gateway's";
 const ADMISSION: &str = "the prefill queue and its limits are the gateway's admission";
+const THRESHOLDS: &str = "the gateway builds its worker objects with the two overload thresholds unless the document switches its block off, and no document carries one";
 
 const EPD: &[&str] = &[
     "--epd-disaggregation",
@@ -495,8 +512,8 @@ const ROUTING_FLAGS: &[Row] = &[
         "it says the default, and is kept so that an old command line still parses",
     ),
     lands("disable-worker-overload-protection", &[], &[]),
-    lands("worker-overload-waiting-requests", &[], &["32"]),
-    lands("worker-overload-token-usage", &[], &["0.9"]),
+    kept("worker-overload-waiting-requests", &[], &["32"], THRESHOLDS),
+    kept("worker-overload-token-usage", &[], &["0.9"], THRESHOLDS),
     lands("worker-overload-shed", &[], &[]),
     deferred("overlap-decay", &["0.5"], "the prefix-affinity decay"),
     deferred(
@@ -536,7 +553,7 @@ const ROUTING_FLAGS: &[Row] = &[
         &[],
         "whether a rank is a worker of its own is its registration's, not the document's",
     ),
-    refused("routing-key-override", &[], "routing_key_override.enabled"),
+    lands("routing-key-override", &[], &[]),
     lands("pd-pairing-mode", PAIR, &["strict"]),
     lands("routing-key-headers", MANUAL, &["x-session-id"]),
     kept(
@@ -557,7 +574,7 @@ const ROUTING_FLAGS: &[Row] = &[
     lands("worker-warmup-thin-ratio", &[], &["0.25"]),
     lands("worker-warmup-divert-every", &[], &["4"]),
     kept(
-        "policy-controller",
+        "grand-central",
         &[],
         &["on"],
         "it chooses who runs the policy document and leaves the flags' meaning alone",
@@ -600,7 +617,7 @@ fn document(context: &[&str], given: &[String]) -> Result<Converted, String> {
 }
 
 /// A command line's document, or the setting of it that no document says.
-type Converted = Result<PolicySpec, PolicyDocumentError>;
+type Converted = Result<PolicySpec, RoutingSettingsError>;
 
 /// The document a flag's value landed in: one the value moved.
 fn landed<'a>(with: &'a Converted, without: &Converted) -> Result<&'a PolicySpec, String> {
@@ -632,7 +649,9 @@ impl Row {
                 Err(other) => Err(format!("the controller refuses its document: {other}")),
             },
             Fate::Refused(setting) => match &with {
-                Err(PolicyDocumentError::Unsaid { setting: named, .. }) if *named == setting => {
+                Err(RoutingSettingsError::UnsupportedSetting { setting: named, .. })
+                    if *named == setting =>
+                {
                     Ok(())
                 }
                 Ok(_) | Err(_) => Err(format!("it is not refused with {setting} named: {with:?}")),
@@ -719,24 +738,51 @@ fn the_print_option_answers_with_the_document_a_command_line_means() {
     );
 }
 
+/// Whether `sentence` is one line that begins with `head` and says more.
+fn is_one_sentence_headed(sentence: &str, head: &str) -> bool {
+    sentence
+        .strip_prefix(head)
+        .is_some_and(|words| !words.is_empty() && !words.contains('\n'))
+}
+
 #[test]
 fn the_print_option_says_a_refusal_in_one_sentence() {
-    // A setting no document says: no document, and the setting by its name.
-    let sticky = "routing_key_override.enabled = true: the controller holds no recorded form of \
-                  the sticky sessions' rule yet";
-    assert_eq!(
-        printed(&["smg", "--routing-key-override", "--print-policy-spec"]),
-        PolicySpecPrint::Refused(sticky.to_string())
+    // A setting no document says: no document, and one sentence with the
+    // setting by its name at the head. The words behind the head are the
+    // Grand Central crate's, and no case of the gateway holds them. The sticky
+    // override's rule places both sides of a pair, and this line's prefill
+    // policy reads the routing key itself.
+    let mut line = vec!["smg"];
+    line.extend_from_slice(PAIR);
+    line.extend_from_slice(&[
+        "--prefill-policy",
+        "consistent_hashing",
+        "--routing-key-override",
+        "--print-policy-spec",
+    ]);
+    let sticky = printed(&line);
+    assert_eq!(sticky.document(), None);
+    assert!(
+        sticky
+            .refusal()
+            .is_some_and(|sentence| is_one_sentence_headed(
+                sentence,
+                "routing_key_override.enabled = true: "
+            )),
+        "{sticky:?}"
     );
 
     // A line the binary itself refuses: the configuration's own sentence.
-    let alone = printed(&["smg", "--policy", "power_of_two", "--print-policy-spec"]);
-    assert_eq!(alone.document(), None);
+    let mut line = vec!["smg"];
+    line.extend_from_slice(PAIR);
+    line.extend_from_slice(&["--decode-policy", "bucket", "--print-policy-spec"]);
+    let bucket = printed(&line);
+    assert_eq!(bucket.document(), None);
     assert!(
-        alone
+        bucket
             .refusal()
-            .is_some_and(|sentence| sentence.contains("at least 2 workers")),
-        "{alone:?}"
+            .is_some_and(|sentence| sentence.contains("Decode policy should not be allowed")),
+        "{bucket:?}"
     );
 
     // A document this build's controller does not run yet: it prints, with
@@ -746,12 +792,28 @@ fn the_print_option_says_a_refusal_in_one_sentence() {
         read_back(&decayed),
         PolicySpec::preset("cache_aware").expect("a preset")
     );
-    assert_eq!(
-        decayed.refusal(),
-        Some(
-            "profiles.cache_aware.score[1].prefix-affinity: the prefix-affinity decay is not in \
-             this build"
-        )
+    assert!(
+        decayed
+            .refusal()
+            .is_some_and(|sentence| is_one_sentence_headed(
+                sentence,
+                "profiles.cache_aware.score[1].prefix-affinity: "
+            )),
+        "{decayed:?}"
+    );
+}
+
+/// A policy that compares two workers prints its document with one worker
+/// URL or none: no rule counts the worker URLs a line gives, since a URL
+/// registers one worker per data-parallel rank of its engine.
+#[test]
+fn the_print_counts_no_worker_urls_under_power_of_two() {
+    let alone = printed(&["smg", "--policy", "power_of_two", "--print-policy-spec"]);
+    assert!(
+        alone
+            .document()
+            .is_some_and(|yaml| yaml.contains("pick: power-of-two")),
+        "{alone:?}"
     );
 }
 
@@ -772,28 +834,6 @@ fn the_print_checks_its_document_as_the_gateway_checks_one_it_hosts() {
     assert_eq!(
         tenant.refusal(),
         Some("view.headers[0]: header \"x-tenant-id\" is on the deny-list")
-    );
-}
-
-/// The print's check is the start's own: a document past the operators'
-/// door's bound prints with the refusal a start stops by. Twenty thousand
-/// cache boundaries are a line the flags' own checks take.
-#[test]
-fn the_print_refuses_a_document_past_the_doors_bound_as_a_start_does() {
-    let boundaries: Vec<String> = (1..=20_000).map(|at| at.to_string()).collect();
-    let boundaries = boundaries.join(",");
-    let answer = printed(&[
-        "smg",
-        "--policy",
-        "cache_aware",
-        "--cache-boundaries",
-        &boundaries,
-        "--print-policy-spec",
-    ]);
-    let written = answer.document().expect("the document prints").len();
-    assert_eq!(
-        answer.refusal(),
-        Some(format!("the document is {written} bytes; at most 131072").as_str())
     );
 }
 
@@ -835,5 +875,41 @@ fn the_print_refuses_its_part_of_a_line_as_a_start_refuses_it() {
         let mut asked = line.to_vec();
         asked.push("--print-policy-spec");
         assert_eq!(printed(&asked), PolicySpecPrint::Refused(start), "{line:?}");
+    }
+}
+
+/// The connection mode is no flag: a start reads it off the worker
+/// addresses, and a pair's document follows it. Over HTTP the document
+/// binds a single request behind the pair, and over gRPC and over ZMQ it
+/// plans the pair alone. The routing part reads the mode off the same
+/// addresses, so the print answers with the document a start hosts.
+#[test]
+fn the_print_reads_the_connection_mode_off_the_addresses_as_a_start_does() {
+    for (prefill, decode, bindings) in [
+        ("http://prefill-a:8000", "http://decode-a:8000", 2),
+        ("grpc://prefill-a:8000", "grpc://decode-a:8000", 1),
+        ("ipc:///tmp/smg-zmq/p0", "ipc:///tmp/smg-zmq/d0", 1),
+    ] {
+        let line = [
+            "smg",
+            "--pd-disaggregation",
+            "--prefill",
+            prefill,
+            "--decode",
+            decode,
+        ];
+        let argv: Vec<String> = line.iter().map(|word| (*word).to_string()).collect();
+        let start = router_config(&argv)
+            .expect("a start takes the line")
+            .policy_document();
+        assert_eq!(one_routing_part(&argv, &start), Ok(()), "{prefill}");
+
+        let mut asked = line.to_vec();
+        asked.push("--print-policy-spec");
+        let answer = printed(&asked);
+        assert_eq!(answer.refusal(), None, "{prefill}");
+        let document = read_back(&answer);
+        assert_eq!(document.bindings.len(), bindings, "{prefill}");
+        assert_eq!(Ok(document), start, "{prefill}");
     }
 }

@@ -6,14 +6,15 @@
 //! Placement then reads a prefill's partner list instead of comparing
 //! descriptors on the request path.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+use smg_grand_central::engine::{LentList, PartnerClasses, PublishedList};
 use smg_worker::{
     identity::basic::Worker,
     pd::pairing::{PairingMismatch, PdPairing, PdPairingMode},
 };
 
-use crate::routers::common::snapshot::RoutingPool;
+use crate::routers::common::{pair_classes, place_request::stated_facts, snapshot::RoutingPool};
 
 /// A shared, immutable list of workers, as the routing snapshot holds them.
 type Workers = Arc<[Arc<dyn Worker>]>;
@@ -103,6 +104,20 @@ pub(crate) struct PdPairIndex {
     pub partners: Vec<Arc<[Arc<dyn Worker>]>>,
     /// Set when both pools have workers and no pair is compatible.
     pub refusal: Option<PairingRefusal>,
+    /// What Grand Central is lent of this index ([`Published`]): empty
+    /// until the engine first places a pair over it.
+    published: OnceLock<Published>,
+}
+
+/// What Grand Central is lent of an index ([`PdPairIndex::lent`]): the
+/// two pools as the engine's published lists, the prefill pool's and then
+/// the decode pool's, and their pair classes. Each list holds its pool, the
+/// cell the engine keeps its value of the pool in, and what this gateway
+/// states of the pool's workers beside their objects ([`stated_facts`]).
+#[derive(Debug)]
+struct Published {
+    lists: [PublishedList; 2],
+    classes: PartnerClasses,
 }
 
 impl PdPairIndex {
@@ -158,7 +173,39 @@ impl PdPairIndex {
             prefill: prefill.into(),
             partners,
             refusal,
+            published: OnceLock::new(),
         }
+    }
+
+    /// What the engine is lent of the index, made at the first call and
+    /// kept with the index: a membership pays for it once, and a gateway
+    /// whose pairs no engine places never does. A call that arrives during
+    /// the first waits for it.
+    fn published(&self) -> &Published {
+        let list = |pool: &Workers| PublishedList::stating(Arc::clone(pool), stated_facts(pool));
+        self.published.get_or_init(|| Published {
+            lists: [list(&self.prefill_pool), list(&self.decode_pool)],
+            classes: pair_classes::of(self),
+        })
+    }
+
+    /// The two pools as Grand Central is lent them, the prefill pool
+    /// and then the decode pool, and their pair classes: the class of every
+    /// worker of the two pools, in each pool's order, and the table of the
+    /// classes that pair, which are these partner lists as the engine's
+    /// pair decision reads them ([`pair_classes::of`]). Each pool is lent
+    /// with the cell that stands beside it in this index and with what the
+    /// gateway states of its workers. The engine keeps its value of the
+    /// list in that cell from the index's first pair on, and the value
+    /// falls with the index, as the lists do.
+    ///
+    /// The lists and the classes are read from one place
+    /// ([`Self::published`]): a pair's lending reads no more than it did
+    /// while the gateway stated no fact.
+    pub(crate) fn lent(&self) -> ([LentList<'_>; 2], &PartnerClasses) {
+        let published = self.published();
+        let [prefill, decode] = &published.lists;
+        ([prefill.lent(), decode.lent()], &published.classes)
     }
 
     /// Whether some prefill can pair at all: both pools have workers and at
@@ -176,6 +223,7 @@ impl PdPairIndex {
             prefill: Arc::from([]),
             partners: Vec::new(),
             refusal: None,
+            published: OnceLock::new(),
         }
     }
 }
@@ -212,13 +260,16 @@ fn pairing_mismatches(
 #[cfg(test)]
 mod tests {
     use openai_protocol::model_card::ModelCard;
+    use smg_grand_central::engine::FixedFacts;
     use smg_worker::{
         identity::basic::{ConnectionMode, RuntimeType, WorkerType},
         test_support::no_health_check,
     };
 
     use super::*;
-    use crate::routers::grpc::backend_client::BasicWorkerBuilder;
+    use crate::routers::{
+        common::place_request::wire_number, grpc::backend_client::BasicWorkerBuilder,
+    };
 
     fn worker(url: &str, worker_type: WorkerType, connector: Option<&str>) -> Arc<dyn Worker> {
         let mut builder = BasicWorkerBuilder::new(url)
@@ -463,6 +514,61 @@ mod tests {
             strict.refusal.map(|refusal| refusal.mismatches),
             Some(vec!["unknown runtime".to_string()])
         );
+    }
+
+    /// The two pools are lent with what the gateway states of each worker:
+    /// the number of its runtime and transport and nothing else, in each
+    /// pool's order. The facts, the cells and the pair classes are the
+    /// index's own: a second lending hands the same ones.
+    #[test]
+    fn the_pools_are_lent_with_the_wire_each_worker_is_on() {
+        let (prefill, decode) = three_runtimes();
+        let index = PdPairIndex::build(
+            Arc::clone(&prefill),
+            Arc::clone(&decode),
+            PdWire::Grpc,
+            PdPairingMode::Off,
+        );
+        let ([prefills, decodes], classes) = index.lent();
+        assert!(Arc::ptr_eq(prefills.workers, &prefill));
+        assert!(Arc::ptr_eq(decodes.workers, &decode));
+        let numbers = |list: LentList<'_>| -> Vec<u32> {
+            let stated = |facts: &FixedFacts| {
+                let mut wire_alone = FixedFacts::default();
+                wire_alone.demands.runtime = facts.demands.runtime;
+                assert_eq!(*facts, wire_alone, "the wire and nothing else");
+                facts.demands.runtime
+            };
+            let facts = list.facts.expect("one fact a worker");
+            facts.iter().map(stated).collect()
+        };
+        let on = |runtime| wire_number(runtime, ConnectionMode::Grpc);
+        assert_eq!(
+            numbers(prefills),
+            [
+                on(RuntimeType::Vllm),
+                on(RuntimeType::Sglang),
+                on(RuntimeType::TokenSpeed)
+            ]
+        );
+        assert_eq!(
+            numbers(decodes),
+            [on(RuntimeType::Vllm), on(RuntimeType::Sglang)]
+        );
+
+        let ([again, _], classes_again) = index.lent();
+        assert!(std::ptr::eq(classes, classes_again));
+        assert!(std::ptr::eq(prefills.cell, again.cell));
+        assert!(!std::ptr::eq(prefills.cell, decodes.cell));
+        let at = |list: LentList<'_>| list.facts.map(<[FixedFacts]>::as_ptr);
+        assert_eq!(at(prefills), at(again));
+
+        // Two empty pools are lent as two lists of no worker and no fact.
+        let empty = PdPairIndex::empty(PdWire::Http);
+        let ([prefills, decodes], _) = empty.lent();
+        assert!(prefills.workers.is_empty() && decodes.workers.is_empty());
+        assert_eq!(numbers(prefills), numbers(decodes));
+        assert!(numbers(prefills).is_empty());
     }
 }
 

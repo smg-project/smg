@@ -1,13 +1,14 @@
 //! The ways a Harmony Responses turn ends on a call to a server tool in the
 //! plain and streamed forms. The outcomes are alike except when the token
-//! limit cuts the first call: only the streamed form recovers that call.
+//! limit cuts the first call inside its arguments: only the streamed form
+//! recovers that call.
 //! A turn that ended on its call runs it: the loop asks the model again and
 //! answers. A turn the token limit cut inside a tool's name read no call:
 //! nothing runs, and the response keeps the truncation.
 
 use serde_json::{json, Value};
 
-use super::harmony_loop_harness::{serve, token_ids, End, Served, Turn, ANSWER};
+use super::harmony_loop_harness::{serve, serve_with_input, token_ids, End, Served, Turn, ANSWER};
 
 /// A call to the mock tool server's search tool up to its arguments, the
 /// arguments whole and cut, and the call's closing token.
@@ -103,6 +104,16 @@ fn exits() -> Vec<Exit> {
             None,
         )
         .stream_only(),
+        // The token limit cut the first call right behind its header: a
+        // server tool's call with no argument bytes is not read, nothing runs.
+        Exit::new(
+            "the token limit behind the first call's header",
+            &[CALL],
+            End::Finish("length"),
+            false,
+            "incomplete",
+            Some("max_output_tokens"),
+        ),
         // The call closed and the token limit cut a second one: the closed
         // call runs and the cut one is not read.
         Exit::new(
@@ -359,4 +370,126 @@ async fn the_loop_runs_the_server_call_a_turn_ended_on() {
         misread.len(),
         misread.join("\n")
     );
+}
+
+/// Codex replays a patch result and asks for another edit. The model sees its
+/// function-shaped tool, while the client receives raw patch text and a call id
+/// it can echo on the next turn.
+#[tokio::test]
+async fn harmony_replays_and_emits_codex_custom_patch_calls() {
+    let patch = "*** Begin Patch\n*** Add File: hello.txt\n+Hello\n*** End Patch\n";
+    let reply = format!(
+        "<|channel|>commentary to=functions.apply_patch <|constrain|>json<|message|>{}<|call|>",
+        json!({"input": patch})
+    );
+    let turns = [Turn {
+        output_ids: token_ids(&[&reply]).remove(0),
+        prompt_tokens: 24,
+        end: End::Finish("stop"),
+    }];
+    let input = json!([
+        {"type":"additional_tools", "role":"developer", "tools":[
+            {"type":"namespace", "name":"functions", "description":"Default tools", "tools":[
+                {"type":"custom", "name":"apply_patch"}
+            ]}
+        ]},
+        {"role":"user", "content":"Create a README and a greeting."},
+        {"type":"custom_tool_call", "name":"apply_patch", "call_id":"call_readme",
+         "input":"*** Begin Patch\n*** Add File: README.md\n+# Demo\n*** End Patch"},
+        {"type":"custom_tool_call_output", "call_id":"call_readme", "output":"Exit code: 0\nWall time: 0.1 seconds\nOutput:\nSuccess. Updated the following files:\nA README.md\n"}
+    ]);
+    for stream in [false, true] {
+        let served = serve_with_input(&turns, stream, input.clone()).await;
+        let item = served.response["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == "apply_patch")
+            .unwrap();
+        assert_eq!(item["type"], "custom_tool_call");
+        assert_eq!(item["input"], patch);
+        assert_eq!(served.response["output"], served.stored["output"]);
+        assert_eq!(served.tool_calls, 0);
+        if stream {
+            let events: Vec<_> = served
+                .events
+                .iter()
+                .filter(|e| e["item"]["id"] == item["id"] || e["item_id"] == item["id"])
+                .collect();
+            let types: Vec<_> = events.iter().filter_map(|e| e["type"].as_str()).collect();
+            assert_eq!(
+                types,
+                [
+                    "response.output_item.added",
+                    "response.custom_tool_call_input.delta",
+                    "response.custom_tool_call_input.done",
+                    "response.output_item.done"
+                ]
+            );
+            assert_eq!(events[0]["item"]["call_id"], item["call_id"]);
+            assert_eq!(events[1]["delta"], patch);
+            assert_eq!(events[2]["input"], patch);
+        }
+    }
+}
+
+/// A generation returned an exec command and started a patch before it ended.
+/// The parser returned only the command. Close the announced patch item without
+/// telling the client that it received an empty patch to run.
+#[tokio::test]
+async fn harmony_omits_a_cut_patch_after_a_complete_client_call() {
+    let text = concat!(
+        "<|channel|>commentary to=functions.exec_command <|constrain|>json<|message|>",
+        r#"{"cmd":"ls"}"#,
+        "<|call|><|start|>assistant",
+        "<|channel|>commentary to=functions.apply_patch <|constrain|>json<|message|>",
+        r#"{"input":"*** Begin Patch"#,
+    );
+    let turns = [Turn {
+        output_ids: token_ids(&[text]).remove(0),
+        prompt_tokens: 24,
+        end: End::Finish("stop"),
+    }];
+    let input = json!([
+        {"type":"additional_tools","role":"developer","tools":[
+            {"type":"function","name":"exec_command","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}},
+            {"type":"custom","name":"apply_patch"}
+        ]},
+        {"role":"user","content":"List the files and patch the README."}
+    ]);
+    for stream in [false, true] {
+        let served = serve_with_input(&turns, stream, input.clone()).await;
+        assert_eq!(
+            served.response["status"], "completed",
+            "stream={stream}: {}",
+            served.response
+        );
+        assert_eq!(served.stored["status"], "completed");
+        assert_eq!(served.response["output"], served.stored["output"]);
+        let calls: Vec<_> = served.response["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["name"].as_str())
+            .collect();
+        assert_eq!(calls, ["exec_command"]);
+        if stream {
+            let patch = served
+                .events
+                .iter()
+                .find(|event| {
+                    event["type"] == "response.output_item.added"
+                        && event["item"]["name"] == "apply_patch"
+                })
+                .unwrap();
+            let id = &patch["item"]["id"];
+            assert!(served
+                .events
+                .iter()
+                .any(|event| event["type"] == "response.output_item.done"
+                    && event["item"]["id"] == *id
+                    && event["item"]["status"] == "incomplete"));
+            assert!(served.events.iter().all(|event| event["item_id"] != *id));
+        }
+    }
 }

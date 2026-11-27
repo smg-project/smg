@@ -1,14 +1,16 @@
 use std::{
     net::{IpAddr, SocketAddr},
     path::Path,
+    time::Duration,
 };
 
-use axum::http::{uri::Authority, HeaderName, HeaderValue, Uri};
+use axum::http::{HeaderName, HeaderValue, Uri};
 use sha2::{Digest, Sha256};
 #[cfg(test)]
 use smg_worker::identity::url_door::listed_worker_url_refusal;
-use smg_worker::identity::{
-    basic::ConnectionMode, endpoint::Endpoint, url_door::worker_url_refusal,
+use smg_worker::{
+    identity::{basic::ConnectionMode, endpoint::Endpoint, url_door::worker_url_refusal},
+    load::monitor::LEAST_POLL_INTERVAL,
 };
 use tokio::sync::Semaphore;
 
@@ -16,8 +18,8 @@ use super::*;
 use crate::{middleware::scheduler, policies::cost as selection_cost, tenant::MAX_TENANT_ID_LEN};
 
 /// The credential header names `routing_key_override.headers` may not carry
-/// (see [`ConfigValidator::validate_routing_key_headers`]). The policy
-/// controller crate refuses the same names in a specification's header
+/// (see [`ConfigValidator::validate_routing_key_headers`]). The Grand
+/// Central crate refuses the same names in a specification's header
 /// lists.
 const DENIED_HEADERS: [&str; 7] = [
     "authorization",
@@ -395,27 +397,40 @@ pub fn runtime_worker_threads_oversubscription(threads: usize, cpus: usize) -> O
     })
 }
 
-/// The warning for `--dp-minimum-tokens-scheduler` set with `--dp-aware`,
-/// `None` for every other pair. The scheduler chooses a data-parallel rank
-/// for a request from the ranks' reported token loads where an engine is
-/// registered as one worker (the HTTP prefill-decode router's rank choice
-/// for an engine the gateway does not expand); under `--dp-aware` an engine
-/// registers as one worker per rank, the routing policy's pick among those
-/// workers is the rank choice, and the scheduler, asked about a worker that
-/// is one rank, can only answer that rank: it chooses nothing. Advice at
-/// start-up, not a refusal: the pair runs as `--dp-aware` alone does, and
-/// the flag's cache of per-rank token loads is kept up for nothing. Pure
-/// over the two settings so the rule is testable; start-up logs it with the
+/// The deprecation line for `dp_aware` set (`--dp-aware`, the settings
+/// field, a binding's argument), `None` where it is left out. The setting is
+/// accepted and does nothing: every registration reads an engine's
+/// data-parallel size and registers one worker per rank, with it or without.
+/// Pure over the setting so the rule is testable; start-up logs it with the
 /// configuration's other warnings.
+pub fn dp_aware_deprecation_warning(dp_aware: bool) -> Option<String> {
+    dp_aware.then(|| {
+        "dp_aware (--dp-aware) is deprecated and does nothing: every registration reads an \
+         engine's data-parallel size and registers one worker per rank; remove the setting"
+            .to_string()
+    })
+}
+
+/// The warning for `--dp-minimum-tokens-scheduler` set, `None` where it is
+/// not. The scheduler chooses a data-parallel rank for a request from the
+/// ranks' reported token loads where an engine is registered as one worker
+/// (the HTTP prefill-decode router's rank choice). An engine that reports
+/// its data-parallel size registers as one worker per rank, the routing
+/// policy's pick among those workers is the rank choice, and the scheduler,
+/// asked about a worker that is one rank, can only answer that rank: it
+/// chooses nothing there, and its cache of per-rank token loads is kept up
+/// for nothing. It still chooses for an engine that registered as one worker
+/// because the registration read no size. Advice at start-up, not a
+/// refusal. Pure over the setting so the rule is testable; start-up logs it
+/// with the configuration's other warnings.
 pub fn dp_minimum_tokens_scheduler_scope_warning(
-    dp_aware: bool,
     dp_minimum_tokens_scheduler: bool,
 ) -> Option<String> {
-    (dp_aware && dp_minimum_tokens_scheduler).then(|| {
-        "dp_minimum_tokens_scheduler chooses nothing under dp_aware: the engine's ranks are \
-         registered as workers and the routing policy's pick among them is the rank choice; \
-         the scheduler applies to the HTTP prefill-decode router for an engine registered as \
-         one worker"
+    dp_minimum_tokens_scheduler.then(|| {
+        "dp_minimum_tokens_scheduler chooses nothing for an engine that reports its \
+         data-parallel size: the engine's ranks are registered as workers and the routing \
+         policy's pick among them is the rank choice; the scheduler applies to the HTTP \
+         prefill-decode router for an engine registered as one worker"
             .to_string()
     })
 }
@@ -483,7 +498,6 @@ impl ConfigValidator {
     }
 
     pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
-        Self::validate_policy_controller(config)?;
         Self::validate_routing_shapes(config)?;
         Self::validate_server_settings(config)?;
         Self::validate_cors_allowed_origins(config)?;
@@ -515,7 +529,15 @@ impl ConfigValidator {
         let retry_cfg = config.effective_retry_config();
         let cb_cfg = config.effective_circuit_breaker_config();
         Self::validate_retry(&retry_cfg)?;
-        Self::validate_circuit_breaker(&cb_cfg)?;
+        Self::validate_circuit_breaker(
+            [
+                "circuit_breaker.failure_threshold",
+                "circuit_breaker.success_threshold",
+                "circuit_breaker.timeout_duration_secs",
+                "circuit_breaker.window_duration_secs",
+            ],
+            &cb_cfg,
+        )?;
         Self::validate_health_check(&config.health_check)?;
 
         if config.history_backend == HistoryBackend::Oracle {
@@ -1423,6 +1445,15 @@ impl ConfigValidator {
             "load_monitor_interval_secs",
             config.load_monitor_interval_secs,
         )?;
+        if let Some(millis) = config.load_monitor_interval_ms {
+            if Duration::from_millis(millis) < LEAST_POLL_INTERVAL {
+                return Err(ConfigError::invalid_value(
+                    "load_monitor_interval_ms",
+                    millis,
+                    format!("Must be >= {}", LEAST_POLL_INTERVAL.as_millis()),
+                ));
+            }
+        }
 
         Ok(())
     }
@@ -1752,29 +1783,30 @@ impl ConfigValidator {
         Ok(())
     }
 
-    fn validate_circuit_breaker(cb: &CircuitBreakerConfig) -> ConfigResult<()> {
+    /// The floors of the breaker's settings. The four names are the failure
+    /// threshold, the success threshold, the open time and the failure
+    /// window as the caller's input spells them: the global settings, or a
+    /// worker's overrides at registration.
+    pub(crate) fn validate_circuit_breaker(
+        [failure_threshold, success_threshold, timeout, window]: [&str; 4],
+        cb: &CircuitBreakerConfig,
+    ) -> ConfigResult<()> {
         if cb.failure_threshold < 1 {
             return Err(ConfigError::invalid_value(
-                "circuit_breaker.failure_threshold",
+                failure_threshold,
                 cb.failure_threshold,
                 "Must be >= 1 (set to u32::MAX to effectively disable CB)",
             ));
         }
         if cb.success_threshold < 1 {
             return Err(ConfigError::invalid_value(
-                "circuit_breaker.success_threshold",
+                success_threshold,
                 cb.success_threshold,
                 "Must be >= 1",
             ));
         }
-        require_positive(
-            "circuit_breaker.timeout_duration_secs",
-            cb.timeout_duration_secs,
-        )?;
-        require_positive(
-            "circuit_breaker.window_duration_secs",
-            cb.window_duration_secs,
-        )?;
+        require_positive(timeout, cb.timeout_duration_secs)?;
+        require_positive(window, cb.window_duration_secs)?;
         Ok(())
     }
 
@@ -1918,83 +1950,15 @@ impl ConfigValidator {
         Ok(())
     }
 
-    fn validate_policy_controller(config: &RouterConfig) -> ConfigResult<()> {
-        let refuse = |reason: &str| {
-            Err(ConfigError::IncompatibleConfig {
-                reason: reason.to_owned(),
-            })
-        };
-        let Some(address) = &config.policy_controller_address else {
-            let tls = [
-                (
-                    "--policy-controller-tls-ca-cert",
-                    &config.policy_controller_tls_ca_cert,
-                ),
-                (
-                    "--policy-controller-tls-cert",
-                    &config.policy_controller_tls_cert,
-                ),
-                (
-                    "--policy-controller-tls-key",
-                    &config.policy_controller_tls_key,
-                ),
-            ];
-            if let Some((option, _)) = tls.into_iter().find(|(_, path)| path.is_some()) {
-                return refuse(&format!("{option} requires --policy-controller-address"));
-            }
-            return Ok(());
-        };
-        if !config.policy_controller {
-            return refuse("--policy-controller-address requires the policy_controller setting (--policy-controller on)");
-        }
-        // The follower dials through the controller crate's client, which
-        // the gateway's manifest takes on these two targets alone.
-        if cfg!(not(any(target_os = "linux", target_os = "macos"))) {
-            return refuse("--policy-controller-address is followed on Linux and macOS alone");
-        }
-        let valid_address = address.parse::<Authority>().is_ok_and(|authority| {
-            !address.contains('@')
-                && url::Host::parse(authority.host()).is_ok()
-                && authority.port_u16().is_some_and(|port| port != 0)
-        });
-        if !valid_address {
-            return refuse("--policy-controller-address must be host:port with a port from 1 to 65535 and brackets around IPv6");
-        }
-        if config.policy_controller_tls_cert.is_some() != config.policy_controller_tls_key.is_some()
-        {
-            return refuse("--policy-controller-tls-cert and --policy-controller-tls-key must be given together");
-        }
-        // The connection trusts the authority's file and no other root: a
-        // client certificate without it could verify no controller.
-        if config.policy_controller_tls_cert.is_some()
-            && config.policy_controller_tls_ca_cert.is_none()
-        {
-            return refuse("--policy-controller-tls-cert requires --policy-controller-tls-ca-cert, the one root the connection trusts");
-        }
-        // Nothing of a gateway whose every router is a provider's is placed
-        // through a controller: the address would be dropped unsaid.
-        if let Some(mode) = config.provider_alone() {
-            return refuse(&format!("--policy-controller-address supplies the workers, and the {mode} provider mode places its requests by no routing policy"));
-        }
-        if config.mode.worker_count() != 0 {
-            return refuse("--policy-controller-address supplies the workers and conflicts with --worker-urls, --encode, --prefill and --decode");
-        }
-        if config.discovery.is_some() {
-            return refuse("--policy-controller-address supplies the workers and conflicts with --service-discovery and --discovery-provider");
-        }
-        Ok(())
-    }
-
     /// The two refusals of a policy document that would not run as it was
     /// given: one beside the switch off, and a path whose document was
-    /// never loaded. The validator holds a configuration to them. The
-    /// controller's start holds the configuration it is handed to them as
-    /// well: a host may build its context from one it never validated.
+    /// never loaded. The validator holds a configuration to them, and so
+    /// can a start that is handed a configuration it never validated.
     pub(crate) fn validate_policy_document(config: &RouterConfig) -> ConfigResult<()> {
         // A launcher gives the document's path, and a host may hand the
         // document itself. Either one, with the switch off, would be dropped
         // and the classic policies would serve.
-        if !config.policy_controller
+        if !config.engine_decides()
             && (config.policy_spec_path.is_some() || config.policy_spec.is_some())
         {
             return Err(ConfigError::invalid_value(
@@ -2003,7 +1967,7 @@ impl ConfigValidator {
                     .policy_spec_path
                     .as_deref()
                     .unwrap_or("the given document"),
-                "a policy document is run by the policy controller: set --policy-controller on",
+                "a policy document is run by Grand Central: set --grand-central on",
             ));
         }
         // The path is written with the configuration and the document is
@@ -2041,86 +2005,17 @@ impl ConfigValidator {
             });
         }
 
-        // IGW may receive workers dynamically, so worker-count validation cannot
-        // reason about its eventual topology. Mode-level compatibility still applies.
+        // IGW may receive workers dynamically: only the mode-level
+        // compatibility above applies to it.
         if config.enable_igw {
             return Ok(());
         }
 
-        Self::validate_mtls(config)?;
-
-        // Under dp_aware each URL registers one worker per DP rank.
-        // A followed fleet gets its workers from the controller.
-        if !has_service_discovery && !config.dp_aware && config.policy_controller_address.is_none()
-        {
-            if let PolicyConfig::PowerOfTwo { .. } = &config.policy {
-                let worker_count = config.mode.worker_count();
-                if worker_count < 2 {
-                    return Err(ConfigError::IncompatibleConfig {
-                        reason: "Power-of-two policy requires at least 2 workers".to_string(),
-                    });
-                }
-            }
-
-            if let RoutingMode::PrefillDecode {
-                prefill_urls,
-                decode_urls,
-                prefill_policy,
-                decode_policy,
-            } = &config.mode
-            {
-                if let Some(PolicyConfig::PowerOfTwo { .. }) = prefill_policy {
-                    if prefill_urls.len() < 2 {
-                        return Err(ConfigError::IncompatibleConfig {
-                            reason: "Power-of-two policy for prefill requires at least 2 prefill workers".to_string(),
-                        });
-                    }
-                }
-
-                if let Some(PolicyConfig::PowerOfTwo { .. }) = decode_policy {
-                    if decode_urls.len() < 2 {
-                        return Err(ConfigError::IncompatibleConfig {
-                            reason:
-                                "Power-of-two policy for decode requires at least 2 decode workers"
-                                    .to_string(),
-                        });
-                    }
-                }
-            }
-
-            if let RoutingMode::EncodePrefillDecode {
-                prefill_urls,
-                decode_urls,
-                prefill_policy,
-                decode_policy,
-                ..
-            } = &config.mode
-            {
-                let effective_prefill_policy = prefill_policy.as_ref().unwrap_or(&config.policy);
-                let effective_decode_policy = decode_policy.as_ref().unwrap_or(&config.policy);
-
-                if matches!(effective_prefill_policy, PolicyConfig::PowerOfTwo { .. })
-                    && prefill_urls.len() < 2
-                {
-                    return Err(ConfigError::IncompatibleConfig {
-                        reason:
-                            "Power-of-two policy for prefill requires at least 2 prefill workers"
-                                .to_string(),
-                    });
-                }
-
-                if matches!(effective_decode_policy, PolicyConfig::PowerOfTwo { .. })
-                    && decode_urls.len() < 2
-                {
-                    return Err(ConfigError::IncompatibleConfig {
-                        reason: "Power-of-two policy for decode requires at least 2 decode workers"
-                            .to_string(),
-                    });
-                }
-            }
-        }
-
-        Ok(())
+        // No rule counts the worker URLs a policy is given: a URL registers
+        // one worker per data-parallel rank of its engine, which start-up
+        // does not know. A policy that compares two workers picks the one
+        // it has where there is one.
+        Self::validate_mtls(config)
     }
 
     fn validate_urls(urls: &[String]) -> ConfigResult<()> {
@@ -2135,296 +2030,6 @@ impl ConfigValidator {
 mod tests {
 
     use super::*;
-
-    /// A configuration under an address. Startup refuses the address first
-    /// on a target that does not build the follower, so the cases that
-    /// read past that refusal are built on the two targets that do.
-    fn following_config() -> RouterConfig {
-        RouterConfig {
-            policy_controller: true,
-            policy_controller_address: Some("controller:30100".to_owned()),
-            ..Default::default()
-        }
-    }
-
-    fn controller_refusal(config: &RouterConfig, names: &[&str]) {
-        let error = config
-            .validate()
-            .expect_err("the configuration is refused")
-            .to_string();
-        for name in names {
-            assert!(error.contains(name), "{error}");
-        }
-    }
-
-    /// A gateway keeps a health path of its own under every setting. Where
-    /// it hosts the controller, the worker a registration builds carries
-    /// the path, and the holder keeps that worker as the row's object.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn a_health_path_of_its_own_is_kept_under_every_setting() {
-        let health_check = HealthCheckConfig {
-            endpoint: "/healthz".to_owned(),
-            ..HealthCheckConfig::default()
-        };
-        for kept in [
-            RouterConfig {
-                policy_controller: true,
-                health_check: health_check.clone(),
-                ..Default::default()
-            },
-            RouterConfig {
-                health_check: health_check.clone(),
-                ..Default::default()
-            },
-            RouterConfig {
-                policy_controller: true,
-                ..Default::default()
-            },
-            RouterConfig {
-                policy_controller: true,
-                health_check: HealthCheckConfig {
-                    disable_health_check: true,
-                    ..health_check.clone()
-                },
-                ..Default::default()
-            },
-            RouterConfig {
-                health_check,
-                ..following_config()
-            },
-        ] {
-            let checked = ConfigValidator::validate_policy_controller(&kept);
-            assert!(checked.is_ok(), "{checked:?}");
-        }
-    }
-
-    #[test]
-    fn a_controller_address_requires_the_policy_controller() {
-        controller_refusal(
-            &RouterConfig {
-                policy_controller: false,
-                ..following_config()
-            },
-            &["--policy-controller-address", "policy_controller"],
-        );
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn a_controller_address_is_a_host_with_a_port() {
-        for address in [
-            "",
-            ":30100",
-            "controller",
-            "controller:0",
-            "controller:65536",
-            "http://controller:30100",
-            "controller:30100/path",
-            "user@controller:30100",
-            "2001:db8::1:30100",
-            "[not-an-ip]:30100",
-        ] {
-            controller_refusal(
-                &RouterConfig {
-                    policy_controller_address: Some(address.to_owned()),
-                    ..following_config()
-                },
-                &["--policy-controller-address", "host:port"],
-            );
-        }
-        // Each end of the port range is taken.
-        for address in [
-            "controller:30100",
-            "127.0.0.1:80",
-            "[::1]:443",
-            "controller:1",
-            "controller:65535",
-        ] {
-            RouterConfig {
-                policy_controller_address: Some(address.to_owned()),
-                ..following_config()
-            }
-            .validate()
-            .unwrap();
-        }
-    }
-
-    #[test]
-    fn every_controller_tls_option_requires_an_address() {
-        for (name, config) in [
-            (
-                "--policy-controller-tls-ca-cert",
-                RouterConfig {
-                    policy_controller_tls_ca_cert: Some("ca.pem".to_owned()),
-                    ..Default::default()
-                },
-            ),
-            (
-                "--policy-controller-tls-cert",
-                RouterConfig {
-                    policy_controller_tls_cert: Some("cert.pem".to_owned()),
-                    ..Default::default()
-                },
-            ),
-            (
-                "--policy-controller-tls-key",
-                RouterConfig {
-                    policy_controller_tls_key: Some("key.pem".to_owned()),
-                    ..Default::default()
-                },
-            ),
-        ] {
-            controller_refusal(&config, &[name, "--policy-controller-address"]);
-        }
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn a_controller_tls_certificate_and_key_require_each_other() {
-        for config in [
-            RouterConfig {
-                policy_controller_tls_cert: Some("cert.pem".to_owned()),
-                ..following_config()
-            },
-            RouterConfig {
-                policy_controller_tls_key: Some("key.pem".to_owned()),
-                ..following_config()
-            },
-        ] {
-            controller_refusal(
-                &config,
-                &[
-                    "--policy-controller-tls-cert",
-                    "--policy-controller-tls-key",
-                ],
-            );
-        }
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn a_controller_client_certificate_requires_its_authority() {
-        let pair = || RouterConfig {
-            policy_controller_tls_cert: Some("cert.pem".to_owned()),
-            policy_controller_tls_key: Some("key.pem".to_owned()),
-            ..following_config()
-        };
-        controller_refusal(
-            &pair(),
-            &[
-                "--policy-controller-tls-cert",
-                "--policy-controller-tls-ca-cert",
-            ],
-        );
-        RouterConfig {
-            policy_controller_tls_ca_cert: Some("ca.pem".to_owned()),
-            ..pair()
-        }
-        .validate()
-        .expect("a pair beside its authority's file is taken");
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn a_controller_address_refuses_worker_urls() {
-        controller_refusal(
-            &RouterConfig {
-                mode: RoutingMode::Regular {
-                    worker_urls: vec!["http://worker:8000".to_owned()],
-                },
-                ..following_config()
-            },
-            &["--policy-controller-address", "--worker-urls"],
-        );
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn a_controller_address_refuses_a_gateway_of_providers_alone() {
-        for mode in [
-            RoutingMode::OpenAI {
-                worker_urls: Vec::new(),
-            },
-            RoutingMode::Anthropic {
-                worker_urls: Vec::new(),
-            },
-            RoutingMode::Gemini {
-                worker_urls: Vec::new(),
-            },
-        ] {
-            // Nothing of such a gateway is placed through a controller.
-            controller_refusal(
-                &RouterConfig {
-                    mode: mode.clone(),
-                    ..following_config()
-                },
-                &["--policy-controller-address", "provider mode"],
-            );
-            // A multi-router gateway places self-hosted workers beside the
-            // provider's, and the controller supplies them.
-            RouterConfig {
-                mode,
-                enable_igw: true,
-                ..following_config()
-            }
-            .validate()
-            .expect("a multi-router gateway follows a controller beside a provider");
-        }
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn a_controller_address_refuses_service_discovery() {
-        controller_refusal(
-            &RouterConfig {
-                discovery: Some(
-                    FileDiscoveryConfig {
-                        path: "fleet.yaml".into(),
-                        check_interval_secs: 1,
-                    }
-                    .into(),
-                ),
-                ..following_config()
-            },
-            &[
-                "--policy-controller-address",
-                "--service-discovery",
-                "--discovery-provider",
-            ],
-        );
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn a_followed_fleet_can_use_power_of_two_without_static_workers() {
-        let config = RouterConfig {
-            policy: PolicyConfig::PowerOfTwo {
-                load_metric: Default::default(),
-            },
-            ..following_config()
-        };
-        config.validate().unwrap();
-        assert!(RouterConfig {
-            policy_controller_address: None,
-            ..config
-        }
-        .validate()
-        .is_err());
-    }
-
-    /// A following configuration read back from its own record is the one
-    /// that was written: the setting the address needs is written with it.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn a_following_configuration_read_back_from_its_record_is_valid() {
-        let record = serde_json::to_value(following_config()).unwrap();
-        let back: RouterConfig = serde_json::from_value(record.clone()).unwrap();
-        back.validate()
-            .expect("the record of a following gateway reads back whole");
-        assert_eq!(record["policy_controller"], true);
-        assert!(back.policy_controller);
-    }
 
     /// The reason reads "Must be > 0", so a signed zero and a negative are refused alike.
     #[test]
@@ -2687,6 +2292,27 @@ mod tests {
             ..Default::default()
         };
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    /// A load monitor interval in milliseconds under the monitor's least is
+    /// refused under its own name, zero included. The least itself is
+    /// taken, and so is a configuration that states none.
+    #[test]
+    fn a_load_monitor_interval_under_the_least_is_refused_by_its_name() {
+        let least = u64::try_from(LEAST_POLL_INTERVAL.as_millis()).expect("milliseconds");
+        let stating = |millis: Option<u64>| RouterConfig {
+            load_monitor_interval_ms: millis,
+            ..Default::default()
+        };
+        for under in [0, least - 1] {
+            assert!(matches!(
+                ConfigValidator::validate(&stating(Some(under))),
+                Err(ConfigError::InvalidValue { ref field, ref reason, .. })
+                    if field == "load_monitor_interval_ms" && reason == "Must be >= 100"
+            ));
+        }
+        assert!(ConfigValidator::validate(&stating(Some(least))).is_ok());
+        assert!(ConfigValidator::validate(&stating(None)).is_ok());
     }
 
     /// A `RouterConfig` built directly, as a language binding or a library
@@ -2989,33 +2615,49 @@ mod tests {
         }
     }
 
-    /// The minimum-tokens scheduler set with rank expansion is a warning,
-    /// not a refusal: the pure rule names the pair and the scheduler's
-    /// scope, says nothing for the other three settings, and the validator
-    /// passes the pair.
+    /// The minimum-tokens scheduler is a warning, not a refusal, on a
+    /// gateway given no other setting: the pure rule names the scheduler's
+    /// scope where it is set and says nothing where it is not, and the
+    /// validator passes it.
     #[test]
-    fn the_minimum_tokens_scheduler_under_dp_aware_warns_without_a_refusal() {
-        let warning = dp_minimum_tokens_scheduler_scope_warning(true, true).expect("a warning");
+    fn the_minimum_tokens_scheduler_warns_without_a_refusal() {
+        let warning = dp_minimum_tokens_scheduler_scope_warning(true).expect("a warning");
         assert!(
-            warning.contains("chooses nothing under dp_aware")
+            warning.contains("chooses nothing for an engine that reports its data-parallel size")
                 && warning.contains("HTTP prefill-decode router"),
             "{warning}"
         );
-        for (dp_aware, scheduler) in [(false, false), (true, false), (false, true)] {
-            assert_eq!(
-                dp_minimum_tokens_scheduler_scope_warning(dp_aware, scheduler),
-                None,
-                "dp_aware {dp_aware}, scheduler {scheduler}"
-            );
-        }
-        // The pair validates: advice, not a refusal.
+        assert_eq!(dp_minimum_tokens_scheduler_scope_warning(false), None);
+        // It validates: advice, not a refusal.
         let config = RouterConfig::builder()
             .regular_mode(vec![])
             .round_robin_policy()
-            .dp_aware(true)
             .dp_minimum_tokens_scheduler(true)
             .build_unchecked();
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    /// `dp_aware` is accepted and does nothing. Set, it is one deprecation
+    /// line that says so and names what every registration does; left out,
+    /// nothing is said. The validator passes it either way.
+    #[test]
+    fn dp_aware_set_is_a_deprecation_line_without_a_refusal() {
+        let warning = dp_aware_deprecation_warning(true).expect("a deprecation line");
+        assert!(
+            warning.contains("--dp-aware")
+                && warning.contains("deprecated and does nothing")
+                && warning.contains("one worker per rank"),
+            "{warning}"
+        );
+        assert_eq!(dp_aware_deprecation_warning(false), None);
+        for dp_aware in [false, true] {
+            let config = RouterConfig::builder()
+                .regular_mode(vec![])
+                .round_robin_policy()
+                .dp_aware(dp_aware)
+                .build_unchecked();
+            assert!(ConfigValidator::validate(&config).is_ok(), "{dp_aware}");
+        }
     }
 
     /// A count above a small multiple of the CPUs available to the process
@@ -4507,6 +4149,30 @@ mod tests {
     }
 
     #[test]
+    fn a_pairing_protocol_label_that_is_empty_or_padded_is_refused() {
+        for bad in ["", " ", " example.com/rollout", "example.com/rollout "] {
+            let mut config = regular_mode_config();
+            config.discovery = Some(
+                KubernetesDiscoveryConfig {
+                    selector: [("app".to_string(), "worker".to_string())].into(),
+                    pairing_protocol_label: bad.to_string(),
+                    ..Default::default()
+                }
+                .into(),
+            );
+
+            assert!(
+                matches!(
+                    ConfigValidator::validate(&config),
+                    Err(ConfigError::InvalidValue { ref field, .. })
+                        if field == "discovery.pairing_protocol_label"
+                ),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_validate_invalid_urls() {
         let config = RouterConfig::new(
             RoutingMode::Regular {
@@ -4946,31 +4612,43 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// No rule counts the worker URLs a power-of-two policy is given: one
+    /// URL registers one worker per data-parallel rank of its engine, which
+    /// start-up does not know. One URL validates in every mode, with
+    /// `dp_aware` set or not: the setting changes nothing.
     #[test]
-    fn test_validate_pd_mode_power_of_two_insufficient_workers() {
-        let mut config = RouterConfig::new(
-            RoutingMode::PrefillDecode {
-                prefill_urls: vec![("http://prefill1:8000".to_string(), None)], // Only 1 prefill
-                decode_urls: vec![
-                    "http://decode1:8000".to_string(),
-                    "http://decode2:8000".to_string(),
-                ],
-                prefill_policy: Some(PolicyConfig::PowerOfTwo {
-                    load_metric: Default::default(),
-                }), // Requires 2+ workers
-                decode_policy: None,
+    fn power_of_two_with_one_worker_url_validates_in_every_mode() {
+        let power_of_two = || PolicyConfig::PowerOfTwo {
+            load_metric: Default::default(),
+        };
+        let one = || vec!["http://decode1:8000".to_string()];
+        let modes = [
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker1:8000".to_string()],
             },
-            PolicyConfig::Random,
-        );
-
-        let result = ConfigValidator::validate(&config);
-        assert!(result.is_err());
-        if let Err(e) = result {
-            assert!(e.to_string().contains("prefill requires at least 2"));
+            RoutingMode::PrefillDecode {
+                prefill_urls: vec![("http://prefill1:8000".to_string(), None)],
+                decode_urls: one(),
+                prefill_policy: Some(power_of_two()),
+                decode_policy: Some(power_of_two()),
+            },
+            RoutingMode::EncodePrefillDecode {
+                encode_urls: vec![("http://encode1:8000".to_string(), None)],
+                prefill_urls: vec![("http://prefill1:8000".to_string(), None)],
+                decode_urls: one(),
+                encode_policy: Some(PolicyConfig::RoundRobin),
+                prefill_policy: Some(power_of_two()),
+                decode_policy: Some(power_of_two()),
+            },
+        ];
+        for mode in modes {
+            for dp_aware in [false, true] {
+                let mut config = RouterConfig::new(mode.clone(), power_of_two());
+                config.dp_aware = dp_aware;
+                let result = ConfigValidator::validate(&config);
+                assert!(result.is_ok(), "{mode:?}, dp_aware {dp_aware}: {result:?}");
+            }
         }
-
-        config.dp_aware = true;
-        assert!(ConfigValidator::validate(&config).is_ok());
     }
 
     #[test]

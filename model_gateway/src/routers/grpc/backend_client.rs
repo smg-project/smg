@@ -38,7 +38,6 @@ use smg_grpc_client::{
     tokenspeed_proto, vllm_proto, OutputConstraint, SglangGenerateRequestOptions,
     SglangSchedulerClient, TokenSpeedSchedulerClient, VllmEngineClient,
 };
-use smg_policy_controller::tracking::TransportClass;
 use smg_worker::{
     connection::engine::{
         AdminAnswer, ConnectorDefault, EngineConnection, EngineConnector, HealthAnswer, LoadSource,
@@ -590,9 +589,10 @@ fn check_every_rank_is_pinnable(client: &BackendClient) -> Result<(), String> {
     };
     if pinnable < connected {
         return Err(format!(
-            "dp-aware routing pins a request to its rank, which reaches only {pinnable} of the \
+            "a rank worker pins a request to its rank, which reaches only {pinnable} of the \
              {connected} engines connected: their ZMQ indices do not run from 0. Launch the \
-             group at data-parallel start rank 0, or register it without --dp-aware"
+             group at data-parallel start rank 0, or register it with no engine count, as one \
+             grouped worker"
         ));
     }
     Ok(())
@@ -738,7 +738,7 @@ enum Asked {
     NoWire,
     /// No answer of the engine's, with the reason: the status is the
     /// channel's own, as the request path classes it
-    /// ([`TonicStatusExt::transport_class`]).
+    /// ([`TonicStatusExt::is_no_answer`]).
     Lost(String),
 }
 
@@ -751,7 +751,7 @@ enum Asked {
 /// as an engine that speaks the wire, and the call is dropped there.
 async fn asked<T>(ask: impl Future<Output = Result<T, tonic::Status>>) -> Asked {
     match tokio::time::timeout(ASK_BOUND, ask).await {
-        Ok(Err(status)) if status.transport_class() == TransportClass::ConnectFailed => {
+        Ok(Err(status)) if status.is_no_answer() => {
             let reason = status.client_message();
             Asked::Lost(format!("the engine's health call got no answer: {reason}"))
         }
@@ -1896,10 +1896,12 @@ mod tests {
         let mut sources = Vec::new();
         sources_under(package, &mut sources);
         for binding in ["golang", "python"] {
-            sources_under(
-                &package.join("../bindings").join(binding).join("src"),
-                &mut sources,
-            );
+            for folder in ["src", "tests"] {
+                sources_under(
+                    &package.join("../bindings").join(binding).join(folder),
+                    &mut sources,
+                );
+            }
         }
         assert!(
             sources.contains(&this_file),
@@ -1911,6 +1913,7 @@ mod tests {
             "benches/access_log.rs",
             "test_harness/src/lib.rs",
             "../bindings/golang/src/lib.rs",
+            "../bindings/golang/tests/unit/tests.rs",
             "../bindings/python/src/lib.rs",
         ] {
             assert!(

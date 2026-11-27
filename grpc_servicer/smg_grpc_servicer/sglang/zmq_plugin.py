@@ -121,6 +121,9 @@ def register() -> None:
     HookRegistry.register(f"{_SCHEDULER}.init_idle_sleeper", init_idle_sleeper, HookType.AROUND)
     HookRegistry.register(f"{_SCHEDULER}.maybe_init_rust_server", after_rust_server, HookType.AFTER)
     HookRegistry.register(f"{_RECEIVER}._pull_raw_reqs", pull_raw_reqs, HookType.AROUND)
+    split_target = f"{_RECEIVER}._split_work_and_control_reqs"
+    if _resolves(split_target):
+        HookRegistry.register(split_target, split_work_and_control_reqs, HookType.AROUND)
     HookRegistry.register(f"{_SCHEDULER}.run_event_loop", run_event_loop, HookType.AROUND)
     from smg_grpc_servicer.sglang import mm_broadcast
 
@@ -189,6 +192,39 @@ def pull_raw_reqs(original, receiver, *args, **kwargs):
     if isinstance(recv, MsgpackRecvSocket):
         return recv.drain(receiver.max_recv_per_poll)
     return original(receiver, *args, **kwargs)
+
+
+def split_work_and_control_reqs(original, receiver, recv_reqs, *args, **kwargs):
+    """AROUND ``_split_work_and_control_reqs``: keep DP-rank-targeted aborts in ``work_reqs``.
+
+    SMG routes ZMQ ``ABORT`` and ``EncoderDispatchErrorReq`` directly to the owning DP rank.
+    Without moving them out of ``control_reqs``, SGLang's DP-attention broadcast would overwrite
+    ``DP > 0`` control lists from global rank 0 and silently drop those aborts.
+    """
+    work_reqs, control_reqs = original(receiver, recv_reqs, *args, **kwargs)
+    if not isinstance(receiver.recv_from_tokenizer, MsgpackRecvSocket) or not control_reqs:
+        return work_reqs, control_reqs
+
+    from sglang.srt.managers import io_struct
+
+    dp_scoped = tuple(
+        cls
+        for cls in (
+            getattr(io_struct, "AbortReq", None),
+            getattr(io_struct, "EncoderDispatchErrorReq", None),
+        )
+        if cls is not None
+    )
+    if not dp_scoped:
+        return work_reqs, control_reqs
+
+    dp_ids = {id(req) for req in control_reqs if isinstance(req, dp_scoped)}
+    if not dp_ids:
+        return work_reqs, control_reqs
+    work_ids = {id(req) for req in work_reqs}
+    ordered_work = [req for req in recv_reqs if id(req) in work_ids or id(req) in dp_ids]
+    remaining_control = [req for req in control_reqs if id(req) not in dp_ids]
+    return ordered_work, remaining_control
 
 
 def run_event_loop(original, scheduler, *args, **kwargs):

@@ -243,6 +243,7 @@ impl SglangScheduler for ScoringWorker {
         let response = sg::GenerateResponse {
             media_identity: None,
             request_id: request.request_id,
+            prepared_input: Vec::new(),
             response: Some(sg::generate_response::Response::Complete(complete)),
         };
         Ok(GrpcResponse::new(Box::pin(stream::iter([Ok(response)]))))

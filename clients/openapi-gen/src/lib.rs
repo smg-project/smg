@@ -412,9 +412,6 @@ pub const CONTROL_PLANE_ROUTES: &[(&str, &str)] = &[
     ("POST", "/secrets/reload"),
     ("GET", "/rate-limits/tenants"),
     ("PUT", "/rate-limits/tenants"),
-    ("GET", "/policy/spec"),
-    ("POST", "/policy/spec:validate"),
-    ("GET", "/policy/snapshot"),
     ("POST", "/flush_cache"),
     ("POST", "/start_profile"),
     ("POST", "/stop_profile"),
@@ -422,6 +419,7 @@ pub const CONTROL_PLANE_ROUTES: &[(&str, &str)] = &[
     ("GET", "/get_loads"),
     ("POST", "/parse/function_call"),
     ("POST", "/parse/reasoning"),
+    ("GET", "/policy/explain/{request_id}"),
     ("POST", "/wasm"),
     ("GET", "/wasm"),
     ("DELETE", "/wasm/{module_uuid}"),
@@ -1548,308 +1546,37 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
         },
     );
 
+    // ---- A kept routing decision ----
+    paths.insert(
+        "/policy/explain/{request_id}".to_string(),
+        PathItem {
+            get: Some(operation(
+                "explainRoutingDecision",
+                "The newest routing decision Grand Central kept of one request, where the policy spec sets explain.sample",
+                Some(vec![path_param("request_id")]),
+                None,
+                refused_with(
+                    inline_response(
+                        "The kept decision, each worker with its address",
+                        serde_json::json!({
+                            "type": "object",
+                            "properties": {"decision": {"type": "object"}},
+                            "required": ["decision"]
+                        }),
+                    ),
+                    &worker_error_name,
+                ),
+            )),
+            ..PathItem::default()
+        },
+    );
+
     // ---- Models ----
     use openai_protocol::models::ListModelsResponse as OpenAIListModelsResponse;
     let resp_name = collect_schema(schema_for!(OpenAIListModelsResponse), &mut schemas)?;
     paths.insert(
         "/v1/models".to_string(),
         get_endpoint("listModels", "List available models", &resp_name),
-    );
-
-    // ---- The policy document, where the policy controller decides ----
-    let generation_of = |description: &str| {
-        serde_json::json!({
-            "type": "object",
-            "description": description,
-            "properties": {
-                "generation": {"type": "integer"},
-                "digest": {"type": ["string", "null"], "description": "`sha256:` and 64 hex digits; null where no document stands"}
-            },
-            "required": ["generation", "digest"]
-        })
-    };
-    let policy_off = || {
-        refused("The classic policies decide for this gateway, which holds no policy document (POLICY_CONTROLLER_OFF)")
-    };
-    paths.insert(
-        "/policy/spec".to_string(),
-        PathItem {
-            get: Some(operation(
-                "getPolicySpec",
-                "The policy document in force as the gateway holds it: the admin role alone, mounted only with control-plane authentication",
-                None,
-                None,
-                {
-                    let mut responses = inline_response(
-                        "The document with its generation, digest, form and application time; the digest, quoted, in ETag",
-                        serde_json::json!({
-                            "type": "object",
-                            "properties": {
-                                "generation": {"type": "integer"},
-                                "digest": {"type": "string", "description": "`sha256:` and 64 hex digits"},
-                                "format": {"type": "string", "enum": ["yaml", "json"], "description": "The form `document` is in"},
-                                "applied_at": {"type": "string", "format": "date-time"},
-                                "document": {"type": "string", "description": "The document as the gateway holds it: the YAML its start applied, the gateway's own writing of a given document"}
-                            },
-                            "required": ["generation", "digest", "format", "applied_at", "document"]
-                        }),
-                    );
-                    responses.insert("409".to_string(), policy_off());
-                    responses
-                },
-            )),
-            ..PathItem::default()
-        },
-    );
-    let needs_rows = serde_json::json!({
-        "type": "array",
-        "items": {
-            "type": "object",
-            "properties": {
-                "model": {"type": "string"},
-                "phase": {"type": "string", "enum": ["single", "prefill", "decode", "encode"]},
-                "needs": {
-                    "type": "object",
-                    "description": "The facts a host feeds for the model and phase, each a flag by its name, and the sample a picker draws",
-                    "properties": {
-                        "sample": {"type": "integer", "minimum": 0, "description": "The rows a sampling picker draws of a large pool; 0 for none"}
-                    },
-                    "required": ["sample"],
-                    "additionalProperties": {"type": "boolean"}
-                }
-            },
-            "required": ["model", "phase", "needs"]
-        }
-    });
-    let refused_dry_run = |description: &str| Response {
-        description: description.to_string(),
-        content: Some(inline_content(serde_json::json!({
-            "type": "object",
-            "properties": {
-                "error": {"type": "string"},
-                "code": {"type": "string"},
-                "field_path": {"type": "string", "description": "The path of the field a refused document's refusal is about; empty where it is about the whole document"},
-                "standing": generation_of("The generation that stands")
-            },
-            "required": ["error", "code", "standing"]
-        }))),
-    };
-    paths.insert(
-        "/policy/spec:validate".to_string(),
-        PathItem {
-            post: Some(operation(
-                "validatePolicySpec",
-                "What an apply of a policy document would do against the one in force, with nothing applied: the admin role alone, mounted only with control-plane authentication",
-                Some(vec![
-                    // The guard: the digest the caller read as standing, as
-                    // `GET /policy/spec` writes it in ETag. Absent or `*`
-                    // guards nothing.
-                    Parameter {
-                        name: "If-Match".to_string(),
-                        location: "header".to_string(),
-                        required: false,
-                        schema: ParameterSchema::of("string"),
-                    },
-                ]),
-                Some(RequestBody {
-                    required: true,
-                    content: BTreeMap::from([
-                        (
-                            "application/yaml".to_string(),
-                            MediaType {
-                                schema: serde_json::json!({"type": "string"}),
-                            },
-                        ),
-                        (
-                            "application/json".to_string(),
-                            MediaType {
-                                schema: serde_json::json!({"type": "object"}),
-                            },
-                        ),
-                    ]),
-                }),
-                {
-                    let mut responses = inline_response(
-                        "The document would run: the generation it was checked against, the number it would run under with its digest, and what a host must feed before and after",
-                        serde_json::json!({
-                            "type": "object",
-                            "properties": {
-                                "standing": generation_of("The generation the document was checked against"),
-                                "would_run": generation_of("The number an apply would run the document under, with the document's digest"),
-                                "needs": {
-                                    "type": "object",
-                                    "properties": {"before": needs_rows.clone(), "after": needs_rows},
-                                    "required": ["before", "after"]
-                                }
-                            },
-                            "required": ["standing", "would_run", "needs"]
-                        }),
-                    );
-                    responses.insert(
-                        "400".to_string(),
-                        refused("If-Match is a list, a weak tag or no text; it carries one ETag"),
-                    );
-                    responses.insert("409".to_string(), policy_off());
-                    responses.insert(
-                        "412".to_string(),
-                        refused_dry_run("If-Match names another digest than the standing one's (PRECONDITION_FAILED)"),
-                    );
-                    responses.insert(
-                        "413".to_string(),
-                        Response {
-                            description: "The body is over 128 KiB, a document's bound; it is not read past the bound".to_string(),
-                            content: None,
-                        },
-                    );
-                    responses.insert(
-                        "415".to_string(),
-                        refused("Content-Type names no form of a policy document"),
-                    );
-                    responses.insert(
-                        "422".to_string(),
-                        refused_dry_run("The document would not run (INVALID_DOCUMENT); the body names the field"),
-                    );
-                    responses.insert(
-                        "429".to_string(),
-                        refused("As many dry runs wait as may (TOO_MANY_DRY_RUNS); Retry-After says when to come again"),
-                    );
-                    responses
-                },
-            )),
-            ..PathItem::default()
-        },
-    );
-
-    let nullable = |kind: &str| serde_json::json!({"type": [kind, "null"]});
-    let worker_row = serde_json::json!({
-        "type": "object",
-        "description": "A worker row by the field names of the controller's contract; a fact the row does not state is null",
-        "properties": {
-            "id": {"type": "string", "description": "Sixteen hex digits, as the controller's messages print a worker"},
-            "registration_key": {"type": "string", "description": "The address a gateway dials, without its userinfo"},
-            "incarnation": {"type": "integer"},
-            "engine": {"type": "string", "description": "The engine the row belongs to: one for the ranks of a data-parallel engine"},
-            "wire": {"type": "array", "items": {"type": "string", "enum": ["http", "grpc", "zmq"]}},
-            "role": {"type": "string", "enum": ["single", "prefill", "decode", "encode"]},
-            "runtime": {"type": "string"},
-            "models": {"type": "array", "items": {"type": "string"}},
-            "dp_rank": {"type": "integer"},
-            "dp_size": {"type": "integer"},
-            "labels": {"type": "object", "additionalProperties": {"type": "string"}},
-            "zone": nullable("string"),
-            "status": {"type": "string", "enum": ["pending", "ready", "not_ready", "failed", "draining"]},
-            "revision": {"type": "integer", "description": "Counts the row's stated facts"},
-            "reachable": {
-                "type": "object",
-                "description": "Either `any`, true, or `gateway_id`, the one gateway that holds a host-local wire",
-                "properties": {"any": {"type": "boolean"}, "gateway_id": {"type": "string"}}
-            },
-            "pairing": {
-                "type": ["object", "null"],
-                "description": "What the row states of a pair and of an encode handoff; null where it states nothing of either",
-                "properties": {
-                    "protocol": nullable("string"),
-                    "transport": nullable("string"),
-                    "version": nullable("string"),
-                    "bootstrap_port": nullable("integer"),
-                    "kv_layout": {"type": "object", "additionalProperties": {"type": "string"}},
-                    "ec_producer": {"type": "boolean"},
-                    "ec_consumer": {"type": "boolean"},
-                    "vision": {"type": "boolean"},
-                    "encode_handoff": {"type": "string", "enum": ["none", "push", "rendezvous"]},
-                    "ec_connector": nullable("string"),
-                    "encode_references": {"type": "boolean"}
-                },
-                "required": [
-                    "protocol", "transport", "version", "bootstrap_port", "kv_layout", "ec_producer",
-                    "ec_consumer", "vision", "encode_handoff", "ec_connector", "encode_references"
-                ]
-            },
-            "max_running": nullable("integer"),
-            "kv_block_size": nullable("integer"),
-            "priority": {"type": "integer"},
-            "overload": {
-                "type": "object",
-                "properties": {"queue_limit": nullable("integer"), "kv_usage_permille": nullable("integer")},
-                "required": ["queue_limit", "kv_usage_permille"]
-            },
-            "signals": {
-                "type": "object",
-                "properties": {
-                    "events": {"type": "boolean"},
-                    "loads": {"type": "boolean"},
-                    "scrape_interval_ms": {"type": "integer"}
-                },
-                "required": ["events", "loads", "scrape_interval_ms"]
-            },
-            "health_policy": {
-                "type": "object",
-                "properties": {
-                    "failure_threshold": {"type": "integer"},
-                    "success_threshold": {"type": "integer"},
-                    "check_interval_ms": {"type": "integer"},
-                    "timeout_ms": {"type": "integer"},
-                    "disabled": {"type": "boolean"}
-                },
-                "required": [
-                    "failure_threshold", "success_threshold", "check_interval_ms", "timeout_ms", "disabled"
-                ]
-            },
-            "admitted_age_ms": {"type": "integer", "description": "The row's age at the read, in milliseconds"},
-            "maker": {
-                "type": ["object", "null"],
-                "description": "The provider that made the row, its key without a userinfo; null for a control call's row",
-                "properties": {"provider": {"type": "string"}, "key": {"type": "string"}},
-                "required": ["provider", "key"]
-            }
-        },
-        "required": [
-            "id", "registration_key", "incarnation", "engine", "wire", "role", "runtime", "models",
-            "dp_rank", "dp_size", "labels", "zone", "status", "revision", "reachable", "pairing",
-            "max_running", "kv_block_size", "priority", "overload", "signals", "health_policy",
-            "admitted_age_ms", "maker"
-        ]
-    });
-    paths.insert(
-        "/policy/snapshot".to_string(),
-        PathItem {
-            get: Some(operation(
-                "getPolicySnapshot",
-                "The worker rows the policy controller's store holds, in registration key order: the admin role alone, mounted only with control-plane authentication",
-                Some(vec![
-                    // Model ids, comma separated: the rows that serve one.
-                    optional_query_param("models"),
-                    // At least one row and at most 1,024, which is the default.
-                    typed_query_param("limit", ParameterSchema::of("integer")),
-                ]),
-                None,
-                {
-                    let mut responses = inline_response(
-                        "The rows under the generation that runs; truncated says a matching row was left out, by the row cap or by the policy crate's bound on a page, 2 MiB by its measure of the rows",
-                        serde_json::json!({
-                            "type": "object",
-                            "properties": {
-                                "generation": {"type": "integer"},
-                                "rows": {"type": "array", "items": worker_row},
-                                "truncated": {"type": "boolean"}
-                            },
-                            "required": ["generation", "rows", "truncated"]
-                        }),
-                    );
-                    responses.insert(
-                        "400".to_string(),
-                        refused("The query names a key other than models and limit, names more than 128 models or one past 256 bytes or with a blank, or limit is zero or no number"),
-                    );
-                    responses.insert("409".to_string(), policy_off());
-                    responses.insert(
-                        "429".to_string(),
-                        refused("As many snapshots wait as may (TOO_MANY_SNAPSHOTS); Retry-After says when to come again"),
-                    );
-                    responses
-                },
-            )),
-            ..PathItem::default()
-        },
     );
 
     // ---- The control-plane routes take the bearer ----
@@ -1882,174 +1609,5 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::BTreeSet;
-
-    use serde_json::json;
-
-    use super::*;
-
-    fn document_value() -> Value {
-        serde_json::to_value(document().expect("the document builds")).expect("it serializes")
-    }
-
-    fn listed_routes() -> BTreeSet<(String, String)> {
-        CONTROL_PLANE_ROUTES
-            .iter()
-            .chain(RL_CONTROL_PLANE_ROUTES)
-            .map(|(method, path)| (method.to_lowercase(), path.to_string()))
-            .collect()
-    }
-
-    #[test]
-    fn every_control_plane_route_has_an_operation_that_takes_the_bearer() {
-        let doc = document_value();
-
-        for (method, path) in listed_routes() {
-            let operation = &doc["paths"][&path][&method];
-            assert!(operation.is_object(), "{method} {path} has no operation");
-            assert_eq!(
-                operation["security"],
-                json!([{ BEARER_SCHEME: [] }]),
-                "{method} {path} does not take the bearer"
-            );
-        }
-        assert_eq!(
-            doc["components"]["securitySchemes"][BEARER_SCHEME]["scheme"],
-            json!("bearer")
-        );
-    }
-
-    #[test]
-    fn only_the_listed_routes_take_the_bearer() {
-        let doc = document_value();
-        let listed = listed_routes();
-
-        for (path, item) in doc["paths"].as_object().expect("the paths") {
-            for (method, operation) in item.as_object().expect("a path item") {
-                let takes_bearer = operation.get("security").is_some();
-                assert_eq!(
-                    takes_bearer,
-                    listed.contains(&(method.clone(), path.clone())),
-                    "{method} {path}: takes the bearer {takes_bearer}, listed otherwise"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn the_worker_routes_take_the_types_the_gateway_reads() {
-        let doc = document_value();
-        let item = &doc["paths"]["/workers/{worker_id}"];
-        let body_schema = |method: &str| {
-            item[method]["requestBody"]["content"]["application/json"]["schema"]["$ref"].clone()
-        };
-
-        assert_eq!(body_schema("put"), json!("#/components/schemas/WorkerSpec"));
-        assert_eq!(
-            body_schema("patch"),
-            json!("#/components/schemas/WorkerUpdateRequest")
-        );
-        assert_eq!(
-            item["delete"]["responses"]["4XX"]["content"]["application/json"]["schema"]["$ref"],
-            json!("#/components/schemas/WorkerErrorResponse")
-        );
-        assert_eq!(
-            doc["paths"]["/workers"]["get"]["parameters"][0]["name"],
-            json!("model")
-        );
-    }
-
-    #[test]
-    fn the_input_items_list_names_its_paging_parameters() {
-        let doc = document_value();
-        let parameters: Vec<_> = doc["paths"]["/v1/responses/{response_id}/input_items"]["get"]
-            ["parameters"]
-            .as_array()
-            .expect("the parameters")
-            .iter()
-            .map(|parameter| {
-                (
-                    parameter["name"].as_str().unwrap_or(""),
-                    parameter["in"].as_str().unwrap_or(""),
-                    parameter["required"].as_bool(),
-                    parameter["schema"]["type"].as_str().unwrap_or(""),
-                    parameter["schema"]["items"]["type"].as_str(),
-                )
-            })
-            .collect();
-        assert_eq!(
-            parameters,
-            vec![
-                ("response_id", "path", Some(true), "string", None),
-                ("limit", "query", Some(false), "integer", None),
-                ("order", "query", Some(false), "string", None),
-                ("after", "query", Some(false), "string", None),
-                ("include", "query", Some(false), "array", Some("string")),
-            ]
-        );
-    }
-
-    #[test]
-    fn the_rate_limit_document_write_declares_its_precondition_header() {
-        let doc = document_value();
-        let parameters = doc["paths"]["/rate-limits/tenants"]["put"]["parameters"]
-            .as_array()
-            .expect("the write's parameters")
-            .clone();
-        let if_match = parameters
-            .iter()
-            .find(|parameter| parameter["name"] == json!("If-Match"))
-            .expect("the If-Match parameter");
-        assert_eq!(if_match["in"], json!("header"));
-        assert_eq!(if_match["required"], json!(true));
-        assert_eq!(if_match["schema"]["type"], json!("string"));
-        assert!(
-            parameters
-                .iter()
-                .any(|parameter| parameter["name"] == json!("dry_run")),
-            "the dry run stays declared"
-        );
-    }
-
-    #[test]
-    fn the_module_and_tokenizer_routes_refuse_in_the_worker_envelope() {
-        let doc = document_value();
-        let envelope = json!("#/components/schemas/WorkerErrorResponse");
-        for (path, method, status) in [
-            ("/v1/tokenizers", "post", "409"),
-            ("/v1/tokenizers", "post", "4XX"),
-            ("/v1/tokenizers/{tokenizer_id}", "get", "4XX"),
-            ("/v1/tokenizers/{tokenizer_id}", "delete", "4XX"),
-            ("/v1/tokenizers/{tokenizer_id}/status", "get", "4XX"),
-            ("/wasm", "post", "4XX"),
-            ("/wasm/{module_uuid}", "delete", "4XX"),
-        ] {
-            assert_eq!(
-                doc["paths"][path][method]["responses"][status]["content"]["application/json"]
-                    ["schema"]["$ref"],
-                envelope,
-                "{method} {path} {status}"
-            );
-        }
-    }
-
-    /// The WASM load's explicit 400 carries two bodies, the per-module results
-    /// and, for a refused body, the envelope; the explicit status hides the
-    /// 4XX range, so the document declares both under it.
-    #[test]
-    fn the_wasm_load_400_declares_the_per_module_shape_and_the_envelope() {
-        let doc = document_value();
-        let schema = &doc["paths"]["/wasm"]["post"]["responses"]["400"]["content"]
-            ["application/json"]["schema"];
-        let shapes = schema["oneOf"]
-            .as_array()
-            .unwrap_or_else(|| panic!("the 400 carries no oneOf: {schema}"));
-        assert_eq!(shapes.len(), 2, "{schema}");
-        assert_eq!(shapes[0]["required"], json!(["modules"]));
-        assert_eq!(
-            shapes[1]["$ref"],
-            json!("#/components/schemas/WorkerErrorResponse")
-        );
-    }
-}
+#[path = "../tests/unit/tests.rs"]
+mod tests;

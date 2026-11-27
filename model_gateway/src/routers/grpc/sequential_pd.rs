@@ -8,17 +8,14 @@
 //! the prefill worker's metadata (`KvConnectorMode`).
 
 use std::{
-    cell::RefCell,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use axum::response::Response;
+use axum::{http::HeaderMap, response::Response};
 use smg_grpc_client::vllm_proto as vllm;
 use smg_worker::{
-    health::liveness,
-    identity::{basic::Worker, sampling_defaults::DEFAULT_SAMPLING_PARAMS_LABEL},
-    metrics::writers::Metrics as WorkerMetrics,
+    health::liveness, identity::basic::Worker, metrics::writers::Metrics as WorkerMetrics,
 };
 use tracing::{debug, error, warn};
 
@@ -31,29 +28,36 @@ use crate::{
                 connector_mode_for_worker, is_moriio_worker, mooncake_decode_params,
                 mooncake_prefill_params, KvConnectorMode, NIXL_PREFILL_KV_PARAMS,
             },
-            pd_admission::{self, Tried},
             pd_failure::{PdSide, SidePhase},
             prefill_admission::PrefillLoadGuard,
             retry::mark_non_retryable,
         },
         error,
         grpc::{
-            backend_client::{connected_backend_client, BackendClient},
-            common::stages::request_execution::{
-                decode_silence_response, dispatch_prefill_within, first_prefill_response_within,
-                is_prefill_silence, pd_start_failure_response, prefill_silence_response,
-                retire_pd_side, PdSides, PrefillBound, PrefillWait, Retirement, SideDispatch,
-                StreamResult,
+            backend_client::BackendClient,
+            common::stages::{
+                request_execution::{
+                    decode_silence_response, dispatch_prefill_within,
+                    first_prefill_response_within, is_prefill_silence, owe_decode_end,
+                    pd_start_failure_response, prefill_silence_response, retire_pd_side,
+                    tell_prefill_failure, PdSides, PrefillBound, PrefillWait, Retirement,
+                    SideDispatch, StreamResult,
+                },
+                MovedDecode, RequestAgain, WorkerSelectionStage,
             },
-            context::{ClientSelection, ExecutionResult, PdTiming, Placement, WorkerSelection},
+            context::{
+                ClientSelection, ExecutionResult, LoadGuards, PdTiming, RoutingSnapshot,
+                WireConstraint, WorkerSelection,
+            },
             multimodal::worker_language_model_only,
             proto_wrapper::{
                 FirstItem, PrefillCachedTokens, PrefillTicket, ProtoGenerateRequest,
                 ProtoInputLogProbs, ProtoResponseVariant, ProtoStream,
             },
             utils::{
-                account_pd_side_failure, mark_error_reason, stream_failure::UpstreamClass,
-                tonic_ext::TonicStatusExt,
+                account_pd_side_failure, mark_error_reason,
+                stream_failure::UpstreamClass,
+                tonic_ext::{is_receive_bound_refusal, is_the_engines_own_report, TonicStatusExt},
             },
         },
     },
@@ -267,6 +271,8 @@ async fn first_decode_response_within(
 /// The attempt's answer for a decode side that failed to start or fell
 /// silent on the sequential path: the breaker sample, the worker-error
 /// counter (the silence verdict counted itself) and the client response.
+/// The answer bears the end the decode owes Grand Central, as the breaker
+/// sampled it: the plan holds the decode's guard and tells it.
 fn sequential_decode_failure(
     e: &tonic::Status,
     workers: &WorkerSelection,
@@ -276,6 +282,17 @@ fn sequential_decode_failure(
     if let Some(status) = e.breaker_status() {
         workers.record_outcome_decode(ledger, status);
     }
+    let mut response = sequential_decode_answer(e, workers, connection);
+    owe_decode_end(&mut response, workers, || e.end_status());
+    response
+}
+
+/// The client response of [`sequential_decode_failure`], with its counter.
+fn sequential_decode_answer(
+    e: &tonic::Status,
+    workers: &WorkerSelection,
+    connection: &'static str,
+) -> Response {
     if is_decode_side_silence(e) {
         if let Some(decode) = workers.decode_worker() {
             return decode_silence_response(e, decode);
@@ -339,6 +356,10 @@ enum SequentialPdDecodeForm {
 /// Worker selection keeps such a request off such workers while the model
 /// pairs a decode worker with the vision encoder (`decode_needs_vision`), so
 /// a refusal here means none is paired.
+// Always in line: the plan's decision ran this built in, on every sequential
+// request's path, before the check of its refusals called it too. With two
+// callers it stood alone, and a request read 32 instructions more.
+#[inline(always)]
 fn sequential_pd_decode_form(
     request: &ProtoGenerateRequest,
     decode_language_model_only: bool,
@@ -398,10 +419,19 @@ fn sequential_pd_decode_form(
     Ok(SequentialPdDecodeForm::TextPlusHashes)
 }
 
+/// What refuses a pair on the MoRI-IO connector, for the plan's decision and
+/// for the check of its refusals alike.
+fn moriio_unsupported() -> Response {
+    error::not_implemented(
+        "moriio_grpc_pd_unsupported",
+        "MoRIIOConnector PD is supported by the HTTP PD router only",
+    )
+}
+
 /// What the sequential dispatch decides before either side is sent: the pair's
 /// KV connector mode, whether the KV handoff is relayed through the router,
 /// the transfer id the router mints for Mooncake, and the decode side's form.
-struct SequentialPlan {
+pub(crate) struct SequentialPlan {
     mode: KvConnectorMode,
     /// The KV handoff is single-consumer: with n>1 each fan-out child on decode
     /// would pull, and the first completion frees the prefill blocks under its
@@ -421,10 +451,13 @@ struct SequentialPlan {
 
 impl SequentialPlan {
     /// Decide the plan from the pair and the request; a pairing this pipeline
-    /// cannot serve (a MoRI-IO decode, a language-model-only decode the
-    /// request's multimodal payload needs more of) is refused here, before
-    /// either side is sent.
-    fn decide(
+    /// cannot serve (a MoRI-IO decode or prefill, a language-model-only
+    /// decode the request's multimodal payload needs more of) is refused
+    /// here, before either side is sent. The dispatch decides it ahead of
+    /// [`execute_sequential_pd`], so a refused request's prefill was never
+    /// said to be sent. [`Self::refuses`] makes the same refusals without
+    /// the plan: a refusal added here is added there.
+    pub(crate) fn decide(
         proto_request: &ProtoGenerateRequest,
         workers: &WorkerSelection,
     ) -> Result<Self, Response> {
@@ -454,12 +487,7 @@ impl SequentialPlan {
             ),
             // Relaying nothing would let the decode engine compute over KV that
             // never arrives, so refuse until this pipeline speaks the protocol.
-            KvConnectorMode::MoriIo => {
-                return Err(error::not_implemented(
-                    "moriio_grpc_pd_unsupported",
-                    "MoRIIOConnector PD is supported by the HTTP PD router only",
-                ));
-            }
+            KvConnectorMode::MoriIo => return Err(moriio_unsupported()),
             KvConnectorMode::Store => debug!(
                 "vLLM PD (KV store): the prefill writes its blocks to the shared store and the \
                  decode reads them back by prefix hash; no connector params on either side"
@@ -510,6 +538,34 @@ impl SequentialPlan {
             stripped_mm_decode,
             streaming: proto_request.stream(),
         })
+    }
+
+    /// What [`Self::decide`] refuses of the pair and the request, asked
+    /// without the plan: of each side's connector it asks one thing,
+    /// whether it is MoRI-IO, and it logs no line and mints no transfer id.
+    /// For a caller that asks ahead of the dispatch that decides the plan.
+    /// `decide` makes the same two refusals in its own lines, which every
+    /// sequential request runs.
+    pub(crate) fn refuses(
+        proto_request: &ProtoGenerateRequest,
+        workers: &WorkerSelection,
+    ) -> Result<(), Response> {
+        // The plan's mode is MoRI-IO for a MoRI-IO decode, and else what the
+        // prefill's connector says.
+        let moriio = [workers.decode_worker(), workers.prefill_worker()]
+            .into_iter()
+            .flatten()
+            .any(|worker| is_moriio_worker(worker.as_ref()));
+        if moriio {
+            return Err(moriio_unsupported());
+        }
+        let relay_kv_params = proto_request.sampling_n() <= 1;
+        let decode_language_model_only = proto_request.is_vllm()
+            && workers
+                .decode_worker()
+                .is_some_and(|worker| worker_language_model_only(worker.as_ref()));
+        sequential_pd_decode_form(proto_request, decode_language_model_only, relay_kv_params)
+            .map(drop)
     }
 
     /// The prefill request carried KV params, so the servicer was asked for
@@ -577,7 +633,7 @@ impl SequentialPlan {
 /// What the drained prefill side hands on: its completed stream, the connector
 /// params and the processed media identity its Complete frame carried, the
 /// input logprobs and the prefix-cache hit, and the side's start and end.
-struct PrefillHarvest {
+pub(crate) struct PrefillHarvest {
     stream: ProtoStream,
     kv_params: Option<String>,
     media_identity: Option<vllm::MediaIdentity>,
@@ -587,20 +643,66 @@ struct PrefillHarvest {
     done: Instant,
 }
 
+/// What the sequential dispatch of one request holds for its decode, which
+/// goes out behind its prefill. The decode's load guard was made ahead of
+/// its send ([`LoadGuards::behind_prefill`]), so the dispatch owes it two
+/// things once the prefill has answered: the decode asked again
+/// ([`WorkerSelectionStage::decode_again`]), which may move the request to
+/// another decode, and the send said on the decode the request goes to. A
+/// decode the classic policies picked is owed neither, and its dispatch
+/// holds nothing for it.
+///
+/// A batch's dispatch is handed the same for its decode guards, which were
+/// made ahead of their send too: it asks no decode again, and says the send
+/// once, behind what refuses a sub-request. A dispatch that refuses its
+/// request drops this as it is, and the guards are dropped unsent.
+pub(crate) struct DecodeBehindPrefill<'a> {
+    /// The selection stage, which states the request again.
+    pub stage: &'a WorkerSelectionStage,
+    /// The model the request is routed under.
+    pub model_id: &'a str,
+    /// What of the request outlived its parse.
+    pub routing: &'a RoutingSnapshot,
+    pub headers: Option<&'a HeaderMap>,
+    /// The retained plan's wire.
+    pub wire: WireConstraint,
+    /// The engines the request's failed attempts were sent to.
+    pub tried: &'a [String],
+    /// The attempt's guards, the decode's among them.
+    pub guards: &'a mut LoadGuards,
+    /// Where the dispatch leaves the selection that names the decode it
+    /// sent, where the decode moved: the response's stages and a retry
+    /// read it in the first selection's place.
+    pub moved: &'a mut Option<WorkerSelection>,
+}
+
 /// Execute vLLM PD: send to prefill with max_tokens=1 first, wait for completion,
 /// then send original request to decode.
 ///
 /// For Mooncake: injects bootstrap_host/port from prefill worker metadata into
 /// the decode request. For NIXL: tags the prefill request with do_remote_decode,
 /// then relays the kv_transfer_params returned by the prefill engine to decode.
+///
+/// `plan` is the pair's plan as the dispatch decided it
+/// ([`SequentialPlan::decide`]), and `prefill_guard` the prefill's load with
+/// its send said: the dispatch says it behind the plan's refusals.
+///
+/// `behind` is what one request's dispatch holds for its decode
+/// ([`DecodeBehindPrefill`]): once the prefill has answered the decode is
+/// asked again, and its send is said where it goes out. `None` for a
+/// dispatch that owes its decode neither: a batch's sub-request, whose
+/// decode's send the batch or the guard's making said, and a pair the
+/// classic policies picked.
+#[expect(clippy::too_many_arguments)]
 pub(crate) async fn execute_sequential_pd(
+    plan: SequentialPlan,
     proto_request: ProtoGenerateRequest,
     clients: &mut ClientSelection,
     workers: &WorkerSelection,
     model: &str,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
-    placement: Option<&Placement>,
+    behind: Option<DecodeBehindPrefill<'_>>,
 ) -> Result<ExecutionResult, Response> {
     let runtime = workers
         .disaggregated_runtime_type()
@@ -609,17 +711,11 @@ pub(crate) async fn execute_sequential_pd(
     let (prefill_client, decode_client) =
         clients.disaggregated_or_mismatch("execute_sequential_pd")?;
 
-    let plan = SequentialPlan::decide(&proto_request, workers)?;
     // Recorded on the success path (after decode established) so failed
     // requests don't pollute success metrics; captured here before use of mode.
     let kv_connector_label = plan.mode.metrics_label();
     let (prefill_request, mut decode_request) = plan.requests(proto_request, workers);
     let sides = PdSides::of(workers, ledger, &prefill_request, plan.streaming);
-    // A decode that stands chosen is asked again behind the prefill's
-    // answer. The prefill side then says no end of its own: the end is
-    // said below, behind the decode's dispatch.
-    let waiting = placement.filter(|placement| placement.decode_waits());
-    let ending = placement.filter(|_| waiting.is_none());
 
     let PrefillHarvest {
         stream: prefill_stream,
@@ -631,41 +727,67 @@ pub(crate) async fn execute_sequential_pd(
         done: prefill_done,
     } = sequential_prefill_side(
         &sides,
-        prefill_request,
-        prefill_client.clone(),
+        Box::pin({
+            let mut client = prefill_client.clone();
+            async move { client.generate(prefill_request).await }
+        }),
         prefill_guard,
-        ending,
     )
     .await?;
 
     debug!("vLLM PD: prefill completed, sending decode request");
 
-    // The document picks the decode after the prefill, and the prefill has
-    // answered: the decode is asked again here, on the loads of this
-    // instant. A decode that moved takes the place of the first one from
-    // here on: its selection, and its client, which the gateway held ahead
-    // of the move. Nothing can fail between the move and the send.
-    let moved = match waiting {
-        Some(placement) => {
-            let moved = decode_asked_again(placement, workers, model, ledger);
-            // A decode still chosen leaves with its prefill's end, so its
-            // dispatch is said ahead of that end.
-            placement.decode_dispatched(Instant::now());
-            let prompt_tokens = u32::try_from(sides.prompt_tokens).unwrap_or(u32::MAX);
-            placement.prefill_ended(prompt_tokens, prefill_done);
-            moved
-        }
-        None => None,
-    };
+    // The prefill has answered: the decode is asked again, and the request
+    // goes to the decode the answer names, with that decode's client and
+    // its gate's claim.
     let mut decode_client = decode_client.clone();
-    let moved = moved.map(|MovedDecode { worker, client }| {
-        if let Some((_, held)) = clients.disaggregated_mut() {
-            *held = client.clone();
+    let mut workers = workers;
+    let mut guards = None;
+    if let Some(behind) = behind {
+        let DecodeBehindPrefill {
+            stage,
+            model_id,
+            routing,
+            headers,
+            wire,
+            tried,
+            guards: held,
+            moved: slot,
+        } = behind;
+        if let Some(first) = workers.decode() {
+            let request = RequestAgain {
+                model_id,
+                routing,
+                headers,
+                tokens: decode_request.token_ids(),
+                wire,
+                tried,
+                ledger,
+                claimed: held.claimed(),
+            };
+            let mut moved = None;
+            held.map_decode(|ahead| {
+                let (decode, guard) = stage.decode_again(&request, first, ahead);
+                moved = decode;
+                guard
+            });
+            if let Some(MovedDecode {
+                decode,
+                client,
+                claim,
+            }) = moved
+            {
+                held.claim_moved(claim);
+                if let Some((_, held)) = clients.disaggregated_mut() {
+                    *held = client.clone();
+                }
+                decode_client = client;
+                *slot = workers.with_decode(decode);
+                workers = slot.as_ref().unwrap_or(workers);
+            }
         }
-        decode_client = client;
-        workers.with_decode(worker)
-    });
-    let workers = moved.as_ref().unwrap_or(workers);
+        guards = Some(held);
+    }
     let sides = PdSides { workers, ..sides };
 
     let handed_off = relay_to_decode(
@@ -675,6 +797,11 @@ pub(crate) async fn execute_sequential_pd(
         kv_params,
         media_identity.as_ref(),
     )?;
+    // The decode goes out: its send is said on the answer the request goes
+    // to, with the guard made ahead of it.
+    if let (Some(guards), Some(decode)) = (guards, workers.decode()) {
+        guards.map_decode(|ahead| decode.sent(ahead));
+    }
     let (decode_stream, decode_sent) =
         sequential_decode_side(&sides, &plan, decode_request, decode_client, handed_off).await?;
     // Decode established: record the success-only PD metrics here.
@@ -717,121 +844,19 @@ pub(crate) async fn execute_sequential_pd(
     })
 }
 
-/// A decode a pair moved to behind its second ask, with the client the
-/// gateway held for it ahead of the move.
-struct MovedDecode {
-    worker: Arc<dyn Worker>,
-    client: BackendClient,
-}
-
-/// A placed pair's second ask of its decode, behind its prefill's answer:
-/// the decode the placement moved to, where it moved.
-///
-/// The route's rule for a decode the pair may move to: the request's ledger
-/// admits it, as at every commit; it reads the built request as the first
-/// decode does ([`reads_the_request_alike`]), in a window no narrower
-/// ([`holds_what_the_first_holds`]); the gateway holds its client, since a
-/// connect behind the prefill's answer could fail a request the first
-/// decode would have served; and its admission gate takes the request now,
-/// by one try with no wait ([`pd_admission::try_admit_decode`]). The first
-/// decode holds with no try: its client and its claim stand.
-///
-/// Where the placement moves, the claim moves with it: the moved decode's
-/// claim takes the first one's place, and the first worker's rooms are
-/// given back. A claim tried for a decode the commit then passes over is
-/// given back at the next try, and at the walk's end.
-fn decode_asked_again(
-    placement: &Placement,
-    workers: &WorkerSelection,
-    model: &str,
-    ledger: &AttemptLedger,
-) -> Option<MovedDecode> {
-    let first = workers.decode_worker()?;
-    // What the walk holds of the decode it stands at.
-    let taken = RefCell::new(None);
-    let takes_the_request = |worker: &Arc<dyn Worker>| {
-        taken.replace(None);
-        let alike = reads_the_request_alike(first.as_ref(), worker.as_ref())
-            && holds_what_the_first_holds(first.as_ref(), worker.as_ref(), model);
-        if !alike || !ledger.admits(worker.as_ref()) {
-            return false;
-        }
-        if Arc::ptr_eq(worker, first) {
-            return true;
-        }
-        let Some(client) = connected_backend_client(worker.as_ref()) else {
-            return false;
-        };
-        let claim = match pd_admission::try_admit_decode(worker, 1) {
-            Tried::NoWindow => None,
-            Tried::Claimed(claim) => Some(claim),
-            Tried::Full => return false,
-        };
-        taken.replace(Some((client, claim)));
-        true
-    };
-    // A second decision that names the first decode again moved nothing.
-    let worker = placement
-        .decode_again(takes_the_request, Instant::now())
-        .filter(|decode| !Arc::ptr_eq(decode, first))?;
-    // The walk's last try was the moved decode's.
-    let (client, claim) = taken.into_inner()?;
-    placement.claim_moved(claim);
-    Some(MovedDecode {
-        worker,
-        client: (*client).clone(),
-    })
-}
-
-/// Whether `worker` reads a decode request built for `first` as `first`
-/// does. The request is built whole before the prefill goes out, for the
-/// decode the first decision named, and nothing shapes it again behind a
-/// second ask. So a decode that takes it rides the first one's connection,
-/// constrains a turn by the same labels, samples by the same defaults, and
-/// handles media the same way. It is no MoRI-IO engine, whose prefill would
-/// have been told its decode.
-fn reads_the_request_alike(first: &dyn Worker, worker: &dyn Worker) -> bool {
-    worker.connection_mode() == first.connection_mode()
-        && worker.metadata().decoding == first.metadata().decoding
-        && sampling_defaults(worker) == sampling_defaults(first)
-        && worker_language_model_only(worker) == worker_language_model_only(first)
-        && !is_moriio_worker(worker)
-}
-
-/// Whether `worker`'s context window for `model` holds every request that
-/// `first`'s holds. The request's sizes were checked against the first
-/// decode alone, where the pair was placed with no window demand stated. A
-/// worker that states no window binds nothing, as at that check.
-fn holds_what_the_first_holds(first: &dyn Worker, worker: &dyn Worker, model: &str) -> bool {
-    match (first.context_length(model), worker.context_length(model)) {
-        (_, None) => true,
-        (Some(first), Some(window)) => window >= first,
-        (None, Some(_)) => false,
-    }
-}
-
-/// The sampling defaults a worker's label states, which request building
-/// lays under a request for its decode worker.
-fn sampling_defaults(worker: &dyn Worker) -> Option<&String> {
-    let labels = &worker.metadata().spec.labels;
-    labels.get(DEFAULT_SAMPLING_PARAMS_LABEL)
-}
-
 /// The prefill side of the sequential dispatch: sent and answered within its
 /// bound, booked on its worker, then drained for what the decode side needs;
 /// its admission slot is released once it is drained. A failure anywhere is
 /// the attempt's, where the retry layer can still take the request to another
 /// prefill worker.
-async fn sequential_prefill_side(
+pub(crate) async fn sequential_prefill_side(
     sides: &PdSides<'_>,
-    prefill_request: ProtoGenerateRequest,
-    mut prefill_client: BackendClient,
+    dispatch: SideDispatch,
     prefill_guard: PrefillLoadGuard,
-    placement: Option<&Placement>,
 ) -> Result<PrefillHarvest, Response> {
     let workers = sides.workers;
     debug!(
-        request_id = %prefill_request.request_id(),
+        request_id = %sides.request_id,
         "vLLM PD: sending prefill request (max_tokens=1)"
     );
 
@@ -846,7 +871,7 @@ async fn sequential_prefill_side(
     let bound = prefill_worker
         .and_then(|worker| PrefillBound::at(worker, sides.prompt_tokens, prefill_start));
     if let Some(prefill) = prefill_worker {
-        WorkerMetrics::record_worker_request(prefill.url(), prefill.model_id());
+        WorkerMetrics::record_worker_request(prefill.as_ref());
     }
     // Booked before the call is polled, for the servicers that send their
     // headers with the first message (see `PrefillTicket::book`); the bound
@@ -858,7 +883,7 @@ async fn sequential_prefill_side(
             bound: bound.clone(),
             encode: None,
         },
-        Box::pin(async move { prefill_client.generate(prefill_request).await }),
+        dispatch,
         prefill_worker.cloned(),
         None,
         sides.prefill_label,
@@ -866,7 +891,10 @@ async fn sequential_prefill_side(
         sides.prompt_tokens,
     )
     .await
-    .map_err(|e| sequential_prefill_failure(&e, workers, sides.ledger, sides.prefill_label))?;
+    .map_err(|e| {
+        tell_prefill_failure(&prefill_guard, &e);
+        sequential_prefill_failure(&e, workers, sides.ledger, sides.prefill_label)
+    })?;
     // The prompt has been pending prefill on its worker since the dispatch,
     // until the first response, which teaches the worker's rate; the stream
     // takes the booking over.
@@ -894,6 +922,7 @@ async fn sequential_prefill_side(
     {
         // Dropping the stream aborts the side's room: nothing was handed off.
         drop(prefill_stream);
+        tell_prefill_failure(&prefill_guard, &e);
         return Err(sequential_prefill_failure(
             &e,
             workers,
@@ -926,8 +955,14 @@ async fn sequential_prefill_side(
                 }
             }
             Err(e) => {
-                if let Some(status) = e.breaker_status() {
+                // A collected answer does not charge the engine's own report,
+                // as in the collector; a streamed answer charges it.
+                if let Some(status) = e
+                    .breaker_status()
+                    .filter(|_| sides.streaming || !is_the_engines_own_report(&e))
+                {
                     workers.record_outcome_prefill(sides.ledger, status);
+                    tell_prefill_failure(&prefill_guard, &e);
                 }
                 UpstreamClass::account_dispatch_failure(
                     metrics_labels::WORKER_PREFILL,
@@ -938,25 +973,25 @@ async fn sequential_prefill_side(
                 error!(function = "execute_sequential_pd", error = %e, "Prefill stream error");
                 let mut response =
                     PdSide::Prefill.answer(SidePhase::Stream, e.http_status(), e.message());
+                // An answer above the receive bound is as large from any
+                // prefill worker: final, as the collector's drain makes it.
+                if is_receive_bound_refusal(&e) {
+                    mark_non_retryable(&mut response);
+                }
                 mark_error_reason(&mut response, e.error_reason());
                 return Err(response);
             }
         }
     }
     prefill_stream.mark_completed();
-    // Prefill is drained: its admission slot is free while decode runs.
+    // Prefill is drained: it is told its good answer through its load, and
+    // its admission slot is free while decode runs.
+    prefill_guard.end().report(200, || true);
     drop(prefill_guard);
     workers.record_outcome_prefill(sides.ledger, 200);
     // The prefill phase ends at the drain; recorded by the executor only once
     // decode is established.
     let done = Instant::now();
-    // One prefill phase of a placed pair ends here for the controller too.
-    // The side ends with the dispatch's last phase, and the controller then
-    // reads the prefill worker free while the decode runs.
-    if let Some(placement) = placement {
-        let prompt_tokens = u32::try_from(sides.prompt_tokens).unwrap_or(u32::MAX);
-        placement.prefill_ended(prompt_tokens, done);
-    }
     Ok(PrefillHarvest {
         stream: prefill_stream,
         kv_params,
@@ -1089,7 +1124,7 @@ async fn sequential_decode_side(
     let workers = sides.workers;
     // Send request to decode
     if let Some(decode) = workers.decode_worker() {
-        WorkerMetrics::record_worker_request(decode.url(), decode.model_id());
+        WorkerMetrics::record_worker_request(decode.as_ref());
     }
     // The relay phase ends at the decode dispatch. Everything after this
     // instant, including the engines' KV transfer and the decode scheduling,
@@ -1186,11 +1221,8 @@ async fn sequential_decode_side(
 mod tests {
     use std::fmt::Write as _;
 
-    use openai_protocol::model_card::ModelCard;
-    use smg_grpc_client::VllmEngineClient;
     use smg_worker::identity::basic::{
-        ConnectionMode, RuntimeType, Worker, WorkerType, MOONCAKE_CONNECTOR, MORIIO_CONNECTOR,
-        NIXL_CONNECTOR,
+        ConnectionMode, RuntimeType, Worker, WorkerType, MOONCAKE_CONNECTOR, NIXL_CONNECTOR,
     };
 
     use super::*;
@@ -1200,173 +1232,14 @@ mod tests {
             common::{attempt_ledger::FailedSide, retry::is_retryable_response},
             grpc::{
                 backend_client::BasicWorkerBuilder,
-                client::GrpcClient,
                 common::stages::request_execution::tests::{
                     answers_after, fails_now, failure, media_refs_request, never_answers,
                     tokenspeed_pair, vllm_pd_mm_request,
                 },
-                context::test_support::{pair_behind_its_prefill, DECODES},
                 proto_wrapper::FanoutStream,
-                test_engine::mock_engine,
             },
         },
     };
-
-    /// The decodes of a pair as the cases below shape them: each states the
-    /// running window beside its place, where one is given, and holds a
-    /// client of the gateway's where `held` says so.
-    async fn decodes(
-        windows: [Option<&'static str>; 2],
-        held: [bool; 2],
-    ) -> impl Fn(&str, BasicWorkerBuilder) -> BasicWorkerBuilder {
-        let (url, _engine) = mock_engine("model-a").await;
-        let client = VllmEngineClient::connect(&url)
-            .await
-            .expect("connect the mock engine");
-        let client = BackendClient::Grpc(GrpcClient::Vllm(client));
-        move |url: &str, worker: BasicWorkerBuilder| {
-            let Some(at) = DECODES.iter().position(|decode| *decode == url) else {
-                return worker;
-            };
-            let worker = worker
-                .connection_mode(ConnectionMode::Grpc)
-                .runtime_type(RuntimeType::Vllm);
-            let worker = match windows[at] {
-                Some(window) => worker.label("max_running_requests", window),
-                None => worker,
-            };
-            if held[at] {
-                worker.engine_connection(client.clone())
-            } else {
-                worker
-            }
-        }
-    }
-
-    /// A decode that moves behind its second ask takes its claim with it.
-    /// Both decodes state a running window, and the first decode's gate
-    /// granted the dispatch its room. The loads turn over while the prefill
-    /// runs: the pair moves to the second decode by one try at that gate,
-    /// the first worker's room is given back at the move, and the second's
-    /// is held to the answer's end. The client that goes with the move is
-    /// the one the gateway held.
-    #[tokio::test]
-    async fn a_moved_decode_takes_its_claim_and_its_client_with_it() {
-        let shaped = decodes([Some("4"), Some("4")], [true, true]).await;
-        let (guards, selection, [first, second]) = pair_behind_its_prefill(shaped).await;
-        let placement = guards.placement().expect("the pair's placement");
-        assert_eq!((first.pd_admitted(), second.pd_admitted()), (1, 0));
-
-        let ledger = AttemptLedger::default();
-        let moved = decode_asked_again(placement, &selection, "model-a", &ledger);
-        let moved = moved.expect("the decode moved");
-        assert!(Arc::ptr_eq(&moved.worker, &second));
-        assert_eq!((first.pd_admitted(), second.pd_admitted()), (0, 1));
-        assert_eq!((first.load(), second.load()), (0, 1));
-        assert_eq!(second.pd_waiting_rooms(), 0, "the try left its place");
-
-        placement.decode_dispatched(Instant::now());
-        placement.prefill_ended(37, Instant::now());
-        placement.completed(37, 4);
-        drop(guards);
-        assert_eq!((first.pd_admitted(), second.pd_admitted()), (0, 0));
-        assert_eq!((first.load(), second.load()), (0, 0));
-    }
-
-    /// A decode that cannot take the request now keeps the pair on the first
-    /// decode, with the first claim as it stood and nothing held at the
-    /// other gate: one whose window is full, one a request already waits
-    /// at, and one whose client the gateway does not hold.
-    #[tokio::test]
-    async fn a_decode_that_cannot_take_the_request_now_keeps_the_first() {
-        for refuses in ["a full window", "a waiting request", "no client held"] {
-            let held = [true, refuses != "no client held"];
-            let shaped = decodes([Some("4"), Some("1")], held).await;
-            let (guards, selection, [first, second]) = pair_behind_its_prefill(shaped).await;
-            let placement = guards.placement().expect("the pair's placement");
-            let full = refuses == "a full window" && second.try_admit_pd(1, 1);
-            let waiting = (refuses == "a waiting request").then(|| second.pd_enqueue(1));
-
-            let ledger = AttemptLedger::default();
-            let moved = decode_asked_again(placement, &selection, "model-a", &ledger);
-            assert!(moved.is_none(), "{refuses}");
-            assert_eq!(first.pd_admitted(), 1, "{refuses}: the first claim");
-            assert_eq!(second.pd_admitted(), usize::from(full), "{refuses}");
-            let in_line = usize::from(waiting.is_some());
-            assert_eq!(second.pd_waiting_rooms(), in_line, "{refuses}");
-            assert_eq!((first.load(), second.load()), (1, 0), "{refuses}");
-
-            placement.decode_dispatched(Instant::now());
-            placement.prefill_ended(37, Instant::now());
-            placement.completed(37, 4);
-            drop(guards);
-            assert_eq!(first.pd_admitted(), 0, "{refuses}");
-        }
-    }
-
-    /// A decode request is built for the decode the first decision named.
-    /// A second ask moves the pair to a decode that reads it alike alone:
-    /// each difference here refuses the move.
-    #[test]
-    fn a_built_decode_request_moves_to_a_decode_that_reads_it_alike_alone() {
-        type Shape = fn(BasicWorkerBuilder) -> BasicWorkerBuilder;
-        let decode = |shape: Shape| {
-            let worker = BasicWorkerBuilder::new("grpc://decode:30000")
-                .worker_type(WorkerType::Decode)
-                .connection_mode(ConnectionMode::Grpc)
-                .runtime_type(RuntimeType::Vllm);
-            shape(worker).build()
-        };
-        let first = decode(|worker| worker);
-        assert!(reads_the_request_alike(&first, &decode(|worker| worker)));
-        let others: [(&str, Shape); 5] = [
-            ("another connection", |worker| {
-                worker.connection_mode(ConnectionMode::Zmq)
-            }),
-            ("another grammar start", |worker| {
-                worker.label("constrained_decoding_start", "first_token")
-            }),
-            ("no vision encoder", |worker| {
-                worker.label("supports_vision", "false")
-            }),
-            ("the MoRI-IO connector", |worker| {
-                worker.kv_connector(MORIIO_CONNECTOR)
-            }),
-            ("other sampling defaults", |worker| {
-                worker.label(DEFAULT_SAMPLING_PARAMS_LABEL, r#"{"temperature":1.0}"#)
-            }),
-        ];
-        for (what, shape) in others {
-            let other = decode(shape);
-            assert!(!reads_the_request_alike(&first, &other), "{what}");
-        }
-    }
-
-    /// A request's sizes were checked against the first decode's context
-    /// window. A decode the pair moves to holds a window no narrower, or
-    /// states none.
-    #[test]
-    fn a_moved_decode_holds_a_window_no_narrower_than_the_first() {
-        let decode = |window: Option<u32>| {
-            let card = ModelCard::new("m");
-            let card = match window {
-                Some(window) => card.with_context_length(window),
-                None => card,
-            };
-            BasicWorkerBuilder::new("grpc://decode:30000")
-                .worker_type(WorkerType::Decode)
-                .model(card)
-                .build()
-        };
-        let holds = |first: Option<u32>, other: Option<u32>| {
-            holds_what_the_first_holds(&decode(first), &decode(other), "m")
-        };
-        assert!(holds(Some(32_768), Some(32_768)));
-        assert!(holds(Some(4_096), Some(32_768)));
-        assert!(!holds(Some(32_768), Some(4_096)), "a narrower window");
-        assert!(holds(Some(32_768), None), "no window stated binds nothing");
-        assert!(!holds(None, Some(4_096)), "the first stated none");
-    }
 
     fn three_second_decode_bound() -> DecodeBound {
         DecodeBound {
@@ -1506,7 +1379,7 @@ mod tests {
         let selection = WorkerSelection::Disaggregated {
             encode_assignments: None,
             prefill,
-            decode,
+            decode: decode.into(),
             runtime_type: RuntimeType::Vllm,
         };
         let prefilling = |handed_off, relay_kv_params| {
@@ -1859,8 +1732,138 @@ mod tests {
         WorkerSelection::Disaggregated {
             encode_assignments: None,
             prefill,
-            decode,
+            decode: decode.into(),
             runtime_type: RuntimeType::Vllm,
+        }
+    }
+
+    /// The check of a plan's refusals answers as the plan's own decision
+    /// does: the same refusal, by its code, for every pairing and request
+    /// the decision refuses, and none where the decision makes a plan.
+    #[test]
+    fn the_check_of_a_plans_refusals_answers_as_the_plan_does() {
+        use smg_worker::{identity::basic::MORIIO_CONNECTOR, labels::SUPPORTS_VISION_LABEL};
+
+        let side = |url: &str, worker_type, connector: Option<&str>, vision: Option<&str>| {
+            let mut worker = BasicWorkerBuilder::new(url)
+                .worker_type(worker_type)
+                .runtime_type(RuntimeType::Vllm)
+                .connection_mode(ConnectionMode::Grpc);
+            if let Some(connector) = connector {
+                worker = worker.kv_connector(connector);
+            }
+            if let Some(vision) = vision {
+                worker = worker.label(SUPPORTS_VISION_LABEL, vision);
+            }
+            let worker: Arc<dyn Worker> = Arc::new(worker.build());
+            worker
+        };
+        let pair = |prefill: Option<&str>, decode: Option<&str>, vision: Option<&str>| {
+            WorkerSelection::Disaggregated {
+                encode_assignments: None,
+                prefill: side("grpc://prefill:30000", WorkerType::Prefill, prefill, None),
+                decode: side("grpc://decode:30000", WorkerType::Decode, decode, vision).into(),
+                runtime_type: RuntimeType::Vllm,
+            }
+        };
+        let code = |refused: Response| {
+            refused
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .and_then(|code| code.to_str().ok())
+                .map(str::to_owned)
+        };
+
+        // A multimodal request in the three forms a language-model-only
+        // decode is refused, as the decode form's own case builds them.
+        let gridded = vllm_pd_mm_request();
+        let mut refs_only = vllm_pd_mm_request();
+        let ProtoGenerateRequest::Vllm(req) = &mut refs_only else {
+            panic!("expected vLLM request");
+        };
+        req.mm_inputs = None;
+        req.extra_mm_inputs.clear();
+        // Pixels alone in one sample, which such a decode takes: the same
+        // pixels in two samples are the third form it is refused.
+        let mut pixels = vllm_pd_mm_request();
+        let ProtoGenerateRequest::Vllm(req) = &mut pixels else {
+            panic!("expected vLLM request");
+        };
+        req.media_refs = None;
+        req.mm_inputs
+            .as_mut()
+            .unwrap()
+            .model_specific_tensors
+            .clear();
+        req.sampling_params.get_or_insert_with(Default::default).n = 1;
+        let mut fanout = pixels.clone();
+        let ProtoGenerateRequest::Vllm(req) = &mut fanout else {
+            panic!("expected vLLM request");
+        };
+        req.sampling_params.get_or_insert_with(Default::default).n = 2;
+        let text = recorded_request(1);
+
+        let nixl = Some(NIXL_CONNECTOR);
+        let moriio = Some(MORIIO_CONNECTOR);
+        let rows = [
+            ("a NIXL pair", pair(nixl, None, None), &text, None),
+            (
+                "a MoRI-IO decode",
+                pair(nixl, moriio, None),
+                &text,
+                Some("moriio_grpc_pd_unsupported"),
+            ),
+            (
+                "a MoRI-IO prefill",
+                pair(moriio, None, None),
+                &text,
+                Some("moriio_grpc_pd_unsupported"),
+            ),
+            (
+                "grids for a language-model-only decode",
+                pair(nixl, None, Some("false")),
+                &gridded,
+                Some("pd_decode_language_model_only_mrope"),
+            ),
+            (
+                "media references for a language-model-only decode",
+                pair(nixl, None, Some("false")),
+                &refs_only,
+                Some("pd_decode_language_model_only_media_refs"),
+            ),
+            (
+                "samples of a multimodal prompt for a language-model-only decode",
+                pair(nixl, None, Some("false")),
+                &fanout,
+                Some("pd_decode_language_model_only_n_samples"),
+            ),
+            (
+                "one sample of a multimodal prompt for a language-model-only decode",
+                pair(nixl, None, Some("false")),
+                &pixels,
+                None,
+            ),
+            (
+                "text for a language-model-only decode",
+                pair(nixl, None, Some("false")),
+                &text,
+                None,
+            ),
+            (
+                "grids for a decode with the vision encoder",
+                pair(nixl, None, Some("true")),
+                &gridded,
+                None,
+            ),
+        ];
+        for (name, workers, request, refused) in rows {
+            // A refusal is read as one whatever it bears: a refusal with no
+            // code is not a row's `None`.
+            let refused = refused.map(|code| Some(code.to_owned()));
+            let checked = SequentialPlan::refuses(request, &workers).err().map(code);
+            let decided = SequentialPlan::decide(request, &workers).err().map(code);
+            assert_eq!(checked, refused, "{name}: the check");
+            assert_eq!(decided, refused, "{name}: the plan's decision");
         }
     }
 

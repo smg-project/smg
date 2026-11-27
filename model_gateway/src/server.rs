@@ -39,16 +39,16 @@ use openai_protocol::{
     tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
     validated::{ValidatedJson, ValidatedPath, ValidatedQuery, ValueBody},
     worker::{
-        ListWorkersQuery, StartProfileRequest, StopProfileRequest, WorkerErrorResponse,
-        WorkerListFormat, WorkerSpec, WorkerUpdateRequest,
+        ListWorkersQuery, StartProfileRequest, StopProfileRequest, WorkerListFormat, WorkerSpec,
+        WorkerUpdateRequest,
     },
 };
 use serde::Deserialize;
+use smg_grand_central::stages::StageRegistry;
 use smg_mesh::{
     ClusterState, MeshServer, MeshServerBuilder, MeshServerConfig, MeshServerHandler,
     PreparedMeshServer,
 };
-use smg_policy_controller::stages::Catalog;
 use tokio::{signal, spawn};
 use tracing::{debug, error, info, warn, Level};
 use wfaas::LoggingSubscriber;
@@ -58,6 +58,7 @@ mod responses_ws;
 pub mod connection_limit;
 pub mod connection_timeouts;
 pub mod health;
+mod policy_explain;
 pub mod posture;
 mod rate_limit_document;
 pub(crate) mod tls;
@@ -74,6 +75,7 @@ use smg_worker::{
     health::manager::{WorkerManager, WorkerManagerConfig},
     identity::{basic::ConnectionMode, endpoint::Endpoint},
     jobs::WorkerJobs,
+    registry::WorkerId,
 };
 
 use crate::{
@@ -83,7 +85,8 @@ use crate::{
     },
     app_context::{effective_max_concurrent_requests, AppContext},
     config::{
-        available_cpus, bind_socket_addr, dp_minimum_tokens_scheduler_scope_warning, redacted,
+        available_cpus, bind_socket_addr, dp_aware_deprecation_warning,
+        dp_minimum_tokens_scheduler_scope_warning, redacted,
         runtime_worker_threads_oversubscription, unused_credentials_warnings,
         validate_mesh_listener_port, ParserChoice, RouterConfig,
     },
@@ -101,7 +104,6 @@ use crate::{
         logging::LoggingConfig, metrics, metrics::PrometheusConfig, metrics_server, otel_trace,
         runtime_metrics,
     },
-    policy_controller::{follower::Follower, operators},
     routers::{
         common::{realtime::ws::RealtimeQueryParams, worker_selection::WorkerSelector},
         error as route_error,
@@ -120,6 +122,7 @@ use crate::{
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
     workflow::{
         job_queue::{JobQueue, JobQueueConfig},
+        worker_events::spawn_worker_event_reactions,
         Job, TokenizerConfigRequest, WorkflowEngines,
     },
 };
@@ -131,7 +134,9 @@ pub struct AppState {
     pub gateway: Option<Arc<Gateway>>,
     pub mesh_handler: Option<Arc<MeshServerHandler>>,
     pub mesh_adapters: Option<Arc<MeshAdapters>>,
-    /// Readiness state shared with the optional dedicated probe listener.
+    /// Cached O(1) readiness state shared with the optional dedicated
+    /// probe listener. Maintained event-driven by
+    /// [`crate::server::health::spawn_readiness_maintainer`].
     pub probe_state: Arc<ProbeState>,
     /// Where this start read its secrets (the command line, the environment
     /// or a file), for the configuration view; the values are not here.
@@ -189,7 +194,11 @@ async fn liveness() -> Response {
     liveness_response()
 }
 
-/// Read the readiness state shared by all probe routes.
+/// O(1) readiness: reads the event-maintained snapshot (see
+/// [`crate::server::health::spawn_readiness_maintainer`]) and the drain flag — no registry
+/// scan per probe. The decision logic lives in
+/// [`crate::server::health::ProbeState::recompute`] and is unchanged from the previous
+/// inline implementation, plus the drain gate (not-ready while draining).
 async fn readiness(State(state): State<Arc<AppState>>) -> Response {
     state.probe_state.readiness_response()
 }
@@ -869,12 +878,7 @@ async fn inflight_requests(State(state): State<Arc<AppState>>) -> Response {
 /// The control-plane reads the `admin` role alone may make: the gate
 /// refuses the `user` role there before any handler and writes the denial
 /// line, as for a mutation ([`smg_auth::ControlPlaneAuthState::with_admin_only_reads`]).
-pub const ADMIN_ONLY_READS: &[&str] = &[
-    "/config",
-    "/rate-limits/tenants",
-    "/policy/spec",
-    "/policy/snapshot",
-];
+pub const ADMIN_ONLY_READS: &[&str] = &["/config", "/rate-limits/tenants"];
 
 /// `GET /config`: the effective configuration with every secret
 /// redacted and the keys in force named by fingerprint. The `admin` role
@@ -926,8 +930,7 @@ async fn reload_secrets(State(state): State<Arc<AppState>>) -> Response {
 
 /// The control-plane routes that exist only behind control-plane
 /// authentication, mounted by `build_apps` when it is configured: the
-/// routes that expose addresses, tell or check a document in force, or
-/// change the configuration. A route
+/// routes that expose addresses or change the configuration. A route
 /// that joins this group is listed in [`GATED_ROUTES`] too, which the
 /// start-up record prints and the role matrix test reads.
 fn gated_control_plane_routes() -> Router<Arc<AppState>> {
@@ -938,16 +941,6 @@ fn gated_control_plane_routes() -> Router<Arc<AppState>> {
             "/rate-limits/tenants",
             get(rate_limit_document::get).put(rate_limit_document::put),
         )
-        .route("/policy/spec", get(operators::spec))
-        // The door's bound at the edge: a body that declares a longer length
-        // is refused unread, and one that declares none is read to the bound.
-        .route(
-            "/policy/spec:validate",
-            post(operators::validate).layer(middleware::RequestBodyLimitLayer::new(
-                operators::document_bytes(),
-            )),
-        )
-        .route("/policy/snapshot", get(operators::snapshot))
 }
 
 /// The gated routes by name, in the order of `gated_control_plane_routes`.
@@ -956,9 +949,6 @@ pub const GATED_ROUTES: &[(&str, &str)] = &[
     ("POST", "/secrets/reload"),
     ("GET", "/rate-limits/tenants"),
     ("PUT", "/rate-limits/tenants"),
-    ("GET", "/policy/spec"),
-    ("POST", "/policy/spec:validate"),
-    ("GET", "/policy/snapshot"),
 ];
 
 async fn list_workers_rest(
@@ -987,7 +977,11 @@ async fn get_worker(
 ) -> Response {
     match state.context.worker_service.get_worker(&worker_id_raw) {
         Ok(mut result) => {
-            if let Some(monitor) = state.context.worker_monitor.as_ref() {
+            // Only a worker in the registry has a load of its own: the
+            // address of a pending view can be another worker's.
+            let id = WorkerId::from_string(result.0.id.clone());
+            let registered = state.context.worker_registry.get(&id).is_some();
+            if let Some(monitor) = state.context.worker_monitor.as_ref().filter(|_| registered) {
                 let snapshot = monitor.load_snapshot();
                 result.0.engine_load = snapshot.get(&result.0.spec.url).cloned();
             }
@@ -1042,18 +1036,6 @@ async fn replace_worker(
         Ok(result) => result.into_response(),
         Err(err) => err.into_response(),
     }
-}
-
-async fn refuse_worker_write(_: Request, _: axum::middleware::Next) -> impl IntoResponse {
-    (
-        StatusCode::CONFLICT,
-        Json(WorkerErrorResponse {
-            error:
-                "With --policy-controller-address, add, change and remove workers at the controller"
-                    .to_owned(),
-            code: "WORKER_CONTROLLER_OWNED".to_owned(),
-        }),
-    )
 }
 
 // ============================================================================
@@ -1186,26 +1168,17 @@ impl ServerConfig {
 /// What a host binary adds to the gateway at startup.
 #[non_exhaustive]
 pub struct Extensions {
-    stages: Option<Catalog>,
     connector: Option<Arc<dyn EngineConnector>>,
+    policy_stages: Option<StageRegistry>,
 }
 
 impl Extensions {
-    /// Use the stock stages and connector.
+    /// Use the stock connector and the stock policy stages.
     pub fn new() -> Self {
         Self {
-            stages: None,
             connector: None,
+            policy_stages: None,
         }
-    }
-
-    /// Set the catalog of stages a policy document may name. Start with
-    /// [`Catalog::builtin`] and register the host's stages on it. The
-    /// catalog is read only when startup selects the policy controller.
-    #[must_use]
-    pub fn stages(mut self, stages: Catalog) -> Self {
-        self.stages = Some(stages);
-        self
     }
 
     /// Set the connector workers of this gateway use to probe and connect
@@ -1241,6 +1214,27 @@ impl Extensions {
     #[must_use]
     pub fn connector(mut self, connector: Arc<dyn EngineConnector>) -> Self {
         self.connector = Some(connector);
+        self
+    }
+
+    /// Set the table of stages a policy document of this gateway may name,
+    /// where the gateway runs Grand Central (`grand_central`
+    /// on). Start from the stock table ([`StageRegistry::builtin`]) and add
+    /// each stage of your own under a new name, with
+    /// [`StageRegistry::filter`], [`StageRegistry::scorer`] or
+    /// [`StageRegistry::picker`]. A supplied document (`policy_spec`) then
+    /// names your stage as it names a stock one, and the engine that places
+    /// this gateway's requests runs it.
+    ///
+    /// The gateway validates its document against this table first, before
+    /// it opens a store or listens. A document that names a stage the table
+    /// does not hold ends the start by the stage's name. Without this call
+    /// the document is validated against the stock table.
+    ///
+    /// With Grand Central off the table is not read.
+    #[must_use]
+    pub fn policy_stages(mut self, stages: StageRegistry) -> Self {
+        self.policy_stages = Some(stages);
         self
     }
 }
@@ -1452,6 +1446,10 @@ pub fn build_apps(
     let access_log_fields = middleware::AccessLogFields::from_fields(
         &app_state.context.router_config.access_log_fields,
     );
+    // Under a policy spec that keeps a sample, each router also gets the
+    // write of a request's own id, directly inside the edge layers
+    // ([`own_request_id_layer`]). Every other gateway installs nothing.
+    let own_request_id = own_request_id_layer(app_state.context.policy_registry.engine());
     let websocket_enabled = app_state.context.router_config.enable_responses_websocket;
     let typed_protection =
         typed_protection
@@ -1568,7 +1566,8 @@ pub fn build_apps(
                     .layer(axum::middleware::from_fn_with_state(
                         serving_auth_config.clone(),
                         responses_ws::before_request_hooks,
-                    )),
+                    ))
+                    .layer_if_some(own_request_id.clone()),
                 max_payload_bytes,
                 app_state.context.inflight_tracker.clone(),
                 request_id_headers.clone(),
@@ -1635,6 +1634,7 @@ pub fn build_apps(
         .route("/get_loads", get(get_loads))
         .route("/parse/function_call", post(parse_function_call))
         .route("/parse/reasoning", post(parse_reasoning))
+        .route("/policy/explain/{request_id}", get(policy_explain::get))
         .route("/wasm", post(add_wasm_module))
         .route("/wasm/{module_uuid}", delete(remove_wasm_module))
         .route("/wasm", get(list_wasm_modules))
@@ -1652,23 +1652,16 @@ pub fn build_apps(
             get(v1_tokenizers_status),
         );
 
-    let mut worker_writes = Router::new().route("/workers", post(create_worker)).route(
-        "/workers/{worker_id}",
-        axum::routing::put(replace_worker)
-            .patch(update_worker)
-            .delete(delete_worker),
-    );
-    if app_state
-        .context
-        .router_config
-        .policy_controller_address
-        .is_some()
-    {
-        worker_writes = worker_writes.route_layer(axum::middleware::from_fn(refuse_worker_write));
-    }
-    let worker_routes = worker_writes
-        .route("/workers", get(list_workers_rest))
-        .route("/workers/{worker_id}", get(get_worker));
+    // Build worker routes
+    let worker_routes = Router::new()
+        .route("/workers", post(create_worker).get(list_workers_rest))
+        .route(
+            "/workers/{worker_id}",
+            get(get_worker)
+                .put(replace_worker)
+                .patch(update_worker)
+                .delete(delete_worker),
+        );
 
     // Fallback (no control-plane auth) normally uses `admin_auth_config`.
     // If only tenant keys are configured (no shared `--api-key`), there's no
@@ -1735,7 +1728,7 @@ pub fn build_apps(
     // is what answers 404 for a route that lives on the other listener.
     let finish = |app: Router<Arc<AppState>>| {
         attach_edge_layers(
-            app,
+            app.layer_if_some(own_request_id.clone()),
             max_payload_size,
             app_state.context.inflight_tracker.clone(),
             request_id_headers.clone(),
@@ -1763,6 +1756,27 @@ pub fn build_apps(
             admin: None,
         })
     }
+}
+
+/// The layer that restates each request's chosen id on the request
+/// (`middleware::request_id::restate`), for a gateway whose Grand Central
+/// keeps a sample of its decisions: `engine` runs under a policy spec whose
+/// `explain.sample` is not zero. `None` for every other gateway, a classic
+/// one among them: it installs nothing and its requests pay nothing for it
+/// (see [`LayerIfSome`]).
+///
+/// The engine reads a host's id of a request only where it keeps a
+/// decision, so the id is stated only there. The engine starts with the
+/// context, ahead of the applications' build, and the answer is taken once,
+/// at that build. A policy spec put in force later on the running engine
+/// does not move it.
+fn own_request_id_layer(
+    engine: Option<&smg_grand_central::engine::InProcess>,
+) -> Option<tower::util::MapRequestLayer<impl Fn(Request) -> Request + Clone + Send + Sync + 'static>>
+{
+    engine
+        .is_some_and(|engine| engine.spec().engine().explain_sample() != 0)
+        .then(|| tower::util::MapRequestLayer::new(middleware::request_id::restate))
 }
 
 /// The middleware every request crosses, matched or not: body limits, the
@@ -1860,10 +1874,11 @@ fn supervise_discovery(
 /// store connections are behind us; the mesh TLS material, the apps and the
 /// listener addresses can still fail the start after this, with these
 /// listeners bound) and before the admin and HTTP listeners: the O(1)
-/// readiness state the probes read (the controller's first snapshot when
-/// following, or the cached state from worker registry events and a short
-/// checkpoint for what no event carries); the metrics listener (the recorder
-/// exists since the top of start-up, the port binds only now, eagerly, so a conflict or a bad address
+/// readiness state the probes read (maintained from
+/// WorkerRegistry events plus a short checkpoint for what no event carries,
+/// served by `/readiness` on the main listener and on the optional
+/// probe listener); the metrics listener (the recorder exists since the top of
+/// start-up, the port binds only now, eagerly, so a conflict or a bad address
 /// fails the start before the HTTP listener) with the Tokio runtime observer
 /// on it (event-loop canary and sampler; `startup` runs on the main runtime,
 /// so the observer lands on, and measures, the runtime that serves requests);
@@ -1881,24 +1896,20 @@ async fn start_observability(
     app_context: &Arc<AppContext>,
     metrics_handle: Option<PrometheusHandle>,
 ) -> Result<Arc<ProbeState>, Box<dyn std::error::Error>> {
-    let probe_state = ProbeState::with_follower(
-        app_context.inflight_tracker.clone(),
-        app_context.policy_follower.as_ref().map(Arc::downgrade),
+    let probe_state = ProbeState::new(app_context.inflight_tracker.clone());
+    let _readiness_maintainer = spawn_readiness_maintainer(
+        probe_state.clone(),
+        app_context.worker_registry.clone(),
+        app_context.tokenizer_registry.clone(),
+        config.router_config.clone(),
     );
-    if app_context.policy_follower.is_none() {
-        let _readiness_maintainer = spawn_readiness_maintainer(
-            probe_state.clone(),
-            app_context.worker_registry.clone(),
-            app_context.tokenizer_registry.clone(),
-            config.router_config.clone(),
-        );
-    }
 
     if let (Some(handle), Some(prometheus_config)) = (metrics_handle, &config.prometheus_config) {
         let (_metrics_addr, _server_handle) = metrics_server::start_metrics_server(
             handle,
             prometheus_config.host.clone(),
             prometheus_config.port,
+            app_context.policy_registry.engine(),
         )
         .await?;
         runtime_metrics::spawn_observer();
@@ -1933,9 +1944,7 @@ async fn start_discovery(
 ) -> DiscoveryTasks {
     let mut discovery_tasks = DiscoveryTasks::default();
 
-    if app_context.follows_controller() {
-        info!("Skipping worker discovery because --policy-controller-address is set");
-    } else if let Some(service_discovery_config) = service_discovery_config {
+    if let Some(service_discovery_config) = service_discovery_config {
         let app_context_arc = Arc::clone(app_context);
         match start_service_discovery(service_discovery_config, app_context_arc).await {
             Ok(handle) => {
@@ -1984,8 +1993,7 @@ async fn start_discovery(
 /// The job queue and the typed workflow engines, then the start-up jobs on
 /// them, in this order: the tokenizer (when a tokenizer or model path is
 /// configured and autoload is on; before the workers, so the tokenizer is
-/// there when they arrive), the workers from the configuration where the
-/// controller does not supply them, and the MCP
+/// there when they arrive), the workers from the configuration, and the MCP
 /// servers when an MCP configuration is given (the orchestrator then refreshes
 /// its inventory on its own channel, by `inventory.refresh_interval`). Each
 /// job completes in the background; a job the queue refuses fails the start.
@@ -2010,9 +2018,8 @@ async fn start_workflow_engines(
         .set(worker_job_queue)
         .expect("JobQueue should only be initialized once");
 
-    // Initialize typed workflow engines. Where the gateway decides in its
-    // own process, the worker workflows write at its store's door.
-    let engines = WorkflowEngines::with_feed(&config.router_config, app_context.door_feed());
+    // Initialize typed workflow engines
+    let engines = WorkflowEngines::new(&config.router_config);
 
     // Subscribe logging to all workflow engines
     engines.subscribe_all(Arc::new(LoggingSubscriber)).await;
@@ -2073,6 +2080,16 @@ async fn start_workflow_engines(
         info!("Startup tokenizer job submitted (will complete in background)");
     }
 
+    // A worker that no workflow registers here (a mesh peer's) gets its
+    // model's tokenizer job from the registry's events.
+    spawn_worker_event_reactions(app_context);
+
+    info!(
+        "Initializing workers for routing mode: {:?}",
+        config.router_config.mode
+    );
+
+    // Submit worker initialization job to queue
     #[expect(
         clippy::expect_used,
         reason = "JobQueue was initialized above; absence is unreachable"
@@ -2081,23 +2098,15 @@ async fn start_workflow_engines(
         .worker_job_queue
         .get()
         .expect("JobQueue should be initialized");
-    if app_context.follows_controller() {
-        info!("Skipping startup worker registration because --policy-controller-address is set");
-    } else {
-        info!(
-            "Initializing workers for routing mode: {:?}",
-            config.router_config.mode
-        );
-        let job = Job::InitializeWorkersFromConfig {
-            router_config: Box::new(config.router_config.clone()),
-        };
-        job_queue
-            .submit(job)
-            .await
-            .map_err(|e| format!("Failed to submit worker initialization job: {e}"))?;
+    let job = Job::InitializeWorkersFromConfig {
+        router_config: Box::new(config.router_config.clone()),
+    };
+    job_queue
+        .submit(job)
+        .await
+        .map_err(|e| format!("Failed to submit worker initialization job: {e}"))?;
 
-        info!("Worker initialization job submitted (will complete in background)");
-    }
+    info!("Worker initialization job submitted (will complete in background)");
 
     if let Some(mcp_config) = &config.router_config.mcp_config {
         info!("Found {} MCP server(s) in config", mcp_config.servers.len());
@@ -2149,8 +2158,8 @@ async fn prepare_mesh_server(
     Ok(Some(prepared))
 }
 
-/// Run the gateway on `runtime` with the stock stages. See [`run_with`] for
-/// shutdown behavior.
+/// Run the gateway on `runtime` with no extension of a host. See
+/// [`run_with`] for shutdown behavior.
 pub fn run(
     runtime: &tokio::runtime::Runtime,
     config: ServerConfig,
@@ -2204,11 +2213,33 @@ struct BoundListeners {
     admin: Option<std::net::TcpListener>,
 }
 
+/// The accept queue a client-facing listener asks for: more than a host
+/// allows, so the kernel caps it at the host's own maximum
+/// (`net.core.somaxconn` on Linux).
+const LISTEN_QUEUE: u32 = i32::MAX.unsigned_abs();
+
+/// A listener on `addr` with [`LISTEN_QUEUE`] asked for. The runtime's own
+/// bind takes no queue length and its socket queued 128 connections on a
+/// host that allows 4096: a burst of new connections overflowed it. Runs
+/// inside the runtime: the socket registers with its reactor before
+/// `into_std` hands it back.
+fn listen_on(addr: std::net::SocketAddr) -> std::io::Result<std::net::TcpListener> {
+    let socket = match addr {
+        std::net::SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+        std::net::SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
+    };
+    // As the runtime's bind sets it: a restart takes its port back at once.
+    #[cfg(not(windows))]
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    socket.listen(LISTEN_QUEUE)?.into_std()
+}
+
 /// The admin and HTTP listeners, bound in that order after the mesh
 /// listener, eagerly: a port another process holds fails the start here,
 /// before anything serves (the comments inside say why each binds where it
 /// does and how).
-async fn bind_listeners(
+fn bind_listeners(
     addr: std::net::SocketAddr,
     admin_addr: Option<std::net::SocketAddr>,
 ) -> Result<BoundListeners, Box<dyn std::error::Error>> {
@@ -2216,26 +2247,17 @@ async fn bind_listeners(
     // listener did in `startup` before this call: a port another process
     // holds fails the start here, before anything serves.
     let admin_listener = match admin_addr {
-        Some(admin_addr) => Some(
-            tokio::net::TcpListener::bind(admin_addr)
-                .await
-                .and_then(tokio::net::TcpListener::into_std)
-                .map_err(|e| {
-                    format!("Failed to bind the admin listener on {admin_addr} (--admin-port): {e}")
-                })?,
-        ),
+        Some(admin_addr) => Some(listen_on(admin_addr).map_err(|e| {
+            format!("Failed to bind the admin listener on {admin_addr} (--admin-port): {e}")
+        })?),
         None => None,
     };
     // The HTTP listener binds now, eagerly, the last of the listeners: a port
     // another process holds fails the start here, before `startup` lets the
-    // mesh server join the cluster. Bound through tokio, as axum-server
-    // binds (the same socket options and accept backlog; std's bind would
-    // queue 128 connections instead of 1024), and served from the socket in
+    // mesh server join the cluster. Served from the socket in
     // `serve_listeners`.
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .and_then(tokio::net::TcpListener::into_std)
-        .map_err(|e| format!("Failed to bind the HTTP listener on {addr}: {e}"))?;
+    let listener =
+        listen_on(addr).map_err(|e| format!("Failed to bind the HTTP listener on {addr}: {e}"))?;
     info!("Starting server on {addr}");
     Ok(BoundListeners {
         addr,
@@ -2381,61 +2403,8 @@ fn serve_listeners(
     Ok((data_serving, admin_serving))
 }
 
-/// Start the local health loop and keep its handle until the server stops.
-fn start_worker_health_checks(app_context: &AppContext) -> Option<WorkerManager> {
-    if app_context.follows_controller() {
-        info!("Skipping worker health checks because --policy-controller-address is set");
-        return None;
-    }
-    let config = &app_context.router_config;
-    let registry = app_context.worker_registry.clone();
-    let manager = WorkerManagerConfig {
-        default_check_interval_secs: config.health_check.check_interval_secs,
-        remove_unhealthy: config.unhealthy_removal_scope(),
-    };
-    let jobs = app_context
-        .worker_job_queue
-        .get()
-        .map(|queue| Arc::clone(queue) as Arc<dyn WorkerJobs>);
-    // With a feed the loop writes through the feed's sink, so each worker's
-    // health keeps one writer. The feed's rows take each move of a worker's
-    // liveness veto from the loop as well, so a feed keeps the loop with the
-    // checks off: it then probes no worker whose own checks are off.
-    if let Some(feed) = &app_context.policy_feed {
-        return Some(WorkerManager::start_with_sink(
-            registry,
-            feed.health_sink(),
-            manager,
-            jobs,
-        ));
-    }
-    WorkerManager::maybe_start(
-        registry,
-        manager,
-        jobs,
-        !config.health_check.disable_health_check,
-        config.connection_mode == ConnectionMode::Zmq,
-    )
-}
-
-/// End the watch if startup exits while another task still holds the context.
-struct FollowerOnExit<'a>(&'a AppContext);
-
-impl FollowerOnExit<'_> {
-    fn take(&self) -> Option<Follower> {
-        self.0.policy_follower.as_ref()?.lock().take()
-    }
-}
-
-impl Drop for FollowerOnExit<'_> {
-    fn drop(&mut self) {
-        // The follower leaves the context here, and its task ends with it.
-        let _follower = self.take();
-    }
-}
-
-/// The context of this process, built over what the host added: its stages
-/// and its worker connector.
+/// The context of this process, built over what the host added: its
+/// worker connector and its table of policy stages.
 async fn build_app_context(
     config: &ServerConfig,
     extensions: Extensions,
@@ -2446,11 +2415,23 @@ async fn build_app_context(
             config.router_config.request_timeout_secs,
             config.webrtc_bind_addr,
             config.webrtc_stun_server.clone(),
-            extensions.stages,
             extensions.connector,
+            extensions.policy_stages,
         )
         .await?,
     ))
+}
+
+/// What the start line says places this process's requests: the policy
+/// document Grand Central runs in place of the one the routing
+/// settings mean, by its path where it was read from one, and the routing
+/// settings' policy everywhere else.
+fn start_line_policy(config: &RouterConfig) -> String {
+    match (&config.policy_spec, &config.policy_spec_path) {
+        (None, _) => format!("{:?}", config.policy),
+        (Some(_), Some(path)) => format!("document {path}"),
+        (Some(_), None) => "a supplied document".to_owned(),
+    }
 }
 
 /// Start the gateway listeners and drain them within the configured shutdown budget.
@@ -2474,11 +2455,6 @@ pub async fn startup_with(
     // of construction path — a bypassed empty/duplicate tenant key would
     // otherwise silently reach `AuthConfig`.
     config.router_config.validate()?;
-    if config.router_config.policy_controller_address.is_some()
-        && config.service_discovery_config.is_some()
-    {
-        return Err("--policy-controller-address conflicts with service_discovery_config (--service-discovery or --discovery-provider)".into());
-    }
     // The mesh listener's port against the others: the mesh configuration is
     // not part of `RouterConfig`, so the validator cannot see it, and this is
     // the one place the CLI, the Python binding and a library caller all pass.
@@ -2572,12 +2548,16 @@ pub async fn startup_with(
     for warning in unused_credentials_warnings(&config.router_config.mode) {
         tracing::warn!("{warning}");
     }
-    // A rank scheduler under rank expansion chooses nothing: the operator's
-    // configuration runs, with the word that one of its flags does nothing.
-    if let Some(warning) = dp_minimum_tokens_scheduler_scope_warning(
-        config.router_config.dp_aware,
-        config.router_config.dp_minimum_tokens_scheduler,
-    ) {
+    // Two settings the operator's configuration still carries and that
+    // choose nothing where an engine's ranks are registered as workers: the
+    // configuration runs, with the word that the setting does nothing.
+    for warning in [
+        dp_aware_deprecation_warning(config.router_config.dp_aware),
+        dp_minimum_tokens_scheduler_scope_warning(config.router_config.dp_minimum_tokens_scheduler),
+    ]
+    .into_iter()
+    .flatten()
+    {
         tracing::warn!("{warning}");
     }
 
@@ -2659,18 +2639,15 @@ pub async fn startup_with(
     };
 
     info!(
-        "Starting router on {}:{} | mode: {:?} | policy: {:?} | max_payload: {}MB",
+        "Starting router on {}:{} | mode: {:?} | policy: {} | max_payload: {}MB",
         config.router_config.host,
         config.router_config.port,
         config.router_config.mode,
-        config.router_config.policy,
+        start_line_policy(&config.router_config),
         config.router_config.max_payload_size / (1024 * 1024)
     );
 
     let app_context = build_app_context(&config, extensions).await?;
-    let follower_on_exit = app_context
-        .follows_controller()
-        .then(|| FollowerOnExit(&app_context));
     // The history store's size on /metrics, from the stores that can count.
     if config.prometheus_config.is_some() {
         history_metrics::spawn_sampler(Arc::clone(&app_context));
@@ -2694,7 +2671,8 @@ pub async fn startup_with(
     }
 
     // The job queue, the typed workflow engines and the start-up jobs on
-    // them. The jobs complete in the background.
+    // them: the tokenizer, the workers from the configuration, the MCP
+    // servers; the jobs complete in the background.
     start_workflow_engines(&app_context, &config).await?;
 
     // Note: MCP orchestrator handles background refresh internally via refresh channel
@@ -2708,7 +2686,27 @@ pub async fn startup_with(
 
     let gateway = Gateway::from_config(&config, &app_context).await?;
 
-    let _worker_manager = start_worker_health_checks(&app_context);
+    // WorkerManager owns the background health check loop. Its handle must
+    // outlive the server to keep the task alive — bind it here so its Drop
+    // (which aborts the task) runs at server shutdown. `maybe_start` decides
+    // whether the loop has any work to do (health polling and/or promoting
+    // workers that wait on the connect signal) and skips it otherwise. ZMQ
+    // workers are promoted only by the connect signal, so pass the configured
+    // transport up front: config workers register in the background after this
+    // point, so the registry cannot yet reveal them.
+    let _worker_manager = WorkerManager::maybe_start(
+        app_context.worker_registry.clone(),
+        WorkerManagerConfig {
+            default_check_interval_secs: config.router_config.health_check.check_interval_secs,
+            remove_unhealthy: config.router_config.unhealthy_removal_scope(),
+        },
+        app_context
+            .worker_job_queue
+            .get()
+            .map(|queue| Arc::clone(queue) as Arc<dyn WorkerJobs>),
+        !config.router_config.health_check.disable_health_check,
+        config.router_config.connection_mode == ConnectionMode::Zmq,
+    );
 
     // WorkerMonitor subscribes to registry events. Starting its event
     // loop here (after the synchronous worker population in
@@ -2719,22 +2717,6 @@ pub async fn startup_with(
         worker_monitor.start_event_loop();
         debug!("Started WorkerMonitor event loop");
     }
-    // Under the feed the collector writes the store from its own tasks. The
-    // feed's loop shows those writes when the store's instant comes.
-    let _publications = app_context
-        .policy_feed
-        .as_ref()
-        .filter(|_| app_context.worker_monitor.is_some())
-        .map(|feed| feed.publications());
-    // Under the feed the workers' cache events reach the store's index, and
-    // their pushed load records the worker monitor, by the feed's follow,
-    // for the server's life. Under a controller's address the controller
-    // reads them, and this gateway reads none.
-    let _cache_events = app_context
-        .policy_feed
-        .as_ref()
-        .filter(|_| app_context.policy_follower.is_none())
-        .map(|feed| feed.cache_events(app_context.worker_monitor.as_ref()));
 
     let admission_queue =
         if app_context.rate_limiter.is_some() && config.router_config.queue_size > 0 {
@@ -2849,15 +2831,13 @@ pub async fn startup_with(
     )
     .await;
 
-    if !app_state.context.follows_controller() {
-        info!(
-            "Router ready | workers: {:?}",
-            WorkerManager::get_worker_urls(&app_state.context.worker_registry)
-                .iter()
-                .map(|url| Endpoint::redacted_str(url))
-                .collect::<Vec<_>>()
-        );
-    }
+    info!(
+        "Router ready | workers: {:?}",
+        WorkerManager::get_worker_urls(&app_state.context.worker_registry)
+            .iter()
+            .map(|url| Endpoint::redacted_str(url))
+            .collect::<Vec<_>>()
+    );
 
     let request_id_headers = config
         .router_config
@@ -2926,7 +2906,7 @@ pub async fn startup_with(
     // The mesh listener binds and the mesh server prepares now, eagerly,
     // before the admin and HTTP listeners bind (see `prepare_mesh_server`).
     let mesh_server = prepare_mesh_server(mesh_server, config.mesh_server_config.as_ref()).await?;
-    let listeners = bind_listeners(addr, admin_addr).await?;
+    let listeners = bind_listeners(addr, admin_addr)?;
 
     // The mesh server serves once every listener is bound: a member that
     // joined the cluster and vanished with a failed bind is the partial start
@@ -3023,11 +3003,6 @@ pub async fn startup_with(
     info!("HTTP server stopped. Starting component cleanup...");
 
     drop(discovery_tasks);
-
-    let follower = follower_on_exit.as_ref().and_then(FollowerOnExit::take);
-    if let Some(follower) = follower {
-        follower.stop().await;
-    }
 
     // This triggers background task cancellation, waits for tools, and denies approvals
     if let Some(orchestrator) = app_context.mcp_orchestrator.get() {
@@ -3896,6 +3871,8 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> Option<tower_http::cors::C
 mod tests {
     mod connector;
     mod load_source;
+    mod policy_stages;
+    mod worker_data;
 
     use std::convert::Infallible;
 
@@ -3907,385 +3884,128 @@ mod tests {
     use super::*;
     use crate::config::TenantApiKeyEntry;
 
-    fn worker_app_state(context: Arc<AppContext>, probe_state: Arc<ProbeState>) -> Arc<AppState> {
-        Arc::new(AppState {
-            router: Arc::new(Gateway::new(context.worker_registry.clone())),
-            context,
-            admission_queue: None,
-            gateway: None,
-            mesh_handler: None,
-            mesh_adapters: None,
-            probe_state,
-            secret_sources: Default::default(),
-            secrets: None,
-        })
-    }
-
-    fn worker_test_app(context: Arc<AppContext>, probe_state: Arc<ProbeState>) -> Router {
-        build_app(
-            worker_app_state(context, probe_state),
-            AuthConfig::new(None),
-            AuthConfig::new(None),
-            None,
-            4096,
-            vec![],
-            vec![],
-        )
-        .unwrap()
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    /// The gateway's start hands its metrics endpoint the Grand Central it
+    /// started. A scrape of a gateway whose policy document names a shadow
+    /// holds that binding's shadow series, at zero before any request.
     #[tokio::test]
-    async fn worker_writes_are_refused_only_while_following_a_controller() {
-        use axum::body::{to_bytes, Body};
-        use tower::ServiceExt;
+    async fn the_started_metrics_endpoint_publishes_the_engines_shadow_counts() {
+        use crate::observability::metrics::test_support::{shadow_kinds, shadowing_document};
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let _guard = ::metrics::set_default_local_recorder(&recorder);
+        let router_config = RouterConfig {
+            grand_central: true,
+            policy_spec: Some(shadowing_document()),
+            ..RouterConfig::default()
+        };
+        // The start binds the port its configuration names. A port read as
+        // free is held by nobody until then, so another case may take it: a
+        // start that fails is tried again on another port.
+        let mut tries = 0;
+        let (port, _probes) = loop {
+            let free = TcpListener::bind("127.0.0.1:0").await.expect("a free port");
+            let port = free.local_addr().expect("the port's address").port();
+            drop(free);
+            let prometheus = PrometheusConfig {
+                port,
+                host: "127.0.0.1".to_string(),
+                duration_buckets: None,
+            };
+            let config = ServerConfig {
+                prometheus_config: Some(prometheus),
+                ..ServerConfig::minimal(router_config.clone())
+            };
+            let app = build_app_context(&config, Extensions::new())
+                .await
+                .expect("the gateway starts");
+            match start_observability(&config, &app, Some(recorder.handle())).await {
+                Ok(probes) => break (port, probes),
+                Err(error) => {
+                    tries += 1;
+                    assert!(tries < 8, "the metrics endpoint starts: {error}");
+                }
+            }
+        };
+
+        let url = format!("http://127.0.0.1:{port}/metrics");
+        let scrape = http_client().get(url).send().await.expect("a scrape");
+        let body = scrape.text().await.expect("the scrape's text");
+        assert_eq!(shadow_kinds(&body), [Some(0); 4], "{body}");
+    }
+
+    /// A gRPC worker imported from a mesh peer runs no registration workflow
+    /// here; without its model's tokenizer, readiness answers 503.
+    #[tokio::test]
+    async fn an_imported_grpc_workers_model_gets_its_tokenizer() {
+        use openai_protocol::model_card::ModelCard;
+        use smg_worker::{
+            identity::basic::ConnectionMode,
+            registry::RemoteWorkerState,
+            worker::{WorkerModels, WorkerSpec},
+        };
 
         use crate::{
-            app_context::testing::app_context_for_tests, routers::common::snapshot::WorkerRegistry,
-            workflow::job_queue::recording_for_tests,
+            routers::grpc::backend_client::BasicWorkerBuilder,
+            workflow::tokenizer_registration::test_support::tokenizer_dir,
         };
 
-        let missing = "/workers/00000000-0000-0000-0000-000000000001";
-        for following in [true, false] {
-            let config = RouterConfig {
-                policy_controller: true,
-                policy_controller_address: following.then(|| "controller:30100".to_owned()),
-                ..Default::default()
-            };
-            let context = app_context_for_tests(config, Arc::new(WorkerRegistry::new()), None);
-            // A following gateway has a queue to refuse ahead of.
-            let _jobs = following.then(|| {
-                let (queue, jobs) = recording_for_tests(&context);
-                assert!(context.worker_job_queue.set(queue).is_ok());
-                jobs
-            });
-            let probes = ProbeState::new(context.inflight_tracker.clone());
-            let app = worker_test_app(Arc::clone(&context), probes);
-            // A GET by id asks the queue: not found where one stands, an
-            // error where none does.
-            let by_id = if following {
-                StatusCode::NOT_FOUND
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
-            for (method, path, body, classic) in [
-                (
-                    "POST",
-                    "/workers",
-                    r#"{"url":"http://worker:8000"}"#,
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                ),
-                (
-                    "PUT",
-                    missing,
-                    r#"{"url":"http://worker:8000"}"#,
-                    StatusCode::NOT_FOUND,
-                ),
-                ("PATCH", missing, "{}", StatusCode::NOT_FOUND),
-                ("DELETE", missing, "", StatusCode::NOT_FOUND),
-                ("GET", "/workers", "", StatusCode::OK),
-                ("GET", missing, "", by_id),
-            ] {
-                let response = app
-                    .clone()
-                    .oneshot(
-                        http::Request::builder()
-                            .method(method)
-                            .uri(path)
-                            .header("content-type", "application/json")
-                            .body(Body::from(body))
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                if following && method != "GET" {
-                    assert_eq!(response.status(), StatusCode::CONFLICT, "{method} {path}");
-                    let body = to_bytes(response.into_body(), 4096).await.unwrap();
-                    let body: Value = serde_json::from_slice(&body).unwrap();
-                    assert_eq!(body["code"], "WORKER_CONTROLLER_OWNED", "{method} {path}");
-                    assert!(
-                        body["error"]
-                            .as_str()
-                            .unwrap()
-                            .contains("--policy-controller-address"),
-                        "{body}"
-                    );
-                } else {
-                    assert_eq!(response.status(), classic, "{method} {path}");
-                }
-            }
-            if following {
-                // The refusal stands ahead of the worker API: no job was
-                // queued and no id reserved.
-                let url = "http://worker:8000";
-                let queue = context.worker_job_queue.get().unwrap();
-                assert!(queue.get_status(url).is_none());
-                let registry = &context.worker_registry;
-                assert!(registry.get_id_by_url_or_reservation(url).is_none());
-            }
-        }
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[tokio::test]
-    async fn readiness_waits_for_the_first_snapshot_on_both_routers() {
-        use axum::body::{to_bytes, Body};
-        use smg_policy_controller::service::controller::Scope;
-        use tokio::{sync::oneshot, time};
-        use tower::ServiceExt;
-
-        use crate::policy_controller::follower::tests::bind_controller;
-
-        time::timeout(Duration::from_secs(5), async {
-            let controller = bind_controller().await;
-            let config = ServerConfig::minimal(RouterConfig {
-                policy_controller: true,
-                policy_controller_address: Some(
-                    controller
-                        .addresses()
-                        .of(Scope::Gateway)
-                        .unwrap()
-                        .to_string(),
-                ),
-                ..Default::default()
-            });
-            let context = Arc::new(
-                AppContext::from_config(config.router_config.clone(), 10, None, None)
-                    .await
-                    .unwrap(),
-            );
-            let probes = start_observability(&config, &context, None).await.unwrap();
-            let apps = [
-                worker_test_app(context.clone(), probes.clone()),
-                health::probe_router(probes),
-            ];
-            let ready = |app: Router| async move {
-                app.oneshot(
-                    http::Request::builder()
-                        .uri("/readiness")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap()
-            };
-            for app in &apps {
-                let response = ready(app.clone()).await;
-                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-                let body = to_bytes(response.into_body(), 4096).await.unwrap();
-                assert!(std::str::from_utf8(&body)
-                    .unwrap()
-                    .contains("controller's first snapshot"));
-            }
-            let (stop, stopped) = oneshot::channel::<()>();
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "the case stops and joins the controller"
-            )]
-            let serving = spawn(controller.serve(async {
-                let _ = stopped.await;
-            }));
-            for app in &apps {
-                while ready(app.clone()).await.status() != StatusCode::OK {
-                    time::sleep(Duration::from_millis(10)).await;
-                }
-            }
-            assert!(context.worker_registry.get_all().is_empty());
-            assert!(context.worker_monitor.is_none());
-            stop.send(()).unwrap();
-            serving.await.unwrap().unwrap();
-            for app in &apps {
-                assert_eq!(ready(app.clone()).await.status(), StatusCode::OK);
-            }
-            // A draining gateway is not ready, whatever it follows: load
-            // balancers are told for the whole settle window.
-            context.inflight_tracker.begin_drain();
-            for app in apps {
-                let response = ready(app).await;
-                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-                let body = to_bytes(response.into_body(), 4096).await.unwrap();
-                assert!(std::str::from_utf8(&body).unwrap().contains("draining"));
-            }
-        })
-        .await
-        .expect("both routers report the first snapshot within five seconds");
-    }
-
-    fn file_discovery() -> RuntimeDiscoveryConfig {
-        use smg_service_discovery::Roles;
-
-        use crate::config::FileDiscoveryConfig;
-
-        RuntimeDiscoveryConfig::from_config(
-            &FileDiscoveryConfig {
-                path: "fleet.yaml".into(),
-                check_interval_secs: 1,
-            }
-            .into(),
-            Some(Roles::Regular),
-        )
-        .unwrap()
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[tokio::test]
-    async fn startup_refuses_runtime_worker_discovery_beside_a_controller_address() {
-        let mut config = ServerConfig::minimal(RouterConfig {
-            policy_controller: true,
-            policy_controller_address: Some("controller:30100".to_owned()),
-            ..Default::default()
-        });
-        config.service_discovery_config = Some(file_discovery());
-        let error = tokio::time::timeout(Duration::from_secs(1), Box::pin(startup(config)))
-            .await
-            .unwrap()
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("--policy-controller-address")
-                && error.contains("service_discovery_config"),
-            "{error}"
-        );
-    }
-
-    /// A gateway that decides in its own process keeps the health loop with
-    /// the checks off. The loop then probes no worker, and it carries each
-    /// move of a worker's liveness veto to the feed's rows, where a decision
-    /// reads it.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[tokio::test]
-    async fn a_feed_takes_a_liveness_move_with_the_checks_off() {
-        use std::time::Instant;
-
-        use smg_policy_controller::{
-            engine::{Role, WireModes},
-            store::{Ask, GatewayId, HealthPolicy, Maker, ViewBuffers, WorkerFacts},
-            worker_host::Expect,
-        };
-        use smg_worker::runtime::StallReason;
-
-        const URL: &str = "http://worker:8000";
-        const MODEL: &str = "model-a";
-
-        /// Whether `holds` comes true within five seconds.
-        async fn comes(holds: impl Fn() -> bool) -> bool {
-            for _ in 0..500 {
-                if holds() {
-                    return true;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            holds()
-        }
-
-        let mut router = RouterConfig {
-            policy_controller: true,
-            ..Default::default()
-        };
-        router.health_check.disable_health_check = true;
+        let tokenizer = tokenizer_dir();
+        let config = ServerConfig::minimal(RouterConfig::default());
         let context = Arc::new(
-            AppContext::from_config(router, 10, None, None)
+            AppContext::from_config(config.router_config.clone(), 10, None, None)
                 .await
                 .unwrap(),
         );
-        let feed = context.policy_feed.as_ref().expect("the store has a feed");
-        let _health = start_worker_health_checks(&context).expect("a feed keeps the loop");
-
-        let stated = WorkerFacts {
-            key: URL.to_owned(),
-            engine: URL.to_owned(),
-            role: Role::Single,
-            wire_modes: WireModes::HTTP,
-            models: vec![MODEL.to_owned()],
-            dp_size: 1,
-            max_running: Some(64),
-            health: HealthPolicy {
-                probes: false,
-                ..HealthPolicy::default()
-            },
-            ..WorkerFacts::default()
+        let import = |model: &str, url: &str| {
+            let mut spec = WorkerSpec::new(url);
+            spec.connection_mode = ConnectionMode::Grpc;
+            spec.models = WorkerModels::Single(Box::new(ModelCard::new(model)));
+            spec.labels.insert(
+                "tokenizer_path".to_string(),
+                tokenizer.path().to_str().unwrap().to_string(),
+            );
+            context
+                .worker_registry
+                .on_remote_worker_state(&RemoteWorkerState {
+                    worker_id: model.to_string(),
+                    model_id: model.to_string(),
+                    url: url.to_string(),
+                    health: true,
+                    version: 1,
+                    spec: serde_json::to_vec(&spec).unwrap(),
+                });
         };
-        feed.door
-            .found(&Maker::Control, Expect::Nothing, URL, &|_| stated.clone())
-            .expect("the worker registers");
-        let worker = context
-            .worker_registry
-            .get_by_url(URL)
-            .expect("the row's object stands");
-        // Whether the next decision reads the pool's worker as stalled.
-        let stalled = || {
-            let ask = Ask {
-                gateway: GatewayId::LOCAL,
-                now: Instant::now(),
-                pinned: None,
-                affinity: false,
-                signal_cells: false,
-            };
-            feed.store().deciding(|world| {
-                let mut view = ViewBuffers::default();
-                let built = world.build(MODEL, Role::Single, &ask, &mut view).is_some();
-                built && view.candidates.iter().any(|row| row.health.stalled)
+        import("imported-early", "grpc://127.0.0.1:1");
+        start_workflow_engines(&context, &config).await.unwrap();
+        // A worker registered here is its own workflow's: no job from the task.
+        context.worker_registry.register(Arc::new(
+            BasicWorkerBuilder::new("grpc://127.0.0.1:3")
+                .model(ModelCard::new("registered-here"))
+                .label("tokenizer_path", tokenizer.path().to_str().unwrap())
+                .connection_mode(ConnectionMode::Grpc)
+                .build(),
+        ));
+        import("imported-late", "grpc://127.0.0.1:2");
+        for model in ["imported-early", "imported-late"] {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !context.tokenizer_registry.contains(model) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
             })
-        };
-        assert!(!stalled());
-
-        assert!(worker.set_stall(Some(StallReason::Unreachable)));
-        assert!(comes(&stalled).await, "the row takes the doubt");
-        assert!(worker.set_stall(None));
-        assert!(comes(|| !stalled()).await, "and its clearing");
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[tokio::test]
-    #[tracing_test::traced_test]
-    async fn following_skips_startup_registration_health_load_and_worker_discovery() {
-        let socket = tokio::net::TcpSocket::new_v4().unwrap();
-        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        for following in [false, true] {
-            let config = ServerConfig::minimal(RouterConfig {
-                policy_controller: true,
-                policy_controller_address: following
-                    .then(|| socket.local_addr().unwrap().to_string()),
-                ..Default::default()
-            });
-            let context = Arc::new(
-                AppContext::from_config(config.router_config.clone(), 10, None, None)
-                    .await
-                    .unwrap(),
-            );
-            assert_eq!(context.follows_controller(), following);
-            start_workflow_engines(&context, &config).await.unwrap();
-            assert_eq!(
-                context
-                    .worker_job_queue
-                    .get()
-                    .unwrap()
-                    .get_status("startup")
-                    .is_none(),
-                following
-            );
-            assert_eq!(start_worker_health_checks(&context).is_none(), following);
-            assert_eq!(context.worker_monitor.is_none(), following);
-            let discovery =
-                start_discovery(Some(file_discovery()), None, &context, None, None).await;
-            assert_eq!(discovery.0.is_empty(), following);
-            if following {
-                let follower = context.policy_follower.as_ref().unwrap();
-                assert!(follower.lock().is_some());
-                drop(FollowerOnExit(&context));
-                assert!(follower.lock().is_none());
+            .await
+            .unwrap_or_else(|_| panic!("no tokenizer for the model of the import {model}"));
+        }
+        // A peer's tombstone takes an import and runs no removal workflow.
+        let late = context.worker_registry.get_id_by_url("grpc://127.0.0.1:2");
+        context.worker_registry.remove_remote(&late.unwrap());
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while context.tokenizer_registry.contains("imported-late") {
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-        }
-        for component in [
-            "startup worker registration",
-            "worker health checks",
-            "worker load monitoring",
-            "worker discovery",
-        ] {
-            assert!(logs_contain(&format!(
-                "Skipping {component} because --policy-controller-address is set"
-            )));
-        }
+        })
+        .await
+        .expect("the tokenizer of the import that left is still loaded");
+        assert!(!context.tokenizer_registry.contains("registered-here"));
     }
 
     /// The not-found fallback sits inside the edge layers: an unknown route
@@ -4319,6 +4039,85 @@ mod tests {
                 response.headers().contains_key("x-request-id"),
                 "{path} skipped the edge middleware"
             );
+        }
+    }
+
+    /// The write of a request's own id stands under a policy spec that
+    /// keeps a sample, and under no other. A gateway with no engine and one
+    /// whose policy spec keeps no sample get no layer: a client's value
+    /// under the private name reaches the route as it came. Under a
+    /// sampling spec the route sees the id the response's `x-request-id`
+    /// shows, whatever the client sent under the name. Each router is built
+    /// as `build_apps` finishes one: the write, then the edge layers around
+    /// it.
+    #[tokio::test]
+    async fn the_own_request_id_is_written_under_a_sampling_policy_spec_alone() {
+        use axum::body::Body;
+        use http_body_util::BodyExt;
+        use smg_grand_central::{
+            document::{AppliedSpec, PolicySpec},
+            engine::InProcess,
+        };
+        use tower::ServiceExt;
+
+        /// Every value the route received under the private name, joined
+        /// by `,`.
+        async fn seen(request: Request) -> String {
+            let values: Vec<_> = request
+                .headers()
+                .get_all(&middleware::request_id::OWN_REQUEST_ID)
+                .iter()
+                .map(|value| value.to_str().unwrap_or("?"))
+                .collect();
+            values.join(",")
+        }
+
+        let engine = |sample: u32| {
+            let mut document = PolicySpec::preset("round_robin").expect("a stock preset");
+            document.explain.sample = sample;
+            InProcess::new(AppliedSpec::validate(&document).expect("a valid policy spec"))
+        };
+        let (keeps_none, keeps_all) = (engine(0), engine(1));
+        let own = middleware::request_id::OWN_REQUEST_ID.as_str();
+        for (engine, written) in [
+            (None, false),
+            (Some(&keeps_none), false),
+            (Some(&keeps_all), true),
+        ] {
+            let own_request_id = own_request_id_layer(engine);
+            assert_eq!(own_request_id.is_some(), written);
+            let app = attach_edge_layers(
+                Router::new()
+                    .route("/seen", get(seen))
+                    .layer_if_some(own_request_id),
+                1024,
+                InFlightRequestTracker::new(),
+                vec![],
+                vec![],
+                middleware::AccessLogFields::NONE,
+            );
+            let response = app
+                .oneshot(
+                    http::Request::builder()
+                        .uri("/seen")
+                        .header(own, "a-clients")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let echoed = response.headers()["x-request-id"]
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            let expected = if written {
+                echoed.as_str()
+            } else {
+                "a-clients"
+            };
+            assert_eq!(body, expected, "written: {written}");
         }
     }
 
@@ -5884,6 +5683,47 @@ mod tests {
         );
     }
 
+    /// The start line names what places requests. Under the classic
+    /// policies, and where Grand Central runs the document the
+    /// settings mean, it is the settings' policy in its debug form. A
+    /// supplied document is named in its place: by its path where it was
+    /// read from one, and without one where the caller set it.
+    #[test]
+    fn the_start_line_names_a_supplied_document() {
+        let classic = RouterConfig::default();
+        assert_eq!(start_line_policy(&classic), format!("{:?}", classic.policy));
+
+        let the_settings_own = RouterConfig {
+            grand_central: true,
+            ..RouterConfig::default()
+        };
+        assert_eq!(
+            start_line_policy(&the_settings_own),
+            format!("{:?}", the_settings_own.policy)
+        );
+
+        let document = classic
+            .policy_document()
+            .expect("the default settings mean a document");
+        let read_from_a_path = RouterConfig {
+            grand_central: true,
+            policy_spec_path: Some("routing.yaml".to_owned()),
+            policy_spec: Some(document.clone()),
+            ..RouterConfig::default()
+        };
+        assert_eq!(
+            start_line_policy(&read_from_a_path),
+            "document routing.yaml"
+        );
+
+        let set_by_the_caller = RouterConfig {
+            grand_central: true,
+            policy_spec: Some(document),
+            ..RouterConfig::default()
+        };
+        assert_eq!(start_line_policy(&set_by_the_caller), "a supplied document");
+    }
+
     /// `minimal` leaves a library caller on the CLI's shutdown grace, not a
     /// shorter one of its own: in-flight streams get the product's drain.
     #[test]
@@ -5894,5 +5734,31 @@ mod tests {
             DEFAULT_SHUTDOWN_GRACE_SECS
         );
         assert_eq!(config.shutdown_grace_period_secs, 180);
+    }
+
+    /// The HTTP listener queues as many unaccepted connections as its host
+    /// allows: the runtime's own bind stopped at 128.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_http_listener_queues_what_its_host_allows() {
+        let allowed: usize = std::fs::read_to_string("/proc/sys/net/core/somaxconn")
+            .expect("the host's accept queue maximum")
+            .trim()
+            .parse()
+            .expect("a number");
+        let listeners = bind_listeners("127.0.0.1:0".parse().expect("an address"), None)
+            .expect("the listeners");
+        let addr = listeners.data.local_addr().expect("its address");
+        // Nothing accepts: a connection past the queue waits on the kernel's
+        // retries and is never queued.
+        let queued = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut held = Vec::new();
+            for _ in 0..allowed.min(256) {
+                held.push(TcpStream::connect(addr).await.expect("a connection"));
+            }
+            held
+        })
+        .await;
+        assert!(queued.is_ok(), "a connection past 128 was not queued");
     }
 }

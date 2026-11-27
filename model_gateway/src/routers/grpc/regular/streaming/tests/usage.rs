@@ -104,6 +104,7 @@ fn scheduler_choice_frames(
             scheduler::GenerateResponse {
                 media_identity: None,
                 request_id: String::new(),
+                prepared_input: Vec::new(),
                 response: Some(SchedulerEvent::Chunk(scheduler::GenerateStreamChunk {
                     index,
                     completion_tokens: generated,
@@ -116,6 +117,7 @@ fn scheduler_choice_frames(
     frames.push(scheduler::GenerateResponse {
         media_identity: None,
         request_id: String::new(),
+        prepared_input: Vec::new(),
         response: Some(SchedulerEvent::Complete(scheduler::GenerateComplete {
             index,
             finish_reason: "stop".to_string(),
@@ -332,6 +334,7 @@ async fn streamed_generate(
         backend_type: "test",
         model: "eof-test".to_string(),
         expected_choices: choices,
+        dispatch_wait: None,
     };
     let (tx, rx) = sse_channel();
     let result = if with_input_logprobs {

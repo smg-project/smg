@@ -26,7 +26,7 @@ use std::{
     collections::{hash_map::Entry, BTreeSet, HashMap, VecDeque},
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, OnceLock, RwLock,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -382,7 +382,8 @@ pub enum OutputSeed {
     /// Preserve the existing request-ID-based output sequence.
     #[default]
     RequestId,
-    /// Equal prompt token IDs produce equal outputs across transports and retries.
+    /// Equal prompt token IDs produce equal outputs across transports and retries
+    /// (the ids as the cache keys them: a media item's tokens by the item).
     Prompt,
 }
 
@@ -439,6 +440,10 @@ pub struct EngineParams {
     /// stream shaped for a gateway that parses the engine's tokens (a channel
     /// header, say). Empty by default.
     pub output_prefix: Vec<u32>,
+    /// What the engine sends for each id of its synthetic draw, the draw's
+    /// ids in order: the ids the tokenizer the worker serves decodes. `None`
+    /// sends the id drawn.
+    pub output_table: Option<Arc<[u32]>>,
     /// The data-parallel rank this engine stamps on its KV-event batches
     /// (`KvEventBatch.dp_rank`): 0 for a single-rank engine, the rank's index
     /// for one of a gRPC worker's `--grpc-dp-size` ranks.
@@ -568,6 +573,7 @@ impl Default for EngineParams {
             kv_broadcast_capacity: 1024,
             kv_replay_capacity: 4096,
             output_prefix: Vec::new(),
+            output_table: None,
             dp_rank: 0,
             kv_cache_groups: vec![KvCacheGroup::full_attention()],
             pass_time_scale: 1.0,
@@ -710,11 +716,41 @@ impl EngineShared {
     }
 
     /// Publish the actor's snapshot with the time of its last prefill pass.
+    /// While the load-lag hook is set the snapshot also joins the history a
+    /// trailing report is read from. A millisecond keeps the last snapshot
+    /// published in it, under that snapshot's own instant, so a report
+    /// states no count before the engine published it; the oldest entry is
+    /// never replaced, and of the entries older than the lag only the
+    /// newest stays, the one a report states now.
     fn publish(&self, state: &SchedulerState, snapshot: LoadSnapshot) {
-        *self.snapshot.write().unwrap_or_else(|p| p.into_inner()) = PublishedLoad {
+        let published = PublishedLoad {
             snapshot,
             prefill_at: state.prefill_at(),
         };
+        *self.snapshot.write().unwrap_or_else(|p| p.into_inner()) = published.clone();
+        // Read after the write: a hook set meanwhile starts from this snapshot.
+        let lag = Duration::from_millis(self.faults.load_lag_ms.load(Ordering::Relaxed));
+        if lag.is_zero() {
+            return;
+        }
+        let now = Instant::now();
+        let mut history = self
+            .faults
+            .load_history
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        while history
+            .get(1)
+            .is_some_and(|(at, _)| now.saturating_duration_since(*at) >= lag)
+        {
+            history.pop_front();
+        }
+        let millis = |at: Instant| at.saturating_duration_since(self.output_clock).as_millis();
+        let kept = history.len();
+        match history.back_mut() {
+            Some(last) if kept > 1 && millis(last.0) == millis(now) => *last = (now, published),
+            _ => history.push_back((now, published)),
+        }
     }
 }
 
@@ -724,6 +760,7 @@ impl EngineShared {
 /// applied where the snapshot is read ([`Engine::load`]), so an idle or
 /// paused engine stops reporting the rate a minute after that pass, as a
 /// servicer's tracker does once its samples expired.
+#[derive(Clone)]
 struct PublishedLoad {
     snapshot: LoadSnapshot,
     prefill_at: Option<Instant>,
@@ -740,8 +777,9 @@ impl PublishedLoad {
 
 /// Fault hooks the admin API switches on: batches lost on the wire, published
 /// twice or in the other order, event streams cut, delayed publishing,
-/// delayed admission, a frozen engine, a publisher restart, and requests
-/// answered with an error status, held back or cut mid-stream.
+/// delayed admission, a load report that trails the engine or stands
+/// still, a frozen engine, a publisher restart, and requests answered with
+/// an error status, held back or cut mid-stream.
 #[derive(Default)]
 struct Faults {
     /// Event batches still to lose on the wire.
@@ -771,6 +809,12 @@ struct Faults {
     admit_next: tokio::sync::Mutex<Option<Instant>>,
     /// The engine is frozen: no passes until resumed.
     paused: AtomicBool,
+    /// The status a load poll is answered with instead of a report (0 =
+    /// none): a worker whose load call fails, or is not implemented.
+    load_fail_status: AtomicU16,
+    /// The engine pushes no load report: a worker whose pushed reports
+    /// stop, so that the last one ages. A load poll is no push.
+    load_muted: AtomicBool,
     /// Publisher generation; a restart bumps it.
     generation: AtomicU64,
     restarts: AtomicU64,
@@ -788,6 +832,22 @@ struct Faults {
     /// new shape, during which the engine produces nothing while its load
     /// record keeps flowing and its silence grows.
     cold_shape_ms: AtomicU64,
+    /// How far a load report trails the engine, in ms (0 = none): a report
+    /// states the snapshot that stood this long before it is read, as an
+    /// engine whose counters trail its intake reports.
+    load_lag_ms: AtomicU64,
+    /// The snapshots a trailing report is read from, oldest first, each
+    /// with the instant it was published: the report that stood when the
+    /// lag was set, then what the engine published since, less the entries
+    /// a newer one older than the lag made of no use.
+    load_history: Mutex<VecDeque<(Instant, PublishedLoad)>>,
+    /// The load-freeze hook is set: every load report states
+    /// `load_standing`, whatever the engine holds meanwhile.
+    load_frozen: AtomicBool,
+    /// The report that stands while the load-freeze hook is set, written
+    /// with `load_frozen` under this lock. A report takes the lock only
+    /// while the hook is set.
+    load_standing: Mutex<Option<LoadSnapshot>>,
 }
 
 /// A request fault the admin API arms: what the worker answers instead of
@@ -846,6 +906,8 @@ pub(crate) struct FaultStatus {
     pub admit_delay_ms: u64,
     pub admit_per_sec: u64,
     pub paused: bool,
+    pub load_fail_status: u16,
+    pub load_muted: bool,
     pub generation: u64,
     pub restarts: u64,
     /// The armed request fault, if any.
@@ -854,6 +916,8 @@ pub(crate) struct FaultStatus {
     pub cut_total: u64,
     pub stalled_total: u64,
     pub cold_shape_ms: u64,
+    pub load_lag_ms: u64,
+    pub load_frozen: bool,
 }
 
 /// What the engine itself would serve from cache for a prompt right now.
@@ -903,7 +967,9 @@ pub(crate) enum Place {
 
 /// Messages into the engine actor.
 enum EngineMsg {
-    Request(NewRequest),
+    /// A request, and the ids the cache keys its prompt by where they differ
+    /// from the ids as sent ([`Engine::submit_keyed`]).
+    Request(NewRequest, Option<Vec<u32>>),
     Abort(String),
     /// Drop every cached block and announce `AllBlocksCleared` (an engine
     /// restart, as far as the gateway's index is concerned).
@@ -950,6 +1016,10 @@ const RECORD_CAPACITY: usize = 500_000;
 /// capacity: the servicers' load trackers drop their samples after a minute,
 /// and a worker idle that long is priced by the fallback again.
 const PREFILL_RATE_TTL: Duration = Duration::from_secs(60);
+
+/// The longest lag the load-lag hook takes, in ms: it bounds the history
+/// of snapshots a trailing report is read from.
+const MAX_LOAD_LAG_MS: u64 = 60_000;
 
 /// The process-wide shared KV tier (`--global-l3-blocks`): block keys in LRU
 /// order. A pass writes the blocks it completed once its time has passed
@@ -1160,7 +1230,15 @@ impl Engine {
 
     /// Submit a request. Dropped silently if the engine has shut down.
     pub fn submit(&self, req: NewRequest) {
-        let _ = self.tx.send(EngineMsg::Request(req));
+        self.submit_keyed(req, None);
+    }
+
+    /// Submit a request whose prompt the cache keys by `key_token_ids`, one
+    /// for each id of the prompt, where they are given: the keyed ids of a
+    /// transport whose engine keys a media item's tokens by the item and
+    /// keeps the ids as sent in its stored-block events.
+    pub(crate) fn submit_keyed(&self, req: NewRequest, key_token_ids: Option<Vec<u32>>) {
+        let _ = self.tx.send(EngineMsg::Request(req, key_token_ids));
     }
 
     /// Abort a queued or running request. Unknown or completed IDs are harmless.
@@ -1248,6 +1326,51 @@ impl Engine {
             .store(ms, Ordering::Relaxed);
     }
 
+    /// Have every load report state the counts the engine published `ms`
+    /// milliseconds before the report is read (0 clears, a minute at most):
+    /// an engine whose counters trail its intake. The requests are served
+    /// on time. A lag set on an engine that had none starts from the report
+    /// that stands; one set over another keeps the history it has, and a
+    /// cleared one gives the history's room back.
+    pub(crate) fn fault_load_lag_ms(&self, ms: u64) {
+        let faults = &self.shared.faults;
+        let ms = ms.min(MAX_LOAD_LAG_MS);
+        let mut history = faults
+            .load_history
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let was = faults.load_lag_ms.swap(ms, Ordering::Relaxed);
+        if ms == 0 {
+            *history = VecDeque::new();
+        } else if was == 0 {
+            let standing = self
+                .shared
+                .snapshot
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
+            history.clear();
+            history.push_back((Instant::now(), standing));
+        }
+    }
+
+    /// Have every load report state what a report reads now, until the hook
+    /// is turned off: an engine that serves its requests while its counters
+    /// stand still. Set again while it is set, the report that stands stays.
+    pub(crate) fn fault_load_freeze(&self, on: bool) {
+        let faults = &self.shared.faults;
+        let mut standing = faults
+            .load_standing
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if !on {
+            *standing = None;
+        } else if standing.is_none() {
+            *standing = Some(self.load_at(Instant::now()));
+        }
+        faults.load_frozen.store(on, Ordering::Relaxed);
+    }
+
     /// Let at most `per_sec` new requests per second into the engine (0
     /// clears); the rest wait their turn, unseen by the load record.
     pub(crate) fn fault_admit_per_sec(&self, per_sec: u64) {
@@ -1285,7 +1408,9 @@ impl Engine {
     /// failure, or a cut when it names a token count), then the admission
     /// delay and rate. `Ok(true)` when the fault asks for a `finish=error`
     /// completion, counted as a cut; `Err` is the status to answer. The
-    /// engine never runs the prompt: nothing is admitted, no record is left.
+    /// engine runs no prompt here: nothing is admitted, no record is left
+    /// (a prefill worker under `--prefill-engine` submits its prompt after
+    /// these hooks).
     pub(crate) async fn admit_without_tokens(&self) -> Result<bool, u16> {
         let mut finish_error = false;
         if let Some(fault) = self.inject() {
@@ -1328,6 +1453,35 @@ impl Engine {
     pub(crate) fn resume(&self) {
         self.shared.faults.paused.store(false, Ordering::Relaxed);
         self.shared.resume.notify_one();
+    }
+
+    /// Answer every load poll of this engine with `status` instead of a
+    /// report (0 clears): a worker whose load call fails, or with 501 one
+    /// that does not implement it. Its requests are served, and what it
+    /// pushes is no poll.
+    pub(crate) fn fault_load_fail(&self, status: u16) {
+        self.shared
+            .faults
+            .load_fail_status
+            .store(status, Ordering::Relaxed);
+    }
+
+    /// The status the load-fail hook answers a load poll with, while set.
+    pub(crate) fn load_refused(&self) -> Option<u16> {
+        let status = self.shared.faults.load_fail_status.load(Ordering::Relaxed);
+        (status != 0).then_some(status)
+    }
+
+    /// Push no load report of this engine while `on`: no load record on a
+    /// KV-event stream, no scheduler stats on a ZMQ rank's outputs. Its
+    /// load polls are answered and its requests are served.
+    pub(crate) fn fault_load_mute(&self, on: bool) {
+        self.shared.faults.load_muted.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether the load-mute hook withholds what this engine pushes.
+    pub(crate) fn load_muted(&self) -> bool {
+        self.shared.faults.load_muted.load(Ordering::Relaxed)
     }
 
     /// How long the engine has produced nothing while it holds requests
@@ -1436,6 +1590,8 @@ impl Engine {
             admit_delay_ms: f.admit_delay_ms.load(Ordering::Relaxed),
             admit_per_sec: f.admit_per_sec.load(Ordering::Relaxed),
             paused: f.paused.load(Ordering::Relaxed),
+            load_fail_status: f.load_fail_status.load(Ordering::Relaxed),
+            load_muted: f.load_muted.load(Ordering::Relaxed),
             generation: f.generation.load(Ordering::Relaxed),
             restarts: f.restarts.load(Ordering::Relaxed),
             fail,
@@ -1443,6 +1599,8 @@ impl Engine {
             cut_total: f.cut_total.load(Ordering::Relaxed),
             stalled_total: f.stalled_total.load(Ordering::Relaxed),
             cold_shape_ms: f.cold_shape_ms.load(Ordering::Relaxed),
+            load_lag_ms: f.load_lag_ms.load(Ordering::Relaxed),
+            load_frozen: f.load_frozen.load(Ordering::Relaxed),
         }
     }
 
@@ -1543,22 +1701,65 @@ impl Engine {
     /// the read: an idle engine builds no new snapshot, and the one it
     /// published when its last pass ended would carry that pass's rate for
     /// as long as the engine sits idle (a paused one too), where a servicer's
-    /// tracker drops its samples after a minute (`PREFILL_RATE_TTL`).
+    /// tracker drops its samples after a minute (`PREFILL_RATE_TTL`). Under
+    /// the load-freeze hook it is the report that stood when the hook was
+    /// set, whole.
     pub fn load(&self) -> LoadSnapshot {
-        self.load_at(Instant::now())
+        let faults = &self.shared.faults;
+        let standing = if faults.load_frozen.load(Ordering::Relaxed) {
+            faults
+                .load_standing
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+        } else {
+            None
+        };
+        standing.unwrap_or_else(|| self.load_at(Instant::now()))
     }
 
-    /// [`Self::load`] as read at `now` (a test reads a minute ahead).
+    /// The engine's own counts, whatever the load-lag and load-freeze hooks
+    /// have a report state: the ground truth the admin API's fleet states.
+    pub(crate) fn load_truth(&self) -> LoadSnapshot {
+        self.load_behind(Instant::now(), Duration::ZERO)
+    }
+
+    /// [`Self::load`] as read at `now` (a test reads a minute ahead), under
+    /// the lag of the load-lag hook.
     fn load_at(&self, now: Instant) -> LoadSnapshot {
-        let published = self
-            .shared
-            .snapshot
-            .read()
-            .unwrap_or_else(|p| p.into_inner());
-        let mut snapshot = published.snapshot.clone();
+        let lag = self.shared.faults.load_lag_ms.load(Ordering::Relaxed);
+        self.load_behind(now, Duration::from_millis(lag))
+    }
+
+    /// The report that stood `lag` before `now`, or the oldest kept where
+    /// the hook was set later than that; with no lag, the engine's own.
+    fn load_behind(&self, now: Instant, lag: Duration) -> LoadSnapshot {
+        let as_of = now.checked_sub(lag).unwrap_or(now);
+        let trailing = if lag.is_zero() {
+            None
+        } else {
+            let history = self
+                .shared
+                .faults
+                .load_history
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let reached = history.partition_point(|(at, _)| *at <= as_of);
+            history
+                .get(reached.saturating_sub(1))
+                .map(|(_, published)| published.clone())
+        };
+        let published = trailing.unwrap_or_else(|| {
+            self.shared
+                .snapshot
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+        });
+        let mut snapshot = published.snapshot;
         let expired = published
             .prefill_at
-            .is_none_or(|at| now.saturating_duration_since(at) > PREFILL_RATE_TTL);
+            .is_none_or(|at| as_of.saturating_duration_since(at) > PREFILL_RATE_TTL);
         if expired {
             snapshot.prefill_throughput = None;
         }
@@ -1831,9 +2032,10 @@ fn handle_msg(
     msg: EngineMsg,
 ) {
     match msg {
-        EngineMsg::Request(req) => {
+        EngineMsg::Request(req, key_ids) => {
             let oracle_tokens = if params.prefix_cache {
-                let keys = prompt_blocks(&req.prompt_token_ids, params.block_size as usize).0;
+                let ids = key_ids.as_deref().unwrap_or(&req.prompt_token_ids);
+                let keys = prompt_blocks(ids, params.block_size as usize).0;
                 let fleet_best = fleet_engines()
                     .iter()
                     .map(|e| e.match_prefix(&keys))
@@ -1874,7 +2076,7 @@ fn handle_msg(
             if state.is_idle() {
                 shared.note_output();
             }
-            state.enqueue_with_oracle(req, params, oracle_tokens);
+            state.enqueue_with_oracle(req, key_ids, params, oracle_tokens);
             shared.in_flight.store(state.in_flight(), Ordering::Relaxed);
         }
         EngineMsg::Abort(request_id) => {
@@ -1924,6 +2126,9 @@ struct RunningReq {
     /// Tokens to (re)compute: the prompt, extended by the output generated
     /// before a preemption.
     seq_prompt: Vec<u32>,
+    /// The ids the cache keys `seq_prompt` by, where they differ from it
+    /// ([`Engine::submit_keyed`]), extended as it is by a preemption.
+    seq_key: Option<Vec<u32>>,
     /// Content keys of `seq_prompt`'s full blocks.
     seq_keys: Vec<u64>,
     /// Prompt / cached tokens as reported on the stream (constant per request).
@@ -1991,6 +2196,9 @@ struct Resume {
 /// A request admitted to the queue but not yet running.
 struct WaitingReq {
     req: NewRequest,
+    /// The ids the cache keys the prompt by, where they differ from it
+    /// ([`Engine::submit_keyed`]).
+    key_ids: Option<Vec<u32>>,
     /// Content keys of the prompt's full blocks and the hash of every token.
     keys: Vec<u64>,
     rolling_hash: u64,
@@ -2338,15 +2546,22 @@ impl SchedulerState {
     /// Queue a request with no oracle information (tests).
     #[cfg(test)]
     fn enqueue(&mut self, req: NewRequest, p: &EngineParams) {
-        self.enqueue_with_oracle(req, p, 0);
+        self.enqueue_with_oracle(req, None, p, 0);
     }
 
     /// Queue a request, recording the queued token-work it contributes, together
     /// with the fleet oracle's cached-token count at arrival (what the
     /// best-informed router could have obtained).
-    fn enqueue_with_oracle(&mut self, req: NewRequest, p: &EngineParams, oracle_tokens: u32) {
+    fn enqueue_with_oracle(
+        &mut self,
+        req: NewRequest,
+        key_ids: Option<Vec<u32>>,
+        p: &EngineParams,
+        oracle_tokens: u32,
+    ) {
         let prompt_tokens = req.prompt_token_ids.len() as u32;
-        let (keys, rolling_hash, _) = prompt_blocks(&req.prompt_token_ids, p.block_size as usize);
+        let ids = key_ids.as_deref().unwrap_or(&req.prompt_token_ids);
+        let (keys, rolling_hash, _) = prompt_blocks(ids, p.block_size as usize);
         let cached_blocks = if p.prefix_cache {
             self.pool.match_prefix(&keys, p)
         } else {
@@ -2357,6 +2572,7 @@ impl SchedulerState {
         let cached = ((cached_blocks + restored_blocks) as u32 * p.block_size).min(prompt_tokens);
         self.waiting.push_back(WaitingReq {
             req,
+            key_ids,
             keys,
             rolling_hash,
             prompt_tokens,
@@ -2645,6 +2861,7 @@ impl SchedulerState {
                 events,
                 seq_keys: w.keys,
                 seq_prompt: prompt_token_ids,
+                seq_key: w.key_ids,
                 prompt_tokens: w.prompt_tokens,
                 cached_tokens: reported_cached,
                 computed: cached,
@@ -2853,9 +3070,17 @@ impl SchedulerState {
         };
         self.release(&r, p);
         self.preemptions += 1;
+        let output = &r.output_ids[r.resumed_output as usize..];
         let mut seq = r.seq_prompt;
-        seq.extend_from_slice(&r.output_ids[r.resumed_output as usize..]);
-        let (keys, rolling_hash, _) = prompt_blocks(&seq, p.block_size.max(1) as usize);
+        seq.extend_from_slice(output);
+        let seq_key = r.seq_key.map(|mut ids| {
+            ids.extend_from_slice(output);
+            ids
+        });
+        let (keys, rolling_hash, _) = prompt_blocks(
+            seq_key.as_deref().unwrap_or(&seq),
+            p.block_size.max(1) as usize,
+        );
         let len = seq.len() as u32;
         let cached_blocks = if p.prefix_cache {
             self.pool.match_prefix(&keys, p)
@@ -2872,6 +3097,7 @@ impl SchedulerState {
                 choice: r.choice,
                 events: r.events,
             },
+            key_ids: seq_key,
             keys,
             rolling_hash,
             prompt_tokens: r.prompt_tokens,
@@ -2943,7 +3169,7 @@ impl SchedulerState {
             .output_prefix
             .get(r.generated as usize)
             .copied()
-            .unwrap_or_else(|| next_token(r));
+            .unwrap_or_else(|| next_token(r, p.output_table.as_deref()));
         r.generated += 1;
         r.output_ids.push(token_id);
         r.rolling_hash = fnv_step(r.rolling_hash, token_id);
@@ -3292,14 +3518,49 @@ fn prompt_blocks(ids: &[u32], block_size: usize) -> (Vec<u64>, u64, Vec<u32>) {
     (keys, h, pending)
 }
 
+/// The synthetic output ids: the draw takes one of `OUTPUT_ID_COUNT` ids
+/// from `OUTPUT_ID_FIRST` on.
+const OUTPUT_ID_FIRST: u32 = 100;
+const OUTPUT_ID_COUNT: u32 = 30_000;
+
 /// A synthetic output token derived from the configured identity and position.
 /// Prompt-seeded requests can intentionally share both prompt and decode blocks.
-fn next_token(r: &RunningReq) -> u32 {
+/// Under `sent` ([`EngineParams::output_table`]) the id drawn gives way to the
+/// one the table holds in its place.
+fn next_token(r: &RunningReq, sent: Option<&[u32]>) -> u32 {
     let mixed = r
         .token_seed
         .wrapping_add(r.generated)
         .wrapping_mul(2_654_435_761);
-    100 + (mixed % 30_000)
+    let slot = mixed % OUTPUT_ID_COUNT;
+    sent.and_then(|sent| sent.get(slot as usize))
+        .copied()
+        .unwrap_or(OUTPUT_ID_FIRST + slot)
+}
+
+/// The table of [`EngineParams::output_table`] for a vocabulary, where
+/// `decodes` says whether a gateway gets text for an id. An id of the draw
+/// that decodes stays the id sent, so an output keeps the ids it has without
+/// the table wherever they decode; one that does not (an id outside the
+/// vocabulary, a special token, an end-of-sequence id) gives way to an id
+/// that does. `None` where every id of the draw decodes, and where none does:
+/// the engine then sends the id drawn.
+pub(crate) fn output_table(decodes: impl Fn(u32) -> bool) -> Option<Arc<[u32]>> {
+    let drawn = OUTPUT_ID_FIRST..OUTPUT_ID_FIRST + OUTPUT_ID_COUNT;
+    let decoded: Vec<u32> = drawn.clone().filter(|&id| decodes(id)).collect();
+    if decoded.is_empty() || decoded.len() == drawn.len() {
+        return None;
+    }
+    let mut spare = decoded.iter().copied().cycle();
+    let mut decoded_ids = decoded.iter().copied().peekable();
+    Some(
+        drawn
+            .map(|id| match decoded_ids.next_if_eq(&id) {
+                Some(id) => id,
+                None => spare.next().unwrap_or(id),
+            })
+            .collect(),
+    )
 }
 
 fn ewma(prev: f64, sample: f64, alpha: f64) -> f64 {
@@ -4151,6 +4412,61 @@ mod tests {
         );
     }
 
+    /// Under a table the engine sends, for each id it draws, the id the
+    /// table holds: an id that decodes stays, one that does not gives way to
+    /// one that does. With no table the ids are the ids drawn.
+    #[test]
+    fn the_output_is_drawn_from_the_ids_that_decode() {
+        let output = |p: &EngineParams| {
+            let mut st = SchedulerState::new();
+            let (r, mut rx) = req("drawn", vec![7; 4], 64);
+            st.enqueue(r, p);
+            let mut tokens = Vec::new();
+            for _ in 0..100_000 {
+                let step = st.step(p);
+                for (tx, ev) in step.sends {
+                    let _ = tx.send(ev);
+                }
+                while let Ok(ev) = rx.try_recv() {
+                    if let GenEvent::Token { token_id, .. } = ev {
+                        tokens.push(token_id);
+                    }
+                }
+                if tokens.len() == 64 {
+                    break;
+                }
+            }
+            tokens
+        };
+        let drawn = output(&EngineParams::default());
+        assert_eq!(drawn.len(), 64);
+        assert!(
+            drawn.iter().any(|id| !(100..5_104).contains(id)),
+            "the draw leaves a small vocabulary: {drawn:?}"
+        );
+
+        // A vocabulary of 5,104 ids whose id 4,000 is a special token.
+        let decodes = |id: u32| id < 5_104 && id != 4_000;
+        let table = output_table(decodes).expect("a table");
+        assert_eq!(table.len(), 30_000);
+        assert!(table.iter().all(|&id| decodes(id)));
+        for id in (100..5_104).filter(|&id| decodes(id)) {
+            assert_eq!(table[id as usize - 100], id, "an id that decodes stays");
+        }
+        let sent = output(&EngineParams {
+            output_table: Some(table),
+            ..EngineParams::default()
+        });
+        assert_eq!(sent.len(), 64);
+        assert!(sent.iter().all(|&id| decodes(id)), "{sent:?}");
+        for (drawn, sent) in drawn.iter().zip(&sent) {
+            assert!(!decodes(*drawn) || drawn == sent, "{drawn} became {sent}");
+        }
+
+        assert!(output_table(|_| true).is_none(), "every id decodes");
+        assert!(output_table(|_| false).is_none(), "no id decodes");
+    }
+
     /// Run passes until the given request emits its first Token, returning the
     /// accumulated simulated time (TTFT) and pass count.
     fn run_to_first_token(
@@ -4231,7 +4547,7 @@ mod tests {
         let p = EngineParams::default();
         let mut st = SchedulerState::new();
         let (r1, rx1) = req("first", vec![9; 64], 1);
-        st.enqueue_with_oracle(r1, &p, 48);
+        st.enqueue_with_oracle(r1, None, &p, 48);
         let step = st.step(&p);
         assert_eq!(step.admitted.len(), 1);
         assert_eq!(step.admitted[0].prompt_tokens, 64);
@@ -4247,7 +4563,7 @@ mod tests {
         // The same prompt again: every block is cached, and the last one is
         // recomputed anyway (vLLM's rule), so 48 of 64 tokens are served.
         let (r2, rx2) = req("second", vec![9; 64], 1);
-        st.enqueue_with_oracle(r2, &p, 0);
+        st.enqueue_with_oracle(r2, None, &p, 0);
         let step = st.step(&p);
         let admitted = step
             .admitted
@@ -5797,6 +6113,105 @@ mod tests {
                 .is_none_or(|silence| silence < Duration::from_millis(150)),
             "a pass ran"
         );
+    }
+
+    /// An engine whose counters trail its intake: under the load-lag hook a
+    /// report states the counts of that long ago while the admin API's
+    /// truth states the engine's own, a request leaves the report the lag
+    /// after it ends, and a cleared hook gives the history's room back.
+    #[tokio::test]
+    async fn a_load_lag_reports_the_counts_of_that_long_ago() {
+        let lag = Duration::from_millis(100);
+        let engine = live();
+        engine.fault_load_lag_ms(100);
+        // A snapshot published in the millisecond the hook was set leaves
+        // the report that stood then.
+        let mut busy = LoadSnapshot::idle(&EngineParams::default());
+        busy.num_running_reqs = 7;
+        engine.shared.publish(&SchedulerState::new(), busy);
+        assert_eq!(engine.load().num_running_reqs, 0, "the report that stood");
+        assert_eq!(engine.load_truth().num_running_reqs, 7, "the engine's own");
+
+        let (request, mut rx) = req("a", vec![3; 32], 40);
+        engine.submit(request);
+        let mut served = false;
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("the request is served under the lag")
+                .expect("stream open");
+            if !served {
+                served = true;
+                assert_eq!(
+                    engine.load().num_running_reqs,
+                    0,
+                    "the report from before the request stands"
+                );
+                assert_eq!(engine.load_truth().num_running_reqs, 1, "the truth");
+            }
+            if matches!(event, GenEvent::Done { .. }) {
+                break;
+            }
+        }
+        // The request ran longer than the lag, so entries aged out meanwhile.
+        let ended = Instant::now();
+        assert_eq!(engine.load_truth().num_running_reqs, 0, "it ended");
+        assert_eq!(
+            engine.load_at(ended).num_running_reqs,
+            1,
+            "the report still counts it"
+        );
+        assert_eq!(
+            engine.load_at(ended + lag).num_running_reqs,
+            0,
+            "it leaves the report the lag after its end"
+        );
+        let history = &engine.shared.faults.load_history;
+        let kept = history.lock().unwrap_or_else(|p| p.into_inner()).len();
+        assert!(kept <= 102, "one snapshot a millisecond of the lag: {kept}");
+        engine.fault_load_lag_ms(0);
+        assert_eq!(engine.fault_status().load_lag_ms, 0);
+        let room = history.lock().unwrap_or_else(|p| p.into_inner()).capacity();
+        assert_eq!(room, 0, "a cleared lag gives the history's room back");
+    }
+
+    /// An engine that serves while its counters stand still: under the
+    /// load-freeze hook every report states the one that stood when the
+    /// hook was set while the admin API's truth states the engine's own,
+    /// and a report follows the engine again once the hook is turned off.
+    #[tokio::test]
+    async fn a_load_freeze_holds_the_report_while_the_engine_serves() {
+        let engine = live();
+        let (request, mut rx) = req("a", vec![3; 32], 40);
+        engine.submit(request);
+        // The hook is set at the request's first token, and the request
+        // ends under it.
+        let mut frozen = false;
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("the request is served under the freeze")
+                .expect("stream open");
+            if !frozen {
+                frozen = true;
+                engine.fault_load_freeze(true);
+            }
+            if matches!(event, GenEvent::Done { .. }) {
+                break;
+            }
+        }
+        // Set again while it is set: the report that stands stays.
+        engine.fault_load_freeze(true);
+        assert_eq!(
+            engine.load().num_running_reqs,
+            1,
+            "the report from before the request ended stands"
+        );
+        assert_eq!(engine.load_truth().num_running_reqs, 0, "the truth");
+        assert!(engine.fault_status().load_frozen);
+        engine.fault_load_freeze(false);
+        assert_eq!(engine.load().num_running_reqs, 0, "off: its own count");
+        assert!(!engine.fault_status().load_frozen);
     }
 
     /// A kernel built for a new shape: the engine holds before the pass that

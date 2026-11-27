@@ -10,6 +10,7 @@ use std::{
 };
 
 use openai_protocol::{worker::TagVocabulary, UNKNOWN_MODEL_ID};
+use smg_grand_central::engine::{LentList, PublishedList};
 use smg_worker::{
     identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
     load,
@@ -20,7 +21,13 @@ use symphony::grammar::GrammarStart;
 
 use crate::{
     policies::hash_ring::HashRing,
-    routers::common::pair_index::{PdPairIndex, PdWire},
+    routers::{
+        common::{
+            pair_index::{PdPairIndex, PdWire},
+            place_request::stated_facts,
+        },
+        grpc::multimodal::MediaFacts,
+    },
 };
 
 /// Static routing pool inside a model snapshot.
@@ -73,8 +80,7 @@ impl RoutingPool {
     }
 
     /// Whether `worker` is a member of this pool: the one rule of
-    /// membership. The snapshot projects its pools by it, and a route asks
-    /// it of a worker handed to it from outside the snapshot.
+    /// membership. The snapshot projects its pools by it.
     pub(crate) fn matches(self, worker: &dyn Worker) -> bool {
         match self {
             Self::HttpRegular => {
@@ -154,6 +160,20 @@ pub(crate) struct ModelLabels {
     pub(crate) vocabulary: TagVocabulary,
 }
 
+/// What the regular HTTP workers of a generation say together to the
+/// decision of a request's body path, before the body arrives
+/// ([`ModelWorkerSnapshot::body_facts`]). The HTTP router holds the rule
+/// that reads each from the workers; a snapshot keeps the answers.
+///
+/// The answers depend on the membership, never on a request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BodyFacts {
+    /// A card of a worker names an alias.
+    pub(crate) aliased: bool,
+    /// A worker rewrites the body it is sent.
+    pub(crate) mutates: bool,
+}
+
 /// Immutable membership snapshot. Route-specific projections are populated
 /// lazily once and then shared by every request until membership changes
 /// publish a replacement snapshot.
@@ -161,10 +181,23 @@ pub(crate) struct ModelLabels {
 /// Multi-role selection (PD/EPD) must derive every role from ONE snapshot: two
 /// separate registry lookups can straddle a concurrent membership change and
 /// pair workers that never coexisted.
+///
+/// A snapshot stands on cache lines of its own, apart from the count of its
+/// handles. Every request takes a handle of its model's snapshot and drops
+/// it, so the count's line is one every caller writes, and a selection
+/// borrows its pool from the snapshot: a field beside the count would be
+/// read from that line all through the selection.
 #[derive(Debug)]
+#[repr(align(128))]
 pub struct ModelWorkerSnapshot {
     all: WorkerSnapshot,
     pools: [LazyRoutingPool; RoutingPool::COUNT],
+    /// Each pool's list as Grand Central is lent it: the list, the cell
+    /// the engine keeps its value of the list in, and what this gateway
+    /// states of each worker beside its object. Made where the engine is
+    /// first asked over that list (see [`Self::lent`]). A gateway that
+    /// starts no engine makes none.
+    lent: [OnceLock<PublishedList>; RoutingPool::COUNT],
     /// The compatible prefill/decode pairs per wire and pairing mode, built
     /// once from the pools above (see [`PdPairIndex`]).
     pd_pairs: [[OnceLock<Arc<PdPairIndex>>; PdPairingMode::COUNT]; PdWire::COUNT],
@@ -177,9 +210,16 @@ pub struct ModelWorkerSnapshot {
     /// What the workers of this generation say together, kept with the
     /// model id it was read for (see [`Self::labels`]).
     labels: OnceLock<(Box<str>, ModelLabels)>,
+    /// What the media gates read from the workers of this generation
+    /// together (see [`Self::media`]). `MediaFacts` stays with the gates in
+    /// `routers::grpc::multimodal`, so this module depends on that one.
+    media: OnceLock<MediaFacts>,
     /// The consistent-hash ring over the URLs of this generation's members
     /// (see [`Self::hash_ring`]).
     hash_ring: OnceLock<Arc<HashRing>>,
+    /// What the regular HTTP workers of this generation say together to
+    /// the decision of a request's body path (see [`Self::body_facts`]).
+    body_facts: OnceLock<Option<BodyFacts>>,
 }
 
 impl ModelWorkerSnapshot {
@@ -187,11 +227,14 @@ impl ModelWorkerSnapshot {
         Self {
             all,
             pools: std::array::from_fn(|_| OnceLock::new()),
+            lent: std::array::from_fn(|_| OnceLock::new()),
             pd_pairs: std::array::from_fn(|_| std::array::from_fn(|_| OnceLock::new())),
             harmony: OnceLock::new(),
             window_floors: std::array::from_fn(|_| OnceLock::new()),
             labels: OnceLock::new(),
+            media: OnceLock::new(),
             hash_ring: OnceLock::new(),
+            body_facts: OnceLock::new(),
         }
     }
 
@@ -264,6 +307,38 @@ impl ModelWorkerSnapshot {
             .labels
             .get_or_init(|| (model_id.into(), read(&self.all)));
         (**spelling == *model_id).then_some(labels)
+    }
+
+    /// What the media gates read from the snapshot's workers together:
+    /// `read` reads them on the first media request after the membership
+    /// change, every request after it reads the kept answers. They hang on
+    /// the workers' labels, connection modes and engines, which a worker
+    /// holds from its construction (see [`Self::labels`]), and on no model
+    /// id as spelled, so one snapshot keeps one value. The rules stay with
+    /// the media gates.
+    pub(crate) fn media(&self, read: impl FnOnce(&[Arc<dyn Worker>]) -> MediaFacts) -> &MediaFacts {
+        self.media.get_or_init(|| read(&self.all))
+    }
+
+    /// What the regular HTTP workers of this generation say together to
+    /// the decision of a request's body path: `read` reads them at the first
+    /// such decision after the membership change, every decision after it
+    /// reads what `read` said, so it walks no worker here, however many
+    /// there are. The HTTP router asks the snapshot of the whole membership
+    /// alone. A built-in worker holds what the answers hang on from its
+    /// construction (the cards and the rank of its spec), so whatever
+    /// changes one publishes a new snapshot (see [`Self::harmony`]). A
+    /// worker of another type may change an answer on the handle this
+    /// snapshot holds: `read` says `None` for a pool with one, and a caller
+    /// that is told `None` reads that pool itself at every decision. The
+    /// rule stays with the HTTP router.
+    pub(crate) fn body_facts(
+        &self,
+        read: impl FnOnce(&[Arc<dyn Worker>]) -> Option<BodyFacts>,
+    ) -> Option<BodyFacts> {
+        *self
+            .body_facts
+            .get_or_init(|| read(self.pool(RoutingPool::HttpRegular)))
     }
 
     /// The consistent-hash ring over the URLs of this generation's members,
@@ -360,6 +435,28 @@ impl ModelWorkerSnapshot {
                 .cloned()
                 .collect()
         })
+    }
+
+    /// The list of `pool` as Grand Central is lent it: the pool's own
+    /// list ([`Self::pool`]) with the cell that stands beside it and what
+    /// the gateway states of each worker ([`stated_facts`]). The engine
+    /// keeps its value of the list in that cell from the list's first
+    /// request on, and the value falls with this snapshot, as the list
+    /// does: a membership change publishes the next one with none. A list
+    /// of no workers is lent on with a cell of its request's own
+    /// (`placed_by_engine`), so the cell here takes no value of it.
+    ///
+    /// The three are one [`PublishedList`], made at the list's first
+    /// lending and read from one place at every later one: a lending reads
+    /// no more than it did while the gateway stated no fact.
+    pub(crate) fn lent(&self, pool: RoutingPool) -> LentList<'_> {
+        self.lent[pool.index()]
+            .get_or_init(|| {
+                let workers = Arc::clone(self.pool(pool));
+                let facts = stated_facts(&workers);
+                PublishedList::stating(workers, facts)
+            })
+            .lent()
     }
 }
 

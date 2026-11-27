@@ -170,7 +170,7 @@ const SGLANG_GRPC_KEYS: &[&str] = &[
     "max_running_requests",
     // Whether the engine splits `max_running_requests` across its
     // attention-DP workers (the flag, or the width its newer releases resolve
-    // it into): under `--dp-aware` each rank worker then gets its share of
+    // it into): each rank worker of such an engine then gets its share of
     // the window (see `create_worker::labels_for_rank`).
     "enable_dp_attention",
     "attn_dp_size",
@@ -214,6 +214,10 @@ const SGLANG_GRPC_KEYS: &[&str] = &[
     // verdict here on purpose, and the gateway refuses image and video input
     // for the worker at its gate instead of after fetching it.
     "supports_vision",
+    // The fields of `GenerateRequest.cache_partition` that the servicer gives
+    // to the scheduler (`cache_salt,extra_key`). A servicer that does not read
+    // them does not write the key.
+    "cache_partition_fields",
 ];
 
 /// Keys worth extracting from TokenSpeed gRPC `server_args` (post-rename: bare
@@ -325,6 +329,18 @@ mod tests {
         let labels = info.to_labels();
         assert_eq!(labels["ec_connector"], "ECCPUConnector");
         assert_eq!(labels["ec_role"], "ec_producer");
+    }
+
+    /// A vLLM servicer that reads no cache partition field has no label.
+    #[test]
+    fn vllm_cache_partition_fields_flatten_into_a_label() {
+        let info = ServerInfo::Vllm(Box::new(vllm_proto::GetServerInfoResponse {
+            cache_partition_fields: "cache_salt".into(),
+            ..Default::default()
+        }));
+        assert_eq!(info.to_labels()["cache_partition_fields"], "cache_salt");
+        let older = ServerInfo::Vllm(Box::default()).to_labels();
+        assert!(!older.contains_key("cache_partition_fields"));
     }
 
     /// A vLLM worker's `GetServerInfo` fields flatten into labels as they
@@ -857,6 +873,10 @@ mod tests {
                         "multimodal_encoder_dtype".to_string(),
                         string_value("bfloat16"),
                     ),
+                    (
+                        "cache_partition_fields".to_string(),
+                        string_value("cache_salt,extra_key"),
+                    ),
                     // Not in SGLANG_GRPC_KEYS — must not become a label.
                     ("api_key".to_string(), string_value("secret")),
                 ]),
@@ -914,6 +934,10 @@ mod tests {
         assert_eq!(
             labels.get("mm_item_limits").map(String::as_str),
             Some("image=1,video=1")
+        );
+        assert_eq!(
+            labels.get("cache_partition_fields").map(String::as_str),
+            Some("cache_salt,extra_key")
         );
     }
 
