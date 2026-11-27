@@ -538,14 +538,15 @@ whether it is marked non-exhaustive and how code writes it:
 | the records a caller builds | `Needs`, `Outcome`, `Plain`, `TokenKey`, `TextKey`, `EncodeMember`, `PoolWord` | yes | a stage writes its `Needs` as one chain from `Needs::NONE`, a call a flag. A host makes an `Outcome` by `Outcome::reported`. Each of the other five is made by its call (`Plain::of`, `TokenKey::of`, `TextKey::of`, `EncodeMember::of`, `PoolWord::of`), which takes every field the record has today |
 | the records a stage answers with | `Shortlist`, `HeadRule` | yes | each is made by its call |
 | the view a stage only reads | `RequestFacts`, `Candidate`, `Constraints`, `PoolFacts`, `LoadRow`, `AffinityFacts`, `AffinityRows`, `AffinityHolder`, `Health`, `MediaCounts`, `Header`, `ZoneCapacity`, and its enums `HashKind`, `SignalSource`, `OverloadRegime` | yes | code outside the crate starts a record from its `Default`, or a `Candidate` from `Candidate::ready`, and assigns the fields it knows. It never matches one whole, and a `match` on one of the enums keeps an arm for the rest |
+| what a policy document states | `ProfileSpec`, `RoutingKeySpec`, `IndexSpec`, `BucketParams`, `CostMargin`, `Match`, `OverloadSpec`, `KeySourceSpec`, `BindingSpec`, `ResidentWorkParams`, `LeastCostParams`, `BestParams`, `BestWithTemperatureParams`, `HasRoomParams`, `Bounds`, `HeaderMatch`, `SessionsSpec`, `CanarySpec`, `SignalSpec`, and what a snapshot caller asks of the worker rows, `WorkerRowsQuery` | yes | ten of them have no start (`ResidentWorkParams`, `LeastCostParams`, `BestParams`, `BestWithTemperatureParams`, `HasRoomParams`, `Bounds`, `HeaderMatch`, `SessionsSpec`, `CanarySpec`, `SignalSpec`): code outside the crate builds none: it deserializes one, or takes one in a spec the crate made, and a start comes the day a caller needs one. It starts eight from their `Default` and assigns the fields it knows (`IndexSpec`, `BucketParams`, `CostMargin`, `Match`, `OverloadSpec`, `KeySourceSpec`, `BindingSpec`, `WorkerRowsQuery`). It makes a profile by `ProfileSpec::of` and a routing key by `RoutingKeySpec::of`, each from the one field a document must write. A pattern on one ends with `..`. The doc of the module `document` says this once for the nineteen a document states: the own doc of such a record is its description in the published schema. `WorkerRowsQuery` says it in its own doc |
 | the parts of a decision, of a lease and of a profile | `Target`, `Pair`, `Trace`, `Shed`, `Queue`, `LiftedVeto`, `DemandFacts`, `Lease`, `LeaseKind`, `Dispatch`, `WeightedScorer`, `Profile`, `Binding`, `PairPools`, `EncoderFacts`, `EncodePool`, `EncodeItems` | yes | code outside the crate starts a record from its `Default` or from its call (`Target::of`, `Pair::of`, `PairPools::of`, `WeightedScorer::of`, `Profile::of`, `Binding::of`) and assigns the fields it knows. A `Trace`, a `Shed` and a `Queue` are answers: a caller reads one and builds none. It never matches one whole, and a `match` on `LiftedVeto` or `LeaseKind` keeps an arm for the rest |
 | what a host states of a worker, of a store's history and of a signal | `EncodeOffer`, `PairingDescriptor`, `Position`, `SignalCell` | yes | code outside the crate starts an offer, a descriptor or a position from its `Default` and assigns the fields it knows. It makes a cell by `SignalCell::of`, which takes both of its fields, or starts from `SignalCell::NONE`. A pattern on one ends with `..` |
 | what a host starts a service or a plugin with | `Config`, `Listener`, `ElectionConfig`, `ElectionSettings`, `WorkerFollowerSettings`, `PemFile`, `ClientIdentity`, `Exposure`, `BreakerSpec`, `Abi`, the three records named `Tls`, and the elector's `LeaseRecord` | yes | code outside the crate starts an exposure, a breaker, an election's configuration, its timing or the elector's lease record from its `Default` and assigns the fields it knows. It makes each of the others by its call. `Config::of` takes the three fields a host must state. Each other call takes every field the record has: none has a neutral value, and a TLS left out by silence would be a plaintext listener or a plain dial. A pattern on one ends with `..` |
 | what no caller builds or matches whole | `Pick`, `Overlap`, `HeldDecision`, `HeldDecode`, `SessionRule`, and every other public enum or record that no program outside the crate builds or matches whole | yes | a caller reads one by its fields, and starts one from its `Default` or its call where it has one. A `match` on one keeps an arm for the rest, and a pattern on one ends with `..` |
-| what a caller builds or matches whole | the lists a request lends and its `Demands`, the routing settings, a store's checkpoint | not yet | each takes its mark with a call to start from, and its module or its own declaration says so |
+| what a caller builds or matches whole | the lists a request lends and its `Demands`, a store's checkpoint | not yet | each takes its mark with a call to start from, and its module or its own declaration says so |
 | the enums closed by design | `Decision`, `ShedReason`, `Side`, `Phase`, `Role`, `Said`, `Pairing`, `Head`, the elector's `TickOutcome`, and the client's `Answer` | no | a caller answers every case of them, and a new case must stop its build |
 | the records closed by their shape | a record of one value: `WorkerId`, `LeaseId`, `GatewayId`, `TieBand`. A record with no field, as the stage `Best` | no | its one value, or its name, is the whole record |
-| the records closed by their own doc | `DispatchCounts`, and a lease as a store holds it: `LeaseRecord`, `DecodeSide`, `Sides` | no | a further number goes on `CreditedDispatches`. A store's door takes a lease's record or its decode side whole, and a store answers both parts: a field that joins stops each writer's build until the writer states it |
+| the records closed by their own doc | `DispatchCounts`, a lease as a store holds it: `LeaseRecord`, `DecodeSide`, `Sides`, and a gateway's routing settings: `RoutingSettings`, `RoutingKeyOverrideSettings` | no | a further number goes on `CreditedDispatches`. A store's door takes a lease's record or its decode side whole, and a store answers both parts: a field that joins stops each writer's build until the writer states it. A gateway's literal of the routing settings with no rest stops its build at a setting that joins, until the gateway states it |
 | an enum with no case | `DiscoverySettings` in a build without discovery | no | it has no value, and a caller may match it with no arm |
 
 The crate's lint lines hold the table. `clippy::exhaustive_enums` and `clippy::exhaustive_structs` are
@@ -746,14 +747,14 @@ none of the three: it keeps a table of placements with a time to live for reques
 ids, and balances a text request by load. The engine follows it there by its record of sent
 prefixes: under an index of the kind `hash` the record is keyed at `view.boundaries` alone, and
 the settings translate to a `prefix-affinity` threshold of zero and a `warmup-slice` that names
-nobody. So a request of token ids goes back to the worker its head at a boundary was sent to,
-and a request with fewer whole blocks than the first boundary's, or one hashed by its text, is
-recorded nowhere. Five
-things differ from classic. The engine keeps no time to live: a placement stays until the
-record's size bound takes it. It keeps every worker sent a head as its holder, where classic
-keeps three. A key ends at the last whole block under its boundary and keys every request that
-holds those blocks, where classic asks for the boundary's every token. A boundary past the first
-`view.max_block_hashes` blocks of a request keys nothing, where classic keys every boundary the
+nobody. So a request of token ids can go back to the worker its head at a boundary was sent to.
+A request that carries fewer block hashes than its first boundary has whole blocks, or one hashed
+by its text, is recorded nowhere. Several
+things differ from classic. The engine keeps no time to live: as a rule a placement stays until
+the record's size bound takes it. As a rule it keeps every worker sent a head as its holder,
+where classic keeps three. A key ends at the last whole block under its boundary and keys every
+request that holds those blocks, where classic asks for the boundary's every token. A boundary of
+more whole blocks than `view.max_block_hashes` keys nothing, where classic keys every boundary the
 prompt reaches. And where the model's index of cache events holds a block, the engine reads
 record A for a request of token ids, which classic under `hash` does not read. The routing
 settings never raise `view.max_block_hashes`, so a gateway whose settings state a boundary past
@@ -770,6 +771,12 @@ Between two passes it grows past the bound.
 
 A request's prompt is stored under its **cache partition** (cache salt, extra value, adapter), so
 that two tenants' prompts never match. The gateway derives the partition once for each request.
+
+The rest of this section describes the engine under an index of the kind `tree`. Under `hash` it
+asks its host for no tree, and its record keys a request as said above: one given as text has no
+key there. The record's second fault below stands under `hash` too. So does the first rule of its
+third: on a request of token ids, a profile that reads cache events neither reads nor writes the
+record for a worker the index holds a block for.
 
 **The engine today [built].** It reads record A through two small traits that the host
 implements over its own index (`CacheIndexes`, `CacheIndex`, in `engine/in_process/overlap.rs`).
@@ -943,7 +950,9 @@ A controller keeps one engine object too, built at its store's start. The store 
 it applies in force on it, by `InProcess::apply`, the call of a host that keeps one engine (section
 8.1, step 6, and section 10.2).
 
-The session table and the record of sent prompts stand across the call. So do the stages of a
+The session table stands across the call. So does the record of sent prompts, as a rule: a
+document that keys a model's record another way can start that record anew, by another kind of
+the model's index or by other boundaries under a hash index (section 4.5). So do the stages of a
 profile whose name and text did not change, with what they remember, under the rules that follow.
 Nothing is kept unless both documents were validated over one stage table: the stock one, or one
 table of the host's own that took no stage between the two validations.
@@ -1511,6 +1520,15 @@ On main three pickers say so: round robin, `random` and `passthrough`.
    the whole pass hands out for that seed, in that order; a worker whose state moved since the
    list said so ends the draw at once where the draw asks about it, and the whole pass decides as
    if nothing had been drawn.
+   A prefill and decode pair whose two sides both pick of two is decided on a draw of each side:
+   the two records each side's draw names are written, and the pair is the one the whole pass
+   names for that seed. It is drawn so only where each list holds its side's floor of workers (8
+   or 16, as above) and no ranks of a data-parallel engine, and every worker of both lists
+   publishes its routing state available; where the request states nothing beside its two lists
+   (no session key, no worker tried or excluded, no place, no held decode, no veto of its host);
+   where each side holds one partner class and the host's admission refuses no place of either
+   list; and where the document names no shadow and reads neither signal cells nor affinity.
+   Every other pair has every record of both lists written.
    A request whose session key holds no pin is decided on a draw too, where its sessions rule
    leaves a new key to a profile whose picker takes turns and whose filters are one test of a
    worker's record. The worker the list's counter points at has its record written first, with no
@@ -2812,7 +2830,7 @@ The design adds no second mechanism where one exists.
 | load reports | the load monitor's `LoadSnapshot` | the last report of a worker whose load call fails, kept beside the snapshot's entries, and the one read that gives it (decision 12) |
 | which worker holds a prompt, by cache events | the kv-index crate's index, through two traits | the gateway's two readers of its index for those traits (section 9.2) |
 | which prefill pairs with which decode | the gateway's pair index (`PdPairIndex`) | the pair classes read from it, one file (section 9.2) |
-| which worker was sent a prompt | the host's own trees, of the kv-index crate's two tree types | one more question on the trait the host already answers for cache events |
+| which worker was sent a prompt | the host's own trees, of the kv-index crate's two tree types, under an index of the kind `tree` | one more question on the trait the host already answers for cache events |
 | a request's lifetime on a worker | the load guard every route keeps | one optional field (decision 4) |
 | the place where a worker is chosen | classic's four placement functions | one call in each |
 | the rank a request is sent with | the worker object's own rank, where its registration states one | nothing: no rank choice runs behind the pick of a worker registered rank by rank, and the classic rank option is refused at the start beside the engine (section 9.2 names the two places a rank is still chosen) |
@@ -3325,7 +3343,8 @@ The store keeps one engine object for its life and puts each document it applies
 on it, by `InProcess::apply`, the call of a host that keeps one engine (section 8.1, step 6). The
 session pins, the record of sent
 prompts and the stages of a profile whose name and text did not change stand, with what they hold,
-and the members that stand are told to the stages built new alone. A decision runs under the
+under the rules of section 5.1, and the members that stand are told to the stages built new alone.
+A decision runs under the
 document of the world it read: the list's value it asks, its lease, the stages told that issue and
 its shadow's count are that document's, whatever document is applied meanwhile. A word of a lease on
 file is told by the document in force at the word, which on a controller is the one its store's
@@ -3945,7 +3964,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | The stage interfaces and a builder's own stages | **[built]** | |
 | The engine over worker lists (`InProcess`) | **[partly]** | refuses a subset hint, and a request that states protocols where a worker of its list is dialed over one it does not state; of the recorded lines only the three hard-demand sheets, `sticky_rank`, `encode_pair`, `pair_named` and 23 lines of `pair_sticky` (132), and 31 lines of `prefix_hash`, replay through it |
 | `round_robin`, `random`, `passthrough`, `least_load`, `power_of_two` on that engine | **[partly]** | no sheet over a healthy pool for four of them |
-| `cache_aware` on that engine | **[partly]** | a single request whose maker names its entry by token ids (`RequestMaker::token_key`) is decided in the host's token tree, where the host lends it, the model has no index of cache events and the profile reads sent prefixes and names the holders' rows, as the preset does: the record's first two faults do not reach it. A single request of token ids under a model whose index of cache events holds a block reads the index alone, as classic does, unless its profile reads the record alone. Every other request the engine names the holders of reads the engine's own record, with its three faults, the third being that a request with token ids reads it for no worker the index holds a block for, unless its profile reads the record alone: a request of text whose caller names no entry is one. A request its host holds as text is decided the same way in a lent string tree (`RequestMaker::text_key`), with or without an index. The gateway lends its string trees, and names the entry by classic's own key |
+| `cache_aware` on that engine | **[partly]** | a single request whose maker names its entry by token ids (`RequestMaker::token_key`) is decided in the host's token tree, where the host lends it, the model has no index of cache events and the profile reads sent prefixes and names the holders' rows, as the preset does: the record's first two faults do not reach it. A single request of token ids under a model whose index of cache events holds a block reads the index alone, as classic does, unless its profile reads the record alone. Every other request the engine names the holders of reads the engine's own record, with its three faults, the third being that a request with token ids reads it for no worker the index holds a block for, unless its profile reads the record alone: a request of text whose caller names no entry is one. A request its host holds as text is decided the same way in a lent string tree (`RequestMaker::text_key`), with or without an index of cache events. The gateway lends its string trees, and names the entry by classic's own key. This row describes an index of the kind `tree`; section 4.5 speaks of the kind `hash` |
 | `consistent_hashing`, `prefix_hash` on that engine | **[partly]** | placed on the ring the host lends (decision 3): through `place` the plain ring at the place the engine reads with the request's keys, and `prefix_hash` at the places the host's ring answers for the request's heads, where it answers for a head; that both are classic's is proven at stage 3; a host that lends none is placed on the crate's ring, which may be another worker than classic's |
 | `manual` and sticky sessions on that engine | **[partly]** | the sheets of `manual` and of the sticky override's single requests (`sticky_override`) replay through the decision function, not through the engine; the override's sheet of pairs (`pair_sticky`) replays through the engine's one call for a host in process, under the document the routing settings give for each line: 23 of its 25 lines as recorded, and the settings refuse the other 2 by name, a pair with one side under `consistent_hashing` |
 | `bucket` on that engine | **[partly]** | the same |

@@ -388,4 +388,8 @@ fn the_schema_names_every_section_and_refuses_unknown_properties() {
         signals["propertyNames"]["pattern"],
         "^[a-z][a-z0-9_]{0,62}$"
     );
+    // The count of profiles, as the validator takes it.
+    let profiles = &root["properties"]["profiles"];
+    assert_eq!(profiles["minProperties"], 1);
+    assert_eq!(profiles["maxProperties"], u16::MAX);
 }

@@ -111,6 +111,32 @@ impl Ranked {
             self.tables.indexed_blocks(upper, 1),
         )
     }
+
+    /// A cut names the engine's rank 0 row under `address`: its object at
+    /// the first address ends, and one is laid at `address`.
+    fn cut_to(&self, address: &str) {
+        let mut cut = self.store.checkpoint();
+        let moved = cut.rows.iter_mut().find(|row| row.id == self.lower);
+        moved.expect("the row").facts = rank_facts(address, address, 0);
+        assert!(self.host.objects.watch_from(&self.store, cut));
+    }
+
+    /// The object at `address` opens a feed on the engine's rank 0 row:
+    /// one more, beside the feeds that stand open for the row.
+    fn open_at(&self, address: &str) {
+        let object = self.host.objects.registry().get_by_url(address);
+        let object = object.expect("the object at the address");
+        let ticket = self.host.enroll(&object, MODEL);
+        assert_eq!(ticket, Ok(self.lower));
+        assert!(self.host.open(ticket, &object, MODEL).is_some());
+    }
+
+    /// The record of the engine's feed: what a batch on its stream reads
+    /// ahead of its row's state.
+    fn feed(&self) -> Arc<Feed> {
+        let feed = self.sink.feeds.lock().get(&self.lower).cloned();
+        feed.expect("the stream's feed")
+    }
 }
 
 /// A batch of rank 1 on the engine's one stream is indexed under rank
@@ -536,6 +562,133 @@ fn a_removal_that_leaves_a_feed_open_takes_nothing() {
     assert!(rows.written.is_empty() && rows.fed.is_empty());
 }
 
+/// A feed's opening releases the rows of other ranks that its row's
+/// stream still writes and reaches no longer. A cut names the row under
+/// another address, and rank 1's row stays at the first: the holder
+/// routes it no batch of the row's stream. The second address's feed
+/// opens while the first's removal is not told. Behind that opening rank
+/// 1's row holds no block, the adapter keeps no entry of it, and the sum
+/// the row's gauge is set from counts its own row alone. The first
+/// address's removal then takes nothing, and the second's clears the row.
+#[test]
+fn a_feeds_opening_releases_the_rank_rows_its_stream_reaches_no_longer() {
+    let f = Ranked::new();
+    let upper = f.upper();
+    let store = |hash| Data::Stored(wide_store(hash, 16));
+    assert_eq!(f.admit(0, 1, store(1)), BatchOutcome::Applied);
+    assert_eq!(f.admit(1, 1, store(2)), BatchOutcome::Applied);
+    assert_eq!(f.blocks(upper), (1, 1));
+    f.cut_to(OTHER);
+    assert_eq!(f.sink.routed(f.lower, 1), None, "the second has no rank 1");
+    assert_eq!(f.tables.indexed_blocks(upper, 1), 1, "the cut leaves it");
+
+    f.open_at(OTHER);
+    assert_eq!(f.tables.indexed_blocks(upper, 1), 0);
+    {
+        let rows = f.sink.rows.lock();
+        assert!(!rows.written.contains_key(&upper));
+        assert!(rows.fed.get(&f.lower).is_none_or(Vec::is_empty));
+    }
+    // The gauge moves at a batch, to the sum of what the stream's rows
+    // hold.
+    assert_eq!(f.admit(0, 2, store(3)), BatchOutcome::Applied);
+    assert_eq!(f.sink.held(f.lower), 1);
+
+    // The first address's removal, told behind the second feed's opening.
+    f.sink.removed(f.lower);
+    assert_eq!(f.tables.indexed_blocks(f.lower, 0), 1);
+    assert_eq!(f.admit(0, 3, store(4)), BatchOutcome::Applied);
+    f.sink.removed(f.lower);
+    assert_eq!(f.blocks(upper), (0, 0));
+}
+
+/// Two feeds of one address keep their rank rows. A second feed opens
+/// for the same object ahead of the first's removal: the holder names
+/// rank 1's row among the rows of the row's engine, and the opening
+/// releases none. Its block stands through the opening and through the
+/// first feed's removal, and the stream's next batch of rank 1 is taken.
+#[test]
+fn two_feeds_of_one_address_keep_their_rank_rows() {
+    let f = Ranked::new();
+    let upper = f.upper();
+    let store = |hash| Data::Stored(wide_store(hash, 16));
+    assert_eq!(f.admit(1, 1, store(1)), BatchOutcome::Applied);
+    f.open_at(URL);
+    assert_eq!(f.tables.indexed_blocks(upper, 1), 1);
+    assert_eq!(f.sink.rows.lock().fed.get(&f.lower), Some(&vec![upper]));
+
+    f.sink.removed(f.lower);
+    assert_eq!(f.admit(1, 2, store(2)), BatchOutcome::Applied);
+    assert_eq!(f.tables.indexed_blocks(upper, 1), 2);
+    f.sink.removed(f.lower);
+    assert_eq!(f.tables.indexed_blocks(upper, 1), 0);
+}
+
+/// A released row laid again as a rank of the row's engine begins from
+/// nothing: the row's stream takes it at its next batch of that rank, as
+/// a row it writes for the first time, and lists it again.
+#[test]
+fn a_released_row_laid_again_as_a_rank_of_the_engine_begins_from_nothing() {
+    let f = Ranked::new();
+    let upper = f.upper();
+    let store = |hash| Data::Stored(wide_store(hash, 16));
+    assert_eq!(f.admit(1, 1, store(1)), BatchOutcome::Applied);
+    f.cut_to(OTHER);
+    f.open_at(OTHER);
+    assert!(!f.sink.rows.lock().written.contains_key(&upper));
+
+    // The released row is laid again as rank 1 of the second address.
+    assert_eq!(f.write(rank_facts(UPPER, OTHER, 1)), upper);
+    assert_eq!(f.sink.routed(f.lower, 1), Some(upper));
+    assert_eq!(f.admit(1, 2, store(2)), BatchOutcome::Applied);
+    assert_eq!(f.tables.indexed_blocks(upper, 1), 1);
+    assert_eq!(f.sink.rows.lock().fed.get(&f.lower), Some(&vec![upper]));
+}
+
+/// An opening holds each row its stream still writes against the
+/// holder's answer by itself. The second address has a rank 1 row of its
+/// own, which the row's stream writes too: the opening keeps that row
+/// and its block, and releases the first address's.
+#[test]
+fn an_opening_keeps_its_engines_rank_row_and_releases_the_other() {
+    let f = Ranked::new();
+    let upper = f.upper();
+    let store = |hash| Data::Stored(wide_store(hash, 16));
+    assert_eq!(f.admit(1, 1, store(1)), BatchOutcome::Applied);
+    f.cut_to(OTHER);
+    let second = f.write(rank_facts(FOURTH, OTHER, 1));
+    assert_eq!(f.sink.routed(f.lower, 1), Some(second));
+    assert_eq!(f.admit(1, 2, store(2)), BatchOutcome::Applied);
+    let both = vec![upper, second];
+    assert_eq!(f.sink.rows.lock().fed.get(&f.lower), Some(&both));
+
+    f.open_at(OTHER);
+    assert_eq!(f.tables.indexed_blocks(upper, 1), 0);
+    assert_eq!(f.tables.indexed_blocks(second, 1), 1);
+    let rows = f.sink.rows.lock();
+    assert!(!rows.written.contains_key(&upper));
+    assert_eq!(rows.fed.get(&f.lower), Some(&vec![second]));
+}
+
+/// A feed's own row laid again in place as rank 0 of another engine
+/// releases its rank rows at the new engine's feed's opening. The
+/// holder's own write of the row's facts makes the state: no cut is built
+/// by hand.
+#[test]
+fn a_row_laid_again_under_another_engine_releases_its_rank_rows() {
+    let f = Ranked::new();
+    let upper = f.upper();
+    let store = |hash| Data::Stored(wide_store(hash, 16));
+    assert_eq!(f.admit(1, 1, store(1)), BatchOutcome::Applied);
+    assert_eq!(f.write(rank_facts(URL, OTHER, 0)), f.lower);
+    assert_eq!(f.sink.routed(f.lower, 1), None, "the engine has no rank 1");
+    assert_eq!(f.tables.indexed_blocks(upper, 1), 1, "the write leaves it");
+
+    f.open_at(URL);
+    assert_eq!(f.tables.indexed_blocks(upper, 1), 0);
+    assert!(!f.sink.rows.lock().written.contains_key(&upper));
+}
+
 /// A route read before a row was laid again takes no open feed's own
 /// row. The row stands at rank 0 of its own engine and its feed is
 /// open: the old stream's late batch is passed over, and the row's own
@@ -581,12 +734,14 @@ fn a_feeds_open_asks_the_holder_in_the_hold_that_writes_its_row() {
 }
 
 /// What `seen` reads while `step` stands still inside its clear of
-/// `row`. The tables' own lock is the probe: a clear of a row takes its
-/// lane's lock, and here a batch's body holds that lock until `seen`
-/// has answered, so the step cannot get past its clear before then.
+/// `row`, the row of `rank`. The tables' own lock is the probe: a clear
+/// of a row takes its lane's lock, and here a batch's body holds that
+/// lock until `seen` has answered, so the step cannot get past its clear
+/// before then.
 fn at_its_clear<T>(
     tables: &KvTables,
     row: WorkerId,
+    rank: u16,
     sequence: u64,
     step: impl FnOnce() + Send,
     seen: impl Fn() -> Option<T>,
@@ -595,7 +750,7 @@ fn at_its_clear<T>(
     let (release, held) = mpsc::channel::<()>();
     std::thread::scope(|scope| {
         scope.spawn(move || {
-            let outcome = tables.admit_through(row, 0, facts(sequence), &mut |_| {
+            let outcome = tables.admit_through(row, rank, facts(sequence), &mut |_| {
                 entered.send(()).expect("the case waits for the body");
                 held.recv().expect("the case lets the body go");
             });
@@ -654,10 +809,10 @@ fn a_claimed_rows_first_clear_runs_in_the_hold_that_writes_its_entry() {
 
     // Another stream's take of the row, then the open of its own feed.
     let take = || assert!(sink.take(other, row).is_some());
-    let held = at_its_clear(&tables, row, 1, take, || held_at_its_clear(other));
+    let held = at_its_clear(&tables, row, 0, 1, take, || held_at_its_clear(other));
     assert!(held, "a take's clear runs in the hold of its claim");
     let begin = || assert_eq!(sink.begin(row, || true), Ok(()));
-    let held = at_its_clear(&tables, row, 1, begin, || held_at_its_clear(row));
+    let held = at_its_clear(&tables, row, 0, 1, begin, || held_at_its_clear(row));
     assert!(held, "a begin's clear runs in the hold of its claim");
 
     // The feed's removal: its mark stands in the list, which is free,
@@ -670,5 +825,241 @@ fn a_claimed_rows_first_clear_runs_in_the_hold_that_writes_its_entry() {
             .is_some_and(|written| written.leaving);
         leaving.then_some(())
     };
-    at_its_clear(&tables, row, 1, || sink.removed(row), marked);
+    at_its_clear(&tables, row, 0, 1, || sink.removed(row), marked);
+}
+
+/// A rank's row that an opening releases bears its mark while its clear
+/// runs: the list is free then, and no stream takes the row until the
+/// clear has ended and the row is forgotten.
+#[test]
+fn a_released_row_bears_its_mark_while_its_clear_runs() {
+    let f = Ranked::new();
+    let upper = f.upper();
+    let store = |hash| Data::Stored(wide_store(hash, 16));
+    assert_eq!(f.admit(1, 1, store(1)), BatchOutcome::Applied);
+    f.cut_to(OTHER);
+    let (sink, lower) = (&f.sink, f.lower);
+    let marked = || {
+        let rows = sink.rows.try_lock()?;
+        let leaving = rows
+            .written
+            .get(&upper)
+            .is_some_and(|written| written.leaving);
+        leaving.then_some(())
+    };
+    // The second address's feed begins the row, and its release's clear
+    // of rank 1's row waits for that row's lane.
+    let begin = || assert_eq!(sink.begin(lower, || true), Ok(()));
+    at_its_clear(&f.tables, upper, 1, 2, begin, marked);
+    assert!(!sink.rows.lock().written.contains_key(&upper));
+    assert_eq!(f.tables.indexed_blocks(upper, 1), 0);
+}
+
+/// A batch that took a row's state ahead of the row's release stores
+/// nothing behind it. A batch of rank 1 reads its feed's record and its
+/// row's state, and the cut and the second address's opening then
+/// release the row. The batch goes on behind that: it is passed over,
+/// the row holds no block, the adapter keeps no entry of it, and the
+/// sum the stream's gauge is set from stands as it was.
+#[test]
+fn a_batch_that_took_a_rows_state_ahead_of_its_release_stores_nothing() {
+    let f = Ranked::new();
+    let upper = f.upper();
+    let store = |hash| Data::Stored(wide_store(hash, 16));
+    assert_eq!(f.admit(0, 1, store(1)), BatchOutcome::Applied);
+    assert_eq!(f.admit(1, 1, store(2)), BatchOutcome::Applied);
+    let feed = f.feed();
+    let state = f.sink.applied(f.lower, upper).expect("the row's state");
+    f.cut_to(OTHER);
+    f.open_at(OTHER);
+    assert_eq!(f.tables.indexed_blocks(upper, 1), 0);
+    let held = f.sink.held(f.lower);
+
+    let (late, place) = (batch([store(3)]), (upper, 1));
+    let outcome = f
+        .sink
+        .admit_under(f.lower, place, &feed, state, facts(2), &late);
+    assert_eq!(outcome, BatchOutcome::Skipped);
+    assert_eq!(f.tables.indexed_blocks(upper, 1), 0);
+    assert!(!f.sink.rows.lock().written.contains_key(&upper));
+    assert_eq!(f.sink.held(f.lower), held);
+}
+
+/// The same at a stream's removal, for its own row. A batch of rank 0
+/// reads its feed's record and its row's state, which the adapter keeps,
+/// and the removal is told. The batch goes on behind it: it is passed
+/// over, the row holds no block and the adapter keeps no entry of it.
+#[test]
+fn a_batch_that_took_its_rows_state_ahead_of_its_removal_stores_nothing() {
+    let f = Ranked::new();
+    let store = |hash| Data::Stored(wide_store(hash, 16));
+    assert_eq!(f.admit(0, 1, store(1)), BatchOutcome::Applied);
+    let feed = f.feed();
+    let state = f.sink.applied(f.lower, f.lower).expect("the row's state");
+    assert!(state.1, "the adapter keeps the state");
+    f.sink.removed(f.lower);
+    assert_eq!(f.tables.indexed_blocks(f.lower, 0), 0);
+
+    let (late, place) = (batch([store(2)]), (f.lower, 0));
+    let outcome = f
+        .sink
+        .admit_under(f.lower, place, &feed, state, facts(2), &late);
+    assert_eq!(outcome, BatchOutcome::Skipped);
+    assert_eq!(f.tables.indexed_blocks(f.lower, 0), 0);
+    assert!(!f.sink.rows.lock().written.contains_key(&f.lower));
+    assert_eq!(f.sink.held(f.lower), 0);
+}
+
+/// A leaving row's mark bears a released state. A batch of the stream
+/// that asks for the row's state while the row's release stands in its
+/// clear gets the mark's, and stores nothing under it behind the
+/// release's end.
+#[test]
+fn a_batch_that_reads_a_leaving_rows_mark_stores_nothing() {
+    let f = Ranked::new();
+    let upper = f.upper();
+    let store = |hash| Data::Stored(wide_store(hash, 16));
+    assert_eq!(f.admit(1, 1, store(1)), BatchOutcome::Applied);
+    let feed = f.feed();
+    f.cut_to(OTHER);
+    let (sink, lower) = (&f.sink, f.lower);
+    // What a batch of the stream gets for the row once its mark stands.
+    let marked = || {
+        let leaving = sink.rows.try_lock()?.written.get(&upper)?.leaving;
+        leaving.then(|| sink.applied(lower, upper))
+    };
+    let begin = || assert_eq!(sink.begin(lower, || true), Ok(()));
+    let state = at_its_clear(&f.tables, upper, 1, 2, begin, marked);
+    let state = state.expect("the stream's batch gets the mark's state");
+    assert!(state.0.lock().released, "the mark's state is released");
+
+    let late = batch([store(2)]);
+    let outcome = sink.admit_under(lower, (upper, 1), &feed, state, facts(3), &late);
+    assert_eq!(outcome, BatchOutcome::Skipped);
+    assert_eq!(f.tables.indexed_blocks(upper, 1), 0);
+    assert!(!sink.rows.lock().written.contains_key(&upper));
+}
+
+/// A leaving row's state is released ahead of the row's clear. A
+/// batch's body holds the row's lane, so the release's clear waits, and
+/// the state the stream held of the row reads released by then.
+#[test]
+fn a_leaving_rows_state_is_released_ahead_of_its_clear() {
+    let f = Ranked::new();
+    let upper = f.upper();
+    let store = |hash| Data::Stored(wide_store(hash, 16));
+    assert_eq!(f.admit(1, 1, store(1)), BatchOutcome::Applied);
+    let (state, _) = f.sink.applied(f.lower, upper).expect("the row's state");
+    f.cut_to(OTHER);
+    let (sink, lower) = (&f.sink, f.lower);
+    let released = || state.try_lock()?.released.then_some(());
+    let begin = || assert_eq!(sink.begin(lower, || true), Ok(()));
+    at_its_clear(&f.tables, upper, 1, 2, begin, released);
+    assert_eq!(f.tables.indexed_blocks(upper, 1), 0);
+}
+
+/// A batch that holds a released state is passed over ahead of the row's
+/// cursor. The released row is laid again as a rank of the row's engine,
+/// and the stream writes it anew at sequence 10. A late batch at 1,
+/// which the cursor would read as a restart, leaves the row's block and
+/// the cursor as they were. So does one at 12, which asks no replay, and
+/// a late chunk of a snapshot. The stream's batch at 11 is taken.
+#[test]
+fn a_batch_that_holds_a_released_state_leaves_the_cursor_where_it_was() {
+    let f = Ranked::new();
+    let upper = f.upper();
+    let store = |hash| Data::Stored(wide_store(hash, 16));
+    assert_eq!(f.admit(1, 1, store(1)), BatchOutcome::Applied);
+    let feed = f.feed();
+    let (state, kept) = f.sink.applied(f.lower, upper).expect("the row's state");
+    f.cut_to(OTHER);
+    f.open_at(OTHER);
+    assert_eq!(f.write(rank_facts(UPPER, OTHER, 1)), upper);
+    assert_eq!(f.admit(1, 10, store(2)), BatchOutcome::Applied);
+
+    let (late, place) = (batch([store(3)]), (upper, 1));
+    let applied = || f.sink.cursor(f.lower, 1).map(|cursor| cursor.applied);
+    let chunk = BatchFacts {
+        snapshot: Some(SnapshotChunk::default()),
+        ..facts(20)
+    };
+    for header in [facts(1), facts(12), chunk] {
+        let held = (Arc::clone(&state), kept);
+        let outcome = f
+            .sink
+            .admit_under(f.lower, place, &feed, held, header, &late);
+        assert_eq!(outcome, BatchOutcome::Skipped);
+        assert_eq!(f.tables.indexed_blocks(upper, 1), 1);
+        assert_eq!(applied(), Some(10));
+    }
+    assert_eq!(f.admit(1, 11, store(4)), BatchOutcome::Applied);
+}
+
+/// Two batches of one stream that both missed a row's entry take one
+/// state. Two feeds of one row can both ask for a rank's row no entry is
+/// kept of. The second take hands the state the first made and clears
+/// nothing, so the first batch's store stands.
+#[test]
+fn two_batches_that_both_missed_a_rows_entry_take_one_state() {
+    let f = Ranked::new();
+    let upper = f.upper();
+    let feed = f.feed();
+    let first = f.sink.take(f.lower, upper).expect("the stream takes it");
+    let (stored, place) = (batch([Data::Stored(wide_store(1, 16))]), (upper, 1));
+    let held = (Arc::clone(&first), true);
+    let outcome = f
+        .sink
+        .admit_under(f.lower, place, &feed, held, facts(1), &stored);
+    assert_eq!(outcome, BatchOutcome::Applied);
+    let second = f.sink.take(f.lower, upper).expect("the stream's row");
+    assert!(Arc::ptr_eq(&first, &second));
+    assert_eq!(f.tables.indexed_blocks(upper, 1), 1, "no second clear");
+}
+
+/// A holder's stand-in that stands a row at rank 0 and then names no row
+/// of its engine: what an opening could read between the two holds of a
+/// row's object laid again, were it to ask twice. It counts how often
+/// an engine's rows are asked.
+struct Between {
+    upper: WorkerId,
+    asked: AtomicU32,
+}
+
+impl Ranks for Between {
+    fn row_of(&self, row: WorkerId, rank: u16) -> Option<WorkerId> {
+        Some(if rank == 0 { row } else { self.upper })
+    }
+
+    fn rows_of(&self, _: WorkerId) -> Vec<WorkerId> {
+        self.asked.fetch_add(1, Ordering::Relaxed);
+        Vec::new()
+    }
+}
+
+/// An opening asks the holder's ranks once: the rows of its row's engine.
+/// Where the holder names none, the row stands at rank 0 no longer. The
+/// opening is refused, and it releases no row its stream writes.
+#[test]
+fn an_opening_the_holder_names_no_rows_for_is_refused_and_releases_nothing() {
+    let store = Arc::new(MemoryStore::new());
+    let tables = Arc::new(KvTables::default());
+    let lower = store.upsert(rank_facts(URL, URL, 0)).id();
+    let upper = store.upsert(rank_facts(UPPER, URL, 1)).id();
+    for id in [lower, upper] {
+        tables.member(&store.get(id).expect("the row"));
+    }
+    let asked = AtomicU32::new(0);
+    let between = Arc::new(Between { upper, asked });
+    let ranks: Arc<dyn Ranks> = Arc::clone(&between) as _;
+    let sink = KvAdapter::over(Arc::clone(&tables), Some(ranks));
+    // The stream's record stands, and it writes rank 1's row.
+    sink.opened(lower, MODEL, URL);
+    let stored = batch([Data::Stored(wide_store(1, 16))]);
+    let outcome = sink.admit(lower, 1, facts(1), &stored);
+    assert_eq!(outcome, BatchOutcome::Applied);
+
+    assert_eq!(sink.begin(lower, || true), Err(SkipReason::UpperRank));
+    assert_eq!(between.asked.load(Ordering::Relaxed), 1, "one ask");
+    assert_eq!(tables.indexed_blocks(upper, 1), 1);
+    assert_eq!(sink.rows.lock().fed.get(&lower), Some(&vec![upper]));
 }

@@ -34,7 +34,10 @@
 //! its every decode over its thresholds under a binding that sheds such a
 //! list: each request is then shed as saturated. `--refused outage` takes
 //! its every decode out of service under such a binding: each request is
-//! then shed with no endpoint. `--shadow twin` names a
+//! then shed with no endpoint. `--no-room N` leaves the last `N` decodes of
+//! a pair's cell with no room at their host's gate: each pair then goes to
+//! a decode that has one. `--live-gates 1` has a pair's host read each
+//! place's worker at every answer of its gate. `--shadow twin` names a
 //! copy of the cell's profile as its binding's shadow, so each decision is
 //! followed by its shadow profile's. `--shadow other` names that shadow at
 //! a binding of another model: the cell's decisions then have no shadow,
@@ -439,6 +442,12 @@ const CELLS: &[Cell] = &[
         ..Cell::PLAIN
     },
     Cell {
+        name: "pair_power_of_two",
+        document: || pair::of("power_of_two"),
+        request: pair::request,
+        ..Cell::PLAIN
+    },
+    Cell {
         name: "pair_round_robin",
         document: || pair::of("round_robin"),
         request: pair::request,
@@ -755,6 +764,12 @@ struct Run {
     engines: u64,
     /// The entry asked for a request: the bench's `place` file reads it.
     entry: String,
+    /// Whether the host of a pair's cell reads each place's worker at every
+    /// answer of its gate: the bench's `pair` file reads it.
+    live_gates: bool,
+    /// How many decodes at the end of a pair's cell have no room at their
+    /// host's gate: the bench's `pair` file reads it.
+    no_room: usize,
     /// How many other models the document states, each bound to a copy of
     /// the cell's profile under a name of its own.
     other_models: usize,
@@ -782,6 +797,8 @@ fn run() -> Run {
         decisions: 1_000_000,
         engines: 1,
         entry: "decide_at".to_owned(),
+        live_gates: false,
+        no_room: 0,
         other_models: 0,
         overloaded: false,
         publish_ms: 0,
@@ -811,6 +828,8 @@ fn run() -> Run {
             "--decisions" => run.decisions = number(),
             "--engines" => run.engines = number(),
             "--entry" => run.entry = place::named(&value),
+            "--live-gates" => run.live_gates = number() != 0,
+            "--no-room" => run.no_room = number() as usize,
             "--other-models" => run.other_models = number() as usize,
             "--runtimes" => RUNTIMES.store(number() as u32, Ordering::Relaxed),
             "--overloaded" => run.overloaded = number() != 0,
@@ -1042,12 +1061,16 @@ fn warm_stack() {
 fn main() {
     let run = run();
     // A pair's cell hands two lists and an encode request's three: such a
-    // run is its file's. A pair's cell alone runs refused.
+    // run is its file's. A pair's cell alone runs refused or short of a
+    // room.
     if pair::runs(&run) {
         return;
     }
-    let open = run.refused == pair::Refused::No;
-    assert!(open, "a pair's cell alone runs refused");
+    let open = run.refused == pair::Refused::No && run.no_room == 0 && !run.live_gates;
+    assert!(
+        open,
+        "a pair's cell alone runs refused, short of a room or with live gates"
+    );
     if encode::runs(&run) {
         return;
     }

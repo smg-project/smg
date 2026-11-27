@@ -3,6 +3,8 @@
 
 use super::*;
 
+mod decode;
+
 /// The pair plan's document of the cases, as generation 1: a request of
 /// the prefill or the decode phase under one pair binding, each side by
 /// `pick`, and a single request under the same profile.

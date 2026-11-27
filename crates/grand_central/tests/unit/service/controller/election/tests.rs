@@ -887,15 +887,34 @@ fn followed(term: u64) -> Arc<MemoryStore> {
     store
 }
 
-/// A take of term 1 over a store whose log followed `followed`, a term at
-/// or above it: another replica led that term, and the take starts none in
-/// the log. The loop leaves the lease in the take's own step, ahead of the
-/// standing, and the release states the higher of the two terms. The next
-/// take is `next`, above the followed term, and the log leads it. One
+/// A store that followed `term` as a standby's does: the start of a
+/// leader's term, applied at the place the applier holds for it. The log
+/// follows the term and the store's own term rises to it, where a restart
+/// of the log alone leaves the store's term to the take.
+fn followed_as_a_standby(term: u64) -> Arc<MemoryStore> {
+    let (store, feed) = journaled_from(&LeasePlace::Process, 0);
+    let at = Position { seq: 1, term };
+    {
+        let _place = feed.log.adopt(at).expect("a place the log takes");
+        store.follow_term(at);
+    }
+    assert_eq!((store.term(), store.followed()), (term, Some(term)));
+    store
+}
+
+/// A take of term 1 over `store`, whose log followed `followed_term`, a
+/// term at or above it: another replica led that term, and the take starts
+/// none in the log. The loop leaves the lease in the take's own step, ahead
+/// of the standing, and the release states the higher of the two terms. The
+/// next take is `next`, above the followed term, and the log leads it. One
 /// warning says the take, and the leave's line says the term `said`.
-fn a_take_under_a_followed_term_is_left(followed_term: u64, said: Option<u64>, next: u64) {
+fn a_take_under_a_followed_term_is_left(
+    store: Arc<MemoryStore>,
+    followed_term: u64,
+    said: Option<u64>,
+    next: u64,
+) {
     let name = "b@127.0.0.1:2";
-    let store = followed(followed_term);
     let (standing, stood) = watch::channel(ElectionObservation::default());
     let releases = Arc::new(Mutex::new(Vec::new()));
     let lease = SeesStanding {
@@ -920,16 +939,10 @@ fn a_take_under_a_followed_term_is_left(followed_term: u64, said: Option<u64>, n
     until("the line of the lead", || looping.said(": leading"));
     let (warned, text) = looping.stopped_with("started no term");
     assert_eq!(warned, 1, "{text}");
-    let count = |what: &str| text.lines().filter(|line| line.contains(what)).count();
+    let count = |what: &str| lines_with(&text, what);
     assert_eq!(count(&format!("followed={followed_term}")), 1, "{text}");
     // One leave, and its line names the term said or none.
-    let mut left = text.lines().filter(|line| line.contains("stepped down"));
-    let line = left.next().expect("the leave's line");
-    assert_eq!(left.next(), None, "{text}");
-    match said {
-        Some(term) => assert!(line.contains(&format!("above={term}")), "{text}"),
-        None => assert!(!line.contains("above="), "{text}"),
-    }
+    assert_eq!(left_under(&text), [said], "{text}");
     // The take that was left says no lead and no wait for one: the next
     // take leads, once.
     assert_eq!(count(": leading"), 1, "{text}");
@@ -938,12 +951,55 @@ fn a_take_under_a_followed_term_is_left(followed_term: u64, said: Option<u64>, n
 
 #[test]
 fn a_take_under_a_term_its_log_followed_is_left_for_a_take_above_that_term() {
-    a_take_under_a_followed_term_is_left(5, Some(5), 6);
+    a_take_under_a_followed_term_is_left(followed(5), 5, Some(5), 6);
 }
 
 #[test]
 fn a_take_at_the_term_its_log_followed_is_left_with_no_term_said() {
-    a_take_under_a_followed_term_is_left(1, None, 2);
+    a_take_under_a_followed_term_is_left(followed(1), 1, None, 2);
+}
+
+/// A take under a term its store followed as a standby is left as one over
+/// a log that was restarted is. The store stands at the followed term, and
+/// a lower take does not lower it: the loop reads the followed term off the
+/// log, whatever term the store holds.
+#[test]
+fn a_take_under_a_term_its_store_followed_as_a_standby_is_left() {
+    a_take_under_a_followed_term_is_left(followed_as_a_standby(5), 5, Some(5), 6);
+}
+
+/// A take under the term below the last one, which its log followed, is
+/// left: the last term is still there to take, and the next take is it. The
+/// loop asks the elector's rule for the followed term itself, never for the
+/// term above it.
+#[test]
+fn a_take_under_the_term_below_the_last_one_is_left_for_the_last_term() {
+    let below = TERM_CEILING - 2;
+    a_take_under_a_followed_term_is_left(followed(below), below, Some(below), below + 1);
+}
+
+/// What the leave's line says of a replica alone over its lease: its next
+/// step takes the lease again. A stop read first leaves no next step.
+const RETAKES: &str = "alone over its lease, takes it again at its next step";
+
+/// How many lines of `text` hold `what`.
+fn lines_with(text: &str, what: &str) -> usize {
+    text.lines().filter(|line| line.contains(what)).count()
+}
+
+/// What each line of `text` that holds `stepped down` says behind its last
+/// ` above=`, a line each: `None` for a line with no such text, else the
+/// run of digits there as a term. A line with no digit there fails the
+/// case. The identities of the cases that ask this hold no ` above=`.
+fn left_under(text: &str) -> Vec<Option<u64>> {
+    text.lines()
+        .filter(|line| line.contains("stepped down"))
+        .map(|line| {
+            let (_, said) = line.rsplit_once(" above=")?;
+            let digits = said.split(|at: char| !at.is_ascii_digit()).next()?;
+            Some(digits.parse().expect("a number behind the line's `above`"))
+        })
+        .collect()
 }
 
 /// No other candidate can take a lease the elector made itself. So the
@@ -963,10 +1019,231 @@ fn a_replica_alone_takes_again_at_once_above_the_term_its_log_followed() {
     assert_eq!(stood.borrow().term, 6);
     assert_eq!(store.followed(), None);
     until("the line of the lead", || looping.said(": leading"));
-    let (said, text) = looping.stopped_with("alone over its lease, takes it again at once");
+    let (said, text) = looping.stopped_with(RETAKES);
     assert_eq!(said, 1, "{text}");
     assert_eq!(text.matches("started no term").count(), 1, "{text}");
     assert_eq!(text.matches(": leading").count(), 1, "{text}");
+}
+
+/// The same at the take's own term. The log followed term 1, the first
+/// take's: no term is said to the elector, and the leave is the replica's
+/// own. The next step follows at once all the same, a renew period of a
+/// minute ahead of the clock's next step, and takes term 2.
+#[test]
+fn a_replica_alone_takes_again_at_once_at_the_term_its_log_followed() {
+    let name = "a@127.0.0.1:1";
+    let store = followed(1);
+    let elector = Elector::alone(name, unhurried()).expect("the settings are in order");
+    let (standing, stood) = watch::channel(ElectionObservation::default());
+    let looping = looping_over(elector, Arc::clone(&store), standing);
+    until("the retake above the followed term", || {
+        store.term() == 2 && stood.borrow().holder == name
+    });
+    assert_eq!(stood.borrow().term, 2);
+    assert_eq!(store.followed(), None);
+    until("the line of the lead", || looping.said(": leading"));
+    let (said, text) = looping.stopped_with(RETAKES);
+    assert_eq!(said, 1, "{text}");
+    assert_eq!(left_under(&text), [None], "{text}");
+    assert_eq!(text.matches("started no term").count(), 1, "{text}");
+    assert_eq!(text.matches(": leading").count(), 1, "{text}");
+}
+
+/// A stop that waits behind the log's leave ends the loop with no further
+/// take. The replica is alone over its lease and its log followed term 5:
+/// its first take, term 1, starts no term and is left in its own step. The
+/// stop stood on the channel before the loop began, so no clock decides: the
+/// loop reads it ahead of the take that would follow at once. The store
+/// stays under the first take's term, and no line says a lead.
+#[test]
+fn a_stop_queued_behind_the_logs_leave_ends_the_loop_with_no_further_take() {
+    let name = "a@127.0.0.1:1";
+    let store = followed(5);
+    let elector = Elector::alone(name, unhurried()).expect("the settings are in order");
+    let (standing, stood) = watch::channel(ElectionObservation::default());
+    let looping = looping_behind(elector, Arc::clone(&store), standing, vec![Word::Stop]);
+    let text = looping.ended();
+    // One take, the first: the store was told its term and no other, and
+    // its log leads none.
+    assert_eq!(store.term(), 1, "{text}");
+    assert_eq!(store.followed(), Some(5), "{text}");
+    // The last standing names nobody, under the term the leave said.
+    assert_eq!(
+        *stood.borrow(),
+        ElectionObservation {
+            holder: String::new(),
+            term: 5,
+            looked: true,
+        }
+    );
+    assert_eq!(lines_with(&text, "started no term"), 1, "{text}");
+    assert_eq!(lines_with(&text, RETAKES), 1, "{text}");
+    assert_eq!(lines_with(&text, ": leading"), 0, "{text}");
+}
+
+/// The same behind a word's leave. The replica alone leads under term 1. A
+/// word to leave, a stop and a word of term 7 stood on the channel before
+/// the loop began: the loop leaves at the first, and reads the stop ahead
+/// of its next take. The word behind the stop is not worked: the last
+/// standing holds term 1. One take was made, and one line says a lead.
+#[test]
+fn a_stop_queued_behind_a_words_leave_ends_the_loop_with_no_further_take() {
+    let name = "a@127.0.0.1:1";
+    let store = Arc::new(MemoryStore::new());
+    let elector = Elector::alone(name, unhurried()).expect("the settings are in order");
+    let (standing, stood) = watch::channel(ElectionObservation::default());
+    let ahead = vec![Word::StepDown(None), Word::Stop, Word::StepDown(Some(7))];
+    let looping = looping_behind(elector, Arc::clone(&store), standing, ahead);
+    let text = looping.ended();
+    assert_eq!(store.term(), 1, "{text}");
+    assert_eq!(
+        *stood.borrow(),
+        ElectionObservation {
+            holder: String::new(),
+            term: 1,
+            looked: true,
+        }
+    );
+    assert_eq!(lines_with(&text, RETAKES), 1, "{text}");
+    assert_eq!(lines_with(&text, ": leading"), 1, "{text}");
+}
+
+/// The same where the word that leaves says a term. A word of term 7 and a
+/// stop stood on the channel before the loop began: the replica counts the
+/// term and leaves its first lease for it, and reads the stop ahead of the
+/// take that would stand above the term. One take was made, and one line
+/// says a lead.
+#[test]
+fn a_stop_queued_behind_a_said_terms_leave_ends_the_loop_with_no_further_take() {
+    let name = "a@127.0.0.1:1";
+    let store = Arc::new(MemoryStore::new());
+    let elector = Elector::alone(name, unhurried()).expect("the settings are in order");
+    let (standing, stood) = watch::channel(ElectionObservation::default());
+    let ahead = vec![Word::StepDown(Some(7)), Word::Stop];
+    let looping = looping_behind(elector, Arc::clone(&store), standing, ahead);
+    let text = looping.ended();
+    assert_eq!(store.term(), 1, "{text}");
+    assert_eq!(
+        *stood.borrow(),
+        ElectionObservation {
+            holder: String::new(),
+            term: 7,
+            looked: true,
+        }
+    );
+    assert_eq!(lines_with(&text, RETAKES), 1, "{text}");
+    assert_eq!(lines_with(&text, ": leading"), 1, "{text}");
+}
+
+/// The same with a term said between the two, and the leave a planned
+/// hand-over's. A hand-over of term 1, a word of term 7 and a stop stood on
+/// the channel before the loop began: the loop leaves at the first, counts
+/// the term of the second with no lease held, and reads the stop ahead of
+/// the take that would stand above that term. One take was made, and one
+/// line says a lead. One line says a leave, and it names no term: the
+/// hand-over left the lease, and the word of term 7 found none to leave.
+#[test]
+fn a_stop_queued_behind_a_hand_over_and_a_said_term_ends_the_loop_with_no_further_take() {
+    let name = "a@127.0.0.1:1";
+    let store = Arc::new(MemoryStore::new());
+    let elector = Elector::alone(name, unhurried()).expect("the settings are in order");
+    let (standing, stood) = watch::channel(ElectionObservation::default());
+    let ahead = vec![Word::HandOver(1), Word::StepDown(Some(7)), Word::Stop];
+    let looping = looping_behind(elector, Arc::clone(&store), standing, ahead);
+    let text = looping.ended();
+    assert_eq!(store.term(), 1, "{text}");
+    assert_eq!(
+        *stood.borrow(),
+        ElectionObservation {
+            holder: String::new(),
+            term: 7,
+            looked: true,
+        }
+    );
+    assert_eq!(lines_with(&text, RETAKES), 1, "{text}");
+    assert_eq!(left_under(&text), [None], "{text}");
+    assert_eq!(lines_with(&text, ": leading"), 1, "{text}");
+}
+
+/// A channel closed behind a hand-over's leave ends the loop with no
+/// further take, as a stop read there does. The replica alone leads under
+/// term 1. A hand-over of that term stood on the channel, and the channel
+/// was closed behind it, before the loop began: the loop leaves at the
+/// word and finds the channel's end ahead of its next take. One take was
+/// made, and the one leave's line names no term.
+#[test]
+fn a_channel_closed_behind_a_hand_over_ends_the_loop_with_no_further_take() {
+    let name = "a@127.0.0.1:1";
+    let store = Arc::new(MemoryStore::new());
+    let elector = Elector::alone(name, unhurried()).expect("the settings are in order");
+    let (standing, stood) = watch::channel(ElectionObservation::default());
+    let ahead = vec![Word::HandOver(1)];
+    let looping = looping_on(elector, Arc::clone(&store), standing, ahead, true);
+    let text = looping.ended();
+    assert_eq!(store.term(), 1, "{text}");
+    assert_eq!(
+        *stood.borrow(),
+        ElectionObservation {
+            holder: String::new(),
+            term: 1,
+            looked: true,
+        }
+    );
+    assert_eq!(left_under(&text), [None], "{text}");
+    assert_eq!(lines_with(&text, ": leading"), 1, "{text}");
+}
+
+/// A term said behind a word's leave of a replica alone is counted ahead of
+/// the take, and the take stands above it. A word to leave and a word of
+/// term 7 stood on the channel before the loop began: the replica leaves its
+/// first lease, counts the term, and takes term 8. No take stands between
+/// the two: one leave was made, and two lines say a lead.
+#[test]
+fn a_term_said_behind_a_words_leave_is_counted_ahead_of_the_take() {
+    let name = "a@127.0.0.1:1";
+    let store = Arc::new(MemoryStore::new());
+    let elector = Elector::alone(name, unhurried()).expect("the settings are in order");
+    let (standing, stood) = watch::channel(ElectionObservation::default());
+    let ahead = vec![Word::StepDown(None), Word::StepDown(Some(7))];
+    let looping = looping_behind(elector, Arc::clone(&store), standing, ahead);
+    until("the take above the term said", || {
+        let stands = stood.borrow();
+        stands.holder == name && stands.term == 8
+    });
+    assert_eq!(store.term(), 8);
+    until("the line of the second lead", || {
+        looping.count(": leading") == 2
+    });
+    let (left, text) = looping.stopped_with("stepped down");
+    assert_eq!(left, 1, "{text}");
+    assert_eq!(text.matches(": leading").count(), 2, "{text}");
+}
+
+/// The same behind the log's leave. The replica alone took term 1 over a
+/// log that followed term 5, and a word of term 7 stood on the channel
+/// before the loop began. The loop leaves that take in its own step and
+/// counts the term said ahead of the take that follows at once: that take
+/// is term 8, and none stands at term 6. One line says a leave, and it
+/// names the followed term: the log's leave, with none at the word. One
+/// line says a lead.
+#[test]
+fn a_term_said_behind_the_logs_leave_is_counted_ahead_of_the_take() {
+    let name = "a@127.0.0.1:1";
+    let store = followed(5);
+    let elector = Elector::alone(name, unhurried()).expect("the settings are in order");
+    let (standing, stood) = watch::channel(ElectionObservation::default());
+    let ahead = vec![Word::StepDown(Some(7))];
+    let looping = looping_behind(elector, Arc::clone(&store), standing, ahead);
+    until("the take above the term said", || {
+        let stands = stood.borrow();
+        stands.holder == name && stands.term == 8
+    });
+    assert_eq!(store.term(), 8);
+    until("the line of the lead", || looping.said(": leading"));
+    let (said, text) = looping.stopped_with(RETAKES);
+    assert_eq!(said, 1, "{text}");
+    assert_eq!(left_under(&text), [Some(5)], "{text}");
+    assert_eq!(lines_with(&text, ": leading"), 1, "{text}");
 }
 
 /// A take over a store whose log followed the last term: the next take
@@ -1296,6 +1573,33 @@ fn looping_over(
     store: Arc<MemoryStore>,
     standing: watch::Sender<ElectionObservation>,
 ) -> Looping {
+    looping_behind(elector, store, standing, Vec::new())
+}
+
+/// The same with `ahead` on the loop's channel before its thread starts: the
+/// loop reads those words in their order, and no clock decides which step
+/// meets them.
+fn looping_behind(
+    elector: Elector,
+    store: Arc<MemoryStore>,
+    standing: watch::Sender<ElectionObservation>,
+    ahead: Vec<Word>,
+) -> Looping {
+    looping_on(elector, store, standing, ahead, false)
+}
+
+/// The same, with the channel `closed` behind `ahead` or left open. Closed,
+/// no sender is left when the thread starts: a loop that reads past those
+/// words finds the channel's end, as it does where the election's handle
+/// is dropped and no notifier holds the channel. Nothing can be sent to
+/// such a loop: [`Looping::ended`] waits it out.
+fn looping_on(
+    elector: Elector,
+    store: Arc<MemoryStore>,
+    standing: watch::Sender<ElectionObservation>,
+    ahead: Vec<Word>,
+    closed: bool,
+) -> Looping {
     let lines = Logged(Arc::new(Mutex::new(Vec::new())));
     let writer = lines.clone();
     let subscriber = tracing_subscriber::fmt()
@@ -1304,6 +1608,18 @@ fn looping_over(
         .finish();
     let beside = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
     let (stop, stopped) = mpsc::channel();
+    for word in ahead {
+        stop.send(word)
+            .expect("the channel's other end stands here");
+    }
+    // Closed, the sender the words went through is gone before the thread
+    // starts: the one kept beside the loop reaches nobody.
+    let stop = if closed {
+        drop(stop);
+        mpsc::channel().0
+    } else {
+        stop
+    };
     let thread = thread::spawn(move || {
         tracing::subscriber::with_default(subscriber, || {
             run(elector, &store, &standing, &stopped);
@@ -1323,6 +1639,21 @@ impl Looping {
         String::from_utf8_lossy(&self.lines.0.lock()).contains(words)
     }
 
+    /// How many of the lines so far hold `words`.
+    fn count(&self, words: &str) -> usize {
+        lines_with(&String::from_utf8_lossy(&self.lines.0.lock()), words)
+    }
+
+    /// Waits out, bounded, the end of a loop that a stop on its channel
+    /// ended, or the channel's end: the whole text.
+    fn ended(self) -> String {
+        until("the loop's end at its stop or its channel's end", || {
+            self.thread.is_finished()
+        });
+        self.thread.join().expect("the loop ends");
+        String::from_utf8(self.lines.0.lock().clone()).expect("the lines are text")
+    }
+
     /// Stops the loop, waits its end out, bounded, and counts the lines
     /// that hold `words`; the whole text comes back for a failure's
     /// message.
@@ -1333,8 +1664,7 @@ impl Looping {
         });
         self.thread.join().expect("the loop ends");
         let text = String::from_utf8(self.lines.0.lock().clone()).expect("the lines are text");
-        let count = text.lines().filter(|line| line.contains(words)).count();
-        (count, text)
+        (lines_with(&text, words), text)
     }
 }
 
@@ -2464,7 +2794,7 @@ fn a_replica_alone_over_its_own_lease_that_is_told_to_leave_leads_again_at_the_w
     // No other candidate can take a lease the elector made itself: a
     // word holds nothing back and the take follows it at once, a renew
     // period of a minute ahead of the next step by the clock. The line
-    // at the word says so.
+    // at the word says that the next step takes the lease again.
     let elector = Elector::alone("a@127.0.0.1:1", unhurried()).expect("the settings are in order");
     let fence = elector.fence();
     let (standing, stood) = watch::channel(ElectionObservation::default());
@@ -2483,7 +2813,7 @@ fn a_replica_alone_over_its_own_lease_that_is_told_to_leave_leads_again_at_the_w
         stood.borrow().holder == "a@127.0.0.1:1"
     });
     assert_eq!(stood.borrow().term, 8);
-    let (said, text) = looping.stopped_with("alone over its lease, takes it again at once");
+    let (said, text) = looping.stopped_with(RETAKES);
     assert_eq!(said, 1, "{text}");
     // The fence closed at the word, and the retake says it leads again.
     assert_eq!(text.matches(": leading").count(), 2, "{text}");

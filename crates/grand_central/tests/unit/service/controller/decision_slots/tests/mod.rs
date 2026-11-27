@@ -71,16 +71,12 @@ impl DecisionSlots {
     }
 }
 
-mod asked_again;
 mod busy;
-mod decode;
 pub(crate) mod encode;
 mod faults;
 mod fence;
 mod gateway;
-mod give_up;
 mod leases;
-mod marks;
 mod measured;
 mod named;
 mod pair;
@@ -271,7 +267,7 @@ pub(crate) fn written_ready(
         written,
         MembershipChange::Registered { .. } | MembershipChange::Replaced { .. }
     ) {
-        let row = objects.record(id).expect("the record the write laid");
+        let row = objects.read_row(id).expect("the row the write laid");
         objects.connect_row(store, id, row.revision);
     }
     id

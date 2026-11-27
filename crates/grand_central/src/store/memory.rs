@@ -815,7 +815,7 @@ impl MemoryStore {
     /// the call a host that decides in its own process makes
     /// (`InProcess::apply`). The session table and its pins, the records
     /// of sent prefixes and the stage objects of each profile that did not
-    /// change stand across the apply, with what they hold. A build without
+    /// change stand across the apply, as that call rules. A build without
     /// that feature keeps nothing: every stage is built new. That call
     /// runs under both locks, behind the last word that may refuse the
     /// generation: a generation the store does not publish is never in

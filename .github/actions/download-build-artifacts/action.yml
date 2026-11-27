@@ -1,8 +1,9 @@
 name: 'Download build artifacts'
 description: >-
-  The artifacts the build-wheel job published, into the paths the jobs read them
-  from: the wheel, the WASM test fixtures, the Python client types and the Go FFI
-  library, each when asked. Requires checkout to be done first.
+  The artifacts the build-wheel and build-go-ffi jobs published, into the paths
+  the jobs read them from: the wheel, the WASM test fixtures, the Python client
+  types and the Go FFI library, each when asked. Requires checkout to be done
+  first.
 
 inputs:
   wheel:
