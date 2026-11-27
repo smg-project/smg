@@ -418,28 +418,9 @@ async fn load_from_source(
     };
     tokenizer_shares::shares()
         .load(read, || {
-            load_off_the_runtime(source.to_owned(), chat_template.map(str::to_owned))
+            factory::create_tokenizer_async_with_chat_template(source, chat_template)
         })
         .await
-}
-
-/// One load on the blocking pool: the parse of a large vocabulary takes
-/// hundreds of milliseconds a runtime worker would be held from the requests
-/// it serves. A pool thread drives the factory's future to its end, a
-/// download from the hub included.
-async fn load_off_the_runtime(
-    source: String,
-    chat_template: Option<String>,
-) -> anyhow::Result<Arc<dyn Tokenizer>> {
-    let runtime = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || {
-        runtime.block_on(factory::create_tokenizer_async_with_chat_template(
-            &source,
-            chat_template.as_deref(),
-        ))
-    })
-    .await
-    .map_err(|ended| anyhow::anyhow!("The tokenizer load did not end: {ended}"))?
 }
 
 /// What a load that ended means for the step: a tokenizer loaded is logged
@@ -713,7 +694,7 @@ async fn fetch_bundle(worker: &dyn Worker) -> Result<StreamBundle, String> {
 /// The tokenizer of a bundle a worker served, loaded with the chat template;
 /// a multimodal configuration the bundle carries is registered under the
 /// tokenizer's id on the way. The bundle is unpacked and parsed on the
-/// blocking pool, as a load from files is (see [`load_off_the_runtime`]).
+/// blocking pool (see [`on_the_pool`]), as the factory parses a source.
 async fn install_bundle(
     app_context: &AppContext,
     tokenizer_id: &str,
@@ -722,11 +703,9 @@ async fn install_bundle(
     chat_template_path: Option<&str>,
 ) -> Result<Arc<dyn Tokenizer>, String> {
     let chat_template_path = chat_template_path.map(str::to_owned);
-    let (tokenizer, mm_config) = tokio::task::spawn_blocking(move || {
-        load_tokenizer_from_bundle(&bundle, chat_template_path.as_deref())
-    })
-    .await
-    .map_err(|ended| format!("bundle load did not end: {ended}"))??;
+    let (tokenizer, mm_config) =
+        on_the_pool(move || load_tokenizer_from_bundle(&bundle, chat_template_path.as_deref()))
+            .await?;
     if let Some(cfg) = mm_config {
         app_context
             .multimodal_config_registry
@@ -738,6 +717,15 @@ async fn install_bundle(
         );
     }
     Ok(tokenizer)
+}
+
+/// `work` on the blocking pool. A panic of it unwinds the caller, as it did
+/// when the work ran on the step's task: the engine ends the attempt as a
+/// panic, with no retry.
+async fn on_the_pool<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    tokio::task::spawn_blocking(work)
+        .await
+        .unwrap_or_else(|ended| std::panic::resume_unwind(ended.into_panic()))
 }
 
 // ============================================================================
@@ -835,8 +823,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        app_context::testing::app_context_for_tests, config::RouterConfig,
-        routers::grpc::backend_client::BasicWorkerBuilder,
+        app_context::testing::app_context_for_tests,
+        config::RouterConfig,
+        routers::grpc::{backend_client::BasicWorkerBuilder, multimodal::HubEnv},
     };
 
     #[test]
@@ -1411,8 +1400,16 @@ mod tests {
         assert_eq!(lines.load(Ordering::SeqCst), 0);
     }
 
-    /// A path that is not on this host fails from the pool in the factory's
-    /// words, as it did on the runtime: the hub is not asked for it.
+    /// A load that panics on the pool unwinds the step's task, as it did when
+    /// it ran there: it is not turned into a failed load the step retries.
+    #[tokio::test]
+    #[should_panic(expected = "the load panicked")]
+    async fn a_load_that_panics_on_the_pool_unwinds_its_step() {
+        on_the_pool(|| panic!("the load panicked")).await;
+    }
+
+    /// A path that is not on this host fails in the factory's words, as it
+    /// did before: the hub is not asked for it.
     #[tokio::test]
     async fn a_path_that_is_not_there_fails_as_it_did_on_the_runtime() {
         let error = load_from_source("/no/such/tokenizer", None)
@@ -1420,6 +1417,61 @@ mod tests {
             .err()
             .expect("nothing stands at the path");
         assert_eq!(error.to_string(), "File not found: /no/such/tokenizer");
+    }
+
+    /// A download that never ends stops with its step: the engine drops the
+    /// step's future when the step times out, and the request the load
+    /// holds at the Hub is closed with it, so nothing goes on downloading
+    /// behind the step. No network: the Hub is a loopback listener that
+    /// takes the request and never answers.
+    #[tokio::test]
+    async fn a_download_that_never_ends_stops_with_its_step() {
+        use tokio::io::AsyncReadExt;
+
+        const REPO: &str = "cell/never-answers";
+        let home = tempfile::tempdir().unwrap();
+        let hub = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", hub.local_addr().unwrap());
+        let _env = HubEnv::set(home.path(), &endpoint).await;
+
+        let app_context = app_context(WorkerRegistry::new());
+        let mut context = WorkflowContext::new(
+            WorkflowInstanceId::new(),
+            create_tokenizer_workflow_data(
+                request("never-answers", std::path::Path::new(REPO)),
+                Arc::clone(&app_context),
+            ),
+        );
+        let mut step = Box::pin(LoadTokenizerStep.execute(&mut context));
+
+        // The step runs until the Hub holds the download's request. The
+        // Hub's variables are process-wide, so a request of another test may
+        // come first: it is let go.
+        let request_for_repo = async {
+            loop {
+                let (mut socket, _) = hub.accept().await.unwrap();
+                let mut head = [0; 1024];
+                let read = socket.read(&mut head).await.unwrap_or(0);
+                if String::from_utf8_lossy(&head[..read]).contains(REPO) {
+                    break socket;
+                }
+            }
+        };
+        let mut asked = tokio::select! {
+            socket = request_for_repo => socket,
+            ended = &mut step => panic!("the step ended before the Hub was asked: {ended:?}"),
+        };
+
+        // The step times out: the engine drops its future.
+        drop(step);
+
+        let mut rest = Vec::new();
+        let closed =
+            tokio::time::timeout(Duration::from_secs(5), asked.read_to_end(&mut rest)).await;
+        assert!(
+            closed.is_ok(),
+            "the download holds its request at the Hub behind the step that timed out"
+        );
     }
 
     /// Two spellings of one directory are two sources: each name holds its
