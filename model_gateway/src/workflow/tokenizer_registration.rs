@@ -418,9 +418,28 @@ async fn load_from_source(
     };
     tokenizer_shares::shares()
         .load(read, || {
-            factory::create_tokenizer_async_with_chat_template(source, chat_template)
+            load_off_the_runtime(source.to_owned(), chat_template.map(str::to_owned))
         })
         .await
+}
+
+/// One load on the blocking pool: the parse of a large vocabulary takes
+/// hundreds of milliseconds a runtime worker would be held from the requests
+/// it serves. A pool thread drives the factory's future to its end, a
+/// download from the hub included.
+async fn load_off_the_runtime(
+    source: String,
+    chat_template: Option<String>,
+) -> anyhow::Result<Arc<dyn Tokenizer>> {
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        runtime.block_on(factory::create_tokenizer_async_with_chat_template(
+            &source,
+            chat_template.as_deref(),
+        ))
+    })
+    .await
+    .map_err(|ended| anyhow::anyhow!("The tokenizer load did not end: {ended}"))?
 }
 
 /// What a load that ended means for the step: a tokenizer loaded is logged
@@ -615,9 +634,11 @@ async fn fetch_tokenizer_from_worker(
             app_context,
             tokenizer_id,
             model_id,
-            &bundle,
+            bundle,
             chat_template_path,
-        ) {
+        )
+        .await
+        {
             Ok(tokenizer) => return Ok(tokenizer),
             Err(e) => {
                 let failure = format!("worker {} (runtime: {runtime}) {e}", worker.redacted_url());
@@ -691,15 +712,21 @@ async fn fetch_bundle(worker: &dyn Worker) -> Result<StreamBundle, String> {
 
 /// The tokenizer of a bundle a worker served, loaded with the chat template;
 /// a multimodal configuration the bundle carries is registered under the
-/// tokenizer's id on the way.
-fn install_bundle(
+/// tokenizer's id on the way. The bundle is unpacked and parsed on the
+/// blocking pool, as a load from files is (see [`load_off_the_runtime`]).
+async fn install_bundle(
     app_context: &AppContext,
     tokenizer_id: &str,
     model_id: &str,
-    bundle: &StreamBundle,
+    bundle: StreamBundle,
     chat_template_path: Option<&str>,
 ) -> Result<Arc<dyn Tokenizer>, String> {
-    let (tokenizer, mm_config) = load_tokenizer_from_bundle(bundle, chat_template_path)?;
+    let chat_template_path = chat_template_path.map(str::to_owned);
+    let (tokenizer, mm_config) = tokio::task::spawn_blocking(move || {
+        load_tokenizer_from_bundle(&bundle, chat_template_path.as_deref())
+    })
+    .await
+    .map_err(|ended| format!("bundle load did not end: {ended}"))??;
     if let Some(cfg) = mm_config {
         app_context
             .multimodal_config_registry
@@ -800,6 +827,8 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use openai_protocol::{model_card::ModelCard, worker::WorkerType};
     use smg_worker::test_support::no_health_check;
     use wfaas::WorkflowInstanceId;
@@ -828,15 +857,34 @@ mod tests {
         assert_eq!(statuses, [Ready, Pending]);
     }
 
-    #[test]
-    fn worker_tokenizer_bundle_preserves_configured_template() {
+    /// A bundle as a worker serves it: a zip archive of `files` and its
+    /// SHA-256.
+    fn bundle_of<const N: usize>(files: [(&str, String); N]) -> StreamBundle {
         use std::io::{Cursor, Write};
 
         use sha2::{Digest, Sha256};
         use zip::{write::SimpleFileOptions, ZipWriter};
 
         let mut archive = ZipWriter::new(Cursor::new(Vec::new()));
-        for (name, data) in [
+        for (name, data) in files {
+            archive
+                .start_file(name, SimpleFileOptions::default())
+                .unwrap();
+            archive.write_all(data.as_bytes()).unwrap();
+        }
+        let compressed_data = archive.finish().unwrap().into_inner();
+        StreamBundle {
+            sha256: Sha256::digest(&compressed_data)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            compressed_data,
+        }
+    }
+
+    #[test]
+    fn worker_tokenizer_bundle_preserves_configured_template() {
+        let bundle = bundle_of([
             (
                 "tokenizer.json",
                 serde_json::json!({
@@ -844,26 +892,14 @@ mod tests {
                     "normalizer":null, "pre_tokenizer":{"type":"Whitespace"},
                     "post_processor":null, "decoder":null,
                     "model":{"type":"BPE", "vocab":{"hello":0}, "merges":[]}
-                }),
+                })
+                .to_string(),
             ),
             (
                 "tokenizer_config.json",
-                serde_json::json!({"chat_template":"worker_default"}),
+                serde_json::json!({"chat_template":"worker_default"}).to_string(),
             ),
-        ] {
-            archive
-                .start_file(name, SimpleFileOptions::default())
-                .unwrap();
-            archive.write_all(data.to_string().as_bytes()).unwrap();
-        }
-        let compressed_data = archive.finish().unwrap().into_inner();
-        let bundle = StreamBundle {
-            sha256: Sha256::digest(&compressed_data)
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect(),
-            compressed_data,
-        };
+        ]);
         let dir = tempfile::tempdir().unwrap();
         let template = dir.path().join("override.jinja");
         std::fs::write(&template, "router_override").unwrap();
@@ -1318,6 +1354,72 @@ mod tests {
         assert!(Arc::ptr_eq(&first.tokenizer, &second.tokenizer));
         assert_ne!(first.id, second.id);
         assert_eq!(app_context.tokenizer_registry.len(), 2);
+    }
+
+    /// A count of the factory's log lines written on this thread from here
+    /// on, with the guard that keeps the count running: a test runs on one
+    /// runtime thread, and a load that parsed on it would write them there.
+    fn factory_lines_on_this_thread() -> (Arc<AtomicUsize>, tracing::subscriber::DefaultGuard) {
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+        struct FactoryLines(Arc<AtomicUsize>);
+        impl<S: tracing::Subscriber> Layer<S> for FactoryLines {
+            fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+                if event.metadata().target().starts_with("llm_tokenizer") {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+
+        let lines = Arc::new(AtomicUsize::new(0));
+        let on_this_thread = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(FactoryLines(Arc::clone(&lines))),
+        );
+        (lines, on_this_thread)
+    }
+
+    #[tokio::test]
+    async fn a_load_from_files_parses_off_the_runtime_thread() {
+        let dir = test_support::tokenizer_dir();
+        let source = dir.path().to_str().unwrap();
+        let (lines, _on_this_thread) = factory_lines_on_this_thread();
+
+        // The factory logs as it loads a directory: the zero below is a
+        // count of something.
+        factory::create_tokenizer_with_chat_template(source, None).unwrap();
+        assert!(lines.swap(0, Ordering::SeqCst) > 0);
+
+        load_from_source(source, None).await.unwrap();
+        assert_eq!(lines.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_load_from_a_workers_bundle_parses_off_the_runtime_thread() {
+        let dir = test_support::tokenizer_dir();
+        let tokenizer = std::fs::read_to_string(dir.path().join("tokenizer.json")).unwrap();
+        let bundle = bundle_of([("tokenizer.json", tokenizer)]);
+        let app_context = app_context(WorkerRegistry::new());
+        let (lines, _on_this_thread) = factory_lines_on_this_thread();
+
+        // As above: the factory logs as it loads an unpacked bundle.
+        load_tokenizer_from_bundle(&bundle, None).unwrap();
+        assert!(lines.swap(0, Ordering::SeqCst) > 0);
+
+        install_bundle(&app_context, "t", "m", bundle, None)
+            .await
+            .unwrap();
+        assert_eq!(lines.load(Ordering::SeqCst), 0);
+    }
+
+    /// A path that is not on this host fails from the pool in the factory's
+    /// words, as it did on the runtime: the hub is not asked for it.
+    #[tokio::test]
+    async fn a_path_that_is_not_there_fails_as_it_did_on_the_runtime() {
+        let error = load_from_source("/no/such/tokenizer", None)
+            .await
+            .err()
+            .expect("nothing stands at the path");
+        assert_eq!(error.to_string(), "File not found: /no/such/tokenizer");
     }
 
     /// Two spellings of one directory are two sources: each name holds its
