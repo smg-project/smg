@@ -5779,8 +5779,8 @@ impl Engine {
             filters.chain(scorers).chain([picker]).collect::<Vec<_>>()
         };
         // The standing profiles' places by their names, read once: each
-        // profile finds its twin at one lookup, so the keep grows with the
-        // profiles and not by their square.
+        // profile finds its twin at one lookup. That search no longer grows
+        // by the profiles' square; the walk of the counts below still may.
         let mut places = HashMap::with_capacity(standing.profiles.len());
         for (at, stood) in standing.profiles.iter().enumerate() {
             places.entry(stood.name.as_str()).or_insert(at);
@@ -9976,7 +9976,7 @@ fn tell_completed<'p>(
 /// thousand applies holds a thousand profiles once.
 ///
 /// A host that tells leases off a file of its own names the engine whole
-/// as one too ([`Engine::stands`]): every profile hears, under no
+/// as one too (`Engine::stands`): every profile hears, under no
 /// generation's bound, so a profile made under the last generation a
 /// document can bear hears as any other.
 #[cfg(feature = "in-process")]

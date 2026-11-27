@@ -11,8 +11,8 @@
 //! (`.github/bench-gates/grand-central-engine.toml`).
 //!
 //! Under the feature `in-process`, one apply on a running engine whose
-//! document gained one profile at each of its generations, as a host's does
-//! that registers one model at a time. Ids:
+//! document gained one profile at each of its generations, as a supplied
+//! spec may. Ids:
 //! `engine/spec/apply_grown/<profiles>` at ten, a hundred and a thousand
 //! profiles. A row is the check of the document and its apply: the engine
 //! keeps every profile, each made under a generation of its own, and holds

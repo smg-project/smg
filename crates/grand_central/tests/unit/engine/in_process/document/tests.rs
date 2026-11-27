@@ -791,8 +791,8 @@ fn a_lease_of_the_last_generation_reaches_the_profile_its_document_built() {
 /// generations they were made under, and nothing for an earlier
 /// generation: a word of an older lease is told by the generations the
 /// document's own profiles were made under ([`InForce::stood_at`]). Twelve
-/// documents each add one profile and keep the ones that stand, as a host
-/// does that registers one model at a time. Under the last, a dispatch of
+/// documents each add one profile and keep the ones that stand, as a
+/// supplied spec may. Under the last, a dispatch of
 /// a lease of each earlier generation reaches the profiles made by then,
 /// one more a generation, and a lease of the document's own generation or
 /// of one above it reaches the eleven it kept. Each profile's object is
