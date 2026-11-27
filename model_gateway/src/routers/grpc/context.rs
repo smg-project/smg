@@ -402,14 +402,16 @@ pub(crate) struct RoutingSnapshot {
     /// same demand.
     pub decode_needs_vision: bool,
     /// The model's language model computes token positions from the grid
-    /// tensors (the spec's answer the preprocessed media carries,
-    /// `MultimodalIntermediate::language_model_reads_grids`), noted at first
-    /// selection so dispatch picks the decode side's form under the same
-    /// answer: a language-model-only decode worker takes a grid-bearing
-    /// request's decode side stripped only when it is `false`. `true` for a
-    /// request the gateway did not preprocess, the answer that keeps the
-    /// refusal. The snapshot has no default: worker selection writes every
-    /// field.
+    /// tensors, noted at first selection so a retry, a second ask for the
+    /// decode and the dispatch read the decode side's form under the same
+    /// answer: a language-model-only decode worker takes a request's decode
+    /// side stripped only when it is `false`. It is the spec's answer the
+    /// preprocessed media carries
+    /// (`MultimodalIntermediate::language_model_reads_grids`), or a
+    /// references plan's (`MediaPlan::language_model_reads_grids`) for a
+    /// single-sample request in prefill/decode mode; `true`, the answer that
+    /// keeps the refusal, for every other request. The snapshot has no
+    /// default: worker selection writes every field.
     pub language_model_reads_grids: bool,
 }
 

@@ -588,6 +588,7 @@ impl Bed {
                     media_refs: request.references,
                     vision: request.images,
                     pipeline: PipelinePin::Any,
+                    refs_stripped_decode: false,
                 },
                 decode_vision: request.decode_images,
                 image_fanout: request.fanout,

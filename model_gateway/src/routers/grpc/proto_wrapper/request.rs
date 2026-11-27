@@ -437,6 +437,24 @@ impl ProtoGenerateRequest {
         matches!(self, Self::Vllm(req) if req.media_refs.is_some())
     }
 
+    /// Strip this vLLM request in place to the media content hashes it
+    /// carries: no references, and each batch cut to its hashes and modality
+    /// (no pixels, grids or placeholders), the side a language-model-only
+    /// decode worker takes. The same cut as [`Self::clone_without_mm`]'s, on
+    /// the request itself. Another engine's request carries no media
+    /// identity and is left as it is.
+    pub fn strip_mm_to_hashes(&mut self) {
+        if let Self::Vllm(req) = self {
+            req.media_refs = None;
+            req.mm_inputs = req.mm_inputs.as_ref().and_then(vllm_mm_hash_identity);
+            req.extra_mm_inputs = req
+                .extra_mm_inputs
+                .iter()
+                .filter_map(vllm_mm_hash_identity)
+                .collect();
+        }
+    }
+
     /// Replace this vLLM request's media references with the identity the
     /// prefill side produced: the expanded prompt ids and the pixel-less
     /// per-modality inputs, in the shape a router-preprocessed decode side has.

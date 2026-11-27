@@ -114,6 +114,12 @@ pub(crate) async fn prepare_rendered_prompt(
                     .get(Modality::Image)
                     .and_then(|anchor| tokenizer.token_to_id(anchor));
             }
+            // Whether the language model reads the grid tensors decides if a
+            // language-model-only decode worker can take the stripped side;
+            // the spec answered in placeholder preparation, and worker
+            // selection reads it off the plan.
+            let mut media_plan = media_plan;
+            media_plan.set_language_model_reads_grids(placeholders.language_model_reads_grids());
             multimodal_refs = Some(media_plan);
         } else {
             // Preparation asked the matrix with a worker that processes
