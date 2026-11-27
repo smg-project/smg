@@ -2051,6 +2051,40 @@ jobs:
       min_selected: 4 # the 4 PD multimodal cases
     secrets: inherit
 
+  # Worker-side media processing on the AMD NIXL prefill/decode pair. The
+  # complete multimodal module retains Qwen placement and Phi router fallback.
+  e2e-2gpu-pd-mm-worker-amd:
+    name: e2e-2gpu-pd-mm-worker-amd (vllm)
+    needs: [e2e-1gpu-gateway-vllm-amd, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_VLLM_PD_MM_WORKER == 'true'
+      && vars.SMG_RUNNER_AMD_GPU_2 != ''
+      && needs.e2e-1gpu-gateway-vllm-amd.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: vllm
+      gpu_tier: "2"
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_2 }}
+      # Original lane's 40/34-minute budgets; not yet measured on AMD.
+      timeout: 40
+      test_timeout: 34
+      test_dirs: e2e_test/router/test_pd_multimodal.py
+      vllm_kv_backend: nixl
+      mm_processing: worker
+      # The prefill/decode placement assertions read this per-request line.
+      worker_log_filter: info,engine_servicer::request=debug
+      min_selected: 7 # All original methods must be selected; GPU results are separate
+      gpu_vendor: amd
+      container_image: vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+    secrets: inherit
+
   # === 4 GPU ===
 
   # The 4-GPU lanes follow their 1-GPU prerequisite and, like the PD lanes,
@@ -2661,7 +2695,7 @@ jobs:
           path: benchmark_go_bindings/
 
   finish:
-    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-chat-python-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-cpu-mock, e2e-vendor, go-unit-tests, go-bindings-e2e, e2e-1gpu-completions-vllm-amd, e2e-1gpu-embeddings-vllm-amd, e2e-1gpu-gateway-vllm-amd]
+    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-chat-python-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-cpu-mock, e2e-vendor, go-unit-tests, go-bindings-e2e, e2e-1gpu-completions-vllm-amd, e2e-1gpu-embeddings-vllm-amd, e2e-1gpu-gateway-vllm-amd, e2e-2gpu-pd-mm-worker-amd]
     if: always()
     # A hosted runner, never a self-hosted pool: this job runs on a cancelled
     # run too, and a cancelled run is complete only once it has run. Until
@@ -2743,6 +2777,7 @@ jobs:
                 "${{ needs.e2e-1gpu-completions-vllm-amd.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-embeddings-vllm-amd.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-gateway-vllm-amd.result }}" =~ $bad || \
+                "${{ needs.e2e-2gpu-pd-mm-worker-amd.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat-python-servicer.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat-mm-worker.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat-zmq.result }}" =~ $bad || \
