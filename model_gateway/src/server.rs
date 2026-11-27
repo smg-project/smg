@@ -2009,8 +2009,9 @@ async fn start_workflow_engines(
         info!("Startup tokenizer job submitted (will complete in background)");
     }
 
-    // A worker that no workflow registers here (a mesh peer's) gets its
-    // model's tokenizer job from the registry's events.
+    // A worker that no workflow registers or removes here (a mesh peer's)
+    // gets its model's tokenizer job and the close of its pooled encode
+    // connections from the registry's events.
     spawn_worker_event_reactions(app_context);
 
     info!(
