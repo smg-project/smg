@@ -2694,6 +2694,17 @@ impl WorkerSelectionStage {
         let capable = |worker: &Arc<dyn Worker>| capable_for(worker, demand.encode);
         available_encode.retain(capable);
         let registered_encode = snapshot.pool(RoutingPool::GrpcEncode);
+        // A pair that lacks the request's cache partition fields is a fact of
+        // membership. An encoder that is down is not. So the pair gap comes
+        // first: when no pair lists the fields, no encoder can help.
+        let partition = demand.partition;
+        let pairs = snapshot.pd_pairs(PdWire::Grpc, self.policy_registry.pd_pairing_mode());
+        if partition.any()
+            && pair_admitted_by(&pairs, demand.wire, &|_| true)
+            && !pair_admitted_by(&pairs, demand.wire, &|worker| partition.met_by(worker))
+        {
+            return Err(EpdSelectionFailure::CachePartitionUnsupported(partition));
+        }
         if needs_encode && available_encode.is_empty() {
             // Only membership can prove a permanent configuration gap.
             return Err(if registered_encode.iter().any(capable) {
@@ -2742,7 +2753,6 @@ impl WorkerSelectionStage {
                 || worker.worker_type() != &WorkerType::Decode
                 || vision_capable(worker)
         };
-        let pairs = snapshot.pd_pairs(PdWire::Grpc, self.policy_registry.pd_pairing_mode());
         let ec_pair_exists = pair_admitted_by(&pairs, demand.wire, &registered_ec);
         if !ec_pair_exists && pair_admitted_by(&pairs, demand.wire, &|_| true) {
             return Err(EpdSelectionFailure::EcIncompatible);
@@ -2755,7 +2765,6 @@ impl WorkerSelectionStage {
         }
         // The encoders take no cache partition field; the pair takes them all.
         // The pair must also meet the decode vision demand above.
-        let partition = demand.partition;
         let applies = |worker: &dyn Worker| registered_ec(worker) && partition.met_by(worker);
         if partition.any()
             && ec_pair_exists

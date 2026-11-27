@@ -537,3 +537,47 @@ async fn a_decode_asked_again_moves_only_to_a_decode_that_lists_the_fields() {
         "a salted request does not move to a decode that drops the salt"
     );
 }
+
+/// A pair that lacks the fields is a fact of membership. An encoder that is
+/// down is not. So with the encoder down, a salted request that no pair takes
+/// still gets the 400, and a request without a field gets the 503.
+#[test]
+fn an_epd_pair_gap_is_judged_before_the_encoder_health() {
+    let model_id = "test-model";
+    let registry = ec_registry(
+        model_id,
+        &[
+            (9691, WorkerType::Encode, "ECCPUConnector"),
+            (9692, WorkerType::Prefill, "ECCPUConnector"),
+            (9693, WorkerType::Decode, "ECCPUConnector"),
+        ],
+    );
+    registry
+        .get_by_url("grpc://127.0.0.1:9691")
+        .unwrap()
+        .set_status(WorkerStatus::NotReady);
+    let stage = stage(&registry, WorkerSelectionMode::EncodePrefillDecode);
+    let pick = |partition| {
+        stage.select_encode_prefill_decode_workers(
+            model_id,
+            PlacementInputs::default(),
+            &[vec![1]],
+            EpdDemands {
+                wire: None,
+                encode: MediaDemands::NONE,
+                decode_vision: false,
+                image_fanout: false,
+                partition,
+            },
+            None,
+        )
+    };
+    assert!(matches!(
+        pick(CachePartitionDemand::default()),
+        Err(EpdSelectionFailure::Unavailable)
+    ));
+    assert!(matches!(
+        pick(salt()),
+        Err(EpdSelectionFailure::CachePartitionUnsupported(_))
+    ));
+}
