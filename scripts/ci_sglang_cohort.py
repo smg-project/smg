@@ -165,14 +165,18 @@ class BorrowedPackages:
         )
 
 
-def activate(manifest_path):
+def activate(manifest_path, *, manifest_bytes=None):
     """Validate origins before importing protected packages in a fresh process."""
-    spec = json.loads(Path(manifest_path).read_text())
+    spec = json.loads(
+        Path(manifest_path).read_bytes() if manifest_bytes is None else manifest_bytes
+    )
     site = Path(__file__).resolve().parent
     if Path(sys.prefix).resolve() != Path(spec["interpreter_prefix"]):
         raise ValueError("Wrong cohort interpreter")
     if not sys.flags.isolated or not sys.flags.dont_write_bytecode:
         raise ValueError("Cohort requires the original -I and explicit -B")
+    if spec["python_version"] != list(sys.version_info[:2]):
+        raise ValueError("Cohort Python version differs")
     _check_child_launch(spec)
     cache = canonical(spec["pycache_prefix"])
     if not cache.is_relative_to(Path(sys.prefix).resolve()) or any(cache.iterdir()):
@@ -215,7 +219,7 @@ def activate(manifest_path):
         if not any(Path(p["module_path"]).is_relative_to(base) for base in borrowed)
     }
     # Plain path insertion deliberately does not process borrowed .pth files.
-    sys.path[:0] = [str(p) for p in roots]
+    sys.path.extend(str(p) for p in roots)
     # The finder explicitly checks ordinary owned paths first, then merges
     # namespace providers without exposing the borrowed site as a startup path.
     if borrowed:
@@ -246,6 +250,13 @@ def activate(manifest_path):
         if len(matches) != 1:
             raise ValueError("Ambiguous or missing distribution metadata")
         dist = matches[0]
+        # RECORD entries cannot establish which METADATA the selected
+        # PathDistribution itself reads. Bind that directory independently.
+        if not isinstance(dist, metadata.PathDistribution):
+            raise ValueError("Filesystem distribution metadata required")
+        own_metadata = checked_file(Path(dist._path) / "METADATA", root, package["metadata_sha256"])
+        if own_metadata != meta:
+            raise ValueError("Selected distribution metadata origin differs")
         candidates = [
             Path(dist.locate_file(f)).resolve()
             for f in dist.files or ()
@@ -280,8 +291,9 @@ def start():
             return
         if "sitecustomize" in sys.modules:
             raise ValueError("Foreign sitecustomize was already loaded")
-        module.SMG_COHORT = activate(manifest)
-        module.SMG_MANIFEST_SHA256 = digest(manifest)
+        manifest_bytes = manifest.read_bytes()
+        module.SMG_COHORT = activate(manifest, manifest_bytes=manifest_bytes)
+        module.SMG_MANIFEST_SHA256 = hashlib.sha256(manifest_bytes).hexdigest()
         # Borrowed sitecustomize must not run after plain path insertion. This
         # interpreter's reviewed bootstrap owns the startup module instead.
         sys.modules["sitecustomize"] = module
@@ -302,7 +314,14 @@ def verify_loaded(observed):
 
 
 def create(
-    prefix, import_roots, packages, *, borrowed_sites=(), isolated_children=False, backend_hook=None
+    prefix,
+    import_roots,
+    packages,
+    *,
+    borrowed_sites=(),
+    isolated_children=False,
+    backend_hook=None,
+    editable_projects=None,
 ):
     """Create only an empty no-pip venv plus its reviewed bootstrap files.
 
@@ -315,36 +334,60 @@ def create(
         raise ValueError("Fresh exclusive prefix required")
     roots = [str(canonical(p)) for p in import_roots]
     borrowed = [str(canonical(p)) for p in borrowed_sites]
+    if editable_projects is not None and not isinstance(editable_projects, dict):
+        raise ValueError("Explicit editable project mapping required")
+    editable = {}
+    for project, locations in (editable_projects or {}).items():
+        project = str(canonical(project))
+        if not isinstance(locations, (list, tuple)) or not locations:
+            raise ValueError("Explicit editable import root list required")
+        locations = [str(canonical(path)) for path in locations]
+        if not locations or not set(locations) <= set(roots):
+            raise ValueError("Editable import roots must be explicit owned import roots")
+        editable[project] = locations
     if set(roots) & set(borrowed):
         raise ValueError("Owned and borrowed data roots must be distinct")
-    venv.EnvBuilder(with_pip=False, system_site_packages=False, symlinks=False).create(prefix)
-    sites = list(prefix.glob("lib/python*/site-packages"))
-    if len(sites) != 1 or list(sites[0].iterdir()):
-        raise ValueError("Unexpected fresh venv site layout")
-    site = sites[0]
-    target = site / "ci_sglang_cohort.py"
-    shutil.copyfile(__file__, target)
-    cache = prefix / "source-cache"
-    cache.mkdir()
-    spec = {
-        "interpreter_prefix": str(prefix),
-        "bootstrap_sha256": digest(target),
-        "import_roots": roots,
-        "borrowed_sites": borrowed,
-        "pycache_prefix": str(cache),
-        "packages": packages,
-    }
-    if isolated_children:
-        spec.update(_isolated_launchers(prefix))
-        spec["backend_hook"] = backend_hook
-    if borrowed:
-        metadata_path = prefix / "borrowed-metadata"
-        metadata_path.mkdir()
-        spec["borrowed_metadata_path"] = str(metadata_path)
-    manifest = site / "smg-cohort.json"
-    manifest.write_text(json.dumps(spec, indent=2) + "\n")
-    # The interpreter site remains installation-free. All package payloads go
-    # to separate data roots. Python catches .pth exceptions by default, so
-    # start() must terminate on failure before any consumer can execute.
-    (site / "00-smg-cohort.pth").write_text(BOOTSTRAP_PTH)
-    return prefix / "bin/python"
+    prefix.mkdir(mode=0o700)  # Exclusive reservation before EnvBuilder can reuse it.
+    identity = prefix.stat().st_dev, prefix.stat().st_ino
+    try:
+        venv.EnvBuilder(with_pip=False, system_site_packages=False, symlinks=False).create(prefix)
+        sites = list(prefix.glob("lib/python*/site-packages"))
+        if len(sites) != 1 or list(sites[0].iterdir()):
+            raise ValueError("Unexpected fresh venv site layout")
+        site = sites[0]
+        target = site / "ci_sglang_cohort.py"
+        shutil.copyfile(__file__, target)
+        cache = prefix / "source-cache"
+        cache.mkdir()
+        spec = {
+            "interpreter_prefix": str(prefix),
+            "python_version": list(sys.version_info[:2]),
+            "editable_projects": editable,
+            "bootstrap_sha256": digest(target),
+            "import_roots": roots,
+            "borrowed_sites": borrowed,
+            "pycache_prefix": str(cache),
+            "packages": packages,
+        }
+        if isolated_children:
+            spec.update(_isolated_launchers(prefix))
+            spec["backend_hook"] = backend_hook
+        if borrowed:
+            metadata_path = prefix / "borrowed-metadata"
+            metadata_path.mkdir()
+            spec["borrowed_metadata_path"] = str(metadata_path)
+        manifest = site / "smg-cohort.json"
+        manifest.write_text(json.dumps(spec, indent=2) + "\n")
+        # The interpreter site remains installation-free. All package payloads go
+        # to separate data roots. Python catches .pth exceptions by default, so
+        # start() must terminate on failure before any consumer can execute.
+        (site / "00-smg-cohort.pth").write_text(BOOTSTRAP_PTH)
+        return prefix / "bin/python"
+    except BaseException:
+        # Clean only the directory reserved by this invocation. A substituted
+        # path belongs to neither this call nor its failure cleanup.
+        if not prefix.is_symlink() and prefix.is_dir():
+            actual = prefix.stat()
+            if (actual.st_dev, actual.st_ino) == identity:
+                shutil.rmtree(prefix)
+        raise

@@ -1,20 +1,14 @@
-#!/usr/bin/env python3
-"""Install and report the fixed-image GPT-OSS 20B SDK source pair.
+"""Observe the fixed-image SDK source pair for the shared native verifier.
 
-Only an explicitly opted-in AMD SGLang job may use this CLI. This report
-qualifies SDK source bytes; it is not native, numerical or model acceptance.
-The original packed-checkpoint numeric probe remains a separate prerequisite.
+A5 supplies source_hashes/verify_installed only. The opted-in SDK patch installer
+and its pinned patch payload belong to the separate specialized SDK change.
+This observer never edits SDK files or executes an installation CLI.
 """
 
-import argparse
 import hashlib
 import importlib.util
-import json
 import os
-import shutil
-import subprocess
 from pathlib import Path
-from tempfile import NamedTemporaryFile, TemporaryDirectory
 
 ROW_ENV = "E2E_SGLANG_GPTOSS_MXFP4_BF16"
 IMAGE = "lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d"
@@ -28,7 +22,6 @@ FILES = {
         "b0f90a0b1e539657e5d23ac4893550975136e5c46d7deb2e07e724f7d94f9e5c",
     ),
 }
-PATCH = Path(__file__).with_name("patches") / "sglang-0.5.21-gptoss-gfx942.patch"
 PATCH_SHA = "db59b663d2e4a0f87f6bd7f788ade509a60780bfa0d756b5c63eddb77fe4422e"
 
 
@@ -53,7 +46,7 @@ def source_hashes(root):
         if (
             path.is_symlink()
             or not path.is_file()
-            or not path.resolve().is_relative_to(root.resolve())
+            or (not path.resolve().is_relative_to(root.resolve()))
         ):
             raise RuntimeError("Invalid SGLang SDK source: " + name)
         hashes[name] = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -63,7 +56,7 @@ def source_hashes(root):
 def verify_installed(root=None):
     root = sdk_root() if root is None else root
     actual = source_hashes(root)
-    expected = {name: pair[int(enabled())] for name, pair in FILES.items()}
+    expected = {name: pair[int(enabled())] for (name, pair) in FILES.items()}
     if actual != expected:
         raise RuntimeError("Unexpected or mixed SGLang MXFP4 SDK source pair: " + repr(actual))
     return {
@@ -74,117 +67,7 @@ def verify_installed(root=None):
     }
 
 
-def install(root):
-    if not enabled():
-        return verify_installed(root)
-    actual = source_hashes(root)
-    original = {name: pair[0] for name, pair in FILES.items()}
-    patched = {name: pair[1] for name, pair in FILES.items()}
-    if actual == patched:
-        return verify_installed(root)
-    if actual != original:
-        raise RuntimeError("Refuse to patch unknown or mixed SGLang SDK sources")
-    if hashlib.sha256(PATCH.read_bytes()).hexdigest() != PATCH_SHA:
-        raise RuntimeError("SGLang compatibility patch bytes changed")
-    # Validate both outputs on disposable copies before any installed SDK write.
-    with TemporaryDirectory(prefix="smg-sglang-mxfp4-") as tmp:
-        stage = Path(tmp)
-        for name in FILES:
-            target = stage / "sglang" / name
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(root / name, target)
-        subprocess.run(
-            [
-                "patch",
-                "--batch",
-                "--forward",
-                "--fuzz=0",
-                "-p2",
-                "-d",
-                str(stage),
-                "-i",
-                str(PATCH.resolve()),
-            ],
-            check=True,
-            capture_output=True,
-            timeout=10,
-        )
-        if source_hashes(stage / "sglang") != patched:
-            raise RuntimeError("SGLang compatibility patch output differs")
-        for name in FILES:
-            target = root / name
-            temporary = None
-            try:
-                with NamedTemporaryFile(
-                    dir=target.parent, prefix=".smg-mxfp4-", delete=False
-                ) as stream:
-                    temporary = Path(stream.name)
-                    os.fchmod(stream.fileno(), target.stat().st_mode & 0o777)
-                    stream.write((stage / "sglang" / name).read_bytes())
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                os.replace(temporary, target)
-            finally:
-                if temporary is not None:
-                    temporary.unlink(missing_ok=True)
-    return verify_installed(root)
-
-
-def main(argv=None):
-    """Export a fresh prepared/final source report without overwriting evidence."""
-    from importlib.metadata import version
-
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--verify-only", action="store_true")
-    parser.add_argument("--phase", choices=("prepared", "final"))
-    parser.add_argument("--output", type=Path)
-    args = parser.parse_args(argv)
-    if args.phase and not args.verify_only:
-        parser.error("--phase requires --verify-only")
-    # Reserve evidence before touching the SDK. An existing report is an error,
-    # including a symlink, and cannot cause a second installation attempt.
-    report = args.output.open("x", encoding="utf-8") if args.output else None
-    record = {
-        "status": "failed",
-        "phase": args.phase or ("verify" if args.verify_only else "install"),
-        "scope": "SDK source pair only; not numerical/native/model acceptance",
-        "image": os.environ.get("SMG_SGLANG_ROCM_IMAGE"),
-        "patch_sha256": PATCH_SHA,
-    }
-    try:
-        if (
-            os.environ.get("E2E_ENGINE") != "sglang"
-            or os.environ.get("E2E_GPU_VENDOR") != "amd"
-            or not enabled()
-            or os.environ.get("SMG_SGLANG_ROCM_IMAGE") != IMAGE
-        ):
-            raise RuntimeError("Explicit AMD SGLang fixed-image 20B profile required")
-        record["sglang_version"] = version("sglang")
-        if record["sglang_version"] != "0.5.21":
-            raise RuntimeError("Unsupported SGLang version for the checked MXFP4 patch")
-        root = sdk_root()
-        record["sdk"] = verify_installed(root) if args.verify_only else install(root)
-        record["status"] = "pass"
-        return 0
-    except Exception as error:
-        record["error"] = {"type": type(error).__name__, "message": str(error)[:2048]}
-        if isinstance(error, (subprocess.CalledProcessError, subprocess.TimeoutExpired)):
-            for stream in ("stdout", "stderr"):
-                captured = getattr(error, stream, None)
-                if captured is not None:
-                    if isinstance(captured, bytes):
-                        captured = captured.decode(errors="replace")
-                    record["error"][stream] = captured[-1024:]
-        return 1
-    finally:
-        body = json.dumps(record, sort_keys=True) + "\n"
-        if report is not None:
-            try:
-                report.write(body)
-            finally:
-                report.close()
-        print(body, end="")
-
-
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(
+        "SDK source observer has no install CLI; use the separate specialized SDK producer"
+    )

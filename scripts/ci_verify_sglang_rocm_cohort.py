@@ -138,6 +138,20 @@ def _source_imports():
             sys.pycache_prefix, sys.dont_write_bytecode = previous
 
 
+def sdk_source_root(*, private_cohort=False):
+    """Bind the SDK observer to its own provider, not the sibling native site."""
+    from ci_sglang_mxfp4_fallback import sdk_root
+
+    root = sdk_root()
+    if private_cohort:
+        boot = sys.modules["ci_sglang_cohort"]
+        expected = Path(boot.SMG_COHORT["sglang"]["module_path"]).parent
+        require(
+            root == expected and root == root.resolve(), "SDK origin differs from active cohort"
+        )
+    return root
+
+
 def verify(report, *, private_cohort=False):
     if private_cohort:
         from ci_sglang_native_paths import current_layout
@@ -186,7 +200,7 @@ def verify(report, *, private_cohort=False):
     )
     from ci_sglang_mxfp4_fallback import verify_installed
 
-    report["gptoss_mxfp4_sdk"] = verify_installed()
+    report["gptoss_mxfp4_sdk"] = verify_installed(sdk_source_root(private_cohort=private_cohort))
     if private_cohort:
         root = layout["site"]
         require(root.is_relative_to(layout["scope"]), "Unexpected cohort site-packages")

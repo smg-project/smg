@@ -5,11 +5,13 @@ caller must prepare the owned SDK and interpreter before invoking this API.
 """
 
 import argparse
+import csv
 import hashlib
 import json
 import os
+import re
 import subprocess
-import sys
+from email.parser import Parser
 from pathlib import Path
 
 from ci_verify_sglang_rocm_cohort import CONSTRAINT, CONSTRAINT_SHA, IMAGE
@@ -60,7 +62,7 @@ def directory(path):
     return path
 
 
-def install_command(manifest_path, arguments):
+def install_command(manifest_path, arguments, *, cwd=None):
     """Validate the declared transaction without importing or executing pip."""
     manifest_path = Path(manifest_path)
     spec = json.loads(manifest_path.read_text())
@@ -75,8 +77,17 @@ def install_command(manifest_path, arguments):
         or target.is_relative_to(Path("/opt/venv"))
     ):
         raise ValueError("Installation must target separate owned cohort data")
-    site = target / f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
-    if str(directory(site)) not in spec["import_roots"]:
+    version = spec["python_version"]
+    if (
+        not isinstance(version, list)
+        or len(version) != 2
+        or any(type(part) is not int or part < 0 for part in version)
+    ):
+        raise ValueError("Explicit cohort Python version required")
+    site = directory(target / f"lib/python{version[0]}.{version[1]}/site-packages")
+    if site.is_relative_to(prefix):
+        raise ValueError("Install site must be outside the interpreter prefix")
+    if str(site) not in spec["import_roots"]:
         raise ValueError("Install scheme is absent from the cohort import contract")
     python = prefix / "bin/python"
     bootstrap = manifest_path.with_name("ci_sglang_cohort.py")
@@ -95,11 +106,21 @@ def install_command(manifest_path, arguments):
         raise ValueError("Complete nonempty pip arguments required")
     if any(a.split("=", 1)[0] in DESTINATION_OPTIONS for a in arguments):
         raise ValueError("Caller cannot override the private install destination")
+
+    def editable(value):
+        project = directory((Path.cwd() if cwd is None else Path(cwd)) / value.split("[", 1)[0])
+        roots = spec.get("editable_projects", {}).get(str(project))
+        if not roots or any(str(directory(root)) not in spec["import_roots"] for root in roots):
+            raise ValueError("Editable project requires explicit cohort import mapping")
+
     needs_value = False
+    option = None
     for argument in arguments:
         if needs_value:
             if argument.startswith("-"):
                 raise ValueError("Missing explicit pip option value")
+            if option in ("-e", "--editable"):
+                editable(argument)
             needs_value = False
             continue
         if argument.startswith("-"):
@@ -107,6 +128,9 @@ def install_command(manifest_path, arguments):
             if name in TAIL_VALUES:
                 if equal and not value:
                     raise ValueError("Empty pip option value")
+                if name in ("-e", "--editable") and equal:
+                    editable(value)
+                option = name
                 needs_value = not equal
             elif name not in TAIL_SWITCHES or equal:
                 raise ValueError("Undeclared pip option or destination abbreviation")
@@ -117,7 +141,20 @@ def install_command(manifest_path, arguments):
     constraints = os.environ.get("PIP_CONSTRAINT", "")
     if str(CONSTRAINT) not in constraints.split():
         raise ValueError("Original Torch constraint input is absent")
-    environment = {k: v for k, v in os.environ.items() if k not in DESTINATION_ENV}
+    # pip accepts every long option through PIP_* as well as argv. Keep only
+    # the original registry/TLS inputs; all behavior is explicit in arguments.
+    registry = {
+        "PIP_INDEX_URL",
+        "PIP_EXTRA_INDEX_URL",
+        "PIP_TRUSTED_HOST",
+        "PIP_CERT",
+        "PIP_CLIENT_CERT",
+    }
+    environment = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in DESTINATION_ENV and (not k.startswith("PIP_") or k in registry)
+    }
     environment["PIP_CONSTRAINT"] = constraints
     environment["PIP_CONFIG_FILE"] = os.devnull
     # Actual captured pip metadata/__init__.py30-60 permits this override.
@@ -149,9 +186,82 @@ def install_command(manifest_path, arguments):
     return command, environment
 
 
+def installed_records(manifest_path):
+    """Observe only the owned target; never import or uninstall a distribution."""
+    spec = json.loads(Path(manifest_path).read_bytes())
+    target = directory(spec["install_prefix"])
+    major, minor = spec["python_version"]
+    site = directory(target / f"lib/python{major}.{minor}/site-packages")
+    found = {}
+    for folder in site.glob("*.dist-info"):
+        directory(folder)
+        metadata, record = folder / "METADATA", folder / "RECORD"
+        if any(path.is_symlink() or not path.is_file() for path in (metadata, record)):
+            raise ValueError("Owned installed metadata/RECORD must be regular files")
+        name = Parser().parsestr(metadata.read_text())["Name"]
+        if not name:
+            raise ValueError("Owned distribution name is missing")
+        name = re.sub(r"[-_.]+", "-", name).lower()
+        if name in found:
+            raise ValueError("Owned package replacement produced duplicate metadata: " + name)
+        paths = set()
+        for row in csv.reader(record.read_text().splitlines()):
+            if len(row) != 3 or not row[0] or Path(row[0]).is_absolute():
+                raise ValueError("Invalid owned installed RECORD")
+            path = site / row[0]
+            if path.is_symlink() or not path.resolve().is_relative_to(target):
+                raise ValueError("Owned installed RECORD escapes its target")
+            paths.add(path.resolve())
+        found[name] = paths
+    return found
+
+
 def install(manifest_path, arguments, *, cwd, timeout=600):
-    command, environment = install_command(manifest_path, arguments)
-    subprocess.run(command, env=environment, cwd=directory(cwd), check=True, timeout=timeout)
+    """Install with full arguments; refuse ambiguous or stale owned replacements.
+
+    pip's outside-venv uninstall guard also protects this sibling target. A
+    replacement that requires old-file cleanup is unsupported: fail the job
+    instead of reporting success or deleting unproven files. Retry in a fresh
+    owned scope after that failure, never reuse the partial installation.
+    """
+    cwd = directory(cwd)
+    command, environment = install_command(manifest_path, arguments, cwd=cwd)
+    spec = json.loads(Path(manifest_path).read_bytes())
+    scope = directory(spec["interpreter_prefix"]).parent
+    marker = scope / ".private-pip-transaction"
+    # Retain a failed/in-flight transaction across ci_retry and process exits.
+    # Only a fully successful transaction removes its own exact marker.
+    fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as stream:
+        identity = os.fstat(stream.fileno())
+        json.dump({"manifest": str(manifest_path), "sha256": digest(manifest_path)}, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
+    parent_fd = os.open(scope, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+    before = installed_records(manifest_path)
+    subprocess.run(command, env=environment, cwd=cwd, check=True, timeout=timeout)
+    after = installed_records(manifest_path)
+    claimed = set().union(*after.values()) if after else set()
+    if any(name not in after for name in before):
+        raise ValueError("Owned distribution disappeared during install")
+    if any(
+        path.exists() or path.is_symlink() for paths in before.values() for path in paths - claimed
+    ):
+        raise ValueError("Owned package replacement left stale files; fresh scope required")
+
+    actual = marker.stat()
+    if marker.is_symlink() or (actual.st_dev, actual.st_ino) != (identity.st_dev, identity.st_ino):
+        raise ValueError("Owned transaction marker changed")
+    marker.unlink()
+    parent_fd = os.open(scope, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
 
 
 def main(argv=None):

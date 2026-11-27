@@ -170,7 +170,9 @@ def test_source_cache_redirect_ignores_valid_old_pyc_for_owned_and_borrowed(coho
         source = Path(entry["module_path"])
         source.write_text("VALUE = 'stale'\n")
         stamp = source.stat()
-        py_compile.compile(str(source), doraise=True)
+        py_compile.compile(
+            str(source), doraise=True, invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP
+        )
         source.write_text("VALUE = 'fresh'\n")
         os.utime(source, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
         assert digest(source) == entry["source_sha256"]
@@ -247,7 +249,15 @@ def private_pip(cohort, monkeypatch):
     for name in ("home", "tmp", "cache", "build-tracker"):
         (cohort.root / name).mkdir()
     spec = json.loads(cohort.manifest.read_text())
-    spec.update(image=api.IMAGE, install_prefix=str(target))
+    project = cohort.root / "fixture-project"
+    project.mkdir()
+    (project / "editablefixture.py").write_text("VALUE='editable'\n")
+    spec.update(
+        image=api.IMAGE,
+        install_prefix=str(target),
+        editable_projects={str(project): [str(project)]},
+    )
+    spec["import_roots"].append(str(project))
     spec["import_roots"].append(str(site))
     cohort.manifest.write_text(json.dumps(spec))
     return api, cohort, target
@@ -255,7 +265,9 @@ def private_pip(cohort, monkeypatch):
 
 def test_private_install_command_preserves_full_dependencies_and_owns_write_inputs(private_pip):
     api, cohort, target = private_pip
-    command, env = api.install_command(cohort.manifest, ["-e", "fixture-project"])
+    command, env = api.install_command(
+        cohort.manifest, ["-e", str(cohort.root / "fixture-project")]
+    )
     assert command == [
         str(cohort.python),
         "-m",
@@ -267,7 +279,7 @@ def test_private_install_command_preserves_full_dependencies_and_owns_write_inpu
         "--no-compile",
         "--no-build-isolation",
         "-e",
-        "fixture-project",
+        str(cohort.root / "fixture-project"),
     ]
     assert "--no-deps" not in command and "--ignore-installed" not in command
     assert "PIP_TARGET" not in env and "PYTHONPATH" not in env
@@ -377,3 +389,218 @@ def test_original_sdk_pre_observer_rejects_changed_or_aliased_fixture_bytes(tmp_
     source.symlink_to(tmp_path / "outside.py")
     with pytest.raises(RuntimeError, match="Invalid SGLang SDK source"):
         observer.source_hashes(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "name", ["PIP_PYTHON", "PIP_NO_DEPS", "PIP_DRY_RUN", "PIP_REQUIREMENT", "PIP_EDITABLE"]
+)
+def test_inherited_pip_behavior_cannot_override_complete_arguments(private_pip, monkeypatch, name):
+    api, cohort, _ = private_pip
+    monkeypatch.setenv(name, "untrusted")
+    monkeypatch.setenv("PIP_INDEX_URL", "https://fixture.invalid/simple")
+    command, env = api.install_command(cohort.manifest, ["fixture-package", "--no-deps"])
+    assert name not in env
+    assert "--no-deps" in command
+    assert env["PIP_INDEX_URL"] == "https://fixture.invalid/simple"
+    assert env["PIP_CONSTRAINT"] == str(api.CONSTRAINT)
+
+
+def test_editable_needs_declared_mapping_and_fresh_child_can_import_it(private_pip):
+    api, cohort, _ = private_pip
+    project = cohort.root / "fixture-project"
+    api.install_command(cohort.manifest, ["-e", str(project)])
+    result = child(
+        cohort.python, "import editablefixture; assert editablefixture.VALUE=='editable'"
+    )
+    assert result.returncode == 0, result.stderr
+    spec = json.loads(cohort.manifest.read_text())
+    spec["editable_projects"] = {}
+    cohort.manifest.write_text(json.dumps(spec))
+    with pytest.raises(ValueError, match="explicit cohort import mapping"):
+        api.install_command(cohort.manifest, ["--editable=" + str(project)])
+
+
+def test_transaction_scheme_uses_declared_cohort_minor(private_pip):
+    api, cohort, target = private_pip
+    spec = json.loads(cohort.manifest.read_text())
+    minor = sys.version_info.minor + 1
+    site = target / f"lib/python3.{minor}/site-packages"
+    site.mkdir(parents=True)
+    spec["python_version"] = [3, minor]
+    spec["import_roots"].append(str(site))
+    cohort.manifest.write_text(json.dumps(spec))
+    # Command construction observes the declared scheme; executing the foreign
+    # version manifest would be rejected by the actual interpreter bootstrap.
+    api.install_command(cohort.manifest, ["fixture-package"])
+
+
+def test_create_failure_removes_only_its_reserved_prefix(tmp_path, monkeypatch):
+    api = load("ci_sglang_cohort")
+    prefix = tmp_path / "new-interpreter"
+
+    def fail(_self, path):
+        (path / "bin").mkdir()
+        (path / "bin/python").write_text("partial launcher")
+        raise OSError("fixture setup failure")
+
+    monkeypatch.setattr(api.venv.EnvBuilder, "create", fail)
+    with pytest.raises(OSError, match="fixture setup failure"):
+        api.create(prefix, [], [])
+    assert not prefix.exists()
+
+
+def test_exclusive_reservation_refuses_a_creator_that_lost_the_race(tmp_path, monkeypatch):
+    api = load("ci_sglang_cohort")
+    prefix = tmp_path / "interpreter"
+    prefix.mkdir()
+    marker = prefix / "other-owner"
+    marker.touch()
+    exists = Path.exists
+    monkeypatch.setattr(Path, "exists", lambda p: False if p == prefix else exists(p))
+    with pytest.raises(FileExistsError):
+        api.create(prefix, [], [])
+    assert marker.is_file()
+
+
+def test_stdlib_stays_before_unprotected_owned_module(cohort):
+    (cohort.owned / "colorsys.py").write_text("raise RuntimeError('owned stdlib shadow')\n")
+    result = child(cohort.python, "import colorsys; assert colorsys.rgb_to_hsv(1,0,0)==(0.0,1.0,1)")
+    assert result.returncode == 0, result.stderr
+
+
+def test_distribution_cannot_redirect_record_to_another_metadata_file(cohort):
+    entry = cohort.packages[0]
+    original = Path(entry["metadata_path"]).parent
+    nested = cohort.owned / "pins" / original.name
+    nested.parent.mkdir()
+    original.rename(nested)
+    decoy = cohort.owned / "decoy.dist-info"
+    decoy.mkdir()
+    (decoy / "METADATA").write_text("Name: ownedfixture\nVersion: 1.0\nUnverified: yes\n")
+    (decoy / "RECORD").write_text(str((nested / "METADATA").relative_to(cohort.owned)) + ",,\n")
+    spec = json.loads(cohort.manifest.read_text())
+    spec["packages"][0]["metadata_path"] = str(nested / "METADATA")
+    cohort.manifest.write_text(json.dumps(spec))
+    result = child(cohort.python, "print('CONSUMER_EXECUTED')")
+    assert result.returncode == 78
+    assert "CONSUMER_EXECUTED" not in result.stdout
+
+
+def test_start_hashes_exactly_the_manifest_bytes_it_validated(cohort, monkeypatch):
+    api = cohort.api
+    before = cohort.manifest.read_bytes()
+    monkeypatch.setattr(api, "__file__", str(cohort.manifest.with_name("ci_sglang_cohort.py")))
+    monkeypatch.setitem(sys.modules, "ci_sglang_cohort", api)
+    monkeypatch.delitem(sys.modules, "sitecustomize", raising=False)
+
+    def validate(path, *, manifest_bytes=None):
+        assert manifest_bytes == before
+        path.write_bytes(before + b" ")
+        return {}
+
+    def exit_refused(code):
+        raise RuntimeError("refused startup " + str(code))
+
+    monkeypatch.setattr(api, "activate", validate)
+    monkeypatch.setattr(api, "os", types.SimpleNamespace(write=lambda *_: None, _exit=exit_refused))
+    api.start()
+    assert api.SMG_MANIFEST_SHA256 == hashlib.sha256(before).hexdigest()
+    with pytest.raises(RuntimeError, match="refused startup 78"):
+        api.start()
+
+
+def test_sdk_root_matches_its_approved_provider_not_the_native_site(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(SCRIPTS))
+    native = load("ci_verify_sglang_rocm_cohort")
+    import ci_sglang_mxfp4_fallback as observer
+
+    sdk = tmp_path / "sdk-site/sglang"
+    sdk.mkdir(parents=True)
+    boot = types.SimpleNamespace(SMG_COHORT={"sglang": {"module_path": str(sdk / "__init__.py")}})
+    monkeypatch.setitem(sys.modules, "ci_sglang_cohort", boot)
+    monkeypatch.setattr(observer, "sdk_root", lambda: sdk)
+    assert native.sdk_source_root(private_cohort=True) == sdk
+    monkeypatch.setattr(observer, "sdk_root", lambda: tmp_path / "foreign-sdk")
+    with pytest.raises(RuntimeError, match="SDK origin differs"):
+        native.sdk_source_root(private_cohort=True)
+
+
+@pytest.mark.parametrize("mode", ["new_distribution", "version_replacement", "stale_same_version"])
+def test_owned_transactions_refuse_mixed_or_stale_replacements(private_pip, monkeypatch, mode):
+    api, cohort, target = private_pip
+    site = target / f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
+
+    def dist(name, version, extra=False):
+        folder = site / f"{name}-{version}.dist-info"
+        folder.mkdir(exist_ok=True)
+        (folder / "METADATA").write_text(f"Name: {name}\nVersion: {version}\n")
+        paths = [f"{folder.name}/METADATA", f"{folder.name}/RECORD", f"{name}.py"]
+        (site / f"{name}.py").write_text("# harmless fixture\n")
+        if extra:
+            (site / "old_only.py").touch()
+            paths.append("old_only.py")
+        (folder / "RECORD").write_text("".join(p + ",,\n" for p in paths))
+
+    dist("fixture", "1.0", extra=True)
+
+    def transaction(*args, **kwargs):
+        if mode == "new_distribution":
+            dist("another", "1.0")
+        elif mode == "version_replacement":
+            dist("fixture", "2.0")
+        else:
+            dist("fixture", "1.0")
+
+    monkeypatch.setattr(api, "subprocess", types.SimpleNamespace(run=transaction))
+    if mode == "new_distribution":
+        api.install(cohort.manifest, ["fixture-input"], cwd=cohort.root)
+        assert not (cohort.root / ".private-pip-transaction").exists()
+        api.install(cohort.manifest, ["fixture-input"], cwd=cohort.root)
+        assert not (cohort.root / ".private-pip-transaction").exists()
+    else:
+        with pytest.raises(ValueError, match="duplicate metadata|stale files"):
+            api.install(cohort.manifest, ["fixture-input", "--upgrade"], cwd=cohort.root)
+        assert (cohort.root / ".private-pip-transaction").is_file()
+        # ci_retry must not turn the second attempt into success after a new
+        # RECORD has forgotten the stale file retained by the failed attempt.
+        monkeypatch.setattr(api, "subprocess", types.SimpleNamespace(run=lambda *a, **k: None))
+        with pytest.raises(FileExistsError):
+            api.install(cohort.manifest, ["fixture-input"], cwd=cohort.root)
+
+
+def test_computed_site_cannot_be_inside_an_ancestor_target_interpreter(private_pip):
+    api, cohort, _ = private_pip
+    prefix = cohort.root / "lib"
+    site = prefix / f"python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
+    # The venv itself uses lib/lib/pythonX.Y; the target scheme below would
+    # still write inside the interpreter even though target is its ancestor.
+    python = cohort.api.create(prefix, [cohort.owned], [cohort.packages[0]], isolated_children=True)
+    site.mkdir(parents=True)
+    manifest = next(prefix.glob("lib/python*/site-packages/smg-cohort.json"))
+    spec = json.loads(manifest.read_text())
+    spec.update(image=api.IMAGE, install_prefix=str(cohort.root))
+    spec["import_roots"].append(str(site))
+    manifest.write_text(json.dumps(spec))
+    assert python.is_file()
+    with pytest.raises(ValueError, match="Install site must be outside"):
+        api.install_command(manifest, ["fixture-input"])
+
+
+def test_shared_observer_does_not_expose_a_dead_specialized_install_cli(tmp_path):
+    report = tmp_path / "must-not-be-created.json"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            str(SCRIPTS / "ci_sglang_mxfp4_fallback.py"),
+            "--output",
+            str(report),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode != 0
+    assert "no install CLI" in result.stderr
+    assert not report.exists()
