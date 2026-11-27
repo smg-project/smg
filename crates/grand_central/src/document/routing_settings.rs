@@ -153,7 +153,7 @@ use crate::{
 #[derive(Clone, Debug, PartialEq)]
 #[expect(
     clippy::exhaustive_structs,
-    reason = "closed by its doc: a gateway names every setting, and a new one must stop its build"
+    reason = "closed by its doc: a literal that names every setting stops its build at a new one"
 )]
 pub struct RoutingSettings {
     /// The kinds of worker the gateway routes to, with each side's own policy.
@@ -280,7 +280,7 @@ pub enum ConnectionModeSetting {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[expect(
     clippy::exhaustive_structs,
-    reason = "closed by its doc: a gateway names every setting, and a new one must stop its build"
+    reason = "closed by its doc: a literal that names every setting stops its build at a new one"
 )]
 pub struct RoutingKeyOverrideSettings {
     /// A request that carries a sticky key is placed by the sticky sessions'
