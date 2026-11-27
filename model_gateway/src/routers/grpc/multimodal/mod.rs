@@ -332,6 +332,10 @@ pub(crate) struct MultimodalIntermediate {
     /// when no batch is images; a video's or an audio clip's placeholders
     /// are not image tokens.
     image_prompt_tokens: Option<u32>,
+    /// Whether the model's language model computes token positions from the
+    /// grid tensors (`ModelProcessorSpec::language_model_reads_grids`).
+    /// `true` until the spec says otherwise.
+    language_model_reads_grids: bool,
 }
 
 impl MultimodalIntermediate {
@@ -356,6 +360,7 @@ impl MultimodalIntermediate {
             batches,
             encoder_input_format: EncoderInputFormat::Reference,
             image_prompt_tokens: None,
+            language_model_reads_grids: true,
         })
     }
 
@@ -381,10 +386,30 @@ impl MultimodalIntermediate {
         &self.batches
     }
 
-    /// Whether a batch carries the grid tensors a disaggregated decode side
-    /// derives its positions from ([`VLLM_MROPE_GRID_KEYS`]): such a side
-    /// cannot be served by a decode worker without a vision encoder.
-    pub(crate) fn has_mrope_grids(&self) -> bool {
+    pub(crate) fn with_language_model_reads_grids(
+        mut self,
+        language_model_reads_grids: bool,
+    ) -> Self {
+        self.language_model_reads_grids = language_model_reads_grids;
+        self
+    }
+
+    /// The spec's answer: whether the model's language model computes token
+    /// positions from the grid tensors.
+    pub(crate) fn language_model_reads_grids(&self) -> bool {
+        self.language_model_reads_grids
+    }
+
+    /// Whether a disaggregated decode side of this request derives its
+    /// positions from grid tensors: a batch carries them
+    /// ([`VLLM_MROPE_GRID_KEYS`]) and the model's language model reads them
+    /// ([`Self::language_model_reads_grids`]). Such a side cannot be served
+    /// by a decode worker without a vision encoder.
+    pub(crate) fn decode_side_needs_grids(&self) -> bool {
+        self.language_model_reads_grids && self.has_grids()
+    }
+
+    fn has_grids(&self) -> bool {
         self.batches.iter().any(|batch| {
             batch
                 .preprocessed

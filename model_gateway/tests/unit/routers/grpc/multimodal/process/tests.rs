@@ -6,6 +6,21 @@ use llm_multimodal::{
 use super::*;
 use crate::observability::metrics::test_support::global_recorder;
 
+/// A tokenizer with no vocabulary, for a spec lookup that reads the model's
+/// config alone.
+struct NoTokenizer;
+impl Tokenizer for NoTokenizer {
+    fn token_to_id(&self, _token: &str) -> Option<u32> {
+        None
+    }
+    fn id_to_token(&self, _id: u32) -> Option<String> {
+        None
+    }
+    fn encode_text(&self, _text: &str) -> Option<Vec<u32>> {
+        None
+    }
+}
+
 /// The queue wait is measured on the pool thread before the work and
 /// recorded there: a task behind the one held thread records at least
 /// the time from its queueing to the hold's release and at most the time
@@ -338,18 +353,6 @@ fn preprocessor_config_for_video_is_the_video_config_when_shipped() {
 /// samples a clip the way its processor groups it.
 #[test]
 fn video_sampling_reads_the_processors_config() {
-    struct NoTokenizer;
-    impl Tokenizer for NoTokenizer {
-        fn token_to_id(&self, _token: &str) -> Option<u32> {
-            None
-        }
-        fn id_to_token(&self, _id: u32) -> Option<String> {
-            None
-        }
-        fn encode_text(&self, _text: &str) -> Option<Vec<u32>> {
-            None
-        }
-    }
     let model = serde_json::json!({
         "model_type": "muse_spark", "image_token_id": 1, "video_token_id": 2
     });
@@ -571,6 +574,49 @@ fn image_prompt_tokens_are_the_image_replacements_alone() {
         "a video's placeholders are not image tokens"
     );
     assert_eq!(image_prompt_tokens(std::iter::empty()), None);
+}
+
+/// The intermediate takes the spec's answer to whether the language model
+/// reads the grid tensors: MiniMax M3's grids feed only its vision tower,
+/// and Qwen2-VL keeps the default, that its positions read them.
+#[test]
+fn the_intermediate_carries_the_specs_answer_on_the_grids() {
+    let registry = ModelRegistry::new();
+    let intermediate = |model_id: &str, model_type: &str| {
+        let config = serde_json::json!({ "model_type": model_type });
+        let spec = registry
+            .lookup(&ModelMetadata {
+                model_id,
+                tokenizer: &NoTokenizer,
+                config: &config,
+            })
+            .expect("the family's spec");
+        let image = Arc::new(ImageFrame::new(
+            image::RgbImage::new(28, 28).into(),
+            Default::default(),
+            Default::default(),
+            ImageSource::InlineBytes,
+            model_id.to_string(),
+        ));
+        let part = PreparedMultimodalPart {
+            preprocessed: PreprocessedEncoderInputs::new(
+                ndarray::Array2::<f32>::zeros((1, 1)),
+                vec![1],
+                vec![(28, 28)],
+            ),
+            media: MediaBatch::Images(vec![image]),
+            prompt_replacements: Vec::new(),
+            search_token_id: None,
+            placeholder_token_id: None,
+            field_layouts: spec.encoder_field_layouts_for(Modality::Image),
+            keep_on_cpu_keys: Vec::new(),
+            encoder_input_key: None,
+        };
+        intermediate_of(vec![part], vec![Vec::new()], spec).expect("one image batch")
+    };
+
+    assert!(!intermediate("MiniMax-M3", "minimax_m3_vl").language_model_reads_grids());
+    assert!(intermediate("Qwen2-VL-7B-Instruct", "qwen2_vl").language_model_reads_grids());
 }
 
 #[test]
