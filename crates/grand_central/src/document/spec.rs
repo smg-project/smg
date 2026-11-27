@@ -2994,12 +2994,6 @@ impl SpecError {
             }
             Self::PlanPhases { index, .. } => format!("bindings[{index}].match.phase"),
             Self::BadModelGlob { index, .. } => format!("bindings[{index}].match.model"),
-            // The one sessions refusal that is about the binding's plan.
-            Self::BadSessions {
-                index,
-                name: "plan",
-                ..
-            } => format!("bindings[{index}].plan"),
             Self::BadSessions { index, name, .. } => format!("bindings[{index}].sessions.{name}"),
             Self::NoBindings { .. } => "bindings".to_owned(),
             Self::IndexOverlap { first, .. } => format!("index.{first}"),
@@ -5142,6 +5136,11 @@ fn check_binding(
     Ok(built)
 }
 
+/// [`UNTOLD_ON_FILE`] under the `epd` plan, whose pair's two sides the same
+/// file keeps no word of: the refusal names the plan its rule stands under.
+const UNTOLD_ON_FILE_EPD: &str =
+    "`told` under the epd plan in this build: a file of leases keeps no side's word";
+
 /// Why a sessions rule that keeps what it places from the profile is refused
 /// under the `pd-pair` plan in the build of a host that makes some of the
 /// lifecycle's calls only ([`session_rule`]), as the refusal prints it
@@ -5165,30 +5164,29 @@ const UNTOLD_ON_FILE: &str =
 ///
 /// Under the `epd` plan the rule runs on the pair's two sides, each by its
 /// own session, and places no item. An item goes by its side's policy.
-/// The rule is in the build of a host that makes the lifecycle's calls,
-/// under either word. The build of a host that makes some only refuses it
-/// by the plan's name, with a cap or with none. The rule is not in that
-/// build at all, and an encode request's frame names no count of a key's
-/// requests on its rows.
+/// The rule is in both builds where it tells its stages, and under a cap
+/// each side's records carry the count as a pair's do. A rule that keeps
+/// what it places from the profile is refused as under `pd-pair`: by the
+/// field's name, in the build of a host that makes some calls only. Its
+/// reason names the plan it stands under.
 fn session_rule(
     sessions: &SessionsSpec,
     index: usize,
     plan: Plan,
     lifecycle: bool,
 ) -> Result<SessionRule, SpecError> {
+    // The word a file of leases keeps for no side of a pair, in the build
+    // of the host that tells a lease's words off that file.
+    let untold = sessions.rule_placed != RulePlaced::Told && !lifecycle;
     let refused = match plan {
-        Plan::Single => None,
-        Plan::PdPair if sessions.rule_placed != RulePlaced::Told && !lifecycle => {
-            Some(("rule_placed", UNTOLD_ON_FILE))
-        }
-        Plan::PdPair => None,
-        Plan::Epd { .. } if !lifecycle => Some(("plan", "`single` or `pd-pair`")),
-        Plan::Epd { .. } => None,
+        Plan::PdPair if untold => Some(UNTOLD_ON_FILE),
+        Plan::Epd { .. } if untold => Some(UNTOLD_ON_FILE_EPD),
+        Plan::Single | Plan::PdPair | Plan::Epd { .. } => None,
     };
-    if let Some((name, reason)) = refused {
+    if let Some(reason) = refused {
         return Err(SpecError::BadSessions {
             index,
-            name,
+            name: "rule_placed",
             reason,
         });
     }

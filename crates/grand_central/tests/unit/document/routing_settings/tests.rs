@@ -10,6 +10,7 @@ use crate::{
         view::Phase,
     },
     policies::cache_aware::Gates,
+    stages::StageRegistry,
 };
 
 /// The settings of a gateway that sets none, as its configuration
@@ -1928,7 +1929,9 @@ fn one_router_and_the_encode_mode_say_the_document_they_said() {
                 }
                 for settings in kinds {
                     let row = format!("{name}, {:?}, {connection_mode:?}", settings.mode);
-                    assert!(matches!(three_sided(&settings), Ok(None)), "{row}");
+                    let (mode, main) = (&settings.mode, &settings.policy);
+                    let three = three_sided(mode, main, settings.enable_igw);
+                    assert!(matches!(three, Ok(None)), "{row}");
                     let document = settings.policy_document();
                     assert_eq!(document, before_three_sides(&settings), "{row}");
                     said += usize::from(document.is_ok());
@@ -1979,7 +1982,8 @@ fn many_routers_keep_the_plan_they_had_where_three_sides_have_no_document() {
     // What the plan of three sides says alone: the setting it is
     // refused by, or a document the check refuses.
     let three = |settings: &RoutingSettings| {
-        let plan = three_sided(settings).expect("the plan's presets");
+        let plan = three_sided(&settings.mode, &settings.policy, settings.enable_igw);
+        let plan = plan.expect("the plan's presets");
         written(settings, plan.expect("a plan of three sides"))
     };
     let refused_by = |settings: &RoutingSettings| match three(settings) {
@@ -2063,6 +2067,11 @@ fn the_manual_policy_on_both_sides_of_a_pair_runs_under_three_sides() {
             decode_policy: decode,
         }
     };
+    // The stock controller checks a document in a catalog with no stage
+    // that needs the lifecycle's calls. It takes each plan of three sides
+    // below: the manual policy's rule tells its stages.
+    let served = StageRegistry::builtin().without_lifecycle();
+    let on_file = |document: &PolicySpec| document.validate_in(&served, &[]).err();
 
     // A pair mode of many routers: the document it said under two
     // families, with the encode side ahead of the pair's two.
@@ -2076,6 +2085,7 @@ fn the_manual_policy_on_both_sides_of_a_pair_runs_under_three_sides() {
     assert_eq!(three, with_encode_side(two_families));
     assert_eq!(three.bindings[0].sessions, rule);
     assert_eq!(validated(&three).err(), None);
+    assert_eq!(on_file(&three), None);
     // A label is written into that plan, between its two bindings.
     let labelled = with_labels(&pairs, &[("m", "random")]).expect("a labelled one");
     assert_eq!(labelled.bindings.len(), 3);
@@ -2097,6 +2107,7 @@ fn the_manual_policy_on_both_sides_of_a_pair_runs_under_three_sides() {
     assert_eq!(three.bindings[0].sessions, rule);
     assert_eq!(three.bindings[1].sessions, rule);
     assert_eq!(validated(&three).err(), None);
+    assert_eq!(on_file(&three), None);
 
     // The encode mode of one router: the mode's three presets, with the
     // manual preset's rule on their one binding.
@@ -2109,6 +2120,7 @@ fn the_manual_policy_on_both_sides_of_a_pair_runs_under_three_sides() {
     own.bindings[0].sessions.clone_from(&rule);
     assert_eq!(one_router.policy_document().as_ref(), Ok(&own));
     assert_eq!(validated(&own).err(), None);
+    assert_eq!(on_file(&own), None);
     // Of many routers the main policy's single binding stands behind it.
     let many = many_routers(one_router.clone())
         .policy_document()
@@ -2118,6 +2130,7 @@ fn the_manual_policy_on_both_sides_of_a_pair_runs_under_three_sides() {
     assert_eq!(many.bindings[0].sessions, rule);
     assert_eq!(many.bindings[1].sessions, None);
     assert_eq!(validated(&many).err(), None);
+    assert_eq!(on_file(&many), None);
 
     // One manual side of the two, in each mode that plans three sides.
     let one_side = [
@@ -2177,21 +2190,18 @@ fn the_manual_policy_on_both_sides_of_a_pair_runs_under_three_sides() {
     // A regular configuration under the manual policy: no plan of three
     // sides, and the document of its single requests alone.
     let regular = config(at_flag_defaults("manual"));
-    assert!(matches!(
-        three_sided(&many_routers(regular.clone())),
-        Ok(None)
-    ));
-    assert_eq!(
-        many_routers(regular.clone()).policy_document(),
-        regular.policy_document()
-    );
+    let many = many_routers(regular.clone());
+    let three = three_sided(&many.mode, &many.policy, many.enable_igw);
+    assert!(matches!(three, Ok(None)));
+    assert_eq!(many.policy_document(), regular.policy_document());
     // A provider's configuration under it, the same: of many routers it
     // plans the gateway's own workers, their single requests alone.
     let provider = many_routers(RoutingSettings {
         mode: ModeSettings::Provider("a_provider"),
         ..config(at_flag_defaults("manual"))
     });
-    assert!(matches!(three_sided(&provider), Ok(None)));
+    let three = three_sided(&provider.mode, &provider.policy, provider.enable_igw);
+    assert!(matches!(three, Ok(None)));
     assert_eq!(provider.policy_document(), regular.policy_document());
 }
 

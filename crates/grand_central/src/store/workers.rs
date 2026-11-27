@@ -172,9 +172,11 @@ pub struct WorkerFacts {
     pub signals: Signals,
     pub health: HealthPolicy,
     pub overload: Overload,
-    /// The seconds a removal waits behind a drain, where the worker's
-    /// registration states another window than the default. A host that
-    /// builds the worker's object from the row gives the object this window.
+    /// The seconds a removal waits behind a drain, where the row states a
+    /// window: a control call's registration states any, and a found
+    /// worker's is a fact of its row where it is not the default. A host
+    /// that builds the worker's object from the row gives the object this
+    /// window.
     pub drain_settle_secs: Option<u32>,
     /// What the worker states for a request's hard demands beside its
     /// vision ([`DemandFacts`]), in its registering host's own numbers. A

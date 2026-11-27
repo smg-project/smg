@@ -1821,10 +1821,11 @@ async fn a_promoted_standby_holds_every_row_of_its_leader() {
     let mut standby = Replica::serve("replication-1", FOLLOWER, port, shared(&dir)).await;
     // A ready worker the load monitor polls, at an address nobody answers.
     // It states what a worker states for a request's hard demands, it
-    // takes images, and it states an end of the encode handoff: the log's
-    // row tells the three, so the standby holds the row whole. The offer's
-    // connector holds a blank: a holder's write takes any text, the log
-    // tells it, and a standby reads it as told.
+    // takes images, and it states an end of the encode handoff, a priority
+    // and a drain window: the log's row tells the five, so the standby
+    // holds the row whole. The offer's connector holds a blank: a holder's
+    // write takes any text, the log tells it, and a standby reads it as
+    // told.
     let mut stated = DemandFacts::default();
     stated.runtime = 7;
     stated.references = true;
@@ -1840,6 +1841,8 @@ async fn a_promoted_standby_holds_every_row_of_its_leader() {
         demand_facts: stated,
         vision: true,
         encode: offered,
+        priority: -5,
+        drain_settle_secs: Some(45),
         ..facts("grpc://127.0.0.1:1", 1, 0)
     };
     let written = leader

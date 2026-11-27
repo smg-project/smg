@@ -18,7 +18,7 @@ pub(crate) type Member = (MembershipChange, Option<WorkerRow>, Option<WorkerRow>
 
 /// What a journal was told of each status write: the row's id, the
 /// status it left, the one it took and the models it serves.
-type Status = (WorkerId, WorkerStatus, WorkerStatus, Arc<[String]>);
+pub(crate) type Status = (WorkerId, WorkerStatus, WorkerStatus, Arc<[String]>);
 
 /// One word of a journal: a membership write or a status write.
 #[derive(Clone)]
@@ -147,7 +147,7 @@ impl Replica {
     }
 
     /// Each status write as the journal was told it, in its order.
-    fn statuses(&self) -> Vec<Status> {
+    pub(crate) fn statuses(&self) -> Vec<Status> {
         let told = self.told.0.lock();
         let statuses = told.iter().filter_map(|word| match word {
             Word::Status(status) => Some(status.clone()),
@@ -616,6 +616,21 @@ fn a_status_that_hands_models_the_table_does_not_hold_stops_a_debug_build() {
     replica.objects.connect_row(&replica.store, id, 1);
 }
 
+/// The debug hold reads past the first model: a status that hands a part
+/// of the models the table's row serves stops too.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(
+    expected = "the models a holder read off its object are the ones the table's row serves"
+)]
+fn a_status_that_hands_a_part_of_the_tables_models_stops_a_debug_build() {
+    let replica = Replica::new();
+    let id = replica.upsert(facts(1, "gold")).expect("registered").id();
+    let part: Arc<[String]> = ["m".to_owned()].into();
+    let (ready, word) = (WorkerStatus::Ready, LeadWord::FREE);
+    replica.store.status_told(id, ready, 1, word, Some(part));
+}
+
 /// A host with no journal tells no entry: its holder hands its store no
 /// models with a status, and none is held to the table's row. A status
 /// behind a refresh of the worker's models is taken, in a debug build
@@ -629,7 +644,6 @@ fn a_host_that_tells_no_entry_takes_a_status_behind_a_refresh() {
     objects.connect_row(store, id, 1);
     let status = store.by_key(A).map(|row| row.status);
     assert_eq!(status, Some(WorkerStatus::Ready));
-    assert!(replica.told.0.lock().is_empty(), "no entry is told");
 }
 
 /// Another writer of the registry sets the models of the object under

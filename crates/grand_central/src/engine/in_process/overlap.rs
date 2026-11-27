@@ -431,8 +431,8 @@ pub trait CacheIndexes: Send + Sync {
 #[derive(Default)]
 pub struct Affinity {
     indexes: OnceLock<Arc<dyn CacheIndexes>>,
-    /// The record of sent prefixes of each model, by the model id its
-    /// workers registered under. Locked where a list's table is read, at a
+    /// The record of sent prefixes of each model, by the id a list's first
+    /// worker lists the model under. Locked where a list's table is read, at a
     /// change of membership and at the timer's sweep: never by a decision's naming
     /// or its write, which hold their record by the list's table. A write
     /// a thread keeps holds its record itself ([`Waiting`]).
@@ -513,9 +513,10 @@ impl Affinity {
     /// registry: each one the map alone holds that holds a worker's place,
     /// under a model `stated` says none of the follow's workers states as
     /// its own, with the number of its last taking. A list keeps its
-    /// record under the model its first worker states, so no list reads a
-    /// record whose model no worker that stands states. The follow asks
-    /// its registry of each ahead of [`Self::let_go`].
+    /// record under a model its first worker lists (the id of the card
+    /// that answers to the request's name, else its first model), so no
+    /// list reads a record whose model no worker that stands lists. The
+    /// follow asks its registry of each ahead of [`Self::let_go`].
     pub(super) fn unstated(&self, stated: impl Fn(&str) -> bool) -> Vec<(Box<str>, u64)> {
         let mut records = self.records.lock();
         let unstated = records.iter_mut().filter_map(|(model, record)| {
@@ -627,16 +628,24 @@ impl Affinity {
             .collect()
     }
 
-    /// The record of `model`, made at its first asking and held to `bound`
-    /// placements.
-    fn record_of(&self, model: &str, bound: usize) -> Arc<PrefixRecord> {
+    /// The record of `model`, made at its first asking and held to the
+    /// placements `max_size` tokens make at `size` tokens a block, the size
+    /// the list's first worker is hashed by. A record a list reads from
+    /// `behind` its first worker's first model is read by lists of other
+    /// first models and other sizes: it is held by the smallest size asked
+    /// ([`PrefixRecord::hold`]).
+    fn record_of(&self, model: &str, max_size: u64, size: u32, behind: bool) -> Arc<PrefixRecord> {
+        let bound = |size: u32| {
+            let bound = (max_size / u64::from(size.max(1))).max(1);
+            usize::try_from(bound).unwrap_or(usize::MAX)
+        };
         let record = {
             let mut records = self.records.lock();
             let record = if let Some(record) = records.get(model) {
                 Arc::clone(record)
             } else {
                 let left = self.left_past.load(Ordering::Relaxed);
-                let record = Arc::new(PrefixRecord::new(bound, left));
+                let record = Arc::new(PrefixRecord::new(bound(size), left));
                 records.insert(model.into(), Arc::clone(&record));
                 record
             };
@@ -648,7 +657,7 @@ impl Affinity {
             record
         };
         // Outside the map's mutex: a bound that moved takes the record.
-        record.bound_to(bound);
+        record.hold(size, behind, bound);
         record
     }
 }
@@ -662,6 +671,13 @@ struct PrefixRecord {
     /// The record's bound as the last table set it: a table's read takes
     /// the record, which the deciders hold, only where the bound moved.
     bound: AtomicUsize,
+    /// The block sizes the record's lists asked it with, which hold its
+    /// bound once a list read it from behind its first model. Such a
+    /// record is read by lists hashed at different sizes: held by the
+    /// size of each, its bound would follow which worker heads a list.
+    /// One table's read at a time takes them, to size the record
+    /// ([`Self::hold`]).
+    sizes: Mutex<Sizes>,
     /// Work waits for a sweep: a worker left, or the bound came down.
     sweeping: AtomicBool,
     /// How many leaves were told, counted on from where the map's records
@@ -727,6 +743,14 @@ const fn tick_of(now_micros: u64) -> u16 {
     (now_micros >> 20) as u16
 }
 
+/// The block sizes a record's lists asked it with ([`PrefixRecord::hold`]).
+struct Sizes {
+    /// The smallest size a list asked with since the record was made.
+    smallest: u32,
+    /// A list read the record from behind its first model.
+    shared: bool,
+}
+
 impl PrefixRecord {
     /// A write gives the lock back after this many blocks.
     const SLICE: usize = 16;
@@ -737,6 +761,10 @@ impl PrefixRecord {
         Self {
             predictor: RwLock::new(PrefixPredictor::new(bound)),
             bound: AtomicUsize::new(bound),
+            sizes: Mutex::new(Sizes {
+                smallest: u32::MAX,
+                shared: false,
+            }),
             sweeping: AtomicBool::new(false),
             left: AtomicU64::new(left),
             left_out: AtomicU64::new(0),
@@ -751,6 +779,21 @@ impl PrefixRecord {
             self.predictor.write().set_bound(bound);
             self.sweeping.store(true, Ordering::Relaxed);
         }
+    }
+
+    /// Holds the record to the placements `bound` makes of the block size
+    /// a list asks with: `size` while every list reads the record under
+    /// its first model, as its bound always was; the smallest size asked
+    /// since the record was made, by the lists ahead too, once a list read
+    /// it from `behind` its first model. That size does not rise while the
+    /// record lives. The size is picked and the bound set under one lock:
+    /// a list that picked ahead of a smaller size sets no bound behind it.
+    fn hold(&self, size: u32, behind: bool, bound: impl Fn(u32) -> usize) {
+        let mut sizes = self.sizes.lock();
+        sizes.smallest = sizes.smallest.min(size);
+        sizes.shared |= behind;
+        let size = if sizes.shared { sizes.smallest } else { size };
+        self.bound_to(bound(size));
     }
 
     /// Counts the leave also where the record holds no place for `worker`:
@@ -1191,24 +1234,37 @@ impl Table {
             table.warming = warming.into();
         }
         let record = engine.pool_record_for(model, phase);
-        // The record is the registered model's, and so are its settings.
-        let settings = spec.index_for(registered);
+        // The record is the model's the request names, and so are its
+        // settings and the trees lent for it, by the id of the first
+        // worker's card that answers to the name, an id ahead of an alias
+        // as the registry reads a name: a list of a model holds workers of
+        // different first models. A name no card answers to is the
+        // caller's own word, and reads the first model's record.
+        let mut named = None;
+        first.any_model(&mut |card| {
+            let id = card.id == model;
+            if id || (named.is_none() && card.matches(model)) {
+                named = Some(card.id.clone());
+            }
+            id
+        });
+        let named = named.as_deref().unwrap_or(registered);
+        let settings = spec.index_for(named);
         if let Some(alone) = record.filter(|_| settings.kind == IndexKind::Tree) {
             let size = affinity.block_size(registered);
             let size = size.unwrap_or_else(|| spec.block_size()).max(1);
-            let bound = (settings.max_size / u64::from(size)).max(1);
-            let bound = usize::try_from(bound).unwrap_or(usize::MAX);
-            table.record = Some(affinity.record_of(registered, bound));
+            let behind = named != registered;
+            table.record = Some(affinity.record_of(named, settings.max_size, size, behind));
             table.alone = alone;
             table.side_alone = engine.side_reads_sent_alone(model, phase);
             if cap != 0 {
                 let lent = affinity.indexes.get();
                 if !table.holds {
-                    table.sent = lent.and_then(|indexes| indexes.token_tree(registered, phase));
+                    table.sent = lent.and_then(|indexes| indexes.token_tree(named, phase));
                 }
                 // A request of text reads no index: its tree is asked for
                 // beside one too.
-                table.sent_text = lent.and_then(|indexes| indexes.string_tree(registered, phase));
+                table.sent_text = lent.and_then(|indexes| indexes.string_tree(named, phase));
             }
             if table.sent.is_some() || table.sent_text.is_some() {
                 let print = |worker: &Arc<dyn Worker>| fingerprint(worker.url().as_bytes());

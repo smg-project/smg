@@ -169,6 +169,38 @@ fn a_mask_is_numbered_with_the_encoders_offered() {
     assert_eq!(placed.encoders().first().map(|t| t.position), Some(2));
 }
 
+/// Beside a whole pool a mask is read as it is handed. Both encoders are of
+/// the prefill's class and no hard filter reads the mask, so the encoders
+/// offered are the pool. A key's run then reads the list its host stated,
+/// an entry that names no row among it: nothing is numbered anew.
+#[test]
+fn a_mask_over_every_encoder_offered_is_read_as_it_is_handed() {
+    let mut engine = engine();
+    let notes = noting(&mut engine);
+    let encode = engine
+        .binding("m", Phase::Prefill)
+        .and_then(|binding| match binding.plan {
+            Plan::Epd { encode } => Some(usize::from(encode)),
+            Plan::Single | Plan::PdPair => None,
+        })
+        .expect("the epd plan");
+    let filters = &mut own(&mut engine.profiles[encode]).filters;
+    filters.retain(|filter| filter.name() != "healthy");
+    engine.marks[encode] = framework::Marks::of(&engine.profiles[encode], engine.orders[encode]);
+    let mut bed = Bed::new();
+    bed.encoders = vec![row(0, Role::Encode, 0, 0), row(1, Role::Encode, 0, 0)];
+    bed.facts = vec![pushing(1), pushing(1)];
+    let (facts, _) = bed.asked();
+    let (open, masked) = (Constraints::default(), masking(&[1, 9]));
+    let sides = [&open, &open, &masked];
+    let (decision, _) = decide_under(&bed, &engine, &facts, bed.pools(), sides);
+    assert!(decision.pick().is_some(), "a pick, not {decision:?}");
+    let read = noted_under(&notes, Phase::Encode);
+    // Each of the two encoders was asked, under the mask as handed.
+    assert_eq!(read.iter().map(|note| note.at).collect::<Vec<_>>(), [0, 1]);
+    assert!(read.iter().all(|note| note.mask == [1, 9]), "{read:?}");
+}
+
 /// A filter that refuses the rows the host holds and reads no mask: a hard
 /// one, or a soft one that the pass opening the encoders does not ask.
 #[derive(Debug)]

@@ -129,8 +129,9 @@ pub const PROTOCOL_PACKAGE: &str = "smg.policy.v1";
 /// `Hello` offers and its `Leader` answers, and the newest its `Welcome`
 /// picks (design 5.2). A change a peer must know its controller reads
 /// raises it, and every other additive change within the package keeps
-/// it. Version 2 is the first whose frames state a request's hard demands
-/// (`DecideRequest.demands`).
+/// it. The rule binds from the first shipped release that carries the
+/// contract, as the contract's header says. Version 2 is the first whose
+/// frames state a request's hard demands (`DecideRequest.demands`).
 pub const PROTOCOL_VERSION: u32 = 2;
 
 /// The oldest protocol version this build speaks, the bottom of the same

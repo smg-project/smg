@@ -224,6 +224,8 @@ fn numbers(
         health_policy: Some(health_policy(facts.health)),
         demand_facts: stated_demand_facts(facts.demand_facts),
         vision: facts.vision,
+        priority: facts.priority,
+        drain_settle_secs: facts.drain_settle_secs,
         ..Default::default()
     }
 }
@@ -521,13 +523,13 @@ fn maker_weight(maker: &Registrant) -> usize {
 /// Refuses, by its fact's path, a row the log would not give back whole. A
 /// standby builds its rows from the log, so it would hold the row without
 /// the fact, and a promoted one would decide by other facts than its leader
-/// did. The row on the wire carries a pairing's port alone and no priority
-/// or drain window. It reads an empty zone, an empty connector of an encode
-/// offer and a zero admission window, block size or port as none. The facts
-/// are written as the log writes them and read back as a standby reads
-/// them, so a fact the wire gains is taken here with no second list. A text
-/// the log tells comes back as it was told, so the door holds an encode
-/// offer's connector to no rule of its words.
+/// did. The row on the wire carries a pairing's port alone. It reads an
+/// empty zone, an empty connector of an encode offer and a zero admission
+/// window, block size or port as none. The facts are written as the log
+/// writes them and read back as a standby reads them, so a fact the wire
+/// gains is taken here with no second list. A text the log tells comes back
+/// as it was told, so the door holds an encode offer's connector to no rule
+/// of its words.
 #[cfg_attr(
     not(any(test, feature = "discovery")),
     expect(dead_code, reason = "the host's door asks it of each registration")
@@ -539,7 +541,6 @@ pub(crate) fn carried(facts: &WorkerFacts) -> Result<(), Refused> {
     let lost = [
         ("row.pairing", back.pairing != facts.pairing),
         ("row.encode", back.encode != facts.encode),
-        ("row.priority", back.priority != facts.priority),
         ("row.zone", back.zone != facts.zone),
         ("row.max_running", back.max_running != facts.max_running),
         (
@@ -549,10 +550,6 @@ pub(crate) fn carried(facts: &WorkerFacts) -> Result<(), Refused> {
         (
             "row.bootstrap_port",
             back.bootstrap_port != facts.bootstrap_port,
-        ),
-        (
-            "row.drain_settle_secs",
-            back.drain_settle_secs != facts.drain_settle_secs,
         ),
         ("row", back != *facts),
     ];
@@ -728,9 +725,9 @@ fn told_status(status: i32) -> Option<WorkerStatus> {
 /// The store's row of the wire's, the standby's half of [`row`]: every fact
 /// the wire's row tells, as told, the admission instant `now` less the age
 /// the row crossed with. Of a pairing descriptor the wire's row tells the
-/// bootstrap port alone. The facts it does not tell (the store's typed
-/// descriptor, the priority) stand at the store's defaults: no call states
-/// them in this build.
+/// bootstrap port alone. The one fact it does not tell, the store's typed
+/// descriptor, stands at the store's default: no call states it in this
+/// build.
 ///
 /// A value this build cannot hold (a status, a role, a scope or an encode
 /// handoff it does not know, a count past the store's width) is refused by
@@ -845,6 +842,8 @@ pub(crate) fn told_row(told: &proto::WorkerRow, now: Instant) -> Result<WorkerRo
             .map(|block| offer(block, "row.encode.handoff"))
             .transpose()?
             .unwrap_or_default(),
+        priority: told.priority,
+        drain_settle_secs: told.drain_settle_secs,
         ..WorkerFacts::default()
     };
     let maker = match &told.maker {
@@ -1184,6 +1183,14 @@ fn over(
     // so a registration that states the row's offer again finds it unmoved.
     if let Some(block) = &spec.encode {
         facts.encode = offer(block, "spec.encode.handoff")?.normalized();
+    }
+    // A priority and a drain window are the registration's where it states
+    // them: one that states none keeps the row's.
+    if let Some(priority) = spec.priority {
+        facts.priority = priority;
+    }
+    if let Some(window) = spec.drain_settle_secs {
+        facts.drain_settle_secs = Some(window);
     }
     // The health policy of record is the registration's, whole: one that
     // states none is checked under the defaults.
