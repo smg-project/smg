@@ -36,11 +36,11 @@ const TEST: &str = "two_processes_over_one_lease_file_hand_over_without_an_overl
 
 /// A tenth of the design's settings, the same order between them.
 fn settings() -> ElectionSettings {
-    ElectionSettings {
-        duration: Duration::from_millis(400),
-        renew_period: Duration::from_millis(100),
-        renew_deadline: Duration::from_millis(250),
-    }
+    let mut settings = ElectionSettings::default();
+    settings.duration = Duration::from_millis(400);
+    settings.renew_period = Duration::from_millis(100);
+    settings.renew_deadline = Duration::from_millis(250);
+    settings
 }
 
 fn wall_micros() -> u64 {

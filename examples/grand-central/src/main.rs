@@ -135,7 +135,7 @@ mod tests {
             Candidate, InProcess, LentList, ListCell, LoadRow, PlaceRequest, RequestFacts, Scorer,
             TieBand, Unplaced, WorkerLists, WorkerRule,
         },
-        service::controller::{Config, Controller, ElectionConfig, Error, Listener, Scope},
+        service::controller::{Config, Controller, Error, Listener, Scope},
         stages::StageRegistry,
     };
     use smg_worker::{
@@ -457,28 +457,18 @@ mod tests {
     /// host picks. The command line builds the same value from its flags.
     fn config() -> Config {
         let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
-        let listener = |name: &str, scopes: &[Scope]| Listener {
-            name: name.to_owned(),
-            addr: loopback,
-            scopes: scopes.to_vec(),
-            tls: None,
+        let listener = |name: &str, scopes: &[Scope]| {
+            Listener::of(name.to_owned(), loopback, scopes.to_vec(), None)
         };
-        Config {
-            controller_id: "example-0".to_owned(),
-            listeners: vec![
+        Config::of(
+            "example-0".to_owned(),
+            vec![
                 listener("gateway", &[Scope::Gateway]),
                 listener("control", &[Scope::Control]),
                 listener("replication", &[Scope::Replication]),
             ],
-            admin: loopback,
-            decide_shards: Config::default_decide_shards(),
-            shutdown_settle: Config::DEFAULT_SHUTDOWN_SETTLE,
-            shutdown_grace: Config::DEFAULT_SHUTDOWN_GRACE,
-            load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
-            worker_overload: Config::DEFAULT_WORKER_OVERLOAD,
-            election: ElectionConfig::default(),
-            discovery: None,
-        }
+            loopback,
+        )
     }
 
     #[tokio::test]

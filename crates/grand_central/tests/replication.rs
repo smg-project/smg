@@ -39,10 +39,7 @@ use prost::Message as _;
 use smg_grand_central::{
     engine::{DemandFacts, WireModes, WorkerId},
     service::{
-        controller::{
-            Config, Controller, ElectionConfig, Error, LeasePlace, Listener, Readiness, Scope,
-            State,
-        },
+        controller::{Config, Controller, Error, LeasePlace, Listener, Readiness, Scope, State},
         elector::{ElectionSettings, Elector, FileLease, TickOutcome},
         proto::{
             self, grand_central_client::GrandCentralClient, replica_frame::Frame,
@@ -73,20 +70,15 @@ use tonic_health::pb::{
 /// holds its takes back for the duration, so it takes none again inside
 /// the case.
 fn settings() -> ElectionSettings {
-    ElectionSettings {
-        duration: Duration::from_secs(60),
-        renew_period: Duration::from_millis(500),
-        renew_deadline: Duration::from_secs(40),
-    }
+    let mut settings = ElectionSettings::default();
+    settings.duration = Duration::from_secs(60);
+    settings.renew_period = Duration::from_millis(500);
+    settings.renew_deadline = Duration::from_secs(40);
+    settings
 }
 
 fn listener(name: &str, scopes: &[Scope]) -> Listener {
-    Listener {
-        name: name.to_owned(),
-        addr: loopback(),
-        scopes: scopes.to_vec(),
-        tls: None,
-    }
+    Listener::of(name.to_owned(), loopback(), scopes.to_vec(), None)
 }
 
 /// What a case reaches of the controller it runs against.
@@ -134,28 +126,27 @@ where
 {
     // A replica under a shared lease follows, and one that follows names
     // its replication port: a number of the pairs' own.
-    let config = |port| Config {
-        controller_id: "replication-0".to_owned(),
-        listeners: vec![
-            listener("gateway", &[Scope::Gateway]),
-            listener("control", &[Scope::Control]),
-            Listener {
-                addr: SocketAddr::new(LEADER, port),
-                ..listener("replication", &[Scope::Replication])
-            },
-        ],
-        admin: loopback(),
-        shutdown_settle: Duration::from_millis(50),
-        shutdown_grace: Duration::from_secs(5),
-        load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
-        worker_overload: Config::DEFAULT_WORKER_OVERLOAD,
-        decide_shards: 2,
-        discovery: None,
-        election: ElectionConfig {
-            lease: place.clone(),
-            settings: settings(),
-            advertise: None,
-        },
+    let config = |port| {
+        let mut configuration = Config::of(
+            "replication-0".to_owned(),
+            vec![
+                listener("gateway", &[Scope::Gateway]),
+                listener("control", &[Scope::Control]),
+                {
+                    let mut listening = listener("replication", &[Scope::Replication]);
+                    listening.addr = SocketAddr::new(LEADER, port);
+                    listening
+                },
+            ],
+            loopback(),
+        );
+        configuration.shutdown_settle = Duration::from_millis(50);
+        configuration.shutdown_grace = Duration::from_secs(5);
+        configuration.decide_shards = 2;
+        configuration.election.lease = place.clone();
+        configuration.election.settings = settings();
+        configuration.election.advertise = None;
+        configuration
     };
     let mut controller = bind_drawn(LEADER, None, config).await;
     // Each listener takes an identity as told.
@@ -1662,31 +1653,31 @@ impl Replica {
     /// leader, on its standby's address too ([`pair::free`]): the number a
     /// standby of this replica then binds on its own address.
     async fn serve(id: &str, ip: IpAddr, port: u16, place: LeasePlace) -> Self {
-        let listener = |name: &str, scopes: &[Scope], port| Listener {
-            name: name.to_owned(),
-            addr: SocketAddr::new(ip, port),
-            scopes: scopes.to_vec(),
-            tls: None,
+        let listener = |name: &str, scopes: &[Scope], port| {
+            Listener::of(
+                name.to_owned(),
+                SocketAddr::new(ip, port),
+                scopes.to_vec(),
+                None,
+            )
         };
-        let config = |port| Config {
-            controller_id: id.to_owned(),
-            listeners: vec![
-                listener("gateway", &[Scope::Gateway], 0),
-                listener("control", &[Scope::Control], 0),
-                listener("replication", &[Scope::Replication], port),
-            ],
-            admin: SocketAddr::new(ip, 0),
-            shutdown_settle: Duration::from_millis(50),
-            shutdown_grace: Duration::from_secs(5),
-            load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
-            worker_overload: Config::DEFAULT_WORKER_OVERLOAD,
-            decide_shards: 2,
-            discovery: None,
-            election: ElectionConfig {
-                lease: place.clone(),
-                settings: settings(),
-                advertise: None,
-            },
+        let config = |port| {
+            let mut configuration = Config::of(
+                id.to_owned(),
+                vec![
+                    listener("gateway", &[Scope::Gateway], 0),
+                    listener("control", &[Scope::Control], 0),
+                    listener("replication", &[Scope::Replication], port),
+                ],
+                SocketAddr::new(ip, 0),
+            );
+            configuration.shutdown_settle = Duration::from_millis(50);
+            configuration.shutdown_grace = Duration::from_secs(5);
+            configuration.decide_shards = 2;
+            configuration.election.lease = place.clone();
+            configuration.election.settings = settings();
+            configuration.election.advertise = None;
+            configuration
         };
         let mut controller = if port == 0 {
             bind_drawn(ip, (ip == LEADER).then_some(FOLLOWER), config).await

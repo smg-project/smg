@@ -127,11 +127,11 @@ pub fn timings(default: ElectionSettings, out: &mut impl Write) -> ElectionSetti
                 .collect();
             let [duration, renew_period, renew_deadline] =
                 <[u64; 3]>::try_from(counts).expect("SMG_REPLICAS_TIMINGS_MS takes three counts");
-            ElectionSettings {
-                duration: Duration::from_millis(duration),
-                renew_period: Duration::from_millis(renew_period),
-                renew_deadline: Duration::from_millis(renew_deadline),
-            }
+            let mut timing = ElectionSettings::default();
+            timing.duration = Duration::from_millis(duration);
+            timing.renew_period = Duration::from_millis(renew_period);
+            timing.renew_deadline = Duration::from_millis(renew_deadline);
+            timing
         }
     };
     writeln!(
