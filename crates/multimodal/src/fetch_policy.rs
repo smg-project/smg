@@ -17,6 +17,7 @@
 //! it as it did before there was a policy.
 
 use std::{
+    borrow::Cow,
     collections::{hash_map::Entry, HashMap, HashSet},
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -27,6 +28,9 @@ use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use url::{Host, Url};
 
 use crate::error::MediaConnectorError;
+
+/// The schemes media is fetched over.
+pub(crate) const FETCHED_SCHEMES: [&str; 2] = ["http", "https"];
 
 /// The allow-list and the address policy of one connector.
 #[derive(Debug)]
@@ -88,6 +92,67 @@ impl MediaHostPolicy {
             }
         }
         Ok(host)
+    }
+
+    /// The verdict on a URL handed on as written to another fetcher, from
+    /// its text alone (no lookup: what a name resolves to is the fetcher's
+    /// to judge). It holds only if the fetcher reads the same host, so an
+    /// authority URL readers split differently is refused as invalid.
+    pub(crate) fn check_as_written(&self, url: &str) -> Result<(), MediaConnectorError> {
+        if self.allowed_domains.is_none() && !self.checks_addresses() {
+            return Ok(());
+        }
+        // Read as URL readers do: nothing before the scheme, no ASCII tab or
+        // newline anywhere.
+        let dropped = |c: char| matches!(c, '\t' | '\n' | '\r');
+        let text = url.trim_start_matches(|c: char| c <= ' ');
+        let text: Cow<'_, str> = if text.contains(dropped) {
+            Cow::Owned(text.chars().filter(|&c| !dropped(c)).collect())
+        } else {
+            Cow::Borrowed(text)
+        };
+        let Some((scheme, after_scheme)) = text.split_once(':') else {
+            return Ok(());
+        };
+        if !FETCHED_SCHEMES
+            .iter()
+            .any(|fetched| scheme.eq_ignore_ascii_case(fetched))
+        {
+            return Ok(());
+        }
+        let invalid = || MediaConnectorError::InvalidUrl(url.to_string());
+        // Readers disagree on the host when the `//` is missing or the
+        // authority is empty, holds a backslash or a second `@`.
+        let authority = after_scheme
+            .strip_prefix("//")
+            .and_then(|rest| rest.split(['/', '?', '#']).next())
+            .ok_or_else(invalid)?;
+        if authority.is_empty()
+            || authority.contains('\\')
+            || authority.matches('@').nth(1).is_some()
+        {
+            return Err(invalid());
+        }
+        let parsed = Url::parse(&text).map_err(|_| invalid())?;
+        let name = self.check_name(&parsed)?;
+        if !self.checks_addresses() {
+            return Ok(());
+        }
+        let address = match parsed.host() {
+            // `localhost` and every name under it is the loopback interface
+            // whatever a resolver answers (RFC 6761, section 6.3).
+            Some(Host::Domain(_)) => {
+                let name = name.strip_suffix('.').unwrap_or(&name);
+                if name != "localhost" && !name.ends_with(".localhost") {
+                    return Ok(());
+                }
+                IpAddr::V4(Ipv4Addr::LOCALHOST)
+            }
+            Some(Host::Ipv4(address)) => IpAddr::V4(address),
+            Some(Host::Ipv6(address)) => IpAddr::V6(address),
+            None => return Err(invalid()),
+        };
+        check_address(&name, address)
     }
 }
 
