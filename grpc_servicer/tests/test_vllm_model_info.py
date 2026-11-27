@@ -39,6 +39,35 @@ def _model_config(**overrides):
     return config
 
 
+@pytest.mark.parametrize(
+    ("v2", "speculative", "sampler"),
+    [
+        (False, None, None),
+        (True, None, "vllm.v1.worker.gpu.sample.thinking_budget"),
+        (False, object(), "vllm.v1.sample.thinking_budget_state"),
+    ],
+)
+def test_thinking_budget_requires_support_in_the_selected_sampler(
+    monkeypatch, v2, speculative, sampler
+):
+    config = SimpleNamespace(
+        use_v2_model_runner=v2,
+        speculative_config=speculative,
+        reasoning_config=SimpleNamespace(
+            reasoning_start_token_ids=[1], reasoning_end_token_ids=[2]
+        ),
+    )
+    if sampler is not None:
+        monkeypatch.setattr(model_info.importlib.util, "find_spec", lambda name: None)
+        assert not model_info.supports_thinking_token_budget(config)
+        monkeypatch.setattr(
+            model_info.importlib.util, "find_spec", lambda name: name == sampler or None
+        )
+    assert model_info.supports_thinking_token_budget(config)
+    config.reasoning_config.enabled = False
+    assert not model_info.supports_thinking_token_budget(config)
+
+
 def test_constrained_decoding_start_follows_the_reasoning_parser():
     # No structured-outputs section (an older vLLM): neither fact is known,
     # and the Router keeps the grammar shape that fits either kind of engine.

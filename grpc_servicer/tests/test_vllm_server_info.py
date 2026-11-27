@@ -46,6 +46,15 @@ def _server_info_method(response_type):
     return namespace["GetServerInfo"]
 
 
+def _servicer(config, *, thinking_budget=False, encoder_budget=0):
+    return SimpleNamespace(
+        engine=SimpleNamespace(vllm_config=config),
+        _mm_processor=None,
+        _mm_encoder_budget=encoder_budget,
+        _supports_thinking_token_budget=thinking_budget,
+    )
+
+
 def _response_type(legacy):
     """Build either wire schema regardless of the installed proto version."""
     descriptor = descriptor_pb2.FileDescriptorProto.FromString(
@@ -93,9 +102,7 @@ def test_get_server_info_reports_encoder_dtype_with_current_and_legacy_protos(
     config = SimpleNamespace(
         model_config=model_config, parallel_config=SimpleNamespace(data_parallel_size=1)
     )
-    servicer = SimpleNamespace(
-        engine=SimpleNamespace(vllm_config=config), _mm_processor=None, _mm_encoder_budget=0
-    )
+    servicer = _servicer(config)
     info = asyncio.run(_server_info_method(response_type)(servicer, None, None))
     assert info.model_dtype == (dtype or "")
     if legacy:
@@ -122,6 +129,23 @@ def _response_type_without(*names):
     )
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_get_server_info_reports_thinking_token_budget(enabled, legacy):
+    missing = ("supports_thinking_token_budget",) if legacy else ()
+    response_type = _response_type_without(*missing)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(dtype="torch.bfloat16", is_multimodal_model=False),
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+    )
+    servicer = _servicer(config, thinking_budget=enabled)
+    info = asyncio.run(_server_info_method(response_type)(servicer, None, None))
+    if legacy:
+        assert "supports_thinking_token_budget" not in info.DESCRIPTOR.fields_by_name
+    else:
+        assert info.supports_thinking_token_budget == enabled
+
+
 @pytest.mark.parametrize("legacy", [False, True])
 def test_get_server_info_reports_where_the_engine_starts_a_grammar(legacy):
     """The handler sets the reasoning-parser facts off the structured-outputs config when the
@@ -139,9 +163,7 @@ def test_get_server_info_reports_where_the_engine_starts_a_grammar(legacy):
             reasoning_parser="deepseek_r1", enable_in_reasoning=False
         ),
     )
-    servicer = SimpleNamespace(
-        engine=SimpleNamespace(vllm_config=config), _mm_processor=None, _mm_encoder_budget=0
-    )
+    servicer = _servicer(config)
     info = asyncio.run(_server_info_method(response_type)(servicer, None, None))
     if legacy:
         assert "constrained_decoding_start" not in info.DESCRIPTOR.fields_by_name
@@ -167,9 +189,7 @@ def test_get_server_info_reports_the_structural_tag_vocabulary(
             backend=backend, reasoning_parser="", enable_in_reasoning=False
         ),
     )
-    servicer = SimpleNamespace(
-        engine=SimpleNamespace(vllm_config=config), _mm_processor=None, _mm_encoder_budget=0
-    )
+    servicer = _servicer(config)
     info = asyncio.run(_server_info_method(_response_type(False))(servicer, None, None))
     assert info.structural_tag_vocabulary == label
 
@@ -184,9 +204,7 @@ def test_get_server_info_reports_the_engines_encoder_budget(legacy):
     config = SimpleNamespace(
         model_config=model_config, parallel_config=SimpleNamespace(data_parallel_size=1)
     )
-    servicer = SimpleNamespace(
-        engine=SimpleNamespace(vllm_config=config), _mm_processor=None, _mm_encoder_budget=192000
-    )
+    servicer = _servicer(config, encoder_budget=192000)
     info = asyncio.run(_server_info_method(response_type)(servicer, None, None))
     if legacy:
         assert "mm_encoder_budget" not in info.DESCRIPTOR.fields_by_name
@@ -205,9 +223,7 @@ def test_get_server_info_reports_the_cache_partition_fields(legacy):
         model_config=SimpleNamespace(dtype="torch.bfloat16", is_multimodal_model=False),
         parallel_config=SimpleNamespace(data_parallel_size=1),
     )
-    servicer = SimpleNamespace(
-        engine=SimpleNamespace(vllm_config=config), _mm_processor=None, _mm_encoder_budget=0
-    )
+    servicer = _servicer(config)
     handler = _server_info_method(_response_type_without(*missing))
     info = asyncio.run(handler(servicer, None, None))
     assert getattr(info, "cache_partition_fields", None) == (None if legacy else "cache_salt")
@@ -232,13 +248,8 @@ def test_ec_addresses_preserve_managed_global_rank_slots(monkeypatch, ranks):
             ec_port=9000,
         ),
     )
-    servicer = SimpleNamespace(
-        engine=SimpleNamespace(
-            vllm_config=config, logger_manager=SimpleNamespace(engine_indexes=ranks)
-        ),
-        _mm_processor=None,
-        _mm_encoder_budget=0,
-    )
+    servicer = _servicer(config)
+    servicer.engine.logger_manager = SimpleNamespace(engine_indexes=ranks)
     info = asyncio.run(
         _server_info_method(vllm_engine_pb2.GetServerInfoResponse)(servicer, None, None)
     )

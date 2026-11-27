@@ -90,6 +90,7 @@ from smg_grpc_servicer.vllm.model_info import (
     mm_item_limits,
     model_facts,
     server_facts,
+    supports_thinking_token_budget,
 )
 from smg_grpc_servicer.vllm.warmup import WARMUP_ENV, warmup_inputs_from_config, warmup_wire
 
@@ -173,6 +174,7 @@ def model_info_from_config(
         "mm_encoder_budget": (
             mm_encoder_budget(vllm_config) if encoder_budget is None else encoder_budget
         ),
+        "supports_thinking_token_budget": supports_thinking_token_budget(vllm_config),
         "engine_reasoning_parser": engine_reasoning_parser(vllm_config),
         "constrained_decoding_start": constrained_decoding_start(vllm_config),
         # The vocabulary of structural-tag nodes that backend takes, when the
