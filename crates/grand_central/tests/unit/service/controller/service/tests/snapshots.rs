@@ -379,6 +379,11 @@ async fn a_snapshot_shares_the_feeds_cut_and_keeps_none_with_no_watch_open() {
 async fn a_lone_snapshot_takes_a_cut_only_where_it_tells_every_row() {
     use proto::snapshot_request::Slice;
 
+    use crate::{
+        document::operator::snapshot::Rows,
+        service::controller::snapshot::{asked, in_turn, read},
+    };
+
     let (_elector, _standing, control) = electing(true);
     let feed = control.shared.feed.clone();
     let models = ["model-a", "model-a", "model-a", "model-b"];
@@ -408,10 +413,31 @@ async fn a_lone_snapshot_takes_a_cut_only_where_it_tells_every_row() {
             .into_inner();
         (answer.workers.len(), answer.truncated)
     };
+    // The road a lone call's rows come by: whether its take shares the
+    // feed's cut. The take runs in the route's own turn, so the call
+    // holds its place among the readers as a call through the route does.
+    let shares = async |limit, models: &[&str]| {
+        let query = asked(proto::SnapshotRequest {
+            slices: vec![i32::from(Slice::Workers)],
+            models: models.iter().copied().map(str::to_owned).collect(),
+            limit,
+            ..Default::default()
+        })
+        .expect("a request this build serves");
+        let shared = Arc::clone(&control.shared);
+        let take = move || read(&query, &shared.readers, (&shared.objects, &shared.store));
+        let rows = in_turn(&control.shared.readers, take)
+            .await
+            .expect("its turn");
+        matches!(rows, Rows::Shared(_))
+    };
     assert_eq!(told(1).await, (1, true));
-    assert_eq!(feed.cuts(), 0, "a lone call for one row copied every row");
+    assert!(
+        !shares(1, &[]).await,
+        "a lone call for one row copied every row"
+    );
     assert_eq!(told(0).await, (4, false));
-    assert_eq!(feed.cuts(), 1, "a call for every row takes the cut");
+    assert!(shares(0, &[]).await, "a call for every row takes the cut");
     assert!(feed.kept().is_none(), "no reader can share the cut");
 
     // A lone call for one model with no limit reads that model's rows
@@ -424,7 +450,10 @@ async fn a_lone_snapshot_takes_a_cut_only_where_it_tells_every_row() {
         .expect("the rows")
         .into_inner();
     assert_eq!((answer.workers.len(), answer.truncated), (3, false));
-    assert_eq!(feed.cuts(), 1, "a lone call for its models took the cut");
+    assert!(
+        !shares(0, &["model-a"]).await,
+        "a lone call for its models took the cut"
+    );
 
     // Another call is let in beside it: the call for one row takes the
     // cut the two share, and the call behind it shares that one.
@@ -435,9 +464,12 @@ async fn a_lone_snapshot_takes_a_cut_only_where_it_tells_every_row() {
         .place()
         .expect("a place is free");
     assert_eq!(told(1).await, (1, true));
-    assert_eq!(feed.cuts(), 2, "a call beside another takes their cut");
+    let theirs = feed.kept().expect("a call beside another takes their cut");
     assert_eq!(told(0).await, (4, false));
-    assert_eq!(feed.cuts(), 2, "one copy for the calls let in");
+    assert!(
+        Arc::ptr_eq(&theirs, &feed.kept().expect("still kept")),
+        "one copy for the calls let in"
+    );
     drop(beside);
 
     // A watch is open, and no cut stands at the log's head: the call
@@ -449,9 +481,12 @@ async fn a_lone_snapshot_takes_a_cut_only_where_it_tells_every_row() {
         .watch_workers(from("gateway-a", proto::WatchWorkersRequest::default()))
         .await
         .expect("opened");
+    assert!(feed.kept().is_none(), "the watch's open took no cut");
     assert_eq!(told(1).await, (1, true));
-    assert_eq!(feed.cuts(), 3, "a call beside an open watch takes its cut");
-    assert!(feed.kept().is_some(), "kept for the watch");
+    assert!(
+        feed.kept().is_some(),
+        "a call beside an open watch takes its cut, kept for the watch"
+    );
     drop(watching);
 }
 

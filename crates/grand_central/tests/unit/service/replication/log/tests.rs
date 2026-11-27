@@ -7,6 +7,12 @@ use std::{
 use super::*;
 use crate::service::replication::tests::ascends;
 
+thread_local! {
+    /// How many times this thread searched the ring ([`Kept::until`]): a
+    /// case reads it to count the searches of one read.
+    pub(super) static SEARCHES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 impl Log {
     /// The log's lock, held: for a case that shows what waits for it.
     pub(in crate::service) fn held(&self) -> impl Sized + '_ {
