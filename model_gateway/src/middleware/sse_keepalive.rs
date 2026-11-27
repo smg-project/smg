@@ -98,7 +98,17 @@ fn is_event_stream(response: &Response) -> bool {
         .headers()
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .and_then(|content_type| content_type.trim_start().get(.."text/event-stream".len()))
+        .is_some_and(names_event_stream)
+}
+
+/// Whether `content_type` names an event stream. A media type's name is
+/// case-insensitive (RFC 9110, section 8.3.1), so a worker's
+/// `Text/Event-Stream` names one too; what follows the name (a charset) is
+/// not read.
+pub(crate) fn names_event_stream(content_type: &str) -> bool {
+    content_type
+        .trim_start()
+        .get(.."text/event-stream".len())
         .is_some_and(|head| head.eq_ignore_ascii_case("text/event-stream"))
 }
 
