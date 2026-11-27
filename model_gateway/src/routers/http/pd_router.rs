@@ -3874,6 +3874,31 @@ mod tests {
         tenant::TenantKey,
     };
 
+    #[test]
+    fn a_moved_http_decode_reuses_the_serialized_thinking_budget_spelling() {
+        let decode = |url, runtime| {
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Decode)
+                .runtime_type(runtime)
+                .build()
+        };
+        let vllm = decode("http://vllm", RuntimeType::Vllm);
+        let trtllm = decode("http://trtllm", RuntimeType::Trtllm);
+        let sglang = decode("http://sglang", RuntimeType::Sglang);
+        let other_sglang = decode("http://other-sglang", RuntimeType::Sglang);
+        let mlx = decode("http://mlx", RuntimeType::Mlx);
+        let tokenspeed = decode("http://tokenspeed", RuntimeType::TokenSpeed);
+
+        assert!(takes_sequential_decode_body(&vllm, &trtllm, true));
+        assert!(takes_sequential_decode_body(&sglang, &other_sglang, true));
+        assert!(takes_sequential_decode_body(&mlx, &tokenspeed, true));
+        assert!(!takes_sequential_decode_body(&vllm, &sglang, true));
+        assert!(!takes_sequential_decode_body(&sglang, &vllm, true));
+        assert!(!takes_sequential_decode_body(&mlx, &vllm, true));
+        assert!(!takes_sequential_decode_body(&sglang, &mlx, true));
+        assert!(takes_sequential_decode_body(&sglang, &mlx, false));
+    }
+
     /// A call that never reached its worker, with the worker's URL on the
     /// error as reqwest attaches it.
     async fn call_refused_by(addr: std::net::SocketAddr) -> reqwest::Error {
@@ -11467,6 +11492,73 @@ mod tests {
                  requests the free one served"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_pd_retry_rebuilds_the_signed_thinking_budget_for_each_http_worker() {
+        let router = PDRouter {
+            policy_registry: Arc::new(
+                PolicyRegistry::new(PolicyConfig::RoundRobin)
+                    .with_pd_pairing_mode(PdPairingMode::Off),
+            ),
+            ..quick_retry_router()
+        };
+        let (prefill_url, prefill_seen) =
+            spawn_recording_stub(healthy_answer(Shape::Sequential, PdSide::Prefill)).await;
+        let (first_url, first_seen) = refusing_stub(StatusCode::INTERNAL_SERVER_ERROR).await;
+        let (retry_url, retry_seen) = spawn_recording_stub(r#"{"choices":[]}"#).await;
+        router
+            .policy_registry
+            .set_decode_policy(Arc::new(Favours(first_url.clone())));
+        for builder in [
+            BasicWorkerBuilder::new(prefill_url)
+                .worker_type(WorkerType::Prefill)
+                .runtime_type(RuntimeType::Vllm)
+                .kv_connector("NixlConnector"),
+            BasicWorkerBuilder::new(first_url)
+                .worker_type(WorkerType::Decode)
+                .runtime_type(RuntimeType::Sglang),
+            BasicWorkerBuilder::new(retry_url)
+                .worker_type(WorkerType::Decode)
+                .runtime_type(RuntimeType::Generic),
+        ] {
+            let worker = builder.build();
+            worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+            router.worker_registry.register_or_replace(Arc::new(worker));
+        }
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let request = serde_json::from_value(json!({
+            "model": "m", "messages": [{"role":"user", "content":"hi"}],
+            "thinking_token_budget": -1,
+            "custom_params": {"thinking_budget": 64, "other": 42}
+        }))
+        .unwrap();
+        let response = router
+            .route_chat(None, &tenant, Arc::new(request), UNKNOWN_MODEL_ID)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let prefill = prefill_seen.lock().unwrap();
+        assert_eq!(prefill.len(), 2);
+        for (_, body) in prefill.iter() {
+            assert_eq!(body["thinking_token_budget"], -1);
+            assert_eq!(body["custom_params"], json!({"other": 42}));
+        }
+        let first = first_seen.lock().unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(first[0].get("thinking_token_budget").is_none());
+        assert_eq!(
+            first[0]["custom_params"],
+            json!({"thinking_budget": -1, "other": 42})
+        );
+        let retry = retry_seen.lock().unwrap();
+        assert_eq!(retry.len(), 1);
+        let body = &retry[0].1;
+        assert_eq!(body["thinking_token_budget"], -1);
+        assert_eq!(
+            body["custom_params"],
+            json!({"thinking_budget": -1, "other": 42})
+        );
     }
 
     /// The prefill side's twin of the lone decode worker: a prefill worker's

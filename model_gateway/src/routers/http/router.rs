@@ -112,7 +112,7 @@ use crate::{
         },
         http::{
             request_body::{
-                serialize_request_body, serialize_request_body_preserving_fields, RequestBodyError,
+                serialize_request_body, serialize_request_body_with_edits, RequestBodyError,
             },
             request_stream::{CappedBodyStream, StreamProgress},
             stream_failure::{cause, head_success_recorded, RelaySource},
@@ -961,24 +961,14 @@ impl Router {
             .serialize_with(|view| {
                 if let Some(adapter) = decision_adapter {
                     serialize_request_body(adapter.request(), canonical_model, worker, raw_body_len)
-                } else if matches!(route, "/v1/decisions" | "/v1/systemone") {
-                    serialize_request_body_preserving_fields(
-                        view.request,
-                        canonical_model,
-                        worker,
-                        raw_body_len,
-                    )
                 } else {
-                    let bytes = serialize_request_body(
+                    serialize_request_body_with_edits(
                         view.request,
                         canonical_model,
                         worker,
                         raw_body_len,
-                    )?;
-                    super::thinking_budget::prepare_regular(
-                        bytes,
+                        !matches!(route, "/v1/decisions" | "/v1/systemone"),
                         view.request.thinking_token_budget(),
-                        worker,
                     )
                 }
             })
@@ -4688,18 +4678,26 @@ mod tests {
 
     /// Loopback engine stub: captures the forwarded `/generate` request and
     /// answers with the given content type and body.
+    pub(super) async fn spawn_capture_stub(
+        content_type: &'static str,
+        response_body: &'static str,
+    ) -> (String, CapturedUpstreamRequest) {
+        spawn_capture_stub_for_route("/generate", content_type, response_body).await
+    }
+
     #[expect(
         clippy::disallowed_methods,
         reason = "test stub server lives for the duration of the test process"
     )]
-    pub(super) async fn spawn_capture_stub(
+    async fn spawn_capture_stub_for_route(
+        route: &str,
         content_type: &'static str,
         response_body: &'static str,
     ) -> (String, CapturedUpstreamRequest) {
         let captured: CapturedUpstreamRequest = Arc::new(tokio::sync::Mutex::new(None));
         let sink = Arc::clone(&captured);
         let app = axum::Router::new().route(
-            "/generate",
+            route,
             axum::routing::post(move |headers: HeaderMap, body: Bytes| {
                 let sink = Arc::clone(&sink);
                 async move {
@@ -7718,6 +7716,81 @@ mod tests {
             .header(CONTENT_LENGTH, body.len())
             .body(Body::from(body))
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn streamed_chat_upload_validates_and_translates_the_thinking_budget() {
+        use openai_protocol::validated::ValidatedJson;
+
+        const CHAT: &str = "/v1/chat/completions";
+        const HEAD: &[u8] =
+            br#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true"#;
+        let request = |first: &'static [u8], last: &'static [u8]| {
+            let mut req = streamed_request(&[HEAD, first, last]);
+            *req.uri_mut() = CHAT.parse().unwrap();
+            req
+        };
+
+        let (url, captured) =
+            spawn_capture_stub_for_route(CHAT, "text/event-stream", "data: [DONE]\n\n").await;
+        let worker = BasicWorkerBuilder::new(url)
+            .runtime_type(RuntimeType::Sglang)
+            .model(ModelCard::new("m"))
+            .health_config(no_health_check())
+            .build();
+        assert!(!worker.mutates_request());
+        let mut router = streaming_router(least_load_policy(), 1024 * 1024, vec![worker]);
+        router.retry_config = fast_retry_config(1);
+        let router = Arc::new(router);
+        let state = StreamBodyState::new(router.clone(), create_test_app_context());
+        let app = axum::Router::new()
+            .route(CHAT, axum::routing::post(
+                move |headers: HeaderMap, ValidatedJson(body): ValidatedJson<ChatCompletionRequest>| {
+                    let router = Arc::clone(&router);
+                    async move {
+                        let tenant = TenantRequestMeta::new(TenantKey::new("test"));
+                        let model = body.model.clone();
+                        router.route_chat(Some(&headers), &tenant, Arc::new(body), &model).await
+                    }
+                },
+            ))
+            .route_layer(state.layer());
+
+        let (status, error) = posted(
+            app.clone(),
+            request(
+                br#","custom_params":{"thinking_budget":1}"#,
+                br#","thinking_token_budget":-2}"#,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&error).unwrap()["error"]["code"],
+            "invalid_thinking_token_budget"
+        );
+        assert!(captured.lock().await.is_none());
+
+        let orders: [(&[u8], &[u8]); 2] = [
+            (
+                br#","thinking_token_budget":0"#,
+                br#","custom_params":{"thinking_budget":1}}"#,
+            ),
+            (
+                br#","custom_params":{"thinking_budget":1}"#,
+                br#","thinking_token_budget":0}"#,
+            ),
+        ];
+        for (first, last) in orders {
+            let (status, events) = posted(app.clone(), request(first, last)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(events.as_ref(), b"data: [DONE]\n\n");
+            let (_, bytes) = captured.lock().await.take().unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["stream"], true);
+            assert_eq!(body["custom_params"]["thinking_budget"], 0);
+            assert!(body.get("thinking_token_budget").is_none());
+        }
     }
 
     /// The lean layer does what the `from_fn` form did on the paths that do

@@ -2,7 +2,7 @@ use axum::response::Response;
 use serde_json::{value::to_raw_value, Map, Value};
 use smg_worker::identity::basic::{RuntimeType, Worker};
 
-use super::request_body::{RawBody, RequestBodyError};
+use super::request_body::RawBody;
 use crate::routers::error;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -75,28 +75,6 @@ pub(super) fn translate(
     Ok(())
 }
 
-pub(super) fn prepare_regular(
-    bytes: Vec<u8>,
-    budget: Option<i64>,
-    worker: &dyn Worker,
-) -> Result<Vec<u8>, RequestBodyError> {
-    let Some(budget) = budget else {
-        return Ok(bytes);
-    };
-    let format = wire(worker.metadata().spec.runtime_type);
-    if format == BudgetWire::Passthrough {
-        return Ok(bytes);
-    }
-    let mut body = RawBody::parse(&bytes).map_err(RequestBodyError::Serialize)?;
-    translate(&mut body, format, budget).map_err(RequestBodyError::ThinkingBudget)?;
-    if body.mutated() {
-        body.to_bytes(Some(bytes.len()))
-            .map_err(RequestBodyError::Serialize)
-    } else {
-        Ok(bytes)
-    }
-}
-
 pub(super) fn prepare_pair<'a>(
     budget: Option<i64>,
     prefill: (&mut RawBody<'a>, &dyn Worker),
@@ -118,40 +96,68 @@ mod tests {
     use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
     #[test]
-    fn both_budget_spellings_reach_each_http_runtime_in_its_native_field() {
-        let top = json!({"thinking_token_budget":0,"custom_params":{"other":1}});
-        let nested = json!({"custom_params":{"thinking_budget":0,"other":1}});
-        let prefill = BasicWorkerBuilder::new("http://prefill")
-            .runtime_type(RuntimeType::Sglang)
-            .build();
-        for input in [&top, &nested] {
-            let sent = serde_json::to_vec(input).unwrap();
-            for (runtime, expected) in [
-                (RuntimeType::Sglang, &nested),
-                (RuntimeType::Vllm, &top),
-                (RuntimeType::Trtllm, &top),
-                (RuntimeType::Generic, input),
+    fn thinking_token_budget_uses_the_selected_http_wire() {
+        for budget in [-1, 0, 64] {
+            let canonical = json!({"thinking_token_budget":budget, "custom_params":{"sibling":42}});
+            let nested = json!({"custom_params":{"thinking_budget":budget,"sibling":42}});
+            let both = json!({"thinking_token_budget":budget,"custom_params":{"thinking_budget":7,"sibling":42}});
+            let aligned = json!({"thinking_token_budget":budget,"custom_params":{"thinking_budget":budget,"sibling":42}});
+            for (input, passthrough) in [
+                (&canonical, &canonical),
+                (&nested, &nested),
+                (&both, &aligned),
             ] {
-                let worker = BasicWorkerBuilder::new("http://worker")
-                    .runtime_type(runtime)
-                    .build();
-                let bytes = prepare_regular(sent.clone(), Some(0), &worker).unwrap();
-                assert_eq!(
-                    &serde_json::from_slice::<Value>(&bytes).unwrap(),
-                    expected,
-                    "{runtime:?}"
-                );
-                let mut prefill_body = RawBody::parse(&sent).unwrap();
-                let mut decode_body = prefill_body.clone();
-                prepare_pair(
-                    Some(0),
-                    (&mut prefill_body, &prefill),
-                    (&mut decode_body, &worker),
-                )
-                .unwrap();
-                assert_eq!(serde_json::to_value(&prefill_body).unwrap(), nested);
-                assert_eq!(&serde_json::to_value(&decode_body).unwrap(), expected);
+                let mut chat = json!({"model":"m","messages":[]});
+                chat.as_object_mut()
+                    .unwrap()
+                    .extend(input.as_object().unwrap().clone());
+                let chat = super::super::chat_for_upstream(serde_json::from_value(chat).unwrap());
+                for (runtime, expected) in [
+                    (RuntimeType::Sglang, &nested),
+                    (RuntimeType::Vllm, &canonical),
+                    (RuntimeType::Trtllm, &canonical),
+                    (RuntimeType::Generic, passthrough),
+                    (RuntimeType::Unspecified, passthrough),
+                ] {
+                    let worker = BasicWorkerBuilder::new("http://worker")
+                        .runtime_type(runtime)
+                        .build();
+                    let bytes = super::super::request_body::serialize_request_body_with_edits(
+                        &chat,
+                        None,
+                        &worker,
+                        None,
+                        true,
+                        Some(budget),
+                    )
+                    .unwrap();
+                    let sent: Value = serde_json::from_slice(&bytes).unwrap();
+                    for key in [TOP, "custom_params"] {
+                        assert_eq!(sent.get(key), expected.get(key), "{runtime:?}: {input}");
+                    }
+                }
             }
         }
+    }
+
+    #[test]
+    fn thinking_token_budget_removes_only_the_alias_for_strict_http_servers() {
+        let trt = BasicWorkerBuilder::new("http://worker")
+            .runtime_type(RuntimeType::Trtllm)
+            .build();
+        let input = json!({"custom_params":{"thinking_budget":0}});
+        let bytes = super::super::request_body::serialize_request_body_with_edits(
+            &input,
+            None,
+            &trt,
+            None,
+            true,
+            Some(0),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).unwrap(),
+            json!({"thinking_token_budget":0})
+        );
     }
 }
