@@ -60,7 +60,7 @@ use crate::{
     routers::{
         common::{
             openai_bridge::FormatRegistry, prefill_admission::test_support::select_worker,
-            test_support::fast_retry_config,
+            snapshot::test_support::discovered_grpc_worker, test_support::fast_retry_config,
         },
         grpc::{
             backend_client::BasicWorkerBuilder,
@@ -556,7 +556,7 @@ fn register_worker_of_runtime(
     runtime: RuntimeType,
     labels: &[(&str, &str)],
 ) -> Arc<dyn Worker> {
-    let worker = crate::routers::common::snapshot::test_support::discovered_grpc_worker(
+    let worker = discovered_grpc_worker(
         &format!("grpc://127.0.0.1:{port}"),
         MODEL,
         worker_type,

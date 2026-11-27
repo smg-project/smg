@@ -10,7 +10,7 @@ use smg_worker::{
     connection::engine::EngineConnection,
     health::{circuit_breaker::CircuitState, resilience::ResolvedResilience},
     identity::{
-        basic::{BasicWorker, WorkerMetadata, WorkerType},
+        basic::{BasicWorker, RuntimeType, WorkerMetadata, WorkerType},
         error::WorkerResult,
     },
 };
@@ -590,7 +590,7 @@ fn a_custom_prepare_request_keeps_the_value_pipeline() {
 fn a_custom_prepare_keeps_its_edits_when_the_budget_is_translated() {
     let worker = CustomPrepare(
         BasicWorkerBuilder::new("http://worker")
-            .runtime_type(smg_worker::identity::basic::RuntimeType::Vllm)
+            .runtime_type(RuntimeType::Vllm)
             .build(),
     );
     let req = json!({"model":"alias","custom_params":{"thinking_budget":0,"keep":true}});
