@@ -735,6 +735,56 @@ fn a_stage_built_since_a_leases_generation_and_kept_later_did_not_stand_at_it() 
         held.under(&engine).hearing(4).is_none(),
         "no stage booked it"
     );
+    // A fourth document builds `second` anew. A lease of its generation
+    // reaches the picker it built, which stood by no earlier generation:
+    // the engine whole hears it, and not what the engine kept alone.
+    let applied = engine.apply(hearing_over(&stages, 4, second_profile));
+    applied.expect("a number above the standing one");
+    let held = engine.spec();
+    let own = held.under(&engine).hearing(4);
+    let own = own.expect("the standing generation");
+    let lease = crate::tracking::Lease {
+        generation: 4,
+        ..Default::default()
+    };
+    own.dispatched_stages(&lease, &Target::default(), crate::tracking::Side::Single, 0);
+    assert_eq!(words(&built, 0).len(), 4, "kept since the first");
+    assert_eq!(words(&built, 7), ["dispatched"], "built under the fourth");
+    assert_eq!(words(&built, 3).len(), 2, "replaced: it hears no more");
+}
+
+/// The last generation a document can bear is one as any other. On a host
+/// with a file of leases, a lease of the document's own generation reaches
+/// every profile of the document, the one it built under `u64::MAX` among
+/// them. A lease of the first document reaches the profile kept since
+/// then alone.
+#[cfg(feature = "controller")]
+#[test]
+fn a_lease_of_the_last_generation_reaches_the_profile_its_document_built() {
+    let (stages, built) = hearing_stages();
+    let engine = InProcess::new(hearing_over(&stages, 1, |_| {}));
+    let applied = engine.apply(hearing_over(&stages, u64::MAX, second_profile));
+    applied.expect("a number above the standing one");
+    let held = engine.spec();
+    let side = crate::tracking::Side::Single;
+    let lease = |generation| crate::tracking::Lease {
+        generation,
+        ..Default::default()
+    };
+    let own = held.under(&engine).hearing(u64::MAX);
+    let own = own.expect("the standing generation");
+    own.dispatched_stages(&lease(u64::MAX), &Target::default(), side, 0);
+    // The pickers by the place the table built them at: `random` of the
+    // first document, kept, the one let go for it, and the `second` the
+    // last document built.
+    assert_eq!(words(&built, 0), ["dispatched"]);
+    assert_eq!(words(&built, 2), ["dispatched"], "built under the last");
+    let older = held.under(&engine).hearing(1);
+    let older = older.expect("a generation under the standing one");
+    older.dispatched_stages(&lease(1), &Target::default(), side, 0);
+    assert_eq!(words(&built, 0).len(), 2, "kept since the first");
+    assert_eq!(words(&built, 2).len(), 1, "it did not stand by the first");
+    assert!(words(&built, 1).is_empty(), "let go untold");
 }
 
 /// A document holds each of its profiles once, whatever the number of

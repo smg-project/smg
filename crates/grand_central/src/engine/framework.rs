@@ -5887,7 +5887,7 @@ impl Engine {
     pub(crate) fn stood_by(&self, generation: u64) -> Stood<'_> {
         Stood {
             engine: self,
-            below: generation.saturating_add(1).min(self.generation),
+            below: Some(generation.saturating_add(1).min(self.generation)),
         }
     }
 
@@ -5900,7 +5900,7 @@ impl Engine {
     pub(crate) fn stands(&self) -> Stood<'_> {
         Stood {
             engine: self,
-            below: u64::MAX,
+            below: None,
         }
     }
 
@@ -9974,12 +9974,18 @@ fn tell_completed<'p>(
 /// earlier generation, whatever the number of generations its profiles
 /// were made under: a document that gained one profile at each of a
 /// thousand applies holds a thousand profiles once.
+///
+/// A host that tells leases off a file of its own names the engine whole
+/// as one too ([`Engine::stands`]): every profile hears, under no
+/// generation's bound, so a profile made under the last generation a
+/// document can bear hears as any other.
 #[cfg(feature = "in-process")]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Stood<'a> {
     engine: &'a Engine,
-    /// A profile made under a generation below this one hears.
-    below: u64,
+    /// A profile made under a generation below this one hears. With
+    /// none, every profile hears: the engine whole.
+    below: Option<u64>,
 }
 
 #[cfg(feature = "in-process")]
@@ -9988,7 +9994,7 @@ impl<'a> Stood<'a> {
     #[inline]
     fn profiles(self) -> impl Iterator<Item = &'a Arc<Profile>> {
         let made = self.engine.profiles.iter().zip(&self.engine.born);
-        made.filter(move |(_, born)| **born < self.below)
+        made.filter(move |(_, born)| self.below.is_none_or(|below| **born < below))
             .map(|(profile, _)| profile)
     }
 }
