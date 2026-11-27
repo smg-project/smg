@@ -141,7 +141,7 @@ use crate::{
         lease_events,
         list_cell::LentList,
         pair_classes::PartnerClasses,
-        records::{decide_pair_drawn, vetoes, with_shadow::Lends, HeldCells, Live, PoolRecords},
+        records::{vetoes, with_shadow::Lends, HeldCells, Live, PoolRecords},
         sticky_sessions::{DecodeVerdict, SessionVerdict},
         view::{
             AffinityFacts, Candidate, Constraints, Feed, Phase, PoolFacts, RequestFacts, Role,
@@ -688,7 +688,7 @@ impl<'a> PairLists<'a> {
                     row.pair_class = classes.decodes().get(at).copied().unwrap_or(0);
                     row.has_room = true;
                 };
-                let drawn = decide_pair_drawn(
+                let drawn = PoolRecords::decide_pair_drawn(
                     spec.engine(),
                     facts,
                     cx,
