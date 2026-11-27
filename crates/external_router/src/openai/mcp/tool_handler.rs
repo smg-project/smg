@@ -172,11 +172,11 @@ pub(crate) struct StreamingToolHandler {
     /// announced, the text streamed for it since laid into its parts. A
     /// turn cut or stopped there closes them (see [`Self::take_open_items`]).
     open_items: Vec<(usize, Value)>,
-    /// The items other than function calls that the upstream closed behind
-    /// a hand-over, each under the output index the client read for it. The
-    /// next turn's handler replaces this one, so the loop keeps them for
-    /// the final response (see [`Self::take_closed_items`]).
-    closed_items: Vec<(usize, Value)>,
+    /// The upstream output indices of the items other than function calls
+    /// that the upstream closed behind a hand-over. The loop keeps those
+    /// items for the final response, each at the output index the client
+    /// read for it (see [`Self::take_closed_items`]).
+    closed_items: Vec<usize>,
 }
 
 /// The text deltas of an item other than a function call: the event, the
@@ -383,8 +383,9 @@ impl StreamingToolHandler {
                     StreamAction::Drop
                 } else {
                     // Behind a hand-over an item that is no function call
-                    // reaches the client closed: it is kept for the final
-                    // response, which reads the last turn's handler alone.
+                    // reaches the client closed: the loop keeps it for the
+                    // final response, among its own items. The accumulator
+                    // holds the item; its index is noted here.
                     if !self.dispatched_tool_call_indices.is_empty() {
                         if let (Some(upstream_index), Some(item)) =
                             (done_output_index, parsed.get("item"))
@@ -394,8 +395,7 @@ impl StreamingToolHandler {
                                 .and_then(Value::as_str)
                                 .is_some_and(is_function_call_type);
                             if !is_function_call {
-                                let output_index = self.ensure_output_index(upstream_index);
-                                self.closed_items.push((output_index, item.clone()));
+                                self.closed_items.push(upstream_index);
                             }
                         }
                     }
@@ -460,9 +460,21 @@ impl StreamingToolHandler {
 
     /// Takes the items other than function calls that the upstream closed
     /// behind a hand-over, each under the output index the client read for
-    /// it and as the upstream closed it.
+    /// it and as the upstream closed it. They move out of the accumulator:
+    /// a final response built from this handler (the stop at the tool-call
+    /// limit) lists each once, where the loop places it.
     pub fn take_closed_items(&mut self) -> Vec<(usize, Value)> {
-        std::mem::take(&mut self.closed_items)
+        let closed_items = std::mem::take(&mut self.closed_items);
+        closed_items
+            .into_iter()
+            .filter_map(|upstream_index| {
+                let item = self.accumulator.take_output_item(upstream_index)?;
+                let output_index = self
+                    .mapped_output_index(upstream_index)
+                    .unwrap_or(upstream_index);
+                Some((output_index, item))
+            })
+            .collect()
     }
 
     /// Takes the items the upstream left open behind a hand-over, each

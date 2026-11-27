@@ -1360,7 +1360,9 @@ pub(super) fn handle_streaming_with_tool_interception(
                 state.iteration += 1;
                 state.total_calls += pending_calls.len();
 
-                // Record tool loop iteration metric
+                // Record tool loop iteration metric: one a hand-over, so the
+                // calls of a turn count the same whether the upstream is
+                // asked once for them all or once for each.
                 Metrics::record_mcp_tool_iteration(&original_request.model);
 
                 let effective_limit = match max_tool_calls {
@@ -1436,6 +1438,14 @@ pub(super) fn handle_streaming_with_tool_interception(
                         .await
                     {
                         return;
+                    }
+                    // The final response of this stop is built from this
+                    // turn's handler: the items the upstream closed behind
+                    // a call of the turn leave it for their places among
+                    // the loop's items, by the output index the client
+                    // read, and are not listed behind the calls.
+                    for (output_index, item) in handler.take_closed_items() {
+                        state.retain_streamed_item(output_index, item);
                     }
                     break 'turns (handler, ToolLoopEnd::ToolCallLimit);
                 }

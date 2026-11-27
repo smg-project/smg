@@ -1407,6 +1407,30 @@ async fn a_message_left_open_at_the_tool_call_limit_is_closed_and_kept() {
     assert_eq!(kept, closed, "{text}");
 }
 
+/// A message the upstream completes before the request's tool-call
+/// allowance is spent stands in the final response at its output index
+/// too, between the call that ran and the call that did not.
+#[tokio::test]
+async fn a_message_completed_before_the_tool_call_limit_keeps_its_index() {
+    use crate::test_support::http_client;
+
+    let (requests, text) =
+        a_limited_turn_cut_behind_its_first_call(Cut::Nowhere, Some(1), http_client()).await;
+    assert_eq!(
+        requests.len(),
+        1,
+        "the loop stops at the allowance and asks nothing again: {text}"
+    );
+    let (closed, kept) = closed_by_index_and_kept(&text);
+    assert_eq!(
+        closed.len(),
+        3,
+        "the call that ran, the message and the call over the limit: {text}"
+    );
+    assert_eq!(closed[1], "msg_2", "{text}");
+    assert_eq!(kept, closed, "{text}");
+}
+
 /// The same turn on a stream that stalls behind the call until the
 /// client's deadline: the turn ends at the deadline, not the request.
 #[tokio::test]

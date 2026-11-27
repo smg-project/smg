@@ -170,7 +170,8 @@ impl ToolLoopState {
     /// Keeps an item of a streamed turn that the last turn's own output
     /// does not carry (a call that did not run, an item a cut turn or the
     /// tool-call limit left half-open, an item the upstream closed behind a
-    /// call of an earlier turn) for the final response, at
+    /// call of an earlier turn or of the turn that limit ended) for the
+    /// final response, at
     /// the place of `output_index`, the index the client read for it: before
     /// the first kept item of a higher index. So the response lists a turn's
     /// items in the order the stream numbered them, whatever the order they
