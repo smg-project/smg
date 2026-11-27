@@ -62,10 +62,11 @@ use crate::{
     openai::{
         context::{RequestContext, StreamingEventContext, StreamingRequest},
         mcp::{
-            execute_streaming_tool_calls, inject_mcp_metadata_last, prepare_mcp_tools_as_functions,
-            resume_payload_in_place, retained_output_items, send_mcp_list_tools_events,
-            skip_streaming_tool_calls, StreamAction, StreamingToolHandler, ToolLoopState,
-            NOT_EXECUTED_AT_STREAM_BREAK, NOT_EXECUTED_AT_TOOL_CALL_LIMIT, TOOL_CALL_LIMIT_REASON,
+            close_streaming_open_items, execute_streaming_tool_calls, inject_mcp_metadata_last,
+            prepare_mcp_tools_as_functions, resume_payload_in_place, retained_output_items,
+            send_mcp_list_tools_events, skip_streaming_tool_calls, StreamAction,
+            StreamingToolHandler, ToolLoopState, NOT_EXECUTED_AT_STREAM_BREAK,
+            NOT_EXECUTED_AT_TOOL_CALL_LIMIT, TOOL_CALL_LIMIT_REASON,
         },
     },
     persistence_utils::persist_conversation_items_owned,
@@ -915,8 +916,9 @@ enum RelayEnd {
     /// The stream ended with no call waiting in the handler: the model's
     /// answer, or the end of a turn whose calls the loop has run.
     Answered,
-    /// The stream broke behind a call of its turn the loop ran: the turn
-    /// ends there and the loop asks the upstream again.
+    /// The turn was cut behind a call of it the loop ran (its stream broke,
+    /// carried a terminal other than `response.completed`, or ended with
+    /// none): the turn ends there and the loop asks the upstream again.
     Broke,
     /// The handler holds complete tool calls; the loop executes them.
     ToolCalls,
@@ -986,6 +988,34 @@ async fn relay_upstream_stream(
 
                     match action {
                         StreamAction::Forward => {
+                            // Behind a call of this turn the loop ran, an
+                            // upstream terminal other than
+                            // `response.completed` ends the turn as a broken
+                            // stream does: it is not forwarded (the loop
+                            // writes the request's one terminal) and the
+                            // upstream is asked again.
+                            if upstream_stream.handed_over {
+                                let terminal = parsed
+                                    .as_ref()
+                                    .and_then(|v| v.get("type"))
+                                    .and_then(|t| t.as_str())
+                                    .filter(|kind| {
+                                        matches!(
+                                            *kind,
+                                            ResponseEvent::INCOMPLETE
+                                                | ResponseEvent::FAILED
+                                                | "error"
+                                        )
+                                    });
+                                if let Some(terminal) = terminal {
+                                    warn!(
+                                        event = terminal,
+                                        "An upstream turn ended unfinished behind a tool call of that turn: the turn ends there and the upstream is asked again"
+                                    );
+                                    return RelayEnd::Broke;
+                                }
+                            }
+
                             // Skip response.created and response.in_progress on subsequent iterations
                             let should_skip = if flags.first_iteration {
                                 false
@@ -1129,6 +1159,14 @@ async fn relay_upstream_stream(
             None => break,
         };
     }
+    // Behind a call of this turn the loop ran, a stream that ends without
+    // the turn's `response.completed` is a cut turn as well.
+    if upstream_stream.handed_over && !handler.accumulator.is_completed() {
+        warn!(
+            "The stream of an upstream turn ended without its terminal event behind a tool call of that turn: the turn ends there and the upstream is asked again"
+        );
+        return RelayEnd::Broke;
+    }
     RelayEnd::Answered
 }
 
@@ -1269,9 +1307,11 @@ pub(super) fn handle_streaming_with_tool_interception(
                 if end == RelayEnd::Answered {
                     break;
                 }
-                // The stream broke behind a call of this turn: the turn ends
-                // there. A call it left half-open is closed as not executed,
-                // and the upstream is asked again with the calls that ran.
+                // The turn was cut behind a call of it: the turn ends there.
+                // A call it left half-open is closed as not executed, any
+                // other item it left half-open as incomplete with what was
+                // streamed, and the upstream is asked again with the calls
+                // that ran.
                 if end == RelayEnd::Broke {
                     let half_open = handler.take_pending_calls();
                     if !skip_streaming_tool_calls(
@@ -1284,6 +1324,13 @@ pub(super) fn handle_streaming_with_tool_interception(
                         &mut sequence_number,
                     )
                     .await
+                        || !close_streaming_open_items(
+                            handler.take_open_items(),
+                            &tx,
+                            &mut state,
+                            &mut sequence_number,
+                        )
+                        .await
                     {
                         return;
                     }

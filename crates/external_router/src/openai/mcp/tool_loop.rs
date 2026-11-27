@@ -503,6 +503,40 @@ pub(crate) async fn skip_streaming_tool_calls(
     true
 }
 
+/// The items other than function calls that an upstream turn left half-open
+/// when it was cut behind a call that ran, as
+/// [`super::StreamingToolHandler::take_open_items`] hands them over: each gets the
+/// `response.output_item.done` the upstream did not write, with the item as
+/// closed there, and takes its place among the final response's items after
+/// the calls that ran. Returns false when the client left.
+pub(crate) async fn close_streaming_open_items(
+    open_items: Vec<(usize, Value)>,
+    tx: &SseSender,
+    state: &mut ToolLoopState,
+    sequence_number: &mut u64,
+) -> bool {
+    for (output_index, item) in open_items {
+        let done_payload = json!({
+            "type": OutputItemEvent::DONE,
+            "sequence_number": *sequence_number,
+            "output_index": output_index,
+            "item": item
+        });
+        *sequence_number += 1;
+        let done_event = format!(
+            "event: {}\ndata: {}\n\n",
+            OutputItemEvent::DONE,
+            done_payload
+        );
+        if tx.send(Ok(Bytes::from(done_event))).await.is_err() {
+            return false;
+        }
+
+        state.mcp_call_items.push(item);
+    }
+    true
+}
+
 /// Transform payload to replace MCP/builtin tools with function tools.
 ///
 /// Retains existing function tools from the request, removes non-function tools

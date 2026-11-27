@@ -879,6 +879,25 @@ async fn a_turn_of_two_calls_costs_one_upstream_round_trip() {
     assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
 }
 
+const MESSAGE_ADDED: &str = "event: response.output_item.added\ndata: {\"type\":\
+                             \"response.output_item.added\",\"sequence_number\":4,\
+                             \"output_index\":1,\"item\":{\"type\":\"message\",\"id\":\"msg_2\",\
+                             \"status\":\"in_progress\",\"role\":\"assistant\",\"content\":[]}}";
+const MESSAGE_DELTA: &str = "event: response.output_text.delta\ndata: {\"type\":\
+                             \"response.output_text.delta\",\"sequence_number\":5,\"item_id\":\
+                             \"msg_2\",\"output_index\":1,\"content_index\":0,\"delta\":\"so f\"}";
+const INCOMPLETE: &str = "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\
+                          \"sequence_number\":5,\"response\":{\"id\":\"resp_1\",\"object\":\
+                          \"response\",\"created_at\":1,\"model\":\"m\",\"status\":\
+                          \"incomplete\",\"incomplete_details\":{\"reason\":\
+                          \"max_output_tokens\"},\"output\":[]}}";
+const FAILED: &str = "event: response.failed\ndata: {\"type\":\"response.failed\",\
+                      \"sequence_number\":5,\"response\":{\"id\":\"resp_1\",\"object\":\
+                      \"response\",\"created_at\":1,\"model\":\"m\",\"status\":\"failed\",\
+                      \"output\":[]}}";
+const ERROR: &str = "event: error\ndata: {\"type\":\"error\",\"sequence_number\":5,\"code\":\
+                     \"server_error\",\"message\":\"the upstream failed\",\"param\":null}";
+
 /// What the stub upstream of [`a_turn_cut_behind_its_first_call`] does
 /// behind the first complete call of its tool turn.
 #[derive(Clone, Copy)]
@@ -887,6 +906,15 @@ enum Cut {
     Break,
     /// The stream stays open and writes nothing more.
     Stall,
+    /// The second call's item opens, the upstream writes this terminal
+    /// event and ends the stream.
+    Terminal(&'static str),
+    /// The second call's item opens and the stream ends with no terminal
+    /// event.
+    End,
+    /// A message opens, part of its text is streamed and the connection
+    /// breaks.
+    Message,
 }
 
 /// Serves one streamed request from a stub upstream whose tool turn is cut
@@ -919,7 +947,9 @@ async fn a_turn_cut_behind_its_first_call(
     let port = listener.local_addr().expect("an address").port();
     let first_call = [CREATED, IN_PROGRESS, CALL_ADDED, CALL_DONE, CALL_ITEM_DONE];
     let cut_turn = match cut {
-        Cut::Break => [&first_call[..], &[SECOND_CALL_ADDED][..]].concat(),
+        Cut::Break | Cut::End => [&first_call[..], &[SECOND_CALL_ADDED][..]].concat(),
+        Cut::Terminal(event) => [&first_call[..], &[SECOND_CALL_ADDED, event][..]].concat(),
+        Cut::Message => [&first_call[..], &[MESSAGE_ADDED, MESSAGE_DELTA][..]].concat(),
         Cut::Stall => first_call.to_vec(),
     }
     .join("\n\n")
@@ -945,13 +975,14 @@ async fn a_turn_cut_behind_its_first_call(
                 let head = stream::iter([Ok(Bytes::from(cut_turn.clone()))]);
                 match cut {
                     // The frames are on the wire before the connection breaks.
-                    Cut::Break => head
+                    Cut::Break | Cut::Message => head
                         .chain(stream::once(async {
                             tokio::time::sleep(Duration::from_millis(200)).await;
                             Err(io::Error::other("the upstream broke"))
                         }))
                         .boxed(),
                     Cut::Stall => head.chain(stream::pending()).boxed(),
+                    Cut::Terminal(_) | Cut::End => head.boxed(),
                 }
             };
             async move {
@@ -1039,6 +1070,13 @@ async fn a_stream_that_breaks_behind_a_call_that_ran_ends_the_turn_not_the_reque
 
     let (requests, text) = a_turn_cut_behind_its_first_call(Cut::Break, http_client()).await;
     assert_served_from_the_first_call(&requests, &text);
+    assert_the_half_open_call_is_closed(&text);
+}
+
+/// No item the cut turn announced stays open, and the call it left
+/// half-open says that the stream ended, not that the tool-call allowance
+/// was spent.
+fn assert_the_half_open_call_is_closed(text: &str) {
     assert_eq!(
         text.matches("event: response.output_item.added").count(),
         text.matches("event: response.output_item.done").count(),
@@ -1056,6 +1094,91 @@ async fn a_stream_that_breaks_behind_a_call_that_ran_ends_the_turn_not_the_reque
         !text.contains(NOT_EXECUTED_AT_TOOL_CALL_LIMIT),
         "no call reads as stopped at the limit: {text}"
     );
+}
+
+/// A turn the upstream ends unfinished behind a call that ran, with its
+/// `response.incomplete`, `response.failed` or `error` event, is cut the
+/// way a broken stream cuts it: that event is not forwarded, the call the
+/// turn left half-open is closed, the upstream is asked again, and the
+/// client reads one terminal event, the loop's own.
+#[tokio::test]
+async fn an_upstream_terminal_behind_a_call_that_ran_ends_the_turn_not_the_request() {
+    use crate::test_support::http_client;
+
+    for event in [INCOMPLETE, FAILED, ERROR] {
+        let (requests, text) =
+            a_turn_cut_behind_its_first_call(Cut::Terminal(event), http_client()).await;
+        assert_served_from_the_first_call(&requests, &text);
+        assert_the_half_open_call_is_closed(&text);
+        let terminals: Vec<&str> = text
+            .split("\n\n")
+            .filter_map(|frame| frame.strip_prefix("event: "))
+            .filter_map(|frame| frame.split('\n').next())
+            .filter(|name| {
+                matches!(
+                    *name,
+                    "response.completed" | "response.incomplete" | "response.failed" | "error"
+                )
+            })
+            .collect();
+        assert_eq!(terminals, ["response.completed"], "{text}");
+    }
+}
+
+/// The same turn on a stream that ends with no terminal event behind the
+/// call: the turn ends there, the half-open call is closed and the
+/// upstream is asked again.
+#[tokio::test]
+async fn a_stream_that_ends_without_its_terminal_behind_a_call_that_ran_ends_the_turn() {
+    use crate::test_support::http_client;
+
+    let (requests, text) = a_turn_cut_behind_its_first_call(Cut::End, http_client()).await;
+    assert_served_from_the_first_call(&requests, &text);
+    assert_the_half_open_call_is_closed(&text);
+}
+
+/// A message the cut turn left half-open behind the call is closed on the
+/// wire as incomplete with the text streamed for it, under its output
+/// index, and the final response keeps that item.
+#[tokio::test]
+async fn a_message_a_cut_turn_left_half_open_is_closed_as_incomplete_and_kept() {
+    use crate::test_support::http_client;
+
+    let (requests, text) = a_turn_cut_behind_its_first_call(Cut::Message, http_client()).await;
+    assert_served_from_the_first_call(&requests, &text);
+    assert_eq!(
+        text.matches("event: response.output_item.added").count(),
+        text.matches("event: response.output_item.done").count(),
+        "no item the stream announced stays open: {text}"
+    );
+    let events: Vec<Value> = text
+        .split("\n\n")
+        .filter_map(|frame| frame.split_once("\ndata: "))
+        .filter_map(|(_, data)| serde_json::from_str(data).ok())
+        .collect();
+    let closed = events
+        .iter()
+        .find(|event| {
+            event["type"] == "response.output_item.done" && event["item"]["id"] == "msg_2"
+        })
+        .unwrap_or_else(|| panic!("the message's closing event: {text}"));
+    assert_eq!(closed["output_index"], 1, "{text}");
+    assert_eq!(
+        closed["item"],
+        json!({
+            "type": "message", "id": "msg_2", "status": "incomplete", "role": "assistant",
+            "content": [{"type": "output_text", "text": "so f", "annotations": []}]
+        }),
+        "{text}"
+    );
+    let kept: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["type"] == "response.completed")
+        .filter_map(|event| event["response"]["output"].as_array())
+        .flatten()
+        .filter(|item| item["id"] == "msg_2")
+        .collect();
+    assert_eq!(kept, [&closed["item"]], "{text}");
 }
 
 /// The same turn on a stream that stalls behind the call until the

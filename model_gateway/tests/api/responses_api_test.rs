@@ -3508,13 +3508,16 @@ async fn a_tool_that_outruns_the_request_timeout_does_not_fail_the_stream() {
 }
 
 /// A turn whose rest is larger than the loop's read-ahead while its tool
-/// runs: the loop stops reading ahead at its bound, the rest of the turn
-/// waits unread until the call is done, and the stream ends as the same
-/// request ends without the padding: the call that fit ran, the one over
-/// the limit is closed, then the terminal. The padding is nine mebibytes of
-/// comment blocks, which the relay drops, behind the first turn's call.
+/// runs past the client's deadline: the loop stops reading ahead at its
+/// bound, and the first read behind the call meets the deadline, so the
+/// turn is cut there (its rest and its terminal are never read) and the
+/// upstream is asked again. The stream ends as the same request ends
+/// without the padding: the call that fit ran, the one over the limit is
+/// closed, then the terminal; the case does not tell the two apart on the
+/// wire. The padding is nine mebibytes of comment blocks, which the relay
+/// drops, behind the first turn's call.
 #[tokio::test]
-async fn a_turn_larger_than_the_read_ahead_ends_as_the_same_turn_under_it() {
+async fn a_turn_larger_than_the_read_ahead_is_cut_at_the_deadline_and_asked_again() {
     use std::{
         sync::{
             atomic::{AtomicUsize, Ordering},

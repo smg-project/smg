@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use openai_protocol::event_types::{
-    is_function_call_type, FunctionCallEvent, OutputItemEvent, ResponseEvent,
+    is_function_call_type, FunctionCallEvent, OutputItemEvent, OutputTextEvent, ResponseEvent,
 };
 use serde_json::Value;
 use tracing::warn;
@@ -167,7 +167,46 @@ pub(crate) struct StreamingToolHandler {
     /// `output_item.done` itself, so the upstream's own umbrella for such a
     /// call, read when the relay goes on with the turn, is dropped.
     dispatched_tool_call_indices: HashSet<usize>,
+    /// The items other than function calls that the upstream opened behind
+    /// a hand-over and has not closed, by upstream output index: each as
+    /// announced, the text streamed for it since laid into its parts. A
+    /// turn cut there closes them (see [`Self::take_open_items`]).
+    open_items: Vec<(usize, Value)>,
 }
+
+/// The text deltas of an item other than a function call: the event, the
+/// item's list of parts, the event's key for the part's index, the part's
+/// type and the part's key for its text.
+const OPEN_ITEM_TEXT_DELTAS: [(&str, &str, &str, &str, &str); 4] = [
+    (
+        OutputTextEvent::DELTA,
+        "content",
+        "content_index",
+        "output_text",
+        "text",
+    ),
+    (
+        "response.refusal.delta",
+        "content",
+        "content_index",
+        "refusal",
+        "refusal",
+    ),
+    (
+        "response.reasoning_summary_text.delta",
+        "summary",
+        "summary_index",
+        "summary_text",
+        "text",
+    ),
+    (
+        "response.reasoning_text.delta",
+        "content",
+        "content_index",
+        "reasoning_text",
+        "text",
+    ),
+];
 
 impl StreamingToolHandler {
     pub fn with_starting_index(start: usize) -> Self {
@@ -178,6 +217,7 @@ impl StreamingToolHandler {
             original_response_id: None,
             native_passthrough_tool_call_indices: HashSet::new(),
             dispatched_tool_call_indices: HashSet::new(),
+            open_items: Vec::new(),
         }
     }
 
@@ -246,6 +286,9 @@ impl StreamingToolHandler {
                 let done_output_index = extract_output_index(parsed);
                 if let Some(output_index) = done_output_index {
                     self.ensure_output_index(output_index);
+                    // The upstream closed the item: a cut has nothing to
+                    // close for it.
+                    self.open_items.retain(|(open, _)| *open != output_index);
                 }
                 // Only suppress the umbrella `output_item.done` when it is
                 // closing a tool-call item that we are intercepting — an
@@ -336,8 +379,85 @@ impl StreamingToolHandler {
                     StreamAction::Forward
                 }
             }
-            _ => StreamAction::Forward,
+            event_type => {
+                if !self.open_items.is_empty() {
+                    self.record_open_item_text(event_type, parsed);
+                }
+                StreamAction::Forward
+            }
         }
+    }
+
+    /// Lays one text delta into the open item it belongs to, in the part
+    /// the event names, so a turn cut there closes the item with what was
+    /// streamed. A part is opened by its first delta, in order.
+    fn record_open_item_text(&mut self, event_type: &str, parsed: &Value) {
+        let Some(&(_, list, index_key, part_type, text_key)) =
+            OPEN_ITEM_TEXT_DELTAS.iter().find(|row| row.0 == event_type)
+        else {
+            return;
+        };
+        let (Some(output_index), Some(delta)) = (
+            extract_output_index(parsed),
+            parsed.get("delta").and_then(Value::as_str),
+        ) else {
+            return;
+        };
+        let Some(parts) = self
+            .open_items
+            .iter_mut()
+            .find(|(open, _)| *open == output_index)
+            .and_then(|(_, item)| item.as_object_mut())
+            .map(|item| item.entry(list).or_insert_with(|| Value::Array(Vec::new())))
+            .and_then(Value::as_array_mut)
+        else {
+            return;
+        };
+        let part_index = parsed
+            .get(index_key)
+            .and_then(Value::as_u64)
+            .and_then(|index| usize::try_from(index).ok())
+            .unwrap_or(0);
+        if part_index == parts.len() {
+            let mut part = serde_json::Map::new();
+            part.insert("type".to_string(), Value::String(part_type.to_string()));
+            part.insert(text_key.to_string(), Value::String(String::new()));
+            if part_type == "output_text" {
+                part.insert("annotations".to_string(), Value::Array(Vec::new()));
+            }
+            parts.push(Value::Object(part));
+        }
+        if let Some(Value::String(text)) = parts
+            .get_mut(part_index)
+            .and_then(|part| part.get_mut(text_key))
+        {
+            text.push_str(delta);
+        }
+    }
+
+    /// Takes the items the upstream left open behind a hand-over, each
+    /// under the output index the client reads and closed the way a cut
+    /// turn closes it: the item as announced with the text streamed for
+    /// it, `incomplete` (a hosted tool call: `failed`, the status the skip
+    /// road gives a call of its type that did not run).
+    pub fn take_open_items(&mut self) -> Vec<(usize, Value)> {
+        let open_items = std::mem::take(&mut self.open_items);
+        open_items
+            .into_iter()
+            .map(|(upstream_index, mut item)| {
+                let status = match item.get("type").and_then(Value::as_str) {
+                    Some(item_type) if is_tool_call_item_type(item_type) => "failed",
+                    _ => "incomplete",
+                };
+                if let Some(obj) = item.as_object_mut() {
+                    obj.insert("status".to_string(), Value::String(status.to_string()));
+                }
+                let output_index = self
+                    .mapped_output_index(upstream_index)
+                    .unwrap_or(upstream_index);
+                (output_index, item)
+            })
+            .collect()
     }
 
     fn handle_output_item_added(&mut self, parsed: &Value) -> StreamAction {
@@ -367,6 +487,13 @@ impl StreamingToolHandler {
                 if let Some(output_index) = cached_output_index {
                     self.native_passthrough_tool_call_indices
                         .insert(output_index);
+                }
+            }
+            // Behind a hand-over the turn can be cut: an item that opens
+            // there is kept as announced until the upstream closes it.
+            if !self.dispatched_tool_call_indices.is_empty() {
+                if let Some(output_index) = cached_output_index {
+                    self.open_items.push((output_index, item.clone()));
                 }
             }
             return StreamAction::Forward;

@@ -67,6 +67,11 @@ impl StreamingResponseAccumulator {
         self.build_fallback_response()
     }
 
+    /// Whether the stream carried its `response.completed`.
+    pub fn is_completed(&self) -> bool {
+        self.completed_response.is_some()
+    }
+
     pub fn encountered_error(&self) -> Option<&Value> {
         self.encountered_error.as_ref()
     }
