@@ -565,6 +565,34 @@ impl ShortPieceTable {
         true
     }
 
+    /// [`Self::keep`] for a caller that has counted the table's room: it
+    /// knows the length stands under [`Self::fill_bound`], so the tests left
+    /// are those of the piece alone (the count of its ids, the mask of its
+    /// vacancy, the slot still empty). A function of its own beside
+    /// [`Self::keep`]: the walk compiles that one in, and stays as it is.
+    #[inline(always)]
+    pub(super) fn keep_with_room(&mut self, vacancy: Vacancy, entry: &Entry) -> bool {
+        let slot = vacancy.slot as usize;
+        if (entry.key >> COUNT_SHIFT) as usize > INLINE_IDS
+            || vacancy.mask as usize != self.mask
+            || self.tags[slot] != EMPTY_TAG
+        {
+            return false;
+        }
+        debug_assert!(
+            self.len < self.fill_bound(),
+            "the caller counted room under the fill bound"
+        );
+        debug_assert!(
+            self.occupied_up_to(vacancy.key, slot),
+            "a vacancy of the table as it is: no clear between the probe and the copy"
+        );
+        self.tags[slot] = vacancy.tag;
+        self.entries[slot] = *entry;
+        self.len += 1;
+        true
+    }
+
     /// Stores `ids` as the piece's encoding and answers true. A table at its
     /// fill bound with fewer slots than `bound` entries take grows first
     /// (in the steps of `grow`: more than doubling while small, up to
@@ -1087,6 +1115,52 @@ mod tests {
         assert!(table.insert_at(vacancy, &[7], bound));
         assert!(table.slots() > slots);
         assert_eq!(ids_of(&table, b"word"), Some(vec![7]));
+    }
+
+    #[test]
+    fn a_copy_kept_with_counted_room_is_the_copy_keep_stores() {
+        fn entry_of<'a>(seed: &'a ShortPieceTable, piece: &[u8]) -> &'a Entry {
+            let Ok(entry) = seed.probe(key(piece)) else {
+                panic!("the seed holds the piece");
+            };
+            entry
+        }
+        let mut seed = ShortPieceTable::for_entries(8);
+        assert!(seed.insert(key(b"word"), &[7, 8], 8));
+        assert!(seed.insert(key(b"spilled"), &[1, 2, 3, 4, 5], 8));
+        assert!(seed.insert(key(b"taken"), &[9], 8));
+        assert!(seed.insert(key(b"later"), &[10], 8));
+        let (mut by_keep, mut table) = (ShortPieceTable::new(), ShortPieceTable::new());
+        let mut out = Vec::new();
+        let vacancy = by_keep.lookup(key(b"word"), &mut out).expect("a miss");
+        assert!(by_keep.keep(vacancy, entry_of(&seed, b"word")));
+        let vacancy = table.lookup(key(b"word"), &mut out).expect("a miss");
+        assert!(table.keep_with_room(vacancy, entry_of(&seed, b"word")));
+        assert_eq!(table.len(), by_keep.len());
+        assert_eq!(ids_of(&table, b"word"), ids_of(&by_keep, b"word"));
+        assert_eq!(ids_of(&table, b"word"), Some(vec![7, 8]));
+        // The tests of the piece itself stand. Ids in the other table's
+        // spill are not a copy to keep,
+        let vacancy = table.lookup(key(b"spilled"), &mut out).expect("a miss");
+        assert!(!table.keep_with_room(vacancy, entry_of(&seed, b"spilled")));
+        assert_eq!(ids_of(&table, b"spilled"), None);
+        // nor is a slot taken since the probe overwritten,
+        let stale = table.lookup(key(b"taken"), &mut out).expect("a miss");
+        assert!(table.insert(key(b"taken"), &[11], 1000));
+        assert!(!table.keep_with_room(stale, entry_of(&seed, b"taken")));
+        assert_eq!(ids_of(&table, b"taken"), Some(vec![11]));
+        assert_eq!(table.len(), 2);
+        // nor a vacancy of the table before it grew taken.
+        let stale = table.lookup(key(b"later"), &mut out).expect("a miss");
+        let slots = table.slots();
+        let mut stored = 0usize;
+        while table.slots() == slots {
+            assert!(table.insert(key(&stored.to_le_bytes()), &[stored as u32], 1000));
+            stored += 1;
+        }
+        assert!(!table.keep_with_room(stale, entry_of(&seed, b"later")));
+        assert_eq!(ids_of(&table, b"later"), None);
+        assert_eq!(table.len(), 2 + stored);
     }
 
     #[test]

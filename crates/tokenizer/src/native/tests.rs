@@ -4315,6 +4315,136 @@ fn a_table_cleared_while_pieces_wait_answers_every_one_of_them() {
     );
 }
 
+/// A batch of waiting pieces fills a thread to its share, and its packed
+/// table to its fill bound, and no further: the piece behind the last one
+/// the share takes clears the tiers and the one behind the fill bound grows
+/// the table, as when each piece asked both for itself. A piece merged in
+/// the batch takes one of the share as a copy of the seed's entry does.
+#[test]
+fn a_waiting_batch_fills_a_thread_to_its_share_and_its_table_to_its_bound() {
+    let (tokenizer, _) = waiting_fixture();
+    let model = tokenizer.get_model();
+    let id = |token: &str| model.token_to_id(token).expect("a token");
+    // The ids, the packed table's entries and slots and the thread's clears
+    // behind one batch of `pieces` (in the text's order: the last is
+    // answered first) on a thread of `share` whose table holds `held`.
+    let answered = |share: usize, held: u64, pieces: &[&[u8]]| {
+        let (_, native) = waiting_fixture();
+        let mut cache = native.thread_piece_cache().borrow_mut();
+        cache.share = share;
+        for i in 0..held {
+            let key = ShortPieceKey::of(&i.to_le_bytes()).expect("key");
+            assert!(cache.packed.insert(key, &[1], share));
+        }
+        let mut ids = vec![7];
+        cache.last_miss = 0;
+        for piece in pieces {
+            assert!(miss(&native, piece, &mut ids, &mut cache));
+        }
+        assert_eq!(cache.waiting.len(), pieces.len(), "every piece waits");
+        native.answer_waiting(&mut ids, &mut cache);
+        (ids, cache.packed.len(), cache.packed.slots(), cache.clears)
+    };
+    // Five pieces the seed holds under a share of three: three copies, the
+    // fourth piece clears the tiers, the fifth is a copy again.
+    assert_eq!(
+        answered(3, 0, &[&b"x"[..], b"y", b"q", b"ab", b"xy"]),
+        (
+            vec![7, id("x"), id("y"), id("q"), id("a"), id("b"), id("xy")],
+            2,
+            MIN_SLOTS,
+            1
+        )
+    );
+    // A merged piece ("xyq", answered first) takes one of the three: two
+    // copies, and the fourth piece clears.
+    assert_eq!(
+        answered(3, 0, &[&b"q"[..], b"ab", b"xy", b"xyq"]),
+        (
+            vec![7, id("q"), id("a"), id("b"), id("xy"), id("xy"), id("q")],
+            1,
+            MIN_SLOTS,
+            1
+        )
+    );
+    // Two entries under the fill bound of the smallest table, at the whole
+    // share: two copies, the third piece grows the table, and the fourth,
+    // whose vacancy is of the table before it grew, is stored by probing.
+    let held = MIN_SLOTS / 4 * 3 - 2;
+    let pieces = [&b"q"[..], b"ab", b"xy", b"x"];
+    let (ids, len, slots, clears) = answered(PIECE_CACHE_CAPACITY, held as u64, &pieces);
+    assert_eq!(
+        ids,
+        [7, id("q"), id("a"), id("b"), id("xy"), id("x")],
+        "the ids"
+    );
+    assert_eq!((len, clears), (held + 4, 0));
+    assert!(slots > MIN_SLOTS, "{slots}");
+}
+
+/// The room a thread counts once for the copies of a waiting batch
+/// (`PieceCache::keep_room`) is the distance to the first test that would
+/// turn: the share of its tiers, the fill bound of its packed table and, at
+/// the whole share, that table's own bound. Each entry takes one of it, and
+/// a test turns at its end and not before.
+#[test]
+fn a_threads_room_for_copies_ends_where_its_share_or_its_packed_table_fills() {
+    let turned = |cache: &PieceCache, share: usize| {
+        cache.short_full(share) || cache.packed.len() >= cache.packed.fill_bound()
+    };
+    let key_of = |i: u32| ShortPieceKey::of(word(i).as_bytes()).expect("key");
+    // A share under the fill bound of the smallest table (one entry of the
+    // map counts against it), a share above that bound, and the whole
+    // share, where the map's entry is counted apart from the packed table.
+    let smallest = MIN_SLOTS / 4 * 3;
+    for (share, first) in [
+        (5, 4),
+        (2 * MIN_SLOTS, smallest),
+        (PIECE_CACHE_CAPACITY, smallest),
+    ] {
+        let mut cache = PieceCache::with_share(share);
+        cache
+            .short
+            .insert(b"a piece of the map"[..].into(), [1u32][..].into());
+        assert_eq!(cache.keep_room(share), first, "{share}");
+        let mut stored = 0;
+        while stored < 4 * MIN_SLOTS as u32 {
+            let room = cache.keep_room(share);
+            for taken in 0..room {
+                assert!(!turned(&cache, share), "{share}: {taken} of {room}");
+                assert!(cache.packed.insert(key_of(stored), &[1], share));
+                stored += 1;
+            }
+            assert!(turned(&cache, share), "{share}: a room of {room} taken");
+            // Behind the turn a piece is remembered as `remember_piece`
+            // does: the tiers cleared at the share, the table grown at its
+            // fill bound.
+            if cache.short_full(share) {
+                cache.clear_short(share);
+            }
+            assert!(cache.packed.insert(key_of(stored), &[1], share));
+            stored += 1;
+        }
+    }
+    // The packed table's own bound at the whole share ends the room by
+    // itself in a table with more slots than that share gives one.
+    let share = PIECE_CACHE_CAPACITY;
+    let mut cache = PieceCache::with_share(share);
+    cache.packed = ShortPieceTable::for_entries(2 * share);
+    for i in 0..(FULL_SHARE_PACKED - 3) as u32 {
+        assert!(cache.packed.insert(key_of(i), &[1], 2 * share));
+    }
+    assert!(cache.packed.fill_bound() > FULL_SHARE_PACKED);
+    assert_eq!(cache.keep_room(share), 3);
+    for i in 0..3 {
+        assert!(!cache.short_full(share), "{i} of 3");
+        let key = key_of(FULL_SHARE_PACKED as u32 + i);
+        assert!(cache.packed.insert(key, &[1], 2 * share));
+    }
+    assert!(cache.short_full(share));
+    assert_eq!(cache.keep_room(share), 0);
+}
+
 /// A miss far behind the last one stands alone: the seed answers it where
 /// it is met and nothing waits; a piece the seed does not hold is left to
 /// the slow call, with no hole. The miss close behind it waits.

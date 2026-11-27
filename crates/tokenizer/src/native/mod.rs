@@ -826,6 +826,24 @@ impl PieceCache {
             || (share >= PIECE_CACHE_CAPACITY && self.packed.len() >= FULL_SHARE_PACKED)
     }
 
+    /// How many copies the packed table is certain to keep from here on
+    /// before [`Self::short_full`] or its own fill bound can turn: the least
+    /// of the three distances. A copy adds one entry to the packed table and
+    /// to nothing else, and so does a short piece remembered from its ids
+    /// while the tiers are not full (it clears nothing then): each takes one
+    /// of the room, and that many of them leave every one of those tests as
+    /// it reads now. The share does not move inside one encode.
+    fn keep_room(&self, share: usize) -> usize {
+        let packed = self.packed.len();
+        let mut room = share
+            .saturating_sub(self.counted_entries(share))
+            .min(self.packed.fill_bound().saturating_sub(packed));
+        if share >= PIECE_CACHE_CAPACITY {
+            room = room.min(FULL_SHARE_PACKED.saturating_sub(packed));
+        }
+        room
+    }
+
     /// Counts `asked` asks of the learned table, `of_use` of them answered
     /// by it, and judges every `ASKS_JUDGED` of them: where the table
     /// answered fewer than one in `ASKS_OF_USE_PART`, under one ask in
@@ -4795,6 +4813,10 @@ impl NativeEncoder {
         let mut late_len = 0;
         // The asks of the learned table here, and those it answers.
         let (mut asked, mut of_use) = (0u32, 0u32);
+        // The copies the thread's table is certain to keep: read once a
+        // batch, counted down by each copy and by each piece remembered
+        // another way.
+        let mut room = cache.keep_room(cache.share);
         answer.clear();
         for piece in waiting.iter().rev() {
             let key = piece.vacancy.key();
@@ -4818,7 +4840,15 @@ impl NativeEncoder {
             }
             if let Some(vacancy) = vacancy {
                 if let Ok(entry) = self.seed.probe(key) {
-                    one = self.keep_answer(&self.seed, entry, vacancy, from, &mut answer, cache);
+                    one = self.keep_answer(
+                        &self.seed,
+                        entry,
+                        vacancy,
+                        from,
+                        &mut answer,
+                        cache,
+                        &mut room,
+                    );
                 } else {
                     // The seed does not hold it: the thread's table (a
                     // copy of a piece of this batch), the learned table
@@ -4844,6 +4874,7 @@ impl NativeEncoder {
                                     from,
                                     &mut answer,
                                     cache,
+                                    &mut room,
                                 );
                                 of_use += 1;
                             } else {
@@ -4878,6 +4909,8 @@ impl NativeEncoder {
                                     }
                                 }
                                 self.remember_piece(piece, Some(fresh), from, &answer, cache);
+                                // One entry of the packed table at most.
+                                room = room.saturating_sub(1);
                                 if let Some(learned) = learned {
                                     learned.learn(key, &answer[from..]);
                                 }
@@ -4940,6 +4973,7 @@ impl NativeEncoder {
     /// at `vacancy` as a copy ([`ShortPieceTable::keep`]) or, where that
     /// table takes no copy, remembered from its ids.
     #[inline(always)]
+    #[expect(clippy::too_many_arguments)]
     fn keep_answer(
         &self,
         table: &ShortPieceTable,
@@ -4948,9 +4982,23 @@ impl NativeEncoder {
         from: usize,
         answer: &mut Vec<u32>,
         cache: &mut PieceCache,
+        room: &mut usize,
     ) -> Option<u32> {
         let one = table.one_or_append(entry, answer);
-        if cache.short_full(cache.share) || !cache.packed.keep(*vacancy, entry) {
+        // Inside the counted room neither the full test of the tiers nor
+        // the fill bound of the packed table can have turned: the tests of
+        // the piece alone are left. With no room both are asked, as before.
+        let kept = if *room != 0 {
+            debug_assert!(
+                !cache.short_full(cache.share),
+                "room counted under the full test"
+            );
+            *room -= 1;
+            cache.packed.keep_with_room(*vacancy, entry)
+        } else {
+            !cache.short_full(cache.share) && cache.packed.keep(*vacancy, entry)
+        };
+        if !kept {
             // Not kept as a copy: remembered from its ids.
             answer.extend(one);
             self.remember_seeded(*vacancy, from, answer, cache);
