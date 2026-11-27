@@ -208,6 +208,17 @@ jobs:
         if: inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd'
         run: bash scripts/ci_setup_sglang_rocm_image.sh
 
+      - name: Check SGLang ROCm Mooncake binding
+        if: inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd' && inputs.kv_backend == 'mooncake'
+        run: |
+          python3 - <<'PY'
+          import torch
+          import mooncake.engine as mooncake_engine
+
+          assert torch.version.hip, "Mooncake ROCm check requires HIP-enabled Torch"
+          print("Mooncake binding:", mooncake_engine.TransferEngine, mooncake_engine.__file__)
+          PY
+
       - name: Setup vLLM backend
         if: inputs.engine == 'vllm' && inputs.gpu_vendor != 'amd'
         uses: ./.github/actions/setup-vllm
