@@ -247,8 +247,8 @@ impl PairAdmission for Rooms {
 /// gateway that keeps its gate on its workers does: a prefill has capacity
 /// by its load, and a decode ahead of the stated place has a room by its
 /// running window, its admitted requests and the rooms waited for at its
-/// gate. No decode from the stated place on has a room. Whether it refuses
-/// no place is the trait's own walk of the two lists.
+/// gate. No decode from the stated place on has a room. The engine asks
+/// each place of the two lists once a decision, ahead of a pair's draws.
 #[derive(Debug)]
 struct Gates {
     prefills: Arc<[Arc<dyn Worker>]>,

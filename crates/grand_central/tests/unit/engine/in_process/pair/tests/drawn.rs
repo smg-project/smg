@@ -335,3 +335,62 @@ fn a_pair_with_a_refused_place_is_decided_whole_and_asks_each_place_once() {
         }
     }
 }
+
+/// An admission that refuses no place and lays one request on `worker` at
+/// the first place it is asked of: a host whose answer moves a load.
+#[derive(Debug)]
+struct Loading {
+    worker: Arc<dyn Worker>,
+    asked: AtomicU32,
+}
+
+impl PairAdmission for Loading {
+    fn has_capacity(&self, _: usize) -> bool {
+        if self.asked.fetch_add(1, Ordering::Relaxed) == 0 {
+            self.worker.increment_load();
+        }
+        true
+    }
+
+    fn has_room(&self, _: usize) -> bool {
+        true
+    }
+}
+
+#[test]
+fn a_pair_decided_by_its_draws_asks_its_places_ahead_of_the_rows_it_writes() {
+    // The draw asks every place ahead of the two rows a side it writes;
+    // the whole pass writes every row and asks behind them. So a load
+    // the host lays at its first answer is read by the draw alone: the
+    // prefill a seed picks at level loads loses its tie there. Decided
+    // whole, no seed moves its pick.
+    let host = drawing(8, 8);
+    let mut moved = false;
+    for seed in 0..256 {
+        let level = host.decide_vetoed(
+            &Counted::default(),
+            (seed, None),
+            Constraints::default(),
+            [None, None],
+            UNMASKED,
+        );
+        let (prefill, _) = host.picked(&level);
+        let loading = Loading {
+            worker: Arc::clone(&host.prefills[prefill]),
+            asked: AtomicU32::new(0),
+        };
+        let drawn = host.decide_vetoed(
+            &loading,
+            (seed, None),
+            Constraints::default(),
+            [None, None],
+            UNMASKED,
+        );
+        host.prefills[prefill].decrement_load();
+        moved |= host.picked(&drawn).0 != prefill;
+    }
+    assert!(
+        moved,
+        "no seed moved off the prefill loaded as its gates were read"
+    );
+}

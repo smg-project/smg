@@ -1499,11 +1499,13 @@ On main three pickers say so: round robin, `random` and `passthrough`.
    if nothing had been drawn.
    A prefill and decode pair whose two sides both pick of two is decided on a draw of each side:
    the two records each side's draw names are written, and the pair is the one the whole pass
-   names for that seed. It is drawn so only where the request states nothing beside its two
-   lists (no worker tried or excluded, no place, no held decode, no veto of its host), each side
-   holds one partner class, the host's admission refuses no place of either list, and the
-   document reads neither signal cells nor affinity; every other pair has every record of both
-   lists written.
+   names for that seed. It is drawn so only where each list holds its side's floor of workers (8
+   or 16, as above) and no ranks of a data-parallel engine, and every worker of both lists
+   publishes its routing state available; where the request states nothing beside its two lists
+   (no session key, no worker tried or excluded, no place, no held decode, no veto of its host);
+   where each side holds one partner class and the host's admission refuses no place of either
+   list; and where the document names no shadow and reads neither signal cells nor affinity.
+   Every other pair has every record of both lists written.
    A request whose session key holds no pin is decided on a draw too, where its sessions rule
    leaves a new key to a profile whose picker takes turns and whose filters are one test of a
    worker's record. The worker the list's counter points at has its record written first, with no
