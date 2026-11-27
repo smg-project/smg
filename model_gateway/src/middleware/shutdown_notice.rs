@@ -140,6 +140,10 @@ where
 fn shutting_down() -> Response {
     error::service_unavailable(
         SERVER_SHUTTING_DOWN_CODE,
-        "The server is shutting down and did not complete the request",
+        "The server is shutting down and did not answer the request",
     )
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/middleware/shutdown_notice/tests.rs"]
+mod tests;
