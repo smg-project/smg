@@ -37,4 +37,5 @@ impl DiscoveryHost for AppContext {
 }
 
 #[cfg(test)]
+#[path = "../tests/unit/discovery_host/tests.rs"]
 mod tests;
