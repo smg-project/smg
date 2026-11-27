@@ -9,9 +9,9 @@
 //! the route reads the body and hands that id on. Where the route stated
 //! none, it stands under the gateway's own id of the request: the one its
 //! response's `x-request-id` header shows. The gateway restates that id on
-//! the request under a policy spec that keeps a sample, and the placement
-//! reads it off the headers its route hands it
-//! (`middleware::request_id`). Of a request that states no id of its own
+//! the request under a policy spec that keeps a sample
+//! (`middleware::request_id`), and the engine reads what stands there as
+//! that id. Of a request that states no id of its own
 //! and whose route hands its placement no headers, no decision is kept. An
 //! id that finds no record is answered 404 with the reason, in the control
 //! plane's error envelope.
