@@ -9,6 +9,7 @@ parity nor performance. Other models, vendors and the default stay unchanged.
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 
 MODEL = "openai/gpt-oss-20b"
@@ -18,7 +19,18 @@ PROFILE_ENV = "E2E_SGLANG_GPTOSS_MXFP4_BF16"
 
 def enabled(engine: str, model_id: str) -> bool:
     """Only the original 20B model in an explicitly opted-in AMD job."""
-    if engine != "sglang" or model_id != MODEL or os.environ.get("E2E_GPU_VENDOR") != "amd":
+    if engine != "sglang" or model_id != MODEL:
+        return False
+    # Match the harness's vendor normalization and SMI fallback without importing
+    # it: the numeric preflight loads this stdlib-only module from its file.
+    vendor = os.environ.get("E2E_GPU_VENDOR", "").strip().lower()
+    if not vendor:
+        vendor = (
+            "amd"
+            if shutil.which("nvidia-smi") is None and shutil.which("amd-smi") is not None
+            else "nvidia"
+        )
+    if vendor != "amd":
         return False
     value = os.environ.get(PROFILE_ENV, "0")
     if value not in ("0", "1"):
@@ -32,6 +44,7 @@ def prepare_launch(
     model_path: str,
     spec: dict,
     extra_args: list[str] | None,
+    extra_env: dict[str, str] | None = None,
 ) -> tuple[str, dict]:
     """Bind the selected profile's checkpoint, served id and fixed MoE flags."""
     if not enabled(engine, model_id):
@@ -67,14 +80,25 @@ def prepare_launch(
             if value != MODEL:
                 raise ValueError("The fixed GPT-OSS fallback owns its served model name")
             named = True
+    # Worker applies extra_env over its inherited environment before launch.
+    # Resolve the checkpoint against that same effective cache, with the Hub
+    # cache taking precedence over HF_HOME in both environments.
+    effective_env = {**os.environ, **(extra_env or {})}
     cache = Path(
-        os.environ.get("HF_HUB_CACHE") or Path(os.environ.get("HF_HOME") or "/models") / "hub"
+        effective_env.get("HF_HUB_CACHE") or Path(effective_env.get("HF_HOME") or "/models") / "hub"
     )
-    snapshot = str(cache / "models--openai--gpt-oss-20b" / "snapshots" / REVISION)
+    snapshot_path = cache / "models--openai--gpt-oss-20b" / "snapshots" / REVISION
+    snapshot = str(snapshot_path)
     # An arbitrary local mapping does not establish the numeric probe's
     # checkpoint identity. This opt-in accepts only its fixed original path.
     if model_path not in (MODEL, snapshot):
         raise ValueError("The fixed GPT-OSS fallback requires its original checkpoint revision")
+    if not (snapshot_path / "config.json").is_file():
+        raise FileNotFoundError(
+            f"The fixed GPT-OSS fallback requires {MODEL}@{REVISION}: "
+            f"missing {snapshot_path / 'config.json'}. "
+            "Download this exact revision into the worker's effective HF cache before launch."
+        )
     model_path = snapshot
     args = list(spec.get("sglang_args", []))
     if not named:

@@ -465,7 +465,12 @@ class Worker:
 
         if self.engine == "sglang":
             model_path, spec = prepare_gptoss_launch(
-                self.engine, self.model_id, model_path, spec, self.extra_engine_args
+                self.engine,
+                self.model_id,
+                model_path,
+                spec,
+                self.extra_engine_args,
+                self.extra_env,
             )
             if self.mode == ConnectionMode.ZMQ:
                 # The launcher validates the complete engine argument list

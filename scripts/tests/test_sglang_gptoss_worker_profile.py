@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import importlib.util
 import os
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -21,23 +22,39 @@ REVISION = "6cee5e81ee83917806bbde320786a8fb61efebee"
 
 class WorkerProfileTests(unittest.TestCase):
     def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.hf_home = Path(self.temporary.name) / "hf"
+        self.snapshot = self.make_snapshot(self.hf_home / "hub")
         self.environment = patch.dict(
             os.environ,
-            {"E2E_GPU_VENDOR": "amd", "E2E_SGLANG_GPTOSS_MXFP4_BF16": "1"},
+            {
+                "E2E_GPU_VENDOR": "amd",
+                "E2E_SGLANG_GPTOSS_MXFP4_BF16": "1",
+                "HF_HOME": str(self.hf_home),
+            },
             clear=True,
         )
         self.environment.start()
         self.addCleanup(self.environment.stop)
         self.spec = {"model": MODEL, "sglang_args": ["--context-length", "4096"]}
 
-    def launch(self, *, engine="sglang", model=MODEL, path=MODEL, spec=None, extra=None):
+    def make_snapshot(self, cache):
+        snapshot = cache / "models--openai--gpt-oss-20b" / "snapshots" / REVISION
+        snapshot.mkdir(parents=True)
+        (snapshot / "config.json").write_text("{}")
+        return str(snapshot)
+
+    def launch(
+        self, *, engine="sglang", model=MODEL, path=MODEL, spec=None, extra=None, extra_env=None
+    ):
         return profile.prepare_launch(
-            engine, model, path, self.spec if spec is None else spec, extra
+            engine, model, path, self.spec if spec is None else spec, extra, extra_env
         )
 
     def test_original_packed_checkpoint_and_served_id_are_retained(self):
         path, spec = self.launch()
-        self.assertEqual(path, f"/models/hub/models--openai--gpt-oss-20b/snapshots/{REVISION}")
+        self.assertEqual(path, self.snapshot)
         self.assertEqual(
             spec["sglang_args"],
             [
@@ -53,14 +70,86 @@ class WorkerProfileTests(unittest.TestCase):
         )
 
     def test_cache_environment_precedence(self):
-        os.environ["HF_HOME"] = "/owned/hf"
+        alternate_home = Path(self.temporary.name) / "alternate-home"
+        alternate_hub = Path(self.temporary.name) / "alternate-hub"
+        home_snapshot = self.make_snapshot(alternate_home / "hub")
+        hub_snapshot = self.make_snapshot(alternate_hub)
+        os.environ["HF_HOME"] = str(alternate_home)
+        self.assertEqual(self.launch()[0], home_snapshot)
+        os.environ["HF_HUB_CACHE"] = str(alternate_hub)
+        self.assertEqual(self.launch()[0], hub_snapshot)
+
+    def test_worker_cache_overrides_are_used_without_mutating_environment(self):
+        worker_home = Path(self.temporary.name) / "worker-home"
+        worker_hub = Path(self.temporary.name) / "worker-hub"
+        home_snapshot = self.make_snapshot(worker_home / "hub")
+        hub_snapshot = self.make_snapshot(worker_hub)
+        # Only the child cache has the pinned revision.
+        (Path(self.snapshot) / "config.json").unlink()
+        inherited_before = dict(os.environ)
+        extra = {"HF_HOME": str(worker_home)}
+        self.assertEqual(self.launch(extra_env=extra)[0], home_snapshot)
+        self.assertEqual(extra, {"HF_HOME": str(worker_home)})
+        os.environ["HF_HUB_CACHE"] = str(worker_hub)
+        self.assertEqual(self.launch(extra_env=extra)[0], hub_snapshot)
         self.assertEqual(
-            self.launch()[0], f"/owned/hf/hub/models--openai--gpt-oss-20b/snapshots/{REVISION}"
+            self.launch(extra_env={"HF_HUB_CACHE": "", "HF_HOME": str(worker_home)})[0],
+            home_snapshot,
         )
-        os.environ["HF_HUB_CACHE"] = "/owned/hub"
-        self.assertEqual(
-            self.launch()[0], f"/owned/hub/models--openai--gpt-oss-20b/snapshots/{REVISION}"
-        )
+        os.environ.pop("HF_HUB_CACHE")
+        self.assertEqual(self.launch(extra_env={"HF_HUB_CACHE": str(worker_hub)})[0], hub_snapshot)
+        self.assertEqual(dict(os.environ), inherited_before)
+
+    def test_missing_fixed_snapshot_is_refused_before_launch_preparation_returns(self):
+        config = Path(self.snapshot) / "config.json"
+        config.unlink()
+        before = copy.deepcopy(self.spec)
+        for kind in ("missing", "directory"):
+            with (
+                self.subTest(kind=kind),
+                self.assertRaisesRegex(
+                    FileNotFoundError, rf"{MODEL}@{REVISION}.*config.json.*effective HF cache"
+                ),
+            ):
+                if kind == "directory":
+                    config.mkdir()
+                self.launch()
+            self.assertEqual(self.spec, before)
+
+    def test_explicit_vendor_is_normalized_like_the_harness(self):
+        for vendor in ("amd", "AMD", " amd "):
+            with self.subTest(vendor=vendor):
+                os.environ["E2E_GPU_VENDOR"] = vendor
+                self.assertEqual(self.launch()[0], self.snapshot)
+                env = {}
+                profile.apply_environment("sglang", MODEL, env, None)
+                self.assertEqual(env["SGLANG_GPTOSS_MXFP4_BF16_FALLBACK"], "1")
+
+    def test_unset_vendor_matches_harness_smi_availability_without_running_smi(self):
+        for vendor in (None, "", " "):
+            for nvidia, amd, selected in (
+                (None, "/mock/amd-smi", True),
+                ("/mock/nvidia-smi", "/mock/amd-smi", False),
+                ("/mock/nvidia-smi", None, False),
+                (None, None, False),
+            ):
+                with self.subTest(vendor=vendor, nvidia=nvidia, amd=amd):
+                    if vendor is None:
+                        os.environ.pop("E2E_GPU_VENDOR", None)
+                    else:
+                        os.environ["E2E_GPU_VENDOR"] = vendor
+                    with patch.object(
+                        profile.shutil,
+                        "which",
+                        side_effect=lambda name: nvidia if name == "nvidia-smi" else amd,
+                    ):
+                        path, spec = self.launch()
+                        self.assertEqual(path, self.snapshot if selected else MODEL)
+                        if not selected:
+                            self.assertIs(spec, self.spec)
+                        env = {}
+                        profile.apply_environment("sglang", MODEL, env, None)
+                        self.assertEqual(bool(env), selected)
 
     def test_source_model_spec_and_extra_arguments_are_not_mutated(self):
         extra = ["--trust-remote-code"]
@@ -72,7 +161,7 @@ class WorkerProfileTests(unittest.TestCase):
         self.assertIsNot(configured["sglang_args"], self.spec["sglang_args"])
 
     def test_explicit_original_snapshot_keeps_its_path_and_original_name(self):
-        original = f"/models/hub/models--openai--gpt-oss-20b/snapshots/{REVISION}"
+        original = self.snapshot
         path, spec = self.launch(path=original)
         self.assertEqual(path, original)
         args = spec["sglang_args"]
@@ -163,7 +252,7 @@ class WorkerProfileTests(unittest.TestCase):
 
     def test_unknown_vendor_other_engines_and_original_120b_do_not_opt_in(self):
         for vendor, engine, model in (
-            ("", "sglang", MODEL),
+            ("unknown-vendor", "sglang", MODEL),
             ("amd", "vllm", MODEL),
             ("amd", "sglang", "openai/gpt-oss-120b"),
             ("amd", "sglang", "Qwen/Qwen3-VL-8B-Instruct"),
