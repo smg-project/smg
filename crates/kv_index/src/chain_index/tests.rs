@@ -1725,9 +1725,9 @@ fn the_sixty_fifth_worker_reads_and_writes_right() {
     assert_eq!(holders, (0..64u32).map(|w| (w, 4)).collect::<Vec<_>>());
 }
 
-/// A split and a store read a run's coverage as far as a worker can hold a bit: a run only
-/// the 65th worker holds keeps that holder on both halves when a worker of the first word
-/// forks off it, and the 65th still grows its own leaf.
+/// A store and a split read a run's coverage as far as a worker can hold a bit. The 65th
+/// worker grows the leaf it alone holds in place, a hole it cuts into that run leaves it on
+/// the tail, and a worker of the first word does not grow in place a leaf the 65th holds too.
 #[test]
 fn a_split_and_a_store_read_a_holder_of_a_further_word() {
     let index = ChainIndex::with_max_workers(MAX_WORDS * 64);
@@ -1738,33 +1738,79 @@ fn a_split_and_a_store_read_a_holder_of_a_further_word() {
     let far = index.intern_worker("w64").expect("id");
     assert_eq!((near, far), (0, 64));
     let (mut near_map, mut far_map) = (ChainBlockMap::default(), ChainBlockMap::default());
-    let base: Vec<ContentHash> = (0..6).map(|p| content(1, p)).collect();
-    let mut fork = base[..3].to_vec();
-    fork.extend((0..4).map(|p| content(2, p)));
-    let mut longer = base.clone();
-    longer.extend((6..8).map(|p| content(1, p)));
+    let held: Vec<ContentHash> = (0..10).map(|p| content(1, p)).collect();
+    let blocks = blocks_of(&held);
     index
-        .apply_stored(far, &blocks_of(&base), None, &mut far_map)
+        .apply_stored(far, &blocks[..6], None, &mut far_map)
         .expect("store far");
     index
-        .apply_stored(near, &blocks_of(&fork), None, &mut near_map)
-        .expect("store near");
-    assert_eq!(scores(&index, &base), vec![(near, 3), (far, 6)]);
-    assert_eq!(scores(&index, &fork), vec![(near, 7), (far, 3)]);
-    index
-        .apply_stored(far, &blocks_of(&longer), None, &mut far_map)
+        .apply_stored(far, &blocks[6..8], Some(blocks[5].seq_hash), &mut far_map)
         .expect("grow far");
-    assert_eq!(scores(&index, &longer), vec![(near, 3), (far, 8)]);
+    assert_eq!(
+        index.stats().runs_live,
+        1,
+        "the far worker grows its own leaf"
+    );
+    // A hole splits the run: the tail keeps its only holder, so the healed chain matches whole.
+    index.apply_removed(far, &[blocks[2].seq_hash], &mut far_map);
+    assert_eq!(scores(&index, &held), vec![(far, 2)]);
+    index
+        .apply_stored(far, &blocks[2..3], Some(blocks[1].seq_hash), &mut far_map)
+        .expect("heal");
+    assert_eq!(scores(&index, &held), vec![(far, 8)]);
+    // The near worker holds the tail whole too and stores past it: no leaf of one worker.
+    index
+        .apply_stored(near, &blocks[..8], None, &mut near_map)
+        .expect("store near");
+    index
+        .apply_stored(near, &blocks[8..], Some(blocks[7].seq_hash), &mut near_map)
+        .expect("grow near");
+    assert_eq!(scores(&index, &held), vec![(near, 10), (far, 8)]);
     let mut reference = ReferenceIndexer::new();
     reference
-        .apply_stored(far, &blocks_of(&base), None)
+        .apply_stored(far, &blocks[..8], None)
         .expect("ref far");
     reference
-        .apply_stored(near, &blocks_of(&fork), None)
+        .apply_stored(near, &blocks, None)
         .expect("ref near");
-    reference
-        .apply_stored(far, &blocks_of(&longer), None)
-        .expect("ref grow");
+    assert_eq!(index.debug_blocks(), reference.blocks());
+}
+
+/// A removal reads a run's coverage as far as a worker can hold a bit: a run the 65th worker
+/// holds whole stays in the tree when the last holder of the first word leaves it, by an
+/// eviction of its blocks and by the removal of the worker.
+#[test]
+fn a_removal_leaves_a_run_a_holder_of_a_further_word_still_holds() {
+    let index = ChainIndex::with_max_workers(MAX_WORDS * 64);
+    let near = index.intern_worker("w0").expect("id");
+    for name in 1..64 {
+        index.intern_worker(&format!("w{name}")).expect("id");
+    }
+    let far = index.intern_worker("w64").expect("id");
+    assert_eq!((near, far), (0, 64));
+    let (mut near_map, mut far_map) = (ChainBlockMap::default(), ChainBlockMap::default());
+    let evicted: Vec<ContentHash> = (0..6).map(|p| content(1, p)).collect();
+    let left: Vec<ContentHash> = (0..6).map(|p| content(2, p)).collect();
+    let mut reference = ReferenceIndexer::new();
+    for held in [&evicted, &left] {
+        let blocks = blocks_of(held);
+        index
+            .apply_stored(near, &blocks, None, &mut near_map)
+            .expect("store near");
+        index
+            .apply_stored(far, &blocks, None, &mut far_map)
+            .expect("store far");
+        reference.apply_stored(far, &blocks, None).expect("ref far");
+    }
+    let hashes: Vec<_> = blocks_of(&evicted)
+        .iter()
+        .map(|block| block.seq_hash)
+        .collect();
+    index.apply_removed(near, &hashes, &mut near_map);
+    assert_eq!(scores(&index, &evicted), vec![(far, 6)]);
+    index.remove_worker(near, near_map);
+    assert_eq!(scores(&index, &evicted), vec![(far, 6)]);
+    assert_eq!(scores(&index, &left), vec![(far, 6)]);
     assert_eq!(index.debug_blocks(), reference.blocks());
 }
 
