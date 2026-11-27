@@ -253,7 +253,7 @@ impl EncodeLists<'_> {
             placed,
             |_| true,
             |_| true,
-            Some(SessionCountedUnder::default),
+            SessionCountedUnder::default,
         )
     }
 
@@ -346,9 +346,8 @@ impl EncodeLists<'_> {
     /// side of the pair then reads it under the name of the side's own
     /// session, as a pair's own decision does. The encoders' records read
     /// it under no name: an item goes by its side's policy, whatever the
-    /// request's key. An entry that hands `None` names no count, and every
-    /// record of its request reads none: the entry of a host that files a
-    /// pick's lease itself ([`Loaded::decide_encode_without_lease`]).
+    /// request's key. Every entry hands its maker's word, and the lists' own
+    /// decision, which holds no maker, the key's own text ([`Self::decide`]).
     #[expect(
         clippy::too_many_arguments,
         reason = "a pair's inputs and the encode side's"
@@ -365,7 +364,7 @@ impl EncodeLists<'_> {
         placed: &mut EncodePlaced,
         sends_to: impl Fn(&Target) -> bool,
         sends_to_encoder: impl Fn(u32) -> bool,
-        counted: Option<impl FnOnce() -> SessionCountedUnder>,
+        counted: impl FnOnce() -> SessionCountedUnder,
     ) -> Decision {
         let (spec, clock) = (&engine.document.spec, &engine.clock);
         let pair = &self.pair;
@@ -385,18 +384,16 @@ impl EncodeLists<'_> {
             }
         }
         // The name each side of the pair reads the count of the key's
-        // requests under, as a pair's own decision names it: the one its
-        // side's session is counted under, as the request's maker states
-        // it. Named under a document that reads the count and under no
-        // other, and by no entry that hands no word: by the one function
-        // that names a pair's sides.
+        // requests under, as a pair's own decision names it. It is the one
+        // its side's session is counted under, as the request's maker
+        // states it. Named under a document that reads the count and under
+        // no other, by the one function that names a pair's sides.
         let mut names;
-        let [prefill_key, decode_key] = match counted {
-            Some(counted) if spec.engine().needs().session_in_flight => {
-                names = [[0; Session::TEXT_LEN]; 2];
-                counted().sides(&request.facts, &mut names)
-            }
-            _ => [None; 2],
+        let [prefill_key, decode_key] = if spec.engine().needs().session_in_flight {
+            names = [[0; Session::TEXT_LEN]; 2];
+            counted().sides(&request.facts, &mut names)
+        } else {
+            [None; 2]
         };
         // One value for the three lists' records, as a pair's decision
         // takes one for its two.
@@ -652,11 +649,11 @@ impl Loaded<'_, '_> {
     /// is for a single request and for a pair, under the document this
     /// value holds. The wires' test stands in it.
     ///
-    /// It names no count of the request's key, whatever the document
-    /// reads: every record of the request carries none, a side's as an
-    /// encoder's. The host it serves refuses a sessions rule under the
-    /// `epd` plan, and its encode request's rows read what they read
-    /// before such a rule ran in a host's own process.
+    /// It hands its maker's word of where a key's requests are counted, as
+    /// the entry that issues a lease does. Under a document that reads the
+    /// count each side's records carry it, and an encoder's carry none. A
+    /// host that serves no request counts by the leases it holds on file
+    /// ([`RequestMaker::session_counted_under`]).
     ///
     /// # Errors
     ///
@@ -678,9 +675,9 @@ impl Loaded<'_, '_> {
         self.over_three(maker, placed, |lists, request, loads, placed| {
             let sends_to = |target: &_| maker.sends_to(target);
             let encoder = |place| maker.sends_to_encoder(place);
-            let uncounted = None::<fn() -> SessionCountedUnder>;
+            let counted = || maker.session_counted_under();
             decide(
-                self, lists, request, items, loads, placed, now, sends_to, encoder, uncounted,
+                self, lists, request, items, loads, placed, now, sends_to, encoder, counted,
             )
         })
     }
@@ -699,7 +696,7 @@ impl Loaded<'_, '_> {
             let later = request.constraints.decode_later;
             let sends_to = |target: &_| maker.sends_to(target);
             let encoder = |place| maker.sends_to_encoder(place);
-            let counted = Some(|| maker.session_counted_under());
+            let counted = || maker.session_counted_under();
             let decided = decided(
                 self,
                 lists,
@@ -803,7 +800,7 @@ pub(super) fn decide(
     now: Instant,
     sends_to: impl Fn(&Target) -> bool,
     sends_to_encoder: impl Fn(u32) -> bool,
-    counted: Option<impl FnOnce() -> SessionCountedUnder>,
+    counted: impl FnOnce() -> SessionCountedUnder,
 ) -> Decision {
     // The engine's own value of each of the pair's lists, asked of the
     // list's cell once. The encoders' is asked where it is read: here
@@ -876,7 +873,7 @@ pub(super) fn decided(
     now: Instant,
     sends_to: impl Fn(&Target) -> bool,
     sends_to_encoder: impl Fn(u32) -> bool,
-    counted: Option<impl FnOnce() -> SessionCountedUnder>,
+    counted: impl FnOnce() -> SessionCountedUnder,
 ) -> DecideOutcome {
     let decision = decide(
         own,
