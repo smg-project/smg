@@ -19,7 +19,7 @@ use super::{
     *,
 };
 use crate::{
-    store::{memory::seam, Signals, WorkerFacts, WorkerStatus, WorkersStore},
+    store::{Signals, WorkerFacts, WorkerStatus, WorkersStore},
     worker_host::{KvTables, Members},
 };
 
@@ -153,7 +153,7 @@ fn the_holders_turn_is_held_over_the_stores_write_and_no_lock_of_the_store_over_
     leader.upsert(facts(1, "gold"));
     let seen = Rc::new(Cell::new(None));
     let (within, read) = (Rc::clone(&standby), Rc::clone(&seen));
-    seam::on_release(move || {
+    on_let_go(move || {
         let turn = within.objects.turn.is_locked();
         let table = within.store.by_key(A).is_some();
         read.set(Some((turn, table, within.object(A).is_some())));

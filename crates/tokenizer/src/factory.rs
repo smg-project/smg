@@ -453,16 +453,26 @@ pub async fn create_tokenizer_async_with_chat_template(
     model_name_or_path: &str,
     chat_template_path: Option<&str>,
 ) -> Result<Arc<dyn traits::Tokenizer>> {
+    // Each parse below runs off the runtime (see `off_the_runtime`); the
+    // download is awaited here, so it stops when this future is dropped.
     // Check if it's a file path
     let path = Path::new(model_name_or_path);
     if path.exists() {
-        return create_tokenizer_with_chat_template(model_name_or_path, chat_template_path);
+        let (source, chat_template) = (
+            model_name_or_path.to_owned(),
+            chat_template_path.map(str::to_owned),
+        );
+        return off_the_runtime(move || {
+            create_tokenizer_with_chat_template(&source, chat_template.as_deref())
+        })
+        .await;
     }
 
     // Check if it's a GPT model name that should use Tiktoken
     if !starts_as_a_path(model_name_or_path) && is_likely_openai_model(model_name_or_path) {
         // Try tiktoken first, but fall back to HuggingFace if it fails
-        match TiktokenTokenizer::from_model_name(model_name_or_path) {
+        let name = model_name_or_path.to_owned();
+        match off_the_runtime(move || TiktokenTokenizer::from_model_name(&name)).await {
             Ok(tokenizer) => return Ok(Arc::new(tokenizer)),
             Err(e) => {
                 debug!(
@@ -481,11 +491,32 @@ pub async fn create_tokenizer_async_with_chat_template(
     // Try to download tokenizer files from HuggingFace
     match download_tokenizer_from_hf(model_name_or_path).await {
         Ok(cache_dir) => {
-            create_tokenizer_from_downloaded_dir(&cache_dir, model_name_or_path, chat_template_path)
+            let (name, chat_template) = (
+                model_name_or_path.to_owned(),
+                chat_template_path.map(str::to_owned),
+            );
+            off_the_runtime(move || {
+                create_tokenizer_from_downloaded_dir(&cache_dir, &name, chat_template.as_deref())
+            })
+            .await
         }
         Err(e) => Err(Error::msg(format!(
             "Failed to download tokenizer from HuggingFace: {e}"
         ))),
+    }
+}
+
+/// `parse` on the blocking pool of the runtime that drives the caller: a
+/// parse of hundreds of milliseconds holds no runtime worker from the tasks
+/// it serves. A parse that panics unwinds the caller, as it did inline; with
+/// no runtime to hand it to, the parse runs inline as before.
+async fn off_the_runtime<T: Send + 'static>(parse: impl FnOnce() -> T + Send + 'static) -> T {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return parse();
+    };
+    match runtime.spawn_blocking(parse).await {
+        Ok(parsed) => parsed,
+        Err(ended) => std::panic::resume_unwind(ended.into_panic()),
     }
 }
 
@@ -1122,5 +1153,27 @@ mod tests {
         );
         std::fs::remove_file(path.join("chat_template.json")).unwrap();
         assert_eq!(super::discover_processor_chat_template_in_dir(path), None);
+    }
+
+    /// A parse that panics on the pool unwinds the caller, as it did when it
+    /// ran inline: the panic is not turned into a failed load.
+    #[tokio::test]
+    #[should_panic(expected = "the parse panicked")]
+    async fn a_parse_that_panics_unwinds_the_caller() {
+        super::off_the_runtime(|| panic!("the parse panicked")).await;
+    }
+
+    /// With no runtime to hand the parse to, it runs inline as before: the
+    /// future is ready at its first poll.
+    #[test]
+    fn a_parse_with_no_runtime_runs_inline() {
+        use std::{
+            future::Future,
+            task::{Context, Poll, Waker},
+        };
+
+        let parse = std::pin::pin!(super::off_the_runtime(|| 7));
+        let ready = parse.poll(&mut Context::from_waker(Waker::noop()));
+        assert_eq!(ready, Poll::Ready(7));
     }
 }

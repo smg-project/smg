@@ -2283,11 +2283,14 @@ request states no hard demand, its host states no places of the prefills or the 
 encode pass is laid for it. One decision more is then held to the rule's prefills, with no decode
 lent.
 
-Under a binding that sheds a list wholly over its thresholds, that decision sheds the request as
-saturated where the rule's prefills that pair with a decode are so. That shed is the answer, for
-the prefill side. Any other
-shed of it leaves the answer as it was. A decision that panics there is answered as refused, as
-any is. The gateway's own selection judges the rule's prefills
+Under a binding that sheds a list wholly over its thresholds, that decision may shed the request
+as saturated: that shed is the answer, for the prefill side. It does where the rule's prefills that
+pair with a decode are so and none of them stands under the prefill side's hard filters, its limit
+set aside. Under a side that lists no overload veto, one over its thresholds may stand, and the
+answer stays as it was.
+
+Any other shed of that decision leaves the answer as it was. A decision that panics there is
+answered as refused, as any is. The gateway's own selection judges the rule's prefills
 first there (`pair_pass` in `model_gateway/src/routers/common/placement.rs`, where no prefill is
 eligible).
 
