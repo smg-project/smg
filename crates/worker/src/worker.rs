@@ -895,6 +895,8 @@ pub struct WorkerSpec {
     /// Per-worker multimodal tensor transport override (`inline` | `shm` | `auto` | `rdma`).
     /// Overrides the router-level `multimodal_tensor_transport` for this worker
     /// (e.g. force `shm` for a co-located worker, `inline` for a remote one).
+    /// The RDMA lane is process-wide and only the router-level setting turns it
+    /// on or off: `rdma` here alone carries this worker's tensors inline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multimodal_tensor_transport: Option<TransportMode>,
 
