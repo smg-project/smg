@@ -80,7 +80,7 @@ mod tests {
         engine::Engine,
         event::{DropReason, Event, FinishReason, MalformedReason, Text},
         input::EngineFinish,
-        Declared,
+        Declared, Parser,
     };
 
     /// The generation prompt's tail: the assistant's message opened, and its thought.
@@ -102,6 +102,245 @@ mod tests {
             prompt,
             pieces,
         )
+    }
+
+    /// Synthetic token origins, not a captured model stream. Each marked piece
+    /// begins with an actual atomic framing token; identical bytes elsewhere
+    /// are ordinary text. Counts use synthetic character tokens independently.
+    fn token_bound(
+        prompt: &str,
+        pieces: &[(&str, bool)],
+        cut: usize,
+        finish: EngineFinish,
+    ) -> Vec<Event<'static>> {
+        let text: String = pieces.iter().map(|(text, _)| *text).collect();
+        let mut engine = Engine::with_call_ids(Arc::new(kimi_k3()), Declared::default(), ids());
+        engine.bind_structural_token_origins().unwrap();
+        let mut all = Vec::new();
+        let mut events = crate::Events::new();
+        engine
+            .feed(
+                crate::Input::Prompt {
+                    token_ids: &[],
+                    text: prompt,
+                },
+                &mut events,
+            )
+            .unwrap();
+        all.extend(events.consume().map(Event::into_owned));
+        let mut at = 0;
+        let mut tokens = Vec::new();
+        for (piece, structural) in pieces {
+            let mut ordinary = 0;
+            if *structural {
+                let atom = if piece.starts_with("<|open|>") {
+                    "<|open|>"
+                } else {
+                    "<|close|>"
+                };
+                assert!(piece.starts_with(atom));
+                engine
+                    .note_structural_token_origin(atom, at..at + atom.len())
+                    .unwrap();
+                tokens.push((
+                    at,
+                    at + atom.len(),
+                    if atom == "<|open|>" { 100 } else { 101 },
+                ));
+                ordinary = atom.len();
+            }
+            for (offset, ch) in piece[ordinary..].char_indices() {
+                let start = at + ordinary + offset;
+                tokens.push((start, start + ch.len_utf8(), 1));
+            }
+            at += piece.len();
+        }
+        for (start, end) in [(0, cut), (cut, text.len())] {
+            let part = &text[start..end];
+            let spans: Vec<_> = tokens
+                .iter()
+                .filter(|(a, b, _)| *a < end && *b > start)
+                .map(|(a, b, id)| crate::TokenSpan {
+                    token_id: *id,
+                    start: (*a).max(start) - start,
+                    end: (*b).min(end) - start,
+                    continued: *a < start,
+                })
+                .collect();
+            let token_ids: Vec<_> = spans
+                .iter()
+                .filter(|span| !span.continued)
+                .map(|span| span.token_id)
+                .collect();
+            let mut events = crate::Events::new();
+            engine
+                .feed(
+                    crate::Input::Delta {
+                        token_ids: &token_ids,
+                        text: part,
+                        spans: &spans,
+                    },
+                    &mut events,
+                )
+                .unwrap();
+            all.extend(events.consume().map(Event::into_owned));
+        }
+        let mut events = crate::Events::new();
+        engine
+            .feed(crate::Input::End { finish }, &mut events)
+            .unwrap();
+        all.extend(events.consume().map(Event::into_owned));
+        let counted: u32 = all
+            .iter()
+            .map(|event| match event {
+                Event::Content(text)
+                | Event::Reasoning(text)
+                | Event::Dropped { text, .. }
+                | Event::Malformed { text, .. }
+                | Event::ToolCallStart { source: text, .. }
+                | Event::ToolCallArguments { source: text, .. }
+                | Event::ToolCallEnd { source: text, .. } => text.tokens.unwrap(),
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(counted, tokens.len() as u32);
+        all
+    }
+
+    #[test]
+    fn ordinary_marker_spellings_do_not_end_a_token_bound_thought_at_any_cut() {
+        let thought = "Quote {\"response\":\"<|open|>response<|sep|>\",\"think\":\"<|close|>think<|sep|>\"}; é🌍� then continue. ";
+        let answer =
+            "{\"response\":\"<|open|>response<|sep|>\",\"think\":\"<|close|>think<|sep|>\"}";
+        let pieces = [
+            (thought, false),
+            ("<|close|>think<|sep|>", true),
+            ("<|open|>response<|sep|>", true),
+            (answer, false),
+            ("<|close|>response<|sep|>", true),
+            ("<|close|>message<|sep|>", true),
+        ];
+        let text: String = pieces.iter().map(|(text, _)| *text).collect();
+        for cut in text.char_indices().map(|(at, _)| at).chain([text.len()]) {
+            let events = token_bound(PROMPT, &pieces, cut, EngineFinish::Stop);
+            assert_eq!(reasoning(&events), thought, "cut {cut}");
+            assert_eq!(content(&events), answer, "cut {cut}");
+            assert_eq!(bytes(&events), text, "cut {cut}");
+            assert!(events
+                .iter()
+                .all(|event| !matches!(event, Event::Malformed { .. })));
+        }
+    }
+
+    #[test]
+    fn bound_arguments_keep_ordinary_tag_spellings_at_every_cut() {
+        for value in [
+            "hello",
+            "Kimi ends a value with <|close|>argument<|sep|> and starts one with <|open|>argument key=\"k\" type=\"string\"<|sep|> in its template.",
+            "é🌍 <|close|>call<|sep|><|open|>tools<|sep|> stays text",
+        ] {
+            let pieces = [
+                ("<|close|>think<|sep|>", true),
+                ("<|open|>tools<|sep|>", true),
+                ("<|open|>call tool=\"delete_file\" index=\"1\"<|sep|>", true),
+                ("<|open|>argument key=\"content\" type=\"string\"<|sep|>", true),
+                (value, false),
+                ("<|close|>argument<|sep|>", true),
+                ("<|close|>call<|sep|>", true),
+                ("<|close|>tools<|sep|>", true),
+                ("<|close|>message<|sep|>", true),
+            ];
+            let output: String = pieces.iter().map(|(text, _)| *text).collect();
+            for finish in [EngineFinish::Stop, EngineFinish::Length] {
+                for cut in output.char_indices().map(|(at, _)| at).chain([output.len()]) {
+                    let events = token_bound(PROMPT, &pieces, cut, finish.clone());
+                    assert_eq!(
+                        serde_json::from_str::<serde_json::Value>(&arguments_of(&events, 0)).unwrap(),
+                        serde_json::json!({"content": value}),
+                        "cut {cut}, finish {finish:?}"
+                    );
+                    assert!(malformed(&events).is_empty());
+                    assert_eq!(bytes(&events), output);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bound_argument_cut_tails_require_origins_at_every_cut() {
+        for tail in ["<|close|>argu", "<|open|>argu"] {
+            for structural in [false, true] {
+                let pieces = [
+                    ("<|close|>think<|sep|>", true),
+                    ("<|open|>tools<|sep|>", true),
+                    ("<|open|>call tool=\"delete_file\" index=\"1\"<|sep|>", true),
+                    (
+                        "<|open|>argument key=\"content\" type=\"string\"<|sep|>",
+                        true,
+                    ),
+                    ("keep ", false),
+                    (tail, structural),
+                ];
+                let output: String = pieces.iter().map(|(text, _)| *text).collect();
+                let expected = format!("keep {}", if structural { "" } else { tail });
+                for finish in [EngineFinish::Stop, EngineFinish::Length] {
+                    for cut in 0..=output.len() {
+                        let events = token_bound(PROMPT, &pieces, cut, finish.clone());
+                        let actual = arguments_of(&events, 0);
+                        if finish == EngineFinish::Stop {
+                            assert_eq!(
+                                serde_json::from_str::<serde_json::Value>(&actual).unwrap(),
+                                serde_json::json!({"content": expected}),
+                                "cut {cut}"
+                            );
+                        } else {
+                            let quoted = serde_json::to_string(&expected).unwrap();
+                            assert_eq!(
+                                actual,
+                                format!("{{\"content\": {}", &quoted[..quoted.len() - 1]),
+                                "cut {cut}"
+                            );
+                        }
+                        assert_eq!(bytes(&events), output);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn genuine_sibling_open_still_recovers_even_after_an_unmatched_quote() {
+        let pieces = [
+            ("Unmatched quote \" then ", false),
+            ("<|open|>response<|sep|>", true),
+            ("answer", false),
+            ("<|close|>response<|sep|>", true),
+        ];
+        let events = token_bound(PROMPT, &pieces, 4, EngineFinish::Stop);
+        assert_eq!(reasoning(&events), "Unmatched quote \" then ");
+        assert_eq!(content(&events), "answer");
+    }
+
+    #[test]
+    fn prefilled_answer_keeps_ordinary_cut_tags_but_drops_genuine_cut_tags() {
+        let prompt = "<|open|>message role=\"assistant\"<|sep|><|open|>response<|sep|>";
+        for structural in [false, true] {
+            let pieces = [("answer", false), ("<|close|>message", structural)];
+            for finish in [EngineFinish::Stop, EngineFinish::Length] {
+                for cut in 0..=pieces.iter().map(|(text, _)| text.len()).sum() {
+                    let events = token_bound(prompt, &pieces, cut, finish.clone());
+                    assert_eq!(
+                        content(&events),
+                        if structural {
+                            "answer"
+                        } else {
+                            "answer<|close|>message"
+                        }
+                    );
+                    assert_eq!(reasoning(&events), "");
+                }
+            }
+        }
     }
 
     fn ends<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {

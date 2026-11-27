@@ -51,6 +51,11 @@ impl Ledger {
         !self.uncounted
     }
 
+    /// Bytes already delivered in events; no parser rescan can revisit them.
+    pub(crate) fn emitted_bytes(&self) -> usize {
+        self.emitted
+    }
+
     /// Take note of a delta's tokens before its text is parsed.
     pub fn note(&mut self, text: &str, spans: &[TokenSpan]) {
         let at = self.received;
