@@ -62,6 +62,8 @@ An embedded host can implement or use the store's ingress traits for health and 
 
 ## Run it
 
+The standalone service stands on [a page of its own](docs/service.md): its flags, its worker discovery, the calls it serves and the client a host calls it with.
+
 ### In a host process
 
 Validate a `PolicySpec` to get an `Engine`. Call `Engine::decide` with request facts, rows, constraints and reusable `Scratch`. A host that needs booking makes an `InProcess` from an `AppliedSpec` and asks it, itself or through a `DecisionGuard`, lending its worker lists with each request. `InProcess` runs on the caller's thread. It issues the lease for the first target. The host takes a target, reports dispatch and completion or release, and calls `DecisionEngine::sweep` on its timer. `InProcess` decides a pair when asked at its prefill: that one request decides both sides. It returns `PairSide` for a decode or an encode request that is a side of its plan's pair or that hands more than one list, and `Faulted` if it cannot decide a pick. A single pick of `InProcess` states what its first worker holds of the request's prefix (`Pick::overlap`): the leading blocks held, the request's blocks and where the match came from. `InProcess` reads them from that worker's entry of the rows its decision was given: the rows it named from the host's data, a column the host filled, or the rows the host named. It asks no stage, so no stage's threshold applies. A worker the rows do not name is a miss of the request's blocks. A request decided inside a tree its host lends is given the rows the tree's match names and the match's own two numbers: its size and the request's, in the tree's unit, tokens or characters. A pick of a worker named among the match's holders states those two numbers and names the tree as where they came from (`OverlapSource::Tree`), with nothing rounded to a block. Any other worker is a miss of the request's blocks. Past the profile's sample the holders named are a draw. A pair's first pick states the same of its prefill, which its first target names, from the prefills' column, and nothing of its decode. Nothing is stated for a pair's decode decided again, for an encode request's pair, for a pick the sessions rule keeps from the profile, or under a profile that reads no affinity. The word on the prefix margin stays `false`. `Engine::decide` states nothing, and the controller's `Decide` answer does not carry it. [Engine example](tests/unit/engine/framework/tests/profile_run.rs) · [InProcess API](src/engine/in_process.rs) · [DecisionGuard API](src/tracking/decision_guard.rs)
@@ -76,7 +78,7 @@ Every other stage starts empty, and is told the workers that stand in the regist
 
 A dispatch, a completion or a release of a lease issued under an earlier document is told to the stages that stood under that document and stand still, and to no stage built since. Its dispatch is counted once by every tally of sends in force, kept or built new.
 
-The crate defaults to `wasm`. Use `default-features = false` for the library without that runtime. `controller` adds the service, its protocol, command line and gRPC plugin host, and enables `operator`, `worker-host` and `in-process`, the engine over a host's worker objects. `client` enables the reference client and watcher and implies `controller`. `kubernetes` adds the namespaced Lease backend. `operator` adds the operators' door for a host's own process. It builds no server, and it builds on every target. `worker-host` adds an optional registry of worker objects, one for each membership row, written through the holder's write calls. In the controller build those objects use a lazy gRPC connector. The feature also has the cache feed's two parts: `worker_host::KvAdapter` writes a worker's cache events to the index, and `worker_host::KvHost` gives each event subscription its row. A controller built with the feature fills its index itself: every replica opens a cache-event stream to each gRPC worker whose row asks for events and names a model. The stock controller is built with it: its binary requires `controller`, which enables it. `discovery` lets the controller run a worker discovery provider, and enables `controller`: see [Worker discovery](#worker-discovery). `test-util` supports the crate's tests and benches. [Cargo features](Cargo.toml)
+The crate defaults to `wasm`. Use `default-features = false` for the library without that runtime. `controller` adds the service, its protocol, command line and gRPC plugin host, and enables `operator`, `worker-host` and `in-process`, the engine over a host's worker objects. `client` enables the reference client and watcher and implies `controller`. `kubernetes` adds the namespaced Lease backend. `operator` adds the operators' door for a host's own process. It builds no server, and it builds on every target. `worker-host` adds an optional registry of worker objects, one for each membership row, written through the holder's write calls. In the controller build those objects use a lazy gRPC connector. The feature also has the cache feed's two parts: `worker_host::KvAdapter` writes a worker's cache events to the index, and `worker_host::KvHost` gives each event subscription its row. A controller built with the feature fills its index itself: every replica opens a cache-event stream to each gRPC worker whose row asks for events and names a model. The stock controller is built with it: its binary requires `controller`, which enables it. `discovery` lets the controller run a worker discovery provider, and enables `controller`: see [Worker discovery](docs/service.md#worker-discovery). `test-util` supports the crate's tests and benches. [Cargo features](Cargo.toml)
 
 A host built with `worker-host` can keep a worker object for each membership row. Use `Objects::new(registry)` and write each row through its write calls (`Objects::upsert`, `Objects::patch`, `Objects::remove`). A row a store took as a decided change around the holder (`MemoryStore::follow`) has no object until a snapshot is laid whole, and the holder's registration of its key is refused until then. A status told the same way does nothing to the object: a worker object's status leads its row's. A host writes a status on the worker object, and the store is told: the connect signal with `Objects::connect_row`, a drain with `Objects::drain_row`, and a probe's verdict through `HealthAdapter`. A `Watcher` lays the status its watch tells.
 
@@ -103,174 +105,6 @@ Once the prefill is dispatched, `store.issue_decode(gateway, id, decode, now)` c
 `issue_decode` returns `DecodeRefused::NoLease` when the gateway has no lease under that id, `NotChosen` when the lease was filed without a chosen side, `PrefillNotHeld` when its prefill is waiting or has ended, and `DecodeStands` when its chosen side has already been issued or dispatched, or its gateway ended it.
 
 `LeasesStore::expire` returns both sides as the sweep left them. For example, a completed decode stays `Completed` when its prefill is released as abandoned.
-
-### Standalone service
-
-Build from a checkout with `protoc` available. The service feature uses the worker protocol files from the checkout. The stock binary requires the `controller` feature, which enables `worker-host`. Without `controller`, cargo builds no binary and says nothing. Save the first policy document above as `policy.yaml`, then run the following from the checkout root.
-
-```sh
-cargo build --release --locked -p smg-grand-central --features controller
-target/release/smg-grand-central --controller-id controller-0 --spec-file policy.yaml \
-  --gateway-listen 127.0.0.1:30100 --control-listen 127.0.0.1:30101 \
-  --replication-listen 127.0.0.1:30102 --admin-listen 127.0.0.1:30103 \
-  --identity-as-told gateway,control
-```
-
-Register workers with `RegisterWorker` on the control listener. Use `Session` and `Decide` on the gateway listener to ask for a worker. The service returns targets and leases for the caller to dispatch and report. For a complete local example of registration and the decision stream, see [the controller's wire test](tests/controller_cases/decisions.rs). The deployment chart can mount `grandCentral.spec` as a file or `grandCentral.specStoreClaim` as a store. [Deployment chart](../../deploy/helm/smg/README.md#grand-central)
-
-| Flags | Default and effect |
-|---|---|
-| `--help`, `--version` | Show help or version and exit. |
-| `--controller-id` | Reads `HOSTNAME` if omitted. Use letters, digits, `.`, `_` and `-`. |
-| `--spec-file`, `--spec-store` | Choose exactly one. A watched YAML or JSON file, or an existing directory managed through the spec calls. |
-| `--gateway-listen`, `--control-listen`, `--replication-listen`, `--admin-listen` | Bind all addresses by default at ports 30100, 30101, 30102 and 30103 respectively. Admin uses HTTP. |
-| `--identity-as-told` | Comma-separated listener names, empty by default. A named listener accepts one `x-smg-principal` value as the caller's identity. Use it on loopback or behind a trusted proxy. |
-| `--tls-cert`, `--tls-key` | Optional PEM server chain and key together for the gRPC listeners. |
-| `--gateway-client-ca`, `--control-client-ca`, `--replication-client-ca` | Optional PEM client CA per scope. Requires server TLS and conflicts with `--identity-as-told` on that listener. |
-| `--lease-file`, `--lease-name`, `--lease-namespace` | A process-local lease by default. File lease for replicas on one host with an existing parent directory. A named Lease needs the `kubernetes` feature. Its namespace defaults to the client's namespace. The two shared lease types are exclusive. |
-| `--advertise-address` | A dialable host or host:port. A bare host uses the gateway port. Required for a shared lease when the gateway binds a wildcard address. |
-| `--lease-duration-ms`, `--lease-renew-deadline-ms`, `--lease-renew-period-ms` | 3000, 2000, 1000. The duration must exceed the deadline, which must exceed the positive period. The named Lease uses whole seconds. |
-| `--load-monitor-interval` | 10 seconds, positive. Load polling interval and the freshness window for a stream report to stand in for a poll. |
-| `--worker-overload-waiting-requests`, `--worker-overload-token-usage` | 8 and 0.8, the gateway's flags of the same names. The overload thresholds of an engine's worker whose registration states none: a count of queued requests from 1, and a KV usage above 0 and at most 1. A count over 2^63 - 1 is refused, which the gateway's flag takes. A registration's own threshold stands over each. A worker of the `external` runtime takes no default. Start every replica with the same two: each judges by its own while it leads. |
-| `--shutdown-settle-secs`, `--shutdown-grace-period-secs` | 5 and 30 seconds. Grace is positive and includes settle. Settle is at most half of grace. Readiness drops before the listeners close. |
-| `--decide-shards` | 1–256, available parallelism capped at 8 by default. Each model maps to one shard with room for 128 jobs. |
-| `--runtime-worker-threads` | 1–4096 when set. Unset uses the async runtime's default. |
-| `--log-level`, `--log-json` | `info` by default, also accepts `debug`, `warn`, `error`. `RUST_LOG` can set the filter. Text output by default. `NO_COLOR`, `FORCE_COLOR` and `CLICOLOR_FORCE` control text color, with force taking precedence. |
-
-Startup rejects missing or duplicate scopes, duplicate listener names or addresses, unusable TLS material, and invalid lease addresses or timings. A client CA requires a verified certificate at transport level. This build has no certificate-to-principal mapping. Calls requiring a principal use a listener configured with `--identity-as-told`. A stated subject is a visible ASCII token of at most 253 bytes without commas. The service checks the scope before the principal. [Flags](src/service/controller/run.rs) · [Listener configuration](src/service/controller/config.rs)
-
-### Worker discovery
-
-A controller built with the `discovery` feature looks for its workers by itself: the replica that leads registers each worker a pass finds and removes each one its source lists no more. The feature is off by default, and the stock image does not build it yet.
-
-```sh
-cargo build --release --locked -p smg-grand-central --features discovery
-```
-
-The binary then takes the gateway's worker discovery flags, under the same names and with the same defaults. `--discovery-provider` selects one of `kubernetes`, `file`, `slurm` and `consul`. `--service-discovery` still selects Kubernetes.
-
-| Flags | Default and effect |
-|---|---|
-| `--discovery-provider` | One of `kubernetes`, `file`, `slurm` and `consul`. Unset by default: the controller runs no provider. Give this or `--service-discovery`, not both. |
-| `--service-discovery` | The older spelling of `--discovery-provider kubernetes`. |
-| `--discovery-check-interval-secs` | Seconds between periodic passes, 30 when unset. It must be positive. A start that failed is tried again after it. Refused with no provider. |
-| `--api-key`, `--api-key-file` | A key for discovered workers, or a file that holds it alone. Refused with no provider, and refused with one today: the controller keeps no worker key yet. |
-| `--selector` | Kubernetes: the label selector of regular worker pods, as `key=value`. |
-| `--encode-selector`, `--prefill-selector`, `--decode-selector` | Kubernetes: the label selectors of encode, prefill and decode pods. Under any provider a prefill or decode one selects the prefill and decode pair, and an encode one beside them selects all three roles. The file and Consul providers refuse a record outside the selected roles, and Slurm refuses job names that do not fit them. |
-| `--service-discovery-port` | Kubernetes: 80. The port of a discovered pod that has no `smg.ai/worker-ports` annotation. |
-| `--service-discovery-namespace` | Kubernetes: the namespace to watch. Every namespace when unset. |
-| `--model-id-from` | Kubernetes: take each worker's model id from pod metadata: `namespace`, `label:<key>` or `annotation:<key>`. |
-| `--kv-connector-annotation`, `--kv-engine-id-annotation` | Kubernetes: `smg.ai/kv-connector` and `smg.ai/kv-engine-id`. The pod annotations that name a worker's KV connector and its engine ids. |
-| `--pairing-protocol-label` | Kubernetes: `smg.ai/pairing-protocol`. The pod label that names a worker's prefill/decode pairing protocol. A prefill and a decode that both name one pair only when the two are equal, under `lenient` and `strict`. |
-| `--discovery-file` | File: the JSON manifest that lists the workers. Required with `--discovery-provider file`. It may be created after startup. |
-| `--slurm-job-name`, `--slurm-encode-job-name`, `--slurm-prefill-job-name`, `--slurm-decode-job-name` | Slurm: the job names whose nodes are regular, encode, prefill and decode workers. Each can be given more than once. |
-| `--slurm-port` | Slurm: the inference port on every node of a discovered job. Required with `--discovery-provider slurm`. |
-| `--slurm-bootstrap-port` | Slurm: the bootstrap port of discovered encode and prefill workers. |
-| `--slurm-user`, `--slurm-account`, `--slurm-partition` | Slurm: discover this user's jobs (the user the controller runs as when unset), and only the jobs of this account or partition. |
-| `--consul-service` | Consul: the service whose instances with passing health checks are the workers. Required with `--discovery-provider consul`. |
-| `--consul-address`, `--consul-datacenter` | Consul: the HTTP API address (`CONSUL_HTTP_ADDR`, else 127.0.0.1:8500) and the datacenter (the agent's own when unset). |
-
-```sh
-smg-grand-central --controller-id controller-0 --spec-file policy.yaml \
-  --discovery-provider file --discovery-file /etc/smg/workers.json
-```
-
-- The replica that leads runs the provider. A standby runs none.
-- The provider stops when the replica loses the lead, when its lease runs out, and at shutdown. The next leader starts its own.
-- A provider that cannot start is logged as an error and tried again after the check interval. So is a provider that ends by itself.
-- A Slurm or Consul flag, or `--discovery-file`, given with another provider or with none, is refused at the start. The Kubernetes flags are not. Under another provider the role selectors select the roles, as the table says, and the other Kubernetes flags, `--selector` among them, do nothing. A selector that is not `key=value` is still refused, and so is a malformed `--model-id-from`.
-- The controller checks discovery settings as the gateway does and refuses bad settings at the start. A refusal of one setting's value names the flag that sets it. A refusal of settings that do not fit the roles names `--discovery-provider` and says that the roles follow the selectors and job names given. A Slurm bootstrap port with no encode or prefill job name is refused that way, and so is a Slurm job name given for two roles.
-- The key sent to discovered workers comes from `--api-key` or `SMG_API_KEY`, or from a file named by `--api-key-file` or `SMG_API_KEY_FILE`. Each flag beats its own variable. A key and a key file together are refused, from any source. The key never prints.
-- The key is read only when a provider is selected. A key flag with no provider is refused. With a provider a key from any source is refused at the start today, under `--api-key`: the controller keeps no key of a worker it finds, and it drops none in silence.
-- A registration runs a gateway's registration steps on the worker, then writes the worker's row as provider `discovery` under the term the replica leads. A removal marks the row draining, waits the worker's drain window and takes the row out. A replica that does not lead runs no pass, and a job that ends behind a lost lead writes nothing.
-- No flag sets a registration's timing yet. A starting worker is polled every 30 seconds for 1800 seconds, a gateway's defaults, and a found worker's row states the worker crate's default health checks.
-- A found worker's row asks for its engine's cache events where the policy document in force at the find reads them for the worker's first model. A document applied later does not write that word again.
-- The controller dials a found worker with no client identity and no private CA, and no flag sets either. A worker served over TLS under a private CA, or one that requires mTLS, is never registered: every probe of it fails.
-- A worker whose row another maker holds, a `RegisterWorker` call's for one, is not the provider's. Where a source lists it too, every pass asks its registration again: the worker is dialed, the write is refused, and the pass logs an error.
-- The controller has no routing mode. A prefill or decode selector or job name selects the prefill and decode pair. An encode one beside them selects all three roles. Under Slurm a job's role comes from the job-name list that names it, and the names must fit the selected roles.
-- `--router-selector` and `--model-alias` stay with the gateway.
-
-What discovery does not do yet is [listed below](#what-is-not-built-yet). [Discovery flags](src/service/controller/discovery/flags.rs)
-
-### Remote calls from a gateway
-
-A gateway you host can call the standalone service. Use the generated client or the crate's `service::client::Client` or `service::client::blocking::Client`. The reference client dials and asks `Leader`, opens a session, sends one decision at a time, and reports `dispatched`, `completed` and `released` when its caller asks. Use `connect_with` for a configured TLS endpoint. For concurrent requests, clone a `service::client::Link`: it shares one session and one decide stream. An ask takes one credit and waits for its own answer inside its budget. Reports go through a bounded queue, and a full queue ends the link. The client exposes `welcome`, `term_floor`, `gateway_id`, `hashes_cut`, `session_end` and `watch_workers`. `Watcher` can apply worker events and resume positions to a local store. The host handles dispatch, fallbacks, retries, lease ownership and reconnection. There is no bundled operator CLI. [Reference client](src/service/client.rs) · [Worker watcher](src/service/watcher.rs)
-
-| Scope | Call | What this build serves |
-|---|---|---|
-| Any gRPC listener | `Leader` | Reports the known leader, address and term. One lease covers all models. It takes no principal. |
-| Gateway | `Session` | Start with `Hello` naming the caller and a protocol range containing 1 or 2. `Welcome` returns identity and limits. Its spec generation is 0 and it leaves needs and hashing unset. Send dispatch, completion, release or gateway veto frames. A new session replaces the earlier one for that gateway. Hello can restore vetoes. Lease and pin restoration via `HelloPage`, `SpecAck` and pushing new specs to gateway sessions are unserved. |
-| Gateway | `Decide` | Bidirectional stream for a present gateway. Accepts single decisions, a pair at its prefill, a decode call that names the pair's lease, an encode request that carries its items (`DecideRequest.encode`), and a prefill or a decode request that its plan pairs no side of. A call the lease refuses gives `Busy` under a reason of its own. An encode request's answer names each item's encoder beside its pick (`DecideAnswer.encode`), and no lease is issued for an encoder. A frame of the encode phase that does not state `DecideRequest.encode`, and a decode request that names no lease under a pair plan, give `Busy` with an unspecified reason, and their gateway decides them. |
-| Gateway | `WatchWorkers` | Snapshot followed by membership and status changes, for all models or a named set. Resume from a term and sequence. A position outside the retained history can require a new snapshot. The service refuses `with_needs`. |
-| Control | `RegisterWorker` | `ADD` (default), `REPLACE`, or `UPSERT` by URL. An upsert that changes role, wire, models, demand facts or whether the worker takes images makes a new incarnation. `wait_ready` requires probes disabled. |
-| Control | `PatchWorker`, `DeregisterWorker` | Guard by worker ID and revision. Patch sets and removes labels and can replace overload thresholds. Deregister can mark draining, or remove. A drain needs a later remove. A decision made behind an acknowledged registration, drain or removal reads the fleet that call left. |
-| Control | `GetSnapshot` | Leader's redacted `SLICE_WORKERS` and `SLICE_SPEC`. Name the slices explicitly. Empty requests ask for all nine and are refused. The spec slice includes retained generations with a store. |
-| Control | `Explain` | Read a sampled decision by gateway and request ID on the leader. |
-| Control | `ApplyPolicySpec`, `GetPolicySpec`, `RollbackPolicySpec` | Validate, read or change documents as described under [Updating a document](#updating-a-document). |
-| Control | `StepDown`, `WatchRegime` | Return `UNIMPLEMENTED` after admission. |
-| Replication | `Replicate` | Standby follows the leader's term, replays retained events or restores a snapshot. Automatic following uses the advertised leader host and the same fixed replication port on each replica, in cleartext with `--identity-as-told replication`. |
-
-The controller exposes the gRPC health service on each gRPC listener. The admin listener serves `/liveness` and `/health` even while draining, `/readiness` (200 for leader and ready follower, 503 otherwise), `/version` and `/metrics`. [Controller protocol](contracts/grand_central.proto)
-
-### Holding a decision
-
-A host that decides in process calls `DecisionGuard::decide` with its door. A host with the `client` feature can share a `Link` to a controller and ask for the same kind of handle.
-
-```rust
-let now = Instant::now();
-let mut handle = DecisionGuard::<&InProcess>::asked(&link, &request, now, budget).await?;
-```
-
-Give the controller time to decide in `request.facts.budget_micros`. On the wire, zero means that time is spent. A request built for the door states no budget with 0, so set one before you ask: the handle answers a zero budget `DecisionUnavailable::Late` before anything is sent. A request that states a hard demand (`Constraints::demands`) states it on its frame, over a session on protocol 2. An encode request that states one is answered `DecisionUnavailable::Unsent` before it is sent. The separate `budget` is how long the link waits for the answer. The handle counts the time to dispatch and the lease's dispatch span from `now`.
-
-Use `take` to choose a target, then say `dispatched` and `completed`, or `released` if the request is given up. For a pair, use `dispatched_decode` for the decode and name each side in its completion. Dropping a handle gives up any sides still owed. A linked handle reports on the session, and the controller ends the lease's side with the outcome. The controller's session rule covers leases when the link ends.
-
-Linked targets carry worker ids and ranks. Candidate positions stay with the controller. A shed keeps its stage where that is one a demand sheds under (`wires`, `vision`, `references`, `pipeline`, `context-window` or `decoding`), and any other stage reads `controller`. An answer the handle cannot read returns `DecisionUnavailable::Unsent` and the link releases its leases as late. The caller handles an unanswered request.
-
-### Following a controller's workers
-
-With the `client` feature, a host can keep a copy of the controller's worker rows in a `MemoryStore` through a `Watcher`. `Watcher::new(store, objects)` takes the store and the host's `Objects`, and the watcher writes each row through them. So a row's worker object stands when the event that told it returns. Use `Watcher::open_on(&link)` to take the snapshot and the changes that follow it over the link's channel. The watch opens within the same five-second bound as `Client::watch_workers`. Once open, it has its own stream, so the link can answer asks and carry reports while the watch waits. Use one link for the gateway id. A second session with that id takes the first one's place.
-
-A watch can outlive the link. A host that follows only while the link stands can wait for either to end.
-
-```rust
-let mut following = watcher.open_on(&link).await?;
-let end = loop {
-    tokio::select! {
-        biased;
-        () = link.closed() => break None,
-        event = following.next() => match event {
-            Ok(true) => {}
-            result => break Some(result),
-        },
-    }
-};
-```
-
-`None` means the link ended. `Some` gives the watch's own end. `Link::ended()` gives the cause once the link ends. A closed send queue can refuse an ask or a report before its stream reader sees the end. A full report queue ends the link at once.
-
-Drop the stream before opening the watch again. The watcher asks for changes after the last event it took, or for a snapshot if it has no place. When a link ends, the host dials a new one. An ended link lets its channel go, and `Link::watch_workers` on it answers `Error::LinkEnded`.
-
-When the watch starts from a snapshot, its last page puts the rows into use through `MemoryStore::watch_from`, and their worker objects with them. A worker still present keeps its object. The watch carries worker rows and their status.
-
-For example, if the watch starts again while a request is running, its lease stays on file. If its worker is still present, the request still counts toward that worker's in-flight total and the worker keeps its gateway vetoes. If the worker has left, the lease ends when the host reports the request's end. The store keeps its session pins through the snapshot.
-
-### Worker credentials
-
-A host built with `worker-host` can hand its worker objects a keeper with `Objects::with_credentials`. The keeper has one entry per address an object dials, and each entry is bound to the rows that host's registrations wrote. If two rank rows name `http://worker:8000` as their engine, the keeper holds their credential once at `http://worker:8000`, bound to both rows.
-
-The host calls `keep` before it writes a registration, with the facts it writes and `None` where the registration has no credential. `keep` returns a token. The host calls the token's `accepted` with the row the door answered, whether or not the write moved the row, and its `put_back` where the write was refused. It answers at the door's answer, with no await between the two. A token dropped with no answer is put back. Where either answer returns `true`, the host calls `Objects::lay_again` with the same facts, and the holder builds the address's objects again.
-
-One registration is in flight at an address. A `keep` at an address whose last `keep` has no answer yet takes nothing and returns `RegistrationInFlight`. The host waits, or tells its caller to ask again.
-
-A worker object takes its address's credential only where a registration of this host bound its row. A worker that another replica registered is built here with no key. So is a worker that takes an address after its last worker left: it is another row. While a registration is in flight, an object built at its address takes what it stated, and the answer settles it.
-
-Registering the same worker again with a new key moves no row: the door answers `MembershipWriteOutcome::Unmoved` for equal facts. The host calls `accepted` all the same. It returns `true`, and `lay_again` builds the worker's objects with the new key.
-
-The holder forgets by itself. A snapshot laid whole drops the rows it finds gone from the keeper, whoever wrote the removal, and an entry goes with its last row. A snapshot laid whole lays its own rows, then reads the status the table holds for each. A write the store refuses reads no row. A write the store takes reads no store: where it takes a row out, it drops that row from the keeper. `lay_again` reads no store either, and drops each bound row that has no object. The keeper lives in the host's process and starts empty at restart. Membership rows and their watches carry no credentials. The stock controller builds its worker objects without a keeper.
-
-A host that keeps credentials builds its registration line with `worker_host::registration_into_store_keeping_credentials`. The line keeps in the keeper of the holder it is handed (`Objects::with_credentials`) and takes the store its door writes. The door must write through the holder's write calls (`Objects::upsert`, `Objects::patch`, `Objects::remove`), so a row's object stands when the door answers, and the line follows no store. It returns `worker_host::NoCredentials` for a holder built with no keeper. The write keeps what each worker states ahead of its row, answers the keeper with the door's answer, and has the address laid again where the keeper says so. The write runs in the holder's turn: a replacement by id is refused as moved where another object stands under its URL by then, since a registration of another credential alone lays another object and moves no row. `registration_into_store` keeps nothing.
-
 
 ## Extend it
 
