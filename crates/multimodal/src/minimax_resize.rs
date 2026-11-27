@@ -26,7 +26,9 @@ pub const IMAGE_DEFAULT_LONG_SIDE: u32 = 2016;
 pub(crate) const VIDEO_DEFAULT_LONG_SIDE: u32 = 672;
 /// Internal processor marker for images whose source geometry was already planned.
 pub const RESIZED_KEY: &str = "minimax_media_resized";
-/// Internal selector for the SGLang MiniMax M3.1 day-0 resize contract.
+/// Internal selector for the SGLang MiniMax M3.1 day-0 resize contract. On a
+/// video preprocessor config it also decides whether a clip's prompt carries
+/// time stamps: the family's registry entry stamps a clip only under it.
 pub const SGLANG_RESIZE_KEY: &str = "minimax_sglang_resize";
 
 #[cfg(test)]
