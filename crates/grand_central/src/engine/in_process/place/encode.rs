@@ -213,8 +213,9 @@ fn asked<'a>(
 /// What an ask answers, and [`Unplaced::NoWorkers`] where the call's last
 /// ask takes no placement. A rule that takes no worker of one of the
 /// pair's two lists sheds the request with no endpoint, under `admits`
-/// ([`super::hold_to_rule`]), or leaves it its first decision's shed
-/// ([`pair::again`]).
+/// ([`super::hold_to_rule`]), leaves it its first decision's shed, or,
+/// where no pass is laid for it, sheds it by one decision more over the
+/// rule's prefills ([`pair::again`]).
 pub(super) fn place<'a>(
     engine: Loaded<'static, '_>,
     request: &PlaceRequest<'a>,

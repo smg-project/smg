@@ -2239,29 +2239,30 @@ to the ones that take images. The rule is asked behind such a request's shed as 
 So the rule's one worker of a long list is found, one
 over its overload thresholds is answered by the binding's rule for a list wholly over them, and
 one an earlier attempt tried is handed again where no other is left. A request whose rule takes
-no worker of a list is shed with no endpoint under `admits`, but for three cases of a pair and of
+no worker of a list is shed with no endpoint under `admits`, but for four cases of a pair and of
 an encode request's pair.
 
-The first of the three stands behind a first decision that shed the request with no endpoint. That
-shed is the answer, under the stage that decision names and with no side. That decision judged the
+The first of the four stands behind a first decision that shed the request with no endpoint. That
+shed is the answer, under the stage that decision names and with no side, but where the fourth
+case answers in its place. That decision judged the
 lists it was handed, as the gateway's own selection judges every worker of a list on its wire
 where its filter takes none of them. The rule's lists are the caller's to judge a role by.
 
-The two others stand behind a first decision that shed the request as saturated and said the list
-it shed over. They hold for a request that states no hard demand and whose host states no places
-of the prefills or the decodes. They hold under a binding that sheds a list wholly over its
+The second and the third stand behind a first decision that shed the request as saturated and said
+the list it shed over. They hold for a request that states no hard demand and whose host states no
+places of the prefills or the decodes. They hold under a binding that sheds a list wholly over its
 thresholds, and in both that shed is the answer.
 
 A prefill that pairs with no decode is no prefill of the rule's in either: the gateway's own
 selection holds no such prefill. So a rule that takes only such prefills is answered as one that
-takes none, by the one test the call holds of the rule's prefills. In the first the rule takes no
+takes none, by the one test the call holds of the rule's prefills. In the second the rule takes no
 prefill, and the decision shed over the prefills: the decodes are then not asked.
 
 A request the encode pass is laid for keeps the answer it had there. Behind a rule that takes only
 such prefills its decodes are asked too, and a decision among the rule's workers answers where the
 rule takes a decode.
 
-In the second the rule takes a prefill and no decode, and the
+In the third the rule takes a prefill and no decode, and the
 decision said a list. There the shed is the answer where one of the rule's prefills can take the
 request and the decision shed over the decodes, and where none can, one of them is ready and every
 ready one is over its thresholds.
@@ -2269,6 +2270,21 @@ ready one is over its thresholds.
 A shed that stands names the side of the list the gateway's own selection judges there. That is
 the decision's own side, but the prefill side where none of the rule's prefills can take the
 request, whichever list the decision said.
+
+The fourth case stands where the rule takes a prefill and no decode, and no shed as saturated
+stands. So it is behind a first decision that picked, behind one that shed the request with no
+endpoint, and behind a shed as saturated that does not stand. The
+request states no hard demand, its host states no places of the prefills or the decodes, and no
+encode pass is laid for it. One decision more is then held to the rule's prefills, with no decode
+lent.
+
+Under a binding that sheds a list wholly over its thresholds, that decision sheds the request as
+saturated where the rule's prefills that pair with a decode are so. That shed is the answer, for
+the prefill side. Any other
+shed of it leaves the answer as it was. A decision that panics there is answered as refused, as
+any is. The gateway's own selection judges the rule's prefills
+first there (`pair_pass` in `model_gateway/src/routers/common/placement.rs`, where no prefill is
+eligible).
 
 A pair's decision asks one question where its prefill side sheds, with no pair for its default and
 no prefill that waits on its admission limit alone. The question is the gateway's own selection's:
@@ -2343,18 +2359,10 @@ later decision is given what the call has left of the request's budget, and a re
 left when a decision is due is shed under `budget`. A pair's decisions are each given the whole
 budget.
 
-Two answers of a pair stand open there under rule 6. In each the engine's answer is of another
-kind than the gateway's own selection's: a shed as saturated beside anything but its overload
-shed, or a shed with no endpoint beside anything but its answer that it has no worker.
+One answer of a pair stands open there under rule 6. In it the engine's answer is of another kind
+than the gateway's own selection's: a shed as saturated beside anything but its overload shed, or
+a shed with no endpoint beside anything but its answer that it has no worker.
 
-- No decision said a list. The rule takes no decode, and its prefills are wholly over their
-  thresholds, behind a first decision that picked or one that shed the request with no endpoint.
-
-  The engine sheds the request with no endpoint, under `admits` or under the stage that first shed
-  names: no decision judged the rule's prefills. The gateway's own selection answers its overload
-  shed, since it judges the rule's prefills first (`pair_pass` in
-  `model_gateway/src/routers/common/placement.rs`, where no prefill is eligible). One decision
-  more, held to the rule's prefills, ends it: such a decision sheds as its count reads.
 - A part of a list. The encode pass is laid for a request that states an item, or holds its decode
   to the ones that take images. It hands the pair's decision the prefills an open encoder serves
   and the decodes that take the images.
@@ -2368,7 +2376,10 @@ shed, or a shed with no endpoint beside anything but its answer that it has no w
 
   Where the rule takes no worker of a list the engine sheds such a request with no endpoint. It
   does so under `admits` behind a first decision that picked or that shed it as saturated, as it
-  did before a shed stood behind a rule.
+  did before a shed stood behind a rule. No decision more is held to the rule's prefills for such
+  a request. So where no shed as saturated stands, one whose rule takes prefills wholly over their
+  thresholds and no decode keeps that shed. The gateway's own selection answers its overload shed
+  under a filter that takes those workers.
 
   Behind a first shed with no endpoint, a request whose host states places is shed under that
   shed's own stage. One that states a hard demand, or that the encode pass is laid for, keeps that

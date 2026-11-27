@@ -1474,8 +1474,9 @@ pub enum Unplaced {
     /// For a single request, for a pair and for an encode request's pair,
     /// a rule that answers each worker one way within a call is not the
     /// cause: a request whose rule takes no worker of a list is shed,
-    /// under the rule's name (`admits`) or by its first decision's shed
-    /// where that stands, and one whose rule takes some is decided among
+    /// under the rule's name (`admits`), by its first decision's shed
+    /// where that stands, or by a pair's one decision more over the rule's
+    /// prefills, and one whose rule takes some is decided among
     /// them. Under a profile that filters by health a list
     /// with no ready worker is shed by that filter. So this answer is left
     /// for a worker that stopped being ready between a decision's read of
@@ -1700,9 +1701,10 @@ pub(super) fn give_up(
 /// # Errors
 ///
 /// The shed of a request whose rule takes no worker of the list
-/// ([`ShedReason::NoEndpoints`], under `admits`): no further decision is
-/// made. A pair's routine answers its first decision's shed in its place,
-/// where that shed stands ([`pair::again`]).
+/// ([`ShedReason::NoEndpoints`], under `admits`): a single request is
+/// asked no further decision. A pair's routine answers its first
+/// decision's shed in its place where that shed stands, or the shed of
+/// one decision more over the rule's prefills ([`pair::again`]).
 #[cold]
 #[inline(never)]
 fn hold_to_rule(
@@ -2036,7 +2038,8 @@ impl InProcess {
     /// two later decisions are made among them: three decisions a call.
     /// A request whose rule takes no worker of a list is shed
     /// with no endpoint, under `admits`. A pair whose first decision shed
-    /// it with no endpoint keeps that shed there, under the stage that
+    /// it with no endpoint keeps that shed there but in the last case
+    /// below, under the stage that
     /// decision named and with no side; where no prefill of its lists
     /// pairs with a decode, or the pair states a hard demand, that shed
     /// answers with its side and the rule is not asked behind it. Behind
@@ -2047,15 +2050,20 @@ impl InProcess {
     /// and whose host states no places of the prefills or the decodes
     /// ([`PairLists::prefill_places`](crate::engine::PairLists::prefill_places),
     /// [`PairLists::decode_places`](crate::engine::PairLists::decode_places)),
-    /// is answered otherwise in two cases, behind a first decision that
-    /// shed it as saturated and said the list it shed over, which a
-    /// decision does under a document that sheds a list wholly over its
-    /// thresholds. That shed is its answer where the rule takes no prefill
+    /// is answered otherwise in three cases, under a document that sheds
+    /// a list wholly over its thresholds. Two stand behind a first
+    /// decision that shed it as saturated and said the list it shed over.
+    /// That shed is its answer where the rule takes no prefill
     /// and the decision shed over the prefills. It is its answer too where
     /// the rule takes a prefill and no decode: where one of its prefills
     /// can take the request and the decision shed over the decodes, and
     /// where none can, one is ready and every ready one is over its
-    /// thresholds. One whose rule takes workers none of which is ready, or
+    /// thresholds. In the third the rule takes a prefill and no decode,
+    /// and no such shed stands: one decision more is held to the rule's
+    /// prefills, with no decode lent, and its shed as saturated over
+    /// those of them that pair with a decode is the answer, for the
+    /// prefill side. One whose rule takes workers
+    /// none of which is ready, or
     /// workers of a pair's two lists no two of which pair, is answered by
     /// the decision held to them, which names what left nobody. Behind a
     /// shed made over the prefills, a rule whose every prefill pairs with
@@ -2066,7 +2074,9 @@ impl InProcess {
     /// item, or holds its decode to the ones that take images, is not
     /// answered so behind a rule whose every prefill pairs with no decode:
     /// its decodes are asked too, and where the rule takes one a decision
-    /// among the rule's workers answers.
+    /// among the rule's workers answers. Nor is the third case's decision
+    /// made for it: with no such shed standing it keeps the answer it had,
+    /// under `admits` or by its first decision's shed with no endpoint.
     ///
     /// A decision that is given up has written what its stages write as
     /// they decide, and its release takes none of that back: the tokens a
