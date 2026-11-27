@@ -83,7 +83,17 @@ confirm thinking is disabled. A custom chat template with an ambiguous
 reasoning state receives HTTP 400 for a finite budget. TensorRT-LLM gRPC
 also returns HTTP 400 for a finite budget. Omission, `null` and `-1` all use
 the worker default on gRPC. On a mixed pool, the gateway places finite
-budgets on capable workers. Standalone SGLang and vLLM workers registered
+budgets on capable workers. Both prefill and decode must support the budget
+in a disaggregated deployment. If none of the registered workers for the
+model support the budget, the gateway returns HTTP 400
+(`unsupported_thinking_token_budget`). If a capable worker is registered
+but none are ready, the gateway returns HTTP 503.
+
+The Rust SGLang servicer advertises support only when every connected
+scheduler rank reports an active filter. Direct ZMQ generation and managed
+prepared-input requests use the same check. A caller that sends an explicit
+budget, including zero, gets `INVALID_ARGUMENT` before submission if a rank
+has not confirmed support. Standalone SGLang and vLLM workers registered
 over direct ZMQ currently lack this capability label, so the gateway
 returns HTTP 400 for a finite budget on those routes.
 
