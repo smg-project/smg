@@ -260,6 +260,12 @@ pub struct WorkerRuntime {
     /// blocks the index held for the worker then (see [`Self::warmup_growth`]).
     warmup_base_admitted_ms: AtomicU64,
     warmup_base_blocks: AtomicUsize,
+    /// Whether the index held a block for the worker when the warm-up slice
+    /// last read it: a read of none behind it is an index emptied underneath.
+    warmup_held: AtomicBool,
+    /// When the warm-up slice last read the index emptied underneath, on the
+    /// clock of `admitted_at_ms`; `0` when it never did.
+    warmup_emptied_ms: AtomicU64,
     /// Clock before which this thin worker, with requests in flight, takes
     /// no further diverted hit.
     divert_until_ms: AtomicU64,
@@ -744,6 +750,8 @@ impl WorkerRuntime {
             admitted_at_ms: AtomicU64::new(super::health::liveness::now_ms()),
             warmup_base_admitted_ms: AtomicU64::new(u64::MAX),
             warmup_base_blocks: AtomicUsize::new(0),
+            warmup_held: AtomicBool::new(false),
+            warmup_emptied_ms: AtomicU64::new(0),
             divert_until_ms: AtomicU64::new(0),
             busy_since_ms: AtomicU64::new(0),
             tracked_in_flight: AtomicUsize::new(0),
@@ -759,6 +767,15 @@ impl WorkerRuntime {
 
     pub fn admitted_age(&self) -> Duration {
         Self::age_of(self.admitted_at_ms.load(Ordering::Relaxed))
+    }
+
+    /// Time since the worker's warm-up clock last started: since it became
+    /// routable, or since [`Self::warmup_growth`] last read its index
+    /// emptied underneath, whichever is later.
+    pub(crate) fn warmup_age(&self) -> Duration {
+        let admitted = self.admitted_at_ms.load(Ordering::Relaxed);
+        let emptied = self.warmup_emptied_ms.load(Ordering::Relaxed);
+        Self::age_of(admitted.max(emptied))
     }
 
     pub fn divert_until_ms(&self) -> u64 {
@@ -778,7 +795,20 @@ impl WorkerRuntime {
     /// drops to zero when the index was cleared underneath (the count went
     /// down). Two racing callers may both take the same baseline; nothing
     /// worse.
+    ///
+    /// An index that held a block at the last read and holds none now was
+    /// emptied underneath: the worker has its first cache to build again, so
+    /// its warm-up clock starts again at this read ([`Self::warmup_age`]).
+    /// The admission stands as it was.
     pub fn warmup_growth(&self, indexed: usize) -> usize {
+        let held = indexed > 0;
+        if self.warmup_held.load(Ordering::Relaxed) != held {
+            self.warmup_held.store(held, Ordering::Relaxed);
+            if !held {
+                self.warmup_emptied_ms
+                    .store(super::health::liveness::now_ms(), Ordering::Relaxed);
+            }
+        }
         let admitted = self.admitted_at_ms.load(Ordering::Relaxed);
         if self.warmup_base_admitted_ms.load(Ordering::Relaxed) != admitted {
             self.warmup_base_admitted_ms
@@ -2239,5 +2269,32 @@ mod tests {
         runtime.note_admitted();
         assert_eq!(runtime.warmup_growth(900), 0);
         assert_eq!(runtime.warmup_growth(1300), 400);
+    }
+
+    #[test]
+    fn an_index_emptied_underneath_restarts_the_warm_up_clock_and_not_the_admission() {
+        let ms = Duration::from_millis;
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        thread::sleep(ms(40));
+        // Never read holding a block: a read of none is no emptying, and
+        // the clock is the admission's.
+        assert_eq!(runtime.warmup_growth(0), 0);
+        let (admitted, warm) = (runtime.admitted_age(), runtime.warmup_age());
+        assert!(warm >= admitted && admitted >= ms(40));
+        // Read holding blocks, then none: the clock starts again at that
+        // read, and the admission stands where it was.
+        assert_eq!(runtime.warmup_growth(500), 500);
+        assert_eq!(runtime.warmup_growth(0), 0);
+        let (warm, admitted) = (runtime.warmup_age(), runtime.admitted_age());
+        assert!(admitted >= warm + ms(30), "{admitted:?} {warm:?}");
+        // A second read of none is no second emptying.
+        thread::sleep(ms(40));
+        assert_eq!(runtime.warmup_growth(0), 0);
+        assert!(runtime.warmup_age() >= ms(40));
+        // Admitted again, the clock is the admission's again.
+        thread::sleep(ms(400));
+        runtime.note_admitted();
+        let (admitted, warm) = (runtime.admitted_age(), runtime.warmup_age());
+        assert!(warm >= admitted && warm < admitted + ms(300));
     }
 }

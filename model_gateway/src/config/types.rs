@@ -306,6 +306,8 @@ pub struct RouterConfig {
     /// Warm-up slice for cache-aware routing: for this many seconds after a
     /// worker becomes routable, until its index has grown by
     /// `worker_warmup_blocks` blocks, one cache miss in `1 / share` goes to it.
+    /// A thin worker that holds nothing is thin for as long
+    /// (`worker_warmup_thin_ratio`).
     #[serde(default = "default_worker_warmup_secs")]
     pub worker_warmup_secs: u64,
     /// The share of cache misses offered to warming workers: a finite value
@@ -319,7 +321,9 @@ pub struct RouterConfig {
     /// the warm-up slice until it has grown by `worker_warmup_blocks`,
     /// whatever emptied it (a resync after a publisher restart, an
     /// out-of-range or data-loss resubscription, an engine that came back
-    /// empty). A finite value from 0.0 to 1.0; 0 keeps the age rule alone.
+    /// empty). A worker that holds nothing is thin for `worker_warmup_secs`
+    /// alone, counted from when it became routable or its index was last
+    /// emptied. A finite value from 0.0 to 1.0; 0 keeps the age rule alone.
     #[serde(default = "default_worker_warmup_thin_ratio")]
     pub worker_warmup_thin_ratio: f32,
     /// One cache hit in this many is diverted to a thin worker although

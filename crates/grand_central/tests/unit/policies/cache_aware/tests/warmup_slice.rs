@@ -425,17 +425,35 @@ fn a_host_that_names_warming_rows_enters_the_stages_own_ruling() {
     assert_eq!(named_by(&rule, fleets[2], 639_999_999).0, vec![1, 3]);
     assert_eq!(named_by(&rule, fleets[2], 640_000_000).0, vec![1]);
     // The rows of one entry stand for every later instant while the
-    // sizes do: read then, they are the ruling's own of that instant.
+    // sizes do: read then, they are the ruling's own of that instant. One
+    // ruling ends: thin rows that all hold nothing, once the last of them
+    // ended, where a host rules again.
+    let ends_at = |rule: &WarmUpRule, fleet: &[(u32, u64)]| {
+        let sizes: Vec<u32> = fleet.iter().map(|row| row.0).collect();
+        let admitted: Vec<u64> = fleet.iter().map(|row| NOW - row.1 * 1_000_000).collect();
+        let (mut scratch, mut rows) = (Vec::new(), Vec::new());
+        let warming = rule.list_warming_rows(&sizes, &admitted, NOW, &mut scratch, &mut rows);
+        let last = rows.iter().map(|&(_, until)| until).max();
+        last.filter(|_| warming.thin).unwrap_or(u64::MAX)
+    };
     let laters = [
         1, 29_999_999, 30_000_000, 39_999_999, 40_000_000, 49_999_999, 50_000_000, 70_000_000,
     ];
+    let mut ruled_again = 0;
     for fleet in fleets {
+        let end = ends_at(&rule, fleet);
         for later in laters {
             let now = NOW + later;
-            let stood = read_at(&rule, fleet, NOW, now);
+            let read = if now < end { NOW } else { end };
+            ruled_again += usize::from(now >= end);
+            let stood = read_at(&rule, fleet, read, now);
             assert_eq!(stood, named_by(&rule, fleet, now), "{fleet:?} +{later}");
         }
     }
+    // The second fleet's one thin row holds nothing, ten seconds into its
+    // window: its ruling ends fifty seconds on, and no other ruling ends.
+    assert_eq!(ends_at(&rule, fleets[1]), NOW + 50_000_000);
+    assert_eq!(ruled_again, 2);
     // A fleet that is all young names nobody until its first row is
     // young no more, then the rest, each until its own end.
     let all_young = |later: u64| read_at(&rule, fleets[3], NOW, NOW + later).0;
@@ -454,4 +472,104 @@ fn a_host_that_names_warming_rows_enters_the_stages_own_ruling() {
     let narrow = WarmupSlice::new(&narrow, Gates::of(None, None, Some(16)));
     let narrow = narrow.warm_up_rule().expect("the stage rules who warms");
     assert_eq!(named_by(&narrow, &fleet, NOW).0, Vec::<u32>::new());
+}
+
+/// A row that holds nothing is thin for the window of its warm-up clock
+/// alone: a fleet half warm where no worker joined and no index was emptied
+/// names nobody, a row whose clock started inside the window is named until
+/// the window is over, and from its first block a row is named with no end
+/// until it crosses the ratio. A column says no more of a worker's age than
+/// its admission, so the stage's own ruling of one keeps a row that holds
+/// nothing thin whatever its age.
+#[test]
+fn a_row_that_holds_nothing_is_thin_for_its_window_alone() {
+    const NOW: u64 = 600_000_000;
+    const WINDOW: u64 = 60_000_000;
+    let stage = warmup(0.25, 8);
+    let rule = stage.warm_up_rule().expect("the stage rules who warms");
+    // A row: its index size and how many seconds ago its clock started.
+    let named = |fleet: &[(u32, u64)]| {
+        let sizes: Vec<u32> = fleet.iter().map(|row| row.0).collect();
+        let started: Vec<u64> = fleet.iter().map(|row| NOW - row.1 * 1_000_000).collect();
+        let (mut scratch, mut rows) = (Vec::new(), Vec::new());
+        let warming = rule.list_warming_rows(&sizes, &started, NOW, &mut scratch, &mut rows);
+        (rows, warming.thin)
+    };
+    // Half the fleet warm, nobody new, nothing emptied: nobody warms.
+    let half_warm = [(40, 500), (40, 500), (0, 500), (0, 500)];
+    assert_eq!(named(&half_warm), (vec![], false));
+    assert_eq!(
+        named(&[(40, 500), (40, 500), (40, 500), (0, 500)]),
+        (vec![], false)
+    );
+    // A row whose clock started ten seconds ago, by a join or by an
+    // emptying, is thin until its window is over; the old one beside it is
+    // not.
+    assert_eq!(
+        named(&[(40, 500), (40, 500), (0, 10), (0, 500)]),
+        (vec![(2, NOW - 10_000_000 + WINDOW)], true)
+    );
+    // From its first block a row is thin with no end, whatever its age.
+    assert_eq!(
+        named(&[(40, 500), (40, 500), (1, 500), (0, 500)]),
+        (vec![(2, u64::MAX)], true)
+    );
+    // The stage's own ruling of a column: the rows that hold nothing stay
+    // thin whatever their age.
+    let column: Vec<AffinityFacts> = half_warm
+        .iter()
+        .map(|&(size, age)| AffinityFacts {
+            admitted_age_ms: (age * 1_000) as u32,
+            indexed_growth: size,
+            indexed_blocks: size,
+            ..AffinityFacts::default()
+        })
+        .collect();
+    let warm = stage.ruled(&column).expect("a thin row is ruled");
+    let mut warming = stage.warming::<false>(warm, Feed::Column(&column));
+    let rows: Vec<u32> = (0..4).filter(|&row| warming(row)).collect();
+    assert_eq!((rows, warm.thin()), (vec![2, 3], true));
+}
+
+/// An emptied row is thin for a window while it holds nothing and is not
+/// young again: the young rule reads a row's admission, and the instant its
+/// index was emptied is read for the thin row that holds nothing alone. So
+/// a row emptied ten seconds ago that regrew past the ratio is named no
+/// more, though it gained less than a young row's first blocks since. A
+/// host that hands the emptying as the row's admission names it young.
+#[test]
+fn an_emptied_row_regrown_past_the_ratio_is_not_young() {
+    const NOW: u64 = 600_000_000;
+    const WINDOW: u64 = 60_000_000;
+    let stage = warmup(0.25, 8);
+    let rule = stage.warm_up_rule().expect("the stage rules who warms");
+    let old = NOW - 500_000_000;
+    let admitted = [old; 4];
+    let emptied = [old, old, NOW - 10_000_000, old];
+    let named = |sizes: [u32; 4], admitted: &[u64], emptied: &[u64]| {
+        let (mut scratch, mut rows) = (Vec::new(), Vec::new());
+        let warming = rule.list_warming_rows_emptied(
+            &sizes,
+            &sizes,
+            admitted,
+            emptied,
+            NOW,
+            &mut scratch,
+            &mut rows,
+        );
+        (rows, warming.thin)
+    };
+    // Emptied, it holds nothing: thin until its window is over.
+    assert_eq!(
+        named([12, 12, 0, 12], &admitted, &emptied),
+        (vec![(2, NOW - 10_000_000 + WINDOW)], true)
+    );
+    // Regrown past the ratio of the level, short of a young row's first
+    // blocks: neither thin nor young.
+    assert_eq!(named([12, 12, 7, 12], &admitted, &emptied), (vec![], false));
+    // The emptying handed as the admission: young until the window is over.
+    assert_eq!(
+        named([12, 12, 7, 12], &emptied, &emptied),
+        (vec![(2, NOW - 10_000_000 + WINDOW)], false)
+    );
 }

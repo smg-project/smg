@@ -829,7 +829,7 @@
           "exclusiveMinimum": 0
         },
         "secs": {
-          "description": "How long after admission a worker counts as warming, in seconds; 0\nswitches the age rule off (default 60).",
+          "description": "How long after admission a worker counts as warming, in seconds; 0\nswitches the age rule off (default 60). For a single request a worker\nthat holds nothing is thin for this long alone, from its admission or\nfrom when its index was last emptied, so never under 0; a side of a\npair keeps such a worker thin whatever its age.",
           "type": [
             "integer",
             "null"

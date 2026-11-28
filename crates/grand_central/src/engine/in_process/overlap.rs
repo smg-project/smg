@@ -979,6 +979,11 @@ struct Table {
     phase: Phase,
     /// The decision clock at the read.
     read_at: u64,
+    /// The instant the table stands until: its second, or sooner where its
+    /// warming rows are thin ones that all hold nothing, at the end of the
+    /// last of them. Behind it a ruling names the young rows this one left
+    /// out for the thin, so the table is read again there.
+    stands_until: u64,
     /// The most rows of each list a decision is named: the profile's
     /// sample. `0` where the profile is named no row.
     cap: usize,
@@ -1154,6 +1159,7 @@ impl Table {
             model: model.into(),
             phase,
             read_at: now,
+            stands_until: now.saturating_add(TABLE_STANDS_MICROS),
             cap,
             reads,
             states: engine.profile_reads_affinity(model, phase),
@@ -1209,11 +1215,13 @@ impl Table {
         let mut sizes = vec![0u32; rows];
         let mut growth = vec![0u32; rows];
         let mut admitted = vec![0u64; rows];
+        let mut emptied = vec![0u64; rows];
         let mut column = vec![AffinityFacts::default(); rows];
         let mut numbered = 0usize;
         for (row, worker) in workers.iter().enumerate() {
             let age = micros(worker.admitted_age());
             admitted[row] = now.saturating_sub(age);
+            emptied[row] = admitted[row];
             column[row].admitted_age_ms = millis(age);
             let Some(index) = heard_by else {
                 continue;
@@ -1230,6 +1238,13 @@ impl Table {
             growth[row] = count(worker.warmup_growth(blocks));
             column[row].indexed_blocks = sizes[row];
             column[row].indexed_growth = growth[row];
+            // A row that holds nothing is thin by the warm-up clock, which
+            // starts again where the read of the growth sees an index
+            // emptied underneath: read behind it, the clock shows an
+            // emptying in this table. A young row is young by its admission,
+            // and the column keeps the admitted age, which is all its record
+            // holds.
+            emptied[row] = now.saturating_sub(micros(worker.warmup_age()));
             numbered = numbered.max(number as usize + 1);
         }
         table.column = column.into();
@@ -1260,16 +1275,23 @@ impl Table {
         // age and size.
         if let Some(rule) = engine.pool_rule_for(model, phase).filter(|_| table.holds) {
             let (mut level, mut warming) = (Vec::new(), Vec::new());
-            table.ruled = rule.list_warming_rows_grown(
+            table.ruled = rule.list_warming_rows_emptied(
                 &sizes,
                 &growth,
                 &admitted,
+                &emptied,
                 now,
                 &mut level,
                 &mut warming,
             );
             let ends = warming.iter().map(|&(_, until)| until);
-            table.first_end = ends.min().unwrap_or(u64::MAX);
+            table.first_end = ends.clone().min().unwrap_or(u64::MAX);
+            // A thin row that holds nothing ends with its window; one that
+            // holds a block has no end.
+            if table.ruled.thin {
+                let last_end = ends.max().unwrap_or(u64::MAX);
+                table.stands_until = table.stands_until.min(last_end);
+            }
             table.warming = warming.into();
         }
         let record = engine.pool_record_for(model, phase);
@@ -2668,10 +2690,10 @@ impl PoolAffinity {
         let standing = self.table.load();
         let table = standing.as_deref();
         if let Some(table) = table.filter(|table| table.is_of(asked.model, asked.phase)) {
-            // It stands for its second, while the index hands none of its
-            // numbers on and keeps its word of holding a block.
-            let stands = asked.now.saturating_sub(table.read_at) < TABLE_STANDS_MICROS
-                && table.stands_by_index();
+            // It stands for its second, or until its last thin row that
+            // holds nothing ends, while the index hands none of its numbers
+            // on and keeps its word of holding a block.
+            let stands = asked.now < table.stands_until && table.stands_by_index();
             // One decision reads a table again; the others decide by the
             // one that stands, whose lookup names nobody once a number of
             // it was handed on, and whose word of the index is the old one

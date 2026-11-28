@@ -1027,8 +1027,9 @@ struct Rows {
     /// workers' index sizes, what a thin worker is thin against.
     fleet_level: usize,
     /// Rows of the warm-up slice's candidates at the build: the workers
-    /// thinner than the fleet (an index emptied by a resync, or never fed)
-    /// whatever their age, else the workers inside the warm-up window
+    /// thinner than the fleet whatever their age (one that holds nothing,
+    /// emptied by a resync or never fed, inside its warm-up window alone),
+    /// else the workers inside the warm-up window
     /// (admitted within it, index still growing) unless every worker was (a
     /// young fleet slices nothing).
     warming: Vec<u32>,
@@ -1078,7 +1079,15 @@ impl Rows {
                     Some((indexed, grown)) => (*indexed, Some(*grown)),
                     None => (0, None),
                 };
-                if !warmup.applies(worker.admitted_age(), grown, indexed, fleet_level) {
+                // A worker that holds nothing is thin for the window of its
+                // warm-up clock alone, which starts again where its index is
+                // emptied; the young rule reads its admission.
+                let empty_thin = indexed == 0
+                    && warmup.is_thin(0, fleet_level)
+                    && worker.warmup_age() < warmup.secs;
+                if !empty_thin
+                    && !warmup.applies(worker.admitted_age(), grown, indexed, fleet_level)
+                {
                     continue;
                 }
                 if warmup.is_thin(indexed, fleet_level) {
@@ -2049,12 +2058,11 @@ impl CacheAwarePolicy {
             }
             let indexed = table.rows().id_at[row].map(|id| indexer.worker_block_count(id));
             let grown = indexed.map(|indexed| worker.warmup_growth(indexed));
-            if !warmup.applies(
-                worker.admitted_age(),
-                grown,
-                indexed.unwrap_or(0),
-                table.rows().fleet_level,
-            ) {
+            let (held, level) = (indexed.unwrap_or(0), table.rows().fleet_level);
+            // A worker that holds nothing is thin for its window alone.
+            let empty_thin =
+                held == 0 && warmup.is_thin(0, level) && worker.warmup_age() < warmup.secs;
+            if !empty_thin && !warmup.applies(worker.admitted_age(), grown, held, level) {
                 continue;
             }
             if self.over_count_pressure_gate(workers[idx].load() as f64, avg_load, 0.0) {
@@ -2175,7 +2183,10 @@ impl CacheAwarePolicy {
                 continue;
             }
             let indexed = table.rows().id_at[row].map_or(0, |id| indexer.worker_block_count(id));
-            if !warmup.is_thin(indexed, table.rows().fleet_level) {
+            // A worker that holds nothing is thin for its window alone.
+            if !warmup.is_thin(indexed, table.rows().fleet_level)
+                || (indexed == 0 && worker.warmup_age() >= warmup.secs)
+            {
                 continue;
             }
             if state.load > 0 && now < worker.divert_until_ms() {

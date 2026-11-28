@@ -151,7 +151,7 @@ Every scorer takes a `weight`: a finite number above zero, 1 by default. The wei
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `secs` | 60 | The age rule. Zero switches it off. |
+| `secs` | 60 | The age rule. Zero switches it off. Where a host names the warming rows, also how long a thin row that holds nothing is named. |
 | `share` | 0.25 | The share of the misses, 0 to 1. |
 | `blocks` | 1024 | The growth rule. |
 | `thin_ratio` | 0.5 | A share of the median index size, 0 to 1. Zero switches the thin-cache rule off. |

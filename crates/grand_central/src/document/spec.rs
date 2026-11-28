@@ -877,7 +877,10 @@ pub struct WarmupSliceParams {
     #[schemars(extend("exclusiveMinimum" = 0))]
     pub weight: f32,
     /// How long after admission a worker counts as warming, in seconds; 0
-    /// switches the age rule off (default 60).
+    /// switches the age rule off (default 60). For a single request a worker
+    /// that holds nothing is thin for this long alone, from its admission or
+    /// from when its index was last emptied, so never under 0; a side of a
+    /// pair keeps such a worker thin whatever its age.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secs: Option<u64>,
     /// The share of misses offered to warming workers; between 0 and 1
