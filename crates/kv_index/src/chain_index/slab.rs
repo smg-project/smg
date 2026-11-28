@@ -168,13 +168,14 @@ impl Run {
 /// the further words.
 pub(super) struct RunChunk {
     pub(super) runs: Box<[Run; RUN_CHUNK]>,
-    /// The first coverage words of every run, a run's words side by side: as many a run as
-    /// the pool's workers spanned when the chunk was made, at least one. A fleet that fits
-    /// one word holds one word a run, not the index's ceiling.
+    /// The first coverage words of every run, a run's words side by side: one a run where
+    /// the pool's workers fit one word when the chunk was made, else every word up to the
+    /// index's ceiling. A fleet that fits one word holds one word a run, not the ceiling.
     base: Box<[AtomicU64]>,
     /// Every later word of the runs' coverage up to the index's ceiling, a run's words side
     /// by side, made when a worker of such a word first holds a whole run of this chunk:
-    /// the pool grew after the chunk was made. While it is missing those words read as zero.
+    /// the pool outgrew one word after the chunk was made. While it is missing those words
+    /// read as zero.
     side: Box<OnceLock<Box<[AtomicU64]>>>,
 }
 
@@ -264,7 +265,7 @@ pub(super) struct RunSlab {
     /// Coverage words a lookup has to read: enough for the highest worker id interned so far
     /// (ids are handed out densely and reused), at most `words`. An index sized for a thousand
     /// workers that serves eight reads one word per run instead of sixteen, and a chunk made
-    /// now lays that many words a run.
+    /// while this is at most one lays one word a run.
     pub(super) live_words: AtomicUsize,
 }
 
@@ -282,9 +283,14 @@ impl RunSlab {
     #[inline]
     pub(super) fn chunk(&self, index: usize) -> &RunChunk {
         self.dir[index].get_or_init(|| {
-            // As wide as the pool needs now: a worker of a later word finds its bit in the
-            // further block.
-            let base = self.live_words.load(Ordering::Acquire).clamp(1, self.words);
+            // One word a run while the pool fits one word: a worker of a later word finds its
+            // bit in the further block. A wider pool lays the whole ceiling, so a lookup
+            // reads every word of a run from one place.
+            let base = if self.live_words.load(Ordering::Acquire) <= 1 {
+                1
+            } else {
+                self.words
+            };
             RunChunk {
                 runs: Box::new(std::array::from_fn(|_| Run::blank())),
                 base: zeroed_words(RUN_CHUNK * base),

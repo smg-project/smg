@@ -395,9 +395,10 @@ impl ChainIndex {
         self.arena.cap_words = words;
     }
 
-    /// An index for up to `max_workers` interned workers (at most 1024). A chunk of runs lays
-    /// one coverage word per run for each 64 workers interned when the chunk is made, at least
-    /// one, and the rest of the ceiling once a worker of a later word holds a whole run there.
+    /// An index for up to `max_workers` interned workers (at most 1024). A chunk of runs made
+    /// while the interned workers fit one coverage word lays one word per run, and the rest of
+    /// the ceiling once a worker of a later word holds a whole run there; a chunk made at a
+    /// wider pool lays the whole ceiling.
     pub fn with_max_workers(max_workers: usize) -> Self {
         let max_workers = max_workers.clamp(1, MAX_WORDS * 64);
         let words = max_workers.div_ceil(64);
