@@ -25,28 +25,24 @@ use llm_multimodal::{
     MediaConnectorError, MediaErrorCode, MediaFault, Modality, ModelMetadata, ModelRegistry,
     MultiModalError, PlaceholderRange, PreprocessedEncoderInputs, VideoClip,
 };
-use llm_tokenizer::{registry::TokenizerRegistry, Encoding, TokenizerTrait};
+use llm_tokenizer::{Encoding, TokenizerTrait};
 
 use crate::routers::{
     common::retry::mark_non_retryable, error, grpc::proto_wrapper::VLLM_MROPE_GRID_KEYS,
 };
 
 /// Whether the prepared images or videos of `model_id` carry the grid
-/// tensors of [`MultimodalIntermediate::has_mrope_grids`]: its spec lays out
-/// a grid field ([`VLLM_MROPE_GRID_KEYS`]) for one of them. It reads only the
-/// cached config, so it waits on no load. `None` while the model has no
-/// tokenizer entry or no cached config, or while no spec matches it.
+/// tensors of [`MultimodalIntermediate::has_mrope_grids`]: its spec, found
+/// from its `tokenizer` and `config` as the pipeline finds it, lays out a
+/// grid field ([`VLLM_MROPE_GRID_KEYS`]) for one of them. `None` if no spec
+/// matches the model.
 pub(crate) fn model_media_carries_mrope_grids(
-    tokenizers: &TokenizerRegistry,
-    configs: &MultimodalConfigRegistry,
     specs: &ModelRegistry,
     model_id: &str,
+    tokenizer: &dyn TokenizerTrait,
+    config: &MultimodalModelConfig,
 ) -> Option<bool> {
-    let entry = tokenizers
-        .get_by_name(model_id)
-        .or_else(|| tokenizers.get_by_id(model_id))?;
-    let config = configs.get(&entry.id)?;
-    let tokenizer = RegistryTokenizer(entry.tokenizer.as_ref());
+    let tokenizer = RegistryTokenizer(tokenizer);
     let metadata = ModelMetadata {
         model_id,
         tokenizer: &tokenizer,

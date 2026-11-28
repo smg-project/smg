@@ -26,6 +26,7 @@ use axum::{
     http::{HeaderMap, HeaderValue},
     response::Response,
 };
+use dashmap::{mapref::entry::Entry, DashMap};
 use llm_multimodal::ModelRegistry;
 use llm_tokenizer::registry::TokenizerRegistry;
 use openai_protocol::{
@@ -51,6 +52,7 @@ use openai_protocol::{
 use smg_data_connector::MemoryConfig;
 use smg_external_router::spec_for_provider;
 use smg_worker::identity::basic::{ConnectionMode, Worker};
+use tokio::runtime::Handle;
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -281,11 +283,138 @@ pub struct Gateway {
 
 /// The registries the gRPC pipeline finds a model's media spec in: its
 /// tokenizer, its cached config, and the specs. The family draw reads them
-/// to tell if a model's images carry mRoPE grids.
+/// to tell if a model's images carry mRoPE grids, and loads a config that
+/// is not cached.
 struct MediaSpecs {
     tokenizers: Arc<TokenizerRegistry>,
     configs: Arc<MultimodalConfigRegistry>,
     specs: ModelRegistry,
+    /// The config loads of the draw, by tokenizer id: a load that runs, or
+    /// one that failed. A load that ends with the config cached leaves no
+    /// entry.
+    loads: Arc<DashMap<String, ConfigLoad>>,
+}
+
+/// A config load of the family draw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConfigLoad {
+    Running,
+    Failed,
+}
+
+/// What the family draw knows of whether a model's images carry mRoPE
+/// grids.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MediaGrids {
+    /// The model's media spec tells.
+    Known(bool),
+    /// The model's config loads, so its spec cannot tell yet.
+    Loading,
+    /// The spec cannot tell, and the draw starts no load to change that:
+    /// the gateway has no media specs, the model has no tokenizer entry, its
+    /// config failed to load, or no spec matches the model.
+    Unknown,
+}
+
+impl MediaGrids {
+    /// Whether the draw takes the images to carry grids. While the config
+    /// loads, they do: the EPD router refuses an image with grids on a
+    /// decode worker without a vision encoder, and the load ends soon. If
+    /// the spec cannot tell, they do not, as before, and the EPD router
+    /// decides.
+    fn assumed(self) -> bool {
+        match self {
+            Self::Known(grids) => grids,
+            Self::Loading => true,
+            Self::Unknown => false,
+        }
+    }
+}
+
+impl MediaSpecs {
+    /// What the draw knows of whether the images of `model_id` carry mRoPE
+    /// grids ([`model_media_carries_mrope_grids`]). If the model's config is
+    /// not cached, this starts a load of it ([`Self::load_config`]).
+    fn grids(&self, model_id: &str) -> MediaGrids {
+        // The tokenizer entry, found as the gRPC pipeline finds it.
+        let entry = self
+            .tokenizers
+            .get_by_name(model_id)
+            .or_else(|| self.tokenizers.get_by_id(model_id));
+        let Some(entry) = entry else {
+            return MediaGrids::Unknown;
+        };
+        let Some(config) = self.configs.get(&entry.id) else {
+            return self.load_config(&entry.id, &entry.source);
+        };
+        model_media_carries_mrope_grids(&self.specs, model_id, entry.tokenizer.as_ref(), &config)
+            .map_or(MediaGrids::Unknown, MediaGrids::Known)
+    }
+
+    /// Starts a load of the config of tokenizer `id` from `source`, as the
+    /// gRPC pipeline loads it, unless a load of it runs or failed. Returns
+    /// `Loading` while a load runs, and `Unknown` after a load failed or
+    /// when no runtime can run one. The load runs in the background, so no
+    /// request waits on it.
+    fn load_config(&self, id: &str, source: &str) -> MediaGrids {
+        let load = match self.loads.get(id) {
+            Some(load) => *load,
+            None => {
+                let Ok(runtime) = Handle::try_current() else {
+                    return MediaGrids::Unknown;
+                };
+                match self.loads.entry(id.to_string()) {
+                    Entry::Occupied(load) => *load.get(),
+                    Entry::Vacant(slot) => {
+                        slot.insert(ConfigLoad::Running);
+                        runtime.spawn(self.config_load(id.to_string(), source.to_string()));
+                        ConfigLoad::Running
+                    }
+                }
+            }
+        };
+        match load {
+            ConfigLoad::Running => MediaGrids::Loading,
+            ConfigLoad::Failed => MediaGrids::Unknown,
+        }
+    }
+
+    /// The load of [`Self::load_config`]. A config that loads stays cached,
+    /// where the draw and the gRPC pipeline read it. A load that fails is
+    /// kept as failed, so the draw does not try again; a gRPC pipeline that
+    /// prepares the model's media still loads the config itself.
+    fn config_load(&self, id: String, source: String) -> impl Future<Output = ()> + 'static {
+        let (tokenizers, configs, loads) = (
+            Arc::clone(&self.tokenizers),
+            Arc::clone(&self.configs),
+            Arc::clone(&self.loads),
+        );
+        async move {
+            let loaded = configs.get_or_load(&id, &source).await;
+            // A tokenizer removed while its config loaded keeps neither.
+            if tokenizers.get_by_id(&id).is_none() {
+                configs.remove(&id);
+                loads.remove(&id);
+                return;
+            }
+            match loaded {
+                Ok(_) => {
+                    loads.remove(&id);
+                }
+                Err(error) => {
+                    warn!(
+                        tokenizer_id = %id,
+                        error = %error,
+                        "The family draw could not load the model's multimodal config; \
+                         it takes the model's images to carry no mRoPE grids"
+                    );
+                    // The failed loads of tokenizers removed since go too.
+                    loads.retain(|id, _| tokenizers.get_by_id(id).is_some());
+                    loads.insert(id, ConfigLoad::Failed);
+                }
+            }
+        }
+    }
 }
 
 /// The answer when no router serves a request: the JSON error object, a 404
@@ -327,16 +456,17 @@ impl Gateway {
             tokenizers,
             configs,
             specs: ModelRegistry::default(),
+            loads: Arc::new(DashMap::new()),
         });
         self
     }
 
-    /// Whether the images of `model_id` carry mRoPE grids, as its media spec
-    /// tells ([`model_media_carries_mrope_grids`]); `None` while the spec
-    /// does not tell.
-    fn media_carries_mrope_grids(&self, model_id: &str) -> Option<bool> {
-        let media = self.media_specs.as_ref()?;
-        model_media_carries_mrope_grids(&media.tokenizers, &media.configs, &media.specs, model_id)
+    /// What the draw knows of whether the images of `model_id` carry mRoPE
+    /// grids ([`MediaSpecs::grids`]).
+    fn media_grids(&self, model_id: &str) -> MediaGrids {
+        self.media_specs
+            .as_ref()
+            .map_or(MediaGrids::Unknown, |media| media.grids(model_id))
     }
 
     /// The gateway with its message threads in a store bounded as the
@@ -544,10 +674,10 @@ impl Gateway {
     /// grids ([`decode_takes_vision`]) if the model's images carry grids. The
     /// EPD router asks this of the prepared media. The draw runs before the
     /// request is prepared, so it asks the model's spec
-    /// ([`Self::media_carries_mrope_grids`]). If the spec does not tell, the
-    /// images carry no grids, as before. Only a gRPC pipeline caches the
-    /// config that the spec needs, and it does so when it prepares the
-    /// model's first request with media.
+    /// ([`Self::media_grids`]). If the spec needs a config that is not cached,
+    /// the draw starts a load of it in the background, and takes the images
+    /// to carry grids until the load ends. If the spec cannot tell, the
+    /// images carry no grids, as before.
     ///
     /// A worker can serve if it is ready, permitted by the circuit breaker,
     /// and not stalled. If no family gets weight, a stalled worker can serve
@@ -596,16 +726,11 @@ impl Gateway {
             .map(|policies| policies.pd_pairing_mode())
             .unwrap_or_default();
         let vision = matches!(epd, EpdDemand::PairAndEncoder { vision: true });
-        // Whether the model's images carry mRoPE grids, read once and only
-        // for a decode worker that does not take them. While the spec does
-        // not tell, they carry none, as before: only a gRPC pipeline caches
-        // the config, so a draw that kept images off EPD until then could
-        // keep them off for good. The first image that a gRPC router
-        // prepares caches the config, and the draw reads the spec from then
-        // on.
+        // Whether the draw takes the model's images to carry mRoPE grids
+        // ([`MediaGrids::assumed`]), read once and only for a decode worker
+        // that does not take them.
         let grids = OnceCell::new();
-        let carries_grids =
-            || *grids.get_or_init(|| self.media_carries_mrope_grids(model_id) == Some(true));
+        let carries_grids = || *grids.get_or_init(|| self.media_grids(model_id).assumed());
         // Whether `pool` holds an encode worker that the EPD router can use
         // for `worker`. The EPD router has no fallback to a stalled encode
         // worker, so this does not change with the check.
@@ -1621,6 +1746,8 @@ mod tests {
     use std::{
         collections::{BTreeMap, HashMap},
         fmt::Debug,
+        path::Path,
+        time::Duration,
     };
 
     use async_trait::async_trait;
@@ -3523,10 +3650,13 @@ mod tests {
     #[tokio::test]
     async fn an_epd_family_takes_an_image_only_if_its_decode_worker_takes_vision() {
         for (decode_vision, image) in [("false", "http"), ("true", "grpc_epd")] {
-            let (gateway, configs) = media_spec_gateway().await;
-            cache_config(&configs, "qwen2_vl");
+            let model = model_dir(Some("qwen2_vl"));
+            let gateway = media_spec_gateway(model.path()).await;
             let gateway =
                 named_families_over(gateway, &[(HTTP, WorkerType::Regular, Serving::Stalled)]);
+            assert_eq!(gateway.media_grids("m"), MediaGrids::Loading);
+            config_loads_end(&gateway).await;
+            assert_eq!(gateway.media_grids("m"), MediaGrids::Known(true));
             register_vllm_epd(&gateway, decode_vision);
             let fleet = format!("vLLM EPD, decode supports_vision={decode_vision}, stalled HTTP");
             let media = |vision| EpdDemand::PairAndEncoder { vision };
@@ -3576,64 +3706,86 @@ mod tests {
         }
     }
 
-    /// A gateway whose media specs hold a tokenizer for model `m`, and the
-    /// config cache that they read. The cache holds no config yet.
-    async fn media_spec_gateway() -> (Gateway, Arc<MultimodalConfigRegistry>) {
+    /// A gateway whose media specs hold a tokenizer for model `m`, loaded
+    /// from the model directory `model`, and no cached config.
+    async fn media_spec_gateway(model: &Path) -> Gateway {
         use llm_tokenizer::{mock::MockTokenizer, TokenizerTrait};
 
+        let source = model.to_str().expect("the temporary path is UTF-8");
         let tokenizers = Arc::new(TokenizerRegistry::new());
         let mock: Arc<dyn TokenizerTrait> = Arc::new(MockTokenizer::new());
         tokenizers
-            .load("tok-m", "m", "m", || async { Ok(mock) })
+            .load("tok-m", "m", source, || async { Ok(mock) })
             .await
             .expect("the mock tokenizer loads");
         let configs = Arc::new(MultimodalConfigRegistry::new());
-        let gateway = Gateway::new(Arc::new(WorkerRegistry::new()))
-            .with_media_specs(tokenizers, Arc::clone(&configs));
-        (gateway, configs)
+        Gateway::new(Arc::new(WorkerRegistry::new())).with_media_specs(tokenizers, configs)
     }
 
-    /// Caches a config of `model_type` for the tokenizer of model `m`, as a
-    /// gRPC router does when it prepares the model's first request with
-    /// media.
-    fn cache_config(configs: &MultimodalConfigRegistry, model_type: &str) {
-        use llm_multimodal::PreProcessorConfig;
+    /// A model directory whose `config.json` names `model_type`, or, for
+    /// `None`, a model directory with no `config.json`.
+    fn model_dir(model_type: Option<&str>) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        if let Some(model_type) = model_type {
+            let config = serde_json::json!({ "model_type": model_type });
+            std::fs::write(dir.path().join("config.json"), config.to_string())
+                .expect("config.json is written");
+        }
+        dir
+    }
 
-        use crate::routers::grpc::multimodal::MultimodalModelConfig;
-
-        let config = MultimodalModelConfig::new(
-            serde_json::json!({ "model_type": model_type }),
-            PreProcessorConfig::default(),
-            None,
-        );
-        configs.insert("tok-m".to_string(), Arc::new(config));
+    /// Waits until no config load of the draw runs.
+    async fn config_loads_end(gateway: &Gateway) {
+        let media = gateway
+            .media_specs
+            .as_ref()
+            .expect("the gateway has media specs");
+        let running = || media.loads.iter().any(|load| *load == ConfigLoad::Running);
+        let ended = async {
+            while running() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), ended)
+            .await
+            .expect("the config load ends");
     }
 
     /// The decode worker must take mRoPE grids only if the model's images
-    /// carry them, as its media spec tells. A `llava` model's images carry
-    /// none, so its image goes to the vLLM pair whose decode worker has no
-    /// vision encoder. A `qwen2_vl` model's images carry grids, so its image
-    /// goes to the stalled HTTP worker. While the spec does not tell, an
-    /// image of either model goes to the vLLM pair. Its preparation caches
-    /// the config, and the draw reads the spec from then on.
+    /// carry them, as its media spec tells. While the model's config is not
+    /// cached, the draw loads it and takes the images to carry grids, so an
+    /// image goes to the stalled HTTP worker. When the load ends, a `llava`
+    /// model's image goes to the vLLM pair whose decode worker has no vision
+    /// encoder, and a `qwen2_vl` model's image still goes to HTTP. If the
+    /// config cannot load, or the gateway has no media specs, the spec
+    /// cannot tell, and the image goes to the vLLM pair, as before.
     #[tokio::test]
     async fn an_image_needs_a_decode_worker_that_takes_grids_only_if_the_model_has_them() {
         let image_demand = EpdDemand::PairAndEncoder { vision: true };
-        for (model_type, image) in [("llava", "grpc_epd"), ("qwen2_vl", "http")] {
-            let (gateway, configs) = media_spec_gateway().await;
+        for (model_type, grids, image) in [
+            (Some("llava"), MediaGrids::Known(false), "grpc_epd"),
+            (Some("qwen2_vl"), MediaGrids::Known(true), "http"),
+            (None, MediaGrids::Unknown, "grpc_epd"),
+        ] {
+            let model = model_dir(model_type);
+            let gateway = media_spec_gateway(model.path()).await;
             let gateway =
                 named_families_over(gateway, &[(HTTP, WorkerType::Regular, Serving::Stalled)]);
             register_vllm_epd(&gateway, "false");
             let fleet = format!(
-                "{model_type} with no cached config, vLLM EPD, decode supports_vision=false"
+                "{model_type:?} while its config loads, vLLM EPD, decode supports_vision=false"
             );
-            assert_drawn(&gateway, image_demand, &fleet, &[("grpc_epd", 1.0)]);
-            cache_config(&configs, model_type);
-            let fleet = format!("{model_type}, vLLM EPD, decode supports_vision=false");
+            assert_drawn(&gateway, image_demand, &fleet, &[("http", 1.0)]);
+            config_loads_end(&gateway).await;
+            assert_eq!(gateway.media_grids("m"), grids, "{model_type:?}");
+            let fleet = format!(
+                "{model_type:?} once its config load ended, vLLM EPD, decode supports_vision=false"
+            );
             assert_drawn(&gateway, image_demand, &fleet, &[(image, 1.0)]);
         }
         let gateway = named_family_gateway(&[(HTTP, WorkerType::Regular, Serving::Stalled)]);
         register_vllm_epd(&gateway, "false");
+        assert_eq!(gateway.media_grids("m"), MediaGrids::Unknown);
         let fleet = "no media specs, vLLM EPD, decode supports_vision=false";
         assert_drawn(&gateway, image_demand, fleet, &[("grpc_epd", 1.0)]);
     }
