@@ -180,6 +180,67 @@ fn every_table_that_reads_calls_writes_a_forced_tag_in_every_configuration() {
     assert!(checked > 0, "no table reads calls");
 }
 
+/// Behind a close of the thought the model writes, a call the request owes follows at once.
+/// Where no start is named, the free text that leads the tag cannot write a close of the thought
+/// (the closes the first-token tag ends its thought with): the close follows the text, once or
+/// not at all, and the text behind the close and the calls follow that.
+#[test]
+fn an_owed_call_follows_the_close_of_the_thought_at_once() {
+    let tools = tools();
+    let mut led = 0;
+    for table in Table::ALL {
+        let format = table.format();
+        if format.call_syntax().is_none() {
+            continue;
+        }
+        for (configuration, options, passed) in configurations() {
+            if !options.at_least_one
+                || !options.reasoning_open
+                || !matches!(options.start, GrammarStart::Unknown | GrammarStart::Either)
+            {
+                continue;
+            }
+            let payload = |start| {
+                format
+                    .grammar_for(&tools[passed.clone()], Options { start, ..options })
+                    .map(|tag| tag.payload())
+            };
+            let Some(tag) = payload(options.start) else {
+                continue;
+            };
+            let elements = &tag["format"]["elements"];
+            if elements[0]["type"] != "any_text" {
+                // A tag that takes no prefix: its ways in close the thought themselves.
+                continue;
+            }
+            let first = payload(GrammarStart::FirstToken).expect("a first-token tag");
+            let closes = match &first["format"]["elements"][0]["end"] {
+                serde_json::Value::Array(closes) => closes.clone(),
+                close => vec![close.clone()],
+            };
+            let what = format!("{} ({configuration}): {tag}", table.name());
+            let excludes = elements[0]["excludes"]
+                .as_array()
+                .expect("the excluded texts");
+            assert_eq!(elements[1]["type"], "optional", "{what}");
+            let written = elements[1]["content"].to_string();
+            for close in &closes {
+                assert!(close.is_string(), "{what}");
+                assert!(excludes.contains(close), "the text writes no close: {what}");
+                assert!(
+                    written.contains(&close.to_string()),
+                    "the close follows: {what}"
+                );
+            }
+            led += 1;
+        }
+    }
+    assert!(
+        led > 0,
+        "the sweep meets tables whose tag takes the free text before it"
+    );
+}
+
 #[test]
 fn every_answer_grammar_a_table_writes_passes_the_engines_rule() {
     // An answer held to a JSON schema (`response_format`), with the prompt's thought closed or

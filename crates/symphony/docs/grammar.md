@@ -40,6 +40,11 @@ owed at its end, so the forced call follows the reasoning instead of replacing i
 grammar from the first token, and a newline or nothing where the engine runs a reasoning parser and
 applies the grammar only after the model's own close; a prefix the thought's close ended would be
 owed a second time there, and the model would fill the gap with a fabricated observation and answer.
+Before a call the request owes (`tool_choice` `required`, a named function), the text cannot write
+the thought's close: the close follows the text, once or not at all, and the calls follow at once.
+So no prose stands between a close the model writes and the call, and an engine that applies the
+grammar after the model's own close reads the text it read before. The Lark spelling keeps the
+close writable in the text, since its lexer ends a text at one following word.
 A table without a thought has nothing to wrap, and the tag comes back as it is; a thought that
 closes only into the block has no prefix, its close being its own way in, and the table gives `None`
 rather than a tag the model could write inside its thought; a thought that closes into the text

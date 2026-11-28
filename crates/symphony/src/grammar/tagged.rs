@@ -408,14 +408,21 @@ mod tests {
                 "<parameter=",
                 "</parameter>",
                 "</function>",
+                "</think>",
             ])
         );
-        // The table's layout writes its two newlines after the thought's close, between the
-        // prefix and the calls.
+        // The call is owed: the thought's close leaves the text and follows it, once or not at
+        // all.
         assert_eq!(
             payload["format"]["elements"][1],
+            value!({"type": "optional", "content": {"type": "const_string", "value": "</think>"}})
+        );
+        // The table's layout writes its two newlines after the thought's close, between the
+        // close and the calls.
+        assert_eq!(
+            payload["format"]["elements"][2],
             value!({"type": "const_string", "value": "\n\n"})
         );
-        assert_eq!(payload["format"]["elements"][2]["type"], "plus");
+        assert_eq!(payload["format"]["elements"][3]["type"], "plus");
     }
 }

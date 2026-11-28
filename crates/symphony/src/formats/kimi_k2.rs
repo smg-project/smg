@@ -903,7 +903,8 @@ mod tests {
         // K2.5's prompt ends with `<think>`. After the gate of the engine's reasoning parser the
         // block comes at once, since the template writes nothing between `</think>` and the
         // block; from the first token the thought is written first, closed by its marker; an
-        // engine that does not say gets the free-text prefix.
+        // engine that does not say gets the free-text prefix, which cannot write the close, and
+        // the close behind it, once or not at all.
         let gated = payload(
             &[forecast()],
             forced(true, true, GrammarStart::AfterReasoning),
@@ -927,7 +928,11 @@ mod tests {
         let unknown =
             payload(&[forecast()], forced(true, true, GrammarStart::Unknown)).expect("a tag");
         assert_eq!(unknown["format"]["elements"][0]["type"], "any_text");
-        assert_eq!(unknown["format"]["elements"][1], gated["format"]);
+        assert_eq!(
+            unknown["format"]["elements"][1],
+            value!({"type": "optional", "content": {"type": "const_string", "value": "</think>"}})
+        );
+        assert_eq!(unknown["format"]["elements"][2], gated["format"]);
         // A tool with no name has no call; no tool, no tag.
         assert!(payload(&[], forced(false, true, GrammarStart::Unknown)).is_none());
         assert!(payload(

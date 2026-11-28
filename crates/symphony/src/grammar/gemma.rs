@@ -905,7 +905,9 @@ mod tests {
 
     #[test]
     fn with_the_thought_open_the_prefix_excludes_the_call_markers_and_the_string_token() {
-        // The thought's own markers stay writable; the call's two and the string's token are not.
+        // The thought's opener stays writable; the call's two and the string's token are not, nor
+        // the thought's close before a call the request owes: it follows the text, once or not
+        // at all.
         let payload = formats::gemma4()
             .grammar(&[tool("ping", value!({"type": "object"}))], true, true)
             .expect("a grammar")
@@ -915,9 +917,13 @@ mod tests {
             payload["format"]["elements"][0],
             value!({
                 "type": "any_text",
-                "excludes": ["<|tool_call>", "<tool_call|>", "<|\"|>"],
+                "excludes": ["<|tool_call>", "<tool_call|>", "<|\"|>", "<channel|>"],
             })
         );
-        assert_eq!(payload["format"]["elements"][1]["type"], "triggered_tags");
+        assert_eq!(
+            payload["format"]["elements"][1],
+            value!({"type": "optional", "content": {"type": "const_string", "value": "<channel|>"}})
+        );
+        assert_eq!(payload["format"]["elements"][2]["type"], "triggered_tags");
     }
 }
