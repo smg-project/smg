@@ -527,6 +527,7 @@ impl Bed {
             media_refs: request.refs.is_some(),
             vision: request.vision,
             pipeline: pin,
+            refs_stripped_decode: false,
         };
         let context = request
             .window

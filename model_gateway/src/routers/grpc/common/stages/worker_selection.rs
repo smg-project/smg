@@ -396,6 +396,10 @@ struct SelectionInputs<'a> {
     /// vision input: regular mode's single worker takes the whole request,
     /// and the disaggregated sides their shares of it (see `PairDemands`).
     needs_vision: bool,
+    /// The model's answer to whether its language model reads the grid
+    /// tensors, kept in the routing snapshot for the dispatch
+    /// (`RoutingSnapshot::language_model_reads_grids`).
+    language_model_reads_grids: bool,
     context_requirements: ContextRequirements,
     demand: PairDemands,
     text: Option<&'a str>,
@@ -439,11 +443,33 @@ impl<'a> SelectionInputs<'a> {
         } else {
             ContextRequirements::new(prep, &input.request_type)
         };
+        // The preprocessed media's answer, or a references plan's for a
+        // single sample in prefill/decode mode: there alone a
+        // language-model-only decode worker may take the stripped side of
+        // such a plan. Every other request keeps `true`, the answer that
+        // keeps the refusal.
+        let language_model_reads_grids = match (intermediate, refs) {
+            (Some(intermediate), _) => intermediate.language_model_reads_grids(),
+            (None, Some(plan))
+                if stage.mode == WorkerSelectionMode::PrefillDecode
+                    && input.request_type.sampling_n() <= 1 =>
+            {
+                plan.language_model_reads_grids()
+            }
+            _ => true,
+        };
+        // A references request whose decode side can be stripped may fall
+        // back to a language-model-only decode worker: no reference reaches
+        // that side. A decode worker with the encoder stays preferred
+        // (`decode_side_needs_vision`).
+        let refs_stripped_decode =
+            stage.refs_stripped_decode(media_refs, language_model_reads_grids);
         let demand = PairDemands::new(
             stage.prefill_side_needs_vision(needs_vision),
             stage.decode_side_needs_vision(&input.request_type, intermediate, media_refs),
         )
         .with_media_refs(media_refs, media_refs_pipeline)
+        .with_refs_stripped_decode(refs_stripped_decode)
         .with_context(context_requirements);
 
         let text = prep.routing_text();
@@ -481,6 +507,7 @@ impl<'a> SelectionInputs<'a> {
             } else {
                 PipelinePin::Any
             },
+            refs_stripped_decode,
         };
 
         let model_id = input.model_id.as_str();
@@ -499,6 +526,7 @@ impl<'a> SelectionInputs<'a> {
             intermediate,
             media_refs,
             needs_vision,
+            language_model_reads_grids,
             context_requirements,
             demand,
             text,
@@ -540,9 +568,7 @@ impl<'a> SelectionInputs<'a> {
             cache_namespace: self.cache_namespace,
             needs_vision: self.needs_vision,
             decode_needs_vision: self.demand.decode,
-            language_model_reads_grids: self
-                .intermediate
-                .is_none_or(multimodal::MultimodalIntermediate::language_model_reads_grids),
+            language_model_reads_grids: self.language_model_reads_grids,
         }
     }
 
@@ -759,6 +785,7 @@ impl WorkerSelectionStage {
                 &workers,
                 plan,
                 ctx.state.media_refs_pipeline,
+                inputs.demand.refs_stripped_decode,
             ) {
                 return Err(err.into_response());
             }
@@ -831,7 +858,12 @@ impl WorkerSelectionStage {
         // fact.
         let wire = Some(ctx.wire);
         let media_refs = ctx.wire.requires_media_refs;
-        let media = retry_media(ctx);
+        // The first selection's reading of the decode side, replayed from
+        // the snapshot: a stripped-side request keeps the language-model-only
+        // decode exemption on the retry.
+        let media = retry_media(ctx).with_refs_stripped_decode(
+            self.refs_stripped_decode(media_refs, ctx.routing.language_model_reads_grids),
+        );
         // A retry skips the workers that already answered this request
         // definitively (see `routers::common::attempt_ledger`), and stays on
         // the workers that decide its constraint as the first attempt's did
@@ -914,6 +946,7 @@ impl WorkerSelectionStage {
                                         == Some(EncodeHandoff::Push)),
                         )
                         .with_media_refs(media_refs, ctx.wire.pipeline)
+                        .with_refs_stripped_decode(media.refs_stripped_decode)
                         .with_context(context_requirements),
                         restated,
                     )
@@ -973,10 +1006,20 @@ impl WorkerSelectionStage {
         // first it says yes to that is ready: that last yes is the decode
         // the request moves to.
         let brought: Mutex<Option<Brought>> = Mutex::new(None);
+        let refs_stripped_decode = self.refs_stripped_decode(
+            request.wire.requires_media_refs,
+            request.routing.language_model_reads_grids,
+        );
         let takes_the_request = |worker: &dyn Worker| {
             let mut brought = brought.lock();
             *brought = None;
-            let alike = takes_the_built_request(&**first, worker, model_id, request.wire);
+            let alike = takes_the_built_request(
+                &**first,
+                worker,
+                model_id,
+                request.wire,
+                refs_stripped_decode,
+            );
             if !alike || !request.ledger.admits(worker) {
                 return false;
             }
@@ -1064,6 +1107,19 @@ impl WorkerSelectionStage {
                 .is_some_and(multimodal::MultimodalIntermediate::decode_side_needs_grids),
             WorkerSelectionMode::Regular => false,
         }
+    }
+
+    /// Whether a media-references request's decode side may be served
+    /// stripped to text and content hashes, so that a language-model-only
+    /// decode worker may take it without processing references itself: in
+    /// prefill/decode mode, for a single-sample request whose model's
+    /// language model reads no grid tensors (`language_model_reads_grids`,
+    /// the answer the routing snapshot keeps, which is `true` otherwise).
+    /// The first selection, a retry and a second ask for the decode read it
+    /// alike. Encode/prefill/decode mode never strips a references side this
+    /// way: every worker the references reach has to take them.
+    fn refs_stripped_decode(&self, media_refs: bool, language_model_reads_grids: bool) -> bool {
+        self.mode == WorkerSelectionMode::PrefillDecode && media_refs && !language_model_reads_grids
     }
 
     /// Whether this stage's prefill side needs a vision encoder for a request
@@ -1276,17 +1332,21 @@ fn same_worker(held: &Arc<dyn Worker>, worker: &dyn Worker) -> bool {
 /// pipeline pin, as every selection asks of a candidate
 /// ([`MediaDemands::accepts_refs`]). A decode request can keep its
 /// references: a request of more than one sample works its prompt out again
-/// on its decode, and a decode that processes none would refuse it.
+/// on its decode, and a decode that processes none would refuse it. A side
+/// the dispatch strips (`refs_stripped_decode`) takes the exemption every
+/// selection gives it.
 fn takes_the_built_request(
     first: &dyn Worker,
     worker: &dyn Worker,
     model: &str,
     wire: WireConstraint,
+    refs_stripped_decode: bool,
 ) -> bool {
     reads_the_request_alike(first, worker)
         && holds_what_the_first_holds(first, worker, model)
         && MediaDemands::NONE
             .with_wire(Some(wire))
+            .with_refs_stripped_decode(refs_stripped_decode)
             .accepts_refs(worker)
 }
 
@@ -1346,7 +1406,10 @@ fn vision_capable(worker: &dyn Worker) -> bool {
 /// side recomputes the prompt locally; grid tensors the model's language
 /// model derives the side's positions from). A text request of any `n` and a
 /// single-sample image request without such grids take such a worker's
-/// stripped side, so they are not steered away from it.
+/// stripped side, so they are not steered away from it. Media references
+/// stay a demand even where the decode side can be stripped
+/// ([`WorkerSelectionStage::refs_stripped_decode`]): a decode worker with
+/// the encoder is preferred, and a language-model-only one is the fallback.
 fn decode_needs_vision(
     request: &RequestType,
     intermediate: Option<&multimodal::MultimodalIntermediate>,
@@ -1356,6 +1419,17 @@ fn decode_needs_vision(
         || intermediate.is_some_and(|intermediate| {
             request.sampling_n() > 1 || intermediate.decode_side_needs_grids()
         })
+}
+
+/// Whether `worker` is a decode worker a request's stripped references side
+/// lets take the references it never sees: a vLLM language-model-only one
+/// ([`multimodal::worker_takes_stripped_refs_side`]), the prefill side's
+/// media identity replacing them before dispatch. Every references
+/// predicate of selection reads it here.
+fn stripped_side_exempts(refs_stripped_decode: bool, worker: &dyn Worker) -> bool {
+    refs_stripped_decode
+        && matches!(worker.worker_type(), WorkerType::Decode)
+        && multimodal::worker_takes_stripped_refs_side(worker)
 }
 
 /// Context bounds for both token-processing sides, and which sides need a vision
@@ -1380,6 +1454,10 @@ struct PairDemands {
     /// ([`pipeline_admits`]); the probes count only the pairs on that side,
     /// so a pair the pin excludes never stands in for one it admits.
     pipeline: PipelinePin,
+    /// With `refs`: a language-model-only decode worker takes the decode
+    /// side stripped to text and content hashes (the prefill side's media
+    /// identity), so it is exempt from the references predicate.
+    refs_stripped_decode: bool,
 }
 
 impl PairDemands {
@@ -1393,6 +1471,7 @@ impl PairDemands {
             decode,
             refs: false,
             pipeline: PipelinePin::Any,
+            refs_stripped_decode: false,
         }
     }
 
@@ -1404,6 +1483,16 @@ impl PairDemands {
         Self {
             refs,
             pipeline: if refs { pipeline } else { PipelinePin::Any },
+            ..self
+        }
+    }
+
+    /// The same demand with the decode side's references exemption: set when
+    /// a language-model-only decode worker would take the side stripped of
+    /// everything but the expanded ids and the content hashes.
+    fn with_refs_stripped_decode(self, refs_stripped_decode: bool) -> Self {
+        Self {
+            refs_stripped_decode,
             ..self
         }
     }
@@ -1530,6 +1619,9 @@ fn retry_media(ctx: &DispatchContext) -> MediaDemands {
         media_refs: ctx.wire.requires_media_refs,
         vision: ctx.routing.needs_vision,
         pipeline: ctx.wire.pipeline,
+        // The stage adds the decode side's exemption for its mode
+        // (`WorkerSelectionStage::refs_stripped_decode`).
+        refs_stripped_decode: false,
     }
 }
 
@@ -1548,6 +1640,13 @@ struct MediaDemands {
     /// With forwarded references: which of the workers that process them the
     /// plan may use ([`pipeline_admits`]).
     pipeline: PipelinePin,
+    /// With forwarded references: a language-model-only decode worker takes
+    /// the side stripped to text and content hashes (the prefill side's
+    /// media identity), so no reference ever reaches it and it needs no
+    /// media processing of its own. Set in prefill/decode mode when the
+    /// request is single-sample and its model's language model reads no
+    /// grids (see `WorkerSelectionStage::refs_stripped_decode`).
+    refs_stripped_decode: bool,
 }
 
 impl MediaDemands {
@@ -1556,6 +1655,7 @@ impl MediaDemands {
         media_refs: false,
         vision: false,
         pipeline: PipelinePin::Any,
+        refs_stripped_decode: false,
     };
 
     /// These demands plus the retained plan's pins on a retry.
@@ -1567,14 +1667,38 @@ impl MediaDemands {
                 PipelinePin::Any => wire.map_or(PipelinePin::Any, |w| w.pipeline),
                 pin => pin,
             },
+            refs_stripped_decode: self.refs_stripped_decode,
         }
     }
 
+    /// The same demands with the decode side's references exemption (see
+    /// [`Self::refs_stripped_decode`]).
+    fn with_refs_stripped_decode(self, refs_stripped_decode: bool) -> Self {
+        Self {
+            refs_stripped_decode,
+            ..self
+        }
+    }
+
+    /// Whether `worker` is a language-model-only decode worker that the
+    /// request's stripped decode side exempts from the references predicate
+    /// ([`Self::refs_stripped_decode`]): the references go to the prefill
+    /// side alone, so it needs neither to process them nor to sit on the
+    /// side of the pipeline pin. A vLLM worker only: no other runtime's
+    /// dispatch strips the side
+    /// ([`multimodal::worker_takes_stripped_refs_side`]).
+    fn exempts(self, worker: &dyn Worker) -> bool {
+        self.media_refs && stripped_side_exempts(self.refs_stripped_decode, worker)
+    }
+
     /// Whether `worker` may take the request's references: it processes
-    /// them, on the side of the pipeline pin the plan carries. The vision
-    /// demand is the side's own (see [`Self::accepts`]).
+    /// them, on the side of the pipeline pin the plan carries, or the
+    /// request's stripped decode side exempts it ([`Self::exempts`]). The
+    /// vision demand is the side's own (see [`Self::accepts`]).
     fn accepts_refs(self, worker: &dyn Worker) -> bool {
-        (!self.media_refs || accepts_media_refs(worker)) && pipeline_admits(self.pipeline, worker)
+        self.exempts(worker)
+            || ((!self.media_refs || accepts_media_refs(worker))
+                && pipeline_admits(self.pipeline, worker))
     }
 
     fn any(self) -> bool {
@@ -2344,6 +2468,10 @@ impl WorkerSelectionStage {
     /// processes references, or none of those that do is on the side of
     /// the plan's pipeline pin. Both are the request's own 400, as the
     /// regular path answers them, not a retryable 503 over healthy workers.
+    /// A decode worker the request's stripped decode side exempts
+    /// ([`MediaDemands::exempts`]) counts as taking the references: a pool of
+    /// such workers none of which is available is answered as a text
+    /// request's would be.
     /// A verdict for the pair's whole, as an unbound plan's, was judged
     /// from no pool: no pool's media explains it, and it is answered as it
     /// is.
@@ -2363,15 +2491,14 @@ impl WorkerSelectionStage {
             if !pool.is_empty() {
                 let processing: Vec<&Arc<dyn Worker>> = pool
                     .iter()
-                    .filter(|w| accepts_media_refs(w.as_ref()))
+                    .filter(|w| accepts_media_refs(w.as_ref()) || media.exempts(w.as_ref()))
                     .collect();
                 if processing.is_empty() {
                     return Self::media_refs_shed(model_id);
                 }
-                if !processing
-                    .iter()
-                    .any(|w| pipeline_admits(media.pipeline, w.as_ref()))
-                {
+                if !processing.iter().any(|w| {
+                    media.exempts(w.as_ref()) || pipeline_admits(media.pipeline, w.as_ref())
+                }) {
                     match media.pipeline {
                         PipelinePin::Only => return Self::pipeline_worker_required(model_id),
                         PipelinePin::Never => return Self::pipeline_takes_no_audio(model_id),
@@ -2498,8 +2625,12 @@ impl WorkerSelectionStage {
         // workers. A pool with no pair that takes the references at all is
         // not this refusal: the placement's media-references verdict names
         // that gap, and the fix that applies to it.
+        // A decode worker the request's stripped decode side exempts
+        // ([`stripped_side_exempts`]) never sees a reference.
         let takes_refs = |worker: &dyn Worker| {
-            !demand.refs || (accepts_media_refs(worker) && pipeline_admits(demand.pipeline, worker))
+            !demand.refs
+                || (accepts_media_refs(worker) && pipeline_admits(demand.pipeline, worker))
+                || stripped_side_exempts(demand.refs_stripped_decode, worker)
         };
         if demand.prefill
             && !pairs.prefill_pool.is_empty()
@@ -2983,7 +3114,7 @@ mod tests {
     };
     use smg_grpc_client::vllm_proto as vllm;
     use smg_worker::{
-        identity::basic::{ConnectionMode, WorkerLoadGuard},
+        identity::basic::{ConnectionMode, WorkerLoadGuard, MOONCAKE_CONNECTOR, NIXL_CONNECTOR},
         test_support::no_health_check,
     };
 
@@ -5400,6 +5531,7 @@ mod tests {
                             media_refs: false,
                             vision: true,
                             pipeline: PipelinePin::Any,
+                            refs_stripped_decode: false,
                         },
                         decode_vision: false,
                         image_fanout: true,
@@ -5486,6 +5618,7 @@ mod tests {
                 media_refs: false,
                 vision: items,
                 pipeline: PipelinePin::Any,
+                refs_stripped_decode: false,
             },
             decode_vision: false,
             image_fanout: items,
@@ -5705,6 +5838,7 @@ mod tests {
                             media_refs: false,
                             vision: true,
                             pipeline: PipelinePin::Any,
+                            refs_stripped_decode: false,
                         },
                         decode_vision: false,
                         image_fanout: true,
@@ -5825,6 +5959,7 @@ mod tests {
                                 media_refs,
                                 vision: true,
                                 pipeline: PipelinePin::Any,
+                                refs_stripped_decode: false,
                             },
                             decode_vision: true,
                             image_fanout,
@@ -5874,6 +6009,7 @@ mod tests {
                             media_refs,
                             vision: true,
                             pipeline: PipelinePin::Any,
+                            refs_stripped_decode: false,
                         },
                         decode_vision: true,
                         image_fanout: false,
@@ -6070,6 +6206,7 @@ mod tests {
                             media_refs: false,
                             vision: needs_vision,
                             pipeline: PipelinePin::Any,
+                            refs_stripped_decode: false,
                         },
                         decode_vision: grids,
                         image_fanout: false,
@@ -6109,7 +6246,8 @@ mod tests {
                                 encode: MediaDemands {
                                     media_refs: false,
                                     vision: true,
-                                    pipeline: PipelinePin::Any
+                                    pipeline: PipelinePin::Any,
+                                    refs_stripped_decode: false,
                                 },
                                 decode_vision: grids,
                                 image_fanout: false,
@@ -6126,6 +6264,7 @@ mod tests {
                             media_refs: true,
                             vision: needs_vision,
                             pipeline: PipelinePin::Any,
+                            refs_stripped_decode: false,
                         },
                         decode_vision: false,
                         image_fanout: false,
@@ -6296,23 +6435,27 @@ mod tests {
         media_refs: true,
         vision: false,
         pipeline: PipelinePin::Any,
+        refs_stripped_decode: false,
     };
     const VISION: MediaDemands = MediaDemands {
         media_refs: false,
         vision: true,
         pipeline: PipelinePin::Any,
+        refs_stripped_decode: false,
     };
     /// References of a family only the gateway's own pipeline expands.
     const PIPELINE_REFS: MediaDemands = MediaDemands {
         media_refs: true,
         vision: false,
         pipeline: PipelinePin::Only,
+        refs_stripped_decode: false,
     };
     /// Audio references, which the gateway's own pipeline does not take.
     const AUDIO_REFS: MediaDemands = MediaDemands {
         media_refs: true,
         vision: false,
         pipeline: PipelinePin::Never,
+        refs_stripped_decode: false,
     };
 
     /// A regular worker with `labels`, built as [`labeled_worker`] builds every
@@ -6599,6 +6742,7 @@ mod tests {
             media_refs: true,
             vision: true,
             pipeline: PipelinePin::Any,
+            refs_stripped_decode: false,
         };
         let refs_with_vision = [
             ("mm_processor", "inprocess"),
@@ -7105,6 +7249,7 @@ mod tests {
                 media_refs: true,
                 vision: true,
                 pipeline: pin,
+                refs_stripped_decode: false,
             };
             let accepts_refs = |worker: &dyn Worker| demands.accepts_refs(worker);
             let selected = stage.select_pd_pair(
@@ -7301,6 +7446,7 @@ mod tests {
                 refs: false,
                 context: ContextRequirements::default(),
                 pipeline: PipelinePin::Any,
+                refs_stripped_decode: false,
             },
             "a single-sample image: the prefill side takes the pixels, the decode side is stripped"
         );
@@ -7312,6 +7458,7 @@ mod tests {
                 refs: false,
                 context: ContextRequirements::default(),
                 pipeline: PipelinePin::Any,
+                refs_stripped_decode: false,
             },
             "what the decode side cannot run without the encoder, the prefill side cannot either"
         );
@@ -8091,12 +8238,26 @@ mod tests {
         worker_type: WorkerType,
         labels: &[(&str, &str)],
     ) -> Arc<dyn Worker> {
+        labeled_worker_on(url, model_id, worker_type, labels, None)
+    }
+
+    /// [`labeled_worker`] on the KV connector `connector`, none when `None`.
+    fn labeled_worker_on(
+        url: &str,
+        model_id: &str,
+        worker_type: WorkerType,
+        labels: &[(&str, &str)],
+        connector: Option<&str>,
+    ) -> Arc<dyn Worker> {
         let mut builder = BasicWorkerBuilder::new(url)
             .model(ModelCard::new(model_id))
             .worker_type(worker_type)
             .runtime_type(RuntimeType::Vllm)
             .connection_mode(ConnectionMode::Grpc)
             .health_config(no_health_check());
+        if let Some(connector) = connector {
+            builder = builder.kv_connector(connector);
+        }
         for (key, value) in labels {
             builder = builder.label(*key, *value);
         }
@@ -8298,6 +8459,546 @@ mod tests {
 
         let regular = stage(WorkerSelectionMode::Regular);
         assert!(!regular.decode_side_needs_vision(&request, Some(&gridded), false));
+    }
+
+    /// A one-image media-references plan whose model's language model reads
+    /// the grid tensors (`reads_grids`) or reads none of them.
+    fn refs_plan(reads_grids: bool) -> multimodal::MediaPlan {
+        let mut plan = multimodal::MediaPlan::new([llm_multimodal::MediaContentPart::ImageUrl {
+            url: "https://a/1.png".to_string().into(),
+            detail: None,
+            uuid: None,
+            max_long_side_pixel: None,
+        }]);
+        plan.set_language_model_reads_grids(reads_grids);
+        plan
+    }
+
+    /// The labels of a worker that processes media references itself.
+    const PROCESSES_REFS: [(&str, &str); 2] = [
+        ("mm_processor", "inprocess"),
+        ("mm_media_ref_schemes", "http,https,data"),
+    ];
+
+    /// `labels` plus the labels of a worker that processes media references.
+    fn with_refs(labels: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'static str)> {
+        let mut labels = labels.to_vec();
+        labels.extend(PROCESSES_REFS);
+        labels
+    }
+
+    /// A registry of `model_id` with a prefill worker that processes
+    /// references (port 9020), a language-model-only decode worker that
+    /// processes none (9022), and, with `vision_decode`, a decode worker that
+    /// processes them and has the encoder (9021), every worker on the KV
+    /// connector `connector`.
+    fn stripped_refs_registry(
+        model_id: &str,
+        vision_decode: bool,
+        connector: Option<&str>,
+    ) -> Arc<WorkerRegistry> {
+        let registry = Arc::new(WorkerRegistry::new());
+        let mut workers = vec![
+            (
+                "grpc://127.0.0.1:9020",
+                WorkerType::Prefill,
+                with_refs(VISION_ENCODER),
+            ),
+            (
+                "grpc://127.0.0.1:9022",
+                WorkerType::Decode,
+                NO_VISION_ENCODER.to_vec(),
+            ),
+        ];
+        if vision_decode {
+            workers.push((
+                "grpc://127.0.0.1:9021",
+                WorkerType::Decode,
+                with_refs(VISION_ENCODER),
+            ));
+        }
+        for (url, worker_type, labels) in workers {
+            registry
+                .register(labeled_worker_on(
+                    url,
+                    model_id,
+                    worker_type,
+                    &labels,
+                    connector,
+                ))
+                .unwrap();
+        }
+        registry
+    }
+
+    /// The decode workers six first selections of a one-image references
+    /// request pick, sorted, with the snapshot each leaves; `n` is the
+    /// request's sample count.
+    async fn selected_refs_decode_workers(
+        registry: &Arc<WorkerRegistry>,
+        plan: &multimodal::MediaPlan,
+        n: u32,
+    ) -> Result<(Vec<String>, bool, bool), Response> {
+        let stage = round_robin_pd_stage(Arc::clone(registry));
+        let mut seen = HashMap::new();
+        let mut answers = (true, true);
+        for _ in 0..6 {
+            let body = serde_json::json!({
+                "model": "test-model",
+                "text": "Hello",
+                "sampling_params": {"n": n}
+            });
+            let mut ctx = prepared_ctx_of(Arc::clone(registry), None, body);
+            ctx.state.multimodal_refs = Some(plan.clone());
+            stage.execute(&mut ctx).await?;
+            match ctx.state.workers.as_ref().expect("a pair is selected") {
+                WorkerSelection::Disaggregated { decode, .. } => {
+                    *seen.entry(decode.url().to_string()).or_insert(0) += 1;
+                }
+                WorkerSelection::Single { .. } => panic!("expected a PD selection"),
+            }
+            let snapshot = ctx.state.routing_snapshot.as_ref().expect("snapshot");
+            answers = (
+                snapshot.decode_needs_vision,
+                snapshot.language_model_reads_grids,
+            );
+        }
+        let mut urls: Vec<String> = seen.into_keys().collect();
+        urls.sort();
+        Ok((urls, answers.0, answers.1))
+    }
+
+    /// A single-sample media-references request whose model's language
+    /// model reads no grids keeps preferring a decode worker with the encoder
+    /// that takes the references, and falls back to a language-model-only
+    /// decode worker only where the model has no such worker: the references
+    /// then go to the prefill side alone, and the decode side is served the
+    /// prefill's media identity stripped to text and hashes. A request the
+    /// stripped side cannot serve (a model whose language model reads the
+    /// grids, more than one sample, or a pool on a connector that returns no
+    /// identity) takes no such fallback.
+    #[tokio::test]
+    async fn a_stripped_refs_decode_side_falls_back_to_a_language_model_only_worker() {
+        let nixl = Some(NIXL_CONNECTOR);
+        let mixed = stripped_refs_registry("test-model", true, nixl);
+        let lm_only = stripped_refs_registry("test-model", false, nixl);
+        // No connector: the handoff asks the prefill for no identity, so the
+        // dispatch could not strip the side.
+        let unconnected = stripped_refs_registry("test-model", false, None);
+        let unread = refs_plan(false);
+        let read = refs_plan(true);
+
+        let Ok(mixed_pick) = selected_refs_decode_workers(&mixed, &unread, 1).await else {
+            panic!("a mixed decode pool serves the request");
+        };
+        assert_eq!(
+            mixed_pick,
+            (vec!["grpc://127.0.0.1:9021".to_string()], true, false),
+            "the decode worker with the encoder stays preferred"
+        );
+        let Ok(fallback) = selected_refs_decode_workers(&lm_only, &unread, 1).await else {
+            panic!("a pool of language-model-only decode workers serves the request");
+        };
+        assert_eq!(
+            fallback,
+            (vec!["grpc://127.0.0.1:9022".to_string()], true, false),
+            "the language-model-only decode worker is the fallback"
+        );
+
+        for (name, registry, plan, n) in [
+            ("the language model reads the grids", &lm_only, &read, 1),
+            ("two samples", &lm_only, &unread, 2),
+            (
+                "a connector that returns no identity",
+                &unconnected,
+                &unread,
+                1,
+            ),
+        ] {
+            let Err(refusal) = selected_refs_decode_workers(registry, plan, n).await else {
+                panic!("{name}: no decode worker takes the references");
+            };
+            assert_eq!(
+                error::extract_error_code_from_response(&refusal),
+                "no_media_ref_capable_worker",
+                "{name}"
+            );
+        }
+    }
+
+    /// The decode workers a retry of a media-references request re-selects
+    /// on `stage` over eight attempts, sorted, from the snapshot's answer on
+    /// the grids; a references request's decode side always demands the
+    /// encoder there, as the first selection notes it.
+    async fn reselected_refs_decode_workers(
+        stage: &WorkerSelectionStage,
+        model_id: &str,
+        language_model_reads_grids: bool,
+    ) -> Result<Vec<String>, Response> {
+        let mut seen = HashMap::new();
+        for _ in 0..8 {
+            let mut ctx = dispatch_ctx(
+                model_id,
+                WireConstraint {
+                    requires_media_refs: true,
+                    ..grpc_wire(RuntimeType::Vllm)
+                },
+            );
+            ctx.routing.needs_vision = true;
+            ctx.routing.decode_needs_vision = true;
+            ctx.routing.language_model_reads_grids = language_model_reads_grids;
+            stage.reselect(&mut ctx, &retained_plan(&[1, 2, 3])).await?;
+            match ctx.workers.expect("a pair is selected") {
+                WorkerSelection::Disaggregated { decode, .. } => {
+                    *seen.entry(decode.url().to_string()).or_insert(0) += 1;
+                }
+                WorkerSelection::Single { .. } => panic!("expected a PD selection"),
+            }
+        }
+        let mut urls: Vec<String> = seen.into_keys().collect();
+        urls.sort();
+        Ok(urls)
+    }
+
+    /// A retry keeps the first selection's reading of a references request's
+    /// decode side: one that can be stripped prefers the decode worker with
+    /// the encoder and falls back to the language-model-only one, and one
+    /// that cannot takes no such fallback.
+    #[tokio::test]
+    async fn reselect_keeps_the_fallback_of_a_stripped_refs_decode_side() {
+        let model_id = "test-model-stripped-refs-reselect";
+        let nixl = Some(NIXL_CONNECTOR);
+        let mixed = round_robin_pd_stage(stripped_refs_registry(model_id, true, nixl));
+        let lm_only = round_robin_pd_stage(stripped_refs_registry(model_id, false, nixl));
+        let unconnected = round_robin_pd_stage(stripped_refs_registry(model_id, false, None));
+
+        assert_eq!(
+            reselected_refs_decode_workers(&mixed, model_id, false)
+                .await
+                .ok(),
+            Some(vec!["grpc://127.0.0.1:9021".to_string()]),
+            "the decode worker with the encoder stays preferred"
+        );
+        assert_eq!(
+            reselected_refs_decode_workers(&lm_only, model_id, false)
+                .await
+                .ok(),
+            Some(vec!["grpc://127.0.0.1:9022".to_string()]),
+            "the language-model-only decode worker is the fallback"
+        );
+        for (name, stage, reads) in [
+            ("a side whose model reads the grids", &lm_only, true),
+            (
+                "a pool on a connector that returns no identity",
+                &unconnected,
+                false,
+            ),
+        ] {
+            let Err(refusal) = reselected_refs_decode_workers(stage, model_id, reads).await else {
+                panic!("{name}: no fallback");
+            };
+            assert_eq!(
+                error::extract_error_code_from_response(&refusal),
+                "no_media_ref_capable_worker",
+                "{name}: a retryable 503, as before the fallback existed"
+            );
+        }
+    }
+
+    /// The exemption of a stripped references side is a vLLM
+    /// language-model-only decode worker's alone, on NIXL, whose handoff
+    /// always returns the prefill's media identity. Only the vLLM dispatch
+    /// strips the side: an SGLang pair sends its decode worker the
+    /// references, so a decode worker of that runtime that processes none
+    /// stays out, as do a prefill worker and a decode worker with the
+    /// encoder.
+    #[test]
+    fn the_stripped_side_exempts_a_vllm_language_model_only_decode_worker_alone() {
+        let model_id = "test-model-stripped-refs-exemption";
+        let demands = MediaDemands {
+            media_refs: true,
+            vision: true,
+            pipeline: PipelinePin::Any,
+            refs_stripped_decode: true,
+        };
+        let on = |runtime: RuntimeType,
+                  worker_type: WorkerType,
+                  labels: &[(&str, &str)],
+                  connector: Option<&str>| {
+            let mut builder = BasicWorkerBuilder::new("grpc://127.0.0.1:9060")
+                .model(ModelCard::new(model_id))
+                .worker_type(worker_type)
+                .runtime_type(runtime)
+                .connection_mode(ConnectionMode::Grpc)
+                .health_config(no_health_check());
+            if let Some(connector) = connector {
+                builder = builder.kv_connector(connector);
+            }
+            for (key, value) in labels {
+                builder = builder.label(*key, *value);
+            }
+            let worker: Arc<dyn Worker> = Arc::new(builder.build());
+            worker
+        };
+        let of = |runtime, worker_type, labels: &[(&str, &str)]| {
+            on(runtime, worker_type, labels, Some(NIXL_CONNECTOR))
+        };
+        let vllm_decode = of(RuntimeType::Vllm, WorkerType::Decode, NO_VISION_ENCODER);
+        assert!(
+            demands.exempts(vllm_decode.as_ref()),
+            "a vLLM language-model-only decode worker is exempt"
+        );
+        assert!(
+            demands.accepts_refs(vllm_decode.as_ref()),
+            "and so takes the references it never sees"
+        );
+        assert!(
+            !demands
+                .with_refs_stripped_decode(false)
+                .accepts_refs(vllm_decode.as_ref()),
+            "a side that is not stripped sends the worker the references"
+        );
+        for (name, worker) in [
+            (
+                "an SGLang decode worker",
+                of(RuntimeType::Sglang, WorkerType::Decode, NO_VISION_ENCODER),
+            ),
+            (
+                "a prefill worker",
+                of(RuntimeType::Vllm, WorkerType::Prefill, NO_VISION_ENCODER),
+            ),
+            (
+                "a decode worker with the encoder",
+                of(RuntimeType::Vllm, WorkerType::Decode, VISION_ENCODER),
+            ),
+            (
+                "a decode worker on a connector that returns no identity",
+                on(
+                    RuntimeType::Vllm,
+                    WorkerType::Decode,
+                    NO_VISION_ENCODER,
+                    None,
+                ),
+            ),
+            (
+                "a decode worker on Mooncake, whose prefill may have no engine id",
+                on(
+                    RuntimeType::Vllm,
+                    WorkerType::Decode,
+                    NO_VISION_ENCODER,
+                    Some(MOONCAKE_CONNECTOR),
+                ),
+            ),
+        ] {
+            assert!(!demands.exempts(worker.as_ref()), "{name}");
+            assert!(!demands.accepts_refs(worker.as_ref()), "{name}");
+        }
+    }
+
+    /// An SGLang pair serves no stripped references side: a single-sample
+    /// references request of a model that reads no grids, on a pool whose only decode worker
+    /// runs as a language model and processes no references is refused at
+    /// selection, as it was before the stripped side existed, and no
+    /// reference reaches that worker.
+    #[tokio::test]
+    async fn execute_keeps_references_off_a_language_model_only_decode_worker_of_another_runtime() {
+        let registry = Arc::new(WorkerRegistry::new());
+        for (url, worker_type, labels) in [
+            (
+                "grpc://127.0.0.1:9070",
+                WorkerType::Prefill,
+                vec![
+                    ("mm_processor", multimodal::GATEWAY_PIPELINE_PROCESSOR),
+                    ("mm_media_ref_schemes", "http,https,data"),
+                    (smg_worker::labels::SUPPORTS_VISION_LABEL, "true"),
+                ],
+            ),
+            (
+                "grpc://127.0.0.1:9071",
+                WorkerType::Decode,
+                NO_VISION_ENCODER.to_vec(),
+            ),
+        ] {
+            let mut builder = BasicWorkerBuilder::new(url)
+                .model(ModelCard::new("test-model"))
+                .worker_type(worker_type)
+                .runtime_type(RuntimeType::Sglang)
+                .connection_mode(ConnectionMode::Grpc)
+                .health_config(no_health_check());
+            for (key, value) in labels {
+                builder = builder.label(key, value);
+            }
+            registry.register(Arc::new(builder.build())).unwrap();
+        }
+        let stage = round_robin_pd_stage(Arc::clone(&registry));
+        let mut ctx = prepared_ctx(Arc::clone(&registry), None);
+        ctx.state.multimodal_refs = Some(refs_plan(false));
+        let Err(refusal) = stage.execute(&mut ctx).await else {
+            panic!("the decode worker takes no references");
+        };
+        assert_eq!(refusal.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&refusal),
+            "no_media_ref_capable_worker"
+        );
+        assert!(ctx.state.workers.is_none());
+    }
+
+    /// A failed pair's verdict counts a decode worker the request's stripped
+    /// references side exempts as taking the references: a pool of
+    /// language-model-only decode workers none of which is available answers
+    /// as it would a text request, and a side that is not stripped is told
+    /// that no decode worker processes references.
+    #[test]
+    fn a_stripped_refs_side_whose_decode_pool_is_down_is_answered_as_a_text_request() {
+        let model_id = "test-model-stripped-refs-decode-down";
+        let registry = Arc::new(WorkerRegistry::new());
+        for (url, worker_type, labels) in [
+            (
+                "grpc://127.0.0.1:9030",
+                WorkerType::Prefill,
+                with_refs(VISION_ENCODER),
+            ),
+            (
+                "grpc://127.0.0.1:9031",
+                WorkerType::Decode,
+                NO_VISION_ENCODER.to_vec(),
+            ),
+        ] {
+            registry
+                .register(labeled_worker_on(
+                    url,
+                    model_id,
+                    worker_type,
+                    &labels,
+                    Some(NIXL_CONNECTOR),
+                ))
+                .unwrap();
+        }
+        let stage = round_robin_pd_stage(Arc::clone(&registry));
+        let verdict = |refs_stripped_decode: bool| {
+            let demands = MediaDemands {
+                media_refs: true,
+                vision: true,
+                pipeline: PipelinePin::Any,
+                refs_stripped_decode,
+            };
+            // The decode worker is kept out, as a failed attempt's is.
+            let admitted = |worker: &dyn Worker| {
+                demands.accepts_refs(worker) && worker.url() != "grpc://127.0.0.1:9031"
+            };
+            let response = stage
+                .select_pd_pair(
+                    model_id,
+                    PlacementInputs {
+                        candidate_filter: Some(&admitted),
+                        ..Default::default()
+                    },
+                    None,
+                    None,
+                    PairDemands::new(true, false)
+                        .with_media_refs(true, PipelinePin::Any)
+                        .with_refs_stripped_decode(refs_stripped_decode),
+                )
+                .map_err(|failure| stage.pd_selection_failure(model_id, failure, demands))
+                .expect_err("no decode worker is left");
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            error::extract_error_code_from_response(&response).to_string()
+        };
+        assert_eq!(
+            verdict(true),
+            "no_available_workers",
+            "an exempt decode worker counts as taking the references"
+        );
+        assert_eq!(
+            verdict(false),
+            "no_media_ref_capable_worker",
+            "a side that is not stripped needs a decode worker that processes them"
+        );
+    }
+
+    /// Encode/prefill/decode mode never serves a references request's decode
+    /// side stripped to the prefill's media identity: whatever the model's
+    /// spec says, its selection asks every worker the references reach to
+    /// take them, first and on a retry, as it did before the spec's answer
+    /// existed. Regular mode has no decode side to strip.
+    #[tokio::test]
+    async fn encode_prefill_decode_mode_keeps_the_references_predicate_on_its_decode_side() {
+        let model_id = "test-model";
+        let registry = stripped_refs_registry(model_id, true, Some(NIXL_CONNECTOR));
+        let stage = |mode| {
+            WorkerSelectionStage::new(
+                Arc::clone(&registry),
+                Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+                mode,
+                None,
+            )
+        };
+        let pd = stage(WorkerSelectionMode::PrefillDecode);
+        let epd = stage(WorkerSelectionMode::EncodePrefillDecode);
+        let regular = stage(WorkerSelectionMode::Regular);
+        assert!(
+            pd.refs_stripped_decode(true, false),
+            "prefill/decode mode strips the side"
+        );
+        assert!(
+            !epd.refs_stripped_decode(true, false),
+            "encode/prefill/decode mode does not"
+        );
+        assert!(
+            !regular.refs_stripped_decode(true, false),
+            "regular mode has no decode side"
+        );
+
+        // The first selection's inputs: a single-sample references request
+        // of a model that reads no grids sets the exemption, and the
+        // snapshot's answer the dispatch reads, in prefill/decode mode only.
+        let ctx = prepared_ctx(Arc::clone(&registry), None);
+        let prep = ctx.state.preparation.as_ref().expect("prepared");
+        let plan = refs_plan(false);
+        let gathered = |stage: &WorkerSelectionStage| {
+            let inputs = SelectionInputs::gather(
+                stage,
+                &ctx.input,
+                prep,
+                None,
+                Some(&plan),
+                PipelinePin::Any,
+            );
+            (
+                inputs.demand.refs_stripped_decode,
+                inputs.media.refs_stripped_decode,
+                inputs.snapshot().language_model_reads_grids,
+            )
+        };
+        assert_eq!(gathered(&pd), (true, true, false));
+        assert_eq!(
+            gathered(&epd),
+            (false, false, true),
+            "outside prefill/decode mode the snapshot keeps the answer that keeps the refusal"
+        );
+        assert_eq!(gathered(&regular), (false, false, true));
+        let lmo_decode = labeled_worker(
+            "grpc://127.0.0.1:9022",
+            model_id,
+            WorkerType::Decode,
+            NO_VISION_ENCODER,
+        );
+        let inputs =
+            SelectionInputs::gather(&epd, &ctx.input, prep, None, Some(&plan), PipelinePin::Any);
+        assert!(
+            !inputs.media.accepts_refs(lmo_decode.as_ref()),
+            "a decode worker that processes no references is no candidate"
+        );
+
+        // A retry of the mode reads the same snapshot and keeps the decode
+        // side on the worker that takes the references.
+        assert_eq!(
+            reselected_refs_decode_workers(&epd, model_id, false)
+                .await
+                .ok(),
+            Some(vec!["grpc://127.0.0.1:9021".to_string()])
+        );
     }
 
     /// A request whose decode side needs a vision encoder pairs with a decode
@@ -9415,60 +10116,70 @@ mod tests {
     }
 
     /// The dispatch decides a pair's decode side by the answer the routing
-    /// snapshot keeps: a request with grid tensors for a language-model-only
-    /// decode is refused ahead of any send while the snapshot says the
-    /// model's language model reads the grids, and goes out, its prefill
-    /// sent, when the snapshot says it reads none of them.
+    /// snapshot keeps: a request with grid tensors, or with media
+    /// references, for a language-model-only decode is refused ahead of any
+    /// send while the snapshot says the model's language model reads the
+    /// grids, and goes out, its prefill sent, when the snapshot says it reads
+    /// none of them.
     #[tokio::test]
     async fn the_dispatch_decides_the_decode_side_by_the_snapshots_grid_answer() {
         use smg_grpc_client::vllm_proto as vllm;
 
-        use crate::routers::grpc::regular::stages::testing::mock_backend_client;
+        use crate::routers::grpc::{
+            common::stages::request_execution::tests::media_refs_request,
+            regular::stages::testing::mock_backend_client,
+        };
 
         let (client, engine) = mock_backend_client("m").await;
         let stage = regular_stage(Arc::new(WorkerRegistry::new()));
-        let gridded = || {
-            ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
-                mm_inputs: Some(vllm::MultimodalInputs {
-                    mm_hashes: vec!["h".to_string()],
-                    model_specific_tensors: HashMap::from([(
-                        "image_grid_thw".to_string(),
-                        vllm::TensorData::default(),
-                    )]),
-                    ..Default::default()
-                }),
+        let gridded = ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
+            mm_inputs: Some(vllm::MultimodalInputs {
+                mm_hashes: vec!["h".to_string()],
+                model_specific_tensors: HashMap::from([(
+                    "image_grid_thw".to_string(),
+                    vllm::TensorData::default(),
+                )]),
                 ..Default::default()
-            }))
-        };
-        for reads in [true, false] {
-            let (heard, workers, ahead) =
-                a_pair_ahead_of_its_send("NixlConnector", RuntimeType::Vllm, Some("false"));
-            let mut ctx = an_attempt_over(workers, ahead, &client, RuntimeType::Vllm);
-            ctx.routing.language_model_reads_grids = reads;
-            let plan = ExecutionPlan::PrefillDecode(gridded());
-            let bound = Some(Duration::from_secs(5));
-            let answered =
-                execute_plan(&mut ctx, plan, true, bound, GroupedDpSticky::Off, &stage).await;
-            let code = answered.err().and_then(|refused| {
-                refused
-                    .headers()
-                    .get(error::HEADER_X_SMG_ERROR_CODE)
-                    .and_then(|code| code.to_str().ok())
-                    .map(str::to_owned)
-            });
-            let sent = heard
-                .lock()
-                .expect("the stage heard")
-                .iter()
-                .any(|word| word == "dispatched Prefill");
-            if reads {
-                assert_eq!(code.as_deref(), Some("pd_decode_language_model_only_mrope"));
-                assert!(!sent, "refused ahead of the prefill's send");
-            } else {
-                assert_ne!(code.as_deref(), Some("pd_decode_language_model_only_mrope"));
-                assert!(sent, "the stripped side's pair goes out");
+            }),
+            ..Default::default()
+        }));
+        for (request, refused) in [
+            (gridded, "pd_decode_language_model_only_mrope"),
+            (
+                media_refs_request("r", 1),
+                "pd_decode_language_model_only_media_refs",
+            ),
+        ] {
+            for reads in [true, false] {
+                let (heard, workers, ahead) =
+                    a_pair_ahead_of_its_send("NixlConnector", RuntimeType::Vllm, Some("false"));
+                let mut ctx = an_attempt_over(workers, ahead, &client, RuntimeType::Vllm);
+                ctx.routing.language_model_reads_grids = reads;
+                let plan = ExecutionPlan::PrefillDecode(request.clone());
+                let bound = Some(Duration::from_secs(5));
+                let answered =
+                    execute_plan(&mut ctx, plan, true, bound, GroupedDpSticky::Off, &stage).await;
+                let code = answered.err().and_then(|refused| {
+                    refused
+                        .headers()
+                        .get(error::HEADER_X_SMG_ERROR_CODE)
+                        .and_then(|code| code.to_str().ok())
+                        .map(str::to_owned)
+                });
+                let sent = heard
+                    .lock()
+                    .expect("the stage heard")
+                    .iter()
+                    .any(|word| word == "dispatched Prefill");
+                if reads {
+                    assert_eq!(code.as_deref(), Some(refused));
+                    assert!(!sent, "{refused}: refused ahead of the prefill's send");
+                } else {
+                    assert_ne!(code.as_deref(), Some(refused));
+                    assert!(sent, "{refused}: the stripped side's pair goes out");
+                }
+                drop(ctx);
             }
-            drop(ctx);
         }
         engine.abort();
     }
@@ -9577,6 +10288,39 @@ mod tests {
         assert!(!holds(None, Some(4_096)), "the first stated none");
     }
 
+    /// A decode request the dispatch strips of its references may move to
+    /// another vLLM language-model-only decode worker, which processes none:
+    /// the side takes the exemption every selection gives it. Without the
+    /// exemption such a worker is no place for a request that keeps its
+    /// references.
+    #[test]
+    fn a_stripped_refs_decode_request_moves_to_another_language_model_only_decode() {
+        let decode = |url: &str| {
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Decode)
+                .connection_mode(ConnectionMode::Grpc)
+                .runtime_type(RuntimeType::Vllm)
+                .kv_connector(NIXL_CONNECTOR)
+                .label(smg_worker::labels::SUPPORTS_VISION_LABEL, "false")
+                .build()
+        };
+        let first = decode("grpc://decode-a:30000");
+        let other = decode("grpc://decode-b:30000");
+        assert!(reads_the_request_alike(&first, &other));
+        let wire = WireConstraint {
+            requires_media_refs: true,
+            ..grpc_wire(RuntimeType::Vllm)
+        };
+        assert!(
+            takes_the_built_request(&first, &other, "m", wire, true),
+            "a stripped side moves"
+        );
+        assert!(
+            !takes_the_built_request(&first, &other, "m", wire, false),
+            "a side that keeps its references does not"
+        );
+    }
+
     /// A decode request can keep the media references its plan forwards. A
     /// decode the pair moves to takes them as every selection asks of a
     /// candidate: it processes references, on the side of the wire's
@@ -9602,7 +10346,7 @@ mod tests {
         let takes = |processor: Option<&str>, wire: WireConstraint| {
             let other = decode(processor);
             assert!(reads_the_request_alike(&first, &other));
-            takes_the_built_request(&first, &other, "m", wire)
+            takes_the_built_request(&first, &other, "m", wire, false)
         };
         let gateways = Some(multimodal::GATEWAY_PIPELINE_PROCESSOR);
 

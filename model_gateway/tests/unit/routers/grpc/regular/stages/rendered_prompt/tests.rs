@@ -233,6 +233,46 @@ async fn media_a_worker_processes_itself_leaves_as_references_with_the_pin_set()
     assert_eq!(ctx.state.media_refs_pipeline, expected_pin);
 }
 
+/// Media kept as references carries the spec's answer to whether the
+/// language model reads the grid tensors, as placeholder preparation
+/// recorded it: worker selection reads it off the plan.
+#[tokio::test]
+async fn kept_references_carry_the_specs_answer_on_the_grids() {
+    for reads in [true, false] {
+        let (mut ctx, tokenizer) = context().await;
+        let mut placeholders = PlaceholderTokens::worker_only();
+        placeholders.set_language_model_reads_grids(reads);
+        let media = media_for(
+            MediaPlan::new([MediaContentPart::AudioUrl {
+                url: "https://a/1.wav".to_string().into(),
+                uuid: None,
+            }]),
+            MmProcessingMode::Worker,
+            placeholders,
+        );
+        let Ok(rendered) = prepare_rendered_prompt(
+            &mut ctx,
+            &tokenizer,
+            "Hello world",
+            PromptEncoding::FromText,
+            Some(media),
+            &[],
+            "test",
+        )
+        .await
+        else {
+            panic!("worker-side media is prepared as references");
+        };
+        assert_eq!(
+            rendered
+                .multimodal_refs
+                .as_ref()
+                .map(MediaPlan::language_model_reads_grids),
+            Some(reads)
+        );
+    }
+}
+
 /// A prompt without media is the renderer's tokens and nothing else: no
 /// intermediate, no references, no pipeline pin.
 #[tokio::test]
