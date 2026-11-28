@@ -182,13 +182,13 @@ pub trait Lifecycle: Send + Sync {
     /// whatever it answers: no host reads those two kinds of the answer
     /// yet.
     ///
-    /// A plugin's stage answers the kinds its fallback stage names. The
-    /// first scorer or picker stage an engine's build makes of a plugin
-    /// answers every kind the plugin observes beside them, so the plugin
-    /// hears an event once. A plugin's stage hands each word it is told
-    /// on to its fallback behind the plugin's own call, whatever the
-    /// fallback names: a plugin's fallback may hear a word it does not
-    /// name, and hears none at which that call panics.
+    /// A plugin's stage answers its fallback stage's kinds, and the kinds it
+    /// forwards to its plugin. Of the stages made through one binder, the
+    /// first scorer or picker forwards every kind the plugin observes, and
+    /// the others none. A plugin's stage hands each word it is told on to
+    /// its fallback, behind its plugin's call where it makes one, whatever
+    /// the fallback names: a fallback may hear a word it does not name, and
+    /// none at which that call panics.
     ///
     /// The two answers part for a stage that takes a word only to drop
     /// state early: it decides the same without the call and declares no
