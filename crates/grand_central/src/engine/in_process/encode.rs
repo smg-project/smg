@@ -18,20 +18,24 @@
 //!
 //! **Who holds the prompt.** Each side of the pair is handed its own
 //! list's column and writes its pick behind the decision, as a pair's
-//! first decision does ([`side_columns`], [`record_sides`]).
+//! first decision does ([`overlap::decide_by_columns`]).
 //!
 //! **The entries.** A host asks through
 //! [`InProcess::decide_encode_at`]: the three lists' decision, with the
 //! pair's lease a pick is issued. No lease is issued for an encoder.
 
-use std::{cell::OnceCell, sync::Arc, time::Instant};
+use std::{
+    cell::{OnceCell, RefCell},
+    sync::Arc,
+    time::Instant,
+};
 
 use smg_worker::load::state::LoadSnapshot;
 
 use super::{
+    overlap,
     pair::{
-        issued, not_decided, record_sides, said_apart, side_columns, stamp, tried_engines, Buffers,
-        PairLists, BUFFERS,
+        issued, listed, not_decided, said_apart, stamp, tried_engines, Buffers, PairLists, BUFFERS,
     },
     signals, single, InProcess, Loaded, PoolMembers,
 };
@@ -42,7 +46,7 @@ use crate::engine::{
     framework::{EncodeItems, EncodePlaced, EncodePool, EncoderFacts, PairPools},
     list_cell::LentList,
     records::{HeldCells, Live, PoolRecords},
-    view::{Constraints, Phase, RequestFacts, Session, SessionCountedUnder},
+    view::{AffinityFacts, Constraints, Phase, RequestFacts, Session, SessionCountedUnder},
 };
 
 #[cfg(test)]
@@ -351,10 +355,11 @@ impl EncodeLists<'_> {
     /// cell it does not read. `sends_to` says whether the request's caller
     /// sends it to a target of the pick: each side's record of sent
     /// prefixes is written for the first target it takes, as a pair's is
-    /// ([`record_sides`]). `sends_to_encoder` says the same of an encoder
-    /// the decision placed, by its place in the encoders' list: the record
-    /// is written for no target where the caller sends to one of them no
-    /// more, since it then sends the request to no target of the pick.
+    /// ([`overlap::decide_by_columns`]). `sends_to_encoder` says the same
+    /// of an encoder the decision placed, by its place in the encoders'
+    /// list: the record is written for no target where the caller sends to
+    /// one of them no more, since it then sends the request to no target
+    /// of the pick.
     ///
     /// `counted` says where a worker's object counts the requests of the
     /// request's session key ([`RequestMaker::session_counted_under`]). It
@@ -525,39 +530,44 @@ impl EncodeLists<'_> {
                     .map(|side| side.as_ref().and_then(HeldCells::cells)),
                 None => [None; 3],
             };
-            // Each side of the pair is handed its own list's column of who
-            // holds the prompt, as a pair's first decision is. The engine
-            // keeps a column's entries beside the rows it admits.
-            let sides = (Some((prefill, prefill_records)), (decode, decode_records));
-            let read = side_columns(engine, facts, sides.0, sides.1, &mut buffers.columns);
-            let [prefill_column, decode_column] = &buffers.columns;
-            let pools = PairPools {
-                prefills,
-                decodes,
-                prefill_signal_cells,
-                decode_signal_cells,
-                prefill_affinity: prefill_column.as_slice(),
-                decode_affinity: decode_column.as_slice(),
-                table: pair.classes.table(),
-                first: pair.classes.first(),
-                // A demand left each side the workers that meet it.
-                part: demanded,
+            // The pass writes the encoders it placed, and the caller's
+            // word of an encoder reads them behind the pick: one at a time,
+            // so the two hold the list by a cell.
+            let placed = RefCell::new(&mut *placed);
+            let scratch = &mut buffers.scratch;
+            // The decision over the two columns of who holds the prompt.
+            // The engine keeps a column's entries beside the rows it admits.
+            let over_columns = |prefill_column: &[AffinityFacts],
+                                decode_column: &[AffinityFacts]| {
+                let pools = PairPools {
+                    prefills,
+                    decodes,
+                    prefill_signal_cells,
+                    decode_signal_cells,
+                    prefill_affinity: prefill_column,
+                    decode_affinity: decode_column,
+                    table: pair.classes.table(),
+                    first: pair.classes.first(),
+                    // A demand left each side the workers that meet it.
+                    part: demanded,
+                };
+                let encode = EncodePool {
+                    encoders: rows,
+                    signal_cells,
+                    facts: self.facts,
+                    prefill_classes: self.prefill_classes,
+                    // What each encoder states for a demand, as its list
+                    // keeps it: read where the encode side states one.
+                    demands: records.demand_facts(),
+                    ..EncodePool::default()
+                };
+                let mut placed = placed.borrow_mut();
+                let (engine, placed) = (spec.engine(), &mut **placed);
+                engine.decide_encode_pair_judged(
+                    facts, &pool, pools, encode, items, prefill_cx, decode_cx, encode_cx, unmet,
+                    scratch, placed,
+                )
             };
-            let encode = EncodePool {
-                encoders: rows,
-                signal_cells,
-                facts: self.facts,
-                prefill_classes: self.prefill_classes,
-                // What each encoder states for a demand, as its list keeps
-                // it: read where the encode side states one.
-                demands: records.demand_facts(),
-                ..EncodePool::default()
-            };
-            let (engine, scratch) = (spec.engine(), &mut buffers.scratch);
-            let decision = engine.decide_encode_pair_judged(
-                facts, &pool, pools, encode, items, prefill_cx, decode_cx, encode_cx, unmet,
-                scratch, placed,
-            );
             // Behind the pick, each side's record keeps where the prompt
             // went, as behind a pair's: nowhere, where the request's caller
             // cannot send to an encoder the decision placed. The encoders
@@ -565,6 +575,7 @@ impl EncodeLists<'_> {
             let every_encoder = OnceCell::new();
             let sends = |target: &Target| {
                 let asked = || {
+                    let placed = placed.borrow();
                     let encoders = placed.encoders();
                     encoders.iter().enumerate().all(|(at, encoder)| {
                         let place = encoder.position;
@@ -574,15 +585,20 @@ impl EncodeLists<'_> {
                 };
                 *every_encoder.get_or_init(asked) && sends_to(target)
             };
-            record_sides(
-                &decision,
+            // Each side of the pair is handed its own list's column of who
+            // holds the prompt, as a pair's first decision is.
+            overlap::decide_by_columns(
+                &engine.affinity,
+                spec,
                 facts,
-                (prefill, decode),
-                read,
-                &buffers.columns,
+                Some(|| listed(prefill, prefill_records)),
+                || listed(decode, decode_records),
+                &mut buffers.columns,
                 sends,
-            );
-            decision
+                over_columns,
+                // An encode request turns nothing in its pick here.
+                |_, _| {},
+            )
         };
         let decision = BUFFERS.with(|buffers| match buffers.try_borrow_mut() {
             Ok(mut buffers) => decide(&mut buffers),

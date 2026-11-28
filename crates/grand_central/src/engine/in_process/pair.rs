@@ -77,13 +77,14 @@
 //! longer list on the heap.
 //!
 //! **Who holds the prompt.** A side whose phase reads affinity is handed
-//! its own list's column for the decision ([`overlap::column`]): what
-//! each worker of the side holds of the request, by the host's index of
-//! cache events and by the record of sent prefixes, read at the side's
-//! phase. The record is read by the side's own profile's word of it: for
-//! every worker where that profile reads sent prefixes alone.
-//! Behind a pick its profile is told of, each side's record keeps where
-//! the prompt went ([`overlap::record_by_column`]). A pair's first pick
+//! its own list's column for the decision: what each worker of the side
+//! holds of the request, by the host's index of cache events and by the
+//! record of sent prefixes, read at the side's phase. The record is read
+//! by the side's own profile's word of it: for every worker where that
+//! profile reads sent prefixes alone. Behind a pick its profile is told
+//! of, each side's record keeps where the prompt went. One function reads
+//! the two columns and writes the two records around the decision
+//! ([`overlap::decide_by_columns`]). A pair's first pick
 //! states what its prefill holds of the request, by the prefills' column
 //! ([`overlap::state`]): a host observes its cache series from it. Nothing
 //! is stated of the decode. The decode asked again
@@ -587,8 +588,9 @@ impl<'a> PairLists<'a> {
         said: Option<Room<'_, '_>>,
     ) -> Decision {
         let (spec, clock) = (&engine.document.spec, &engine.clock);
-        // The engine as the fill of a side's column takes it: the name
-        // stands for the document's engine inside the decision below.
+        // The engine as a shadowed decision takes it, and what it keeps
+        // beside its lists for the two columns: the name stands for the
+        // document's engine inside the decision below.
         let loaded = engine;
         // The name each side's records read the count of the key's
         // requests under, on a worker's object: the one its side's session
@@ -733,18 +735,11 @@ impl<'a> PairLists<'a> {
                     &mut buffers.scratch,
                 );
                 if let Some(decision) = drawn {
-                    let first = Some((prefill, prefill_records));
-                    let columns = &mut buffers.columns;
-                    let read =
-                        side_columns(loaded, facts, first, (decode, decode_records), columns);
-                    record_sides(
-                        &decision,
-                        facts,
-                        (prefill, decode),
-                        read,
-                        &buffers.columns,
-                        &sends_to,
-                    );
+                    // Neither side's phase reads who holds the prompt here,
+                    // by the test above: no column is read and no record
+                    // of sent prefixes is written. Each column is left
+                    // empty, as a side that reads none leaves it.
+                    buffers.columns.iter_mut().for_each(Vec::clear);
                     return decision;
                 }
                 if asked {
@@ -829,77 +824,91 @@ impl<'a> PairLists<'a> {
                     .map(|side| side.as_ref().and_then(HeldCells::cells)),
                 None => [None; 2],
             };
+            // The decision over the two columns of who holds the prompt.
+            let over_columns = |prefill_column: &[AffinityFacts],
+                                decode_column: &[AffinityFacts]| {
+                let pools = PairPools {
+                    prefills,
+                    decodes,
+                    prefill_affinity: prefill_column,
+                    decode_affinity: decode_column,
+                    prefill_signal_cells,
+                    decode_signal_cells,
+                    table: self.classes.table(),
+                    first: self.classes.first(),
+                    // A demand left each side the workers that meet it.
+                    part: demanded,
+                };
+                match (held, said) {
+                    (None, None) => {
+                        let sides = (cx, [prefill_side, decode_side]);
+                        decide_records(engine, facts, sides, &prefill_facts, pools, scratch)
+                    }
+                    // An entry that lends room for them is left what each
+                    // side's shadow said beside the pair.
+                    (None, Some(said)) => {
+                        let (sides, pool) = ((cx, [prefill_side, decode_side]), &prefill_facts);
+                        decide_shadowed(loaded, facts, sides, pool, pools, scratch, said)
+                    }
+                    (Some(held), None) => {
+                        let (side, pool) = ((cx, decode_side), &decode_facts);
+                        decide_decode_records(engine, facts, side, pool, pools, held, scratch)
+                    }
+                    // The decode's shadow alone: the prefill ran already.
+                    (Some(held), Some(said)) => {
+                        let (side, pool) = ((cx, decode_side), &decode_facts);
+                        decide_decode_shadowed(
+                            loaded, facts, side, pool, pools, held, scratch, said,
+                        )
+                    }
+                }
+            };
+            // What a pair turns in its pick where the pick stands, ahead of
+            // the records' writes. Handed beside the decision: turned inside
+            // the closure that makes it, the decision was copied once more
+            // on its way out, for every pair the whole pass decides.
+            let turned = |decision: &mut Decision, prefill_column: &[AffinityFacts]| {
+                // A pair states what its prefill holds of the request: its
+                // first target is that prefill, and the prefills' column is
+                // the one this decision was given. Stated at a first
+                // decision alone, where the request's own profile reads who
+                // holds the prompt at the prefill phase: the decode asked
+                // again has no prefill to state of, and a shadow's rows say
+                // nothing of the live pick.
+                if held.is_none()
+                    && engine.needs_for_phase(Phase::Prefill).affinity
+                    && engine.profile_reads_affinity(facts.model, Phase::Prefill)
+                {
+                    let column = Feed::Column(prefill_column);
+                    overlap::state(decision, column, facts, spec.block_size());
+                }
+                // The decode the pair holds, named again: the decision that
+                // put the request there stands, and its word of the side
+                // with it, ahead of the record's write.
+                if let (Decision::Pick(pick), Some(held)) =
+                    (decision, held.and_then(|held| held.pair))
+                {
+                    pick.targets.decode_placed_as(&held);
+                }
+            };
             // A side whose phase reads who holds the prompt is handed its
-            // own list's column. The decode asked again reads the decodes'
+            // own list's column, and its record keeps where the prompt went
+            // behind the pick. The decode asked again reads the decodes'
             // alone: its prefill ran already.
-            let first = held.is_none().then_some((prefill, prefill_records));
-            let columns = &mut buffers.columns;
-            let read = side_columns(loaded, facts, first, (decode, decode_records), columns);
-            let [prefill_column, decode_column] = &buffers.columns;
-            let pools = PairPools {
-                prefills,
-                decodes,
-                prefill_affinity: prefill_column.as_slice(),
-                decode_affinity: decode_column.as_slice(),
-                prefill_signal_cells,
-                decode_signal_cells,
-                table: self.classes.table(),
-                first: self.classes.first(),
-                // A demand left each side the workers that meet it.
-                part: demanded,
-            };
-            let mut decision = match (held, said) {
-                (None, None) => {
-                    let sides = (cx, [prefill_side, decode_side]);
-                    decide_records(engine, facts, sides, &prefill_facts, pools, scratch)
-                }
-                // An entry that lends room for them is left what each
-                // side's shadow said beside the pair.
-                (None, Some(said)) => {
-                    let (sides, pool) = ((cx, [prefill_side, decode_side]), &prefill_facts);
-                    decide_shadowed(loaded, facts, sides, pool, pools, scratch, said)
-                }
-                (Some(held), None) => {
-                    let side = (cx, decode_side);
-                    decide_decode_records(engine, facts, side, &decode_facts, pools, held, scratch)
-                }
-                // The decode's shadow alone: the prefill ran already.
-                (Some(held), Some(said)) => {
-                    let (side, pool) = ((cx, decode_side), &decode_facts);
-                    decide_decode_shadowed(loaded, facts, side, pool, pools, held, scratch, said)
-                }
-            };
-            // A pair states what its prefill holds of the request: its first
-            // target is that prefill, and the prefills' column is the one
-            // this decision was given. Stated at a first decision alone,
-            // where the request's own profile reads who holds the prompt at
-            // the prefill phase: the decode asked again has no prefill to
-            // state of, and a shadow's rows say nothing of the live pick.
-            if held.is_none()
-                && engine.needs_for_phase(Phase::Prefill).affinity
-                && engine.profile_reads_affinity(facts.model, Phase::Prefill)
-            {
-                let column = Feed::Column(prefill_column);
-                overlap::state(&mut decision, column, facts, spec.block_size());
-            }
-            // The decode the pair holds, named again: the decision that
-            // put the request there stands, and its word of the side with
-            // it, ahead of the record's write. The pick is turned where it
-            // stands: built beside it, it was copied once more.
-            if let (Decision::Pick(pick), Some(held)) =
-                (&mut decision, held.and_then(|held| held.pair))
-            {
-                pick.targets.decode_placed_as(&held);
-            }
-            record_sides(
-                &decision,
+            let first = held
+                .is_none()
+                .then_some(|| listed(prefill, prefill_records));
+            overlap::decide_by_columns(
+                &loaded.affinity,
+                spec,
                 facts,
-                (prefill, decode),
-                read,
-                &buffers.columns,
+                first,
+                || listed(decode, decode_records),
+                &mut buffers.columns,
                 &sends_to,
-            );
-            decision
+                over_columns,
+                turned,
+            )
         };
         let decision = BUFFERS.with(|buffers| match buffers.try_borrow_mut() {
             Ok(mut buffers) => decide(&mut buffers),
@@ -921,94 +930,16 @@ impl<'a> PairLists<'a> {
     }
 }
 
-/// A pair's two columns of who holds the prompt, the prefills' first, and
-/// what each fill read of the record of sent prefixes. A side whose phase
-/// reads affinity is handed its own list's column, read at the side's
-/// phase and by the side's own profile's word of the record
-/// ([`overlap::column`]), which the list's table read. A side whose phase
-/// reads none pays one test and keeps an empty column. `prefill` is `None`
-/// for the decode asked again, which fills no column of the prefills.
-///
-/// A pair's decision and an encode request's fill their columns here, so
-/// the two read one way.
-// In line at its two callers: as a call it costs a pair's decision whose
-// sides read no affinity 25 instructions, counted with Callgrind.
-#[inline(always)]
-pub(super) fn side_columns(
-    engine: Loaded<'_, '_>,
-    facts: &RequestFacts<'_>,
-    prefill: Option<(&PoolMembers, &PoolRecords)>,
-    decode: (&PoolMembers, &PoolRecords),
-    columns: &mut [Vec<AffinityFacts>; 2],
-) -> [Option<overlap::PrefixRead>; 2] {
-    // The host's indexes of cache events and the records of sent
-    // prefixes, which a side's column is read from.
-    let (kept, spec) = (&engine.affinity, &engine.document.spec);
-    let fill = |(side, records): (&PoolMembers, &PoolRecords), phase, column: &mut Vec<_>| {
-        column.clear();
-        if !spec.engine().needs_for_phase(phase).affinity {
-            return None;
-        }
-        let (workers, ids) = (side.workers(), records.ids());
-        overlap::column(
-            kept,
-            side.affinity(),
-            spec,
-            workers,
-            ids,
-            phase,
-            facts,
-            column,
-        )
-    };
-    let [prefill_column, decode_column] = columns;
-    let prefill_read = match prefill {
-        Some(side) => fill(side, Phase::Prefill, prefill_column),
-        None => {
-            prefill_column.clear();
-            None
-        }
-    };
-    [prefill_read, fill(decode, Phase::Decode, decode_column)]
-}
-
-/// Behind a pick, each side's record of sent prefixes keeps where the
-/// prompt went ([`overlap::record_by_column`]), where that side's profile
-/// is told of the side ([`lease_events::stages_hear`]): the first target
-/// the request's caller sends to (`sends_to`, [`overlap::sent_to`]), and
-/// nobody where it sends to none. Each side asks its own word: a sessions
-/// rule that keeps what it places from the profile may have placed one
-/// side alone and left the other to its stages, and the side it placed
-/// writes nothing. The prefill's worker is written at the prefill phase
-/// and the decode's at the decode phase, each where its side's fill read
-/// the record (`read`, as [`side_columns`] returned it, and `columns` as
-/// it filled them). A pair neither side of which read its record asks
-/// nothing of the pick.
-#[inline(always)]
-pub(super) fn record_sides(
-    decision: &Decision,
-    facts: &RequestFacts<'_>,
-    (prefill, decode): (&PoolMembers, &PoolMembers),
-    [prefill_read, decode_read]: [Option<overlap::PrefixRead>; 2],
-    [prefill_column, decode_column]: &[Vec<AffinityFacts>; 2],
-    sends_to: impl Fn(&Target) -> bool,
-) {
-    let told = |side| lease_events::stages_hear(decision, side);
-    let prefill_read = prefill_read.filter(|_| told(Side::Prefill));
-    let decode_read = decode_read.filter(|_| told(Side::Decode));
-    if prefill_read.is_none() && decode_read.is_none() {
-        return;
-    }
-    let Some(sent) = overlap::sent_to(decision, sends_to) else {
-        return;
-    };
-    if let Some(read) = prefill_read {
-        let (pool, column) = (prefill.affinity(), prefill_column.as_slice());
-        overlap::record_by_column(pool, Phase::Prefill, facts, read, column, sent.id);
-    }
-    if let (Some(read), Some(pair)) = (decode_read, sent.pair) {
-        let (pool, column) = (decode.affinity(), decode_column.as_slice());
-        overlap::record_by_column(pool, Phase::Decode, facts, read, column, pair.decode_id);
+/// One list of a pair as its side's column is read from it
+/// ([`overlap::decide_by_columns`]): what is kept beside the list, its
+/// workers and their ids. A pair's decision over its columns and an
+/// encode request's name their lists here, so the two read one way.
+#[inline]
+pub(super) fn listed<'a>(side: &'a PoolMembers, records: &'a PoolRecords) -> overlap::SideList<'a> {
+    overlap::SideList {
+        pool: side.affinity(),
+        workers: side.workers(),
+        ids: records.ids(),
     }
 }
 
