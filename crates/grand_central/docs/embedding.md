@@ -52,7 +52,7 @@ A host decides at one of two levels: the engine alone, or the engine with bookin
 - It asks no stage, so no stage's threshold applies.
 - A worker the rows do not name is a miss of the request's blocks.
 - A pair's first pick states the same of its prefill, which its first target names, from the prefills' column. It states nothing of its decode.
-- Nothing is stated for a pair's decode decided again, nor for an encode request's pair.
+- Nothing is stated for a pair's decode decided again, nor for an encode request's pair. An encode request that names a worker and is answered as a pair states what a pair does.
 - Nothing is stated for a pick the sessions rule keeps from the profile, nor under a profile that reads no affinity.
 - The word on the prefix margin stays `false`.
 - `Engine::decide` states nothing, and the controller's `Decide` answer does not carry it.

@@ -1064,8 +1064,9 @@ impl Engine {
     /// `affinity-column` before a cut, as the pair entry names it. So does
     /// a column on the request, or rows named on it, before a stage of the
     /// encode side is asked. A number on the decode side
-    /// ([`Constraints::target_worker`]) names `target-worker`: an encode
-    /// request names no worker.
+    /// ([`Constraints::target_worker`]) names `target-worker`: this entry
+    /// counts none. A request's one call holds an encode request to the
+    /// pair it names by the places of that pair's two lists.
     ///
     /// A list this side hands on in a pool's stead (the prefills or the
     /// decodes it admits, the encoders it offers a key) is numbered anew. A
@@ -1250,8 +1251,9 @@ impl Engine {
         if carries_a_column(facts) {
             return turned_away(ShedReason::PolicyDeclined, AFFINITY_COLUMN, unbound);
         }
-        // An encode request names no worker: a number on its decode side
-        // would count rows this side numbers anew.
+        // This entry counts no number: one on its decode side would count
+        // rows this side numbers anew. A request's call holds an encode
+        // request to the pair it names by places.
         if decode_cx.target_worker.is_some() {
             return turned_away(ShedReason::PolicyDeclined, TARGET_WORKER, unbound);
         }
@@ -1435,8 +1437,11 @@ impl Engine {
             return gap(DECODE_VISION);
         }
         // No gap of the pairs' membership stands, and the encoders' places
-        // hold the request off every encoder that takes it.
+        // hold the request off every encoder that takes it. The decision
+        // says whose places they are ([`Scratch::shed_over`]): a side of
+        // the pair held off below bears the same name, and says no word.
         if held_off {
+            scratch.shed_over = Some(ShedOver::Encoders);
             return gap(PLACES);
         }
         let vision = items.decode_images || (items.references && pixels && any_vision);

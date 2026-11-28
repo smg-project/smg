@@ -348,6 +348,19 @@ fn decide_under(
     pools: PairPools<'_>,
     sides: [&Constraints<'_>; 3],
 ) -> (Decision, EncodePlaced) {
+    decide_under_in(bed, engine, facts, pools, sides, &mut Scratch::new())
+}
+
+/// [`decide_under`], made with `scratch`: the scratch keeps the decision's
+/// word of the list it shed over.
+fn decide_under_in(
+    bed: &Bed,
+    engine: &Engine,
+    facts: &RequestFacts<'_>,
+    pools: PairPools<'_>,
+    sides: [&Constraints<'_>; 3],
+    scratch: &mut Scratch,
+) -> (Decision, EncodePlaced) {
     let (_, pool) = bed.asked();
     let encode = EncodePool {
         encoders: &bed.encoders,
@@ -374,7 +387,7 @@ fn decide_under(
         cx,
         decode_cx,
         encode_cx,
-        &mut Scratch::new(),
+        scratch,
         &mut placed,
     );
     (decision, placed)

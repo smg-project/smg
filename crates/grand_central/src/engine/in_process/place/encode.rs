@@ -42,6 +42,13 @@
 //! Three lists with no item stated are placed as their pair
 //! ([`super::pair`]), and name no encoder.
 //!
+//! Under a document that names a target source, a request that names its
+//! worker has its pair held to that worker on each side that reads the
+//! number ([`super::target::encode`]): its asks are these, lent the three
+//! lists with the pair held to the places its number reached. A pair held
+//! on both sides is asked again behind an encoder alone, held as it was,
+//! and no rule is asked of a list there.
+//!
 //! [`RequestMaker::sends_to_encoder`]: crate::engine::decision_engine::RequestMaker::sends_to_encoder
 
 use std::{
@@ -176,15 +183,20 @@ fn asked<'a>(
     // reads each target's sides all the same, notes the ones that cannot be
     // sent to, and gives the decision up.
     let read = OnceCell::new();
+    // Whether a target's two sides could be sent to and an encoder could
+    // not: the call's word of an ask given up for an encoder alone.
+    let past_encoder = Cell::new(false);
     let mut taken = walk(engine, decided, later, now, &mut call.missed, |target| {
         let (_, down) = read.get_or_init(&encoders);
         let sides = sides(request, &lists.pair, target, &kept)?;
         if down.is_empty() {
             Ok(sides)
         } else {
+            past_encoder.set(true);
             Err([None; 2])
         }
     });
+    call.past_encoder = past_encoder.get();
     let Ok(walked) = &mut taken else {
         return taken;
     };
@@ -252,7 +264,17 @@ pub(super) fn place<'a>(
 /// alone. One the pass is laid for keeps such a shed, as it did before a
 /// pair's decision asked its one question, and so does one that states a
 /// hard demand. One made for the encoders names no side.
-fn asks<'a>(
+///
+/// The call of a request that names its worker asks so too, lent the
+/// three lists with its pair held to the places its number reached
+/// ([`super::target::encode`]). A pair held to the two workers the request
+/// names is asked no second time for a shed, nor behind a side that could
+/// not be sent to, as a pair's own call is not ([`pair::again`]). Behind
+/// an ask given up for an encoder alone ([`Call::past_encoder`]) it is
+/// asked again, lent what that ask was: an item's encoder is no part of
+/// the name, and the next decision is told the one that could not be sent
+/// to.
+pub(super) fn asks<'a>(
     engine: Loaded<'static, '_>,
     request: &PlaceRequest<'a>,
     lists: &EncodeLists<'_>,
@@ -268,18 +290,32 @@ fn asks<'a>(
     };
     let next =
         |lent: &WorkerLists<'_>, call: &mut Call| asks(engine, request, lists, items, lent, call);
+    // The pair a request names on both sides is the call's one pair, and
+    // an item's encoder is no part of that name: behind an ask given up
+    // for an encoder alone the call asks again, held as it was.
+    if call.named_pair && shed.is_none() && call.past_encoder {
+        return call.again(|call| next(lent, call));
+    }
     pair::again(request, &lists.pair, lent, call, shed, &next)
+}
+
+/// The `items` a request states, as its call lends them: with the ring
+/// the request states ([`PlaceRequest::ring`]), whatever their caller
+/// wrote into them ([`EncodeItems::ring`]). A caller of the placing call
+/// states its ring once. The encode profile's word alone says whether
+/// that ring is asked for an item, so a request whose own profile reads
+/// no ring lends its items one.
+pub(super) fn ringed<'r>(request: &PlaceRequest<'r>, items: EncodeItems<'r>) -> EncodeItems<'r> {
+    EncodeItems {
+        ring: request.ring,
+        ..items
+    }
 }
 
 /// A request that hands an encode request's three lists: placed with the
 /// items it carries ([`place`]), and as its pair where it states none.
-/// Out of line: a request with other lists runs none of it.
-///
-/// The items are lent the ring the request states
-/// ([`PlaceRequest::ring`]), whatever their caller wrote into them
-/// ([`EncodeItems::ring`]): a caller of this call states its ring once.
-/// The encode profile's word alone says whether that ring is asked for an
-/// item, so a request whose own profile reads no ring lends its items one.
+/// Out of line: a request with other lists runs none of it. Its items are
+/// lent the ring the request states ([`ringed`]).
 ///
 /// # Errors
 ///
@@ -292,10 +328,7 @@ pub(super) fn three<'a>(
 ) -> Result<Placement<'a>, Unplaced> {
     match request.encode {
         Some(items) => {
-            let items = EncodeItems {
-                ring: request.ring,
-                ..items
-            };
+            let items = ringed(request, items);
             place(engine, request, lists, items, &mut Call::default())
         }
         // No item stated: the three lists are placed as their pair.
