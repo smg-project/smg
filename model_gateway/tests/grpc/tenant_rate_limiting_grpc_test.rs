@@ -3,8 +3,8 @@
 //! a real (mock) gRPC backend rather than by driving `RateLimitReserveStage`
 //! in isolation.
 //!
-//! Calls `RouterTrait` methods directly, mirroring
-//! `routers/grpc/router.rs`'s own `tests` module (`router/tests.rs`), rather than going
+//! Calls `RouterTrait` methods directly, mirroring `routers/grpc/router.rs`'s own `tests`
+//! module (`tests/unit/routers/grpc/router/tests.rs`), rather than going
 //! through the full HTTP app: `test_harness/src/test_app.rs`'s lightweight test
 //! app doesn't wire the tenant-resolution middleware that would otherwise
 //! populate `tenant_request_meta`, so a real per-request tenant identity is
