@@ -116,6 +116,29 @@ fn a_bound_the_clock_adds_to_the_lags_origin_and_not_to_its_frame_never_lapses()
 }
 
 #[test]
+fn a_frame_at_or_past_the_most_microseconds_the_lag_counts_is_kept_at_them() {
+    let bound = Duration::from_secs(1);
+    // A frame at the most microseconds the lag counts, one a microsecond
+    // on, whose count is the most 64 bits hold, and one a millisecond on,
+    // whose count they do not hold: each on a lag that holds no frame.
+    for past in [0, 1, 1_000].map(Duration::from_micros) {
+        let lag = Lag::new(bound);
+        // The frame's word is its count of microseconds past the origin,
+        // plus one: the most the lag counts is one under the most the word
+        // holds.
+        let kept = lag.origin + Duration::from_micros(u64::MAX - 1);
+        let at = kept + past;
+        lag.applied(at);
+        // The lag keeps the frame at that count, and its age is the rest.
+        assert_eq!(
+            lag.read(at),
+            Some((past, Lapse::At(kept + bound))),
+            "{past:?}"
+        );
+    }
+}
+
+#[test]
 fn an_applied_frame_dated_before_the_lapse_and_written_after_it_tells_a_turn() {
     // The loop reads its instant, applies the batch, then writes the
     // lag: the clock of that write says whether a reader saw the sync
@@ -1487,11 +1510,14 @@ async fn a_streak_of_streams_that_applied_nothing_is_said_once_and_again_after_o
     // line is on or off by the thread that reaches it first.
     let _beside = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
     let _kept = tracing::subscriber::set_default(subscriber);
+    // The message between the mark that ends the line's head and the name
+    // of its first field: a word more behind its last is no match.
+    let line = ": this standby does not follow its leader; it reads synced only \
+                while its lag is under its bound controller_id=";
     let said = || {
         let kept = lines.0.lock();
         let text = String::from_utf8_lossy(&kept);
-        text.matches("this standby does not follow its leader")
-            .count()
+        text.matches(line).count()
     };
     let mut bed = Bed::new().await;
     let (_elector, standing, standby) = standing_by(&bed, FIVE);
