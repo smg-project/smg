@@ -1743,19 +1743,26 @@ where
         // the access log; the trace context on the response; the Messages
         // envelope outside the body-size limit (a declared over-limit length
         // is refused by the limit layer before any route layer runs, and
-        // still leaves in the envelope); the payload limit on the request
+        // still leaves in the envelope); the shutdown's answer to a request
+        // its drain gave up on (inside the envelope and the log, so it is
+        // shaped, logged and counted); the payload limit on the request
         // body (a declared over-limit length is refused there, in the
         // gateway's envelope, before any layer inside runs; a chunked upload
         // is capped on its way in); innermost, the default body limit.
         .layer(
             tower::ServiceBuilder::new()
                 .layer(middleware::RequestIdLayer::new(request_id_headers))
-                .layer(middleware::HttpMetricsLayer::new(inflight_tracker))
+                .layer(middleware::HttpMetricsLayer::new(Arc::clone(
+                    &inflight_tracker,
+                )))
                 .layer(middleware::create_logging_layer(access_log_fields))
                 .layer(tower::util::MapResponseLayer::new(
                     middleware::trace_context_on_response,
                 ))
                 .layer(middleware::MessagesErrorEnvelopeLayer)
+                .layer(middleware::shutdown_notice::ShutdownNoticeLayer::new(
+                    inflight_tracker,
+                ))
                 .layer(middleware::RequestBodyLimitLayer::new(max_payload_size))
                 .layer(axum::extract::DefaultBodyLimit::max(max_payload_size)),
         )
@@ -3017,18 +3024,28 @@ fn stop_the_mesh(mesh_handler: Option<&MeshServerHandler>) {
     }
 }
 
+/// How long before the end of the grace the drain gives up on what is still
+/// in flight: the time the `503` of a request still waiting for its handler
+/// has to leave (see `middleware::shutdown_notice`) before the listeners
+/// close the connections that still stand. It is taken out of the drain,
+/// never more than half of it, so the shutdown ends within the grace.
+const SHUTDOWN_NOTICE: Duration = Duration::from_millis(250);
+
 /// The graceful shutdown after the signal, in its phases. Phase 1: readiness
 /// flips to 503 and the listeners stay open through the settle window, during
 /// which `leave_mesh` runs (with no window, it gets what the grace allows;
 /// one that does not finish in time is cut short and `stop_mesh` is called),
 /// then `stop_listeners` gates new connections with what is left of the
 /// grace. Phase 2: the in-flight requests drain within that, or the drain
-/// gives up and says so. Phase 3, the teardown, is the caller's once the
+/// gives up one [`SHUTDOWN_NOTICE`] ahead of its end and says so, and a
+/// request still waiting for its handler is woken to answer `503` (see
+/// `middleware::shutdown_notice`) while the grace lasts. Phase 3,
+/// the teardown, is the caller's once the
 /// listeners have stopped and this drain has ended (see
 /// [`drain_before_teardown`]). Returns the end of the grace, the deadline
 /// the phases share, for the caller's own wait to end by; `None` when this
-/// drain ran to that deadline and gave up there, which it said: the caller
-/// has nothing left to wait for or to say.
+/// drain gave up, which it said, and ran to that deadline with work still
+/// in flight: the caller has nothing left to wait for or to say.
 async fn graceful_shutdown(
     inflight_tracker: &InFlightRequestTracker,
     budget: ShutdownBudget,
@@ -3078,7 +3095,12 @@ async fn graceful_shutdown(
     // Re-check after gating to catch requests that arrived between the
     // snapshot and graceful_shutdown stopping the accept loop.
     if !inflight_tracker.is_empty() {
-        let drained = inflight_tracker.wait_for_drain(drain_timeout).await;
+        // The last of the drain is the notice: the listeners close what
+        // stands at the end of the grace, as they did, and a `503` written
+        // at that instant would not leave.
+        let notice = SHUTDOWN_NOTICE.min(drain_timeout / 2);
+        let waited = drain_timeout.saturating_sub(notice);
+        let drained = inflight_tracker.wait_for_drain(waited).await;
         if drained {
             info!("All in-flight requests drained");
         } else {
@@ -3087,7 +3109,14 @@ async fn graceful_shutdown(
                 timeout_secs = drain_timeout.as_secs(),
                 "Drain timed out, forcing shutdown with requests still in-flight"
             );
-            return None;
+            // Who still waits for a handler answers now, a 503 that names
+            // the shutdown, and has the notice to leave in. Where all of it
+            // left inside the notice, this drain ended ahead of the deadline
+            // after all, and what is admitted since gets what is left.
+            inflight_tracker.give_up_drain();
+            if !inflight_tracker.wait_for_drain(notice).await {
+                return None;
+            }
         }
     }
     // Phase 3: the teardown is the main task's, once the listeners have
@@ -3560,6 +3589,131 @@ mod graceful_shutdown_tests {
             Some((Duration::ZERO, Duration::ZERO))
         );
         assert!(tracker.is_draining());
+    }
+
+    /// A request still waiting for its handler when the drain gives up is
+    /// answered through the edge's layers: `503` in the gateway's envelope
+    /// with the code that names the shutdown, and it leaves the in-flight
+    /// count. (Its future was dropped with its connection before, and its
+    /// client read nothing.) The answer is made one notice ahead of the end
+    /// of the grace, where the listeners close what stands, as they did, and
+    /// the shutdown itself ends on that deadline, as it did.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_still_waiting_when_the_drain_gives_up_is_answered_503() {
+        use axum::{body::Body, http::StatusCode, routing::get, Router};
+        use tower::ServiceExt;
+
+        use crate::middleware::{self, shutdown_notice::SERVER_SHUTTING_DOWN_CODE};
+
+        let tracker = InFlightRequestTracker::new();
+        let app = super::attach_edge_layers(
+            Router::new().route("/never", get(std::future::pending::<StatusCode>)),
+            1024,
+            Arc::clone(&tracker),
+            vec![],
+            vec![],
+            middleware::AccessLogFields::NONE,
+        );
+        let start = tokio::time::Instant::now();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the request waits in a task of its own while the shutdown runs"
+        )]
+        let waiting = tokio::spawn(async move {
+            let request = http::Request::builder()
+                .uri("/never")
+                .body(Body::empty())
+                .unwrap();
+            (app.oneshot(request).await, start.elapsed())
+        });
+        while tracker.is_empty() {
+            tokio::task::yield_now().await;
+        }
+        let gated = Arc::new(Mutex::new(None));
+        let ended = graceful_shutdown(
+            &tracker,
+            ShutdownBudget::from_grace_secs(10, None),
+            async {},
+            || panic!("a completed mesh leave must not be stopped again"),
+            {
+                let gated = Arc::clone(&gated);
+                move |drain_timeout| {
+                    *gated.lock().expect("no poison") = Some((start.elapsed(), drain_timeout));
+                }
+            },
+        )
+        .await;
+        assert_eq!(ended, None, "the drain gave up");
+        assert_eq!(
+            gated.lock().expect("no poison").take(),
+            Some((Duration::from_secs(5), Duration::from_secs(5))),
+            "the listeners close what stands at the end of the grace"
+        );
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_secs(10),
+            "the deadline held"
+        );
+        let (response, answered_at) = waiting.await.expect("the request's task ended");
+        assert_eq!(
+            answered_at,
+            Duration::from_secs(10) - super::SHUTDOWN_NOTICE,
+            "the answer is made one notice ahead of the end of the grace"
+        );
+        let response = response.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], SERVER_SHUTTING_DOWN_CODE, "{body}");
+        assert!(tracker.is_empty(), "the answered request left the count");
+    }
+
+    /// On the Messages route that answer leaves in the route's own error
+    /// shape, which carries no `code`: the notice sits inside the Messages
+    /// envelope.
+    #[tokio::test(start_paused = true)]
+    async fn the_shutdowns_503_leaves_the_messages_route_in_its_error_shape() {
+        use axum::{body::Body, http::StatusCode, routing::post, Router};
+        use tower::ServiceExt;
+
+        use crate::middleware::{self, shutdown_notice::SERVER_SHUTTING_DOWN_CODE};
+
+        let tracker = InFlightRequestTracker::new();
+        let app = super::attach_edge_layers(
+            Router::new().route("/v1/messages", post(std::future::pending::<StatusCode>)),
+            1024,
+            Arc::clone(&tracker),
+            vec![],
+            vec![],
+            middleware::AccessLogFields::NONE,
+        );
+        tracker.give_up_drain();
+        let request = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("/v1/messages")
+            .body(Body::empty())
+            .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(1), app.oneshot(request))
+            .await
+            .expect("a request that parks after the giving up is answered at once")
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-smg-error-code")
+                .map(http::HeaderValue::as_bytes),
+            Some(SERVER_SHUTTING_DOWN_CODE.as_bytes()),
+            "a Messages client reads the code in the header"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "overloaded_error", "{body}");
+        assert!(body["error"].get("code").is_none(), "{body}");
     }
 }
 
@@ -4070,14 +4224,9 @@ mod tests {
 
     /// A recorded control-plane mutation whose handler waits at a gate, sent
     /// through the real edge stack over the control-plane layer with the
-    /// state the gateway attaches. Returns the call, polled once (the
-    /// handler waits and the client is still there), and the gate that lets
-    /// the handler answer.
-    fn a_mutation_at_its_gate(
-        tracker: &Arc<InFlightRequestTracker>,
-    ) -> (ClientCall, Arc<tokio::sync::Notify>) {
-        use std::task::{Context, Waker};
-
+    /// state the gateway attaches. Returns the call, not polled yet, and the
+    /// gate that lets the handler answer.
+    fn a_mutation(tracker: &Arc<InFlightRequestTracker>) -> (ClientCall, Arc<tokio::sync::Notify>) {
         use axum::{body::Body, extract::State, middleware::from_fn_with_state};
         use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, ControlPlaneAuthState, Role};
         use tokio::sync::Notify;
@@ -4122,7 +4271,18 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let mut call: ClientCall = Box::pin(app.oneshot(request));
+        let call: ClientCall = Box::pin(app.oneshot(request));
+        (call, gate)
+    }
+
+    /// That mutation with its call polled once: the handler waits and the
+    /// client is still there.
+    fn a_mutation_at_its_gate(
+        tracker: &Arc<InFlightRequestTracker>,
+    ) -> (ClientCall, Arc<tokio::sync::Notify>) {
+        use std::task::{Context, Waker};
+
+        let (mut call, gate) = a_mutation(tracker);
         let mut cx = Context::from_waker(Waker::noop());
         assert!(
             call.as_mut().poll(&mut cx).is_pending(),
@@ -4462,6 +4622,60 @@ mod tests {
                 times,
                 (secs(7), secs(exit_at)),
                 "the mutation answers at {answers_at:?} s"
+            );
+        }
+    }
+
+    /// The same once the task's drain gave up: what it gave up on left
+    /// inside the notice, so that drain too ended ahead of the deadline, and
+    /// a mutation admitted after it, while the listeners still close their
+    /// connections, and whose client leaves, is waited for until it answers,
+    /// or to the end of the grace when it never does.
+    #[tokio::test(start_paused = true)]
+    async fn a_mutation_admitted_after_the_notice_emptied_the_count_holds_the_exit() {
+        use std::task::{Context, Poll, Waker};
+
+        let secs = Duration::from_secs;
+        // The drain of a grace of 30 s gives up one notice ahead of its end.
+        // What it gives up on leaves a fifth into the notice, the mutation
+        // is admitted a fifth later, and the listeners, stopped at 5 s, have
+        // closed their connections a fifth after that.
+        let (gave_up, fifth) = (secs(30) - SHUTDOWN_NOTICE, SHUTDOWN_NOTICE / 5);
+        let (left_at, admitted_at, closed_at) =
+            (gave_up + fifth, gave_up + 2 * fifth, gave_up + 3 * fifth);
+        for (answers_at, exit_at) in [
+            (Some(gave_up + 4 * fifth), gave_up + 4 * fifth),
+            (None, secs(30)),
+        ] {
+            let tracker = InFlightRequestTracker::new();
+            let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+            let given_up_on = tracker.track();
+            let admitted = async {
+                tokio::time::sleep(left_at).await;
+                drop(given_up_on);
+                tokio::time::sleep(admitted_at - left_at).await;
+                // The drain gave up: the notice answers the client at the
+                // first poll, and the mutation runs on, in the count.
+                let (mut call, gate) = a_mutation(&tracker);
+                let mut cx = Context::from_waker(Waker::noop());
+                let Poll::Ready(Ok(answer)) = call.as_mut().poll(&mut cx) else {
+                    panic!("the notice answers at the first poll");
+                };
+                assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
+                drop((answer, call));
+                if let Some(at) = answers_at {
+                    tokio::time::sleep(at - admitted_at).await;
+                    gate.notify_one();
+                }
+            };
+            let (times, ()) = tokio::join!(
+                exit(&tracker, budget, WayOut::Signal, closed_at - secs(5)),
+                admitted
+            );
+            assert_eq!(
+                times,
+                (closed_at, exit_at),
+                "the mutation answers at {answers_at:?}"
             );
         }
     }

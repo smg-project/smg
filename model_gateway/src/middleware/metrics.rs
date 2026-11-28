@@ -36,8 +36,10 @@
 //! upstream answer that declared its length is never polled for its trailing
 //! end. The 499 also covers the rare request the server itself dropped
 //! before it answered: a handler that panicked (the edge stack catches no
-//! panic) and a connection cut by a forced shutdown after the drain timeout
-//! look the same from here, a request's future dropped without a response.
+//! panic) and a connection cut by a forced shutdown look the same from
+//! here, a request's future dropped without a response. (A request still
+//! waiting for its handler when the shutdown's drain gives up is answered
+//! first, a 503 counted as that: see `shutdown_notice`.)
 
 use std::{
     sync::Arc,

@@ -19,6 +19,7 @@ pub mod metrics;
 pub mod request_id;
 pub mod request_start;
 pub mod scheduler;
+pub mod shutdown_notice;
 pub mod sse_keepalive;
 pub mod storage_context;
 pub mod tenant_resolution;
