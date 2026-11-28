@@ -1374,15 +1374,17 @@ impl PoolRecords {
         Some(converted)
     }
 
-    /// Pays `looked_up`, the records one decision wrote without the
-    /// list's rows ([`Singly::looked_up`]), toward the conversion of the
-    /// list's reports ([`LookUps`]): the draw that pays the last of the
-    /// list's length converts them, and the draws behind it copy the
-    /// rows. A decision that reads no snapshot of reports pays nothing.
-    // In line at its callers: as a call it costs a plain draw 16
-    // instructions and a pair's two sides 45, counted with Callgrind.
+    /// Pays the records that `singly`, one decision's writer over the
+    /// list's workers, wrote without the list's rows
+    /// ([`Singly::looked_up`]) toward the conversion of the list's
+    /// reports ([`LookUps`]): the draw that pays the last of the list's
+    /// length converts them, and the draws behind it copy the rows. A
+    /// decision that reads no snapshot of reports pays nothing.
+    // In line at its callers: as a call it costs a plain draw 17
+    // instructions and a pair's two sides 37, counted with Callgrind.
     #[inline(always)]
-    fn paid(&self, workers: &[Arc<dyn Worker>], live: &Live<'_>, looked_up: u32) {
+    fn paid(&self, singly: &Singly<'_>) {
+        let (workers, live, looked_up) = (singly.workers, singly.live, singly.looked_up());
         if let (Some(loads), true) = (live.loads, looked_up > 0) {
             let held = self.reported.load();
             let _ = self.convert(workers, loads, live, &held, looked_up);

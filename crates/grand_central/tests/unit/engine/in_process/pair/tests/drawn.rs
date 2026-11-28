@@ -215,23 +215,30 @@ fn reported(host: &Host) -> Arc<LoadSnapshot> {
 }
 
 /// Each side of a drawn pair pays the records it wrote without its
-/// list's rows toward its own list's conversion: two a decision. So the
-/// prefill list of eight converts at the fourth decision and the decode
-/// list of sixteen at the eighth, and the decisions behind copy the rows.
+/// list's rows toward its own list's conversion: two a decision. So a
+/// list converts at the decision that brings its paid records to its
+/// length, one of eight at the fourth and one of sixteen at the eighth,
+/// whichever side holds which, and the decisions behind copy the rows.
 #[test]
 fn each_side_of_a_drawn_pair_pays_toward_its_own_lists_conversion() {
-    let host = drawing(8, 16);
-    let (loads, classes) = (reported(&host), every(8, 16));
-    let converted = || {
-        host.lists
-            .each_ref()
-            .map(|list| host.engine.conversions(list.lent()))
-    };
-    for decision in 1..=40_u64 {
-        let asks = host.asks_by(&classes, (decision, false), Some(Arc::clone(&loads)));
-        let _ = host.first(&asks);
-        let want = [u64::from(decision >= 4), u64::from(decision >= 8)];
-        assert_eq!(converted(), want, "decision {decision}");
+    for lengths in [[8_u32, 16], [16, 8]] {
+        let host = drawing(lengths[0] as usize, lengths[1] as usize);
+        let (loads, classes) = (reported(&host), every(lengths[0] as usize, lengths[1]));
+        let converted = || {
+            host.lists
+                .each_ref()
+                .map(|list| host.engine.conversions(list.lent()))
+        };
+        for decision in 1..=40_u64 {
+            let asks = host.asks_by(&classes, (decision, false), Some(Arc::clone(&loads)));
+            let _ = host.first(&asks);
+            let want = lengths.map(|length| u64::from(2 * decision >= u64::from(length)));
+            assert_eq!(
+                converted(),
+                want,
+                "lists of {lengths:?}, decision {decision}"
+            );
+        }
     }
 }
 

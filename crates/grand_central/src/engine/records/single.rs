@@ -62,7 +62,7 @@ impl PoolRecords {
             cx,
             scratch,
         );
-        self.paid(workers, live, singly.looked_up());
+        self.paid(&singly);
         decision
     }
 
@@ -111,7 +111,7 @@ impl PoolRecords {
             cx,
             scratch,
         );
-        self.paid(workers, live, singly.looked_up());
+        self.paid(&singly);
         claimed
     }
 }
