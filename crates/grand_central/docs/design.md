@@ -159,7 +159,7 @@ replaces the old one whole, under a number above the old one's.
 pub struct PolicySpec {
     pub api_version: String,                     // always "smg.policy/v1"
     pub generation: u64,                         // the document's number
-    // (one private field reads a `kind` line only to refuse it)
+    // (one private field reads a `kind` line only to refuse one with a value)
     pub view: ViewSpec,                          // what a decision may read beyond the basic facts
     pub index: BTreeMap<String, IndexSpec>,      // settings of the record of sent prefixes, by model
     pub signals: BTreeMap<String, SignalSpec>,   // named values of a worker's report that stages read

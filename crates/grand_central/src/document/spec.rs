@@ -2917,7 +2917,11 @@ const SIGNAL_UNIT_PATTERN: &str = "^[!-~]*$";
 /// The policy specification, version `smg.policy/v1`: what the host builds
 /// into the view, the per-model index settings, the signals its stages
 /// read, the profiles with their stages, the plans' rules and the ordered
-/// bindings. An unknown field at any level is refused by name.
+/// bindings. An unknown field at any level is refused by name. The JSON
+/// schema generated from these types does not hold every rule of
+/// validation: a binding can pass the schema while it names a profile the
+/// document never declares, so a document the schema admits can still be
+/// refused.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PolicySpec {
@@ -2930,9 +2934,11 @@ pub struct PolicySpec {
     #[serde(default)]
     pub generation: u64,
     /// A `kind` line is read only to refuse it by name: the document has
-    /// no kind (its forms are a file and the API). Never in the schema, and
-    /// private so that no code writes one: a document is built by parsing,
-    /// by a preset or by [`PolicySpec::new`].
+    /// no kind (its forms are a file and the API). A `kind` with no value
+    /// reads as left out and is not refused. Never in the schema, whose
+    /// closed top refuses the key with or without a value, and private so
+    /// that no code writes one: a document is built by parsing, by a
+    /// preset or by [`PolicySpec::new`].
     #[serde(default, skip_serializing)]
     #[schemars(skip)]
     kind: Option<String>,
