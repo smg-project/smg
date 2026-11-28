@@ -173,7 +173,7 @@ impl EncodeLists<'_> {
     /// [`Demands::held_by`]). A request with no item takes no encoder: its
     /// pair's sides are held as a pair's own, and no encoder is judged.
     ///
-    /// Each side of the pair is judged ahead of the engine's pass, as a
+    /// Each side of the pair is held ahead of the engine's pass, as a
     /// pair's own request is a side at a time: it is held to the places
     /// whose worker meets its part of the demand, among the places its
     /// host states for it, and a side left nobody sheds the request with
@@ -291,9 +291,9 @@ impl EncodeLists<'_> {
     /// under the hard demand it states: the prefills', the decodes', the
     /// encoders'. Each side of the pair is held to the places whose worker
     /// meets what the side is held to, among the places its host states
-    /// ([`PairLists::sides_meeting`]): `kept` takes the places, the
-    /// prefills' first. The two sides state no demand: theirs is judged
-    /// here.
+    /// ([`PairLists::sides_meeting`]): `kept` takes the places of each side
+    /// that is judged, the prefills' first. The two sides state no demand:
+    /// theirs is judged here.
     ///
     /// `items` says the request carries items. An encoder then takes its
     /// media: the encoders are held to the runtime and the media's demands
@@ -389,9 +389,9 @@ impl EncodeLists<'_> {
     ) -> Decision {
         let (spec, clock) = (&engine.document.spec, &engine.clock);
         let pair = &self.pair;
-        // A hard demand is judged below for the pair's two sides, and
-        // kept by the pass for the encoders. What these lists do not
-        // decide beside it is the pair's to answer: a subset hint, and
+        // A hard demand is judged below for each side of the pair that it
+        // holds, and kept by the pass for the encoders. What these lists do
+        // not decide beside it is the pair's to answer: a subset hint, and
         // places or a mask of the request's own.
         let demanded = !request.constraints.demands.is_none();
         if not_decided(&request.constraints).is_some() {
@@ -483,10 +483,10 @@ impl EncodeLists<'_> {
             let (decodes, _) = decode_records.write(decode_workers, decode_live, decodes);
             stamp(prefills, decodes, pair.classes, pair.admission);
             let (rows, _) = records.write(encode_workers, encode_live, &mut buffers.encoders);
-            // A hard demand the request states is judged here for the
-            // pair's two sides, and the engine's pass is handed the places
-            // that meet it. The encoders' part is the pass's to keep. A
-            // request that states none pays one test.
+            // A hard demand the request states is judged here for each side
+            // of the pair that it holds, and the engine's pass is handed the
+            // places that meet it. The encoders' part is the pass's to keep.
+            // A request that states none pays one test.
             let met;
             let mut unmet = None;
             let [prefill_cx, decode_cx, encode_cx] = if demanded {

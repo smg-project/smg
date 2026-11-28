@@ -1169,6 +1169,64 @@ fn a_requests_vision_is_its_encoders_to_meet_where_it_has_items() {
     assert!(placed.encoders().is_empty(), "no key stays placed");
 }
 
+/// Where an encode request that carries an item is decided as one, a
+/// demand whose every part is the encoders' to meet judges no side of its
+/// pair. Its vision and its references are its encoders': the pair's
+/// sides are held to the rest ([`Demands::beside_encoders`]), which then
+/// states nothing, and neither side is judged. A completion's bound
+/// beside them judges the decodes alone, and the input's bound each side.
+///
+/// A side that is judged writes the places it keeps into its decision's
+/// list for it: the thread's list here, where no decision is asked
+/// inside another. So a list that still holds its mark tells a side
+/// this decision's demand did not judge.
+#[test]
+fn a_demand_for_the_media_alone_judges_no_side_of_the_requests_pair() {
+    // A place no list holds: the mark of a list that was not written.
+    const MARK: u32 = u32::MAX;
+    // Both encoders push with their role and process references by their
+    // own pipeline. The first takes images.
+    let pushing = Enc::on(0).pushing().processing(false);
+    let fleet = fleet((0, 0), [pushing.seeing(), pushing]);
+    // The sides of the pair one decision's demand judged, the prefills'
+    // and then the decodes', and the place of the encoder its item went
+    // to.
+    let judged = |media: (bool, bool), demands: Demands| {
+        BUFFERS.with_borrow_mut(|buffers| buffers.meeting = [vec![MARK], vec![MARK]]);
+        let answer = answered(&fleet, media, demands);
+        let sides = BUFFERS.with_borrow(|buffers| {
+            let [prefills, decodes] = &buffers.meeting;
+            [prefills.as_slice() != [MARK], decodes.as_slice() != [MARK]]
+        });
+        (sides, answer)
+    };
+    let (image, both) = ((true, false), (true, true));
+    let none = Demands::default();
+    let pixels = Demands {
+        vision: true,
+        ..none
+    };
+    assert_eq!(judged(image, pixels), ([false, false], Ok(0)), "vision");
+    let any = Demands {
+        references: References::Any,
+        ..pixels
+    };
+    let neither = ([false, false], Ok(0));
+    assert_eq!(judged(both, any), neither, "vision and references");
+    let budget = Demands {
+        output_window: 1_024,
+        ..pixels
+    };
+    let decodes = ([false, true], Ok(0));
+    assert_eq!(judged(image, budget), decodes, "a budget: the decodes");
+    let prompt = Demands {
+        input_window: 1_024,
+        ..pixels
+    };
+    let each = ([true, true], Ok(0));
+    assert_eq!(judged(image, prompt), each, "the input: each side");
+}
+
 /// A host hears the encode pass's own two words for the encoders' media,
 /// whether it states the demand or not. The encode pass tests an encoder's
 /// vision and its media from the request's own facts, and holds an encoder
@@ -2492,6 +2550,10 @@ impl Filter for ReadsCounts {
 /// count under the name that maker states, and an encoder's row carries
 /// none.
 ///
+/// Where the document's one sessions rule states no cap, the document
+/// reads no count, and no row carries one, whatever its worker holds,
+/// under either entry.
+///
 /// The classic gateway's sticky map reads the count for the role it pins,
 /// under the key's own text, and never for an encoder
 /// (`model_gateway/src/policies/registry.rs:796`, `:810`; an item's policy
@@ -2513,11 +2575,15 @@ fn an_encode_requests_sides_read_their_keys_count_and_its_encoders_none() {
         profile.filter.push("reads-counts".into());
     }
     let ruled = PolicySpec::preset("manual").expect("a built-in preset");
-    let mut rule = ruled.bindings[0].sessions.clone();
-    rule.as_mut().expect("the stock rule").inflight_cap = 2;
-    document.bindings[0].sessions = rule;
+    document.bindings[0].sessions = ruled.bindings[0].sessions.clone();
     document.view.headers.push("x-smg-routing-key".to_owned());
+    // The rule's cap under the reads below: two, and 65535 under the last
+    // two, which is how a document states no cap.
+    let cap = std::cell::Cell::new(2);
     let spec = || {
+        let mut document = document.clone();
+        let rule = document.bindings[0].sessions.as_mut();
+        rule.expect("the stock rule").inflight_cap = cap.get();
         let digest = document.digest().expect("a digest");
         let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[]);
         spec.expect("a rule under the three-sided plan")
@@ -2619,6 +2685,11 @@ fn an_encode_requests_sides_read_their_keys_count_and_its_encoders_none() {
         neither,
         "unleased, no held decision's count"
     );
+    // The document's one rule states no cap now, and the document reads
+    // no count: no row of either side carries one, under either entry.
+    cap.set(u16::MAX);
+    assert_eq!(read(text, [TALK; 2], true), neither, "no cap");
+    assert_eq!(read(text, [TALK; 2], false), neither, "unleased, no cap");
 }
 
 /// The side of each issue a stage heard.
