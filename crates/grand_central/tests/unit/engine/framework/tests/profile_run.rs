@@ -536,6 +536,289 @@ fn bindings_match_globs_and_phases_in_order() {
     assert!(!suffix.matches("x-code", Phase::Single));
 }
 
+// A request's binding, found by the engine's table of its bindings and by
+// a walk of them (`ByModel::find`, `Engine::walked`): the two roads answer
+// alike, whatever the document and whatever its count of bindings.
+
+/// A binding of the pattern `model` that covers `phases`, each of them
+/// where the list is empty.
+fn bound(model: &str, phases: &[Phase]) -> Binding {
+    Binding {
+        model: model.into(),
+        phases: phases.to_vec(),
+        ..single_binding()
+    }
+}
+
+/// An engine of one profile under `bindings`.
+fn under(bindings: Vec<Binding>) -> Engine {
+    Engine::new(
+        vec![least_requests_profile()],
+        bindings,
+        1,
+        Needs::default(),
+    )
+}
+
+/// The place of the binding a request of `model` at `phase` resolves to,
+/// asked of both roads: the walk and `by_model`, the table of the engine's
+/// bindings. The two answer one place.
+fn place(engine: &Engine, by_model: &ByModel, model: &str, phase: Phase) -> Option<usize> {
+    let walked = engine.walked(model, phase);
+    let looked = by_model.find(&engine.bindings, model, phase);
+    assert_eq!(walked, looked, "{model} at {phase:?}");
+    walked
+}
+
+/// Whether `pattern` covers `model`, as a document's reader says it: one
+/// star at an end stands for any text, and a pattern with none names one
+/// id. Written here again, apart from the engine's own compare.
+fn covers(pattern: &str, model: &str) -> bool {
+    match (pattern.strip_prefix('*'), pattern.strip_suffix('*')) {
+        _ if pattern == "*" => true,
+        (Some(suffix), _) => model.ends_with(suffix),
+        (_, Some(prefix)) => model.starts_with(prefix),
+        _ => pattern == model,
+    }
+}
+
+/// Each order of `0..count`, by turns of two places (Heap's rule).
+fn orders(count: usize) -> Vec<Vec<usize>> {
+    let mut order: Vec<usize> = (0..count).collect();
+    let mut turns = vec![0; count];
+    let mut all = vec![order.clone()];
+    let mut at = 0;
+    while at < count {
+        if turns[at] < at {
+            order.swap(if at % 2 == 0 { 0 } else { turns[at] }, at);
+            all.push(order.clone());
+            turns[at] += 1;
+            at = 0;
+        } else {
+            turns[at] = 0;
+            at += 1;
+        }
+    }
+    all
+}
+
+/// The index answers as the walk does, and both as the document reads,
+/// for every order of a document's bindings. Six bindings stand in each
+/// of their 720 orders: an id bound twice under two phase lists, a second
+/// id, a prefix and a suffix that each cover one of the ids, and a
+/// catch-all of one phase. Each order is asked six ids in every phase:
+/// the two ids bindings name, an id no binding names that the prefix
+/// covers, one that the suffix covers, and one that the catch-all alone
+/// covers in its phase and nothing covers in another. The sixth is a
+/// bound id with a blank behind it: another id, which no binding names.
+#[test]
+fn the_index_answers_as_the_walk_for_every_order_of_a_documents_bindings() {
+    use Phase::{Decode, Prefill, Single};
+    let bindings: [(&str, &[Phase]); 6] = [
+        ("alpha", &[]),
+        ("alpha", &[Prefill]),
+        ("beta", &[Single, Decode]),
+        ("al*", &[]),
+        ("*ta", &[Single]),
+        ("*", &[Decode]),
+    ];
+    let asked = ["alpha", "beta", "alto", "delta", "gamma", "alpha "];
+    let all = orders(bindings.len());
+    let mut apart = all.clone();
+    apart.sort_unstable();
+    apart.dedup();
+    assert_eq!((all.len(), apart.len()), (720, 720), "each order once");
+    let (mut found, mut refused) = (0, 0);
+    for order in &all {
+        let document: Vec<_> = order.iter().map(|&at| bindings[at]).collect();
+        let made = document.iter().map(|&(model, phases)| bound(model, phases));
+        let engine = under(made.collect());
+        let by_model = ByModel::over(&engine.bindings);
+        for model in asked {
+            for phase in PHASES {
+                let first = document.iter().position(|&(pattern, phases)| {
+                    covers(pattern, model) && (phases.is_empty() || phases.contains(&phase))
+                });
+                let place = place(&engine, &by_model, model, phase);
+                assert_eq!(place, first, "{document:?}");
+                if first.is_some() {
+                    found += 1;
+                } else {
+                    refused += 1;
+                }
+            }
+        }
+    }
+    // The fixture's own check, which no product line moves: both answers
+    // stand among the asks, a binding and none.
+    assert!(found > 0 && refused > 0, "{found} found, {refused} not");
+}
+
+/// Three rules of the lookup, each by a document written out with the
+/// place it answers. A pattern ahead of an id's binding wins where it
+/// covers the id. A pattern behind an id's binding does not, though it
+/// covers the id too. A binding whose phase list leaves a phase out
+/// passes that phase to the next binding that matches: the id's next
+/// one, or a pattern that stands between the two.
+#[test]
+fn a_pattern_wins_ahead_of_an_id_and_a_phase_left_out_passes_on() {
+    use Phase::{Decode, Prefill, Single};
+    type Document = &'static [(&'static str, &'static [Phase])];
+    let table: [(Document, &str, Phase, Option<usize>); 9] = [
+        (&[("al*", &[]), ("alpha", &[])], "alpha", Single, Some(0)),
+        (&[("alpha", &[]), ("al*", &[])], "alpha", Single, Some(0)),
+        (&[("alpha", &[]), ("al*", &[])], "alto", Single, Some(1)),
+        (
+            &[("alpha", &[Prefill]), ("alpha", &[])],
+            "alpha",
+            Prefill,
+            Some(0),
+        ),
+        (
+            &[("alpha", &[Prefill]), ("alpha", &[])],
+            "alpha",
+            Single,
+            Some(1),
+        ),
+        (
+            &[("alpha", &[Prefill]), ("*", &[]), ("alpha", &[])],
+            "alpha",
+            Single,
+            Some(1),
+        ),
+        (
+            &[("alpha", &[Prefill]), ("*", &[Decode]), ("alpha", &[])],
+            "alpha",
+            Single,
+            Some(2),
+        ),
+        (
+            &[("alpha", &[Prefill]), ("beta", &[])],
+            "alpha",
+            Single,
+            None,
+        ),
+        (&[("alpha", &[]), ("beta", &[])], "gamma", Single, None),
+    ];
+    for (document, model, phase, answer) in table {
+        let made = document.iter().map(|&(model, phases)| bound(model, phases));
+        let engine = under(made.collect());
+        let by_model = ByModel::over(&engine.bindings);
+        let place = place(&engine, &by_model, model, phase);
+        assert_eq!(place, answer, "{document:?}");
+    }
+}
+
+/// The engine's own lookup answers alike at the two sides of the count
+/// under which a document is walked ([`WALKED_ID_BINDINGS`]): a document
+/// with that many bindings that name an id holds no table, and the same
+/// document with one such binding more holds one. An id is bound twice,
+/// under two phase lists, ahead of the bindings of other ids, and a
+/// catch-all stands last. Each id of the smaller document, and one that
+/// the catch-all alone covers, resolves to a binding of the same text
+/// under both. The id bound twice resolves by the request's phase under
+/// both: to its first binding, to its second, and to the catch-all where
+/// neither covers the phase.
+#[test]
+fn the_engines_lookup_answers_alike_at_the_two_sides_of_the_count() {
+    use Phase::{Prefill, Single};
+    // A document of `named` bindings that name an id, ahead of its
+    // catch-all: the id bound twice, then ids of their own.
+    let ids = |named: usize| {
+        let twice = [bound("twice", &[Prefill]), bound("twice", &[Single])];
+        let ids = (0..named - 2).map(|at| bound(&format!("id-{at}"), &[]));
+        let all = twice.into_iter().chain(ids).chain([bound("*", &[])]);
+        all.collect::<Vec<_>>()
+    };
+    let at_count = under(ids(WALKED_ID_BINDINGS));
+    let past_count = under(ids(WALKED_ID_BINDINGS + 1));
+    assert_eq!(at_count.bindings.len(), WALKED_ID_BINDINGS + 1);
+    assert!(at_count.by_model.is_none() && past_count.by_model.is_some());
+    // The id bound twice, by the request's phase: its place under each.
+    let both = [
+        (&at_count, WALKED_ID_BINDINGS),
+        (&past_count, WALKED_ID_BINDINGS + 1),
+    ];
+    for (engine, last) in both {
+        for phase in PHASES {
+            let want = match phase {
+                Prefill => 0,
+                Single => 1,
+                _ => last,
+            };
+            let at = engine.binding_position("twice", phase);
+            assert_eq!(at, u32::try_from(want).ok(), "twice at {phase:?}");
+        }
+    }
+    let asked = (0..WALKED_ID_BINDINGS - 2).map(|at| format!("id-{at}"));
+    for model in asked.chain(["another".to_owned()]) {
+        for phase in PHASES {
+            let text = |engine: &Engine| {
+                let entry = engine.entry(&model, phase);
+                entry.map(|entry| entry.binding.model.clone())
+            };
+            let answer = text(&at_count);
+            assert!(answer.is_some(), "{model} at {phase:?}");
+            assert_eq!(answer, text(&past_count), "{model} at {phase:?}");
+            let named = model.starts_with("id-");
+            let catch_all = answer.as_deref() == Some("*");
+            assert_ne!(named, catch_all, "{model}: an id's binding names it");
+            // The place too, of the larger document's own entry.
+            let at = past_count.binding_position(&model, phase);
+            let at = usize::try_from(at.expect("a binding")).expect("a place");
+            let there = &past_count.bindings[at].binding.model;
+            assert_eq!(Some(there), answer.as_ref());
+        }
+    }
+}
+
+/// Which documents hold a table is told by their bindings that name an id
+/// alone: more of them than the count ([`WALKED_ID_BINDINGS`]), wherever
+/// they stand and whatever patterns stand beside them. Each number of
+/// such bindings, from none to twice the count and one, stands beside
+/// each number of patterns in that range: a prefix, a suffix and a
+/// catch-all by turns. Each pair stands in three orders: the ids ahead,
+/// the patterns ahead, and a pattern then an id by turns.
+#[test]
+fn a_document_holds_a_table_by_its_bindings_that_name_an_id() {
+    let id = |at: usize| bound(&format!("id-{at}"), &[]);
+    let pattern = |at: usize| match at % 3 {
+        0 => bound(&format!("p{at}-*"), &[]),
+        1 => bound(&format!("*-s{at}"), &[]),
+        _ => bound("*", &[]),
+    };
+    let most = 2 * WALKED_ID_BINDINGS + 1;
+    let (mut holding, mut walked) = (0, 0);
+    for named in 0..=most {
+        for beside in 0..=most {
+            let ahead = (0..named).map(id).chain((0..beside).map(pattern));
+            let behind = (0..beside).map(pattern).chain((0..named).map(id));
+            let by_turns = (0..named.max(beside)).flat_map(|at| {
+                let first = (at < beside).then(|| pattern(at));
+                first.into_iter().chain((at < named).then(|| id(at)))
+            });
+            let orders: [Vec<Binding>; 3] = [ahead.collect(), behind.collect(), by_turns.collect()];
+            for document in orders {
+                assert_eq!(document.len(), named + beside);
+                let holds = under(document).by_model.is_some();
+                assert_eq!(
+                    holds,
+                    named > WALKED_ID_BINDINGS,
+                    "{named} ids, {beside} patterns"
+                );
+                if holds {
+                    holding += 1;
+                } else {
+                    walked += 1;
+                }
+            }
+        }
+    }
+    // The fixture's own check, which no product line moves: both answers
+    // stand among the documents.
+    assert!(holding > 0 && walked > 0, "{holding} hold, {walked} do not");
+}
+
 /// A binding's model pattern is read once, when the engine is built: a
 /// request is matched by what the engine read then, and neither the lookup
 /// of a binding nor the one of its position reads the stars of a pattern's

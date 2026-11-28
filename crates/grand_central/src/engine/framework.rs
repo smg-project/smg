@@ -8,8 +8,11 @@ use std::{
     cell::OnceCell,
     collections::HashMap,
     fmt::Debug,
+    ops::Range,
     sync::{atomic::AtomicU64, Arc},
 };
+
+use rustc_hash::FxHashMap;
 
 // `Lease` and `Membership` are named only by doc links of this module.
 #[cfg(doc)]
@@ -3931,8 +3934,8 @@ impl Pattern<'_> {
 
 /// What a binding's model pattern asks of a model id ([`Pattern`]), with
 /// the text a suffix or a prefix compares. The engine reads it once when
-/// it is built ([`Entry`]), so a walk of the bindings reads no pattern's
-/// stars.
+/// it is built ([`Entry`]), so the lookup of a request's binding reads no
+/// pattern's stars.
 #[derive(Debug)]
 enum Glob {
     Any,
@@ -4275,6 +4278,12 @@ pub struct Engine {
     /// The bindings in the spec's order, each beside what the build derived
     /// from it ([`Entry`]).
     bindings: Vec<Entry>,
+    /// The bindings' places by the models their patterns ask for
+    /// ([`ByModel`]), where more of the document's bindings name an id
+    /// than a walk is asked to pass ([`WALKED_ID_BINDINGS`]): the
+    /// engine's lookup of a request's binding then reads it
+    /// ([`Self::entry`], [`Self::binding_position`], a shadow's run).
+    by_model: Option<Box<ByModel>>,
     /// A shadow's placing assignment beside each binding, in the same
     /// order. Empty when no binding names a shadow.
     shadow_placing: Box<[Option<Assignment>]>,
@@ -5027,6 +5036,119 @@ const fn placed_by(assignment: Assignment, by_assignment: bool) -> Assignment {
     }
 }
 
+/// A document with this many bindings that name an id, or fewer, holds
+/// no table of its bindings ([`ByModel`]): a request's binding is found
+/// by a walk of them ([`Engine::entry`], [`Engine::walked`],
+/// [`Engine::shadow`]). A table costs each lookup a question of it, and
+/// lets the lookup pass the bindings that name another id: so few leave
+/// little to pass. A pattern's binding is read under a table as on a
+/// walk, so a document of patterns alone holds none.
+const WALKED_ID_BINDINGS: usize = 3;
+
+/// The places of an engine's bindings by the models their patterns ask
+/// for ([`Glob`]): the bindings of one id under that id, and the others,
+/// a prefix's, a suffix's and every id's, in the document's order. A
+/// request's binding is found by it with no read of a binding that names
+/// another id ([`Self::find`]). It is made once, at the engine's build.
+///
+/// The table's keys are the document's alone: a request's id is looked up
+/// and never put in. The table's hash is not a keyed one, and no request
+/// chooses a key of it.
+#[derive(Debug)]
+struct ByModel {
+    /// By an id, where the places of its bindings stand in `places`.
+    ids: FxHashMap<Box<str>, Range<usize>>,
+    /// The places of the bindings whose pattern is one id
+    /// ([`Glob::Exact`]): an id's together, in the document's order.
+    places: Box<[usize]>,
+    /// The places of the other bindings, in the document's order: each
+    /// one's pattern is a prefix, a suffix or every id.
+    patterns: Box<[usize]>,
+}
+
+impl ByModel {
+    /// The table of `bindings`, where more of them name an id than a walk
+    /// is asked to pass ([`WALKED_ID_BINDINGS`]). The count reads the
+    /// bindings up to the first that names an id past that number, and no
+    /// further.
+    fn of(bindings: &[Entry]) -> Option<Box<Self>> {
+        let names_an_id = |entry: &&Entry| matches!(entry.glob, Glob::Exact);
+        let past = bindings.iter().filter(names_an_id).nth(WALKED_ID_BINDINGS);
+        past.map(|_| Box::new(Self::over(bindings)))
+    }
+
+    /// The table of `bindings`, whatever their count.
+    fn over(bindings: &[Entry]) -> Self {
+        let places = bindings.iter().enumerate();
+        let (ids, patterns): (Vec<_>, Vec<_>) =
+            places.partition(|(_, entry)| matches!(entry.glob, Glob::Exact));
+        // An id's bindings together, in the document's order: the sort
+        // keeps the order of the bindings of one id.
+        let ids = ids.into_iter();
+        let ids = ids.map(|(at, entry)| (entry.binding.model.as_str(), at));
+        let mut ids: Vec<(&str, usize)> = ids.collect();
+        ids.sort_by_key(|&(id, _)| id);
+        let mut by_id = FxHashMap::default();
+        let mut from = 0;
+        for of_one in ids.chunk_by(|(a, _), (b, _)| a == b) {
+            by_id.insert(of_one[0].0.into(), from..from + of_one.len());
+            from += of_one.len();
+        }
+        Self {
+            ids: by_id,
+            places: ids.iter().map(|&(_, at)| at).collect(),
+            patterns: patterns.into_iter().map(|(at, _)| at).collect(),
+        }
+    }
+
+    /// The place of the first of `bindings` that matches a request of
+    /// `model` at `phase`, in the document's order: `bindings` are the
+    /// ones this table was made over. No binding of another id can match.
+    /// So the bindings read are the ones that name `model` whole and the
+    /// patterns', by turns in the document's order, up to the first that
+    /// matches: each is a binding the walk reads too, in the walk's order.
+    fn find(&self, bindings: &[Entry], model: &str, phase: Phase) -> Option<usize> {
+        let own = self.ids.get(model);
+        let mut own = own.map_or(&[][..], |of_id| &self.places[of_id.clone()]);
+        let mut patterns = &self.patterns[..];
+        loop {
+            // The next place in the document's order: the id's own next
+            // binding where it stands ahead of the next pattern's.
+            let (at, named) = match (own.split_first(), patterns.split_first()) {
+                (Some((&id, rest)), pattern) if pattern.is_none_or(|(&next, _)| id < next) => {
+                    own = rest;
+                    (id, true)
+                }
+                (_, Some((&pattern, rest))) => {
+                    patterns = rest;
+                    (pattern, false)
+                }
+                (_, None) => return None,
+            };
+            let entry = &bindings[at];
+            // A binding of the id names the model whole: its phase list is
+            // all that is left to ask.
+            let matches = if named {
+                entry.binding.covers(phase)
+            } else {
+                entry.binding.matches_as(&entry.glob, model, phase)
+            };
+            if matches {
+                return Some(at);
+            }
+        }
+    }
+
+    /// The binding [`Self::find`] answers the place of. It stands out of
+    /// line: the engine's lookup under a document it walks then holds the
+    /// walk alone ([`Engine::entry`]).
+    #[inline(never)]
+    fn entry<'a>(&self, bindings: &'a [Entry], model: &str, phase: Phase) -> Option<&'a Entry> {
+        let at = self.find(bindings, model, phase)?;
+        bindings.get(at)
+    }
+}
+
 /// A binding as the engine holds it: the binding as the spec declared it,
 /// which is what [`Engine::binding`] answers, and beside it what the build
 /// derived from it for the engine's own decisions.
@@ -5663,12 +5785,14 @@ impl Engine {
                     binding,
                 }
             })
-            .collect();
+            .collect::<Vec<Entry>>();
+        let by_model = ByModel::of(&bindings);
         Self {
             #[cfg(feature = "in-process")]
             born: vec![generation; profiles.len()],
             profiles: profiles.into_iter().map(Arc::new).collect(),
             bindings,
+            by_model,
             shadow_placing: shadow_placing.into_boxed_slice(),
             shadow_rows: shadow_rows.into_boxed_slice(),
             shadow_sides: shadow_sides.into_boxed_slice(),
@@ -6480,19 +6604,39 @@ impl Engine {
     }
 
     /// The first binding that matches, beside what the build derived from
-    /// it: the engine's own lookup.
+    /// it: the engine's own lookup. By the table where the engine holds
+    /// one ([`ByModel`]), and by a walk of the bindings where it holds
+    /// none: the two answer alike for every model and phase. Under a
+    /// document the engine walks ([`WALKED_ID_BINDINGS`]) it is one test
+    /// and the walk: the table's lookup stands out of line
+    /// ([`ByModel::entry`]).
     fn entry(&self, model: &str, phase: Phase) -> Option<&Entry> {
-        self.bindings
-            .iter()
-            .find(|entry| entry.binding.matches_as(&entry.glob, model, phase))
+        match &self.by_model {
+            Some(by_model) => by_model.entry(&self.bindings, model, phase),
+            None => {
+                let mut bindings = self.bindings.iter();
+                bindings.find(|entry| entry.binding.matches_as(&entry.glob, model, phase))
+            }
+        }
     }
 
-    /// The position of the first matching binding in this generation.
+    /// The position of the first matching binding in this generation: by
+    /// the table where the engine holds one ([`ByModel::find`]), and by a
+    /// walk of the bindings where it holds none ([`Self::walked`]).
     pub(crate) fn binding_position(&self, model: &str, phase: Phase) -> Option<u32> {
-        self.bindings
-            .iter()
-            .position(|entry| entry.binding.matches_as(&entry.glob, model, phase))
-            .and_then(|at| u32::try_from(at).ok())
+        let at = match &self.by_model {
+            Some(by_model) => by_model.find(&self.bindings, model, phase),
+            None => self.walked(model, phase),
+        };
+        at.and_then(|at| u32::try_from(at).ok())
+    }
+
+    /// The place of the first binding that matches a request of `model`
+    /// at `phase`, by a walk of the bindings in the document's order.
+    #[inline(always)]
+    fn walked(&self, model: &str, phase: Phase) -> Option<usize> {
+        let mut bindings = self.bindings.iter();
+        bindings.position(|entry| entry.binding.matches_as(&entry.glob, model, phase))
     }
 
     pub(crate) fn binding_at(&self, at: u32) -> Option<&Binding> {
@@ -6836,9 +6980,9 @@ impl Engine {
         })
     }
 
-    /// The binding a request resolves to, with its profile for the phase: one
-    /// walk of the bindings per decision; `None` when no binding matches or
-    /// the binding's plan has no side for the phase.
+    /// The binding a request resolves to, with its profile for the phase,
+    /// by the engine's lookup ([`Self::entry`]); `None` when no binding
+    /// matches or the binding's plan has no side for the phase.
     fn resolve(&self, model: &str, phase: Phase) -> Option<(&Entry, u16, &Profile)> {
         let entry = self.entry(model, phase)?;
         let index = profile_index(&entry.binding, phase)?;
@@ -7434,11 +7578,19 @@ impl Engine {
         scratch: &mut Scratch,
     ) -> Option<Decision> {
         let (model, phase) = (facts.model, facts.phase);
-        let (entry, placing) = self
-            .bindings
-            .iter()
-            .zip(&self.shadow_placing)
-            .find(|(entry, _)| entry.binding.matches_as(&entry.glob, model, phase))?;
+        // The request's own binding and its shadow's placing beside it: by
+        // the table where the engine holds one, and by a walk of the two
+        // together where it holds none.
+        let (entry, placing) = match &self.by_model {
+            Some(by_model) => {
+                let at = by_model.find(&self.bindings, model, phase)?;
+                (self.bindings.get(at)?, self.shadow_placing.get(at)?)
+            }
+            None => {
+                let mut bound = self.bindings.iter().zip(&self.shadow_placing);
+                bound.find(|(entry, _)| entry.binding.matches_as(&entry.glob, model, phase))?
+            }
+        };
         let placing = (*placing)?;
         let index = entry.binding.shadow?;
         let profile = &self.profiles[usize::from(index)];
