@@ -6,7 +6,8 @@
   "properties": {
     "apiVersion": {
       "description": "`smg.policy/v1`.",
-      "type": "string"
+      "type": "string",
+      "const": "smg.policy/v1"
     },
     "generation": {
       "description": "The document's generation: written by the operator, or by the apply\nthat persisted it.",
@@ -24,6 +25,9 @@
       "type": "object",
       "additionalProperties": {
         "$ref": "#/$defs/IndexSpec"
+      },
+      "propertyNames": {
+        "pattern": "^(\\*[^*]*|[^*]+\\*?)$"
       }
     },
     "signals": {
@@ -80,10 +84,12 @@
           "description": "The request headers a stage may read, lowercase, in the order their\npositions take on the wire. A name on the deny-list (`authorization`,\n`proxy-authorization`, `cookie`, `set-cookie`, `x-api-key`, `api-key`,\n`x-goog-api-key`, the host's tenant header) is refused. Every header a\nbinding's `sessions`, `canary` or `match.header` names must be listed\nhere. At most 256: a view names a header by its position in one byte.",
           "type": "array",
           "items": {
-            "type": "string"
+            "type": "string",
+            "pattern": "^[a-z0-9!#$%&'*+.^_`|~-]+$"
           },
           "maxItems": 256,
-          "default": []
+          "default": [],
+          "uniqueItems": true
         },
         "block_size": {
           "description": "The token block size the host hashes prefixes by when no engine has\npublished one; absent, the host's own default. The block size of\nrecord learned from an engine's events wins at run time.",
@@ -126,25 +132,31 @@
           "description": "The worker labels a stage may read, each a selector of one label\nkey: `key` (the worker carries the label, whatever its value) or\n`key=value` (it carries the label with that value), split at the\nfirst `=`. A worker's row holds one bit for each selector it meets,\nin this order. At most 64; empty for none.",
           "type": "array",
           "items": {
-            "type": "string"
+            "type": "string",
+            "pattern": "^[^=]+(=[\\s\\S]+)?$"
           },
-          "maxItems": 64
+          "maxItems": 64,
+          "uniqueItems": true
         },
         "zones": {
           "description": "The zones a stage may tell apart. A worker's row names its zone by\nits position in this list, from 1; a worker with no zone reads 0,\nand so does one whose zone this list does not name. At most 256;\nempty for none, where every row reads 0.",
           "type": "array",
           "items": {
-            "type": "string"
+            "type": "string",
+            "minLength": 1
           },
-          "maxItems": 256
+          "maxItems": 256,
+          "uniqueItems": true
         },
         "engines": {
           "description": "The engine families a stage may tell apart, spelled as a worker's\nregistration spells its own. A worker's row names its family by its\nposition in this list, from 1; a worker whose family this list does\nnot name reads 0. At most 64; empty for none, where every row reads\n0.",
           "type": "array",
           "items": {
-            "type": "string"
+            "type": "string",
+            "minLength": 1
           },
-          "maxItems": 64
+          "maxItems": 64,
+          "uniqueItems": true
         }
       },
       "additionalProperties": false
@@ -1431,7 +1443,8 @@
         "model": {
           "description": "The model id after aliasing: an exact id, `prefix*`, `*suffix` or\n`*`.",
           "type": "string",
-          "default": "*"
+          "default": "*",
+          "pattern": "^(\\*[^*]*|[^*]+\\*?)$"
         },
         "phase": {
           "description": "The phases the binding covers; empty covers every phase. A plan with\nseveral sides names every side's phase or none.",
@@ -1446,7 +1459,8 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "minLength": 1
         },
         "priority": {
           "description": "The priority band the request carries, as a closed range.",
@@ -1486,7 +1500,8 @@
           "type": "array",
           "items": {
             "type": "string"
-          }
+          },
+          "uniqueItems": true
         }
       },
       "additionalProperties": false
@@ -1528,7 +1543,8 @@
       "properties": {
         "name": {
           "description": "The header's name, lowercase, listed in `view.headers`.",
-          "type": "string"
+          "type": "string",
+          "pattern": "^[a-z0-9!#$%&'*+.^_`|~-]+$"
         },
         "values": {
           "description": "The values that match; empty matches the header's presence.",
@@ -1622,7 +1638,8 @@
             "$ref": "#/$defs/KeySourceSpec"
           },
           "minItems": 1,
-          "maxItems": 13
+          "maxItems": 13,
+          "uniqueItems": true
         },
         "strip_lineage": {
           "description": "Take the turn and retry suffixes off a key, so every turn of a\nconversation shares one (`conv_t2_r1` keys as `conv`); default\nfalse.",
@@ -1643,7 +1660,8 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "pattern": "^[a-z0-9!#$%&'*+.^_`|~-]+$"
         },
         "rid": {
           "description": "The request's own id, the `rid` of its body: `true` names it. Under\na ring's prefix form (`prefix_tokens`) its key names the session\nalone: a sessions rule pins it, and the ring places the request by\nits prompt. The plain ring places by it, and so does a controller's\nprefix ring where its host's frame does not say the id handed it.",
@@ -1676,14 +1694,17 @@
       "properties": {
         "sticky_header": {
           "description": "The header whose value is the session key; listed in `view.headers`.\nLeft out where the binding names its key's sources under\n`routing_key`: a binding names them once.",
-          "type": "string"
+          "type": "string",
+          "pattern": "^[a-z0-9!#$%&'*+.^_`|~-]*$"
         },
         "headers": {
           "description": "The headers looked up in order for the key, the sticky header among\nthem; empty means the sticky header alone. Each listed in\n`view.headers`. Left out under `routing_key` too.",
           "type": "array",
           "items": {
-            "type": "string"
-          }
+            "type": "string",
+            "pattern": "^[a-z0-9!#$%&'*+.^_`|~-]+$"
+          },
+          "uniqueItems": true
         },
         "ttl_s": {
           "description": "How long an idle key stays pinned, in seconds, before the rule's\nnext sweep forgets it; above zero (default 14400), `4294967295` for\never.",
@@ -1833,7 +1854,8 @@
           "type": "array",
           "items": {
             "type": "string"
-          }
+          },
+          "uniqueItems": true
         },
         "header": {
           "description": "A request header that selects the canary.",

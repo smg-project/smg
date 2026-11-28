@@ -1655,7 +1655,7 @@ fn the_view_checks_block_size_boundaries_and_the_hash_cap() {
         bad_field(&spec_with_view(r#"{"boundaries":[0,16]}"#)),
         "view.boundaries[0]"
     );
-    for boundaries in ["[256,128]", "[256,256]"] {
+    for boundaries in ["[256,128]", "[256,256]", "[16,0]"] {
         assert_eq!(
             bad_field(&spec_with_view(&format!(
                 r#"{{"boundaries":{boundaries}}}"#
