@@ -59,6 +59,11 @@ if [ "$*" = 'pip show flashinfer-python' ]; then echo 'Version: 0.7.0'; fi
 """,
             )
         self.write_tool("id", '#!/bin/sh\necho "$TEST_UID"\n')
+        # Stub host C/C++ compilers so installer tests stay deterministic on minimal
+        # CPU runner pods without gcc/g++; the dedicated missing-compiler test uses
+        # its own isolated PATH without self.tools.
+        for compiler in ("gcc", "g++"):
+            self.write_tool(compiler, "#!/bin/sh\nexit 0\n")
         cuda_bin = Path(self.env["CUDA_HOME"]) / "bin"
         cuda_bin.mkdir(parents=True)
         cuda_bin.joinpath("nvcc").write_text(

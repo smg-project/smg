@@ -70,8 +70,13 @@ class JitCacheSetupTests(unittest.TestCase):
         self, engine: str = "vllm", **overrides: str
     ) -> tuple[subprocess.CompletedProcess[str], dict[str, str]]:
         self.github_env.write_text("")
+        base_env = {
+            k: v
+            for k, v in os.environ.items()
+            if k not in ("GITHUB_EVENT_NAME", "GITHUB_REF", "SMG_JIT_CACHE_TRUST_TIER")
+        }
         env = (
-            os.environ
+            base_env
             | {
                 "PATH": f"{self.bin}:{os.environ['PATH']}",
                 "PYTHONPATH": str(self.packages),

@@ -116,16 +116,17 @@ if [[ "$MIN_FREE_GB" =~ ^[0-9]+$ ]] && [ "$MIN_FREE_GB" -gt 0 ]; then
     fi
 fi
 
-# Isolate untrusted (PR / feature-branch) JIT caches from trusted main/release
-# runs so an unreviewed PR job cannot poison artifacts loaded by trusted jobs on
-# the same shared GPU runner pool.
+# Separate PR/feature-branch JIT cache keys from main/release keys so jobs on
+# different branches do not accidentally reuse each other's compiled entries.
+# Note: this is key separation, not an OS permission boundary (pods on a shared
+# runner pool mount /models read-write as the same uid).
 resolve_trust_tier() {
     if [ -n "${SMG_JIT_CACHE_TRUST_TIER:-}" ]; then
         printf '%s' "$SMG_JIT_CACHE_TRUST_TIER"
         return 0
     fi
     case "${GITHUB_EVENT_NAME:-}" in
-        push|schedule|workflow_dispatch|merge_group|release)
+        push|schedule|workflow_dispatch|release)
             case "${GITHUB_REF:-}" in
                 refs/heads/main|refs/heads/release/*|refs/tags/*)
                     printf 'trusted'
