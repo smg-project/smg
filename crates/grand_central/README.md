@@ -33,7 +33,7 @@ A profile runs three steps over the workers that serve the request's model.
 2. **Score.** Each scorer rates the workers that are left from 0 to 1. Above, `least-requests` rates the worker with the fewest requests in flight highest.
 3. **Pick.** One picker chooses from the scores. A pick names the chosen worker and up to three alternates, best first.
 
-A decision that finds no worker is a *shed*: a refusal that names its reason and a stage or constraint. As a rule it names the one that stopped the decision; a pair's shed can name another. By default a single profile first tries again with the overload veto lifted, then with liveness doubts lifted. See [Decisions and refusals](REFERENCE.md#decisions-and-refusals).
+A decision that finds no worker is a *shed*: a refusal that names its reason and a stage or constraint. As a rule it names the one that stopped the decision; a pair's shed can name another. By default a single profile first tries again with the overload veto lifted, then with liveness doubts lifted. See [Decisions and refusals](docs/guarantees.md#decisions-and-refusals).
 
 A profile can weigh one scorer over another:
 
@@ -173,7 +173,7 @@ A host can add stages of its own in three ways:
 - [Prefill and decode pairs](docs/policy-spec.md#prefill-and-decode) and [encode with a pair](docs/policy-spec.md#encode-with-a-pair)
 - [Overload](docs/policy-spec.md#overload), [sessions](docs/policy-spec.md#sessions), [a request's key](docs/policy-spec.md#the-requests-key), [shadows](docs/policy-spec.md#a-shadow-profile) and [reserved fields](docs/policy-spec.md#reserved-fields)
 - [Signals a decision can read](docs/embedding.md#signals-a-decision-can-read)
-- [Decisions and refusals](REFERENCE.md#decisions-and-refusals) and [updating a policy spec](REFERENCE.md#updating-a-document)
+- [Decisions and refusals](docs/guarantees.md#decisions-and-refusals) and [updating a policy spec](docs/guarantees.md#updating-a-spec)
 - [Explain and metrics](REFERENCE.md#explain-and-metrics)
 - [Worker discovery](docs/service.md#worker-discovery) for the standalone service
 - [Cost and regression gates](REFERENCE.md#cost-and-regression-gates)

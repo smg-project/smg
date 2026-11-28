@@ -21,7 +21,7 @@ profiles:
     pick: best
 ```
 
-1. **Filter.** Start with the model's pool for the requested role. Hard filters run first, in their written order. An empty hard pass usually sheds. A soft filter that would empty the pool leaves it as it was before that filter. Overload and liveness have [fallback rules](#decisions-and-refusals).
+1. **Filter.** Start with the model's pool for the requested role. Hard filters run first, in their written order. An empty hard pass usually sheds. A soft filter that would empty the pool leaves it as it was before that filter. Overload and liveness have [fallback rules](docs/guarantees.md#decisions-and-refusals).
 2. **Score.** Each scorer rates the rows it is asked to compare from 0 to 1, higher first. The combined score is a weighted average. A bare name has weight 1. A mapping puts the weight beside that scorer's other parameters. In the next document the weights give `least-load` three quarters of the combined score.
 3. **Pick.** Every profile has one picker. A pick carries up to four ordered targets. A shed gives a reason and a stage or constraint: the one that stopped the decision, but for two sheds of a pair. The picker can narrow the comparison before scoring.
 
@@ -62,106 +62,7 @@ The document's fields, its bindings and its plans stand on a page of their own: 
 
 ## Guarantees and limits
 
-### Decisions and refusals
-
-A pick's first target is booked at issue by the door or service. The caller can dispatch an alternate and report which target it took. Report completion or release so the lease can end. An undispatched lease expires after five seconds. A repeat marked `again` ends an earlier lease still waiting for dispatch. A decode call's repeat takes back that call's issue alone. The service checks the leadership term and budget as it makes the decision and checks the term and lease at send. A decision takes its engine and the asking gateway's vetoes from one published world, reads the worker list the worker objects' registry publishes, and keeps the issuing engine for lease events. A new generation builds fresh stages for each profile it does not keep: the paragraph "What a new document keeps" of [Updating a document](#updating-a-document) has the rule. Outstanding leases still belong to their issuing engine while the store holds them.
-
-- A single profile's empty pass can rerun filters with the overload veto lifted, then with liveness doubts lifted. It favors fewer in-flight requests on fallback. `shed_when_all_vetoed: true` keeps overload in force and can still lift liveness alone. Draining, not-ready and breaker holds stay refused by the health check. In a host's own process a pair's decode pool takes the overload half of that fallback at its first decision. A decode asked again behind its prefill takes both halves. The encoders of an `epd` decision shed without it: as saturated under `shed_when_all_vetoed: true`, and for a missing endpoint under `encoders` otherwise.
-- Unmatched bindings, no endpoints, an empty filter pass and a declined picker are sheds, and so are incompatible pair or encode workers in a host's own process. The built-ins emit no queue tickets. Hosts decide how to map sheds to request status and retry behavior.
-- A shed's answer says the reason and the stopping stage or constraint, with two exceptions for a pair. One shed as saturated names the overload veto, whichever stage ended its pass.
-- A pair's shed with no endpoint, behind a pass the overload veto ended, names the stage that refused a worker with room of the list judged. Where none has room it is the first ready worker's, or else the list's first. A list judged with no worker names `partnered`.
-- `Decide` has a 64 KiB incoming frame limit, including unknown fields. It requires a request ID of 1–256 bytes, known phase and hash kind, and at most 256 headers with positions in 0–255. A nonzero session hash must decode to a nonzero fingerprint for its model and phase. Zero means no key. A malformed or oversized frame can end the stream. The client cuts tail hashes to fit or returns an error when cutting them cannot make the message fit.
-- `Welcome` grants 128 credits per decide stream and up to 256 streams per gateway. Requests spend credit. A credit frame replenishes it. `Busy` reasons are `queue_depth`, `no_credit`, `budget_gone_on_arrival`, `not_leader` and `unspecified`, beside four of a decode call its lease refuses (`decode_no_lease`, `decode_not_chosen`, `decode_prefill_not_held`, `decode_stands`). The five cover a full shard queue, exhausted stream credit, expired budgets or dispatch span, a fenced replica, and cases such as raw prompt text, an unsupported side, a decider fault or exit, spent lease IDs or a document still awaited. The caller owns any local fallback.
-- The session expects `Hello` within five seconds, as its first frame, with a matching principal and protocol 1 or 2 in range. A gateway can keep one current session and get ten seconds of grace after disconnect. The table holds up to 4096 gateways, up to 4096 vetoes per gateway and eight kinds per worker per gateway. A `Hello` veto count must match the list. An unspecified veto kind, excess vetoes or an invalid lifecycle frame can end the stream. Old terms and replaced sessions can end calls. The reference client applies its term floor to decision and session answers. It waits up to five seconds per operation step, with a separately streamed watch.
-- Workers registered over gRPC take one rank and one HTTP or gRPC wire. A new row must supply its role and wire. The service refuses a host-local wire, rank width above one, nonempty topology, or extra pairing descriptor fields. It accepts at most 128 labels per row, a 2048-byte URL, 256-byte names for model, runtime and zone, 128-byte label keys, 4096-byte label values and a 16 KiB encoded row. No count bounds a row's model IDs: the row's size does. The URL and model IDs cannot contain blanks or control characters. An encode offer's connector is any text, and the row's size alone bounds it. The service reads it past the blanks around it, and a blank one states none. A scrape needs an interval and uses the registered runtime's parser. The stock controller's load monitor reads an HTTP worker by the controller's own load interval, whatever the row's scrape interval. Probes default to three failures, two successes, a 60-second interval and a five-second timeout. Duplicate adds, missing IDs or URLs, stale revisions and another maker's row have separate statuses. A registration over a draining row is the URL's next incarnation, whatever its facts: a drain ends with the registration it named, and only a patch or a second drain keeps it.
-- `WatchWorkers` allows four watches per principal. It can require a fresh snapshot when history no longer matches, and ends a stalled watch when polling resumes after 30 seconds. Worker watch pages hold up to 128 rows and 2 MiB of row data. Watches and `GetSnapshot` accept up to 128 model IDs. `GetSnapshot` can cap the worker rows returned and takes one snapshot at a time with up to 32 waiting. It refuses unknown or unavailable slices, invalid filter fields, and clear identifiers. `Explain` refuses a decision ID or an incomplete key and returns `NOT_FOUND` on a miss.
-- A shared lease keeps a ring of 4096 watched events for replication. Load reports are not replicated. History gaps require a snapshot. The leader holds up to four snapshot restores at once and can release a stalled restore after 60 seconds.
-- A call on the wrong scope returns `PERMISSION_DENIED`. A scoped call without a principal returns `UNAUTHENTICATED`. Leader-only operations can return `FAILED_PRECONDITION` with leader details, or `UNAVAILABLE` during a term transition. Unserved calls return `UNIMPLEMENTED` after admission.
-
-### When a gateway loses its stream
-
-A gateway asks the stock controller for decisions on a stream. A pick carries a **lease** that books its worker. A side that no dispatch names within five seconds is given up. A pair's decode side that was issued with its prefill is held while that prefill is dispatched. Once the prefill has ended, the side has at least five seconds to be dispatched.
-
-A stream can end with requests unanswered. Two rules keep one lease standing for one request.
-
-- **The stream's end.** A decide stream that ends gives up the lease of every decision it had not sent yet. No gateway could use them.
-- **A request asked again.** A gateway whose stream ended sends each unanswered request again and marks it `again` (`DecideRequest.again` in [`contracts`](contracts)). The controller ends the lease of the earlier ask at once, where it still waits for a dispatch, and decides the request anew.
-
-What a gateway must hold to:
-
-- The mark is for a request whose stream has ended, and the gateway reads nothing more from that stream. On a stream that is still open the earlier answer can still arrive, and it would carry a lease the mark has ended.
-- A request sent twice without the mark is two requests and two leases.
-- A repeat that the stream answers `Busy` before a decider takes it ends nothing. The next ask of that request carries the mark again.
-- The earlier lease is found by a 64-bit fingerprint of the request's id, among that gateway's own leases.
-- A decode call is the exception to each rule above. The pair's lease it names stays: an answer that was not sent, or a repeat with the mark, gives back that call's one issue. A repeat without the mark is refused `decode_stands` while the decode side stands, and is a first call where it does not. No fingerprint is searched.
-
-Two counters tell what happened, on the admin listener's `/metrics`:
-
-| counter | what it counts |
-|---|---|
-| `smg_grand_central_decide_asked_again_total` | requests marked `again`, by `earlier_lease`: `ended` where the earlier lease still waited, `none` where no lease of the request waited |
-| `smg_grand_central_decide_answers_dropped_total` | answers no stream took, by `cause`: `stream_gone` where the stream had ended, before the answer was made or with it still in the stream's queue, and `queue_full` |
-
-After a stream's end most repeats read `none`: the stream gave the lease up, or the first ask was never decided. That is no error.
-
-### Updating a document
-
-**File.** Use a path that leads to a regular file of at most 128 KiB. The reader follows symlinks. A `.json` suffix selects JSON. The controller checks the file at startup. The watch polls after one second and reads a changed identity after two matching looks. A rejected update leaves the running generation in place and is logged and counted once per settled file state while leading. Unchanged documents count as neither apply nor rejection. A fast same-size edit can escape detection if the file identity does not move. An update that stays unstable can be rejected.
-
-**Store.** `--spec-store` uses an existing directory with a lock and support for hard links. It runs with a process-local lease. Startup loads the newest file or starts with no document in an empty store. An empty store can report ready and shed requests until the first apply. Enforce persists before publishing and retains the newest eight files normally. A competing start waits up to the shutdown grace for the lock. Startup runs the newest file under the number in its name, also where the host's store already runs that document under a lower number. If the store refuses a generation after its file is written and the file cannot be removed, the apply fails as `not persisted` and says both. The store removes that file before its next write. A process that starts before that write reads it as a generation on file, and runs it if it is the newest.
-
-**Generation.** A zero or omitted number starts at 1 and increments on change. A file can claim a higher number. Enforce through the store takes the next number. Changed content under the standing number, a stale number, or an out-of-order store number is refused. An identical document with the standing or automatic number is a no-op. The digest is a canonical `sha256:` digest of parsed content without the generation line.
-
-**Calls.** `ApplyPolicySpec` requires a mode. Use `yaml` or `json` for the document format. `DRY_RUN` on either source checks the candidate under that source's rules. `ENFORCE` writes only under a store. Both can take the current `expected_digest` as a guard. A verdict can include before and after needs, or one issue with a field path when one applies. `AUDIT` is unserved. `GetPolicySpec` returns this replica's standing document, or a generation by number if held. It returns `NOT_FOUND` when none is held. `RollbackPolicySpec` under a store reapplies a named retained generation using a new number. Enforce and rollback under a file return `read_only` before document validation. Each dry-run and write queue has room for up to 32 waiting. Both use the same 128 KiB document cap as the file, with a separate bound on decoded YAML expansion.
-
-**In process.** A host that embeds the store takes the same door with the crate's `operator` feature. `document::operator::DocumentManager::new(store, catalog, denied_headers)` makes it. `apply` takes the host's document as bytes, YAML or JSON. It checks the document over the host's catalog and denied headers, and runs it. A changed document that leaves `generation` out runs as the next generation. One that states a higher number runs under that number. `dry_run` checks a document and applies nothing. A refused apply counts once in `apply_counts`, and a dry run counts nothing. `document::operator::MAX_DOCUMENT_BYTES` is the 128 KiB bound, and `Format::named` reads `yaml` or `json`. `status`, `document` and `standing` read the generation that runs, and `apply_counts` the applies. `EnforceRefused` and `NotHeld` are errors a host can print. `NotHeld` says what was asked, what is held, what stands and what a spec store has on file. `document::operator::snapshot::worker_rows_page` gives the worker rows an operator reads. An address is told without userinfo, and so is a provider's key that is a URL. A provider's key that is no URL and holds an `@` reads as `<unparsable address>`. No spec store is bound in process. `writable` says so, and `enforce` and `roll_back` are refused there with `not persisted: no spec store is bound`. The spec store itself builds on Linux and macOS.
-
-**A host's file.** A host that starts from a file names the file's form with `document::operator::Format::of` (a `.json` suffix selects JSON) and reads its bytes with `Format::read`, the read an apply passes too.
-
-**Shared lease.** A standby follows the leader's document if replication is configured and working. It validates its own file at startup and watches without applying it while following. On promotion it may apply its file after it settles. A file already observed running since the last change is skipped. An unnumbered document the standby never saw run can take effect on promotion even if its file is older. An explicit generation keeps a stale number from taking over. A new leader awaiting its first document can return `Busy`. File lease renewals are durable writes. With the default timings, a slow renewal can stop decisions, close sessions or lose the lease. For slower storage, the lease flags can give more time, for example `--lease-duration-ms 15000 --lease-renew-deadline-ms 10000 --lease-renew-period-ms 2000`.
-
-**Sends.** A profile's tally of sends (`StageBuild::dispatch_credit`: what the host sent each row since the row's last load report) carries over to the next document, when both have a stage that reads it. A `least-load` in the new document keeps the dispatches held under the standing one, so its estimate does not restart at a new document. The profiles of a document that set the same `sent_ttl_ms` and `sent_report_delay_ms` read one tally, and it carries over to the tally under the same two settings in the next document, whichever profiles read it there: a profile under a new name keeps the sends where its settings stand. Under the same two settings the two generations share the entries, and a send that one read releases has left the other too. A tally under two settings that no standing tally has shares none: it takes a copy of the sends the standing tallies hold, for each rank of a worker those of the tally that holds the most, so a changed `sent_ttl_ms` applies from the next read. A send that every standing tally has released is in no copy, and a tally starts empty where no tally stands. A refused document takes nothing. `MemoryStore::apply` makes the carry before it publishes, and `InProcess::apply` before its new document decides. A host with a store of its own calls `Engine::succeed` where it swaps engines. A dispatch reported to a served controller for a worker that its worker objects no longer hold at that rank adds nothing to the tally.
-
-**A running engine.** `InProcess::apply` puts a document in force on an engine that stays. A worker list that stands across N documents keeps N values in its cell, and a read under the newest passes N - 1 of them, until the host publishes the list again. A dispatch said behind a new document for a decision made under an earlier one is counted once by every tally of sends in force, whether the tally stands since that document or was built since. The session table hears it. A pair's decode asked again behind a new document tells its issue to the stages kept since the pair's own document that name it. A header's name and a profile's name in a document are kept for the life of the process. `Members::standing` and `Members::facts_of` run under the lock a change of membership is told under: neither may call `forget`, `joined` or `apply`. `InProcess::spec` counts a reference at each call, and `DecisionEngine::with_spec` borrows the document for the call.
-
-**What a new document keeps.** A profile keeps its stages where its name and its block are the same in both documents, and so are the document's `signals` and its `view`. One difference of the `view` keeps them too: another header list. No stage is built from that list. A stage that reads a header by a place its host wrote is kept as it stands: it reads that place of the new list.
-
-A profile is built anew too where one of its stages, built again, says otherwise of itself than the standing one. That is another name, other words of a request's life to hear, or anything else the engine reads of a stage when it builds a profile. The words to hear and `Lifecycle::keeps_loads` are compared as the two stages answer at the apply, and as each answered at its own build. A factory of the host's own may build such a stage: build the same stage from the same text.
-
-A tally of sends stands where a profile that reads it is kept. A profile built new beside it reads the same tally, and a send is counted once. A tally none of whose readers is kept is built new, and carries over as the paragraph "**Sends.**" says. Profiles under the same `sent_ttl_ms` and `sent_report_delay_ms` read one tally, and a document that states neither puts them all under one.
-
-The keep stands between two documents validated over the stock stage table, or over one `StageRegistry` of the host's own as it stood at both validations. A host that builds its table anew for each document keeps nothing. A stage that a validation built for a kept profile is let go at the call.
-
-**A replaced document.** A document that `InProcess::apply` replaces lives until its last decision ends, its last `SpecHandle` is let go, and each thread that read it last asks an engine again or ends: at most one replaced document for each thread. The stages the new document did not keep are dropped by the last of those holders: as a rule a thread that asks the engine, at its next entry of an engine (a decision, a lease's word or a read of the document) or at its end. A stage whose drop blocks holds that call meanwhile. A drop that panics there unwinds out of that call. It aborts the process where the call is made while the thread already unwinds, as a `DecisionGuard` dropped with a report owed speaks for its lease, and at a thread's end.
-
-The validator refuses unknown document fields and a non-null `kind`, wrong API version, malformed or duplicate map keys, invalid names or ranges, missing or conflicting bindings, missing plan sides, unsafe headers, unknown stages, unsupported active fields and stage factory errors. The one exception is the parameters of a scorer you register: its own type reads them, and must deny unknown fields to refuse one. A refusal can be about the whole document. The validator messages in these two examples also appear in startup or apply errors.
-
-<!-- refused -->
-```yaml
-apiVersion: smg.policy/v1
-profiles:
-  default:
-    filter: [ready]
-    pick: random
-```
-
-```text
-profile "default": unknown filter "ready"
-```
-
-<!-- refused -->
-```yaml
-apiVersion: smg.policy/v1
-profiles:
-  default:
-    score: [least-load]
-    pick:
-      best-with-temperature: { temperature: 0.5 }
-```
-
-```text
-profiles.default.pick: the best-with-temperature picker is not in this build
-```
+What a decision books, what the service refuses and how a spec is updated stand on [a page of their own](docs/guarantees.md).
 
 ### Explain and metrics
 

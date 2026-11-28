@@ -276,7 +276,7 @@ A gateway you host can call the standalone service. Use the generated client or 
 | Control | `PatchWorker`, `DeregisterWorker` | Guard by worker ID and revision. |
 | Control | `GetSnapshot` | The leader's redacted `SLICE_WORKERS` and `SLICE_SPEC`. |
 | Control | `Explain` | Read a sampled decision by gateway and request ID on the leader. |
-| Control | `ApplyPolicySpec`, `GetPolicySpec`, `RollbackPolicySpec` | Validate, read or change specs, as [Updating a document](../REFERENCE.md#updating-a-document) describes. |
+| Control | `ApplyPolicySpec`, `GetPolicySpec`, `RollbackPolicySpec` | Validate, read or change specs, as [Updating a spec](guarantees.md#updating-a-spec) describes. |
 | Control | `StepDown`, `WatchRegime` | Return `UNIMPLEMENTED` after admission. |
 | Replication | `Replicate` | A standby follows the leader's term. It replays retained events or restores a snapshot. |
 

@@ -40,7 +40,7 @@ These rules hold for the whole spec:
 | `bindings` | The bindings, in order. See [Bindings](#bindings). | Empty |
 | `explain.sample` | Each deciding thread keeps every Nth pick or shed it counts, for explain. N is 0 to 4294967295. | `0`: keeps none |
 
-A `generation` of zero asks the service to number the spec. See [Updating a policy spec](../REFERENCE.md#updating-a-document).
+A `generation` of zero asks the service to number the spec. See [Updating a policy spec](guarantees.md#updating-a-spec).
 
 In a host's own process the engine counts a request only where an id names it. See [Explain and metrics](../REFERENCE.md#explain-and-metrics).
 
@@ -624,8 +624,8 @@ The entry and its refusal names stand in [`encode.rs`](../src/engine/framework/e
 
 ## Where the rest stands
 
-A spec's life is in the reference:
+Updates and refusals stand on the guarantees page, and the presets in the reference:
 
-- [Updating a policy spec](../REFERENCE.md#updating-a-document)
-- [Decisions and refusals](../REFERENCE.md#decisions-and-refusals)
+- [Updating a policy spec](guarantees.md#updating-a-spec)
+- [Decisions and refusals](guarantees.md#decisions-and-refusals)
 - [The presets](../REFERENCE.md#presets), each as a whole spec
