@@ -34,9 +34,8 @@ use super::{InProcess, Loaded, PoolMembers};
 use crate::engine::{
     decision::Decision,
     decision_engine::{AlonePick, DecideOutcome, Request, RequestMaker},
-    explain::{DecisionRecord, SampleCount},
+    explain::{shadow::Shadowed, DecisionRecord, SampleCount},
     records,
-    shadow::Shadowed,
     view::Phase,
 };
 

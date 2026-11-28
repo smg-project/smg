@@ -82,8 +82,8 @@ use crate::{
     engine::{
         decision::Decision,
         decision_engine::{Request, RequestMaker},
+        explain::shadow::Shadowed,
         records::{DecisionClock, HeldCells, Live},
-        shadow::Shadowed,
         view::{Phase, RequestFacts},
     },
 };

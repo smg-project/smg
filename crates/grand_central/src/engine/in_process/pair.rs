@@ -114,7 +114,7 @@
 //! the decision alone ([`decide`]), nor an encode request's first
 //! decision. An encode request's decode decided again comes through this
 //! entry: its decode side is asked as a pair's is and counted under
-//! [`ShadowSide::DecodeAgain`](crate::engine::shadow::ShadowSide::DecodeAgain),
+//! [`ShadowSide::DecodeAgain`](crate::engine::explain::shadow::ShadowSide::DecodeAgain),
 //! with no count of its first decision beside it.
 
 use std::{
@@ -133,10 +133,9 @@ use crate::{
         decision::{shed, Decision, PairSide, ShedReason, Target, SUBSET_HINT, WIRES},
         decision_engine::{DecideOutcome, HeldDecision, Leased, Request},
         demands::{Demands, UnmetDemand},
-        framework::{Engine, Issuing, PairPools, Scratch, ShedOver},
+        framework::{pair_classes::PartnerClasses, Engine, Issuing, PairPools, Scratch, ShedOver},
         lease_events,
         list_cell::LentList,
-        pair_classes::PartnerClasses,
         records::{vetoes, with_shadow::Lends, HeldCells, Live, PoolRecords},
         sticky_sessions::{DecodeVerdict, SessionVerdict},
         view::{

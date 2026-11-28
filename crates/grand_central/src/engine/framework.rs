@@ -2,6 +2,20 @@
 //! picker; plans that sequence profiles; the engine that resolves a request
 //! to its binding and decides. A scorer or picker allocates nothing per
 //! decision: scratch lives in the per-thread [`Scratch`] the host keeps.
+//!
+//! Its child modules:
+//! - `alone`: which places of a document one pick of a picker decides.
+//! - `builder`: what a document's build gathers for the engine it makes.
+//! - `encode`: the encode side of a pair decision under the `epd` plan.
+//! - `encode_classes`: which encoders hand an encoded item to which prefills.
+//! - `engines`: the engine as a pick's unit.
+//! - `issuing`: the words an engine hears, and how it tells them to its stages.
+//! - `keyed`: a keyed decision over rows read one at a time.
+//! - `pair_classes`: the pair classes of two lists of workers.
+//! - `pair_pools`: a pair's two pools and the table of the classes that pair.
+//! - `places`: a request held to places of its pool.
+//! - `profiles`: the engine's profiles, as the engine answers for them.
+//! - `vetoed`: what a decision does when the overload veto leaves it no worker.
 
 use std::{
     any::Any,
@@ -50,9 +64,11 @@ use crate::{
 mod alone;
 mod builder;
 mod encode;
+pub(crate) mod encode_classes;
 mod engines;
 mod issuing;
 mod keyed;
+pub(crate) mod pair_classes;
 mod pair_pools;
 mod places;
 mod profiles;

@@ -22,8 +22,8 @@ use super::{with_buffers, Buffers, Live, PoolRecords};
 use crate::{
     engine::{
         decision::{Decision, ShadowKind},
+        explain::shadow::{budget_left, Shadow, Shadowed, SHADOW_FLOOR},
         framework::{release, Engine, ShadowRows},
-        shadow::{budget_left, Shadow, Shadowed, SHADOW_FLOOR},
         view::{Constraints, RequestFacts},
     },
     policies::consistent_hashing::LentRing,

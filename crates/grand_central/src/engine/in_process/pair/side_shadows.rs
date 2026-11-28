@@ -14,10 +14,10 @@
 use super::{decide_decode_records, decide_records, first_decode, Beside};
 use crate::engine::{
     decision::{Decision, PairSide, Pick, ShadowKind, Target},
+    explain::shadow::{budget_left, ShadowSide, Shadowed, SHADOW_FLOOR},
     framework::{PairPools, Scratch, ShadowRows},
     in_process::{with_shadow, Loaded},
     records::with_shadow::Lends,
-    shadow::{budget_left, ShadowSide, Shadowed, SHADOW_FLOOR},
     view::{Constraints, Phase, PoolFacts, RequestFacts, WorkerId},
 };
 // `Engine`, `decided` and `InProcess` are named only by doc links of this module.

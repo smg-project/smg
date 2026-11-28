@@ -15,11 +15,11 @@ use crate::{
     document::spec::{Assignment, ShadowSpec},
     engine::{
         decision::{LiftedVeto, ShadowKind},
+        explain::shadow::{ShadowSide, Shadowed, SHADOW_FLOOR},
         in_process::{
             place::{Made, PlaceRequest},
             with_shadow::tests::{Heard, Rule, Takes},
         },
-        shadow::{ShadowSide, Shadowed, SHADOW_FLOOR},
     },
     policies::consistent_hashing::{Head, LentRing},
 };

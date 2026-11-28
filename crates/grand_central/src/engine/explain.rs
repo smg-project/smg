@@ -3,6 +3,10 @@
 //!
 //! The engine in a gateway's own process counts on each calling thread and
 //! keeps one ring a document (`InProcess::explained`).
+//!
+//! Its child modules:
+//! - `json`: a kept decision as JSON, under the contract's field names.
+//! - `shadow`: a binding's shadow profile next to a live decision.
 
 #![cfg_attr(
     not(any(test, feature = "in-process")),
@@ -18,8 +22,8 @@ use crate::{
     document::spec::PlanName,
     engine::{
         decision::{Decision, ShadowKind},
+        explain::shadow::Shadowed,
         framework::{Engine, Plan},
-        shadow::Shadowed,
         view::{fingerprint, WorkerId},
     },
     store::GatewayId,
@@ -27,6 +31,7 @@ use crate::{
 
 #[cfg(feature = "in-process")]
 mod json;
+pub(crate) mod shadow;
 
 /// The maximum records a decider holds.
 const SLOTS: usize = 1_024;
