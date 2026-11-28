@@ -296,7 +296,7 @@ impl DispatchCreditPass<'_> {
             .get(&(row.id, row.dp_rank))
             .map_or_else(CreditedDispatches::default, |since| {
                 let sample = row.load.map_or(0, |_| row.load_sampled_at_micros);
-                let sent = since.sent_through(self.through(sample));
+                let (sent, estimated_tokens) = since.credited_through(self.through(sample));
                 // The count of sends of no stated size and their
                 // estimates are read apart from the other two: beside a
                 // send that lands between the reads the count is held to
@@ -305,7 +305,7 @@ impl DispatchCreditPass<'_> {
                     requests: sent.requests,
                     tokens: sent.tokens,
                     unsized_requests: sent.unsized_requests.min(sent.requests),
-                    estimated_tokens: since.estimated(),
+                    estimated_tokens,
                 }
             })
     }
