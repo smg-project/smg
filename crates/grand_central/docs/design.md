@@ -1164,7 +1164,12 @@ decision of a single request wrote whole for a list. Where its next such decisio
 the same rows, and reads the same session counts, it writes the live half over them and copies
 nothing. The load report comes from the
 load snapshot, a kept report included (decision 12), and is as old as its sample. A snapshot's
-reports are converted once for a list and cached. Until the list
+reports are converted once for a list and cached. The engine has no order of two snapshots and takes
+the decision that began later to hold the newer one: where that decision still holds the older
+snapshot, it can convert it over the newer rows, and the next decision under the newer snapshot then
+converts that one again: at most one such pair of conversions more each time a decision that still
+holds the older snapshot comes to the list, no new pair once the last of them has ended, and
+each decision reads the reports of its own snapshot throughout. Until the list
 holds them, a record written alone takes its report by one read of the snapshot, which looks
 among the kept reports too where it holds no entry of the worker: a drawn
 worker's, a worker's that a routing key names, and the held prefill's of a decode decided again.
@@ -1609,7 +1614,9 @@ What one decision writes:
 - a session pin, where a sessions rule decides;
 - the sample's ring, for a decision that is kept (decision 7);
 - the record of sent prefixes, where a cache-affinity profile decides;
-- once for each new load snapshot and list, the converted load reports, which allocates.
+- once for each new load snapshot and list, the converted load reports, which allocates; once more
+  each time a decision that still holds the snapshot before a publication converts it over the newer
+  rows, and each time the next decision under the newer snapshot converts its own again.
 
 On the short path a decision allocates only for what is kept for later decisions, among it:
 

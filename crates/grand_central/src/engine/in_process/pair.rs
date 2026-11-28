@@ -65,9 +65,11 @@
 //! No function here waits for a lock. A decision's records are written into
 //! buffers of the calling thread, so it allocates nothing once they have
 //! grown to the lists. The one exception stands under a snapshot of load
-//! reports: one decision converts a list's reports, at most once a
-//! published snapshot a list. It allocates the converted rows, under the
-//! list's claim, which is tried and never waited for
+//! reports: one decision at a time converts a list's reports, once a
+//! published snapshot a list. A decision that still holds the snapshot
+//! before it can convert that one over its rows, and the next decision
+//! under the newer snapshot then converts its own again. It allocates the
+//! converted rows, under the list's claim, which is tried and never waited for
 //! ([`PoolRecords::write`](crate::engine::records::PoolRecords::write)). A
 //! stage takes what it takes of its own state, where it scores a record by
 //! its report and where it hears a word. So does a request's maker, where
