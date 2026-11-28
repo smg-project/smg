@@ -109,8 +109,8 @@ impl PoolRecords {
             cx,
             scratch,
         );
-        prefills.paid(prefill_workers, prefill_live, prefill_singly.looked_up());
-        decodes.paid(decode_workers, decode_live, decode_singly.looked_up());
+        prefills.paid(&prefill_singly);
+        decodes.paid(&decode_singly);
         decision
     }
 }
