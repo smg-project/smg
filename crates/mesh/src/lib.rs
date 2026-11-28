@@ -19,6 +19,7 @@ mod types;
 
 // Internal tests module with full access to private types
 #[cfg(test)]
+#[path = "../tests/unit/tests/mod.rs"]
 mod tests;
 
 // Re-export commonly used types
