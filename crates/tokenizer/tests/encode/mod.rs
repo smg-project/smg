@@ -1,6 +1,7 @@
 //! Encode and decode integration tests: the encode paths, special tokens, vocabularies and their
 //! parity with the reference encoders.
 
+mod config_added_tokens;
 mod configured_special_tokens;
 mod encode_path_choice;
 mod native_encode_parity;
