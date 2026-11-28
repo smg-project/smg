@@ -108,24 +108,8 @@ pub fn round3(value: f64) -> f64 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn median_is_the_middle_or_the_mean_of_the_two_middles() {
-        assert_eq!(median(&[3.0, 1.0, 2.0]), Some(2.0));
-        assert_eq!(median(&[4.0, 1.0, 3.0, 2.0]), Some(2.5));
-        assert_eq!(median(&[]), None);
-    }
-
-    #[test]
-    fn python_float_text() {
-        assert_eq!(py_float(300.0), "300.0");
-        assert_eq!(py_float(0.589), "0.589");
-        assert_eq!(py_float(-2.0), "-2.0");
-        assert_eq!(round3(0.12345), 0.123);
-    }
-}
+#[path = "../tests/unit/tests.rs"]
+mod tests;
 
 /// A float the way Python's `format(value, f"{precision}g")` prints it: `precision`
 /// significant digits, trailing zeros dropped, scientific notation below 1e-4 or at
@@ -161,20 +145,5 @@ fn strip_zeros(text: &str) -> String {
 }
 
 #[cfg(test)]
-mod py_g_tests {
-    use super::py_g;
-
-    #[test]
-    fn general_format_matches_python() {
-        assert_eq!(py_g(300.5, 4), "300.5");
-        assert_eq!(py_g(300.0, 4), "300");
-        assert_eq!(py_g(1.55, 4), "1.55");
-        assert_eq!(py_g(500.0, 6), "500");
-        assert_eq!(py_g(1000.5, 6), "1000.5");
-        assert_eq!(py_g(0.0001234, 4), "0.0001234");
-        assert_eq!(py_g(0.00001234, 4), "1.234e-05");
-        assert_eq!(py_g(123456.0, 4), "1.235e+05");
-        assert_eq!(py_g(0.0, 4), "0");
-        assert_eq!(py_g(-2.5, 4), "-2.5");
-    }
-}
+#[path = "../tests/unit/py_g_tests.rs"]
+mod py_g_tests;
