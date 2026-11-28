@@ -2374,13 +2374,14 @@ fn a_table_goes_under_a_number_of_its_own_by_each_of_its_six_adders() {
     }
 }
 
-/// A profile is kept only where its stages bear the standing profile's
-/// names in their order: a factory that builds a stage of another name
-/// at a later call has its profile built new, and kept once the name
-/// stands again.
+/// A plain factory's every build is held to the name it is registered
+/// under: a factory that builds a stage of another name at a later call
+/// has its document refused at that validation, by both names. The
+/// standing document is as it was: once the factory answers its name
+/// again the next validation passes and keeps the standing profile.
 #[cfg(feature = "in-process")]
 #[test]
-fn a_profile_whose_factory_builds_a_stage_of_another_name_is_built_new() {
+fn a_profile_whose_factory_builds_a_stage_of_another_name_is_refused() {
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
     let calls = AtomicUsize::new(0);
@@ -2389,7 +2390,7 @@ fn a_profile_whose_factory_builds_a_stage_of_another_name_is_built_new() {
     let added = own.picker("turns", move || {
         let call = calls.fetch_add(1, Relaxed);
         Box::new(ReadsHashes(
-            ["turns", "turns", "another", "another"][call.min(3)],
+            ["turns", "turns", "another", "turns"][call.min(3)],
         ))
     });
     added.expect("a free name");
@@ -2400,12 +2401,18 @@ fn a_profile_whose_factory_builds_a_stage_of_another_name_is_built_new() {
         Arc::ptr_eq(&new.profiles()[0], &old.profiles()[0])
     };
     let standing = validated().expect("a valid document");
-    let mut next = validated().expect("a valid document");
-    next.keep_from(&standing);
-    assert!(!same(&next, &standing), "another name: built new");
-    let mut third = validated().expect("a valid document");
-    third.keep_from(&next);
-    assert!(same(&third, &next), "the same name again: kept");
+    let refused = validated().expect_err("another name");
+    let reason = r#"picker registered as "turns" answers the name "another""#;
+    assert_eq!(
+        refused,
+        SpecError::BadStage {
+            path: "profiles.p.pick.turns".to_string(),
+            reason: reason.to_string(),
+        }
+    );
+    let mut third = validated().expect("the registered name again");
+    third.keep_from(&standing);
+    assert!(same(&third, &standing), "the same name again: kept");
 }
 
 /// A profile is kept only where its stages say of themselves what the
@@ -2413,10 +2420,11 @@ fn a_profile_whose_factory_builds_a_stage_of_another_name_is_built_new() {
 /// that answers otherwise one thing a validation or the engine reads
 /// of a stage has its profile built new: the words it takes, the load
 /// reports, a need, a mark, its ranks, the rule of its heads, its
-/// warm-up ruling, a filter of another type under one name, the
-/// lifecycle's calls, or no ask for the count of sends. The other
-/// reader of its count of sends is kept, and the count with it. The
-/// same stage again is kept.
+/// warm-up ruling, the lifecycle's calls, or no ask for the count of
+/// sends. The other reader of its count of sends is kept, and the count
+/// with it. The same stage again is kept. A filter of the engine's own
+/// type under the guest's name is no such stage: it answers the name
+/// `healthy`, and its document is refused.
 #[cfg(feature = "in-process")]
 #[test]
 fn a_profile_whose_factory_builds_a_stage_that_says_otherwise_is_built_new() {
@@ -2494,8 +2502,8 @@ fn a_profile_whose_factory_builds_a_stage_that_says_otherwise_is_built_new() {
             (self.0 == 7).then_some(rule)
         }
     }
-    /// A guest filter that says what `healthy` says, and is no type of
-    /// the engine's own.
+    /// A guest filter that keeps the rows `healthy` keeps, under a name
+    /// of its own, and is no type of the engine's own.
     #[derive(Debug)]
     struct Wraps(&'static str);
     impl Filter for Wraps {
@@ -2529,13 +2537,12 @@ fn a_profile_whose_factory_builds_a_stage_that_says_otherwise_is_built_new() {
         Ok(Box::new(Says(said)))
     });
     added.expect("a free name");
-    // The registration asks the name once: `guest`. A validation then
-    // builds a filter that names itself `healthy`, the engine's own
-    // type at the last turn.
+    // The registration asks the name once, and each validation again:
+    // `guest`. At 8 the factory builds the engine's own type, which
+    // names itself `healthy`.
     let added = own.filter("guest", move || match filter.load(Relaxed) {
-        u8::MAX => Box::new(Wraps("guest")),
         8 => Box::new(Healthy),
-        _ => Box::new(Wraps("healthy")),
+        _ => Box::new(Wraps("guest")),
     });
     added.expect("a free name");
     // `p` and `q` read one count of sends, and `p` holds the guests.
@@ -2558,7 +2565,6 @@ fn a_profile_whose_factory_builds_a_stage_that_says_otherwise_is_built_new() {
         (5, "other ranks"),
         (6, "a rule of heads"),
         (7, "a warm-up ruling"),
-        (8, "a filter of another type"),
         (9, "the lifecycle's calls"),
         (10, "no ask for the count"),
     ];
@@ -2579,6 +2585,14 @@ fn a_profile_whose_factory_builds_a_stage_that_says_otherwise_is_built_new() {
         third.keep_from(&next);
         assert_eq!(kept(&third, &next), all, "{what}: the same stage again");
     }
+    // The engine's own filter under the guest's name: nothing is built
+    // to keep or to build anew.
+    says.store(8, Relaxed);
+    let refused = validated().expect_err("another name");
+    assert_eq!(
+        refused.to_string(),
+        r#"profiles.p.filter[0].guest: filter registered as "guest" answers the name "healthy""#
+    );
 }
 
 /// A spec that keeps one count of sends and builds a second, under

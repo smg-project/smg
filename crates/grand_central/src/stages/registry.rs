@@ -12,8 +12,10 @@
 //! A factory that takes no parameters builds a stage at registration to
 //! check its name and again for each use during validation. A factory that
 //! takes parameters builds during validation from each entry that names it.
-//! Under a name the engine refuses under neither builds during validation.
-//! Each validated policy owns its stages.
+//! Where one of those builds answers another name than the stage is
+//! registered under, the validator refuses the document. Under a name the
+//! engine refuses under neither builds during validation. Each validated
+//! policy owns its stages.
 //!
 //! A stage in code is the host's own binary, trusted as a built-in is: no
 //! sandbox and no budget. A policy that must change without a rebuild is a
@@ -93,6 +95,10 @@ pub(crate) enum Found<T: ?Sized, F = Infallible> {
     /// the validator refuses the document that names it, and the lookup
     /// runs no factory for it.
     Kept,
+    /// A plain factory's stage that answers another name than the one it
+    /// is held under, with the name it answered: the lookup drops the
+    /// stage, and the validator refuses the document that names it.
+    Misnamed(&'static str),
 }
 
 /// The parameters and profile state available to a stage's factory.
@@ -347,7 +353,7 @@ pub enum StageRegistryError {
     #[error("stage name {name:?} is already a {held}'s")]
     Held { name: &'static str, held: StageKind },
     /// The stage answers another name than the one it is registered under:
-    /// a document, a shed's reason and the stage itself say one name.
+    /// a document, a shed's reason and the stage itself are to say one name.
     #[error("the {kind} registered as {name:?} answers the name {answers:?}")]
     Misnamed {
         kind: StageKind,
@@ -364,7 +370,14 @@ pub enum StageRegistryError {
 /// by itself, such as [`BINDING`](crate::engine::BINDING) or
 /// [`TARGET_WORKER`](crate::engine::TARGET_WORKER), and validation refuses
 /// a document that names it: at the name it answers
-/// [`SpecError::BadStage`].
+/// [`SpecError::BadStage`]. A host asks
+/// [`refuses_under`](crate::engine::refuses_under) of a name before it
+/// ships a stage under it.
+///
+/// A stage answers the name it is registered under at every build. A
+/// registration asks a factory that takes no parameter once. Validation
+/// refuses a document that names a stage whose build answers another
+/// name.
 ///
 /// A running engine keeps a profile's stages from one document to the next
 /// (`InProcess::apply`) only where both were validated over the stock
@@ -454,6 +467,8 @@ impl StageRegistry {
     /// Adds a filter under `name`: a document names it as it names a
     /// built-in. It takes no parameter: a map written under its name is
     /// refused. Refused when the name is held or is not the filter's own.
+    /// Validation refuses a document that names it where a later build
+    /// answers another name.
     /// Built with no context, the filter resolves no signal: validation
     /// refuses one whose needs set `signal_cells`
     /// ([`Self::filter_with`] resolves one).
@@ -497,9 +512,10 @@ impl StageRegistry {
 
     /// Adds a scorer under `name`; a document gives it a weight, `{ name:
     /// { weight } }`, or names it bare at weight one. Refused when the name
-    /// is held or is not the scorer's own. Built with no context, the
-    /// scorer resolves no signal: validation refuses one whose needs set
-    /// `signal_cells` ([`Self::scorer_with`] resolves one).
+    /// is held or is not the scorer's own. Validation refuses a document
+    /// that names it where a later build answers another name. Built with
+    /// no context, the scorer resolves no signal: validation refuses one
+    /// whose needs set `signal_cells` ([`Self::scorer_with`] resolves one).
     pub fn scorer<F>(
         &mut self,
         name: &'static str,
@@ -540,9 +556,10 @@ impl StageRegistry {
 
     /// Adds a picker under `name`. It takes no parameter: a map written
     /// under its name is refused. Refused when the name is held or is not
-    /// the picker's own. Built with no context, the picker resolves no
-    /// signal: validation refuses one whose needs set `signal_cells`
-    /// ([`Self::picker_with`] resolves one).
+    /// the picker's own. Validation refuses a document that names it where
+    /// a later build answers another name. Built with no context, the
+    /// picker resolves no signal: validation refuses one whose needs set
+    /// `signal_cells` ([`Self::picker_with`] resolves one).
     pub fn picker<F>(
         &mut self,
         name: &'static str,
@@ -636,17 +653,17 @@ impl StageRegistry {
 
     /// The filter a document names, or how the validator builds it.
     pub(crate) fn find_filter(&self, name: &str) -> Option<Found<dyn Filter, &FilterFactory>> {
-        find(&self.filters, name, Box::as_ref)
+        find(&self.filters, name, Filter::name, Box::as_ref)
     }
 
     /// The scorer a document names, or how the validator builds it.
     pub(crate) fn find_scorer(&self, name: &str) -> Option<Found<dyn Scorer, &ScorerFactory>> {
-        find(&self.scorers, name, Box::as_ref)
+        find(&self.scorers, name, Scorer::name, Box::as_ref)
     }
 
     /// The picker a document names, or how the validator builds it.
     pub(crate) fn find_picker(&self, name: &str) -> Option<Found<dyn Picker, &PickerFactory>> {
-        find(&self.pickers, name, Box::as_ref)
+        find(&self.pickers, name, Picker::name, Box::as_ref)
     }
 }
 
@@ -654,19 +671,29 @@ impl StageRegistry {
 /// behind the three kinds. A name the engine refuses under ([`KEPT`]) that
 /// a stage of the kind holds answers [`Found::Kept`], ahead of any build:
 /// no factory runs for it. One that no stage of the kind holds answers
-/// `None`, as any other name does.
+/// `None`, as any other name does. A plain factory's stage is asked its
+/// name (`answers`) at every build, as a registration asks it once: one
+/// that answers another name than the one it is held under is dropped
+/// here ([`Found::Misnamed`]).
 fn find<'a, T: ?Sized, B, F>(
     held: &'a [(&'static str, Build<T, B>)],
     name: &str,
+    answers: impl FnOnce(&T) -> &'static str,
     factory_ref: impl FnOnce(&'a B) -> F,
 ) -> Option<Found<T, F>> {
-    let (_, build) = held.iter().find(|(held, _)| *held == name)?;
+    let (under, build) = held.iter().find(|(held, _)| *held == name)?;
     if KEPT.contains(&name) {
         return Some(Found::Kept);
     }
     Some(match build {
         Build::Typed => Found::Typed,
-        Build::Factory(factory) => Found::Built(factory()),
+        Build::Factory(factory) => {
+            let stage = factory();
+            match answers(&stage) {
+                said if said == *under => Found::Built(stage),
+                said => Found::Misnamed(said),
+            }
+        }
         Build::With(factory) => Found::With(factory_ref(factory)),
     })
 }

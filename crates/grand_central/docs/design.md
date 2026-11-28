@@ -513,7 +513,8 @@ The built-in stages:
 A program that embeds the crate can add stages of its own under new names
 (`StageRegistry::filter`, `scorer`, `picker`) and validate documents against that table.
 The engine keeps the names it refuses under. The registry takes a host's stage of such a name, and
-the check refuses a document that names it.
+the check refuses a document that names it. A stage answers the name it is registered under at
+every build, or the check refuses the document that names it.
 
 **[built]** One default method is shown, `balances_load_against_affinity`: a scorer of a program's
 own that weighs load against affinity must answer it, because a pair's lift rests on it. A scorer
@@ -978,10 +979,11 @@ the host's own reads the places its code names. So a kept stage and one built an
 header under any list. A binding names its headers by name, and every binding is built new.
 
 A profile is built anew too where one of its stages, built again, says otherwise of itself than the
-standing one. That is another name, other words of a request's life to hear, or anything else the
-engine reads of a stage when it builds a profile. The words to hear and `Lifecycle::keeps_loads`
-are compared as the two stages answer at the apply, and as each answered at its own build. A
-factory of the host's own may build such a stage.
+standing one. That is other words of a request's life to hear, or anything else the engine reads
+of a stage when it builds a profile. The words to hear and `Lifecycle::keeps_loads` are compared
+as the two stages answer at the apply, and as each answered at its own build. A factory of the
+host's own may build such a stage. A stage built again under another name is no such stage: the
+check refuses its document.
 
 A count of sends stands where a profile that reads it is kept. A profile built new beside it reads
 the same count, and a send is counted once. A count none of whose readers is kept is built new, and

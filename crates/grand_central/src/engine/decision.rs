@@ -1131,6 +1131,19 @@ pub const TARGET_WORKER: &str = "target-worker";
 /// it.
 pub const BINDING: &str = "binding";
 
+/// Whether `name` is one of the engine's own refusal words: a name the
+/// engine sheds or declines under that no stock stage bears. The registry
+/// takes a host's stage of such a name, and no document can name that
+/// stage, so a host asks this of a name before it ships a stage. The
+/// public [`BINDING`] and [`TARGET_WORKER`] are among the words. A stock
+/// stage's name is none of them: the registry itself refuses a host's
+/// stage under one. The name is matched whole and by case. A later
+/// release may keep more names.
+#[must_use]
+pub fn refuses_under(name: &str) -> bool {
+    KEPT.contains(&name)
+}
+
 /// The stage a pool is shed under when none of its rows takes the pixels
 /// its request holds, an image or a video: the `epd` plan's vision rule
 /// sheds under it, and so does a request's vision demand
@@ -1248,13 +1261,16 @@ pub(crate) const CONTROLLER: &str = "controller";
 /// stage of such a name, and the validator refuses a document that names
 /// it, and at the name it answers
 /// [`SpecError::BadStage`](crate::document::SpecError::BadStage): no
-/// document runs a stage registered under one. A stage can still bear
-/// such a name in ways the validator does not see. Three are known: a
-/// profile a host builds in code, a plain factory whose later build
-/// answers another name than it registered under, and a stage that
-/// answers one name where the registry or the validator asks it and
-/// another at a decision. Under [`CONTROLLER`] the client's door also
-/// reads a stage of the controller's own document.
+/// document runs a stage registered under one. The validator holds a
+/// stage to its registered name at every build, so no stage it builds
+/// answers such a name then. A stage can still bear one in ways the
+/// validator does not see. Two are known: a profile a host builds in
+/// code, and a stage that answers one name where the registry or the
+/// validator asks it and another behind that: where the engine is built,
+/// where a profile is kept, or at a decision. A host asks
+/// [`refuses_under`] of a name before it ships a stage. Under
+/// [`CONTROLLER`] the client's door also reads a stage of the
+/// controller's own document.
 pub(crate) const KEPT: [&str; 28] = [
     WIRES,
     SUBSET_HINT,
