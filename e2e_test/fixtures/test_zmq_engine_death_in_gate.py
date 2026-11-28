@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 from infra.constants import ENV_STARTUP_TIMEOUT, ConnectionMode
+from infra.no_startup_profile import no_startup_profile  # noqa: F401
 from infra.process_utils import ProcessExitedError
 
 setup = import_module("fixtures.setup_backend")

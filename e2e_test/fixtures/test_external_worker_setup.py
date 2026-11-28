@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 from fixtures import hooks
 from infra.constants import DEFAULT_MODEL, ENV_MODEL, ConnectionMode
+from infra.no_startup_profile import no_startup_profile  # noqa: F401
 from infra.worker import Worker
 
 setup = importlib.import_module("fixtures.setup_backend")

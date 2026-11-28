@@ -3,6 +3,7 @@
 import importlib
 
 from infra import ENV_STARTUP_TIMEOUT, ConnectionMode
+from infra.no_startup_profile import no_startup_profile  # noqa: F401
 
 # The package's ``setup_backend`` is the fixture; the module holds the helper.
 setup = importlib.import_module("fixtures.setup_backend")
