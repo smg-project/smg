@@ -4427,8 +4427,8 @@ The move stays, on a prefill that took no request.
 
 The engine's prefill side places the request again and moves no pin. A prefill whose partners
 leave no decode is passed over. The pin moves where the pair forms, to the prefill the pair formed
-on and ahead of any dispatch (`Engine::decide_pair` in `engine/framework.rs`). A decision that forms
-no pair moves none.
+on and ahead of any dispatch (`Engine::decide_pair` in `engine/framework/pair.rs`). A decision that
+forms no pair moves none.
 
 So behind a pair that fails past its prefill's selection, the key's next request finds the pin
 moved under classic and where it stood under the engine.
