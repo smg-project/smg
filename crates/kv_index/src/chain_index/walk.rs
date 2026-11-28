@@ -131,7 +131,7 @@ impl ChainIndex {
         // Only the words that can carry a holder: reading all sixteen of a thousand-worker
         // index per run visited, and sweeping them three times, was most of a lookup's cost
         // in a fleet of eight.
-        let words = self.live_words.load(Ordering::Acquire).min(self.words);
+        let words = self.coverage_words();
         let mut alive = [0u64; MAX_WORDS];
         // The partial-holder entries of the run in hand live in a per-thread buffer: a walk
         // writes the prefix it then reads, so nothing is zeroed per lookup (the 8 KB this
@@ -156,8 +156,8 @@ impl ChainIndex {
                     .count();
                 let coverage = self.slab.coverage(run_id);
                 let mut held = [0u64; MAX_WORDS];
-                for (word, slot) in held[..words].iter_mut().zip(coverage) {
-                    *word = slot.load(Ordering::Relaxed);
+                for (index, word) in held[..words].iter_mut().enumerate() {
+                    *word = coverage.word(index);
                 }
                 // The partial-holder table is another line of the arena: read it only when it
                 // can change the answer, that is at the first run (every entry is a holder there)
@@ -182,8 +182,8 @@ impl ChainIndex {
                             partials += 1;
                         }
                     }
-                    for (word, slot) in held[..words].iter_mut().zip(coverage) {
-                        *word |= slot.load(Ordering::Relaxed);
+                    for (index, word) in held[..words].iter_mut().enumerate() {
+                        *word |= coverage.word(index);
                     }
                 }
                 let next = if position + matched < content_hashes.len() {

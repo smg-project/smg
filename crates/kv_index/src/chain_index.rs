@@ -192,7 +192,8 @@ pub struct ChainIndexStats {
     /// Bytes the word arena holds from the process allocator: whole chunks (8 MiB each), the
     /// first taken by the first array or table and each kept once taken.
     pub arena_chunk_bytes: usize,
-    /// Bytes of run headers, coverage words included (all allocated runs).
+    /// Bytes of the headers of all allocated runs, the first coverage word of each included.
+    /// The words a chunk made past the first are counted in `slab_bytes`.
     pub header_bytes: usize,
     /// Bytes the run slab holds from the process allocator: whole chunks of headers and coverage
     /// words, used or not.
@@ -275,10 +276,6 @@ pub struct ChainIndex {
     /// Stores whose blocks carried the engine hashes the index holds for other content.
     landing_mismatches: AtomicUsize,
     /// Blocks a store moved to another place for their worker (the old membership released).
-    /// Coverage words a lookup has to read: enough for the highest worker id interned so far
-    /// (ids are handed out densely and reused), at most `words`. An index sized for a thousand
-    /// workers that serves eight reads one word per run instead of sixteen.
-    live_words: AtomicUsize,
     moved_hashes: AtomicUsize,
     /// Splits by cause and runs unlinked, always counted (one relaxed increment per split or
     /// death): the fragmentation figures a churn harness and the gateway's gauges read.
@@ -398,8 +395,11 @@ impl ChainIndex {
         self.arena.cap_words = words;
     }
 
-    /// An index for up to `max_workers` interned workers (at most 1024); coverage costs one bit
-    /// per worker per run, rounded up to 64.
+    /// An index for up to `max_workers` interned workers (at most 1024). A chunk of runs made
+    /// before the index has had more than 64 workers interned at once lays one word per run, and
+    /// the rest of the ceiling once a worker of a later word holds a whole run there; a chunk
+    /// made after that lays the whole ceiling, also once the pool has shrunk: the bound only
+    /// rises.
     pub fn with_max_workers(max_workers: usize) -> Self {
         let max_workers = max_workers.clamp(1, MAX_WORDS * 64);
         let words = max_workers.div_ceil(64);
@@ -436,7 +436,6 @@ impl ChainIndex {
             engine_conflicts: AtomicUsize::new(0),
             cap_refusals: AtomicUsize::new(0),
             landing_mismatches: AtomicUsize::new(0),
-            live_words: AtomicUsize::new(0),
             moved_hashes: AtomicUsize::new(0),
             splits_branch: AtomicUsize::new(0),
             splits_hole: AtomicUsize::new(0),
@@ -493,7 +492,8 @@ impl ChainIndex {
                         let id = (registry.names.len() - 1) as u32;
                         // Published before the id can hold anything: the worker's first store
                         // comes after this returns.
-                        self.live_words
+                        self.slab
+                            .live_words
                             .fetch_max(id as usize / 64 + 1, Ordering::Release);
                         id
                     }
@@ -948,11 +948,18 @@ impl ChainIndex {
         }
     }
 
+    /// Coverage words that can carry a holder: see the slab's `live_words`. An id is published
+    /// there before its first store, so a walk of a whole coverage reads these and no further.
+    #[inline]
+    fn coverage_words(&self) -> usize {
+        self.slab.live_words.load(Ordering::Acquire).min(self.words)
+    }
+
     /// Blocks of a run held by at least one worker: all of them while anybody holds the whole
     /// run, otherwise the longest partial prefix.
     fn held_len(&self, run_id: u32) -> usize {
         let run = self.slab.run(run_id);
-        if coverage_is_empty(self.slab.coverage(run_id)) {
+        if coverage_is_empty(self.slab.coverage(run_id), self.coverage_words()) {
             self.arena.partial_max(run.partials.load(Ordering::Relaxed))
         } else {
             run.len()
@@ -960,7 +967,7 @@ impl ChainIndex {
     }
 
     fn has_holders(&self, run_id: u32) -> bool {
-        !coverage_is_empty(self.slab.coverage(run_id))
+        !coverage_is_empty(self.slab.coverage(run_id), self.coverage_words())
             || self
                 .arena
                 .table_live(self.slab.run(run_id).partials.load(Ordering::Relaxed))
@@ -1112,7 +1119,8 @@ impl ChainIndex {
             .filter(|(_, cutoff)| *cutoff as usize > at)
             .map(|&(worker, cutoff)| (worker, cutoff - at as u32))
             .collect();
-        let suffix_held = !coverage_is_empty(coverage) || !beyond.is_empty();
+        let words = self.coverage_words();
+        let suffix_held = !coverage_is_empty(coverage, words) || !beyond.is_empty();
         // Children hang off any offset of the run: those past `at` move to the suffix, keyed by
         // their offset within it; the rest stay. Decided under the version step, after
         // the inserts in flight have landed, so none is missed.
@@ -1158,9 +1166,7 @@ impl ChainIndex {
                 },
             );
             let suffix = self.slab.run(suffix_id);
-            for (slot, word) in self.slab.coverage(suffix_id).iter().zip(coverage) {
-                slot.store(word.load(Ordering::Relaxed), Ordering::Relaxed);
-            }
+            coverage.copy_into(self.slab.coverage(suffix_id), words);
             for &(_, child, _) in &moved {
                 self.slab
                     .run(child)
@@ -1775,7 +1781,7 @@ impl ChainIndex {
             && run_id != ROOT
             && children == NONE
             && run.forwards.load(Ordering::Relaxed) == NONE
-            && covered_only_by(coverage, worker);
+            && covered_only_by(coverage, worker, self.coverage_words());
         let (target, first) = if own_leaf {
             self.append(run, &contents, &engines)?;
             (run_id, len)
@@ -2138,18 +2144,8 @@ impl ChainIndex {
                 .collect();
             if let [only] = children[..] {
                 let (child_window, _) = self.slab.run(only).snapshot();
-                let parent_words: Vec<u64> = self
-                    .slab
-                    .coverage(run_id)
-                    .iter()
-                    .map(|w| w.load(Ordering::Relaxed))
-                    .collect();
-                let child_words: Vec<u64> = self
-                    .slab
-                    .coverage(only)
-                    .iter()
-                    .map(|w| w.load(Ordering::Relaxed))
-                    .collect();
+                let parent_words = self.slab.coverage(run_id).to_words();
+                let child_words = self.slab.coverage(only).to_words();
                 let same_coverage = parent_words == child_words;
                 let subset = parent_words
                     .iter()
@@ -2181,7 +2177,7 @@ impl ChainIndex {
             arena_bytes: self.arena.used() as usize * size_of::<AtomicU64>(),
             arena_free_bytes: self.arena.free_words() * size_of::<AtomicU64>(),
             arena_chunk_bytes: self.arena.chunk_bytes(),
-            header_bytes: allocated * (size_of::<Run>() + self.words * size_of::<AtomicU64>()),
+            header_bytes: allocated * (size_of::<Run>() + size_of::<AtomicU64>()),
             slab_bytes: self.slab.chunk_bytes(),
             engine_conflicts: self.engine_conflicts.load(Ordering::Relaxed),
             cap_refusals: self.cap_refusals.load(Ordering::Relaxed),
