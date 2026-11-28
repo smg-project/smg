@@ -146,6 +146,19 @@ async fn the_bind_draws_its_logs_first_place() {
     assert!(starts.iter().all(|start| start.seq != 0 && start.term == 0));
 }
 
+/// A controller hands out the fence its bind took from its candidate: a
+/// candidate a case puts in behind the bind has another, and the
+/// controller's stays the bind's.
+#[tokio::test]
+async fn a_controller_hands_out_the_fence_its_bind_took() {
+    let mut controller = Controller::bind(valid()).await.expect("the listeners bind");
+    let bound = controller.fence();
+    controller.elector = Elector::alone("controller-0@127.0.0.1:1", ElectionSettings::default())
+        .expect("the settings are in order");
+    assert!(Arc::ptr_eq(&controller.fence(), &bound));
+    assert!(!Arc::ptr_eq(&controller.elector.fence(), &bound));
+}
+
 /// The thread gone at its take, before the serve read ready, and at its
 /// first renewal, after: the serve ends with the error either way, so
 /// the process exits and its supervisor starts it again.
@@ -191,7 +204,7 @@ async fn a_served_controller_decides_under_its_next_term_past_a_terms_mark() {
     });
     let case = async {
         let (wait, begun) = (Duration::from_secs(20), Instant::now());
-        while shared.fence.leader_term(Instant::now()).is_none() {
+        while shared.leading(Instant::now()).is_none() {
             assert!(begun.elapsed() < wait, "no first take");
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -234,7 +247,7 @@ async fn a_served_controller_keeps_no_sent_prefixes_of_a_model_whose_workers_lef
     });
     let case = async {
         let (wait, begun) = (Duration::from_secs(20), Instant::now());
-        while shared.fence.leader_term(Instant::now()).is_none() {
+        while shared.leading(Instant::now()).is_none() {
             assert!(begun.elapsed() < wait, "no first take");
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -282,7 +295,7 @@ async fn a_served_controller_lays_a_worker_written_through_its_holder() {
     });
     let case = async {
         let (wait, begun) = (Duration::from_secs(20), Instant::now());
-        while shared.fence.leader_term(Instant::now()).is_none() {
+        while shared.leading(Instant::now()).is_none() {
             assert!(begun.elapsed() < wait, "no first take");
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -334,7 +347,7 @@ async fn a_served_controller_probes_its_rows_while_it_leads() {
     });
     let case = async {
         let (wait, begun) = (Duration::from_secs(20), Instant::now());
-        while shared.fence.leader_term(Instant::now()).is_none() {
+        while shared.leading(Instant::now()).is_none() {
             assert!(begun.elapsed() < wait, "no first take");
             tokio::time::sleep(Duration::from_millis(5)).await;
         }

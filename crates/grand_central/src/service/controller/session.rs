@@ -162,7 +162,7 @@ impl Answers {
     /// The `NotLeader` of a replica whose fence read closed: the leader
     /// `Leader` names, under the highest term this replica knows.
     async fn not_leader(&mut self, shared: &Shared) {
-        let leader = shared.leader(None);
+        let leader = shared.leader_elsewhere();
         let frame = controller_frame::Frame::NotLeader(proto::NotLeader {
             leader_address: leader.address,
             successor_id: String::new(),
@@ -265,7 +265,7 @@ async fn session(
     // the open and the loop after the Welcome hears on. Every mark of it
     // is made before the session's read of the fence, so no step after
     // that read is missed.
-    let mut steps = shared.standing.clone();
+    let mut steps = shared.steps();
     steps.mark_unchanged();
     let mut election = true;
     let first = {
@@ -291,7 +291,7 @@ async fn session(
                         // The election is gone with the run loop: the deadline
                         // bounds the wait.
                         election = false;
-                    } else if shared.fence.leader_term(Instant::now()).is_none() {
+                    } else if shared.leading(Instant::now()).is_none() {
                         return Some(not_leading(shared, answers).await);
                     }
                 }
@@ -323,7 +323,7 @@ async fn session(
         return Some(status);
     }
     // One read: the verdict and the term the Welcome carries.
-    let Some(term) = shared.fence.leader_term(now) else {
+    let Some(term) = shared.leading(now) else {
         return Some(not_leading(shared, answers).await);
     };
     if let Some(status) = floor(shared, &principal.subject, first.term_floor, term) {
@@ -422,7 +422,7 @@ async fn session(
 /// The fence's verdict at `now` on a session welcomed under `term`:
 /// `None` while the fence shows that term.
 async fn fenced(shared: &Shared, term: u64, now: Instant, answers: &mut Answers) -> Option<Status> {
-    match shared.fence.leader_term(now) {
+    match shared.leading(now) {
         Some(shown) if shown == term => None,
         Some(later) => Some(Status::aborted(format!(
             "this controller leads under term {later} now and welcomed the session under term {term}: say Hello again"

@@ -464,7 +464,7 @@ impl Log {
     /// the log's term is `term` and the store's own writes stand under it.
     /// A refusal carries the term the log stands at, so no caller reads the
     /// log again for its words. Four callers read it, each in its own
-    /// turn: the service's guard, the replication's check, the door's check
+    /// turn: the election's reader, the replication's check, the door's check
     /// of its term and the door's word for a status it writes. The check
     /// runs ahead of a life's mint, of each row a registration writes or
     /// removes and of a refresh's write, and once more behind a write the
