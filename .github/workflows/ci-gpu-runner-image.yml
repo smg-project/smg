@@ -306,6 +306,7 @@ jobs:
     if: >-
       always()
       && github.repository == 'smg-project/smg'
+      && github.ref == 'refs/heads/main'
       && needs.build-backend-carriers.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 10

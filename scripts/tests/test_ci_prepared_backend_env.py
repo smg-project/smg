@@ -378,6 +378,71 @@ os.execv({sys.executable!r}, [{sys.executable!r}] + sys.argv[1:])
         self.assertIn("apt-get install", self.commands())
         self.assertNotIn("sudo ", self.commands())
 
+    def test_missing_host_c_compiler_is_installed_even_when_python_headers_exist(self):
+        # Simulate a bare pod where Python.h is present but gcc/g++ are absent from PATH.
+        isolated_bin = self.root / "no-gcc-bin"
+        isolated_bin.mkdir()
+        for tool in (
+            "bash",
+            "dirname",
+            "pwd",
+            "cat",
+            "rm",
+            "cp",
+            "mv",
+            "grep",
+            "sed",
+            "awk",
+            "sleep",
+            "chmod",
+        ):
+            resolved = shutil.which(tool)
+            if resolved:
+                (isolated_bin / tool).symlink_to(resolved)
+        for tool in ("python3", "id", "curl", "dpkg"):
+            shutil.copy(self.tools / tool, isolated_bin / tool)
+        sudo_stub = isolated_bin / "sudo"
+        sudo_stub.write_text('#!/bin/bash\necho "sudo $*" >> "$TEST_LOG"\nexec "$@"\n')
+        sudo_stub.chmod(0o755)
+        apt_stub = isolated_bin / "apt-get"
+        apt_stub.write_text(
+            f"""#!/bin/bash
+echo "apt-get $*" >> "$TEST_LOG"
+if [ "$1" = install ]; then
+    for compiler in gcc g++; do
+        printf '#!/bin/sh\\nexit 0\\n' > "{isolated_bin}/$compiler"
+        chmod +x "{isolated_bin}/$compiler"
+    done
+fi
+"""
+        )
+        apt_stub.chmod(0o755)
+        result = self.run_script("ci_ensure_python_headers.sh", PATH=str(isolated_bin))
+        self.assertIn("Host JIT toolchain missing (gcc/g++)", result.stdout)
+        self.assertIn(
+            "apt-get install -y --no-install-recommends gcc g++ libc6-dev", self.commands()
+        )
+
+    def test_trtllm_prefers_validated_cuda13_home_over_stale_default_dir(self):
+        stale_default = self.root / "stale-cuda-13.0"
+        (stale_default / "bin").mkdir(parents=True)
+        stale_nvcc = stale_default / "bin/nvcc"
+        stale_nvcc.write_text("#!/bin/sh\necho 'Cuda compilation tools, release 12.8'\n")
+        stale_nvcc.chmod(0o755)
+
+        venv = self.make_prepared("trtllm")
+        self.run_script("ci_setup_python_venv.sh", SMG_CI_BACKEND="trtllm")
+        self.assertEqual(self.job.joinpath(".venv").resolve(), venv)
+        Path(self.env["GITHUB_ENV"]).write_text("")
+        self.run_script(
+            "ci_install_trtllm.sh",
+            SMG_TRTLLM_CUDA13_DIR=str(stale_default),
+        )
+        self.assertNotIn("apt-get", self.commands())
+        github_env = Path(self.env["GITHUB_ENV"]).read_text()
+        self.assertIn(f"CUDA_HOME={self.env['CUDA_HOME']}", github_env)
+        self.assertNotIn(f"CUDA_HOME={stale_default}", github_env)
+
     def test_sglang_prepared_unset_transport_repairs_missing_rdma_libs(self):
         self.metadata("torch", "2.13.0")
         self.write_torch("13.0")

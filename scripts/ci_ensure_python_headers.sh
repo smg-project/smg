@@ -1,23 +1,24 @@
 #!/bin/bash
-# Guarantee the CPython development headers for the CI venv's interpreter.
+# Guarantee the CPython development headers and host C/C++ compiler for the CI
+# venv's interpreter.
 #
-# Triton (and torch's cpp_extension) compile C sources against the interpreter's
-# headers at RUNTIME, not at install time: the first Triton kernel build looks
-# for Python.h and, when it is missing, every vLLM worker dies inside the engine
-# profile run with
+# Triton, torch's cpp_extension, and nvcc (SGLang/FlashInfer/TRT-LLM) compile C
+# and C++ sources against the interpreter's headers at RUNTIME, not at install
+# time. Without Python.h or gcc/g++, workers die during startup JIT builds with:
 #
 #   fatal error: Python.h: No such file or directory
-#   torch._inductor.exc.InductorError: CalledProcessError: gcc ... cuda_utils.c
+#   RuntimeError: Failed to find C compiler. Please specify via CC environment variable
+#   gcc: No such file or directory / nvcc fatal: Failed to preprocess host compiler properties
 #
-# (TokenSpeed reports the same failure as "Triton is not supported on the
-# current platform".)
+# (TokenSpeed reports the missing header as "Triton is not supported on the
+# current platform", and go-bindings-e2e silently falls back to CGO_ENABLED=0
+# when gcc is absent.)
 #
-# Whether the headers exist depends on how ci_setup_python_venv.sh obtained the
-# interpreter: a uv-provisioned CPython bundles them in its own prefix, while a
-# host interpreter only has them if python3.X-dev is installed. That package
-# used to arrive by accident, as an apt Recommends of python3-pip pulled in by
-# the venv script's repair path, so a host whose `python3 -m venv` just works
-# (Ubuntu 24.04 bare-metal runners) never gets it. Install it explicitly.
+# Both Python.h and gcc/g++ used to arrive by accident on bare pods via the
+# Recommends of `apt-get install -y python3-pip` in ci_setup_python_venv.sh's
+# repair path (or via apt-installed cuda-nvcc/cuda-toolkit). Adopting a prebuilt
+# carrier venv + NVMe-cached CUDA toolkit skips both apt installs, so install
+# whichever host pieces are missing explicitly here.
 #
 # Called by the engine install scripts (ci_install_{vllm,sglang,trtllm,
 # tokenspeed}.sh) right after they activate the venv. Deliberately NOT part of
@@ -43,27 +44,44 @@ if [ -z "$PYTHON" ]; then
 fi
 
 include_dir="$("$PYTHON" -c 'import sysconfig; print(sysconfig.get_paths(scheme="posix_prefix")["include"])')"
-if [ -f "${include_dir}/Python.h" ]; then
-    echo "Python headers: present at ${include_dir}"
+missing_pkgs=()
+missing_desc=()
+
+if [ ! -f "${include_dir}/Python.h" ]; then
+    py_version="$("$PYTHON" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+    missing_pkgs+=("python${py_version}-dev")
+    missing_desc+=("Python.h (${include_dir})")
+fi
+
+if ! command -v gcc &> /dev/null || ! command -v g++ &> /dev/null; then
+    missing_pkgs+=(gcc g++ libc6-dev)
+    missing_desc+=("gcc/g++")
+fi
+
+if [ ${#missing_pkgs[@]} -eq 0 ]; then
+    echo "Python headers and C/C++ compiler: present (${include_dir})"
     exit 0
 fi
 
-py_version="$("$PYTHON" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
-echo "Python.h missing from ${include_dir}; installing python${py_version}-dev"
+echo "Host JIT toolchain missing (${missing_desc[*]}); installing ${missing_pkgs[*]}"
 if ! command -v apt-get &> /dev/null; then
-    echo "ERROR: no apt-get to install python${py_version}-dev with" >&2
+    echo "ERROR: no apt-get to install ${missing_pkgs[*]} with" >&2
     exit 1
 fi
 export DEBIAN_FRONTEND=noninteractive
 bash "${SCRIPT_DIR}/ci_apt_mirror.sh"
 $RETRY 3 10 $SUDO apt-get update -qq
-$RETRY 3 10 $SUDO apt-get install -y --no-install-recommends "python${py_version}-dev"
+$RETRY 3 10 $SUDO apt-get install -y --no-install-recommends "${missing_pkgs[@]}"
 
-# Fail here rather than 20 minutes later inside a Triton JIT compile. A miss
+# Fail here rather than 20 minutes later inside a Triton/nvcc JIT compile. A miss
 # after a successful install means the interpreter is not the distro one (its
-# include dir is elsewhere), which apt cannot fix.
+# include dir is elsewhere) or the compiler is not on PATH.
 if [ ! -f "${include_dir}/Python.h" ]; then
-    echo "ERROR: python${py_version}-dev did not provide ${include_dir}/Python.h" >&2
+    echo "ERROR: ${include_dir}/Python.h still missing after apt-get install" >&2
     exit 1
 fi
-echo "Python headers: installed at ${include_dir}"
+if ! command -v gcc &> /dev/null || ! command -v g++ &> /dev/null; then
+    echo "ERROR: gcc/g++ still missing from PATH after apt-get install" >&2
+    exit 1
+fi
+echo "Python headers and C/C++ compiler: installed (${include_dir})"

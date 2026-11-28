@@ -103,7 +103,7 @@ class JitCacheSetupTests(unittest.TestCase):
         self.assertIn("Enabled persistent JIT cache", result.stdout)
         triton_dir = Path(exported["TRITON_CACHE_DIR"])
         entry = triton_dir.parent
-        self.assertTrue(entry.name.startswith("vllm-sm90-drv580-"), entry.name)
+        self.assertTrue(entry.name.startswith("vllm-untrusted-sm90-drv580-"), entry.name)
         self.assertEqual(exported["FLASHINFER_WORKSPACE_BASE"], str(entry / "flashinfer"))
         self.assertEqual(exported["VLLM_CACHE_ROOT"], str(entry / "vllm"))
         self.assertEqual(exported["TORCHINDUCTOR_CACHE_DIR"], str(entry / "torchinductor"))
@@ -122,15 +122,66 @@ class JitCacheSetupTests(unittest.TestCase):
             self.assertTrue(Path(exported[key]).is_dir(), key)
         manifest = (entry / "manifest.txt").read_text()
         self.assertIn("pkg.vllm=0.31.0", manifest)
+        self.assertIn("trust_tier=untrusted", manifest)
         self.assertIn("gpu_arch=sm90-drv580", manifest)
 
     def test_amd_keys_by_gcn_arch_and_omits_cuda_cache_path(self):
         result, exported = self.run_setup("vllm", E2E_GPU_VENDOR="amd", FAKE_ROCM_ARCH="gfx942")
         self.assertEqual(result.returncode, 0, result.stderr)
         entry = Path(exported["TRITON_CACHE_DIR"]).parent
-        self.assertTrue(entry.name.startswith("vllm-gfx942"), entry.name)
+        self.assertTrue(entry.name.startswith("vllm-untrusted-gfx942"), entry.name)
         self.assertNotIn("CUDA_CACHE_PATH", exported)
         self.assertEqual(exported["VLLM_CACHE_ROOT"], str(entry / "vllm"))
+
+    def test_trusted_main_and_pull_request_entries_are_isolated(self):
+        _, pr_exp = self.run_setup(
+            "vllm", GITHUB_EVENT_NAME="pull_request", GITHUB_REF="refs/pull/8969/merge"
+        )
+        _, branch_dispatch = self.run_setup(
+            "vllm", GITHUB_EVENT_NAME="workflow_dispatch", GITHUB_REF="refs/heads/feature/x"
+        )
+        _, main_push = self.run_setup(
+            "vllm", GITHUB_EVENT_NAME="push", GITHUB_REF="refs/heads/main"
+        )
+        _, main_schedule = self.run_setup(
+            "vllm", GITHUB_EVENT_NAME="schedule", GITHUB_REF="refs/heads/main"
+        )
+        pr_entry = Path(pr_exp["TRITON_CACHE_DIR"]).parent
+        branch_entry = Path(branch_dispatch["TRITON_CACHE_DIR"]).parent
+        main_entry = Path(main_push["TRITON_CACHE_DIR"]).parent
+        sched_entry = Path(main_schedule["TRITON_CACHE_DIR"]).parent
+
+        self.assertTrue(pr_entry.name.startswith("vllm-untrusted-"), pr_entry.name)
+        self.assertEqual(pr_entry, branch_entry)
+        self.assertTrue(main_entry.name.startswith("vllm-trusted-"), main_entry.name)
+        self.assertEqual(main_entry, sched_entry)
+        self.assertNotEqual(pr_entry, main_entry)
+
+    def test_low_space_sweeps_expired_entries_before_skipping(self):
+        self.cache_root.mkdir(parents=True, exist_ok=True)
+        stale = self.cache_root / "vllm-untrusted-sm90-drv580-stale0000000000"
+        stale.mkdir()
+        old_time = time.time() - 10 * 86400
+        os.utime(stale, (old_time, old_time))
+        # Fake df reports 40 GiB free while the stale directory exists and 80 GiB once reclaimed.
+        self.write_tool(
+            "df",
+            f"""#!/bin/sh
+echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
+if [ -d "{stale}" ]; then
+    echo "/dev/nvme0 104857600 62914560 41943040 60% /models"
+else
+    echo "/dev/nvme0 104857600 20971520 83886080 20% /models"
+fi
+""",
+        )
+        res, exp = self.run_setup(
+            "vllm", SMG_JIT_CACHE_MIN_FREE_GB="50", SMG_JIT_CACHE_MAX_AGE_DAYS="7"
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertFalse(stale.exists(), "expired entry should be swept before low-space skip")
+        self.assertIn("TRITON_CACHE_DIR", exp)
+        self.assertTrue(Path(exp["TRITON_CACHE_DIR"]).is_dir())
 
     def test_version_driver_and_arch_changes_isolate_cache_keys(self):
         _, base = self.run_setup("vllm")

@@ -69,16 +69,76 @@ if [ -z "$probe" ]; then
 fi
 rm -f "$probe"
 
-# Guard against filling /raid (ci-node-health alarms above 85% disk usage).
-if [[ "$MIN_FREE_GB" =~ ^[0-9]+$ ]] && [ "$MIN_FREE_GB" -gt 0 ]; then
+# Non-blocking LRU sweep of stale entries untouched for > MAX_AGE_DAYS.
+sweep_expired_entries() {
+    local keep_name="${1:-}"
+    if ! [[ "$MAX_AGE_DAYS" =~ ^[0-9]+$ ]] || [ "$MAX_AGE_DAYS" -le 0 ]; then
+        return 0
+    fi
+    (
+        flock -n 200 || exit 0
+        while IFS= read -r stale; do
+            [ -n "$stale" ] || continue
+            if [ -n "$keep_name" ] && [ "$(basename "$stale")" = "$keep_name" ]; then
+                continue
+            fi
+            old="$(mktemp -d "${CACHE_ROOT}/.evict.XXXXXX" 2> /dev/null || true)"
+            if [ -n "$old" ] && mv -T "$stale" "$old" 2> /dev/null; then
+                rm -rf "$old" 2> /dev/null || true
+            else
+                rm -rf "$old" 2> /dev/null || true
+            fi
+        done < <(find "$CACHE_ROOT" -mindepth 1 -maxdepth 1 -type d \
+            ! -name '.locks' ! -name '.evict.*' \
+            -mtime "+${MAX_AGE_DAYS}" 2> /dev/null)
+    ) 200> "${CACHE_ROOT}/.locks/sweep.lock" || true
+}
+
+free_space_gb() {
+    local avail_kb
     avail_kb="$(df -Pk "$CACHE_ROOT" 2> /dev/null | awk 'NR==2 {print $4}')"
     if [[ "$avail_kb" =~ ^[0-9]+$ ]]; then
-        avail_gb=$((avail_kb / 1024 / 1024))
-        if [ "$avail_gb" -lt "$MIN_FREE_GB" ]; then
+        echo $((avail_kb / 1024 / 1024))
+    fi
+}
+
+# Guard against filling /raid (ci-node-health alarms above 85% disk usage).
+# Reclaim expired cache entries first so the mount can self-recover when space
+# dips below MIN_FREE_GB because of stale entries.
+if [[ "$MIN_FREE_GB" =~ ^[0-9]+$ ]] && [ "$MIN_FREE_GB" -gt 0 ]; then
+    avail_gb="$(free_space_gb)"
+    if [[ "$avail_gb" =~ ^[0-9]+$ ]] && [ "$avail_gb" -lt "$MIN_FREE_GB" ]; then
+        sweep_expired_entries ""
+        avail_gb="$(free_space_gb)"
+        if [[ "$avail_gb" =~ ^[0-9]+$ ]] && [ "$avail_gb" -lt "$MIN_FREE_GB" ]; then
             skip "only ${avail_gb} GiB free on ${CACHE_ROOT} (threshold ${MIN_FREE_GB} GiB)"
         fi
     fi
 fi
+
+# Isolate untrusted (PR / feature-branch) JIT caches from trusted main/release
+# runs so an unreviewed PR job cannot poison artifacts loaded by trusted jobs on
+# the same shared GPU runner pool.
+resolve_trust_tier() {
+    if [ -n "${SMG_JIT_CACHE_TRUST_TIER:-}" ]; then
+        printf '%s' "$SMG_JIT_CACHE_TRUST_TIER"
+        return 0
+    fi
+    case "${GITHUB_EVENT_NAME:-}" in
+        push|schedule|workflow_dispatch|merge_group|release)
+            case "${GITHUB_REF:-}" in
+                refs/heads/main|refs/heads/release/*|refs/tags/*)
+                    printf 'trusted'
+                    return 0
+                    ;;
+            esac
+            ;;
+    esac
+    printf 'untrusted'
+}
+
+TRUST_TIER="$(resolve_trust_tier | tr -c 'A-Za-z0-9._-' '_')"
+[ -n "$TRUST_TIER" ] || TRUST_TIER="untrusted"
 
 detect_gpu_arch() {
     if [ "$GPU_VENDOR" = "amd" ]; then
@@ -153,13 +213,14 @@ if [ -n "$NVCC_BIN" ]; then
     NVCC_VERSION="$("$NVCC_BIN" --version 2> /dev/null | grep -oE 'release [0-9]+\.[0-9]+(, V[0-9.]+)?' | head -1 || echo unknown)"
 fi
 
-MANIFEST="$("$PYTHON" - "$ENGINE" "$GPU_VENDOR" "$GPU_ARCH" "$NVCC_VERSION" <<'PY' 2> /dev/null
+MANIFEST="$("$PYTHON" - "$ENGINE" "$TRUST_TIER" "$GPU_VENDOR" "$GPU_ARCH" "$NVCC_VERSION" <<'PY' 2> /dev/null
 import importlib.metadata as metadata
 import sys
 
-engine, vendor, arch, nvcc = sys.argv[1:5]
+engine, trust_tier, vendor, arch, nvcc = sys.argv[1:6]
 lines = [
     f"engine={engine}",
+    f"trust_tier={trust_tier}",
     f"gpu_vendor={vendor}",
     f"gpu_arch={arch}",
     f"python={sys.version_info.major}.{sys.version_info.minor}",
@@ -198,7 +259,7 @@ PY
 [ -n "$MANIFEST" ] || skip "empty version manifest"
 
 VERSION_HASH="$(printf '%s\n' "$MANIFEST" | sha256sum | cut -c 1-16)"
-KEY="${ENGINE}-${GPU_ARCH}-${VERSION_HASH}"
+KEY="${ENGINE}-${TRUST_TIER}-${GPU_ARCH}-${VERSION_HASH}"
 ENTRY="${CACHE_ROOT}/${KEY}"
 
 subdirs=(triton flashinfer vllm torchinductor tvm-ffi)
@@ -218,22 +279,7 @@ fi
 touch "$ENTRY" 2> /dev/null || true
 
 # Non-blocking LRU sweep of stale entries untouched for > MAX_AGE_DAYS.
-if [[ "$MAX_AGE_DAYS" =~ ^[0-9]+$ ]] && [ "$MAX_AGE_DAYS" -gt 0 ]; then
-    (
-        flock -n 200 || exit 0
-        while IFS= read -r stale; do
-            [ -n "$stale" ] || continue
-            old="$(mktemp -d "${CACHE_ROOT}/.evict.XXXXXX" 2> /dev/null || true)"
-            if [ -n "$old" ] && mv -T "$stale" "$old" 2> /dev/null; then
-                rm -rf "$old" 2> /dev/null || true
-            else
-                rm -rf "$old" 2> /dev/null || true
-            fi
-        done < <(find "$CACHE_ROOT" -mindepth 1 -maxdepth 1 -type d \
-            ! -name "$KEY" ! -name '.locks' ! -name '.evict.*' \
-            -mtime "+${MAX_AGE_DAYS}" 2> /dev/null)
-    ) 200> "${CACHE_ROOT}/.locks/sweep.lock" || true
-fi
+sweep_expired_entries "$KEY"
 
 export_var() {
     local name="$1" value="$2"
@@ -253,4 +299,4 @@ if [ "$GPU_VENDOR" != "amd" ]; then
     export_var "CUDA_CACHE_MAXSIZE" "4294967296"
 fi
 
-log "Enabled persistent JIT cache at ${ENTRY} (vendor=${GPU_VENDOR}, arch=${GPU_ARCH})"
+log "Enabled persistent JIT cache at ${ENTRY} (trust=${TRUST_TIER}, vendor=${GPU_VENDOR}, arch=${GPU_ARCH})"

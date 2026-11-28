@@ -8,6 +8,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPT="$REPO_ROOT/scripts/ci_fetch_backend_prebuilt.sh"
 TAG="ci-gpu-backend-sglang-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 IMAGE="ghcr.io/smg-project/smg:${TAG}"
+CACHE_KEY="${TAG}-$(printf '%s' "$IMAGE" | sha256sum | cut -c 1-12)"
 
 assert_eq() {
     local expected="$1" actual="$2" what="${3:-}"
@@ -92,10 +93,10 @@ pull_count() { grep -c '^pull ' "$FAKE_DOCKER_LOG" || true; }
 test_cold_pull_populates_backend_and_shared_cuda_link() {
     setup
     local out; out="$(run_fetch sglang "$T/opt-smg" "$T/usr-local" 100)"
-    assert_file "$CACHE/sglang/$TAG/.complete"
-    assert_file "$CACHE/sglang/$TAG/smg-ci/sglang/.venv/.smg-ci-recipe"
+    assert_file "$CACHE/sglang/$CACHE_KEY/.complete"
+    assert_file "$CACHE/sglang/$CACHE_KEY/smg-ci/sglang/.venv/.smg-ci-recipe"
     assert_link_into "$T/opt-smg/sglang" "$CACHE/sglang/jobs"
-    assert_link_into "$T/usr-local/cuda-13.0" "$CACHE/sglang/$TAG"
+    assert_link_into "$T/usr-local/cuda-13.0" "$CACHE/sglang/$CACHE_KEY"
     assert_file "$T/usr-local/cuda/bin/nvcc"
     assert_eq 1 "$(pull_count)" "one docker pull"
     assert_contains "$(cat "$T/opt-smg/github.env")" "SMG_PREBUILT_JOB_DIR=$CACHE/sglang/jobs/"
@@ -109,7 +110,7 @@ test_warm_cache_skips_docker_entirely() {
     local out; out="$(run_fetch sglang "$T/opt-b" "$T/usr-b" 200)"
     assert_eq "" "$(cat "$FAKE_DOCKER_LOG")" "no docker calls on warm cache"
     assert_link_into "$T/opt-b/sglang" "$CACHE/sglang/jobs"
-    assert_link_into "$T/usr-b/cuda-13.0" "$CACHE/sglang/$TAG"
+    assert_link_into "$T/usr-b/cuda-13.0" "$CACHE/sglang/$CACHE_KEY"
     assert_contains "$out" "cache hit"
 }
 
@@ -120,8 +121,18 @@ test_job_copies_are_private_and_cuda_is_shared_readonly() {
     [ "$(readlink "$T/opt-a/trtllm")" != "$(readlink "$T/opt-b/trtllm")" ] || { echo "FAIL: shared job venv"; exit 1; }
     assert_eq "$(readlink "$T/usr-a/cuda-13.0")" "$(readlink "$T/usr-b/cuda-13.0")" "CUDA toolkit shared read-only"
     echo "pr-wheel" > "$T/opt-a/trtllm/.venv/pr.pth"
-    assert_no_file "$CACHE/trtllm/$TAG/smg-ci/trtllm/.venv/pr.pth"
+    assert_no_file "$CACHE/trtllm/$CACHE_KEY/smg-ci/trtllm/.venv/pr.pth"
     assert_no_file "$T/opt-b/trtllm/.venv/pr.pth"
+}
+
+test_different_repositories_with_same_tag_do_not_collide() {
+    setup
+    run_fetch vllm "$T/opt-first" "$T/usr-first" 100 SMG_BACKEND_PREBUILT_IMAGE="ghcr.io/example/first:custom" > /dev/null
+    echo "stamp-second" > "$FAKE_IMAGE_ROOT/opt/smg-ci/vllm/.venv/.smg-ci-recipe"
+    run_fetch vllm "$T/opt-second" "$T/usr-second" 200 SMG_BACKEND_PREBUILT_IMAGE="ghcr.io/example/second:custom" > /dev/null
+    assert_eq 2 "$(pull_count)" "each repository override pulls separately"
+    assert_eq "stamp-vllm" "$(cat "$T/opt-first/vllm/.venv/.smg-ci-recipe")" "first payload preserved"
+    assert_eq "stamp-second" "$(cat "$T/opt-second/vllm/.venv/.smg-ci-recipe")" "second payload pulled"
 }
 
 test_self_resolves_content_addressed_tag_when_env_unset() {
@@ -188,6 +199,7 @@ tests=(
     test_cold_pull_populates_backend_and_shared_cuda_link
     test_warm_cache_skips_docker_entirely
     test_job_copies_are_private_and_cuda_is_shared_readonly
+    test_different_repositories_with_same_tag_do_not_collide
     test_self_resolves_content_addressed_tag_when_env_unset
     test_self_resolves_nondefault_carrier_settings
     test_failed_pull_falls_back_softly

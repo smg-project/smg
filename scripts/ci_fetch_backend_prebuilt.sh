@@ -75,9 +75,13 @@ fi
 
 log "Prebuilt image: ${IMAGE}"
 
-# Reduce the digest (or immutable content-addressed tag) to a plain path segment.
-tag="$(printf '%s' "${IMAGE##*:}" | tr -c 'A-Za-z0-9._-' '_')"
-[ -n "$tag" ] || fallback "cannot derive a cache key from ${IMAGE}"
+# Key the cache by the complete image reference so identical tags across
+# different override repositories never collide, while keeping a readable tag
+# prefix for diagnostics.
+tag_part="$(printf '%s' "${IMAGE##*:}" | tr -c 'A-Za-z0-9._-' '_')"
+image_hash="$(printf '%s' "$IMAGE" | sha256sum | cut -c 1-12)"
+tag="${tag_part}-${image_hash}"
+[ -n "$tag_part" ] && [ -n "$image_hash" ] || fallback "cannot derive a cache key from ${IMAGE}"
 
 init_cache_root() { mkdir -p "$1/.locks" "$1/jobs" 2> /dev/null; }
 job_local=0

@@ -176,6 +176,7 @@ class ImageTagTests(unittest.TestCase):
 
         publisher = (ROOT / ".github/workflows/ci-gpu-runner-image.yml").read_text()
         self.assertIn('--carrier-base-image "$CARRIER_BASE_IMAGE"', publisher)
+        self.assertIn("github.ref == 'refs/heads/main'", publisher)
 
         for action in ("setup-vllm", "setup-sglang", "setup-trtllm"):
             with self.subTest(action=action):

@@ -68,10 +68,13 @@ install_trtllm_system_deps() {
     $RETRY 3 10 $SUDO apt-get install -y --no-install-recommends "${pkgs[@]}"
 }
 
-has_cuda13_nvcc() {
+CUDA13_DEFAULT_DIR="${SMG_TRTLLM_CUDA13_DIR:-/usr/local/cuda-13.0}"
+
+find_cuda13_home() {
     local dir
-    for dir in /usr/local/cuda-13.0 "${CUDA_HOME:-/usr/local/cuda}"; do
+    for dir in "$CUDA13_DEFAULT_DIR" "${CUDA_HOME:-/usr/local/cuda}"; do
         if [ -x "${dir}/bin/nvcc" ] && "${dir}/bin/nvcc" --version 2>/dev/null | grep -q "release 13\."; then
+            printf '%s\n' "$dir"
             return 0
         fi
     done
@@ -88,21 +91,25 @@ fi
 # Prepared runner images carry all three packages; bare pods adopting a carrier
 # venv already get /usr/local/cuda-13.0 symlinked from NVMe and only need the
 # tiny host shared libraries when missing.
+VALIDATED_CUDA13_HOME="$(find_cuda13_home || true)"
 if [ "$PREPARED_ENV" = 0 ]; then
     missing_pkgs=(libopenmpi-dev libnvinfer10)
-    if ! has_cuda13_nvcc; then
+    if [ -z "$VALIDATED_CUDA13_HOME" ]; then
         missing_pkgs+=(cuda-toolkit-13-0)
     fi
     install_trtllm_system_deps "${missing_pkgs[@]}"
 else
-    if ! has_cuda13_nvcc; then
+    if [ -z "$VALIDATED_CUDA13_HOME" ]; then
         install_trtllm_system_deps cuda-toolkit-13-0
     fi
 fi
 
 # ── CUDA runtime setup ───────────────────────────────────────────────────────
-if [ -x "/usr/local/cuda-13.0/bin/nvcc" ]; then
-    export CUDA_HOME="/usr/local/cuda-13.0"
+# Select the directory that passed the CUDA 13 release check rather than
+# assuming an unvalidated executable under /usr/local/cuda-13.0 is CUDA 13.
+VALIDATED_CUDA13_HOME="$(find_cuda13_home || true)"
+if [ -n "$VALIDATED_CUDA13_HOME" ]; then
+    export CUDA_HOME="$VALIDATED_CUDA13_HOME"
 else
     export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 fi
