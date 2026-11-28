@@ -247,7 +247,7 @@ impl WorkerLoadManager {
 
     /// Select and increment the least-loaded eligible rank. A virtual worker
     /// can only select its pinned rank; missing telemetry returns `None`, and
-    /// so do loads another worker laid at the URL ([`RankLoads`]).
+    /// so do loads another worker laid at the URL (`RankLoads`).
     pub fn select_and_increment_lowest_dp_load(
         &self,
         worker: &dyn Worker,
