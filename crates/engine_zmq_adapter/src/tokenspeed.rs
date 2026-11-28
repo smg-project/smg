@@ -1634,7 +1634,9 @@ mod tests {
         use engine_zmq_client::codec::decode_msgpack;
         use tokenspeed_proto::sampling_params::Constraint;
 
-        use crate::test_support::{answer_tag, call_tag, pinned_other_backend, ANSWER_SCHEMA};
+        use crate::test_support::{
+            answer_tag, older_call_tag, pinned_other_backend, ANSWER_SCHEMA,
+        };
 
         let (client, engine, _dir) = connected_pair(RuntimeType::TokenSpeed).await;
         client.set_structured_outputs_support(pinned_other_backend());
@@ -1642,7 +1644,7 @@ mod tests {
         let mut streams = Vec::new();
         for (id, tag, schema) in [
             ("answer", answer_tag(), Some(ANSWER_SCHEMA)),
-            ("call", call_tag(), None),
+            ("call", older_call_tag(), None),
         ] {
             let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams {
                 constraint: Some(Constraint::StructuralTag(tag.clone())),

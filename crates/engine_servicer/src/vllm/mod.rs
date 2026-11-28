@@ -210,8 +210,10 @@ pub struct VllmModelInfo {
 /// `outlines` and `lm-format-enforcer` compile JSON schemas, regular
 /// expressions and choices and fail a structural tag at compile. Neither
 /// compiles an EBNF grammar either; that kind stays set for them because a
-/// choice is judged by it, so a grammar still goes to the engine. Every other
-/// name compiles all four kinds or is not judged here. The adapter refuses a
+/// choice is judged by it, so a grammar still goes to the engine. `guidance`
+/// compiles all four, a structural tag by its `structures` and `triggers`
+/// alone: the adapter refuses it a tag without them. Every other name
+/// compiles all four kinds or is not judged here. The adapter refuses a
 /// constraint outside this before the engine, as on every wire.
 pub(super) fn structured_outputs_support(model: &VllmModelInfo) -> StructuredOutputsSupport {
     use StructuredOutputBackend::{LmFormatEnforcer, Outlines};

@@ -3620,6 +3620,52 @@ async fn a_constraint_the_grammar_backend_cannot_enforce_is_refused_before_the_s
     }
 }
 
+/// `llguidance` reads a structural tag by its `structures` and `triggers`:
+/// the triggered-tags format is refused before the scheduler, which would
+/// admit the request and fail it at grammar compile; a tag of the older
+/// vocabulary reaches the scheduler.
+#[tokio::test]
+async fn a_structural_tag_llguidance_cannot_read_is_refused_before_the_scheduler() {
+    use sg::sampling_params::Constraint;
+
+    let tagged = |id: &str, tag: &str| {
+        let mut request = generate_request(id, false, Vec::new());
+        request.sampling_params.as_mut().unwrap().constraint =
+            Some(Constraint::StructuralTag(tag.to_string()));
+        request
+    };
+    let mut h = harness(SglangModelInfo {
+        server_args_json: r#"{"grammar_backend":"llguidance"}"#.to_string(),
+        ..model_info()
+    })
+    .await;
+    let triggered = r#"{"format":{"type":"triggered_tags","triggers":["<w>"],"tags":[]}}"#;
+    let status = h
+        .client
+        .generate(tagged("t1", triggered))
+        .await
+        .expect_err("refused");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(
+        status.message().contains("`guidance (llguidance)`")
+            && status
+                .message()
+                .contains("`structures` and `triggers` only"),
+        "{}",
+        status.message()
+    );
+    assert_scheduler_idle(&mut h.engine_in).await;
+    let older = r#"{"type":"structural_tag","structures":[],"triggers":["<w>"]}"#;
+    let _stream = h
+        .client
+        .generate(tagged("t2", older))
+        .await
+        .expect("generate")
+        .into_inner();
+    assert_eq!(recv_add(&mut h.engine_in).await.rid, "t2");
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// A prompt that fills the scheduler's context window, or an empty one, is
 /// refused before the scheduler sees it, with both lengths named; the
 /// refusal releases the registration, so the same id then serves a healthy

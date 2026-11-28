@@ -299,7 +299,9 @@ pub(crate) fn answer_schema_in_place_of_tag(
 /// bare engine abort (INTERNAL) when it does not; the refusal here is the
 /// caller's error on either. A kind outside what the backend compiles ([`ConstraintKinds`]) is
 /// refused: the engine would admit the request and fail it at grammar
-/// compile. Under xgrammar (`Auto`, or pinned) a JSON schema with a feature
+/// compile; so is, under the guidance backend, a structural tag without the
+/// `structures` and `triggers` that backend reads one by, the triggered-tags
+/// format among them. Under xgrammar (`Auto`, or pinned) a JSON schema with a feature
 /// xgrammar's converter drops is refused, as the request's own schema or
 /// inside a structural tag alike (its `json_schema` elements go through the
 /// same converter): xgrammar compiles such a schema with the keyword dropped
@@ -334,6 +336,17 @@ pub fn refuse_unenforceable_constraint(
             support.kinds.named()
         ));
     }
+    if support.backend == StructuredOutputsBackendConfig::Pinned(StructuredOutputBackend::Guidance)
+        && matches!(constraint, ConstraintRef::StructuralTag(tag) if !guidance_reads_structural_tag(tag))
+    {
+        // The backend goes by `guidance` on one engine and by `llguidance`, the library
+        // under it, on the others: this refusal says both.
+        return Err(format!(
+            "{source} cannot be enforced: `guidance (llguidance)`, the structured-output \
+             backend this engine runs, compiles a structural tag by its `structures` and \
+             `triggers` only"
+        ));
+    }
     if !support.backend.is_xgrammar() {
         return Ok(());
     }
@@ -346,6 +359,15 @@ pub fn refuse_unenforceable_constraint(
         Some(feature) => Err(xgrammar_cannot_enforce(source, &feature)),
         None => Ok(()),
     }
+}
+
+/// Whether the guidance backend compiles `tag`: it reads a structural tag by
+/// its top-level `structures` and `triggers`, the older vocabulary, and fails
+/// one without both at grammar compile. Text that is no JSON object reads as
+/// a tag it fails.
+fn guidance_reads_structural_tag(tag: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(tag)
+        .is_ok_and(|tag| tag.get("structures").is_some() && tag.get("triggers").is_some())
 }
 
 /// The refusal of a schema feature xgrammar drops: the source, the keyword,
@@ -510,6 +532,44 @@ mod tests {
         );
     }
 
+    /// The guidance backend reads a structural tag by its `structures` and
+    /// `triggers`: a tag without both, the triggered-tags format among them,
+    /// is refused, naming the backend and the two keys; a tag of the older
+    /// vocabulary passes, and every other backend takes either tag.
+    #[test]
+    fn a_structural_tag_the_guidance_backend_cannot_read_is_refused() {
+        const OLDER: &str = r#"{"type":"structural_tag","structures":[],"triggers":["<w>"]}"#;
+        let guidance = StructuredOutputsSupport::from(Pinned(StructuredOutputBackend::Guidance));
+        for tag in [
+            r#"{"format":{"type":"triggered_tags","triggers":["<w>"],"tags":[]}}"#,
+            r#"{"type":"structural_tag","structures":[]}"#,
+            r#"{"type":"structural_tag","triggers":["<w>"]}"#,
+            r#"["structures","triggers"]"#,
+        ] {
+            let tag_ref = Some(ConstraintRef::StructuralTag(tag));
+            let refused = refuse_unenforceable_constraint(tag_ref, guidance).expect_err("refused");
+            assert!(
+                refused.contains(
+                    "`guidance (llguidance)`, the structured-output backend this engine runs, \
+                     compiles a structural tag by its `structures` and `triggers` only"
+                ),
+                "{tag}: {refused}"
+            );
+        }
+        let older = Some(ConstraintRef::StructuralTag(OLDER));
+        assert_eq!(refuse_unenforceable_constraint(older, guidance), Ok(()));
+        for backend in [Auto, Pinned(StructuredOutputBackend::Xgrammar), Other] {
+            for tag in [OLDER, r#"{"format":{}}"#] {
+                let tag_ref = Some(ConstraintRef::StructuralTag(tag));
+                assert_eq!(
+                    refuse_unenforceable_constraint(tag_ref, backend.into()),
+                    Ok(()),
+                    "{backend:?}: {tag}"
+                );
+            }
+        }
+    }
+
     /// Under xgrammar, pinned or as the engine's default, a schema with a
     /// feature xgrammar drops is refused as the request's own schema and
     /// inside a structural tag alike; the other kinds pass, as does a schema
@@ -565,11 +625,18 @@ mod tests {
                 );
             }
         }
-        for backend in [Pinned(StructuredOutputBackend::Guidance), Other] {
+        // The guidance backend reads a tag of the older vocabulary alone.
+        let older = format!(
+            r#"{{"structures":[{{"begin":"<w>","schema":{MULTIPLE_OF},"end":"</w>"}}],"triggers":["<w>"]}}"#
+        );
+        for (backend, tag) in [
+            (Pinned(StructuredOutputBackend::Guidance), &older),
+            (Other, &tag),
+        ] {
             let support = StructuredOutputsSupport::from(backend);
             for constraint in [
                 ConstraintRef::JsonSchema(MULTIPLE_OF),
-                ConstraintRef::StructuralTag(&tag),
+                ConstraintRef::StructuralTag(tag),
             ] {
                 assert_eq!(
                     refuse_unenforceable_constraint(Some(constraint), support),

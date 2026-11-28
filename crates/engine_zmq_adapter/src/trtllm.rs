@@ -893,7 +893,9 @@ mod tests {
     async fn an_answer_tag_reaches_a_pinned_other_backend_as_its_schema() {
         use trtllm::guided_decoding_params::GuideType;
 
-        use crate::test_support::{answer_tag, call_tag, pinned_other_backend, ANSWER_SCHEMA};
+        use crate::test_support::{
+            answer_tag, older_call_tag, pinned_other_backend, ANSWER_SCHEMA,
+        };
 
         let (client, engine, _dir) = connected_pair(RuntimeType::Trtllm).await;
         client.set_structured_outputs_support(pinned_other_backend());
@@ -901,7 +903,7 @@ mod tests {
         let mut streams = Vec::new();
         for (id, tag, schema) in [
             ("answer", answer_tag(), Some(ANSWER_SCHEMA)),
-            ("call", call_tag(), None),
+            ("call", older_call_tag(), None),
         ] {
             let mut req = request(id);
             req.guided_decoding = Some(trtllm::GuidedDecodingParams {

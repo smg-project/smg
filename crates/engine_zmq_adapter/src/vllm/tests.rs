@@ -1392,7 +1392,8 @@ fn a_schema_xgrammar_cannot_enforce_is_refused_wherever_xgrammar_is_the_backend(
     // parser with structural tags sends them (one `tag` per tool, the
     // parameters its `json_schema` content): refused under `auto` and a
     // pinned xgrammar, the message naming the keyword and where it
-    // stands in the tag; a pinned guidance takes the tag as it is; a tag
+    // stands in the tag; a pinned guidance takes a tag of the older
+    // vocabulary, the one it reads, as it is, keyword and all; a tag
     // whose schemas xgrammar compiles whole passes, stamped xgrammar.
     let tag = |parameters: serde_json::Value| {
         let tag = serde_json::json!({"format": {"type": "triggered_tags",
@@ -1426,7 +1427,15 @@ fn a_schema_xgrammar_cannot_enforce_is_refused_wherever_xgrammar_is_the_backend(
             "{config:?}: {refused}"
         );
     }
-    let params = translate(tag(unique_items), Pinned(StructuredOutputBackend::Guidance))
+    let older = tokenized_req(vllm::SamplingParams {
+        constraint: Some(vllm::sampling_params::Constraint::StructuralTag(
+            serde_json::json!({"structures": [{"begin": "<tool_call>", "schema": unique_items,
+                "end": "</tool_call>"}], "triggers": ["<tool_call>"]})
+            .to_string(),
+        )),
+        ..Default::default()
+    });
+    let params = translate(older, Pinned(StructuredOutputBackend::Guidance))
         .expect("translated")
         .sampling_params
         .and_then(|sp| sp.structured_outputs)
@@ -2393,7 +2402,7 @@ async fn an_answer_tag_reaches_a_pinned_other_backend_as_its_schema() {
     use engine_zmq_client::protocol::vllm::structured_outputs::StructuredOutputConstraint;
     use vllm::sampling_params::Constraint;
 
-    use crate::test_support::{answer_tag, call_tag, pinned_other_backend, ANSWER_SCHEMA};
+    use crate::test_support::{answer_tag, older_call_tag, pinned_other_backend, ANSWER_SCHEMA};
 
     let (client, engine, _dir) = connected_pair(RuntimeType::Vllm).await;
     client.set_structured_outputs_support(pinned_other_backend());
@@ -2401,7 +2410,7 @@ async fn an_answer_tag_reaches_a_pinned_other_backend_as_its_schema() {
     let mut streams = Vec::new();
     for (id, tag, schema) in [
         ("answer", answer_tag(), Some(ANSWER_SCHEMA)),
-        ("call", call_tag(), None),
+        ("call", older_call_tag(), None),
     ] {
         let req = vllm::GenerateRequest {
             request_id: id.to_string(),
