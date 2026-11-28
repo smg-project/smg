@@ -452,7 +452,7 @@ What a policy remembers lives in several places, among them:
 generations. It can keep the last eight generations in a folder, one file each, and roll back to
 one of them.
 
-A gateway reads the supplied file by the crate's one read of a document (`Format::read`), the read an apply and a controller's file pass. A file whose name ends in `.json`, in any letter case, is read as JSON, any other name as YAML (`Format::of`). Either form is read into values first, and the document is built from those values by one typed read.
+A gateway reads the supplied file by the crate's one read of a document (`Format::read`), the read an apply and a controller's file pass. A file whose name has the extension `json`, in any letter case, is read as JSON, any other name as YAML (`Format::of`); a file named only `.json` has no extension and is read as YAML. Either form is read into values first, and the document is built from those values by one typed read.
 
 So a YAML document reads as JSON does. Text that looks like a number, a boolean or a null is written in quotes. A key with nothing under it is refused where a list or a map must stand. A list item with nothing in it is refused in a list of the spec's own.
 
