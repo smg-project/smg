@@ -386,7 +386,8 @@ pub(super) fn said(placement: &mut Placement<'_>) {
 
 /// Runs the cell of `run` where it is an encode request's, one named
 /// `encode_...`, and says whether it did. The cell's request reads nothing
-/// the cell makes behind its engine, and none is made ahead of that.
+/// the cell makes behind its engine. Ahead of that, a request is made only
+/// to read the demand it states.
 pub(super) fn runs(run: &Run) -> bool {
     let Cell {
         behind,
