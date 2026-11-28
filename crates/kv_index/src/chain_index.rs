@@ -396,9 +396,10 @@ impl ChainIndex {
     }
 
     /// An index for up to `max_workers` interned workers (at most 1024). A chunk of runs made
-    /// while the interned workers fit one coverage word lays one word per run, and the rest of
-    /// the ceiling once a worker of a later word holds a whole run there; a chunk made at a
-    /// wider pool lays the whole ceiling.
+    /// before the index has had more than 64 workers interned at once lays one word per run, and
+    /// the rest of the ceiling once a worker of a later word holds a whole run there; a chunk
+    /// made after that lays the whole ceiling, also once the pool has shrunk: the bound only
+    /// rises.
     pub fn with_max_workers(max_workers: usize) -> Self {
         let max_workers = max_workers.clamp(1, MAX_WORDS * 64);
         let words = max_workers.div_ceil(64);

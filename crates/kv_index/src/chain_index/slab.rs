@@ -169,8 +169,9 @@ impl Run {
 pub(super) struct RunChunk {
     pub(super) runs: Box<[Run; RUN_CHUNK]>,
     /// The first coverage words of every run, a run's words side by side: one a run where
-    /// the pool's workers fit one word when the chunk was made, else every word up to the
-    /// index's ceiling. A fleet that fits one word holds one word a run, not the ceiling.
+    /// the chunk was made before the index had more than 64 workers interned at once, else
+    /// every word up to the index's ceiling. A fleet that never passes one word holds one
+    /// word a run, not the ceiling.
     base: Box<[AtomicU64]>,
     /// Every later word of the runs' coverage up to the index's ceiling, a run's words side
     /// by side, made when a worker of such a word first holds a whole run of this chunk:
@@ -283,9 +284,10 @@ impl RunSlab {
     #[inline]
     pub(super) fn chunk(&self, index: usize) -> &RunChunk {
         self.dir[index].get_or_init(|| {
-            // One word a run while the pool fits one word: a worker of a later word finds its
-            // bit in the further block. A wider pool lays the whole ceiling, so a lookup
-            // reads every word of a run from one place.
+            // One word a run until the index has had more than 64 workers interned at once
+            // (`live_words` only rises): a worker of a later word finds its bit in the
+            // further block. From then on a chunk lays the whole ceiling, so a lookup reads
+            // every word of a run from one place.
             let base = if self.live_words.load(Ordering::Acquire) <= 1 {
                 1
             } else {
