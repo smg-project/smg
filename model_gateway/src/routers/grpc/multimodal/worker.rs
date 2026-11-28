@@ -111,7 +111,8 @@ pub struct WorkerMediaSettings {
     /// loader the engine registers for its processor class, none for a
     /// sampler that never followed a loader): a spec that samples the way a
     /// loader does would otherwise sample a clip differently from the engine's
-    /// own server.
+    /// own server. The interval walk is refused none and takes the rate a
+    /// `video.fps` entry states (`interval_walk_start_fps`).
     pub video_loader_rule: Option<String>,
     /// The engine's encoder budget: the most feature tokens it can place for
     /// one media item (vLLM's encoder-cache budget, the "budget of N tokens"
@@ -183,7 +184,9 @@ fn default_loader_reads(entry: &str) -> bool {
 /// stamps of a clip without decoder timing). A key one of these loaders
 /// ignores (`min_frames` for the walk, `temporal_patch_size` for the spread)
 /// is refused with the others rather than telling the per-class loaders apart
-/// by key.
+/// by key. The interval walk ([`FrameSampling::Interval`]) is the walk of
+/// such a loader as well, one that reads the rate alone of these keys: no
+/// rule refuses it, and it follows the rate ([`interval_walk_start_fps`]).
 fn loader_rule_conflict(
     rule: Option<&str>,
     spec_name: &str,
@@ -211,6 +214,33 @@ fn loader_rule_conflict(
          inprocess or redis",
         conflicting.join("; ")
     ))
+}
+
+/// The rate the reported loader rules state for the interval walk
+/// ([`FrameSampling::Interval`]): the engine's loader for that walk reads the
+/// `fps` of the media kwargs as its rate, so the engine's own server walks a
+/// clip at the rate its start states, and the pipeline does the same. A value
+/// that is no number inside the range a part's own rate is held to is no
+/// rate (the engine's own default, `-1`, among them): the walk keeps the
+/// spec's default, as under a start that states none. No other sampler takes
+/// a rate from the rules: [`loader_rule_conflict`] refuses the loader-style
+/// ones, and the rest never followed a loader.
+fn interval_walk_start_fps(rule: Option<&str>, sampling: FrameSampling) -> Option<f64> {
+    if sampling != FrameSampling::Interval {
+        return None;
+    }
+    rule?
+        .split("; ")
+        .find_map(|entry| {
+            entry
+                .trim()
+                .strip_prefix(LOADER_FLAG_RULE)?
+                .strip_prefix("video.fps=")
+        })?
+        .trim()
+        .parse()
+        .ok()
+        .filter(|fps| llm_multimodal::sample_fps_in_range(*fps))
 }
 
 /// What set a modality's effective per-request item limit.
@@ -678,6 +708,10 @@ impl WorkerMediaPipeline {
             drain_fetches_on_error: true,
             inflight: None,
             video_frame_budget: settings.video_frame_budget,
+            video_start_fps: interval_walk_start_fps(
+                settings.video_loader_rule.as_deref(),
+                video_sampling,
+            ),
             // The worker processes its own requests' media: no router's
             // mode applies.
             pixels_go_to: WorkerType::Regular,
@@ -2460,6 +2494,68 @@ mod unsupported_model_tests {
             );
         }
         assert_eq!(loader_rule_conflict(None, "gemma4", loader), None);
+    }
+
+    /// A start that states a loader rate walks a clip of the interval walk at
+    /// that rate, as the engine's own server does: a clip of twelve seconds
+    /// gives 25 frames at the rate 2 where the spec's default of 1 gives 13.
+    /// A value the loader takes for no rate, a start that states none and
+    /// every other sampler keep the default.
+    #[tokio::test]
+    async fn the_interval_walk_follows_the_rate_the_start_states() {
+        let dir = tempfile::Builder::new()
+            .prefix("minimax-m3-")
+            .tempdir()
+            .unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type":"minimax_m3_vl","image_token_index":32000}"#,
+        )
+        .unwrap();
+        let settings = WorkerMediaSettings {
+            video_loader_rule: Some("--media-io-kwargs video.fps=2".to_string()),
+            ..pipeline_settings(dir.path().to_str().unwrap())
+        };
+        let tokenizer = Arc::new(MockTokenizer::new().with_tokens(&[
+            ("]<]image[>[", 32000),
+            ("]<]start of image[>[", 32001),
+            ("]<]end of image[>[", 32002),
+        ]));
+        let pipeline = WorkerMediaPipeline::new(settings, tokenizer).await.unwrap();
+        assert_eq!(pipeline.components.video_start_fps, Some(2.0));
+        let frames = |sample_fps| {
+            let walk = llm_multimodal::VideoFetchConfig {
+                sample_fps,
+                sampling: FrameSampling::Interval,
+                ..Default::default()
+            };
+            llm_multimodal::media::sampled_frame_indices(360, 30.0, walk).len()
+        };
+        assert_eq!((frames(1.0), frames(2.0)), (13, 25));
+
+        let stated = "--media-io-kwargs video.fps=2";
+        for (rule, rate) in [
+            (Some(stated), Some(2.0)),
+            (
+                Some("VLLM_VIDEO_LOADER_BACKEND=opencv_dynamic; --media-io-kwargs video.fps=0.5"),
+                Some(0.5),
+            ),
+            (Some("--media-io-kwargs video.fps=-1"), None),
+            (Some("--media-io-kwargs video.fps=10"), None),
+            (Some("--media-io-kwargs video.fps=fast"), None),
+            (Some("--media-io-kwargs video.num_frames=8"), None),
+            (None, None),
+        ] {
+            assert_eq!(
+                interval_walk_start_fps(rule, FrameSampling::Interval),
+                rate,
+                "{rule:?}"
+            );
+        }
+        assert_eq!(
+            interval_walk_start_fps(Some(stated), FrameSampling::Even),
+            None
+        );
     }
 
     /// A family on the engine's default loader passes the rules that loader

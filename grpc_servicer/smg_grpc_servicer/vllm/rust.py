@@ -443,8 +443,10 @@ def video_loader_rule(model_config, environ: Mapping[str, str] | None = None) ->
     processor class (the Qwen2-VL line, Qwen3-Omni, the GLM-5 family and the
     Qwen3-VL family: the environment variable never reaches that loader, an
     explicit ``opencv`` swaps it), the flag rules alone; and none for the
-    families with a sampler of their own, which never followed the loader and
-    start as before, so a fleet-wide loader setting does not block them."""
+    families with a sampler of their own, which start as before, so a
+    fleet-wide loader setting does not block them: they never followed the
+    loader, but for the interval walk, which takes a reported ``fps`` as its
+    rate."""
     source = os.environ if environ is None else environ
     mm_config = multimodal_config(model_config)
     kwargs = getattr(mm_config, "media_io_kwargs", None) or {}
