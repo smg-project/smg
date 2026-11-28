@@ -1450,7 +1450,8 @@ mod tests {
         // The same pipeline under a crop that is not square: the cut stays a
         // square of the crop height and every sample is center-cropped to
         // the crop. No earlier code is pinned here: both columns of a
-        // witness hold the reference's value.
+        // witness hold the reference's value. The last two witnesses lie in
+        // the image of one cut sample each, not in its padding.
         let narrow = Pinned {
             width: 70,
             height: 100,
@@ -1459,20 +1460,16 @@ mod tests {
             witnesses: &[
                 (0, -0.9309554, -0.9309554),
                 (1, -1.2667192, -1.2667192),
-                (351_033, -1.752097, -1.752097),
-                (677_375, -1.4802198, -1.4802198),
+                (351_208, 0.5891146, 0.5891146),
+                (677_182, 0.7096704, 0.7096704),
             ],
         };
-        let config = PreProcessorConfig::from_json(
-            r#"{"crop_size": {"height": 336, "width": 224}, "do_center_crop": true,
-                "do_convert_rgb": true, "do_normalize": true, "do_rescale": true,
-                "do_resize": true,
-                "image_mean": [0.48145466, 0.4578275, 0.40821073],
-                "image_std": [0.26862954, 0.26130258, 0.27577711],
-                "resample": 3, "rescale_factor": 0.00392156862745098,
-                "size": {"shortest_edge": 336}}"#,
-        )
-        .unwrap();
+        let mut config = reference_config();
+        config.crop_size = Some(
+            [("height".to_string(), 336), ("width".to_string(), 224)]
+                .into_iter()
+                .collect(),
+        );
         let processor = LlavaNextProcessor::new().with_preprocessor_config(&config);
         let image = lcg_rgb_image(narrow.width, narrow.height, narrow.seed);
         let result = processor.preprocess(&[&image]).unwrap();
