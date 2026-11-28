@@ -225,6 +225,18 @@ impl AttemptLedger {
         answered_by: impl IntoIterator<Item = &'a Arc<dyn Worker>>,
         pool: impl IntoIterator<Item = &'a Arc<dyn Worker>>,
     ) {
+        self.settle_with(response, answered_by, pool, |worker| worker.is_available());
+    }
+
+    /// As `settle`, using the route's availability check. A PD placement can
+    /// admit an overloaded prefill when shedding is disabled.
+    pub(crate) fn settle_with<'a>(
+        &self,
+        response: &mut Response,
+        answered_by: impl IntoIterator<Item = &'a Arc<dyn Worker>>,
+        pool: impl IntoIterator<Item = &'a Arc<dyn Worker>>,
+        available: impl Fn(&dyn Worker) -> bool,
+    ) {
         if !closes_retry_window(response) {
             return;
         }
@@ -244,7 +256,7 @@ impl AttemptLedger {
         let alternative = pool.into_iter().any(|worker| {
             side.as_ref()
                 .is_none_or(|side| *worker.worker_type() == side.worker_type)
-                && worker.is_available()
+                && available(worker.as_ref())
                 && self.admits(worker.as_ref())
         });
         if !alternative {

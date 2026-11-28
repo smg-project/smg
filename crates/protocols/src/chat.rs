@@ -599,6 +599,11 @@ pub struct ChatCompletionRequest {
     )]
     pub stream_reasoning: bool,
 
+    /// Per-request limit on tokens in a reasoning block. Zero is an explicit budget.
+    /// Falls back to `custom_params.thinking_budget` when absent or null. An explicit -1 keeps the
+    /// native sentinel on HTTP and leaves the optional gRPC limit unset.
+    pub thinking_token_budget: Option<i64>,
+
     /// Chat template kwargs
     #[serde(serialize_with = "crate::common::serialize_with_sorted_keys")]
     pub chat_template_kwargs: Option<HashMap<String, Value>>,
@@ -677,6 +682,68 @@ impl ThinkingParam {
 }
 
 impl ChatCompletionRequest {
+    /// The finite cap for the optional unsigned field on the gRPC wire.
+    pub fn resolved_thinking_token_budget(
+        &self,
+    ) -> Result<Option<u32>, validator::ValidationError> {
+        Ok(self
+            .checked_thinking_token_budget()?
+            .and_then(|budget| u32::try_from(budget).ok()))
+    }
+
+    /// An upstream may read either spelling. Preserve the client's keys while giving
+    /// both the top-level value, and omit a null alias when no budget was set.
+    pub(crate) fn normalize_upstream_thinking_budget(&mut self) {
+        let Some(params) = self
+            .other
+            .get_mut("custom_params")
+            .and_then(Value::as_object_mut)
+        else {
+            return;
+        };
+        let Some(alias) = params.get_mut("thinking_budget") else {
+            return;
+        };
+        if let Some(budget) = self.thinking_token_budget {
+            *alias = budget.into();
+        } else if alias.is_null() {
+            params.remove("thinking_budget");
+            if params.is_empty() {
+                self.other.remove("custom_params");
+            }
+        }
+    }
+
+    /// Resolve the aliases without losing the HTTP engine's explicit -1 sentinel.
+    fn checked_thinking_token_budget(&self) -> Result<Option<i64>, validator::ValidationError> {
+        const CANONICAL: &str = "thinking_token_budget";
+        const ALIAS: &str = "custom_params.thinking_budget";
+        let invalid_budget = |field| {
+            invalid_at(
+                field,
+                "invalid_thinking_token_budget",
+                "thinking token budget must be an integer from -1 through 4294967295",
+            )
+        };
+        let (field, budget) = if let Some(budget) = self.thinking_token_budget {
+            (CANONICAL, budget)
+        } else {
+            let Some(value) = self
+                .other
+                .get("custom_params")
+                .and_then(|params| params.get("thinking_budget"))
+                .filter(|value| !value.is_null())
+            else {
+                return Ok(None);
+            };
+            (ALIAS, value.as_i64().ok_or_else(|| invalid_budget(ALIAS))?)
+        };
+        if !(-1..=i64::from(u32::MAX)).contains(&budget) {
+            return Err(invalid_budget(field));
+        }
+        Ok(Some(budget))
+    }
+
     /// The cap the client put on the completion: `max_completion_tokens`,
     /// else the deprecated `max_tokens`; when the client wrote both, the
     /// current name wins, as the serving engines resolve the pair. The
@@ -847,6 +914,8 @@ fn validate_verbosity(verbosity: &str) -> Result<(), validator::ValidationError>
 fn validate_chat_cross_parameters(
     req: &ChatCompletionRequest,
 ) -> Result<(), validator::ValidationError> {
+    req.checked_thinking_token_budget()?;
+
     // 1. Validate logprobs dependency
     if req.top_logprobs.is_some() && !req.logprobs {
         return Err(invalid_at(
@@ -1266,6 +1335,10 @@ impl Normalizable for ChatCompletionRequest {
 // ============================================================================
 
 impl GenerationRequest for ChatCompletionRequest {
+    fn thinking_token_budget(&self) -> Option<i64> {
+        self.checked_thinking_token_budget().ok().flatten()
+    }
+
     fn rid(&self) -> Option<&str> {
         self.rid.as_deref()
     }
@@ -1746,6 +1819,56 @@ mod tests {
     /// The borrowed stream choice serializes to the bytes of the owned one, shape for shape:
     /// text deltas, a reasoning delta, a tool call's start and arguments, the finishing choice,
     /// a role, a matched stop.
+    #[test]
+    fn thinking_token_budget_aliases() {
+        let request = |top: Value, nested: Value| {
+            serde_json::from_value::<ChatCompletionRequest>(json!({
+                "model":"test", "messages":[{"role":"user","content":"hello"}],
+                "thinking_token_budget":top, "custom_params":{"thinking_budget":nested}
+            }))
+        };
+        let ordinary: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test", "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        assert_eq!(ordinary.thinking_token_budget(), None);
+        for (a, b, expected) in [
+            (json!(0), Value::Null, Some(0)),
+            (Value::Null, json!(17), Some(17)),
+            (json!(17), json!(17), Some(17)),
+            (json!(0), json!(7), Some(0)),
+            (json!(-1), json!(7), None),
+            (json!(7), json!("ignored"), Some(7)),
+            (json!(u32::MAX), json!(-2), Some(u32::MAX)),
+            (json!(-1), json!(-1), None),
+            (Value::Null, Value::Null, None),
+        ] {
+            assert_eq!(
+                request(a, b)
+                    .unwrap()
+                    .resolved_thinking_token_budget()
+                    .unwrap(),
+                expected
+            );
+        }
+        for (a, b) in [
+            (json!(-2), json!(7)),
+            (Value::Null, json!(true)),
+            (json!(-2), Value::Null),
+            (Value::Null, json!(3.0)),
+            (Value::Null, json!("3")),
+            (json!(4294967296_i64), Value::Null),
+        ] {
+            assert!(request(a, b)
+                .unwrap()
+                .resolved_thinking_token_budget()
+                .is_err());
+        }
+        for value in [json!(true), json!(3.0), json!("3")] {
+            assert!(request(value, Value::Null).is_err());
+        }
+    }
+
     #[test]
     fn borrowed_stream_choice_serializes_as_the_owned_one() {
         let delta = |role: Option<&str>,

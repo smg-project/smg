@@ -60,7 +60,7 @@ use crate::{
     routers::{
         common::{
             openai_bridge::FormatRegistry, prefill_admission::test_support::select_worker,
-            test_support::fast_retry_config,
+            snapshot::test_support::discovered_grpc_worker, test_support::fast_retry_config,
         },
         grpc::{
             backend_client::BasicWorkerBuilder,
@@ -141,6 +141,7 @@ struct GatedScheduler {
     fail_first: bool,
     fail_always: bool,
     fail_internal: bool,
+    fail_first_internal: bool,
     fail_mid_stream: bool,
     /// The call of this place, counted from zero, ends its stream with the
     /// engine's own error a pace behind its first frame: the calls beside
@@ -331,7 +332,7 @@ impl TokenSpeedScheduler for GatedScheduler {
         {
             return Err(Status::unavailable("release-test induced failure"));
         }
-        if self.fail_internal {
+        if self.fail_internal || (self.fail_first_internal && place == 0) {
             return Err(Status::internal("release-test induced engine failure"));
         }
         if self.fail_constraint {
@@ -555,19 +556,13 @@ fn register_worker_of_runtime(
     runtime: RuntimeType,
     labels: &[(&str, &str)],
 ) -> Arc<dyn Worker> {
-    let mut builder = BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
-        .worker_type(worker_type)
-        .connection_mode(ConnectionMode::Grpc)
-        .runtime_type(runtime)
-        .model(ModelCard::new(MODEL))
-        .health_config(HealthCheckConfig {
-            disable_health_check: true,
-            ..Default::default()
-        });
-    for (key, value) in labels {
-        builder = builder.label(*key, *value);
-    }
-    let worker: Arc<dyn Worker> = Arc::new(builder.build());
+    let worker = discovered_grpc_worker(
+        &format!("grpc://127.0.0.1:{port}"),
+        MODEL,
+        worker_type,
+        runtime,
+        labels,
+    );
     registry
         .register(Arc::clone(&worker))
         .expect("register release-test worker");
@@ -839,6 +834,15 @@ async fn chat_response(
     components: Arc<SharedComponents>,
     request: serde_json::Value,
 ) -> Response {
+    chat_response_with_retries(pipeline, components, request, None).await
+}
+
+async fn chat_response_with_retries(
+    pipeline: &RequestPipeline,
+    components: Arc<SharedComponents>,
+    request: serde_json::Value,
+    retry: Option<&RetryConfig>,
+) -> Response {
     let request: Arc<ChatCompletionRequest> =
         Arc::new(serde_json::from_value(request).expect("chat request"));
     tokio::time::timeout(
@@ -850,7 +854,7 @@ async fn chat_response(
             components,
             None,
             None,
-            None,
+            retry,
             None,
         ),
     )
@@ -866,13 +870,17 @@ async fn chat_error_body(
     request: serde_json::Value,
 ) -> (http::StatusCode, serde_json::Value) {
     let response = chat_response(pipeline, components, request).await;
+    chat_body(response).await
+}
+
+async fn chat_body(response: Response) -> (http::StatusCode, serde_json::Value) {
     let status = response.status();
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("drain body");
     (
         status,
-        serde_json::from_slice(&body).expect("json error body"),
+        serde_json::from_slice(&body).expect("chat response JSON"),
     )
 }
 

@@ -14,8 +14,10 @@ nothing from vLLM.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import logging
+import os
 from collections.abc import Callable
 from typing import Any
 
@@ -189,6 +191,33 @@ def running_window(vllm_config: Any) -> int:
     accounting; 0 when the config does not carry it, which leaves both as
     they were."""
     return EngineConfigView(vllm_config).max_num_seqs
+
+
+def supports_thinking_token_budget(vllm_config: Any) -> bool:
+    """The running sampler must both recognize reasoning boundaries and enforce the cap."""
+    reasoning = getattr(vllm_config, "reasoning_config", None)
+    if reasoning is None:
+        return False
+    # Before ReasoningConfig.enabled, the resolved token IDs were the flag.
+    enabled = getattr(reasoning, "enabled", None)
+    if enabled is None:
+        enabled = getattr(reasoning, "reasoning_start_token_ids", None) and getattr(
+            reasoning, "reasoning_end_token_ids", None
+        )
+    if not enabled:
+        return False
+    # Older V2 runners silently ignored the sampling field. Older V1
+    # runners disabled the budget's logits processor under speculation.
+    if getattr(vllm_config, "use_v2_model_runner", os.getenv("VLLM_USE_V2_MODEL_RUNNER") == "1"):
+        sampler = "vllm.v1.worker.gpu.sample.thinking_budget"
+    elif getattr(vllm_config, "speculative_config", None):
+        sampler = "vllm.v1.sample.thinking_budget_state"
+    else:
+        return True
+    try:
+        return importlib.util.find_spec(sampler) is not None
+    except ModuleNotFoundError:
+        return False
 
 
 def engine_reasoning_parser(vllm_config: Any) -> str:
