@@ -43,7 +43,7 @@ class PreparedBackendEnvTests(unittest.TestCase):
             "TEST_UID": "1000",
             "CUDA_HOME": str(self.root / "cuda"),
         }
-        for name in ("uv", "sudo", "apt-get", "curl"):
+        for name in ("uv", "pip", "sudo", "apt-get", "curl", "dpkg"):
             self.write_tool(
                 name,
                 """#!/bin/bash
@@ -53,11 +53,17 @@ if [ "$(basename "$0")" = uv ] && [ -n "${UV_CUDA_DRIVER_VERSION:-}" ]; then
 fi
 if [ "$(basename "$0")" = sudo ] && [ "$TEST_UID" = 0 ]; then echo 'root is not in the sudoers file' >&2; exit 1; fi
 if [ "$(basename "$0")" = apt-get ]; then touch "$TEST_HEADERS/Python.h"; fi
+if [ "$(basename "$0")" = dpkg ] && [ "$1" = -l ]; then exit 1; fi
 if [ "$1" = --version ]; then echo 'uv 0.12.5'; fi
 if [ "$*" = 'pip show flashinfer-python' ]; then echo 'Version: 0.7.0'; fi
 """,
             )
         self.write_tool("id", '#!/bin/sh\necho "$TEST_UID"\n')
+        # Stub host C/C++ compilers so installer tests stay deterministic on minimal
+        # CPU runner pods without gcc/g++; the dedicated missing-compiler test uses
+        # its own isolated PATH without self.tools.
+        for compiler in ("gcc", "g++"):
+            self.write_tool(compiler, "#!/bin/sh\nexit 0\n")
         cuda_bin = Path(self.env["CUDA_HOME"]) / "bin"
         cuda_bin.mkdir(parents=True)
         cuda_bin.joinpath("nvcc").write_text(
@@ -68,6 +74,10 @@ if [ "$*" = 'pip show flashinfer-python' ]; then echo 'Version: 0.7.0'; fi
         for name, version in {
             "vllm": "0.31.0",
             "sglang": "0.5.21",
+            "tensorrt-llm": "1.3.0rc24",
+            "cuda-bindings": "13.3.1",
+            "typer": "0.25.0",
+            "nvidia-nccl-cu13": "2.29.0",
             "torch": "2.13.0+cu132",
             "flashinfer-python": "0.7.0",
             "flashinfer-jit-cache": "0.7.0",
@@ -92,6 +102,18 @@ if [ "$*" = 'pip show flashinfer-python' ]; then echo 'Version: 0.7.0'; fi
             "if os.environ.get('TEST_DRIVER_ABSENT') == '1':\n"
             "    raise ImportError('libcuda.so.1: cannot open shared object file')\n"
             "TransferEngine = object\n"
+        )
+        (self.packages / "cuda/bindings").mkdir(parents=True)
+        (self.packages / "cuda/__init__.py").touch()
+        (self.packages / "cuda/bindings/__init__.py").touch()
+        (self.packages / "cuda/bindings/runtime.py").write_text(
+            "class cudaIpcMemHandle_t:\n    reserved = 0\n"
+        )
+        (self.packages / "tensorrt_llm/commands").mkdir(parents=True)
+        (self.packages / "tensorrt_llm/__init__.py").write_text("__version__ = '1.3.0rc24'\n")
+        (self.packages / "tensorrt_llm/commands/__init__.py").touch()
+        (self.packages / "tensorrt_llm/commands/serve.py").write_text(
+            "def main(): pass\nif __name__ == '__main__': print('usage: serve')\n"
         )
 
     def write_tool(self, name, source):
@@ -360,6 +382,130 @@ os.execv({sys.executable!r}, [{sys.executable!r}] + sys.argv[1:])
         self.run_script("ci_ensure_python_headers.sh", TEST_UID="0")
         self.assertIn("apt-get install", self.commands())
         self.assertNotIn("sudo ", self.commands())
+
+    def test_missing_host_c_compiler_is_installed_even_when_python_headers_exist(self):
+        # Simulate a bare pod where Python.h is present but gcc/g++ are absent from PATH.
+        isolated_bin = self.root / "no-gcc-bin"
+        isolated_bin.mkdir()
+        for tool in (
+            "bash",
+            "dirname",
+            "pwd",
+            "cat",
+            "rm",
+            "cp",
+            "mv",
+            "grep",
+            "sed",
+            "awk",
+            "sleep",
+            "chmod",
+        ):
+            resolved = shutil.which(tool)
+            if resolved:
+                (isolated_bin / tool).symlink_to(resolved)
+        for tool in ("python3", "id", "curl", "dpkg"):
+            shutil.copy(self.tools / tool, isolated_bin / tool)
+        sudo_stub = isolated_bin / "sudo"
+        sudo_stub.write_text('#!/bin/bash\necho "sudo $*" >> "$TEST_LOG"\nexec "$@"\n')
+        sudo_stub.chmod(0o755)
+        apt_stub = isolated_bin / "apt-get"
+        apt_stub.write_text(
+            f"""#!/bin/bash
+echo "apt-get $*" >> "$TEST_LOG"
+if [ "$1" = install ]; then
+    for compiler in gcc g++; do
+        printf '#!/bin/sh\\nexit 0\\n' > "{isolated_bin}/$compiler"
+        chmod +x "{isolated_bin}/$compiler"
+    done
+fi
+"""
+        )
+        apt_stub.chmod(0o755)
+        result = self.run_script("ci_ensure_python_headers.sh", PATH=str(isolated_bin))
+        self.assertIn("Host JIT toolchain missing (gcc/g++)", result.stdout)
+        self.assertIn(
+            "apt-get install -y --no-install-recommends gcc g++ libc6-dev", self.commands()
+        )
+
+    def test_trtllm_prefers_validated_cuda13_home_over_stale_default_dir(self):
+        stale_default = self.root / "stale-cuda-13.0"
+        (stale_default / "bin").mkdir(parents=True)
+        stale_nvcc = stale_default / "bin/nvcc"
+        stale_nvcc.write_text("#!/bin/sh\necho 'Cuda compilation tools, release 12.8'\n")
+        stale_nvcc.chmod(0o755)
+
+        venv = self.make_prepared("trtllm")
+        self.run_script("ci_setup_python_venv.sh", SMG_CI_BACKEND="trtllm")
+        self.assertEqual(self.job.joinpath(".venv").resolve(), venv)
+        Path(self.env["GITHUB_ENV"]).write_text("")
+        self.run_script(
+            "ci_install_trtllm.sh",
+            SMG_TRTLLM_CUDA13_DIR=str(stale_default),
+        )
+        self.assertNotIn("apt-get", self.commands())
+        github_env = Path(self.env["GITHUB_ENV"]).read_text()
+        self.assertIn(f"CUDA_HOME={self.env['CUDA_HOME']}", github_env)
+        self.assertNotIn(f"CUDA_HOME={stale_default}", github_env)
+
+    def test_sglang_prepared_unset_transport_repairs_missing_rdma_libs(self):
+        self.metadata("torch", "2.13.0")
+        self.write_torch("13.0")
+        venv = self.make_prepared("sglang")
+        self.run_script("ci_setup_python_venv.sh", SMG_CI_BACKEND="sglang")
+        self.assertEqual(self.job.joinpath(".venv").resolve(), venv)
+        # Simulate a bare pod without libibverbs.so.1 where TransferEngine import fails
+        # and E2E_KV_BACKEND / E2E_SGLANG_TRANSFER_BACKEND are unset (default PD Mooncake).
+        self.write_tool("ldconfig", "#!/bin/sh\nexit 0\n")
+        result = self.run_script(
+            "ci_install_sglang.sh",
+            TEST_DRIVER_ABSENT="1",
+            E2E_KV_BACKEND="",
+            E2E_SGLANG_TRANSFER_BACKEND="",
+        )
+        self.assertIn("Installing missing mooncake RDMA runtime libraries", result.stdout)
+        self.assertIn(
+            "apt-get install -y --no-install-recommends "
+            "libnuma-dev libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils",
+            self.commands(),
+        )
+
+    def test_trtllm_prepared_env_adoption_skips_apt_and_pip(self):
+        venv = self.make_prepared("trtllm")
+        self.run_script("ci_setup_python_venv.sh", SMG_CI_BACKEND="trtllm")
+        self.assertEqual(self.job.joinpath(".venv").resolve(), venv)
+        Path(self.env["GITHUB_ENV"]).write_text("")
+        result = self.run_script(
+            "ci_install_trtllm.sh",
+            SMG_TRTLLM_CUDA13_DIR=str(self.root / "missing-cuda-13.0"),
+        )
+        self.assertIn("Using prepared TRT-LLM dependencies", result.stdout)
+        self.assertIn("cuda-bindings IPC handle canary OK", result.stdout)
+        self.assertNotIn("apt-get", self.commands())
+        self.assertNotIn("pip install", self.commands())
+        github_env = Path(self.env["GITHUB_ENV"]).read_text()
+        self.assertIn(f"CUDA_HOME={self.env['CUDA_HOME']}", github_env)
+        self.assertIn("LD_LIBRARY_PATH=", github_env)
+
+    def test_trtllm_cpu_build_marks_prepared_env_without_sudo(self):
+        self.run_script("ci_setup_python_venv.sh", TEST_UID="0")
+        result = self.run_script("ci_install_trtllm.sh", SMG_BUILD_PREPARED_ENV="1", TEST_UID="0")
+        self.assertIn("Deferring TRT-LLM driver-dependent import canaries", result.stdout)
+        self.assertIn("tensorrt-llm==1.3.0rc24", self.commands())
+        self.assertIn("cuda-bindings==13.3.1", self.commands())
+        self.assertIn("typer<0.26", self.commands())
+        self.assertNotIn("sudo ", self.commands())
+        self.assertTrue(self.job.joinpath(".venv/.smg-ci-recipe").is_file())
+
+    def test_trtllm_changed_recipe_falls_back_to_fresh_install(self):
+        venv = self.make_prepared("trtllm")
+        with self.scripts.joinpath("ci_install_trtllm.sh").open("a") as f:
+            f.write("\n# changed trtllm recipe\n")
+        result = self.run_script("ci_setup_python_venv.sh", SMG_CI_BACKEND="trtllm")
+        self.assertNotEqual(self.job.joinpath(".venv").resolve(), venv)
+        self.assertIn("using a fresh environment", result.stdout)
+        self.run_script("ci_install_trtllm.sh")
+        self.assertIn("tensorrt-llm==1.3.0rc24", self.commands())
 
 
 if __name__ == "__main__":

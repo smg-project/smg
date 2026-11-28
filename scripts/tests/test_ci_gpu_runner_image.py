@@ -1,4 +1,4 @@
-"""CPU-only image identity and registry-failure policy checks."""
+"""CPU-only image identity, workflow runner, and registry-failure policy checks."""
 
 import importlib.util
 import re
@@ -17,7 +17,9 @@ assert SPEC and SPEC.loader
 helper = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(helper)
 BUILD_INPUTS = helper.BUILD_INPUTS
+BACKEND_INPUTS = helper.BACKEND_INPUTS
 BASE = "ghcr.io/example/runner@sha256:" + "a" * 64
+CARRIER_BASE = "ubuntu:24.04@sha256:" + "b" * 64
 IMAGE = "ghcr.io/example/smg:ci-gpu-runner-test"
 
 
@@ -31,8 +33,8 @@ class ImageTagTests(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(name)
 
-    def tag(self, base=BASE, driver="580"):
-        return helper.image_tag(self.root, base, driver)
+    def tag(self, base=BASE, driver="580", backend="all"):
+        return helper.image_tag(self.root, base, driver, backend=backend)
 
     def test_same_inputs_ignore_checkout_location_and_other_sources(self):
         expected = self.tag()
@@ -48,6 +50,46 @@ class ImageTagTests(unittest.TestCase):
     def test_base_digest_and_driver_change_identity(self):
         self.assertNotEqual(self.tag(), self.tag(base=BASE[:-1] + "b"))
         self.assertNotEqual(self.tag(), self.tag(driver="590"))
+        self.assertNotEqual(
+            helper.image_tag(self.root, BASE, "580", carrier_base_image=CARRIER_BASE),
+            helper.image_tag(self.root, BASE, "580", carrier_base_image=CARRIER_BASE[:-1] + "c"),
+        )
+        with self.assertRaises(ValueError):
+            helper.image_tag(self.root, BASE, "580", carrier_base_image="ubuntu:24.04")
+
+    def test_per_backend_carrier_tags_are_isolated(self):
+        original = {
+            b: self.tag(base=CARRIER_BASE, driver="580", backend=b)
+            for b in ("vllm", "sglang", "trtllm")
+        }
+        for backend, tag in original.items():
+            self.assertTrue(tag.startswith(f"ci-gpu-backend-{backend}-"), tag)
+        self.assertEqual(len(set(original.values())), 3)
+
+        # Changing TRT-LLM installer only invalidates trtllm carrier, not vllm/sglang.
+        trt_path = self.root / "scripts/ci_install_trtllm.sh"
+        trt_path.write_text("trtllm-changed")
+        self.assertEqual(
+            original["vllm"], self.tag(base=CARRIER_BASE, driver="580", backend="vllm")
+        )
+        self.assertEqual(
+            original["sglang"], self.tag(base=CARRIER_BASE, driver="580", backend="sglang")
+        )
+        self.assertNotEqual(
+            original["trtllm"], self.tag(base=CARRIER_BASE, driver="580", backend="trtllm")
+        )
+        trt_path.write_text("scripts/ci_install_trtllm.sh")
+
+        # Driver version only affects vLLM (which uses --torch-backend=auto).
+        self.assertNotEqual(
+            original["vllm"], self.tag(base=CARRIER_BASE, driver="590", backend="vllm")
+        )
+        self.assertEqual(
+            original["sglang"], self.tag(base=CARRIER_BASE, driver="590", backend="sglang")
+        )
+        self.assertEqual(
+            original["trtllm"], self.tag(base=CARRIER_BASE, driver="590", backend="trtllm")
+        )
 
     def test_forced_candidates_do_not_replace_the_recipe_tag(self):
         stable = self.tag()
@@ -74,6 +116,8 @@ class ImageTagTests(unittest.TestCase):
         for driver in ("", "latest", "580\nimage=other"):
             with self.subTest(driver=driver), self.assertRaises(ValueError):
                 self.tag(driver=driver)
+        with self.assertRaises(ValueError):
+            self.tag(backend="unknown")
         (self.root / BUILD_INPUTS[0]).unlink()
         with self.assertRaises(FileNotFoundError):
             self.tag()
@@ -82,6 +126,9 @@ class ImageTagTests(unittest.TestCase):
         dockerfile = (ROOT / "docker/ci-gpu-runner.Dockerfile").read_text()
         copied = re.findall(r"scripts/[A-Za-z0-9_]+\.sh", dockerfile)
         self.assertTrue(set(copied) <= set(BUILD_INPUTS))
+        self.assertIn("scripts/ci_install_trtllm.sh", BUILD_INPUTS)
+        for stage in ("carrier-base", "vllm", "sglang", "trtllm", "runner"):
+            self.assertRegex(dockerfile, rf"(?m)^FROM .* AS {re.escape(stage)}$")
         workflow = (ROOT / ".github/workflows/ci-gpu-runner-image.yml").read_text()
         for name in BUILD_INPUTS:
             self.assertIn(f"- '{name}'", workflow)
@@ -95,6 +142,73 @@ class ImageTagTests(unittest.TestCase):
             defaults.append(default.group(1))
         self.assertTrue(defaults[0].startswith("ghcr.io/actions/actions-runner:"))
         self.assertTrue(helper.image_tag(ROOT, *defaults).startswith("ci-gpu-runner-"))
+
+        carrier_base = re.search(r"vars\.SMG_CI_GPU_CARRIER_BASE_IMAGE \|\| '([^']+)'", workflow)
+        self.assertIsNotNone(carrier_base, "Missing workflow fallback for CARRIER_BASE_IMAGE")
+        for backend in ("vllm", "sglang", "trtllm"):
+            tag = helper.image_tag(ROOT, carrier_base.group(1), defaults[1], backend=backend)
+            self.assertTrue(tag.startswith(f"ci-gpu-backend-{backend}-"), tag)
+
+    def test_image_workflows_do_not_default_to_retired_cpu_e5_runner(self):
+        for wf_name in ("ci-gpu-runner-image.yml", "ci-tokenspeed-image.yml"):
+            with self.subTest(workflow=wf_name):
+                text = (ROOT / ".github/workflows" / wf_name).read_text()
+                self.assertNotIn("cpu-e5", text)
+                self.assertIn("vars.SMG_RUNNER_DOCKER || 'ubuntu-24.04'", text)
+
+    def test_publisher_and_consumers_forward_nondefault_carrier_settings(self):
+        required_vars = (
+            "vars.SMG_CI_GPU_CARRIER_BASE_IMAGE",
+            "vars.SMG_CI_GPU_RUNNER_CUDA_DRIVER_VERSION",
+            "vars.SMG_CI_GPU_RUNNER_IMAGE_REPOSITORY",
+        )
+        for wf_name in (
+            "ci-gpu-runner-image.yml",
+            "e2e-gpu-job.yml",
+            "pr-test-rust.yml",
+            "nightly-bfcl.yml",
+            "nightly-tau2.yml",
+        ):
+            with self.subTest(workflow=wf_name):
+                text = (ROOT / ".github/workflows" / wf_name).read_text()
+                for var in required_vars:
+                    self.assertIn(var, text, f"{wf_name} missing {var}")
+
+        publisher = (ROOT / ".github/workflows/ci-gpu-runner-image.yml").read_text()
+        self.assertIn('--carrier-base-image "$CARRIER_BASE_IMAGE"', publisher)
+        self.assertIn("github.ref == 'refs/heads/main'", publisher)
+
+        for action in ("setup-vllm", "setup-sglang", "setup-trtllm"):
+            with self.subTest(action=action):
+                text = (ROOT / ".github/actions" / action / "action.yml").read_text()
+                for env_name in (
+                    "SMG_CI_GPU_CARRIER_BASE_IMAGE",
+                    "SMG_CI_GPU_RUNNER_CUDA_DRIVER_VERSION",
+                    "SMG_CI_GPU_RUNNER_IMAGE_REPOSITORY",
+                ):
+                    self.assertIn(env_name, text, f"{action} missing {env_name}")
+
+        # Verify consumer script and publisher helper resolve the exact same non-default image.
+        custom_base = "ubuntu:24.04@sha256:" + "c" * 64
+        custom_driver = "590.10.01"
+        expected_tag = helper.image_tag(ROOT, custom_base, custom_driver, backend="vllm")
+        result = subprocess.run(
+            [
+                "python3",
+                str(ROOT / "scripts/ci_gpu_runner_image.py"),
+                "tag",
+                "--backend",
+                "vllm",
+                "--base-image",
+                custom_base,
+                "--cuda-driver-version",
+                custom_driver,
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertEqual(result.stdout.strip(), expected_tag)
 
     def test_cuda_layout_probe_requires_the_compatible_toolkit_alias(self):
         workflow = (ROOT / ".github/workflows/ci-gpu-runner-image.yml").read_text()

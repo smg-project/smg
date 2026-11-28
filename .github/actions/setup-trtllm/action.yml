@@ -1,11 +1,38 @@
 name: 'Setup TRT-LLM Backend'
-description: 'Create Python venv and install TensorRT-LLM pre-release wheel from PyPI.'
+description: 'Fetch prebuilt TRT-LLM environment if available, create/adopt Python venv, and install TensorRT-LLM.'
+
+inputs:
+  carrier_base_image:
+    description: 'Optional override for SMG_CI_GPU_CARRIER_BASE_IMAGE'
+    required: false
+    default: ''
+  cuda_driver_version:
+    description: 'Optional override for SMG_CI_GPU_RUNNER_CUDA_DRIVER_VERSION'
+    required: false
+    default: ''
+  image_repository:
+    description: 'Optional override for SMG_CI_GPU_RUNNER_IMAGE_REPOSITORY'
+    required: false
+    default: ''
 
 runs:
   using: 'composite'
   steps:
+    - name: Fetch prebuilt TRT-LLM
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        GITHUB_ACTOR: ${{ github.actor }}
+        GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        SMG_CI_GPU_CARRIER_BASE_IMAGE: ${{ inputs.carrier_base_image || env.SMG_CI_GPU_CARRIER_BASE_IMAGE }}
+        SMG_CI_GPU_RUNNER_CUDA_DRIVER_VERSION: ${{ inputs.cuda_driver_version || env.SMG_CI_GPU_RUNNER_CUDA_DRIVER_VERSION }}
+        SMG_CI_GPU_RUNNER_IMAGE_REPOSITORY: ${{ inputs.image_repository || env.SMG_CI_GPU_RUNNER_IMAGE_REPOSITORY }}
+      run: bash scripts/ci_fetch_backend_prebuilt.sh trtllm
+
     - name: Setup Python venv
       shell: bash
+      env:
+        SMG_CI_BACKEND: trtllm
       run: bash scripts/ci_setup_python_venv.sh
 
     - name: Install TRT-LLM

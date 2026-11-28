@@ -1,6 +1,10 @@
 name: CI Prepared GPU Runner Image
 
 # Nightly checks image availability; unchanged recipes do not trigger rebuilds.
+# Publishes per-backend carrier images (vllm, sglang, trtllm) that bare GPU
+# runner pods cache on node NVMe (/models/.ci-cache/), plus an optional
+# combined actions-runner image when a self-hosted Docker builder is configured
+# or requested on dispatch.
 on:
   schedule:
     - cron: '0 6 * * *'
@@ -15,6 +19,7 @@ on:
       - 'scripts/ci_ensure_python_headers.sh'
       - 'scripts/ci_install_vllm.sh'
       - 'scripts/ci_install_sglang.sh'
+      - 'scripts/ci_install_trtllm.sh'
       - 'scripts/ci_install_flashinfer_jit_cache.sh'
       - 'scripts/ci_gpu_runner_image.py'
       - 'scripts/tests/test_ci_gpu_runner_image.py'
@@ -23,6 +28,10 @@ on:
     inputs:
       force:
         description: 'Build a separate run-tagged candidate without layer cache'
+        default: false
+        type: boolean
+      build_runner_image:
+        description: 'Also build the combined self-hosted actions-runner image (requires >=60 GB free disk)'
         default: false
         type: boolean
 
@@ -35,12 +44,142 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build-and-push:
+  build-backend-carriers:
+    name: Build ${{ matrix.backend }} carrier
     if: github.repository == 'smg-project/smg'
-    runs-on: ${{ vars.SMG_RUNNER_DOCKER || 'cpu-e5' }}
-    timeout-minutes: 120
+    runs-on: ${{ vars.SMG_RUNNER_DOCKER || 'ubuntu-24.04' }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [vllm, sglang, trtllm]
+    env:
+      CARRIER_BASE_IMAGE: ${{ vars.SMG_CI_GPU_CARRIER_BASE_IMAGE || 'ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55' }}
+      UV_CUDA_DRIVER_VERSION: ${{ vars.SMG_CI_GPU_RUNNER_CUDA_DRIVER_VERSION || '580.65.06' }}
+      IMAGE_REPOSITORY: ${{ vars.SMG_CI_GPU_RUNNER_IMAGE_REPOSITORY || format('ghcr.io/{0}/smg', github.repository_owner) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Test image identity and availability handling
+        run: python3 -m unittest scripts.tests.test_ci_gpu_runner_image
+
+      - name: Resolve carrier image
+        id: resolve
+        env:
+          BACKEND: ${{ matrix.backend }}
+          FORCE_REBUILD: ${{ inputs.force == true }}
+        run: |
+          force_run=""
+          if [ "$FORCE_REBUILD" = true ]; then force_run="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"; fi
+          tag="$(python3 scripts/ci_gpu_runner_image.py tag \
+            --backend "$BACKEND" \
+            --base-image "$CARRIER_BASE_IMAGE" \
+            --cuda-driver-version "$UV_CUDA_DRIVER_VERSION" \
+            --force-run "$force_run")"
+          if [[ ! "$IMAGE_REPOSITORY" =~ ^ghcr\.io/[a-z0-9._/-]+$ ]]; then
+            echo 'SMG_CI_GPU_RUNNER_IMAGE_REPOSITORY must be an untagged GHCR repository' >&2
+            exit 1
+          fi
+          echo "image=${IMAGE_REPOSITORY}:${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check for an existing image
+        id: exists
+        env:
+          IMAGE: ${{ steps.resolve.outputs.image }}
+        run: |
+          # Only a missing manifest means rebuild. Auth/network failures fail
+          # this step rather than spending hours rebuilding an unusable target.
+          exists="$(python3 scripts/ci_gpu_runner_image.py exists "$IMAGE")"
+          echo "exists=${exists}" >> "$GITHUB_OUTPUT"
+          echo "**${{ matrix.backend }} carrier:** \`${IMAGE}\`; exists=${exists}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Free disk space on GitHub-hosted runner
+        if: (steps.exists.outputs.exists != 'true' || inputs.force) && runner.environment == 'github-hosted'
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/.ghcup /usr/share/swift /opt/hostedtoolcache/CodeQL
+          docker system prune -af || true
+          df -h /
+
+      - name: Set up Docker Buildx
+        if: steps.exists.outputs.exists != 'true' || inputs.force
+        uses: docker/setup-buildx-action@v4
+        with:
+          driver: docker
+
+      - name: Build carrier image on CPU
+        id: build
+        if: steps.exists.outputs.exists != 'true' || inputs.force
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/ci-gpu-runner.Dockerfile
+          target: ${{ matrix.backend }}
+          push: false
+          load: true
+          platforms: linux/amd64
+          no-cache: ${{ inputs.force == true }}
+          build-args: |
+            CARRIER_BASE_IMAGE=${{ env.CARRIER_BASE_IMAGE }}
+            UV_CUDA_DRIVER_VERSION=${{ env.UV_CUDA_DRIVER_VERSION }}
+          tags: ${{ steps.resolve.outputs.image }}
+
+      - name: Validate prepared environment
+        if: steps.exists.outputs.exists != 'true' || inputs.force
+        env:
+          BACKEND: ${{ matrix.backend }}
+          IMAGE: ${{ steps.resolve.outputs.image }}
+        run: |
+          container="smg-ci-env-check-${BACKEND}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cleanup() { docker rm -f "$container" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          # Expand the probe's variables inside the container.
+          # shellcheck disable=SC2016
+          timeout --kill-after=30s 5m docker run --rm --name "$container" \
+            --entrypoint bash -e SMG_BUILD_PREPARED_ENV=1 -e BACKEND="$BACKEND" \
+            "$IMAGE" -euo pipefail -c '
+            source /opt/smg-ci/scripts/ci_prepared_backend_env.sh
+            venv="/opt/smg-ci/${BACKEND}/.venv"
+            smg_prepared_env_matches "$BACKEND" "$venv"
+            "$venv/bin/python" -c "import torch; assert torch.version.cuda is not None; print(torch.__version__, torch.version.cuda)"
+            if [ "$BACKEND" = sglang ] || [ "$BACKEND" = trtllm ]; then
+              test /usr/local/cuda -ef /usr/local/cuda-13.0
+              test -x /usr/local/cuda/bin/nvcc
+            fi
+          '
+
+      - name: Publish validated carrier image
+        if: steps.exists.outputs.exists != 'true' || inputs.force
+        env:
+          IMAGE: ${{ steps.resolve.outputs.image }}
+        run: |
+          bash scripts/ci_retry.sh 3 30 docker push "$IMAGE"
+          echo "**Published:** \`${IMAGE}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Clean up the local built image
+        if: always() && steps.build.outcome == 'success'
+        env:
+          IMAGE: ${{ steps.resolve.outputs.image }}
+        run: docker rmi "$IMAGE" || true
+
+  build-and-push:
+    name: Build combined runner image
+    if: github.repository == 'smg-project/smg' && (vars.SMG_RUNNER_DOCKER != '' || inputs.build_runner_image == true)
+    runs-on: ${{ vars.SMG_RUNNER_DOCKER || 'ubuntu-24.04' }}
+    timeout-minutes: 150
     env:
       BASE_IMAGE: ${{ vars.SMG_CI_GPU_RUNNER_BASE_IMAGE || 'ghcr.io/actions/actions-runner:2.337.0@sha256:5036480998280bb21e32ade9fe1b02b493861ac314b62ba1aea320b94f56ec97' }}
+      CARRIER_BASE_IMAGE: ${{ vars.SMG_CI_GPU_CARRIER_BASE_IMAGE || 'ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55' }}
       UV_CUDA_DRIVER_VERSION: ${{ vars.SMG_CI_GPU_RUNNER_CUDA_DRIVER_VERSION || '580.65.06' }}
       IMAGE_REPOSITORY: ${{ vars.SMG_CI_GPU_RUNNER_IMAGE_REPOSITORY || format('ghcr.io/{0}/smg', github.repository_owner) }}
     steps:
@@ -60,7 +199,10 @@ jobs:
           force_run=""
           if [ "$FORCE_REBUILD" = true ]; then force_run="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"; fi
           tag="$(python3 scripts/ci_gpu_runner_image.py tag \
-            --base-image "$BASE_IMAGE" --cuda-driver-version "$UV_CUDA_DRIVER_VERSION" --force-run "$force_run")"
+            --base-image "$BASE_IMAGE" \
+            --carrier-base-image "$CARRIER_BASE_IMAGE" \
+            --cuda-driver-version "$UV_CUDA_DRIVER_VERSION" \
+            --force-run "$force_run")"
           if [[ ! "$IMAGE_REPOSITORY" =~ ^ghcr\.io/[a-z0-9._/-]+$ ]]; then
             echo 'SMG_CI_GPU_RUNNER_IMAGE_REPOSITORY must be an untagged GHCR repository' >&2
             exit 1
@@ -85,6 +227,14 @@ jobs:
           echo "exists=${exists}" >> "$GITHUB_OUTPUT"
           echo "**Prepared image:** \`${IMAGE}\`; exists=${exists}" >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Free disk space on GitHub-hosted runner
+        if: (steps.exists.outputs.exists != 'true' || inputs.force) && runner.environment == 'github-hosted'
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/.ghcup /usr/share/swift /opt/hostedtoolcache/CodeQL
+          docker system prune -af || true
+          df -h /
+
       - name: Set up Docker Buildx
         if: steps.exists.outputs.exists != 'true' || inputs.force
         uses: docker/setup-buildx-action@v4
@@ -98,16 +248,18 @@ jobs:
         with:
           context: .
           file: docker/ci-gpu-runner.Dockerfile
+          target: runner
           push: false
           load: true
           platforms: linux/amd64
           no-cache: ${{ inputs.force == true }}
           build-args: |
             BASE_IMAGE=${{ env.BASE_IMAGE }}
+            CARRIER_BASE_IMAGE=${{ env.CARRIER_BASE_IMAGE }}
             UV_CUDA_DRIVER_VERSION=${{ env.UV_CUDA_DRIVER_VERSION }}
           tags: ${{ steps.resolve.outputs.image }}
 
-      - name: Validate both prepared environments as the runner user
+      - name: Validate all prepared environments as the runner user
         if: steps.exists.outputs.exists != 'true' || inputs.force
         env:
           IMAGE: ${{ steps.resolve.outputs.image }}
@@ -121,7 +273,7 @@ jobs:
             --entrypoint bash -e SMG_BUILD_PREPARED_ENV=1 "$IMAGE" -euo pipefail -c '
             test "$(id -u)" -ne 0
             source /opt/smg-ci/scripts/ci_prepared_backend_env.sh
-            for backend in vllm sglang; do
+            for backend in vllm sglang trtllm; do
               venv="/opt/smg-ci/${backend}/.venv"
               smg_prepared_env_matches "$backend" "$venv"
               "$venv/bin/python" -c "import torch; assert torch.version.cuda is not None; print(torch.__version__, torch.version.cuda)"
@@ -145,3 +297,33 @@ jobs:
         env:
           IMAGE: ${{ steps.resolve.outputs.image }}
         run: docker rmi "$IMAGE" || true
+
+  # Keep recent carrier/runner images for in-flight PRs and prune superseded tags
+  # per prefix so GHCR storage stays bounded.
+  prune:
+    name: Prune superseded GPU images
+    needs: [build-backend-carriers, build-and-push]
+    if: >-
+      always()
+      && github.repository == 'smg-project/smg'
+      && github.ref == 'refs/heads/main'
+      && needs.build-backend-carriers.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    env:
+      SMG_CI_GPU_CARRIER_BASE_IMAGE: ${{ vars.SMG_CI_GPU_CARRIER_BASE_IMAGE || 'ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55' }}
+      SMG_CI_GPU_RUNNER_CUDA_DRIVER_VERSION: ${{ vars.SMG_CI_GPU_RUNNER_CUDA_DRIVER_VERSION || '580.65.06' }}
+      SMG_CI_GPU_RUNNER_IMAGE_REPOSITORY: ${{ vars.SMG_CI_GPU_RUNNER_IMAGE_REPOSITORY || format('ghcr.io/{0}/smg', github.repository_owner) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Prune superseded images
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/ci_prune_gpu_runner_images.sh

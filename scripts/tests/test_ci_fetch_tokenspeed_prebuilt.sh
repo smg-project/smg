@@ -274,6 +274,17 @@ test_superseded_tag_dirs_are_swept_after_seven_days() {
     assert_file "$CACHE/$TAG/.complete"
 }
 
+test_cuda_toolkit_is_cached_and_linked_when_present() {
+    setup
+    mkdir -p "$FAKE_IMAGE_ROOT/usr/local/cuda-13.0/bin"
+    printf '#!/bin/sh\necho "Cuda compilation tools, release 13.0"\n' > "$FAKE_IMAGE_ROOT/usr/local/cuda-13.0/bin/nvcc"
+    chmod +x "$FAKE_IMAGE_ROOT/usr/local/cuda-13.0/bin/nvcc"
+    local out; out="$(run_fetch "$T/opt" 100 TOKENSPEED_PREBUILT_CUDA_ROOT="$T/usr-local")"
+    assert_link_into "$T/usr-local/cuda-13.0" "$CACHE/$TAG"
+    assert_file "$T/usr-local/cuda-13.0/bin/nvcc"
+    assert_contains "$out" "Linked cached CUDA 13.0 toolkit"
+}
+
 tests=(
     test_cold_pull_populates_cache_and_links_install_root
     test_warm_cache_skips_docker_entirely
@@ -289,6 +300,7 @@ tests=(
     test_concurrent_callers_pull_once
     test_stale_job_dirs_are_swept
     test_superseded_tag_dirs_are_swept_after_seven_days
+    test_cuda_toolkit_is_cached_and_linked_when_present
 )
 # Optional: name one or more tests on the command line to run only those.
 [ $# -eq 0 ] || tests=("$@")

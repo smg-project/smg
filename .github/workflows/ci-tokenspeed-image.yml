@@ -45,7 +45,7 @@ concurrency:
 jobs:
   build-and-push:
     if: github.repository == 'smg-project/smg'
-    runs-on: ${{ vars.SMG_RUNNER_DOCKER || 'cpu-e5' }}
+    runs-on: ${{ vars.SMG_RUNNER_DOCKER || 'ubuntu-24.04' }}
     timeout-minutes: 120
     steps:
       - name: Checkout code
@@ -94,6 +94,14 @@ jobs:
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Free disk space on GitHub-hosted runner
+        if: (steps.exists.outputs.exists != 'true' || inputs.force || github.event_name == 'push') && runner.environment == 'github-hosted'
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/.ghcup /usr/share/swift /opt/hostedtoolcache/CodeQL
+          docker system prune -af || true
+          df -h /
 
       - name: Set up Docker Buildx
         if: steps.exists.outputs.exists != 'true' || inputs.force || github.event_name == 'push'

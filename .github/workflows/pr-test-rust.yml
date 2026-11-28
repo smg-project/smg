@@ -686,6 +686,13 @@ jobs:
 
       - name: Setup SGLang backend
         uses: ./.github/actions/setup-sglang
+        with:
+          carrier_base_image: ${{ vars.SMG_CI_GPU_CARRIER_BASE_IMAGE }}
+          cuda_driver_version: ${{ vars.SMG_CI_GPU_RUNNER_CUDA_DRIVER_VERSION }}
+          image_repository: ${{ vars.SMG_CI_GPU_RUNNER_IMAGE_REPOSITORY }}
+
+      - name: Setup persistent JIT cache
+        run: bash scripts/ci_setup_jit_cache.sh sglang
 
       - name: Download build artifacts
         uses: ./.github/actions/download-build-artifacts
@@ -734,6 +741,10 @@ jobs:
           path: benchmark-logs/
           if-no-files-found: ignore
           retention-days: 7
+
+      - name: Remove per-job prebuilt backend payload copy
+        if: always() && env.SMG_PREBUILT_JOB_DIR != ''
+        run: rm -rf "$SMG_PREBUILT_JOB_DIR"
 
   # Initial advisory AMD PR performance slice: same regular HTTP/gRPC test,
   # four TP1 workers and thresholds as NVIDIA. PD performance remains separate.
@@ -1267,6 +1278,7 @@ jobs:
               ("scripts/ci_rust_tests.sh",                       NONE),
               ("scripts/ci_install_wasm_tools.sh",               NONE),
               ("scripts/ci_gpu_runner_image.py",                 NONE),
+              ("scripts/ci_prune_gpu_runner_images.sh",          NONE),
               ("scripts/ci_node_health.py",                      NONE),
               ("scripts/ci_prune_tokenspeed_images.sh",          NONE),
               ("scripts/ci_setup_sglang_rocm_image.sh",          SGLANG),
@@ -2507,6 +2519,13 @@ jobs:
 
       - name: Setup SGLang backend
         uses: ./.github/actions/setup-sglang
+        with:
+          carrier_base_image: ${{ vars.SMG_CI_GPU_CARRIER_BASE_IMAGE }}
+          cuda_driver_version: ${{ vars.SMG_CI_GPU_RUNNER_CUDA_DRIVER_VERSION }}
+          image_repository: ${{ vars.SMG_CI_GPU_RUNNER_IMAGE_REPOSITORY }}
+
+      - name: Setup persistent JIT cache
+        run: bash scripts/ci_setup_jit_cache.sh sglang
 
       - name: Setup Go
         uses: actions/setup-go@v7
@@ -2549,6 +2568,10 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+      - name: Remove per-job prebuilt backend payload copy
+        if: always() && env.SMG_PREBUILT_JOB_DIR != ''
+        run: rm -rf "$SMG_PREBUILT_JOB_DIR"
+
   go-bindings-benchmark:
     name: go-bindings-benchmark
     needs: [build-wheel, build-go-ffi]
@@ -2564,6 +2587,13 @@ jobs:
 
       - name: Setup SGLang backend
         uses: ./.github/actions/setup-sglang
+        with:
+          carrier_base_image: ${{ vars.SMG_CI_GPU_CARRIER_BASE_IMAGE }}
+          cuda_driver_version: ${{ vars.SMG_CI_GPU_RUNNER_CUDA_DRIVER_VERSION }}
+          image_repository: ${{ vars.SMG_CI_GPU_RUNNER_IMAGE_REPOSITORY }}
+
+      - name: Setup persistent JIT cache
+        run: bash scripts/ci_setup_jit_cache.sh sglang
 
       - name: Setup Go
         uses: actions/setup-go@v7
