@@ -173,17 +173,11 @@ fn registration(app: &Arc<AppContext>, url: &str) -> WorkflowContext<WorkerWorkf
     WorkflowContext::new(WorkflowInstanceId::new(), data)
 }
 
+/// Registers `url` as a local gRPC worker. The registration's probes dial
+/// the engine: they get time enough on a loaded host.
 async fn register_grpc(app: &Arc<AppContext>, url: &str) -> Arc<dyn Worker> {
-    register_grpc_from(app, url, registration(app, url)).await
-}
-
-/// [`register_grpc`] over `context`, a registration of `url` its case set
-/// up.
-async fn register_grpc_from(
-    app: &Arc<AppContext>,
-    url: &str,
-    mut context: WorkflowContext<WorkerWorkflowData>,
-) -> Arc<dyn Worker> {
+    let mut context = registration(app, url);
+    context.data.config.health.timeout_secs = Some(30);
     context.data.worker_kind = Some(WorkerKind::Local);
     DetectConnectionModeStep
         .execute(&mut context)
@@ -353,11 +347,7 @@ async fn stock_startup_uses_the_stock_connector_on_each_path() {
 async fn the_host_can_delegate_a_stock_engine_to_the_stock_connector() {
     let (url, _) = mock_grpc_engine().await;
     let app = gateway(Extensions::new().connector(Arc::new(HostConnector))).await;
-    // The engine listens and the registration's probes dial it: they get
-    // time enough on a loaded host.
-    let mut registering = registration(&app, &url);
-    registering.data.config.health.timeout_secs = Some(30);
-    let worker = register_grpc_from(&app, &url, registering).await;
+    let worker = register_grpc(&app, &url).await;
     let connector = app.engine_connector();
     assert!(Arc::ptr_eq(&worker.engine_connector().unwrap(), &connector));
     // The gateway's client the host delegated to passes the wrap as it is.
@@ -462,11 +452,7 @@ async fn a_worker_on_a_hosts_connection_is_polled_through_it_and_sent_to_through
 ) {
     let (url, _) = mock_grpc_engine().await;
     let app = gateway(Extensions::new().connector(Arc::new(HostLoadsConnector))).await;
-    // The engine listens and the registration's probes dial it: they get
-    // time enough on a loaded host.
-    let mut registering = registration(&app, &url);
-    registering.data.config.health.timeout_secs = Some(30);
-    let worker = register_grpc_from(&app, &url, registering).await;
+    let worker = register_grpc(&app, &url).await;
     let connection = worker.engine_connection().await.unwrap().unwrap();
     let fronted = connection.downcast_arc::<Fronted>().unwrap();
     let front = Arc::clone(fronted.front());
@@ -550,11 +536,7 @@ async fn the_load_feed_holds_the_value_a_stock_grpc_polls_answer_states_by_name(
         let mut engines = Vec::new();
         for free in [10.0, 40.0, 70.0] {
             let url = mock_grpc_engine_stating(wire, NAME, UNIT, free).await;
-            // The engine listens and the registration's probes dial it:
-            // they get time enough on a loaded host.
-            let mut registering = registration(&app, &url);
-            registering.data.config.health.timeout_secs = Some(30);
-            let worker = register_grpc_from(&app, &url, registering).await;
+            let worker = register_grpc(&app, &url).await;
             engines.push((worker, free));
         }
         let (first, _) = &engines[0];
@@ -575,7 +557,9 @@ async fn the_load_feed_holds_the_value_a_stock_grpc_polls_answer_states_by_name(
 
         let published = feed.borrow();
         for (worker, free) in &engines {
-            let report = published.get(worker.url()).unwrap();
+            let report = published.get(worker.url()).unwrap_or_else(|| {
+                panic!("{wire:?}: no report of {} after ten polls", worker.url())
+            });
             let stated: Vec<_> = report
                 .loads
                 .iter()
