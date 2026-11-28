@@ -31,8 +31,7 @@ impl Loaded<'_, '_> {
     /// decision made ahead of every profile.
     #[must_use]
     pub(crate) fn label_at(self, position: u16) -> &'static str {
-        let label = self.document.labels.get(usize::from(position));
-        label.copied().unwrap_or("")
+        self.document.label_at(position)
     }
 }
 

@@ -28,9 +28,9 @@ use crate::{
         framework::Place,
         list_cell::PublishedList,
         records::worker_id,
+        sticky_sessions::SessionVerdict,
     },
     store::GatewayId,
-    tracking::lease::EventSet,
 };
 
 /// The engine of `document`, as its host holds it: for the life of the
@@ -363,8 +363,7 @@ fn a_place_a_noted_place_and_a_whole_decision_are_kept_under_a_hosts_id() {
         let engine = hosted(&document);
         let handle = engine.spec();
         let one_pick = matches!(handle.place_for(MODEL, Phase::Single), Place::Alone(_));
-        let beside = engine.in_force().hears_beside_table;
-        let hears = beside.intersects(EventSet::LEASE);
+        let hears = engine.in_force().hears_leases_of(SessionVerdict::None);
         assert_eq!((one_pick, hears), (alone, noted), "{road}");
         let list = pool(4);
         let members = PublishedList::new(Arc::clone(&list));
@@ -490,8 +489,8 @@ fn a_singles_record_holds_what_its_shadow_said() {
 #[test]
 fn a_noted_place_is_kept_as_it_was_noted() {
     let engine = hosted(&noting(1));
-    let beside = engine.in_force().hears_beside_table;
-    assert!(beside.intersects(EventSet::LEASE), "a count takes a word");
+    let beside = engine.in_force().hears_leases_of(SessionVerdict::None);
+    assert!(beside, "a count takes a word");
     let handle = engine.spec();
     let alone = matches!(handle.place_for(MODEL, Phase::Single), Place::Alone(_));
     assert!(alone, "one pick decides the place");
@@ -526,9 +525,9 @@ fn a_noted_place_is_kept_as_it_was_noted() {
 #[test]
 fn a_place_is_kept_under_a_table_that_alone_takes_a_word() {
     let engine = hosted(&ruled_ahead(sampling("round_robin", 2)));
-    assert!(engine.in_force().hears.intersects(EventSet::LEASE));
-    let beside = engine.in_force().hears_beside_table;
-    assert!(!beside.intersects(EventSet::LEASE), "the table alone");
+    assert!(engine.in_force().hears_leases());
+    let beside = engine.in_force().hears_leases_of(SessionVerdict::None);
+    assert!(!beside, "the table alone");
     let list = pool(4);
     let members = PublishedList::new(Arc::clone(&list));
     let asks = Asks::of(request(), Some(&members));
