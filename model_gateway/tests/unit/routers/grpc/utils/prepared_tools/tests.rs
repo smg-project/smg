@@ -101,12 +101,8 @@ fn the_table_starts_over_when_the_kept_sets_would_exceed_their_weight() {
         .unwrap()
     };
     let one = [enum_tool("weight_probe")];
-    let weight = set_weight(
-        serde_json::to_vec(&one).unwrap().len(),
-        &one.iter()
-            .map(|t| serde_json::to_value(t).unwrap())
-            .collect::<Vec<_>>(),
-    );
+    let probe = tool_values(&one).unwrap();
+    let weight = set_weight(key_of(&one).len(), &probe);
     assert!(weight < PREPARED_TOOLS_MAX_SET_WEIGHT, "{weight}");
     let sets = PREPARED_TOOLS_KEPT_WEIGHT / weight + 2;
     assert!(
@@ -128,17 +124,12 @@ fn the_table_starts_over_when_the_kept_sets_would_exceed_their_weight() {
         "a set the weight's restart dropped is prepared again"
     );
     // Heavy kept, light on the wire: 12,000 one-digit numbers serialize to
-    // about 24 KiB, under the key cap, and weigh past the per-set cap.
+    // about 24 KiB and their key is no longer, under the key cap, and they
+    // weigh past the per-set cap.
     let heavy = [serde_json::from_value::<Tool>(json!({"type": "function", "function": {"name": "heavy",
         "parameters": {"type": "object", "properties": {"code": {"type": "integer", "enum": (0..12000).map(|i| i % 10).collect::<Vec<_>>()}}}}})).unwrap()];
-    let heavy_key = serde_json::to_vec(&heavy).unwrap().len();
-    let heavy_weight = set_weight(
-        heavy_key,
-        &heavy
-            .iter()
-            .map(|t| serde_json::to_value(t).unwrap())
-            .collect::<Vec<_>>(),
-    );
+    let heavy_key = key_of(&heavy).len();
+    let heavy_weight = set_weight(heavy_key, &tool_values(&heavy).unwrap());
     assert!(
         heavy_key <= PREPARED_TOOLS_MAX_KEY_BYTES && heavy_weight > PREPARED_TOOLS_MAX_SET_WEIGHT,
         "{heavy_key} bytes, {heavy_weight} weight"
@@ -224,6 +215,24 @@ fn key_of(tools: &[Tool]) -> Vec<u8> {
     let mut key = Vec::new();
     write_key(&mut key, tools).unwrap();
     key
+}
+
+/// The `tojson` texts a kept set comes to hold are compact JSON, longer than
+/// its key: the table charges them by that text's length, not by the key's.
+#[test]
+fn a_kept_set_is_charged_its_tojson_texts_by_their_compact_length() {
+    let tools = [tool("charged_probe", "")];
+    let values = tool_values(&tools).unwrap();
+    let text = serde_json::to_vec(&values).unwrap().len();
+    let key = key_of(&tools).len();
+    assert!(
+        key < text,
+        "the key ({key}) is shorter than the text ({text})"
+    );
+    assert_eq!(
+        set_weight(key, &values),
+        key + text * PreparedTools::KEPT_TOJSON_TEXTS_PER_TOOL + kept_weight(&values)
+    );
 }
 
 /// The key stands for the serialized tools: two sets share a key exactly
