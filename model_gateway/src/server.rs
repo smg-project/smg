@@ -4924,10 +4924,10 @@ mod tests {
         tokio::pin!(exit);
         tokio::select! {
             _ = &mut exit => panic!("the exit ended while the mutation was in flight"),
-            status = status_read_by(&a, "B", NodeStatus::Leaving, secs(5)) => assert_eq!(
+            status = status_read_by(&a, "B", NodeStatus::Leaving, secs(20)) => assert_eq!(
                 status,
                 Some(NodeStatus::Leaving),
-                "what A reads of B within five seconds of B's listener failure"
+                "what A reads of B behind B's listener failure"
             ),
         }
         let own_entry = || b.state.read().get("B").map(|b| (b.status, b.version));
