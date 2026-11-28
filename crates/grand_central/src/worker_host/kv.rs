@@ -439,24 +439,28 @@ impl BlockIndex for Lane<'_, '_> {
     }
 }
 
-/// The lane's map inside a row's state for one batch. Dropped, it puts the
-/// map back, also behind rules that unwound: the tables then empty the
-/// rank by a map that names every block the row wrote.
+/// The lane's side of a batch's loan: the lane's map, out of the lane for
+/// one batch. The row's state holds it for the rules' call alone and hands
+/// it back here ([`WorkerIndexState::holding`]). Dropped, this puts the
+/// map back in the lane, also behind rules that unwound: the tables then
+/// empty the rank by a map that names every block the row holds in the
+/// chain. The map names nothing of the row's group view: the tables clear
+/// the view in a step of its own.
 struct Lending<'a, 'w> {
     lane: &'a mut LaneWriter<'w>,
-    state: &'a mut WorkerIndexState<Lent>,
+    map: Lent,
 }
 
 impl<'a, 'w> Lending<'a, 'w> {
-    fn new(lane: &'a mut LaneWriter<'w>, state: &'a mut WorkerIndexState<Lent>) -> Self {
-        state.blocks = Lent(Some(mem::take(lane.map())));
-        Self { lane, state }
+    fn new(lane: &'a mut LaneWriter<'w>) -> Self {
+        let map = Lent(Some(mem::take(lane.map())));
+        Self { lane, map }
     }
 }
 
 impl Drop for Lending<'_, '_> {
     fn drop(&mut self) {
-        if let Some(map) = self.state.blocks.0.take() {
+        if let Some(map) = self.map.0.take() {
             *self.lane.map() = map;
         }
     }
@@ -882,34 +886,36 @@ impl KvAdapter {
             } = &mut *locked;
             if *emptied != Some(lane.emptied()) {
                 // The tables emptied the rank since the row's last batch, or
-                // the row begins: what the rules kept beside the map goes
-                // with the blocks.
-                state.index_emptied();
-                // The view is the index's, under the row's id there. A
-                // lane made again holds another: the rules write that one.
-                if state.groups.is_some() {
-                    state.groups = Some(lane.groups());
-                }
+                // the row begins: the copies, the block of record and the
+                // view's blocks go with the row's blocks. The view is the
+                // index's, under the row's id there. A lane made again holds
+                // another: a state that holds a view takes that one, and the
+                // rules write it.
+                state.index_emptied_in(&Lane(lane), lane.worker());
             }
             let worker = lane.worker();
             {
-                let lending = Lending::new(lane, state);
+                let mut lending = Lending::new(lane);
                 let (op, disposition) = if snapshot {
                     ("snapshot", "snapshot")
                 } else {
                     ("stored", "applied")
                 };
-                // Applied and accounted for under the worker's name.
-                took = Some(apply_counted(
-                    batch,
-                    url,
-                    worker,
-                    &Lane(lending.lane),
-                    lending.state,
-                    op,
-                    disposition,
-                ));
-                *blocks = lending.state.blocks.len();
+                // Applied and accounted for under the worker's name, with
+                // the lane's map the state's for the call.
+                let (spent, count) = state.holding(&mut lending.map, |state| {
+                    apply_counted(
+                        batch,
+                        url,
+                        worker,
+                        &Lane(lending.lane),
+                        state,
+                        op,
+                        disposition,
+                    )
+                });
+                took = Some(spent);
+                *blocks = count;
             }
             *emptied = Some(lane.emptied());
             record = state.block_of_record();

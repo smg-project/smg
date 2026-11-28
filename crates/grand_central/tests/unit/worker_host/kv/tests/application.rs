@@ -1,7 +1,8 @@
 //! A batch's application: what its stores, removals and clears write, what
-//! the row's stream showed of its groups, and a batch the cursor skips. The
-//! port's other calls: a resync's reason, a cursor's reading, a
-//! reconnection and a removal, as each reaches the tables.
+//! the row's stream showed of its groups, a batch the cursor skips, and
+//! the lane's map behind a loan whose call unwinds. The port's other
+//! calls: a resync's reason, a cursor's reading, a reconnection and a
+//! removal, as each reaches the tables.
 
 use super::*;
 
@@ -738,6 +739,46 @@ fn a_lane_made_again_gives_the_rows_state_the_indexs_new_view() {
     assert!(!Arc::ptr_eq(&old, &new));
     assert!(new.knows(1), "the new view is the one the row writes");
     assert_eq!(new.named_blocks(), 1);
+}
+
+/// A loan's call unwinds behind the rules' store. The lane's map is back
+/// in the lane with both blocks: the one the row held and the one the
+/// rules wrote ahead of the unwinding.
+#[test]
+fn a_loan_whose_call_unwinds_puts_the_map_back_in_the_lane() {
+    let f = Fixture::new();
+    f.applied(1, &batch([Data::Stored(stored(1))]));
+    let second = batch([Data::Stored(stored(2))]);
+    let mut back = None;
+    let outcome = f.tables.admit_through(f.row, RANK, facts(2), &mut |lane| {
+        let mut state = WorkerIndexState::<Lent>::default();
+        let worker = lane.worker();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut lending = Lending::new(lane);
+            let _: ((), usize) = state.holding(&mut lending.map, |state| {
+                apply_counted(
+                    &second,
+                    URL,
+                    worker,
+                    &Lane(lending.lane),
+                    state,
+                    "stored",
+                    "applied",
+                );
+                panic!("the call unwinds")
+            });
+        }));
+        assert!(unwound.is_err());
+        let map = lane.map();
+        let held = [1_i64, 2].map(|hash| map.contains_key(SequenceHash::from(hash)));
+        back = Some((map.len(), held));
+    });
+    assert_eq!(outcome, BatchOutcome::Applied);
+    assert_eq!(
+        back,
+        Some((2, [true, true])),
+        "the lane holds its map and both blocks"
+    );
 }
 
 #[test]
