@@ -756,11 +756,13 @@ impl Reader {
     /// client reads which function is called before the arguments' key arrives. A whole
     /// answer is read without it: an output cut behind a name holds no call there. Under a
     /// choice that drops a call (`none`, a named function, an allowed list, and a `required`
-    /// list, which drops a call to a function the request does not declare) the engine stays
-    /// as built: a call that ends before its arguments is no call there and its bytes stay
-    /// the answer's content, where a call dropped at its name would take them with it.
+    /// list, which drops a call to a function the request does not declare), and where one
+    /// call only is taken ([`Self::first_call_only`], said before this, which drops every
+    /// later call), the engine stays as built: a call that ends before its arguments is no
+    /// call there and its bytes stay the answer's content, where a call dropped at its name
+    /// would take them with it.
     pub(crate) fn starts_calls_at_name(mut self) -> Self {
-        if self.forbidden.forbids == Forbids::Nothing {
+        if self.forbidden.forbids == Forbids::Nothing && !self.first_call_only {
             self.engine = self.engine.starts_calls_at_name();
         }
         self
