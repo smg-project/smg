@@ -1063,6 +1063,123 @@ fn a_prefills_shadow_that_sheds_is_shown_the_lent_ring_in_the_defaults_step() {
     assert_eq!(shown, placed, "the filter at every ask");
 }
 
+/// What a [`SeesEachRow`] was shown, ask by ask: whether a ring, and the
+/// places.
+type AsksShown = Vec<(bool, Vec<u64>)>;
+
+/// A filter of the host's own that declares the ring need and reads a row
+/// alone. It keeps every row and records what each ask shows it.
+#[derive(Debug)]
+struct SeesEachRow(Arc<Mutex<AsksShown>>);
+
+impl Filter for SeesEachRow {
+    fn name(&self) -> &'static str {
+        "decode-declares"
+    }
+
+    fn keep(&self, facts: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+        let shown = (facts.ring.is_some(), facts.ring_positions.to_vec());
+        self.0.lock().push(shown);
+        true
+    }
+
+    fn row_wise(&self) -> bool {
+        true
+    }
+
+    fn needs(&self) -> Needs {
+        Needs {
+            ring: true,
+            ..Needs::default()
+        }
+    }
+}
+
+/// A filter that keeps no row and declares nothing.
+#[derive(Debug)]
+struct KeepsNone;
+
+impl Filter for KeepsNone {
+    fn name(&self) -> &'static str {
+        "keeps-none"
+    }
+
+    fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+        false
+    }
+}
+
+/// A prefill's shadow that reads the ring by another kind of place than
+/// the live pair is lent no ring, and its runs read none. Where they
+/// shed, the pair's default asks the live decode profile's hard filters
+/// once more, on the request as the pair's decision showed it to them: a
+/// filter of that profile that declares the ring need is shown the lent
+/// ring and the request's place there too. The live pair places by the
+/// routing value's own text and the shadow by a prompt's head. The
+/// shadow's own filter keeps no prefill, so both its runs shed and the
+/// default takes none. The decode's filter reads a row alone, so the
+/// default asks it: more often than beside no shadow, and it is shown the
+/// same at every ask.
+#[test]
+fn a_prefills_shadow_lent_no_ring_shows_the_live_decodes_filter_the_ring_in_the_defaults_step() {
+    let list = pool(2);
+    let cell = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&cell);
+    let [records, refuses] = ["decode-declares", "keeps-none"];
+    let mut stages = StageRegistry::builtin();
+    let added = stages.filter(records, move || Box::new(SeesEachRow(Arc::clone(&seen))));
+    added.expect("a free name");
+    let added = stages.filter(refuses, || Box::new(KeepsNone));
+    added.expect("a free name");
+    let members = PublishedList::new(Arc::clone(&list));
+    let both = &[0_u32, 1][..];
+    let classes = PartnerClasses::number_first(2, [(both, &[0][..]), (both, &[][..])]);
+    let addresses = list.iter().map(|worker| worker.url().to_owned());
+    let ring = Lent(addresses.collect());
+    let headers = [("x-smg-routing-key", "conv-1")];
+    let request = PlaceRequest {
+        headers: &headers,
+        ring: Some(&ring),
+        ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair_of(&members, &classes)))
+    };
+    // What the decode's filter was shown at each ask of one decision,
+    // beside the prefill's shadow or beside none.
+    let shown_beside = |shadowed: bool| {
+        let plain = "consistent_hashing";
+        let mut document = PolicySpec::pair_presets(plain, plain).expect("the pair presets");
+        let decode = document.profiles.get_mut("decode");
+        let decode = decode.expect("the live decode profile");
+        decode.filter.push(FilterSpec::Name(records.to_owned()));
+        if shadowed {
+            let prefix = PolicySpec::pair_presets("prefix_hash", "prefix_hash");
+            let mut sides = prefix.expect("the pair presets").profiles.into_iter();
+            let shadow = sides.find(|(side, _)| side == "prefill");
+            let (side, mut shadow) = shadow.expect("the prefix form's prefill profile");
+            shadow.filter.push(FilterSpec::Name(refuses.to_owned()));
+            let name = format!("{side}-next");
+            document.profiles.insert(name.clone(), shadow);
+            let sides = ShadowSpec::Sides([(side, name)].into_iter().collect());
+            document.bindings[0].shadow = Some(sides);
+        }
+        document.generation = 1;
+        let spec = AppliedSpec::validate_in(&document, &stages, &[]);
+        let engine = hosted(InProcess::new(spec.expect("the stages hold the filters")));
+        let maker = Made::new(engine, &request, &[]);
+        let decided = engine.decide_at(&maker, Instant::now);
+        assert!(decided.is_ok(), "the pair's decision");
+        // The shadow keeps its shed: another outcome, and no fault.
+        let said = (sides_said(engine)[0], engine.faults());
+        assert_eq!(said, ([0, 0, u64::from(shadowed), 0], 0), "the shadow");
+        std::mem::take(&mut *cell.lock())
+    };
+    let alone = shown_beside(false);
+    let beside = shown_beside(true);
+    assert!(beside.len() > alone.len(), "the default asks the filter");
+    let placed = (true, vec![ring.position("conv-1")]);
+    assert!(alone.iter().all(|shown| *shown == placed), "{alone:?}");
+    assert!(beside.iter().all(|shown| *shown == placed), "{beside:?}");
+}
+
 /// A decode's shadow the all-vetoed rule steers, one of whose filters
 /// declares the ring need, asks the lender ahead of its filters: a ring
 /// that panics where it is asked counts one fault of the shadow at the

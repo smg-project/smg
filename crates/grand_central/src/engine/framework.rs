@@ -9599,6 +9599,7 @@ impl Engine {
         // The place stated on a lent ring is the two live sides' where
         // one list is both sides', and the side's own live profile's
         // where each side is stated its own.
+        let came = facts;
         let unlent = self.unlent(index, held_to(&lives, side, facts), facts);
         let facts = unlent.as_ref().unwrap_or(facts);
         let (prefills, prefill_facts) = pools.side(PairSide::Prefill, facts)?;
@@ -9684,13 +9685,19 @@ impl Engine {
                 // A run that still sheds goes to the pair's default for
                 // its prefill, the live decode profile on the other side.
                 // The default reads every open class and the constraints
-                // as they are stated. The decode side's facts are this
-                // run's, with no ring where the shadow is lent none: that
-                // step asks the decode profile's hard filters alone, and
-                // none of the crate's own reads a ring.
+                // as they are stated. That step asks the live decode
+                // profile's hard filters on the request's facts as they
+                // came, as the pair's decision asked them: with the ring
+                // the request lends, where the shadow itself is lent none.
                 if !waits && refused(&run) {
                     let live_decode = lives[PairSide::Decode.index()];
                     let live_decode_profile = self.profiles.get(usize::from(live_decode))?;
+                    let whole = if unlent.is_some() {
+                        Some(pools.side(PairSide::Decode, came)?.1)
+                    } else {
+                        None
+                    };
+                    let live_decode_facts = whole.as_ref().unwrap_or(&decode_facts);
                     // The shadow's own hard filters are asked there on the
                     // facts its run showed them, as the limit's test asks
                     // them.
@@ -9701,7 +9708,7 @@ impl Engine {
                         Half::new(
                             live_decode_profile,
                             live_decode,
-                            &decode_facts,
+                            live_decode_facts,
                             decodes,
                             decode_cx,
                         ),
