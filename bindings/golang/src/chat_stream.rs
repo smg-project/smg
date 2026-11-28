@@ -87,6 +87,16 @@ pub(crate) fn prepare_chat(
             format!("Failed to parse request JSON: {e}"),
         )
     })?;
+    if request
+        .resolved_thinking_token_budget()
+        .map_err(|err| (SglErrorCode::InvalidArgument, err.to_string()))?
+        .is_some()
+    {
+        return Err((
+            SglErrorCode::InvalidArgument,
+            "This SGLang connection cannot enforce a finite thinking_token_budget".to_string(),
+        ));
+    }
     let processed = process_chat_messages(&request, tokenizer, None).map_err(|e| {
         (
             SglErrorCode::TokenizationError,

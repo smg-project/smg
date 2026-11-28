@@ -11,6 +11,7 @@ pub(crate) mod tenant_rate_limit;
 #[cfg(test)]
 #[path = "../../../tests/unit/routers/http/test_support.rs"]
 pub(crate) mod test_support;
+mod thinking_budget;
 
 use axum::response::Response;
 use openai_protocol::{chat::ChatCompletionRequest, profile::ProviderProfile};
