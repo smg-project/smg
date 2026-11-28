@@ -109,6 +109,7 @@ pub(crate) async fn prepare_rendered_prompt(
             // plan (see `resolve_mm_processing` and `PipelinePin`).
             ctx.state.media_refs_pipeline =
                 multimodal::media_refs_pipeline_pin(&media_plan, &placeholders);
+            ctx.state.media_refs_hints = multimodal::plan_has_hints(&media_plan);
             if media_plan.modalities() == [Modality::Image] {
                 ctx.state.image_anchor = placeholders
                     .get(Modality::Image)

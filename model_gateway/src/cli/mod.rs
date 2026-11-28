@@ -947,8 +947,9 @@ struct WorkerArgs {
     /// else router), `router` (always the gateway), `worker` (the engine,
     /// except that a request whose items carry per-item hints
     /// (max_long_side_pixel, fps) is preprocessed by the gateway, which
-    /// applies them; models without worker expansion are rejected). Falls
-    /// back to `SMG_MM_PROCESSING`, then `auto`.
+    /// applies them, unless every media-processing worker of the model
+    /// applies them itself (mm_item_hints); models without worker expansion
+    /// are rejected). Falls back to `SMG_MM_PROCESSING`, then `auto`.
     #[arg(long, value_parser = parse_mm_processing, help_heading = "Multimodal")]
     mm_processing: Option<MmProcessingMode>,
 

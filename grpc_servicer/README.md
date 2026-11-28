@@ -248,7 +248,9 @@ model whose workers report a vision encoder has no worker advertising
 and its other models, and each vision worker without a media processor is
 warned about once at registration); the outcome is counted in
 `smg_mm_processing_total{model,mode,reason}` (`pipeline_workers` and
-`auto_pipeline` name the forwarded-by-the-pipeline case), and the startup line
+`auto_pipeline` name the forwarded-by-the-pipeline case, `hints_forwarded` a
+request whose per-item hints rode its references, `hint_fallback` one the
+router preprocessed for them), and the startup line
 `multimodal processing mode` names the value and its source (`flag`, `env` or
 `default`). `SMG_MM_PROCESSING` is the deprecated env fallback: it applies only
 when the flag is absent, logs a deprecation line, and goes away in the next
@@ -763,10 +765,13 @@ name reads `"true"`. `inprocess`, `redis` and the Python servicer apply none,
 report `mm_item_hints` false, and refuse a hinted reference with
 `INVALID_ARGUMENT` naming the reason. Every vLLM worker carries the label: it
 reads `"false"` for those processors and for a servicer older than the hints,
-which drops them as unknown fields. The router forwards no hints yet: under
-`--mm-processing worker` it preprocesses a hinted request itself
-(`hint_fallback`), or refuses one it cannot preprocess with
-`multimodal_hint_unsupported_in_worker_mode`.
+which drops them as unknown fields. Under `--mm-processing worker` the router
+forwards a hinted request's references only to a model whose
+media-processing workers all have the label `"true"`, and places it on those
+workers alone, first attempt and retries. Otherwise it preprocesses the
+request itself (`hint_fallback`), or refuses one it cannot preprocess with
+`multimodal_hint_unsupported_in_worker_mode`. `auto` preprocesses every
+hinted request itself.
 
 The in-flight cap, the saturation refusal, the advertised `mm_processor` /
 `mm_media_ref_schemes` / `mm_processor_source` and the PD prefill side's

@@ -60,7 +60,7 @@ use crate::{
                 PreparationOutput, RequestContext, RequestInput, RequestType, RoutingSnapshot,
                 WireConstraint, WorkerSelection,
             },
-            multimodal,
+            multimodal::{self, pipeline_admits},
         },
         prefill_queue_full, prefill_queue_timeout,
     },
@@ -98,6 +98,9 @@ enum EpdSelectionFailure {
     DecodeVisionUnsupported,
     EncodeNotSupported,
     EncodeVisionUnsupported,
+    /// The references carry per-item hints and no push encoder that would
+    /// take them applies hints.
+    HintsNotApplied,
     /// Grand Central places the gateway's requests, and it places no
     /// encoder: a request that carries an encode item is not served.
     EncodeUnderGrandCentral,
@@ -431,6 +434,7 @@ impl<'a> SelectionInputs<'a> {
         intermediate: Option<&'a multimodal::MultimodalIntermediate>,
         refs: Option<&'a multimodal::MediaPlan>,
         media_refs_pipeline: PipelinePin,
+        media_refs_hints: bool,
     ) -> Self {
         let media_refs = refs.is_some();
         let needs_vision = multimodal::request_needs_vision(intermediate, refs);
@@ -443,7 +447,7 @@ impl<'a> SelectionInputs<'a> {
             stage.prefill_side_needs_vision(needs_vision),
             stage.decode_side_needs_vision(&input.request_type, intermediate, media_refs),
         )
-        .with_media_refs(media_refs, media_refs_pipeline)
+        .with_media_refs(media_refs, media_refs_pipeline, media_refs_hints)
         .with_context(context_requirements);
 
         let text = prep.routing_text();
@@ -481,6 +485,7 @@ impl<'a> SelectionInputs<'a> {
             } else {
                 PipelinePin::Any
             },
+            hints: media_refs && media_refs_hints,
         };
 
         let model_id = input.model_id.as_str();
@@ -494,6 +499,7 @@ impl<'a> SelectionInputs<'a> {
             connection: ConnectionMode::Grpc,
             requires_media_refs: false,
             pipeline: PipelinePin::Any,
+            hints: false,
         });
         Self {
             intermediate,
@@ -590,6 +596,7 @@ impl WorkerSelectionStage {
             ctx.state.multimodal_intermediate.as_ref(),
             ctx.state.multimodal_refs.as_ref(),
             ctx.state.media_refs_pipeline,
+            ctx.state.media_refs_hints,
         );
         ctx.state.sticky_key = self
             .policy_registry
@@ -657,16 +664,7 @@ impl WorkerSelectionStage {
                 let hashes = if let Some(plan) = ctx.state.multimodal_refs.as_ref() {
                     let refs = multimodal::assemble_media_refs(plan)
                         .map_err(multimodal::MmRefsError::into_response)?;
-                    Ok(refs
-                        .items
-                        .iter()
-                        .map(|item| {
-                            let mut hash = blake3::Hasher::new();
-                            hash.update(&item.modality.to_le_bytes());
-                            hash.update(item.url.as_bytes());
-                            hash.finalize().as_bytes().to_vec()
-                        })
-                        .collect())
+                    Ok(refs.items.iter().map(media_ref_routing_hash).collect())
                 } else {
                     encode_item_hashes(inputs.intermediate)
                 };
@@ -913,7 +911,7 @@ impl WorkerSelectionStage {
                                     || PdProtocol::encode_handoff(ctx.wire.runtime)
                                         == Some(EncodeHandoff::Push)),
                         )
-                        .with_media_refs(media_refs, ctx.wire.pipeline)
+                        .with_media_refs(media_refs, ctx.wire.pipeline, ctx.wire.hints)
                         .with_context(context_requirements),
                         restated,
                     )
@@ -1173,6 +1171,10 @@ impl WorkerSelectionStage {
                     EpdSelectionFailure::EncodeVisionUnsupported => {
                         return self.vision_refusal(model_id, "encode workers")
                     }
+                    EpdSelectionFailure::HintsNotApplied => {
+                        return multimodal::MmRefsError::HintsNotAppliedBySelection
+                            .into_response()
+                    }
                     EpdSelectionFailure::Placement(failure) => {
                         return self.pair_failure(model_id, *failure)
                     }
@@ -1273,8 +1275,8 @@ fn same_worker(held: &Arc<dyn Worker>, worker: &dyn Worker) -> bool {
 /// place: `worker` reads it as `first` does ([`reads_the_request_alike`]),
 /// in a window no narrower ([`holds_what_the_first_holds`]), and takes the
 /// media references the retained plan's wire forwards, on the side of its
-/// pipeline pin, as every selection asks of a candidate
-/// ([`MediaDemands::accepts_refs`]). A decode request can keep its
+/// pipeline pin and applying their per-item hints, as every selection asks of
+/// a candidate ([`MediaDemands::accepts_refs`]). A decode request can keep its
 /// references: a request of more than one sample works its prompt out again
 /// on its decode, and a decode that processes none would refuse it.
 fn takes_the_built_request(
@@ -1380,6 +1382,10 @@ struct PairDemands {
     /// ([`pipeline_admits`]); the probes count only the pairs on that side,
     /// so a pair the pin excludes never stands in for one it admits.
     pipeline: PipelinePin,
+    /// With `refs`: the references carry per-item hints, so the probes count
+    /// only the pairs whose workers apply them
+    /// ([`multimodal::worker_applies_hints`]), as they count the pin's.
+    hints: bool,
 }
 
 impl PairDemands {
@@ -1393,19 +1399,30 @@ impl PairDemands {
             decode,
             refs: false,
             pipeline: PipelinePin::Any,
+            hints: false,
         }
     }
 
     /// The same demand for a request that forwards media references (`refs`,
-    /// the caller's references predicate) on the side of `pipeline`: the
-    /// prefill side's refusal and the capacity refusal are judged among the
-    /// workers that take them there.
-    fn with_media_refs(self, refs: bool, pipeline: PipelinePin) -> Self {
+    /// the caller's references predicate) on the side of `pipeline`, carrying
+    /// per-item hints when `hints`: the prefill side's refusal and the
+    /// capacity refusal are judged among the workers that take them there.
+    fn with_media_refs(self, refs: bool, pipeline: PipelinePin, hints: bool) -> Self {
         Self {
             refs,
             pipeline: if refs { pipeline } else { PipelinePin::Any },
+            hints: refs && hints,
             ..self
         }
+    }
+
+    /// Whether `worker` takes the request's references: it processes them,
+    /// on the side of the pin, applying their hints when they carry some.
+    fn takes_refs(self, worker: &dyn Worker) -> bool {
+        !self.refs
+            || (accepts_media_refs(worker)
+                && pipeline_admits(self.pipeline, worker)
+                && (!self.hints || multimodal::worker_applies_hints(worker)))
     }
 
     /// Context bounds shared by both token-processing sides, never the encoder.
@@ -1523,13 +1540,14 @@ fn pair_admitted_by(
 }
 
 /// What a retry's media demands of a candidate. The retained wire carries
-/// the media-refs pin and the pipeline pin, the routing snapshot the
-/// pixel-media fact.
+/// the media-refs pin, the pipeline pin and the hint demand, the routing
+/// snapshot the pixel-media fact.
 fn retry_media(ctx: &DispatchContext) -> MediaDemands {
     MediaDemands {
         media_refs: ctx.wire.requires_media_refs,
         vision: ctx.routing.needs_vision,
         pipeline: ctx.wire.pipeline,
+        hints: ctx.wire.hints,
     }
 }
 
@@ -1548,6 +1566,10 @@ struct MediaDemands {
     /// With forwarded references: which of the workers that process them the
     /// plan may use ([`pipeline_admits`]).
     pipeline: PipelinePin,
+    /// With forwarded references: they carry per-item hints, so only a
+    /// worker that applies them ([`multimodal::worker_applies_hints`]); one
+    /// that does not would serve the media unsized.
+    hints: bool,
 }
 
 impl MediaDemands {
@@ -1556,6 +1578,7 @@ impl MediaDemands {
         media_refs: false,
         vision: false,
         pipeline: PipelinePin::Any,
+        hints: false,
     };
 
     /// These demands plus the retained plan's pins on a retry.
@@ -1567,14 +1590,18 @@ impl MediaDemands {
                 PipelinePin::Any => wire.map_or(PipelinePin::Any, |w| w.pipeline),
                 pin => pin,
             },
+            hints: self.hints || wire.is_some_and(|w| w.hints),
         }
     }
 
     /// Whether `worker` may take the request's references: it processes
-    /// them, on the side of the pipeline pin the plan carries. The vision
-    /// demand is the side's own (see [`Self::accepts`]).
+    /// them, on the side of the pipeline pin the plan carries, applying their
+    /// per-item hints when they carry some. The vision demand is the side's
+    /// own (see [`Self::accepts`]).
     fn accepts_refs(self, worker: &dyn Worker) -> bool {
-        (!self.media_refs || accepts_media_refs(worker)) && pipeline_admits(self.pipeline, worker)
+        (!self.media_refs || accepts_media_refs(worker))
+            && pipeline_admits(self.pipeline, worker)
+            && (!self.hints || multimodal::worker_applies_hints(worker))
     }
 
     fn any(self) -> bool {
@@ -1584,17 +1611,6 @@ impl MediaDemands {
     /// Whether `worker` meets every demand.
     fn accepts(self, worker: &dyn Worker) -> bool {
         self.accepts_refs(worker) && (!self.vision || vision_capable(worker))
-    }
-}
-
-/// Whether `worker` is on the side of `pin`: running the gateway's own
-/// pipeline for [`PipelinePin::Only`], not running it for
-/// [`PipelinePin::Never`], anything for [`PipelinePin::Any`].
-fn pipeline_admits(pin: PipelinePin, worker: &dyn Worker) -> bool {
-    match pin {
-        PipelinePin::Any => true,
-        PipelinePin::Only => multimodal::worker_runs_gateway_pipeline(worker),
-        PipelinePin::Never => !multimodal::worker_runs_gateway_pipeline(worker),
     }
 }
 
@@ -1829,6 +1845,13 @@ impl WorkerSelectionStage {
                     PipelinePin::Never => Self::pipeline_takes_no_audio(model_id),
                     PipelinePin::Any => Self::media_refs_shed(model_id),
                 };
+            }
+            let capable: Vec<Arc<dyn Worker>> = capable
+                .into_iter()
+                .filter(|w| !media.hints || multimodal::worker_applies_hints(w.as_ref()))
+                .collect();
+            if capable.is_empty() {
+                return multimodal::MmRefsError::HintsNotAppliedBySelection.into_response();
             }
             match placement::failure_from(
                 &capable,
@@ -2286,13 +2309,12 @@ impl WorkerSelectionStage {
         tried: &[String],
         stated: impl FnOnce() -> placement::Stated,
     ) -> Option<Placed> {
-        // A retry pins the retained wire, and with it the media pin and the
-        // pipeline pin, on top of whatever the caller excludes.
-        let pipeline = wire.map_or(PipelinePin::Any, |w| w.pipeline);
+        // A retry pins the retained wire, and with it the media pin, the
+        // pipeline pin and the hint demand, on top of whatever the caller
+        // excludes.
+        let media = MediaDemands::NONE.with_wire(wire);
         let pinned = |worker: &dyn Worker| {
-            accepts_media_refs(worker)
-                && pipeline_admits(pipeline, worker)
-                && candidate_filter.is_none_or(|accepts| accepts(worker))
+            media.accepts_refs(worker) && candidate_filter.is_none_or(|accepts| accepts(worker))
         };
         let candidate_filter: Option<CandidateFilter<'_>> =
             if wire.is_some_and(|w| w.requires_media_refs) {
@@ -2340,13 +2362,14 @@ impl WorkerSelectionStage {
     }
 
     /// The placement's verdict for a failed pair, unless the failing role's
-    /// pool explains it by the request's media: no worker of the role
-    /// processes references, or none of those that do is on the side of
-    /// the plan's pipeline pin. Both are the request's own 400, as the
-    /// regular path answers them, not a retryable 503 over healthy workers.
-    /// A verdict for the pair's whole, as an unbound plan's, was judged
-    /// from no pool: no pool's media explains it, and it is answered as it
-    /// is.
+    /// pool explains it by the request's media, narrowed as
+    /// [`Self::media_failure`] narrows a pool: no worker of the role
+    /// processes references, none of those that do is on the side of the
+    /// plan's pipeline pin, or none of those applies the per-item hints the
+    /// references carry. Each is the request's own 400, as the regular path
+    /// answers them, not a retryable 503 over healthy workers. A verdict for
+    /// the pair's whole, as an unbound plan's, was judged from no pool: no
+    /// pool's media explains it, and it is answered as it is.
     fn pd_pair_failure(
         &self,
         model_id: &str,
@@ -2368,15 +2391,22 @@ impl WorkerSelectionStage {
                 if processing.is_empty() {
                     return Self::media_refs_shed(model_id);
                 }
-                if !processing
-                    .iter()
-                    .any(|w| pipeline_admits(media.pipeline, w.as_ref()))
-                {
+                let pinned: Vec<&Arc<dyn Worker>> = processing
+                    .into_iter()
+                    .filter(|w| pipeline_admits(media.pipeline, w.as_ref()))
+                    .collect();
+                if pinned.is_empty() {
                     match media.pipeline {
                         PipelinePin::Only => return Self::pipeline_worker_required(model_id),
                         PipelinePin::Never => return Self::pipeline_takes_no_audio(model_id),
                         PipelinePin::Any => {}
                     }
+                } else if media.hints
+                    && !pinned
+                        .iter()
+                        .any(|w| multimodal::worker_applies_hints(w.as_ref()))
+                {
+                    return multimodal::MmRefsError::HintsNotAppliedBySelection.into_response();
                 }
             }
         }
@@ -2498,9 +2528,7 @@ impl WorkerSelectionStage {
         // workers. A pool with no pair that takes the references at all is
         // not this refusal: the placement's media-references verdict names
         // that gap, and the fix that applies to it.
-        let takes_refs = |worker: &dyn Worker| {
-            !demand.refs || (accepts_media_refs(worker) && pipeline_admits(demand.pipeline, worker))
-        };
+        let takes_refs = |worker: &dyn Worker| demand.takes_refs(worker);
         if demand.prefill
             && !pairs.prefill_pool.is_empty()
             && !pairs.decode_pool.is_empty()
@@ -2625,6 +2653,18 @@ impl WorkerSelectionStage {
                 })
             {
                 EpdSelectionFailure::EncodeVisionUnsupported
+            } else if demand.encode.hints
+                && registered_encode.iter().any(|worker| {
+                    capable_for(
+                        worker,
+                        MediaDemands {
+                            hints: false,
+                            ..demand.encode
+                        },
+                    )
+                })
+            {
+                EpdSelectionFailure::HintsNotApplied
             } else if registered_encode.iter().any(|worker| {
                 PdProtocol::encode_handoff(worker.metadata().spec.runtime_type)
                     == Some(EncodeHandoff::Push)
@@ -2800,6 +2840,27 @@ fn encode_item_hashes(
         return Ok(Vec::new());
     };
     multimodal::encode_routing_hashes(intermediate)
+}
+
+/// The encode routing key of one forwarded media reference: its modality,
+/// its URL and the per-item hints it carries. An encoder makes different
+/// output of one URL under different hints, so a hinted and an unhinted copy
+/// of it never share a key; a reference without hints keys as before the
+/// hints were part of it.
+fn media_ref_routing_hash(item: &smg_grpc_client::vllm_proto::MediaRef) -> Vec<u8> {
+    let mut hash = blake3::Hasher::new();
+    hash.update(&item.modality.to_le_bytes());
+    hash.update(item.url.as_bytes());
+    let hints = item.item_hints();
+    if let Some(cap) = hints.max_long_side_pixel {
+        hash.update(b"\0max_long_side_pixel");
+        hash.update(&cap.to_le_bytes());
+    }
+    if let Some(fps) = hints.fps {
+        hash.update(b"\0fps");
+        hash.update(&fps.to_bits().to_le_bytes());
+    }
+    hash.finalize().as_bytes().to_vec()
 }
 
 fn assign_encode_workers(
@@ -4476,6 +4537,7 @@ mod tests {
             connection: ConnectionMode::Grpc,
             requires_media_refs: false,
             pipeline: PipelinePin::Any,
+            hints: false,
         }
     }
 
@@ -5400,6 +5462,7 @@ mod tests {
                             media_refs: false,
                             vision: true,
                             pipeline: PipelinePin::Any,
+                            hints: false,
                         },
                         decode_vision: false,
                         image_fanout: true,
@@ -5486,6 +5549,7 @@ mod tests {
                 media_refs: false,
                 vision: items,
                 pipeline: PipelinePin::Any,
+                hints: false,
             },
             decode_vision: false,
             image_fanout: items,
@@ -5705,6 +5769,7 @@ mod tests {
                             media_refs: false,
                             vision: true,
                             pipeline: PipelinePin::Any,
+                            hints: false,
                         },
                         decode_vision: false,
                         image_fanout: true,
@@ -5825,6 +5890,7 @@ mod tests {
                                 media_refs,
                                 vision: true,
                                 pipeline: PipelinePin::Any,
+                                hints: false,
                             },
                             decode_vision: true,
                             image_fanout,
@@ -5874,6 +5940,7 @@ mod tests {
                             media_refs,
                             vision: true,
                             pipeline: PipelinePin::Any,
+                            hints: false,
                         },
                         decode_vision: true,
                         image_fanout: false,
@@ -6070,6 +6137,7 @@ mod tests {
                             media_refs: false,
                             vision: needs_vision,
                             pipeline: PipelinePin::Any,
+                            hints: false,
                         },
                         decode_vision: grids,
                         image_fanout: false,
@@ -6109,7 +6177,8 @@ mod tests {
                                 encode: MediaDemands {
                                     media_refs: false,
                                     vision: true,
-                                    pipeline: PipelinePin::Any
+                                    pipeline: PipelinePin::Any,
+                                    hints: false,
                                 },
                                 decode_vision: grids,
                                 image_fanout: false,
@@ -6126,6 +6195,7 @@ mod tests {
                             media_refs: true,
                             vision: needs_vision,
                             pipeline: PipelinePin::Any,
+                            hints: false,
                         },
                         decode_vision: false,
                         image_fanout: false,
@@ -6296,23 +6366,27 @@ mod tests {
         media_refs: true,
         vision: false,
         pipeline: PipelinePin::Any,
+        hints: false,
     };
     const VISION: MediaDemands = MediaDemands {
         media_refs: false,
         vision: true,
         pipeline: PipelinePin::Any,
+        hints: false,
     };
     /// References of a family only the gateway's own pipeline expands.
     const PIPELINE_REFS: MediaDemands = MediaDemands {
         media_refs: true,
         vision: false,
         pipeline: PipelinePin::Only,
+        hints: false,
     };
     /// Audio references, which the gateway's own pipeline does not take.
     const AUDIO_REFS: MediaDemands = MediaDemands {
         media_refs: true,
         vision: false,
         pipeline: PipelinePin::Never,
+        hints: false,
     };
 
     /// A regular worker with `labels`, built as [`labeled_worker`] builds every
@@ -6462,6 +6536,419 @@ mod tests {
         }
     }
 
+    /// References carrying per-item hints.
+    const HINTED_REFS: MediaDemands = MediaDemands {
+        hints: true,
+        ..REFS
+    };
+    /// A worker that processes references and applies their hints, and one
+    /// that processes references and does not.
+    const APPLIES_HINTS: &[(&str, &str)] = &[
+        ("mm_processor", multimodal::GATEWAY_PIPELINE_PROCESSOR),
+        ("mm_media_ref_schemes", "http,https,data"),
+        ("mm_item_hints", "true"),
+    ];
+    const APPLIES_NO_HINTS: &[(&str, &str)] = &[
+        ("mm_processor", "inprocess"),
+        ("mm_media_ref_schemes", "http,https,data"),
+        ("mm_item_hints", "false"),
+    ];
+
+    /// A retained wire that forwards media references, carrying hints when
+    /// `hints`.
+    fn references_wire(hints: bool) -> WireConstraint {
+        WireConstraint {
+            requires_media_refs: true,
+            hints,
+            ..grpc_wire(RuntimeType::Vllm)
+        }
+    }
+
+    /// The urls a regular stage's first selection lands on for `media`, as
+    /// [`WorkerSelectionStage::select`] makes it.
+    fn first_picks(
+        stage: &WorkerSelectionStage,
+        model_id: &str,
+        media: MediaDemands,
+    ) -> Vec<String> {
+        let mut seen: Vec<String> = (0..6)
+            .map(|_| {
+                stage
+                    .select_regular(
+                        model_id,
+                        ContextRequirements::default(),
+                        media,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        &[],
+                    )
+                    .expect("a worker is selectable")
+                    .into_worker()
+                    .url()
+                    .to_string()
+            })
+            .collect();
+        seen.sort();
+        seen.dedup();
+        seen
+    }
+
+    /// References that carry per-item hints go only to a worker that applies
+    /// them, on the first selection and on a retry, which reads the demand
+    /// off the retained wire as it reads the pipeline pin; plain references
+    /// go to either worker. A pool with no worker that applies them refuses
+    /// the hinted request with its own 400, never a retryable shed.
+    #[tokio::test]
+    async fn hinted_references_select_only_workers_that_apply_hints() {
+        let model_id = "hinted-refs-model";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        for (url, labels) in [
+            ("grpc://127.0.0.1:9350", APPLIES_HINTS),
+            ("grpc://127.0.0.1:9351", APPLIES_NO_HINTS),
+        ] {
+            worker_registry
+                .register(regular_worker(url, model_id, labels))
+                .unwrap();
+        }
+        let stage = regular_stage(Arc::clone(&worker_registry));
+        assert_eq!(
+            first_picks(&stage, model_id, HINTED_REFS),
+            ["grpc://127.0.0.1:9350"]
+        );
+        assert_eq!(
+            first_picks(&stage, model_id, REFS),
+            ["grpc://127.0.0.1:9350", "grpc://127.0.0.1:9351"]
+        );
+
+        for (hinted, expected) in [
+            (true, &["grpc://127.0.0.1:9350"][..]),
+            (
+                false,
+                &["grpc://127.0.0.1:9350", "grpc://127.0.0.1:9351"][..],
+            ),
+        ] {
+            let mut ctx = dispatch_ctx(model_id, references_wire(hinted));
+            let mut seen = Vec::new();
+            for _ in 0..6 {
+                stage
+                    .reselect(&mut ctx, &retained_plan(&[1, 2, 3]))
+                    .await
+                    .expect("re-selection succeeds");
+                match ctx.workers.as_ref().unwrap() {
+                    WorkerSelection::Single { worker } => seen.push(worker.url().to_string()),
+                    WorkerSelection::Disaggregated { .. } => panic!("expected single selection"),
+                }
+            }
+            seen.sort();
+            seen.dedup();
+            assert_eq!(seen, expected, "hinted: {hinted}");
+        }
+
+        let unhinted_only = "hinted-refs-model-without-the-capability";
+        worker_registry
+            .register(regular_worker(
+                "grpc://127.0.0.1:9352",
+                unhinted_only,
+                APPLIES_NO_HINTS,
+            ))
+            .unwrap();
+        let response =
+            stage.selection_failure(unhinted_only, &[WorkerType::Regular], None, HINTED_REFS);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "multimodal_hint_unsupported_in_worker_mode"
+        );
+        let response = stage.selection_failure(
+            unhinted_only,
+            &[WorkerType::Regular],
+            Some(references_wire(true)),
+            TEXT,
+        );
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "the retained wire alone carries the hint demand on a retry"
+        );
+    }
+
+    /// On a pair both sides take the references, so both are held to workers
+    /// that apply the hints, on the first selection and on a retry; a pair
+    /// pool with no such worker answers the hinted request's 400.
+    #[tokio::test]
+    async fn a_pairs_hinted_references_stay_on_workers_that_apply_hints() {
+        let model_id = "hinted-refs-pair-model";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        for (url, worker_type, labels) in [
+            ("grpc://127.0.0.1:9360", WorkerType::Prefill, APPLIES_HINTS),
+            (
+                "grpc://127.0.0.1:9361",
+                WorkerType::Prefill,
+                APPLIES_NO_HINTS,
+            ),
+            ("grpc://127.0.0.1:9362", WorkerType::Decode, APPLIES_HINTS),
+            (
+                "grpc://127.0.0.1:9363",
+                WorkerType::Decode,
+                APPLIES_NO_HINTS,
+            ),
+        ] {
+            worker_registry
+                .register(labeled_worker(url, model_id, worker_type, labels))
+                .unwrap();
+        }
+        let stage = round_robin_pd_stage(Arc::clone(&worker_registry));
+        let only_appliers = ["grpc://127.0.0.1:9360", "grpc://127.0.0.1:9362"];
+        let accepts_refs = |worker: &dyn Worker| HINTED_REFS.accepts_refs(worker);
+        let mut first = std::collections::BTreeSet::new();
+        for _ in 0..8 {
+            let (prefill, decode, _) = stage
+                .select_pd_pair(
+                    model_id,
+                    PlacementInputs {
+                        candidate_filter: Some(&accepts_refs),
+                        ..Default::default()
+                    },
+                    None,
+                    None,
+                    PairDemands::new(false, true).with_media_refs(true, PipelinePin::Any, true),
+                )
+                .expect("a pair that applies the hints");
+            first.insert(prefill.url().to_string());
+            first.insert(decode.url().to_string());
+        }
+        assert_eq!(first.into_iter().collect::<Vec<_>>(), only_appliers);
+
+        for hinted in [true, false] {
+            let mut sides = std::collections::BTreeSet::new();
+            for _ in 0..8 {
+                let mut ctx = dispatch_ctx(model_id, references_wire(hinted));
+                stage
+                    .reselect(&mut ctx, &retained_plan(&[1, 2, 3]))
+                    .await
+                    .expect("re-selection succeeds");
+                match ctx.workers.expect("a pair is selected") {
+                    WorkerSelection::Disaggregated {
+                        prefill, decode, ..
+                    } => {
+                        sides.insert(prefill.url().to_string());
+                        sides.insert(decode.url().to_string());
+                    }
+                    WorkerSelection::Single { .. } => panic!("expected a PD selection"),
+                }
+            }
+            if hinted {
+                assert_eq!(sides.into_iter().collect::<Vec<_>>(), only_appliers);
+            } else {
+                assert_eq!(sides.len(), 4, "plain references pair on every worker");
+            }
+        }
+
+        let unhinted_only = "hinted-refs-pair-model-without-the-capability";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        for (url, worker_type) in [
+            ("grpc://127.0.0.1:9364", WorkerType::Prefill),
+            ("grpc://127.0.0.1:9365", WorkerType::Decode),
+        ] {
+            worker_registry
+                .register(labeled_worker(
+                    url,
+                    unhinted_only,
+                    worker_type,
+                    APPLIES_NO_HINTS,
+                ))
+                .unwrap();
+        }
+        let stage = round_robin_pd_stage(Arc::clone(&worker_registry));
+        let response = stage
+            .select_pd_pair(
+                unhinted_only,
+                PlacementInputs {
+                    candidate_filter: Some(&accepts_refs),
+                    ..Default::default()
+                },
+                None,
+                None,
+                PairDemands::new(false, true).with_media_refs(true, PipelinePin::Any, true),
+            )
+            .map_err(|failure| stage.pd_selection_failure(unhinted_only, failure, HINTED_REFS))
+            .expect_err("no worker applies the hints");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "multimodal_hint_unsupported_in_worker_mode"
+        );
+    }
+
+    /// The prefill side's probes count only the pairs whose workers apply
+    /// the hints a request's references carry: a prefill worker with the
+    /// vision encoder that applies none does not stand in for the one that
+    /// applies them and has no encoder, so the request gets the vision
+    /// refusal, not a retryable 503; without hints the same pool serves it.
+    #[test]
+    fn the_pd_probes_count_only_the_pairs_that_apply_the_hints() {
+        let model_id = "hinted-refs-pair-probe";
+        let with = |labels: &[(&'static str, &'static str)], vision: &'static str| {
+            let mut labels = labels.to_vec();
+            labels.push((smg_worker::labels::SUPPORTS_VISION_LABEL, vision));
+            labels
+        };
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        for (url, worker_type, labels) in [
+            (
+                "grpc://127.0.0.1:9370",
+                WorkerType::Prefill,
+                with(APPLIES_HINTS, "false"),
+            ),
+            (
+                "grpc://127.0.0.1:9371",
+                WorkerType::Prefill,
+                with(APPLIES_NO_HINTS, "true"),
+            ),
+            (
+                "grpc://127.0.0.1:9372",
+                WorkerType::Decode,
+                with(APPLIES_HINTS, "true"),
+            ),
+        ] {
+            worker_registry
+                .register(labeled_worker(url, model_id, worker_type, &labels))
+                .unwrap();
+        }
+        let stage = round_robin_pd_stage(Arc::clone(&worker_registry));
+        let select = |media: MediaDemands| {
+            let accepts_refs = |worker: &dyn Worker| media.accepts_refs(worker);
+            stage.select_pd_pair(
+                model_id,
+                PlacementInputs {
+                    candidate_filter: Some(&accepts_refs),
+                    ..Default::default()
+                },
+                None,
+                None,
+                PairDemands::new(true, false).with_media_refs(true, PipelinePin::Any, media.hints),
+            )
+        };
+        assert!(matches!(
+            select(HINTED_REFS),
+            Err(PdSelectionFailure::NoVisionCapablePrefill)
+        ));
+        let (prefill, _, _) = select(REFS).expect("plain references pair");
+        assert_eq!(prefill.url(), "grpc://127.0.0.1:9371");
+    }
+
+    /// An encoder's routing key covers a reference's hints: a hinted and an
+    /// unhinted copy of one URL key apart, as do two caps, while a reference
+    /// without hints keys by its modality and URL alone, as it always has.
+    #[test]
+    fn a_hinted_reference_keys_its_encoder_apart_from_the_unhinted_copy() {
+        let reference = |max_long_side_pixel, fps| {
+            let mut reference = vllm::MediaRef {
+                modality: smg_grpc_client::common_proto::Modality::Video as i32,
+                url: "https://a/1.mp4".to_string(),
+                ..Default::default()
+            };
+            reference.set_item_hints(smg_grpc_client::MediaItemHints {
+                max_long_side_pixel,
+                fps,
+            });
+            reference
+        };
+        let plain = media_ref_routing_hash(&reference(None, None));
+        let mut legacy = blake3::Hasher::new();
+        legacy.update(&(smg_grpc_client::common_proto::Modality::Video as i32).to_le_bytes());
+        legacy.update(b"https://a/1.mp4");
+        assert_eq!(plain, legacy.finalize().as_bytes().to_vec());
+        let keys = [
+            plain,
+            media_ref_routing_hash(&reference(Some(504), None)),
+            media_ref_routing_hash(&reference(Some(1008), None)),
+            media_ref_routing_hash(&reference(None, Some(2.0))),
+            media_ref_routing_hash(&reference(Some(504), Some(2.0))),
+        ];
+        let distinct: std::collections::HashSet<_> = keys.iter().collect();
+        assert_eq!(distinct.len(), keys.len(), "every hint set keys apart");
+    }
+
+    /// Hinted references on the encode-prefill-decode pipeline go to a push
+    /// encoder that applies the hints; a pool whose push encoder applies none
+    /// is the hint's refusal, not the encode refusal, whose advice (run
+    /// another placement) would not apply.
+    #[test]
+    fn hinted_references_reach_only_an_encoder_that_applies_hints() {
+        for applies in [true, false] {
+            let model = if applies {
+                "hinted-refs-epd"
+            } else {
+                "hinted-refs-epd-without-the-capability"
+            };
+            let registry = Arc::new(WorkerRegistry::new());
+            for (port, role) in [
+                (9380, WorkerType::Encode),
+                (9381, WorkerType::Prefill),
+                (9382, WorkerType::Decode),
+            ] {
+                let mut worker = BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
+                    .model(ModelCard::new(model))
+                    .worker_type(role)
+                    .runtime_type(RuntimeType::Vllm)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .health_config(no_health_check())
+                    .label("kv_connector", "NixlConnector");
+                if role != WorkerType::Decode {
+                    worker = worker
+                        .label("supports_ec_transfer", "true")
+                        .label("ec_connector", "ECCPUConnector")
+                        .label(
+                            "ec_role",
+                            if role == WorkerType::Encode {
+                                "ec_producer"
+                            } else {
+                                "ec_consumer"
+                            },
+                        );
+                }
+                if role == WorkerType::Encode {
+                    worker = worker
+                        .label("mm_processor", multimodal::GATEWAY_PIPELINE_PROCESSOR)
+                        .label("mm_media_ref_schemes", "http,https,data")
+                        .label("mm_item_hints", if applies { "true" } else { "false" });
+                }
+                registry.register(Arc::new(worker.build())).unwrap();
+            }
+            let stage = WorkerSelectionStage::new(
+                registry,
+                Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+                WorkerSelectionMode::EncodePrefillDecode,
+                None,
+            );
+            let picked = stage.select_encode_prefill_decode_workers(
+                model,
+                PlacementInputs::default(),
+                &[vec![1]],
+                EpdDemands {
+                    wire: None,
+                    encode: HINTED_REFS,
+                    decode_vision: false,
+                    image_fanout: false,
+                },
+                None,
+            );
+            if applies {
+                let (encoders, ..) = picked.unwrap_or_else(|_| panic!("the encoder applies hints"));
+                assert_eq!(encoders[0].worker.url(), "grpc://127.0.0.1:9380");
+            } else {
+                assert!(matches!(picked, Err(EpdSelectionFailure::HintsNotApplied)));
+            }
+        }
+    }
+
     /// Pixel media never reaches a worker labeled without a vision encoder:
     /// in a mixed pool every image request lands on a worker with one or
     /// without a verdict, while a text request still uses the whole pool.
@@ -6599,6 +7086,7 @@ mod tests {
             media_refs: true,
             vision: true,
             pipeline: PipelinePin::Any,
+            hints: false,
         };
         let refs_with_vision = [
             ("mm_processor", "inprocess"),
@@ -6773,6 +7261,73 @@ mod tests {
             2,
             "a text request uses the whole pool: {seen:?}"
         );
+    }
+
+    /// The stage reads the hint demand off preparation's state: a hinted
+    /// request forwarded as references selects a worker that applies the
+    /// hints, and the dispatch context's retained wire keeps the demand, so
+    /// its retry does too; the same references without hints use either
+    /// worker.
+    #[tokio::test]
+    async fn execute_keeps_a_hinted_request_on_workers_that_apply_hints_through_its_retry() {
+        use llm_multimodal::MediaContentPart;
+
+        let registry = Arc::new(WorkerRegistry::new());
+        for (url, labels) in [
+            ("grpc://127.0.0.1:9390", APPLIES_HINTS),
+            ("grpc://127.0.0.1:9391", APPLIES_NO_HINTS),
+        ] {
+            registry
+                .register(regular_worker(url, "test-model", labels))
+                .unwrap();
+        }
+        let stage = regular_stage(Arc::clone(&registry));
+        let image = |max_long_side_pixel| {
+            multimodal::MediaPlan::new([MediaContentPart::ImageUrl {
+                url: "data:image/png;base64,AAAA".to_string().into(),
+                detail: None,
+                uuid: None,
+                max_long_side_pixel,
+            }])
+        };
+        let picked = |ctx: &Option<WorkerSelection>| match ctx.as_ref().expect("a worker") {
+            WorkerSelection::Single { worker } => worker.url().to_string(),
+            WorkerSelection::Disaggregated { .. } => panic!("regular mode selects one"),
+        };
+
+        for (hinted, expected) in [
+            (true, &["grpc://127.0.0.1:9390"][..]),
+            (
+                false,
+                &["grpc://127.0.0.1:9390", "grpc://127.0.0.1:9391"][..],
+            ),
+        ] {
+            let mut first = Vec::new();
+            let mut retried = Vec::new();
+            for _ in 0..4 {
+                let mut ctx = prepared_ctx(Arc::clone(&registry), None);
+                let plan = image(hinted.then_some(504));
+                ctx.state.media_refs_hints = multimodal::plan_has_hints(&plan);
+                ctx.state.multimodal_refs = Some(plan);
+                stage.execute(&mut ctx).await.expect("the request selects");
+                first.push(picked(&ctx.state.workers));
+                // Request building attaches the references.
+                ctx.state.multimodal_refs = None;
+                ctx.state.media_refs_forwarded = true;
+                let mut dispatch = Box::new(ctx).into_dispatch().unwrap();
+                assert_eq!(dispatch.wire.hints, hinted);
+                stage
+                    .reselect(&mut dispatch, &retained_plan(&[1, 2, 3]))
+                    .await
+                    .expect("the retry selects");
+                retried.push(picked(&dispatch.workers));
+            }
+            for seen in [&mut first, &mut retried] {
+                seen.sort();
+                seen.dedup();
+                assert_eq!(seen.as_slice(), expected, "hinted: {hinted}");
+            }
+        }
     }
 
     /// The steering default: with every worker over the thresholds the gRPC
@@ -7105,6 +7660,7 @@ mod tests {
                 media_refs: true,
                 vision: true,
                 pipeline: pin,
+                hints: false,
             };
             let accepts_refs = |worker: &dyn Worker| demands.accepts_refs(worker);
             let selected = stage.select_pd_pair(
@@ -7115,7 +7671,7 @@ mod tests {
                 },
                 None,
                 None,
-                PairDemands::new(true, false).with_media_refs(true, pin),
+                PairDemands::new(true, false).with_media_refs(true, pin, false),
             );
             if pairs {
                 assert!(
@@ -7159,7 +7715,7 @@ mod tests {
                 },
                 None,
                 None,
-                PairDemands::new(true, true).with_media_refs(true, PipelinePin::Any),
+                PairDemands::new(true, true).with_media_refs(true, PipelinePin::Any, false),
             )
             .map_err(|failure| stage.pd_selection_failure(model_id, failure, REFS))
             .expect_err("no pair takes the references");
@@ -7301,6 +7857,7 @@ mod tests {
                 refs: false,
                 context: ContextRequirements::default(),
                 pipeline: PipelinePin::Any,
+                hints: false,
             },
             "a single-sample image: the prefill side takes the pixels, the decode side is stripped"
         );
@@ -7312,6 +7869,7 @@ mod tests {
                 refs: false,
                 context: ContextRequirements::default(),
                 pipeline: PipelinePin::Any,
+                hints: false,
             },
             "what the decode side cannot run without the encoder, the prefill side cannot either"
         );
@@ -7558,7 +8116,7 @@ mod tests {
                 },
                 None,
                 None,
-                PairDemands::new(true, true).with_media_refs(true, PipelinePin::Any),
+                PairDemands::new(true, true).with_media_refs(true, PipelinePin::Any, false),
             )
             .expect_err("no prefill worker that takes references has the encoder");
         assert!(
@@ -9624,6 +10182,38 @@ mod tests {
             !takes(gateways, forwards(PipelinePin::Never)),
             "the gateway's pipeline, where the engine's processor is pinned"
         );
+    }
+
+    /// The decode a pair moves to behind its prefill's answer takes the
+    /// references' per-item hints as every selection asks of a candidate: a
+    /// first decode that applies them never moves to one that does not.
+    #[test]
+    fn a_moved_decode_applies_the_hints_its_wire_forwards() {
+        let decode = |applies: bool| {
+            BasicWorkerBuilder::new("grpc://decode:30000")
+                .worker_type(WorkerType::Decode)
+                .connection_mode(ConnectionMode::Grpc)
+                .runtime_type(RuntimeType::Vllm)
+                .label("mm_processor", multimodal::GATEWAY_PIPELINE_PROCESSOR)
+                .label("mm_item_hints", if applies { "true" } else { "false" })
+                .build()
+        };
+        let first = decode(true);
+        let hinted = WireConstraint {
+            requires_media_refs: true,
+            hints: true,
+            ..grpc_wire(RuntimeType::Vllm)
+        };
+        let plain = WireConstraint {
+            hints: false,
+            ..hinted
+        };
+        assert!(takes_the_built_request(&first, &decode(true), "m", hinted));
+        assert!(
+            !takes_the_built_request(&first, &decode(false), "m", hinted),
+            "a decode that applies no hints"
+        );
+        assert!(takes_the_built_request(&first, &decode(false), "m", plain));
     }
 }
 

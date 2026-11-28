@@ -148,7 +148,8 @@ impl StepExecutor<WorkerWorkflowData> for CheckLocalWorkerStep {
 /// once, here, with the worker's address: an engine with a vision
 /// encoder that does not process media references never receives a
 /// media reference under `--mm-processing worker` (a request with
-/// per-item hints it still serves, through the router's pipeline). The
+/// per-item hints it still serves, through the router's pipeline, unless
+/// every media-processing worker of the model applies the hints). The
 /// line says what follows for the model, read from its pool (the
 /// registered workers and the ones registering with it): with a capable
 /// worker beside this one the references are served (selection picks

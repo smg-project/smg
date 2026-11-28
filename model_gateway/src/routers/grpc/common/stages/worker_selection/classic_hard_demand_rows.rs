@@ -522,11 +522,13 @@ impl Bed {
             connection: transport.mode(),
             requires_media_refs: request.refs.is_some(),
             pipeline: pin,
+            hints: false,
         });
         let media = MediaDemands {
             media_refs: request.refs.is_some(),
             vision: request.vision,
             pipeline: pin,
+            hints: false,
         };
         let context = request
             .window

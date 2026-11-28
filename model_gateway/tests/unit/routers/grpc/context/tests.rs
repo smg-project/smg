@@ -109,7 +109,7 @@ fn a_disaggregated_selections_wire_is_the_prefill_sides() {
         ),
         worker("grpc://decode:1", ConnectionMode::Grpc, WorkerType::Decode),
     );
-    let wire = WireConstraint::of(&zmq_prefill, false, PipelinePin::Any);
+    let wire = WireConstraint::of(&zmq_prefill, false, PipelinePin::Any, false);
     assert_eq!(wire.connection, ConnectionMode::Zmq);
     assert_eq!(wire.runtime, RuntimeType::TokenSpeed);
     assert!(!wire.requires_media_refs);
@@ -126,9 +126,10 @@ fn a_disaggregated_selections_wire_is_the_prefill_sides() {
             WorkerType::Decode,
         ),
     );
-    let wire = WireConstraint::of(&grpc_prefill, true, PipelinePin::Any);
+    let wire = WireConstraint::of(&grpc_prefill, true, PipelinePin::Any, true);
     assert_eq!(wire.connection, ConnectionMode::Grpc);
     assert!(wire.requires_media_refs);
+    assert!(wire.hints, "the retained wire keeps the hint demand");
 }
 
 #[tokio::test]
