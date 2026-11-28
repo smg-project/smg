@@ -96,6 +96,10 @@ pub trait RequestMaker {
     /// the ring need ([`Needs::ring`](crate::document::spec::Needs::ring)),
     /// it asks this ahead of the shadow's filters, which read the answer:
     /// it asks whether or not they keep a worker, and once a decision.
+    /// Beside a pair the pair's default made, the decode's shadow makes no
+    /// run of its own and follows the default's step: the engine asks
+    /// this for such a profile there, and the filters that step asks read
+    /// the answer.
     fn shadow_ring<'w>(
         &'w self,
         spec: &'w AppliedSpec,

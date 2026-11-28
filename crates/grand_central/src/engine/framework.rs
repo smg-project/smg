@@ -111,10 +111,9 @@ pub trait Filter: Any + Send + Sync + Debug {
     /// is shown what its lender answers: the ring and the shadow's place
     /// on it, or the facts as they stand where it answers none. So are
     /// the hard filters a prefill's shadow asks once more at its admission
-    /// limit's test. Where no filter declares it, the scoring half alone
-    /// is: the filters are shown no ring and no place. Neither are they in
-    /// the steps of the pair's default that a side's shadow follows,
-    /// whatever they declare.
+    /// limit's test, and those a side's shadow asks in the steps of the
+    /// pair's default that it follows. Where no filter declares it, the
+    /// scoring half alone is: the filters are shown no ring and no place.
     ///
     /// Asked only while the stage's generation is built, perhaps more than
     /// once there. The answer stands for that generation: no decision and
@@ -2765,9 +2764,10 @@ fn run_side(
 }
 
 /// `facts` with the ring and the places a lender answered, where it
-/// answered any. A shadow's run ([`run_side_lent`]) and the admission
-/// limit's test behind it (`shadow_side`) both state the request through
-/// this, so the test judges on the facts the run showed its filters.
+/// answered any. A shadow's run ([`run_side_lent`]), the admission
+/// limit's test behind it and the steps of the pair's default that a
+/// side's shadow follows (`shadow_side`) all state the request through
+/// this, so each judges on the facts the run shows its filters.
 fn with_lent<'f>(
     facts: &RequestFacts<'f>,
     lent: Option<(&'f dyn LentRing, &'f [u64])>,
@@ -9451,15 +9451,18 @@ impl Engine {
     /// ([`Self::side_ring_profile`]), asked of `lends` behind the filter
     /// half of its run ([`run_side_lent`]): a shadow whose set the filters
     /// emptied, which the all-vetoed rule steers or sheds, asks nothing.
-    /// Neither does the pair's default that a side's shadow follows: no
-    /// step of it scores.
+    /// Neither does the pair's default that a side's shadow follows, where
+    /// no filter of the profile declares the ring need: no step of it
+    /// scores.
     ///
     /// A shadow profile with a filter that declares the ring need
     /// ([`Filter::needs`]) asks ahead of the filter half of its run,
     /// whatever its filters then keep, and once a decision: a prefill's
     /// shadow that runs again reads the answer of its first run. The
-    /// pair's default asks nothing there either, and its steps show the
-    /// shadow's filters no ring and no place.
+    /// steps of the pair's default that a side's shadow follows show its
+    /// filters that answer too. The prefill's shadow reads the answer of
+    /// its run there. The decode's, which makes no run of its own beside
+    /// a pair the default made, asks for it there.
     ///
     /// The decode's shadow is put to the binding's all-vetoed rule by the
     /// binding's word, as its live side is ([`Set::ruled`]): where a veto
@@ -9573,6 +9576,10 @@ impl Engine {
         let asked = OnceCell::new();
         let lent = || *asked.get_or_init(|| self.side_ring_profile(at, side).and_then(lends));
         let ahead = self.marks[usize::from(index)].ring_filter();
+        // What the hard filters asked outside a run of the side are shown:
+        // the lender's answer where a filter of the profile declares the
+        // ring need, as in that run.
+        let ahead_lent = || if ahead { lent() } else { None };
         // The mark the pair's decision left on the prefill's buffer: the
         // tier the pair's default paired in, and none beside a pair the
         // profiles made ([`Self::decide_pair`]).
@@ -9628,7 +9635,7 @@ impl Engine {
                 // stands, and the lender is asked nothing more.
                 let firsts_shed = scratch.among_first && refused(&run);
                 let waits = firsts_shed && {
-                    let stated = with_lent(&prefill_facts, if ahead { lent() } else { None });
+                    let stated = with_lent(&prefill_facts, ahead_lent());
                     let shown = stated.as_ref().unwrap_or(&prefill_facts);
                     let takes = Half::new(profile, index, shown, prefills, run_cx);
                     takes.waits_among(&scratch.classes)
@@ -9651,8 +9658,13 @@ impl Engine {
                 if !waits && refused(&run) {
                     let live_decode = lives[PairSide::Decode.index()];
                     let live_decode_profile = self.profiles.get(usize::from(live_decode))?;
+                    // The shadow's own hard filters are asked there on the
+                    // facts its run showed them, as the limit's test asks
+                    // them.
+                    let stated = with_lent(&prefill_facts, ahead_lent());
+                    let shown = stated.as_ref().unwrap_or(&prefill_facts);
                     let sides = [
-                        Half::new(profile, index, &prefill_facts, prefills, cx),
+                        Half::new(profile, index, shown, prefills, cx),
                         Half::new(
                             live_decode_profile,
                             live_decode,
@@ -9707,8 +9719,14 @@ impl Engine {
                     // requests, in the pass of the tier the mark names.
                     // The shadow's is that step's answer over the decodes
                     // its own profile's hard filters keep in that pass,
-                    // every partner alike.
-                    let half = Half::new(profile, index, &decode_facts, decodes, decode_cx);
+                    // every partner alike. Where one of them declares the
+                    // ring need, they read what the shadow's lender
+                    // answers, as the filters of its own run do. The
+                    // lender is asked here: no run of the shadow's stands
+                    // beside such a pair.
+                    let stated = with_lent(&decode_facts, ahead_lent());
+                    let shown = stated.as_ref().unwrap_or(&decode_facts);
+                    let half = Half::new(profile, index, shown, decodes, decode_cx);
                     half.usable(defaulted, steers, &mut scratch.decode);
                     let (table, buf) = (&pools.table, &mut scratch.decode);
                     match vetoed::paired_decode::<true>(&half, table, class, pool, buf) {

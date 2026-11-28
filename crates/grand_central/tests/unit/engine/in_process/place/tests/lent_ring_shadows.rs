@@ -861,6 +861,69 @@ fn a_filter_that_declares_the_ring_need_is_shown_the_ring_a_sides_shadow_is_lent
     }
 }
 
+/// A side's shadow follows the steps of the pair's default: the
+/// prefill's behind its own run's refusal, the decode's beside a pair the
+/// default made, where it makes no run of its own. A filter of its
+/// profile that declares the ring need is shown the lent ring and the
+/// place of the request's key on it in those steps too, as it is in the
+/// shadow's own run: the prefill's shadow in the default's first step,
+/// the decode's in its second. Every worker is overloaded, so no prefill
+/// stands but for the veto and the pair is made past it. Each side's
+/// shadow agrees with its live side, and neither faults. The lender is
+/// asked once for each side's shadow: for the prefill's in its run, for
+/// the decode's in the default's step.
+#[test]
+fn a_filter_that_declares_the_ring_need_is_shown_the_lent_ring_in_the_defaults_steps() {
+    let names = ["prefill-declares", "decode-declares"];
+    let cells = [(); 2].map(|()| Arc::new(Mutex::new(Shown::new())));
+    let mut stages = StageRegistry::builtin();
+    for (at, name) in names.into_iter().enumerate() {
+        let cell = Arc::clone(&cells[at]);
+        let added = stages.filter(name, move || {
+            Box::new(SeesPlace {
+                name,
+                declares: true,
+                shown: Arc::clone(&cell),
+            })
+        });
+        added.expect("a free name");
+    }
+    let plain = "consistent_hashing";
+    let mut document = ring_shadowed(plain, plain, false);
+    for (shadow, name) in ["prefill-next", "decode-next"].into_iter().zip(names) {
+        let shadow = document.profiles.get_mut(shadow);
+        let shadow = shadow.expect("the side's shadow profile");
+        shadow.filter.push(FilterSpec::Name(name.to_owned()));
+    }
+    let spec = AppliedSpec::validate_in(&document, &stages, &[]);
+    let engine = hosted(InProcess::new(spec.expect("the stages hold the filters")));
+    let list = pool(2);
+    let members = PublishedList::new(Arc::clone(&list));
+    let classes = PartnerClasses::number(2, [&[0_u32, 1][..], &[0, 1][..]]);
+    let addresses = list.iter().map(|worker| worker.url().to_owned());
+    let ring = Lent(addresses.collect());
+    for worker in list.iter() {
+        worker.set_overloaded(true);
+    }
+    let headers = [("x-smg-routing-key", "conv-1")];
+    let request = PlaceRequest {
+        headers: &headers,
+        ring: Some(&ring),
+        ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair_of(&members, &classes)))
+    };
+    let maker = Recorded(Made::new(engine, &request, &[]), RefCell::default());
+    assert!(engine.decide_at(&maker, Instant::now).is_ok(), "a pair");
+    let agreed = [1, 0, 0, 0];
+    let said = (sides_said(engine), engine.faults());
+    assert_eq!(said, ([agreed, agreed, [0; 4]], 0), "the sides' words");
+    let shown = [0, 1].map(|at| std::mem::take(&mut *cells[at].lock()));
+    let placed = Shown::from([(true, vec![ring.position("conv-1")])]);
+    assert_eq!(shown, [placed.clone(), placed], "each side's filter");
+    let asked = maker.1.take();
+    assert_eq!(asked.len(), 2, "one ask a side's shadow: {asked:?}");
+    assert_ne!(asked[0], asked[1], "each side's own profile");
+}
+
 /// A filter that declares the ring need and answers by the ring it is
 /// shown: with a ring it keeps the one worker it holds, with none every
 /// row.
@@ -934,6 +997,70 @@ fn a_prefills_shadow_judges_its_admission_limit_on_the_lent_ring() {
     let asks = maker.1.load(atomic::Ordering::Relaxed);
     let said = (sides_said(engine)[0], engine.faults(), asks);
     assert_eq!(said, ([0, 1, 0, 0], 0, 1), "the prefill's shadow");
+}
+
+/// A prefill's shadow whose own runs shed follows the default's first
+/// step beside a pair the live profiles made too, and a filter of its
+/// profile that declares the ring need is shown the lent ring there, as
+/// in its runs. A second filter keeps a worker outside the pool alone
+/// where it is shown a ring: both runs of the shadow are refused, and
+/// the default's step takes no prefill. The first filter is shown the
+/// ring and the request's place at every ask. The shadow keeps its
+/// shed: another outcome, no fault, and one ask of the lender across
+/// its runs and that step.
+#[test]
+fn a_prefills_shadow_that_sheds_is_shown_the_lent_ring_in_the_defaults_step() {
+    let list = pool(2);
+    let stranger = worker_id(pool(3)[2].as_ref());
+    let cell = Arc::new(Mutex::new(Shown::new()));
+    let seen = Arc::clone(&cell);
+    // The filter that records is asked ahead of the one that refuses.
+    let [records, refuses] = ["prefill-declares", "owner-alone"];
+    let mut stages = StageRegistry::builtin();
+    let added = stages.filter(records, move || {
+        Box::new(SeesPlace {
+            name: records,
+            declares: true,
+            shown: Arc::clone(&seen),
+        })
+    });
+    added.expect("a free name");
+    let added = stages.filter(refuses, move || Box::new(OwnerAlone(stranger)));
+    added.expect("a free name");
+    let plain = "consistent_hashing";
+    let mut document = ring_shadowed(plain, plain, false);
+    if let Some(ShadowSpec::Sides(sides)) = document.bindings[0].shadow.as_mut() {
+        sides.retain(|side, _| side.contains("prefill"));
+    }
+    let shadow = document.profiles.get_mut("prefill-next");
+    let shadow = shadow.expect("the prefill's shadow profile");
+    for name in [records, refuses] {
+        shadow.filter.push(FilterSpec::Name(name.to_owned()));
+    }
+    let spec = AppliedSpec::validate_in(&document, &stages, &[]);
+    let engine = hosted(InProcess::new(spec.expect("the stages hold the filters")));
+    let members = PublishedList::new(Arc::clone(&list));
+    let both = &[0_u32, 1][..];
+    let classes = PartnerClasses::number_first(2, [(both, &[0][..]), (both, &[][..])]);
+    let addresses = list.iter().map(|worker| worker.url().to_owned());
+    let ring = Lent(addresses.collect());
+    let headers = [("x-smg-routing-key", "conv-1")];
+    let request = PlaceRequest {
+        headers: &headers,
+        ring: Some(&ring),
+        ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair_of(&members, &classes)))
+    };
+    let maker = Counted(Made::new(engine, &request, &[]), AtomicU32::new(0));
+    let decided = engine.decide_at(&maker, Instant::now);
+    assert!(decided.is_ok(), "the pair's decision");
+    let ids = [0, 1].map(|at| worker_id(list[at].as_ref()));
+    assert!(!ids.contains(&stranger), "a worker outside the pool");
+    let asks = maker.1.load(atomic::Ordering::Relaxed);
+    let said = (sides_said(engine)[0], engine.faults(), asks);
+    assert_eq!(said, ([0, 0, 1, 0], 0, 1), "the prefill's shadow");
+    let shown = std::mem::take(&mut *cell.lock());
+    let placed = Shown::from([(true, vec![ring.position("conv-1")])]);
+    assert_eq!(shown, placed, "the filter at every ask");
 }
 
 /// A decode's shadow the all-vetoed rule steers, one of whose filters
