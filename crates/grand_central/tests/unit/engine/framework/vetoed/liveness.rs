@@ -697,6 +697,37 @@ fn a_kept_key_in_a_doubted_pool_is_steered_past_the_rings_walk() {
     }
 }
 
+/// A kept key no pin took is answered by the lifted pass where that pass
+/// leaves nobody: with the liveness tier's pick, or with a shed. Neither
+/// pins the key. Under a sessions rule without a TTL the key keeps no row
+/// behind either answer; under a TTL its row stays to its end.
+#[test]
+fn a_kept_key_the_lifted_pass_answers_keeps_no_row_under_no_ttl() {
+    let request = RequestFacts {
+        now_micros: 10,
+        ..keyed("k1")
+    };
+    let steered = [doubted(0, 5), doubted(1, 4), doubted(2, 1)];
+    let mut unready = [free(0, 5), free(1, 4), free(2, 1)];
+    for worker in &mut unready {
+        worker.health.healthy = false;
+    }
+    for (ttl_s, rows, site) in [(u32::MAX, 0, "no TTL"), (60, 1, "a TTL")] {
+        let engine = ring_under_a_ttl(ttl_s);
+        let decision = decide(&engine, &request, &steered);
+        assert_eq!(order(&decision)[0], 2, "{site}");
+        assert_eq!(decision.trace().lifted, LiftedVeto::Liveness, "{site}");
+        let pick = decision.pick().expect("a pick");
+        assert_eq!(pick.session_verdict, SessionVerdict::None, "{site}");
+        assert_eq!(engine.sessions().len(), rows, "{site}: behind the pick");
+
+        let engine = ring_under_a_ttl(ttl_s);
+        let shed = decide(&engine, &request, &unready);
+        assert_eq!(shed_of(&shed), (ShedReason::NoEndpoints, "healthy"));
+        assert_eq!(engine.sessions().len(), rows, "{site}: behind the shed");
+    }
+}
+
 /// An encode item of the `epd` plan is put to the liveness tier as it is
 /// put to the overload tier, behind the plan's own rules: encoders
 /// doubted on every worker take it by the fewest requests in flight, and

@@ -871,7 +871,7 @@ fn a_draw_that_claims_dates_its_claim_by_its_decisions_instant() {
     engine.on_released(&lease(501), ReleaseReason::CommitFailed);
     assert_eq!(pins(), Some([claimed, WorkerId(0)]), "another instant");
     engine.on_released(&lease(500), ReleaseReason::CommitFailed);
-    assert_eq!(pins(), Some([WorkerId(0); 2]), "its own lease");
+    assert_eq!(pins(), None, "its own lease");
 }
 
 #[test]

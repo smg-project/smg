@@ -338,6 +338,10 @@ struct Entry {
     /// ([`SessionTable::dispatched`]), a move at the cap
     /// ([`SessionTable::respilled`]) and a decode call's date.
     ///
+    /// The give-back reads it beside them ([`Entry::spare`]): a key gives
+    /// its room back only where its oldest reader read at the caller's
+    /// instant.
+    ///
     /// `0` in an entry no read began, one a claim or a dispatch made
     /// ([`SessionTable::slot`]). It stays `0` until a read that writes
     /// the key begins a life ([`SessionTable::lookup`]): no word is
@@ -355,6 +359,15 @@ struct Entry {
     /// stood in, until such a write or the dispatch that puts the pin
     /// back. One byte of the slot's padding.
     over: Over,
+    /// Whether a second call read this life at the instant of the read
+    /// before it, under a rule without a TTL ([`Entry::touch`]). Calls
+    /// that read at one instant leave the same dates, so the dates do not
+    /// tell them apart: such a life gives no room back
+    /// ([`Entry::spare`]). Calls at different instants are told by the
+    /// dates. A claim call that finds pins its decision did not read is
+    /// such a second call too, at any instant ([`SessionTable::claim`]).
+    /// One byte of the slot's padding.
+    shared: bool,
 }
 
 impl Entry {
@@ -383,7 +396,14 @@ impl Entry {
                         SessionRule::sweep_at_or_after(rule.sweep_micros, idle_ends);
                 }
             }
-            None => self.expires_at_micros = u64::MAX,
+            None => {
+                // A second read at one instant writes the dates the
+                // first wrote: the life itself says that two read it.
+                if self.touched_at_micros == now_micros {
+                    self.shared = true;
+                }
+                self.expires_at_micros = u64::MAX;
+            }
         }
         self.touched_at_micros = now_micros;
         self.recovery = rule.recovery;
@@ -758,7 +778,9 @@ impl Entry {
     /// Takes the pins of `workers` off the key. False where that takes the
     /// key's last pin: it leaves the table and is placed afresh. A key
     /// that holds no pin stays: a decision read it and its claim follows
-    /// ([`SessionTable::lookup`]), and the idle keys' pass alone reclaims it.
+    /// ([`SessionTable::lookup`]). The idle keys' pass reclaims it, and so
+    /// does a call that leaves it no worker where no other call read it
+    /// ([`SessionTable::move_claim`], [`SessionTable::unplaced`]).
     fn unpin(&mut self, workers: &[WorkerId]) -> bool {
         let held = self.pins[0] != WorkerId(0);
         // A first claim its lease's dispatch withdrew is put back while
@@ -775,6 +797,34 @@ impl Entry {
             self.pins = [self.pins[1], WorkerId(0)];
         }
         !held || self.pins[0] != WorkerId(0)
+    }
+
+    /// A claim call found pins its decision did not read
+    /// ([`SessionTable::claim`]): a second call read this life. The dates
+    /// do not tell such a reader at any instant, so the life says it
+    /// (`shared`).
+    fn read_again(&mut self) {
+        self.shared = true;
+    }
+
+    /// Whether the call at `at` leaves the key with no worker under a rule
+    /// without a TTL, and no other call read it: no pin, no claim, an end
+    /// the idle keys' pass does not reach, a life whose newest and oldest
+    /// reader both read at `at`, and no second read of it (`shared`).
+    /// Such a key gives its room back ([`SessionTable::move_claim`],
+    /// [`SessionTable::unplaced`]) where no life began behind the
+    /// call's read ([`SessionTable::gives_back`]). A life that another
+    /// call read stays, at another instant or at this one: that call's
+    /// claim or dispatch is written into the life it read. A call that
+    /// states no instant (`0`) gives nothing back.
+    fn spare(&self, at: u64) -> bool {
+        !self.shared
+            && self.pins == [WorkerId(0); 2]
+            && self.claim == WorkerId(0)
+            && self.expires_at_micros == u64::MAX
+            && at != 0
+            && self.touched_at_micros == at
+            && self.oldest_reader_micros == at
     }
 }
 
@@ -824,9 +874,21 @@ const KEYS: usize = 4_194_304;
 /// How many keys a table holds, on cache lines of its own: a key that enters
 /// or leaves writes it, and a decision of a key the table holds reads none of
 /// its lines.
+///
+/// Its second word is the newest decision instant behind which a key's life
+/// may have begun unseen by a decision under way: the newest read of a key
+/// a walk took out ([`SessionTable::retain`]), and the newest read a full
+/// table kept no row of ([`SessionTable::lookup`]). A decision at or before
+/// it may have read a life that left since, or none, and a life another
+/// decision began at the same instant reads the same dates: its call gives
+/// no room back ([`SessionTable::gives_back`]). A decision past it read the
+/// life its key holds. The word stands in this block because its writers
+/// are here already: a walk that takes keys out writes the count behind
+/// it, and a read a full table refuses has just read the count. Its one
+/// reader asks before a key gives its room back, which writes the count.
 #[derive(Debug, Default)]
 #[repr(align(128))]
-struct Held(AtomicUsize);
+struct Held(AtomicUsize, AtomicU64);
 
 /// How long a worker that left keeps its pins where no rule says a TTL:
 /// four hours, the TTL a rule takes where its document names none.
@@ -858,7 +920,9 @@ pub struct SessionTable {
     shards: Box<[Shard]>,
     /// The keys the table holds: a key is counted before its entry is made
     /// and given back behind the walk that takes it, each under its shard's
-    /// mutex, so the count is never under the entries.
+    /// mutex, so the count is never under the entries. Beside it, in the
+    /// same block, the instant at or before which no call gives room back
+    /// ([`Held`]).
     held: Held,
     /// The decision clock at the next sweep, of the idle keys or of a
     /// worker that left: `u64::MAX` while neither is owed.
@@ -1084,6 +1148,11 @@ impl SessionTable {
         }
         let mut shard = self.shard(key).lock();
         let Some(entry) = self.slot(&mut shard, key) else {
+            // No row holds this read: a life the key begins at this
+            // instant, once room is back, is another decision's.
+            if self.held.1.load(Ordering::Relaxed) < now_micros {
+                self.held.1.fetch_max(now_micros, Ordering::Relaxed);
+            }
             return [WorkerId(0); 2];
         };
         if entry.expires_at_micros <= now_micros {
@@ -1202,6 +1271,10 @@ impl SessionTable {
         // decision moved them, or the step renamed one. Their
         // newcomer is the pin to follow, by the id that stands.
         if let Some(owner) = entry.newcomer(&seen, target) {
+            // The call read a life its decision did not: one another
+            // call wrote, or one a later read began where the key left
+            // the table under the decision.
+            entry.read_again();
             return Claim::Standing(owner, entry.pins);
         }
         if let Some(replaced) = entry.claimed(stands, target, at) {
@@ -1282,9 +1355,10 @@ impl SessionTable {
     /// issued at `at` ([`Entry::reached_by`]). A later decision's claim on
     /// the same worker is dated later, so a refusal told late leaves it.
     /// The claim written for `target` keeps `at`. A caller that states no
-    /// instant (`0`) is known by its worker alone. The call reads no date
-    /// of the key's life and writes none: it reaches its caller's own
-    /// claim alone.
+    /// instant (`0`) is known by its worker alone. The call writes no date
+    /// of the key's life: it reaches its caller's own claim alone. It
+    /// reads the dates only to tell whether a key the withdrawal leaves
+    /// with no worker gives its room back ([`Self::gives_back`]).
     pub(crate) fn move_claim(
         &self,
         key: Session,
@@ -1313,10 +1387,65 @@ impl SessionTable {
         }
         entry.withdraw_claim();
         if target == WorkerId(0) || entry.holds(stands) {
+            // A key the withdrawal leaves with no worker under a rule
+            // without a TTL gives its room back here, under the lock held,
+            // where the claim's decision alone read it.
+            if target == WorkerId(0) && self.gives_back(entry, at) {
+                shard.remove(&key);
+                self.held.0.fetch_sub(1, Ordering::Relaxed);
+            }
             return SessionVerdict::Pinned;
         }
         entry.claimed(stands, target, at);
         SessionVerdict::Claimed(target)
+    }
+
+    /// The decision at `now_micros` read `key` and named no worker. Where
+    /// that leaves the key with no pin and no claim under a rule without a
+    /// TTL, and no other call read it, the key gives its room back, as
+    /// behind a withdrawn claim ([`Self::move_claim`]). A key under a TTL
+    /// stays to its end. So does a key another decision claimed
+    /// meanwhile, and one another decision read, at another instant or at
+    /// this one: that decision's claim and dispatch are written into the
+    /// life it read. The callers ask under a rule without a TTL alone.
+    /// One of them is the lifted pass's end, which answers with a shed or
+    /// with the all-vetoed rule's pick: that pick pins no key and its
+    /// dispatch writes nothing, so the key gives its room back there too.
+    ///
+    /// `seen` is the pins the decision read. A decision that read a pin
+    /// gives nothing back: a key that holds none then is a life a later
+    /// read began, where the key left the table under that decision
+    /// ([`Entry::unpin`]), and that read's claim and dispatch are written
+    /// into it. No lock is taken for such a call. A decision that read
+    /// no pin can meet a life a later read began too, where the life it
+    /// read left by a walk or its read met a full table: that call
+    /// gives nothing back either ([`Self::gives_back`]).
+    pub(crate) fn unplaced(&self, key: Session, seen: SessionPins, now_micros: u64) {
+        if seen != [WorkerId(0); 2] {
+            return;
+        }
+        let key = key.get();
+        let mut shard = self.shard(key).lock();
+        if shard
+            .get(&key)
+            .is_some_and(|entry| self.gives_back(entry, now_micros))
+        {
+            shard.remove(&key);
+            self.held.0.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether the call at `at` gives the room of `entry` back: the call
+    /// leaves the key with no worker and no other call read it
+    /// ([`Entry::spare`]), and the life is the one the call's decision
+    /// read. A life begun behind that read, at the same instant, reads
+    /// the same dates. It begins only where the row the decision read
+    /// left by a walk, or where its read met a full table: either
+    /// writes its instant ([`Held`]), and a call at or before that
+    /// instant gives nothing back. Asked under the key's shard, so a
+    /// walk of that shard is read behind its store.
+    fn gives_back(&self, entry: &Entry, at: u64) -> bool {
+        entry.spare(at) && at > self.held.1.load(Ordering::Relaxed)
     }
 
     /// A decode call read `key` at `at`, its own instant, under the lease
@@ -1665,9 +1794,20 @@ impl SessionTable {
     fn retain(&self, shard: &Shard, mut keep: impl FnMut(&mut Entry) -> bool) {
         let mut keys = shard.0.lock();
         let before = keys.len();
-        keys.retain(|_, entry| keep(entry));
+        // The newest read among the keys that leave.
+        let mut left_micros = 0_u64;
+        keys.retain(|_, entry| {
+            let stays = keep(entry);
+            if !stays {
+                left_micros = left_micros.max(entry.touched_at_micros);
+            }
+            stays
+        });
         let left = before - keys.len();
         if left != 0 {
+            // Written under the shard's lock: a give-back of one of its
+            // keys reads it behind this store.
+            self.held.1.fetch_max(left_micros, Ordering::Relaxed);
             self.held.0.fetch_sub(left, Ordering::Relaxed);
             let kept = keys.len();
             if kept < keys.capacity() / 4 {
