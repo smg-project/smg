@@ -477,7 +477,9 @@ grandCentral:
   #    load either way, and with enabled: false the Lease goes too, so the
   #    term starts again.
   #    A Lease deleted under standbys that follow turns every pod not ready
-  #    until the release is applied again: the pods cannot make it.
+  #    until the release is applied again: the pods cannot make it. A standby
+  #    stays ready until its replication lag reaches one load poll interval,
+  #    two seconds at the least.
   election:
     enabled: false
     leaseName: ""

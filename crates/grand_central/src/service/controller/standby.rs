@@ -377,10 +377,13 @@ impl Lag {
     /// more of them than `at` is past it. So the origin plus them is an
     /// instant the clock holds, and the two sums that make the kept instant
     /// again ([`Self::turn`], [`Self::read`]) need no check.
+    ///
+    /// The word is that count plus one, `0` being no frame. A count of the
+    /// most the word holds, or of more, is kept one under that most.
     fn store(&self, at: Instant) -> u64 {
         let micros = at.saturating_duration_since(self.origin).as_micros();
         let micros = u64::try_from(micros).unwrap_or(u64::MAX - 1);
-        self.frame.swap(micros + 1, Ordering::Relaxed)
+        self.frame.swap(micros.saturating_add(1), Ordering::Relaxed)
     }
 
     /// Tells a turn where the frame `before` left was none, or was as old
@@ -480,10 +483,10 @@ impl Lapse {
 }
 
 /// The lag a standby reads synced under: one load poll interval, and never
-/// under two of the leader's heartbeats, which an idle stream's lag reaches
-/// by itself.
-/// The lag is the first of the counts synced reads (design 5.4): the live
-/// ranks and the generation narrow the same bit with their steps.
+/// under two of the leader's heartbeats. An idle stream brings a frame a
+/// heartbeat, so its lag reaches one of them by itself.
+/// `synced` reads the lag alone: the ranks and the generation the sync
+/// state names beside it are left at zero, and narrow nothing.
 pub(crate) fn synced_within(load_poll_interval: Duration) -> Duration {
     load_poll_interval.max(2 * BEAT)
 }
@@ -710,7 +713,7 @@ impl Standby {
                         leader = %leader.controller_id,
                         address = %self.target(&leader.address),
                         why = %why,
-                        "this standby does not follow its leader; it reads not synced until it does"
+                        "this standby does not follow its leader; it reads synced only while its lag is under its bound"
                     );
                 }
                 ended.next
