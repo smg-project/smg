@@ -201,8 +201,11 @@ pub struct Match {
 }
 ```
 
-A binding matches a request by its model and its phase. Bindings are read in document order and
-the first match wins.
+A binding matches a request by its model and its phase. The first match in document order wins.
+The engine walks the bindings of a document where `WALKED_ID_BINDINGS` of them or fewer name an
+id. Of any other it keeps a table of the ids its bindings name: a request's id finds its own
+bindings there. The engine then reads those bindings and the patterns' alone, in document order,
+up to the first that matches.
 
 ### 3.2 Two documents
 

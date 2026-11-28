@@ -45,8 +45,15 @@
 //! models ahead of the cell's own, each bound to a copy of the cell's
 //! profile under a name of its own: the document then holds `N` more
 //! profiles, as one that gives each model a profile does. No request
-//! names one of them. A single request's cell alone takes the switch,
-//! and a run under it says `N` on its row.
+//! names one of them: the cell's own binding, of every model, stands
+//! behind them. Each one's id is as long as the cell's own, up to
+//! 100,000 of them: a lookup that compares two ids reads their letters.
+//! A cell the engine picks alone for finds its binding once a list: a
+//! timed decision that keeps that pick looks no binding up. A call that
+//! decides again looks one up, as under `--entry place_held` where the
+//! rule refuses the first pick.
+//! A single request's cell alone takes the switch, and a run under an
+//! `N` over 0 says `N` on its row.
 //! `--runtimes N` has the host state a
 //! fact of each worker beside its object: the number of one of `N` runtimes
 //! by the worker's place, as a gateway that dials several runtimes states
@@ -1124,7 +1131,9 @@ fn main() {
         let live = own.profile.as_ref().expect("a binding of one profile");
         let profile = document.profiles[live].clone();
         let others = (0..run.other_models).map(|at| {
-            let name = format!("other-model-{at:05}");
+            // An id as long as the cell's own, up to 100,000 of them: a
+            // lookup that compares the two ids reads their letters.
+            let name = format!("other-{at:05}");
             document.profiles.insert(name.clone(), profile.clone());
             let mut other = own.clone();
             name.clone_into(&mut other.matcher.model);
