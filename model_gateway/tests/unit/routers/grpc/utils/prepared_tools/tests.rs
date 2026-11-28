@@ -217,8 +217,10 @@ fn key_of(tools: &[Tool]) -> Vec<u8> {
     key
 }
 
-/// The `tojson` texts a kept set comes to hold are compact JSON, longer than
-/// its key: the table charges them by that text's length, not by the key's.
+/// The table charges the `tojson` texts a kept set comes to hold by the
+/// length of its values' compact JSON text, which is longer than its key, not
+/// by the key's. The charge is an estimate: a text of the filter's default
+/// form carries a space behind each separator and runs a little longer.
 #[test]
 fn a_kept_set_is_charged_its_tojson_texts_by_their_compact_length() {
     let tools = [tool("charged_probe", "")];
@@ -232,6 +234,26 @@ fn a_kept_set_is_charged_its_tojson_texts_by_their_compact_length() {
     assert_eq!(
         set_weight(key, &values),
         key + text * PreparedTools::KEPT_TOJSON_TEXTS_PER_TOOL + kept_weight(&values)
+    );
+}
+
+/// A tool with no schema keeps its `tojson` texts with the `null` schema in
+/// them, 18 bytes a text that the tool serialized does not hold. The table
+/// charges those bytes, so such a tool weighs a little more than it did when
+/// its serialized bytes were the key and the charge.
+#[test]
+fn a_tool_without_a_schema_is_charged_the_null_schema_its_texts_hold() {
+    let tools = [declared(json!({"name": "charged_bare"}))];
+    let values = tool_values(&tools).unwrap();
+    let serialized = serde_json::to_vec(&tools).unwrap().len();
+    let text = serde_json::to_vec(&values).unwrap().len();
+    assert_eq!(text, serialized + r#","parameters":null"#.len());
+    let by_serialized_bytes =
+        serialized * (1 + PreparedTools::KEPT_TOJSON_TEXTS_PER_TOOL) + kept_weight(&values);
+    let weight = set_weight(key_of(&tools).len(), &values);
+    assert!(
+        weight > by_serialized_bytes,
+        "{weight} charged, {by_serialized_bytes} by the serialized bytes"
     );
 }
 
@@ -350,7 +372,9 @@ fn two_tool_sets_share_a_key_exactly_when_they_serialize_alike() {
 /// The table's bounds were set by the serialized bytes and read the key: a
 /// key is no longer than its set serialized, whatever the set is made of
 /// (many numbers, arrays in arrays, many fields, texts at the lengths where
-/// a length takes one more byte), so a set the table kept it still keeps.
+/// a length takes one more byte), so a set the key bound admitted it still
+/// admits. (The weight is another matter for a tool with no schema, which is
+/// charged the `null` schema its texts hold: the test of that name above.)
 #[test]
 fn a_key_is_no_longer_than_its_tools_serialized() {
     let many_fields: Map<String, Value> = (0..300).map(|i| (format!("k{i}"), json!(i))).collect();

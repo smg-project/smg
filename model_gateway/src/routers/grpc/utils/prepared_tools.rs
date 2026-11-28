@@ -146,8 +146,11 @@ const OBJECT: u8 = 7;
 /// request with tools pays the walk on every lookup, at a fraction of the
 /// serialization it stands for (a string is copied whole, where a JSON writer
 /// reads its every byte for an escape). The key of a set within the size
-/// bound is no longer than the set serialized, so what the bounds admitted
-/// by the serialized bytes they still admit.
+/// bound is no longer than the set serialized, so what the key bound admitted
+/// by the serialized bytes it still admits. The weight bounds charge a tool
+/// with no schema a little more than the serialized bytes did: its kept
+/// texts hold the `null` schema ([`tool_value`]), 18 bytes a text that the
+/// tool serialized does not, and [`set_weight`] counts them.
 fn write_key(key: &mut Vec<u8>, tools: &[Tool]) -> Result<(), serde_json::Error> {
     for tool in tools {
         // Taken apart whole: a field added to either record does not build
