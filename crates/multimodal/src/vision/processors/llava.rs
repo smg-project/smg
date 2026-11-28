@@ -1409,7 +1409,8 @@ mod tests {
 
     /// Two seeded images through the anyres pipeline (the base image plus the
     /// two crops of a 336x672 or 672x336 best fit, zero padding between)
-    /// against the reference processor's output on the same bytes.
+    /// against the reference processor's output on the same bytes, and a
+    /// third under a crop of height 336 and width 224.
     #[test]
     fn anyres_patches_match_the_reference_bit_for_bit() {
         let cases = [
@@ -1445,5 +1446,40 @@ mod tests {
             assert_eq!(result.encoder_input.shape(), &[1, 3, 3, 336, 336]);
             assert_pinned(&result.encoder_input.write_as(EncoderDtype::Float32), case);
         }
+
+        // The same pipeline under a crop that is not square: the cut stays a
+        // square of the crop height and every sample is center-cropped to
+        // the crop. No earlier code is pinned here: both columns of a
+        // witness hold the reference's value.
+        let narrow = Pinned {
+            width: 70,
+            height: 100,
+            seed: 31,
+            digest: "74409fd7d651d3fa92e934aea2555e6b7450880157db3013701913880b34c2c4",
+            witnesses: &[
+                (0, -0.9309554, -0.9309554),
+                (1, -1.2667192, -1.2667192),
+                (351_033, -1.752097, -1.752097),
+                (677_375, -1.4802198, -1.4802198),
+            ],
+        };
+        let config = PreProcessorConfig::from_json(
+            r#"{"crop_size": {"height": 336, "width": 224}, "do_center_crop": true,
+                "do_convert_rgb": true, "do_normalize": true, "do_rescale": true,
+                "do_resize": true,
+                "image_mean": [0.48145466, 0.4578275, 0.40821073],
+                "image_std": [0.26862954, 0.26130258, 0.27577711],
+                "resample": 3, "rescale_factor": 0.00392156862745098,
+                "size": {"shortest_edge": 336}}"#,
+        )
+        .unwrap();
+        let processor = LlavaNextProcessor::new().with_preprocessor_config(&config);
+        let image = lcg_rgb_image(narrow.width, narrow.height, narrow.seed);
+        let result = processor.preprocess(&[&image]).unwrap();
+        assert_eq!(result.encoder_input.shape(), &[1, 3, 3, 336, 224]);
+        assert_pinned(
+            &result.encoder_input.write_as(EncoderDtype::Float32),
+            &narrow,
+        );
     }
 }
