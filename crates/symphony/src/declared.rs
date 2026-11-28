@@ -30,6 +30,10 @@ pub struct Declared {
     /// The function the request forces, whose arguments alone the output is under the gateway's
     /// JSON-schema constraint ([`formats::forced`](crate::formats::forced())).
     forced: Option<String>,
+    /// Whether the engine that reads under this record starts a JSON call at its name
+    /// ([`Engine::starts_calls_at_name`](crate::Engine::starts_calls_at_name)): the engine's
+    /// choice, kept here because this record is what every call assembler is fed with.
+    calls_start_at_name: bool,
 }
 
 impl Declared {
@@ -54,6 +58,7 @@ impl Declared {
         Self {
             tools,
             forced: None,
+            calls_start_at_name: false,
         }
     }
 
@@ -67,6 +72,17 @@ impl Declared {
     /// The function the request forces, if it names one.
     pub fn forced(&self) -> Option<&str> {
         self.forced.as_deref()
+    }
+
+    /// The engine starts a JSON call at its name
+    /// ([`Engine::starts_calls_at_name`](crate::Engine::starts_calls_at_name)).
+    pub(crate) fn start_calls_at_name(&mut self) {
+        self.calls_start_at_name = true;
+    }
+
+    /// Whether a JSON call starts at its name ([`Self::start_calls_at_name`]).
+    pub(crate) fn calls_start_at_name(&self) -> bool {
+        self.calls_start_at_name
     }
 
     /// `function`'s whole `parameters` schema, as the first tool of that name declares it.

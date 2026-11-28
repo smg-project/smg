@@ -270,6 +270,7 @@ A binding with no block says the defaults.
 `bindings[].sessions` configures sticky placement. The rule pins a key to a worker, and a later request of the key follows that pin where it can. Among what sends it elsewhere: the rule's cap, a filter that refuses the worker for that request, and a target entry that names another worker.
 
 - The rule runs under `single`. It also runs on the two sides of `pd-pair` and of the pair in `epd`, each side by its own session.
+- Under `pd-pair` a rule's `sides` can name the one side it covers, `prefill` or `decode`. A side it leaves out is placed by its profile alone, and the rule reads, claims and writes no pin of that side's session.
 - Under `epd` it places no encode item.
 - A picker that places by session assignment runs on the pair's two sides of `epd`, and is refused on its encode side.
 - The stock controller refuses a rule that states `rule_placed: untold` under `pd-pair` and under `epd`.
@@ -284,6 +285,7 @@ A binding with no block says the defaults.
 | `inflight_cap` | 2 | Requests of one key a worker holds before the next is placed again. Above zero. 65535 means no cap. |
 | `recovery` | `original` | Which pin leads once both of a key's pins are usable again. |
 | `rule_placed` | `told` | Whether a request the rule placed alone is the profile's own. |
+| `sides` | Left out: both sides | Under `pd-pair`, the sides the rule covers: `prefill`, `decode` or both, each once. An empty list is refused. So is any list under `single` and under `epd`. |
 | `issue_session_id` | `false` | `true` is refused. |
 
 **The assignment.**

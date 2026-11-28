@@ -16,6 +16,15 @@ with nothing in it, on every path that reads the fragments (a client of the stre
 server call made from the arguments). A member whose key came and whose value never began is not
 one: the call ends with what arrived, and nothing is made up for a value the model botched.
 
+An engine built with `Engine::starts_calls_at_name` starts the call at the name instead: the head
+up to the name's closing quote is the `source` of `ToolCallStart`, and what stands between the name
+and the arguments value leaves with the value's first fragment. It is for a reader that streams, so
+that a client holds the name while the arguments are still being written. An output that ends
+behind the name and before the arguments value is then a call that started: it ends with no
+arguments, one `Malformed { UnterminatedRegion }` of no bytes says they are no whole value, and what
+stood behind the name comes back as the tail of an object that never closed does. Without the
+option, the default, such an output never started a call.
+
 The assembler keeps the promise `ToolCallArguments` makes, that the fragments so far are a prefix
 of JSON a strict reader accepts until the parser says otherwise: each new run of argument bytes is
 judged by `Prefix` before it is emitted, and at the first byte a strict reader refuses, one

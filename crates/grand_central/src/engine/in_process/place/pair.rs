@@ -5,11 +5,11 @@
 //!
 //! A pair's target names a prefill by its place in the prefill list and a
 //! decode by its place in the decode list ([`PairLists`]). The targets are
-//! walked as a single request's are ([`walk`]), over two workers a target:
-//! each side is read once, by the one read a single request's worker gets
-//! ([`sendable`]): ready, and admitted by the route's own rule. A target
-//! one of whose sides cannot be sent to is passed over whole, and the next
-//! is asked.
+//! walked as a single request's are ([`super::walk`]), over two workers a
+//! target: each side is read once, by the one read a single request's
+//! worker gets ([`sendable`]): ready, and admitted by the route's own
+//! rule. A target one of whose sides cannot be sent to is passed over
+//! whole, and the next is asked.
 //!
 //! Where no target of a call's first decision holds, or that decision
 //! sheds the request, as saturated or with no endpoint over lists that
@@ -41,8 +41,8 @@
 use std::{sync::Arc, time::Instant};
 
 use super::{
-    decide, hold_to_rule, raise, ready_by, sendable, walk, Call, Made, PlaceRequest, Sent, Sides,
-    Unplaced,
+    decide, hold_to_rule, raise, ready_by, sendable, walk_naming_side, Call, Made, PlaceRequest,
+    Sent, Sides, Unplaced,
 };
 use crate::{
     engine::{
@@ -86,13 +86,16 @@ pub(super) fn decode_label(engine: Loaded<'_, '_>, model: &str) -> &'static str 
 ///
 /// # Errors
 ///
-/// The decision's shed, its queue or its refusal. Prefills with an open
-/// partner that are all at the caller's admission limit shed the decision
-/// under the capacity filter's name ([`prefills_full`]): that is no
+/// The decision's shed, its queue or its refusal. Where the prefill
+/// side's filters leave its run nobody and a prefill with an open
+/// partner stands but for the caller's admission limit, the decision is
+/// shed under the capacity filter's name ([`prefills_full`]): that is no
 /// refusal, and the answer is [`Unplaced::PrefillsFull`], on which the
-/// caller waits for room. A place answered for a pair is the engine's
-/// fault ([`DecisionRefused::Faulted`]): no ask after it would leave
-/// anything new out.
+/// caller waits for room. So it is where the pair's default takes a
+/// prefill at that limit, under a profile that lists it as a hard
+/// filter. A place answered for a pair is the engine's fault
+/// ([`DecisionRefused::Faulted`]): no ask after it would leave anything
+/// new out.
 pub(super) fn ask<'a>(
     engine: Loaded<'static, '_>,
     request: &PlaceRequest<'a>,
@@ -123,7 +126,8 @@ pub(super) fn ask<'a>(
     }
     let now = dated.unwrap_or_else(Instant::now);
     let held = |target: &Target| sides(request, lists, target, &kept);
-    let placement = walk(engine, decided, later, now, &mut call.missed, held)?;
+    let unsent = Some(&mut call.unsent);
+    let placement = walk_naming_side(engine, decided, later, now, &mut call.missed, unsent, held)?;
     Ok(placement.map(|mut placement| {
         placement.routing_key = key;
         placement.decode_profile = Some(decode_label(engine, request.model));
@@ -133,8 +137,9 @@ pub(super) fn ask<'a>(
 
 /// The two workers of `target` in `lists`, where `request` can be sent to
 /// both ([`sendable`]): what a walk of a pair's targets asks of each
-/// ([`walk`]), over a pair's two lists and over the pair's two of an encode
-/// request's three. Else the ids of the sides it cannot be sent to.
+/// ([`super::walk`]), over a pair's two lists and over the pair's two of
+/// an encode request's three. Else the ids of the sides it cannot be sent
+/// to.
 ///
 /// A worker the decision asked of is taken by the answer it was given
 /// there (`kept`: the prefills', then the decodes'), and read no second

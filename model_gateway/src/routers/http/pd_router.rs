@@ -11213,6 +11213,23 @@ mod tests {
     /// a conversation's three turns would reach three engines of a side.
     #[tokio::test]
     async fn a_pairs_conversation_keeps_its_two_engines_under_the_overrides_rule() {
+        conversations_keep_their_engines(PolicyConfig::RoundRobin).await;
+    }
+
+    /// Beside a prefill under `consistent_hashing` the override's rule
+    /// names the decode side alone. Every turn of a conversation still
+    /// reaches one prefill engine, by the ring over its key, and the decode
+    /// engine its first turn reached, by its pin.
+    #[tokio::test]
+    async fn a_pairs_conversation_keeps_its_engines_beside_a_hash_prefill() {
+        conversations_keep_their_engines(PolicyConfig::ConsistentHashing).await;
+    }
+
+    /// Ten conversations of three turns through the pair route. The
+    /// document is the one the settings make of the `prefill` policy beside
+    /// a round-robin decode with the override on. The turns of each
+    /// conversation reach one engine a side.
+    async fn conversations_keep_their_engines(prefill: PolicyConfig) {
         use smg_grand_central::document::AppliedSpec;
 
         use crate::config::types::{RouterConfig, RoutingKeyOverrideConfig, RoutingMode};
@@ -11222,11 +11239,14 @@ mod tests {
         // the lineage of their id alone.
         const CONVERSATIONS: usize = 10;
 
+        // A side under round robin spreads the conversations by its turns.
+        // A ring spreads them by its hash of addresses a run draws.
+        let by_turns = matches!(prefill, PolicyConfig::RoundRobin);
         let settings = RouterConfig {
             mode: RoutingMode::PrefillDecode {
                 prefill_urls: Vec::new(),
                 decode_urls: Vec::new(),
-                prefill_policy: Some(PolicyConfig::RoundRobin),
+                prefill_policy: Some(prefill),
                 decode_policy: Some(PolicyConfig::RoundRobin),
             },
             policy: PolicyConfig::RoundRobin,
@@ -11326,7 +11346,7 @@ mod tests {
             engines.len()
         };
         assert!(
-            engines(|pair| pair.0) > 1 && engines(|pair| pair.1) > 1,
+            (!by_turns || engines(|pair| pair.0) > 1) && engines(|pair| pair.1) > 1,
             "ten conversations went to one engine of a side: {kept:?}"
         );
     }

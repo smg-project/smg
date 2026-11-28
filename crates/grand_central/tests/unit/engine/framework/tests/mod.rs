@@ -8,7 +8,7 @@ use crate::{
     document::spec::{self, PolicySpec, Recovery, RulePlaced},
     engine::{
         decision::{self, Pair},
-        sticky_sessions::DecodeVerdict,
+        sticky_sessions::{DecodeVerdict, SessionExpiry, SessionSides},
         view::{self, Health, Identity, MediaCounts, Role, Session, WorkerId},
     },
     policies::{
@@ -373,6 +373,7 @@ const SESSIONS: SessionRule = SessionRule {
     sweep_micros: 0,
     recovery: Recovery::Latest,
     rule_placed: RulePlaced::Told,
+    sides: SessionSides::Any,
 };
 
 /// The least-requests profile under a sessions rule.

@@ -3012,6 +3012,7 @@ fn the_manual_preset_states_its_whole_rule() {
             issue_session_id: false,
             recovery: Recovery::Original,
             rule_placed: RulePlaced::Told,
+            sides: None,
         }
     );
     assert_eq!(spec.view.headers, ["x-smg-routing-key"]);
@@ -3261,6 +3262,164 @@ fn a_sessions_rule_runs_under_a_pair_and_under_epd_by_its_hosts_calls() {
         )
     };
     assert_eq!(of_encode(&ruled), of_encode(&bare));
+}
+
+/// A sessions rule under a pair names the sides it covers (`sides`):
+/// `prefill`, `decode` or both, each once and in either order. Left
+/// out, the rule covers both sides, and a document that names none
+/// writes no `sides` key.
+///
+/// The check refuses, each by the field's path: a list under the single
+/// plan or under `epd`, an empty list and a side named twice. It refuses
+/// the encode side and every other name too. A list that leaves out a
+/// side whose picker leaves the placement to the rule is not in this
+/// build, by the path of that side's profile.
+///
+/// A gateway's sticky map places a role at a time. It asks the role's
+/// policy, and leaves the role to one that keeps a routing key's
+/// handling to itself: `manual` and `consistent_hashing` (`sticky_for`
+/// in `model_gateway/src/policies/registry.rs`).
+#[test]
+fn a_sessions_rule_names_the_sides_of_a_pair_it_covers() {
+    // One binding under a rule, beside the profile `q` and the profile
+    // `sticky`, whose picker leaves the placement to the rule.
+    let bound = |binding: &str, sides: &str| {
+        doc(&format!(
+            r#"{{"apiVersion":"smg.policy/v1","view":{{"headers":["x-session-id"]}},"profiles":{{"q":{{"pick":"random"}},"sticky":{{"pick":"manual"}}}},"bindings":[{{{binding},"sessions":{{"sticky_header":"x-session-id"{sides}}}}}]}}"#
+        ))
+    };
+    let pair = |prefill: &str, decode: &str| {
+        format!(r#""plan":"pd-pair","profiles":{{"prefill":"{prefill}","decode":"{decode}"}}"#)
+    };
+    let named = |sides: &str| format!(r#","sides":{sides}"#);
+    let plain = pair("q", "q");
+    let covered = |sides: &str| {
+        let built = bound(&plain, sides).validate();
+        let built = built.expect("the document validates");
+        let binding = built.binding("m", Phase::Prefill).expect("the binding");
+        binding.sessions.as_ref().expect("the rule").sides
+    };
+    assert_eq!(covered(""), SessionSides::Any);
+    // The type's own default is that rule: one built in code that names
+    // no side covers both.
+    assert_eq!(SessionSides::default(), SessionSides::Any);
+    for (sides, rule) in [
+        (r#"["prefill"]"#, SessionSides::Prefill),
+        (r#"["decode"]"#, SessionSides::Decode),
+        (r#"["prefill","decode"]"#, SessionSides::Any),
+        (r#"["decode","prefill"]"#, SessionSides::Any),
+    ] {
+        assert_eq!(covered(&named(sides)), rule, "{sides}");
+    }
+    // The rule as a document writes it.
+    let written = |sides: &str| {
+        let document = serde_json::to_value(bound(&plain, sides)).expect("a document");
+        document["bindings"][0]["sessions"].clone()
+    };
+    assert_eq!(written("").get("sides"), None);
+    let decode = written(&named(r#"["decode"]"#));
+    assert_eq!(decode["sides"], serde_json::json!(["decode"]));
+    // A `null` is the field left out, under the single plan too.
+    let single = bound(r#""profile":"q""#, &named("null")).validate();
+    assert!(single.is_ok(), "{:?}", single.err());
+
+    // Under `epd` a rule covers the pair's two sides, and takes no list.
+    let epd = r#""plan":"epd","profiles":{"encode":"q","prefill":"q","decode":"q"}"#;
+    assert_eq!(bound(epd, "").validate().err(), None);
+    let (by_prefill, by_decode) = (pair("sticky", "q"), pair("q", "sticky"));
+    let other = "`prefill`, `decode` or both: a rule covers no other side";
+    for (binding, sides, reason) in [
+        (
+            r#""profile":"q""#,
+            r#"["prefill"]"#,
+            "left out under the single plan: a single request has one side",
+        ),
+        (
+            epd,
+            r#"["decode"]"#,
+            "left out under the epd plan in this build: a rule covers the pair's two sides there",
+        ),
+        (
+            plain.as_str(),
+            "[]",
+            "a list of one side at least: leave it out for both",
+        ),
+        (
+            plain.as_str(),
+            r#"["decode","decode"]"#,
+            "a list that names each side once",
+        ),
+        (
+            plain.as_str(),
+            r#"["prefill","prefill"]"#,
+            "a list that names each side once",
+        ),
+        // A third item is read as the first two are.
+        (
+            plain.as_str(),
+            r#"["prefill","decode","decode"]"#,
+            "a list that names each side once",
+        ),
+        (plain.as_str(), r#"["encode"]"#, other),
+        (plain.as_str(), r#"["prefill","both"]"#, other),
+        // A name is read as written, with a space before it, behind it
+        // or both.
+        (plain.as_str(), r#"[" decode"]"#, other),
+        (plain.as_str(), r#"["decode "]"#, other),
+        (plain.as_str(), r#"[" decode "]"#, other),
+    ] {
+        let refused = bound(binding, &named(sides)).validate().err();
+        let by_name = SpecError::BadSessions {
+            index: 0,
+            name: "sides",
+            reason,
+        };
+        assert_eq!(refused.as_ref(), Some(&by_name), "{sides}");
+        assert_eq!(by_name.field_path(), "bindings[0].sessions.sides");
+        assert_eq!(
+            by_name.to_string(),
+            format!("binding 0: sessions sides is not {reason}")
+        );
+    }
+    // A refusal names its own binding: the second of two here.
+    let second = doc(&format!(
+        r#"{{"apiVersion":"smg.policy/v1","view":{{"headers":["x-session-id"]}},"profiles":{{"q":{{"pick":"random"}}}},"bindings":[{{"match":{{"model":"other"}},"profile":"q"}},{{{plain},"sessions":{{"sticky_header":"x-session-id","sides":[]}}}}]}}"#
+    ));
+    let by_name = SpecError::BadSessions {
+        index: 1,
+        name: "sides",
+        reason: "a list of one side at least: leave it out for both",
+    };
+    assert_eq!(second.validate().err().as_ref(), Some(&by_name));
+    assert_eq!(by_name.field_path(), "bindings[1].sessions.sides");
+    // A side whose picker leaves the placement to the rule is not left
+    // out: the binding's one rule would not place it, and it holds no
+    // second.
+    for (binding, sides, side) in [
+        (&by_prefill, r#"["decode"]"#, "prefill"),
+        (&by_decode, r#"["prefill"]"#, "decode"),
+    ] {
+        let lacking = SpecError::NotInBuild {
+            path: format!("bindings[0].profiles.{side}"),
+            what: BY_RULE_ON_A_SIDE_LEFT_OUT,
+        };
+        let refused = bound(binding, &named(sides)).validate().err();
+        assert_eq!(refused, Some(lacking), "{sides}");
+    }
+    assert_eq!(
+        BY_RULE_ON_A_SIDE_LEFT_OUT,
+        "a picker that places by the sessions rule on a side the rule's `sessions.sides` leaves out",
+    );
+    // Such a side stands under a rule that names it, alone or beside
+    // the other side, and under one that names none.
+    for (binding, sides) in [
+        (&by_prefill, named(r#"["prefill"]"#)),
+        (&by_decode, named(r#"["decode"]"#)),
+        (&by_decode, named(r#"["decode","prefill"]"#)),
+        (&by_decode, String::new()),
+    ] {
+        assert_eq!(bound(binding, &sides).validate().err(), None, "{sides}");
+    }
 }
 
 #[test]

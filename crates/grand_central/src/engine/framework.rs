@@ -3695,7 +3695,10 @@ pub enum Plan {
     /// the open encoders of the chosen prefill's class that take the
     /// request's media, once per encode item or once for the items taken
     /// as one. A request with items that no encoder is open to is refused
-    /// ahead of the pair. The binding's `profile` is the prefill side and
+    /// ahead of the pair. The pair of a request with items is picked among
+    /// the prefills whose class holds an open encoder that takes its media.
+    /// A decode without the vision a request asks of it is no candidate of
+    /// the pair either. The binding's `profile` is the prefill side and
     /// `decode_profile` the decode side. The encode side rides the plan,
     /// so a binding keeps the pair's two fields.
     Epd {
@@ -3792,10 +3795,10 @@ pub struct Binding {
     pub decode_shadow: Option<u16>,
     /// Sticky sessions: a keyed request stays on the worker its key was
     /// placed on (design 4.6), under the `single` plan and on each side of
-    /// a pair, by the side's own session. A document states the rule: code
-    /// outside this crate builds none ([`SessionRule`]), so a binding it
-    /// makes leaves this `None`, or takes the rule of a document's binding
-    /// ([`Engine::binding`]).
+    /// a pair the rule covers, by the side's own session. A document states
+    /// the rule: code outside this crate builds none ([`SessionRule`]), so
+    /// a binding it makes leaves this `None`, or takes the rule of a
+    /// document's binding ([`Engine::binding`]).
     pub sessions: Option<SessionRule>,
 }
 
@@ -6083,6 +6086,18 @@ impl Engine {
                 let sides_placed = binding.sessions.is_some()
                     || assigned(binding.profile)
                     || binding.decode_profile.is_some_and(assigned);
+                // A side its rule leaves out is its profile's alone, and a
+                // picker that leaves the placement to the rule has no
+                // stages to place it by. A document's check refuses that
+                // binding. One built in code stops a debug build here.
+                debug_assert!(
+                    binding.sessions.is_none_or(|rule| {
+                        let decode = binding.decode_profile.unwrap_or(binding.profile);
+                        (rule.sides.covers(false) || !assigned(binding.profile))
+                            && (rule.sides.covers(true) || !assigned(decode))
+                    }),
+                    "a picker that places by the sessions rule on a side the rule's sides leave out"
+                );
                 // Each side of a pair may be asked by its draw where its
                 // profile is a pick of two that draws first, asks nothing
                 // ahead of the draw and folds its filters into one test.
@@ -8759,14 +8774,26 @@ impl Engine {
     /// Whether a side of a pair is placed by its binding's sessions rule or
     /// by the assignment its own picker leaves the placement to, and not by
     /// the side's profile alone ([`Self::placed_side`]): a request with a
-    /// session key under a rule, and every request of such a picker. The
+    /// session key under a rule that covers the side
+    /// ([`SessionRule::sides`]), and every request of such a picker. The
     /// entry's byte is asked first ([`Entry::sides_placed`]): a pair under
     /// no rule, each side's picker its own, runs its two profiles as it
-    /// did, behind that one test.
+    /// did, behind that one test. A side the rule does not cover is its
+    /// profile's: the rule's run alone reads a pin, claims one or leaves a
+    /// verdict for a dispatch to write by. A document's check keeps a
+    /// picker that leaves the placement to the rule on a side it covers.
     #[inline(always)]
-    fn places_side(&self, entry: &Entry, index: u16, facts: &RequestFacts<'_>) -> bool {
+    fn places_side(
+        &self,
+        entry: &Entry,
+        index: u16,
+        side: PairSide,
+        facts: &RequestFacts<'_>,
+    ) -> bool {
+        let covers = |rule: &SessionRule| rule.sides.covers(side == PairSide::Decode);
         entry.sides_placed
-            && ((entry.binding.sessions.is_some() && !facts.session_key.is_none())
+            && ((entry.binding.sessions.as_ref().is_some_and(covers)
+                && !facts.session_key.is_none())
                 || self.marks[usize::from(index)].by_assignment())
     }
 
@@ -8888,10 +8915,11 @@ impl Engine {
     /// name `written-rows` before either scope opens, as [`Self::decide`]
     /// declines it. A pair side carries no pin.
     ///
-    /// Under the binding's sessions rule each side follows its key's pin by
-    /// the side's own session, and a side whose picker leaves the placement
-    /// to the rule is placed by the assignment. The pick states the prefill
-    /// side's verdict, and its first target's pair the decode side's
+    /// Under the binding's sessions rule each side the rule covers follows
+    /// its key's pin by the side's own session. A side whose picker leaves
+    /// the placement to the rule is placed by the assignment. The pick
+    /// states the prefill side's verdict, and its first target's pair the
+    /// decode side's
     /// ([`Pair::decode_verdict`](super::decision::Pair::decode_verdict)).
     /// A claim of the prefill side names the prefill the pair formed on,
     /// before any dispatch, and a decision that sheds leaves none.
@@ -8929,6 +8957,18 @@ impl Engine {
     /// pair's default, a prefill at its limit with no open partner makes no
     /// request wait: its refusal is named by what its partners' own stages
     /// say, as the refusal of a prefill under its limit is.
+    ///
+    /// Behind the pair's default and its question of saturation, where no
+    /// prefill at the request's places stands but for its limit, the limit
+    /// names no shed: its name is the word a host waits on for room. The
+    /// prefill side's stage is read there with the limit set aside
+    /// (`vetoed::Half::emptied_limit_aside`): a prefill at its limit stays
+    /// in that pass until another filter refuses it. So where the prefill
+    /// side's profile lists the limit among its filters changes no answer
+    /// there, under filters whose word on a row does not turn on how
+    /// often they are asked. The gateway's own pair selection asks its
+    /// overload shed ahead of its capacity test (`pair_pass` in
+    /// `model_gateway/src/routers/common/placement.rs`).
     ///
     /// Where the prefill side's run sheds, no default pairs and no prefill
     /// waits on its limit alone, one question says whether the request is
@@ -9187,28 +9227,29 @@ impl Engine {
         // again where the second run needs it. Chosen behind the test, the
         // classes were chosen by value, and a pair under no rule paid 9
         // instructions for it.
-        let mut prefill = if self.places_side(entry, binding.profile, &prefill_facts) {
-            self.placed_prefill(
-                firsts,
-                binding,
-                prefill_profile,
-                &prefill_facts,
-                pool,
-                prefills,
-                run_cx,
-                scratch,
-            )
-        } else {
-            run_profile(
-                prefill_profile,
-                binding.profile,
-                &prefill_facts,
-                pool,
-                Set::side(prefills, None, Some(shown)),
-                run_cx,
-                &mut scratch.single,
-            )
-        };
+        let mut prefill =
+            if self.places_side(entry, binding.profile, PairSide::Prefill, &prefill_facts) {
+                self.placed_prefill(
+                    firsts,
+                    binding,
+                    prefill_profile,
+                    &prefill_facts,
+                    pool,
+                    prefills,
+                    run_cx,
+                    scratch,
+                )
+            } else {
+                run_profile(
+                    prefill_profile,
+                    binding.profile,
+                    &prefill_facts,
+                    pool,
+                    Set::side(prefills, None, Some(shown)),
+                    run_cx,
+                    &mut scratch.single,
+                )
+            };
         if firsts {
             let stands = match &prefill {
                 Decision::Pick(_) => true,
@@ -9240,7 +9281,12 @@ impl Engine {
                 std::mem::swap(&mut scratch.classes, &mut scratch.firsts);
             } else {
                 firsts = false;
-                prefill = if self.places_side(entry, binding.profile, &prefill_facts) {
+                prefill = if self.places_side(
+                    entry,
+                    binding.profile,
+                    PairSide::Prefill,
+                    &prefill_facts,
+                ) {
                     self.placed_prefill(
                         false,
                         binding,
@@ -9275,14 +9321,20 @@ impl Engine {
             // then to the admission limit's shed, for a prefill with an open
             // partner alone, and then to the one question that says whether
             // the request is shed as saturated: the count of the list the
-            // gateway's own pair selection judges. Every other shed has no
-            // endpoint, and is named by the stage that left a pass nobody:
-            // the prefill side's where no prefill stands but for its
-            // admission limit, "partnered" for a class with no decode at all
-            // and for a routable prefill of class 0, and else what the
-            // decode pool's own stages say about the partners of the
-            // prefills that stand so (those were dropped by the partnered
-            // test alone). A picker's decline passes through.
+            // gateway's own pair selection judges, asked over whole lists
+            // alone. Every other shed is named by a stage. It is the
+            // prefill side's where no prefill stands but for its admission
+            // limit, read with that limit set aside, and "none" where that
+            // pass ends at no stage. It is "partnered" for a class with no
+            // decode at all and for a routable prefill of class 0, and else
+            // what the decode pool's own stages say about the partners of
+            // the prefills that stand so (those were dropped by the
+            // partnered test alone). Where those stages name none, the
+            // prefill's own shed stands. Over whole lists each such shed
+            // has no endpoint, and where its stage is the overload veto,
+            // the list judged names it again ([`Half::refused_room`]).
+            // Behind a part a pass the overload veto ended is shed as
+            // saturated. A picker's decline passes through.
             if let Decision::Shed(prefill_shed) = &prefill {
                 if prefill_shed.reason != ShedReason::PolicyDeclined {
                     // A refused pool vetoed on every usable worker goes to
@@ -9405,17 +9457,27 @@ impl Engine {
                         scratch.shed_over = Some(over);
                         return shed(reason_of(veto), veto, prefill_shed.trace).of_side(side);
                     }
-                    // Else the request has no endpoint, and the stage that
-                    // left a pass nobody names the shed: the prefill side's
-                    // where no prefill of the request's stands but for its
-                    // limit, `partnered` where those that stand pair with no
-                    // decode, and else what the decode pool's own stages say
-                    // about the partners of the prefills that stand.
+                    // Else the shed takes a first name. Where no prefill of
+                    // the request's stands but for its limit it is the
+                    // stage that leaves the prefill side's pass nobody, the
+                    // limit aside, and `none` where that pass ends at no
+                    // stage. Where those that stand pair with no decode it
+                    // is `partnered`. Else it is what the decode pool's own
+                    // stages say about the partners of the prefills that
+                    // stand, and the prefill's own shed stands where they
+                    // name none. A first name that is the overload veto's
+                    // sheds as saturated behind a part, and over whole
+                    // lists gives way to the name the list judged gives
+                    // it, below. Every other shed has no endpoint.
                     let named = if routable == 0 {
-                        let whole = Set::side(prefills, None, None);
+                        // The limit's name says a wait for room, and no
+                        // prefill here stands but for its limit. So the
+                        // side's stage is read by a pass that sets the
+                        // limit aside, wherever the profile lists it: a
+                        // prefill at its limit stays in that pass until
+                        // another filter refuses it.
                         let buf = &mut scratch.single;
-                        let stage = filter(prefill_profile, &prefill_facts, run_cx, buf, whole);
-                        Some(stage.unwrap_or(NO_STAGE))
+                        Some(takes.emptied_limit_aside(buf).unwrap_or(NO_STAGE))
                     } else if scratch.classes.is_empty() {
                         Some(PARTNERED)
                     } else {
@@ -9498,28 +9560,29 @@ impl Engine {
             // own, so no host callback is needed to narrow the set.
             let partners = pools.partners(&class, firsts);
             let partners = Set::side(decodes, Some(partners), None).ruled(vetoed);
-            let mut decision = if self.places_side(entry, decode_index, &decode_facts) {
-                self.placed_side::<true>(
-                    binding,
-                    decode_index,
-                    decode_profile,
-                    &decode_facts,
-                    pool,
-                    partners,
-                    decode_cx,
-                    scratch,
-                )
-            } else {
-                run_profile(
-                    decode_profile,
-                    decode_index,
-                    &decode_facts,
-                    pool,
-                    partners,
-                    decode_cx,
-                    &mut scratch.decode,
-                )
-            };
+            let mut decision =
+                if self.places_side(entry, decode_index, PairSide::Decode, &decode_facts) {
+                    self.placed_side::<true>(
+                        binding,
+                        decode_index,
+                        decode_profile,
+                        &decode_facts,
+                        pool,
+                        partners,
+                        decode_cx,
+                        scratch,
+                    )
+                } else {
+                    run_profile(
+                        decode_profile,
+                        decode_index,
+                        &decode_facts,
+                        pool,
+                        partners,
+                        decode_cx,
+                        &mut scratch.decode,
+                    )
+                };
             match &mut decision {
                 // The decode's pick becomes the pair's where it stands: its
                 // targets name the prefill, its trace is the prefill's, and
@@ -10002,7 +10065,7 @@ impl Engine {
         let lives = live_sides(&entry.binding);
         // A side its binding's sessions rule or its picker's assignment
         // placed: a shadow's run is put to neither.
-        if self.places_side(entry, lives[side.index()], facts) {
+        if self.places_side(entry, lives[side.index()], side, facts) {
             return None;
         }
         // The place stated on a lent ring is the two live sides' where
@@ -10241,7 +10304,7 @@ impl Engine {
         // placed, as at the pair's decision.
         let entry = self.bindings.get(at as usize)?;
         let lives = live_sides(&entry.binding);
-        if self.places_side(entry, lives[side.index()], facts) {
+        if self.places_side(entry, lives[side.index()], side, facts) {
             return None;
         }
         let profile = self.profiles.get(usize::from(index))?;
@@ -10416,7 +10479,7 @@ impl Engine {
         scratch.among_first = firsts;
         let partners = pools.partners(&class, firsts);
         let partners = Set::side(decodes, Some(partners), None).ruled(entry.vetoed);
-        let mut decision = if self.places_side(entry, index, &decode_facts) {
+        let mut decision = if self.places_side(entry, index, PairSide::Decode, &decode_facts) {
             // The rule's run reads no `first_decode`: a session's first
             // decision claimed its decode in the session table, and the
             // key's pin answers this call.

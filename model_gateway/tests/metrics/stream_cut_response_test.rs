@@ -45,9 +45,10 @@ const MODEL: &str = "stream-cut-count-test-model";
 /// no other test writes the route's clean `200` row while this one runs: the
 /// worker request counter test sends non-streamed `/generate` requests
 /// through the same recorder, so on that route only the `stream_error` row,
-/// which no other test writes, is read. The dispatch wait tests answer chat
-/// requests through it too; they run under this test's `serial` key, never
-/// beside it.
+/// which no other test writes, is read. The chat cases of the dispatch wait
+/// tests answer chat requests through it too; they run under this test's
+/// `serial` key, never beside it. Their multipart case answers a
+/// transcription, a route this count leaves out, and runs under no key.
 fn routes() -> Vec<(&'static str, Value, bool, bool)> {
     let prompt = "count to twenty";
     vec![

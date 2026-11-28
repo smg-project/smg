@@ -76,12 +76,9 @@ fn the_print_is_the_document_alone_on_stdout_and_a_zero_exit() {
         .map(|binding| binding.sessions.is_some())
         .collect();
     assert_eq!(rules, [true, true]);
-}
 
-#[test]
-fn a_setting_no_document_says_is_one_sentence_on_stderr_and_a_failing_exit() {
-    // The sticky override's rule places both sides of a pair, and this
-    // line's prefill policy reads the routing key itself.
+    // Beside a prefill under `consistent_hashing` the rule on the pair's
+    // binding names the decode side, which it covers alone.
     let answer = print(&[
         "--pd-disaggregation",
         "--prefill",
@@ -93,6 +90,55 @@ fn a_setting_no_document_says_is_one_sentence_on_stderr_and_a_failing_exit() {
         "--routing-key-override",
     ])
     .expect("the binary runs");
+    assert_eq!(answer.status.code(), Some(0), "{}", text(&answer.stderr));
+    assert_eq!(text(&answer.stderr), "");
+    let document: PolicySpec =
+        serde_yaml::from_slice(&answer.stdout).expect("stdout is a document and nothing else");
+    // Each of the two bindings holds a rule, and the pair's alone names a
+    // side.
+    assert_eq!(document.bindings.len(), 2);
+    let sides: Vec<Option<Vec<String>>> = document
+        .bindings
+        .iter()
+        .filter_map(|binding| Some(binding.sessions.as_ref()?.sides.clone()))
+        .collect();
+    assert_eq!(sides, [Some(vec!["decode".to_string()]), None]);
+
+    // A pair whose main policy is the hash policy itself, beside a decode
+    // side the override places. No binding of the override stands behind
+    // the pair's: its rule is the document's one, and the view lists no
+    // client header of the hash side.
+    let answer = print(&[
+        "--pd-disaggregation",
+        "--prefill",
+        "http://prefill-a:8000",
+        "--decode",
+        "http://decode-a:8000",
+        "--policy",
+        "consistent_hashing",
+        "--decode-policy",
+        "round_robin",
+        "--routing-key-override",
+    ])
+    .expect("the binary runs");
+    assert_eq!(answer.status.code(), Some(0), "{}", text(&answer.stderr));
+    assert_eq!(text(&answer.stderr), "");
+    let document: PolicySpec =
+        serde_yaml::from_slice(&answer.stdout).expect("stdout is a document and nothing else");
+    let rules: Vec<bool> = document
+        .bindings
+        .iter()
+        .map(|binding| binding.sessions.is_some())
+        .collect();
+    assert_eq!(rules, [true, false]);
+    assert!(!document.view.headers.iter().any(|name| name == "cookie"));
+}
+
+#[test]
+fn a_setting_no_document_says_is_one_sentence_on_stderr_and_a_failing_exit() {
+    // The sticky override's rule has no document in a gateway of many
+    // routers yet.
+    let answer = print(&["--enable-igw", "--routing-key-override"]).expect("the binary runs");
     assert_eq!(answer.status.code(), Some(1));
     assert_eq!(text(&answer.stdout), "");
     let stderr = text(&answer.stderr);

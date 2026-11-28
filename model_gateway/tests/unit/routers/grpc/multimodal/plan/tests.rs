@@ -934,7 +934,7 @@ fn image_chat_plan(cap: Option<serde_json::Value>) -> MediaPlan {
             "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": image_url}]}]
         }))
         .unwrap();
-    super::super::media_plan_chat(&request.messages)
+    super::super::media_plan_chat(&request.messages, &request.other)
 }
 
 fn image_components(config: serde_json::Value) -> MultimodalComponents {

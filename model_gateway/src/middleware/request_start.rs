@@ -22,10 +22,11 @@
 //! The scope holds a second value beside it: how long the read of the
 //! request's body waited for the client (`RequestStarted::upload_waited`,
 //! written by a reader of the body where it ends a read that had to wait:
-//! the request-body deadline layer, or a reader ahead of it under the same
-//! measure). The dispatch wait counted without the upload is the dispatch
-//! wait less this. A body that came whole leaves it zero: its reader reads
-//! no clock and writes nothing.
+//! the request-body deadline layer, or one of the two readers outside it
+//! under the same measure, the WASM request hook ahead of the layer and the
+//! multipart route, which stands under no body deadline). The dispatch wait
+//! counted without the upload is the dispatch wait less this. A body that
+//! came whole leaves it zero: its reader reads no clock and writes nothing.
 
 use std::{
     cell::Cell,
