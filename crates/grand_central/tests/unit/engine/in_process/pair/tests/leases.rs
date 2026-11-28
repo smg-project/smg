@@ -551,7 +551,7 @@ fn hearing_only(kind: EventKind) -> (AppliedSpec, Arc<Mutex<Vec<Word>>>) {
 }
 
 /// A pair's word reaches the stages wherever the document hears any
-/// word, whatever the kind of the word its guard says. A decode that
+/// word of a lease, whatever the kind of the word its guard says. A decode that
 /// stood chosen is issued by its dispatch, so a stage that takes the
 /// issue alone hears it at a word of another kind. One pair is sent and
 /// ended side by side, its decode with no call, and one is given up
