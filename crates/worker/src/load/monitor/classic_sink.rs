@@ -5,7 +5,7 @@
 //! builds it over the registry and the routing side it is handed.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -413,19 +413,18 @@ impl<G: Generation> LoadSink for ClassicLoadSink<G> {
         if tick.reports.is_empty() {
             return;
         }
-        let mut group_dp_loads: HashMap<String, HashMap<isize, isize>> = HashMap::new();
+        let mut group_dp_loads = Vec::new();
         let mut dp_evict: Vec<String> = Vec::new();
         for polled in tick.reports {
             // The rank counts are laid by URL. A worker the registry no
             // longer holds at its URL lays none there: its eviction clears
-            // them, and the next worker registered at the URL would read
-            // what is laid behind it. A removal that lands between this
-            // test and `update_dp_loads` below is not covered: this road
-            // holds no lock the eviction takes.
+            // them. A removal can land between this test and
+            // `update_dp_loads` below, since this road holds no lock the
+            // eviction takes: the counts name the worker that laid them, so
+            // the next worker registered at the URL is given no rank by them.
             if !self.worker_registry.is_current_handle(polled.worker) {
                 continue;
             }
-            let url = polled.worker.url().to_string();
             // Only feed the DP-rank cache from responses that carry real
             // absolute per-rank token counts. Ratio-only snapshots,
             // which would otherwise poison with a fake `{0: 0}`
@@ -435,12 +434,12 @@ impl<G: Generation> LoadSink for ClassicLoadSink<G> {
             // worker, not by rank, so its repeated `dp_rank: 0` entries
             // would overwrite each other down to a single bogus rank.
             if polled.carries_rank_capacity {
-                group_dp_loads.insert(url, dp_rank_token_loads(polled.report));
+                group_dp_loads.push((polled.worker, dp_rank_token_loads(polled.report)));
             } else {
-                dp_evict.push(url);
+                dp_evict.push(polled.worker.url().to_string());
             }
         }
-        self.worker_load_manager.update_dp_loads(&group_dp_loads);
+        self.worker_load_manager.update_dp_loads(group_dp_loads);
         if !dp_evict.is_empty() {
             self.worker_load_manager.remove_workers(&dp_evict);
         }

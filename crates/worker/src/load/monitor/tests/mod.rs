@@ -273,11 +273,8 @@ async fn dp8_pushes_cannot_redirect_virtual_workers_to_active_ranks() {
 
         // A poll supplies each quiet rank's real idle sample. A later
         // foreign push must neither overwrite it nor redirect selection.
-        let loads = HashMap::from([(
-            worker.url().to_string(),
-            HashMap::from([(rank as isize, 0)]),
-        )]);
-        monitor.worker_load_manager.update_dp_loads(&loads);
+        let loads = vec![(&worker, HashMap::from([(rank as isize, 0)]))];
+        monitor.worker_load_manager.update_dp_loads(loads);
         for pushing_rank in [0, 2] {
             monitor.apply_pushed_load(&worker, pushing_rank, &active, now);
         }
@@ -292,19 +289,21 @@ async fn dp8_pushes_cannot_redirect_virtual_workers_to_active_ranks() {
 /// Foreign cached ranks cannot redirect a pinned worker or invent missing telemetry.
 #[test]
 fn virtual_rank_selection_rejects_foreign_cached_ranks() {
-    let worker = BasicWorkerBuilder::new("grpc://decode:9000")
-        .dp_config(7, 8)
-        .build();
+    let worker: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("grpc://decode:9000")
+            .dp_config(7, 8)
+            .build(),
+    );
     let manager = Arc::new(WorkerLoadManager::new());
     let mut loads = HashMap::from([(0, 0), (2, 0)]);
-    manager.update_dp_loads(&HashMap::from([(worker.url().to_string(), loads.clone())]));
+    manager.update_dp_loads(vec![(&worker, loads.clone())]);
     assert!(manager
-        .select_and_increment_lowest_dp_load(&worker, 1)
+        .select_and_increment_lowest_dp_load(worker.as_ref(), 1)
         .is_none());
     loads.insert(7, 100);
-    manager.update_dp_loads(&HashMap::from([(worker.url().to_string(), loads)]));
+    manager.update_dp_loads(vec![(&worker, loads)]);
     assert_eq!(
-        manager.select_and_increment_lowest_dp_load(&worker, 1),
+        manager.select_and_increment_lowest_dp_load(worker.as_ref(), 1),
         Some(7)
     );
 }
@@ -497,11 +496,11 @@ async fn removed_event_evicts_cached_loads() {
         number: 0,
     };
     monitor.native_loads_memo.insert(url.clone(), file);
-    let mut dp_loads: HashMap<String, HashMap<isize, isize>> = HashMap::new();
     let mut inner = HashMap::new();
     inner.insert(0, 5);
-    dp_loads.insert(url.clone(), inner);
-    monitor.worker_load_manager.update_dp_loads(&dp_loads);
+    monitor
+        .worker_load_manager
+        .update_dp_loads(vec![(&worker, inner)]);
 
     registry.remove(&id);
     tokio::task::yield_now().await;
@@ -556,11 +555,12 @@ async fn stop_all_groups_clears_dp_cache() {
         .register(ready_worker("http://w1:8080", "llama-3"))
         .unwrap();
 
-    let mut dp_loads: HashMap<String, HashMap<isize, isize>> = HashMap::new();
+    let worker = registry.get_by_url("http://w1:8080").unwrap();
     let mut inner = HashMap::new();
     inner.insert(0, 7);
-    dp_loads.insert("http://w1:8080".to_string(), inner);
-    monitor.worker_load_manager.update_dp_loads(&dp_loads);
+    monitor
+        .worker_load_manager
+        .update_dp_loads(vec![(&worker, inner)]);
 
     monitor.stop_all_groups();
 
@@ -586,11 +586,11 @@ async fn status_changed_away_from_ready_evicts_worker() {
         vec![(Arc::clone(&worker), Arc::new(WorkerLoadResponse::default()))],
     );
     assert!(monitor.load_state.snapshot().contains(&url));
-    let mut dp_loads: HashMap<String, HashMap<isize, isize>> = HashMap::new();
     let mut inner = HashMap::new();
     inner.insert(0, 5);
-    dp_loads.insert(url.clone(), inner);
-    monitor.worker_load_manager.update_dp_loads(&dp_loads);
+    monitor
+        .worker_load_manager
+        .update_dp_loads(vec![(&worker, inner)]);
 
     registry.transition_status(&id, WorkerStatus::NotReady);
     tokio::task::yield_now().await;
