@@ -23,6 +23,7 @@ use crate::{
     engine::{
         decision::{Decision, Target, Targets},
         decision_engine::{DecisionEngine, DecisionRefused, Request, RequestMaker, WorkerLists},
+        explain::shadow::{ShadowCounts, Shadowed},
         framework::{EncodeItems, EncodePlaced, Issuing, Picker, Scorer, TieBand},
         in_process::{
             membership::tests::{handed, id, registry, remove},
@@ -34,7 +35,6 @@ use crate::{
         },
         list_cell::PublishedList,
         prompt_hashes::HashSeeds,
-        shadow::{ShadowCounts, Shadowed},
         view::{Candidate, RequestFacts, WorkerId},
     },
     policies::random::Random,

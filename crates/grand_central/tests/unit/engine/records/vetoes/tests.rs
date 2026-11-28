@@ -17,10 +17,10 @@ use crate::{
     engine::{
         decision::{Decision, ShadowKind, ShedReason},
         decision_engine::{DecisionEngine, Request, RequestMaker, WorkerLists},
+        explain::shadow::Shadow,
         framework::{DecisionScope, Filter},
         in_process::InProcess,
         list_cell::PublishedList,
-        shadow::Shadow,
         view::{Candidate, Constraints, Phase, PoolFacts, RequestFacts},
     },
     stages::{registry::StageRegistry, Lifecycle},

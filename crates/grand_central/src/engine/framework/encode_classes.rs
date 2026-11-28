@@ -47,17 +47,17 @@
 //! ([`EncodeHandoff`], [`EncodeOffer`]).
 //!
 //! Where the pair classes beside this module judge nothing
-//! ([`PartnerClasses`](super::PartnerClasses): which workers pair is the
+//! ([`PartnerClasses`](super::super::PartnerClasses): which workers pair is the
 //! caller's word), this rule judges: whether a worker states an end, and
 //! which ends are one ([`hands_to`]).
 
 use rustc_hash::FxHashMap;
 
-use super::framework::EncoderFacts;
+use super::EncoderFacts;
 use crate::store::{pairing::known, EncodeHandoff, EncodeOffer};
 
 #[cfg(test)]
-#[path = "../../tests/unit/engine/encode_classes/tests.rs"]
+#[path = "../../../tests/unit/engine/framework/encode_classes/tests.rs"]
 mod tests;
 
 /// One encoder or prefill as the derivation reads it.

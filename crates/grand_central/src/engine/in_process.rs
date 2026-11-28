@@ -103,6 +103,7 @@ use super::{
         AlonePick, DecideOutcome, Decided, DecisionEngine, DecisionRefused, HeldDecision, Request,
         RequestMaker, WorkerLists,
     },
+    explain::shadow::Shadowed,
     framework::{
         release, AloneProfile, Engine, Issuing, NotAlone, Picker, Place, PoolWord, ShadowRows,
     },
@@ -110,7 +111,6 @@ use super::{
     list_cell::{HandedLists, LentList},
     prompt_hashes::{HashSeeds, PromptHashes},
     records::{DecisionClock, PoolRecords},
-    shadow::Shadowed,
     sticky_sessions::{shards_for_this_host, SessionTable},
     view::{FixedFacts, Phase, WireModes, WorkerId},
 };

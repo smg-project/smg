@@ -85,6 +85,7 @@ use crate::{
     engine::{
         decision::{shed, Decision, Pair, Pick, ShedReason, Target, TARGET_WORKER},
         decision_engine::{DecisionRefused, DecodeRefused, WorkerLists},
+        explain::shadow::Shadowed,
         framework::{release, EncodeItems, EncodePlaced},
         in_process::{
             named_worker::{self, Reached, ReachedPair},
@@ -92,7 +93,6 @@ use crate::{
         },
         lease_events,
         records::PoolRecords,
-        shadow::Shadowed,
         view::{fingerprint, Identity, Phase, RequestFacts, Role, Session},
         EncodeLists, PairLists,
     },

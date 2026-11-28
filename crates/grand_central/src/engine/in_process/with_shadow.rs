@@ -26,7 +26,7 @@
 //! panic is counted with the engine's faults.
 //!
 //! **The counts.** A shadow decision is counted in the tables of its
-//! document ([`ShadowCounts`](crate::engine::shadow::ShadowCounts)): a
+//! document ([`ShadowCounts`](crate::engine::explain::shadow::ShadowCounts)): a
 //! single request's in one, and each side of a pair's in its own
 //! ([`count`], [`ShadowSide`]). It is counted behind the issue of its
 //! live decision: a pick's lease is issued first, and a live shed, which
@@ -58,9 +58,9 @@ use super::{
 use crate::engine::{
     decision::Decision,
     decision_engine::{DecideOutcome, Request, RequestMaker},
+    explain::shadow::{Shadow, ShadowCount, ShadowSide, Shadowed},
     framework::{Engine, ShadowRows},
     records,
-    shadow::{Shadow, ShadowCount, ShadowSide, Shadowed},
     view::{Constraints, RequestFacts},
 };
 
@@ -154,7 +154,7 @@ impl InProcess {
     ///
     /// A row is told once, in the order of the rows: the bindings from the
     /// last row on share it
-    /// ([`SHADOW_ROWS`](crate::engine::shadow::SHADOW_ROWS)). A shadow
+    /// ([`SHADOW_ROWS`](crate::engine::explain::shadow::SHADOW_ROWS)). A shadow
     /// that panicked is in no count here: it is one of the engine's faults
     /// ([`DecisionEngine::faults`](crate::engine::DecisionEngine::faults)).
     ///

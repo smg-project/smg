@@ -4,8 +4,8 @@
 
 use super::*;
 use crate::engine::{
+    framework::pair_classes::PartnerClasses,
     in_process::pair::{PairAdmission, PairLists},
-    pair_classes::PartnerClasses,
     view::Phase,
 };
 

@@ -9,7 +9,7 @@
 
 use rustc_hash::FxHashMap;
 
-use super::framework::{FirstPartners, PairTable};
+use super::{FirstPartners, PairTable};
 
 /// The class of every worker of a prefill list and of a decode list, and
 /// the table of the classes that pair.
@@ -207,7 +207,7 @@ impl PartnerClasses {
 
     /// Each prefill's class, in the prefill list's order: what a caller
     /// writes into that list's records
-    /// ([`Candidate::pair_class`](super::view::Candidate::pair_class)).
+    /// ([`Candidate::pair_class`](super::super::view::Candidate::pair_class)).
     #[must_use]
     pub fn prefills(&self) -> &[u32] {
         &self.prefills
@@ -220,7 +220,7 @@ impl PartnerClasses {
     }
 
     /// Which classes pair, as a pair decision reads it beside its records
-    /// ([`PairPools::table`](super::framework::PairPools::table)).
+    /// ([`PairPools::table`](super::PairPools::table)).
     #[must_use]
     pub fn table(&self) -> PairTable<'_> {
         PairTable::new(&self.ends, &self.listed)
@@ -228,7 +228,7 @@ impl PartnerClasses {
 
     /// The partners each prefill class is paired with first, as a pair
     /// decision reads them beside the table
-    /// ([`PairPools::first`](super::framework::PairPools::first)): none
+    /// ([`PairPools::first`](super::PairPools::first)): none
     /// where the classes were numbered with no first partner.
     #[must_use]
     pub fn first(&self) -> FirstPartners<'_> {
@@ -261,5 +261,5 @@ impl PartnerClasses {
 }
 
 #[cfg(test)]
-#[path = "../../tests/unit/engine/pair_classes/tests.rs"]
+#[path = "../../../tests/unit/engine/framework/pair_classes/tests.rs"]
 mod tests;

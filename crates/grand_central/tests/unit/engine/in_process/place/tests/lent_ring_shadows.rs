@@ -236,7 +236,7 @@ fn ring_shadowed(prefill: &str, decode: &str, after: bool) -> PolicySpec {
 /// another outcome, skipped; the prefill's shadow, the decode's, and the
 /// decode's beside a decode decided again.
 fn sides_said(engine: &InProcess) -> [[u64; 4]; 3] {
-    use crate::engine::shadow::ShadowSide;
+    use crate::engine::explain::shadow::ShadowSide;
 
     let mut kinds = [[0; 4]; 3];
     let _ = engine.shadow_counts(|count| {
@@ -551,7 +551,7 @@ fn a_lender_that_declined_one_sides_shadow_is_asked_nothing_for_the_other() {
 /// where no budget is stated.
 #[test]
 fn a_pair_under_the_shadows_floor_asks_the_lender_nothing() {
-    use crate::engine::shadow::SHADOW_FLOOR;
+    use crate::engine::explain::shadow::SHADOW_FLOOR;
 
     let list = pool(2);
     let members = PublishedList::new(Arc::clone(&list));

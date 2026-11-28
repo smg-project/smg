@@ -35,9 +35,11 @@ use crate::{
     document::spec::AppliedSpec,
     engine::{
         decision::{Decision, PairSide, ShadowKind},
-        explain::{DecisionRecord, Samples},
+        explain::{
+            shadow::{ShadowCount, ShadowCounts, ShadowSide, Shadowed, SHADOW_ROWS},
+            DecisionRecord, Samples,
+        },
         framework::{ShadowRows, Stood, SHADOWS},
-        shadow::{ShadowCount, ShadowCounts, ShadowSide, Shadowed, SHADOW_ROWS},
         view::{fingerprint, Phase},
     },
     stages::Lifecycle,

@@ -19,9 +19,9 @@ use crate::{
     engine::{
         decision::{Decision, ShedReason, MAX_TARGETS, SUBSET_HINT},
         decision_engine::{Decided, Plain, Request, RequestMaker, WorkerLists},
+        framework::pair_classes::PartnerClasses,
         in_process::InProcess,
         list_cell::PublishedList,
-        pair_classes::PartnerClasses,
         view::{
             fingerprint, Constraints, FixedFacts, HashKind, Header, Identity, MediaCounts,
             ModelFingerprint, Phase, RequestFacts, SessionCountedUnder, WireModes, WorkerId,
