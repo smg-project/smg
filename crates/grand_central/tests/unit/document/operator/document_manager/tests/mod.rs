@@ -693,9 +693,9 @@ fn the_stores_entry_is_called_under_the_documents_lock() {
 }
 
 /// The validator's word comes before the digest's. A `kind` line is in
-/// no digest and the validator refuses it: the standing document with
-/// one added is refused by name, under no line and under the standing
-/// one, and where no bytes are held yet these are not kept.
+/// no digest and one with a value is refused: the standing document with
+/// `kind: PolicySpec` added is refused by name, under no line and under
+/// the standing one, and where no bytes are held yet these are not kept.
 #[test]
 fn a_document_the_validator_refuses_is_refused_though_its_digest_stands() {
     let kind = || SpecRejected::Invalid(SpecError::Kind("PolicySpec".to_owned()));

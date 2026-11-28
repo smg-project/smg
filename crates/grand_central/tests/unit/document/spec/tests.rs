@@ -1064,11 +1064,6 @@ fn a_kind_line_is_refused_naming_the_decision_and_an_unknown_field_by_name() {
     assert!(err.to_string().contains("no kind field"), "{err}");
     let serialized = serde_json::to_string(&with_kind).expect("serializes");
     assert!(!serialized.contains("kind"), "{serialized}");
-    let no_value = doc(r#"{ "apiVersion": "smg.policy/v1", "kind": null,
-          "profiles": { "p": { "pick": "random" } } }"#);
-    no_value
-        .validate()
-        .expect("a kind with no value reads as left out");
 
     let err = parse_error(
         r#"{ "apiVersion": "smg.policy/v1", "plugins": [],
@@ -1087,6 +1082,20 @@ fn a_kind_line_is_refused_naming_the_decision_and_an_unknown_field_by_name() {
           "bindings": [ { "profile": "p", "sessions": { "ttl": 600 } } ] }"#,
     );
     assert!(err.contains("unknown field `ttl`"), "{err}");
+}
+
+/// A `kind` with no value reads as left out: the document is the one
+/// without the line, and it validates.
+#[test]
+fn a_kind_with_no_value_reads_as_left_out() {
+    let no_value = doc(r#"{ "apiVersion": "smg.policy/v1", "kind": null,
+          "profiles": { "p": { "pick": "random" } } }"#);
+    let left_out = doc(r#"{ "apiVersion": "smg.policy/v1",
+          "profiles": { "p": { "pick": "random" } } }"#);
+    assert_eq!(no_value, left_out);
+    no_value
+        .validate()
+        .expect("a kind with no value reads as left out");
 }
 
 /// A key written twice in one of the document's maps is refused by name

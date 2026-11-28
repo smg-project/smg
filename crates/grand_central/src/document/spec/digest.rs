@@ -14,8 +14,8 @@ impl PolicySpec {
     /// The document's digest ([`Digest`]): a change of the file's form or of
     /// the `generation` line leaves it as it was, and any other change to a
     /// document the validator admits moves it. A `kind` line is in no
-    /// canonical form and so in no digest: the validator refuses it, and
-    /// equal digests say nothing of a document that was not validated.
+    /// canonical form and so in no digest: one with a value is refused,
+    /// and equal digests say nothing of a document that was not validated.
     pub fn digest(&self) -> Result<Digest, SpecError> {
         let mut hash = Sha256::new();
         serde_json::to_writer(HashWriter(&mut hash), &self.lineless())
