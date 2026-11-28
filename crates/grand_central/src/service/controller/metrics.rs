@@ -54,10 +54,15 @@ pub const REPLICATION_LAG_SECONDS: &str = "smg_grand_central_replication_lag_sec
 pub const REPLICATION_RESTORES_ASKED_TOTAL: &str =
     "smg_grand_central_replication_restores_asked_total";
 /// Load polls by the arbitration's decision (`mode`: `poll`, `fallback`,
-/// `suppressed`; a suppressed one made no call), each counted once per
-/// worker and poll interval, for a worker on a connection. A worker is one
-/// rank of its engine: the count is one an engine and interval but for an
-/// engine of several ranks.
+/// `suppressed`; a suppressed one made no call): one for each worker on a
+/// connection, each time the arbitration decides for it. That can be more
+/// or less than once a poll interval. Each group of workers (a model, a
+/// worker type and a connection mode) has a loop. A loop can decide for a
+/// worker at a beat, when a worker of the same engine joins between two
+/// beats, and when a fetch of that engine ends late. It decides for no
+/// worker while a fetch of its own to the worker's engine is open. Each
+/// rank that is a worker of its own counts, and a worker that serves two
+/// models counts in both groups.
 pub const LOAD_POLLS_TOTAL: &str = "smg_grand_central_load_polls_total";
 /// Load polls over a connection that produced no report, by `reason`.
 pub const LOAD_POLL_FAILURES_TOTAL: &str = "smg_grand_central_load_poll_failures_total";
@@ -287,7 +292,7 @@ impl Metrics {
         recorder.describe_counter(
             KeyName::from_const_str(LOAD_POLLS_TOTAL),
             None,
-            "Load polls by the arbitration's decision (poll, fallback, suppressed), one per worker on a connection and poll interval".into(),
+            "Load polls by the arbitration's decision (poll, fallback, suppressed), one for each worker on a connection each time the arbitration decides for it".into(),
         );
         recorder.describe_counter(
             KeyName::from_const_str(LOAD_POLL_FAILURES_TOTAL),
