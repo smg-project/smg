@@ -362,19 +362,21 @@ fn a_number_that_reaches_a_prefill_no_encoder_serves_is_shed_under_the_targets_n
 }
 
 /// The number names no encoder, so what a request held to its pair is
-/// answered for its encoders is what the same request is answered with no
-/// worker named. Encoders that are all over their thresholds, under a
-/// binding that sheds such a list, shed it as saturated. Encoders that are
-/// all held back by their breakers shed it with no endpoint, under the
-/// encode side's own name. A stage of the encode side that leaves an item
-/// no encoder sheds it under that stage's name, a host's own here. None
-/// is the target's miss, and none names a side of the pair. Each call
-/// looks for the header once, and the request that names a worker was
-/// counted ahead of its answer: over the same encoders, a number past the
-/// prefills is the target's miss.
+/// answered for its encoders stands as it is. Over each fleet here it is
+/// what the same request is answered with no worker named. Encoders that
+/// are all over their thresholds, under a binding that sheds such a list,
+/// shed it as saturated. Encoders that are all held back by their
+/// breakers shed it with no endpoint, under the encode side's own name. A
+/// stage of the encode side that leaves an item no encoder sheds it under
+/// that stage's name, a host's own here. None is the target's miss, and
+/// none names a side of the pair. Each call looks for the header once,
+/// and the request that names a worker was counted ahead of its answer:
+/// over the same encoders, a number past the prefills is the target's
+/// miss.
 ///
-/// The classic router answers a request that no available encoder takes
-/// ahead of its pair selection (`WS:2590`, `WS:2605-2634`).
+/// The classic router answers a request that carries an item and that no
+/// available encoder takes ahead of its pair selection (`WS:2584`,
+/// `WS:2590`, `WS:2605-2634`).
 #[test]
 fn a_shed_made_for_the_encoders_of_a_named_pair_stands() {
     let three = Three::of([2, 2, 2], |_, _| false);
@@ -915,7 +917,7 @@ fn a_rule_that_refuses_the_named_prefill_behind_the_count_misses_the_target() {
 }
 
 /// A request that names no worker is placed as under a document with no
-/// target source, whatever it states of its items: its document's target
+/// target source, whatever it states of its items: its binding's target
 /// source costs it one lookup of the header, and changes nothing else of
 /// its answer. Three lists under a binding of the
 /// pair's own plan are a host's wrong hand, which the engine's entry for

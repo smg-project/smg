@@ -306,7 +306,7 @@ A worker's row, its bounds and the door that writes it stand on [a page of their
 - A client that asks a served controller for a pair's later decode or for its decode call. The controller serves both. The crate's own client states neither yet.
 - A choice by the media a worker can process, outside `epd`. No built-in filter reads it.
 - A binding that matches on a tenant, a priority, a header, a prompt size or labels. The fields are in the schema. A document that writes one is refused as not in this build.
-- A pair's shadows at an encode request's first decision, beside a side its sessions rule or its picker's assignment places and through a served controller, and plugin stages in a shadow profile.
+- A pair's shadows at an encode request's first decision, beside a side its sessions rule or its picker's assignment places and through a served controller, and plugin stages in a shadow profile. An encode request that names a worker and is answered as a pair is shadowed as a pair.
 - `canary`, `override: allowed` and `admission` on a binding, and `issue_session_id` in a sessions rule.
 - A sessions rule under `pd-pair` or `epd` that states `rule_placed: untold`, through the stock controller. Its file of leases keeps no word of a pair's side. In a host's own process a rule runs on both sides of a pair under either plan, or under `pd-pair` on the one side `sides` names.
 - A list of `sides` in a sessions rule under `epd`. The field is the `pd-pair` plan's, and under `epd` a rule covers the pair's two sides.

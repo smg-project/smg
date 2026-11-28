@@ -2305,11 +2305,12 @@ impl InProcess {
     ///
     /// An encode request may name its worker too: the number names the
     /// workers of its pair, on each side that reads it, and no encoder.
-    /// One that names no worker is placed as under any other document,
-    /// behind one lookup of that header. One that names a worker and that
-    /// the encode pass is not laid for, with no item and its decode held
-    /// to no images, is answered as a pair that names that worker is, by
-    /// the pair's own entry. For any other the pair is counted
+    /// One that names no worker is placed as under any other document: a
+    /// target source its binding names costs it one lookup of that
+    /// header. One that names a worker and that the encode pass is not
+    /// laid for, with no item and its decode held to no images, is
+    /// answered as a pair that names that worker is, by the pair's own
+    /// entry. For any other the pair is counted
     /// as a pair's is, by the same lines, and the call then asks as an
     /// encode request's does, lent its three lists with the pair held to
     /// the places the number reached. Each side is counted among the
@@ -2324,15 +2325,14 @@ impl InProcess {
     /// prefill is counted, a number that reaches no worker is said so
     /// ahead of that decision, whatever it would answer. Where the count
     /// reaches a pair, what the call answers for its encoders stands as
-    /// it does for a request that names no worker: a shed made for them
-    /// or over the lists whole, and no worker where its last ask was
-    /// given up for an encoder alone. A pair held on both sides is asked
-    /// again behind such an ask alone, held as it was: the rule is asked
-    /// of no list there. It books its decode with its prefill, as a
-    /// pair's own does. Under a binding whose decode side alone is such a
-    /// ring, a request the pass is laid for is shed under `target-worker`
-    /// for the decode's side: an encode request's decision counts no
-    /// number.
+    /// it is: a shed made for them or over the lists whole, and no worker
+    /// where its last ask was given up for an encoder alone. A pair held
+    /// on both sides is asked again behind such an ask alone, held as it
+    /// was: the rule is asked of no list there. It books its decode with
+    /// its prefill, as a pair's own does. Under a binding whose decode
+    /// side alone is such a ring, a request the pass is laid for is shed
+    /// under `target-worker` for the decode's side: an encode request's
+    /// decision counts no number.
     ///
     /// Declined by name ([`ShedReason::PolicyDeclined`]): a request that
     /// carries encode items over other lists than an encode request's

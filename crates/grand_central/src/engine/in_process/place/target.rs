@@ -68,10 +68,10 @@
 //! it is. A request that names a worker and that the encode pass is not
 //! laid for is its pair's alone, and answered as a pair is, by the pair's
 //! own entry. One that names no worker is placed as under any other
-//! document, behind one lookup of its header. Where the decode's side
-//! alone is the ring's, a request the pass is laid for is shed under that
-//! name for the decode's side: an encode request's decision counts no
-//! number.
+//! document: a target source its binding names costs it one lookup of
+//! its header. Where the decode's side alone is the ring's, a request
+//! the pass is laid for is shed under that name for the decode's side:
+//! an encode request's decision counts no number.
 //!
 //! **A controller's served decision** counts by the same functions, over
 //! the lists its worker objects lend: a single request's number by
@@ -555,8 +555,8 @@ pub(super) fn pair<'a>(
 ///
 /// A request that names no worker ([`held_sides`]) is placed as under any
 /// other document ([`super::encode::three`]), whatever it states of its
-/// items. The document's target source costs it one lookup of the header
-/// and changes nothing else of its answer.
+/// items. A target source its binding names costs it one lookup of the
+/// header, and changes nothing else of its answer.
 ///
 /// One that names a worker and that the encode pass is not laid for
 /// ([`super::pair::laid`]) is its pair's alone: it states no items
@@ -807,9 +807,9 @@ impl<'a> Beside<'a> for Three<'_, '_> {
 
     /// The pair's mapping, less what the call answered for its encoders
     /// ([`for_encoders`]): the number names none of them, so that answer
-    /// stands as the same request is answered with no worker named. An
-    /// encode request's walk writes no side ([`Call::unsent`]), so its
-    /// miss behind asks that sent to nobody names none.
+    /// stands as it is. An encode request's walk writes no side
+    /// ([`Call::unsent`]), so its miss behind asks that sent to nobody
+    /// names none.
     fn held(self, unplaced: Unplaced, call: &Call) -> Unplaced {
         if for_encoders(&unplaced, call) {
             unplaced

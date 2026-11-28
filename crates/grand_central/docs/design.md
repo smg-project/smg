@@ -2725,8 +2725,8 @@ its pair's frame carries (section 10.1).
 each side that reads it, and no encoder. Classic takes such a request's pair by its pair
 selection, and picks an item's encoder under headers that hold the item's content hash alone
 (`assign_encode_workers` in `model_gateway/src/routers/grpc/common/stages/worker_selection.rs`).
-A request that names no worker is placed as under any other document, behind one lookup of the
-header its binding's target source names.
+A request that names no worker is placed as under any other document. A target source its
+binding names costs it one lookup of that source's header.
 
 A request the encode pass is not laid for is its pair's alone: it states no item and holds its
 decode to no images. Where it names a worker, it is answered as a pair that names that worker
@@ -2753,19 +2753,19 @@ does, for a request that holds its decode to them. The decision held to that pla
 worker, and the request is shed under `target-worker`: it takes the worker it names or none.
 Such a shed names no side where the encode pass made it.
 
-The number names no encoder, so what the call answers for its encoders stands as it does for a
-request that names no worker. A shed made for the encoders keeps its own name, and so does one
-by the places a host states for them. So does a gap the encode pass says over the lists whole:
-no pair that an encoder serves, or none whose decode takes images the request needs. A call
-whose last ask was given up for an encoder alone answers that it has no worker.
+The number names no encoder, so what the call answers for its encoders stands as it is. A shed
+made for the encoders keeps its own name, and so does one by the places a host states for them.
+So does a gap the encode pass says over the lists whole: no pair that an encoder serves, or none
+whose decode takes images the request needs. A call whose last ask was given up for an encoder
+alone answers that it has no worker.
 
-Where a worker of the named pair cannot be sent to after all, the request is shed under
-`target-worker`, on no side. An encode request's walk of its targets names no side, where a
-pair's own names one.
+A request can be shed under `target-worker` because its call's last ask could send to no pair.
+For a request the encode pass is laid for, that shed names no side. The walk of its targets
+writes none, where a pair's own names the side it could not send to.
 
 The count runs ahead of the call's decision, as a pair's does. So where a prefill is counted, a
-number that reaches no worker is said first, under `target-worker`. Classic's stage answers for
-its encoders first.
+number that reaches no worker is said first, under `target-worker`. Classic's stage answers first
+where the request carries an item and no available encoder takes it.
 
 Behind an encoder that cannot be sent to, the call decides again, held as it was: three
 decisions at most. A pair held on both sides books its decode with its prefill, as a pair's own
