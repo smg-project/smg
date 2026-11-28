@@ -6367,6 +6367,128 @@ fn a_lookup_behind_a_handed_on_id_names_nobody_through_the_standing_rows() {
     );
 }
 
+/// Three workers over one index for the warm-up's reads through standing
+/// rows: workers 0 and 1 hold a fleet-sized cache each, worker 2 a thin one
+/// under the id `third`.
+struct ThinThird {
+    policy: CacheAwarePolicy,
+    workers: Vec<Arc<dyn Worker>>,
+    indexer: Arc<KvIndex>,
+    third: u32,
+}
+
+impl ThinThird {
+    /// The fleet's level, in blocks.
+    const LEVEL: u32 = 1_100;
+    /// Worker 2's cache, in blocks.
+    const THIN: u32 = 100;
+
+    /// The case, and what worker 2's stream holds in the index.
+    fn new() -> (Self, WorkerBlocks) {
+        let workers = make_workers(&["http://w0:8000", "http://w1:8000", "http://w2:8000"]);
+        let policy = CacheAwarePolicy::with_config(test_config());
+        policy.init_workers(&workers);
+        update_expected_wait_loads(&policy, &workers, &[0, 0, 0]);
+        let indexer = Arc::new(KvIndex::chain());
+        let ids: Vec<u32> = workers
+            .iter()
+            .map(|worker| indexer.intern_worker(worker.url()).unwrap())
+            .collect();
+        Self::fill(&indexer, ids[0], Self::LEVEL, 100_000);
+        Self::fill(&indexer, ids[1], Self::LEVEL, 200_000);
+        let held = Self::fill(&indexer, ids[2], Self::THIN, 300_000);
+        let case = Self {
+            policy,
+            workers,
+            indexer,
+            third: ids[2],
+        };
+        (case, held)
+    }
+
+    /// `blocks` blocks of four tokens from `base` on, stored for index
+    /// worker `id`.
+    fn fill(indexer: &KvIndex, id: u32, blocks: u32, base: u32) -> WorkerBlocks {
+        let tokens: Vec<u32> = (base..base + 4 * blocks).collect();
+        IdHandOver::store(indexer, id, &tokens, u64::from(base) * 10)
+    }
+
+    /// Worker 2's stream ends, and a worker outside the list is interned:
+    /// the id it is handed, and it stores nothing.
+    fn hand_on(&self, held: WorkerBlocks) {
+        self.indexer.remove_worker(self.third, held);
+        let taker = self.indexer.intern_worker("http://w9:8000").unwrap();
+        assert_eq!(taker, self.third, "the id changed hands");
+    }
+}
+
+/// The warm-up slice through rows that stand while another decision reads
+/// them again books no block count under an id that changed hands: the thin
+/// worker's growth baseline stays the count of its own blocks, and the
+/// standing rows slice nothing.
+#[test]
+fn the_slice_through_standing_rows_books_no_count_of_a_handed_on_id() {
+    let (case, held) = ThinThird::new();
+    let thin = ThinThird::THIN as usize;
+    // The rows read while worker 2 holds its id: its baseline is its count.
+    let table = case
+        .policy
+        .pool_table(&case.workers, None, &case.indexer, liveness::now_ms());
+    let grown_before = case.workers[2].warmup_growth(thin);
+    case.hand_on(held);
+    let slice = case.policy.warmup_slice(
+        &case.workers,
+        &table,
+        &case.indexer,
+        &SelectWorkerInfo::default(),
+        0.0,
+    );
+    let grown_behind = case.workers[2].warmup_growth(thin);
+    assert_eq!(
+        (grown_before, grown_behind),
+        (0, 0),
+        "worker 2's baseline stays the count of its own blocks"
+    );
+    assert_eq!(
+        slice, None,
+        "the standing rows slice nothing by an id that changed hands"
+    );
+}
+
+/// The hit diversion through standing rows reads no block count under an id
+/// that changed hands: a worker that came back under another id with a
+/// fleet-sized cache is not read thin by the count of the empty worker that
+/// took its old id.
+#[test]
+fn the_diversion_through_standing_rows_reads_no_count_of_a_handed_on_id() {
+    let (case, held) = ThinThird::new();
+    // The rows read while worker 2 is thin under its id.
+    let table = case
+        .policy
+        .pool_table(&case.workers, None, &case.indexer, liveness::now_ms());
+    case.hand_on(held);
+    let again = case.indexer.intern_worker(case.workers[2].url()).unwrap();
+    assert_ne!(again, case.third, "worker 2 came back under another id");
+    ThinThird::fill(&case.indexer, again, ThinThird::LEVEL, 900_000);
+    // Every hit up to the one a diversion is due at.
+    let diverted: Vec<usize> = (0..liveness::warmup().divert_every)
+        .filter_map(|_| {
+            case.policy.warmup_divert(
+                &case.workers,
+                &table,
+                &case.indexer,
+                &SelectWorkerInfo::default(),
+                &[],
+                0.0,
+            )
+        })
+        .collect();
+    assert!(
+        diverted.is_empty(),
+        "the standing rows divert no hit by an id that changed hands: {diverted:?}"
+    );
+}
+
 /// `count` workers that all hold the shared block `[1, 2, 3, 4]` (a chat
 /// template's head), the one at `deep` also `[5, 6, 7, 8]`.
 fn shared_prefix_pool(
