@@ -484,6 +484,125 @@ fn the_engine_decides_a_pair_whole_and_hears_each_sides_words_from_its_guard() {
     assert_eq!((host.engine.faults(), host.engine.unheard()), (0, 0));
 }
 
+/// [`Hears`] as a stage that takes one kind of word alone, the kind it
+/// names.
+#[derive(Debug)]
+struct HearsOnly(Hears, EventKind);
+
+impl Lifecycle for HearsOnly {
+    fn on_decision_issued(&self, lease: &Lease, decision: &Decision) {
+        self.0.on_decision_issued(lease, decision);
+    }
+
+    fn on_dispatched(&self, lease: &Lease, target: &Target, side: Side, since: u32) {
+        self.0.on_dispatched(lease, target, side, since);
+    }
+
+    fn on_completed(&self, lease: &Lease, outcome: &Outcome) {
+        self.0.on_completed(lease, outcome);
+    }
+
+    fn on_released(&self, lease: &Lease, reason: ReleaseReason) {
+        self.0.on_released(lease, reason);
+    }
+
+    fn hears(&self) -> EventSet {
+        EventSet::of([self.1])
+    }
+}
+
+impl Picker for HearsOnly {
+    fn name(&self) -> &'static str {
+        "hears-only"
+    }
+
+    fn pick(
+        &self,
+        facts: &RequestFacts<'_>,
+        rows: &[Candidate],
+        kept: &[u32],
+        scores: &[f32],
+        band: TieBand,
+        out: &mut Targets,
+    ) {
+        self.0.pick(facts, rows, kept, scores, band, out);
+    }
+}
+
+/// [`hearing`] with a decode side whose stage takes the words of `kind`
+/// alone.
+fn hearing_only(kind: EventKind) -> (AppliedSpec, Arc<Mutex<Vec<Word>>>) {
+    let heard = Arc::new(Mutex::new(Vec::new()));
+    let kept = Arc::clone(&heard);
+    let mut catalog = StageRegistry::builtin();
+    catalog
+        .picker("hears-only", move || {
+            Box::new(HearsOnly(Hears(Arc::clone(&kept)), kind))
+        })
+        .expect("a free picker name");
+    let mut document =
+        PolicySpec::pair_presets("round_robin", "round_robin").expect("the pair presets");
+    document.generation = 3;
+    let decode = document.profiles.get_mut("decode");
+    decode.expect("the decode profile").pick = "hears-only".into();
+    let digest = document.digest().expect("a digest");
+    let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[]);
+    (spec.expect("a valid document"), heard)
+}
+
+/// A pair's word reaches the stages wherever the document hears any
+/// word of a lease, whatever the kind of the word its guard says. A decode that
+/// stood chosen is issued by its dispatch, so a stage that takes the
+/// issue alone hears it at a word of another kind. One pair is sent and
+/// ended side by side, its decode with no call, and one is given up
+/// unsent: a document whose one stage takes one kind of word hears that
+/// kind of each side that says it and no other.
+#[test]
+fn a_pairs_word_is_told_wherever_the_document_hears_a_word_of_a_lease() {
+    let told_of = |kind: EventKind| {
+        let host = Host::under(hearing_only(kind), 1, 1);
+        assert_eq!(host.engine.in_force().hears, EventSet::of([kind]));
+        let classes = every(1, 1);
+        let (asks, now) = (host.asks(&classes, true), Instant::now());
+        let decided = || {
+            DecisionGuard::decide_under(&host.engine, GatewayId::LOCAL, &asks, now)
+                .expect("a decision")
+        };
+        let mut sent = decided();
+        assert!(sent.decode_chosen(), "the decode waits for its send");
+        let first = target_at(sent.decision(), 0);
+        let decode = first.pair.expect("a pair").decode_id;
+        sent.dispatched(now);
+        sent.dispatched_decode(now);
+        sent.completed(&outcome(Side::Prefill, first.id), now);
+        sent.completed(&outcome(Side::Decode, decode), now);
+        drop(sent);
+        drop(decided());
+        assert_eq!((host.engine.faults(), host.engine.unheard()), (0, 0));
+        let words = host.words().into_iter();
+        words
+            .map(|(word, side, ..)| (word, side))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        told_of(EventKind::Issued),
+        [
+            ("issued", Side::Prefill),
+            ("issued", Side::Decode),
+            ("issued", Side::Prefill),
+        ]
+    );
+    assert_eq!(
+        told_of(EventKind::Dispatched),
+        [("dispatched", Side::Prefill), ("dispatched", Side::Decode)]
+    );
+    assert_eq!(
+        told_of(EventKind::Completed),
+        [("completed", Side::Prefill), ("completed", Side::Decode)]
+    );
+    assert_eq!(told_of(EventKind::Released), [("released", Side::Prefill)]);
+}
+
 /// A pair's decision alone ([`decide`]) is the decision its leasing form
 /// makes ([`decided`]): of two engines made alike, the one asked for the
 /// decision alone names, call by call, the pair the other issues a lease
