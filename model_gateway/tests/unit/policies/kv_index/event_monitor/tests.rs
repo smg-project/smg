@@ -431,8 +431,8 @@ fn the_engine_reads_the_index_an_event_wrote() {
 /// event's block. The block size is answered whatever the index holds.
 ///
 /// The classic policy reads an index that holds no block as no index
-/// too (`model_gateway/src/policies/cache_aware.rs:1800`,
-/// `event_index_for`).
+/// too (`event_index_for`,
+/// `model_gateway/src/policies/cache_aware.rs`).
 #[test]
 fn the_engine_is_lent_an_index_that_says_whether_it_holds_a_block() {
     let monitor = KvEventMonitor::new();

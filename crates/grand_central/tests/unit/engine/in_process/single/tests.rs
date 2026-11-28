@@ -558,8 +558,8 @@ fn a_prompts_holder_outside_the_places_is_not_handed() {
 /// to seven workers it was never sent to, is then handed that one under
 /// every seed. The classic policy narrows its workers first and takes
 /// every candidate its tree matched
-/// (`model_gateway/src/routers/common/placement.rs:474-484`,
-/// `model_gateway/src/policies/cache_aware.rs:2541-2552`).
+/// (`model_gateway/src/routers/common/placement.rs:474-484`, and
+/// `select_matched_candidate`, `model_gateway/src/policies/cache_aware.rs`).
 #[test]
 fn a_held_request_is_handed_its_prompts_holder_among_its_places() {
     let engine = preset("cache_aware");

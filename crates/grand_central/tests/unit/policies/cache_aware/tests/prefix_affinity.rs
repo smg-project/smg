@@ -142,7 +142,8 @@ fn a_predicted_placement_counts_only_above_the_threshold_and_the_index_at_any_de
 
 /// A sent prefix's share is taken of the whole prompt, as the classic
 /// policy takes it: its matched tokens over the prompt's tokens, above
-/// the threshold (`model_gateway/src/policies/cache_aware.rs:3561-3569`).
+/// the threshold (`select_worker_with_tokens`,
+/// `model_gateway/src/policies/cache_aware.rs`).
 /// A prompt that ends inside a block is larger than its whole blocks, so
 /// a share of those would let a prefix under the threshold count. The
 /// share is one division of the two counts: at the threshold itself it
@@ -262,7 +263,7 @@ fn decided_past_the_sample(engine: &Engine, pool: &[Candidate], tokens: u32, see
 /// nothing there: they are under 0.3 of the prompt, and a third of its
 /// three whole blocks. The classic policy divides the same two counts,
 /// and under its threshold it selects with no holder named
-/// (`model_gateway/src/policies/cache_aware.rs:3561-3569`, `:3579-3588`).
+/// (`select_worker_with_tokens`, `model_gateway/src/policies/cache_aware.rs`).
 #[test]
 fn behind_a_draw_a_sent_prefix_counts_by_its_share_of_the_whole_prompt() {
     let engine = built_in();

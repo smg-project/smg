@@ -883,7 +883,7 @@ fn held(column: &[AffinityFacts]) -> Vec<(u32, u32)> {
 /// before the sample cuts them. Of twenty warming workers, a request held
 /// to one is named it under every seed. The classic policy takes its
 /// pool's warming workers whole and passes over each that is no candidate
-/// (`model_gateway/src/policies/cache_aware.rs:2065-2069`).
+/// (`warmup_slice`, `model_gateway/src/policies/cache_aware.rs`).
 #[test]
 fn a_held_request_is_named_its_warming_rows_among_its_places() {
     let (affinity, _, index) = hosted(true);
@@ -918,7 +918,7 @@ fn a_held_request_is_named_its_warming_rows_among_its_places() {
 /// workers were sent the prompt, and a request held to two of them is named
 /// both under every seed, by the blocks they were sent. The classic policy
 /// takes every candidate among its tree's matched workers, with no cut
-/// (`model_gateway/src/policies/cache_aware.rs:2541-2552`).
+/// (`select_matched_candidate`, `model_gateway/src/policies/cache_aware.rs`).
 #[test]
 fn a_held_request_is_named_the_workers_sent_its_prefix_among_its_places() {
     let (affinity, _, _) = hosted(false);
@@ -940,7 +940,7 @@ fn a_held_request_is_named_the_workers_sent_its_prefix_among_its_places() {
 /// sixteen never cuts them: under a sample of four, a request held to two of
 /// the eight is named both under every seed. The classic policy takes every
 /// candidate among the workers its tree hands
-/// (`model_gateway/src/policies/cache_aware.rs:2541-2552`).
+/// (`select_matched_candidate`, `model_gateway/src/policies/cache_aware.rs`).
 #[test]
 fn a_held_request_is_named_a_trees_workers_among_its_places() {
     let (affinity, _) = lending(false);
@@ -1568,7 +1568,8 @@ fn a_token_tree_names_the_worker_a_prefix_was_sent_to() {
 ///
 /// The classic policy stores the worker it selected, among the candidates
 /// its router can send to
-/// (`model_gateway/src/policies/cache_aware.rs:3470-3491`, behind
+/// (`select_worker_with_tokens`,
+/// `model_gateway/src/policies/cache_aware.rs`, behind
 /// `model_gateway/src/routers/common/placement.rs:504-509`, `:536-553`).
 #[test]
 fn a_tree_stores_a_prompt_for_the_first_target_its_caller_sends_to() {
@@ -2186,8 +2187,9 @@ fn the_index_decides_a_single_request_of_token_ids_alone() {
 /// named that worker. So is a write that met a held record and waits with
 /// its thread. The classic router sends a request with no token ids to its
 /// tree of sent texts whatever its index of cache events holds
-/// (`model_gateway/src/policies/cache_aware.rs:1511-1538`), and reads and
-/// writes that tree for any worker of the list (`:3519-3596`).
+/// (`select_worker_scanned`, `model_gateway/src/policies/cache_aware.rs`),
+/// and reads and writes that tree for any worker of the list
+/// (`select_worker_with_text`).
 ///
 /// A request hashed by token blocks answers as before beside it: its pick of
 /// that worker writes no entry, and the index alone names the worker.
@@ -2248,13 +2250,14 @@ fn a_request_of_text_is_recorded_for_a_worker_the_index_holds_blocks_for() {
 ///
 /// The gateway's own cache-aware selection reads its approximate token tree
 /// alone where the model has no index of cache events that holds a block
-/// (`model_gateway/src/policies/cache_aware.rs:1511-1534`, `event_index_for`
-/// at `:1802-1818`). There one walk of the tree matches a request with token
-/// ids against every worker a prefix was sent to and stores it for the
-/// worker chosen (`select_worker_with_tokens`, `:3430-3516`). It has no
-/// setting that reads the tree alone beside an index that holds blocks, and
-/// it keeps one policy a model (`model_gateway/src/policies/registry.rs:242`):
-/// the reading beside an index is the engine's own.
+/// (`select_worker_scanned` and `event_index_for`,
+/// `model_gateway/src/policies/cache_aware.rs`). There one walk of the tree
+/// matches a request with token ids against every worker a prefix was sent
+/// to and stores it for the worker chosen (`select_worker_with_tokens`). It
+/// has no setting that reads the tree alone beside an index that holds
+/// blocks, and it keeps one policy a model
+/// (`model_gateway/src/policies/registry.rs:242`): the reading beside an
+/// index is the engine's own.
 ///
 /// The preset, whose prefix stage reads cache events too, answers as before
 /// over the same list: its pick of such a worker writes nothing. So the
@@ -2459,9 +2462,11 @@ fn lending_whenever() -> (Affinity, Arc<ChainIndex>, Arc<TokenTree>) {
 /// worker's events store a block, the next decision finds the index's word
 /// moved and reads the table again inside its second. The index then names
 /// the request's holder alone, and no tree's match is made. The classic
-/// policy asks its index before every request
-/// (`model_gateway/src/policies/cache_aware.rs:1802-1808`) and decides by
-/// the index alone once it holds a block (`:1516-1524`).
+/// policy asks its index ahead of its trees, for a request of token ids
+/// under a tree index that it does not shed for KV pressure first
+/// (`event_index_for`, `model_gateway/src/policies/cache_aware.rs`), and
+/// decides by the index alone once it holds a block
+/// (`select_worker_scanned`).
 #[test]
 fn a_models_first_block_decides_the_next_request_by_the_index() {
     let (affinity, index, _tree) = lending_whenever();
@@ -2488,8 +2493,8 @@ fn a_models_first_block_decides_the_next_request_by_the_index() {
 /// token tree: it is named the worker the tree was written for, and not the
 /// worker picked under the index. The classic policy reads an index that
 /// holds no block as no index
-/// (`model_gateway/src/policies/cache_aware.rs:1806-1808`) and decides in
-/// its token tree (`:1525-1533`).
+/// (`event_index_for`, `model_gateway/src/policies/cache_aware.rs`) and
+/// decides in its token tree (`select_worker_scanned`).
 #[test]
 fn the_last_blocks_leaving_returns_the_next_request_to_the_tree() {
     let (affinity, index, _tree) = lending_whenever();
@@ -2973,7 +2978,8 @@ fn a_profile_named_no_row_is_handed_the_prefix_its_pick_sent() {
 /// the index holds blocks for: its pick of that worker is written, and the
 /// column of the repeat holds it. A request hashed by its text asks no
 /// index, as under the classic router
-/// (`model_gateway/src/policies/cache_aware.rs:1511-1538`, `:3519-3596`).
+/// (`select_worker_scanned` and `select_worker_with_text`,
+/// `model_gateway/src/policies/cache_aware.rs`).
 /// A request hashed by token blocks answers as before beside it: its pick
 /// of that worker writes nothing, and its column holds the index's blocks.
 #[test]
@@ -3256,7 +3262,8 @@ fn a_pick_its_rule_keeps_from_the_profile_states_nothing() {
 /// one its host filled. With the two profiles the other way round the pick
 /// states. The gateway's classic router observes a match ratio inside its
 /// cache-aware policy alone
-/// (`model_gateway/src/policies/cache_aware.rs:2686-2687`, `:3137`).
+/// (`select_worker_event_driven` and `log_tree_decision`,
+/// `model_gateway/src/policies/cache_aware.rs`).
 #[test]
 fn a_shadow_that_reads_affinity_states_nothing_of_the_live_pick() {
     // One preset's profile live, and another's as its shadow.
@@ -3787,7 +3794,8 @@ fn a_naming_the_record_fills_stands_whole_where_every_holder_is_refused() {
 /// a request asks the index nothing. The classic router reads its tree of
 /// sent texts for a request with no token ids, however many workers its
 /// index of cache events names
-/// (`model_gateway/src/policies/cache_aware.rs:1511-1538`, `:3519-3596`). A
+/// (`select_worker_scanned` and `select_worker_with_text`,
+/// `model_gateway/src/policies/cache_aware.rs`). A
 /// request hashed by token blocks reads no record over the same list and
 /// writes none, as before.
 #[test]

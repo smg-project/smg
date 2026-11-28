@@ -253,7 +253,8 @@ async fn a_started_engine_reads_the_cache_indexes_it_was_handed() {
 /// whatever its seed. An index speaks of token blocks, so the engine's
 /// record of sent prefixes speaks for every worker on such a request, as
 /// the classic router's tree of sent texts does
-/// (`model_gateway/src/policies/cache_aware.rs:1511-1538`, `:3519-3596`). A
+/// (`select_worker_scanned` and `select_worker_with_text`,
+/// `model_gateway/src/policies/cache_aware.rs`). A
 /// request of token ids goes to the worker the index holds its blocks for,
 /// as before.
 #[tokio::test(start_paused = true)]
@@ -341,7 +342,8 @@ async fn placed_beside_blocks(spec: AppliedSpec) -> Vec<u32> {
 /// worker. The gateway's own selection reads its approximate token tree
 /// alone where the model has no index that holds a block, and there for
 /// every worker a prefix was sent to
-/// (`model_gateway/src/policies/cache_aware.rs:1511-1534`, `:3430-3516`).
+/// (`select_worker_scanned` and `select_worker_with_tokens`,
+/// `model_gateway/src/policies/cache_aware.rs`).
 ///
 /// Under the preset, whose prefix stage reads cache events too, the index
 /// speaks for those workers, as before: the prompt takes its draws.

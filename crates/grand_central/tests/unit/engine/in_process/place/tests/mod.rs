@@ -428,7 +428,8 @@ fn placing_a_request_asks_the_table_of_names_for_nothing() {
 /// pair's cases (`a_pairs_placement_states_what_its_prefill_holds`).
 ///
 /// The classic policy observes the share of the worker it chose
-/// (`model_gateway/src/policies/cache_aware.rs:2676-2688`).
+/// (`select_worker_event_driven`,
+/// `model_gateway/src/policies/cache_aware.rs`).
 #[test]
 fn a_placement_states_what_its_pick_states_of_the_worker_taken() {
     use crate::engine::decision::{Overlap, OverlapSource};

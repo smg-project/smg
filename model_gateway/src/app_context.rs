@@ -2043,7 +2043,7 @@ mod tests {
     ///
     /// The classic policy reads an index that holds no block as no index
     /// and then reads its own token tree
-    /// (`model_gateway/src/policies/cache_aware.rs:1800`, `event_index_for`).
+    /// (`event_index_for`, `model_gateway/src/policies/cache_aware.rs`).
     /// It asks at each request, so it leaves its tree with the block.
     #[tokio::test]
     async fn a_model_whose_index_holds_no_block_is_decided_in_the_lent_tree() {

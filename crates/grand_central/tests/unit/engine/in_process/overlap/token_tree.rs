@@ -13,7 +13,8 @@ use super::*;
 /// by eight blocks either way, the count the prefix stage sizes the request
 /// by, and by four where its host hashed it by blocks of 32. The classic
 /// policy divides the tokens its tree matched by the prompt's tokens,
-/// whatever the page (`model_gateway/src/policies/cache_aware.rs:3474-3482`).
+/// whatever the page (`select_worker_with_tokens`,
+/// `model_gateway/src/policies/cache_aware.rs`).
 #[test]
 fn a_tree_of_another_page_is_counted_in_the_requests_blocks() {
     let (affinity, _tree) = lending_by(4 * BLOCK as usize, false);
