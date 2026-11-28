@@ -848,16 +848,8 @@ impl RequestPipeline {
 
                 // The retry re-selects away from the engines this attempt used,
                 // while another available worker is left to take the request.
-                let engines: Vec<String> = dctx
-                    .workers
-                    .iter()
-                    .flat_map(WorkerSelection::engines)
-                    .map(str::to_string)
-                    .collect();
-                for engine in engines {
-                    if !dctx.tried.contains(&engine) {
-                        dctx.tried.push(engine);
-                    }
+                for engine in dctx.workers.iter().flat_map(WorkerSelection::engines) {
+                    placement::note_tried(&mut dctx.tried, engine);
                 }
 
                 let next_attempt = attempt + 1;
