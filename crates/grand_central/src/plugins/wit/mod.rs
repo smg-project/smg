@@ -9,7 +9,7 @@
 //! `probes` (an exhaustive destructuring, so a struct that gains, loses or
 //! renames a field fails to compile, and a field whose type moved fails the
 //! probe). `contracts/smg-policy.wit` is the rendering, committed: the test
-//! in `tests/wit.rs` renders the template again and compares it byte for
+//! in `tests/plugin/wit.rs` renders the template again and compares it byte for
 //! byte, so neither the template nor the types can drift from the file a
 //! plugin is built against (`SMG_POLICY_WIT_WRITE=1` rewrites it).
 

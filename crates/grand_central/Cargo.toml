@@ -262,7 +262,7 @@ tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "tes
 tracing-subscriber = { workspace = true }
 # The corpus test reads YAML documents.
 serde_yaml = { workspace = true }
-# The contract tests (tests/contracts.rs) compile the protocol to a
+# The contract tests (tests/plugin/contracts.rs) compile the protocol to a
 # descriptor set through protoc and resolve the WebAssembly world; no code
 # is generated and nothing at run time reads the files.
 prost-build = { version = "0.14.4", default-features = false }
@@ -357,12 +357,24 @@ required-features = ["client"]
 
 [[test]]
 name = "grpc_plugin"
+path = "tests/plugin/grpc_plugin.rs"
 required-features = ["controller"]
 
 # Two cases in a process of their own: each lowers a limit of the process.
 [[test]]
 name = "grpc_runtime"
+path = "tests/plugin/grpc_runtime.rs"
 required-features = ["controller"]
+
+# A program of its own: the contracts' page names it by `--test wit`.
+[[test]]
+name = "wit"
+path = "tests/plugin/wit.rs"
+
+# A program of its own: the contracts' page names it by `--test contracts`.
+[[test]]
+name = "contracts"
+path = "tests/plugin/contracts.rs"
 
 [[test]]
 name = "membership_calls"
