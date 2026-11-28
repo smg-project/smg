@@ -43,7 +43,7 @@ const TOKENIZER_CALL: &str = "/vllm.grpc.engine.VllmEngine/GetTokenizer";
 /// The model of a record file made on this wire ([`super::recorded_model`]).
 pub(super) fn recorded_model() -> Option<super::RecordedModel> {
     let recorded = script::recorded_info(MODEL_INFO_CALL)?;
-    let info = vllm::GetModelInfoResponse::decode(recorded.as_slice()).ok()?;
+    let info = vllm::GetModelInfoResponse::decode(recorded).ok()?;
     Some(super::RecordedModel {
         max_context_length: i32::try_from(info.max_context_length).unwrap_or(i32::MAX),
         max_req_input_len: info.max_req_input_len,
@@ -358,7 +358,7 @@ impl VllmEngine for MockScheduler {
         // recorded engine did; a tokenizer stated on the command line is the
         // one of this host, so its path goes in place of the engine's own.
         if let Some(recorded) = script::recorded_info(MODEL_INFO_CALL) {
-            let mut info = vllm::GetModelInfoResponse::decode(recorded.as_slice())
+            let mut info = vllm::GetModelInfoResponse::decode(recorded)
                 .map_err(|e| Status::internal(format!("the recorded model info: {e}")))?;
             if super::own_tokenizer(&self.cfg) {
                 info.tokenizer_path.clone_from(&self.cfg.tokenizer_path);
@@ -410,7 +410,7 @@ impl VllmEngine for MockScheduler {
     ) -> Result<Response<vllm::GetServerInfoResponse>, Status> {
         self.overrides.server_info().refusal("server info")?;
         if let Some(recorded) = script::recorded_info(SERVER_INFO_CALL) {
-            return vllm::GetServerInfoResponse::decode(recorded.as_slice())
+            return vllm::GetServerInfoResponse::decode(recorded)
                 .map(Response::new)
                 .map_err(|e| Status::internal(format!("the recorded server info: {e}")));
         }

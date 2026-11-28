@@ -20,6 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use bytes::Bytes;
 use futures::{stream, Stream, StreamExt};
 use smg_grpc_client::{common_proto as common, constraint_failed_status};
 use tokio::{
@@ -795,23 +796,43 @@ pub(crate) type TokenizerStream =
 /// states that path in its model info, and the recorded bundle is the one
 /// of another path.
 fn recorded_tokenizer(cfg: &Config, call: &str) -> Result<Option<TokenizerStream>, Status> {
-    use prost::Message as _;
-
     if !cfg.tokenizer_path.is_empty() && cfg.tokenizer_path != cfg.model_id {
         return Ok(None);
     }
-    let Some(recorded) = script::recorded_info(call) else {
-        return Ok(None);
-    };
-    let mut rest = recorded.as_slice();
-    let mut chunks = Vec::new();
+    script::recorded_info(call)
+        .map(tokenizer_chunks)
+        .transpose()
+}
+
+/// The chunks of a recorded tokenizer fetch, each decoded as the stream is
+/// polled for it, off the bytes the store shares: a fetch holds one chunk
+/// beside them and no copy of the bundle. A record that does not decode
+/// ends the call before its first chunk, so the chunks are walked once
+/// first, into one chunk that is kept by nobody.
+fn tokenizer_chunks(recorded: Bytes) -> Result<TokenizerStream, Status> {
+    use prost::Message as _;
+
+    let bad = |e: prost::DecodeError| Status::internal(format!("the recorded tokenizer: {e}"));
+    let mut walked = common::GetTokenizerChunk::default();
+    let mut rest = recorded.clone();
     while !rest.is_empty() {
-        let chunk = common::GetTokenizerChunk::decode_length_delimited(&mut rest)
-            .map_err(|e| Status::internal(format!("the recorded tokenizer: {e}")))?;
-        chunks.push(Ok(chunk));
+        walked.clear();
+        walked.merge_length_delimited(&mut rest).map_err(bad)?;
     }
-    let chunks: TokenizerStream = Box::pin(stream::iter(chunks));
-    Ok(Some(chunks))
+    let mut rest = recorded;
+    let chunks = std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let chunk = common::GetTokenizerChunk::decode_length_delimited(&mut rest).map_err(bad);
+        // The walk above read every chunk, so none fails here; were one to,
+        // its status ends the fetch.
+        if chunk.is_err() {
+            rest.clear();
+        }
+        Some(chunk)
+    });
+    Ok(Box::pin(stream::iter(chunks)))
 }
 
 /// The KV transport a disaggregated mock worker advertises on every wire (as
@@ -2654,6 +2675,66 @@ mod tests {
             .expect("watch item")
             .expect("a stream item")
             .status()
+    }
+
+    /// The answer of a tokenizer fetch as a recorder keeps it: each chunk
+    /// (its data and its fingerprint) behind its length.
+    fn recorded_fetch(chunks: &[(&[u8], &str)]) -> Vec<u8> {
+        use prost::Message as _;
+
+        let mut answer = Vec::new();
+        for (data, sha256) in chunks {
+            let chunk = common::GetTokenizerChunk {
+                data: data.to_vec(),
+                sha256: (*sha256).to_string(),
+            };
+            chunk
+                .encode_length_delimited(&mut answer)
+                .expect("a chunk behind its length");
+        }
+        answer
+    }
+
+    #[tokio::test]
+    async fn a_recorded_tokenizer_fetch_hands_its_chunks_off_the_bytes_it_shares() {
+        // A bundle as an engine sends it: sixteen chunks of 4 KiB, the
+        // fingerprint on the last.
+        let bundle: Vec<Vec<u8>> = (0..16u8).map(|n| vec![n; 4096]).collect();
+        let chunks: Vec<(&[u8], &str)> = bundle
+            .iter()
+            .enumerate()
+            .map(|(n, data)| (data.as_slice(), if n == 15 { "f00d" } else { "" }))
+            .collect();
+        let recorded = Bytes::from(recorded_fetch(&chunks));
+        let mut fetch = tokenizer_chunks(recorded.clone()).expect("the record decodes");
+        // The fetch reads the bytes it was handed and holds no copy of them.
+        assert!(!recorded.is_unique());
+        for (data, sha256) in chunks {
+            let chunk = fetch.next().await.expect("a chunk").expect("it decodes");
+            assert_eq!(
+                (chunk.data.as_slice(), chunk.sha256.as_str()),
+                (data, sha256)
+            );
+        }
+        assert!(fetch.next().await.is_none());
+        drop(fetch);
+        assert!(recorded.is_unique());
+    }
+
+    #[test]
+    fn a_recorded_tokenizer_fetch_that_does_not_decode_ends_before_its_first_chunk() {
+        let mut answer = recorded_fetch(&[(b"a whole chunk", "")]);
+        // A second chunk whose length promises more than the record holds.
+        answer.extend_from_slice(&[0x10, 0x0a]);
+        let status = tokenizer_chunks(Bytes::from(answer))
+            .err()
+            .expect("a record cut short hands no chunk");
+        assert_eq!(status.code(), Code::Internal);
+        assert!(
+            status.message().starts_with("the recorded tokenizer: "),
+            "{}",
+            status.message()
+        );
     }
 
     /// A watch has no end of its own, so the worker's stop ends it: the
