@@ -38,9 +38,9 @@ use crate::routers::grpc::{
     client::GrpcClient,
     context::WorkerSelection,
     proto_wrapper::{
-        cleanup_tokenspeed_items_encoder_shm, SglangMultimodalData, TensorBytes,
-        TokenSpeedModality, TokenSpeedMultimodalData, TokenSpeedMultimodalItem, TokenSpeedTensor,
-        TrtllmMultimodalData, VllmMultimodalData,
+        cleanup_tokenspeed_items_encoder_shm, mm_shm_dev_writable, write_epd_shm_with, EpdShmGuard,
+        SglangMultimodalData, TensorBytes, TokenSpeedModality, TokenSpeedMultimodalData,
+        TokenSpeedMultimodalItem, TokenSpeedTensor, TrtllmMultimodalData, VllmMultimodalData,
     },
     MultimodalData,
 };
@@ -164,6 +164,296 @@ fn assemble_sglang_data(
         intermediate,
         mm_sglang_encoder_input_dtype(workers).as_str(),
     )?))
+}
+
+/// Minimum pixel payload size (in bytes) to transport via `/dev/shm` on the managed encoder path.
+const EPD_SHM_MIN_BYTES: usize = 64 * 1024;
+const EPD_PIXEL_ALIGN: usize = 64;
+
+/// Per-item preprocessing options folded into the Rust encoder item hash.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct CompactItemOptions {
+    pub modality: Option<Modality>,
+    pub detail: Option<llm_multimodal::ImageDetail>,
+}
+
+/// Compact batch metadata for the managed SGLang encoder bridge (no protobuf pixel wrapping).
+#[derive(Debug, Clone)]
+pub struct SglangCompactBatch {
+    pub modality: String,
+    pub pixel_dtype: String,
+    pub pixel_shape: Vec<u32>,
+    pub pixel_offset: usize,
+    pub pixel_nbytes: usize,
+    pub grid_thw: Vec<[i64; 3]>,
+    pub placeholder_lengths: Vec<u32>,
+    pub second_per_grid_ts: Option<(Vec<f32>, Vec<u32>)>,
+    pub item_hashes: Vec<String>,
+}
+
+/// Compact output produced for Managed E: lightweight metadata plus zero-copy SHM or inline pixels.
+#[derive(Debug)]
+pub struct SglangCompactOutput {
+    pub batches: Vec<SglangCompactBatch>,
+    pub embedding_tokens: u64,
+    pub shm_guard: Option<EpdShmGuard>,
+    pub inline_pixels: Option<bytes::Bytes>,
+}
+
+/// Round `offset` up to the next multiple of `align`.
+fn align_up(offset: usize, align: usize) -> Result<usize> {
+    let rem = offset % align;
+    if rem == 0 {
+        Ok(offset)
+    } else {
+        offset
+            .checked_add(align - rem)
+            .context("compact pixel offset overflow")
+    }
+}
+
+/// Derive a deterministic BLAKE3 item key folding modality, raw media hash, dtype, spec, and detail.
+fn compute_encoder_item_hash(
+    modality: &str,
+    media_hash: &str,
+    opt: Option<&CompactItemOptions>,
+    pixel_dtype: &str,
+    spec_name: &str,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"smg-epd-item-v2\0");
+    hasher.update(&(modality.len() as u32).to_le_bytes());
+    hasher.update(modality.as_bytes());
+    hasher.update(&(media_hash.len() as u32).to_le_bytes());
+    hasher.update(media_hash.as_bytes());
+    hasher.update(&(pixel_dtype.len() as u32).to_le_bytes());
+    hasher.update(pixel_dtype.as_bytes());
+    hasher.update(&(spec_name.len() as u32).to_le_bytes());
+    hasher.update(spec_name.as_bytes());
+    let detail_tag = match opt.and_then(|o| o.detail) {
+        None => 0u8,
+        Some(llm_multimodal::ImageDetail::Auto) => 1u8,
+        Some(llm_multimodal::ImageDetail::Low) => 2u8,
+        Some(llm_multimodal::ImageDetail::High) => 3u8,
+    };
+    hasher.update(&[detail_tag]);
+    hasher.finalize().to_hex().to_string()
+}
+
+/// Extract an `[N, 3]` `i64` grid tensor from `model_specific` under `key`.
+fn extract_grid_thw(
+    model_specific: &HashMap<String, ModelSpecificValue>,
+    key: &str,
+) -> Result<Vec<[i64; 3]>> {
+    let Some(ModelSpecificValue::IntTensor { data, shape }) = model_specific.get(key) else {
+        anyhow::bail!("missing or invalid {key} tensor in managed encoder batch");
+    };
+    anyhow::ensure!(
+        shape.len() == 2 && shape[1] == 3 && data.len() == shape[0] * 3,
+        "invalid {key} shape {shape:?} for {} elements",
+        data.len()
+    );
+    Ok(data.as_chunks::<3>().0.to_vec())
+}
+
+/// Extract optional `video_second_per_grid` timing metadata as `(values, shape)`.
+fn extract_second_per_grid(
+    model_specific: &HashMap<String, ModelSpecificValue>,
+) -> Option<(Vec<f32>, Vec<u32>)> {
+    match model_specific.get("video_second_per_grid") {
+        Some(ModelSpecificValue::Tensor { data, shape }) => {
+            Some((data.clone(), shape.iter().map(|&d| d as u32).collect()))
+        }
+        Some(ModelSpecificValue::FloatVec(values)) => {
+            Some((values.clone(), vec![values.len() as u32]))
+        }
+        _ => None,
+    }
+}
+
+/// Assemble SGLang managed-encoder batches directly into compact metadata + `/dev/shm` (or inline)
+/// raw pixels, avoiding protobuf `GenerateRequest` serialization and copying.
+pub(super) fn assemble_sglang_compact_batches(
+    intermediate: MultimodalIntermediate,
+    dtype: &str,
+    spec_name: &str,
+    item_options: &[CompactItemOptions],
+    max_artifact_bytes: usize,
+) -> Result<SglangCompactOutput> {
+    anyhow::ensure!(
+        matches!(dtype, "float32" | "bfloat16" | "float16"),
+        "SGLang media dtype must be float32, bfloat16 or float16"
+    );
+    let target_dtype = wire_dtype(dtype, true);
+    let raw_batches = intermediate.into_batches();
+    anyhow::ensure!(
+        !raw_batches.is_empty(),
+        "SGLang multimodal input has no batches"
+    );
+
+    let mut prepared = Vec::with_capacity(raw_batches.len());
+    let mut running_offset = 0usize;
+    let mut embedding_tokens = 0u64;
+
+    for batch in raw_batches {
+        let (modality, modality_enum, media_hashes): (&str, Modality, Vec<&str>) =
+            match &batch.media {
+                MediaBatch::Images(images) => (
+                    "image",
+                    Modality::Image,
+                    images.iter().map(|f| f.hash.as_str()).collect(),
+                ),
+                MediaBatch::Videos(videos) => (
+                    "video",
+                    Modality::Video,
+                    videos.iter().map(|v| v.hash.as_str()).collect(),
+                ),
+                MediaBatch::Audios(_) => anyhow::bail!("SGLang assembly requires images or videos"),
+            };
+        let is_video = modality_enum == Modality::Video;
+        let grid_key = if is_video {
+            "video_grid_thw"
+        } else {
+            "image_grid_thw"
+        };
+        let grid_thw = extract_grid_thw(&batch.preprocessed.model_specific, grid_key)?;
+        let second_per_grid_ts = if is_video {
+            extract_second_per_grid(&batch.preprocessed.model_specific)
+        } else {
+            None
+        };
+        let placeholder_lengths: Vec<u32> = placeholders_for_bindings(&batch.bindings, true)?
+            .into_iter()
+            .map(|(_, length)| length)
+            .collect();
+        for &length in &placeholder_lengths {
+            embedding_tokens = embedding_tokens.saturating_add(u64::from(length));
+        }
+
+        let matching_opts: Vec<&CompactItemOptions> = item_options
+            .iter()
+            .filter(|opt| opt.modality.is_none() || opt.modality == Some(modality_enum))
+            .collect();
+        let dtype_str = target_dtype.to_string();
+        let item_hashes: Vec<String> = media_hashes
+            .iter()
+            .enumerate()
+            .map(|(idx, hash)| {
+                compute_encoder_item_hash(
+                    modality,
+                    hash,
+                    matching_opts.get(idx).copied(),
+                    &dtype_str,
+                    spec_name,
+                )
+            })
+            .collect();
+
+        let view = batch.preprocessed.encoder_input.view();
+        view.writable_as(target_dtype)
+            .map_err(|message| anyhow::Error::new(super::serialize::WireMismatch(message)))?;
+        let pixel_shape: Vec<u32> = view.shape().iter().map(|&d| d as u32).collect();
+        let pixel_nbytes = view
+            .len()
+            .checked_mul(target_dtype.element_size())
+            .context("compact pixel byte length overflow")?;
+        let pixel_offset = if prepared.is_empty() {
+            0
+        } else {
+            align_up(running_offset, EPD_PIXEL_ALIGN)?
+        };
+        running_offset = pixel_offset
+            .checked_add(pixel_nbytes)
+            .context("compact pixel buffer size overflow")?;
+
+        prepared.push((
+            batch.preprocessed.encoder_input,
+            SglangCompactBatch {
+                modality: modality.to_string(),
+                pixel_dtype: dtype_str,
+                pixel_shape,
+                pixel_offset,
+                pixel_nbytes,
+                grid_thw,
+                placeholder_lengths,
+                second_per_grid_ts,
+                item_hashes,
+            },
+        ));
+    }
+
+    let total_nbytes = running_offset;
+    anyhow::ensure!(
+        total_nbytes <= max_artifact_bytes,
+        "managed CPU artifact exceeds byte budget ({total_nbytes} > {max_artifact_bytes} bytes)"
+    );
+
+    if total_nbytes >= EPD_SHM_MIN_BYTES && mm_shm_dev_writable() {
+        match write_epd_shm_with(total_nbytes, |buf| {
+            for (input, meta) in &prepared {
+                let slice = &mut buf[meta.pixel_offset..meta.pixel_offset + meta.pixel_nbytes];
+                input
+                    .view()
+                    .write_into(target_dtype, slice)
+                    .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
+            }
+            Ok(())
+        }) {
+            Ok(guard) => {
+                let mut batches = Vec::with_capacity(prepared.len());
+                for (input, meta) in prepared {
+                    recycle_encoder_input(input);
+                    batches.push(meta);
+                }
+                return Ok(SglangCompactOutput {
+                    batches,
+                    embedding_tokens,
+                    shm_guard: Some(guard),
+                    inline_pixels: None,
+                });
+            }
+            Err(error) => {
+                warn!(
+                    ?error,
+                    total_nbytes,
+                    "Failed to write managed encoder pixels to /dev/shm; falling back to inline IPC"
+                );
+            }
+        }
+    }
+
+    // Inline fallback (small payloads or non-writable /dev/shm): zero-copy move for single batch.
+    if prepared.len() == 1 {
+        let (input, meta) = prepared.pop().context("missing single compact batch")?;
+        let wire = input
+            .into_wire_bytes_as(target_dtype)
+            .map_err(|message| anyhow::Error::new(super::serialize::WireMismatch(message)))?;
+        let inline_pixels: bytes::Bytes = wire.into_payload();
+        return Ok(SglangCompactOutput {
+            batches: vec![meta],
+            embedding_tokens,
+            shm_guard: None,
+            inline_pixels: Some(inline_pixels),
+        });
+    }
+
+    let mut buffer = vec![0u8; total_nbytes];
+    let mut batches = Vec::with_capacity(prepared.len());
+    for (input, meta) in prepared {
+        let slice = &mut buffer[meta.pixel_offset..meta.pixel_offset + meta.pixel_nbytes];
+        input
+            .view()
+            .write_into(target_dtype, slice)
+            .map_err(|message| anyhow::Error::new(super::serialize::WireMismatch(message)))?;
+        recycle_encoder_input(input);
+        batches.push(meta);
+    }
+    Ok(SglangCompactOutput {
+        batches,
+        embedding_tokens,
+        shm_guard: None,
+        inline_pixels: Some(bytes::Bytes::from(buffer)),
+    })
 }
 
 /// Assemble each modality independently, retaining its tensors and prompt bindings.

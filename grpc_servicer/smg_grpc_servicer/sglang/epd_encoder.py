@@ -6,18 +6,29 @@ import asyncio
 import hashlib
 import json
 import math
+import mmap
+import os
+import sys
+import threading
 import time
+from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from http import HTTPStatus
+from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 import grpc
 
 ARTIFACT_KEY = "__smg_rust_encoder_artifact_v1"
+ARTIFACT_V2_KEY = "__smg_rust_encoder_artifact_v2"
+_EPD_SHM_PREFIX = "smg-epd-"
+_EPD_SHM_DIR = "/dev/shm"
 MAX_RECEIVER_HTTP_BODY_BYTES = 256 * 1024
 MAX_ABANDONED_RIDS = 4096
 ABANDONED_TTL_SECONDS = 125.0
+_DEFAULT_ITEM_CACHE_MB = 16384
+ITEM_CACHE_MB_ENV = "SMG_SGLANG_ENCODER_ITEM_CACHE_MB"
 _ROUTES = {
     "scheduler_receive_meta_data": "metadata",
     "scheduler_receive_url": "register",
@@ -73,6 +84,88 @@ def _extract_artifact(request):
         if isinstance(nested, bytes) and nested:
             return nested
     return None
+
+
+def _extract_artifact_v2(request):
+    """Read the compact/cache-hit v2 Rust artifact from top-level metadata or `mm_items[0]`."""
+    raw = request.get(ARTIFACT_V2_KEY)
+    if isinstance(raw, dict):
+        return raw
+    mm_items = request.get("mm_items")
+    if isinstance(mm_items, (list, tuple)) and mm_items and isinstance(mm_items[0], dict):
+        nested = mm_items[0].get(ARTIFACT_V2_KEY)
+        if isinstance(nested, dict):
+            return nested
+    return None
+
+
+def _validate_shm_path(name):
+    """Validate an EPD `/dev/shm` segment name and return its full path."""
+    if (
+        not isinstance(name, str)
+        or not name.startswith(_EPD_SHM_PREFIX)
+        or "/" in name
+        or "\x00" in name
+        or name in (".", "..")
+    ):
+        raise ValueError("invalid managed encoder SHM segment name")
+    return os.path.join(_EPD_SHM_DIR, name)
+
+
+def _unlink_shm_best_effort(name):
+    """Best-effort unlink of a validated EPD `/dev/shm` segment."""
+    if not isinstance(name, str) or not name.startswith(_EPD_SHM_PREFIX):
+        return
+    try:
+        path = _validate_shm_path(name)
+        os.unlink(path)
+    except (ValueError, OSError):
+        pass
+
+
+def _open_shm_mmap(name, nbytes, *, unlink_immediately):
+    """Map a Rust-produced `/dev/shm` pixel segment zero-copy with COW writability."""
+    path = _validate_shm_path(name)
+    if type(nbytes) is not int or nbytes < 0:
+        raise ValueError("invalid managed encoder SHM byte length")
+    if nbytes == 0:
+        if unlink_immediately:
+            _unlink_shm_best_effort(name)
+        return b""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        if os.fstat(fd).st_size < nbytes:
+            raise ValueError("managed encoder SHM segment truncated")
+        mm = mmap.mmap(fd, nbytes, access=mmap.ACCESS_COPY)
+    finally:
+        os.close(fd)
+    if unlink_immediately:
+        _unlink_shm_best_effort(name)
+    return mm
+
+
+def _derive_item_key_from_rust_hash(
+    stable_ns, modality_name, rust_hash_hex, grid_row, second_per_grid=None
+):
+    """Derive a deterministic 32-byte item key from Rust's raw-content BLAKE3 hash (<1 us)."""
+    import torch
+
+    hasher = hashlib.sha256(stable_ns)
+    hasher.update(b"rust-v2\0")
+    for part in (
+        modality_name.encode("ascii"),
+        rust_hash_hex.encode("ascii"),
+        b",".join(str(int(v)).encode("ascii") for v in grid_row),
+    ):
+        hasher.update(len(part).to_bytes(4, "little"))
+        hasher.update(part)
+    if second_per_grid is not None:
+        spg_bytes = memoryview(second_per_grid.contiguous().reshape(-1).view(torch.uint8).numpy())
+        hasher.update(len(spg_bytes).to_bytes(4, "little"))
+        hasher.update(spg_bytes)
+    else:
+        hasher.update(b"\x00\x00\x00\x00")
+    return hasher.digest()
 
 
 def _build_stable_identity_namespace(encoder, processor_contract):
@@ -166,7 +259,14 @@ class RustPreprocessorBridge:
     """Use artifacts distributed by the native TP request IPC; never read media on a rank."""
 
     def __init__(
-        self, original, max_artifact_bytes, *, stable_identity_ns=None, identity_sink=None
+        self,
+        original,
+        max_artifact_bytes,
+        *,
+        stable_identity_ns=None,
+        identity_sink=None,
+        tp_size=1,
+        item_cache_enabled=None,
     ):
         """Wrap SGLang's encoder preprocessor to consume immutable Rust-produced artifacts."""
         self.original = original
@@ -177,6 +277,12 @@ class RustPreprocessorBridge:
             else hashlib.sha256(b"smg-epd-item-id-v1:default").digest()
         )
         self.identity_sink = identity_sink
+        self.tp_size = max(1, int(tp_size))
+        self._item_cache_enabled = (
+            bool(item_cache_enabled)
+            if item_cache_enabled is not None
+            else (self.tp_size == 1 and _item_cache_budget_bytes() > 0)
+        )
 
     def supports_modality(self, modality):
         """Return True only for IMAGE and VIDEO modalities supported by managed EPD."""
@@ -194,26 +300,31 @@ class RustPreprocessorBridge:
             self.original.preproc_executor, self._materialize_batch, requests, modality
         )
 
-    def _batch_token_counts(self, batch, grid, modality, is_video):
-        """Resolve per-item embedding token counts from Rust placeholder ranges and grid rows."""
+    def _batch_token_counts_from_lengths(self, lengths, grid, modality, is_video):
+        """Derive per-item embedding token counts from Rust placeholder lengths and grid rows."""
         if not is_video:
-            if len(batch.mm_placeholders) != len(grid):
+            if len(lengths) != len(grid):
                 raise ValueError("Rust token counts do not match grid items")
-            return [p.length for p in batch.mm_placeholders]
-        if len(batch.mm_placeholders) == len(grid):
-            return [p.length for p in batch.mm_placeholders]
-        if len(grid) == 1 and batch.mm_placeholders:
-            return [sum(p.length for p in batch.mm_placeholders)]
+            return [int(length) for length in lengths]
+        if len(lengths) == len(grid):
+            return [int(length) for length in lengths]
+        if len(grid) == 1 and lengths:
+            return [sum(int(length) for length in lengths)]
         counts = [self.original.get_num_tokens(row, modality) for row in grid]
-        if sum(counts) != sum(p.length for p in batch.mm_placeholders):
+        if sum(counts) != sum(int(length) for length in lengths):
             raise ValueError("Rust token counts do not match grid items")
         return counts
+
+    def _batch_token_counts(self, batch, grid, modality, is_video):
+        """Extract per-item token counts from a legacy protobuf multimodal batch."""
+        return self._batch_token_counts_from_lengths(
+            [p.length for p in batch.mm_placeholders], grid, modality, is_video
+        )
 
     def _materialize_batch(self, requests, modality):
         """Merge Rust artifacts in native batch order without CPU decoding or normalization."""
         import torch
         from sglang.srt.disaggregation.encoder.preprocessor import EncoderPreprocessResult
-        from smg_grpc_proto.generated import sglang_scheduler_pb2 as sg
 
         if not self.supports_modality(modality):
             raise ValueError("managed encoder refuses non-image/video preprocessing")
@@ -225,10 +336,165 @@ class RustPreprocessorBridge:
             if self.original is not None
             else (lambda row, _mod: int(row[0]) * int(row[1]) * int(row[2]))
         )
+        need_legacy_keys = self.identity_sink is not None or self._item_cache_enabled
         pixels, grids, counts, items_per_req, second_per_grids, all_keys = [], [], [], [], [], []
+        pinned_embs = []
+        pixel_item_indices = []
+        has_cache_hit = False
         has_second_per_grid = None
         all_keys_valid = True
+        total_item_offset = 0
+        sg = None
+
         for request in requests:
+            art_v2 = _extract_artifact_v2(request)
+            if art_v2 is not None:
+                kind = art_v2.get("kind")
+                if kind == "cache_hit":
+                    if is_video:
+                        raise ValueError("cache_hit artifact is supported for images only")
+                    item_keys_hex = art_v2.get("item_keys") or []
+                    grid_rows = art_v2.get("grid_thw") or []
+                    token_counts = art_v2.get("token_counts") or []
+                    req_pinned = art_v2.get("pinned_embeddings") or []
+                    item_count = len(grid_rows)
+                    if (
+                        item_count != len(request["mm_items"])
+                        or len(item_keys_hex) != item_count
+                        or len(token_counts) != item_count
+                        or len(req_pinned) != item_count
+                    ):
+                        raise ValueError("invalid managed cache_hit artifact layout")
+                    grid = torch.tensor(grid_rows, dtype=torch.int64)
+                    if grid.ndim != 2 or grid.shape[1] != 3:
+                        raise ValueError("invalid Rust media grid")
+                    req_keys = [bytes.fromhex(k) for k in item_keys_hex]
+                    grids.append(grid)
+                    counts.extend(int(c) for c in token_counts)
+                    pinned_embs.extend(req_pinned)
+                    items_per_req.append(item_count)
+                    req_id = request.get("req_id")
+                    if isinstance(req_id, str) and req_id and self.identity_sink is not None:
+                        self.identity_sink[req_id] = list(item_keys_hex)
+                    all_keys.extend(req_keys)
+                    has_cache_hit = True
+                    total_item_offset += item_count
+                    continue
+
+                if kind != "compact":
+                    raise ValueError(f"unsupported managed artifact_v2 kind: {kind!r}")
+
+                batches = art_v2.get("batches") or []
+                if not batches:
+                    raise ValueError("managed compact artifact has no batches")
+                shm_name = art_v2.get("shm_name")
+                if shm_name is not None:
+                    shm_nbytes = art_v2.get("shm_nbytes", 0)
+                    if shm_nbytes > self.max_artifact_bytes:
+                        raise ValueError("managed native request exceeds artifact budget")
+                    source_buf = _open_shm_mmap(
+                        shm_name, shm_nbytes, unlink_immediately=(self.tp_size == 1)
+                    )
+                    copy_pixels = False
+                else:
+                    source_buf = art_v2.get("inline_pixels", b"")
+                    if not isinstance(source_buf, (bytes, bytearray, memoryview)):
+                        raise ValueError("managed compact artifact missing inline pixel bytes")
+                    if len(source_buf) > self.max_artifact_bytes:
+                        raise ValueError("managed native request exceeds artifact budget")
+                    copy_pixels = True
+
+                item_count = 0
+                req_keys = []
+                req_keys_valid = True
+                for batch in batches:
+                    pixel = _tensor_from_buffer(
+                        source_buf,
+                        batch["pixel_dtype"],
+                        batch["pixel_shape"],
+                        offset=batch["pixel_offset"],
+                        nbytes=batch["pixel_nbytes"],
+                        copy=copy_pixels,
+                    )
+                    grid_rows = batch["grid_thw"]
+                    grid = torch.tensor(grid_rows, dtype=torch.int64)
+                    if grid.dtype != torch.int64 or grid.ndim != 2 or grid.shape[1] != 3:
+                        raise ValueError("invalid Rust media grid")
+                    spg_tensor = None
+                    if is_video:
+                        batch_spg = batch.get("second_per_grid_ts")
+                        batch_has_spg = batch_spg is not None
+                        if has_second_per_grid is None:
+                            has_second_per_grid = batch_has_spg
+                        elif batch_has_spg != has_second_per_grid:
+                            raise ValueError("inconsistent Rust video timing metadata")
+                        if batch_has_spg:
+                            spg_shape = batch.get("second_per_grid_shape") or [len(batch_spg)]
+                            spg_tensor = torch.tensor(batch_spg, dtype=torch.float32).reshape(
+                                spg_shape
+                            )
+                            second_per_grids.append(spg_tensor)
+                    counts.extend(
+                        self._batch_token_counts_from_lengths(
+                            batch["placeholder_lengths"], grid, modality, is_video
+                        )
+                    )
+                    item_hashes = batch.get("item_hashes") or []
+                    if req_keys_valid and len(item_hashes) == len(grid_rows):
+                        for row_idx, (rust_hash, row) in enumerate(zip(item_hashes, grid_rows)):
+                            item_spg = None
+                            if spg_tensor is not None:
+                                item_spg = (
+                                    spg_tensor[row_idx : row_idx + 1]
+                                    if len(spg_tensor) == len(grid_rows)
+                                    else spg_tensor
+                                )
+                            req_keys.append(
+                                _derive_item_key_from_rust_hash(
+                                    self.stable_identity_ns,
+                                    modality.name,
+                                    rust_hash,
+                                    row,
+                                    item_spg,
+                                )
+                            )
+                    elif req_keys_valid and need_legacy_keys:
+                        batch_keys = _hash_batch_items(
+                            self.stable_identity_ns,
+                            modality,
+                            pixel,
+                            grid_rows,
+                            get_patches,
+                            spg_tensor,
+                        )
+                        if batch_keys is None:
+                            req_keys_valid = False
+                        else:
+                            req_keys.extend(batch_keys)
+                    else:
+                        req_keys_valid = False
+                    pixels.append(pixel)
+                    grids.append(grid)
+                    item_count += len(grid)
+                if item_count != len(request["mm_items"]):
+                    raise ValueError("Rust artifact lost a media occurrence")
+                items_per_req.append(item_count)
+                pinned_embs.extend([None] * item_count)
+                pixel_item_indices.extend(range(total_item_offset, total_item_offset + item_count))
+                total_item_offset += item_count
+                if req_keys_valid and len(req_keys) == item_count:
+                    req_id = request.get("req_id")
+                    if isinstance(req_id, str) and req_id and self.identity_sink is not None:
+                        self.identity_sink[req_id] = [key.hex() for key in req_keys]
+                    all_keys.extend(req_keys)
+                else:
+                    all_keys_valid = False
+                continue
+
+            # Legacy protobuf artifact path (retained for backward compatibility and unit tests).
+            if sg is None:
+                from smg_grpc_proto.generated import sglang_scheduler_pb2 as sg
+
             raw = _extract_artifact(request)
             if not isinstance(raw, bytes) or not raw:
                 raise ValueError("managed encoder is missing its immutable Rust artifact")
@@ -239,11 +505,13 @@ class RustPreprocessorBridge:
                 raise ValueError("managed Rust artifact has no pixels")
             item_count = 0
             req_keys = []
-            req_keys_valid = True
-            for batch in [artifact.mm_inputs, *artifact.extra_mm_inputs]:
+            req_keys_valid = need_legacy_keys
+            legacy_batches = [artifact.mm_inputs, *artifact.extra_mm_inputs]
+            copy_single_legacy = len(requests) == 1 and len(legacy_batches) == 1
+            for batch in legacy_batches:
                 if grid_key not in batch.model_specific_tensors:
                     raise ValueError("unsupported Rust artifact model fields")
-                pixel = _tensor(batch.pixel_values, copy=False)
+                pixel = _tensor(batch.pixel_values, copy=copy_single_legacy)
                 grid = _tensor(batch.model_specific_tensors[grid_key])
                 if grid.dtype != torch.int64 or grid.ndim != 2 or grid.shape[1] != 3:
                     raise ValueError("invalid Rust media grid")
@@ -277,6 +545,9 @@ class RustPreprocessorBridge:
             if item_count != len(request["mm_items"]):
                 raise ValueError("Rust artifact lost a media occurrence")
             items_per_req.append(item_count)
+            pinned_embs.extend([None] * item_count)
+            pixel_item_indices.extend(range(total_item_offset, total_item_offset + item_count))
+            total_item_offset += item_count
             if req_keys_valid and len(req_keys) == item_count:
                 req_id = request.get("req_id")
                 if isinstance(req_id, str) and req_id and self.identity_sink is not None:
@@ -284,18 +555,323 @@ class RustPreprocessorBridge:
                 all_keys.extend(req_keys)
             else:
                 all_keys_valid = False
-        grid = torch.cat(grids, dim=0)
-        mm_inputs = {feature_key: torch.cat(pixels, dim=0), grid_key: grid}
+
+        grid = grids[0] if len(grids) == 1 else torch.cat(grids, dim=0)
+        if pixels:
+            pixel_tensor = pixels[0] if len(pixels) == 1 else torch.cat(pixels, dim=0)
+        else:
+            pixel_tensor = torch.empty((0,), dtype=torch.bfloat16)
+        mm_inputs = {feature_key: pixel_tensor, grid_key: grid}
         if second_per_grids:
-            mm_inputs["second_per_grid_ts"] = torch.cat(second_per_grids, dim=0)
+            mm_inputs["second_per_grid_ts"] = (
+                second_per_grids[0]
+                if len(second_per_grids) == 1
+                else torch.cat(second_per_grids, dim=0)
+            )
         result = EncoderPreprocessResult(mm_inputs=mm_inputs, grid_thw=grid, token_counts=counts)
         if all_keys_valid and len(all_keys) == len(counts):
             result._smg_item_keys = all_keys
+        if has_cache_hit:
+            if not all_keys_valid or len(all_keys) != len(counts):
+                raise ValueError("cannot fuse cache-hit requests with items lacking valid keys")
+            result._smg_pinned_embeddings = pinned_embs
+            if pixels:
+                result._smg_pixel_item_indices = pixel_item_indices
         return result, items_per_req
 
 
-def _tensor(value, *, copy=True):
-    """Materialize an E-local CPU view, validating dtype and byte length."""
+_SGLANG_CACHE_MB_ENV = "SGLANG_VLM_CACHE_SIZE_MB"
+
+
+def _parse_non_negative_int_env(env_name, raw):
+    """Parse a non-negative integer MB env var, rejecting negative or non-integer values."""
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{env_name} must be a non-negative integer, got {raw!r}") from exc
+    if value < 0:
+        raise ValueError(f"{env_name} must be a non-negative integer, got {raw!r}")
+    return value
+
+
+def _item_cache_budget_bytes():
+    """Return configured per-item encoder cache budget in bytes, or 0 when disabled.
+
+    Validates ``SMG_SGLANG_ENCODER_ITEM_CACHE_MB`` strictly when set; when unset, honors
+    ``SGLANG_VLM_CACHE_SIZE_MB`` if set, or derives a container-safe default bounded by
+    1/16 of available container/host RAM (1/8 of the 50% encoder context budget, capped at
+    ``_DEFAULT_ITEM_CACHE_MB``).
+    """
+    raw = os.environ.get(ITEM_CACHE_MB_ENV)
+    if raw is not None and raw.strip() != "":
+        return _parse_non_negative_int_env(ITEM_CACHE_MB_ENV, raw.strip()) * 1024 * 1024
+    sglang_raw = os.environ.get(_SGLANG_CACHE_MB_ENV)
+    if sglang_raw is not None and sglang_raw.strip() != "":
+        return _parse_non_negative_int_env(_SGLANG_CACHE_MB_ENV, sglang_raw.strip()) * 1024 * 1024
+    default_bytes = _DEFAULT_ITEM_CACHE_MB * 1024 * 1024
+    from .epd_launcher import available_memory_bytes
+
+    mem_bytes = available_memory_bytes()
+    if mem_bytes is not None and mem_bytes > 0:
+        return min(default_bytes, mem_bytes // 16)
+    return default_bytes
+
+
+def _encoder_item_cache_budget_bytes(encoder):
+    """Return the startup-resolved per-item cache budget cached on ``encoder``."""
+    cached = getattr(encoder, "_smg_item_cache_budget_bytes", None)
+    if cached is not None:
+        return cached
+    budget = _item_cache_budget_bytes()
+    encoder._smg_item_cache_budget_bytes = budget
+    return budget
+
+
+class PerItemEmbeddingCache:
+    """Thread-safe LRU cache keyed by per-item preprocessed image features."""
+
+    def __init__(self, max_bytes):
+        """Initialize the LRU embedding cache with a byte capacity cap."""
+        self.max_bytes = max(0, int(max_bytes))
+        self.current_bytes = 0
+        self._entries = OrderedDict()
+        self._lock = threading.Lock()
+        self._pending_evictions = []
+        self.hits = 0
+        self.misses = 0
+
+    def __len__(self):
+        """Return the number of cached item embeddings."""
+        with self._lock:
+            return len(self._entries)
+
+    def contains(self, key):
+        """Return whether `key` is currently resident in the cache."""
+        with self._lock:
+            return key in self._entries
+
+    def get(self, key):
+        """Look up a cached item embedding and mark it most-recently used."""
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                self.misses += 1
+                return None
+            self._entries.move_to_end(key)
+            self.hits += 1
+            return entry
+
+    def put(self, key, tensor):
+        """Insert a tensor into the cache, evicting LRU entries as needed, and return eviction count."""
+        if self.max_bytes <= 0:
+            return 0
+        nbytes = int(tensor.numel()) * int(tensor.element_size())
+        if nbytes <= 0 or nbytes > self.max_bytes:
+            return 0
+        evictions = 0
+        with self._lock:
+            prev = self._entries.pop(key, None)
+            if prev is not None:
+                self.current_bytes -= int(prev.numel()) * int(prev.element_size())
+            while self.current_bytes + nbytes > self.max_bytes and self._entries:
+                evicted_key, evicted = self._entries.popitem(last=False)
+                self.current_bytes -= int(evicted.numel()) * int(evicted.element_size())
+                if isinstance(evicted_key, (bytes, bytearray)):
+                    self._pending_evictions.append(evicted_key.hex())
+                evictions += 1
+            self._entries[key] = tensor
+            self.current_bytes += nbytes
+        return evictions
+
+    def drain_evictions(self):
+        """Return and clear hex-encoded keys evicted since the last drain."""
+        with self._lock:
+            if not self._pending_evictions:
+                return []
+            drained = self._pending_evictions
+            self._pending_evictions = []
+            return drained
+
+    def clear(self):
+        """Evict all cached entries and queue their keys for Rust pre-decode cache feedback."""
+        with self._lock:
+            for evicted_key in self._entries:
+                if isinstance(evicted_key, (bytes, bytearray)):
+                    self._pending_evictions.append(evicted_key.hex())
+            self._entries.clear()
+            self.current_bytes = 0
+
+
+def _compute_image_item_keys(encoder, ctx):
+    """Compute per-item content keys from preprocessed pixel_values and grid_thw."""
+    mm_inputs = ctx.preprocess_result.mm_inputs
+    if not isinstance(mm_inputs, dict) or set(mm_inputs.keys()) != {
+        "pixel_values",
+        "image_grid_thw",
+    }:
+        return None
+    pixel_values, grid_thw = mm_inputs["pixel_values"], mm_inputs["image_grid_thw"]
+    if pixel_values is None or grid_thw is None:
+        return None
+    grid_rows = grid_thw.tolist() if hasattr(grid_thw, "tolist") else list(grid_thw)
+    if len(grid_rows) != ctx.num_items:
+        return None
+    pixel_cpu = pixel_values.detach()
+    if pixel_cpu.is_cuda:
+        pixel_cpu = pixel_cpu.cpu()
+    ns = hashlib.sha256(
+        (getattr(encoder, "cache_namespace", "") or "").encode("utf-8", errors="replace")
+    ).digest()
+    return _hash_batch_items(
+        ns, ctx.modality, pixel_cpu.contiguous(), grid_rows, encoder.preprocessor.get_num_patches
+    )
+
+
+def _record_item_cache_metrics(ctx, cache, hit_count, hit_tokens, total_tokens, evictions=0):
+    """Report per-item embedding cache hits, tokens, evictions, and size to SGLang metrics."""
+    srv_mod = sys.modules.get("sglang.srt.disaggregation.encoder.server")
+    metrics_collector = getattr(srv_mod, "encoder_metrics_collector", None) if srv_mod else None
+    if metrics_collector is None or ctx.is_health_check:
+        return
+    if hasattr(metrics_collector, "record_cache_tokens"):
+        metrics_collector.record_cache_tokens(hit_tokens, total_tokens, modality="image")
+    if hasattr(metrics_collector, "record_cache_files"):
+        metrics_collector.record_cache_files(hit_count, ctx.num_items, modality="image")
+    if evictions > 0 and hasattr(metrics_collector, "inc_cache_evictions"):
+        metrics_collector.inc_cache_evictions(modality="image", count=evictions)
+    if cache is not None and hasattr(metrics_collector, "set_cache_state"):
+        metrics_collector.set_cache_state(cache.current_bytes, len(cache))
+
+
+async def cached_compute_direct_embedding(original, encoder, ctx, *, keep_on_gpu=False):
+    """Cache per-item image embeddings across turns and fused multi-request batches."""
+    import torch
+
+    preproc = ctx.preprocess_result
+    smg_keys = getattr(preproc, "_smg_item_keys", None)
+    pinned_embs = getattr(preproc, "_smg_pinned_embeddings", None)
+    has_smg_keys = smg_keys is not None or pinned_embs is not None
+
+    if (
+        (getattr(encoder, "_has_native_item_cache", False) and not has_smg_keys)
+        or ctx.is_health_check
+        or getattr(ctx.modality, "name", "") != "IMAGE"
+        or getattr(encoder, "tp_size", 1) != 1
+        or ctx.num_items <= 0
+    ):
+        return await original(encoder, ctx, keep_on_gpu=keep_on_gpu)
+
+    budget_bytes = _encoder_item_cache_budget_bytes(encoder)
+    if budget_bytes <= 0 and pinned_embs is None:
+        return await original(encoder, ctx, keep_on_gpu=keep_on_gpu)
+
+    cache = None
+    if budget_bytes > 0:
+        cache = getattr(encoder, "_smg_item_cache", None)
+        if cache is None or cache.max_bytes != budget_bytes:
+            cache = encoder._smg_item_cache = PerItemEmbeddingCache(budget_bytes)
+
+    keys = smg_keys if smg_keys is not None else _compute_image_item_keys(encoder, ctx)
+    if keys is None or len(keys) != len(preproc.token_counts):
+        if pinned_embs is not None:
+            raise ValueError("partial-pixel cache-hit batch is missing valid per-item keys")
+        return await original(encoder, ctx, keep_on_gpu=keep_on_gpu)
+
+    token_counts = [int(c) for c in preproc.token_counts]
+    if pinned_embs is not None:
+        if len(pinned_embs) != len(keys):
+            raise ValueError("partial-pixel cache-hit batch pinned embeddings length mismatch")
+        cached_items = list(pinned_embs)
+        if cache is not None:
+            for idx, existing in enumerate(cached_items):
+                if existing is None:
+                    cached_items[idx] = cache.get(keys[idx])
+    elif cache is not None:
+        cached_items = [cache.get(key) for key in keys]
+    else:
+        return await original(encoder, ctx, keep_on_gpu=keep_on_gpu)
+
+    miss_indices = [i for i, cached in enumerate(cached_items) if cached is None]
+    hit_count = len(keys) - len(miss_indices)
+    hit_tokens = sum(token_counts[i] for i, cached in enumerate(cached_items) if cached is not None)
+    total_tokens = sum(token_counts)
+
+    if not miss_indices:
+        if keep_on_gpu:
+            model_dev = (
+                next((p.device for p in encoder.model.parameters()), torch.device("cuda"))
+                if hasattr(encoder, "model")
+                else torch.device("cuda")
+            )
+            out_slices = [
+                t if t.is_cuda else t.to(device=model_dev, non_blocking=False) for t in cached_items
+            ]
+        else:
+            out_slices = [t.cpu() if t.is_cuda else t for t in cached_items]
+        _record_item_cache_metrics(ctx, cache, hit_count, hit_tokens, total_tokens)
+        return out_slices[0].clone() if len(out_slices) == 1 else torch.cat(out_slices, dim=0)
+
+    pixel_item_indices = getattr(preproc, "_smg_pixel_item_indices", None)
+    if pixel_item_indices is not None:
+        index_pos = {orig_idx: pos for pos, orig_idx in enumerate(pixel_item_indices)}
+        remapped_miss_indices = [index_pos[i] for i in miss_indices]
+        compact_grid = preproc.grid_thw[pixel_item_indices]
+        compact_mm_inputs = dict(preproc.mm_inputs)
+        compact_mm_inputs["image_grid_thw"] = compact_grid
+        build_preproc = SimpleNamespace(
+            mm_inputs=compact_mm_inputs,
+            grid_thw=compact_grid,
+            token_counts=[token_counts[i] for i in pixel_item_indices],
+        )
+        build_indices = remapped_miss_indices
+    else:
+        build_preproc = preproc
+        build_indices = miss_indices
+
+    mm_items = encoder._build_model_mm_items(
+        ctx.mm_feature, build_preproc, build_indices, ctx.modality
+    )
+    forward_start = time.perf_counter()
+    with torch.inference_mode():
+        miss_embedding = ctx.get_feature_fn(mm_items)
+        if not keep_on_gpu:
+            miss_embedding = miss_embedding.cpu()
+    if len(miss_embedding.shape) != 2:
+        miss_embedding = miss_embedding.reshape(-1, miss_embedding.shape[-1])
+    if miss_embedding.shape[0] != sum(token_counts[i] for i in miss_indices):
+        if pinned_embs is not None:
+            raise ValueError("partial-pixel cache-hit batch miss embedding token count mismatch")
+        return await original(encoder, ctx, keep_on_gpu=keep_on_gpu)
+
+    srv_mod = sys.modules.get("sglang.srt.disaggregation.encoder.server")
+    metrics_collector = getattr(srv_mod, "encoder_metrics_collector", None) if srv_mod else None
+    if metrics_collector is not None and not ctx.is_health_check:
+        metrics_collector.observe_model_forward(
+            time.perf_counter() - forward_start, modality="image"
+        )
+
+    target_device = miss_embedding.device
+    evictions = 0
+    for slice_tensor, item_idx in zip(
+        torch.split(miss_embedding, [token_counts[i] for i in miss_indices], dim=0),
+        miss_indices,
+    ):
+        if cache is not None:
+            evictions += cache.put(keys[item_idx], slice_tensor.detach().cpu().clone().contiguous())
+        cached_items[item_idx] = slice_tensor
+
+    _record_item_cache_metrics(ctx, cache, hit_count, hit_tokens, total_tokens, evictions=evictions)
+
+    assembled = [
+        t if t.device == target_device else t.to(device=target_device) for t in cached_items
+    ]
+    if len(assembled) == 1:
+        return assembled[0] if 0 in miss_indices else assembled[0].clone()
+    return torch.cat(assembled, dim=0)
+
+
+def _tensor_from_buffer(source_buf, dtype_name, shape, *, offset=0, nbytes=None, copy=True):
+    """Materialize a CPU tensor from raw bytes or mmap, validating dtype and byte length."""
     import torch
 
     dtypes = {
@@ -304,15 +880,28 @@ def _tensor(value, *, copy=True):
         "bfloat16": (torch.bfloat16, 2),
         "int64": (torch.int64, 8),
     }
-    if value.dtype not in dtypes:
+    if dtype_name not in dtypes:
         raise ValueError("unsupported managed artifact dtype")
-    dtype, width = dtypes[value.dtype]
-    data = value.data
-    if not value.shape or math.prod(value.shape) * width != len(data):
+    dtype, width = dtypes[dtype_name]
+    numel = math.prod(shape) if shape else 0
+    expected = numel * width
+    if not shape or expected <= 0:
+        raise ValueError("invalid managed artifact shape")
+    if nbytes is None:
+        nbytes = len(source_buf) - offset
+    if expected != nbytes or offset < 0 or offset + nbytes > len(source_buf):
         raise ValueError("invalid managed artifact byte length")
-    return torch.frombuffer(bytearray(data) if copy else data, dtype=dtype).reshape(
-        list(value.shape)
+    if copy:
+        buf = bytearray(memoryview(source_buf)[offset : offset + nbytes])
+        return torch.frombuffer(buf, dtype=dtype, count=numel).reshape(list(shape))
+    return torch.frombuffer(source_buf, dtype=dtype, count=numel, offset=offset).reshape(
+        list(shape)
     )
+
+
+def _tensor(value, *, copy=True):
+    """Materialize an E-local CPU view, validating dtype and byte length."""
+    return _tensor_from_buffer(value.data, value.dtype, value.shape, copy=copy)
 
 
 def install_bridge(encoder, processor_contract, max_artifact_bytes):
@@ -326,6 +915,17 @@ def install_bridge(encoder, processor_contract, max_artifact_bytes):
         raise ValueError("native encoder preprocessor component contract changed")
     if not processor_contract or max_artifact_bytes <= 0:
         raise ValueError("managed Rust processor requires a contract and byte limit")
+    tp_size = getattr(encoder, "tp_size", 1)
+    budget_bytes = 0
+    if tp_size == 1:
+        # Unify per-item embedding cache with Rust pre-decode index so SGLang's native cache
+        # never allocates a second buffer or re-hashes unpacked pixel tensors.
+        if getattr(encoder, "_item_embedding_cache", None) is not None:
+            encoder._item_embedding_cache = None
+        budget_bytes = _item_cache_budget_bytes()
+        if budget_bytes > 0 and getattr(encoder, "_smg_item_cache", None) is None:
+            encoder._smg_item_cache = PerItemEmbeddingCache(budget_bytes)
+    encoder._smg_item_cache_budget_bytes = budget_bytes
     sink = {} if getattr(encoder, "rank", 0) == 0 else None
     if sink is not None:
         encoder._smg_req_item_identities = sink
@@ -334,12 +934,15 @@ def install_bridge(encoder, processor_contract, max_artifact_bytes):
         max_artifact_bytes,
         stable_identity_ns=_build_stable_identity_namespace(encoder, processor_contract),
         identity_sink=sink,
+        tp_size=tp_size,
+        item_cache_enabled=budget_bytes > 0,
     )
     if hasattr(encoder, "cache_namespace"):
-        base_ns = encoder.cache_namespace or ""
         encoder.cache_namespace = (
             "sha256:"
-            + hashlib.sha256((base_ns + "\0smg-rust\0" + processor_contract).encode()).hexdigest()
+            + hashlib.sha256(
+                ((encoder.cache_namespace or "") + "\0smg-rust\0" + processor_contract).encode()
+            ).hexdigest()
         )
 
 
@@ -436,6 +1039,7 @@ class NativeEntry:
     rid: str
     prefill_host: str
     part_idx: int = 0
+    shm_name: str | None = None
     abort_requested: bool = False
     closing: asyncio.Future = field(default_factory=asyncio.Future)
     delivered: asyncio.Event = field(default_factory=asyncio.Event)
@@ -712,7 +1316,8 @@ class NativeEncoder:
         modality_str = command.get("modality", "image")
         num_parts, part_idx = command.get("num_parts", 1), command.get("part_idx", 0)
         item_count = command.get("item_count", command.get("image_count", 0))
-        require(type(num_parts) is int and 1 <= num_parts <= 2, "invalid native part count")
+        max_parts = max(2, int(self.config.get("max_images", 1024)))
+        require(type(num_parts) is int and 1 <= num_parts <= max_parts, "invalid native part count")
         require(type(part_idx) is int and 0 <= part_idx < num_parts, "invalid native part index")
         require(
             isinstance(modality_str, str) and modality_str.lower() in ("image", "video"),
@@ -723,11 +1328,56 @@ class NativeEncoder:
             if hasattr(Modality, "from_str")
             else getattr(Modality, modality_str.upper())
         )
+
+        artifact_v2 = command.get("artifact_v2")
+        shm_name = None
+        if isinstance(artifact_v2, dict):
+            kind = artifact_v2.get("kind")
+            if kind == "cache_hit":
+                item_keys_hex = artifact_v2.get("item_keys") or []
+                budget_bytes = _encoder_item_cache_budget_bytes(self.backend.encoder)
+                cache = (
+                    getattr(self.backend.encoder, "_smg_item_cache", None)
+                    if budget_bytes > 0 and getattr(self.backend.encoder, "tp_size", 1) == 1
+                    else None
+                )
+                pinned = []
+                missing = []
+                cache_miss = False
+                if cache is None or item_count <= 0 or len(item_keys_hex) != item_count:
+                    missing = list(item_keys_hex)
+                    cache_miss = True
+                else:
+                    for key_hex in item_keys_hex:
+                        try:
+                            key_bytes = bytes.fromhex(key_hex)
+                        except (TypeError, ValueError):
+                            missing.append(key_hex)
+                            cache_miss = True
+                            continue
+                        tensor = cache.get(key_bytes)
+                        if tensor is None:
+                            missing.append(key_hex)
+                            cache_miss = True
+                        else:
+                            pinned.append(tensor)
+                if cache_miss:
+                    evicted = list(missing)
+                    if cache is not None:
+                        evicted.extend(cache.drain_evictions())
+                    return {"released": True, "cache_miss": True, "cache_evicted": evicted}
+                artifact_v2 = {**artifact_v2, "pinned_embeddings": pinned}
+            elif kind == "compact":
+                shm_name = artifact_v2.get("shm_name")
+                if shm_name is None:
+                    artifact_v2 = {**artifact_v2, "inline_pixels": artifact}
+
         entry = NativeEntry(
             time.monotonic() + remaining,
             rid,
             prefill_host=command["prefill_host"],
             part_idx=part_idx,
+            shm_name=shm_name,
         )
         self.abandoned.pop(rid, None)
         self.entries[rid] = entry
@@ -743,12 +1393,17 @@ class NativeEncoder:
             )
             require(size <= self.config["max_staging_bytes_per_request"], "staging budget exceeded")
             require(type(item_count) is int and item_count > 0, "invalid native item count")
+            first_item = (
+                {ARTIFACT_V2_KEY: artifact_v2}
+                if isinstance(artifact_v2, dict)
+                else {ARTIFACT_KEY: artifact}
+            )
             native = {
                 "req_id": rid,
                 "num_parts": num_parts,
                 "part_idx": part_idx,
                 "modality": modality_str,
-                "mm_items": [{ARTIFACT_KEY: artifact}, *([None] * (item_count - 1))],
+                "mm_items": [first_item, *([None] * (item_count - 1))],
             }
             send_sockets = getattr(self.backend, "send_sockets", None)
             pipeline_kwargs = {"send_sockets": send_sockets} if send_sockets is not None else {}
@@ -787,6 +1442,9 @@ class NativeEncoder:
                 await meta_registry.publish(rid, 0, 0, 0, error=error)
             except Exception as exc:
                 error = _err(exc)
+        cache_resident = None
+        cache_evicted = None
+        req_identities = None
         try:
             self._wake_abandoned_sends(rid)
             await self.backend.encoder.abandon_request(rid)
@@ -797,12 +1455,28 @@ class NativeEncoder:
         except Exception as exc:
             return {"released": False, "error": _err(exc)}
         finally:
+            if entry.shm_name is not None:
+                _unlink_shm_best_effort(entry.shm_name)
+                entry.shm_name = None
             identities_map = getattr(self.backend.encoder, "_smg_req_item_identities", None)
-            if isinstance(identities_map, dict):
-                identities_map.pop(rid, None)
+            req_identities = (
+                identities_map.pop(rid, None) if isinstance(identities_map, dict) else None
+            )
+        cache = getattr(self.backend.encoder, "_smg_item_cache", None)
+        if cache is not None:
+            cache_evicted = cache.drain_evictions() or None
+            if error is None and req_identities and cache.max_bytes > 0:
+                resident = [k if cache.contains(bytes.fromhex(k)) else None for k in req_identities]
+                if any(resident):
+                    cache_resident = resident
         entry.sends.clear()
         del self.entries[rid]
-        return {"released": True, "error": error}
+        receipt = {"released": True, "error": error}
+        if cache_resident is not None:
+            receipt["cache_resident"] = cache_resident
+        if cache_evicted is not None:
+            receipt["cache_evicted"] = cache_evicted
+        return receipt
 
     def close(self):
         """Mark the encoder shutting down and wake all pending receiver waiters."""
@@ -835,7 +1509,7 @@ async def _start_http_facade(owner, config):
         config.get("max_http_body_bytes", MAX_RECEIVER_HTTP_BODY_BYTES),
         MAX_RECEIVER_HTTP_BODY_BYTES,
     )
-    slots = asyncio.Semaphore(config.get("max_http_connections", 528))
+    slots = asyncio.Semaphore(config.get("max_http_connections", 2320))
 
     async def handle_route(request):
         kind = _ROUTES.get(request.match_info["route"])

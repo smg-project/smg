@@ -2,7 +2,8 @@
 //! only an explicit released response permits the control owner to return execution permits.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
+    path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::sync_channel,
@@ -14,7 +15,7 @@ use std::{
 use bytes::Bytes;
 use futures::{future::BoxFuture, FutureExt, TryFutureExt};
 use prost::Message;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use smg_grpc_client::{
     common_proto as common,
@@ -311,9 +312,237 @@ fn wire_error(error: impl std::fmt::Display) -> Status {
     Status::unavailable(error.to_string())
 }
 
+const PRE_DECODE_CACHE_MAX_ENTRIES: usize = 65_536;
+
+/// RAII cleanup guard for a `/dev/shm` pixel payload file owned by an in-flight encoder command.
+/// Unlinks the file on drop if Python has not already unlinked it.
+#[derive(Debug)]
+pub struct ShmGuard {
+    path: PathBuf,
+}
+
+impl ShmGuard {
+    /// Wrap a `/dev/shm` file path so it is unlinked when dropped.
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for ShmGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Compact metadata for one preprocessed tensor batch (no protobuf pixel wrapping).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeBatchMeta {
+    pub pixel_dtype: String,
+    pub pixel_shape: Vec<u32>,
+    pub pixel_offset: usize,
+    pub pixel_nbytes: usize,
+    pub grid_thw: Vec<[i64; 3]>,
+    pub placeholder_lengths: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub second_per_grid_ts: Option<Vec<f32>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub second_per_grid_shape: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub item_hashes: Vec<String>,
+}
+
+/// Payload carried from the Rust encoder processor to the Python native encoder runtime.
+#[derive(Debug)]
+pub enum EncoderPayload {
+    /// Legacy serialized `sglang_proto::GenerateRequest` protobuf bytes.
+    LegacyProto(Bytes),
+    /// Compact v2 metadata + zero-copy `/dev/shm` (or inline raw bytes) pixel tensors.
+    Compact {
+        batches: Vec<NativeBatchMeta>,
+        shm_name: Option<String>,
+        shm_nbytes: usize,
+        shm_guard: Option<ShmGuard>,
+        inline_pixels: Option<Bytes>,
+    },
+}
+
 pub struct EncoderArtifact {
-    pub bytes: Bytes,
+    pub payload: EncoderPayload,
     pub embedding_tokens: u64,
+}
+
+impl EncoderArtifact {
+    /// Construct an artifact carrying legacy serialized `GenerateRequest` protobuf bytes.
+    pub fn legacy(bytes: Bytes, embedding_tokens: u64) -> Self {
+        Self {
+            payload: EncoderPayload::LegacyProto(bytes),
+            embedding_tokens,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CachedSourceMeta {
+    item_key_hex: String,
+    grid_thw: [i64; 3],
+    token_count: u32,
+}
+
+struct PreDecodeHit {
+    item_keys: Vec<String>,
+    grid_thw: Vec<[i64; 3]>,
+    token_counts: Vec<u32>,
+    embedding_tokens: u64,
+}
+
+/// Bounded Rust-side pre-decode index mapping immutable `data:` image sources + options
+/// to resident Python `PerItemEmbeddingCache` keys and layout metadata.
+struct PreDecodeCache {
+    by_source: HashMap<[u8; 32], (CachedSourceMeta, u64)>,
+    order: VecDeque<([u8; 32], u64)>,
+    by_item_key: HashMap<String, Vec<[u8; 32]>>,
+    max_entries: usize,
+    next_gen: u64,
+}
+
+impl PreDecodeCache {
+    /// Create a bounded FIFO pre-decode index with at most `max_entries` cached sources.
+    fn new(max_entries: usize) -> Self {
+        Self {
+            by_source: HashMap::new(),
+            order: VecDeque::new(),
+            by_item_key: HashMap::new(),
+            max_entries,
+            next_gen: 0,
+        }
+    }
+
+    /// Return cached item keys and layout metadata only when every item in the batch hits.
+    fn lookup_all(&self, source_keys: &[Option<[u8; 32]>]) -> Option<PreDecodeHit> {
+        if source_keys.is_empty() {
+            return None;
+        }
+        let mut item_keys = Vec::with_capacity(source_keys.len());
+        let mut grid_thw = Vec::with_capacity(source_keys.len());
+        let mut token_counts = Vec::with_capacity(source_keys.len());
+        let mut embedding_tokens = 0u64;
+        for maybe_key in source_keys {
+            let src_key = (*maybe_key)?;
+            let (meta, _) = self.by_source.get(&src_key)?;
+            item_keys.push(meta.item_key_hex.clone());
+            grid_thw.push(meta.grid_thw);
+            token_counts.push(meta.token_count);
+            embedding_tokens = embedding_tokens.saturating_add(u64::from(meta.token_count));
+        }
+        Some(PreDecodeHit {
+            item_keys,
+            grid_thw,
+            token_counts,
+            embedding_tokens,
+        })
+    }
+
+    /// Record or update a source-to-resident-item mapping, evicting oldest entries at capacity.
+    fn insert(&mut self, source_key: [u8; 32], meta: CachedSourceMeta) {
+        if self.max_entries == 0 {
+            return;
+        }
+        let entry_gen = if let Some((prev, prev_gen)) = self.by_source.get(&source_key) {
+            if prev.item_key_hex == meta.item_key_hex
+                && prev.grid_thw == meta.grid_thw
+                && prev.token_count == meta.token_count
+            {
+                return;
+            }
+            let prev_gen = *prev_gen;
+            let old_key = prev.item_key_hex.clone();
+            if let Some(list) = self.by_item_key.get_mut(&old_key) {
+                list.retain(|k| *k != source_key);
+                if list.is_empty() {
+                    self.by_item_key.remove(&old_key);
+                }
+            }
+            prev_gen
+        } else {
+            while self.by_source.len() >= self.max_entries {
+                let Some((oldest, oldest_gen)) = self.order.pop_front() else {
+                    break;
+                };
+                let matches_gen = self
+                    .by_source
+                    .get(&oldest)
+                    .is_some_and(|(_, current_gen)| *current_gen == oldest_gen);
+                if !matches_gen {
+                    continue;
+                }
+                if let Some((evicted, _)) = self.by_source.remove(&oldest) {
+                    if let Some(list) = self.by_item_key.get_mut(&evicted.item_key_hex) {
+                        list.retain(|k| *k != oldest);
+                        if list.is_empty() {
+                            self.by_item_key.remove(&evicted.item_key_hex);
+                        }
+                    }
+                }
+            }
+            if self.order.len() >= self.max_entries.saturating_mul(2) {
+                self.order.retain(|(k, g)| {
+                    self.by_source
+                        .get(k)
+                        .is_some_and(|(_, current_gen)| current_gen == g)
+                });
+            }
+            let generation = self.next_gen;
+            self.next_gen = self.next_gen.wrapping_add(1);
+            self.order.push_back((source_key, generation));
+            generation
+        };
+        self.by_item_key
+            .entry(meta.item_key_hex.clone())
+            .or_default()
+            .push(source_key);
+        self.by_source.insert(source_key, (meta, entry_gen));
+    }
+
+    /// Drop all source mappings associated with item keys evicted by the Python cache.
+    fn evict_item_keys<'a>(&mut self, keys: impl IntoIterator<Item = &'a str>) {
+        for key in keys {
+            if let Some(sources) = self.by_item_key.remove(key) {
+                for src in sources {
+                    self.by_source.remove(&src);
+                }
+            }
+        }
+    }
+}
+
+/// Compute a pre-decode cache key for immutable inline (`data:`) images + resize options.
+/// Remote URLs (`http:`/`https:`) return `None` because their bytes may change remotely.
+fn compute_source_key(modality: EncoderModality, item: &EncoderMediaItem) -> Option<[u8; 32]> {
+    if modality != EncoderModality::Image {
+        return None;
+    }
+    if !item
+        .url
+        .as_bytes()
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"data:"))
+    {
+        return None;
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"smg-epd-src-v1\0");
+    hasher.update(modality.as_str().as_bytes());
+    let detail_tag = match item.detail.as_deref() {
+        None | Some("") => 0u8,
+        Some(d) if d.eq_ignore_ascii_case("auto") => 1u8,
+        Some(d) if d.eq_ignore_ascii_case("low") => 2u8,
+        Some(d) if d.eq_ignore_ascii_case("high") => 3u8,
+        Some(_) => return None,
+    };
+    hasher.update(&[detail_tag]);
+    hasher.update(&(item.url.len() as u64).to_le_bytes());
+    hasher.update(item.url.as_bytes());
+    Some(*hasher.finalize().as_bytes())
 }
 
 /// Media modality handled by one managed encoder request.
@@ -413,6 +642,7 @@ pub struct EncoderRuntime {
     native: NativeEncoderLink,
     processor: EncoderProcessor,
     owners: Mutex<OwnerLedger>,
+    pre_decode_cache: Mutex<PreDecodeCache>,
     execution: Arc<Semaphore>,
     cpu: Arc<Semaphore>,
     draining: AtomicBool,
@@ -460,6 +690,7 @@ impl EncoderRuntime {
             native,
             processor,
             owners: Mutex::new(OwnerLedger::default()),
+            pre_decode_cache: Mutex::new(PreDecodeCache::new(PRE_DECODE_CACHE_MAX_ENTRIES)),
             draining: AtomicBool::new(false),
             quarantined: AtomicUsize::new(0),
             fatal: Mutex::new(None),
@@ -546,7 +777,8 @@ impl EncoderRuntime {
             || remaining > Duration::from_secs(122)
             || request.req_id.is_empty()
             || request.req_id.len() > 256
-            || !(1..=2).contains(&request.num_parts)
+            || request.num_parts == 0
+            || request.num_parts as usize > self.config.max_images.max(2)
             || request.part_idx >= request.num_parts
             || request.mm_items.is_empty()
             || request.mm_items.len() > self.config.max_images
@@ -622,107 +854,71 @@ impl EncoderRuntime {
         }
     }
 
-    /// Run bounded CPU preprocessing, dispatch native execution, and retain permits until `released=true`.
-    async fn execute(
-        self: Arc<Self>,
-        request: EncodeRequest,
-        modality: EncoderModality,
-        owner: Arc<EncodeOwner>,
+    /// Apply Python per-item cache evictions and resident keys reported on the execute receipt.
+    fn apply_cache_feedback(
+        &self,
+        receipt: &Value,
+        source_keys: &[Option<[u8; 32]>],
+        item_metas: Option<&[([i64; 3], u32)]>,
     ) {
-        let mut cancelled = owner.cancel.subscribe();
-        let EncodeRequest {
-            req_id: rid,
-            mm_items: raw_items,
-            num_parts,
-            part_idx,
-            prefill_host,
-            item_options: options,
-            ..
-        } = request;
-        let item_count = raw_items.len();
-        let permit = tokio::select! {
-            permit = self.execution.clone().acquire_owned() => permit.ok(),
-            () = wait_cancel(&mut cancelled, owner.deadline) => None,
-        };
-        let prepared = async {
-            if permit.is_none() {
-                return Err(Status::cancelled("encoder cancelled before execution"));
-            }
-            let cpu = tokio::select! {
-                permit = self.cpu.clone().acquire_owned() => permit
-                    .map_err(|_| Status::unavailable("encoder CPU supply closed"))?,
-                () = wait_cancel(&mut cancelled, owner.deadline) => {
-                    return Err(Status::cancelled("encoder cancelled while waiting for CPU"));
-                }
-            };
-            owner.running.store(true, Ordering::Release);
-            if *owner.cancel.borrow() || Instant::now() >= owner.deadline {
-                return Err(Status::cancelled("encoder cancelled before preprocessing"));
-            }
-            let items = raw_items
-                .into_iter()
-                .enumerate()
-                .map(|(index, url)| {
-                    let option = options.get(index);
-                    EncoderMediaItem {
-                        url,
-                        detail: option
-                            .and_then(|o| (!o.detail.is_empty()).then(|| o.detail.clone())),
-                    }
-                })
-                .collect();
-            let artifact = (self.processor)(modality, items).await;
-            self.release_queued_control(&owner);
-            drop(cpu);
-            let artifact = artifact?;
-            let remaining_ms = owner
-                .deadline
-                .saturating_duration_since(Instant::now())
-                .as_millis() as u64;
-            if *owner.cancel.borrow() || remaining_ms == 0 {
-                return Err(Status::cancelled("encoder expired after preprocessing"));
-            }
-            Ok((artifact, remaining_ms))
+        let evicted = receipt.get("cache_evicted").and_then(Value::as_array);
+        let resident = receipt.get("cache_resident").and_then(Value::as_array);
+        let has_error = receipt.get("error").and_then(Value::as_str).is_some();
+        if evicted.is_none() && (has_error || resident.is_none()) {
+            return;
         }
-        .await;
-        let (artifact, remaining_ms) = match prepared {
-            Ok(ready) => ready,
-            Err(error) => {
-                self.release_owner(&rid);
-                drop(permit);
-                self.native.notify_forget(&rid);
-                owner.result.send_replace(Some(Err(error)));
-                return;
-            }
+        let Ok(mut cache) = self.pre_decode_cache.lock() else {
+            return;
         };
-        let command = serde_json::json!({
-            "operation": "execute",
-            "rid": rid,
-            "prefill_host": prefill_host,
-            "remaining_ms": remaining_ms,
-            "image_count": item_count,
-            "item_count": item_count,
-            "modality": modality.as_str(),
-            "num_parts": num_parts,
-            "part_idx": part_idx,
-            "embedding_tokens": artifact.embedding_tokens,
-        });
+        if let Some(evicted_keys) = evicted {
+            cache.evict_item_keys(evicted_keys.iter().filter_map(Value::as_str));
+        }
+        if !has_error {
+            if let (Some(resident_keys), Some(metas)) = (resident, item_metas) {
+                if resident_keys.len() == source_keys.len() && metas.len() == source_keys.len() {
+                    for ((src_key, key_val), &(grid_thw, token_count)) in
+                        source_keys.iter().zip(resident_keys).zip(metas)
+                    {
+                        if let (Some(src), Some(key_hex)) = (*src_key, key_val.as_str()) {
+                            if !key_hex.is_empty() {
+                                cache.insert(
+                                    src,
+                                    CachedSourceMeta {
+                                        item_key_hex: key_hex.to_owned(),
+                                        grid_thw,
+                                        token_count,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Enqueue an execute command to the native runtime and await its receipt or cancellation.
+    async fn send_and_await_execute(
+        &self,
+        rid: &str,
+        command: Value,
+        binary_frame: Option<Bytes>,
+        cancelled: &mut watch::Receiver<bool>,
+        owner: &Arc<EncodeOwner>,
+    ) -> (PendingReply, bool) {
         let header_bytes = serde_json::to_vec(&command)
             .map(|bytes| bytes.len().saturating_add(32))
             .unwrap_or(usize::MAX);
         if header_bytes > self.config.max_control_bytes {
-            self.release_owner(&rid);
-            drop(permit);
-            self.native.notify_forget(&rid);
-            owner.result.send_replace(Some(Err(Status::invalid_argument(
-                "serialized native encoder command exceeds max_control_bytes",
-            ))));
-            return;
+            return (
+                Err(NativeCallError::NotSent(Status::invalid_argument(
+                    "serialized native encoder command exceeds max_control_bytes",
+                ))),
+                false,
+            );
         }
-        // Enqueue `execute` on the FIFO command channel before racing `cancel`, so Python
-        // always observes `execute` before any subsequent `cancel` for the same `rid`.
         let mut timed_out_sent = false;
-        let receipt: PendingReply = match self.native.enqueue(command, Some(artifact.bytes)).await {
+        let receipt: PendingReply = match self.native.enqueue(command, binary_frame).await {
             Ok((_pending, rx)) => {
                 let mut exec = std::pin::pin!(async move {
                     rx.await.map_err(|_| {
@@ -733,8 +929,8 @@ impl EncoderRuntime {
                 });
                 let timed = tokio::select! {
                     receipt = &mut exec => Ok(receipt),
-                    () = wait_cancel(&mut cancelled, owner.deadline) => {
-                        self.native.send_cancel(&rid).await;
+                    () = wait_cancel(cancelled, owner.deadline) => {
+                        self.native.send_cancel(rid).await;
                         tokio::time::timeout(self.cancel_grace, &mut exec).await
                     }
                 };
@@ -764,10 +960,294 @@ impl EncoderRuntime {
             }
             Err(error) => Err(error),
         };
-        if let Err(NativeCallError::NotSent(error)) = receipt {
+        (receipt, timed_out_sent)
+    }
+
+    /// Run bounded CPU preprocessing, dispatch native execution, and retain permits until `released=true`.
+    async fn execute(
+        self: Arc<Self>,
+        request: EncodeRequest,
+        modality: EncoderModality,
+        owner: Arc<EncodeOwner>,
+    ) {
+        let mut cancelled = owner.cancel.subscribe();
+        let EncodeRequest {
+            req_id: rid,
+            mm_items: raw_items,
+            num_parts,
+            part_idx,
+            prefill_host,
+            item_options: options,
+            ..
+        } = request;
+        let item_count = raw_items.len();
+        let permit = tokio::select! {
+            biased;
+            () = wait_cancel(&mut cancelled, owner.deadline) => None,
+            permit = self.execution.clone().acquire_owned() => permit.ok(),
+        };
+        if permit.is_none() {
             self.release_owner(&rid);
-            drop(permit);
             self.native.notify_forget(&rid);
+            let status = if *owner.cancel.borrow() {
+                Status::cancelled("encoder cancelled before execution")
+            } else {
+                Status::deadline_exceeded("encoder timed out waiting for execution slot")
+            };
+            owner.result.send_replace(Some(Err(status)));
+            return;
+        }
+        let items: Vec<EncoderMediaItem> = raw_items
+            .into_iter()
+            .enumerate()
+            .map(|(index, url)| {
+                let option = options.get(index);
+                EncoderMediaItem {
+                    url,
+                    detail: option.and_then(|o| (!o.detail.is_empty()).then(|| o.detail.clone())),
+                }
+            })
+            .collect();
+
+        let can_pre_decode_cache =
+            modality == EncoderModality::Image && self.config.capabilities.tp_size == 1;
+        let source_keys: Vec<Option<[u8; 32]>> = if can_pre_decode_cache {
+            items
+                .iter()
+                .map(|item| compute_source_key(modality, item))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // Fast path: if every item is a known warm-cache hit, skip Rust decode/preprocess and
+        // pixel IPC altogether. If Python reports a race eviction (`cache_miss=true`), fall
+        // through seamlessly to the normal decode path under the same owner and permit.
+        let cached_hit = if can_pre_decode_cache {
+            self.pre_decode_cache
+                .lock()
+                .ok()
+                .and_then(|cache| cache.lookup_all(&source_keys))
+        } else {
+            None
+        };
+        if let Some(PreDecodeHit {
+            item_keys: hit_keys,
+            grid_thw: hit_grids,
+            token_counts: hit_counts,
+            embedding_tokens: hit_tokens,
+        }) = cached_hit
+        {
+            owner.running.store(true, Ordering::Release);
+            let remaining_ms = owner
+                .deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis() as u64;
+            if *owner.cancel.borrow() || remaining_ms == 0 {
+                self.release_owner(&rid);
+                drop(permit);
+                self.native.notify_forget(&rid);
+                let status = if *owner.cancel.borrow() {
+                    Status::cancelled("encoder cancelled before cache hit dispatch")
+                } else {
+                    Status::deadline_exceeded("encoder expired before cache hit dispatch")
+                };
+                owner.result.send_replace(Some(Err(status)));
+                return;
+            }
+            let (receipt, timed_out_sent) = self
+                .send_and_await_execute(
+                    &rid,
+                    serde_json::json!({
+                        "operation": "execute",
+                        "rid": rid,
+                        "prefill_host": prefill_host,
+                        "remaining_ms": remaining_ms,
+                        "image_count": item_count,
+                        "item_count": item_count,
+                        "modality": modality.as_str(),
+                        "num_parts": num_parts,
+                        "part_idx": part_idx,
+                        "embedding_tokens": hit_tokens,
+                        "artifact_v2": {
+                            "kind": "cache_hit",
+                            "item_keys": hit_keys,
+                            "grid_thw": hit_grids,
+                            "token_counts": hit_counts,
+                        },
+                    }),
+                    None,
+                    &mut cancelled,
+                    &owner,
+                )
+                .await;
+            let is_cache_miss_retry = !timed_out_sent
+                && receipt.as_ref().is_ok_and(|val| {
+                    val.get("released").and_then(Value::as_bool) == Some(true)
+                        && val.get("cache_miss").and_then(Value::as_bool) == Some(true)
+                });
+            if is_cache_miss_retry {
+                if let Ok(ref val) = receipt {
+                    if let Ok(mut cache) = self.pre_decode_cache.lock() {
+                        if let Some(evicted) = val.get("cache_evicted").and_then(Value::as_array) {
+                            cache.evict_item_keys(evicted.iter().filter_map(Value::as_str));
+                        } else {
+                            cache.evict_item_keys(hit_keys.iter().map(String::as_str));
+                        }
+                    }
+                }
+                if *owner.cancel.borrow() || Instant::now() >= owner.deadline {
+                    self.release_owner(&rid);
+                    drop(permit);
+                    self.native.notify_forget(&rid);
+                    let status = if *owner.cancel.borrow() {
+                        Status::cancelled("encoder cancelled after cache miss")
+                    } else {
+                        Status::deadline_exceeded("encoder expired after cache miss")
+                    };
+                    owner.result.send_replace(Some(Err(status)));
+                    return;
+                }
+            } else {
+                if let Ok(ref val) = receipt {
+                    if val.get("released").and_then(Value::as_bool) == Some(true) {
+                        self.apply_cache_feedback(val, &source_keys, None);
+                    }
+                }
+                self.finish_execute(&rid, permit, &owner, receipt, timed_out_sent);
+                return;
+            }
+        }
+
+        let prepared = async {
+            let cpu = tokio::select! {
+                biased;
+                () = wait_cancel(&mut cancelled, owner.deadline) => {
+                    return Err(if *owner.cancel.borrow() {
+                        Status::cancelled("encoder cancelled while waiting for CPU")
+                    } else {
+                        Status::deadline_exceeded("encoder timed out waiting for CPU")
+                    });
+                }
+                permit = self.cpu.clone().acquire_owned() => permit
+                    .map_err(|_| Status::unavailable("encoder CPU supply closed"))?,
+            };
+            owner.running.store(true, Ordering::Release);
+            if *owner.cancel.borrow() {
+                return Err(Status::cancelled("encoder cancelled before preprocessing"));
+            }
+            if Instant::now() >= owner.deadline {
+                return Err(Status::deadline_exceeded(
+                    "encoder expired before preprocessing",
+                ));
+            }
+            let artifact = (self.processor)(modality, items).await;
+            self.release_queued_control(&owner);
+            drop(cpu);
+            let artifact = artifact?;
+            let remaining_ms = owner
+                .deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis() as u64;
+            if *owner.cancel.borrow() {
+                return Err(Status::cancelled("encoder cancelled after preprocessing"));
+            }
+            if remaining_ms == 0 {
+                return Err(Status::deadline_exceeded(
+                    "encoder expired after preprocessing",
+                ));
+            }
+            Ok((artifact, remaining_ms))
+        }
+        .await;
+        let (artifact, remaining_ms) = match prepared {
+            Ok(ready) => ready,
+            Err(error) => {
+                self.release_owner(&rid);
+                drop(permit);
+                self.native.notify_forget(&rid);
+                owner.result.send_replace(Some(Err(error)));
+                return;
+            }
+        };
+
+        let mut command = serde_json::json!({
+            "operation": "execute",
+            "rid": rid,
+            "prefill_host": prefill_host,
+            "remaining_ms": remaining_ms,
+            "image_count": item_count,
+            "item_count": item_count,
+            "modality": modality.as_str(),
+            "num_parts": num_parts,
+            "part_idx": part_idx,
+            "embedding_tokens": artifact.embedding_tokens,
+        });
+        let (binary_frame, _shm_guard, compact_item_metas) = match artifact.payload {
+            EncoderPayload::LegacyProto(bytes) => (Some(bytes), None, None),
+            EncoderPayload::Compact {
+                batches,
+                shm_name,
+                shm_nbytes,
+                shm_guard,
+                inline_pixels,
+            } => {
+                let metas = if can_pre_decode_cache {
+                    let flat: Vec<([i64; 3], u32)> = batches
+                        .iter()
+                        .filter(|b| b.grid_thw.len() == b.placeholder_lengths.len())
+                        .flat_map(|b| {
+                            b.grid_thw
+                                .iter()
+                                .copied()
+                                .zip(b.placeholder_lengths.iter().copied())
+                        })
+                        .collect();
+                    (flat.len() == item_count).then_some(flat)
+                } else {
+                    None
+                };
+                if let Some(fields) = command.as_object_mut() {
+                    fields.insert(
+                        "artifact_v2".into(),
+                        serde_json::json!({
+                            "kind": "compact",
+                            "shm_name": shm_name,
+                            "shm_nbytes": shm_nbytes,
+                            "batches": batches,
+                        }),
+                    );
+                }
+                (inline_pixels, shm_guard, metas)
+            }
+        };
+
+        // Enqueue `execute` on the FIFO command channel before racing `cancel`, so Python
+        // always observes `execute` before any subsequent `cancel` for the same `rid`.
+        let (receipt, timed_out_sent) = self
+            .send_and_await_execute(&rid, command, binary_frame, &mut cancelled, &owner)
+            .await;
+        if let Ok(ref val) = receipt {
+            if val.get("released").and_then(Value::as_bool) == Some(true) {
+                self.apply_cache_feedback(val, &source_keys, compact_item_metas.as_deref());
+            }
+        }
+        self.finish_execute(&rid, permit, &owner, receipt, timed_out_sent);
+    }
+
+    /// Finalize an encode execution, releasing admission state and publishing the result.
+    fn finish_execute(
+        &self,
+        rid: &str,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        owner: &Arc<EncodeOwner>,
+        receipt: PendingReply,
+        timed_out_sent: bool,
+    ) {
+        if let Err(NativeCallError::NotSent(error)) = receipt {
+            self.release_owner(rid);
+            drop(permit);
+            self.native.notify_forget(rid);
             if !timed_out_sent {
                 owner.result.send_replace(Some(Err(error)));
             }
@@ -787,7 +1267,7 @@ impl EncoderRuntime {
             Err(error) => Err(error.into_status()),
         };
         if safe {
-            self.release_owner(&rid);
+            self.release_owner(rid);
             drop(permit);
         } else {
             self.draining.store(true, Ordering::Release);
@@ -808,7 +1288,7 @@ impl EncoderRuntime {
         }
     }
 
-    /// Stop admitting new requests and signal cancellation to every active encoder owner.
+    /// Begin draining active requests and reject new admissions.
     pub fn drain(&self) {
         self.draining.store(true, Ordering::Release);
         if let Ok(ledger) = self.owners.lock() {
@@ -870,6 +1350,7 @@ impl EncoderService {
 
 #[tonic::async_trait]
 impl ep::sglang_encoder_server::SglangEncoder for EncoderService {
+    /// Admit an encode RPC, spawn an independent execution owner, and observe its outcome.
     async fn encode(
         &self,
         request: Request<EncodeRequest>,
@@ -1062,7 +1543,7 @@ impl EncoderServer {
                 let link = NativeEncoderLink::bind(
                     &config.native_commands,
                     &config.native_events,
-                    config.max_active * 16,
+                    config.max_active.saturating_mul(16).clamp(64, 65536),
                 )
                 .await
                 .map_err(|error| error.to_string())?;

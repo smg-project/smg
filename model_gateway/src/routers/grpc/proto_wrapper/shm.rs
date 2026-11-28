@@ -71,43 +71,93 @@ pub fn mm_shm_dev_writable() -> bool {
 /// behind by a *previous* SMG process that crashed between writing a segment and
 /// the consumer unlinking it. Files are named `smg-tokenspeed-<pid>-...`; we only
 /// remove those whose producer pid is no longer alive (and never our own).
-fn sweep_orphan_tokenspeed_shm_once() {
-    static SWEEP: OnceLock<()> = OnceLock::new();
-    SWEEP.get_or_init(|| {
-        let dir = Path::new("/dev/shm");
-        let Ok(entries) = read_dir(dir) else {
-            return;
+/// Minimum age before a `/proc/<pid>`-missing `/dev/shm` segment is treated as orphaned,
+/// preventing cross-PID-namespace (`--ipc=host` / `hostIPC`) neighbors from unlinking live
+/// in-flight segments belonging to another container.
+const ORPHAN_SHM_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Rate-limited sweep of orphaned `/dev/shm` segments for `prefix`, running at most once
+/// every `ORPHAN_SHM_MIN_AGE` seconds so quick crash-restarts still reclaim orphans once
+/// they age past the cross-namespace safety window.
+fn sweep_orphans_in_dir(
+    dir: &Path,
+    prefix: &str,
+    last_sweep_secs: &AtomicU64,
+    now: SystemTime,
+    label: &str,
+) -> bool {
+    let now_secs = now
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let min_interval = ORPHAN_SHM_MIN_AGE.as_secs();
+    let prev = last_sweep_secs.load(Ordering::Relaxed);
+    if prev != 0 && now_secs.saturating_sub(prev) < min_interval {
+        return false;
+    }
+    let claim = now_secs.max(1);
+    if last_sweep_secs
+        .compare_exchange(prev, claim, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
+        return false;
+    }
+    let Ok(entries) = read_dir(dir) else {
+        return true;
+    };
+    let my_pid = process::id();
+    let mut removed = 0u32;
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
         };
-        let my_pid = process::id();
-        let mut removed = 0u32;
-        for entry in entries.flatten() {
-            let file_name = entry.file_name();
-            let Some(name) = file_name.to_str() else {
-                continue;
-            };
-            let Some(rest) = name.strip_prefix("smg-tokenspeed-") else {
-                continue;
-            };
-            // pid is the first '-'-separated field after the prefix.
-            let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<u32>().ok()) else {
-                continue;
-            };
-            // Skip our own files and any still-live producer (pid recycling is a
-            // safe miss: we just keep the file rather than risk deleting a live one).
-            if pid == my_pid || Path::new(&format!("/proc/{pid}")).exists() {
-                continue;
-            }
-            if remove_file(dir.join(name)).is_ok() {
-                removed += 1;
-            }
+        let Some(rest) = name.strip_prefix(prefix) else {
+            continue;
+        };
+        // pid is the first '-'-separated field after the prefix.
+        let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<u32>().ok()) else {
+            continue;
+        };
+        // Skip our own files and any still-live producer (pid recycling is a
+        // safe miss: we just keep the file rather than risk deleting a live one).
+        if pid == my_pid || Path::new(&format!("/proc/{pid}")).exists() {
+            continue;
         }
-        if removed > 0 {
-            tracing::warn!(
-                count = removed,
-                "Swept orphaned TokenSpeed SHM files from dead producer processes"
-            );
+        // In shared `/dev/shm` across PID namespaces (`--ipc=host` / k8s `hostIPC`),
+        // a live sibling container's PID is absent from our `/proc`; skip recent files.
+        let stale = entry
+            .metadata()
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|mtime| now.duration_since(mtime).ok())
+            .is_some_and(|age| age >= ORPHAN_SHM_MIN_AGE);
+        if !stale {
+            continue;
         }
-    });
+        if remove_file(dir.join(name)).is_ok() {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        tracing::warn!(
+            count = removed,
+            kind = label,
+            "Swept orphaned SHM files from dead producer processes"
+        );
+    }
+    true
+}
+
+fn sweep_orphan_tokenspeed_shm() {
+    static LAST_SWEEP_SECS: AtomicU64 = AtomicU64::new(0);
+    sweep_orphans_in_dir(
+        Path::new("/dev/shm"),
+        TOKENSPEED_SHM_NAME_PREFIX,
+        &LAST_SWEEP_SECS,
+        SystemTime::now(),
+        "tokenspeed",
+    );
 }
 
 // TODO: pack all of a request's tensors (encoder_input + model_specific) into
@@ -124,7 +174,7 @@ pub fn write_tokenspeed_shm_with(
     nbytes: usize,
     write_fn: impl FnOnce(&mut [u8]) -> std::io::Result<()>,
 ) -> std::io::Result<common::ShmHandle> {
-    sweep_orphan_tokenspeed_shm_once();
+    sweep_orphan_tokenspeed_shm();
     let name = next_tokenspeed_shm_name();
     let path = tokenspeed_shm_path(&name);
     // create_new (no clobber) + owner-only mode in world-writable /dev/shm.
@@ -403,6 +453,111 @@ fn collect_vllm_tensor_shm_handles(
 /// (see [`next_tokenspeed_shm_name`]). Cleanup only ever unlinks names
 /// carrying this prefix so it cannot remove unrelated `/dev/shm` entries.
 const TOKENSPEED_SHM_NAME_PREFIX: &str = "smg-tokenspeed-";
+const EPD_SHM_NAME_PREFIX: &str = "smg-epd-";
+static EPD_SHM_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// RAII handle for a `/dev/shm` segment carrying preprocessed EPD pixel tensors.
+/// Unlinks the segment on drop unless ownership was explicitly transferred via [`Self::into_parts`].
+#[derive(Debug)]
+pub struct EpdShmGuard {
+    name: String,
+    path: Option<PathBuf>,
+    nbytes: usize,
+}
+
+impl EpdShmGuard {
+    /// Return the segment basename under `/dev/shm`.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Return the allocated payload size in bytes.
+    pub fn nbytes(&self) -> usize {
+        self.nbytes
+    }
+
+    /// Transfer ownership of the `/dev/shm` file to another guard (disarming local unlink-on-drop).
+    pub fn into_parts(mut self) -> (String, PathBuf, usize) {
+        let path = self
+            .path
+            .take()
+            .unwrap_or_else(|| tokenspeed_shm_path(&self.name));
+        (self.name.clone(), path, self.nbytes)
+    }
+}
+
+impl Drop for EpdShmGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = remove_file(&path);
+        }
+    }
+}
+
+/// Periodically remove aged orphaned `smg-epd-*` segments left behind by dead producer PIDs.
+fn sweep_orphan_epd_shm() {
+    static LAST_SWEEP_SECS: AtomicU64 = AtomicU64::new(0);
+    sweep_orphans_in_dir(
+        Path::new("/dev/shm"),
+        EPD_SHM_NAME_PREFIX,
+        &LAST_SWEEP_SECS,
+        SystemTime::now(),
+        "epd",
+    );
+}
+
+/// Allocate a unique `/dev/shm` segment basename prefixed with `smg-epd-`.
+fn next_epd_shm_name() -> String {
+    let seq = EPD_SHM_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("{}{}-{}-{}", EPD_SHM_NAME_PREFIX, process::id(), nanos, seq)
+}
+
+/// Create a private `/dev/shm/smg-epd-...` segment, write `nbytes` directly into its mapping,
+/// and return an RAII [`EpdShmGuard`] that unlinks the segment on error or cancellation.
+#[expect(
+    unsafe_code,
+    reason = "mapping a new, exclusively owned, fixed-length EPD SHM file"
+)]
+pub fn write_epd_shm_with(
+    nbytes: usize,
+    write_fn: impl FnOnce(&mut [u8]) -> std::io::Result<()>,
+) -> std::io::Result<EpdShmGuard> {
+    sweep_orphan_epd_shm();
+    let name = next_epd_shm_name();
+    let path = tokenspeed_shm_path(&name);
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = opts.open(&path)?;
+    let result = if nbytes == 0 {
+        write_fn(&mut [])
+    } else {
+        reserve_tokenspeed_shm_file(&file, nbytes).and_then(|()| {
+            // SAFETY: this process exclusively owns the newly created file,
+            // reserves its full length before mapping, and does not expose or
+            // truncate it until the callback and mapping have both dropped.
+            let mut mapping = unsafe { MmapOptions::new().len(nbytes).map_mut(&file)? };
+            write_fn(&mut mapping)
+        })
+    };
+    if let Err(error) = result {
+        let _ = remove_file(&path);
+        return Err(error);
+    }
+    Ok(EpdShmGuard {
+        name,
+        path: Some(path),
+        nbytes,
+    })
+}
 
 fn validate_tokenspeed_shm_name_for_cleanup(name: &str) -> Option<&str> {
     let name = name.strip_prefix('/').unwrap_or(name);
@@ -434,4 +589,55 @@ fn next_tokenspeed_shm_name() -> String {
 
 pub(super) fn tokenspeed_shm_path(name: &str) -> PathBuf {
     PathBuf::from("/dev/shm").join(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn orphan_shm_sweep_rate_limits_and_reclaims_aged_files_after_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        // Use an impossible PID (u32::MAX) guaranteed absent from /proc.
+        let orphan = dir
+            .path()
+            .join(format!("{EPD_SHM_NAME_PREFIX}{}-0-0", u32::MAX));
+        std::fs::write(&orphan, b"stale-payload").unwrap();
+
+        let last_sweep = AtomicU64::new(0);
+        let t0 = SystemTime::now();
+        // First sweep right after restart runs, but skips the fresh file (< 600s old).
+        assert!(sweep_orphans_in_dir(
+            dir.path(),
+            EPD_SHM_NAME_PREFIX,
+            &last_sweep,
+            t0,
+            "epd",
+        ));
+        assert!(orphan.exists());
+
+        // Subsequent sweep inside the 600s window is rate-limited (no directory scan).
+        let t_mid = t0 + Duration::from_secs(300);
+        assert!(!sweep_orphans_in_dir(
+            dir.path(),
+            EPD_SHM_NAME_PREFIX,
+            &last_sweep,
+            t_mid,
+            "epd",
+        ));
+        assert!(orphan.exists());
+
+        // Once the 600s window elapses, the sweeper runs again and reclaims the aged orphan.
+        let t_later = t0 + ORPHAN_SHM_MIN_AGE + Duration::from_secs(5);
+        assert!(sweep_orphans_in_dir(
+            dir.path(),
+            EPD_SHM_NAME_PREFIX,
+            &last_sweep,
+            t_later,
+            "epd",
+        ));
+        assert!(!orphan.exists());
+    }
 }

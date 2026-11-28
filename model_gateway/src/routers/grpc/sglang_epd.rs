@@ -1,5 +1,6 @@
 //! SGLang metadata adaptation; membership, placement and admission belong to SMG.
 use std::{
+    collections::HashSet,
     future::Future,
     sync::Arc,
     time::{Duration, Instant},
@@ -69,6 +70,48 @@ impl PrepareError {
             }
         }
     }
+}
+
+/// Per-encoder in-flight load threshold below which multi-image prompts fan out across
+/// distinct encoders. Once encoders are saturated at or above this load, prompts collapse
+/// onto a single encoder to avoid multiplying RPC/RDMA/admission overhead.
+pub(crate) const FANOUT_MAX_ENCODER_LOAD: usize = 2;
+
+/// Start index of each contiguous chunk when partitioning `num_items` items across
+/// `num_chunks` encoders (`1 <= num_chunks <= num_items`).
+pub(crate) fn chunk_anchor_indices(num_items: usize, num_chunks: usize) -> Vec<usize> {
+    if num_items == 0 || num_chunks == 0 {
+        return Vec::new();
+    }
+    let chunks = num_chunks.min(num_items);
+    let base = num_items / chunks;
+    let rem = num_items % chunks;
+    (0..chunks).map(|c| c * base + c.min(rem)).collect()
+}
+
+/// Balanced contiguous chunk lengths summing to `num_items` across `num_chunks` parts.
+fn partition_counts(num_items: usize, num_chunks: usize) -> Vec<usize> {
+    if num_items == 0 || num_chunks == 0 {
+        return Vec::new();
+    }
+    let chunks = num_chunks.min(num_items);
+    let base = num_items / chunks;
+    let rem = num_items % chunks;
+    (0..chunks).map(|c| base + usize::from(c < rem)).collect()
+}
+
+/// Compute a deterministic SHA-256 routing digest for one media item and its OpenAI detail level.
+fn item_digest(item: &vllm::MediaRef, detail: Option<ImageDetail>) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(item.modality.to_le_bytes());
+    hasher.update((item.url.len() as u64).to_le_bytes());
+    hasher.update(item.url.as_bytes());
+    hasher.update([match detail {
+        None | Some(ImageDetail::Auto) => 0,
+        Some(ImageDetail::Low) => 1,
+        Some(ImageDetail::High) => 2,
+    }]);
+    hasher.finalize().to_vec()
 }
 
 /// Tonic URIs use HTTP schemes; SMG registration uses a plain `grpc://` hint.
@@ -155,7 +198,7 @@ pub(crate) fn pipeline_ready(
 pub(crate) struct PreparedInput {
     refs: vllm::MediaRefs,
     details: Vec<Option<ImageDetail>>,
-    digest: Vec<u8>,
+    digests: Vec<Vec<u8>>,
     deadline: Instant,
 }
 
@@ -204,30 +247,27 @@ pub(crate) fn prepare(ctx: &RequestContext) -> Result<Option<PreparedInput>, Pre
             "managed media references exceed the 255 MiB control payload limit",
         )));
     }
-    // Hash media references and detail options into a single prompt routing key.
-    let mut hasher = Sha256::new();
-    for (item, detail) in refs.items.iter().zip(&details) {
-        hasher.update(item.modality.to_le_bytes());
-        hasher.update((item.url.len() as u64).to_le_bytes());
-        hasher.update(item.url.as_bytes());
-        hasher.update([match detail {
-            None | Some(ImageDetail::Auto) => 0,
-            Some(ImageDetail::Low) => 1,
-            Some(ImageDetail::High) => 2,
-        }]);
-    }
+    // Compute deterministic per-item routing digests (including standard OpenAI detail)
+    // so single-item prompts keep exact cache affinity while multi-item prompts can fan out
+    // contiguous chunks across distinct lightly-loaded encoders.
+    let digests: Vec<Vec<u8>> = refs
+        .items
+        .iter()
+        .zip(&details)
+        .map(|(item, detail)| item_digest(item, *detail))
+        .collect();
     Ok(Some(PreparedInput {
         refs,
         details,
-        digest: hasher.finalize().to_vec(),
+        digests,
         deadline: Instant::now() + PREPARED_TIMEOUT,
     }))
 }
 
 impl PreparedInput {
-    /// Whole-prompt assignment preserves occurrence order and native batching.
+    /// Per-item routing hashes in prompt occurrence order.
     pub(crate) fn hashes(&self) -> Vec<Vec<u8>> {
-        vec![self.digest.clone()]
+        self.digests.clone()
     }
 
     /// Freeze the workers already chosen by the common EPD policies and populate prepared metadata.
@@ -242,29 +282,41 @@ impl PreparedInput {
         let decode = workers
             .decode_worker()
             .ok_or_else(|| Status::internal("missing D"))?;
-        let encoder = &workers
+        let assignments = workers
             .encode_assignments()
-            .and_then(|a| a.first())
-            .ok_or_else(|| Status::unavailable("missing E"))?
-            .worker;
+            .filter(|a| !a.is_empty())
+            .ok_or_else(|| Status::unavailable("missing E"))?;
         let p = capability(prefill.as_ref())
             .ok_or_else(|| Status::unavailable("missing P capability"))?;
         let d = capability(decode.as_ref())
             .ok_or_else(|| Status::unavailable("missing D capability"))?;
-        let e = capability(encoder.as_ref())
-            .ok_or_else(|| Status::unavailable("missing E capability"))?;
-        if !compatible_pair(
-            encoder.as_ref(),
-            &e,
-            prefill.as_ref(),
-            &p,
-            decode.as_ref(),
-            &d,
-        ) {
-            return Err(Status::failed_precondition(
-                "selected prepared-input contracts differ",
-            ));
+
+        // Deduplicate selected encoders while preserving assignment order and verify every
+        // encoder's managed contract against P and D.
+        let mut seen_urls = HashSet::with_capacity(assignments.len());
+        let mut selected_encoders: Vec<(Arc<dyn Worker>, proto::Capabilities)> =
+            Vec::with_capacity(assignments.len());
+        for assignment in assignments {
+            if !seen_urls.insert(assignment.worker.url().to_owned()) {
+                continue;
+            }
+            let e = capability(assignment.worker.as_ref())
+                .ok_or_else(|| Status::unavailable("missing E capability"))?;
+            if !compatible_pair(
+                assignment.worker.as_ref(),
+                &e,
+                prefill.as_ref(),
+                &p,
+                decode.as_ref(),
+                &d,
+            ) {
+                return Err(Status::failed_precondition(
+                    "selected prepared-input contracts differ",
+                ));
+            }
+            selected_encoders.push((Arc::clone(&assignment.worker), e));
         }
+
         let remaining = self
             .deadline
             .checked_duration_since(Instant::now())
@@ -298,32 +350,78 @@ impl PreparedInput {
                 image_details.push(detail);
             }
         }
-        let image_count = image_urls.len() as u32;
-        let video_count = video_urls.len() as u32;
-        let num_parts = u32::from(!image_urls.is_empty()) + u32::from(!video_urls.is_empty());
-        let mut requests = Vec::with_capacity(num_parts as usize);
-        let push_part = |requests: &mut Vec<EncodeRequest>,
-                         modality: &str,
-                         mm_items: Vec<String>,
-                         item_options: Vec<ImageOption>| {
-            let part_idx = requests.len() as u32;
-            requests.push(EncodeRequest {
-                req_id: format!("{prefill_rid}_local_part_{part_idx}"),
-                mm_items,
-                num_parts,
-                part_idx,
-                prefill_host: p.bootstrap_host.clone(),
-                embedding_port: vec![],
-                item_options,
-                modality: modality.into(),
-            });
-        };
-        if !image_urls.is_empty() {
-            let has_options = image_details
+        let total_images = image_urls.len();
+        let total_videos = video_urls.len();
+
+        // Partition each modality contiguously across selected encoders in ascending encoder
+        // index order, matching SGLang receiver.py's part_idx reassembly order verbatim.
+        let num_encoders = selected_encoders.len();
+        let mut image_counts = vec![0usize; num_encoders];
+        if total_images > 0 {
+            for (idx, count) in partition_counts(total_images, num_encoders)
+                .into_iter()
+                .enumerate()
+            {
+                image_counts[idx] = count;
+            }
+        }
+        let k_img = total_images.min(num_encoders);
+        let mut video_counts = vec![0usize; num_encoders];
+        if total_videos > 0 {
+            if total_videos == 1 && k_img < num_encoders {
+                // Single video paired with fewer image parts than encoders: place on an unused
+                // encoder so image and video encode concurrently while preserving modality order.
+                video_counts[k_img] = 1;
+            } else {
+                for (idx, count) in partition_counts(total_videos, num_encoders)
+                    .into_iter()
+                    .enumerate()
+                {
+                    video_counts[idx] = count;
+                }
+            }
+        }
+
+        // Drop any selected encoder that received zero items so encoder_urls stays compact.
+        let mut active_encoders = Vec::with_capacity(num_encoders);
+        let mut active_image_counts = Vec::with_capacity(num_encoders);
+        let mut active_video_counts = Vec::with_capacity(num_encoders);
+        for idx in 0..num_encoders {
+            if image_counts[idx] > 0 || video_counts[idx] > 0 {
+                active_encoders.push(selected_encoders[idx].clone());
+                active_image_counts.push(image_counts[idx] as u32);
+                active_video_counts.push(video_counts[idx] as u32);
+            }
+        }
+        if active_encoders.is_empty() {
+            return Err(Status::invalid_argument(
+                "prepared input has no media items",
+            ));
+        }
+
+        let num_parts = (active_image_counts.iter().filter(|&&c| c > 0).count()
+            + active_video_counts.iter().filter(|&&c| c > 0).count())
+            as u32;
+        let mut parts = Vec::with_capacity(num_parts as usize);
+
+        // Emit image parts first (part_idx 0..k_img-1), then video parts, in ascending
+        // active_encoders order so SGLang's WaitingRDMARequest / WaitingZmqRequest matches
+        // every part_idx and concatenates items in exact prompt occurrence order.
+        let mut image_urls_iter = image_urls.into_iter();
+        let mut img_offset = 0usize;
+        for (idx, &count_u32) in active_image_counts.iter().enumerate() {
+            let count = count_u32 as usize;
+            if count == 0 {
+                continue;
+            }
+            let chunk_items: Vec<String> = image_urls_iter.by_ref().take(count).collect();
+            let chunk_details = &image_details[img_offset..img_offset + count];
+            img_offset += count;
+            let has_options = chunk_details
                 .iter()
                 .any(|detail| matches!(detail, Some(ImageDetail::Low | ImageDetail::High)));
             let item_options = if has_options {
-                image_details
+                chunk_details
                     .iter()
                     .map(|detail| ImageOption {
                         detail: match detail {
@@ -338,49 +436,133 @@ impl PreparedInput {
             } else {
                 Vec::new()
             };
-            push_part(&mut requests, "image", image_urls, item_options);
+            let part_idx = parts.len() as u32;
+            let worker = Arc::clone(&active_encoders[idx].0);
+            parts.push(NativeEncodePart {
+                request: EncodeRequest {
+                    req_id: format!("{prefill_rid}_local_part_{part_idx}"),
+                    mm_items: chunk_items,
+                    num_parts,
+                    part_idx,
+                    prefill_host: p.bootstrap_host.clone(),
+                    embedding_port: vec![],
+                    item_options,
+                    modality: "image".into(),
+                },
+                // Hold a load guard per dispatched part so bounded-load encoder policies
+                // observe exact in-flight encode concurrency on every selected encoder.
+                _load_guard: WorkerLoadGuard::with_key(Arc::clone(&worker), None),
+                worker,
+            });
         }
-        if !video_urls.is_empty() {
-            push_part(&mut requests, "video", video_urls, Vec::new());
+
+        let mut video_urls_iter = video_urls.into_iter();
+        for (idx, &count_u32) in active_video_counts.iter().enumerate() {
+            let count = count_u32 as usize;
+            if count == 0 {
+                continue;
+            }
+            let chunk_items: Vec<String> = video_urls_iter.by_ref().take(count).collect();
+            let part_idx = parts.len() as u32;
+            let worker = Arc::clone(&active_encoders[idx].0);
+            parts.push(NativeEncodePart {
+                request: EncodeRequest {
+                    req_id: format!("{prefill_rid}_local_part_{part_idx}"),
+                    mm_items: chunk_items,
+                    num_parts,
+                    part_idx,
+                    prefill_host: p.bootstrap_host.clone(),
+                    embedding_port: vec![],
+                    item_options: Vec::new(),
+                    modality: "video".into(),
+                },
+                _load_guard: WorkerLoadGuard::with_key(Arc::clone(&worker), None),
+                worker,
+            });
         }
+
         tracing::debug!(
             logical_request_id = %generation.request_id,
             prefill_rid = %prefill_rid,
             decode_rid = %decode_rid,
             num_parts,
+            num_encoders = active_encoders.len(),
             bootstrap_room = params.bootstrap_room,
             "Prepared EPD plan request mapping"
         );
+        let (encoder_receive_endpoints, encoder_image_counts, encoder_video_counts) =
+            if active_encoders.len() > 1 {
+                (
+                    active_encoders
+                        .iter()
+                        .map(|(_, cap)| cap.receive_endpoint.clone())
+                        .collect(),
+                    if total_images == 0 {
+                        Vec::new()
+                    } else {
+                        active_image_counts
+                    },
+                    if total_videos == 0 {
+                        Vec::new()
+                    } else {
+                        active_video_counts
+                    },
+                )
+            } else {
+                (Vec::new(), Vec::new(), Vec::new())
+            };
         generation.prepared_control = proto::PrefillStart {
             version: VERSION,
             timeout_ms: remaining.as_millis() as u64,
             binding: Some(binding),
-            encoder_receive_endpoint: e.receive_endpoint,
-            image_count,
-            video_count,
+            encoder_receive_endpoint: active_encoders[0].1.receive_endpoint.clone(),
+            image_count: total_images as u32,
+            video_count: total_videos as u32,
+            encoder_receive_endpoints,
+            encoder_image_counts,
+            encoder_video_counts,
         }
         .encode_to_vec();
         generation.mm_inputs = None;
         generation.extra_mm_inputs.clear();
         Ok(NativeEncode {
-            worker: Arc::clone(encoder),
-            requests,
+            parts,
             timeout: remaining,
             deadline: tokio::time::Instant::from_std(self.deadline),
-            // Hold a load guard for the full lifetime of the encode RPC so load-aware
-            // encoder policies observe in-flight encode concurrency in real time.
-            _load_guard: WorkerLoadGuard::with_key(Arc::clone(encoder), None),
         })
     }
 }
 
-/// One prompt is assigned to one native encoder, using its cached worker connection.
-pub(crate) struct NativeEncode {
+/// One encode part assigned to one native encoder, holding its worker load guard until
+/// the RPC completes or is cancelled.
+pub(crate) struct NativeEncodePart {
     worker: Arc<dyn Worker>,
-    requests: Vec<EncodeRequest>,
+    request: EncodeRequest,
+    _load_guard: WorkerLoadGuard,
+}
+
+/// Prepared native encode plan spanning one or more encoders; dropping the dispatch future
+/// cancels all in-flight RPCs and releases every encoder's load guard.
+pub(crate) struct NativeEncode {
+    parts: Vec<NativeEncodePart>,
     timeout: Duration,
     deadline: tokio::time::Instant,
-    _load_guard: WorkerLoadGuard,
+}
+
+/// Dispatch one native encode part to its assigned SGLang encoder worker while holding its load guard.
+async fn dispatch_encode_part(part: NativeEncodePart, timeout: Duration) -> Result<(), String> {
+    let _load_guard = part._load_guard;
+    let backend = get_backend_client(part.worker.as_ref())
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("encoder connection unavailable")?;
+    let BackendClient::Grpc(GrpcClient::Sglang(client)) = backend.as_ref() else {
+        return Err("encoder requires SGLang gRPC".into());
+    };
+    client
+        .encode_native(part.request, timeout)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 impl NativeEncode {
@@ -389,23 +571,21 @@ impl NativeEncode {
         self.deadline
     }
 
-    /// Send all modality encode parts concurrently to the selected SGLang encoder worker.
-    pub(crate) async fn dispatch(self) -> Result<(), String> {
-        let backend = get_backend_client(self.worker.as_ref())
-            .await
-            .map_err(|e| e.to_string())?
-            .ok_or("encoder connection unavailable")?;
-        let BackendClient::Grpc(GrpcClient::Sglang(client)) = backend.as_ref() else {
-            return Err("encoder requires SGLang gRPC".into());
-        };
+    /// Send all modality/chunk encode parts concurrently to their assigned SGLang encoders.
+    pub(crate) async fn dispatch(mut self) -> Result<(), String> {
+        let timeout = self.timeout;
+        if self.parts.len() == 1 {
+            if let Some(part) = self.parts.pop() {
+                return dispatch_encode_part(part, timeout).await;
+            }
+        }
         try_join_all(
-            self.requests
+            self.parts
                 .into_iter()
-                .map(|request| client.encode_native(request, self.timeout)),
+                .map(|part| dispatch_encode_part(part, timeout)),
         )
         .await
         .map(|_| ())
-        .map_err(|e| e.to_string())
     }
 }
 
@@ -635,7 +815,7 @@ mod tests {
                 }],
             },
             details: vec![None],
-            digest: vec![1; 32],
+            digests: vec![vec![1; 32]],
             deadline: Instant::now() + Duration::from_secs(30),
         }
     }
@@ -789,15 +969,16 @@ mod tests {
             worker_with_contract(role, RuntimeType::Sglang, |_| {})
         }));
         let plain_encode = plain.build(&mut base_gen_request(), &workers).unwrap();
-        assert!(plain_encode.requests[0].item_options.is_empty());
-        assert_eq!(plain_encode.requests[0].modality, "image");
+        assert!(plain_encode.parts[0].request.item_options.is_empty());
+        assert_eq!(plain_encode.parts[0].request.modality, "image");
         let encoded = detailed
             .build(&mut base_gen_request(), &workers)
             .unwrap()
-            .requests
+            .parts
             .into_iter()
             .next()
-            .unwrap();
+            .unwrap()
+            .request;
         assert_eq!(
             encoded
                 .item_options
@@ -825,10 +1006,11 @@ mod tests {
         let msg_req = msg_prepared
             .build(&mut base_gen_request(), &workers)
             .unwrap()
-            .requests
+            .parts
             .into_iter()
             .next()
-            .unwrap();
+            .unwrap()
+            .request;
         assert_eq!(
             msg_req.mm_items,
             vec![
@@ -881,12 +1063,12 @@ mod tests {
         let video_ctrl =
             proto::PrefillStart::decode(video_gen.prepared_control.as_slice()).unwrap();
         assert_eq!((video_ctrl.image_count, video_ctrl.video_count), (0, 1));
-        assert_eq!(video_enc.requests.len(), 1);
+        assert_eq!(video_enc.parts.len(), 1);
         assert_eq!(
             (
-                video_enc.requests[0].modality.as_str(),
-                video_enc.requests[0].num_parts,
-                video_enc.requests[0].part_idx
+                video_enc.parts[0].request.modality.as_str(),
+                video_enc.parts[0].request.num_parts,
+                video_enc.parts[0].request.part_idx
             ),
             ("video", 1, 0)
         );
@@ -905,22 +1087,22 @@ mod tests {
         let mixed_ctrl =
             proto::PrefillStart::decode(mixed_gen.prepared_control.as_slice()).unwrap();
         assert_eq!((mixed_ctrl.image_count, mixed_ctrl.video_count), (1, 1));
-        assert_eq!(mixed_enc.requests.len(), 2);
+        assert_eq!(mixed_enc.parts.len(), 2);
         assert_eq!(
             (
-                mixed_enc.requests[0].modality.as_str(),
-                mixed_enc.requests[0].part_idx,
-                mixed_enc.requests[0].num_parts,
-                mixed_enc.requests[0].item_options.len()
+                mixed_enc.parts[0].request.modality.as_str(),
+                mixed_enc.parts[0].request.part_idx,
+                mixed_enc.parts[0].request.num_parts,
+                mixed_enc.parts[0].request.item_options.len()
             ),
             ("image", 0, 2, 1)
         );
         assert_eq!(
             (
-                mixed_enc.requests[1].modality.as_str(),
-                mixed_enc.requests[1].part_idx,
-                mixed_enc.requests[1].num_parts,
-                mixed_enc.requests[1].item_options.len()
+                mixed_enc.parts[1].request.modality.as_str(),
+                mixed_enc.parts[1].request.part_idx,
+                mixed_enc.parts[1].request.num_parts,
+                mixed_enc.parts[1].request.item_options.len()
             ),
             ("video", 1, 2, 0)
         );

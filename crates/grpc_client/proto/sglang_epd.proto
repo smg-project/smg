@@ -80,4 +80,7 @@ message PrefillStart {
   string encoder_receive_endpoint = 4;
   uint32 image_count = 5;
   uint32 video_count = 6;
+  repeated string encoder_receive_endpoints = 7;
+  repeated uint32 encoder_image_counts = 8;
+  repeated uint32 encoder_video_counts = 9;
 }

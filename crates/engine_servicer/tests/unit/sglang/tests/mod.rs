@@ -5255,7 +5255,11 @@ async fn prepared_prefill_abort_before_layout_and_decode_generate_roundtrip() {
             PreparedRequest {
                 binding: binding.clone(),
                 request,
-                external: Some(("http://127.0.0.1:5000".into(), 1, 0)),
+                external: Some(engine_zmq_adapter::ManagedExternalEncode::single(
+                    "http://127.0.0.1:5000",
+                    1,
+                    0,
+                )),
                 manifest: None,
                 deadline: Instant::now() + Duration::from_secs(60),
             },
@@ -5366,7 +5370,11 @@ async fn prepared_publish_layout_ignores_mismatched_binding_and_cancels_matching
             PreparedRequest {
                 binding: active_binding.clone(),
                 request,
-                external: Some(("http://127.0.0.1:5000".into(), 1, 0)),
+                external: Some(engine_zmq_adapter::ManagedExternalEncode::single(
+                    "http://127.0.0.1:5000",
+                    1,
+                    0,
+                )),
                 manifest: None,
                 deadline: Instant::now() + Duration::from_secs(60),
             },
@@ -5470,7 +5478,11 @@ async fn prepared_read_metadata_drops_malformed_frames_without_failing_runtime()
             PreparedRequest {
                 binding: binding.clone(),
                 request,
-                external: Some(("http://127.0.0.1:5000".into(), 1, 0)),
+                external: Some(engine_zmq_adapter::ManagedExternalEncode::single(
+                    "http://127.0.0.1:5000",
+                    1,
+                    0,
+                )),
                 manifest: None,
                 deadline: Instant::now() + Duration::from_secs(60),
             },

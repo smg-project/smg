@@ -20,26 +20,117 @@ from .rust import DRAIN_SECS_ENV
 
 PROCESSOR_CONTRACT = "smg-image-grid-v1"
 MAX_CONTEXT_BYTES = 48 * 1024**3
-DEFAULT_MAX_ACTIVE = 64
+DEFAULT_MAX_ACTIVE = 256
+DEFAULT_MAX_EXECUTION_CAPACITY = 8
 MAX_IMAGE_TOKENS_PER_REQUEST = 32768
+MAX_MEDIA_TOKENS_CEILING = 262144
+_ARTIFACT_HEADER_BYTES = 4 * 1024**2
+_MEMORY_BUDGET_NUMERATOR = 1
+_MEMORY_BUDGET_DENOMINATOR = 2
+_CGROUP_V2_MEMORY_MAX = Path("/sys/fs/cgroup/memory.max")
+_CGROUP_V1_MEMORY_LIMIT = Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+_PROC_MEMINFO = Path("/proc/meminfo")
+_CGROUP_UNLIMITED_SENTINEL = 1 << 60
 _DTYPE_BYTES = {"float16": 2, "bfloat16": 2, "float32": 4}
 _DTYPE_ALIASES = {"half": "float16", "float": "float32"}
 
 
-def resolve_max_active(args=None):
-    """Derive encoder admission cap from native --max-running-requests, defaulting to 64."""
-    raw = getattr(args, "max_running_requests", None)
-    if raw is None:
-        return DEFAULT_MAX_ACTIVE
+def _parse_positive_int_arg(raw, flag_name):
+    """Parse and validate a positive integer CLI argument value."""
     if isinstance(raw, bool) or isinstance(raw, float):
-        raise ValueError("--max-running-requests must be a positive integer")
+        raise ValueError(f"{flag_name} must be a positive integer")
     try:
         value = int(raw)
     except (TypeError, ValueError) as exc:
-        raise ValueError("--max-running-requests must be a positive integer") from exc
+        raise ValueError(f"{flag_name} must be a positive integer") from exc
     if value <= 0:
-        raise ValueError("--max-running-requests must be a positive integer")
+        raise ValueError(f"{flag_name} must be a positive integer")
     return value
+
+
+def resolve_max_active(args=None):
+    """Derive encoder admission cap from native --max-running-requests, defaulting to 256."""
+    raw = getattr(args, "max_running_requests", None)
+    if raw is None:
+        return DEFAULT_MAX_ACTIVE
+    return _parse_positive_int_arg(raw, "--max-running-requests")
+
+
+def resolve_max_media_tokens(args=None, model_config=None):
+    """Derive per-request media token budget from --context-length or model_config.context_len."""
+    raw_cli = getattr(args, "context_length", None)
+    if raw_cli is not None:
+        value = _parse_positive_int_arg(raw_cli, "--context-length")
+        return max(MAX_IMAGE_TOKENS_PER_REQUEST, min(value, MAX_MEDIA_TOKENS_CEILING))
+    raw_model = getattr(model_config, "context_len", None)
+    if type(raw_model) is int and raw_model > 0:
+        return max(MAX_IMAGE_TOKENS_PER_REQUEST, min(raw_model, MAX_MEDIA_TOKENS_CEILING))
+    return MAX_IMAGE_TOKENS_PER_REQUEST
+
+
+def _host_memory_bytes():
+    """Detect total host RAM via POSIX sysconf, falling back to /proc/meminfo."""
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        phys_pages = os.sysconf("SC_PHYS_PAGES")
+        if page_size > 0 and phys_pages > 0:
+            return int(page_size) * int(phys_pages)
+    except (AttributeError, OSError, ValueError):
+        pass
+    try:
+        for line in _PROC_MEMINFO.read_text().splitlines():
+            if line.startswith("MemTotal:"):
+                parts = line.split()
+                if len(parts) >= 2:
+                    kb = int(parts[1])
+                    if kb > 0:
+                        return kb * 1024
+                break
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def available_memory_bytes():
+    """Respect container cgroup v2/v1 memory limits, falling back to host RAM."""
+    host_ram = _host_memory_bytes()
+    try:
+        raw = _CGROUP_V2_MEMORY_MAX.read_text().strip()
+    except OSError:
+        raw = None
+    if raw is not None:
+        if raw != "max":
+            try:
+                value = int(raw)
+                if value > 0:
+                    return min(value, host_ram) if host_ram is not None else value
+            except ValueError:
+                pass
+        return host_ram
+    try:
+        value = int(_CGROUP_V1_MEMORY_LIMIT.read_text().strip())
+        if 0 < value < _CGROUP_UNLIMITED_SENTINEL:
+            return min(value, host_ram) if host_ram is not None else value
+    except (OSError, ValueError):
+        pass
+    return host_ram
+
+
+def resolve_max_context_bytes():
+    """Derive encoder context memory budget as 50% of container/host RAM, defaulting to 48 GiB."""
+    mem_bytes = available_memory_bytes()
+    if mem_bytes is None or mem_bytes <= 0:
+        return MAX_CONTEXT_BYTES
+    return max(1, (mem_bytes * _MEMORY_BUDGET_NUMERATOR) // _MEMORY_BUDGET_DENOMINATOR)
+
+
+def max_execution_capacity(max_batch_size=None):
+    """Bound concurrent Python/GPU execution slots so bursts queue cleanly in Rust."""
+    if max_batch_size is not None and not isinstance(max_batch_size, bool):
+        value = int(max_batch_size)
+        if value > 0:
+            return value
+    return DEFAULT_MAX_EXECUTION_CAPACITY
 
 
 def resolve_max_cpu(execution_capacity, max_batch_size=None):
@@ -53,14 +144,8 @@ def resolve_max_cpu(execution_capacity, max_batch_size=None):
         if value <= 0:
             raise ValueError("SMG_SGLANG_MM_MAX_INFLIGHT must be positive integer")
         return value
-    caps = [available_cpus(), execution_capacity]
-    if (
-        max_batch_size is not None
-        and not isinstance(max_batch_size, bool)
-        and int(max_batch_size) > 0
-    ):
-        caps.append(2 * int(max_batch_size))
-    return max(1, min(caps))
+    batch_cap = 2 * max_execution_capacity(max_batch_size)
+    return max(1, min(available_cpus(), execution_capacity, batch_cap))
 
 
 def _normalize_dtype(value):
@@ -126,6 +211,7 @@ def complete(args, role):
         if not (1 <= args.port <= 65525):
             raise ValueError("managed encoder --port must be in 1..=65525 (control uses port + 10)")
         max_active, max_receivers = resolve_max_active(args), 8
+        resolve_max_media_tokens(args)
         mm_item_limits = sglang_item_limits(args)
         engine_item_limits = {
             modality: int(count)
@@ -135,6 +221,7 @@ def complete(args, role):
         }
         config.update(
             max_active=max_active,
+            max_context_bytes=resolve_max_context_bytes(),
             control_listen=host_port(args.host or "0.0.0.0", args.port + 10),
             receive_endpoint=f"http://{host_port(advertise_host, args.port)}",
             max_artifact_bytes=388 * 1024**2,
@@ -143,7 +230,7 @@ def complete(args, role):
             max_control_bytes=256 * 1024**2,
             max_images=1024,
             mm_item_limits=mm_item_limits,
-            max_http_connections=max_active * max_receivers + 16,
+            max_http_connections=max_active * (max_receivers + 1) + 16,
             processor_options={
                 "model_id": args.model_path,
                 "engine_item_limits": engine_item_limits,
@@ -166,13 +253,11 @@ def _cfg_first(obj, *keys, default=None):
     return default
 
 
-def encoder_artifact_bytes(hf_config, dtype, max_tokens=MAX_IMAGE_TOKENS_PER_REQUEST):
-    """Compute per-request preprocessed pixel-artifact budget from vision geometry and dtype."""
+def _artifact_bytes_per_token(hf_config, dtype):
+    """Return preprocessed pixel artifact bytes per visual token for the model vision geometry."""
     element_bytes = _DTYPE_BYTES.get(dtype)
     if element_bytes is None:
         raise ValueError("unsupported managed visual dtype")
-    if type(max_tokens) is not int or max_tokens <= 0:
-        raise ValueError("unsupported managed media token limit")
     vision = getattr(hf_config, "vision_config", None)
     raw_patch = _cfg_first(vision, "patch_size", default=16)
     if isinstance(raw_patch, (dict, list, tuple)):
@@ -187,7 +272,23 @@ def encoder_artifact_bytes(hf_config, dtype, max_tokens=MAX_IMAGE_TOKENS_PER_REQ
     channels = _cfg_first(vision, "in_chans", "in_channels", "num_channels", default=3)
     if any(type(v) is not int or v <= 0 for v in (patch, temporal, merge, channels)):
         raise ValueError("unsupported managed vision geometry")
-    return max_tokens * channels * temporal * (patch * merge) ** 2 * element_bytes + 4 * 1024**2
+    return channels * temporal * (patch * merge) ** 2 * element_bytes
+
+
+def encoder_artifact_bytes(hf_config, dtype, max_tokens=MAX_IMAGE_TOKENS_PER_REQUEST):
+    """Compute per-request preprocessed pixel-artifact budget from vision geometry and dtype."""
+    per_token = _artifact_bytes_per_token(hf_config, dtype)
+    if type(max_tokens) is not int or max_tokens <= 0:
+        raise ValueError("unsupported managed media token limit")
+    return max_tokens * per_token + _ARTIFACT_HEADER_BYTES
+
+
+def _staging_bytes_per_token(hidden_size, dtype):
+    """Return staged embedding bytes per visual token for `hidden_size` and `dtype`."""
+    element_bytes = _DTYPE_BYTES.get(dtype)
+    if type(hidden_size) is not int or hidden_size <= 0 or element_bytes is None:
+        raise ValueError("unsupported managed embedding dimensions or dtype")
+    return hidden_size * element_bytes
 
 
 def _encoder_embedding_width(encoder, hf_config):
@@ -231,38 +332,93 @@ def _encoder_staging_bytes(
 
 def encoder_staging_bytes(hidden_size, dtype, max_tokens=MAX_IMAGE_TOKENS_PER_REQUEST):
     """Compute per-request staging byte budget from embedding dimension and dtype."""
-    element_bytes = _DTYPE_BYTES.get(dtype)
-    if (
-        type(hidden_size) is not int
-        or hidden_size <= 0
-        or type(max_tokens) is not int
-        or max_tokens <= 0
-        or element_bytes is None
-    ):
+    per_token = _staging_bytes_per_token(hidden_size, dtype)
+    if type(max_tokens) is not int or max_tokens <= 0:
         raise ValueError("unsupported managed embedding dimensions or dtype")
-    return max_tokens * hidden_size * element_bytes
+    return max_tokens * per_token
 
 
-def _control_reserve_bytes(config):
-    """Return the shared queued-control byte reserve bounded by container memory."""
-    budget_bytes = config.get("max_context_bytes", MAX_CONTEXT_BYTES)
+def _control_reserve_bytes(config, budget_bytes=None):
+    """Reserve shared queued-control memory inside the encoder context byte budget."""
+    if budget_bytes is None:
+        budget_bytes = config.get("max_context_bytes")
+        if budget_bytes is None:
+            budget_bytes = resolve_max_context_bytes()
     return min(
         config["max_active"] * config["max_control_bytes"],
         max(config["max_control_bytes"], budget_bytes // 8),
     )
 
 
-def encoder_window(config):
-    """Reserve queued controls, then bound materialized artifacts and native sends."""
+def _item_cache_reserve_bytes(config):
+    """Return configured host-RAM reserve for the managed per-item embedding cache."""
+    raw = config.get("item_cache_bytes", 0)
+    if type(raw) is not int or raw < 0:
+        raise ValueError("item_cache_bytes must be a non-negative integer")
+    return raw
+
+
+def fit_auto_media_tokens(
+    target_tokens,
+    hf_config,
+    vision_dtype,
+    hidden_size,
+    embedding_dtype,
+    config,
+    max_batch_size=None,
+    *,
+    staging_bytes_per_token=None,
+):
+    """Fit auto-derived media tokens to preserve target execution slots within memory budget."""
+    if target_tokens <= MAX_IMAGE_TOKENS_PER_REQUEST:
+        return MAX_IMAGE_TOKENS_PER_REQUEST
+    send_copies = 1 if config.get("embedding_backend") == "mooncake" else config["max_receivers"]
+    staging_per_token = (
+        staging_bytes_per_token
+        if staging_bytes_per_token is not None
+        else _staging_bytes_per_token(hidden_size, embedding_dtype)
+    )
+    bytes_per_token = (
+        2 * _artifact_bytes_per_token(hf_config, vision_dtype)
+        + (1 + send_copies) * staging_per_token
+    )
+    budget_bytes = config.get("max_context_bytes")
+    if budget_bytes is None:
+        budget_bytes = resolve_max_context_bytes()
+    available = (
+        budget_bytes
+        - _control_reserve_bytes(config, budget_bytes)
+        - _item_cache_reserve_bytes(config)
+    )
+    if available <= 0:
+        return MAX_IMAGE_TOKENS_PER_REQUEST
+    exec_cap = config.get("max_execution_capacity", max_execution_capacity(max_batch_size))
+    target_slots = max(1, min(config["max_active"], exec_cap))
+    per_slot = available // target_slots
+    fixed_overhead = 2 * _ARTIFACT_HEADER_BYTES
+    if per_slot <= fixed_overhead:
+        return MAX_IMAGE_TOKENS_PER_REQUEST
+    fit_tokens = (per_slot - fixed_overhead) // bytes_per_token
+    return max(MAX_IMAGE_TOKENS_PER_REQUEST, min(target_tokens, fit_tokens))
+
+
+def encoder_window(config, max_batch_size=None):
+    """Reserve queued controls and item cache, then bound materialized artifacts and native sends."""
     send_copies = 1 if config.get("embedding_backend") == "mooncake" else config["max_receivers"]
     execution_bytes = 2 * config["max_artifact_bytes"] + config["max_staging_bytes_per_request"] * (
         1 + send_copies
     )
-    budget_bytes = config.get("max_context_bytes", MAX_CONTEXT_BYTES)
-    control_reserve = _control_reserve_bytes(config)
-    capacity = min(config["max_active"], (budget_bytes - control_reserve) // execution_bytes)
-    if capacity <= 0:
+    budget_bytes = config.get("max_context_bytes")
+    if budget_bytes is None:
+        budget_bytes = resolve_max_context_bytes()
+    control_reserve = _control_reserve_bytes(config, budget_bytes)
+    cache_reserve = _item_cache_reserve_bytes(config)
+    available = budget_bytes - control_reserve - cache_reserve
+    budget_cap = available // execution_bytes
+    if available <= 0 or budget_cap <= 0:
         raise ValueError("managed E context limit cannot admit queued controls and native work")
+    exec_cap = config.get("max_execution_capacity", max_execution_capacity(max_batch_size))
+    capacity = min(config["max_active"], budget_cap, exec_cap)
     return capacity, execution_bytes
 
 
@@ -361,8 +517,9 @@ async def serve(config, args):
 
     from smg_grpc_servicer.sglang.model_artifacts import encoder_artifact_dirs
 
-    from .epd_encoder import launch_runtime, serve_native
+    from .epd_encoder import _item_cache_budget_bytes, launch_runtime, serve_native
 
+    item_cache_bytes = _item_cache_budget_bytes()
     model_dir, tokenizer_dir = encoder_artifact_dirs(args)
     backend = launch_runtime(args, config["max_active"])
     server = native_task = shutdown_deadline = None
@@ -380,18 +537,40 @@ async def serve(config, args):
             lambda: _normalize_dtype(getattr(visual, "dtype", config["embedding_dtype"])),
         )
         hf_config = backend.encoder.model_config.hf_config
+        config.setdefault("max_context_bytes", resolve_max_context_bytes())
+        config["item_cache_bytes"] = item_cache_bytes if getattr(args, "tp_size", 1) == 1 else 0
+        max_batch_size = getattr(backend.scheduler, "max_batch_size", None)
+        staging_width = _encoder_embedding_width(backend.encoder, hf_config)
+        staging_dtype = _normalize_dtype(
+            getattr(backend.encoder, "_embedding_dtype", None) or config["embedding_dtype"]
+        )
+        staging_per_token = _encoder_staging_bytes(
+            backend.encoder,
+            hf_config,
+            config["embedding_dtype"],
+            max_tokens=1,
+        )
+        max_tokens = fit_auto_media_tokens(
+            resolve_max_media_tokens(args, backend.encoder.model_config),
+            hf_config,
+            vision_dtype,
+            staging_width,
+            staging_dtype,
+            config,
+            max_batch_size=max_batch_size,
+            staging_bytes_per_token=staging_per_token,
+        )
         config["max_staging_bytes_per_request"] = _encoder_staging_bytes(
             backend.encoder,
             hf_config,
             config["embedding_dtype"],
-            max_tokens=MAX_IMAGE_TOKENS_PER_REQUEST,
+            max_tokens=max_tokens,
         )
         config["max_artifact_bytes"] = encoder_artifact_bytes(
-            hf_config, vision_dtype, max_tokens=MAX_IMAGE_TOKENS_PER_REQUEST
+            hf_config, vision_dtype, max_tokens=max_tokens
         )
         config["max_queued_control_bytes"] = _control_reserve_bytes(config)
-        config["execution_capacity"], _ = encoder_window(config)
-        max_batch_size = getattr(backend.scheduler, "max_batch_size", None)
+        config["execution_capacity"], _ = encoder_window(config, max_batch_size=max_batch_size)
         config["max_cpu"] = resolve_max_cpu(
             config["execution_capacity"], max_batch_size=max_batch_size
         )
@@ -405,10 +584,6 @@ async def serve(config, args):
             model_type=hf_config.model_type,
             http_listen=host_port(args.host or "0.0.0.0", args.port),
         )
-        for token_key in ("image_token_id", "video_token_id"):
-            token_val = getattr(hf_config, token_key, None)
-            if isinstance(token_val, int) and not isinstance(token_val, bool):
-                config[token_key] = token_val
         socket_dir = prepare_socket_dir(default_socket_dir())
         with tempfile.TemporaryDirectory(prefix="smg-encoder-", dir=socket_dir) as directory:
             config["native_commands"] = f"ipc://{directory}/commands.sock"

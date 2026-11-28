@@ -2208,6 +2208,7 @@ name = "engine-servicer"
 version = "0.4.0"
 dependencies = [
  "axum",
+ "blake3",
  "bytes",
  "chrono",
  "criterion",

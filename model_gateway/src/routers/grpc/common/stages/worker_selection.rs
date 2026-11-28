@@ -35,8 +35,8 @@ use crate::{
         metrics::{metrics_labels, Metrics},
     },
     policies::{
-        hash_ring::HashRing, policy_reads_hash_ring, CacheNamespace, LoadBalancingPolicy,
-        PolicyRegistry, SelectWorkerInfo, WorkerRole,
+        hash_ring::HashRing, policy_reads_hash_ring, CacheNamespace, ConsistentHashingPolicy,
+        LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerRole,
     },
     routers::{
         common::{
@@ -2917,14 +2917,27 @@ impl WorkerSelectionStage {
         let hash_ring = (!hashes.is_empty() && policy_reads_hash_ring(encode_policy.as_ref()))
             .then(|| self.policy_registry.hash_ring_of(model_id, &snapshot))
             .flatten();
-        let assignments = assign_encode_workers(
-            &available_encode,
-            hashes,
-            model_id,
-            encode_policy.as_ref(),
-            hash_ring,
-            encode_overload_lifted,
-        )
+        let is_prepared = handoff == Some(EncodeHandoff::PreparedInput);
+        let assignments = if is_prepared && hashes.len() > 1 {
+            assign_prepared_encode_workers(
+                &available_encode,
+                hashes,
+                model_id,
+                encode_policy.as_ref(),
+                hash_ring,
+                encode_overload_lifted,
+            )
+        } else {
+            assign_encode_workers(
+                &available_encode,
+                hashes,
+                model_id,
+                encode_policy.as_ref(),
+                hash_ring,
+                encode_overload_lifted,
+                is_prepared,
+            )
+        }
         .ok_or(EpdSelectionFailure::Unavailable)?;
         if encode_overload_lifted {
             Metrics::record_worker_overload_fallback(STAGE_SELECTION);
@@ -3005,6 +3018,90 @@ fn encode_item_hashes(
     multimodal::encode_routing_hashes(intermediate)
 }
 
+/// Select distinct lightly-loaded encoders for multi-item `PreparedInput` fan-out.
+///
+/// When at least two compatible encoders are below the fan-out load threshold, chooses
+/// `min(num_items, lightly_loaded.len())` distinct encoders using contiguous chunk anchor
+/// hashes (with chunk 0 anchored on item 0 for multi-turn cache affinity). Under saturation
+/// (<= 1 lightly-loaded encoder), collapses to a single encoder via item 0's anchor hash so
+/// high-concurrency throughput is never degraded by extra RPC/RDMA amplification.
+fn assign_prepared_encode_workers(
+    encode_workers: &[Arc<dyn Worker>],
+    item_hashes: &[Vec<u8>],
+    model_id: &str,
+    policy: &dyn LoadBalancingPolicy,
+    hash_ring: Option<Arc<HashRing>>,
+    overload_lifted: bool,
+) -> Option<Vec<EncodeWorkerAssignment>> {
+    let max_load = prepared_input::FANOUT_MAX_ENCODER_LOAD;
+    let mut candidates: Vec<Arc<dyn Worker>> = encode_workers
+        .iter()
+        .filter(|worker| worker.load() < max_load)
+        .cloned()
+        .collect();
+    if candidates.len() == 1 {
+        return assign_encode_workers(
+            &candidates,
+            &item_hashes[..1],
+            model_id,
+            policy,
+            hash_ring,
+            overload_lifted,
+            true,
+        );
+    }
+    if candidates.is_empty() {
+        return assign_encode_workers(
+            encode_workers,
+            &item_hashes[..1],
+            model_id,
+            policy,
+            hash_ring,
+            overload_lifted,
+            true,
+        );
+    }
+
+    let num_chunks = item_hashes.len().min(candidates.len());
+    let anchors = prepared_input::chunk_anchor_indices(item_hashes.len(), num_chunks);
+    let mut assignments = Vec::with_capacity(num_chunks);
+    for (part_index, anchor_idx) in anchors.into_iter().enumerate() {
+        let routing_headers = encode_routing_headers(&item_hashes[anchor_idx]);
+        let info = SelectWorkerInfo {
+            request_text: None,
+            tokens: None,
+            headers: Some(&routing_headers),
+            routing_key: None,
+            rid_key: None,
+            cache_namespace: None,
+            hash_ring: hash_ring.clone(),
+            role: WorkerRole::Single,
+            overload_lifted,
+            named: None,
+        };
+        let worker_idx =
+            if let Some(ch_policy) = policy.as_any().downcast_ref::<ConsistentHashingPolicy>() {
+                ch_policy.select_worker_bounded(&candidates, &info)?
+            } else {
+                policy.select_worker(&candidates, &info)?
+            };
+        let worker = candidates.remove(worker_idx);
+        Metrics::record_worker_selection(
+            metrics_labels::WORKER_ENCODE,
+            metrics_labels::CONNECTION_GRPC,
+            model_id,
+            policy.name(),
+        );
+        assignments.push(EncodeWorkerAssignment {
+            item_index: part_index,
+            worker,
+        });
+    }
+    Some(assignments)
+}
+
+/// Assign encode workers per item hash, using bounded-load consistent hashing only for
+/// SGLang managed EPD (`bounded_ch = true`) so vLLM/TokenSpeed preserve standard CH affinity.
 fn assign_encode_workers(
     encode_workers: &[Arc<dyn Worker>],
     item_hashes: &[Vec<u8>],
@@ -3012,6 +3109,7 @@ fn assign_encode_workers(
     policy: &dyn LoadBalancingPolicy,
     hash_ring: Option<Arc<HashRing>>,
     overload_lifted: bool,
+    bounded_ch: bool,
 ) -> Option<Vec<EncodeWorkerAssignment>> {
     if item_hashes.is_empty() {
         return Some(Vec::new());
@@ -3036,7 +3134,15 @@ fn assign_encode_workers(
                 overload_lifted,
                 named: None,
             };
-            let worker_idx = policy.select_worker(encode_workers, &info)?;
+            let worker_idx = if bounded_ch {
+                if let Some(ch_policy) = policy.as_any().downcast_ref::<ConsistentHashingPolicy>() {
+                    ch_policy.select_worker_bounded(encode_workers, &info)?
+                } else {
+                    policy.select_worker(encode_workers, &info)?
+                }
+            } else {
+                policy.select_worker(encode_workers, &info)?
+            };
             let worker = encode_workers[worker_idx].clone();
             Metrics::record_worker_selection(
                 metrics_labels::WORKER_ENCODE,
@@ -6050,6 +6156,113 @@ mod tests {
             Default::default(),
             false
         ));
+    }
+
+    #[test]
+    fn prepared_input_fans_out_when_lightly_loaded_and_collapses_under_saturation() {
+        use smg_worker::identity::basic::WorkerLoadGuard;
+
+        let make = |url: &str| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(WorkerType::Encode)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .runtime_type(RuntimeType::Sglang)
+                    .health_config(no_health_check())
+                    .build(),
+            )
+        };
+        let encoders = vec![
+            make("grpc://enc-0:30000"),
+            make("grpc://enc-1:30000"),
+            make("grpc://enc-2:30000"),
+            make("grpc://enc-3:30000"),
+        ];
+        let ring = Arc::new(HashRing::new(encoders.iter().map(|w| w.url())));
+        let policy = ConsistentHashingPolicy::new();
+
+        // Single-item anchor vs 2-item fan-out: item 0 stays on Turn 1's home encoder and
+        // item 1 always lands on a distinct encoder.
+        let h0 = vec![0xAA; 32];
+        let h1 = vec![0xAA; 32];
+        let turn1 = assign_encode_workers(
+            &encoders,
+            std::slice::from_ref(&h0),
+            "test-model",
+            &policy,
+            Some(Arc::clone(&ring)),
+            false,
+            true,
+        )
+        .unwrap();
+        let two_items = assign_prepared_encode_workers(
+            &encoders,
+            &[h0.clone(), h1.clone()],
+            "test-model",
+            &policy,
+            Some(Arc::clone(&ring)),
+            false,
+        )
+        .unwrap();
+        assert_eq!(two_items.len(), 2);
+        assert_eq!(two_items[0].worker.url(), turn1[0].worker.url());
+        assert_ne!(two_items[0].worker.url(), two_items[1].worker.url());
+
+        // 4 items across 4 idle encoders selects 4 distinct encoders.
+        let four_hashes = vec![vec![1; 32], vec![2; 32], vec![3; 32], vec![4; 32]];
+        let four_items = assign_prepared_encode_workers(
+            &encoders,
+            &four_hashes,
+            "test-model",
+            &policy,
+            Some(Arc::clone(&ring)),
+            false,
+        )
+        .unwrap();
+        assert_eq!(four_items.len(), 4);
+        let unique_urls: std::collections::HashSet<&str> =
+            four_items.iter().map(|a| a.worker.url()).collect();
+        assert_eq!(unique_urls.len(), 4);
+
+        // Under saturation (all encoders at load >= max_load), collapses to 1 encoder.
+        let max_load = prepared_input::FANOUT_MAX_ENCODER_LOAD;
+        let _sat_guards: Vec<_> = encoders
+            .iter()
+            .flat_map(|w| (0..max_load).map(|_| WorkerLoadGuard::with_key(Arc::clone(w), None)))
+            .collect();
+        let saturated = assign_prepared_encode_workers(
+            &encoders,
+            &four_hashes,
+            "test-model",
+            &policy,
+            Some(Arc::clone(&ring)),
+            false,
+        )
+        .unwrap();
+        assert_eq!(saturated.len(), 1);
+
+        // Non-PreparedInput callers (bounded_ch=false, e.g. vLLM Push / TokenSpeed) preserve
+        // standard consistent-hashing affinity even when the home encoder has active load.
+        let home_url = turn1[0].worker.url().to_string();
+        let home_worker = encoders
+            .iter()
+            .find(|w| w.url() == home_url)
+            .cloned()
+            .unwrap();
+        let _home_guards: Vec<_> = (0..4)
+            .map(|_| WorkerLoadGuard::with_key(Arc::clone(&home_worker), None))
+            .collect();
+        let unbounded = assign_encode_workers(
+            &encoders,
+            std::slice::from_ref(&h0),
+            "test-model",
+            &policy,
+            Some(Arc::clone(&ring)),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(unbounded[0].worker.url(), home_url);
     }
 
     /// EPD selects a compatible EC consumer even with mixed runtimes and connectors.

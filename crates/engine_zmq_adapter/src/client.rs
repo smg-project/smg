@@ -401,14 +401,42 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
+/// External encoder assignment for a managed Prefill request.
+///
+/// `encoder_urls` holds the ordered receive endpoints indexed by `image_counts`
+/// and `video_counts`, matching SGLang's `encoder_urls` + `num_items_assigned`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedExternalEncode {
+    pub encoder_urls: Vec<String>,
+    pub image_counts: Vec<u32>,
+    pub video_counts: Vec<u32>,
+}
+
+impl ManagedExternalEncode {
+    /// Single-encoder assignment for the fast path (`num_encoders == 1`).
+    pub fn single(endpoint: impl Into<String>, images: u32, videos: u32) -> Self {
+        Self {
+            encoder_urls: vec![endpoint.into()],
+            image_counts: if images > 0 { vec![images] } else { Vec::new() },
+            video_counts: if videos > 0 { vec![videos] } else { Vec::new() },
+        }
+    }
+
+    /// Return whether at least one image or video item is assigned to external encoders.
+    pub fn has_media(&self) -> bool {
+        self.image_counts.iter().any(|&n| n > 0) || self.video_counts.iter().any(|&n| n > 0)
+    }
+}
+
 impl ZmqEngineClient {
     /// Submit one managed SGLang request through the native plugin.
-    /// `external` is `Some((encoder_receive_endpoint, image_count, video_count))` on Prefill.
+    /// `external` is `Some(...)` on Prefill with the ordered encoder receive endpoints
+    /// and per-encoder modality counts.
     pub async fn generate_sglang_managed(
         &self,
         mut req: sglang_proto::GenerateRequest,
         binding: &managed::InputBinding,
-        external: Option<(&str, u32, u32)>,
+        external: Option<&ManagedExternalEncode>,
         manifest: Option<&managed::PreparedDecodeInput>,
     ) -> Result<SglangGenerateStream, tonic::Status> {
         use prost::Message;
@@ -498,24 +526,35 @@ impl ZmqEngineClient {
                 native.disagg_prefill_dp_rank = rank;
             }
         }
-        if let Some((endpoint, images, videos)) = external {
-            if images > 0 || videos > 0 {
+        if let Some(ext) = external {
+            if ext.has_media() {
                 native.input_text = original_text.filter(|text| !text.is_empty());
                 if native.input_text.is_none() {
                     return Err(tonic::Status::invalid_argument(
                         "managed P requires the rendered prompt",
                     ));
                 }
+                if ext.encoder_urls.is_empty()
+                    || ext.encoder_urls.iter().any(String::is_empty)
+                    || (!ext.image_counts.is_empty()
+                        && ext.image_counts.len() != ext.encoder_urls.len())
+                    || (!ext.video_counts.is_empty()
+                        && ext.video_counts.len() != ext.encoder_urls.len())
+                {
+                    return Err(tonic::Status::invalid_argument(
+                        "invalid managed external encode plan",
+                    ));
+                }
                 native.need_wait_for_mm_inputs = Some(true);
                 let mut assigned = BTreeMap::new();
-                if images > 0 {
-                    assigned.insert(1, vec![images]);
+                if ext.image_counts.iter().any(|&n| n > 0) {
+                    assigned.insert(1, ext.image_counts.clone());
                 }
-                if videos > 0 {
-                    assigned.insert(2, vec![videos]);
+                if ext.video_counts.iter().any(|&n| n > 0) {
+                    assigned.insert(2, ext.video_counts.clone());
                 }
                 native.num_items_assigned = Some(assigned);
-                native.encoder_urls = Some(vec![endpoint.to_owned()]);
+                native.encoder_urls = Some(ext.encoder_urls.clone());
             }
         }
         let mut envelope = vec![
@@ -526,9 +565,7 @@ impl ZmqEngineClient {
             ),
             (
                 OpaqueValue::from("text_only"),
-                OpaqueValue::from(
-                    external.is_some_and(|(_, images, videos)| images == 0 && videos == 0),
-                ),
+                OpaqueValue::from(external.is_some_and(|ext| !ext.has_media())),
             ),
         ];
         if let Some(manifest) = manifest {
@@ -2530,13 +2567,9 @@ mod tests {
         req.request_id = "prefill-rid".into();
         req.tokenized.as_mut().unwrap().original_text = "media prompt".into();
 
+        let mixed_ext = ManagedExternalEncode::single("http://enc:30000", 2, 1);
         let _stream_mixed = client
-            .generate_sglang_managed(
-                req.clone(),
-                &binding,
-                Some(("http://enc:30000", 2, 1)),
-                None,
-            )
+            .generate_sglang_managed(req.clone(), &binding, Some(&mixed_ext), None)
             .await
             .unwrap();
         let frame = engine.recv_request().await.unwrap();
@@ -2547,12 +2580,14 @@ mod tests {
             wire.num_items_assigned,
             Some(BTreeMap::from([(1, vec![2]), (2, vec![1])]))
         );
+        assert_eq!(wire.encoder_urls, Some(vec!["http://enc:30000".into()]));
 
-        let mut video_binding = binding;
+        let mut video_binding = binding.clone();
         video_binding.prefill_rid = "prefill-rid-video".into();
         req.request_id = "prefill-rid-video".into();
+        let video_ext = ManagedExternalEncode::single("http://enc:30000", 0, 1);
         let _stream_video = client
-            .generate_sglang_managed(req, &video_binding, Some(("http://enc:30000", 0, 1)), None)
+            .generate_sglang_managed(req.clone(), &video_binding, Some(&video_ext), None)
             .await
             .unwrap();
         let frame = engine.recv_request().await.unwrap();
@@ -2560,6 +2595,30 @@ mod tests {
         assert_eq!(
             wire.num_items_assigned,
             Some(BTreeMap::from([(2, vec![1])]))
+        );
+
+        let mut fanout_binding = binding;
+        fanout_binding.prefill_rid = "prefill-rid-fanout".into();
+        req.request_id = "prefill-rid-fanout".into();
+        let fanout_ext = ManagedExternalEncode {
+            encoder_urls: vec!["http://enc0:30000".into(), "http://enc1:30000".into()],
+            image_counts: vec![2, 2],
+            video_counts: vec![1, 0],
+        };
+        let _stream_fanout = client
+            .generate_sglang_managed(req, &fanout_binding, Some(&fanout_ext), None)
+            .await
+            .unwrap();
+        let frame = engine.recv_request().await.unwrap();
+        let wire: TokenizedGenerateReqInput = decode_msgpack(&frame[1]).unwrap();
+        assert_eq!(wire.need_wait_for_mm_inputs, Some(true));
+        assert_eq!(
+            wire.encoder_urls,
+            Some(vec!["http://enc0:30000".into(), "http://enc1:30000".into()])
+        );
+        assert_eq!(
+            wire.num_items_assigned,
+            Some(BTreeMap::from([(1, vec![2, 2]), (2, vec![1, 0])]))
         );
     }
 
@@ -2621,8 +2680,9 @@ mod tests {
         req.data_parallel_rank = Some(0);
         req.tokenized.as_mut().unwrap().original_text = "media prompt".into();
 
+        let ext = ManagedExternalEncode::single("http://enc:30000", 1, 0);
         let _stream = client
-            .generate_sglang_managed(req, &binding, Some(("http://enc:30000", 1, 0)), None)
+            .generate_sglang_managed(req, &binding, Some(&ext), None)
             .await
             .unwrap();
         let frame = rank1.recv_request().await.unwrap();
