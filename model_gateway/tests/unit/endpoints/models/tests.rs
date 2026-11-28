@@ -992,3 +992,209 @@ async fn an_unparsed_upstream_list_goes_without_the_clients_url_in_its_line() {
     assert!(logs_contain("Failed to parse upstream models"));
     assert!(!logs_contain("s3cret"));
 }
+
+/// The opt-in lists immutable registration cards, never lazy caller catalogues,
+/// and makes no provider request under either shared or tenant gateway keys.
+#[tokio::test]
+async fn external_inventory_opt_in_uses_registration_cards_without_provider_requests() {
+    let (url, seen) = recording_provider("live-provider").await;
+    let registry = WorkerRegistry::new();
+    register_worker(
+        &registry,
+        "http://local.invalid",
+        vec![ModelCard::new("local")],
+    );
+    let external = external_worker(serde_json::json!({
+        "url": url, "runtime_type": "external", "api_key": "operator-secret",
+        "models": [
+            {"id": "registered-external", "aliases": ["external-alias"],
+             "metadata": {"private": "operator-private-metadata"}},
+            {"id": "local", "provider": "openai"}
+        ]
+    }));
+    registry.register(Arc::clone(&external));
+    let wildcard = external_worker(serde_json::json!({
+        "url": "http://wildcard.invalid", "runtime_type": "external"
+    }));
+    registry.register(Arc::clone(&wildcard));
+    let auth = AuthConfig::with_tenant_keys(
+        Some("shared".into()),
+        &[TenantApiKeyEntry {
+            tenant_id: "red".into(),
+            key: "tenant".into(),
+        }],
+    );
+    let client = http_client();
+    for private in ["tenant-a-private", "tenant-b-private"] {
+        registry.refresh_models(&external, vec![ModelCard::new(private)]);
+        registry.refresh_models(&wildcard, vec![ModelCard::new("wildcard-private")]);
+        for key in ["shared", "tenant"] {
+            for anthropic in [false, true] {
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    header::AUTHORIZATION,
+                    format!("Bearer {key}").parse().unwrap(),
+                );
+                if anthropic {
+                    headers.insert("anthropic-version", "2023-06-01".parse().unwrap());
+                }
+                for query in [
+                    None,
+                    Some("include_external=false"),
+                    Some("include_external=true"),
+                ] {
+                    let response =
+                        list_models_with(&registry, &client, &auth, &headers, query, rid()).await;
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let body = json_of(response).await;
+                    let ids: Vec<_> = body["data"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|card| card["id"].as_str().unwrap())
+                        .collect();
+                    let expected = if query == Some("include_external=true") {
+                        vec!["local", "registered-external"]
+                    } else {
+                        vec!["local"]
+                    };
+                    assert_eq!(ids, expected, "{query:?}, anthropic={anthropic}, {body}");
+                    assert!(!body.to_string().contains(private));
+                    assert!(!body.to_string().contains("wildcard-private"));
+                    assert!(!body.to_string().contains("operator-secret"));
+                    assert!(!body.to_string().contains("operator-private-metadata"));
+                    if !anthropic {
+                        assert_eq!(body["data"][0]["owned_by"], "self_hosted");
+                    }
+                }
+                if anthropic {
+                    let response = list_models_with(
+                        &registry,
+                        &client,
+                        &auth,
+                        &headers,
+                        Some("include_external=true&limit=1&after_id=local"),
+                        rid(),
+                    )
+                    .await;
+                    let body = json_of(response).await;
+                    assert_eq!(body["data"].as_array().unwrap().len(), 1);
+                    assert_eq!(body["data"][0]["id"], "registered-external");
+                }
+            }
+        }
+    }
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "inventory must never call a provider"
+    );
+}
+
+/// Opting in cannot turn a BYOK credential, or an unauthenticated request,
+/// into access to the operator catalogue, nor trigger a provider request.
+#[tokio::test]
+async fn external_inventory_opt_in_requires_a_gateway_key_and_valid_boolean() {
+    let (url, seen) = recording_provider("provider").await;
+    let registry = WorkerRegistry::new();
+    registry.register(external_worker(serde_json::json!({
+        "url": url, "runtime_type": "external", "models": [{"id":"operator-model"}]
+    })));
+    let auth = AuthConfig::with_tenant_keys(Some("gateway".into()), &[]);
+    let client = http_client();
+    for credential in [None, Some("foreign")] {
+        for header_name in ["authorization", "x-api-key"] {
+            let mut headers = HeaderMap::new();
+            if let Some(key) = credential {
+                let value = if header_name == "authorization" {
+                    format!("Bearer {key}")
+                } else {
+                    key.into()
+                };
+                headers.insert(header_name, value.parse().unwrap());
+            }
+            let response = list_models_with(
+                &registry,
+                &client,
+                &auth,
+                &headers,
+                Some("include_external=true"),
+                rid(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_eq!(
+                json_of(response).await["error"]["code"],
+                "external_inventory_requires_gateway_key"
+            );
+        }
+    }
+    let mut headers = HeaderMap::new();
+    headers.insert("x-api-key", "gateway".parse().unwrap());
+    for query in [
+        "include_external=1",
+        "include_external=",
+        "include_external=true&include_external=false",
+    ] {
+        let response =
+            list_models_with(&registry, &client, &auth, &headers, Some(query), rid()).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
+        assert_eq!(
+            json_of(response).await["error"]["code"],
+            "invalid_query_parameter"
+        );
+    }
+    let response = list_models_with(
+        &registry,
+        &client,
+        &auth,
+        &headers,
+        Some("include_external=true"),
+        rid(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json_of(response).await["data"][0]["id"], "operator-model");
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+/// Only the opt-in distinguishes a registered wildcard's empty catalogue
+/// from a gateway with no workers; the default empty-inventory 503 stays.
+#[tokio::test]
+async fn external_inventory_opt_in_keeps_empty_catalogue_and_empty_registry_distinct() {
+    let registry = WorkerRegistry::new();
+    let auth = AuthConfig::with_tenant_keys(Some("gateway".into()), &[]);
+    let client = http_client();
+    let mut headers = HeaderMap::new();
+    headers.insert(header::AUTHORIZATION, "Bearer gateway".parse().unwrap());
+    for anthropic in [false, true] {
+        if anthropic {
+            headers.insert("anthropic-version", "2023-06-01".parse().unwrap());
+        }
+        let response = list_models_with(
+            &registry,
+            &client,
+            &auth,
+            &headers,
+            Some("include_external=true"),
+            rid(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+    registry.register(external_worker(serde_json::json!({
+        "url":"http://wildcard.invalid", "runtime_type":"external"
+    })));
+    for query in [
+        None,
+        Some("include_external=false"),
+        Some("include_external=true"),
+    ] {
+        let response = list_models_with(&registry, &client, &auth, &headers, query, rid()).await;
+        if query == Some("include_external=true") {
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(json_of(response).await["data"], serde_json::json!([]));
+        } else {
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+    }
+}
