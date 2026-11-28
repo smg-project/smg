@@ -644,7 +644,10 @@ impl WorkerMediaPipeline {
             settings.max_items,
             modality_limit_override,
         );
-        if serves_video(&item_limits) {
+        // Both reads of the loader rule stand behind this one test: a
+        // pipeline that is never handed a video walks no clip, so the rate
+        // its start states is not read and a dropped one draws no warning.
+        let video_start_fps = if serves_video(&item_limits) {
             if let Some(message) = loader_rule_conflict(
                 settings.video_loader_rule.as_deref(),
                 spec_name,
@@ -652,7 +655,10 @@ impl WorkerMediaPipeline {
             ) {
                 anyhow::bail!(message);
             }
-        }
+            interval_walk_start_fps(settings.video_loader_rule.as_deref(), video_sampling)
+        } else {
+            None
+        };
         // The processors of the modalities the pipeline serves are built here,
         // so a preprocessor config they cannot serve stops the engine's start
         // rather than failing its requests.
@@ -718,10 +724,7 @@ impl WorkerMediaPipeline {
             drain_fetches_on_error: true,
             inflight: None,
             video_frame_budget: settings.video_frame_budget,
-            video_start_fps: interval_walk_start_fps(
-                settings.video_loader_rule.as_deref(),
-                video_sampling,
-            ),
+            video_start_fps,
             // The worker processes its own requests' media: no router's
             // mode applies.
             pixels_go_to: WorkerType::Regular,
@@ -2521,7 +2524,7 @@ mod unsupported_model_tests {
             .unwrap();
         std::fs::write(
             dir.path().join("config.json"),
-            r#"{"model_type":"minimax_m3_vl","image_token_index":32000}"#,
+            r#"{"model_type":"minimax_m3_vl","image_token_index":32000,"video_token_index":32003}"#,
         )
         .unwrap();
         let settings = WorkerMediaSettings {
@@ -2532,6 +2535,7 @@ mod unsupported_model_tests {
             ("]<]image[>[", 32000),
             ("]<]start of image[>[", 32001),
             ("]<]end of image[>[", 32002),
+            ("]<]video[>[", 32003),
         ]));
         let pipeline = WorkerMediaPipeline::new(settings, tokenizer).await.unwrap();
         assert_eq!(pipeline.components.video_start_fps, Some(2.0));
@@ -2870,5 +2874,46 @@ mod unsupported_model_tests {
         assert!(!serves_video(&HashMap::new()), "no video in the spec");
         assert!(!serves_video(&at(0)), "an engine limit of 0");
         assert!(serves_video(&at(1)));
+    }
+
+    /// Nor is the rate the start states read there: a value the interval
+    /// walk does not take draws no warning from a pipeline that walks no
+    /// clip, and the one warning from a pipeline that can be handed one.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_start_rate_is_read_only_where_a_video_can_be_handed_in() {
+        let dir = tempfile::Builder::new()
+            .prefix("minimax-m3-")
+            .tempdir()
+            .unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type":"minimax_m3_vl","image_token_index":32000,"video_token_index":32003}"#,
+        )
+        .unwrap();
+        for (stated, video_limit, warnings) in [("7", Some(0), 0), ("9", None, 1)] {
+            let settings = WorkerMediaSettings {
+                video_loader_rule: Some(format!("--media-io-kwargs video.fps={stated}")),
+                engine_item_limits: video_limit
+                    .map(|limit| HashMap::from([(Modality::Video, limit)]))
+                    .unwrap_or_default(),
+                ..pipeline_settings(dir.path().to_str().unwrap())
+            };
+            let tokenizer = Arc::new(MockTokenizer::new().with_tokens(&[
+                ("]<]image[>[", 32000),
+                ("]<]start of image[>[", 32001),
+                ("]<]end of image[>[", 32002),
+                ("]<]video[>[", 32003),
+            ]));
+            let pipeline = WorkerMediaPipeline::new(settings, tokenizer).await.unwrap();
+            assert_eq!(pipeline.components.video_start_fps, None, "{stated}");
+            let field = format!("stated=\"{stated}\"");
+            logs_assert(|lines: &[&str]| {
+                match lines.iter().filter(|line| line.contains(&field)).count() {
+                    said if said == warnings => Ok(()),
+                    said => Err(format!("{stated}: {said} warning lines, not {warnings}")),
+                }
+            });
+        }
     }
 }
