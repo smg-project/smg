@@ -2325,10 +2325,14 @@ impl InProcess {
     /// prefill is counted, a number that reaches no worker is said so
     /// ahead of that decision, whatever it would answer. Where the count
     /// reaches a pair, what the call answers for its encoders stands as
-    /// it is: a shed made for them or over the lists whole, and no worker
-    /// where its last ask was given up for an encoder alone. A pair held
-    /// on both sides is asked again behind such an ask alone, held as it
-    /// was: the rule is asked of no list there. It books its decode with
+    /// it is: a shed made for them or over the lists whole, and its answer
+    /// of no worker where its last ask was given up for an encoder alone.
+    /// A pair held on its prefill alone asks again as any pair's does:
+    /// the rule is asked of the named worker's place behind the first ask
+    /// given up. Its refusal there is the pair's, and the request is shed
+    /// under `target-worker`. A pair held on both sides is asked again
+    /// behind an ask given up for an encoder alone, held as it was: the
+    /// rule is asked of no list there. It books its decode with
     /// its prefill, as a pair's own does. Under a binding whose decode
     /// side alone is such a ring, a request the pass is laid for that
     /// names a worker is shed under `target-worker` for the decode's

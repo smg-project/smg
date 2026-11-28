@@ -430,7 +430,8 @@ bindings:
 - A request with no item, whose decode needs to take no images, is answered as a pair that names a worker is. It is a pair's request there: the pair's own refusals apply, and it is observed and shadowed as one.
 - The number names no encoder. A shed made for the encoders keeps its own name. So does one made where no pair of the lists has an encoder that serves it, or a decode that takes the images the request needs.
 - Where a prefill is counted, a number that reaches no worker is said first. The request is shed under `target-worker`, ahead of what its decision would say of its encoders.
-- Behind an encoder that could not take an item, the call decides again, held as it was. It makes three decisions at most.
+- Where an encoder alone could not take an item, the call asks again, held as it was. It makes three decisions at most.
+- For a pair held on its prefill alone, a host's rule is asked of that prefill's place behind the first ask given up. A refusal there sheds the request under `target-worker`.
 - A pair named on both sides books its decode with its prefill, as a pair does: its decode is not picked again behind the prefill.
 - Where the decode's side alone reads the number, a request with an item, or one whose decode needs to take images, is shed under `target-worker`. Its decision counts no number yet.
 - A standalone controller reads no number for such a request yet.

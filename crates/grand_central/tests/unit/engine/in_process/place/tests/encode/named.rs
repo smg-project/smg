@@ -772,6 +772,61 @@ fn a_side_refused_behind_an_encoder_that_could_not_be_sent_to_ends_the_call() {
     assert_eq!(of_prefill.get(), 3, "the count's ask and two decisions'");
 }
 
+/// A rule that refuses the place of the prefill a request names, behind
+/// an ask given up for an encoder alone, misses the target. The pair is
+/// held on its prefill alone, and the first encoder cannot be sent to:
+/// the first decision's pair could be sent to, so that ask is given up
+/// for the encoder alone. The call asks again as any pair's does, and
+/// asks the rule of the one place the prefill is held to. The rule
+/// refuses the prefill there, and the request is shed under
+/// `target-worker`, behind one decision: the stages hear one pair issued
+/// and let go. That refusal is the pair's, whatever the ask before it was
+/// given up for: it is no answer of the encoders, and does not stand
+/// under the rule's own name.
+///
+/// The classic router asks its filter of the workers it gathers as
+/// candidates, ahead of its policies (`P:3208-3213`, `P:3329-3344`).
+#[test]
+fn a_rule_that_refuses_the_named_prefill_behind_an_encoder_misses_the_target() {
+    let ring = "consistent_hashing";
+    let presets = PolicySpec::epd_presets("power_of_two", ring, "round_robin");
+    let mut document = presets.expect("presets");
+    keeps_its_encoders(&mut document);
+    let (engine, heard) = hearing(document);
+    // One decode: a decision has one pair to send to.
+    let three = Three::of([3, 1, 2], |_, _| false);
+    // The first encoder holds fewer requests, and its breaker is open.
+    three.workers[2][1].increment_load();
+    trip(&three.workers[2][0]);
+    let of_prefill = Cell::new(0_u32);
+    // The rule takes the named prefill twice: at the count, and where the
+    // first decision would send to it.
+    let rule = |worker: &dyn Worker| {
+        if worker_id(worker) != three.id(0, 1) {
+            return true;
+        }
+        of_prefill.set(of_prefill.get() + 1);
+        of_prefill.get() <= 2
+    };
+    let headers = [(MANUAL_SESSION_HEADER, "talk-1"), (TARGET, "1")];
+    let request = PlaceRequest {
+        admits: Some(&rule),
+        ..carrying(three.lists((&[PLAIN; 2], &[1; 3])), &headers)
+    };
+    assert_eq!(placed(engine, &three, &request, 1), Err(MISSED));
+    assert_eq!(of_prefill.get(), 3, "the count's ask, a send's, the list's");
+    // No second decision stands behind the list's refusal.
+    let (prefill, decode) = (three.id(0, 1), three.id(1, 0));
+    let released = |worker| ("released CommitFailed".to_owned(), worker);
+    let one = [
+        issued(prefill),
+        issued(decode),
+        released(prefill),
+        released(decode),
+    ];
+    assert_eq!(*heard.lock(), one, "one decision");
+}
+
 /// A named worker that changes between the count that reached it and its
 /// request's decision is missed on its own side in each leg here. Each
 /// request carries its item, and its pair is held on both sides. The rule

@@ -2767,9 +2767,14 @@ The count runs ahead of the call's decision, as a pair's does. So where a prefil
 number that reaches no worker is said first, under `target-worker`. Classic's stage answers first
 where the request carries an item and no available encoder takes it.
 
-Behind an encoder that cannot be sent to, the call decides again, held as it was: three
+Where an encoder alone cannot be sent to, the call asks again, held as it was: three
 decisions at most. A pair held on both sides books its decode with its prefill, as a pair's own
-does. It is asked again behind such an ask alone, and the route's rule is asked of no list there.
+does. It is asked again behind an ask given up for an encoder alone, and the route's rule is
+asked of no list there.
+
+A pair held on its prefill alone asks again as any pair's does. Behind its first ask given up,
+a rule the request states is asked of the place the prefill is held to. A rule that refuses
+the prefill there sheds the request under `target-worker`, whatever that ask was given up for.
 
 Two parts of it are **[planned]**:
 

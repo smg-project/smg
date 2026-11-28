@@ -580,12 +580,16 @@ pub(super) fn pair<'a>(
 ///
 /// What the call answers for its encoders, or over its lists whole,
 /// stands as it is ([`for_encoders`]): a shed its decision made so, and
-/// no worker where the call's last ask was given up for an encoder alone.
-/// A pair held on both sides is asked again behind such an ask alone,
-/// held as it was, and its next decision is told the encoder that could
-/// not be sent to: behind a side that cannot be sent to it has no worker,
-/// as in a pair's own call. A pair held on its prefill alone asks again
-/// as any pair's does, and its decode is each decision's own pick.
+/// its answer of no worker where its last ask was given up for an encoder
+/// alone. Where the rule is asked of the lists and refuses the worker the
+/// request names, that refusal is the pair's, whatever the ask before it
+/// was given up for.
+/// A pair held on both sides is asked again behind an ask given up for an
+/// encoder alone, held as it was, and its next decision is told the
+/// encoder that could not be sent to: behind a side that cannot be sent
+/// to it has no worker, as in a pair's own call. A pair held on its
+/// prefill alone asks again as any pair's does, and its decode is each
+/// decision's own pick.
 ///
 /// The count asks no encoder. Which prefills an encoder serves is the
 /// route's rule to say ([`PlaceRequest::admits`]), as the gateway's own
