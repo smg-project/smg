@@ -159,7 +159,7 @@ replaces the old one whole, under a number above the old one's.
 pub struct PolicySpec {
     pub api_version: String,                     // always "smg.policy/v1"
     pub generation: u64,                         // the document's number
-    // (one private field reads a `kind` line only to refuse it)
+    // (one private field reads a `kind` line only to refuse it; a `kind` with no value reads as left out)
     pub view: ViewSpec,                          // what a decision may read beyond the basic facts
     pub index: BTreeMap<String, IndexSpec>,      // settings of the record of sent prefixes, by model
     pub signals: BTreeMap<String, SignalSpec>,   // named values of a worker's report that stages read
@@ -197,7 +197,7 @@ pub struct Match {
     pub model: String,     // an exact id, `prefix*`, `*suffix` or `*`
     pub phase: Vec<Phase>, // single, prefill, decode, encode; empty covers every phase
     // tenant, priority, header, prompt_tokens and labels are in the schema; a document that
-    // writes one is refused as not in this build
+    // sets one is refused as not in this build (an empty `labels` list sets none)
 }
 ```
 
@@ -309,7 +309,8 @@ them:
   view carries no block for (its depth, or any cache boundary of the view, holds no whole block
   or more blocks than a request carries), and one that sets what the build does not run. The
   mode's own document is checked where it is applied, and its refusal still ends a start: sides
-  that state no policy run the main one.
+  that state no policy run the main one, except an encode side, which is placed by consistent
+  hashing.
 
 A request of the family left out is then refused: the token count in a gateway of one router,
 each single request in a gateway of many routers.
@@ -319,7 +320,7 @@ that the document replaces. The command line refuses such a flag where it was ty
 default value. The Python launcher cannot tell whether a flag was typed, and refuses one that is
 off its default. A configuration built by hand is compared instead. The document is accepted when
 the routing settings say the same document or say nothing. Otherwise the start is refused, and the
-error names the first difference. A gateway's start also refuses a supplied document whose
+error names the first difference. A start that turns on `grouped_dp_sticky` beside a supplied document is refused whatever the document says: the pin reads the gateway's own key, which the document's key sources need not be. A gateway's start also refuses a supplied document whose
 bindings differ in an overload word, and one whose overload block is on where the gateway states
 neither threshold (decision 10). A supplied document that binds no single request refuses each
 single request, in any gateway. For a prefill-decode mode of one router over HTTP that is the
@@ -451,7 +452,7 @@ What a policy remembers lives in several places, among them:
 generations. It can keep the last eight generations in a folder, one file each, and roll back to
 one of them.
 
-A gateway reads the supplied file by the crate's one read of a document (`Format::read`), the read an apply and a controller's file pass. A file named `.json` is read as JSON, any other name as YAML (`Format::of`). Either form is read into values first, and the document is built from those values by one typed read.
+A gateway reads the supplied file by the crate's one read of a document (`Format::read`), the read an apply and a controller's file pass. A file whose name has the extension `json`, in any letter case, is read as JSON, any other name as YAML (`Format::of`); a file named only `.json` has no extension and is read as YAML. Either form is read into values first, and the document is built from those values by one typed read.
 
 So a YAML document reads as JSON does. Text that looks like a number, a boolean or a null is written in quotes. A key with nothing under it is refused where a list or a map must stand. A list item with nothing in it is refused in a list of the spec's own.
 
@@ -508,7 +509,9 @@ The built-in stages:
 |---|---|
 | filter | `healthy`, `not-overloaded`, `has-capacity`, `has-room`, `not-tried` |
 | scorer | `least-load`, `least-requests`, `fewest-sessions`, `session-affinity`, `prefix-affinity`, `kv-pressure`, `warmup-slice`, `bucket`, `consistent-hash`, `resident-work`, `least-cost` |
-| picker | `best`, `round-robin`, `random`, `power-of-two`, `count-first`, `power-of-two-count-first`, `passthrough`, `manual`, `best-with-temperature` |
+| picker | `best`, `round-robin`, `random`, `power-of-two`, `count-first`, `power-of-two-count-first`, `passthrough`, `manual` |
+
+The schema also holds the picker `best-with-temperature`. This build does not run it: a profile that picks by it is refused as not in this build.
 
 A program that embeds the crate can add stages of its own under new names
 (`StageRegistry::filter`, `scorer`, `picker`) and validate documents against that table.
@@ -1141,7 +1144,7 @@ pub struct Candidate {
     pub dp_size: u16,        // how many ranks its engine has
     pub wire_modes: WireModes, // protocols it serves
     pub engine_kind: u16,    // engine family, as a position in the document's list
-    pub connector: u16,      // prefill-decode connector, as a position in the document's list
+    pub connector: u16,      // prefill-decode connector, as a number a host assigns; the document declares no list of them, and the crate's rows read 0
     pub pair_class: u32,     // which decodes a prefill can pair with
     pub zone: u16,           // zone, as a position in the document's list
     pub labels: u64,         // one bit for each label the document declares (at most 64)
@@ -3188,7 +3191,7 @@ request ──> route (HTTP or gRPC, any family)
 - **Membership.** The gateway's value for a model's workers gets one cell for each list, which
   the engine fills.
 
-  The pair classes a gateway hands with a pair's two lists are derived under the pairing of the document in force: beside a supplied document the registry takes that document's `plans.pd_pair.pairing` at its build, and no request reads it.
+  The pair classes a gateway hands with a pair's two lists are derived under the pairing of the document in force: beside a supplied document the registry takes that document's `plans.pd-pair.pairing` at its build, and no request reads it.
 
   On the wire that carries one runtime's request the classes also state each prefill's first partners: its partners on its own known runtime (`PartnerClasses::number_first`). The engine makes a pair among the prefills with a first partner open and those partners while there is one, so a pair on one known runtime goes ahead of a pair with a worker whose runtime is unknown, as under classic. The other wire states no first partner, and a fleet whose every partner would go first states none either.
 - **The rank.** A data-parallel worker registered rank by rank (every registration reads the worker's width and registers one worker a rank; an HTTP worker whose load route does not hold a row for every rank stays one worker, unless its host keeps a load source of its own for it) is the shape the engine serves in full. Each rank is then a worker object, and a record of its own in its list (`Candidate::dp_rank`, section 5.3). The record reads its own rank's named values (section 5.8). A stage that keeps load reports is told each rank's own report, under that rank (`Signal::Load`). `Candidate::engine` is the same number on every rank of one such worker. The request is sent with the rank of the record the engine picked: where a record is one rank, no rank choice runs behind the pick. A rank is chosen behind the pick in two places, each by classic's own code, with the engine on as under classic, and each inside a worker registered once for all its ranks: on the HTTP pair route, under a connector that holds both sides of a pair to one rank, the route's own turn names the rank both sides are sent to; and under the gateway's `--grouped-dp-sticky hash`, the gRPC dispatch pins a single request that has a sticky key, and where the runtime allows it a pair's prefill side, to that key's rank. That option is refused beside a supplied document.
@@ -4089,8 +4092,8 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 |---|---|---|
 | The policy document: profiles, bindings by model and phase, plans, a binding's shed word and its refusal of an overload number, routing key, sessions | **[built]** | |
 | A binding's overload switch (`overload.enabled`) under worker objects | **[built]** | |
-| Bindings by tenant, priority, header, prompt size, labels; a session id issued by the engine (`issue_session_id`) | **[planned]** | in the schema; a document that writes one is refused as not in this build |
-| `canary`, `override: allowed`, `admission` | **[planned]** | in the schema; a document that writes one is refused, and the error names the field |
+| Bindings by tenant, priority, header, prompt size, labels; a session id issued by the engine (`issue_session_id`) | **[planned]** | in the schema; a document that sets one is refused as not in this build (an empty `labels` list and `issue_session_id: false` set none) |
+| `canary`, `override: allowed`, an `admission` switched on | **[planned]** | in the schema; a document that writes one is refused, and the error names the field |
 | `shadow`, `explain.sample` | **[partly]** | the engine runs a single request's shadow, but not one that reads affinity rows of its own; it runs a pair's shadows by side at the pair's first decision, and the decode side's at a decode decided again, in a host's own process; a gateway takes a document that names them, and no served controller asks them, and `explain.sample` is kept by the served controller and, for a single request and a pair's first decision, by the engine in a gateway's process, where the gateway answers a record at `GET /policy/explain/{request_id}` (decision 7) |
 | The ten presets and the conversion from routing settings | **[built]** | |
 | A worker's `policy` label names its model's policy | **[partly]** | section 3.3: built: the builder of the settings' document takes a label and binds its model, the gateway hands it its labels and puts the document in force, a document put in force keeps the stages of a profile that did not change, and the trees the engine is lent are made where a label's document first reads sent prefixes; open: a profile for each labelled model |
@@ -4271,7 +4274,7 @@ takes a document that names a pair's shadows, and a served controller asks no si
 shadow. The explain sample is kept by the served controller, and by the engine in a gateway's
 process for a single request and a pair's first decision. There an encode request decided with
 its items, a decode decided again and a pair's shadows are in no record. The gateway answers a kept record at `GET /policy/explain/{request_id}`, in the JSON the crate writes one in. A request whose route states no id of its own is found by the gateway's own id of it, the one its response's `x-request-id` header shows (section 9.2). Under a policy spec that keeps a sample the gateway states its own request id under `x-smg-request-id`, and a client's value there is replaced. Under a spec that keeps none the gateway neither writes nor reads that header, and a client's value stays as it came. A configuration that names that header for a use of its own is served as for any header it names so. Named as a request id header, it is read and rewritten by the request-id layer where it is the first configured header that is present. No worker is sent the header in either case. A document
-that writes `canary`, `override: allowed` or `admission` is refused. No engine runs them.
+that writes `canary`, `override: allowed` or an `admission` switched on is refused. No engine runs them.
 
 | Option | Cost |
 |---|---|

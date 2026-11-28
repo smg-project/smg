@@ -168,12 +168,14 @@ pub(crate) const TYPES: &[Item] = &[
         doc: &[
             " One candidate row: a worker, or one DP rank of one. Positions are the",
             " row's index in the list the decision was given; the stage results name",
-            " positions. `zone`, `engine-kind` and `connector` are one-based positions",
-            " into the spec's declared lists (0 is unzoned, unspecified or none;",
-            " `zone-capacity.zone` is never 0); `labels` are bits over the declared",
-            " label list (at most 64; validation refuses a longer list). `load` is",
-            " absent when the host has no report; `admitted-age-ms` saturates at the",
-            " u32 maximum, never wraps.",
+            " positions. `zone` and `engine-kind` are one-based positions into the",
+            " spec's declared lists (0 is unzoned or unspecified; `zone-capacity.zone`",
+            " is never 0). `connector` is the pairing descriptor's connector as a",
+            " number the host assigns (0 is none): the spec declares no list of",
+            " connectors, and the rows this crate builds read 0. `labels` are bits",
+            " over the declared label list (at most 64; validation refuses a longer",
+            " list). `load` is absent when the host has no report; `admitted-age-ms`",
+            " saturates at the u32 maximum, never wraps.",
         ],
         fields: &[
             Field {
@@ -317,7 +319,7 @@ pub(crate) const TYPES: &[Item] = &[
         doc: &[
             " One request as a decision sees it. `headers` pairs a zero-based position",
             " into the spec's `view.headers` list with the value (unlike the one-based",
-            " `zone`, `engine-kind` and `connector`); `budget-micros` is relative to",
+            " `zone` and `engine-kind`); `budget-micros` is relative to",
             " the host's receipt; `seed` is the only randomness (see `host`).",
             " `block-hashes` is empty unless the plugin's row declares `token_hashes` or",
             " `text_hashes` among its needs. `prompt-tokens` is zero unless the row",

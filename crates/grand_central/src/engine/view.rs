@@ -4,8 +4,8 @@
 //! host. The names are the wire's: a candidate on the wire is this row with
 //! its affinity facts and without its position and sample instant, a request
 //! this request without its host clock and its affinity column, and positions
-//! into the spec's declared lists (zones, engine kinds, connectors, labels,
-//! headers) are the same positions here.
+//! into the spec's declared lists (zones, engine kinds, labels, headers) are
+//! the same positions here.
 
 use std::sync::atomic::AtomicU64;
 
@@ -943,8 +943,9 @@ pub struct Candidate {
     /// The engine family, as a position into the spec's declared list; `0`
     /// when unspecified.
     pub engine_kind: u16,
-    /// The pairing descriptor's connector, as a position into the spec's
-    /// declared list; `0` when none.
+    /// The pairing descriptor's connector, as a number a host assigns; `0`
+    /// when none. The spec declares no list of connectors, and the rows this
+    /// crate builds read `0`.
     pub connector: u16,
     /// Requests the deciding host holds on the worker right now: what
     /// [`RequestFacts::in_flight`] reads.

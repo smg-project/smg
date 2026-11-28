@@ -9,6 +9,7 @@ fn a_files_form_is_read_off_its_name() {
         ("policy.yaml", Format::Yaml),
         ("policy.yml", Format::Yaml),
         ("policy", Format::Yaml),
+        (".json", Format::Yaml),
         ("policy.json", Format::Json),
         ("POLICY.JSON", Format::Json),
         ("..data/policy.json", Format::Json),
