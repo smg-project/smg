@@ -2644,3 +2644,155 @@ fn none_renders_python_style() {
     let out = state.apply(&[], ChatTemplateParams::default()).unwrap();
     assert_eq!(out, "");
 }
+
+/// A template that does to a message everything a map answers: prints it,
+/// dumps it as it stands and sorted, sorts its items, reverses its keys,
+/// compares it, loops its keys and its items, asks its length, a key, its
+/// type.
+const WALKS_A_MESSAGE: &str = "{%- for message in messages %}{{ message | tojson }}|{{ message }}|\
+    {{ message | tojson(indent=2, sort_keys=true) }}|{{ message | dictsort }}|\
+    {{ message | reverse | list }}|{{ message == messages[0] }}|\
+    {%- for key in message %}{{ key }}={{ message[key] }};{%- endfor %}|\
+    {%- for key, value in message | items %}{{ key }}:{{ value }},{%- endfor %}|\
+    {%- for key, value in message.items() %}{{ key }}:{{ value }},{%- endfor %}|\
+    {{ message | length }}|{{ 'role' in message }}|{{ 'name' in message }}|\
+    {{ message is mapping }}|{{ message.role }}|{{ message['content'] }}|\
+    {{ message.get('name', 'nobody') }}|{{ message.missing is defined }}\n\
+    {%- endfor %}";
+
+fn a_tool_conversation() -> Vec<JsonValue> {
+    vec![
+        serde_json::json!({"role": "system", "content": "Be brief."}),
+        serde_json::json!({"role": "user", "content": [{"type": "text", "text": "Paris?"}]}),
+        serde_json::json!({"role": "assistant", "content": null, "tool_calls": [{
+            "id": "call_1", "type": "function",
+            "function": {"name": "lookup", "arguments": {"city": "Paris", "days": 2}}
+        }]}),
+        serde_json::json!({"role": "tool", "tool_call_id": "call_1", "content": "{\"sky\": 1.5}"}),
+        serde_json::json!({"role": "assistant", "content": "Clear.", "name": "guide"}),
+    ]
+}
+
+/// A message handed to the template as an object that owns its JSON reads
+/// as the map the conversion builds: every answer of the walk is the same
+/// text, in the same key order.
+#[test]
+fn a_message_that_owns_its_json_reads_as_the_converted_map_does() {
+    let state = ChatTemplateState::new(Some(WALKS_A_MESSAGE.to_string())).unwrap();
+    let env = state.env.as_ref().unwrap();
+    let messages = a_tool_conversation();
+    let converted = render_messages(
+        env,
+        messages.iter(),
+        ChatTemplateParams::default(),
+        &state.output_len,
+    )
+    .unwrap();
+    let owned = render_values(
+        env,
+        messages.into_iter().map(OwnedMessage::value).collect(),
+        ChatTemplateParams::default(),
+        &state.output_len,
+    )
+    .unwrap();
+    assert_eq!(owned, converted);
+    assert!(
+        converted.0.contains("role=system;content=Be brief.;|")
+            && converted
+                .0
+                .ends_with("|3|True|True|True|assistant|Clear.|guide|False"),
+        "the walk reads every message: {}",
+        converted.0
+    );
+
+    // An empty message is as false as the empty map.
+    let state = ChatTemplateState::new(Some(
+        "{%- for message in messages %}{{ 'y' if message else 'n' }}{%- endfor %}".to_string(),
+    ))
+    .unwrap();
+    let env = state.env.as_ref().unwrap();
+    let messages = vec![serde_json::json!({}), serde_json::json!({"role": "user"})];
+    let converted = render_messages(
+        env,
+        messages.iter(),
+        ChatTemplateParams::default(),
+        &state.output_len,
+    )
+    .unwrap();
+    let owned = render_values(
+        env,
+        messages.into_iter().map(OwnedMessage::value).collect(),
+        ChatTemplateParams::default(),
+        &state.output_len,
+    )
+    .unwrap();
+    assert_eq!(owned, converted);
+    assert_eq!(converted.0, "ny");
+}
+
+/// Messages handed over render the prompt of the borrowed slice whichever
+/// rewrite the render makes first: none, string content wrapped as text
+/// parts, a root or a developer message turned into the system message, a
+/// continued final message.
+#[test]
+fn messages_handed_over_render_as_the_borrowed_slice_does() {
+    let parts = "{%- for message in messages %}<{{ message.role }}>\
+                 {%- if message.content is string %}{{ message.content }}\
+                 {%- else %}{%- for part in message.content %}[{{ part.text }}]{%- endfor %}\
+                 {%- endif %}{{ message | tojson }}\n{%- endfor %}";
+    let with_roles = |first: &str| {
+        let mut messages = a_tool_conversation();
+        messages.insert(
+            2,
+            serde_json::json!({"role": first, "content": "Be terse."}),
+        );
+        messages
+    };
+    let continued = || ChatTemplateParams {
+        continue_final_message: true,
+        ..ChatTemplateParams::default()
+    };
+    for (template, messages, params) in [
+        (
+            WALKS_A_MESSAGE,
+            a_tool_conversation(),
+            ChatTemplateParams::default(),
+        ),
+        (
+            WALKS_A_MESSAGE,
+            with_roles("developer"),
+            ChatTemplateParams::default(),
+        ),
+        (
+            WALKS_A_MESSAGE,
+            with_roles("root"),
+            ChatTemplateParams::default(),
+        ),
+        (WALKS_A_MESSAGE, a_tool_conversation(), continued()),
+        (
+            parts,
+            with_roles("developer"),
+            ChatTemplateParams::default(),
+        ),
+        (parts, a_tool_conversation(), continued()),
+    ] {
+        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+        let borrowed = state
+            .apply_with_continuation(&messages, ChatTemplateParams { ..params })
+            .unwrap();
+        let owned = state.apply_messages(Cow::Owned(messages), params).unwrap();
+        assert_eq!(owned, borrowed, "{template}");
+    }
+    let state = ChatTemplateState::new(Some(parts.to_string())).unwrap();
+    assert_eq!(state.content_format(), ChatTemplateContentFormat::OpenAI);
+    assert_eq!(
+        state
+            .apply_messages(
+                Cow::Owned(vec![serde_json::json!({"role": "developer", "content": "Be terse."})]),
+                ChatTemplateParams::default(),
+            )
+            .unwrap()
+            .0,
+        "<system>[Be terse.]{\"role\": \"system\", \"content\": [{\"type\": \"text\", \"text\": \"Be terse.\"}]}",
+    );
+}

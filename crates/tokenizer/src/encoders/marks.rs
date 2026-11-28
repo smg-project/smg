@@ -339,9 +339,9 @@ pub(crate) fn marked_special_tokens(tokens: &SpecialTokens) -> SpecialTokens {
 /// special tokens the template reads between the marks; for any other
 /// template, the request as given, the tokenizer's special tokens standing
 /// in when the caller passed none. Owns the copies it had to make, borrows
-/// the rest.
+/// the rest; the messages go back to the caller beside it, so a vector the
+/// caller handed over stays its own when no mark was removed.
 pub(crate) struct TemplateInputs<'a> {
-    messages: Cow<'a, [Value]>,
     tools: Option<Cow<'a, [Value]>>,
     documents: Option<Cow<'a, [Value]>>,
     template_kwargs: Option<Cow<'a, HashMap<String, Value>>>,
@@ -352,16 +352,31 @@ impl<'a> TemplateInputs<'a> {
     /// The inputs of `messages` under `params`: unmarked when `marked_tokens`
     /// is given (the tokenizer's special tokens between the marks, read when
     /// the caller passed none; the caller's own are marked here), else as
-    /// given, with `special_tokens` standing in for the caller's.
+    /// given, with `special_tokens` standing in for the caller's. The
+    /// messages come back first: a copy when a mark was removed, else the
+    /// caller's own.
     pub(crate) fn new(
-        messages: &'a [Value],
+        messages: Cow<'a, [Value]>,
         params: &ChatTemplateParams<'a>,
         marked_tokens: Option<&'a SpecialTokens>,
         special_tokens: &'a SpecialTokens,
-    ) -> Self {
-        match marked_tokens {
-            Some(marked_tokens) => Self {
-                messages: without_marks(messages),
+    ) -> (Cow<'a, [Value]>, Self) {
+        let Some(marked_tokens) = marked_tokens else {
+            let inputs = Self {
+                tools: params.tools.map(Cow::Borrowed),
+                documents: params.documents.map(Cow::Borrowed),
+                template_kwargs: params.template_kwargs.map(Cow::Borrowed),
+                special_tokens: Cow::Borrowed(params.special_tokens.unwrap_or(special_tokens)),
+            };
+            return (messages, inputs);
+        };
+        let unmarked = match without_marks(&messages) {
+            Cow::Owned(unmarked) => Some(unmarked),
+            Cow::Borrowed(_) => None,
+        };
+        (
+            unmarked.map_or(messages, Cow::Owned),
+            Self {
                 tools: params.tools.map(without_marks),
                 documents: params.documents.map(without_marks),
                 template_kwargs: params.template_kwargs.map(kwargs_without_marks),
@@ -370,39 +385,25 @@ impl<'a> TemplateInputs<'a> {
                     None => Cow::Borrowed(marked_tokens),
                 },
             },
-            None => Self {
-                messages: Cow::Borrowed(messages),
-                tools: params.tools.map(Cow::Borrowed),
-                documents: params.documents.map(Cow::Borrowed),
-                template_kwargs: params.template_kwargs.map(Cow::Borrowed),
-                special_tokens: Cow::Borrowed(params.special_tokens.unwrap_or(special_tokens)),
-            },
-        }
+        )
     }
 
-    /// The messages, and `params` with its strings replaced by these (a
-    /// prepared form of the tools is of the tools as given, so a copy of
-    /// them drops it).
-    pub(crate) fn split<'b>(
-        &'b self,
-        params: ChatTemplateParams<'b>,
-    ) -> (&'b [Value], ChatTemplateParams<'b>) {
+    /// `params` with its strings replaced by these (a prepared form of the
+    /// tools is of the tools as given, so a copy of them drops it).
+    pub(crate) fn split<'b>(&'b self, params: ChatTemplateParams<'b>) -> ChatTemplateParams<'b> {
         let tools_copied = matches!(self.tools, Some(Cow::Owned(_)));
-        (
-            &self.messages,
-            ChatTemplateParams {
-                tools: self.tools.as_deref(),
-                documents: self.documents.as_deref(),
-                template_kwargs: self.template_kwargs.as_deref(),
-                special_tokens: Some(&self.special_tokens),
-                prepared_tools: if tools_copied {
-                    None
-                } else {
-                    params.prepared_tools
-                },
-                ..params
+        ChatTemplateParams {
+            tools: self.tools.as_deref(),
+            documents: self.documents.as_deref(),
+            template_kwargs: self.template_kwargs.as_deref(),
+            special_tokens: Some(&self.special_tokens),
+            prepared_tools: if tools_copied {
+                None
+            } else {
+                params.prepared_tools
             },
-        )
+            ..params
+        }
     }
 }
 

@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::HashMap,
     ops::Range,
     path::Path,
@@ -39,9 +40,8 @@ use crate::{
         UnknownId,
     },
     chat_template::{
-        load_chat_template_from_file, wrap_string_content_in_place, ChatTemplateContentFormat,
-        ChatTemplateParams, ChatTemplateState, ConfigChatTemplates, ThinkingKeyName,
-        ThinkingToggle,
+        load_chat_template_from_file, ChatTemplateContentFormat, ChatTemplateParams,
+        ChatTemplateState, ConfigChatTemplates, ThinkingKeyName, ThinkingToggle,
     },
     decode_activity::note_prefix_mismatch,
     encode_path::{self, EncodePath},
@@ -1880,16 +1880,18 @@ impl HuggingFaceTokenizer {
     /// The Jinja renderer, with this tokenizer's special tokens unless the
     /// caller passed its own. The flag says whether the prompt continues the
     /// final message (see `ChatTemplateState::apply_with_continuation`).
+    /// Messages the caller handed over stay its own down to the template
+    /// (see `ChatTemplateState::apply_messages`).
     fn apply_jinja(
         &self,
-        messages: &[serde_json::Value],
+        messages: Cow<'_, [serde_json::Value]>,
         params: ChatTemplateParams,
     ) -> Result<(String, bool)> {
         // A marked template (see `structural_controls`) writes its control
         // tokens between marks, the special tokens it reads included, and
         // reads every request string (messages, tools, documents, template
         // kwargs) with its marks removed, so no request can forge one.
-        let inputs = marks::TemplateInputs::new(
+        let (messages, inputs) = marks::TemplateInputs::new(
             messages,
             &params,
             self.special_tokens_marked
@@ -1897,15 +1899,60 @@ impl HuggingFaceTokenizer {
                 .filter(|_| self.chat_template.marked()),
             &self.special_tokens,
         );
-        let (messages, params) = inputs.split(params);
+        let params = inputs.split(params);
         // A template that writes nothing for the request's tools gets them
         // as a system message block (the V3.1 template, see `deepseek_v31`).
         let with_block = self
             .tools_block
-            .then(|| deepseek_v31::messages_with_tools_block(messages, params.tools))
+            .then(|| deepseek_v31::messages_with_tools_block(&messages, params.tools))
             .flatten();
-        let messages = with_block.as_deref().unwrap_or(messages);
-        self.chat_template.apply_with_continuation(messages, params)
+        let messages = with_block.map_or(messages, Cow::Owned);
+        self.chat_template.apply_messages(messages, params)
+    }
+
+    /// The Jinja renderer of a plain checkpoint and the GLM renderer encode
+    /// from their text. A renderer with an encoder of its own, and the Jinja
+    /// renderer of a checkpoint with `structural_controls`, render their
+    /// control tokens marked (see `encoders::marks`) and the prompt is
+    /// encoded by segments, so that a control-token spelling typed in a
+    /// message stays text: as text all the same when the flat encode would
+    /// cut out exactly the renderer's control tokens (the ids are then the
+    /// same, and the text takes every path and cache a flat encode takes),
+    /// else as a deferred encode of the segments.
+    /// Messages the caller handed over go to the Jinja renderer as its own;
+    /// every other renderer reads them borrowed.
+    fn apply_with_encoding(
+        &self,
+        messages: Cow<'_, [serde_json::Value]>,
+        params: ChatTemplateParams,
+        assistant_prefix: Option<&str>,
+    ) -> Result<ChatTemplateOutput> {
+        // The Jinja and GLM renderers say whether they continued the final
+        // message or appended its text after the generation prompt; their
+        // header is the flag they rendered under (the template's
+        // `add_generation_prompt` variable is that flag: the render context
+        // keeps the field's value over a `template_kwargs` entry of that name).
+        let generation_prompt_unless_continued = params.generation_prompt_unless_continued();
+        let (mut text, continued_final_message) = match self.renderer {
+            Renderer::Jinja if !self.chat_template.marked() => {
+                self.apply_jinja(messages, params)?
+            }
+            Renderer::Glm53(template) => self.apply_glm53(&messages, params, template)?,
+            Renderer::Inkling2 => {
+                return self.apply_inkling2_with_encoding(&messages, params, assistant_prefix)
+            }
+            _ => return self.apply_marked_with_encoding(&messages, params, assistant_prefix),
+        };
+        if let Some(prefix) = assistant_prefix {
+            text.push_str(prefix);
+        }
+        Ok(ChatTemplateOutput {
+            text,
+            encoding: PromptEncoding::FromText,
+            unbilled_prompt_tokens: 0,
+            continued_final_message,
+            generation_prompt: generation_prompt_unless_continued && !continued_final_message,
+        })
     }
 
     fn apply_glm53(
@@ -1921,7 +1968,7 @@ impl HuggingFaceTokenizer {
                 .iter()
                 .any(|key| kwargs.contains_key(*key))
         }) {
-            self.apply_jinja(messages, params)
+            self.apply_jinja(Cow::Borrowed(messages), params)
         } else {
             glm53::render(messages, params, template)
         }
@@ -2834,7 +2881,9 @@ impl HuggingFaceTokenizer {
         match self.renderer {
             // The template compiled marked: whether it continued the final
             // message comes with the render.
-            Renderer::Jinja if self.chat_template.marked() => self.apply_jinja(messages, params),
+            Renderer::Jinja if self.chat_template.marked() => {
+                self.apply_jinja(Cow::Borrowed(messages), params)
+            }
             Renderer::Jinja | Renderer::Glm53(_) | Renderer::Inkling2 => Err(Error::msg(
                 "the Jinja, GLM and Inkling2 renderers render no marked prompt",
             )),
@@ -3053,9 +3102,9 @@ impl TokenizerTrait for HuggingFaceTokenizer {
         params: ChatTemplateParams,
     ) -> Result<String> {
         match self.renderer {
-            Renderer::Jinja if !self.chat_template.marked() => {
-                self.apply_jinja(messages, params).map(|(text, _)| text)
-            }
+            Renderer::Jinja if !self.chat_template.marked() => self
+                .apply_jinja(Cow::Borrowed(messages), params)
+                .map(|(text, _)| text),
             Renderer::Glm53(template) => self
                 .apply_glm53(messages, params, template)
                 .map(|(text, _)| text),
@@ -3069,70 +3118,22 @@ impl TokenizerTrait for HuggingFaceTokenizer {
         }
     }
 
-    /// The Jinja renderer of a plain checkpoint and the GLM renderer encode
-    /// from their text. A renderer with an encoder of its own, and the Jinja
-    /// renderer of a checkpoint with `structural_controls`, render their
-    /// control tokens marked (see `encoders::marks`) and the prompt is
-    /// encoded by segments, so that a control-token spelling typed in a
-    /// message stays text: as text all the same when the flat encode would
-    /// cut out exactly the renderer's control tokens (the ids are then the
-    /// same, and the text takes every path and cache a flat encode takes),
-    /// else as a deferred encode of the segments.
     fn apply_chat_template_with_encoding(
         &self,
         messages: &[serde_json::Value],
         params: ChatTemplateParams,
         assistant_prefix: Option<&str>,
     ) -> Result<ChatTemplateOutput> {
-        // The Jinja and GLM renderers say whether they continued the final
-        // message or appended its text after the generation prompt; their
-        // header is the flag they rendered under (the template's
-        // `add_generation_prompt` variable is that flag: the render context
-        // keeps the field's value over a `template_kwargs` entry of that name).
-        let generation_prompt_unless_continued = params.generation_prompt_unless_continued();
-        let (mut text, continued_final_message) = match self.renderer {
-            Renderer::Jinja if !self.chat_template.marked() => {
-                self.apply_jinja(messages, params)?
-            }
-            Renderer::Glm53(template) => self.apply_glm53(messages, params, template)?,
-            Renderer::Inkling2 => {
-                return self.apply_inkling2_with_encoding(messages, params, assistant_prefix)
-            }
-            _ => return self.apply_marked_with_encoding(messages, params, assistant_prefix),
-        };
-        if let Some(prefix) = assistant_prefix {
-            text.push_str(prefix);
-        }
-        Ok(ChatTemplateOutput {
-            text,
-            encoding: PromptEncoding::FromText,
-            unbilled_prompt_tokens: 0,
-            continued_final_message,
-            generation_prompt: generation_prompt_unless_continued && !continued_final_message,
-        })
+        self.apply_with_encoding(Cow::Borrowed(messages), params, assistant_prefix)
     }
 
     fn apply_chat_template_with_encoding_owned(
         &self,
-        mut messages: Vec<serde_json::Value>,
+        messages: Vec<serde_json::Value>,
         params: ChatTemplateParams,
         assistant_prefix: Option<&str>,
     ) -> Result<ChatTemplateOutput> {
-        // The shaping the Jinja render does for an OpenAI-format template
-        // (`ChatTemplateState::render_with_continuation`: every string content
-        // as a one-item text part list), done in place on the caller's
-        // vector first; the render then finds no string content to wrap and
-        // copies no message.
-        if matches!(self.renderer, Renderer::Jinja)
-            && !self.chat_template.marked()
-            && self
-                .chat_template
-                .content_format_for_tools(params.tools.is_some())
-                == ChatTemplateContentFormat::OpenAI
-        {
-            wrap_string_content_in_place(&mut messages);
-        }
-        self.apply_chat_template_with_encoding(&messages, params, assistant_prefix)
+        self.apply_with_encoding(Cow::Owned(messages), params, assistant_prefix)
     }
 
     fn chat_template_content_format(&self) -> ChatTemplateContentFormat {

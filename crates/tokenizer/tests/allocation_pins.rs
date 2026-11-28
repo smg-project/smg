@@ -553,16 +553,31 @@ const PARTS_TEMPLATE: &str = r"{%- for message in messages -%}
 {%- endfor -%}
 {%- if add_generation_prompt -%}{{- '<|assistant|>' -}}{%- endif -%}";
 
-/// The byte-level vocabulary with `PARTS_TEMPLATE` as its chat template, read
-/// from files the way a checkpoint is.
+/// `PARTS_TEMPLATE` without its branch for a list of parts: a template that
+/// reads string content.
+const STRING_TEMPLATE: &str = r"{%- for message in messages -%}
+{{- '<|' + message['role'] + '|>' -}}
+{%- if message['content'] is string -%}
+{{- message['content'] | trim -}}
+{%- endif -%}
+{{- '<|end|>\n' -}}
+{%- endfor -%}
+{%- if add_generation_prompt -%}{{- '<|assistant|>' -}}{%- endif -%}";
+
 fn parts_template_tokenizer() -> (tempfile::TempDir, HuggingFaceTokenizer) {
+    tokenizer_of_template(PARTS_TEMPLATE)
+}
+
+/// The byte-level vocabulary with `chat_template` as its chat template, read
+/// from files the way a checkpoint is.
+fn tokenizer_of_template(chat_template: &str) -> (tempfile::TempDir, HuggingFaceTokenizer) {
     let dir = tempfile::tempdir().expect("a temporary directory");
     let json = dir.path().join("tokenizer.json");
     common::byte_level_bpe(&common::FEW_MERGES, &[])
         .save(&json, false)
         .expect("the vocabulary file");
     let template = dir.path().join("chat_template.jinja");
-    std::fs::write(&template, PARTS_TEMPLATE).expect("the template file");
+    std::fs::write(&template, chat_template).expect("the template file");
     let tokenizer = HuggingFaceTokenizer::from_file_with_chat_template(
         json.to_str().expect("a utf-8 path"),
         Some(template.to_str().expect("a utf-8 path")),
@@ -630,7 +645,7 @@ fn renders_of(tokenizer: &dyn Tokenizer) -> (usize, usize) {
 /// The render of an OpenAI-format template wraps every string content as a
 /// one-item part list first. On a borrowed slice that is a copy of every
 /// message; on a vector the caller hands over it happens in place, the
-/// prompt the same. Today: 211 calls against 136 for the seven messages of
+/// prompt the same. Today: 187 calls against 112 for the seven messages of
 /// a two-turn tool conversation, after a warm-up render; a copy added to
 /// either path moves its count.
 #[test]
@@ -644,14 +659,37 @@ fn an_owned_render_of_an_openai_format_template_wraps_in_place_and_copies_no_mes
     let (borrowed_calls, owned_calls) = renders_of(&tokenizer);
     assert_eq!(
         (borrowed_calls, owned_calls),
-        (211, 136),
+        (187, 112),
+        "allocation calls of the borrowed and the owned render of seven messages"
+    );
+}
+
+/// The render of a template that reads string content rewrites no message.
+/// A borrowed slice is converted whole into maps of the template engine,
+/// every field of every message; a vector the caller hands over goes to the
+/// template as it stands, each message an object that owns its JSON and
+/// converts a field when the template reads it. Today: 86 calls against 62 for
+/// the seven messages of a two-turn tool conversation, after a warm-up
+/// render.
+#[test]
+fn an_owned_render_of_a_string_format_template_converts_only_the_fields_read() {
+    let (_dir, tokenizer) = tokenizer_of_template(STRING_TEMPLATE);
+    assert_eq!(
+        tokenizer.chat_template_content_format(),
+        llm_tokenizer::chat_template::ChatTemplateContentFormat::String,
+        "the template is detected as the string format"
+    );
+    let (borrowed_calls, owned_calls) = renders_of(&tokenizer);
+    assert_eq!(
+        (borrowed_calls, owned_calls),
+        (86, 62),
         "allocation calls of the borrowed and the owned render of seven messages"
     );
 }
 
 /// The gateway renders through the cached wrapper, whose owned entry must
 /// reach the renderer's for the in-place wrap to hold on the serving path.
-/// Today: 211 calls against 136 through the wrapper, as through the renderer.
+/// Today: 187 calls against 112 through the wrapper, as through the renderer.
 #[test]
 fn the_cached_wrappers_owned_render_wraps_in_place_as_the_renderers_does() {
     let (_dir, tokenizer) = parts_template_tokenizer();
@@ -667,7 +705,7 @@ fn the_cached_wrappers_owned_render_wraps_in_place_as_the_renderers_does() {
     let (borrowed_calls, owned_calls) = renders_of(&cached);
     assert_eq!(
         (borrowed_calls, owned_calls),
-        (211, 136),
+        (187, 112),
         "allocation calls of the borrowed and the owned render through the cached wrapper"
     );
 }
