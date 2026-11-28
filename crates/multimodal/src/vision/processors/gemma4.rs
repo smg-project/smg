@@ -270,6 +270,11 @@ impl Pixels {
         })
     }
 
+    /// Padding is zero in the float reference, even if zero pixels are normalized.
+    fn emits_pixel_bytes(&self) -> bool {
+        self.lut.iter().all(|channel| channel[0].to_bits() == 0)
+    }
+
     /// Whether the three channels map a byte to one value (the released
     /// checkpoints: a rescale and no normalization), so a patch row's
     /// interleaved RGB bytes convert as one run of one channel.
@@ -325,8 +330,8 @@ impl RgbSource for RgbFrameRef<'_> {
 
 /// One encoded image or frame: `max_patches * patch_pixels` values,
 /// `max_patches * 2` positions and the soft-token count.
-struct Encoded {
-    values: Vec<f32>,
+struct Encoded<T> {
+    values: Vec<T>,
     positions: Vec<i64>,
     tokens: usize,
 }
@@ -412,11 +417,12 @@ impl Layout {
 }
 
 /// The resized, patchified and padded form of one image or frame.
-fn encode<F: RgbSource>(
+fn encode<F: RgbSource, T: Copy + Default>(
     frame: &F,
     params: Params,
     pixels: &Pixels,
-) -> Result<Encoded, TransformError> {
+    lut: &[[T; 256]; 3],
+) -> Result<Encoded<T>, TransformError> {
     let (source_w, source_h) = frame.dimensions();
     let (source_w, source_h) = (source_w as usize, source_h as usize);
     let layout = Layout::new(source_w, source_h, params, pixels)?;
@@ -431,7 +437,6 @@ fn encode<F: RgbSource>(
         .try_reserve_exact(params.max_patches() * patch_pixels)
         .map_err(refused)?;
     let data = layout.pixels(frame.rgb()?, source_w, source_h, pixels.filter)?;
-    let lut = &pixels.lut;
     let row_bytes = layout.width * CHANNELS;
     for patch_y in 0..layout.grid_h {
         for patch_x in 0..layout.grid_w {
@@ -449,7 +454,7 @@ fn encode<F: RgbSource>(
             }
         }
     }
-    values.resize(params.max_patches() * patch_pixels, 0.0);
+    values.resize(params.max_patches() * patch_pixels, T::default());
     let mut positions = vec![0_i64; params.max_patches() * 2];
     layout.write_positions(&mut positions);
     Ok(Encoded {
@@ -499,10 +504,15 @@ fn encode_wire<F: RgbSource>(
 }
 
 /// Stack encoded items along the first dimension.
-fn stack(
-    encoded: Vec<Encoded>,
+fn stack<'a, F: RgbSource + 'a, T: Copy + Default>(
+    frames: impl Iterator<Item = &'a F>,
     params: Params,
-) -> Result<(Array3<f32>, ModelSpecificValue, Vec<usize>), TransformError> {
+    pixels: &Pixels,
+    lut: &[[T; 256]; 3],
+) -> Result<(Array3<T>, ModelSpecificValue, Vec<usize>), TransformError> {
+    let encoded = frames
+        .map(|frame| encode(frame, params, pixels, lut))
+        .collect::<Result<Vec<_>, _>>()?;
     let count = encoded.len();
     let (max_patches, patch_pixels) = (params.max_patches(), params.patch_pixels());
     let mut values = Vec::new();
@@ -525,6 +535,21 @@ fn stack(
     Ok((tensor, positions, tokens))
 }
 
+fn encode_batch<'a, F: RgbSource + 'a>(
+    frames: impl Iterator<Item = &'a F>,
+    params: Params,
+    pixels: &Pixels,
+) -> Result<(EncoderInput, ModelSpecificValue, Vec<usize>), TransformError> {
+    if pixels.emits_pixel_bytes() {
+        let lut = [std::array::from_fn(|level| level as u8); 3];
+        let (patches, positions, tokens) = stack(frames, params, pixels, &lut)?;
+        Ok((EncoderInput::bytes(patches, pixels.norm), positions, tokens))
+    } else {
+        let (patches, positions, tokens) = stack(frames, params, pixels, &pixels.lut)?;
+        Ok((patches.into(), positions, tokens))
+    }
+}
+
 fn preprocess_video_frames<F: RgbSource>(
     frames: &[F],
     params: Params,
@@ -538,11 +563,7 @@ fn preprocess_video_frames<F: RgbSource>(
     {
         return Err(shape("Gemma 4 video frames must have identical dimensions"));
     }
-    let encoded = frames
-        .iter()
-        .map(|frame| encode(frame, params, pixels))
-        .collect::<Result<Vec<_>, _>>()?;
-    let (tensor, positions, tokens) = stack(encoded, params)?;
+    let (tensor, positions, tokens) = encode_batch(frames.iter(), params, pixels)?;
     Ok(
         PreprocessedEncoderInputs::new(tensor, vec![tokens.iter().sum()], vec![(width, height)])
             .with_extra("pixel_position_ids_videos", positions)
@@ -720,6 +741,10 @@ impl VisionPreProcessor for Gemma4Processor {
         params.max_patches().checked_mul(params.patch_pixels())
     }
 
+    fn emits_pixel_bytes(&self) -> bool {
+        self.pixels.emits_pixel_bytes()
+    }
+
     fn default_mean(&self) -> [f64; 3] {
         [0.0, 0.0, 0.0]
     }
@@ -734,11 +759,8 @@ impl VisionPreProcessor for Gemma4Processor {
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         TransformError::if_empty(images)?;
         let params = self.params_for(Modality::Image)?;
-        let encoded = images
-            .iter()
-            .map(|image| encode(*image, params, &self.pixels))
-            .collect::<Result<Vec<_>, _>>()?;
-        let (tensor, positions, tokens) = stack(encoded, params)?;
+        let (tensor, positions, tokens) =
+            encode_batch(images.iter().copied(), params, &self.pixels)?;
         let sizes = images
             .iter()
             .copied()
@@ -749,7 +771,7 @@ impl VisionPreProcessor for Gemma4Processor {
     }
 
     /// The image batch written once in `dtype` through the crate's writer.
-    /// `None` for the `uint8` wire (the processor emits floats) and for a
+    /// `None` for the `uint8` wire (served by `preprocess`) and for a
     /// normalization whose channels differ (the interleaved rows cannot
     /// convert as one run; the two-pass path serves).
     fn preprocess_wire(
@@ -945,7 +967,7 @@ mod tests {
             do_resize: false,
             ..Pixels::from_config(&image_config()).unwrap()
         };
-        let encoded = encode(&frame, params, &pipeline).unwrap();
+        let encoded = encode(&frame, params, &pipeline, &pipeline.lut).unwrap();
         let (patch, patch_pixels) = (params.patch, params.patch_pixels());
         let (grid_w, grid_h) = (width / patch, height / patch);
         let mut expected = vec![0.0_f32; params.max_patches() * patch_pixels];
@@ -988,6 +1010,79 @@ mod tests {
         // 1056x576 -> 66 x 36 = 2376 patches; the rest is padding.
         assert_eq!(values[[1, 2375, 0]], 4.0 * (1.0_f32 / 255.0));
         assert_eq!(values[[1, 2376, 0]], 0.0);
+    }
+
+    #[test]
+    fn image_and_video_can_send_unscaled_bytes_with_zero_padded_patches() {
+        let frame = solid(320, 240, [9, 37, 241]);
+        for (modality, defaults, position_key) in [
+            (Modality::Image, image_config(), "pixel_position_ids"),
+            (Modality::Video, video_config(), "pixel_position_ids_videos"),
+        ] {
+            let config = PreProcessorConfig {
+                do_rescale: Some(false),
+                do_normalize: Some(false),
+                ..defaults.clone()
+            };
+            let processor = Gemma4Processor::from_config_for(&config, modality).unwrap();
+            let baseline = Gemma4Processor::from_config_for(&defaults, modality).unwrap();
+            let run = |p: &Gemma4Processor| {
+                match modality {
+                    Modality::Image => p.preprocess(&[&frame]),
+                    _ => p.preprocess_video(
+                        std::slice::from_ref(&frame),
+                        &VideoClipOptions::sampled_at(2.0),
+                    ),
+                }
+                .unwrap()
+            };
+            let (raw, baseline) = (run(&processor), run(&baseline));
+            assert!(processor.emits_pixel_bytes());
+            assert_eq!(raw.feature_token_counts, baseline.feature_token_counts);
+            assert_eq!(raw.encoder_input.shape(), baseline.encoder_input.shape());
+            assert!(matches!(baseline.encoder_input, EncoderInput::U8 { .. }));
+            assert_eq!(raw.encoder_input.pixel_norm(), Some(PixelNorm::identity(1)));
+            let EncoderInput::U8 { patches, .. } = raw.encoder_input else {
+                panic!("expected raw Gemma pixels");
+            };
+            let ModelSpecificValue::IntTensor {
+                data: positions, ..
+            } = &raw.model_specific[position_key]
+            else {
+                panic!("expected patch positions");
+            };
+            let patches = patches.as_slice().unwrap();
+            let patches = patches.as_chunks::<768>().0;
+            for (patch, &position) in patches.iter().zip(positions.as_chunks::<2>().0) {
+                let expected = if position == [-1, -1] {
+                    [0; 3]
+                } else {
+                    [9, 37, 241]
+                };
+                assert!(patch
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
+                    .all(|pixel| *pixel == expected));
+            }
+        }
+    }
+
+    #[test]
+    fn float_padding_is_zero_even_when_normalized_black_is_nonzero() {
+        let config = PreProcessorConfig {
+            do_resize: Some(false),
+            do_normalize: Some(true),
+            image_mean: Some(vec![0.5; 3]),
+            ..image_config()
+        };
+        let processor = Gemma4Processor::from_config_for(&config, Modality::Image).unwrap();
+        let output = processor.preprocess(&[&solid(48, 48, [0; 3])]).unwrap();
+        assert!(!processor.emits_pixel_bytes());
+        assert!(matches!(output.encoder_input, EncoderInput::F32(_)));
+        let float = output.encoder_input.as_f32();
+        assert_eq!(float[[0, 0, 0]], -0.5);
+        assert_eq!(float[[0, 9, 0]].to_bits(), 0);
     }
 
     #[test]

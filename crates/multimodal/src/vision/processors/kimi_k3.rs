@@ -79,8 +79,7 @@ impl KimiK3Processor {
                 merge_size: DEFAULT_MERGE_SIZE,
                 in_patch_limit: DEFAULT_IN_PATCH_LIMIT,
                 patch_limit_on_one_side: DEFAULT_PATCH_LIMIT_ON_ONE_SIDE,
-                mean: PreProcessorConfig::CLIP_MEAN,
-                std: PreProcessorConfig::CLIP_STD,
+                mean_std: Some((PreProcessorConfig::CLIP_MEAN, PreProcessorConfig::CLIP_STD)),
             },
             transparent_bg: Some(default_transparent_bg()),
         }
@@ -137,6 +136,10 @@ impl VisionPreProcessor for KimiK3Processor {
 
     fn default_std(&self) -> [f64; 3] {
         KIMI_K3_STD
+    }
+
+    fn emits_pixel_bytes(&self) -> bool {
+        self.params.mean_std.is_none()
     }
 
     fn preprocess(

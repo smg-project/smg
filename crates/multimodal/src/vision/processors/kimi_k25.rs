@@ -49,8 +49,7 @@ impl KimiK25Processor {
                 merge_size: DEFAULT_MERGE_SIZE,
                 in_patch_limit: DEFAULT_IN_PATCH_LIMIT,
                 patch_limit_on_one_side: DEFAULT_PATCH_LIMIT_ON_ONE_SIDE,
-                mean: PreProcessorConfig::CLIP_MEAN,
-                std: PreProcessorConfig::CLIP_STD,
+                mean_std: Some((PreProcessorConfig::CLIP_MEAN, PreProcessorConfig::CLIP_STD)),
             },
         }
     }
@@ -69,6 +68,10 @@ impl VisionPreProcessor for KimiK25Processor {
 
     fn default_std(&self) -> [f64; 3] {
         KIMI_K25_STD
+    }
+
+    fn emits_pixel_bytes(&self) -> bool {
+        self.params.mean_std.is_none()
     }
 
     fn preprocess(

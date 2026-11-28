@@ -480,25 +480,28 @@ impl ModelProcessorSpec for NemotronOmniSpec {
         modality: Modality,
     ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
         match modality {
-            Modality::Image | Modality::Video => Ok(Box::new(if *self == Self::Packed {
-                NemotronOmniProcessor::new()
-            } else {
-                // The processor config wins where it names a value: Nemotron
-                // 3.5 Super VL sizes its video frames only there.
-                let geometry = Self::geometry(model_config)?
-                    .with_preprocessor_config(preprocessor_config)
-                    .map_err(|error| ModelRegistryError::InvalidPreprocessorConfig {
-                        spec: self.name(),
-                        modality,
-                        reason: match error {
-                            NemotronConfigError::Missing(key) => format!("{key} is missing"),
-                            NemotronConfigError::Invalid(key) => {
-                                format!("{key} holds a value the engine's processor refuses")
-                            }
-                        },
-                    })?;
-                NemotronOmniProcessor::reference(geometry)
-            })),
+            Modality::Image | Modality::Video => {
+                let processor = if *self == Self::Packed {
+                    NemotronOmniProcessor::new()
+                } else {
+                    // The processor config wins where it names a value: Nemotron
+                    // 3.5 Super VL sizes its video frames only there.
+                    let geometry = Self::geometry(model_config)?
+                        .with_preprocessor_config(preprocessor_config)
+                        .map_err(|error| ModelRegistryError::InvalidPreprocessorConfig {
+                            spec: self.name(),
+                            modality,
+                            reason: match error {
+                                NemotronConfigError::Missing(key) => format!("{key} is missing"),
+                                NemotronConfigError::Invalid(key) => {
+                                    format!("{key} holds a value the engine's processor refuses")
+                                }
+                            },
+                        })?;
+                    NemotronOmniProcessor::reference(geometry)
+                };
+                Ok(Box::new(processor.with_pixel_config(preprocessor_config)))
+            }
             _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }

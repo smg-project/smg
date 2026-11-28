@@ -42,10 +42,8 @@ pub(crate) struct MoonVitParams {
     pub in_patch_limit: usize,
     /// Maximum patches along one spatial dimension.
     pub patch_limit_on_one_side: usize,
-    /// Normalization mean (the config's, else CLIP's).
-    pub mean: [f64; 3],
-    /// Normalization std (the config's, else CLIP's).
-    pub std: [f64; 3],
+    /// Reference mean and standard deviation, when MoonViT normalizes pixels.
+    pub mean_std: Option<([f64; 3], [f64; 3])>,
 }
 
 impl MoonVitParams {
@@ -73,8 +71,8 @@ impl MoonVitParams {
                 .get_extra::<usize>("patch_limit_on_one_side")
                 .unwrap_or(self.patch_limit_on_one_side)
                 .max(1),
-            mean: config.get_image_mean(),
-            std: config.get_image_std(),
+            mean_std: (config.do_rescale.unwrap_or(true) || config.do_normalize.unwrap_or(true))
+                .then(|| (config.get_image_mean(), config.get_image_std())),
         }
     }
 
@@ -232,27 +230,27 @@ fn append_patches(
 /// Append the `[3, patch, patch]` patches of a `grid_w` x `grid_h` grid laid
 /// over interleaved RGB bytes: a byte maps through its channel's table, a
 /// cell beyond the image through the table's entry for a zero byte.
-fn write_patches(
+fn write_patches<T: Copy>(
     rgb: &[u8],
     (image_w, image_h): (usize, usize),
     (grid_w, grid_h): (usize, usize),
     patch: usize,
-    levels: &[[f32; 256]; 3],
-    out: &mut Vec<f32>,
+    map: impl Fn(usize, u8) -> T,
+    out: &mut Vec<T>,
 ) {
     let (pixels, _) = rgb.as_chunks::<3>();
     for top in (0..grid_h * patch).step_by(patch) {
         for left in (0..grid_w * patch).step_by(patch) {
             let inside = image_w.saturating_sub(left).min(patch);
-            for (channel, table) in levels.iter().enumerate() {
+            for channel in 0..3 {
                 for y in top..top + patch {
                     let row = if y < image_h && inside > 0 {
                         &pixels[y * image_w + left..][..inside]
                     } else {
                         &[]
                     };
-                    out.extend(row.iter().map(|pixel| table[usize::from(pixel[channel])]));
-                    out.extend(repeat_n(table[0], patch - row.len()));
+                    out.extend(row.iter().map(|pixel| map(channel, pixel[channel])));
+                    out.extend(repeat_n(map(channel, 0), patch - row.len()));
                 }
             }
         }
@@ -300,44 +298,68 @@ pub(crate) fn preprocess(
     images: &[&DynamicImage],
     transparent_bg: Option<TransparentBg>,
 ) -> Result<PreprocessedEncoderInputs, TransformError> {
-    let levels = normalized_levels(&params.mean, &params.std);
+    let patch = params.patch_size;
+    if let Some((mean, std)) = params.mean_std {
+        let levels = normalized_levels(&mean, &std);
+        return batch(
+            params,
+            images,
+            transparent_bg,
+            |elements| {
+                // `scratch::try_take_f32_cap`'s two steps, written out: with its
+                // result mapped (`.map_err(..)`, the buffer inside), the writer
+                // takes about 1 % more instructions.
+                let mut out = scratch::take_kept_f32(elements);
+                out.try_reserve(elements).map_err(refused)?;
+                Ok(out)
+            },
+            |out, rgb, size, grid| {
+                write_patches(
+                    rgb,
+                    size,
+                    grid,
+                    patch,
+                    |c, v| levels[c][usize::from(v)],
+                    out,
+                );
+            },
+            |patches, total| patch_array(patches, total, patch).map(EncoderInput::from),
+        );
+    }
     batch(
         params,
         images,
         transparent_bg,
         |elements| {
-            // `scratch::try_take_f32_cap`'s two steps, written out: with its
-            // result mapped (`.map_err(..)`, the buffer inside), the writer
-            // takes about 1 % more instructions.
-            let mut out = scratch::take_kept_f32(elements);
-            out.try_reserve(elements).map_err(refused)?;
+            let mut out = Vec::new();
+            out.try_reserve_exact(elements).map_err(refused)?;
             Ok(out)
         },
-        |out, rgb, size, grid| write_patches(rgb, size, grid, params.patch_size, &levels, out),
-        |patches, total_patches| {
-            ndarray::Array4::from_shape_vec(
-                (total_patches, 3, params.patch_size, params.patch_size),
-                patches,
-            )
-            .map(EncoderInput::from)
-            .map_err(|e| {
-                TransformError::ShapeError(format!(
-                    "Failed to create encoder_input [{total_patches}, 3, {}, {}]: {e}",
-                    params.patch_size, params.patch_size
-                ))
-            })
+        |out, rgb, size, grid| write_patches(rgb, size, grid, patch, |_, v| v, out),
+        |patches, total| {
+            patch_array(patches, total, patch)
+                .map(|patches| EncoderInput::bytes(patches, PixelNorm::identity(patch * patch)))
         },
     )
 }
 
+fn patch_array<T>(
+    patches: Vec<T>,
+    total: usize,
+    patch: usize,
+) -> Result<ndarray::Array4<T>, TransformError> {
+    ndarray::Array4::from_shape_vec((total, 3, patch, patch), patches)
+        .map_err(|e| TransformError::ShapeError(format!("MoonViT patch layout: {e}")))
+}
+
 /// The normalization of [`normalized_levels`] in the form a wire names: the
 /// byte less the mean, over the std, both in byte units.
-fn wire_norm(params: &MoonVitParams) -> PixelNorm {
+fn wire_norm(patch_size: usize, (mean, std): ([f64; 3], [f64; 3])) -> PixelNorm {
     PixelNorm {
         scale: 1.0,
-        offset: params.mean.map(|mean| mean as f32 * 255.0),
-        divisor: params.std.map(|std| std as f32 * 255.0),
-        channel_block: params.patch_size * params.patch_size,
+        offset: mean.map(|mean| mean as f32 * 255.0),
+        divisor: std.map(|std| std as f32 * 255.0),
+        channel_block: patch_size * patch_size,
     }
 }
 
@@ -353,7 +375,7 @@ fn wire_norm(params: &MoonVitParams) -> PixelNorm {
 /// same value for every byte once narrowed to `bfloat16` or `float16`, and
 /// differ in `float32`. So the wire is written in the two narrow dtypes, and
 /// only when every level of every channel is its norm's; `None` otherwise,
-/// which leaves the caller the float tensor and its write.
+/// which leaves the caller the processor's regular output.
 pub(crate) fn preprocess_wire(
     params: MoonVitParams,
     images: &[&DynamicImage],
@@ -368,8 +390,9 @@ pub(crate) fn preprocess_wire(
     let on_wire = |levels: [[f32; 256]; 3]| {
         levels.map(|channel| channel.map(|level| narrow(level).to_le_bytes()))
     };
-    let norm = wire_norm(&params);
-    let levels = on_wire(normalized_levels(&params.mean, &params.std));
+    let (mean, std) = params.mean_std?;
+    let norm = wire_norm(params.patch_size, (mean, std));
+    let levels = on_wire(normalized_levels(&mean, &std));
     if levels != on_wire(norm.table_f32()) {
         return None;
     }
@@ -502,6 +525,58 @@ mod tests {
     use super::*;
     use crate::test_support::hex;
 
+    #[test]
+    fn kimi_raw_patches_preserve_alpha_padding_and_token_counts() {
+        use crate::vision::{
+            processor::VisionPreProcessor,
+            processors::{KimiK25Processor, KimiK3Processor},
+        };
+
+        let image = DynamicImage::ImageRgba8(image::RgbaImage::from_fn(21, 15, |x, y| {
+            image::Rgba([x as u8, y as u8, 200, if x < 8 { 0 } else { 255 }])
+        }));
+        let defaults = PreProcessorConfig::from_json(
+            r#"{"image_mean":[0.5,0.5,0.5],"image_std":[0.5,0.5,0.5]}"#,
+        )
+        .unwrap();
+        let config = PreProcessorConfig {
+            do_normalize: Some(false),
+            do_rescale: Some(false),
+            ..defaults.clone()
+        };
+        let pairs: [(_, Box<dyn VisionPreProcessor>); 2] = [
+            (
+                KimiK25Processor::from_preprocessor_config(&defaults).preprocess(&[&image]),
+                Box::new(KimiK25Processor::from_preprocessor_config(&config)),
+            ),
+            (
+                KimiK3Processor::from_preprocessor_config(&defaults).preprocess(&[&image]),
+                Box::new(KimiK3Processor::from_preprocessor_config(&config)),
+            ),
+        ];
+        let levels = normalized_levels(&[0.5; 3], &[0.5; 3]);
+        for (baseline, processor) in pairs {
+            let baseline = baseline.unwrap();
+            let raw = processor.preprocess(&[&image]).unwrap();
+            assert!(processor.emits_pixel_bytes());
+            assert_eq!(raw.feature_token_counts, baseline.feature_token_counts);
+            assert_eq!(raw.encoder_input.shape(), baseline.encoder_input.shape());
+            assert!(matches!(baseline.encoder_input, EncoderInput::F32(_)));
+            assert!(processor
+                .preprocess_wire(&[&image], EncoderDtype::BFloat16)
+                .is_none());
+            let EncoderInput::U8 { patches, norm } = raw.encoder_input else {
+                panic!("expected raw MoonViT patches");
+            };
+            assert_eq!(norm, PixelNorm::identity(14 * 14));
+            assert_eq!(patches[[3, 2, 13, 13]], 0);
+            assert!(patches
+                .iter()
+                .zip(baseline.encoder_input.as_f32().iter())
+                .all(|(&byte, &value)| levels[0][usize::from(byte)].to_bits() == value.to_bits()));
+        }
+    }
+
     /// The reference's three steps, each stored as `f32`.
     fn reference_level(level: u8, mean: f64, std: f64) -> f32 {
         let rescaled = (f64::from(level) / 255.0) as f32;
@@ -573,8 +648,7 @@ mod tests {
             merge_size: 2,
             in_patch_limit: 65536,
             patch_limit_on_one_side: 512,
-            mean: [0.5; 3],
-            std: [0.5; 3],
+            mean_std: Some(([0.5; 3], [0.5; 3])),
         };
         // 256 x 28: every level in every channel, under the patch budget, so
         // the resize is the identity; 24 columns of zero padding follow.
@@ -652,8 +726,7 @@ mod tests {
             merge_size: 2,
             in_patch_limit: 3,
             patch_limit_on_one_side: 512,
-            mean: [0.5; 3],
-            std: [0.5; 3],
+            mean_std: Some(([0.5; 3], [0.5; 3])),
         }
     }
 
@@ -756,7 +829,14 @@ mod tests {
         let levels: [[f32; 256]; 3] =
             std::array::from_fn(|c| std::array::from_fn(|level| (c * 1000 + level) as f32));
         let mut out = Vec::new();
-        write_patches(&rgb, (image_w, image_h), (2, 2), patch, &levels, &mut out);
+        write_patches(
+            &rgb,
+            (image_w, image_h),
+            (2, 2),
+            patch,
+            |channel, byte| levels[channel][usize::from(byte)],
+            &mut out,
+        );
         assert_eq!(out.len(), 4 * 3 * patch * patch);
         let mut index = 0;
         for gh in 0..2 {
@@ -830,7 +910,7 @@ mod tests {
                     matches!(
                         &wire.encoder_input,
                         EncoderInput::Wire { dtype: stored, norm, .. }
-                            if *stored == dtype && *norm == wire_norm(&params)
+                            if *stored == dtype && *norm == wire_norm(params.patch_size, params.mean_std.unwrap())
                     ),
                     "{dtype}"
                 );
@@ -868,8 +948,9 @@ mod tests {
     #[test]
     fn the_wires_norm_gives_every_narrow_level_and_not_the_float32_ones() {
         let params = params_with_a_budget_of_three_patches();
-        let reference = normalized_levels(&params.mean, &params.std);
-        let named = wire_norm(&params).table_f32();
+        let (mean, std) = params.mean_std.unwrap();
+        let reference = normalized_levels(&mean, &std);
+        let named = wire_norm(params.patch_size, (mean, std)).table_f32();
         let narrow: [fn(f32) -> u16; 2] = [f32_to_bf16_bits, f32_to_f16_bits];
         for (channel, (reference, named)) in reference.iter().zip(&named).enumerate() {
             for (level, (reference, named)) in reference.iter().zip(named).enumerate() {
@@ -912,8 +993,9 @@ mod tests {
             let (mut offered_pairs, mut kept_pair) = (Vec::new(), None);
             // Every level of every channel, narrowed, is its norm's.
             let agree = |params: &MoonVitParams| {
-                let reference = normalized_levels(&params.mean, &params.std);
-                let named = wire_norm(params).table_f32();
+                let (mean, std) = params.mean_std.unwrap();
+                let reference = normalized_levels(&mean, &std);
+                let named = wire_norm(params.patch_size, (mean, std)).table_f32();
                 reference.iter().zip(&named).all(|(reference, named)| {
                     reference
                         .iter()
@@ -924,8 +1006,7 @@ mod tests {
             for mean in [0.2, 0.4, 0.5, 0.48145466] {
                 for std in [0.1, 0.25, 0.5, 0.26862954] {
                     let params = MoonVitParams {
-                        mean: [mean; 3],
-                        std: [std; 3],
+                        mean_std: Some(([mean; 3], [std; 3])),
                         ..params_with_a_budget_of_three_patches()
                     };
                     let wire = preprocess_wire(params, &[&image], None, dtype);
@@ -964,8 +1045,7 @@ mod tests {
                 mean[odd] = kept_pair.0;
                 std[odd] = kept_pair.1;
                 let params = MoonVitParams {
-                    mean,
-                    std,
+                    mean_std: Some((mean, std)),
                     ..params_with_a_budget_of_three_patches()
                 };
                 assert!(!agree(&params), "{dtype}: channel {odd} misses a level");
@@ -985,8 +1065,7 @@ mod tests {
                 offered_pairs[pairs - 1],
             ];
             let params = MoonVitParams {
-                mean: [a.0, b.0, c.0],
-                std: [a.1, b.1, c.1],
+                mean_std: Some(([a.0, b.0, c.0], [a.1, b.1, c.1])),
                 ..params_with_a_budget_of_three_patches()
             };
             assert!(agree(&params), "{dtype}: three offered channels");
@@ -999,7 +1078,7 @@ mod tests {
             );
             assert_eq!(
                 wire.encoder_input.pixel_norm(),
-                Some(wire_norm(&params)),
+                Some(wire_norm(params.patch_size, params.mean_std.unwrap())),
                 "{dtype}: wire norm"
             );
             let floats = preprocess(params, &[&image], None).unwrap();
@@ -1013,11 +1092,7 @@ mod tests {
                 .view()
                 .try_write_as(dtype)
                 .expect("float tensor writes");
-            assert_eq!(
-                wire_bytes, float_bytes,
-                "{dtype}: mean {:?}, std {:?}",
-                params.mean, params.std
-            );
+            assert_eq!(wire_bytes, float_bytes, "{dtype}: {:?}", params.mean_std);
         }
     }
 
