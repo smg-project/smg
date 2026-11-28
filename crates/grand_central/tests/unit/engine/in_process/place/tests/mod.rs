@@ -5,6 +5,7 @@ mod lent_ring_shadows;
 mod pair;
 mod prompt_entry;
 mod request;
+mod scored;
 mod target;
 
 use std::{

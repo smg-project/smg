@@ -96,6 +96,29 @@ impl fmt::Display for InTheWay {
     }
 }
 
+/// Whether `profile` holds a scorer and each of its scorers may be asked of
+/// the one row its picker picked, behind the pick, by what the scorer says
+/// of itself ([`Engine::scored_alone_for`] states the six words). An engine
+/// asks it of each profile once, where it is built, and keeps the answer:
+/// a scorer says its needs, how its values lie and whether it owns a
+/// request to a build, and no decision asks for them.
+#[cfg(feature = "in-process")]
+pub(super) fn asked_alone(profile: &Profile) -> bool {
+    // What a scorer is fed with no whole pass: the request as its maker
+    // states it and the picked row's record.
+    let fed = Needs::NONE.with_loads().with_prompt_size();
+    !profile.scorers.is_empty()
+        && profile.scorers.iter().all(|weighted| {
+            let scorer = &weighted.scorer;
+            scorer.row_wise()
+                && scorer.spread() == super::ScoreSpread::Any
+                && !scorer.refuses_by_reports()
+                && scorer.scope().is_none()
+                && !scorer.owns()
+                && scorer.needs().within(fed)
+        })
+}
+
 /// One place a binding names: the binding with its position in the
 /// document, the phase, and the profile the binding resolves the phase to
 /// with that profile's position.
@@ -253,7 +276,7 @@ impl Engine {
 
     /// What stands between `place` and one pick of its profile's picker:
     /// the first stage of the profile that asks more
-    /// ([`Self::stage_in_the_way`]), else the binding's sessions rule, else
+    /// ([`Self::stage_in_the_way_of`]), else the binding's sessions rule, else
     /// its shadow. `None` where nothing does. The one function that says
     /// so: [`Self::place_for`] and [`Self::not_alone`] answer by it, and
     /// the engine of a gateway's own process answers a plain request a
@@ -262,7 +285,105 @@ impl Engine {
     /// A stage is named ahead of the binding, so a place that named a
     /// stage before the binding was asked names the same stage.
     fn in_the_way(&self, place: Named<'_>) -> Option<InTheWay> {
-        if let Some(stage) = self.stage_in_the_way(place.index, place.profile, place.phase) {
+        self.in_the_way_of(place, false)
+    }
+
+    /// The profile of the place of `model` and `phase` where one pick of its
+    /// picker decides the place but for its scorers: every other test of
+    /// [`Self::place_for`] holds, and each scorer may be handed the picked
+    /// row alone ([`Scorer::row_wise`](super::Scorer::row_wise)), says
+    /// nothing of how its values lie
+    /// ([`Scorer::spread`](super::Scorer::spread): the whole pass asks a
+    /// rank its own way, and a leading stage that orders nothing not at
+    /// all), refuses nothing by a report, holds no scope, owns no request
+    /// and declares no need beyond the request's size and a worker's load
+    /// report ([`Scorer::needs`](super::Scorer::needs)): a request's maker
+    /// states the size and the picked row's record holds the report. The
+    /// whole pass feeds every other need, as it lends a request a signal's
+    /// cells and the affinity column, so a scorer that declares one keeps
+    /// it. The picker reads no score, so the pick is the whole pass's,
+    /// and the scorers are asked once each behind it, as the whole pass
+    /// asks them ([`Self::score_picked`]). `None` for any other
+    /// place, and for one that holds no scorer, which is
+    /// [`Self::place_for`]'s own: that answer is as it was, since a caller
+    /// that picks by itself asks no scorer.
+    ///
+    /// What the scorers say of themselves is read where the engine is
+    /// built ([`asked_alone`]) and kept beside the profile. A request finds
+    /// its place here, and this asks no scorer: a scorer says its needs
+    /// to a build and to no decision.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn scored_alone_for(&self, model: &str, phase: Phase) -> Option<AloneProfile> {
+        let at = self.binding_position(model, phase)?;
+        let binding = self.binding_at(at)?;
+        let index = profile_index(binding, phase)?;
+        let profile = self.profiles.get(usize::from(index))?;
+        let asked_alone = self.asked_alone.get(usize::from(index));
+        if !asked_alone.is_some_and(|&asked| asked) {
+            return None;
+        }
+        let place = Named {
+            at,
+            binding,
+            phase,
+            index,
+            profile,
+        };
+        self.in_the_way_of(place, true)
+            .is_none()
+            .then_some(AloneProfile(index))
+    }
+
+    /// Asks each scorer of the profile at `profile`
+    /// ([`Self::scored_alone_for`]) of the one row its picker picked,
+    /// behind the pick. `write` writes the record of the row at `place`
+    /// into `rows`, the calling thread's rows over the list's `fixed`
+    /// rows, at its own place, and each scorer is handed `rows` with that
+    /// one place kept: the shape it is handed behind a draw, where a row
+    /// the draw did not ask about holds whatever an earlier decision left
+    /// (a debug build overwrites it first). The scores are read by nobody:
+    /// the picker picked alone. A place past the list has no row, and no
+    /// scorer is asked of it.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn score_picked(
+        &self,
+        profile: u16,
+        facts: &super::RequestFacts<'_>,
+        fixed: &[super::Candidate],
+        rows: &mut [super::Candidate],
+        write: &mut dyn FnMut(&super::Candidate, &mut super::Candidate),
+        place: u32,
+    ) {
+        debug_assert_eq!(fixed.len(), rows.len(), "one buffer row a fixed row");
+        #[cfg(debug_assertions)]
+        for (row, fixed) in rows.iter_mut().zip(fixed) {
+            *row = super::unwritten(fixed);
+        }
+        let at = place as usize;
+        let (Some(stages), Some(fixed), Some(row)) = (
+            self.profiles.get(usize::from(profile)),
+            fixed.get(at),
+            rows.get_mut(at),
+        ) else {
+            debug_assert!(
+                false,
+                "a pick names a profile of the engine and a place of the list"
+            );
+            return;
+        };
+        write(fixed, row);
+        let mut score = [0.0_f32];
+        for weighted in &stages.scorers {
+            weighted.scorer.score(facts, rows, &[place], &mut score);
+        }
+    }
+
+    /// [`Self::in_the_way`], with the profile's scorers passed over where
+    /// `scored` says so.
+    fn in_the_way_of(&self, place: Named<'_>, scored: bool) -> Option<InTheWay> {
+        if let Some(stage) =
+            self.stage_in_the_way_of(place.index, place.profile, place.phase, scored)
+        {
             return Some(stage);
         }
         let binding = place.binding;
@@ -288,7 +409,13 @@ impl Engine {
     /// The first stage of `profile`, which stands at `index`, that asks
     /// more of a decision than one pick of its picker at a place of
     /// `phase`. `None` where no stage does.
-    fn stage_in_the_way(&self, index: u16, profile: &Profile, phase: Phase) -> Option<InTheWay> {
+    fn stage_in_the_way_of(
+        &self,
+        index: u16,
+        profile: &Profile,
+        phase: Phase,
+        scored: bool,
+    ) -> Option<InTheWay> {
         let held = RowTests::held_by_a_pass(phase);
         let mut tests = RowTests::none();
         for filter in &profile.filters {
@@ -300,7 +427,7 @@ impl Engine {
         if let Some(name) = tests.health_test_left_out() {
             return Some(InTheWay::NoFilter(name));
         }
-        if let Some(weighted) = profile.scorers.first() {
+        if let Some(weighted) = profile.scorers.first().filter(|_| !scored) {
             return Some(InTheWay::Scorer(weighted.scorer.name()));
         }
         // The turns' mark says how the picker's draw picks: it asks no

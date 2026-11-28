@@ -243,6 +243,10 @@ pub struct InProcess {
 /// how its shadow profile reads the live decision's affinity rows.
 type ShadowWord = (u32, ShadowRows);
 
+/// A profile one pick decides, with whether its row-wise scorers are still
+/// to be asked, of the picked row ([`Engine::scored_alone_for`]).
+type AloneAsked = (AloneProfile, bool);
+
 /// One pool of one model as the engine keeps it: the gateway's shared list
 /// of worker objects and the pool's own word.
 ///
@@ -279,7 +283,9 @@ pub(crate) struct PoolMembers {
     /// The model of the list's first single request and the profile the
     /// engine picks alone for it, where the document holds one
     /// ([`Self::alone`]).
-    alone: OnceLock<(Box<str>, Option<AloneProfile>)>,
+    /// The profile's second word says its row-wise scorers are still to be
+    /// asked, of the picked row ([`Engine::scored_alone_for`]).
+    alone: OnceLock<(Box<str>, Option<AloneAsked>)>,
     /// The model of the list's first whole decision under a document that
     /// names a shadow, and the document's word of that model's shadow
     /// ([`Self::shadow`]).
@@ -359,10 +365,13 @@ impl PoolMembers {
     /// asks more than one pick. Found once a list, for the model of its
     /// first request: a gateway's list is one model's. Another model's
     /// request is answered by the document at its call.
-    fn alone(&self, spec: &AppliedSpec, model: &str) -> Option<AloneProfile> {
+    fn alone(&self, spec: &AppliedSpec, model: &str) -> Option<AloneAsked> {
         let find = || match spec.engine().place_for(model, Phase::Single) {
-            Place::Alone(profile) => Some(profile),
-            _ => None,
+            Place::Alone(profile) => Some((profile, false)),
+            _ => spec
+                .engine()
+                .scored_alone_for(model, Phase::Single)
+                .map(|profile| (profile, true)),
         };
         let (named, alone) = self.alone.get_or_init(|| (model.into(), find()));
         if **named == *model {
@@ -1253,7 +1262,19 @@ impl Loaded<'_, '_> {
                 // The engine's own value of the list, asked of its cell.
                 let members = self.members_of(lent);
                 asked = Some((lent.cell, members));
-                if let Some(pick) = single::alone(self, maker.model(), plain, members) {
+                let pick = match single::alone(self, maker.model(), plain, members) {
+                    // One pick decides the place but for its row-wise
+                    // scorers, which are asked of the picked row behind
+                    // it: the document takes no word on a lease and keeps
+                    // no sample, so the place is then the whole answer.
+                    Some((pick, true)) => {
+                        single::scored_at(self, maker, members, pick, clock);
+                        return Ok(Some(pick));
+                    }
+                    Some((pick, false)) => Some(pick),
+                    None => None,
+                };
+                if let Some(pick) = pick {
                     // No stage takes a word of the request and the
                     // document keeps no sample: the place is the whole
                     // answer.

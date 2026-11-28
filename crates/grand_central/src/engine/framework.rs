@@ -147,8 +147,8 @@ pub trait Filter: Any + Send + Sync + Debug {
     /// refuses by nothing a report writes, says `false` and leaves that
     /// price. Each built-in stage of this crate says so. A plugin's
     /// stage cannot say it yet: its wrapper keeps the default. The
-    /// answer is read once, where the engine is built ([`Engine::new`]):
-    /// it is the stage's for the engine's whole life.
+    /// answer is read where the engine is built ([`Engine::new`]) and by
+    /// no decision: it is the stage's for the engine's whole life.
     fn refuses_by_reports(&self) -> bool {
         true
     }
@@ -290,9 +290,14 @@ pub trait Scorer: Lifecycle + Debug {
     /// ([`Picker::draw_first`]), where no pass over the pool ran before it.
     /// A row-wise scorer reads each row alone and is promised no order of
     /// the rows it is handed: they stand ascending where the pool is read
-    /// whole, and in the draw's order behind a draw. The default is no,
-    /// and a profile that holds such a scorer runs its whole pass: a
-    /// plugin's scorer is shown the whole view.
+    /// whole, and in the draw's order behind a draw. Where one pick of
+    /// the picker decides the place and reads no score, a gateway's own
+    /// process hands it the one row picked, behind the pick, under a
+    /// document that takes no word on a lease and keeps no sample, where
+    /// the scorer declares no need beyond the request's size and a
+    /// worker's load report ([`Self::needs`]). The
+    /// default is no, and a profile that holds such a scorer runs its
+    /// whole pass: a plugin's scorer is shown the whole view.
     fn row_wise(&self) -> bool {
         false
     }
@@ -314,9 +319,9 @@ pub trait Scorer: Lifecycle + Debug {
     }
 
     /// Whether this scorer places a keyed request by itself
-    /// ([`Self::own`]); the default is no. The engine reads it once per
-    /// profile when it is built, and asks such a scorer first where it is
-    /// the profile's one scorer.
+    /// ([`Self::own`]); the default is no. The engine reads it per
+    /// profile when it is built and in no decision, and asks such a
+    /// scorer first where it is the profile's one scorer.
     fn owns(&self) -> bool {
         false
     }
@@ -368,7 +373,7 @@ pub trait Scorer: Lifecycle + Debug {
         0
     }
 
-    /// How this scorer's values lie ([`ScoreSpread`]), asked once when the
+    /// How this scorer's values lie ([`ScoreSpread`]), asked when the
     /// engine is built. A scorer that writes levels is a rank where its weight
     /// outweighs every stage behind it: a plain decision then asks those stages
     /// of the rows at its ceiling alone, where they fill the decision's targets
@@ -4290,6 +4295,12 @@ pub struct Engine {
     /// Per profile, what its stages ask of a host ([`Profile::needs`]),
     /// asked of them once at the build: a decision reads its answer here.
     profile_needs: Vec<Needs>,
+    /// Per profile, whether each of its scorers may be asked of the one row
+    /// its picker picked, behind the pick ([`alone::asked_alone`]), asked
+    /// of them once at the build: a request that finds its place reads the
+    /// answer here ([`Self::scored_alone_for`]) and asks no scorer.
+    #[cfg(feature = "in-process")]
+    asked_alone: Box<[bool]>,
     /// Per profile, what a host names the rows of its decisions by
     /// ([`NamedBy`]), said once at the build: the cap
     /// ([`Self::affinity_rows_cap`]), the warm-up ruling
@@ -5336,6 +5347,8 @@ impl Engine {
         // the phase answers below fold them.
         let profile_needs: Vec<Needs> = profiles.iter().map(Profile::needs).collect();
         let needs = profile_needs.iter().fold(needs, |all, &own| all.or(own));
+        #[cfg(feature = "in-process")]
+        let asked_alone: Box<[bool]> = profiles.iter().map(alone::asked_alone).collect();
         let orders: Vec<Order> = profiles.iter().map(Order::of).collect();
         let marks: Vec<Marks> = profiles
             .iter()
@@ -5649,6 +5662,8 @@ impl Engine {
             marks,
             head_places,
             profile_needs,
+            #[cfg(feature = "in-process")]
+            asked_alone,
             named_by,
             row_tests,
             set_turns,
@@ -5860,6 +5875,7 @@ impl Engine {
             && self.named_by[at] == standing.named_by[stood]
             && self.row_tests[at] == standing.row_tests[stood]
             && self.head_places[at] == standing.head_places[stood]
+            && self.asked_alone[at] == standing.asked_alone[stood]
             && asked(self, at) == asked(standing, stood)
             && listed()
     }
