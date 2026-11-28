@@ -2330,9 +2330,9 @@ impl InProcess {
     /// on both sides is asked again behind such an ask alone, held as it
     /// was: the rule is asked of no list there. It books its decode with
     /// its prefill, as a pair's own does. Under a binding whose decode
-    /// side alone is such a ring, a request the pass is laid for is shed
-    /// under `target-worker` for the decode's side: an encode request's
-    /// decision counts no number.
+    /// side alone is such a ring, a request the pass is laid for that
+    /// names a worker is shed under `target-worker` for the decode's
+    /// side: an encode request's decision counts no number.
     ///
     /// Declined by name ([`ShedReason::PolicyDeclined`]): a request that
     /// carries encode items over other lists than an encode request's

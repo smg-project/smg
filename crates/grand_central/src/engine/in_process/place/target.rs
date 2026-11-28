@@ -70,8 +70,8 @@
 //! own entry. One that names no worker is placed as under any other
 //! document: a target source its binding names costs it one lookup of
 //! its header. Where the decode's side alone is the ring's, a request
-//! the pass is laid for is shed under that name for the decode's side:
-//! an encode request's decision counts no number.
+//! the pass is laid for that names a worker is shed under that name for
+//! the decode's side: an encode request's decision counts no number.
 //!
 //! **A controller's served decision** counts by the same functions, over
 //! the lists its worker objects lend: a single request's number by
@@ -606,8 +606,9 @@ pub(super) fn pair<'a>(
 ///
 /// A binding whose decode side alone is a plain hash ring's has its number
 /// counted inside a pair's decision ([`decode_alone`]). An encode
-/// request's decision counts none: a request the pass is laid for is shed
-/// under [`TARGET_WORKER`], for the decode's side, and placed nowhere.
+/// request's decision counts none: a request the pass is laid for that
+/// names a worker is shed under [`TARGET_WORKER`], for the decode's side,
+/// and placed nowhere.
 ///
 /// The header's read stands under the engine's catch here, for every
 /// request with three lists, as the read of such a request's headers did

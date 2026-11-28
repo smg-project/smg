@@ -2756,8 +2756,8 @@ Such a shed names no side where the encode pass made it.
 The number names no encoder, so what the call answers for its encoders stands as it is. A shed
 made for the encoders keeps its own name, and so does one by the places a host states for them.
 So does a gap the encode pass says over the lists whole: no pair that an encoder serves, or none
-whose decode takes images the request needs. A call whose last ask was given up for an encoder
-alone answers that it has no worker.
+whose decode takes images the request needs. Where the call has no worker for its asks and its
+last ask was given up for an encoder alone, that answer stands.
 
 A request can be shed under `target-worker` because its call's last ask could send to no pair.
 For a request the encode pass is laid for, that shed names no side. The walk of its targets
