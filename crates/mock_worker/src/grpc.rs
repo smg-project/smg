@@ -76,6 +76,29 @@ fn recorded_model() -> Option<RecordedModel> {
         .or_else(sglang::recorded_model)
 }
 
+/// Lay the tokenizer path a replay was started with over the entry `key` of
+/// its recorded server arguments. An engine names its tokenizer there as
+/// well as in the model info and a gateway reads both, so the path of the
+/// command line goes in both places. Arguments without the entry stay as
+/// recorded, and so does a replay with no tokenizer of its own: none stated
+/// (a config built in process) or the model id (what the command line lays
+/// where the flag is absent).
+fn state_tokenizer(cfg: &Config, args: Option<&mut prost_types::Struct>, key: &str) {
+    use prost_types::value::Kind;
+
+    if cfg.tokenizer_path.is_empty() || cfg.tokenizer_path == cfg.model_id {
+        return;
+    }
+    let Some(entry) = args.and_then(|args| args.fields.get_mut(key)) else {
+        return;
+    };
+    if let Some(Kind::StringValue(path)) = &mut entry.kind {
+        path.clone_from(&cfg.tokenizer_path);
+    } else {
+        entry.kind = Some(Kind::StringValue(cfg.tokenizer_path.clone()));
+    }
+}
+
 /// Serve the mock gRPC service of the configured wire on `port` until the
 /// process exits.
 pub async fn serve(cfg: Arc<Config>, host: String, port: u16) {
