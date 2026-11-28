@@ -28,9 +28,10 @@ ignore = [
     # when the backend changes. Review by 2027-01-15.
     "RUSTSEC-2026-0387",
 
-    # Warning-level advisories: unmaintained crates without a release that drops them. cargo-audit
-    # reports them as warnings (the job stays green); they are listed so that a new warning stands
-    # out in the job's output and each one carries its exit and a review date.
+    # Warning-level advisories: unmaintained crates without a release that drops them, and one
+    # unsound API whose fixed release the lockfile does not hold yet. cargo-audit reports them as
+    # warnings (the job stays green); they are listed so that a new warning stands out in the
+    # job's output and each one carries its exit and a review date.
 
     # RUSTSEC-2025-0012: backoff 0.4, the retry policy of the workflow engine (crates/workflow;
     # crates/mcp declares it as well). RUSTSEC-2024-0384: instant 0.1, pulled by backoff alone.
@@ -70,9 +71,28 @@ ignore = [
     "RUSTSEC-2025-0098",
     # RUSTSEC-2024-0449: unsafe-libyaml 0.2 under serde_yaml 0.9 (deprecated), the YAML reader of
     # the gateway's config, scheduler and rate-limit files, of crates/mcp, of the Python binding
-    # (bindings/python) and of kube-client 3, and under serde_yaml_ng 0.10 (clients/openapi-gen),
-    # which depends on it too, so that crate is no exit. Goes with a YAML crate that does not build
-    # on it in the three crates and in openapi-gen, and the kube release that dropped serde_yaml.
-    # Review by 2027-01-15.
+    # (bindings/python) and of a policy spec in crates/grand_central (the example beside it reads
+    # one in its tests), and under serde_yaml_ng 0.10 (clients/openapi-gen), which depends on it
+    # too, so that crate is no exit. No kube crate brings it any more: kube-client 4 depends on
+    # serde-saphyr, which does not build on it. Goes with such a YAML crate in the four crates,
+    # the example and openapi-gen. Review by 2027-01-15.
     "RUSTSEC-2024-0449",
+    # RUSTSEC-2026-0543: chrono 0.4, declared unmaintained with no fixed release; the advisory
+    # names jiff and time and reports no defect. It reaches this code: twelve workspace crates,
+    # the gateway among them, hold their dates and times in it, and six dependencies build it
+    # (oauth2 and rmcp always; oracle, postgres-types and tracing-subscriber under a feature our
+    # manifests turn on; schemars under one that rmcp turns on). Goes with a move of the twelve
+    # crates to jiff or time and with those dependencies and features leaving it. Review by
+    # 2027-01-15.
+    "RUSTSEC-2026-0543",
+    # RUSTSEC-2026-0486: rustix 1.1, unsound: its six xattr functions (rustix::fs::getxattr,
+    # listxattr and their l- and f- forms) mark bytes they did not write as initialized when the
+    # buffer has no room; fixed in 1.1.6. It does not reach this code: no crate of the graph
+    # calls an xattr function, neither ours (crates/engine_zmq_adapter, crates/grand_central and
+    # the gateway call its file and process functions, crates/grand_central and the bench and
+    # example of crates/multimodal its clock) nor the eleven others that depend on it (tempfile,
+    # polling, async-io, memfd, cap-primitives, fs-set-times, rustix-linux-procfs and four wasmtime
+    # crates). Goes with rustix 1.1.6 in the lockfile: every requirement of the graph admits it.
+    # Review by 2027-01-15.
+    "RUSTSEC-2026-0486",
 ]
