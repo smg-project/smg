@@ -649,8 +649,8 @@ async fn a_whole_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_finish
 /// drops a call with its bytes (none, and a required list, which drops a call to a function the
 /// request does not declare) the start stays where it was: the bytes of a call that never began
 /// are still the answer's content, whichever function it named. Where one call only is taken
-/// the start stays where it was as well: a later call the output cut behind its name is no
-/// call, and its bytes are the answer's content, as a whole answer gives them.
+/// the start stays where it was as well: a call the output cut behind its name is no call, the
+/// first as a later one, and its bytes are the answer's content, as a whole answer gives them.
 #[tokio::test]
 async fn a_streamed_json_call_starts_at_its_name_before_its_arguments_come() {
     let required = json!("required");
@@ -716,6 +716,14 @@ async fn a_streamed_json_call_starts_at_its_name_before_its_arguments_come() {
             "length",
         ),
         (
+            one_call.clone(),
+            "<tool_call>\n{\"name\": \"lookup\", \"argu",
+            "length",
+            Vec::new(),
+            "\n{\"name\": \"lookup\", \"argu",
+            "length",
+        ),
+        (
             one_call,
             "<tool_call>\n{\"name\": \"lookup\", \"arguments\": {\"q\": \"x\"}}\n</tool_call>\n<tool_call>\n{\"name\": \"second\", \"argu",
             "length",
@@ -763,6 +771,40 @@ async fn a_streamed_message_starts_a_json_call_at_its_name() {
         "model_context_window_exceeded",
         "{events:?}"
     );
+}
+
+/// Where one call only is taken the Messages stream goes through the same gate: a call cut behind
+/// its name is no call, the first as a later one, and its bytes are the message's text, behind
+/// the first call's block where that call came whole.
+#[tokio::test]
+async fn a_one_call_message_stream_keeps_the_bytes_of_a_call_cut_behind_its_name() {
+    let text = |bytes: &str| ("text".to_string(), String::new(), json!(bytes));
+    let lookup = (
+        "tool_use".to_string(),
+        "lookup".to_string(),
+        json!({"q": "x"}),
+    );
+    for (output, blocks) in [
+        (
+            "<tool_call>\n{\"name\": \"lookup\", \"argu",
+            vec![text("\n{\"name\": \"lookup\", \"argu")],
+        ),
+        (
+            concat!(
+                "<tool_call>\n{\"name\": \"lookup\", \"arguments\": {\"q\": \"x\"}}\n",
+                "</tool_call>\n<tool_call>\n{\"name\": \"second\", \"argu"
+            ),
+            vec![lookup, text("\n{\"name\": \"second\", \"argu")],
+        ),
+    ] {
+        let mut spec = assigned_message(qwen3(CallSyntax::Json), "<|im_start|>assistant\n", false);
+        spec.first_tool_call_only = true;
+        let mut responses: Vec<_> = output.chars().map(|ch| chunk(0, &ch.to_string())).collect();
+        responses.push(complete(0, "length"));
+        let (result, events) = message_events(responses, spec, None).await;
+        assert!(result.is_ok(), "{output}: {result:?}");
+        assert_eq!(message_blocks(&events), blocks, "{output}: {events:?}");
+    }
 }
 
 /// The same outputs read whole: the unary road starts a call where it did, so an output that ends
