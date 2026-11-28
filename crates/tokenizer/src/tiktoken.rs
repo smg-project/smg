@@ -1115,9 +1115,7 @@ impl TiktokenTokenizer {
             None => params,
         };
         match self.renderer {
-            Renderer::Jinja => self
-                .chat_template
-                .apply_with_continuation(&messages, params),
+            Renderer::Jinja => self.chat_template.apply_messages(messages, params),
             Renderer::KimiK25Tools => apply_kimi_k25_tools(&self.chat_template, &messages, params),
             // This is the layer the checkpoint's own `apply_chat_template` sits
             // at, so it applies that wrapper's `thinking_effort` default. K3 does

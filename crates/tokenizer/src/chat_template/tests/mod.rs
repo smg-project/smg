@@ -2646,8 +2646,12 @@ fn none_renders_python_style() {
 }
 
 /// A template that does to a message everything a map answers: prints it,
-/// dumps it, loops its keys and its items, asks its length, a key, its type.
+/// dumps it as it stands and sorted, sorts its items, reverses its keys,
+/// compares it, loops its keys and its items, asks its length, a key, its
+/// type.
 const WALKS_A_MESSAGE: &str = "{%- for message in messages %}{{ message | tojson }}|{{ message }}|\
+    {{ message | tojson(indent=2, sort_keys=true) }}|{{ message | dictsort }}|\
+    {{ message | reverse | list }}|{{ message == messages[0] }}|\
     {%- for key in message %}{{ key }}={{ message[key] }};{%- endfor %}|\
     {%- for key, value in message | items %}{{ key }}:{{ value }},{%- endfor %}|\
     {%- for key, value in message.items() %}{{ key }}:{{ value }},{%- endfor %}|\
@@ -2700,6 +2704,30 @@ fn a_message_that_owns_its_json_reads_as_the_converted_map_does() {
         "the walk reads every message: {}",
         converted.0
     );
+
+    // An empty message is as false as the empty map.
+    let state = ChatTemplateState::new(Some(
+        "{%- for message in messages %}{{ 'y' if message else 'n' }}{%- endfor %}".to_string(),
+    ))
+    .unwrap();
+    let env = state.env.as_ref().unwrap();
+    let messages = vec![serde_json::json!({}), serde_json::json!({"role": "user"})];
+    let converted = render_messages(
+        env,
+        messages.iter(),
+        ChatTemplateParams::default(),
+        &state.output_len,
+    )
+    .unwrap();
+    let owned = render_values(
+        env,
+        messages.into_iter().map(OwnedMessage::value).collect(),
+        ChatTemplateParams::default(),
+        &state.output_len,
+    )
+    .unwrap();
+    assert_eq!(owned, converted);
+    assert_eq!(converted.0, "ny");
 }
 
 /// Messages handed over render the prompt of the borrowed slice whichever

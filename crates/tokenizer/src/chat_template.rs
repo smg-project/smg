@@ -28,7 +28,7 @@ use minijinja::{
         get_compiled_template, parse, tokenize, Instruction, Token, WhitespaceConfig,
     },
     syntax::SyntaxConfig,
-    value::{DynObject, Enumerator, Kwargs, Object, ObjectRepr, ValueKind},
+    value::{DynObject, Enumerator, Kwargs, Object, ObjectExt, ObjectRepr, ValueKind},
     Environment, Error as MinijinjaError, ErrorKind, Output, State, Template, Value,
 };
 use rustc_hash::FxHashSet;
@@ -3934,13 +3934,24 @@ impl Object for OwnedMessage {
         self.field(key.as_str()?)
     }
 
+    /// The enumerator kind of the converted map, so that every walk the
+    /// template engine picks by that kind (pairs, a reversed walk) reads as
+    /// the map's does; a pair walk converts each field into its cell and
+    /// looks no key up.
     fn enumerate(self: &Arc<Self>) -> Enumerator {
-        Enumerator::Values(
-            self.fields
-                .keys()
-                .map(|name| Value::from(name.as_str()))
-                .collect(),
-        )
+        self.mapped_rev_key_value_enumerator(|this| {
+            Box::new(
+                this.fields
+                    .iter()
+                    .zip(this.values.iter())
+                    .map(|((name, json), cell)| {
+                        (
+                            Value::from(name.as_str()),
+                            cell.get_or_init(|| Value::from_serialize(json)).clone(),
+                        )
+                    }),
+            )
+        })
     }
 
     fn enumerator_len(self: &Arc<Self>) -> Option<usize> {
