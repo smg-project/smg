@@ -1064,6 +1064,11 @@ fn a_kind_line_is_refused_naming_the_decision_and_an_unknown_field_by_name() {
     assert!(err.to_string().contains("no kind field"), "{err}");
     let serialized = serde_json::to_string(&with_kind).expect("serializes");
     assert!(!serialized.contains("kind"), "{serialized}");
+    let no_value = doc(r#"{ "apiVersion": "smg.policy/v1", "kind": null,
+          "profiles": { "p": { "pick": "random" } } }"#);
+    no_value
+        .validate()
+        .expect("a kind with no value reads as left out");
 
     let err = parse_error(
         r#"{ "apiVersion": "smg.policy/v1", "plugins": [],

@@ -24,6 +24,7 @@ These rules hold for the whole spec:
 - In YAML, quote a string that looks like a number or a boolean.
 - A key without a value is null. Write `[]` or `{}` for an empty list or map.
 - The [JSON schema](../policyspec.schema.json) includes reserved fields and the stock stage names.
+- The schema states the shape of a spec alone. Validation also holds rules across two places of a spec, such as a name that must be declared elsewhere in it. A spec the schema admits can still be refused.
 - Validate a spec in the host that will run it. That check says which fields and stages can run there.
 
 ## Top-level fields
