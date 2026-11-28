@@ -15,6 +15,10 @@ BASELINE = (
 )
 COMPONENTS = (
     (
+        "scripts/ci_sglang_mxfp4_numeric.py",
+        "scripts/tests/test_ci_sglang_mxfp4_numeric.py",
+    ),
+    (
         "scripts/ci_install_sglang_gptoss20_sdk.py",
         "scripts/tests/test_ci_install_sglang_gptoss20_sdk.py",
     ),
