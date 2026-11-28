@@ -1164,6 +1164,71 @@ fn a_decode_side_under_a_rule_leaves_the_prefills_buffer_to_the_prefill() {
     }
 }
 
+/// Which shadows of a pair's binding give a decision: each side's at the
+/// pair's decision, the prefill's first, then the decode's by the entry
+/// of a decode decided again.
+type ShadowsDeciding = ([bool; 2], bool);
+
+/// [`ShadowsDeciding`] for a request under `key`, and what the shadows'
+/// runs ask the lender: each ask as the place of its run in that order
+/// and the profile it names. The pair is decided over two prefills and
+/// two decodes that pair all with all. The last entry is asked itself,
+/// behind the first target's prefill: no live decode is decided again.
+/// The lender lends nothing.
+fn shadows_asked(engine: &Engine, key: Option<u64>) -> (ShadowsDeciding, Vec<(usize, u16)>) {
+    let [prefills, decodes] = two_sides(&[0, 5], &[0, 5]);
+    let pools = PairPools {
+        prefills: &prefills,
+        decodes: &decodes,
+        ..PairPools::default()
+    };
+    let (pool, cx) = (PoolFacts::default(), Constraints::default());
+    let (run, asked) = (std::cell::Cell::new(0), std::cell::RefCell::new(Vec::new()));
+    let lends: &dyn Fn(u16) -> Option<(&'static dyn LentRing, &'static [u64])> = &|profile| {
+        asked.borrow_mut().push((run.get(), profile));
+        None
+    };
+    let facts = pair_request(key);
+    let mut scratch = Scratch::new();
+    let live = engine.decide_pair(&facts, &pool, pools, &cx, &cx, &mut scratch);
+    let pick = live.pick().expect("a pair");
+    let held = pick.targets.first().expect("the pair's first target").id;
+    let sides = PairSide::BOTH.map(|side| {
+        run.set(side.index());
+        let shadow = engine.shadow_side(
+            0,
+            side,
+            &facts,
+            &pool,
+            pools,
+            &cx,
+            &cx,
+            pick,
+            &mut scratch,
+            lends,
+        );
+        shadow.is_some()
+    });
+    run.set(2);
+    let later = engine.shadow_decode_later(
+        0,
+        &facts,
+        &pool,
+        pools,
+        held,
+        None,
+        &cx,
+        &mut scratch,
+        lends,
+    );
+    ((sides, later.is_some()), asked.take())
+}
+
+/// [`ShadowsDeciding`] alone, of [`shadows_asked`].
+fn deciding(engine: &Engine, key: Option<u64>) -> ShadowsDeciding {
+    shadows_asked(engine, key).0
+}
+
 /// Beside a side its binding's sessions rule placed, the engine runs
 /// no shadow of that side, at the pair's decision and at a decode
 /// decided again: a shadow's run is put to no sessions rule and to no
@@ -1177,49 +1242,6 @@ fn a_decode_side_under_a_rule_leaves_the_prefills_buffer_to_the_prefill() {
 /// run speaks.
 #[test]
 fn a_side_its_sessions_rule_placed_is_run_no_shadow() {
-    let [prefills, decodes] = two_sides(&[0, 5], &[0, 5]);
-    let pools = PairPools {
-        prefills: &prefills,
-        decodes: &decodes,
-        ..PairPools::default()
-    };
-    let (pool, cx) = (PoolFacts::default(), Constraints::default());
-    // Which runs speak: each side's at the pair's decision, then the
-    // later decode's.
-    let ran = |engine: &Engine, key: Option<u64>| {
-        let facts = pair_request(key);
-        let mut scratch = Scratch::new();
-        let live = engine.decide_pair(&facts, &pool, pools, &cx, &cx, &mut scratch);
-        let pick = live.pick().expect("a pair");
-        let held = pick.targets.first().expect("the pair's first target").id;
-        let sides = PairSide::BOTH.map(|side| {
-            let shadow = engine.shadow_side(
-                0,
-                side,
-                &facts,
-                &pool,
-                pools,
-                &cx,
-                &cx,
-                pick,
-                &mut scratch,
-                &|_| None,
-            );
-            shadow.is_some()
-        });
-        let later = engine.shadow_decode_later(
-            0,
-            &facts,
-            &pool,
-            pools,
-            held,
-            None,
-            &cx,
-            &mut scratch,
-            &|_| None,
-        );
-        (sides, later.is_some())
-    };
     let rule = SessionRule {
         inflight_cap: 0,
         ..SESSIONS
@@ -1232,8 +1254,8 @@ fn a_side_its_sessions_rule_placed_is_run_no_shadow() {
     };
     let profiles = (0..3).map(|_| least_requests_profile()).collect();
     let engine = Engine::new(profiles, vec![ruled], 1, Needs::default());
-    assert_eq!(ran(&engine, Some(7)), ([false; 2], false));
-    assert_eq!(ran(&engine, None), ([true; 2], true));
+    assert_eq!(deciding(&engine, Some(7)), ([false; 2], false));
+    assert_eq!(deciding(&engine, None), ([true; 2], true));
     // A rule that names one side leaves the other to its profile: that
     // side's shadow speaks beside a keyed request, the decode's at a
     // decode decided again too.
@@ -1249,8 +1271,8 @@ fn a_side_its_sessions_rule_placed_is_run_no_shadow() {
         };
         let profiles = (0..3).map(|_| least_requests_profile()).collect();
         let engine = Engine::new(profiles, vec![one_side], 1, Needs::default());
-        assert_eq!(ran(&engine, Some(7)), speak, "{sides:?}");
-        assert_eq!(ran(&engine, None), ([true; 2], true), "{sides:?}");
+        assert_eq!(deciding(&engine, Some(7)), speak, "{sides:?}");
+        assert_eq!(deciding(&engine, None), ([true; 2], true), "{sides:?}");
     }
     let assigned = Binding {
         decode_profile: Some(3),
@@ -1262,7 +1284,84 @@ fn a_side_its_sessions_rule_placed_is_run_no_shadow() {
     profiles.extend((0..3).map(|_| least_requests_profile()));
     let engine = Engine::new(profiles, vec![assigned], 1, Needs::default());
     assert!(engine.shadows_side(0, PairSide::Prefill), "named and free");
-    assert_eq!(ran(&engine, None), ([false, true], true));
+    assert_eq!(deciding(&engine, None), ([false, true], true));
+}
+
+/// A filter that declares the ring need and keeps every row.
+#[derive(Debug)]
+struct AsksTheRing;
+
+impl Filter for AsksTheRing {
+    fn name(&self) -> &'static str {
+        "asks-the-ring"
+    }
+
+    fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+        true
+    }
+
+    fn needs(&self) -> Needs {
+        Needs {
+            ring: true,
+            ..Needs::default()
+        }
+    }
+}
+
+/// A shadow one of whose filters declares the ring need stands aside,
+/// as a shadow with no such filter does, where a keyed request's side is
+/// its binding's sessions rule's. That is asked ahead of the shadow's
+/// place on a ring: no ring is asked for there. So it is at the pair's
+/// decision and at the entry of a decode decided again, under a rule
+/// that hands a new key to the profile and under one that places it by a
+/// count. The live sides here hold a picker of their own and read no
+/// ring. Beside them the shadow of a side the rule does not name gives a
+/// decision, and for a request with no key both sides' do. Each such run
+/// asks the lender once, under its own profile.
+#[test]
+fn a_shadow_whose_filter_asks_the_ring_stands_aside_on_a_keyed_side_of_its_rule() {
+    let asking = || {
+        let mut profile = least_requests_profile();
+        profile.filters.push(Box::new(AsksTheRing));
+        profile
+    };
+    for assignment in [Assignment::Delegate, Assignment::MinLoad] {
+        // For a keyed request under each rule: which shadows give a
+        // decision, and each ask of the lender as its run's place and the
+        // profile it names. The prefill's shadow is profile 1, and the
+        // decode's is 2.
+        let keyed = [
+            (SessionSides::Any, ([false; 2], false), vec![]),
+            (
+                SessionSides::Prefill,
+                ([false, true], true),
+                vec![(1, 2), (2, 2)],
+            ),
+            (SessionSides::Decode, ([true, false], false), vec![(0, 1)]),
+        ];
+        for (sides, decide, asks) in keyed {
+            let rule = SessionRule {
+                sides,
+                assignment,
+                inflight_cap: 0,
+                ..SESSIONS
+            };
+            let binding = Binding {
+                shadow: Some(1),
+                decode_shadow: Some(2),
+                sessions: Some(rule),
+                ..pair_binding()
+            };
+            let profiles = vec![least_requests_profile(), asking(), asking()];
+            let engine = Engine::new(profiles, vec![binding], 1, Needs::default());
+            let marked = [0, 1, 2].map(|profile: usize| engine.marks[profile].ring_filter());
+            assert_eq!(marked, [false, true, true], "the shadows' filter alone");
+            let case = format!("{sides:?}, {assignment:?}");
+            assert_eq!(shadows_asked(&engine, Some(7)), (decide, asks), "{case}");
+            let every = (([true; 2], true), vec![(0, 1), (1, 2), (2, 2)]);
+            assert_eq!(shadows_asked(&engine, None), every, "{case}");
+        }
+    }
 }
 
 /// A later decode of a key follows the key's decode pin: the call
@@ -1742,4 +1841,59 @@ fn a_decode_side_left_out_under_a_picker_that_waits_for_the_rule_stops_a_debug_b
         ..pair_binding()
     };
     let _ = Engine::new(vec![manual_profile()], vec![binding], 1, Needs::default());
+}
+
+/// The build that holds no such stop: with debug assertions off the
+/// engine is built with that binding, and the side its rule leaves out
+/// is the rule's all the same, since its picker has no stages to place
+/// it by. Under each rule that names one side, a key's first pair
+/// claims on both sides the worker with the fewest requests in flight:
+/// `min_load` says so, and under such a picker `delegate` reads the same
+/// count. The table then holds a pin for each side, and the key's next
+/// pair follows both pins past the loads. A request with no key follows
+/// the loads and pins nothing.
+///
+/// The workspace's test profile holds debug assertions, so it does not
+/// build this case. It is built under
+/// `--config profile.dev.package.smg-grand-central.debug-assertions=false`.
+#[cfg(not(debug_assertions))]
+#[test]
+fn a_side_left_out_under_a_picker_that_waits_for_the_rule_is_the_rules_with_no_debug_stop() {
+    for assignment in [Assignment::Delegate, Assignment::MinLoad] {
+        for (sides, _) in ONE_SIDE {
+            let rule = SessionRule {
+                sides,
+                assignment,
+                inflight_cap: 0,
+                ..SESSIONS
+            };
+            let binding = Binding {
+                sessions: Some(rule),
+                ..pair_binding()
+            };
+            let engine = Engine::new(vec![manual_profile()], vec![binding], 1, Needs::default());
+            let mut scratch = Scratch::new();
+            let case = format!("{sides:?}, {assignment:?}");
+            // The fewest in flight: the second prefill and the third decode.
+            let first = two_sides(&[3, 1, 2], &[2, 3, 1]);
+            let keyed = pair_request(Some(7));
+            let (places, verdicts) = pair_placed(&engine, &keyed, &first, &mut scratch);
+            assert_eq!(places, (1, 2), "{case}");
+            let claimed = SessionVerdict::Claimed(first[0][1].id);
+            assert_eq!(verdicts, (claimed, DecodeVerdict::CLAIMED), "{case}");
+            let pins = side_sessions(&keyed).map(|session| engine.sessions.pins(session));
+            let held = [first[0][1].id, first[1][2].id].map(|id| Some([id, WorkerId(0)]));
+            assert_eq!(pins, held, "{case}: a pin for each side");
+            let moved = two_sides(&[0, 5, 2], &[1, 3, 9]);
+            let (places, verdicts) = pair_placed(&engine, &keyed, &moved, &mut scratch);
+            assert_eq!(places, (1, 2), "{case}");
+            let pinned = (SessionVerdict::Pinned, DecodeVerdict::PINNED);
+            assert_eq!(verdicts, pinned, "{case}: both pins followed");
+            let plain = pair_request(None);
+            let (places, verdicts) = pair_placed(&engine, &plain, &moved, &mut scratch);
+            assert_eq!(places, (0, 0), "{case}");
+            assert_eq!(verdicts, (SessionVerdict::None, DecodeVerdict::NONE));
+            assert_eq!(engine.sessions.len(), 2, "{case}: the key's two entries");
+        }
+    }
 }
