@@ -346,6 +346,52 @@ fn a_follower_that_runs_a_standby_is_ready_only_while_it_is_synced() {
     assert_eq!(readiness.state(), State::Draining);
 }
 
+#[test]
+fn a_standby_under_a_bound_its_clock_cannot_add_stays_ready_with_no_lapse_to_wake_at() {
+    let mut elector = Elector::alone("controller-0@127.0.0.1:1", ElectionSettings::default())
+        .expect("the default settings are in order");
+    // The bound of the longest interval a host states: no clock holds a
+    // frame's instant plus it.
+    let lag = Arc::new(Lag::new(Duration::from_secs(u64::MAX)));
+    lag.follow();
+    let (_standing, stepped) = watch::channel(ElectionObservation::default());
+    let (phase, readiness) = detached(elector.fence(), stepped, Arc::clone(&lag));
+    phase.send_replace(Phase::Serving);
+    // Before its first frame it is not ready: no lag, and not synced.
+    let start = Instant::now();
+    assert_eq!(readiness.sample_at(start).0, Sample::from(State::Syncing));
+
+    // A frame at the head: ready from it on.
+    lag.applied(start);
+    assert_eq!(readiness.sample_at(start).0.state, State::Follower);
+    // The lag holds the frame's instant at a whole microsecond.
+    let frame = start - lag.age(start).expect("a frame applied");
+    // A day on and sixty days on, with no further frame, it is ready
+    // still and says the frame's age. The sync does not lapse on this
+    // clock, and the fence of a replica that never led has no turn: the
+    // clock alone turns nothing.
+    let day = Duration::from_secs(86_400);
+    for behind in [day, 60 * day] {
+        let ready = Sample {
+            state: State::Follower,
+            lag: Some(behind),
+            synced: true,
+            restores: 0,
+        };
+        assert_eq!(readiness.sample_at(frame + behind), (ready, None));
+    }
+
+    // A leader follows nobody under such a bound either: it has no lag
+    // and is not synced, whatever frame its lag holds. A candidate alone
+    // over its lease leads from its take's own instant.
+    let taken = Instant::now();
+    assert_eq!(
+        elector.tick(taken).expect("the take"),
+        TickOutcome::Acquired { term: 1 }
+    );
+    assert_eq!(readiness.sample_at(taken).0, Sample::from(State::Leader));
+}
+
 #[tokio::test]
 async fn a_waiter_looks_again_when_a_frame_ends_a_silence_and_when_the_sync_lapses() {
     // A frame ends the silence: the lag tells the waiter, with no move

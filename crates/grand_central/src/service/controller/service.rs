@@ -776,7 +776,7 @@ impl Service {
             address,
             term,
             is_leader,
-            synced: read.is_some_and(|(_, lapse)| lapse.is_some()),
+            synced: read.is_some_and(|(_, lapse)| lapse.synced()),
             sync: read.map(|(lag, _)| proto::SyncState {
                 replication_lag_ms: u32::try_from(lag.as_millis()).unwrap_or(u32::MAX),
                 ..proto::SyncState::default()

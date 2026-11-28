@@ -38,10 +38,13 @@ fn the_sync_holds_under_the_bound_and_turns_by_the_clock_of_the_write() {
     assert_eq!(turned(), 1);
     let under = bound - Duration::from_micros(1);
     assert!(lag.synced(frame + under));
-    assert_eq!(lag.read(frame + under), Some((under, Some(frame + bound))));
+    assert_eq!(
+        lag.read(frame + under),
+        Some((under, Lapse::At(frame + bound)))
+    );
     // At the bound it is gone, and there is nothing left to lapse.
     assert!(!lag.synced(frame + bound));
-    assert_eq!(lag.read(frame + bound), Some((bound, None)));
+    assert_eq!(lag.read(frame + bound), Some((bound, Lapse::Lapsed)));
 
     // A frame written inside the bound keeps the sync and tells no
     // turn.
@@ -58,6 +61,58 @@ fn the_sync_holds_under_the_bound_and_turns_by_the_clock_of_the_write() {
     assert!(!lag.follows());
     lag.follow();
     assert!(lag.follows());
+}
+
+#[test]
+fn a_bound_the_clock_cannot_add_to_a_frame_never_lapses() {
+    // The longest bound there is: no clock holds a frame's instant plus
+    // it.
+    let lag = Lag::new(Duration::MAX);
+    let turns = lag.turns();
+    let at = Instant::now();
+    lag.applied(at);
+    // The read says the frame's age, and that the sync does not lapse.
+    let (age, lapse) = lag.read(at).expect("a frame applied");
+    assert_eq!(lapse, Lapse::Never);
+    // The lag holds the frame's instant at a whole microsecond.
+    let frame = at - age;
+    // A day on with no further frame it says the same, and reads synced.
+    let day = Duration::from_secs(86_400);
+    assert_eq!(lag.read(frame + day), Some((day, Lapse::Never)));
+    assert!(lag.synced(frame + day));
+    // No reader read such a sync gone: the next frame tells no turn.
+    lag.turn(lag.store(frame + day), frame + day);
+    assert_eq!(*turns.borrow(), 1);
+}
+
+#[test]
+fn a_bound_the_clock_adds_to_the_lags_origin_and_not_to_its_frame_never_lapses() {
+    // The most whole seconds the clock adds to a lag's own origin. It adds
+    // one and not every count of them: halving finds the last it adds, and
+    // a second more is past what it holds.
+    let made = Lag::new(Duration::ZERO);
+    let origin = made.origin;
+    let adds = |secs| origin.checked_add(Duration::from_secs(secs)).is_some();
+    let (mut most, mut over) = (1, u64::MAX);
+    assert!(adds(most) && !adds(over));
+    while over - most > 1 {
+        let half = most + (over - most) / 2;
+        if adds(half) {
+            most = half;
+        } else {
+            over = half;
+        }
+    }
+    // The same lag under that bound, and a frame one second past its
+    // origin. The clock adds the bound to the origin and not to the
+    // frame's instant: the sum the read checks is the frame's.
+    let lag = Lag {
+        within: Duration::from_secs(most),
+        ..made
+    };
+    let at = origin + Duration::from_secs(1);
+    lag.applied(at);
+    assert_eq!(lag.read(at), Some((Duration::ZERO, Lapse::Never)));
 }
 
 #[test]
