@@ -16,10 +16,10 @@ import math
 import os
 from pathlib import Path
 import tempfile
+from contextlib import contextmanager
 
 REVISION = "6cee5e81ee83917806bbde320786a8fb61efebee"
 MODEL = "openai/gpt-oss-20b"
-INPUT_SIZE = INTERMEDIATE = OUTPUT_SIZE = 64
 ALPHA, CLAMP = 1.702, 7.0
 REL_L2_LIMIT, SCALED_MAX_LIMIT = 0.02, 0.04
 COUNTERFACTUAL_MIN_REL_L2 = 0.05
@@ -73,7 +73,6 @@ def worker_checkpoint():
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), namespace)
     selected = namespace["_resolve_model_path"](MODEL)
     ref = None
-    checkpoint = Path(selected)
     if selected == MODEL:
         cache = Path(
             os.environ.get("HF_HUB_CACHE") or Path(os.environ.get("HF_HOME") or "/models") / "hub"
@@ -84,7 +83,6 @@ def worker_checkpoint():
         # not floating main, even when a later download has updated this ref.
         if reference.is_file() and reference.stat().st_size <= 128:
             ref = reference.read_text().strip()
-        checkpoint = repository / "snapshots" / REVISION
     # Use the actual scoped worker producer rather than a second launch policy.
     profile_source = source.with_name("sglang_gptoss.py")
     spec = importlib.util.spec_from_file_location("sglang_gptoss_profile", profile_source)
@@ -196,6 +194,43 @@ def checkpoint_file(root, name, repository=None):
             f"{name}: {entry} -> {actual}"
         )
     return actual
+
+
+@contextmanager
+def distributed_numeric_scope(record, output, should_cleanup, cleanups):
+    """Keep the primary failure and attempt every teardown before removing FileStore."""
+    rendezvous = tempfile.TemporaryDirectory(prefix="packed-numeric-", dir=output)
+    primary = None
+    failures = []
+
+    def failed(stage, error):
+        failures.append({"stage": stage, "type": type(error).__name__, "message": str(error)})
+
+    try:
+        yield Path(rendezvous.name)
+    except BaseException as error:
+        primary = error
+        raise
+    finally:
+        try:
+            cleanup_needed = should_cleanup()
+        except Exception as error:
+            failed("distributed_state", error)
+            cleanup_needed = True
+        if cleanup_needed:
+            for stage, cleanup in cleanups:
+                try:
+                    cleanup()
+                except Exception as error:
+                    failed(stage, error)
+        try:
+            rendezvous.cleanup()
+        except Exception as error:
+            failed("rendezvous", error)
+        if failures:
+            record["teardown_failures"] = failures
+            if primary is None:
+                raise RuntimeError("Distributed numeric teardown failed")
 
 
 def main():
@@ -352,27 +387,28 @@ def main():
         publish(server, role="test", ranks=SpawnRanks(world_rank=0, gpu_id=0))
         initialize_moe_config()
         group_started = False
-        try:
-            # Actual SDK public initialization, not fake get_parallel/get_exec globals.
-            with tempfile.TemporaryDirectory(
-                prefix="packed-numeric-", dir=args.output
-            ) as rendezvous:
-                init_distributed_environment(
-                    world_size=1,
-                    rank=0,
-                    local_rank=0,
-                    distributed_init_method="file://" + str(Path(rendezvous) / "store"),
-                    backend="nccl",
-                    timeout=60,
-                    moe_a2a_backend="none",
-                )
-                group_started = True
-                initialize_model_parallel(backend="nccl", enable_symm_mem=False)
-                execute(torch, tensors, record)
-        finally:
-            if group_started or torch.distributed.is_initialized():
-                destroy_model_parallel()
-                destroy_distributed_environment()
+        # Actual SDK public initialization, not fake get_parallel/get_exec globals.
+        with distributed_numeric_scope(
+            record,
+            args.output,
+            lambda: group_started or torch.distributed.is_initialized(),
+            [
+                ("destroy_model_parallel", destroy_model_parallel),
+                ("destroy_distributed_environment", destroy_distributed_environment),
+            ],
+        ) as rendezvous:
+            init_distributed_environment(
+                world_size=1,
+                rank=0,
+                local_rank=0,
+                distributed_init_method="file://" + str(rendezvous / "store"),
+                backend="nccl",
+                timeout=60,
+                moe_a2a_backend="none",
+            )
+            group_started = True
+            initialize_model_parallel(backend="nccl", enable_symm_mem=False)
+            execute(torch, tensors, record)
         record["status"] = "original_packed_slice_actual_generic_triton_numeric_pass"
     except Exception as error:
         record["failure"] = {"type": type(error).__name__, "message": str(error)}
