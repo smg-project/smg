@@ -19,10 +19,10 @@ FILES = {
     ),
     "srt/layers/quantization/mxfp4.py": (
         "10692c68bc5e1d412fc4489d2c469e9916948d396f209b5ba6835c942676d9f9",
-        "b0f90a0b1e539657e5d23ac4893550975136e5c46d7deb2e07e724f7d94f9e5c",
+        "1024f6929dfa98d552591ae886cca5c13973bbb316326b1580b6fb71a2d787dc",
     ),
 }
-PATCH_SHA = "db59b663d2e4a0f87f6bd7f788ade509a60780bfa0d756b5c63eddb77fe4422e"
+PATCH_SHA = "405f2b6ed1166a4a62a1ae4cd1706bb34e4713aae44b42306b492c942377029f"
 
 
 def enabled():
