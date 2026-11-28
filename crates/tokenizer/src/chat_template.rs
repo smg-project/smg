@@ -3837,17 +3837,28 @@ pub(crate) fn continue_final_message(
 }
 
 /// Render the chat, and say whether the prompt continues the final message
-/// (see [`render_continuing_final_message`]).
+/// (see [`render_continuing_final_message`]). A vector the caller handed
+/// over, or one a rewrite of the messages built, goes to the template as
+/// objects that own their JSON ([`OwnedMessage`]); a borrowed slice is
+/// converted whole.
 fn render_chat_template(
     env: &Environment<'_>,
-    messages: &[serde_json::Value],
+    messages: Cow<'_, [serde_json::Value]>,
     params: ChatTemplateParams,
     output_len: &RenderedLength,
 ) -> Result<(String, bool)> {
     if params.continue_final_message {
-        return render_continuing_final_message(env, messages, params, output_len);
+        return render_continuing_final_message(env, &messages, params, output_len);
     }
-    render_messages(env, messages.iter(), params, output_len)
+    match messages {
+        Cow::Borrowed(messages) => render_messages(env, messages.iter(), params, output_len),
+        Cow::Owned(messages) => render_values(
+            env,
+            messages.into_iter().map(OwnedMessage::value).collect(),
+            params,
+            output_len,
+        ),
+    }
 }
 
 /// Render `messages` through the template with the generation prompt the
@@ -3855,6 +3866,92 @@ fn render_chat_template(
 fn render_messages<'a>(
     env: &Environment<'_>,
     messages: impl Iterator<Item = &'a JsonValue>,
+    params: ChatTemplateParams,
+    output_len: &RenderedLength,
+) -> Result<(String, bool)> {
+    // Convert messages to minijinja::Value (messages already processed by router)
+    render_values(
+        env,
+        messages.map(Value::from_serialize).collect(),
+        params,
+        output_len,
+    )
+}
+
+/// One chat message handed to the template as a map that owns its JSON and
+/// converts a field at its first read, so a message the caller hands over
+/// is not copied into a map of the template engine: a template reads two or
+/// three fields of a message and the rest is never converted. It reads as
+/// the converted map does: the same keys in the same order, the same values.
+struct OwnedMessage {
+    fields: serde_json::Map<String, JsonValue>,
+    values: Box<[OnceLock<Value>]>,
+}
+
+impl OwnedMessage {
+    fn value(message: JsonValue) -> Value {
+        match message {
+            JsonValue::Object(fields) => {
+                let values = iter::repeat_with(OnceLock::new)
+                    .take(fields.len())
+                    .collect();
+                Value::from_object(Self { fields, values })
+            }
+            other => Value::from_serialize(&other),
+        }
+    }
+
+    fn field(&self, key: &str) -> Option<Value> {
+        let (index, (_, json)) = self
+            .fields
+            .iter()
+            .enumerate()
+            .find(|(_, (name, _))| name.as_str() == key)?;
+        Some(
+            self.values[index]
+                .get_or_init(|| Value::from_serialize(json))
+                .clone(),
+        )
+    }
+}
+
+impl std::fmt::Debug for OwnedMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&Value::from_serialize(&self.fields), f)
+    }
+}
+
+impl Object for OwnedMessage {
+    fn repr(self: &Arc<Self>) -> ObjectRepr {
+        ObjectRepr::Map
+    }
+
+    fn get_value_by_str(self: &Arc<Self>, key: &str) -> Option<Value> {
+        self.field(key)
+    }
+
+    fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
+        self.field(key.as_str()?)
+    }
+
+    fn enumerate(self: &Arc<Self>) -> Enumerator {
+        Enumerator::Values(
+            self.fields
+                .keys()
+                .map(|name| Value::from(name.as_str()))
+                .collect(),
+        )
+    }
+
+    fn enumerator_len(self: &Arc<Self>) -> Option<usize> {
+        Some(self.fields.len())
+    }
+}
+
+/// [`render_messages`] over messages already converted.
+fn render_values(
+    env: &Environment<'_>,
+    minijinja_messages: Vec<Value>,
     params: ChatTemplateParams,
     output_len: &RenderedLength,
 ) -> Result<(String, bool)> {
@@ -3871,9 +3968,6 @@ fn render_messages<'a>(
     let strftime_now = Value::from_function(move |format: String| {
         strftime(instant.get_or_init(render_instant), &format)
     });
-
-    // Convert messages to minijinja::Value (messages already processed by router)
-    let minijinja_messages: Vec<Value> = messages.map(Value::from_serialize).collect();
 
     // transformers renders with `tools=None` and `documents=None` when the
     // request carries none: the names are defined and hold none. A template
@@ -4147,7 +4241,7 @@ impl ChatTemplateProcessor {
         messages: &[serde_json::Value],
         params: ChatTemplateParams,
     ) -> Result<String> {
-        render_chat_template(&self.env, messages, params, &self.output_len)
+        render_chat_template(&self.env, Cow::Borrowed(messages), params, &self.output_len)
             .map(|(prompt, _)| prompt)
     }
 }
@@ -4561,6 +4655,18 @@ impl ChatTemplateState {
         messages: &[serde_json::Value],
         params: ChatTemplateParams,
     ) -> Result<(String, bool)> {
+        self.apply_messages(Cow::Borrowed(messages), params)
+    }
+
+    /// [`Self::apply_with_continuation`] on messages the caller may hand
+    /// over: a vector it owns is shaped where it stands and goes to the
+    /// template as objects that own their JSON, so no message is copied; a
+    /// borrowed slice renders as [`Self::apply_with_continuation`] does.
+    pub(crate) fn apply_messages(
+        &self,
+        messages: Cow<'_, [serde_json::Value]>,
+        params: ChatTemplateParams,
+    ) -> Result<(String, bool)> {
         self.template_for(&params)
             .render_with_continuation(messages, params)
     }
@@ -4594,7 +4700,7 @@ impl ChatTemplateState {
 
     fn render_with_continuation(
         &self,
-        messages: &[serde_json::Value],
+        mut messages: Cow<'_, [serde_json::Value]>,
         params: ChatTemplateParams,
     ) -> Result<(String, bool)> {
         // A render call carries no template of its own, so the words name
@@ -4615,10 +4721,13 @@ impl ChatTemplateState {
         // separator after every part, a truthiness check on the content)
         // produces the engine's prompt for string content too. A tool result
         // stays a string: the engine joins its text parts back into one.
-        let wrapped = (self.content_format == ChatTemplateContentFormat::OpenAI)
-            .then(|| string_content_as_text_parts(messages))
-            .flatten();
-        let messages = wrapped.as_deref().unwrap_or(messages);
+        // Messages the caller handed over are wrapped where they stand;
+        // borrowed ones are copied first, and only when one has a string.
+        if self.content_format == ChatTemplateContentFormat::OpenAI
+            && messages.iter().any(needs_text_part_wrap)
+        {
+            wrap_string_content_in_place(messages.to_mut());
+        }
 
         // A template without a `root` branch (the MiniMax templates before
         // M3) has no branch that reads the role and would drop a root
@@ -4628,34 +4737,20 @@ impl ChatTemplateState {
         // into that one rather than being lost (the consolidation below).
         // Before the developer step, so a developer message merged next
         // comes after the root's text.
-        let root_converted;
-        let messages: &[serde_json::Value] = if self.root_role_supported {
-            messages
-        } else {
-            match root_messages_as_system(messages) {
-                Some(rewritten) => {
-                    root_converted = rewritten;
-                    &root_converted
-                }
-                None => messages,
+        if !self.root_role_supported {
+            if let Some(rewritten) = root_messages_as_system(&messages) {
+                messages = Cow::Owned(rewritten);
             }
-        };
+        }
 
         // A template without a `developer` branch renders nothing for a
         // developer message; the engine's renderer hands such a template the message
         // as a system message, and so does this one (`tools` on it dropped).
-        let converted;
-        let messages: &[serde_json::Value] = if self.developer_role_supported {
-            messages
-        } else {
-            match developer_messages_as_system(messages) {
-                Some(rewritten) => {
-                    converted = rewritten;
-                    &converted
-                }
-                None => messages,
+        if !self.developer_role_supported {
+            if let Some(rewritten) = developer_messages_as_system(&messages) {
+                messages = Cow::Owned(rewritten);
             }
-        };
+        }
 
         // Apply the resolved thinking preference under the template's own toggle
         // key (`enable_thinking` vs `thinking`, per detection). Skip entirely

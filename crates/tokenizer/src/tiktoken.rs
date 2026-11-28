@@ -1081,15 +1081,15 @@ impl TiktokenTokenizer {
         // (messages, tools, documents, template kwargs) with its marks
         // removed, so no request can forge one; else the tokenizer's special
         // tokens stand in when the caller passed none.
-        let inputs = marks::TemplateInputs::new(
-            messages,
+        let (messages, inputs) = marks::TemplateInputs::new(
+            Cow::Borrowed(messages),
             &params,
             self.special_tokens_marked
                 .as_ref()
                 .filter(|_| self.chat_template.marked()),
             &self.special_tokens,
         );
-        let (messages, params) = inputs.split(params);
+        let params = inputs.split(params);
         // The checkpoint's own class sorts the tools' keys before anything
         // reads them: so here, from the kept sorted form of the prepared set
         // when the caller hands one (made once per set), else sorted now.
@@ -1115,13 +1115,15 @@ impl TiktokenTokenizer {
             None => params,
         };
         match self.renderer {
-            Renderer::Jinja => self.chat_template.apply_with_continuation(messages, params),
-            Renderer::KimiK25Tools => apply_kimi_k25_tools(&self.chat_template, messages, params),
+            Renderer::Jinja => self
+                .chat_template
+                .apply_with_continuation(&messages, params),
+            Renderer::KimiK25Tools => apply_kimi_k25_tools(&self.chat_template, &messages, params),
             // This is the layer the checkpoint's own `apply_chat_template` sits
             // at, so it applies that wrapper's `thinking_effort` default. K3 does
             // not continue a final message (its prefill is the assistant prefix).
             Renderer::KimiXtml(model) => Ok((
-                apply_kimi_k3_xtml_with_effort_default(model, messages, &params)?,
+                apply_kimi_k3_xtml_with_effort_default(model, &messages, &params)?,
                 false,
             )),
         }
