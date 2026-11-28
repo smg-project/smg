@@ -140,10 +140,32 @@ async fn the_bind_draws_its_logs_first_place() {
     let mut starts = Vec::new();
     for _ in 0..2 {
         let controller = Controller::bind(valid()).await.expect("the listeners bind");
-        starts.push(controller.shared.feed.log.head());
+        starts.push(controller.readiness.log_head());
     }
     assert_ne!(starts[0].seq, starts[1].seq, "two runs start apart");
     assert!(starts.iter().all(|start| start.seq != 0 && start.term == 0));
+}
+
+/// The bind takes its handles of one journal. A write to the store the
+/// controller hands out moves the head the readiness reads, and that
+/// head is the place of an applier the shared state makes. That store
+/// is the shared state's: a term set through it is the term the state
+/// says.
+#[tokio::test]
+async fn the_bind_takes_its_handles_of_one_journal() {
+    let controller = Controller::bind(valid()).await.expect("the listeners bind");
+    let store = controller.store();
+    let drawn = controller.readiness.log_head();
+    let written = WorkerFacts {
+        key: "http://w:8000".to_owned(),
+        ..WorkerFacts::default()
+    };
+    store.upsert(written);
+    let head = controller.readiness.log_head();
+    assert_ne!(head, drawn, "the write moved the readiness's log");
+    assert_eq!(controller.shared.follower().place(), head);
+    crate::store::LeasesStore::set_term(&*store, 1);
+    assert_eq!(controller.shared.store_term(), 1);
 }
 
 /// A controller hands out the fence its bind took from its candidate: a

@@ -49,7 +49,7 @@ use crate::{
         },
         replication::{Log, LogPositionLost},
     },
-    store::{LeasesStore, MemoryStore, Position, StoreCheckpoint, WorkerRow},
+    store::{MemoryStore, Position, StoreCheckpoint, WorkerRow},
     worker_host::{Members, Objects},
 };
 
@@ -648,12 +648,7 @@ pub(crate) struct Standby {
 
 impl Standby {
     pub(crate) fn new(shared: Arc<Shared>, port: u16) -> Self {
-        let follower = Follower::new(
-            Arc::clone(&shared.store),
-            Arc::clone(&shared.feed.log),
-            Arc::clone(&shared.objects),
-        )
-        .through(Arc::clone(&shared.generations));
+        let follower = shared.follower().through(Arc::clone(&shared.generations));
         Self {
             shared,
             follower,
@@ -880,7 +875,7 @@ impl Standby {
             // under the term its store stands under. A hello that asks to
             // be restored names its place under no term, and states the
             // floor all the same.
-            term_seen: leader.term.max(self.shared.store.term()),
+            term_seen: leader.term.max(self.shared.store_term()),
             max_backlog: 0,
             last_applied_term: place.term,
         };

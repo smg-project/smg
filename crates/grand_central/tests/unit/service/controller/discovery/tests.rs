@@ -224,7 +224,7 @@ async fn a_leading_controller_registers_what_its_source_names_and_removes_what_i
     let discovery = controller.discovery.as_ref().expect("configured discovery");
     assert!(Arc::ptr_eq(&discovery.fence, &controller.fence()));
     assert!(discovery.host.jobs().is_some(), "the bind hands no queue");
-    let store = Arc::clone(&controller.shared.store);
+    let store = controller.store();
 
     let (stop, stopped) = oneshot::channel();
     let serve = controller.serve(async {
@@ -299,7 +299,7 @@ async fn a_job_of_a_replica_that_leads_no_term_writes_nothing() -> Result<(), Bo
     let controller = Controller::bind(config).await?;
     let discovery = controller.discovery.as_ref().expect("configured discovery");
     let jobs = discovery.host.jobs().expect("the queue of the bind");
-    let written = controller.shared.store.epoch();
+    let written = controller.store.epoch();
 
     let asked = jobs.add_worker(
         WorkerSpec::new(url.as_str()),
@@ -309,8 +309,8 @@ async fn a_job_of_a_replica_that_leads_no_term_writes_nothing() -> Result<(), Bo
     assert_eq!(asked.await, Ok(true));
     let ended = until(SERVED, || (!jobs.job_in_flight(&url)).then_some(())).await;
     assert!(ended.is_some(), "the registration did not end");
-    assert!(controller.shared.store.by_key(&url).is_none());
-    assert_eq!(controller.shared.store.epoch(), written);
+    assert!(controller.store.by_key(&url).is_none());
+    assert_eq!(controller.store.epoch(), written);
     Ok(())
 }
 

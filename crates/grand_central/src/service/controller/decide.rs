@@ -40,7 +40,7 @@
 //! millisecond of the span left, the `Busy` a late decision is told. The
 //! lease of a decision stopped there does not wait for its dispatch
 //! deadline: the stream gives it up, by a release handed to the leases'
-//! file as a `Released` frame's is ([`MemoryStore::hand`]). A decision
+//! file as a `Released` frame's is ([`LeaseHand::given_up`]). A decision
 //! waits in the queue as it was made ([`wire::Decided`]), and its frame is
 //! built at the send, on the thread that encodes it, with what the span
 //! has left there.
@@ -72,7 +72,6 @@
 
 use std::{
     future::{self, Future},
-    mem,
     pin::Pin,
     sync::{atomic::Ordering, Arc},
     task::{Context, Poll, Waker},
@@ -90,13 +89,13 @@ use super::{
     decision_slots::{Job, Refused},
     gateways::Presence,
     principal::Principal,
-    service::Shared,
+    service::{LeaseHand, Shared},
     session,
     wire::{self, Checked, Refusal},
 };
 use crate::{
     service::proto::{self, busy::Reason},
-    store::{GatewayId, Hand, MemoryStore},
+    store::GatewayId,
     tracking::lease::ReleaseReason,
 };
 
@@ -186,7 +185,7 @@ pub(crate) struct Answers<S = Streaming<proto::DecideRequest>> {
     /// The stream's hand at the leases' file: a decision stopped at the
     /// send gives its lease up through it, and so does each decision still
     /// in the queue at the stream's end, where the hand is given back.
-    hand: Hand,
+    hand: LeaseHand,
     /// The gateway's frames; `None` once it closed its side.
     inbound: Option<S>,
     /// The deciders' answers, and the handle each request carries to its
@@ -259,7 +258,7 @@ pub(crate) fn serve<S>(
         let _ = word.wait_for(|stop| *stop).await;
     }));
     let (sender, decided) = mpsc::channel(WINDOW as usize);
-    let hand = Hand::new(gateway);
+    let hand = shared.hand(gateway);
     Ok(Answers {
         shared,
         gateway,
@@ -336,7 +335,7 @@ impl<S> Answers<S> {
             return wire::decided(id, term, &decision, lease.as_ref(), encode);
         };
         if let Some(leased) = lease {
-            leased.given_up(&self.shared.store, &self.hand, release);
+            self.hand.given_up(&leased, release);
         }
         deciders.busy(id, reason)
     }
@@ -416,7 +415,7 @@ impl<S> Drop for Answers<S> {
     /// counted as that decider counts one: dropped, its stream gone.
     ///
     /// The hand then goes back to the store, as a session's does at its
-    /// end ([`MemoryStore::hand_back`]). Where a file's decider keeps its
+    /// end ([`LeaseHand::back`]). Where a file's decider keeps its
     /// watch a hand leaves its frame for that decider's next look. This
     /// last look applies it in place where no decider is at work: what
     /// the stream handed here, and at each send it stopped.
@@ -431,16 +430,14 @@ impl<S> Drop for Answers<S> {
                 ..
             } = decided
             {
-                leased.given_up(&self.shared.store, &self.hand, abandoned);
+                self.hand.given_up(&leased, abandoned);
             }
         }
         if dropped != 0 {
             let counts = self.shared.deciders.counts();
             counts.dropped_gone.fetch_add(dropped, Ordering::Relaxed);
         }
-        let hand = mem::replace(&mut self.hand, Hand::new(self.gateway));
-        let store: &MemoryStore = &self.shared.store;
-        store.hand_back(hand);
+        self.hand.back();
     }
 }
 

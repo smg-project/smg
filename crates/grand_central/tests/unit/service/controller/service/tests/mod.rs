@@ -1558,7 +1558,7 @@ async fn the_presence_tables_task_ends_at_the_stop_it_is_handed() {
     let (_elector, _standing, service) = service_alone(&[Scope::Gateway]);
     let (stop, stopped) = watch::channel(false);
     let mut task = JoinSet::new();
-    task.spawn(service.shared.sweep(stopped));
+    task.spawn(service.shared.presence_task(stopped));
     let early = tokio::time::timeout(Duration::from_secs(3_600), task.join_next()).await;
     assert!(
         early.is_err(),

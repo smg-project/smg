@@ -27,7 +27,7 @@ use crate::{
         replication::{Entry, Event},
     },
     stages::registry,
-    store::{WorkerFacts, WorkerStatus, WorkersStore},
+    store::{LeasesStore, WorkerFacts, WorkerStatus, WorkersStore},
     worker_host::tests::lay_standing,
 };
 
