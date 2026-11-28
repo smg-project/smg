@@ -15,7 +15,11 @@
 //! answers of `GetModelInfo` and `GetServerInfo` once each, as the bytes of
 //! the message, in `PATH` with its extension replaced by `info.jsonl`; of a
 //! server info answer's free-form maps it keeps what the gateway reads
-//! ([`server_info`]).
+//! ([`server_info`]). A `GetTokenizer` fetch that ends well goes there as
+//! well, once a path: its chunks one behind the other, each behind its
+//! length. One fetch waits for that at a time, up to the size a gateway
+//! takes of a bundle; one that begins beside it, or grows past that size,
+//! passes through and is not kept.
 
 use std::{
     collections::{BTreeMap, HashSet},
@@ -23,7 +27,10 @@ use std::{
     future::Future,
     io::{ErrorKind, Write},
     pin::Pin,
-    sync::{Arc, Mutex, PoisonError},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, PoisonError,
+    },
 };
 
 use axum::{extract::State, http::uri::PathAndQuery};
@@ -32,7 +39,8 @@ use futures::{future::BoxFuture, Stream, StreamExt};
 use prost::Message;
 use serde_json::{json, Map, Value};
 use smg_grpc_client::{
-    engine_labels::ServerInfo, sglang_proto as sg, tokenspeed_proto as ts, vllm_proto as vllm,
+    engine_labels::ServerInfo, sglang_proto as sg, tokenizer_bundle::MAX_STREAM_BUNDLE_SIZE,
+    tokenspeed_proto as ts, vllm_proto as vllm,
 };
 use tokio::net::TcpListener;
 use tonic::{
@@ -110,6 +118,7 @@ enum Kept {
     Generate(Wire),
     ModelInfo,
     ServerInfo(Wire),
+    Tokenizer,
     Nothing,
 }
 
@@ -127,6 +136,7 @@ fn kept(path: &str) -> Kept {
         Some("Generate") => Kept::Generate(wire),
         Some("GetModelInfo") => Kept::ModelInfo,
         Some("GetServerInfo") => Kept::ServerInfo(wire),
+        Some("GetTokenizer") => Kept::Tokenizer,
         _ => Kept::Nothing,
     }
 }
@@ -137,6 +147,9 @@ struct Recorder {
     limit: usize,
     file: Arc<Mutex<File>>,
     info: Arc<Mutex<(File, HashSet<String>)>>,
+    /// Whether a tokenizer fetch holds its chunks for the info file: one
+    /// does at a time, so the chunks that wait are those of one fetch.
+    fetching: Arc<AtomicBool>,
 }
 
 /// Serve the recorder on `listener` until `shutdown` resolves.
@@ -209,6 +222,7 @@ fn open(cfg: &Config, upstream: &str) -> Result<Recorder, String> {
         limit: cfg.grpc_max_message_bytes,
         file: Arc::new(Mutex::new(record)),
         info: Arc::new(Mutex::new((info, HashSet::new()))),
+        fetching: Arc::default(),
     })
 }
 
@@ -332,6 +346,7 @@ impl tonic::server::StreamingService<Bytes> for Call {
                         exchange.refused(&status);
                         return Some((Err(status), None));
                     }
+                    exchange.ended_well();
                     // The call ended well: the trailers the engine sent with
                     // its OK go on behind the last message. A status of the
                     // code OK is written as the trailers of a call that
@@ -398,6 +413,11 @@ struct Tapped {
     /// A frame numbered a choice at or past [`CHOICES`]: nothing is kept of
     /// it but this.
     strayed: bool,
+    /// The chunks of a tokenizer fetch so far, each behind its length.
+    fetched: Vec<u8>,
+    /// Whether this tokenizer fetch holds its chunks for the info file,
+    /// settled at its first chunk.
+    waits: Option<bool>,
 }
 
 /// The most choices a request asks: what a gateway sends at most.
@@ -485,9 +505,41 @@ macro_rules! answered {
     }};
 }
 
+/// One line of the info file: the path of an answer and its bytes in hex,
+/// as `json!` writes the two. The line is written into one string of its
+/// whole size, for an answer may be a tokenizer of some MiB; hex digits need
+/// no escaping.
+fn info_line(path: &str, bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    const AHEAD: &str = "{\"path\":";
+    const BETWEEN: &str = ",\"answer_hex\":\"";
+    const BEHIND: &str = "\"}\n";
+    let path = Value::from(path).to_string();
+    let mut line = String::with_capacity(
+        AHEAD.len() + path.len() + BETWEEN.len() + 2 * bytes.len() + BEHIND.len(),
+    );
+    line.push_str(AHEAD);
+    line.push_str(&path);
+    line.push_str(BETWEEN);
+    for byte in bytes {
+        line.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        line.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    line.push_str(BEHIND);
+    line
+}
+
 impl Exchange {
     fn tapped(&self) -> std::sync::MutexGuard<'_, Tapped> {
         self.tapped.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The info file with the paths it holds a line of.
+    fn info(&self) -> std::sync::MutexGuard<'_, (File, HashSet<String>)> {
+        self.recorder
+            .info
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// A message of the request: the first is the request of a unary or
@@ -520,23 +572,73 @@ impl Exchange {
         });
     }
 
+    /// A chunk of a tokenizer fetch: it waits behind its length until the
+    /// call ends. Nothing waits once the info file holds a fetch of the
+    /// path: that file keeps the first. One fetch waits at a time: one that
+    /// begins while another waits passes through whole and is not kept, so
+    /// the chunks held are those of one bundle. They are held up to
+    /// [`MAX_STREAM_BUNDLE_SIZE`], what a gateway takes of a bundle: a fetch
+    /// that grows past it holds nothing more, is not kept, and lets the next
+    /// fetch wait.
+    fn fetched(&self, bytes: &Bytes) {
+        let settled = self.tapped().waits;
+        let waits = settled.unwrap_or_else(|| {
+            let held = self.info().1.contains(&self.path);
+            let waits = !held && !self.recorder.fetching.swap(true, Ordering::AcqRel);
+            self.tapped().waits = Some(waits);
+            waits
+        });
+        if !waits {
+            return;
+        }
+        let mut tapped = self.tapped();
+        if tapped.fetched.len().saturating_add(bytes.len()) > MAX_STREAM_BUNDLE_SIZE {
+            tapped.fetched = Vec::new();
+            tapped.waits = Some(false);
+            drop(tapped);
+            self.recorder.fetching.store(false, Ordering::Release);
+            tracing::warn!(
+                "recorder: a tokenizer fetch above {MAX_STREAM_BUNDLE_SIZE} bytes is not kept"
+            );
+            return;
+        }
+        if prost::encode_length_delimiter(bytes.len(), &mut tapped.fetched).is_ok() {
+            tapped.fetched.extend_from_slice(bytes);
+        }
+    }
+
+    /// The call ended well. A tokenizer fetch goes to the info file whole,
+    /// as the one answer of its path: its chunks, one behind the other. A
+    /// fetch that a status ended, or that its caller let go, does not come
+    /// here and is not kept.
+    fn ended_well(&self) {
+        if !matches!(self.kept, Kept::Tokenizer) {
+            return;
+        }
+        let fetched = std::mem::take(&mut self.tapped().fetched);
+        if !fetched.is_empty() {
+            self.keep_info(&fetched);
+        }
+    }
+
     /// An info answer, the first of its path the info file took: one line of
     /// that file. A line the file took nothing of is written by the next
     /// answer of its path; one it took a part of is not written again, so no
     /// line follows a part of a line.
     fn keep_info(&self, bytes: &[u8]) {
-        let mut info = self
-            .recorder
-            .info
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let held = self.info().1.contains(&self.path);
+        if held {
+            return;
+        }
+        // The line is built with the info file free: an answer may be a
+        // tokenizer of some MiB, and other calls keep theirs meanwhile.
+        let line = info_line(&self.path, bytes);
+        let mut info = self.info();
         if info.1.contains(&self.path) {
             return;
         }
-        let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
         // One write call a line, as a record line is written:
         // each gRPC worker appends through a handle of its own.
-        let line = format!("{}\n", json!({ "path": self.path, "answer_hex": hex }));
         let mut rest = line.as_bytes();
         while !rest.is_empty() {
             match info.0.write(rest) {
@@ -561,6 +663,7 @@ impl Exchange {
         match self.kept {
             Kept::Nothing => {}
             Kept::ModelInfo => self.keep_info(bytes),
+            Kept::Tokenizer => self.fetched(bytes),
             Kept::ServerInfo(wire) => match server_info(wire, bytes) {
                 Some(kept) => self.keep_info(&kept),
                 None => tracing::error!(
@@ -666,6 +769,18 @@ fn asked(wire: Wire, bytes: &Bytes) -> Option<(Vec<u32>, Value)> {
 
 impl Drop for Exchange {
     fn drop(&mut self) {
+        // A tokenizer fetch that waited for the info file waits no longer,
+        // kept or not: the next fetch may.
+        if matches!(self.kept, Kept::Tokenizer) {
+            let tapped = self
+                .tapped
+                .get_mut()
+                .unwrap_or_else(PoisonError::into_inner);
+            if tapped.waits == Some(true) {
+                self.recorder.fetching.store(false, Ordering::Release);
+            }
+            return;
+        }
         let Kept::Generate(wire) = self.kept else {
             return;
         };
@@ -1025,6 +1140,205 @@ mod tests {
             assert_eq!(answer.output_ids, [7, 8, 9]);
             assert_eq!(answer.chunk_frames().len(), empty_chunks);
             assert_eq!(answer.completion_tokens(), 3);
+        }
+    }
+
+    /// The chunks the info file under `dir` holds of a tokenizer fetch, as
+    /// a replay reads them: one behind the other, each behind its length.
+    fn kept_chunks(dir: &Path) -> Vec<smg_grpc_client::common_proto::GetTokenizerChunk> {
+        use smg_grpc_client::common_proto::GetTokenizerChunk;
+
+        let kept = kept_answer(dir);
+        let mut rest = kept.as_slice();
+        let mut chunks = Vec::new();
+        while !rest.is_empty() {
+            chunks.push(GetTokenizerChunk::decode_length_delimited(&mut rest).expect("a chunk"));
+        }
+        chunks
+    }
+
+    /// A later call of the path of `call` at the same recorder.
+    fn again(call: &Exchange) -> Exchange {
+        Exchange {
+            kept: call.kept,
+            path: call.path.clone(),
+            recorder: call.recorder.clone(),
+            tapped: Mutex::default(),
+        }
+    }
+
+    /// A tokenizer fetch that ended well is one line of the info file on
+    /// every wire: its chunks as the engine sent them. The file keeps the
+    /// first: a later fetch of the path adds nothing.
+    #[tokio::test]
+    async fn a_tokenizer_fetch_that_ended_well_is_kept_once() {
+        use smg_grpc_client::common_proto::GetTokenizerChunk;
+
+        let chunk = |data: &[u8], sha256: &str| GetTokenizerChunk {
+            data: data.to_vec(),
+            sha256: sha256.to_string(),
+        };
+        for path in [
+            "/vllm.grpc.engine.VllmEngine/GetTokenizer",
+            "/tokenspeed.grpc.scheduler.TokenSpeedScheduler/GetTokenizer",
+            "/sglang.grpc.scheduler.SglangScheduler/GetTokenizer",
+        ] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let call = exchange(dir.path(), path);
+            let sent = [
+                chunk(b"the first chunk, ", ""),
+                chunk(b"the last chunk", "a-fingerprint"),
+            ];
+            for chunk in &sent {
+                call.answered(&Bytes::from(chunk.encode_to_vec()));
+            }
+            call.ended_well();
+            assert_eq!(kept_chunks(dir.path()), sent, "{path}");
+
+            let later = again(&call);
+            later.answered(&Bytes::from(
+                chunk(b"another bundle", "another").encode_to_vec(),
+            ));
+            later.ended_well();
+            assert_eq!(kept_chunks(dir.path()), sent, "{path}: the first stays");
+        }
+    }
+
+    /// A tokenizer fetch that did not end well leaves no line: one a status
+    /// ended behind its first chunk, and one its caller let go.
+    #[tokio::test]
+    async fn a_tokenizer_fetch_that_did_not_end_well_is_not_kept() {
+        use smg_grpc_client::common_proto::GetTokenizerChunk;
+
+        let first = GetTokenizerChunk {
+            data: b"the first chunk".to_vec(),
+            sha256: String::new(),
+        };
+        let first = Bytes::from(first.encode_to_vec());
+        let dir = tempfile::tempdir().expect("temp dir");
+        let refused = exchange(dir.path(), "/vllm.grpc.engine.VllmEngine/GetTokenizer");
+        let let_go = again(&refused);
+        refused.answered(&first);
+        refused.refused(&Status::out_of_range("a chunk over the size limit"));
+        drop(refused);
+        let_go.answered(&first);
+        assert!(!let_go.tapped().fetched.is_empty(), "the next fetch waits");
+        drop(let_go);
+        let info = std::fs::read_to_string(dir.path().join("session.info.jsonl"));
+        assert_eq!(info.expect("the info file"), "", "no line");
+    }
+
+    /// One tokenizer fetch waits for the info file at a time: a second that
+    /// begins while the first is in flight holds no chunk, also behind the
+    /// end of the first, and is not kept; a fetch that begins with none in
+    /// flight is kept whole.
+    #[tokio::test]
+    async fn one_tokenizer_fetch_waits_at_a_time() {
+        use smg_grpc_client::common_proto::GetTokenizerChunk;
+
+        let chunk = |data: &[u8]| {
+            let chunk = GetTokenizerChunk {
+                data: data.to_vec(),
+                sha256: String::new(),
+            };
+            Bytes::from(chunk.encode_to_vec())
+        };
+        let dir = tempfile::tempdir().expect("temp dir");
+        let first = exchange(dir.path(), "/vllm.grpc.engine.VllmEngine/GetTokenizer");
+        let second = again(&first);
+        let third = again(&first);
+        first.answered(&chunk(b"the first fetch"));
+        second.answered(&chunk(b"the second fetch, "));
+        assert!(second.tapped().fetched.is_empty(), "beside the first");
+        drop(first);
+        second.answered(&chunk(b"its last chunk"));
+        assert!(second.tapped().fetched.is_empty(), "behind the first");
+        second.ended_well();
+        drop(second);
+        let info = std::fs::read_to_string(dir.path().join("session.info.jsonl"));
+        assert_eq!(info.expect("the info file"), "", "no line");
+
+        third.answered(&chunk(b"the third fetch"));
+        third.ended_well();
+        let kept: Vec<Vec<u8>> = kept_chunks(dir.path())
+            .into_iter()
+            .map(|chunk| chunk.data)
+            .collect();
+        assert_eq!(kept, [b"the third fetch".to_vec()]);
+    }
+
+    /// A fetch that grows past what a gateway takes of a bundle is not kept:
+    /// it holds nothing from there on and leaves no line where it ends well,
+    /// and the next fetch waits in its place.
+    #[tokio::test]
+    async fn a_tokenizer_fetch_past_the_bundle_bound_is_not_kept() {
+        use smg_grpc_client::common_proto::GetTokenizerChunk;
+
+        let chunk = |data: Vec<u8>| {
+            let chunk = GetTokenizerChunk {
+                data,
+                sha256: String::new(),
+            };
+            Bytes::from(chunk.encode_to_vec())
+        };
+        let dir = tempfile::tempdir().expect("temp dir");
+        let large = exchange(dir.path(), "/vllm.grpc.engine.VllmEngine/GetTokenizer");
+        let next = again(&large);
+        let piece = chunk(vec![7; 1 << 20]);
+        for _ in 0..=MAX_STREAM_BUNDLE_SIZE / piece.len() {
+            large.answered(&piece);
+        }
+        assert!(large.tapped().fetched.is_empty(), "past the bound");
+        next.answered(&chunk(b"the next fetch".to_vec()));
+        large.answered(&piece);
+        large.ended_well();
+        next.ended_well();
+        let kept: Vec<Vec<u8>> = kept_chunks(dir.path())
+            .into_iter()
+            .map(|chunk| chunk.data)
+            .collect();
+        assert_eq!(kept, [b"the next fetch".to_vec()]);
+    }
+
+    /// The size of the line of a tokenizer fetch: two bytes a byte of its
+    /// chunks (the file keeps an answer as hex) and the line around them.
+    #[tokio::test]
+    async fn a_kept_tokenizer_fetch_takes_two_bytes_a_byte() {
+        use smg_grpc_client::common_proto::GetTokenizerChunk;
+
+        let path = "/vllm.grpc.engine.VllmEngine/GetTokenizer";
+        let dir = tempfile::tempdir().expect("temp dir");
+        let call = exchange(dir.path(), path);
+        let mut framed = 0;
+        for sha256 in [String::new(), "f".repeat(64)] {
+            let chunk = GetTokenizerChunk {
+                data: vec![7; 1 << 20],
+                sha256,
+            };
+            let bytes = Bytes::from(chunk.encode_to_vec());
+            framed += prost::length_delimiter_len(bytes.len()) + bytes.len();
+            call.answered(&bytes);
+        }
+        call.ended_well();
+        let line = std::fs::read(dir.path().join("session.info.jsonl")).expect("the info file");
+        let around = format!("{}\n", json!({ "path": path, "answer_hex": "" })).len();
+        assert_eq!(line.len(), 2 * framed + around, "the line of a 2 MiB fetch");
+        assert_eq!(line.len(), 4_194_533, "in bytes");
+    }
+
+    #[test]
+    fn an_info_line_reads_as_the_json_of_its_path_and_hex() {
+        let bytes: Vec<u8> = (0..=u8::MAX).collect();
+        let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        for path in [
+            "/vllm.grpc.engine.VllmEngine/GetTokenizer",
+            "/a \"quoted\" service\\GetModelInfo",
+        ] {
+            assert_eq!(
+                info_line(path, &bytes),
+                format!("{}\n", json!({ "path": path, "answer_hex": hex })),
+                "{path}: every byte value, as the line was written before"
+            );
         }
     }
 }

@@ -44,6 +44,7 @@ use crate::{
 /// beside a record file ([`script::recorded_info`]).
 const MODEL_INFO_CALL: &str = "/tokenspeed.grpc.scheduler.TokenSpeedScheduler/GetModelInfo";
 const SERVER_INFO_CALL: &str = "/tokenspeed.grpc.scheduler.TokenSpeedScheduler/GetServerInfo";
+const TOKENIZER_CALL: &str = "/tokenspeed.grpc.scheduler.TokenSpeedScheduler/GetTokenizer";
 
 /// The model of a record file made on this wire ([`super::recorded_model`]).
 pub(super) fn recorded_model() -> Option<super::RecordedModel> {
@@ -373,9 +374,13 @@ impl TokenSpeedScheduler for MockScheduler {
         &self,
         _request: Request<common::GetTokenizerRequest>,
     ) -> Result<Response<Self::GetTokenizerStream>, Status> {
-        // The mock has no tokenizer artifacts to serve; the gateway's
+        // A replay hands back the fetch its record holds. The mock has no
+        // tokenizer artifacts of its own to serve; the gateway's
         // remote-tokenizer fallback treats Unimplemented as "not supported".
-        Err(Status::unimplemented("mock-worker"))
+        match super::recorded_tokenizer(&self.cfg, TOKENIZER_CALL)? {
+            Some(chunks) => Ok(Response::new(chunks)),
+            None => Err(Status::unimplemented("mock-worker")),
+        }
     }
 }
 

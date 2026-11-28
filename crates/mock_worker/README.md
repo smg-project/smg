@@ -37,7 +37,8 @@ complete), `GetLoads`, `Abort`, and (realistic mode only) `SubscribeKvEvents`, a
 the admin fan-out's `FlushCache` (every rank's cache cleared at once,
 `success: true`), `StartProfile` and `StopProfile` (a run in progress refused
 with `success: false`, the trace file written at the stop), the same on each
-wire; the other RPCs (`GetTokenizer`, embeddings, LoRA) return `unimplemented`.
+wire; the other RPCs (`GetTokenizer`, embeddings, LoRA) return `unimplemented`
+(a replay answers `GetTokenizer` where its recording holds the fetch).
 `GetLoads` and the pushed load record count a rank's resident tokens
 (`num_resident_tokens`, the context tokens of the requests it runs) on the
 TokenSpeed wire, whose load report has the figure; the other two wires send
@@ -73,7 +74,7 @@ tokenizer a chat request that carries an image is refused with
 `multimodal_not_supported`. A model directory of a vision family serves it:
 every worker is started with `--model mock-llava --tokenizer <dir>` and
 registered with `<dir>` as its tokenizer path, which the gateway reads itself
-(the mock serves no tokenizer: where the gateway cannot read `<dir>`, the
+(the mock serves no tokenizer of its own: where the gateway cannot read `<dir>`, the
 model's requests are answered with `tokenizer_load_failed` once the load has
 failed), and `<dir>` holds a `config.json` of the llava family (`model_type`,
 `image_token_index`, the vision tower's `patch_size` and `image_size`),
@@ -740,7 +741,17 @@ what the engine says; the file replays later with no engine behind it.
   `info.jsonl` (`session.jsonl` gives `session.info.jsonl`, and two records
   that differ only in their extension share one info file); an info answer
   whose line the file took nothing of is written by the next answer of its
-  kind. Of a
+  kind. A `GetTokenizer` fetch that ends well is kept there too, once a
+  path, as one line: its chunks one behind the other, each behind its
+  length, two bytes of the file for a byte of the bundle (a fetch of 2 MiB
+  is a line of about 4 MiB). One fetch waits for the file at a time: a
+  fetch that a status ended is not kept, and neither is one that begins
+  while another waits, even where it alone ends well; the next fetch that
+  begins with none waiting is kept. A fetch whose chunks sum above 200 MiB,
+  what a gateway takes of a bundle at most, passes through and is not kept.
+  Each gRPC worker keeps a fetch of its own, so with `--grpc-count` above
+  one the file may hold one line of the path a worker; a replay reads the
+  first. Of a
   `GetServerInfo` answer the SGLang and TokenSpeed wires hand two free-form
   maps, the arguments the engine was started with and its scheduler's
   state, and a start argument may be a key: the info file keeps of each map
@@ -804,7 +815,12 @@ what the engine says; the file replays later with no engine behind it.
   there stays the worker's own. While an info file is loaded the recorded
   answers stand: `supports_vision` set at the start (`--supports-vision`)
   or through the admin API is not read on any wire, and neither are the
-  server arguments set there on the wire of the recording.
+  server arguments set there on the wire of the recording. A replay
+  answers `GetTokenizer` with the recorded chunks where the info file holds
+  a fetch of its wire, unless it was started with a `--tokenizer` path
+  other than the `--model` path: then, and with no fetch recorded, the call
+  is `unimplemented` as on any mock. Each fetch a replay answers holds a
+  copy of the recorded bundle until it is sent.
 - One recording of text requests serves all three wires: the fields the
   wires state differently for one client request are brought to one form
   before the fold (a temperature left unstated reads 1.0, a `top_k` that is
