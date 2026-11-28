@@ -7,8 +7,6 @@
 # (`.../member_write/<kind>/<n>`). Three read the log: a batch of 16 and of 256 events
 # (`policy_store_journal/read/<events>`) and a watch's read at the head (`.../read/watched_at_head`).
 #
-# The filter leaves every other row of the binary out, the cut's rows (`policy_store_journal/cut/`) among them.
-#
 # Threshold (the method is described in tokenizer.toml): the identical-build spread, read through this gate as
 # three base and three pull-request runs of one build pinned to one core, the base a copy of the binary with one
 # byte appended, on a shared many-core build host. Two readings, both passed (0 failed, 0 suspect of 29 ids). The
@@ -29,6 +27,7 @@ filter = "^policy_store_journal/(status_write|member_write|read)/"
 
 sources = [
     "crates/grand_central/benches/store_journal.rs",
+    "crates/grand_central/benches/common/filled.rs",
 ]
 
 [[gate]]
