@@ -4,16 +4,17 @@
 //! and held to the README's bounds. `docs/stages.md` is the stages' page,
 //! `docs/service.md` the service's page, `docs/embedding.md` the page of a
 //! host that embeds the engine, `docs/worker-rows.md` the page of worker
-//! rows and worker jobs and `docs/extending.md` the page of a host's own
-//! stages and plugins, each cut out and held the same way.
-//! `REFERENCE.md` holds the rest of the detail. Twelve things are read:
+//! rows and worker jobs, `docs/extending.md` the page of a host's own
+//! stages and plugins and `docs/guarantees.md` the page of what a decision
+//! books and of a spec's update, each cut out and held the same way.
+//! `REFERENCE.md` holds the rest of the detail. Thirteen things are read:
 //!
 //! - every fenced `yaml` block of a page is a whole policy document: it
 //!   parses, and the stock catalog validates it (a fragment is fenced as
 //!   text);
-//! - a `yaml` block of the reference under the mark `<!-- refused -->` is a
+//! - a `yaml` block of any page under the mark `<!-- refused -->` is a
 //!   document the validator refuses, and the fenced text after it ends with
-//!   the validator's words;
+//!   the validator's words: the guarantees page shows the two there are;
 //! - the three stage tables of the README and of the stages' page, each
 //!   between its `begin` and `end` marks, name the catalog's filters,
 //!   scorers and pickers: every name, no other, in the catalog's order;
@@ -37,7 +38,10 @@
 //! - the extending page's table of registration calls names each call the
 //!   case reads off the stage table's source, and no row the case reads
 //!   names another;
-//! - the README and the six pages cut out stay inside the bounds a person
+//! - the guarantees page's table of limits shows the rows its case holds,
+//!   in a file of its own (`readme_cases/limits.rs`), and each row's
+//!   constants stand in the crate's source as written there;
+//! - the README and the seven pages cut out stay inside the bounds a person
 //!   reads with ease: no sentence over 30 words, no paragraph over five
 //!   sentences or 100 words, no list item over 50 words, no table cell over
 //!   30 words, no heading over 30 words, and none of the filler words in a
@@ -49,7 +53,7 @@
 //!   them and passes one that stands at a bound, and the reading of a
 //!   page's blocks, headings and links is held to short texts the same
 //!   way;
-//! - every link of the eight pages to a path of the checkout resolves, and
+//! - every link of the nine pages to a path of the checkout resolves, and
 //!   a link that names a heading names one its page holds;
 //! - each command the README shows names what the checkout holds: this
 //!   package, features and an example of its manifest, a unit test of the
@@ -66,6 +70,9 @@ use smg_grand_central::{
     stages::StageRegistry,
     store::WorkerFacts,
 };
+
+#[path = "readme_cases/limits.rs"]
+mod limits;
 
 /// The mark on the line before a document the validator refuses.
 const REFUSED: &str = "<!-- refused -->";
@@ -103,10 +110,14 @@ const WORKER_ROWS_DOCUMENTS: usize = 0;
 /// a document are fenced as text.
 const EXTENDING_DOCUMENTS: usize = 0;
 
+/// The documents the guarantees page shows running: none. Its two `yaml`
+/// blocks stand under the mark of a refused one.
+const GUARANTEES_DOCUMENTS: usize = 0;
+
 /// The commands the README shows, counted as its documents are.
 const README_COMMANDS: usize = 4;
 
-/// The documents the reference shows refused.
+/// The documents the pages show refused: both stand on the guarantees page.
 const REFUSALS: usize = 2;
 
 /// The flags the standalone binary declares, at the least: a walk that
@@ -128,7 +139,7 @@ const SERIES: usize = 22;
 /// least: a walk that finds fewer has lost the shape of the manifest.
 const FEATURES: usize = 9;
 
-/// The most words a sentence of a short page holds: the README and the six
+/// The most words a sentence of a short page holds: the README and the seven
 /// pages cut out of the reference are the short pages. Nothing but a
 /// sentence's end splits one, so a chain joined by semicolons is one
 /// sentence.
@@ -205,6 +216,12 @@ fn worker_rows() -> PathBuf {
 /// component and a gRPC plugin.
 fn extending() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/extending.md")
+}
+
+/// The guarantees page: what a decision books, what the service refuses,
+/// a gateway whose stream ends and a spec's update.
+fn guarantees() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/guarantees.md")
 }
 
 /// One fenced block of the page.
@@ -288,6 +305,7 @@ fn every_document_of_the_page_runs_over_the_stock_catalog() {
         ("embedding page", embedding(), EMBEDDING_DOCUMENTS),
         ("worker rows' page", worker_rows(), WORKER_ROWS_DOCUMENTS),
         ("extending page", extending(), EXTENDING_DOCUMENTS),
+        ("guarantees page", guarantees(), GUARANTEES_DOCUMENTS),
         ("reference", reference(), DOCUMENTS),
     ] {
         let page = fs::read_to_string(path).expect("the page is readable");
@@ -334,33 +352,45 @@ fn every_document_of_the_page_runs_over_the_stock_catalog() {
 
 #[test]
 fn a_refused_document_is_refused_in_the_words_the_page_shows() {
-    let page = fs::read_to_string(reference()).expect("the reference is readable");
-    let blocks = blocks(&page);
     let mut shown = 0;
-    for (at, block) in blocks.iter().enumerate() {
-        if block.language != "yaml" || block.before != REFUSED {
-            continue;
+    for (name, path) in [
+        ("README", readme()),
+        ("policy spec's page", policy_spec()),
+        ("stages' page", stages()),
+        ("service's page", service()),
+        ("embedding page", embedding()),
+        ("worker rows' page", worker_rows()),
+        ("extending page", extending()),
+        ("guarantees page", guarantees()),
+        ("reference", reference()),
+    ] {
+        let page = fs::read_to_string(path).expect("the page is readable");
+        let blocks = blocks(&page);
+        for (at, block) in blocks.iter().enumerate() {
+            if block.language != "yaml" || block.before != REFUSED {
+                continue;
+            }
+            shown += 1;
+            let words = refusal(&block.body);
+            assert!(
+                words.is_some(),
+                "the {name} shows as refused a document that runs:\n{}",
+                block.body
+            );
+            let text = blocks
+                .get(at + 1)
+                .filter(|next| next.language == "text")
+                .map(|next| next.body.trim_end());
+            assert!(
+                text.zip(words.as_deref())
+                    .is_some_and(|(text, words)| text.ends_with(words)),
+                "the text after a refused document ends with the validator's words {words:?}, and the {name} shows {text:?}"
+            );
         }
-        shown += 1;
-        let words = refusal(&block.body);
-        assert!(
-            words.is_some(),
-            "the reference shows as refused a document that runs:\n{}",
-            block.body
-        );
-        let text = blocks
-            .get(at + 1)
-            .filter(|next| next.language == "text")
-            .map(|next| next.body.trim_end());
-        assert!(
-            text.zip(words.as_deref())
-                .is_some_and(|(text, words)| text.ends_with(words)),
-            "the text after a refused document ends with the validator's words {words:?}, and the reference shows {text:?}"
-        );
     }
     assert_eq!(
         shown, REFUSALS,
-        "the reference shows {REFUSALS} refused documents: a mark was lost, or a new one raises the count"
+        "the pages show {REFUSALS} refused documents: a mark was lost, or a new one raises the count"
     );
 }
 
@@ -1118,9 +1148,15 @@ fn fillers(plain: &str) -> Vec<&'static str> {
 /// One row of a table as its cells, the bars at its two ends apart. A bar
 /// behind a backslash is the cell's own.
 fn row_cells(row: &str) -> Vec<String> {
+    cells_between(row.trim().trim_matches('|'))
+}
+
+/// The cells of the text between a row's two end bars. A bar behind a
+/// backslash is the cell's own.
+fn cells_between(inner: &str) -> Vec<String> {
     let mut cells = Vec::new();
     let mut held = String::new();
-    for part in row.trim().trim_matches('|').split('|') {
+    for part in inner.split('|') {
         held.push_str(part);
         if part.ends_with('\\') {
             held.push('|');
@@ -1316,6 +1352,17 @@ fn the_extending_pages_prose_stays_inside_the_same_bounds() {
     assert!(
         over.is_empty(),
         "the extending page is held to the README's bounds, and it is over them:\n{}",
+        over.join("\n")
+    );
+}
+
+#[test]
+fn the_guarantees_pages_prose_stays_inside_the_same_bounds() {
+    let page = fs::read_to_string(guarantees()).expect("the guarantees page is readable");
+    let over = over_bounds(&page);
+    assert!(
+        over.is_empty(),
+        "the guarantees page is held to the README's bounds, and it is over them:\n{}",
         over.join("\n")
     );
 }
@@ -1555,6 +1602,7 @@ fn every_link_of_a_page_resolves_heading_and_all() {
         ("embedding page", embedding()),
         ("worker rows' page", worker_rows()),
         ("extending page", extending()),
+        ("guarantees page", guarantees()),
         ("reference", reference()),
     ] {
         let dead = dead_links(&path);

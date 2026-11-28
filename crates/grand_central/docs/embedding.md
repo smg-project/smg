@@ -42,7 +42,7 @@ A host decides at one of two levels: the engine alone, or the engine with bookin
 - A decode or an encode request is refused as `DecisionRefused::PairSide` where it is a side of its plan's pair, or hands more than one list.
 - The engine catches a stage's panic in a decision and counts it (`DecisionEngine::faults`). A panic in the live decision answers `DecisionRefused::Faulted`, and a shadow's costs its request nothing.
 - It also catches a stage's panic at a lease's word or at a change of membership, and counts it apart (`InProcess::unheard`). The request, the registration or the removal goes on.
-- The drop of a retired stage can panic outside that catch: [Updating a document](../REFERENCE.md#updating-a-document) says where it unwinds.
+- The drop of a retired stage can panic outside that catch: [A replaced spec](guarantees.md#a-replaced-spec) says where it unwinds.
 
 **What a pick says of the prefix.**
 
@@ -84,11 +84,11 @@ A host that keeps one `InProcess` for its life gives it a later spec with `InPro
 - That holds where the new spec changes no `signals`, and its `view` is the same or differs in its header list alone.
 - A profile is built anew too where one of its stages, built again, describes itself otherwise than the standing one. A host's own factory may build such a stage.
 - A host with a stage table of its own validates both specs over the one table. A table built anew for each spec keeps no stage.
-- The paragraph "What a new document keeps" of [Updating a document](../REFERENCE.md#updating-a-document) has the rules, a tally of sends among them.
+- [What a new spec keeps](guarantees.md#what-a-new-spec-keeps) has the rules, a tally of sends among them.
 
 **What starts anew.**
 
-- Every other stage is built new by its factory. A tally of sends it reads follows the reference's rules named above.
+- Every other stage is built new by its factory. A tally of sends it reads follows the rules named above.
 - Before the call returns, the engine tells each scorer and picker built new the workers that stand in the registry the host handed. A filter hears no membership.
 - A stage that panics at that word is held and counted (`InProcess::unheard`), and the stages behind it do not hear the word.
 - A stage that stands is told none of them again by the call. The engine's task reads the registry whole once more at its next upkeep.
