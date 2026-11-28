@@ -1443,8 +1443,10 @@ impl DecisionEngine for InProcess {
 
     fn say(&self, _: GatewayId, held: &HeldDecision<'_>, said: Said, _: Instant) {
         // A single's word no stage takes is told to nobody. A pair's
-        // dispatch may carry its decode's issue: every word of one goes to
-        // the rule of a lease's words, which says what its stages hear.
+        // dispatch may carry its decode's issue: where the document hears
+        // any word, every word of a pair goes to the rule of a lease's
+        // words, which says what its stages hear. Where it hears none, a
+        // pair's word is told to nobody either.
         let kind = match said {
             Said::Dispatched(..) => EventKind::Dispatched,
             Said::Completed(_) => EventKind::Completed,
@@ -1458,7 +1460,10 @@ impl DecisionEngine for InProcess {
         let document = self.in_force();
         if held.lease.generation != document.spec.generation() {
             self.told_older(&document, held, said);
-        } else if held.lease.side != Side::Single || document.hears.contains(kind) {
+        } else if match held.lease.side {
+            Side::Single => document.hears.contains(kind),
+            _ => !document.hears.is_empty(),
+        } {
             let sends = document.spec.engine();
             self.told_of(sends, sends, held, said);
         }
