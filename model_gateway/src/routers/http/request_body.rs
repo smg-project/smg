@@ -28,6 +28,7 @@ use crate::routers::common::{
 
 #[derive(Debug)]
 pub(crate) enum RequestBodyError {
+    ThinkingBudget(String),
     Serialize(serde_json::Error),
     Prepare(WorkerError),
 }

@@ -972,7 +972,7 @@ impl Router {
     /// worker takes one, the typed request with its backend fields kept on the
     /// routes whose extensions have no shared defaults, the typed request
     /// otherwise; a serialization or preparation failure is the 400 it was.
-    fn serialize_attempt_body<T: serde::Serialize>(
+    fn serialize_attempt_body<T: GenerationRequest + serde::Serialize>(
         attempt: &TypedAttempt<'_, T>,
         decision_adapter: Option<&SglangDecisionAdapter>,
         worker: &dyn Worker,
@@ -993,7 +993,17 @@ impl Router {
                         raw_body_len,
                     )
                 } else {
-                    serialize_request_body(view.request, canonical_model, worker, raw_body_len)
+                    let bytes = serialize_request_body(
+                        view.request,
+                        canonical_model,
+                        worker,
+                        raw_body_len,
+                    )?;
+                    super::thinking_budget::prepare_regular(
+                        bytes,
+                        view.request.thinking_token_budget(),
+                        worker,
+                    )
                 }
             })
             .map_err(|failure| match failure {
@@ -1001,6 +1011,9 @@ impl Router {
                     "serialization_failed",
                     format!("Failed to serialize request body: {e}"),
                 ),
+                RequestBodyError::ThinkingBudget(e) => {
+                    error::bad_request("invalid_thinking_token_budget", e)
+                }
                 RequestBodyError::Prepare(e) => error::bad_request(
                     "request_preparation_failed",
                     format!("Failed to prepare request: {e}"),
@@ -2845,9 +2858,8 @@ impl StreamBodyState {
     }
 }
 
-/// The typed routes whose bodies may be streamed, by path; `None` for any
-/// other route.
-fn streamable_route(path: &str) -> Option<&'static str> {
+/// Routes for which this layer decides whether to upload the request body verbatim.
+fn body_policy_route(path: &str) -> Option<&'static str> {
     Some(match path {
         "/generate" => "/generate",
         "/v1/chat/completions" => "/v1/chat/completions",
@@ -2904,7 +2916,7 @@ where
     }
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
-        let Some(route) = streamable_route(req.uri().path()) else {
+        let Some(route) = body_policy_route(req.uri().path()) else {
             return Either::Left(self.inner.call(req));
         };
         let resolved = match self.state.forward_capable_router() {
@@ -2914,6 +2926,12 @@ where
                 return Either::Left(self.inner.call(req));
             }
         };
+        // Either spelling of the thinking budget can appear in the last frame.
+        // Let the typed chat handler validate the winner before contacting a worker.
+        if route == "/v1/chat/completions" {
+            Metrics::record_request_body_path(BODY_PATH_BUFFERED, "chat_validation");
+            return Either::Left(self.inner.call(req));
+        }
         let wasm_request_hooks = self.state.wasm_request_hooks();
         let cancel = PreemptionGuard::from_extensions(req.extensions());
         // The route service a declined request is handed to is the one that
