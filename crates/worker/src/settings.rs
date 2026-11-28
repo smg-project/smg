@@ -33,8 +33,10 @@ pub enum UnhealthyRemovalScope {
 #[serde(rename_all = "lowercase")]
 pub enum PdPairingMode {
     /// Compare nothing of the KV handoff: placement behaves as if no
-    /// descriptor existed. The gRPC wire still keeps two known runtimes
-    /// apart, since its requests are in the runtime's own message type.
+    /// descriptor existed, except prepared-input (`sglang_prepared_key`)
+    /// compatibility so managed and unmanaged workers never mix. The gRPC wire
+    /// still keeps two known runtimes apart, since its requests are in the
+    /// runtime's own message type.
     Off,
     /// A known difference in runtime, transport or KV layout refuses the
     /// pair; unknown components and engine versions pair with anything.

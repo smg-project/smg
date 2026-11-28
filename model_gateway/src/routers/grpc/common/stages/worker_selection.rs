@@ -13,9 +13,12 @@ use axum::{
 use futures::{future::Either, FutureExt};
 use openai_protocol::common::CachePartition;
 use parking_lot::Mutex;
-use smg_worker::identity::{
-    basic::{ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerType},
-    sampling_defaults::DEFAULT_SAMPLING_PARAMS_LABEL,
+use smg_worker::{
+    health::overload::{BRANCH_ALL_OVERLOADED_FALLBACK, STAGE_SELECTION},
+    identity::{
+        basic::{ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerType},
+        sampling_defaults::DEFAULT_SAMPLING_PARAMS_LABEL,
+    },
 };
 use tracing::{debug, error, warn};
 
@@ -39,6 +42,7 @@ use crate::{
         common::{
             attempt_ledger::AttemptLedger,
             kv_transfer::is_moriio_worker,
+            overload,
             pair_index::{PdPairIndex, PdWire},
             pd_admission::{self, PdAdmissionGuard, Tried},
             placement::{
@@ -56,11 +60,11 @@ use crate::{
         grpc::{
             backend_client::{connected_backend_client, BackendClient},
             context::{
-                stage_output, DispatchContext, EncodeWorkerAssignment, ExecutionPlan,
-                PreparationOutput, RequestContext, RequestInput, RequestType, RoutingSnapshot,
-                WireConstraint, WorkerSelection,
+                stage_output, DispatchContext, EncodeOutputs, EncodeWorkerAssignment,
+                ExecutionPlan, PreparationOutput, RequestContext, RequestInput, RequestType,
+                RoutingSnapshot, WireConstraint, WorkerSelection,
             },
-            multimodal,
+            multimodal, sglang_epd as prepared_input,
         },
         prefill_queue_full, prefill_queue_timeout,
     },
@@ -680,7 +684,11 @@ impl WorkerSelectionStage {
                 (disaggregated(pair), Some(guard))
             }
             WorkerSelectionMode::EncodePrefillDecode => {
-                let hashes = if let Some(plan) = ctx.state.multimodal_refs.as_ref() {
+                let hashes = if let Some(EncodeOutputs::PreparedInput(input)) =
+                    ctx.state.encode_outputs.as_ref()
+                {
+                    Ok(input.hashes())
+                } else if let Some(plan) = ctx.state.multimodal_refs.as_ref() {
                     let refs = multimodal::assemble_media_refs(plan)
                         .map_err(multimodal::MmRefsError::into_response)?;
                     Ok(refs
@@ -751,11 +759,14 @@ impl WorkerSelectionStage {
         if let Some(guard) = prefill_guard {
             ctx.state.pd_prefill_guard = Some(guard);
         }
-        // Only an encoder that processes the media itself (a push handoff)
-        // takes references; a rendezvous encoder takes router-processed items.
+        // Push and prepared-input encoders process media references themselves;
+        // rendezvous encoders require router-processed items.
         if self.mode == WorkerSelectionMode::EncodePrefillDecode
             && inputs.media_refs
-            && workers.encode_handoff() != Some(EncodeHandoff::Push)
+            && !matches!(
+                workers.encode_handoff(),
+                Some(EncodeHandoff::Push | EncodeHandoff::PreparedInput)
+            )
         {
             return Err(multimodal::MmRefsError::EncodeNotSupported.into_response());
         }
@@ -2723,7 +2734,11 @@ impl WorkerSelectionStage {
         if needs_encode && self.policy_registry.engine().is_some() {
             return Err(EpdSelectionFailure::EncodeUnderGrandCentral);
         }
-        let mut available_encode = Self::available_workers(&snapshot, RoutingPool::GrpcEncode);
+        let mut available_encode = if needs_encode {
+            Self::available_workers(&snapshot, RoutingPool::GrpcEncode)
+        } else {
+            Vec::new()
+        };
         // An encoder serves the request by its runtime's encode handoff: a
         // push encoder must advertise the producer role of a connector and
         // may take references (it processes the media itself); a rendezvous
@@ -2732,14 +2747,34 @@ impl WorkerSelectionStage {
             WireConstraint::admits(demand.wire, worker.as_ref())
                 && media.accepts(worker.as_ref())
                 && match PdProtocol::encode_handoff(worker.metadata().spec.runtime_type) {
+                    Some(EncodeHandoff::PreparedInput) => {
+                        prepared_input::capability(worker.as_ref()).is_some()
+                    }
                     Some(EncodeHandoff::Push) => ec_role(worker.as_ref(), "ec_producer"),
                     Some(EncodeHandoff::Rendezvous) => !media.media_refs,
                     None => false,
                 }
         };
         let capable = |worker: &Arc<dyn Worker>| capable_for(worker, demand.encode);
-        available_encode.retain(capable);
+        if needs_encode {
+            available_encode.retain(capable);
+        }
         let registered_encode = snapshot.pool(RoutingPool::GrpcEncode);
+        let shedding = self.worker_registry.overload_shed_enabled();
+        let mut encode_overload_lifted = false;
+        if needs_encode && available_encode.is_empty() && !shedding {
+            // Mirror placement.rs: without `--worker-overload-shed`, overload
+            // is steering-only, so an all-overloaded capable encode pool falls
+            // back to its overloaded workers instead of returning 503.
+            available_encode = registered_encode
+                .iter()
+                .filter(|worker| {
+                    capable(worker) && overload::vetoed_by_overload_alone(worker.as_ref())
+                })
+                .cloned()
+                .collect();
+            encode_overload_lifted = !available_encode.is_empty();
+        }
         if needs_encode && available_encode.is_empty() {
             // Only membership can prove a permanent configuration gap.
             return Err(if registered_encode.iter().any(capable) {
@@ -2773,6 +2808,8 @@ impl WorkerSelectionStage {
         let compatible = |encoder: &Arc<dyn Worker>, worker: &dyn Worker| {
             let runtime = worker.metadata().spec.runtime_type;
             encoder.metadata().spec.runtime_type == runtime
+                && (PdProtocol::encode_handoff(runtime) != Some(EncodeHandoff::PreparedInput)
+                    || prepared_input::compatible(encoder.as_ref(), worker))
                 && (PdProtocol::encode_handoff(runtime) != Some(EncodeHandoff::Push)
                     || worker.worker_type() != &WorkerType::Prefill
                     || ec_pair(encoder.as_ref(), worker))
@@ -2804,9 +2841,33 @@ impl WorkerSelectionStage {
         // post-encode dispatch check rejects actual grids before sending P/D.
         let prefer_vision = demand.decode_vision
             || (demand.encode.media_refs && demand.encode.vision && vision_pair_exists);
-        let eligible = |worker: &dyn Worker| {
+        let eligible_for = |encoders: &[Arc<dyn Worker>], worker: &dyn Worker| {
             (!prefer_vision || decode_vision(worker))
-                && (!needs_encode || available_encode.iter().any(|e| compatible(e, worker)))
+                && (!needs_encode || encoders.iter().any(|e| compatible(e, worker)))
+        };
+        let mut fallback_encode = Vec::new();
+        if needs_encode
+            && !shedding
+            && !encode_overload_lifted
+            && !pair_admitted_by(&pairs, demand.wire, &|worker| {
+                (worker.is_available() || overload::vetoed_by_overload_alone(worker))
+                    && eligible_for(&available_encode, worker)
+            })
+        {
+            // Keep healthy encoders intact (a liveness-stalled P/D pair can still pair
+            // with them via `relaxed_pair`), while allowing `select_pair` to also see
+            // overloaded compatible encoders if no healthy encoder pairs with the chosen pair.
+            fallback_encode = registered_encode
+                .iter()
+                .filter(|worker| {
+                    capable(worker) && overload::vetoed_by_overload_alone(worker.as_ref())
+                })
+                .cloned()
+                .collect();
+        }
+        let eligible = |worker: &dyn Worker| {
+            eligible_for(&available_encode, worker)
+                || (!fallback_encode.is_empty() && eligible_for(&fallback_encode, worker))
         };
         let pair = placement::select_pair(
             &self.worker_registry,
@@ -2826,13 +2887,9 @@ impl WorkerSelectionStage {
         )
         .map_err(EpdSelectionFailure::Placement)?;
         let handoff = PdProtocol::encode_handoff(pair.runtime);
-        // The encoders that pair with the chosen prefill side: its runtime
-        // and, under a push handoff, its EC roles and connector.
-        let pairs_with_prefill = |worker: &Arc<dyn Worker>| {
-            worker.metadata().spec.runtime_type == pair.runtime
-                && (handoff != Some(EncodeHandoff::Push)
-                    || ec_pair(worker.as_ref(), &*pair.prefill))
-        };
+        // The encoders that pair with the chosen prefill side: its runtime,
+        // EC roles/connector under Push, and compatible prepared contract under PreparedInput.
+        let pairs_with_prefill = |worker: &Arc<dyn Worker>| compatible(worker, &*pair.prefill);
         // Only image-only reference requests can merge a push encoder's prompt updates.
         let prompt_hash;
         let hashes = if handoff == Some(EncodeHandoff::Push) && needs_encode && !demand.image_fanout
@@ -2848,6 +2905,13 @@ impl WorkerSelectionStage {
             encode_item_hashes
         };
         available_encode.retain(pairs_with_prefill);
+        if needs_encode && available_encode.is_empty() && !fallback_encode.is_empty() {
+            fallback_encode.retain(pairs_with_prefill);
+            if !fallback_encode.is_empty() {
+                available_encode = fallback_encode;
+                encode_overload_lifted = true;
+            }
+        }
         // The ring is read where an item is placed by a policy that walks it.
         let encode_policy = self.policy_registry.get_encode_policy();
         let hash_ring = (!hashes.is_empty() && policy_reads_hash_ring(encode_policy.as_ref()))
@@ -2859,8 +2923,16 @@ impl WorkerSelectionStage {
             model_id,
             encode_policy.as_ref(),
             hash_ring,
+            encode_overload_lifted,
         )
         .ok_or(EpdSelectionFailure::Unavailable)?;
+        if encode_overload_lifted {
+            Metrics::record_worker_overload_fallback(STAGE_SELECTION);
+            debug!(
+                branch = BRANCH_ALL_OVERLOADED_FALLBACK,
+                model_id, "Veto fallback: encode pool over overload thresholds"
+            );
+        }
         Ok((assignments, pair.prefill, pair.decode, pair.runtime))
     }
 
@@ -2939,6 +3011,7 @@ fn assign_encode_workers(
     model_id: &str,
     policy: &dyn LoadBalancingPolicy,
     hash_ring: Option<Arc<HashRing>>,
+    overload_lifted: bool,
 ) -> Option<Vec<EncodeWorkerAssignment>> {
     if item_hashes.is_empty() {
         return Some(Vec::new());
@@ -2960,7 +3033,7 @@ fn assign_encode_workers(
                 cache_namespace: None,
                 hash_ring: hash_ring.clone(),
                 role: WorkerRole::Single,
-                overload_lifted: false,
+                overload_lifted,
                 named: None,
             };
             let worker_idx = policy.select_worker(encode_workers, &info)?;
@@ -5858,6 +5931,125 @@ mod tests {
             fills_the_ring(&PolicyConfig::ConsistentHashing),
             "the encode policy walks the ring"
         );
+    }
+
+    /// A mismatched P must not hide a usable E/P/D pipeline, even with pairing disabled.
+    #[tokio::test]
+    async fn prepared_epd_filters_encoder_contract_before_pair_selection() {
+        use crate::routers::grpc::sglang_epd::test_capability;
+
+        let registry = Arc::new(WorkerRegistry::new());
+        for (port, role, backend) in [
+            (8960, WorkerType::Encode, "mooncake"),
+            (8961, WorkerType::Prefill, "zmq_to_scheduler"),
+            (8962, WorkerType::Prefill, "mooncake"),
+            (8963, WorkerType::Decode, "mooncake"),
+        ] {
+            let mut capability = test_capability(role, 2);
+            capability.embedding_backend = backend.into();
+            registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
+                        .model(ModelCard::new("served-name"))
+                        .worker_type(role)
+                        .runtime_type(RuntimeType::Sglang)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .health_config(no_health_check())
+                        .label("supports_vision", "true")
+                        .label(
+                            "sglang_prepared",
+                            serde_json::to_string(&capability).unwrap(),
+                        )
+                        .label("sglang_prepared_key", "same-pd-contract")
+                        .label(
+                            "mm_processor",
+                            if role == WorkerType::Encode {
+                                "smg"
+                            } else {
+                                ""
+                            },
+                        )
+                        .label("mm_media_ref_schemes", "http,https,data")
+                        .build(),
+                ))
+                .unwrap();
+        }
+        let stage = WorkerSelectionStage::new(
+            Arc::clone(&registry),
+            Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            WorkerSelectionMode::EncodePrefillDecode,
+            None,
+        );
+        for _ in 0..4 {
+            let (encoders, prefill, _, _) = stage
+                .select_encode_prefill_decode_workers(
+                    "served-name",
+                    PlacementInputs::default(),
+                    &[vec![1]],
+                    EpdDemands {
+                        wire: None,
+                        encode: MediaDemands {
+                            media_refs: false,
+                            vision: true,
+                            pipeline: PipelinePin::Any,
+                            refs_stripped_decode: false,
+                        },
+                        decode_vision: false,
+                        image_fanout: false,
+                    },
+                    None,
+                )
+                .unwrap_or_else(|_| panic!("compatible native pipeline is available"));
+            assert_eq!(prefill.url(), "grpc://127.0.0.1:8962");
+            assert_eq!(encoders[0].worker.url(), "grpc://127.0.0.1:8960");
+        }
+        // Exercise the shared post-selection gate as well as the pool picker.
+        // Only E consumes media; P/D keep their prepared-input contract.
+        for (url, accepted) in [
+            ("https://example.test/image.png", true),
+            ("file:///image.png", false),
+        ] {
+            let mut ctx = prepared_ctx(Arc::clone(&registry), None);
+            ctx.input.model_id = "served-name".into();
+            ctx.state.multimodal_refs = Some(multimodal::MediaPlan::new([
+                llm_multimodal::MediaContentPart::ImageUrl {
+                    url: url.to_string().into(),
+                    detail: None,
+                    max_long_side_pixel: None,
+                    uuid: None,
+                },
+            ]));
+            let result = stage.execute(&mut ctx).await;
+            if accepted {
+                result.expect("prepared-input EPD must accept supported media references");
+                assert_eq!(
+                    ctx.state.workers.as_ref().unwrap().encode_handoff(),
+                    Some(EncodeHandoff::PreparedInput)
+                );
+            } else {
+                assert_eq!(
+                    result
+                        .expect_err("E scheme validation remains enforced")
+                        .status(),
+                    StatusCode::BAD_REQUEST
+                );
+            }
+        }
+        let workers = registry.get_all();
+        assert!(prepared_input::pipeline_ready(
+            &workers,
+            Default::default(),
+            false
+        ));
+        let mismatched: Vec<_> = workers
+            .into_iter()
+            .filter(|w| !w.url().ends_with(":8962"))
+            .collect();
+        assert!(!prepared_input::pipeline_ready(
+            &mismatched,
+            Default::default(),
+            false
+        ));
     }
 
     /// EPD selects a compatible EC consumer even with mixed runtimes and connectors.
@@ -10368,6 +10560,284 @@ mod tests {
             !takes(gateways, forwards(PipelinePin::Never)),
             "the gateway's pipeline, where the engine's processor is pinned"
         );
+    }
+
+    /// Build a 2E+1P+1D SGLang managed EPD registry for encode-pool overload tests.
+    fn prepared_epd_overload_fixture(
+        overload_shed: bool,
+    ) -> (
+        Arc<WorkerRegistry>,
+        WorkerSelectionStage,
+        Vec<Arc<dyn Worker>>,
+    ) {
+        use crate::routers::grpc::sglang_epd::test_capability;
+
+        let registry = Arc::new(WorkerRegistry::new());
+        registry.set_overload_shed(overload_shed);
+        let mut encoders: Vec<Arc<dyn Worker>> = Vec::new();
+        for (port, role) in [
+            (8970, WorkerType::Encode),
+            (8971, WorkerType::Encode),
+            (8972, WorkerType::Prefill),
+            (8973, WorkerType::Decode),
+        ] {
+            let capability = test_capability(role, 2);
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
+                    .model(ModelCard::new("epd-overload-model"))
+                    .worker_type(role)
+                    .runtime_type(RuntimeType::Sglang)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .health_config(no_health_check())
+                    .label("supports_vision", "true")
+                    .label(
+                        "sglang_prepared",
+                        serde_json::to_string(&capability).unwrap(),
+                    )
+                    .label("sglang_prepared_key", "same-pd-contract")
+                    .label(
+                        "mm_processor",
+                        if role == WorkerType::Encode {
+                            "smg"
+                        } else {
+                            ""
+                        },
+                    )
+                    .label("mm_media_ref_schemes", "http,https,data")
+                    .build(),
+            );
+            registry.register(Arc::clone(&worker)).unwrap();
+            if role == WorkerType::Encode {
+                encoders.push(worker);
+            }
+        }
+        let stage = WorkerSelectionStage::new(
+            Arc::clone(&registry),
+            Arc::new(PolicyRegistry::new(PolicyConfig::ConsistentHashing)),
+            WorkerSelectionMode::EncodePrefillDecode,
+            None,
+        );
+        (registry, stage, encoders)
+    }
+
+    #[test]
+    fn epd_encode_overload_falls_back_when_shed_disabled() {
+        let (registry, stage, encoders) = prepared_epd_overload_fixture(false);
+        for encoder in &encoders {
+            registry.set_worker_overloaded(encoder, true);
+        }
+        let result = stage.select_encode_prefill_decode_workers(
+            "epd-overload-model",
+            PlacementInputs::default(),
+            &[vec![0xaa, 0xbb]],
+            EpdDemands {
+                wire: None,
+                encode: MediaDemands {
+                    media_refs: false,
+                    vision: true,
+                    pipeline: PipelinePin::Any,
+                    refs_stripped_decode: false,
+                },
+                decode_vision: false,
+                image_fanout: false,
+            },
+            None,
+        );
+        let (assigned, prefill, decode, runtime) = result.unwrap_or_else(|_| {
+            panic!("all-overloaded encode pool must fall back when shed is disabled")
+        });
+        assert_eq!(runtime, RuntimeType::Sglang);
+        assert_eq!(assigned.len(), 1);
+        assert!(
+            assigned[0].worker.url() == "grpc://127.0.0.1:8970"
+                || assigned[0].worker.url() == "grpc://127.0.0.1:8971"
+        );
+        assert_eq!(prefill.url(), "grpc://127.0.0.1:8972");
+        assert_eq!(decode.url(), "grpc://127.0.0.1:8973");
+    }
+
+    #[test]
+    fn epd_encode_overload_sheds_when_shed_enabled() {
+        let (registry, stage, encoders) = prepared_epd_overload_fixture(true);
+        for encoder in &encoders {
+            registry.set_worker_overloaded(encoder, true);
+        }
+        let err = stage.select_encode_prefill_decode_workers(
+            "epd-overload-model",
+            PlacementInputs::default(),
+            &[vec![0xaa, 0xbb]],
+            EpdDemands {
+                wire: None,
+                encode: MediaDemands {
+                    media_refs: false,
+                    vision: true,
+                    pipeline: PipelinePin::Any,
+                    refs_stripped_decode: false,
+                },
+                decode_vision: false,
+                image_fanout: false,
+            },
+            None,
+        );
+        assert!(matches!(err, Err(EpdSelectionFailure::Unavailable)));
+        let response = stage.selection_failure(
+            "epd-overload-model",
+            &[WorkerType::Prefill, WorkerType::Decode, WorkerType::Encode],
+            None,
+            MediaDemands::NONE,
+        );
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn epd_encode_overload_fallback_ignores_incompatible_healthy_encoder() {
+        let (registry, stage, encoders) = prepared_epd_overload_fixture(false);
+        for encoder in &encoders {
+            registry.set_worker_overloaded(encoder, true);
+        }
+        // Register a healthy vLLM push encoder that is capable of vision media but
+        // incompatible with the SGLang P/D pair.
+        let vllm_encoder: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://127.0.0.1:8999")
+                .model(ModelCard::new("epd-overload-model"))
+                .worker_type(WorkerType::Encode)
+                .runtime_type(RuntimeType::Vllm)
+                .connection_mode(ConnectionMode::Grpc)
+                .health_config(no_health_check())
+                .label("supports_vision", "true")
+                .label("supports_ec_transfer", "true")
+                .label("ec_role", "ec_producer")
+                .label("ec_connector", "ECCPUConnector")
+                .build(),
+        );
+        registry.register(Arc::clone(&vllm_encoder)).unwrap();
+        assert!(vllm_encoder.is_available());
+        assert!(ec_role(vllm_encoder.as_ref(), "ec_producer"));
+
+        let (assigned, prefill, decode, runtime) = stage
+            .select_encode_prefill_decode_workers(
+                "epd-overload-model",
+                PlacementInputs::default(),
+                &[vec![0xaa, 0xbb]],
+                EpdDemands {
+                    wire: None,
+                    encode: MediaDemands {
+                        media_refs: false,
+                        vision: true,
+                        pipeline: PipelinePin::Any,
+                        refs_stripped_decode: false,
+                    },
+                    decode_vision: false,
+                    image_fanout: false,
+                },
+                None,
+            )
+            .unwrap_or_else(|_| {
+                panic!("healthy incompatible encoder must not block overloaded compatible fallback")
+            });
+        assert_eq!(runtime, RuntimeType::Sglang);
+        assert_eq!(assigned.len(), 1);
+        assert!(
+            assigned[0].worker.url() == "grpc://127.0.0.1:8970"
+                || assigned[0].worker.url() == "grpc://127.0.0.1:8971"
+        );
+        assert_eq!(prefill.url(), "grpc://127.0.0.1:8972");
+        assert_eq!(decode.url(), "grpc://127.0.0.1:8973");
+    }
+
+    #[test]
+    fn epd_encode_overload_fallback_preserves_healthy_encoder_with_stalled_prefill() {
+        use smg_worker::identity::basic::StallReason;
+
+        // Case A: healthy compatible encoder + liveness-stalled prefill + incompatible
+        // overloaded encoder must still succeed via `relaxed_pair` using the healthy encoder.
+        let (registry, stage, _encoders) = prepared_epd_overload_fixture(false);
+        let prefill_worker = registry.get_by_url("grpc://127.0.0.1:8972").unwrap();
+        prefill_worker.set_stall(Some(StallReason::Wedged));
+        let vllm_encoder: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://127.0.0.1:8999")
+                .model(ModelCard::new("epd-overload-model"))
+                .worker_type(WorkerType::Encode)
+                .runtime_type(RuntimeType::Vllm)
+                .connection_mode(ConnectionMode::Grpc)
+                .health_config(no_health_check())
+                .label("supports_vision", "true")
+                .label("supports_ec_transfer", "true")
+                .label("ec_role", "ec_producer")
+                .label("ec_connector", "ECCPUConnector")
+                .build(),
+        );
+        registry.register(Arc::clone(&vllm_encoder)).unwrap();
+        assert!(vllm_encoder.is_available());
+        assert!(ec_role(vllm_encoder.as_ref(), "ec_producer"));
+        registry.set_worker_overloaded(&vllm_encoder, true);
+
+        let (assigned, prefill, decode, runtime) = stage
+            .select_encode_prefill_decode_workers(
+                "epd-overload-model",
+                PlacementInputs::default(),
+                &[vec![0xaa, 0xbb]],
+                EpdDemands {
+                    wire: None,
+                    encode: MediaDemands {
+                        media_refs: false,
+                        vision: true,
+                        pipeline: PipelinePin::Any,
+                        refs_stripped_decode: false,
+                    },
+                    decode_vision: false,
+                    image_fanout: false,
+                },
+                None,
+            )
+            .unwrap_or_else(|_| {
+                panic!("stalled prefill must still pair with healthy compatible encoder")
+            });
+        assert_eq!(runtime, RuntimeType::Sglang);
+        assert_eq!(assigned.len(), 1);
+        assert!(
+            assigned[0].worker.url() == "grpc://127.0.0.1:8970"
+                || assigned[0].worker.url() == "grpc://127.0.0.1:8971"
+        );
+        assert_eq!(prefill.url(), "grpc://127.0.0.1:8972");
+        assert_eq!(decode.url(), "grpc://127.0.0.1:8973");
+
+        // Case B: healthy compatible encoder (8970) + overloaded compatible encoder (8971)
+        // + liveness-stalled prefill must select ONLY the healthy compatible encoder (8970),
+        // never spilling to the overloaded one.
+        let (registry_b, stage_b, encoders_b) = prepared_epd_overload_fixture(false);
+        let prefill_b = registry_b.get_by_url("grpc://127.0.0.1:8972").unwrap();
+        prefill_b.set_stall(Some(StallReason::Wedged));
+        registry_b.set_worker_overloaded(&encoders_b[1], true);
+
+        for seed in 0u8..8 {
+            let (assigned_b, prefill_sel, decode_sel, runtime_b) = stage_b
+                .select_encode_prefill_decode_workers(
+                    "epd-overload-model",
+                    PlacementInputs::default(),
+                    &[vec![seed, 0xbb]],
+                    EpdDemands {
+                        wire: None,
+                        encode: MediaDemands {
+                            media_refs: false,
+                            vision: true,
+                            pipeline: PipelinePin::Any,
+                            refs_stripped_decode: false,
+                        },
+                        decode_vision: false,
+                        image_fanout: false,
+                    },
+                    None,
+                )
+                .unwrap_or_else(|_| {
+                    panic!("stalled prefill must select healthy compatible encoder")
+                });
+            assert_eq!(runtime_b, RuntimeType::Sglang);
+            assert_eq!(assigned_b.len(), 1);
+            assert_eq!(assigned_b[0].worker.url(), "grpc://127.0.0.1:8970");
+            assert_eq!(prefill_sel.url(), "grpc://127.0.0.1:8972");
+            assert_eq!(decode_sel.url(), "grpc://127.0.0.1:8973");
+        }
     }
 }
 

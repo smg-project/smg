@@ -62,6 +62,7 @@ use crate::{
                 ProtoGenerateRequest, ProtoGenerateResponse, ProtoRequest, ProtoStream,
             },
             sequential_pd::{execute_sequential_pd, DecodeBehindPrefill, SequentialPlan},
+            sglang_epd as prepared_input,
             utils::{
                 account_pd_side_failure,
                 stream_failure::UpstreamClass,
@@ -453,13 +454,13 @@ pub(crate) fn execute_plan<'a>(
                         ledger,
                         room_residue,
                         None,
+                        None,
                         behind.take(),
                         language_model_reads_grids,
                     ))
                     .await
                 }
                 ExecutionPlan::EncodePrefillDecode { request } => {
-                    let push_encode = matches!(encode, Some(EncodeOutputs::Push(_)));
                     // A rendezvous plan's bootstrap info went into the prefill
                     // request at request building and its encode jobs go with the
                     // prefill/decode pair; a push plan runs its encode call first.
@@ -477,14 +478,6 @@ pub(crate) fn execute_plan<'a>(
                         language_model_reads_grids,
                     ))
                     .await
-                    .map_err(|mut response| {
-                        // A push may already have reserved buffers on this
-                        // prefill replica.
-                        if push_encode {
-                            mark_non_retryable(&mut response);
-                        }
-                        response
-                    })
                 }
                 ExecutionPlan::Batch { kind, requests, .. } => {
                     execute_batch_dispatch(
@@ -973,6 +966,7 @@ async fn execute_pd_dispatch(
     ledger: &AttemptLedger,
     room_residue: Option<RoomResidue>,
     encode: Option<EncodeWatch>,
+    prepared_deadline: Option<tokio::time::Instant>,
     behind: Option<DecodeBehindPrefill<'_>>,
     language_model_reads_grids: bool,
 ) -> Result<ExecutionResult, Response> {
@@ -1024,6 +1018,7 @@ async fn execute_pd_dispatch(
                         ledger,
                         room_residue,
                         encode,
+                        None,
                     )
                     .await
                 }
@@ -1035,6 +1030,7 @@ async fn execute_pd_dispatch(
                         prefill_guard,
                         ledger,
                         encode,
+                        prepared_deadline,
                     )
                     .await
                 }
@@ -1090,6 +1086,29 @@ fn attribute_pd_sides(result: ExecutionResult, workers: &WorkerSelection) -> Exe
     }
 }
 
+/// Build per-sample native encoder jobs from an n>1 fan-out's sub-requests.
+fn build_fanout_prepared_encodes(
+    subs: &mut [ProtoGenerateRequest],
+    input: prepared_input::PreparedInput,
+    workers: &WorkerSelection,
+) -> Result<Vec<prepared_input::NativeEncode>, Response> {
+    let mut jobs = Vec::with_capacity(subs.len());
+    for sub in subs {
+        let ProtoGenerateRequest::Sglang(sglang_sub) = sub else {
+            return Err(error::internal_error(
+                "prepared_input",
+                "expected SGLang request",
+            ));
+        };
+        let job = input
+            .clone()
+            .build(sglang_sub, workers)
+            .map_err(|s| s.to_http_error("prepared_input", s.message().to_owned()))?;
+        jobs.push(job);
+    }
+    Ok(jobs)
+}
+
 /// Dispatch an n>1 request as `n` concurrent single-sample PD pairs, each
 /// with its own rendezvous room ([`pd_fanout_requests`]), and merge their
 /// sides into one PD result whose responses carry the sample index.
@@ -1105,21 +1124,46 @@ async fn execute_fanout_pd(
     ledger: &AttemptLedger,
     room_residue: Option<RoomResidue>,
     encode: Option<EncodeWatch>,
+    prepared: Option<prepared_input::PreparedInput>,
 ) -> Result<ExecutionResult, Response> {
-    let subs = pd_fanout_requests(&proto_request, n, workers, room_residue);
+    let mut subs = pd_fanout_requests(&proto_request, n, workers, room_residue);
     debug!(
         request_id = proto_request.request_id(),
         samples = n,
         "PD fan-out: one single-sample pair per sample, each with its own room"
     );
+    let child_encodes: Vec<(Option<EncodeWatch>, Option<tokio::time::Instant>)> =
+        if let Some(input) = prepared {
+            build_fanout_prepared_encodes(&mut subs, input, workers)?
+                .into_iter()
+                .map(|job| {
+                    let deadline = job.deadline();
+                    (Some(launch_prepared_encode(job.dispatch())), Some(deadline))
+                })
+                .collect()
+        } else {
+            vec![(encode, None); subs.len()]
+        };
     // The samples share the one admission slot; each pair's Prefill phase
     // ends on its own, so each carries its own handle.
     let guards = prefill_guard.replicate_to(subs.len());
-    let dispatches = subs.into_iter().zip(guards).map(|(sub, guard)| {
-        let mut clients = clients.clone();
-        let encode = encode.clone();
-        async move { execute_parallel_pd(sub, &mut clients, workers, guard, ledger, encode).await }
-    });
+    let dispatches = subs.into_iter().zip(guards).zip(child_encodes).map(
+        |((sub, guard), (child_encode, child_deadline))| {
+            let mut clients = clients.clone();
+            async move {
+                execute_parallel_pd(
+                    sub,
+                    &mut clients,
+                    workers,
+                    guard,
+                    ledger,
+                    child_encode,
+                    child_deadline,
+                )
+                .await
+            }
+        },
+    );
     let results = try_join_all(dispatches).await?;
 
     let mut prefills = Vec::with_capacity(results.len());
@@ -1191,29 +1235,67 @@ async fn execute_epd_dispatch(
     behind: Option<DecodeBehindPrefill<'_>>,
     language_model_reads_grids: bool,
 ) -> Result<ExecutionResult, Response> {
-    let mut cleanup = prepare_epd_attempt(&mut proto_request, encode, encode_watch).await?;
-    // An EPD request's room is left as minted: no sticky prefill rank.
-    let result = execute_pd_dispatch(
-        proto_request,
-        clients,
-        workers,
-        model,
-        prefill,
-        ledger,
-        None,
-        encode_watch.clone(),
-        behind,
-        language_model_reads_grids,
-    )
-    .await;
-    if result.is_ok() {
-        if let Some(cleanups) = cleanup.as_mut() {
-            for cleanup in cleanups {
-                cleanup.disarm();
+    let non_retryable_encode = matches!(
+        encode,
+        Some(EncodeOutputs::Push(_) | EncodeOutputs::PreparedInput(_))
+    );
+    let outcome: Result<ExecutionResult, Response> = async {
+        if let Some(n) = workers
+            .disaggregated_runtime_type()
+            .and_then(|runtime| PdProtocol::for_runtime(*runtime))
+            .and_then(|protocol| pd_fanout_width(&proto_request, protocol))
+        {
+            if let Some(EncodeOutputs::PreparedInput(input)) = encode {
+                let result = execute_fanout_pd(
+                    proto_request,
+                    n,
+                    clients,
+                    workers,
+                    prefill.sent(),
+                    ledger,
+                    None,
+                    None,
+                    Some(*input),
+                )
+                .await?;
+                return Ok(attribute_pd_sides(result, workers));
             }
         }
+        let (mut cleanup, prepared_deadline) =
+            prepare_epd_attempt(&mut proto_request, workers, encode, encode_watch).await?;
+        // An EPD request's room is left as minted: no sticky prefill rank.
+        let result = execute_pd_dispatch(
+            proto_request,
+            clients,
+            workers,
+            model,
+            prefill,
+            ledger,
+            None,
+            encode_watch.clone(),
+            prepared_deadline,
+            behind,
+            language_model_reads_grids,
+        )
+        .await;
+        if result.is_ok() {
+            if let Some(cleanups) = cleanup.as_mut() {
+                for cleanup in cleanups {
+                    cleanup.disarm();
+                }
+            }
+        }
+        result
     }
-    result
+    .await;
+    outcome.map_err(|mut response| {
+        // A push or prepared-input handoff already bound encoder work to this
+        // attempt and consumed `encode_outputs`, so a retry cannot replay it.
+        if non_retryable_encode {
+            mark_non_retryable(&mut response);
+        }
+        response
+    })
 }
 
 /// Ready an EPD attempt's prefill request for its encode handoff, and leave
@@ -1230,19 +1312,34 @@ async fn execute_epd_dispatch(
 /// Text-only leaves nothing.
 async fn prepare_epd_attempt(
     proto_request: &mut ProtoGenerateRequest,
+    workers: &WorkerSelection,
     encode: Option<EncodeOutputs>,
     carried: &mut Option<EncodeWatch>,
-) -> Result<Option<Vec<PushCleanup>>, Response> {
+) -> Result<(Option<Vec<PushCleanup>>, Option<tokio::time::Instant>), Response> {
     match encode {
-        Some(EncodeOutputs::Push(plan)) => Ok(Some(plan.encode(proto_request).await?)),
+        Some(EncodeOutputs::PreparedInput(input)) => {
+            let ProtoGenerateRequest::Sglang(request) = proto_request else {
+                return Err(error::internal_error(
+                    "prepared_input",
+                    "expected SGLang request",
+                ));
+            };
+            let job = input
+                .build(request, workers)
+                .map_err(|s| s.to_http_error("prepared_input", s.message().to_owned()))?;
+            let deadline = job.deadline();
+            *carried = Some(launch_prepared_encode(job.dispatch()));
+            Ok((None, Some(deadline)))
+        }
+        Some(EncodeOutputs::Push(plan)) => Ok((Some(plan.encode(proto_request).await?), None)),
         Some(EncodeOutputs::Rendezvous { dispatch, .. }) => {
             *carried = launch_encode_dispatch(dispatch);
             proto_request.clear_mm_pixel_values();
-            Ok(None)
+            Ok((None, None))
         }
         None => {
             proto_request.clear_mm_pixel_values();
-            Ok(None)
+            Ok((None, None))
         }
     }
 }
@@ -1310,6 +1407,25 @@ pub(super) fn launch_encode_dispatch(encode_dispatch: EncodeDispatchPlan) -> Opt
     let (failed_tx, failed_rx) = watch::channel(None);
     tokio::spawn(supervise_encode_sends(outcomes, failed_tx));
     Some(failed_rx)
+}
+
+/// Observe the single native encoder RPC until it answers or the last request
+/// watch leaves. Its native owner retains the transfer through cleanup.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the request watches own the encoder RPC"
+)]
+fn launch_prepared_encode(
+    send: impl Future<Output = Result<(), String>> + Send + 'static,
+) -> EncodeWatch {
+    let (failed, watch) = watch::channel(None);
+    tokio::spawn(async move {
+        tokio::select! {
+            () = failed.closed() => {},
+            () = supervise_encode_sends(Box::pin(futures::stream::once(send)), failed.clone()) => {},
+        }
+    });
+    watch
 }
 
 /// Supervise an EPD request's encode sends: the first failure among
@@ -1447,6 +1563,7 @@ async fn execute_batch_dispatch(
                             ledger,
                             None, // the room as minted: no sticky prefill rank
                             None, // no encode dispatch on this path
+                            None, // no prepared-input handoff on batch completion path
                             None, // the decode's send is said: by its guard, or by the batch above
                             language_model_reads_grids,
                         )
@@ -1979,6 +2096,7 @@ async fn execute_parallel_pd(
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
     encode: Option<EncodeWatch>,
+    prepared_deadline: Option<tokio::time::Instant>,
 ) -> Result<ExecutionResult, Response> {
     let streaming = proto_request.stream();
     let runtime = workers
@@ -1989,6 +2107,25 @@ async fn execute_parallel_pd(
         clients.disaggregated_or_mismatch("execute_parallel_pd")?;
 
     let (mut prefill_request, mut decode_request) = parallel_pd_requests(proto_request, workers);
+    let prepared = if let (ProtoGenerateRequest::Sglang(p), ProtoGenerateRequest::Sglang(d)) =
+        (&mut prefill_request, &mut decode_request)
+    {
+        prepared_input::split_requests(p, d)
+            .map_err(|s| s.to_http_error("prepared_input", s.message().to_owned()))?
+            .map(|timeout| {
+                let relative_deadline = tokio::time::Instant::now() + timeout;
+                let deadline =
+                    prepared_deadline.map_or(relative_deadline, |abs| abs.min(relative_deadline));
+                let (tx, rx) = oneshot::channel();
+                ((deadline, tx), (deadline, rx))
+            })
+    } else {
+        None
+    };
+    let (prepared_prefill, prepared_decode) = match prepared {
+        Some((p, d)) => (Some(p), Some(d)),
+        None => (None, None),
+    };
     let reuse_key = sglang_media_reuse_key(&prefill_request, workers);
     if reuse_key.is_some() {
         if let ProtoGenerateRequest::Sglang(req) = &mut prefill_request {
@@ -2042,6 +2179,9 @@ async fn execute_parallel_pd(
         },
         Box::pin(async move {
             let mut stream = prefill_client.generate(prefill_request).await?;
+            if let Some((deadline, tx)) = prepared_prefill {
+                prepared_input::relay_prefill_layout(deadline, stream.next(), tx).await?;
+            }
             if await_identity {
                 // This is a preprocessing control item, not a token or proof
                 // that KV transfer completed. Consume it before tracking TTFT.
@@ -2071,6 +2211,11 @@ async fn execute_parallel_pd(
         sides.prompt_tokens,
     ));
     let decode_dispatch: SideDispatch = Box::pin(async move {
+        if let Some((deadline, prepared_rx)) = prepared_decode {
+            if let ProtoGenerateRequest::Sglang(req) = &mut decode_request {
+                prepared_input::attach_decode_layout(deadline, prepared_rx, req).await?;
+            }
+        }
         if let Some(key) = reuse_key {
             // Bound the optimization, not just inference. Stale capability
             // metadata or a legacy worker must not deadlock the PD rendezvous.
@@ -2140,7 +2285,7 @@ fn sglang_media_reuse_key(req: &ProtoGenerateRequest, workers: &WorkerSelection)
     let ProtoGenerateRequest::Sglang(req) = req else {
         return None;
     };
-    if !media_contract::reusable_request(req) {
+    if !req.prepared_control.is_empty() || !media_contract::reusable_request(req) {
         return None;
     }
     let prefill = workers.prefill_worker()?;
@@ -4825,10 +4970,12 @@ pub(crate) mod tests {
         let (first_attempts_watch, failed_tx) = encode_watch();
         let mut carried = Some(first_attempts_watch);
         let mut request = tokenspeed_request(1, None);
-        let cleanups = prepare_epd_attempt(&mut request, None, &mut carried)
-            .await
-            .expect("nothing to encode");
+        let (cleanups, deadline) =
+            prepare_epd_attempt(&mut request, &tokenspeed_pair(), None, &mut carried)
+                .await
+                .expect("nothing to encode");
         assert!(cleanups.is_none(), "no push plan, nothing to disarm");
+        assert!(deadline.is_none());
         let mut watch = carried
             .clone()
             .expect("the first attempt's watch stands for the replay");
@@ -4852,12 +4999,126 @@ pub(crate) mod tests {
         let mut carried = None;
         let mut request = tokenspeed_request(1, None);
         for _attempt in 0..2 {
-            let cleanups = prepare_epd_attempt(&mut request, None, &mut carried)
-                .await
-                .expect("nothing to encode");
+            let (cleanups, deadline) =
+                prepare_epd_attempt(&mut request, &tokenspeed_pair(), None, &mut carried)
+                    .await
+                    .expect("nothing to encode");
             assert!(cleanups.is_none());
+            assert!(deadline.is_none());
             assert!(carried.is_none());
         }
+    }
+
+    #[test]
+    fn pd_fanout_splits_prepared_epd_samples_with_unique_rooms_and_rids() {
+        use std::collections::HashSet;
+
+        use prost::Message as _;
+        use smg_grpc_client::sglang_managed::{proto as managed_proto, LAYOUT, VERSION};
+
+        use crate::routers::grpc::context::{EncodeWorkerAssignment, RequestContext};
+
+        let make_worker = |role: WorkerType| -> Arc<dyn Worker> {
+            let mut cap = prepared_input::test_capability(role, 1);
+            cap.bootstrap_host = "10.0.0.8".into();
+            cap.bootstrap_port = 8998;
+            cap.receive_endpoint = "10.0.0.9:5000".into();
+            cap.ready = true;
+            let url = format!("grpc://{}:30000", cap.role);
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .runtime_type(RuntimeType::Sglang)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .worker_type(role)
+                    .label(
+                        prepared_input::CAPABILITY,
+                        serde_json::to_string(&cap).unwrap(),
+                    )
+                    .build(),
+            )
+        };
+        let workers = WorkerSelection::Disaggregated {
+            encode_assignments: Some(vec![EncodeWorkerAssignment {
+                item_index: 0,
+                worker: make_worker(WorkerType::Encode),
+            }]),
+            prefill: make_worker(WorkerType::Prefill),
+            decode: make_worker(WorkerType::Decode).into(),
+            runtime_type: RuntimeType::Sglang,
+        };
+        let req = Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "model": "qwen3-vl",
+                "n": 3,
+                "messages": [{"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": "https://example.test/a.png"}}
+                ]}]
+            }))
+            .unwrap(),
+        );
+        let ctx = RequestContext::for_chat(
+            req,
+            None,
+            "qwen3-vl".into(),
+            prepared_input::test_components(),
+        );
+        let prepared = prepared_input::prepare(&ctx).unwrap().unwrap();
+        let proto_request = ProtoGenerateRequest::Sglang(Box::new(sglang::GenerateRequest {
+            request_id: "epd-fan".to_string(),
+            sampling_params: Some(sglang::SamplingParams {
+                n: 3,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        let sglang_protocol = PdProtocol::for_runtime(RuntimeType::Sglang).unwrap();
+        let n = pd_fanout_width(&proto_request, sglang_protocol).unwrap();
+        assert_eq!(n, 3);
+        let mut subs = pd_fanout_requests(&proto_request, n, &workers, None);
+        let jobs = build_fanout_prepared_encodes(&mut subs, prepared, &workers).unwrap();
+        assert_eq!(jobs.len(), 3);
+        let mut rooms = HashSet::new();
+        let mut prefill_rids = HashSet::new();
+        let mut decode_rids = HashSet::new();
+        for (i, sub) in subs.iter().enumerate() {
+            assert_eq!(sub.request_id(), format!("epd-fan-{i}"));
+            assert_eq!(sub.sampling_n(), 1);
+            let ProtoGenerateRequest::Sglang(sg) = sub else {
+                panic!("expected Sglang sub-request");
+            };
+            let control = managed_proto::PrefillStart::decode(sg.prepared_control.as_slice())
+                .expect("prepared control must be stamped");
+            assert_eq!(control.version, VERSION);
+            assert_eq!(control.image_count, 1);
+            let binding = control.binding.unwrap();
+            assert_eq!(binding.layout_contract, LAYOUT);
+            let room = binding.bootstrap.unwrap().room;
+            assert!(rooms.insert(room));
+            assert!(prefill_rids.insert(binding.prefill_rid));
+            assert!(decode_rids.insert(binding.decode_rid));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    /// Prepared encode observers must terminate after their final request owner disappears.
+    async fn prepared_encode_observers_end_when_the_last_request_watch_leaves() {
+        let (owner, mut released) = oneshot::channel::<()>();
+        let watch = launch_prepared_encode(async move {
+            let _owner = owner;
+            std::future::pending().await
+        });
+        let retry_watch = watch.clone();
+        drop(watch);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), &mut released)
+                .await
+                .is_err()
+        );
+        drop(retry_watch);
+        assert!(tokio::time::timeout(Duration::from_millis(1), released)
+            .await
+            .unwrap()
+            .is_err());
     }
 
     /// The encode verdict charges neither side's breaker: the prefill worker
@@ -7430,6 +7691,74 @@ pub(crate) mod tests {
             drop((result, guard));
             assert_eq!(heard_of(&heard), ["issued", "dispatched Single", end_heard]);
         }
+    }
+
+    #[tokio::test]
+    async fn prepared_input_epd_failure_is_marked_non_retryable() {
+        use smg_worker::identity::basic::WorkerLoadGuard;
+
+        use crate::routers::grpc::{
+            context::RequestContext, regular::stages::testing::mock_backend_client,
+        };
+
+        let (client, engine) = mock_backend_client("m").await;
+        let mut clients = ClientSelection::Disaggregated {
+            prefill: client.clone(),
+            decode: client,
+        };
+        let side = |url, worker_type| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(worker_type)
+                    .runtime_type(RuntimeType::Vllm)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .build(),
+            )
+        };
+        let prefill = side("grpc://p:1", WorkerType::Prefill);
+        let workers = WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill: Arc::clone(&prefill),
+            decode: side("grpc://d:1", WorkerType::Decode).into(),
+            runtime_type: RuntimeType::Vllm,
+        };
+        let ahead = PrefillAhead::classic(PrefillLoadGuard::Unbounded {
+            _guard: WorkerLoadGuard::with_key(prefill, None),
+        });
+        let ledger = AttemptLedger::default();
+        let mut watch = None;
+        let req = Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+                ]}]
+            }))
+            .unwrap(),
+        );
+        let ctx =
+            RequestContext::for_chat(req, None, "m".into(), prepared_input::test_components());
+        let prepared = prepared_input::prepare(&ctx)
+            .expect("valid image ref prepares")
+            .expect("image produces PreparedInput");
+        let Err(resp) = execute_epd_dispatch(
+            ProtoGenerateRequest::Vllm(Box::default()),
+            &mut clients,
+            &workers,
+            "m",
+            Some(EncodeOutputs::PreparedInput(Box::new(prepared))),
+            &mut watch,
+            ahead,
+            &ledger,
+            None,
+            false,
+        )
+        .await
+        else {
+            panic!("non-SGLang request with PreparedInput must fail");
+        };
+        assert!(!is_retryable_response(&resp));
+        engine.abort();
     }
 }
 

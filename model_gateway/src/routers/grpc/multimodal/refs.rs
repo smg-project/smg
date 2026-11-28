@@ -549,9 +549,12 @@ pub(crate) fn resolve_mm_processing(
                         .iter()
                         .filter(|worker| *worker.worker_type() == WorkerType::Encode)
                         .all(|worker| {
-                            PdProtocol::encode_handoff(worker.metadata().spec.runtime_type)
-                                == Some(EncodeHandoff::Push)
-                                && worker_supports_ec_transfer(worker.as_ref())
+                            (PdProtocol::encode_handoff(worker.metadata().spec.runtime_type)
+                                == Some(EncodeHandoff::PreparedInput)
+                                || (PdProtocol::encode_handoff(
+                                    worker.metadata().spec.runtime_type,
+                                ) == Some(EncodeHandoff::Push)
+                                    && worker_supports_ec_transfer(worker.as_ref())))
                                 && worker_accepts_media_refs(worker.as_ref())
                         });
                 let uniform = push_encode
@@ -867,7 +870,7 @@ fn echoed_url(url: &str) -> String {
 /// the placement the request lands on. The symbols and the length of a
 /// base64 payload stay the engine's verdict: nothing here reads the payload
 /// past the five bytes a data URL header would occupy.
-fn check_forwarded_references(plan: &MediaPlan) -> Result<(), MmRefsError> {
+pub(crate) fn check_forwarded_references(plan: &MediaPlan) -> Result<(), MmRefsError> {
     let refused = |index: usize, cause: MediaConnectorError| MmRefsError::InvalidReference {
         index,
         cause: cause.to_string(),

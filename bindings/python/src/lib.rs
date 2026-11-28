@@ -1403,10 +1403,13 @@ impl Router {
         };
 
         // `backend` normally only steers the routing mode. Over ZMQ an engine
-        // backend additionally pins the startup workers' runtime. HTTP/gRPC,
-        // and ZMQ without a backend, keep auto-detection (None). Mirrors
+        // backend additionally pins the startup workers' runtime. Explicit SGLang
+        // EPD retains it to select the control protocol. Other HTTP/gRPC workers
+        // and ZMQ without a backend keep auto-detection (None). Mirrors
         // `to_router_config` in model_gateway/src/cli/configure.rs.
-        let startup_worker_runtime_type = if matches!(self.connection_mode, ConnectionMode::Zmq) {
+        let startup_worker_runtime_type = if matches!(self.connection_mode, ConnectionMode::Zmq)
+            || (self.epd_disaggregation && matches!(self.backend, Some(BackendType::Sglang)))
+        {
             self.backend
                 .as_ref()
                 .and_then(BackendType::startup_worker_runtime)
@@ -2128,7 +2131,12 @@ impl Router {
             all_urls.extend(decode_urls.clone());
         }
 
-        let connection_mode = Self::determine_connection_mode(&all_urls);
+        let connection_mode = if epd_disaggregation && matches!(backend, Some(BackendType::Sglang))
+        {
+            ConnectionMode::Grpc
+        } else {
+            Self::determine_connection_mode(&all_urls)
+        };
 
         Ok(Router {
             worker_urls,

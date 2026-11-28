@@ -109,8 +109,8 @@ pub(crate) use process::process_multimodal_plan;
 #[cfg(test)]
 pub(crate) use refs::MM_PROCESSOR_LABEL;
 pub(crate) use refs::{
-    assemble_media_refs, ensure_selection_supports_media_refs, media_refs_pipeline_pin,
-    models_without_media_processing, pool_processes_media_refs,
+    assemble_media_refs, check_forwarded_references, ensure_selection_supports_media_refs,
+    media_refs_pipeline_pin, models_without_media_processing, pool_processes_media_refs,
     registration_lacks_media_processing, resolve_mm_processing, worker_accepts_media_refs,
     worker_runs_gateway_pipeline, worker_supports_ec_transfer, MmProcessing, MmRefsError,
     GATEWAY_PIPELINE_PROCESSOR,
