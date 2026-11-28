@@ -180,6 +180,8 @@ pub struct VllmModelInfo {
     /// advertised as the `engine_reasoning_parser` label; empty when it runs
     /// none.
     pub engine_reasoning_parser: String,
+    /// The launcher verified support for per-request limits in the running sampler.
+    pub supports_thinking_token_budget: bool,
     /// Where the engine starts a request's grammar on a thinking prompt, as
     /// the launcher read it off the structured-outputs config and the Router
     /// shapes a forced tool call's grammar by (`constrained_decoding_start`

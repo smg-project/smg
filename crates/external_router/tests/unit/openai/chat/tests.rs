@@ -269,6 +269,69 @@ async fn the_serialized_request_is_not_copied_a_second_time_for_the_attempts() {
     );
 }
 
+#[tokio::test]
+async fn external_chat_uses_the_same_thinking_token_budget_for_both_spellings() {
+    use axum::{routing::post, Json, Router};
+    use serde_json::{json, Value};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let workers: Arc<dyn WorkerSource> = Arc::new(OneWorker(StubWorker::at(&url)));
+    let deps = ChatRouterContext {
+        workers: &workers,
+        provider_registry: &ProviderRegistry::new(),
+        shared_components: &Arc::new(SharedComponents {
+            client: http_client(),
+        }),
+        retry_config: &RetryConfig::default(),
+    };
+    // Return the body as received by the external provider, after its request transform.
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|body: Json<Value>| async { body }),
+    );
+    let requests = async {
+        let tenant = TenantRequestMeta::new(TenantKey::new("t"));
+        for (top, params, expected) in [
+            (
+                json!(0),
+                json!({"thinking_budget": 8, "keep": true}),
+                Some(json!({"thinking_budget": 0, "keep": true})),
+            ),
+            (
+                Value::Null,
+                json!({"thinking_budget": null, "keep": true}),
+                Some(json!({"keep": true})),
+            ),
+            (Value::Null, json!({"thinking_budget": null}), None),
+        ] {
+            let body = json!({
+                "model": "m", "messages": [{"role":"user","content":"hi"}],
+                "thinking_token_budget": top, "custom_params": params,
+            });
+            let response = route_chat(
+                &deps,
+                None,
+                &tenant,
+                serde_json::from_value(body).unwrap(),
+                "m",
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let received: Value = serde_json::from_slice(&bytes_of(response).await).unwrap();
+            assert_eq!(
+                received.get("thinking_token_budget"),
+                (!top.is_null()).then_some(&top)
+            );
+            assert_eq!(received.get("custom_params"), expected.as_ref());
+        }
+    };
+    tokio::select! {
+        result = axum::serve(listener, app) => panic!("provider exited early: {result:?}"),
+        () = requests => {}
+    }
+}
+
 /// A chat request nothing answers: the caller's 503 says why without the
 /// worker's address. The HTTP client's own error text ends with the
 /// request URL.

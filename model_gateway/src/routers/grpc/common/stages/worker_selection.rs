@@ -13,9 +13,12 @@ use axum::{
 use futures::{future::Either, FutureExt};
 use openai_protocol::common::CachePartition;
 use parking_lot::Mutex;
-use smg_worker::identity::{
-    basic::{ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerType},
-    sampling_defaults::DEFAULT_SAMPLING_PARAMS_LABEL,
+use smg_worker::{
+    identity::{
+        basic::{ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerType},
+        sampling_defaults::DEFAULT_SAMPLING_PARAMS_LABEL,
+    },
+    labels::SUPPORTS_THINKING_TOKEN_BUDGET_LABEL,
 };
 use tracing::{debug, error, warn};
 
@@ -192,6 +195,28 @@ pub(crate) enum WorkerSelectionMode {
     PrefillDecode,
     /// EPD mode: select encode + prefill + decode workers
     EncodePrefillDecode,
+}
+
+pub(crate) fn supports_thinking_budget(worker: &dyn Worker) -> bool {
+    let metadata = worker.metadata();
+    // An operator label cannot enable a capability the worker never reported.
+    metadata.spec.runtime_type == RuntimeType::Vllm
+        && metadata
+            .discovered_labels
+            .get(SUPPORTS_THINKING_TOKEN_BUDGET_LABEL)
+            .is_some_and(|value| value == "true")
+        && metadata
+            .spec
+            .labels
+            .get(SUPPORTS_THINKING_TOKEN_BUDGET_LABEL)
+            .is_some_and(|value| value == "true")
+}
+
+fn unsupported_thinking_budget(model_id: &str) -> Response {
+    error::bad_request(
+        "unsupported_thinking_token_budget",
+        format!("No compatible workers for model '{model_id}' advertise support for thinking_token_budget"),
+    )
 }
 
 impl WorkerSelectionStage {
@@ -439,12 +464,14 @@ impl<'a> SelectionInputs<'a> {
         } else {
             ContextRequirements::new(prep, &input.request_type)
         };
+        let needs_thinking_budget = matches!(&input.request_type, RequestType::Chat(chat) if chat.resolved_thinking_token_budget().ok().flatten().is_some());
         let demand = PairDemands::new(
             stage.prefill_side_needs_vision(needs_vision),
             stage.decode_side_needs_vision(&input.request_type, intermediate, media_refs),
         )
         .with_media_refs(media_refs, media_refs_pipeline)
-        .with_context(context_requirements);
+        .with_context(context_requirements)
+        .with_thinking_budget(needs_thinking_budget);
 
         let text = prep.routing_text();
 
@@ -529,6 +556,7 @@ impl<'a> SelectionInputs<'a> {
     fn snapshot(&self) -> RoutingSnapshot {
         RoutingSnapshot {
             context_requirements: self.context_requirements,
+            needs_thinking_budget: self.demand.needs_thinking_budget,
             routing_text: self
                 .keep_text
                 .then(|| self.text.map(str::to_string))
@@ -606,12 +634,16 @@ impl WorkerSelectionStage {
         let accepts_refs = |worker: &dyn Worker| media.accepts_refs(worker);
         let placement = inputs.placement(inputs.media_refs.then_some(&accepts_refs));
         let sticky_key = ctx.state.sticky_key.as_deref();
+        if inputs.demand.needs_thinking_budget && self.mode != WorkerSelectionMode::Regular {
+            return Err(unsupported_thinking_budget(model_id));
+        }
         let (workers, prefill_guard) = match self.mode {
             WorkerSelectionMode::Regular => {
                 match self.select_regular(
                     model_id,
                     context_requirements,
                     media,
+                    inputs.demand.needs_thinking_budget,
                     None,
                     inputs.text,
                     inputs.tokens(),
@@ -629,6 +661,7 @@ impl WorkerSelectionStage {
                             wire,
                             media,
                             context_requirements,
+                            inputs.demand.needs_thinking_budget,
                         ));
                     }
                 }
@@ -850,6 +883,7 @@ impl WorkerSelectionStage {
                     model_id,
                     context_requirements,
                     media,
+                    ctx.routing.needs_thinking_budget,
                     Some(&admits),
                     text,
                     tokens,
@@ -867,6 +901,7 @@ impl WorkerSelectionStage {
                             wire,
                             media,
                             context_requirements,
+                            ctx.routing.needs_thinking_budget,
                         ))
                     }
                 }
@@ -1369,6 +1404,7 @@ fn decode_needs_vision(
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct PairDemands {
     context: ContextRequirements,
+    needs_thinking_budget: bool,
     prefill: bool,
     decode: bool,
     /// The request forwards media references, which only a worker that
@@ -1389,6 +1425,7 @@ impl PairDemands {
     fn new(pixel_media: bool, decode: bool) -> Self {
         Self {
             context: ContextRequirements::default(),
+            needs_thinking_budget: false,
             prefill: pixel_media || decode,
             decode,
             refs: false,
@@ -1411,6 +1448,13 @@ impl PairDemands {
     /// Context bounds shared by both token-processing sides, never the encoder.
     fn with_context(self, context: ContextRequirements) -> Self {
         Self { context, ..self }
+    }
+
+    fn with_thinking_budget(self, needs_thinking_budget: bool) -> Self {
+        Self {
+            needs_thinking_budget,
+            ..self
+        }
     }
 
     /// The demand on the side `worker` serves.
@@ -1682,11 +1726,18 @@ impl WorkerSelectionStage {
         wire: Option<WireConstraint>,
         media: MediaDemands,
         context: ContextRequirements,
+        needs_thinking_budget: bool,
     ) -> Response {
         let media = media.with_wire(wire);
-        let capable = self.capable_regular(model_id, wire, media);
+        let mut capable = self.capable_regular(model_id, wire, media);
         if capable.is_empty() {
             return self.selection_failure(model_id, &[WorkerType::Regular], wire, media);
+        }
+        if needs_thinking_budget {
+            capable.retain(|worker| supports_thinking_budget(worker.as_ref()));
+            if capable.is_empty() {
+                return unsupported_thinking_budget(model_id);
+            }
         }
         if let Some(refusal) = unheld_by(&capable, context, model_id) {
             return refusal;
@@ -2183,6 +2234,7 @@ impl WorkerSelectionStage {
         model_id: &str,
         context: ContextRequirements,
         media: MediaDemands,
+        needs_thinking_budget: bool,
         admits: Option<CandidateFilter<'_>>,
         text: Option<&str>,
         tokens: Option<&[u32]>,
@@ -2201,14 +2253,18 @@ impl WorkerSelectionStage {
         let accepts = |worker: &dyn Worker| {
             admits.is_none_or(|admits| admits(worker))
                 && media.accepts(worker)
+                && (!needs_thinking_budget || supports_thinking_budget(worker))
                 && left.admits(worker, model_id)
         };
-        let candidate_filter: Option<CandidateFilter<'_>> =
-            if admits.is_none() && media == MediaDemands::NONE && left.binds_nobody() {
-                None
-            } else {
-                Some(&accepts)
-            };
+        let candidate_filter: Option<CandidateFilter<'_>> = if admits.is_none()
+            && !needs_thinking_budget
+            && media == MediaDemands::NONE
+            && left.binds_nobody()
+        {
+            None
+        } else {
+            Some(&accepts)
+        };
         self.select_single_worker_for_attempt(
             &snapshot,
             model_id,
@@ -2937,6 +2993,7 @@ impl SelectionBench {
                 &self.model,
                 self.context,
                 MediaDemands::NONE,
+                false,
                 None,
                 None,
                 tokens,
@@ -2969,6 +3026,7 @@ impl SelectionBench {
 mod tests {
     mod lora;
     mod rank;
+    mod thinking_budget;
 
     use std::{
         collections::HashMap,
@@ -3001,6 +3059,7 @@ mod tests {
                     test_support::select_worker, PrefillLoadGuard, PrefillReservation,
                 },
                 retry::is_retryable_response,
+                snapshot::test_support::discovered_grpc_worker,
             },
             grpc::{
                 backend_client::BasicWorkerBuilder,
@@ -4016,6 +4075,7 @@ mod tests {
                 model_id,
                 ContextRequirements::default(),
                 MediaDemands::NONE,
+                false,
                 None,
                 None,
                 None,
@@ -4183,6 +4243,7 @@ mod tests {
                     model_id,
                     context,
                     MediaDemands::NONE,
+                    false,
                     None,
                     None,
                     None,
@@ -4497,6 +4558,7 @@ mod tests {
             rate_limit_cell: None,
             routing: RoutingSnapshot {
                 context_requirements: ContextRequirements::default(),
+                needs_thinking_budget: false,
                 routing_text: None,
                 rid: None,
                 cache_namespace: None,
@@ -7298,9 +7360,7 @@ mod tests {
             PairDemands {
                 prefill: true,
                 decode: false,
-                refs: false,
-                context: ContextRequirements::default(),
-                pipeline: PipelinePin::Any,
+                ..PairDemands::default()
             },
             "a single-sample image: the prefill side takes the pixels, the decode side is stripped"
         );
@@ -7309,9 +7369,7 @@ mod tests {
             PairDemands {
                 prefill: true,
                 decode: true,
-                refs: false,
-                context: ContextRequirements::default(),
-                pipeline: PipelinePin::Any,
+                ..PairDemands::default()
             },
             "what the decode side cannot run without the encoder, the prefill side cannot either"
         );
@@ -8091,16 +8149,7 @@ mod tests {
         worker_type: WorkerType,
         labels: &[(&str, &str)],
     ) -> Arc<dyn Worker> {
-        let mut builder = BasicWorkerBuilder::new(url)
-            .model(ModelCard::new(model_id))
-            .worker_type(worker_type)
-            .runtime_type(RuntimeType::Vllm)
-            .connection_mode(ConnectionMode::Grpc)
-            .health_config(no_health_check());
-        for (key, value) in labels {
-            builder = builder.label(*key, *value);
-        }
-        Arc::new(builder.build())
+        discovered_grpc_worker(url, model_id, worker_type, RuntimeType::Vllm, labels)
     }
 
     /// A prefill/decode stage over `worker_registry` with independent round-robin
