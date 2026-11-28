@@ -405,18 +405,12 @@ impl Lists {
     /// limit ([`NoLimit`]).
     fn pair(&self) -> PairLists<'_> {
         let cut = self.cut();
-        PairLists {
-            prefill: cut.prefill.lent(),
-            decode: cut.decode.lent(),
-            classes: &cut.classes,
-            admission: &NoLimit,
-            prefill_places: None,
-            decode_places: None,
-            prefill_stalled: &[],
-            prefill_held: &[],
-            decode_stalled: &[],
-            decode_held: &[],
-        }
+        PairLists::of(
+            cut.prefill.lent(),
+            cut.decode.lent(),
+            &cut.classes,
+            &NoLimit,
+        )
     }
 
     /// An encode request's three lists lent: the pair's two as a pair lends
@@ -425,15 +419,12 @@ impl Lists {
     /// veto of its own.
     fn encode(&self) -> EncodeLists<'_> {
         let cut = self.cut();
-        EncodeLists {
-            pair: self.pair(),
-            encoders: cut.encode.lent(),
-            encoders_places: None,
-            encoders_stalled: &[],
-            encoders_held: &[],
-            facts: &cut.encoder_facts,
-            prefill_classes: &cut.prefill_classes,
-        }
+        EncodeLists::of(
+            self.pair(),
+            cut.encode.lent(),
+            &cut.encoder_facts,
+            &cut.prefill_classes,
+        )
     }
 }
 
@@ -754,11 +745,7 @@ impl Program {
         let handed: Arc<WorkerRegistry<Lists>> = Arc::clone(&registry);
         let trees = Arc::new(ModelTrees::new(spec.block_size() as usize));
         let lent: Arc<dyn CacheIndexes> = Arc::new(Trees(Arc::clone(&trees)));
-        let data = WorkerData {
-            registry: handed,
-            loads,
-            cache_indexes: Some(lent),
-        };
+        let data = WorkerData::of(handed, loads, Some(lent));
         let (engine, task) = InProcess::start(spec, data);
         engine.set_lists(Arc::new(PublishedLists(Arc::clone(&registry))));
         let program = Self {
@@ -893,10 +880,8 @@ impl Program {
         let ring = lists.map(|lists| lists.ring() as &dyn LentRing);
         // A retry stays on its first worker's wire: the engine holds it to
         // the workers that state the same number, ahead of every stage.
-        let demands = Demands {
-            runtime: stated.wire,
-            ..Demands::default()
-        };
+        let mut demands = Demands::default();
+        demands.runtime = stated.wire;
         // The prompt as the program holds it: its token ids, and the
         // request itself as its entry in the program's tree. The engine
         // asks the entry where a decision reads that tree, and of no other
@@ -906,18 +891,17 @@ impl Program {
             prompt.tokens = asked.tokens;
             prompt.entry = Some(asked);
         }
-        PlaceRequest {
-            prompt,
-            headers,
-            demands,
-            encode: carries.then_some(items),
-            attempt: stated.number,
-            tried: stated.tried,
-            decode_again: self.in_turn,
-            ring,
-            admits: stated.admits,
-            ..PlaceRequest::of(asked.model, lent)
-        }
+        let mut request = PlaceRequest::of(asked.model, lent);
+        request.prompt = prompt;
+        request.headers = headers;
+        request.demands = demands;
+        request.encode = carries.then_some(items);
+        request.attempt = stated.number;
+        request.tried = stated.tried;
+        request.decode_again = self.in_turn;
+        request.ring = ring;
+        request.admits = stated.admits;
+        request
     }
 
     /// One attempt placed. The engine is asked once, over the generation that
@@ -1181,10 +1165,8 @@ impl Program {
         // decode to send, and no request is stated again for it.
         let taken = attempt.placement.decode_chosen() && {
             let lists = self.published(asked.model);
-            let request = PlaceRequest {
-                counted_on_decode: true,
-                ..self.request(asked, lists.as_deref(), stated)
-            };
+            let mut request = self.request(asked, lists.as_deref(), stated);
+            request.counted_on_decode = true;
             attempt.placement.decode_again(&request).is_ok()
         };
         if taken {

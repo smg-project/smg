@@ -31,8 +31,9 @@ use smg_grand_central::engine::{TextKey, TokenKey};
 use smg_grand_central::{
     document::Needs,
     engine::{
-        DrawUnit, EncodeMember, Health, LoadRow, Phase, Plain, PoolWord, Profile, ScoreFront,
-        ScoreSpread, Shortlist, WeightedScorer, WireModes, WorkerId,
+        Demands, DrawUnit, EncodeMember, HashSeeds, Health, LoadRow, Phase, Plain, PoolWord,
+        Profile, Request, RequestFacts, ScoreFront, ScoreSpread, Shortlist, WeightedScorer,
+        WireModes, WorkerId,
     },
     load::SignalCell,
     policies::prefix_hash::HeadRule,
@@ -766,5 +767,240 @@ mod a_followers_start {
             tls.map(|files| files.ca_cert.path).as_deref(),
             Some("an authority")
         );
+    }
+}
+
+/// A host's request is made by its call, under the constraints' default, and
+/// read by a pattern that ends open.
+#[test]
+fn a_hosts_request_is_made_by_its_call_and_read_by_a_pattern_that_ends_open() {
+    let mut facts = RequestFacts::default();
+    facts.model = "a model";
+    let Request {
+        id,
+        facts: read,
+        constraints,
+        ..
+    } = Request::of(b"an id", facts);
+    assert_eq!((id, read.model), (&b"an id"[..], "a model"));
+    assert!(constraints.excluded.is_empty() && constraints.places.is_none());
+}
+
+/// A request's demands start from their default, which demands nothing, and
+/// take a demand by assignment.
+#[test]
+fn demands_start_from_their_default_and_take_a_field_by_assignment() {
+    let mut demands = Demands::default();
+    assert!(demands.is_none());
+    demands.vision = true;
+    let Demands {
+        vision, runtime, ..
+    } = demands;
+    assert_eq!((vision, runtime), (true, 0));
+    assert!(!demands.is_none());
+}
+
+/// A prompt's seeds start from the constant of a request with no partition
+/// and take a partition's seed by assignment.
+#[test]
+fn hash_seeds_start_from_their_constant_and_take_a_field_by_assignment() {
+    let mut seeds = HashSeeds::PLAIN;
+    seeds.partition = 9;
+    let HashSeeds {
+        event, partition, ..
+    } = seeds;
+    assert_eq!((event, partition), (HashSeeds::PLAIN.event, 9));
+}
+
+/// The cases of the records a program lends its engine, each built by its
+/// start as a program builds it.
+#[cfg(feature = "in-process")]
+mod lent {
+    use std::sync::Arc;
+
+    use smg_grand_central::engine::{
+        CacheIndex, CacheIndexes, EncodeLists, EncoderFacts, HashSeeds, LentList, ListCell,
+        Members, PairAdmission, PairLists, PartnerClasses, PlaceRequest, Prompt, PublishedList,
+        WorkerData, WorkerLists,
+    };
+    use smg_worker::{
+        identity::basic::Worker,
+        load::state::TestFeed,
+        registry::{Generation, WorkerRegistry},
+    };
+
+    /// No worker: a list's value is never asked in these cases.
+    fn nobody() -> Arc<[Arc<dyn Worker>]> {
+        Arc::from(Vec::new())
+    }
+
+    /// A host's reads of its admission that hold nobody back.
+    #[derive(Debug)]
+    struct NoLimit;
+
+    impl PairAdmission for NoLimit {
+        fn has_capacity(&self, _: usize) -> bool {
+            true
+        }
+
+        fn has_room(&self, _: usize) -> bool {
+            true
+        }
+    }
+
+    /// A registry's generation that keeps its members and nothing else.
+    #[derive(Debug)]
+    struct Listed(Arc<[Arc<dyn Worker>]>);
+
+    impl Generation for Listed {
+        fn of(members: Arc<[Arc<dyn Worker>]>) -> Self {
+            Self(members)
+        }
+
+        fn members(&self) -> &Arc<[Arc<dyn Worker>]> {
+            &self.0
+        }
+    }
+
+    /// A program's indexes of cache events that hold no index.
+    #[derive(Debug)]
+    struct NoIndexes;
+
+    impl CacheIndexes for NoIndexes {
+        fn index(&self, _: &str) -> Option<Arc<dyn CacheIndex>> {
+            None
+        }
+
+        fn block_size(&self, _: &str) -> Option<u32> {
+            None
+        }
+    }
+
+    /// A lent list is made by its call, with no facts of its workers, and
+    /// read by a pattern that ends open.
+    #[test]
+    fn a_lent_list_is_made_by_its_call_and_read_by_a_pattern_that_ends_open() {
+        let (workers, cell) = (nobody(), ListCell::default());
+        let LentList {
+            workers: read,
+            cell: beside,
+            facts,
+            ..
+        } = LentList::of(&workers, &cell);
+        assert!(std::ptr::eq(read, &workers) && std::ptr::eq(beside, &cell));
+        assert!(facts.is_none());
+    }
+
+    /// A pair's lists are made by their call, each list on its own side,
+    /// with every place of each list open and none masked, and read by a
+    /// pattern that ends open.
+    #[test]
+    fn a_pairs_lists_are_made_by_their_call_and_read_by_a_pattern_that_ends_open() {
+        let (prefills, decodes) = (PublishedList::new(nobody()), PublishedList::new(nobody()));
+        let classes = PartnerClasses::number(0, std::iter::empty());
+        let PairLists {
+            prefill,
+            decode,
+            classes: read,
+            prefill_places,
+            decode_places,
+            prefill_stalled,
+            prefill_held,
+            decode_stalled,
+            decode_held,
+            ..
+        } = PairLists::of(prefills.lent(), decodes.lent(), &classes, &NoLimit);
+        assert!(std::ptr::eq(prefill.cell, prefills.lent().cell));
+        assert!(std::ptr::eq(decode.cell, decodes.lent().cell));
+        assert!(std::ptr::eq(read, &classes));
+        assert!(prefill_places.is_none() && decode_places.is_none());
+        let masked = [prefill_stalled, prefill_held, decode_stalled, decode_held];
+        assert!(masked.iter().all(|places| places.is_empty()));
+    }
+
+    /// An encode request's lists are made by their call, which takes the
+    /// two tables, with every place of the encoder list open and none
+    /// masked, and read by a pattern that ends open.
+    #[test]
+    fn an_encode_requests_lists_are_made_by_their_call_and_read_by_a_pattern_that_ends_open() {
+        let (prefills, decodes) = (PublishedList::new(nobody()), PublishedList::new(nobody()));
+        let encoders = PublishedList::new(nobody());
+        let classes = PartnerClasses::number(0, std::iter::empty());
+        let pair = PairLists::of(prefills.lent(), decodes.lent(), &classes, &NoLimit);
+        let (of_encoders, prefill_classes) = ([EncoderFacts::default()], [3_u32]);
+        let EncodeLists {
+            pair: read_pair,
+            encoders: read_encoders,
+            encoders_places,
+            encoders_stalled,
+            encoders_held,
+            facts,
+            prefill_classes: read,
+            ..
+        } = EncodeLists::of(pair, encoders.lent(), &of_encoders, &prefill_classes);
+        assert!(std::ptr::eq(read_pair.classes, &classes));
+        assert!(std::ptr::eq(read_encoders.cell, encoders.lent().cell));
+        assert!(encoders_places.is_none());
+        assert!(encoders_stalled.is_empty() && encoders_held.is_empty());
+        assert_eq!((facts.len(), read), (1, &prefill_classes[..]));
+    }
+
+    /// A program's data is made by its call, which takes every field the
+    /// record has today, and read by a pattern that ends open.
+    #[test]
+    fn a_programs_data_is_made_by_its_call_and_read_by_a_pattern_that_ends_open() {
+        let registry: Arc<WorkerRegistry<Listed>> = Arc::new(WorkerRegistry::new());
+        let handed: Arc<dyn Members> = Arc::clone(&registry) as Arc<dyn Members>;
+        let mut channel = None;
+        let _feed = TestFeed::attached_to(|lent| channel = lent);
+        let indexes: Arc<dyn CacheIndexes> = Arc::new(NoIndexes);
+        let WorkerData {
+            registry: read,
+            loads,
+            cache_indexes,
+            ..
+        } = WorkerData::of(handed, channel, Some(indexes));
+        assert!(loads.is_some() && cache_indexes.is_some());
+        assert_eq!(Arc::strong_count(&registry), 2);
+        drop(read);
+        assert_eq!(Arc::strong_count(&registry), 1);
+    }
+
+    /// A caller's request is made by its call, which states nothing but its
+    /// model and its lists, takes a field by assignment, and is read by a
+    /// pattern that ends open.
+    #[test]
+    fn a_callers_request_is_made_by_its_call_and_read_by_a_pattern_that_ends_open() {
+        let mut request = PlaceRequest::of("a model", WorkerLists::None);
+        request.streaming = true;
+        let PlaceRequest {
+            model,
+            lists,
+            streaming,
+            attempt,
+            ..
+        } = request;
+        assert_eq!((model, streaming, attempt), ("a model", true, 0));
+        assert!(matches!(lists, WorkerLists::None));
+    }
+
+    /// A prompt starts from the constant of a request that states none and
+    /// takes its text by assignment.
+    #[test]
+    fn a_prompt_starts_from_its_constant_and_takes_a_field_by_assignment() {
+        let mut prompt = Prompt::NONE;
+        prompt.text = Some("a prompt");
+        let Prompt {
+            tokens,
+            text,
+            seeds,
+            entry,
+            ..
+        } = prompt;
+        assert_eq!(
+            (tokens, text, seeds),
+            (None, Some("a prompt"), HashSeeds::PLAIN)
+        );
+        assert!(entry.is_none());
     }
 }

@@ -44,11 +44,6 @@
 //! items', vision with the request's pixels. So the name follows the
 //! pass's order whether a request states a fact as a demand or as its own.
 
-#![expect(
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
-
 use crate::engine::{decision, view::Role};
 
 /// Where a request's media by reference may be processed.
@@ -70,9 +65,11 @@ pub enum References {
 }
 
 /// What a request demands of the worker that takes it. The default demands
-/// nothing. Further demands add their fields: a host writes the rest of the
-/// type as `..Demands::default()`.
+/// nothing. Further demands add their fields: a host starts from
+/// `Demands::default()` and assigns the demands it states, since no literal
+/// of the record builds outside this crate.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Demands {
     /// The runtime the request stays on: a retry states the number its
     /// first attempt's worker registered ([`DemandFacts::runtime`]), and

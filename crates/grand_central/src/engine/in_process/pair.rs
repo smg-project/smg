@@ -116,11 +116,6 @@
 //! [`ShadowSide::DecodeAgain`](crate::engine::shadow::ShadowSide::DecodeAgain),
 //! with no count of its first decision beside it.
 
-#![expect(
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
-
 use std::{
     cell::{Cell, RefCell},
     fmt,
@@ -256,6 +251,7 @@ impl GatesRead {
 /// A side whose profile shows its rows to a plugin reads them in the rows
 /// written for the decision.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct PairLists<'a> {
     /// The prefills.
     pub prefill: LentList<'a>,
@@ -294,6 +290,36 @@ pub struct PairLists<'a> {
     pub decode_stalled: &'a [u32],
     /// The places of [`Self::decode_stalled`] a hold of the host stands on.
     pub decode_held: &'a [u32],
+}
+
+impl<'a> PairLists<'a> {
+    /// A pair's two lists, their pair classes and the host's reads of its
+    /// admission, with every place of each list open and none masked: the
+    /// places are `None`, the stalled and the held are empty. A host that
+    /// holds a side to a part of its list or masks a place assigns it. It
+    /// checks nothing. Code outside this crate starts here: the record gains
+    /// fields, so no literal of it builds there.
+    #[inline]
+    #[must_use]
+    pub const fn of(
+        prefill: LentList<'a>,
+        decode: LentList<'a>,
+        classes: &'a PartnerClasses,
+        admission: &'a dyn PairAdmission,
+    ) -> Self {
+        Self {
+            prefill,
+            decode,
+            classes,
+            admission,
+            prefill_places: None,
+            decode_places: None,
+            prefill_stalled: &[],
+            prefill_held: &[],
+            decode_stalled: &[],
+            decode_held: &[],
+        }
+    }
 }
 
 /// What a host states of one side's list beside the list: the places the

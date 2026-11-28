@@ -290,20 +290,20 @@ impl Bed {
             self.seed += 1;
             let id = self.seed.to_le_bytes();
             let asked = Asked {
-                request: Request {
-                    id: &id,
-                    facts: {
+                request: {
+                    let mut request = Request::of(&id, {
                         let mut facts = RequestFacts::default();
                         facts.model = MODEL;
                         facts.seed = self.seed;
                         facts
-                    },
-                    constraints,
+                    });
+                    request.constraints = constraints;
+                    request
                 },
-                lent: LentList {
-                    workers: &self.list,
-                    cell: &self.cell,
-                    facts: Some(&self.facts),
+                lent: {
+                    let mut lent = LentList::of(&self.list, &self.cell);
+                    lent.facts = Some(&self.facts);
+                    lent
                 },
             };
             // A maker that says no request plain is answered whole.

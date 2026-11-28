@@ -538,6 +538,7 @@ whether it is marked non-exhaustive and how code writes it:
 | the events a stage hears | `Signal`, `Membership`, `ReleaseReason`, `TransportClass`, `EventKind` | yes | a `match` on one keeps an arm for the rest, and a case with named fields is matched with `..` and made by its call |
 | the answers a stage gives as an enum | `ScoreSpread`, `ScoreFront`, `DrawUnit` | yes | as the events are |
 | the records a caller builds | `Needs`, `Outcome`, `Plain`, `TokenKey`, `TextKey`, `EncodeMember`, `PoolWord` | yes | a stage writes its `Needs` as one chain from `Needs::NONE`, a call a flag. A host makes an `Outcome` by `Outcome::reported`. Each of the other five is made by its call (`Plain::of`, `TokenKey::of`, `TextKey::of`, `EncodeMember::of`, `PoolWord::of`), which takes every field the record has today |
+| what a host lends a request, and its start | `Request`, `PlaceRequest`, `Prompt`, `Demands`, `HashSeeds`, `LentList`, `PairLists`, `EncodeLists`, `WorkerData` | yes | a host starts each from its call (`Request::of`, `PlaceRequest::of`, `LentList::of`, `PairLists::of`, `EncodeLists::of`, `WorkerData::of`), from its constant (`Prompt::NONE`, `HashSeeds::PLAIN`) or from its `Default` (`Demands`), and assigns the fields it knows. No literal of one builds outside the crate, and a pattern on one ends with `..` |
 | the records a stage answers with | `Shortlist`, `HeadRule` | yes | each is made by its call |
 | the view a stage only reads | `RequestFacts`, `Candidate`, `Constraints`, `PoolFacts`, `LoadRow`, `AffinityFacts`, `AffinityRows`, `AffinityHolder`, `Health`, `MediaCounts`, `Header`, `ZoneCapacity`, and its enums `HashKind`, `SignalSource`, `OverloadRegime` | yes | code outside the crate starts a record from its `Default`, or a `Candidate` from `Candidate::ready`, and assigns the fields it knows. It never matches one whole, and a `match` on one of the enums keeps an arm for the rest |
 | what a policy document states | `ProfileSpec`, `RoutingKeySpec`, `IndexSpec`, `BucketParams`, `CostMargin`, `Match`, `OverloadSpec`, `KeySourceSpec`, `BindingSpec`, `ResidentWorkParams`, `LeastCostParams`, `BestParams`, `BestWithTemperatureParams`, `HasRoomParams`, `Bounds`, `HeaderMatch`, `SessionsSpec`, `CanarySpec`, `SignalSpec`, and what a snapshot caller asks of the worker rows, `WorkerRowsQuery` | yes | ten of them have no start (`ResidentWorkParams`, `LeastCostParams`, `BestParams`, `BestWithTemperatureParams`, `HasRoomParams`, `Bounds`, `HeaderMatch`, `SessionsSpec`, `CanarySpec`, `SignalSpec`): code outside the crate builds none: it deserializes one, or takes one in a spec the crate made, and a start comes the day a caller needs one. It starts eight from their `Default` and assigns the fields it knows (`IndexSpec`, `BucketParams`, `CostMargin`, `Match`, `OverloadSpec`, `KeySourceSpec`, `BindingSpec`, `WorkerRowsQuery`). It makes a profile by `ProfileSpec::of` and a routing key by `RoutingKeySpec::of`, each from the one field a document must write. A pattern on one ends with `..`. The doc of the module `document` says this once for the nineteen a document states: the own doc of such a record is its description in the published schema. `WorkerRowsQuery` says it in its own doc |
@@ -545,8 +546,8 @@ whether it is marked non-exhaustive and how code writes it:
 | what a host states of a worker, of a store's history and of a signal | `EncodeOffer`, `PairingDescriptor`, `Position`, `SignalCell` | yes | code outside the crate starts an offer, a descriptor or a position from its `Default` and assigns the fields it knows. It makes a cell by `SignalCell::of`, which takes both of its fields, or starts from `SignalCell::NONE`. A pattern on one ends with `..` |
 | what a host starts a service or a plugin with | `Config`, `Listener`, `ElectionConfig`, `ElectionSettings`, `WorkerFollowerSettings`, `PemFile`, `ClientIdentity`, `Exposure`, `BreakerSpec`, `Abi`, the three records named `Tls`, and the elector's `LeaseRecord` | yes | code outside the crate starts an exposure, a breaker, an election's configuration, its timing or the elector's lease record from its `Default` and assigns the fields it knows. It makes each of the others by its call. `Config::of` takes the three fields a host must state. Each other call takes every field the record has: none has a neutral value, and a TLS left out by silence would be a plaintext listener or a plain dial. A pattern on one ends with `..` |
 | what no caller builds or matches whole | `Pick`, `Overlap`, `HeldDecision`, `HeldDecode`, `SessionRule`, and every other public enum or record that no program outside the crate builds or matches whole | yes | a caller reads one by its fields, and starts one from its `Default` or its call where it has one. A `match` on one keeps an arm for the rest, and a pattern on one ends with `..` |
-| what a caller builds or matches whole | the lists a request lends and its `Demands`, a store's checkpoint | not yet | each takes its mark with a call to start from, and its module or its own declaration says so |
-| the enums closed by design | `Decision`, `ShedReason`, `Side`, `Phase`, `Role`, `Said`, `Pairing`, `Head`, the elector's `TickOutcome`, and the client's `Answer` | no | a caller answers every case of them, and a new case must stop its build |
+| what a caller builds or matches whole | a store's checkpoint | not yet | each takes its mark with a call to start from, and its module or its own declaration says so |
+| the enums closed by design | `Decision`, `Decided`, `ShedReason`, `Side`, `Phase`, `Role`, `Said`, `Pairing`, `Head`, the elector's `TickOutcome`, and the client's `Answer` | no | a caller answers every case of them, and a new case must stop its build |
 | the records closed by their shape | a record of one value: `WorkerId`, `LeaseId`, `GatewayId`, `TieBand`. A record with no field, as the stage `Best` | no | its one value, or its name, is the whole record |
 | the records closed by their own doc | `DispatchCounts`, a lease as a store holds it: `LeaseRecord`, `DecodeSide`, `Sides`, and a gateway's routing settings: `RoutingSettings`, `RoutingKeyOverrideSettings` | no | a further number goes on `CreditedDispatches`. A store's door takes a lease's record or its decode side whole, and a store answers both parts: a field that joins stops each writer's build until the writer states it. A gateway's literal of the routing settings with no rest stops its build at a setting that joins, until the gateway states it |
 | an enum with no case | `DiscoverySettings` in a build without discovery | no | it has no value, and a caller may match it with no arm |
@@ -1956,7 +1957,7 @@ controller keep it differently on main.
 A host's start has these steps.
 
 1. **It starts the engine with its own data, once.** The call is
-   `InProcess::start(spec, WorkerData { registry, loads, cache_indexes })`. It builds the
+   `InProcess::start(spec, WorkerData::of(registry, loads, cache_indexes))`. It builds the
    engine from the document and takes three things of the host:
    - its worker registry (the host implements `Members`, and the worker crate's registry is one);
    - its load monitor's channel;
@@ -2132,11 +2133,12 @@ three things. The names below may change; the contract may not.
 
 ```rust
 // engine/in_process/start.rs
-let (engine, task) = InProcess::start(spec, WorkerData {
+let data = WorkerData::of(
     registry,                              // the worker registry: the engine's task follows its events
-    loads: Some(load_monitor.subscribe()), // the load monitor's channel
-    cache_indexes: Some(kv_monitor),       // the host's indexes of cache events
-});
+    Some(load_monitor.subscribe()),        // the load monitor's channel
+    Some(kv_monitor),                      // the host's indexes of cache events
+);
+let (engine, task) = InProcess::start(spec, data);
 engine.set_lists(lists);                   // the worker lists by model: the task fills their cells
 runtime.spawn(task);                       // the engine's own background task
 ```

@@ -137,8 +137,8 @@ use parking_lot::{Condvar, Mutex};
 use smg_grand_central::{
     document::{AppliedSpec, PolicySpec, RulePlaced, ShadowSpec},
     engine::{
-        Constraints, Decided, FixedFacts, Identity, InProcess, Phase, Plain, PromptEntry,
-        PublishedList, Request, RequestFacts, RequestMaker, TokenKey, WorkerId, WorkerLists,
+        Decided, FixedFacts, Identity, InProcess, Phase, Plain, PromptEntry, PublishedList,
+        Request, RequestFacts, RequestMaker, TokenKey, WorkerId, WorkerLists,
     },
     policies::{
         consistent_hashing::{Head, LentRing},
@@ -628,11 +628,7 @@ fn plain(seed: u64) -> Request<'static> {
     facts.phase = Phase::Single;
     facts.prompt_tokens = 1_024;
     facts.seed = seed;
-    Request {
-        id: b"bench",
-        facts,
-        constraints: Constraints::default(),
-    }
+    Request::of(b"bench", facts)
 }
 
 /// A request held to a runtime, as a request pinned to a wire states it:

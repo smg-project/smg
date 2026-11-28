@@ -122,12 +122,11 @@ impl Replayed for Row {
             let (wire_modes, runtime) = runtimes.stays_on(asked.wire.as_ref())?;
             let mut constraints = Constraints::default();
             constraints.wire_modes = wire_modes;
-            constraints.demands = Demands {
-                runtime,
-                input_window: asked.input_window(),
-                output_window: asked.output_tokens.unwrap_or(0),
-                ..Demands::default()
-            };
+            let mut demands = Demands::default();
+            demands.runtime = runtime;
+            demands.input_window = asked.input_window();
+            demands.output_window = asked.output_tokens.unwrap_or(0);
+            constraints.demands = demands;
             answers.push(bed.answer(constraints, refusal)?);
         }
         Ok(answers)

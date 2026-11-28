@@ -1036,11 +1036,7 @@ mod in_process {
                     .map(|at| ready_worker(&format!("http://w{at}:8000"), MODEL))
                     .collect();
                 let cell = ListCell::default();
-                let lent = LentList {
-                    workers: &list,
-                    cell: &cell,
-                    facts: None,
-                };
+                let lent = LentList::of(&list, &cell);
                 let request = PlaceRequest::of(MODEL, WorkerLists::Single(lent));
                 let serve = || {
                     let mut placement = engine.place(&request).expect("a worker of the list");
@@ -1118,11 +1114,7 @@ mod in_process {
                 .map(|at| ready_worker(&format!("http://w{at}:8000"), MODEL))
                 .collect();
             let cell = ListCell::default();
-            let lent = LentList {
-                workers: &list,
-                cell: &cell,
-                facts: None,
-            };
+            let lent = LentList::of(&list, &cell);
             let request = PlaceRequest::of(MODEL, WorkerLists::Single(lent));
             let serve = || {
                 let placement = engine.place(&request).expect("a worker of the list");
@@ -1157,26 +1149,12 @@ mod in_process {
                 Arc::from([typed("grpc://decode:9000", WorkerType::Decode)]);
             let (prefill_cell, decode_cell) = (ListCell::default(), ListCell::default());
             let classes = PartnerClasses::number(1, [&[0_u32][..]]);
-            let lists = PairLists {
-                prefill: LentList {
-                    workers: &prefills,
-                    cell: &prefill_cell,
-                    facts: None,
-                },
-                decode: LentList {
-                    workers: &decodes,
-                    cell: &decode_cell,
-                    facts: None,
-                },
-                classes: &classes,
-                admission: &Open,
-                prefill_places: None,
-                decode_places: None,
-                prefill_stalled: &[],
-                prefill_held: &[],
-                decode_stalled: &[],
-                decode_held: &[],
-            };
+            let lists = PairLists::of(
+                LentList::of(&prefills, &prefill_cell),
+                LentList::of(&decodes, &decode_cell),
+                &classes,
+                &Open,
+            );
             let request = PlaceRequest::of(MODEL, WorkerLists::Pair(lists));
             let serve = || {
                 let placement = engine.place(&request).expect("a pair of the lists");

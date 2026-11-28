@@ -16,11 +16,6 @@
 //!
 //! [`Affinity::set_indexes`]: super::overlap::Affinity::set_indexes
 
-#![expect(
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
-
 use std::{future::Future, sync::Arc};
 
 use smg_worker::load::state::LoadReceiver;
@@ -31,9 +26,10 @@ use crate::document::spec::AppliedSpec;
 /// Where a program keeps its workers' data: what it hands the engine once,
 /// at the engine's start ([`InProcess::start`]).
 ///
-/// The engine reads each in place. A program names every field: a load
-/// channel or indexes it does not have are `None`, where a reader of its
-/// start sees it.
+/// The engine reads each in place. A program's start names every one
+/// ([`Self::of`]): a load channel or indexes it does not have are `None`,
+/// where a reader of its start sees it.
+#[non_exhaustive]
 pub struct WorkerData {
     /// The program's worker registry. The engine's task follows its events
     /// and tells the document's stages a worker that joined or was removed,
@@ -54,6 +50,26 @@ pub struct WorkerData {
     /// none of them: every worker reads as publishing no cache events, and
     /// no request is decided inside a tree of the program's.
     pub cache_indexes: Option<Arc<dyn CacheIndexes>>,
+}
+
+impl WorkerData {
+    /// A program's registry, its load channel and its indexes of cache events.
+    /// It takes all three: a program names every one, and one it does not have
+    /// is `None` where a reader of its start sees it. It checks nothing. Code
+    /// outside this crate starts here: the record gains fields, so no literal
+    /// of it builds there.
+    #[must_use]
+    pub fn of(
+        registry: Arc<dyn Members>,
+        loads: Option<LoadReceiver>,
+        cache_indexes: Option<Arc<dyn CacheIndexes>>,
+    ) -> Self {
+        Self {
+            registry,
+            loads,
+            cache_indexes,
+        }
+    }
 }
 
 impl InProcess {

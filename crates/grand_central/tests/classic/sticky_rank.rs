@@ -19,8 +19,8 @@ use serde::Deserialize;
 use smg_grand_central::{
     document::{AppliedSpec, PolicySpec},
     engine::{
-        Constraints, Decision, DecisionEngine, Identity, InProcess, LentList, ListCell, Request,
-        RequestFacts, RequestMaker, WorkerLists,
+        Decision, DecisionEngine, Identity, InProcess, LentList, ListCell, Request, RequestFacts,
+        RequestMaker, WorkerLists,
     },
     store::GatewayId,
 };
@@ -169,22 +169,14 @@ impl Bed {
     fn pick(&mut self, key: Option<&str>) -> Result<u16, String> {
         self.seed += 1;
         let asked = Asked {
-            request: Request {
-                id: b"request",
-                facts: {
-                    let mut facts = RequestFacts::default();
-                    facts.model = MODEL;
-                    facts.session_key = key.map_or(Identity::NONE, Identity::plain);
-                    facts.seed = self.seed;
-                    facts
-                },
-                constraints: Constraints::default(),
-            },
-            lent: LentList {
-                workers: &self.list,
-                cell: &self.cell,
-                facts: None,
-            },
+            request: Request::of(b"request", {
+                let mut facts = RequestFacts::default();
+                facts.model = MODEL;
+                facts.session_key = key.map_or(Identity::NONE, Identity::plain);
+                facts.seed = self.seed;
+                facts
+            }),
+            lent: LentList::of(&self.list, &self.cell),
         };
         let decided = self.engine.decide_under(GatewayId::LOCAL, &asked, self.now);
         let decided = decided.map_err(|refused| format!("no decision: {refused:?}"))?;

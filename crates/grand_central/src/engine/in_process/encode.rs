@@ -24,11 +24,6 @@
 //! [`InProcess::decide_encode_at`]: the three lists' decision, with the
 //! pair's lease a pick is issued. No lease is issued for an encoder.
 
-#![expect(
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
-
 use std::{cell::OnceCell, sync::Arc, time::Instant};
 
 use smg_worker::load::state::LoadSnapshot;
@@ -76,6 +71,7 @@ pub(super) fn splits(items: &EncodeItems<'_>, demands: Demands) -> bool {
 /// applies no rule of a runtime's own: a host that holds only some of its
 /// decodes to a label says of the others that they take images.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct EncodeLists<'a> {
     /// The pair's two lists, with their pair classes and the host's reads
     /// of its admission.
@@ -108,6 +104,34 @@ pub struct EncodeLists<'a> {
     /// place in the prefill list
     /// ([`EncodeClasses::prefill_class`](crate::engine::EncodeClasses::prefill_class)).
     pub prefill_classes: &'a [u32],
+}
+
+impl<'a> EncodeLists<'a> {
+    /// An encode request's pair, its encoders, what the encode side reads of
+    /// each encoder and the class each prefill names, with every place of the
+    /// encoder list open and none masked. It takes the two tables: one entry a
+    /// worker has no neutral value. A host that holds the request to some
+    /// encoders or masks one assigns it. It checks nothing. Code outside this
+    /// crate starts here: the record gains fields, so no literal of it builds
+    /// there.
+    #[inline]
+    #[must_use]
+    pub const fn of(
+        pair: PairLists<'a>,
+        encoders: LentList<'a>,
+        facts: &'a [EncoderFacts],
+        prefill_classes: &'a [u32],
+    ) -> Self {
+        Self {
+            pair,
+            encoders,
+            encoders_places: None,
+            encoders_stalled: &[],
+            encoders_held: &[],
+            facts,
+            prefill_classes,
+        }
+    }
 }
 
 impl EncodeLists<'_> {
