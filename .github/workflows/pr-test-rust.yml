@@ -1931,7 +1931,7 @@ jobs:
           # and the log upload about 4. At 40 the job budget cancelled a long
           # test step minutes before the step's own timeout would have failed
           # it, and the leg ended "cancelled" with its cases passing instead
-          # of failing in the step that ran long (smg-project/smg-lab#170).
+          # of failing in the step that ran long.
           - engine: vllm
             timeout: 50
             min_selected: 15 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
@@ -2663,7 +2663,7 @@ jobs:
       - name: Check CI result
         run: |
           # A job that runs into its timeout-minutes ends "cancelled", not
-          # "failure", and fails this gate the same way (smg-project/smg-lab#171).
+          # "failure", and fails this gate the same way.
           # A run cancelled as a whole ends with this gate failed too: it did
           # not pass, and finish stays a verdict on every head.
           bad='^(failure|cancelled)$'
@@ -2671,7 +2671,7 @@ jobs:
           # Rust lint and test jobs and the benchmarks skip on every event, and
           # every e2e lane skips on a pull request (on a push the e2e lanes, the
           # EPD lane included, run on its empty outputs); a skipped job passes this
-          # check, so its own result gates here (smg-project/smg-lab#172).
+          # check, so its own result gates here.
           if [[ "${{ needs.detect-changes.result }}" =~ $bad || \
                 "${{ needs.pre-commit.result }}" =~ $bad || \
                 "${{ needs.python-lint.result }}" =~ $bad || \

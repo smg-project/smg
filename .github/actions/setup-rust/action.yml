@@ -41,7 +41,7 @@ runs:
         workspaces: .
         shared-key: ${{ inputs.cache-key }}
         cache-all-crates: true
-        # Only a job that completed, on main, saves (smg-project/smg-lab#157):
+        # Only a job that completed, on main, saves:
         # - cache-on-failure would widen the post step to failed AND cancelled
         #   jobs, and a push to main cancels the run before it; the partial
         #   target directory of a cancelled job was then saved under the exact
