@@ -22,17 +22,17 @@ use crate::{
     document::spec::{AppliedSpec, BindingSpec, Match, PolicySpec},
     engine::{
         decision::{Decision, Target, Targets},
-        decision_engine::{DecisionEngine, DecisionRefused, Request, RequestMaker, WorkerLists},
+        decision_engine::{Decides, DecisionEngine, DecisionRefused, Request, RequestMaker},
         framework::{EncodeItems, EncodePlaced, Issuing, Picker, Scorer, TieBand},
         in_process::{
+            lists::PublishedList,
             membership::tests::{handed, id, registry, remove},
             single::tests::{
                 decided, hearing_spec_at, hearing_stages, pool, request, Asks, Heard, MODEL,
             },
             task::tests::stock,
-            InProcess,
+            InProcess, LendsLists, WorkerLists,
         },
-        list_cell::PublishedList,
         prompt_hashes::HashSeeds,
         shadow::{ShadowCounts, Shadowed},
         view::{Candidate, RequestFacts, WorkerId},
@@ -64,7 +64,7 @@ impl InProcess {
     /// case of an engine by itself: no world hands it a document.
     pub(crate) fn decide_without_lease(
         &self,
-        maker: &impl RequestMaker,
+        maker: &impl LendsLists,
         now: Instant,
     ) -> Result<(Decision, Option<Shadowed>), DecisionRefused> {
         let document = self.in_force();
@@ -76,7 +76,7 @@ impl InProcess {
     /// of the pair's lease.
     pub(crate) fn decide_decode_without_lease(
         &self,
-        maker: &impl RequestMaker,
+        maker: &impl LendsLists,
         held: &Target,
         now: Instant,
     ) -> Result<Decision, DecisionRefused> {
@@ -89,7 +89,7 @@ impl InProcess {
     /// force, for a case of an engine by itself.
     pub(crate) fn decide_encode_without_lease(
         &self,
-        maker: &impl RequestMaker,
+        maker: &impl LendsLists,
         items: EncodeItems<'_>,
         placed: &mut EncodePlaced,
         now: Instant,
@@ -446,7 +446,9 @@ impl RequestMaker for AppliesInside<'_> {
         }
         self.asks.make(spec)
     }
+}
 
+impl LendsLists for AppliesInside<'_> {
     fn workers(&self) -> WorkerLists<'_> {
         self.asks.workers()
     }

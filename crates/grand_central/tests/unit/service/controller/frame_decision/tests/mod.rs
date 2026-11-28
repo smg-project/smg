@@ -33,9 +33,10 @@ use crate::{
     document::spec::{AppliedSpec, Assignment, PolicySpec, SessionsSpec},
     engine::{
         decision::{Decision, ShedReason, Target, Targets, SUBSET_HINT, WIRES},
-        decision_engine::{Request, RequestMaker, WorkerLists},
+        decision_engine::{Request, RequestMaker},
         decision_slot::DecisionSlot,
         framework::{DecisionScope, Filter, Picker, TieBand},
+        in_process::WorkerLists,
         sticky_sessions::SessionVerdict,
         view::{
             AffinityFacts, AffinityHolder, AffinityRows, Candidate, Constraints, Phase, PoolFacts,

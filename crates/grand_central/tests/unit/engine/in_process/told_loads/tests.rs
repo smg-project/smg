@@ -34,6 +34,7 @@ use crate::{
         decision::Targets,
         framework::{Picker, Scorer, TieBand},
         in_process::{
+            lists::{LentList, ModelLists, PublishedList},
             membership::{
                 tests::{fills::Program, handed},
                 Members,
@@ -41,7 +42,6 @@ use crate::{
             task::tests::{asks, monitor, running, settle, stock},
             InProcess,
         },
-        list_cell::{LentList, ModelLists, PublishedList},
         records::{worker_id, Live},
         view::{Candidate, FixedFacts, LoadRow, RequestFacts, WorkerId},
     },

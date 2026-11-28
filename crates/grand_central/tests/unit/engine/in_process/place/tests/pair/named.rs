@@ -943,7 +943,7 @@ fn a_pair_that_names_its_worker_goes_to_that_worker_under_each_part_of_the_deman
 /// lent list, so the case answers as no line of it.
 #[test]
 fn a_prefill_list_lent_wrong_is_refused_at_the_count_under_a_demand_the_decodes_alone_hold() {
-    use crate::engine::list_cell::ListCell;
+    use crate::engine::in_process::lists::ListCell;
 
     let engine = rings();
     let lists = Lists::of(1, 1);

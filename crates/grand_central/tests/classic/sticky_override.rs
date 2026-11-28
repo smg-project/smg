@@ -719,8 +719,9 @@ mod sends {
     use smg_grand_central::{
         document::{AppliedSpec, Assignment},
         engine::{
-            DecisionEngine, HashSeeds, Identity, InProcess, LentList, ListCell, PlacedBy,
-            PromptHashes, Request, RequestFacts, RequestMaker, SessionVerdict, WorkerLists,
+            DecisionEngine, HashSeeds, Identity, InProcess, LendsLists, LentList, ListCell,
+            PlacedBy, PromptHashes, Request, RequestFacts, RequestMaker, SessionVerdict,
+            WorkerLists,
         },
         store::GatewayId,
         tracking::{self, DecisionGuard, TransportClass},
@@ -769,12 +770,14 @@ mod sends {
             self.request
         }
 
-        fn workers(&self) -> WorkerLists<'_> {
-            WorkerLists::Single(self.members)
-        }
-
         fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
             Some(self.loads)
+        }
+    }
+
+    impl LendsLists for Asks<'_> {
+        fn workers(&self) -> WorkerLists<'_> {
+            WorkerLists::Single(self.members)
         }
     }
 

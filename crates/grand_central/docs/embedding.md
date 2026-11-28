@@ -16,13 +16,13 @@ A host decides at one of two levels: the engine alone, or the engine with bookin
 **With booking.**
 
 - A host that needs booking makes an `InProcess` from an `AppliedSpec`. That type needs the `in-process` Cargo feature.
-- The host asks `InProcess` for each decision, itself or through a `DecisionGuard`. It lends its worker lists with each request.
+- The host asks `InProcess` for each decision, itself or through a `DecisionGuard`. It lends its worker lists with each request. A maker of the host's own lends them by `engine::LendsLists`, beside `engine::RequestMaker`.
 - `InProcess` runs on the caller's thread.
 - A pick's lease books the pick's first target.
 - A single request's pick may come with no lease. The engine issues one where something under the spec in force would hear the lease's words.
 - The host takes a target, then reports its dispatch, and its completion or its release.
 - Of a pick with no lease the host owes the engine no word. It reads the target from the decision (`DecisionGuard::decision`), since `DecisionGuard::take` answers `None` for such a pick.
-- A host that hands a single list asks the engine itself, with `DecisionEngine::decide_under`. A place alone can answer it (`Decided::Alone`): the host sends to that worker and owes the engine no word.
+- A host that hands a single list asks the engine itself, with `Decides::decide_under`. A place alone can answer it (`Decided::Alone`): the host sends to that worker and owes the engine no word.
 - A whole answer (`Decided::Whole`) is held with `DecisionGuard::holding`. A guard has nothing to hold of a place: `DecisionGuard::decide_under` answers one as `DecisionRefused::Faulted`.
 
 **The upkeep.**
@@ -387,7 +387,7 @@ These calls belong to a host's own code, not to a spec.
 - The host resolves a key and supplies it as `RequestFacts::session_key`, or as `facts.session_key` on the wire.
 - The header fields say what the host reads. Sending the header in a `DecideRequest` alone creates no key.
 - A host reads a binding's sources with `AppliedSpec::key_sources_for` and derives a request's key with `KeySources::derive`.
-- A host in process does both inside `InProcess`: through `InProcess::place`, or with its own `engine::RequestMaker` through `InProcess::decide_under` or `DecisionGuard::decide_under`.
+- A host in process does both inside `InProcess`: through `InProcess::place`, or with its own `engine::RequestMaker` through `InProcess::decide_under` or `DecisionGuard::decide_under`. That maker lends the host's lists by `engine::LendsLists`.
 - `InProcess` hands `RequestMaker::make` the applied spec of the world the decision is made under. So the key's sources and the rule that pins the key are of one generation, whatever is applied meanwhile.
 - A host derives the client's key with `KeySources::derive_client` and states it as `RequestFacts::client_key`.
 - The wire's request facts carry it to a standalone controller as `client_key`. So a controller at an address places a request with no session key on the plain ring by its client's key, as the host's own process does.

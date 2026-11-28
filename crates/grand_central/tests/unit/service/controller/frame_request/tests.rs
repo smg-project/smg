@@ -18,9 +18,8 @@ use crate::{
     document::spec::{AppliedSpec, PolicySpec},
     engine::{
         decision::{Decision, ShedReason, MAX_TARGETS, SUBSET_HINT},
-        decision_engine::{Decided, Plain, Request, RequestMaker, WorkerLists},
-        in_process::InProcess,
-        list_cell::PublishedList,
+        decision_engine::{Decided, Plain, Request, RequestMaker},
+        in_process::{lists::PublishedList, InProcess, LendsLists, WorkerLists},
         pair_classes::PartnerClasses,
         view::{
             fingerprint, Constraints, FixedFacts, HashKind, Header, Identity, MediaCounts,
@@ -136,7 +135,9 @@ impl RequestMaker for Stated<'_> {
     fn make<'w>(&'w self, _: &'w AppliedSpec) -> Request<'w> {
         self.request
     }
+}
 
+impl LendsLists for Stated<'_> {
     fn workers(&self) -> WorkerLists<'_> {
         WorkerLists::Single(self.members.lent())
     }
@@ -161,14 +162,16 @@ impl RequestMaker for SaysPlain<'_> {
             prompt_tokens: 0,
         })
     }
+}
 
+impl LendsLists for SaysPlain<'_> {
     fn workers(&self) -> WorkerLists<'_> {
         self.0.workers()
     }
 }
 
 /// The engine's answer to `maker` at `now`.
-fn decided(engine: &InProcess, maker: &impl RequestMaker, now: Instant) -> Decided {
+fn decided(engine: &InProcess, maker: &impl LendsLists, now: Instant) -> Decided {
     engine.decide_at(maker, || now).expect("an answer")
 }
 

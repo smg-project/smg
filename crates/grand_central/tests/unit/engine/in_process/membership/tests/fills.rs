@@ -25,12 +25,12 @@ use super::{handed, id, in_id_order, started, told, url, Follow, MODEL};
 use crate::{
     document::spec::AppliedSpec,
     engine::{
-        decision_engine::{DecisionEngine, DecisionRefused, Request, RequestMaker, WorkerLists},
+        decision_engine::{Decides, DecisionEngine, DecisionRefused, Request, RequestMaker},
         in_process::{
+            lists::{LentList, ListCell, ModelLists},
             single::tests::{hearing, hearing_spec_at, request, Heard},
-            InProcess,
+            InProcess, LendsLists, WorkerLists,
         },
-        list_cell::{LentList, ListCell, ModelLists},
         view::FixedFacts,
     },
     store::GatewayId,
@@ -196,7 +196,9 @@ impl RequestMaker for Lends<'_> {
     fn make<'w>(&'w self, _: &'w AppliedSpec) -> Request<'w> {
         self.0
     }
+}
 
+impl LendsLists for Lends<'_> {
     fn workers(&self) -> WorkerLists<'_> {
         WorkerLists::Single(self.1)
     }

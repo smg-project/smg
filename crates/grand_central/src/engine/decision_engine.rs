@@ -3,8 +3,8 @@
 //!
 //! The engine decides over the worker objects its host lends and holds no
 //! store. A [`DecisionGuard`](crate::tracking::DecisionGuard) holds a
-//! decision of it, and a host's own object asks it, through
-//! [`DecisionEngine`].
+//! decision of it. A host's own object asks it for a decision through
+//! [`Decides`], and tells it of a lease through [`DecisionEngine`].
 //!
 //! **What a guard lends.** A guard lends its engine one view of the
 //! decision it holds, with each word and with a pair's decode call
@@ -200,17 +200,6 @@ pub trait RequestMaker {
         SessionCountedUnder::KeyText
     }
 
-    /// The workers the request may be sent to, where its host holds them:
-    /// the lists the decision's targets name by position
-    /// ([`Target::position`], [`Pair::decode_position`](super::decision::Pair::decode_position)).
-    /// An engine with no store decides over these and refuses a request
-    /// that hands none. An engine that reads its own rows asks for none,
-    /// and a host of such an engine states none.
-    #[cfg(feature = "in-process")]
-    fn workers(&self) -> WorkerLists<'_> {
-        WorkerLists::None
-    }
-
     /// The load reports of the host's workers, as the host holds them for
     /// this decision: its load monitor's snapshot, borrowed once. An engine
     /// that decides over its host's lists reads each worker's report there,
@@ -397,43 +386,6 @@ impl Plain {
     }
 }
 
-/// The workers a request may be sent to, as its host lends them for one
-/// decision: each list with the cell the host keeps beside it
-/// ([`LentList`](super::list_cell::LentList)). The engine asks a cell for
-/// its own value of the list inside the decision, where it decides over
-/// the list, under the document it decides under: a host holds no value of
-/// a list and asks the engine for none. A plain single request that one
-/// pick does not decide lends its list again behind its making, since a
-/// maker may name its list while it makes the request: a cell the pick
-/// asked is not asked again.
-/// A list is the host's own: the host finds a target's worker at the
-/// target's position in the list it lent, with no lookup by id.
-#[cfg(feature = "in-process")]
-#[derive(Clone, Copy, Debug, Default)]
-#[non_exhaustive]
-pub enum WorkerLists<'a> {
-    /// The host hands no list.
-    #[default]
-    None,
-    /// A single request's list, and the one list of a request of another
-    /// phase that stands alone.
-    Single(super::list_cell::LentList<'a>),
-    /// A pair's two lists, its prefills and its decodes, with the pair
-    /// classes of their workers and the host's reads of its admission.
-    Pair(super::in_process::pair::PairLists<'a>),
-    /// An encode request's three lists: its pair's two and its encoders,
-    /// with what the encode side reads of the workers beside their records
-    /// ([`InProcess::decide_encode_at`](super::in_process::InProcess::decide_encode_at)).
-    /// The engine's other entries take no items: through them the three
-    /// are the pair's two, for a request with no item and for a decode
-    /// asked again. Such a decision does not read whether a decode takes
-    /// images, so the encode entry declines a request that states the
-    /// later decode where its decode is held to the ones that take images:
-    /// by its demand, or by the preference of references beside an image
-    /// or a video.
-    Encode(super::in_process::encode::EncodeLists<'a>),
-}
-
 /// The entry of a request's prompt in its host's token tree of sent
 /// prefixes, named by the request's host ([`RequestMaker::token_key`]).
 ///
@@ -531,7 +483,7 @@ impl fmt::Debug for TextKey<'_> {
 
 /// What a guard holds of its decision, lent to its engine for one word
 /// ([`DecisionEngine::say`]) or for a pair's decode call
-/// ([`DecisionEngine::decide_decode_under`]). It is read before the word
+/// ([`Decides::decide_decode_under`]). It is read before the word
 /// moves the guard.
 ///
 /// An engine that keeps no file of its leases tells its stages of a request
@@ -607,7 +559,7 @@ pub struct HeldDecode {
     pub chosen: bool,
 }
 
-/// What the one entry answers its host ([`DecisionEngine::decide_under`]).
+/// What the one entry answers its host ([`Decides::decide_under`]).
 ///
 /// The answer is written where its host reads it and matched at once: it
 /// is not kept, so the two forms differ in size freely. A whole decision in
@@ -707,84 +659,9 @@ impl AlonePick {
     }
 }
 
-/// An engine a host asks for whole decisions and tells of each lease.
+/// An engine a host tells of each lease, and reads the document in force
+/// of. What it decides for stands beside it ([`Decides`]).
 pub trait DecisionEngine {
-    /// One decision for `gateway`'s request at `now`, on the calling
-    /// thread: the binding, its rules, the plan and the profile, for the
-    /// request `maker` makes under the document in force.
-    ///
-    /// The answer is whole ([`Decided::Whole`]) or a place alone
-    /// ([`Decided::Alone`]). A whole pick comes with its lease where a
-    /// stage of the document takes a word on one, issued before the answer
-    /// leaves: the stages that take the issue have heard of the request,
-    /// and its booking stands on the first target. The flag beside it says
-    /// whether the request the maker made stated the later decode
-    /// ([`Constraints::decode_later`](super::view::Constraints::decode_later)).
-    /// A place answers only a maker that hands a single list
-    /// (`RequestMaker::workers`) and says its request plain
-    /// ([`RequestMaker::plain`]).
-    ///
-    /// # Errors
-    ///
-    /// [`DecisionRefused`]: the engine made no decision for the request.
-    fn decide_under(
-        &self,
-        gateway: GatewayId,
-        maker: &impl RequestMaker,
-        now: Instant,
-    ) -> Result<Decided, DecisionRefused>;
-
-    /// [`Self::decide_under`] for a request its host stated ahead.
-    ///
-    /// # Errors
-    ///
-    /// [`DecisionRefused`]: the engine made no decision for the request.
-    fn decide(
-        &self,
-        gateway: GatewayId,
-        request: &Request<'_>,
-        now: Instant,
-    ) -> Result<DecideOutcome, DecisionRefused> {
-        // A request stated ahead hands no list: no place answers it.
-        let decided = self.decide_under(gateway, request, now)?;
-        let (decided, _) = decided.whole().ok_or(DecisionRefused::Faulted)?;
-        Ok(decided)
-    }
-
-    /// A pair's decode, decided again behind its prefill's dispatch: among
-    /// the decodes of the prefill the host holds, as they stand at `now`.
-    /// `held` is the view of the guard that holds the first decision: the
-    /// pair's lease as issued, and the target its host took, which names
-    /// the held prefill. The guard asks only where its prefill is
-    /// dispatched and not ended and its decode stands chosen. A pick
-    /// issues the decode side under the lease's id.
-    ///
-    /// # Errors
-    ///
-    /// [`DecisionRefused`]: the engine made no decision for the call.
-    fn decide_decode_under(
-        &self,
-        gateway: GatewayId,
-        maker: &impl RequestMaker,
-        held: &HeldDecision<'_>,
-        now: Instant,
-    ) -> Result<DecideOutcome, DecisionRefused>;
-
-    /// [`Self::decide_decode_under`] for a request its host stated ahead.
-    ///
-    /// # Errors
-    ///
-    /// [`DecisionRefused`]: the engine made no decision for the call.
-    fn decide_decode(
-        &self,
-        gateway: GatewayId,
-        request: &Request<'_>,
-        held: &HeldDecision<'_>,
-        now: Instant,
-    ) -> Result<DecideOutcome, DecisionRefused> {
-        self.decide_decode_under(gateway, request, held, now)
-    }
-
     /// What the host says of a lease at `now`: a side's dispatch, a side's
     /// end, or a release. `held` is the guard's view of the decision at the
     /// word. The word names its side. Whoever applies the word tells the
@@ -816,6 +693,55 @@ pub trait DecisionEngine {
     /// How many decisions panicked, a shadow's beside a live decision that
     /// stood among them.
     fn faults(&self) -> u64;
+}
+
+/// An engine that decides the requests a maker `M` makes. An engine says
+/// by its implementations which makers it decides for: one that asks more
+/// of a maker than a request names that as the bound of its own
+/// implementation.
+pub trait Decides<M: RequestMaker>: DecisionEngine {
+    /// One decision for `gateway`'s request at `now`, on the calling
+    /// thread: the binding, its rules, the plan and the profile, for the
+    /// request `maker` makes under the document in force.
+    ///
+    /// The answer is whole ([`Decided::Whole`]) or a place alone
+    /// ([`Decided::Alone`]). A whole pick comes with its lease where a
+    /// stage of the document takes a word on one, issued before the answer
+    /// leaves: the stages that take the issue have heard of the request,
+    /// and its booking stands on the first target. The flag beside it says
+    /// whether the request the maker made stated the later decode
+    /// ([`Constraints::decode_later`](super::view::Constraints::decode_later)).
+    /// A place answers only a maker that hands a single list and says its
+    /// request plain ([`RequestMaker::plain`]).
+    ///
+    /// # Errors
+    ///
+    /// [`DecisionRefused`]: the engine made no decision for the request.
+    fn decide_under(
+        &self,
+        gateway: GatewayId,
+        maker: &M,
+        now: Instant,
+    ) -> Result<Decided, DecisionRefused>;
+
+    /// A pair's decode, decided again behind its prefill's dispatch: among
+    /// the decodes of the prefill the host holds, as they stand at `now`.
+    /// `held` is the view of the guard that holds the first decision: the
+    /// pair's lease as issued, and the target its host took, which names
+    /// the held prefill. The guard asks only where its prefill is
+    /// dispatched and not ended and its decode stands chosen. A pick
+    /// issues the decode side under the lease's id.
+    ///
+    /// # Errors
+    ///
+    /// [`DecisionRefused`]: the engine made no decision for the call.
+    fn decide_decode_under(
+        &self,
+        gateway: GatewayId,
+        maker: &M,
+        held: &HeldDecision<'_>,
+        now: Instant,
+    ) -> Result<DecideOutcome, DecisionRefused>;
 }
 
 /// A request and its constraints as the host holds them. A door reads

@@ -676,8 +676,9 @@ mod decided {
     use crate::{
         document::spec::{AppliedSpec, Pairing, PolicySpec},
         engine::{
-            Constraints, DecideOutcome, Decided, Decision, Demands, InProcess, PairLists, Phase,
-            Request, RequestFacts, RequestMaker, Role, ShedReason, WorkerId, WorkerLists,
+            Constraints, DecideOutcome, Decided, Decision, Demands, InProcess, LendsLists,
+            PairLists, Phase, Request, RequestFacts, RequestMaker, Role, ShedReason, WorkerId,
+            WorkerLists,
         },
         store::{Registrant, WorkerFacts, WorkerStatus},
         worker_host::{
@@ -699,7 +700,9 @@ mod decided {
         fn make<'w>(&'w self, _: &'w AppliedSpec) -> Request<'w> {
             self.0
         }
+    }
 
+    impl LendsLists for Asks<'_> {
         fn workers(&self) -> WorkerLists<'_> {
             self.1
         }

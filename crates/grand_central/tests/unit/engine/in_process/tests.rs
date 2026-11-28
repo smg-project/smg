@@ -6,7 +6,7 @@ use smg_worker::{runtime::StallReason, test_support::ready_worker};
 use super::*;
 use crate::{
     document::spec::{Needs, PolicySpec},
-    engine::{framework::InTheWay, list_cell::PublishedList},
+    engine::{framework::InTheWay, in_process::lists::PublishedList},
 };
 
 const MODEL: &str = "model-a";
@@ -686,7 +686,9 @@ fn a_request_is_made_from_the_document_its_decision_is_made_under() {
             self.generation.set(Some(spec.generation()));
             self.asks.make(spec)
         }
+    }
 
+    impl LendsLists for ReadsDocument<'_> {
         fn workers(&self) -> WorkerLists<'_> {
             self.asks.workers()
         }

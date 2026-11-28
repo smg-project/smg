@@ -19,8 +19,8 @@ use serde::Deserialize;
 use smg_grand_central::{
     document::{AppliedSpec, PolicySpec},
     engine::{
-        Decision, DecisionEngine, Identity, InProcess, LentList, ListCell, Request, RequestFacts,
-        RequestMaker, WorkerLists,
+        Decides, Decision, Identity, InProcess, LendsLists, LentList, ListCell, Request,
+        RequestFacts, RequestMaker, WorkerLists,
     },
     store::GatewayId,
 };
@@ -125,7 +125,9 @@ impl RequestMaker for Asked<'_> {
     fn make<'w>(&'w self, _: &'w AppliedSpec) -> Request<'w> {
         self.request
     }
+}
 
+impl LendsLists for Asked<'_> {
     fn workers(&self) -> WorkerLists<'_> {
         WorkerLists::Single(self.lent)
     }

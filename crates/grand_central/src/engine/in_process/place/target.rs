@@ -79,8 +79,7 @@ use crate::{
     document::spec::AppliedSpec,
     engine::{
         decision::{PairSide, ShedReason, TARGET_WORKER},
-        in_process::Loaded,
-        list_cell::LentList,
+        in_process::{lists::LentList, Loaded},
         view::Role,
         PairLists, WorkerLists,
     },

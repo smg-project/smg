@@ -36,10 +36,8 @@ use std::{
 
 use smg_worker::identity::basic::Worker;
 
-use super::{
-    in_process::{InProcess, Loaded, PoolMembers},
-    view::{FixedFacts, WorkerId},
-};
+use super::{InProcess, PoolMembers};
+use crate::engine::view::FixedFacts;
 
 /// The cell beside one worker list: empty when the list is published, and
 /// from the list's first ask on the value each asking engine made of it.
@@ -64,7 +62,7 @@ use super::{
 /// published then stand beside empty cells.
 ///
 /// The engine asks a cell inside the decision or the pick that is lent
-/// its list ([`WorkerLists`](super::decision_engine::WorkerLists),
+/// its list ([`WorkerLists`](super::WorkerLists),
 /// [`InProcess::pick`]), where it decides over the list. The first ask
 /// under a document fills the cell: it reads each worker's registration
 /// and writes the list's records, so its cost grows with the list. Where
@@ -72,9 +70,10 @@ use super::{
 /// engine's own task asks first, off the path of a request, behind the
 /// registry's word of the membership change. Else, and for a request that
 /// comes ahead of the task, the request that asks first pays the fill.
-/// Every later ask is one read and one compare of the document's number,
-/// and one more of both for each value made before the asker's. A program
-/// asks the engine for no value of a list.
+/// Every later ask is one read and one compare of the document's number
+/// where its value is the cell's first. For a value made behind that one
+/// the ask walks from the cell again, at one more of both for each value
+/// up to its own. A program asks the engine for no value of a list.
 ///
 /// The cell is two words in the program's value, filled or empty. Each
 /// value stands in an allocation of its own: it is aligned to cache lines
@@ -114,6 +113,54 @@ impl Drop for ListCell {
     }
 }
 
+impl ListCell {
+    /// The value the cell took first, where that value was made under the
+    /// document `number`: one read of the cell and one compare, in the
+    /// caller's own code.
+    #[inline]
+    pub(super) fn first_under(&self, number: u64) -> Option<&PoolMembers> {
+        match self.0.get() {
+            Some(made) if made.under == number => Some(&made.members),
+            _ => None,
+        }
+    }
+
+    /// The value under the document `number`, found along the cell's chain,
+    /// or made by `make` into the chain's first empty cell. Several may
+    /// come here at once for one empty cell: one of them makes the value
+    /// and the others wait for it. `workers` is the list the cell is lent
+    /// with: a build with debug assertions holds each value the walk
+    /// passes to it.
+    pub(super) fn found_or_made<'a>(
+        &'a self,
+        number: u64,
+        workers: &Arc<[Arc<dyn Worker>]>,
+        make: impl Fn() -> PoolMembers,
+    ) -> &'a PoolMembers {
+        let mut cell = self;
+        loop {
+            let made = cell.0.get_or_init(|| {
+                Box::new(Made {
+                    under: number,
+                    members: make(),
+                    next: Self::default(),
+                })
+            });
+            if made.under == number {
+                return &made.members;
+            }
+            // A value made under another document is of the same list:
+            // asked of each one the walk passes, so a cell lent with
+            // another list is refused whichever engine asks it.
+            debug_assert!(
+                Arc::ptr_eq(made.members.workers(), workers),
+                "a cell is lent with the list it stands beside"
+            );
+            cell = &made.next;
+        }
+    }
+}
+
 /// One value of a list in its cell: the engine's value, the number of the
 /// applied document it was made under, and the cell of the value made
 /// behind it under another number.
@@ -121,46 +168,6 @@ struct Made {
     under: u64,
     members: PoolMembers,
     next: ListCell,
-}
-
-impl Made {
-    /// The value of a lent list, made by `engine` under the document whose
-    /// number is `under`.
-    fn of(engine: Loaded<'_, '_>, lent: LentList<'_>, under: u64) -> Self {
-        assert!(
-            lent.facts
-                .is_none_or(|facts| facts.len() == lent.workers.len()),
-            "a list is lent with one fact a worker, or with none"
-        );
-        // The ids a program states are one id space: asked of this list,
-        // once a fill, in a build with debug assertions. A release build
-        // writes the records of what the program stated.
-        debug_assert!(
-            lent.facts.is_none_or(ids_stand),
-            "a list's facts state an id for every worker or for none, and no id twice"
-        );
-        // The entry asks once a worker, in the list's order.
-        let mut stated = lent.facts.unwrap_or_default().iter();
-        let facts_of = |_: &Arc<dyn Worker>| stated.next().copied().unwrap_or_default();
-        Self {
-            under,
-            members: engine.pool_members_with_fixed_facts(lent.workers, facts_of),
-            next: ListCell::default(),
-        }
-    }
-}
-
-/// Whether the ids that one list's facts state stand: one for every worker
-/// of the list or for none, and no id twice. A zero states none.
-/// [`FixedFacts::id`] asks the first of all a program's lists. A fill sees
-/// one list, so a program that states ids on some of its lists passes it.
-fn ids_stand(facts: &[FixedFacts]) -> bool {
-    let stated = |fact: &FixedFacts| fact.id.filter(|id| *id != WorkerId(0));
-    let mut ids: Vec<WorkerId> = facts.iter().filter_map(stated).collect();
-    let count = ids.len();
-    ids.sort_unstable();
-    ids.dedup();
-    ids.len() == count && (count == 0 || count == facts.len())
 }
 
 /// A worker list lent with its cell and its facts: a shared list the
@@ -433,114 +440,7 @@ impl InProcess {
     }
 }
 
-impl Loaded<'_, '_> {
-    /// The engine's value of a lent list under the document it decides
-    /// under: read from the list's cell, and made into the cell first where
-    /// the cell holds none under that document.
-    ///
-    /// A value the cell took first costs one read and one compare of the
-    /// document's number, in the caller's own code. One made behind it is
-    /// found out of line, at one more of both for each value before it.
-    /// Where the cell holds none under that document, the value is
-    /// made here, as [`Self::pool_members_with_fixed_facts`] makes it, of
-    /// the facts lent with the list, each worker's at its place, and of the
-    /// default where the list is lent with none. The fill reads the lent
-    /// list and its facts and asks the program nothing. Where several ask
-    /// at once for a value the cell does not hold, one of them makes it and
-    /// the others wait for it and read the same one.
-    ///
-    /// A value made under another document stays in the cell beside the new
-    /// one, where it stood: a cell asked under a second document, or by a
-    /// second engine, holds a value for each.
-    ///
-    /// The fill reads each worker's registration and writes the list's
-    /// records, so its cost grows with the list, once for each document the
-    /// list is asked under. The engine's own task pays it ahead of the
-    /// list's requests where the program handed its lists
-    /// ([`InProcess::set_lists`]). Else the request that asks first
-    /// pays it.
-    ///
-    /// # Panics
-    ///
-    /// Facts of another count than the list's workers are an error of the
-    /// program, refused in every build where the value is made: the ask
-    /// panics and the cell takes no value, so each later ask of the list
-    /// lent so is refused again, and the list lent right is filled. A
-    /// decision's entry catches the panic and answers a fault, and the
-    /// engine's task holds it and counts it
-    /// ([`InProcess::upkeep_faults`]). The check stands in the fill and
-    /// costs a read nothing: a cell that holds the value is read with no
-    /// look at the facts.
-    #[inline]
-    pub(crate) fn members_of<'a>(self, lent: LentList<'a>) -> &'a PoolMembers {
-        let number = self.document.applied;
-        let members = match lent.cell.0.get() {
-            // The value the cell took first is read here, in the caller.
-            Some(made) if made.under == number => &made.members,
-            // One made behind it is found out of line, and one the cell
-            // does not hold is made there.
-            _ => self.found_or_made(lent.workers, lent.cell, lent.facts, number),
-        };
-        debug_assert!(
-            Arc::ptr_eq(members.workers(), lent.workers),
-            "a cell is lent with the list it stands beside"
-        );
-        members
-    }
-
-    /// [`Self::members_of`] out of line: the value of a lent list under
-    /// the document `number`, found along the cell's chain, or made where
-    /// the chain holds none. Several may come here at once for one empty
-    /// cell: one of them makes the value and the others wait for it. It
-    /// takes the lent list's three parts: its caller writes no copy of the
-    /// list for a call it does not make.
-    #[cold]
-    #[inline(never)]
-    fn found_or_made<'a>(
-        self,
-        workers: &'a Arc<[Arc<dyn Worker>]>,
-        mut cell: &'a ListCell,
-        facts: Option<&'a [FixedFacts]>,
-        number: u64,
-    ) -> &'a PoolMembers {
-        let lent = LentList {
-            workers,
-            cell,
-            facts,
-        };
-        loop {
-            let made = cell
-                .0
-                .get_or_init(|| Box::new(Made::of(self, lent, number)));
-            if made.under == number {
-                return &made.members;
-            }
-            // A value made under another document is of the same list:
-            // asked of each one the walk passes, so a cell lent with
-            // another list is refused whichever engine asks it.
-            debug_assert!(
-                Arc::ptr_eq(made.members.workers(), workers),
-                "a cell is lent with the list it stands beside"
-            );
-            cell = &made.next;
-        }
-    }
-}
-
 impl InProcess {
-    /// [`Loaded::members_of`] under the document in force at the call: for
-    /// a caller that asks a list's value outside a decision of the engine,
-    /// as the engine's own task does ahead of a list's requests. Such a
-    /// caller reads one document here and at the decision it asks beside
-    /// this call only where no document is put in force between the two. A
-    /// controller's deciding thread asks the value under its world's
-    /// document, which its decision runs under ([`Loaded::members_of`]).
-    #[inline]
-    pub(crate) fn members_of<'a>(&self, lent: LentList<'a>) -> &'a PoolMembers {
-        let document = self.in_force();
-        self.under(&document).members_of(lent)
-    }
-
     /// The bench's count: how many times the reports of `lent`'s list were
     /// converted under the document in force so far. It makes no value: a
     /// list the engine made no value of counts zero.
@@ -559,5 +459,5 @@ impl InProcess {
 }
 
 #[cfg(test)]
-#[path = "../../tests/unit/engine/list_cell/tests.rs"]
+#[path = "../../../tests/unit/engine/in_process/lists/tests.rs"]
 pub(crate) mod tests;

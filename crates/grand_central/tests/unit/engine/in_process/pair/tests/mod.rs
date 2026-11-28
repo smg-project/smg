@@ -14,10 +14,10 @@ use crate::{
     document::spec::{AppliedSpec, Assignment, PolicySpec, Recovery, RulePlaced},
     engine::{
         decision::{Pair, Pick, PlacedBy, Target, Targets},
-        decision_engine::{DecisionEngine, HeldDecode, RequestMaker, WorkerLists},
+        decision_engine::{Decides, DecisionEngine, HeldDecode, RequestMaker},
         demands::DemandFacts,
         framework::{Filter, Picker, TieBand},
-        list_cell::PublishedList,
+        in_process::{lists::PublishedList, LendsLists, WorkerLists},
         prompt_hashes::{HashSeeds, PromptHashes},
         records::worker_id,
         sticky_sessions::{Claim, DecodeVerdict, SessionRule, SessionVerdict},
@@ -353,12 +353,14 @@ impl RequestMaker for Asks<'_> {
         self.0
     }
 
-    fn workers(&self) -> WorkerLists<'_> {
-        WorkerLists::Pair(self.1)
-    }
-
     fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
         self.2.as_ref()
+    }
+}
+
+impl LendsLists for Asks<'_> {
+    fn workers(&self) -> WorkerLists<'_> {
+        WorkerLists::Pair(self.1)
     }
 }
 
@@ -798,7 +800,7 @@ fn issue(
 }
 
 /// The whole decision the leasing entry answers a host's request.
-fn leased(host: &Host, maker: &impl RequestMaker, now: Instant) -> DecideOutcome {
+fn leased(host: &Host, maker: &impl LendsLists, now: Instant) -> DecideOutcome {
     let decided = host.engine.decide_under(GatewayId::LOCAL, maker, now);
     decided.expect("an answer").whole().expect("no place").0
 }

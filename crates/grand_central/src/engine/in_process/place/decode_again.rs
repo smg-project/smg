@@ -20,8 +20,8 @@ use smg_worker::identity::basic::Worker;
 use super::{picked, sendable, Made, PlaceRequest, Unplaced};
 use crate::{
     engine::{
-        decision_engine::{DecisionRefused, DecodeRefused, WorkerLists},
-        in_process::{encode::EncodeLists, InProcess},
+        decision_engine::{DecisionRefused, DecodeRefused},
+        in_process::{encode::EncodeLists, InProcess, WorkerLists},
         records::worker_id,
     },
     tracking::DecisionGuard,

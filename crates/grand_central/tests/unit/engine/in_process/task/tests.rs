@@ -26,13 +26,13 @@ use tokio::{
 use crate::{
     document::spec::{AppliedSpec, PolicySpec},
     engine::{
-        decision_engine::{DecisionEngine, Request, RequestMaker, WorkerLists},
+        decision_engine::{Decides, DecisionEngine, Request, RequestMaker},
         in_process::{
+            lists::PublishedList,
             membership::tests::{handed, id, in_id_order, registry, told},
             single::tests::hearing,
-            InProcess,
+            InProcess, LendsLists, WorkerLists,
         },
-        list_cell::PublishedList,
         view::{Constraints, Identity, RequestFacts, WorkerId},
         PlaceRequest,
     },
@@ -112,12 +112,14 @@ impl RequestMaker for Asks<'_> {
         self.request
     }
 
-    fn workers(&self) -> WorkerLists<'_> {
-        WorkerLists::Single(self.members.lent())
-    }
-
     fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
         self.loads.as_ref()
+    }
+}
+
+impl LendsLists for Asks<'_> {
+    fn workers(&self) -> WorkerLists<'_> {
+        WorkerLists::Single(self.members.lent())
     }
 }
 

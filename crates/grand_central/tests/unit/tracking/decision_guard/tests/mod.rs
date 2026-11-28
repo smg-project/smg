@@ -14,10 +14,9 @@ use crate::{
     document::spec::{AppliedSpec, PolicySpec},
     engine::{
         decision::{Decision, Target, Targets},
-        decision_engine::{Request, RequestMaker, WorkerLists},
+        decision_engine::{Request, RequestMaker},
         framework::{Picker, TieBand},
-        in_process::InProcess,
-        list_cell::PublishedList,
+        in_process::{lists::PublishedList, InProcess, LendsLists, WorkerLists},
         view::{Candidate, Constraints, RequestFacts, WorkerId},
     },
     policies::random::Random,
@@ -161,7 +160,9 @@ impl RequestMaker for Listed<'_> {
     fn make<'w>(&'w self, _: &'w AppliedSpec) -> Request<'w> {
         self.0
     }
+}
 
+impl LendsLists for Listed<'_> {
     fn workers(&self) -> WorkerLists<'_> {
         self.1
             .map_or(WorkerLists::None, |list| WorkerLists::Single(list.lent()))

@@ -1036,7 +1036,7 @@ fn a_stage_that_panics_at_a_pairs_prefill_issue_leaves_the_decode_side_untold() 
 /// first decision left it. The decode side is then sent and ends, or is
 /// `released` with no dispatch. The guard is dropped with its prefill
 /// sent, so that side ends as cancelled.
-fn sizes_by_side<D: DecisionEngine, M: RequestMaker>(
+fn sizes_by_side<D: Decides<M>, M: RequestMaker>(
     door: &D,
     gateway: GatewayId,
     first: &M,

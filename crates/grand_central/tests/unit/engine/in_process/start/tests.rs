@@ -15,6 +15,7 @@ use crate::{
     engine::{
         decision_engine::DecisionEngine,
         in_process::{
+            lists::{ModelLists, PublishedList},
             membership::tests::{
                 fills::{answered, Program},
                 handed, id, in_id_order, register, registry, remove, told, Registry,
@@ -24,7 +25,6 @@ use crate::{
             task::tests::{asks, monitor, picked, reports, settle, spawned, url, MODEL},
             InProcess,
         },
-        list_cell::{ModelLists, PublishedList},
         prompt_hashes::{HashSeeds, PromptHashes},
         view::{HashKind, RequestFacts, TEXT_BYTES_PER_TOKEN},
         WorkerData,

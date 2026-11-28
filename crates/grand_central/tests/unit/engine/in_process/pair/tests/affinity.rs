@@ -287,12 +287,14 @@ impl RequestMaker for ByNumber<'_> {
         self.0.make(spec)
     }
 
-    fn workers(&self) -> WorkerLists<'_> {
-        self.0.workers()
-    }
-
     fn session_counted_under(&self) -> SessionCountedUnder {
         SessionCountedUnder::SessionNumber
+    }
+}
+
+impl LendsLists for ByNumber<'_> {
+    fn workers(&self) -> WorkerLists<'_> {
+        self.0.workers()
     }
 }
 
@@ -358,7 +360,7 @@ fn a_pairs_sides_read_their_keys_count_under_the_name_the_maker_states() {
     /// the key's next pair is decided: each side's verdict.
     fn next(
         host: &Host,
-        maker: &impl RequestMaker,
+        maker: &impl LendsLists,
         names: [&str; 2],
     ) -> (SessionVerdict, DecodeVerdict) {
         let now = Instant::now();
@@ -548,13 +550,15 @@ fn a_pairs_decision_asks_where_a_key_is_counted_under_a_capped_rule_alone() {
             self.0.make(spec)
         }
 
-        fn workers(&self) -> WorkerLists<'_> {
-            self.0.workers()
-        }
-
         fn session_counted_under(&self) -> SessionCountedUnder {
             self.1.set(self.1.get() + 1);
             SessionCountedUnder::KeyText
+        }
+    }
+
+    impl LendsLists for Asked<'_> {
+        fn workers(&self) -> WorkerLists<'_> {
+            self.0.workers()
         }
     }
 

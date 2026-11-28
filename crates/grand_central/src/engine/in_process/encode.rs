@@ -37,14 +37,17 @@ use super::{
     pair::{
         issued, listed, not_decided, said_apart, stamp, tried_engines, Buffers, PairLists, BUFFERS,
     },
-    signals, single, InProcess, Loaded, PoolMembers,
+    signals, single, InProcess, LendsLists, Loaded, PoolMembers, WorkerLists,
 };
+// The maker's trait is named only by doc links of this module.
+#[cfg(doc)]
+use crate::engine::decision_engine::RequestMaker;
 use crate::engine::{
     decision::{shed, Decision, PairSide, ShedReason, Target, DECODE_LATER, WIRES},
-    decision_engine::{DecideOutcome, DecisionRefused, Request, RequestMaker, WorkerLists},
+    decision_engine::{DecideOutcome, DecisionRefused, Request},
     demands::{Demands, UnmetDemand},
     framework::{EncodeItems, EncodePlaced, EncodePool, EncoderFacts, PairPools},
-    list_cell::LentList,
+    in_process::lists::LentList,
     records::{HeldCells, Live, PoolRecords},
     view::{AffinityFacts, Constraints, Phase, RequestFacts, Session, SessionCountedUnder},
 };
@@ -663,7 +666,7 @@ impl InProcess {
     /// panicked. `placed` is left empty where no decision is made.
     pub fn decide_encode_at(
         &self,
-        maker: &impl RequestMaker,
+        maker: &impl LendsLists,
         items: EncodeItems<'_>,
         placed: &mut EncodePlaced,
         clock: impl FnOnce() -> Instant,
@@ -699,7 +702,7 @@ impl Loaded<'_, '_> {
     )]
     pub(crate) fn decide_encode_without_lease(
         self,
-        maker: &impl RequestMaker,
+        maker: &impl LendsLists,
         items: EncodeItems<'_>,
         placed: &mut EncodePlaced,
         now: Instant,
@@ -719,7 +722,7 @@ impl Loaded<'_, '_> {
     /// decision, as the call that places a request does.
     pub(super) fn decide_encode_at(
         self,
-        maker: &impl RequestMaker,
+        maker: &impl LendsLists,
         items: EncodeItems<'_>,
         placed: &mut EncodePlaced,
         clock: impl FnOnce() -> Instant,
@@ -752,7 +755,7 @@ impl Loaded<'_, '_> {
     /// its own. `placed` is left empty where no decision is made.
     fn over_three<R>(
         self,
-        maker: &impl RequestMaker,
+        maker: &impl LendsLists,
         placed: &mut EncodePlaced,
         decide: impl FnOnce(
             &EncodeLists<'_>,

@@ -213,7 +213,10 @@ fn retry_demanding(
 
     use crate::{
         document::spec::AppliedSpec,
-        engine::{Constraints, Decided, Demands, Request, RequestFacts, RequestMaker, WorkerLists},
+        engine::{
+            Constraints, Decided, Demands, LendsLists, Request, RequestFacts, RequestMaker,
+            WorkerLists,
+        },
     };
 
     /// A request stated ahead, with the list its host hands for it.
@@ -227,7 +230,9 @@ fn retry_demanding(
         fn make<'w>(&'w self, _: &'w AppliedSpec) -> Request<'w> {
             self.0
         }
+    }
 
+    impl LendsLists for Asks<'_> {
         fn workers(&self) -> WorkerLists<'_> {
             self.1
         }

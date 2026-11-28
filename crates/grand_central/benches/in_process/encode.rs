@@ -57,8 +57,8 @@ use smg_grand_central::{
     document::{AppliedSpec, PolicySpec},
     engine::{
         EncodeItems, EncodeLists, EncodePlaced, EncoderFacts, FixedFacts, Identity, InProcess,
-        MediaCounts, PairLists, PartnerClasses, PlaceRequest, Plain, PublishedList, Request,
-        RequestMaker, WorkerId, WorkerLists,
+        LendsLists, MediaCounts, PairLists, PartnerClasses, PlaceRequest, Plain, PublishedList,
+        Request, RequestMaker, WorkerId, WorkerLists,
     },
     policies::consistent_hashing::LentRing,
     store::GatewayId,
@@ -177,7 +177,9 @@ impl RequestMaker for StatedEncode<'_> {
     fn plain(&self) -> Option<Plain> {
         self.stated.plain()
     }
+}
 
+impl LendsLists for StatedEncode<'_> {
     fn workers(&self) -> WorkerLists<'_> {
         WorkerLists::Encode(self.lists)
     }

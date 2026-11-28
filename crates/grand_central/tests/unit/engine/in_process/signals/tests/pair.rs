@@ -183,12 +183,14 @@ impl RequestMaker for AsksPair<'_> {
         self.request
     }
 
-    fn workers(&self) -> WorkerLists<'_> {
-        WorkerLists::Pair(self.lists)
-    }
-
     fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
         self.loads.as_ref()
+    }
+}
+
+impl LendsLists for AsksPair<'_> {
+    fn workers(&self) -> WorkerLists<'_> {
+        WorkerLists::Pair(self.lists)
     }
 }
 

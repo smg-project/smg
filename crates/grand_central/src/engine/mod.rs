@@ -26,8 +26,6 @@ pub(crate) mod framework;
 pub(crate) mod in_process;
 #[cfg(feature = "in-process")]
 pub(crate) mod lease_events;
-#[cfg(feature = "in-process")]
-pub(crate) mod list_cell;
 pub(crate) mod pair_classes;
 pub(crate) mod prefix_pass;
 pub(crate) mod prompt_hashes;
@@ -44,11 +42,11 @@ pub use decision::{
     BINDING, MAX_TARGETS, TARGET_WORKER, TRACE_TOP,
 };
 pub use decision_engine::{
-    AlonePick, DecideOutcome, Decided, DecisionEngine, DecisionRefused, DecodeRefused,
+    AlonePick, DecideOutcome, Decided, Decides, DecisionEngine, DecisionRefused, DecodeRefused,
     HeldDecision, HeldDecode, Leased, Plain, Request, RequestMaker,
 };
 #[cfg(feature = "in-process")]
-pub use decision_engine::{TextKey, TokenKey, WorkerLists};
+pub use decision_engine::{TextKey, TokenKey};
 pub use decision_slot::{DecisionSlot, DecisionSlotGuard};
 pub use demands::{DemandFacts, Demands, References, UnmetDemand};
 pub use encode_classes::{hands_to, EncodeClasses, EncodeMember};
@@ -63,6 +61,8 @@ pub use framework::{
 #[cfg(feature = "in-process")]
 pub use in_process::encode::EncodeLists;
 #[cfg(feature = "in-process")]
+pub use in_process::lists::{LentList, ListCell, ModelLists, PublishedList};
+#[cfg(feature = "in-process")]
 pub use in_process::membership::Members;
 #[cfg(feature = "in-process")]
 pub use in_process::overlap::{self, Affinity, CacheIndex, CacheIndexes, PoolAffinity};
@@ -74,10 +74,9 @@ pub use in_process::place::{HeaderRead, PlaceRequest, Prompt, PromptEntry, Unpla
 pub use in_process::start::WorkerData;
 #[cfg(feature = "in-process")]
 pub use in_process::{
-    InProcess, SpecHandle, POLICY_FAULTS_HELP, POLICY_FAULTS_TOTAL, POLICY_FAULT_KINDS,
+    InProcess, LendsLists, SpecHandle, WorkerLists, POLICY_FAULTS_HELP, POLICY_FAULTS_TOTAL,
+    POLICY_FAULT_KINDS,
 };
-#[cfg(feature = "in-process")]
-pub use list_cell::{LentList, ListCell, ModelLists, PublishedList};
 pub use pair_classes::PartnerClasses;
 pub use prompt_hashes::{HashSeeds, PromptHashes};
 #[cfg(feature = "in-process")]

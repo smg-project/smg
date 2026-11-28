@@ -17,10 +17,9 @@ use crate::{
     document::spec::{AppliedSpec, Assignment, PolicySpec, RulePlaced},
     engine::{
         decision::{Decision, PlacedBy, Target, Targets},
-        decision_engine::{Request, RequestMaker, WorkerLists},
+        decision_engine::{Request, RequestMaker},
         framework::{Picker, TieBand},
-        in_process::InProcess,
-        list_cell::PublishedList,
+        in_process::{lists::PublishedList, InProcess, LendsLists, WorkerLists},
         view::{Candidate, Constraints, Identity, RequestFacts},
     },
     policies::{power_of_two::PowerOfTwoMetric, random::Random},
@@ -133,7 +132,9 @@ impl RequestMaker for Asks<'_> {
     fn make<'w>(&'w self, _: &'w AppliedSpec) -> Request<'w> {
         self.request
     }
+}
 
+impl LendsLists for Asks<'_> {
     fn workers(&self) -> WorkerLists<'_> {
         WorkerLists::Single(self.members.lent())
     }

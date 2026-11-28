@@ -433,10 +433,6 @@ impl RequestMaker for Recorded<'_, '_> {
         self.0.make(spec)
     }
 
-    fn workers(&self) -> WorkerLists<'_> {
-        self.0.workers()
-    }
-
     fn shadow_ring<'w>(
         &'w self,
         spec: &'w AppliedSpec,
@@ -444,6 +440,12 @@ impl RequestMaker for Recorded<'_, '_> {
     ) -> Option<(&'w dyn LentRing, &'w [u64])> {
         self.1.borrow_mut().push(shadow);
         self.0.shadow_ring(spec, shadow)
+    }
+}
+
+impl LendsLists for Recorded<'_, '_> {
+    fn workers(&self) -> WorkerLists<'_> {
+        self.0.workers()
     }
 }
 
@@ -1135,10 +1137,6 @@ impl RequestMaker for Counted<'_, '_> {
         self.0.make(spec)
     }
 
-    fn workers(&self) -> WorkerLists<'_> {
-        self.0.workers()
-    }
-
     fn shadow_ring<'w>(
         &'w self,
         spec: &'w AppliedSpec,
@@ -1146,6 +1144,12 @@ impl RequestMaker for Counted<'_, '_> {
     ) -> Option<(&'w dyn LentRing, &'w [u64])> {
         self.1.fetch_add(1, atomic::Ordering::Relaxed);
         self.0.shadow_ring(spec, shadow)
+    }
+}
+
+impl LendsLists for Counted<'_, '_> {
+    fn workers(&self) -> WorkerLists<'_> {
+        self.0.workers()
     }
 }
 

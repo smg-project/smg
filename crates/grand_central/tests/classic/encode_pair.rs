@@ -49,9 +49,9 @@ use smg_grand_central::{
     document::{AppliedSpec, PolicySpec},
     engine::{
         fingerprint, Decision, EncodeClasses, EncodeItems, EncodeLists, EncodeMember, EncodePlaced,
-        EncoderFacts, FixedFacts, Identity, InProcess, LentList, ListCell, PairAdmission,
-        PairLists, PartnerClasses, Phase, Request as HostRequest, RequestFacts, RequestMaker,
-        WorkerLists,
+        EncoderFacts, FixedFacts, Identity, InProcess, LendsLists, LentList, ListCell,
+        PairAdmission, PairLists, PartnerClasses, Phase, Request as HostRequest, RequestFacts,
+        RequestMaker, WorkerLists,
     },
     policies::consistent_hashing::LentRing,
     store::{EncodeHandoff, EncodeOffer},
@@ -478,7 +478,9 @@ impl RequestMaker for Asked<'_> {
     fn make<'w>(&'w self, _: &'w AppliedSpec) -> HostRequest<'w> {
         self.request
     }
+}
 
+impl LendsLists for Asked<'_> {
     fn workers(&self) -> WorkerLists<'_> {
         WorkerLists::Encode(self.lists)
     }

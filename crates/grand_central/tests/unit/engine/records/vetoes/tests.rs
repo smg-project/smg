@@ -16,10 +16,9 @@ use crate::{
     document::spec::{AppliedSpec, PolicySpec, ShadowSpec, PRESETS},
     engine::{
         decision::{Decision, ShadowKind, ShedReason},
-        decision_engine::{DecisionEngine, Request, RequestMaker, WorkerLists},
+        decision_engine::{Decides, Request, RequestMaker},
         framework::{DecisionScope, Filter},
-        in_process::InProcess,
-        list_cell::PublishedList,
+        in_process::{lists::PublishedList, InProcess, LendsLists, WorkerLists},
         shadow::Shadow,
         view::{Candidate, Constraints, Phase, PoolFacts, RequestFacts},
     },
@@ -135,7 +134,9 @@ impl RequestMaker for Hands<'_> {
     fn make<'w>(&'w self, _: &'w AppliedSpec) -> Request<'w> {
         self.0
     }
+}
 
+impl LendsLists for Hands<'_> {
     fn workers(&self) -> WorkerLists<'_> {
         WorkerLists::Single(self.1.lent())
     }

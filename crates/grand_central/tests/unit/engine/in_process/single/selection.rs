@@ -504,7 +504,9 @@ fn a_cell_is_asked_where_its_list_is_decided_over() {
             self.2.set(true);
             self.0
         }
+    }
 
+    impl LendsLists for Late<'_> {
         fn workers(&self) -> WorkerLists<'_> {
             if self.2.get() {
                 WorkerLists::Single(self.1.lent())
@@ -531,7 +533,9 @@ fn a_cell_is_asked_where_its_list_is_decided_over() {
         fn plain(&self) -> Option<Plain> {
             self.0.plain()
         }
+    }
 
+    impl LendsLists for Moved<'_> {
         fn workers(&self) -> WorkerLists<'_> {
             WorkerLists::Single(self.1[usize::from(self.2.get())].lent())
         }

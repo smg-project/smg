@@ -76,9 +76,9 @@ use std::{
 use smg_grand_central::{
     document::{AppliedSpec, Assignment, PolicySpec},
     engine::{
-        prefills_full, Decided, Decision, DecodeVerdict, Demands, Identity, InProcess, LiftedVeto,
-        PairAdmission, PairLists, PartnerClasses, Phase, PlaceRequest, Plain, PublishedList,
-        Request, RequestMaker, ShedReason, Unplaced, WorkerLists,
+        prefills_full, Decided, Decision, DecodeVerdict, Demands, Identity, InProcess, LendsLists,
+        LiftedVeto, PairAdmission, PairLists, PartnerClasses, Phase, PlaceRequest, Plain,
+        PublishedList, Request, RequestMaker, ShedReason, Unplaced, WorkerLists,
     },
     store::GatewayId,
     tracking::{DecisionGuard, Outcome, Side, TransportClass},
@@ -359,7 +359,9 @@ impl RequestMaker for StatedPair<'_> {
     fn plain(&self) -> Option<Plain> {
         self.stated.plain()
     }
+}
 
+impl LendsLists for StatedPair<'_> {
     fn workers(&self) -> WorkerLists<'_> {
         self.decodes.lists(self.stated.host)
     }
