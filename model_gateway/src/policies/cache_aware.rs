@@ -1124,8 +1124,12 @@ impl Rows {
     /// out a second time since. The count does not say which id it handed
     /// on: once it moved, any id of the rows may be another worker's, and
     /// every list's rows over that index are read again. The holder lookup
-    /// tests it ([`CacheAwarePolicy::overlap_holders`]). The warm-up's
-    /// reads of a row's block count do not.
+    /// tests it ([`CacheAwarePolicy::overlap_holders`]), and so does each
+    /// warm-up read of a row's block count
+    /// ([`CacheAwarePolicy::warmup_slice`],
+    /// [`CacheAwarePolicy::warmup_divert`]), behind the read: rows that
+    /// stand while another decision reads them again decide nothing by an
+    /// id that changed hands.
     fn numbered(&self, indexer: &KvIndex) -> bool {
         indexer.numbers_reused() == self.reused
     }
@@ -2048,6 +2052,12 @@ impl CacheAwarePolicy {
                 continue;
             }
             let indexed = table.rows().id_at[row].map(|id| indexer.worker_block_count(id));
+            // The count is this worker's while the index handed no id out
+            // again since the rows were read; behind that it may be another
+            // worker's, so nothing is sliced by it and no baseline booked.
+            if !table.rows().numbered(indexer) {
+                return None;
+            }
             let grown = indexed.map(|indexed| worker.warmup_growth(indexed));
             if !warmup.applies(
                 worker.admitted_age(),
@@ -2175,6 +2185,11 @@ impl CacheAwarePolicy {
                 continue;
             }
             let indexed = table.rows().id_at[row].map_or(0, |id| indexer.worker_block_count(id));
+            // As in the slice: a count read by an id that changed hands
+            // since the rows were read diverts no hit.
+            if !table.rows().numbered(indexer) {
+                return None;
+            }
             if !warmup.is_thin(indexed, table.rows().fleet_level) {
                 continue;
             }
