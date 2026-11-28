@@ -222,14 +222,15 @@ fn loader_rule_conflict(
 /// clip at the rate its start states, and the pipeline does the same. A value
 /// that is no number inside the range a part's own rate is held to is no
 /// rate (the engine's own default, `-1`, among them): the walk keeps the
-/// spec's default, as under a start that states none. No other sampler takes
+/// spec's default, as under a start that states none, and says so in one
+/// warning unless the value is non-positive. No other sampler takes
 /// a rate from the rules: [`loader_rule_conflict`] refuses the loader-style
 /// ones, and the rest never followed a loader.
 fn interval_walk_start_fps(rule: Option<&str>, sampling: FrameSampling) -> Option<f64> {
     if sampling != FrameSampling::Interval {
         return None;
     }
-    rule?
+    let stated = rule?
         .split("; ")
         .find_map(|entry| {
             entry
@@ -237,10 +238,19 @@ fn interval_walk_start_fps(rule: Option<&str>, sampling: FrameSampling) -> Optio
                 .strip_prefix(LOADER_FLAG_RULE)?
                 .strip_prefix("video.fps=")
         })?
-        .trim()
-        .parse()
-        .ok()
-        .filter(|fps| llm_multimodal::sample_fps_in_range(*fps))
+        .trim();
+    match stated.parse::<f64>() {
+        Ok(fps) if llm_multimodal::sample_fps_in_range(fps) => Some(fps),
+        Ok(fps) if fps <= 0.0 => None,
+        _ => {
+            warn!(
+                stated,
+                "the video rate of the engine's start is outside the range the interval walk takes; \
+                 the walk keeps the processor's default rate"
+            );
+            None
+        }
+    }
 }
 
 /// What set a modality's effective per-request item limit.
@@ -2497,8 +2507,9 @@ mod unsupported_model_tests {
     }
 
     /// A start that states a loader rate walks a clip of the interval walk at
-    /// that rate, as the engine's own server does: a clip of twelve seconds
-    /// gives 25 frames at the rate 2 where the spec's default of 1 gives 13.
+    /// that rate, the rate the engine's own loader reads: a clip of twelve
+    /// seconds gives 25 frames at the rate 2 where the spec's default of 1
+    /// gives 13.
     /// A value the loader takes for no rate, a start that states none and
     /// every other sampler keep the default.
     #[tokio::test]

@@ -738,8 +738,9 @@ Worker-side media processing uses the same `--mm-processor` /
   family: `VLLM_VIDEO_LOADER_BACKEND` never reaches that loader, while an
   explicit kwarg, `opencv` included, swaps it), the `--media-io-kwargs` rules
   alone; and none for the families with a sampler of their own, which never
-  followed the loader and start as before. An engine that normalizes pixels on
-  device
+  followed the loader and start as before, but for the interval walk, which
+  takes a `video.fps` kwarg from 0.2 to 5 as its rate. An engine that
+  normalizes pixels on device
   (vLLM's `mm_device_do_normalize`, on by default for the Qwen-VL family)
   takes raw `uint8` pixels, and the pipeline writes those for it; a model
   whose processor cannot emit raw pixels is refused at startup under that
