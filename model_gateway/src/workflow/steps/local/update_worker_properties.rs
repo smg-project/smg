@@ -588,4 +588,5 @@ pub(crate) fn refreshed_labels(
 }
 
 #[cfg(test)]
+#[path = "../../../../tests/unit/workflow/steps/local/update_worker_properties/tests/mod.rs"]
 mod tests;
