@@ -249,4 +249,5 @@ fn validate_kubernetes_discovery(
 }
 
 #[cfg(test)]
+#[path = "../tests/unit/validation/tests.rs"]
 mod tests;

@@ -5,8 +5,14 @@ use smg_worker::test_support::RefusedAddress;
 use super::*;
 use crate::testing::TestHost;
 
-const PASSING_2_0_4: &str = include_str!("../testdata/consul/health-passing-2.0.4.json");
-const PASSING_1_22_7: &str = include_str!("../testdata/consul/health-passing-1.22.7.json");
+const PASSING_2_0_4: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/testdata/consul/health-passing-2.0.4.json"
+));
+const PASSING_1_22_7: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/testdata/consul/health-passing-1.22.7.json"
+));
 
 fn discovery(service: &str, address: Option<&str>) -> ConsulDiscoveryConfig {
     ConsulDiscoveryConfig {

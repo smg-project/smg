@@ -939,4 +939,5 @@ impl ConsulDiscovery {
 }
 
 #[cfg(test)]
+#[path = "../tests/unit/consul/tests.rs"]
 mod tests;

@@ -765,4 +765,5 @@ fn compute_desired_state(pods: &[Arc<Pod>], config: &ServiceDiscoveryConfig) -> 
 }
 
 #[cfg(test)]
+#[path = "../tests/unit/kubernetes/tests.rs"]
 mod tests;
