@@ -1109,7 +1109,8 @@ impl HarmonyBuilder {
 
         for msg in messages {
             match msg {
-                ChatMessage::System { content, name, .. } | ChatMessage::Root { content, name } => {
+                ChatMessage::System { content, name, .. }
+                | ChatMessage::Root { content, name, .. } => {
                     // System messages stay as-is
                     let harmony_msg = HarmonyMessage {
                         author: Author {

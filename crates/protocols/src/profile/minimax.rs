@@ -128,19 +128,35 @@ pub(super) fn apply_defaults(req: &mut ChatCompletionRequest) {
 }
 
 /// The root messages as one: the first one's name, the contents joined in
-/// order.
+/// order, and for the date and for the location the first one a root names
+/// (the template prints one of each, and no line for an empty text, so an
+/// empty one names none).
 fn merge_roots(roots: Vec<ChatMessage>) -> Option<ChatMessage> {
     let mut merged: Option<(MessageContent, Option<String>)> = None;
+    let (mut date, mut location) = (None, None);
     for root in roots {
-        let ChatMessage::Root { content, name } = root else {
+        let ChatMessage::Root {
+            content,
+            name,
+            current_date,
+            current_location,
+        } = root
+        else {
             continue;
         };
+        date = date.or_else(|| current_date.filter(|text| !text.is_empty()));
+        location = location.or_else(|| current_location.filter(|text| !text.is_empty()));
         merged = Some(match merged {
             None => (content, name),
             Some((joined, first_name)) => (join_content(joined, content), first_name),
         });
     }
-    merged.map(|(content, name)| ChatMessage::Root { content, name })
+    merged.map(|(content, name)| ChatMessage::Root {
+        content,
+        name,
+        current_date: date,
+        current_location: location,
+    })
 }
 
 /// Two contents as one: texts joined by a blank line (an empty text adds
