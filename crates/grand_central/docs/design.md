@@ -1112,7 +1112,7 @@ pub(crate) struct PoolMembers {
     records: OnceLock<PoolRecords>,  // the unchanging half of each worker's record (5.3)
     signal: OnceLock<(Box<str>, Phase, bool)>, // whether a decision over this list reads a named signal
     wires: OnceLock<WireModes>,      // which protocols (HTTP, gRPC, ZMQ) the list's workers speak
-    alone: OnceLock<(Box<str>, Option<AloneProfile>)>, // the profile one pick can decide (5.6)
+    alone: OnceLock<(Box<str>, Option<AloneAsked>)>, // the profile one pick can decide (5.6)
     shadow: OnceLock<(Box<str>, Option<ShadowWord>)>,  // the shadow of this list's model, where the
                                      // document names one
     affinity: PoolAffinity,          // this list's lookup table for cache affinity
@@ -1476,6 +1476,20 @@ list.
 A profile is decided by *one pick* when its picker needs nothing of the request, it has no scorer
 and no filter beyond the health tests, and its binding has no sessions rule and names no shadow.
 On main three pickers say so: round robin, `random` and `passthrough`.
+
+A profile that holds scorers is decided by one pick too where each of them, a stock scorer or one a
+host registered in process, says five words of itself: it is row-wise, it says nothing of how its
+values lie, it
+refuses nothing by a report, it holds no scope and it owns no request; where it declares no need
+beyond the request's size and a worker's load report; and where the document keeps no sample and
+takes no word on a lease. The picker picks first, by its rule below, and reads no score, so the
+pick is the one the whole pass makes. The engine then asks each scorer once, of the picked row
+alone: the request is made and dated as the whole pass makes it, and the row's record is written as
+a draw writes the row it lands on. A scorer that keeps the default of one of the five words, and so
+every plugin's scorer, keeps the whole pass. So does a scorer that declares any other need: the
+whole pass feeds it, as it lends a request a signal's cells and the affinity column. Under a
+document that keeps a sample or takes a word on a lease no pick is made ahead of the whole pass,
+which takes the request's one turn of the list's rotation.
 
 1. The engine asks `maker.plain()`. The request takes the short path where all of this holds:
    - the request is plain and a single one;

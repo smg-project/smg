@@ -34,12 +34,12 @@ use crate::{
     document::spec::{AcrossRanks, AppliedSpec, Needs, PolicySpec, ShadowSpec, SignalSpec},
     engine::{
         decision::Decision,
-        decision_engine::{DecisionEngine, Request, RequestMaker, WorkerLists},
+        decision_engine::{DecisionEngine, Plain, Request, RequestMaker, WorkerLists},
         framework::{Scorer, TieBand},
         in_process::InProcess,
         list_cell::PublishedList,
         sticky_sessions::SessionVerdict,
-        view::{Candidate, Constraints, Identity, RequestFacts, WorkerId},
+        view::{Candidate, Constraints, Identity, RequestFacts, WireModes, WorkerId},
     },
     load::{SignalCell, SignalCells, SignalColumn},
     stages::{registry::StageRegistry, Lifecycle},
@@ -100,6 +100,42 @@ impl Scorer for ReadsHeld {
             signal_cells: true,
             ..Needs::default()
         }
+    }
+}
+
+/// [`ReadsHeld`] as a host states it that refuses no worker by a report:
+/// under a picker whose one pick decides the place, its declared signal
+/// alone keeps the scorer on the whole pass.
+#[derive(Debug)]
+struct ReadsHeldFreely(ReadsHeld);
+
+impl Lifecycle for ReadsHeldFreely {}
+
+impl Scorer for ReadsHeldFreely {
+    fn name(&self) -> &'static str {
+        "reads-held-freely"
+    }
+
+    fn score(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+    ) -> TieBand {
+        self.0.score(facts, candidates, kept, out)
+    }
+
+    fn row_wise(&self) -> bool {
+        true
+    }
+
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
+    fn needs(&self) -> Needs {
+        self.0.needs()
     }
 }
 
@@ -173,12 +209,20 @@ fn built_of(document: &PolicySpec) -> Built {
     let (read, seen) = (Read::default(), Arc::new(Mutex::new(Vec::new())));
     let issued = Arc::new(Mutex::new(Vec::new()));
     let (kept, saw, heard) = (Arc::clone(&read), Arc::clone(&seen), Arc::clone(&issued));
+    let freely = Arc::clone(&read);
     let mut stages = StageRegistry::builtin();
     let added = stages.scorer_with("reads-held", move |build| {
         Ok(Box::new(ReadsHeld {
             held: build.signal_column("held")?,
             read: Arc::clone(&kept),
         }))
+    });
+    added.expect("a free name");
+    let added = stages.scorer_with("reads-held-freely", move |build| {
+        Ok(Box::new(ReadsHeldFreely(ReadsHeld {
+            held: build.signal_column("held")?,
+            read: Arc::clone(&freely),
+        })))
     });
     added.expect("a free name");
     let added = stages.scorer("sees-cells", move || Box::new(SeesCells(Arc::clone(&saw))));
@@ -420,6 +464,39 @@ impl RequestMaker for Asks<'_> {
 
     fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
         self.loads.as_ref()
+    }
+}
+
+/// [`Asks`]' request as a host states a plain one: a first attempt that
+/// states no demand, which an engine may place by one pick of its picker
+/// ahead of the request's making.
+struct Plainly<'a>(Asks<'a>);
+
+impl RequestMaker for Plainly<'_> {
+    fn model(&self) -> &str {
+        self.0.model()
+    }
+
+    fn make<'w>(&'w self, spec: &'w AppliedSpec) -> Request<'w> {
+        self.0.make(spec)
+    }
+
+    fn workers(&self) -> WorkerLists<'_> {
+        self.0.workers()
+    }
+
+    fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
+        self.0.loads()
+    }
+
+    fn plain(&self) -> Option<Plain> {
+        use crate::engine::view::Phase;
+
+        Some(Plain {
+            phase: Phase::Single,
+            wires: WireModes::NONE,
+            prompt_tokens: 0,
+        })
     }
 }
 
@@ -1013,6 +1090,41 @@ fn the_entry_that_issues_no_lease_is_lent_the_cells_too() {
     let mut read = mem::take(&mut *built.read.lock());
     read.sort_by_key(|&(place, _)| place);
     assert_eq!(read, stepped_values(10.0));
+}
+
+/// A plain request of a place one pick of its picker decides is lent the
+/// list's cells too, where a row-wise scorer of the place reads a named
+/// signal: the scorer declares the signal, so the request is decided by the
+/// whole pass, which lends the cells, and the scorer reads the own value of
+/// each worker it is asked about.
+#[test]
+fn a_scorer_behind_a_picker_that_picks_alone_reads_its_signal() {
+    for name in ["round_robin", "random", "passthrough"] {
+        let document = PolicySpec::preset(name).expect("a built-in preset");
+        let mut document = serde_json::to_value(document).expect("the document as JSON");
+        document["signals"] = serde_json::json!({"held": {"unit": "tokens"}});
+        let profiles = document["profiles"].as_object_mut();
+        for profile in profiles.expect("the profiles").values_mut() {
+            profile["score"] = serde_json::json!(["reads-held-freely"]);
+        }
+        let mut document: PolicySpec = serde_json::from_value(document).expect("a document");
+        document.generation = 1;
+        let built = built_of(&document);
+        let list = pool(4);
+        let members = PublishedList::new(Arc::clone(&list));
+        let loads = stepped(4, 10.0);
+        let plain = Plainly(asks(7, &members, Some(&loads)));
+        let decided = built
+            .engine
+            .decide_under(GatewayId::LOCAL, &plain, Instant::now());
+        assert!(decided.is_ok(), "{name}: an answer");
+        let read = mem::take(&mut *built.read.lock());
+        assert!(!read.is_empty(), "{name}: the scorer was asked");
+        for (place, value) in read {
+            let stated = Some(10.0 + f64::from(place));
+            assert_eq!(value, stated, "{name}: the value at {place}");
+        }
+    }
 }
 
 /// A binding's shadow profile decides over the facts its live decision was

@@ -137,7 +137,12 @@ pub(super) use crate::engine::decision::PLACES;
 /// where the request takes the whole pass ([`decide`]): its place is not
 /// decided by one pick of a picker, a worker of the list is not dialed on a
 /// wire it states, or the picker's rule finds no eligible worker. Its
-/// caller asks no list's value for a request of another phase.
+/// caller asks no list's value for a request of another phase. The pick's
+/// second word says the profile holds row-wise scorers, which its caller
+/// asks of the picked row behind the pick ([`scored_at`]). Such a place is
+/// the whole pass's too under a document that takes a word on a lease or
+/// keeps a sample, and is declined ahead of the pick: a pick turns the
+/// list's rotation, and the whole pass takes the request's one turn.
 ///
 /// It ends in the place picked. It reads no fact of a request, so none is
 /// made ahead of it, and nothing a host is handed of a pick is built here.
@@ -152,19 +157,68 @@ pub(super) fn alone(
     model: &str,
     plain: Plain,
     members: &PoolMembers,
-) -> Option<AlonePick> {
+) -> Option<(AlonePick, bool)> {
     debug_assert_eq!(plain.phase, Phase::Single, "a single request's");
     // The whole pass declines such a list by name.
     if !plain.wires.is_empty() && !plain.wires.contains(members.wires()) {
         return None;
     }
-    let profile = members.alone(&own.document.spec, model)?;
+    let (profile, scored) = members.alone(&own.document.spec, model)?;
+    // No turn is taken for a request the whole pass decides.
+    if scored && own.document.leases_or_samples {
+        return None;
+    }
     let position = own.pick_over(profile, members, |state: RoutingState| state.eligible())?;
-    Some(AlonePick {
-        place: u32::try_from(position).ok()?,
-        profile: profile.0,
-        generation: own.document.spec.generation(),
-    })
+    // The second word says the profile's row-wise scorers are still to be
+    // asked, of the picked row.
+    Some((
+        AlonePick {
+            place: u32::try_from(position).ok()?,
+            profile: profile.0,
+            generation: own.document.spec.generation(),
+        },
+        scored,
+    ))
+}
+
+/// The scorers of [`alone`]'s pick, asked behind it where the pick's
+/// second word says so: the request is made as the whole pass makes it and
+/// dated by the decision's one clock read, the picked row's record is
+/// written alone, counted under the session key where the document reads
+/// that count, and each scorer of the profile is asked once, of that row
+/// ([`records::PoolRecords::score_picked`]). The picker read no score, so
+/// the pick stands as it was made.
+///
+/// Out of line: a request whose place holds no scorer pays none of this.
+#[inline(never)]
+pub(super) fn scored_at(
+    own: Loaded<'_, '_>,
+    maker: &impl RequestMaker,
+    members: &PoolMembers,
+    pick: AlonePick,
+    clock: impl FnOnce() -> Instant,
+) {
+    let spec = &own.document.spec;
+    let mut request = own.made(maker);
+    let facts = &mut request.facts;
+    let mut name = [0; Session::TEXT_LEN];
+    let key = if spec.engine().needs().session_in_flight {
+        maker.session_counted_under().name(facts, &mut name)
+    } else {
+        None
+    };
+    let read = own.loads_read(maker);
+    let loads = read.snapshot();
+    let live = records::Live::at(spec.engine(), &own.clock, clock(), loads, key);
+    facts.now_micros = live.now_micros();
+    members.records(spec, &own.clock).score_picked(
+        spec.engine(),
+        pick.profile,
+        members.workers(),
+        &live,
+        facts,
+        pick.place,
+    );
 }
 
 /// Whether the worker at the place `pick` names reads ready now

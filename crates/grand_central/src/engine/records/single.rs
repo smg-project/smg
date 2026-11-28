@@ -1,6 +1,7 @@
-//! One decision of a single request over a list's records ([`decide`]), and
+//! One decision of a single request over a list's records ([`decide`]),
 //! its two draws, methods of the records ([`PoolRecords::draw`],
-//! [`PoolRecords::claim`]).
+//! [`PoolRecords::claim`]), and the scorers of a pick made alone, asked of
+//! its one row (`PoolRecords::score_picked`).
 //!
 //! The decision takes its buffers by the parent's borrow ([`with_buffers`])
 //! and each draw writes its rows as a read of one worker does ([`Singly`]),
@@ -19,6 +20,35 @@ use crate::engine::{
 };
 
 impl PoolRecords {
+    /// [`Self::read`] for the scorers of a profile whose picker picked
+    /// first ([`Engine::score_picked`]): the record of the worker at
+    /// `position` is written at its own place in the calling thread's
+    /// rows, as a draw writes the row it lands on ([`Self::draw`]), and
+    /// each scorer of the profile at `profile` is asked of that one place.
+    /// The look-up the write made is paid as a draw's are.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn score_picked(
+        &self,
+        engine: &Engine,
+        profile: u16,
+        workers: &[Arc<dyn Worker>],
+        live: &Live<'_>,
+        facts: &RequestFacts<'_>,
+        position: u32,
+    ) {
+        with_buffers(|buffers| {
+            let rows = &mut buffers.rows;
+            if rows.len() < self.len() {
+                rows.resize(self.len(), Candidate::default());
+            }
+            let rows = &mut rows[..self.len()];
+            let singly = Singly::new(&self.reported, workers, live);
+            let mut write = |fixed: &Candidate, row: &mut Candidate| singly.write(fixed, row);
+            engine.score_picked(profile, facts, &self.fixed, rows, &mut write, position);
+            self.paid(workers, live, singly.looked_up());
+        });
+    }
+
     /// [`decide`]'s plain draw over the list ([`Engine::decide_drawn`]):
     /// the engine draws over the list's fixed rows, and a worker's record
     /// is written when the draw asks about the worker, as [`Self::read`]
