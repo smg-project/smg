@@ -137,6 +137,10 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
             .select_min_expected_wait(workers, candidates, info, self.name())
     }
 
+    fn hears_request_complete(&self) -> bool {
+        false
+    }
+
     fn name(&self) -> &'static str {
         "power_of_two"
     }

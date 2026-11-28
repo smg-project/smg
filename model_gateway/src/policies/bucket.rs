@@ -214,6 +214,10 @@ impl LoadBalancingPolicy for BucketPolicy {
         }
     }
 
+    fn hears_request_complete(&self) -> bool {
+        false
+    }
+
     fn name(&self) -> &'static str {
         "bucket"
     }

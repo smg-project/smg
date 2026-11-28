@@ -410,6 +410,10 @@ impl LoadBalancingPolicy for ManualPolicy {
         result
     }
 
+    fn hears_request_complete(&self) -> bool {
+        false
+    }
+
     fn name(&self) -> &'static str {
         "manual"
     }
