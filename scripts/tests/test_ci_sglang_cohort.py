@@ -449,6 +449,36 @@ def test_create_failure_removes_only_its_reserved_prefix(tmp_path, monkeypatch):
     assert not prefix.exists()
 
 
+@pytest.mark.parametrize("failure_file", ["smg-cohort.json", "00-smg-cohort.pth"])
+def test_failure_after_isolated_launchers_removes_reserved_prefix(
+    tmp_path, monkeypatch, failure_file
+):
+    api = load("ci_sglang_cohort")
+    prefix = tmp_path / "new-interpreter"
+    write_text = Path.write_text
+    observed = []
+
+    def fail_after_launchers(path, *args, **kwargs):
+        if path.name == failure_file and prefix in path.parents:
+            launcher = prefix / "bin/python"
+            assert launcher.is_file() and os.access(launcher, os.X_OK)
+            assert launcher.read_text().startswith("#!/bin/bash -p\n")
+            assert ' -I -B "$@"\n' in launcher.read_text()
+            assert (prefix / "bin/python-core").is_file()
+            if failure_file == "00-smg-cohort.pth":
+                assert path.with_name("smg-cohort.json").is_file()
+            observed.append(failure_file)
+            raise OSError("fixture failure after isolated launchers")
+        return write_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", fail_after_launchers)
+    with pytest.raises(OSError, match="fixture failure after isolated launchers"):
+        api.create(prefix, [], [], isolated_children=True)
+    assert observed == [failure_file]
+    assert not prefix.exists()
+    assert not os.path.lexists(prefix / "bin/python")
+
+
 def test_exclusive_reservation_refuses_a_creator_that_lost_the_race(tmp_path, monkeypatch):
     api = load("ci_sglang_cohort")
     prefix = tmp_path / "interpreter"
