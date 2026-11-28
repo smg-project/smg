@@ -17,6 +17,17 @@
 //! answered by one pick of its picker or by its key's rows: each takes the
 //! whole decision.
 //!
+//! **Inside a lent placement map.** A head of the map stands by the live
+//! profile's test of the rows named for it, whatever the profile's sample
+//! ([`single::decide`]). A shadow profile held to another test could be
+//! named another head, and no caller names a shadow rows of its own. So
+//! for a request that reaches a boundary of the map a shadow that reads
+//! the live rows runs only where the engine can tell the two profiles are
+//! held to one test ([`Engine::shadow_held_alike`]). Any other such
+//! shadow is not run, and its decision is counted as skipped. Rows a
+//! request's host named itself came by no such test: a shadow reads
+//! them as its word says.
+//!
 //! **What a shadow leaves untouched.** The answer is the live profile's,
 //! and the one lease issued is that answer's: the stages hear its events
 //! and none of a shadow's. A shadow claims and renews no session pin,
@@ -73,6 +84,10 @@ struct WithShadow<'a> {
     /// rows of the live decision ([`Engine::shadow_for`]), and what the
     /// request lends that profile alone ([`RequestMaker::shadow_ring`]).
     binding: (u32, ShadowRows, records::with_shadow::Lends<'a>),
+    /// Whether the request came with rows its host named for it: the
+    /// engine's lookup then names none, and no head of a lent placement
+    /// map is put to the live profile's test.
+    host_named: bool,
     outcome: &'a mut Shadow,
 }
 
@@ -86,8 +101,26 @@ impl WholeDecision for WithShadow<'_> {
         facts: &mut RequestFacts<'_>,
         cx: &Constraints<'_>,
     ) -> Decision {
+        // Inside a lent placement map a head stands by the live profile's
+        // test of the rows named for it, under any cap. A shadow profile
+        // not known to be held to that test is owed rows named by its
+        // own, which no caller builds: it is not run, and its decision is
+        // counted as skipped. The head is the one the engine's own lookup
+        // named: rows the request's host named came by no such test.
+        let (at, rows, lends) = self.binding;
+        let named = if self.host_named { None } else { facts.named };
+        let head = named.and_then(|named| named.tree);
+        let rows = match rows {
+            ShadowRows::Same
+                if head.is_some_and(|head| head.counted) && !engine.shadow_held_alike(at) =>
+            {
+                ShadowRows::Own
+            }
+            rows => rows,
+        };
+        let binding = (at, rows, lends);
         let (decided, outcome) =
-            records::with_shadow::decide(engine, records, workers, live, facts, cx, self.binding);
+            records::with_shadow::decide(engine, records, workers, live, facts, cx, binding);
         *self.outcome = outcome;
         decided
     }
@@ -171,9 +204,9 @@ impl InProcess {
 /// said beside it where one was due: the whole decision followed by the
 /// shadow profile's ([`WithShadow`]). `binding` is the document's word of
 /// the request's binding ([`Engine::shadow_for`]), as its list keeps it.
-/// `maker` is the request's own, handed on for its entry in a tree
-/// its host lends ([`single::decide`]): the live answer is the one the
-/// binding would give with no shadow.
+/// `maker` is the request's own, handed on for its entry in a tree or a
+/// placement map its host lends ([`single::decide`]): the live answer is
+/// the one the binding would give with no shadow.
 ///
 /// The answer is the live decision's. A request refused ahead of the whole
 /// decision has no shadow decision: no profile decided it. Nothing is
@@ -202,6 +235,7 @@ pub(super) fn decide(
     let lends = |shadow| maker.shadow_ring(spec, shadow);
     let whole = WithShadow {
         binding: (binding.0, binding.1, &lends),
+        host_named: request.facts.named.is_some(),
         outcome: &mut outcome,
     };
     let decision = single::decide(own, request, members, maker, late, loads, now, whole);

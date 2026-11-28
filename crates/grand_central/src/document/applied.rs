@@ -405,8 +405,11 @@ impl AppliedSpec {
     /// where no stage declares any.
     /// The engine's own call then hashes a prompt where that lookup reads
     /// the list, and not for a request it decides inside a lent token tree.
-    /// A request that call makes of a prompt's token ids with no block
-    /// hashed is sized as the one it makes with its list (`HashDepths`).
+    /// A lent placement map reads no list either, yet a prompt whose caller
+    /// states no entry for it (`Prompt::entry`) is hashed at its making all
+    /// the same: the call's `leaves_hashes` states the rule whole. A
+    /// request that call makes of a prompt's token ids with no block hashed
+    /// is sized as the one it makes with its list (`HashDepths`).
     #[cfg_attr(
         not(feature = "in-process"),
         expect(dead_code, reason = "the engine's own placing call reads it")

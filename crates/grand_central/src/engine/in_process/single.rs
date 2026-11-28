@@ -74,11 +74,11 @@ use crate::{
         decision::{Decision, Shed, ShedReason, Trace, NO_STAGE, SUBSET_HINT, WIRES},
         decision_engine::{AlonePick, DecideOutcome, Leased, Plain, Request, RequestMaker},
         demands::UnmetDemand,
-        framework::Engine,
+        framework::{Engine, RowTest},
         lease_events,
         records::{self, PoolRecords},
         sticky_sessions::SessionVerdict,
-        view::{Constraints, Phase, RequestFacts, Session, WorkerId},
+        view::{AffinityHolder, Constraints, Phase, RequestFacts, Session, WorkerId},
     },
     stages::Lifecycle,
     tracking::lease::{EventKind, EventSet, Lease, LeaseId, LeaseKind, Side, DISPATCH_TTL},
@@ -294,7 +294,8 @@ impl WholeDecision for WithoutShadow {
 /// nothing. The decision is compiled once for each maker type, as the
 /// engine's entry that calls it is, and once more for the trait object
 /// through which a copy that carries signal cells asks
-/// ([`super::signals::decide`]).
+/// ([`super::signals::decide`]). The entry `token_key` names is the
+/// request's entry in a placement map its host lends, too.
 ///
 /// A request that states a hard demand is decided under its constraints
 /// held to the workers that meet it ([`held`]). A list the demands leave
@@ -383,9 +384,13 @@ pub(super) fn decide(
     // A retry leaves every worker of the engines it tried: over a list
     // where an engine holds several, its facts name them all.
     let decision = if facts.tried.is_empty() || !records.has_ranks() {
-        by_facts::<false>(own, members, records, &live, facts, cx, maker, late, whole)
+        by_facts::<false>(
+            own, members, records, &live, facts, cx, maker, late, now, whole,
+        )
     } else {
-        retried(own, members, records, &live, facts, cx, maker, late, whole)
+        retried(
+            own, members, records, &live, facts, cx, maker, late, now, whole,
+        )
     };
     if let Some(meeting) = meeting {
         MEETING.set(meeting);
@@ -412,12 +417,15 @@ pub(super) fn decide(
 /// decision more.
 ///
 /// `maker` is the request's own, a retry's too: the lookup that names a
-/// request's holders asks it for the request's entry in a lent tree,
-/// and which target of its pick the request's caller sends to.
+/// request's holders asks it for the request's entry in a lent tree or
+/// placement map, and which target of its pick the request's caller sends
+/// to. `now` is the decision's instant, the one its records are of: the
+/// lookup reads and writes a lent placement map by it, and no clock is
+/// read again.
 #[inline(always)]
 #[expect(
     clippy::too_many_arguments,
-    reason = "a decision's inputs, the request's maker, the request its call made and the whole decision"
+    reason = "a decision's inputs, the request's maker, the request its call made, the decision's instant and the whole decision"
 )]
 fn by_facts<const RETRY: bool>(
     own: Loaded<'_, '_>,
@@ -428,6 +436,7 @@ fn by_facts<const RETRY: bool>(
     cx: &Constraints<'_>,
     maker: &(impl RequestMaker + ?Sized),
     late: Option<&Made<'_, '_>>,
+    now: Instant,
     mut whole: impl WholeDecision,
 ) -> Decision {
     let spec = &own.document.spec;
@@ -443,7 +452,9 @@ fn by_facts<const RETRY: bool>(
         Some(keyed) if !lease_events::stages_hear(&keyed, Side::Single) => keyed,
         // A pin that is the profile's own goes through the same lookup with
         // its answer made.
-        Some(keyed) => handed_on(own, members, records, facts, maker, late, keyed, leaves),
+        Some(keyed) => handed_on(
+            own, members, records, facts, maker, late, keyed, leaves, now,
+        ),
         // A profile whose stages read who holds the prompt is named its
         // rows from the gateway's own data, at the decision's instant the
         // keyed entry wrote, and its pick is recorded behind it; any other
@@ -460,9 +471,64 @@ fn by_facts<const RETRY: bool>(
             || maker.text_key(),
             |target| maker.sends_to(target),
             || late?.hashed_whole(spec),
+            // The test the whole pass asks of a row, for the holders a lent
+            // placement map names: asked of a holder's record as a read of
+            // one worker writes it. A head stands by a holder every filter
+            // keeps. Where none of its named holders is one, the head's
+            // word is said out of line (`refused`).
+            &|facts, holders| {
+                let test = engine.keeps_for(facts.model, facts.phase, facts, cx)?;
+                let read = |place: u32| records.read(workers, live, place);
+                let keeps = |at: u32| read(at).is_some_and(|row| test.keeps(&row));
+                if holders.iter().any(|holder| keeps(holder.row)) {
+                    return Some(true);
+                }
+                refused(&test, holders, cx.places, records, workers, live)
+            },
+            || now,
             |facts| whole.decide(engine, records, workers, live, facts, cx),
         ),
     }
+}
+
+/// The holder test's word on a head none of whose named `holders` passes
+/// every filter of `test`, for [`by_facts`]: `Some(false)` where the head
+/// is passed for the next, and `None` where the pass alone says which
+/// rows stay, so the head stands as named.
+///
+/// The head is passed where the hard filters refuse its every holder
+/// ([`RowTest::keeps_hard`]). Were each record to stay as it is read
+/// here, a holder that soft filters alone refuse would stay in the pass
+/// only where each of them steps aside. None does while another worker
+/// the request may take passes every filter, so the head is passed then
+/// too. The workers a request may take are its `places` where it states
+/// them, and the whole list otherwise. A named holder is no such worker:
+/// each read makes a worker's record anew, and a holder that passes by
+/// then is no reason to pass its own head.
+///
+/// Out of line: its code stays off the path of a head one of whose
+/// holders passes every filter at its first read.
+#[inline(never)]
+fn refused(
+    test: &RowTest<'_>,
+    holders: &[AffinityHolder],
+    places: Option<&[u32]>,
+    records: &PoolRecords,
+    workers: &[Arc<dyn Worker>],
+    live: &records::Live<'_>,
+) -> Option<bool> {
+    let read = |place: u32| records.read(workers, live, place);
+    let hard = |at: u32| read(at).is_some_and(|row| test.keeps_hard(&row));
+    if !holders.iter().any(|holder| hard(holder.row)) {
+        return Some(false);
+    }
+    let other = |place: u32| holders.iter().all(|holder| holder.row != place);
+    let passes = |at: u32| other(at) && read(at).is_some_and(|row| test.keeps(&row));
+    let elsewhere = match places {
+        Some(places) => places.iter().any(|&place| passes(place)),
+        None => (0..workers.len() as u32).any(passes),
+    };
+    elsewhere.then_some(false)
 }
 
 /// A pin the keyed entry followed that is the profile's own
@@ -472,19 +538,20 @@ fn by_facts<const RETRY: bool>(
 /// no stage is asked again and no row is written for a decision's pass.
 /// Where the profile's stages read who holds the prompt, the lookup does
 /// behind this answer what it does behind any pick. It states in the pick
-/// what the pin's worker holds of the request, from the rows it names. It
-/// hands the prompt to the record of sent prefixes, or to a tree its host
-/// lends by the entry and the target its maker names. It may read its list's
-/// table again, as any decision that finds the table expired, and a tree's
-/// match marks the path it walked as used. Where no binding of the phase
-/// reads affinity, the lookup is one test.
+/// what the pin's worker holds of the request, from the rows it names,
+/// and states no share for a request decided inside a lent placement map.
+/// It hands the prompt to the record of sent prefixes, or to a tree or a
+/// placement map its host lends, by the entry and the target its maker
+/// names. It may read its list's table again, as any decision that finds
+/// the table expired, and a tree's match marks the path it walked as used.
+/// Where no binding of the phase reads affinity, the lookup is one test.
 ///
 /// Out of line: its code stays off the path of a request with no pin, and
 /// of a pin its rule keeps from the profile.
 #[inline(never)]
 #[expect(
     clippy::too_many_arguments,
-    reason = "the list and its records, the request's facts, its maker and the request its call made, the answer and the leaves read ahead of it"
+    reason = "the list and its records, the request's facts, its maker and the request its call made, the answer, the leaves read ahead of it and the decision's instant"
 )]
 fn handed_on(
     own: Loaded<'_, '_>,
@@ -495,6 +562,7 @@ fn handed_on(
     late: Option<&Made<'_, '_>>,
     keyed: Decision,
     leaves: u64,
+    now: Instant,
 ) -> Decision {
     let spec = &own.document.spec;
     overlap::decide_behind(
@@ -508,6 +576,7 @@ fn handed_on(
         || maker.text_key(),
         |target| maker.sends_to(target),
         || late?.hashed_whole(spec),
+        || now,
         leaves,
         keyed,
     )
@@ -521,7 +590,7 @@ fn handed_on(
 /// one list, and the request's own list stays as its host made it. The
 /// decision's instant is written back into `facts`: the request's lease
 /// is dated by it. The request's maker goes with the copy, so a retry is
-/// decided inside a lent tree as a first attempt is.
+/// decided inside a lent tree or placement map as a first attempt is.
 ///
 /// The workers stand in the calling thread's own list ([`TRIED`]), so a
 /// retry allocates nothing once the list has grown. Out of line and cold:
@@ -533,7 +602,7 @@ fn handed_on(
 #[inline(never)]
 #[expect(
     clippy::too_many_arguments,
-    reason = "a decision's inputs, the request's maker, the request its call made and the whole decision"
+    reason = "a decision's inputs, the request's maker, the request its call made, the decision's instant and the whole decision"
 )]
 fn retried(
     own: Loaded<'_, '_>,
@@ -544,6 +613,7 @@ fn retried(
     cx: &Constraints<'_>,
     maker: &(impl RequestMaker + ?Sized),
     late: Option<&Made<'_, '_>>,
+    now: Instant,
     whole: impl WholeDecision,
 ) -> Decision {
     let tried = PoolRecords::tried_engines([records], facts.tried, || TRIED.take());
@@ -560,6 +630,7 @@ fn retried(
         cx,
         maker,
         late,
+        now,
         whole,
     );
     facts.now_micros = widened.now_micros;

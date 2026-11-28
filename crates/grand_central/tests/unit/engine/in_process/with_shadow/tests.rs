@@ -28,7 +28,7 @@ use smg_worker::{
 
 use super::super::single::{
     self,
-    tests::{answered, decided, pool, Asks, MODEL},
+    tests::{answered, decided, hashed_document, lending_under, pool, Asks, MODEL},
 };
 use crate::{
     document::spec::{
@@ -46,7 +46,10 @@ use crate::{
         records::worker_id,
         shadow::{ShadowCount, ShadowCounts, ShadowSide, Shadowed, SHADOW_FLOOR},
         sticky_sessions::SessionVerdict,
-        view::{Candidate, Identity, Phase, RequestFacts, WorkerId},
+        view::{
+            AffinityHolder, AffinityRows, Candidate, Identity, Phase, RequestFacts, TreeMatch,
+            WorkerId,
+        },
     },
     stages::{lifecycle::Lifecycle, pickers::target_of, registry::StageRegistry},
     store::GatewayId,
@@ -1037,6 +1040,126 @@ fn a_shadow_with_other_affinity_rows_than_the_live_profile_is_skipped() {
     let (word, kinds) = shadowed("cache_aware", &sample(16));
     assert_eq!(word, Some(ShadowRows::Same));
     assert_eq!((kinds.iter().sum::<u64>(), kinds[3]), (1, 0), "{kinds:?}");
+}
+
+/// An engine over a host that lends its placement map, under a hash
+/// index, whose one binding names a shadow: a copy of the live profile as
+/// `turn` leaves it. The live profile's bare picker takes no sample, so
+/// its rows are named under a cap that cannot fill, where the shadow's
+/// word compares no test: the shadow reads the live profile's rows
+/// ([`ShadowRows::Same`]) whatever its filters.
+fn lending_with_a_twin(turn: &dyn Fn(&mut ProfileSpec)) -> InProcess {
+    let mut document = hashed_document(None);
+    let live = document.profiles.get_mut("cache_aware");
+    let live = live.expect("the preset's profile");
+    live.pick = "best".into();
+    let mut twin = live.clone();
+    turn(&mut twin);
+    document.profiles.insert("twin".into(), twin);
+    document.bindings[0].shadow = Some(ShadowSpec::Profile("twin".into()));
+    let (engine, _) = lending_under(&document);
+    let word = engine.spec().engine().shadow_for(MODEL, Phase::Single);
+    assert_eq!(word, Some((0, ShadowRows::Same)));
+    engine
+}
+
+/// Inside a placement map its host lends, a head stands by the live
+/// profile's test of a worker, whatever the profile's sample. A shadow
+/// profile of other filters that takes no sample reads the live profile's
+/// rows by its word ([`ShadowRows::Same`]), yet its own test could name
+/// another head, and no caller names a shadow rows of its own. So for a
+/// request that reaches a boundary of the map it is counted as skipped,
+/// and nothing is counted as agreed: behind a request the map holds
+/// nothing of, and behind the same request again, whose head then names
+/// its holder. A request that reaches no boundary is named nobody under
+/// either test, and its shadow runs. A shadow of the live profile's own
+/// filters runs for every one of them.
+#[test]
+fn a_shadow_held_to_another_test_is_skipped_inside_a_lent_placement_map() {
+    // The counts behind a request of 256 tokens, behind that request
+    // again, and behind one of 32 tokens: the document's first boundary
+    // stands at 64 tokens.
+    let counted = |turn: &dyn Fn(&mut ProfileSpec)| {
+        let engine = lending_with_a_twin(turn);
+        let list = pool(4);
+        let members = PublishedList::new(Arc::clone(&list));
+        let sent = |tokens: &[u32]| {
+            let hashes = engine.prompt_hashes(MODEL, Some(tokens), None, HashSeeds::PLAIN);
+            let mut asked = request(7);
+            hashes.write_to(&mut asked.facts);
+            let asks = Asks {
+                key: Some(tokens),
+                ..Asks::of(asked, Some(&members))
+            };
+            let _ = decided(&engine, &asks);
+            kinds(&engine)
+        };
+        let reaches: Vec<u32> = (0..256).collect();
+        [sent(&reaches), sent(&reaches), sent(&reaches[..32])]
+    };
+    // Agreed, another target, another outcome, skipped.
+    let [missed, held, short] = counted(&|twin| {
+        twin.filter.pop();
+    });
+    assert_eq!(missed, [0, 0, 0, 1], "a boundary reached, nobody named");
+    assert_eq!(held, [0, 0, 0, 2], "a boundary reached, a holder named");
+    assert_eq!((short.iter().sum::<u64>(), short[3]), (3, 2), "{short:?}");
+
+    for (ran, counts) in (1..).zip(counted(&|_| {})) {
+        let read = (counts.iter().sum::<u64>(), counts[3]);
+        assert_eq!(read, (ran, 0), "{counts:?}");
+    }
+}
+
+/// Rows a request's host named itself came by no test of the live
+/// profile: the engine's lookup is passed for them, inside no lent map.
+/// So a shadow that reads the live profile's rows runs beside them
+/// whatever its filters, and reads those rows. The host states a match
+/// priced by its whole count ([`TreeMatch::counted`]), as a lent placement
+/// map's head is priced, and names one worker, which holds five requests
+/// where the others hold none. The live answer follows that worker and
+/// the shadow agrees: a shadow that read no row would leave it. A shadow
+/// runs too beside such a match whose host names no holder, beside a
+/// match of nothing, and beside two holders: what a host names is its
+/// own, whatever it holds.
+#[test]
+fn a_shadow_runs_beside_the_rows_a_requests_host_named() {
+    let engine = lending_with_a_twin(&|twin| {
+        twin.filter.pop();
+    });
+    let list = pool(4);
+    let members = PublishedList::new(Arc::clone(&list));
+    (0..5).for_each(|_| list[1].increment_load());
+    let holder = |row| AffinityHolder {
+        row,
+        overlap_blocks: 0,
+        predicted_blocks: 0,
+    };
+    let holders = [holder(1), holder(2)];
+    let named = |holders, matched| AffinityRows {
+        holders,
+        warming: &[],
+        thin: false,
+        mean_in_flight: None,
+        tree: Some(TreeMatch::head(matched, 256)),
+    };
+    let mut asked = request(7);
+    asked.facts.named = Some(named(&holders[..1], 64));
+    let decision = decided(&engine, &Asks::of(asked, Some(&members))).decision;
+    assert_eq!(first(&decision), 1, "the worker its host named");
+    // Agreed, another target, another outcome, skipped.
+    assert_eq!(kinds(&engine), [1, 0, 0, 0]);
+
+    // No holder, a match of nothing, two holders.
+    let more: [(&[AffinityHolder], u32); 3] = [(&[], 64), (&[], 0), (&holders, 64)];
+    for (ran, (holders, matched)) in (2..).zip(more) {
+        let mut asked = request(ran);
+        asked.facts.named = Some(named(holders, matched));
+        let _ = decided(&engine, &Asks::of(asked, Some(&members)));
+        let kinds = kinds(&engine);
+        let read = (kinds.iter().sum::<u64>(), kinds[3]);
+        assert_eq!(read, (ran, 0), "{kinds:?}");
+    }
 }
 
 /// A fresh key under a sessions rule is the shadow profile's to place too.

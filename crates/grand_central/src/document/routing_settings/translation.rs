@@ -983,7 +983,11 @@ fn index_spec((kind, ttl_s, max_size, sweep_s): IndexNumbers) -> IndexSpec {
     // process's life, and no write meets the bound.
     // An index of kind hash keeps its named size at that interval too: its
     // record of sent prefixes is trimmed at its own write, the least used
-    // end first, and waits for no sweep.
+    // end first, and waits for no sweep. The size is the record's alone. A
+    // placement map a host lends in the record's place is held to no
+    // size. Its host's periodic sweep drops the keys whose holders are
+    // all past their lifetime, and the gateway starts no sweep at that
+    // cadence.
     let (max_size, sweep_s) = match (sweep_s, kind) {
         (0, IndexKind::Hash) => (max_size, u32::MAX),
         (0, _) => (u64::MAX, u32::MAX),
@@ -1367,10 +1371,10 @@ fn key_sources(
 ///   its sticky map followed nor for a key the map's own assignment placed
 ///   (`model_gateway/src/policies/registry.rs:794-797`, `:814`, `:840`).
 ///   In a gateway's own process the record of sent prefixes, or a token
-///   tree the host lends, takes a prompt behind a request the profile's
-///   stages place, as under the policy alone, and behind none the rule
-///   places alone: the rule keeps those from the profile
-///   ([`override_rule`]), and the record's writes read that word
+///   tree or a placement map the host lends, takes a prompt behind a
+///   request the profile's stages place, as under the policy alone, and
+///   behind none the rule places alone: the rule keeps those from the
+///   profile ([`override_rule`]), and the record's writes read that word
 ///   (`lease_events::stages_hear`). A controller's decision is this
 ///   engine's, so its record follows the word too.
 fn override_places(policy: &PolicySettings, config: &RoutingSettings) -> bool {

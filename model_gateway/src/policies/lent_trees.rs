@@ -22,13 +22,26 @@
 //! one this process removed does. The engine calls a tree's match and
 //! nothing else.
 //!
+//! A model whose `index` entry is a hash index is lent a placement map in
+//! its trees' place ([`LentTrees::placement_map`]), in the store type the
+//! classic policy keeps its own in. The entry states how long a holder
+//! lives in it and how often it is swept, and the classic policy's own
+//! sweep bounds it and counts its gauge. A worker the registry lost leaves
+//! the maps by the same task. The engine reads a head's live holders and
+//! writes the worker it picked, and nothing else.
+//!
 //! The engine is handed one object for what this process knows of its
-//! workers' caches ([`EngineCaches`]): the cache-event monitor's indexes and
-//! these trees, each to a single request's decision alone.
+//! workers' caches ([`EngineCaches`]): the cache-event monitor's indexes,
+//! these trees and these maps, each to a single request's decision alone.
 
-use std::sync::{Arc, OnceLock};
+use std::{
+    sync::{Arc, OnceLock},
+    time::{Duration, Instant},
+};
 
-use kv_index::{ModelTrees, TenantId, TokenTree, Tree as StringTree};
+use kv_index::{
+    ModelPlacements, ModelTrees, PlacementMap, TenantId, TokenTree, Tree as StringTree,
+};
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 use smg_grand_central::{
     document::{IndexKind, IndexSpec, PolicySpec},
@@ -42,18 +55,21 @@ use tokio::{
 use tracing::{debug, error, warn};
 
 use super::{
-    cache_aware::evict_trees, kv_index::event_monitor::KvEventMonitor, normalize_model_key,
+    cache_aware::{evict_trees, CacheAwarePolicy},
+    kv_index::event_monitor::KvEventMonitor,
+    normalize_model_key,
     utils::PeriodicTask,
 };
 use crate::routers::common::snapshot::WorkerRegistry;
 
 /// The owner of the trees Grand Central is lent: a token tree and a
-/// string tree a model.
+/// string tree a model, and a placement map for a model under a hash index.
 #[derive(Debug)]
 pub(crate) struct LentTrees {
     /// The document the engine runs: a model's `index` entry sizes its
-    /// trees ([`PolicySpec::index_for`]). A document a worker's label puts
-    /// in force takes its place ([`Self::follow`]).
+    /// trees and times its placement map ([`PolicySpec::index_for`]). A
+    /// document a worker's label puts in force takes its place
+    /// ([`Self::follow`]).
     document: Mutex<PolicySpec>,
     /// A token tree's page in tokens: the block size of the document the
     /// owner was made under. Every later document that reads the trees
@@ -63,6 +79,49 @@ pub(crate) struct LentTrees {
     page: usize,
     /// One store for each size and cadence the models asked so far take.
     stores: Mutex<Vec<SizedTrees>>,
+    /// One store of placement maps for each lifetime and cadence the
+    /// models asked so far take.
+    placements: Mutex<Vec<TimedPlacements>>,
+}
+
+/// The placement maps of the models whose `index` entries state one
+/// lifetime and one cadence, with the sweep that bounds them.
+#[derive(Debug)]
+struct TimedPlacements {
+    ttl_s: u32,
+    sweep_s: u32,
+    maps: Arc<ModelPlacements>,
+    /// The sweep on its timer. It ends with the owner.
+    _sweep: Option<PeriodicTask>,
+}
+
+impl TimedPlacements {
+    /// A store of placement maps whose holders live `ttl_s` seconds, swept
+    /// by the classic policy's sweep every `sweep_s` seconds: a holder past
+    /// its lifetime and a key left with none are dropped, and each model's
+    /// gauge is set. The document's longest cadence spawns no sweep, as it
+    /// spawns no size pass: a read still passes a holder past its lifetime
+    /// and a write drops it, so such a map answers the same and is bounded
+    /// by nothing. The routing settings write that cadence for an interval
+    /// of zero, and an interval of that many seconds reads the same: the
+    /// classic policy starts a timer there, of over 136 years, and this
+    /// store starts none.
+    fn new(ttl_s: u32, sweep_s: u32) -> Self {
+        let maps = Arc::new(ModelPlacements::new());
+        let sweep = (sweep_s != u32::MAX).then(|| {
+            let maps = Arc::clone(&maps);
+            let ttl = Duration::from_secs(u64::from(ttl_s));
+            PeriodicTask::spawn(u64::from(sweep_s), "PlacementSweep", move || {
+                CacheAwarePolicy::sweep_placement_index(&maps, ttl, Instant::now());
+            })
+        });
+        Self {
+            ttl_s,
+            sweep_s,
+            maps,
+            _sweep: sweep,
+        }
+    }
 }
 
 /// The trees of the models whose `index` entries state one size and one
@@ -117,6 +176,7 @@ impl LentTrees {
             document: Mutex::new(document),
             page: usize::try_from(page).unwrap_or(usize::MAX),
             stores: Mutex::new(Vec::new()),
+            placements: Mutex::new(Vec::new()),
         }
     }
 
@@ -128,7 +188,8 @@ impl LentTrees {
     /// out of the trees ([`Self::follow_removals`]), on the runtime the
     /// call is made on. The engine's start runs on one, and so does a
     /// registration. Where none is entered no task is started, nothing
-    /// takes a worker out of the trees, and a debug line says so.
+    /// takes a worker out of the trees or the placement maps, and a debug
+    /// line says so.
     pub(crate) fn lend(
         cell: &OnceLock<Arc<Self>>,
         document: &PolicySpec,
@@ -139,7 +200,7 @@ impl LentTrees {
             let trees = Arc::new(Self::of_document(document.clone(), page));
             match Handle::try_current() {
                 Ok(runtime) => trees.follow_removals(workers, &runtime),
-                Err(_) => debug!("No runtime is entered: no task takes a worker that leaves out of the lent trees"),
+                Err(_) => debug!("No runtime is entered: no task takes a worker that leaves out of the lent trees and placement maps"),
             }
             trees
         };
@@ -177,7 +238,16 @@ impl LentTrees {
     /// entry stands as it stood is handed the tree it had. A model whose
     /// entry states another size or cadence under `document` is handed the
     /// tree of that entry's store at its next ask. The engine asks where it
-    /// builds the model's table again.
+    /// builds the model's table again. A placement map is timed the same
+    /// way, by the entry's lifetime and cadence at the ask. The store a
+    /// model leaves keeps the map it had. A table the engine read before
+    /// the change still writes it, until that table is read again, and a
+    /// model timed the first way again is handed it again. That store's
+    /// sweep, where it has one, drops its holders as their lifetime ends
+    /// and still sets the model's gauge by it, beside the new store's: the
+    /// gauge then reads the store swept last. Every document of a process
+    /// is made from its one configuration, whose sides share one index
+    /// entry: the settings time a model one way for its life.
     pub(crate) fn follow(&self, document: PolicySpec) -> PolicySpec {
         std::mem::replace(&mut *self.document.lock(), document)
     }
@@ -187,6 +257,74 @@ impl LentTrees {
     #[cfg(test)]
     pub(crate) fn follows(&self) -> u64 {
         self.document.lock().generation
+    }
+
+    /// The `index` entry of `model` in the document in force at the ask
+    /// ([`Self::follow`]), or the entry's defaults where that document
+    /// writes none for it. The document's lock is let go at the return,
+    /// ahead of a store's: no caller holds the two.
+    fn entry_of(&self, model: &str) -> IndexSpec {
+        let document = self.document.lock();
+        let entry = document.index_for(model);
+        entry.map_or_else(IndexSpec::default, |(_, entry)| entry.clone())
+    }
+
+    /// The placement map of `model`, made at its first ask: every later ask
+    /// under the same `index` entry is handed the same map. It stands with
+    /// the maps of its lifetime and its cadence, a store made at the first
+    /// ask for a map of that lifetime and cadence ([`Self::entry_of`]). The
+    /// engine asks when it builds a model's table under a hash index, not
+    /// for a request.
+    ///
+    /// The first map of a store that starts no sweep
+    /// ([`TimedPlacements::new`]) is lent with one line at warn that says
+    /// so. The line names the `index` entries of the hash kind that state
+    /// that lifetime and that cadence in this owner's document. The
+    /// document is read twice: for the model's entry, which times the
+    /// map, and once the store is made, for the line's names. The engine
+    /// asks under an entry of the hash kind in the document it decides
+    /// by. Another may be in force here at either read
+    /// ([`Self::follow`]): the map is then timed by an entry of either
+    /// kind, and the line names the hash entries of the document its own
+    /// read finds. It can name none.
+    pub(crate) fn placement_map(&self, model: &str) -> Arc<PlacementMap> {
+        let IndexSpec { ttl_s, sweep_s, .. } = self.entry_of(model);
+        let mut stores = self.placements.lock();
+        let found = stores
+            .iter()
+            .position(|store| store.ttl_s == ttl_s && store.sweep_s == sweep_s);
+        let at = found.unwrap_or_else(|| {
+            stores.push(TimedPlacements::new(ttl_s, sweep_s));
+            stores.len() - 1
+        });
+        let map = stores[at].maps.get_or_new(normalize_model_key(model));
+        // A store made here with no sweep owes its line.
+        let unswept = found.is_none() && stores[at]._sweep.is_none();
+        // The line is written with the lock let go, and the document is
+        // read behind the drop of the stores: no caller holds the two
+        // locks.
+        drop(stores);
+        if unswept {
+            let index: Vec<String> = self
+                .document
+                .lock()
+                .index
+                .iter()
+                .filter(|(_, entry)| {
+                    entry.kind == IndexKind::Hash
+                        && entry.ttl_s == ttl_s
+                        && entry.sweep_s == sweep_s
+                })
+                .map(|(key, _)| key.clone())
+                .collect();
+            warn!(
+                ?index,
+                ttl_s,
+                sweep_s,
+                "No periodic sweep starts for the lent placement maps of this ttl_s and sweep_s: this sweep_s is the longest cadence, at which none starts, so no timer drops a key whose holders are past their lifetime"
+            );
+        }
+        map
     }
 
     /// The token tree of `model`, made at its first ask: every later ask
@@ -249,21 +387,13 @@ impl LentTrees {
     /// The store of the trees of `model`'s size and cadence, made at the
     /// first ask for a tree of that size and cadence. The two are the
     /// model's `index` entry of the document in force at the ask
-    /// ([`Self::follow`]), or the entry's defaults where that document
-    /// writes none for it. It is handed under the lock of the stores: a
+    /// ([`Self::entry_of`]). It is handed under the lock of the stores: a
     /// caller takes what it reads of the store and lets the lock go before
     /// it looks a tree up.
     fn store_of(&self, model: &str) -> MappedMutexGuard<'_, SizedTrees> {
-        let document = self.document.lock();
-        let (max_size, sweep_s) = document.index_for(model).map_or_else(
-            || {
-                let unwritten = IndexSpec::default();
-                (unwritten.max_size, unwritten.sweep_s)
-            },
-            |(_, entry)| (entry.max_size, entry.sweep_s),
-        );
-        // Let go ahead of the stores' lock: no caller holds the two.
-        drop(document);
+        let IndexSpec {
+            max_size, sweep_s, ..
+        } = self.entry_of(model);
         let mut stores = self.stores.lock();
         let found = stores
             .iter()
@@ -316,10 +446,11 @@ impl LentTrees {
                 }
                 let purge = tokio::task::spawn_blocking(move || trees.forget_the_removed(&left));
                 // A purge that panicked is this task's last: the size pass
-                // alone bounds the trees from here on.
+                // alone bounds the trees from here on, and a map keeps a
+                // worker that left until its holder's lifetime ends.
                 if let Err(ended) = purge.await {
                     if ended.is_panic() {
-                        error!("A purge of the lent trees panicked: no worker that leaves is taken out of them from here on");
+                        error!("A purge of the lent trees and placement maps panicked: no worker that leaves is taken out of them from here on");
                     }
                     return;
                 }
@@ -327,14 +458,24 @@ impl LentTrees {
         });
     }
 
-    /// Takes the workers `left` says left out of every tree. A worker that
-    /// left is never written again, so the size pass alone would keep its
-    /// prompts for good.
+    /// Takes the workers `left` says left out of every tree and every
+    /// placement map. No decision made behind its leaving writes a worker
+    /// again, so the size pass alone would keep its prompts for good, and
+    /// a map would name it a holder until its lifetime ends. A decision
+    /// under way at the leaving can still write the worker behind the
+    /// purge, as the classic policy's can (`select_worker_hash` writes
+    /// behind its pick, and `remove_worker_by_url` purges beside it). A map
+    /// passes such a holder while no worker stands at its address, and
+    /// names it for a worker registered there again inside the holder's
+    /// lifetime. Past that lifetime the key's next read, write or sweep
+    /// drops it.
     ///
     /// An address a removal named leaves, and nobody is asked: it leaves
     /// whether or not a worker is registered under it again by now. The
-    /// worker that rejoins starts with no prompt, as its cache may not have
-    /// outlived it.
+    /// purge runs behind the removal's event. A worker registered at the
+    /// address again is named by the old entries until the purge has run,
+    /// and behind it by none but one such a decision wrote: its cache may
+    /// not have outlived the worker that left.
     ///
     /// Where events went unheard, every prompt leaves every tree, and a
     /// line at warn says so. A removal may be among those events, and a
@@ -354,10 +495,17 @@ impl LentTrees {
     /// and its count. The call ends where the tree's total reads zero.
     /// Every address stays listed at no tokens, but one a removal named:
     /// that one is purged by name behind the pass.
+    ///
+    /// A placement map loses a named address by the store's own removal
+    /// ([`ModelPlacements::remove_worker`]). Where events went unheard it
+    /// loses every holder touched before the purge's instant, by the
+    /// sweep's own rule at no lifetime: a holder a decision touches at
+    /// that instant or behind it stays, as one of the registry the purge
+    /// stands behind.
     fn forget_the_removed(&self, left: &Left) {
         if left.unheard > 0 {
             warn!(
-                "{} events of the worker registry went unheard: the lent trees are emptied, and cache_aware remembers no prompt until they fill again",
+                "{} events of the worker registry went unheard: the lent trees are emptied and the placement maps lose every holder touched before this purge, and cache_aware fills them again from the requests that follow",
                 left.unheard
             );
         }
@@ -383,6 +531,24 @@ impl LentTrees {
                 |worker| tree.remove_tenant_all(worker),
             );
         }
+        // The placement maps by the same two calls. A map is emptied by
+        // the sweep's own call at no lifetime: every holder written before
+        // this instant leaves, one a request writes meanwhile stays, and
+        // each model's gauge is set.
+        let maps: Vec<Arc<ModelPlacements>> = self
+            .placements
+            .lock()
+            .iter()
+            .map(|store| Arc::clone(&store.maps))
+            .collect();
+        for maps in &maps {
+            left.purge(
+                || {
+                    CacheAwarePolicy::sweep_placement_index(maps, Duration::ZERO, Instant::now());
+                },
+                |worker| maps.remove_worker(worker),
+            );
+        }
     }
 }
 
@@ -398,7 +564,9 @@ struct Left {
 impl Left {
     /// Notes `event`: a removal names the address that left. A
     /// registration, a replacement and a status change take no worker
-    /// away.
+    /// away. A worker replaced at its address keeps what the trees and
+    /// maps hold for it, for a model it no longer serves too: the classic
+    /// policy purges at a removal alone (`RemoveFromPolicyRegistryStep`).
     fn note(&mut self, event: &WorkerEvent) {
         if let WorkerEvent::Removed { worker, .. } = event {
             self.addresses.push(worker.url().to_owned());
@@ -411,8 +579,9 @@ impl Left {
         self.unheard > 0 || !self.addresses.is_empty()
     }
 
-    /// The purge of one tree, of either kind: `empty` is the tree's size
-    /// pass at no size, and `forget` its purge of one worker by name.
+    /// The purge of one tree, of either kind, or of one store of placement
+    /// maps: `empty` is the tree's size pass at no size or the maps' sweep
+    /// at no lifetime, and `forget` the purge of one worker by name.
     fn purge(&self, empty: impl FnOnce(), forget: impl Fn(&TenantId)) {
         if self.unheard > 0 {
             // A tree's own `clear` asks for no writer beside it. This
@@ -429,14 +598,16 @@ impl Left {
 }
 
 /// What a gateway answers Grand Central of its workers' caches, as one
-/// object: the indexes of the cache-event monitor, and the trees it lends.
+/// object: the indexes of the cache-event monitor, and the trees and
+/// placement maps it lends.
 pub(crate) struct EngineCaches {
     /// The cache-event monitor, where the process keeps one.
     events: Option<Arc<KvEventMonitor>>,
-    /// The cell of the lent trees. It is filled where a document put in
-    /// force first reads sent prefixes: at the start, or behind a worker's
-    /// label. The engine asks where it builds a model's table, so trees
-    /// lent behind a label are read at the table's next build.
+    /// The cell of the lent trees and placement maps. It is filled where a
+    /// document put in force first reads sent prefixes: at the start, or
+    /// behind a worker's label. The engine asks where it builds a model's
+    /// table, so what is lent behind a label is read at the table's next
+    /// build.
     trees: Arc<OnceLock<Arc<LentTrees>>>,
 }
 
@@ -482,6 +653,16 @@ impl CacheIndexes for EngineCaches {
             Phase::Prefill | Phase::Decode | Phase::Encode => None,
         }
     }
+
+    /// The placement map of a single request's model. The engine asks for
+    /// it under a hash index alone. A pair's sides are lent none, as they
+    /// are lent no tree.
+    fn placement_map(&self, model: &str, phase: Phase) -> Option<Arc<PlacementMap>> {
+        match phase {
+            Phase::Single => Some(self.trees.get()?.placement_map(model)),
+            Phase::Prefill | Phase::Decode | Phase::Encode => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -493,8 +674,9 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use kv_index::{ContentHash, SequenceHash, StoredBlock};
+    use kv_index::{hash_token_head, record_in, ContentHash, SequenceHash, StoredBlock};
     use openai_protocol::{worker::WorkerStatus, UNKNOWN_MODEL_ID};
+    use smg_grand_central::document::IndexKind;
     use smg_worker::{registry::RemoteWorkerState, test_support::ready_worker};
 
     use super::*;
@@ -1178,5 +1360,293 @@ mod tests {
         assert!(std::ptr::addr_eq(Arc::as_ptr(&lent), Arc::as_ptr(&index)));
         assert!(caches.index("another").is_none());
         assert_eq!(caches.block_size("another"), None);
+    }
+
+    /// A hash `index` entry whose holders live `ttl_s` seconds, swept every
+    /// `sweep_s` seconds.
+    fn hashed(ttl_s: u32, sweep_s: u32) -> IndexSpec {
+        let mut index = IndexSpec::default();
+        index.kind = IndexKind::Hash;
+        index.ttl_s = ttl_s;
+        index.sweep_s = sweep_s;
+        index
+    }
+
+    /// A prompt of 32 tokens no other `prompt` begins with.
+    fn head(prompt: u32) -> Vec<u32> {
+        (prompt * 1_000..prompt * 1_000 + 32).collect()
+    }
+
+    /// Writes `worker` as a holder of `head(prompt)` at its boundary of 16
+    /// tokens, touched at `at`.
+    fn placed(map: &PlacementMap, prompt: u32, worker: &str, at: Instant) {
+        let a_day = Duration::from_secs(86_400);
+        record_in(
+            map,
+            None::<[u32; 2]>,
+            &head(prompt),
+            &[16],
+            worker,
+            at,
+            a_day,
+        );
+    }
+
+    /// Who `map` holds for `head(prompt)` at its boundary of 16 tokens,
+    /// sorted: every holder, whatever its age.
+    fn held(map: &PlacementMap, prompt: u32) -> Vec<String> {
+        let key = (16, hash_token_head(None::<[u32; 2]>, &head(prompt)[..16]));
+        let names = map.get(&key).map(|holders| {
+            let mut names: Vec<String> = holders.iter().map(|h| h.worker_url.clone()).collect();
+            names.sort();
+            names
+        });
+        names.unwrap_or_default()
+    }
+
+    /// A model is handed one placement map, at its first ask and at every
+    /// later one, and another model another. The empty name is the unknown
+    /// model's, as it is for a tree. A store is one lifetime and one
+    /// cadence: two entries of one lifetime and two cadences are two
+    /// stores, each with its sweep, and a model the document writes no
+    /// entry for takes the entry's own defaults.
+    #[test]
+    fn a_model_is_handed_one_placement_map() {
+        let mut stated = document(1_000, 0);
+        stated.index.clear();
+        stated.index.insert("slow*".to_owned(), hashed(60, 2));
+        stated.index.insert("fast*".to_owned(), hashed(60, 1));
+        let maps = owner(stated);
+        let first = maps.placement_map(MODEL);
+        assert!(Arc::ptr_eq(&first, &maps.placement_map(MODEL)));
+        assert!(!Arc::ptr_eq(&first, &maps.placement_map("another")));
+        let unnamed = maps.placement_map("");
+        assert!(Arc::ptr_eq(&unnamed, &maps.placement_map(UNKNOWN_MODEL_ID)));
+        let (slow, fast) = (maps.placement_map("slow-a"), maps.placement_map("fast-a"));
+        assert!(!Arc::ptr_eq(&slow, &fast));
+        maps.placement_map("slow-b");
+
+        let stores = maps.placements.lock();
+        let numbers: Vec<(u32, u32)> = stores
+            .iter()
+            .map(|store| (store.ttl_s, store.sweep_s))
+            .collect();
+        let unwritten = IndexSpec::default();
+        let stated = [(unwritten.ttl_s, unwritten.sweep_s), (60, 2), (60, 1)];
+        assert_eq!(numbers, stated);
+        // The unwritten entry's store holds the three models asked first,
+        // and the slow entry's both slow models.
+        assert!(stores[0].maps.get("another").is_some());
+        assert!(stores[0].maps.get(UNKNOWN_MODEL_ID).is_some() && stores[0].maps.get("").is_none());
+        assert!(stores[1].maps.get("slow-a").is_some() && stores[1].maps.get("slow-b").is_some());
+        assert!(stores.iter().all(|store| store._sweep.is_some()));
+    }
+
+    /// The sweep holds a model's map to the lifetime of the model's own
+    /// `index` entry, on that entry's timer: a holder past it leaves with
+    /// its key, and the same holder under a longer entry stays. The
+    /// settings' interval of zero runs no sweep, as it runs no size pass.
+    ///
+    /// The classic policy sweeps its own map by the same call on its own
+    /// timer, and runs none at an interval of zero
+    /// (`model_gateway/src/policies/cache_aware.rs`, `with_config`).
+    #[test]
+    fn the_sweep_holds_a_map_to_its_index_entrys_lifetime() {
+        let mut stated = document(1_000, 1);
+        stated.index.insert("brief*".to_owned(), hashed(1, 1));
+        stated.index.insert("long*".to_owned(), hashed(3_600, 1));
+        let maps = owner(stated);
+        let (brief, long) = (maps.placement_map("brief-a"), maps.placement_map("long-a"));
+        let old = Instant::now().checked_sub(Duration::from_secs(60));
+        let old = old.expect("a process a minute old");
+        placed(&brief, 1, "http://a:1", old);
+        placed(&long, 1, "http://a:1", old);
+        let until = Instant::now() + Duration::from_secs(20);
+        while !brief.is_empty() && Instant::now() < until {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(brief.is_empty(), "the sweep ran on its timer");
+        assert_eq!(held(&long, 1), ["http://a:1"], "its own entry's lifetime");
+
+        let mut unswept = document(1_000, 0);
+        unswept
+            .index
+            .insert("brief*".to_owned(), hashed(1, u32::MAX));
+        let unswept = owner(unswept);
+        unswept.placement_map("brief-a");
+        let stores = unswept.placements.lock();
+        assert!(
+            stores[0]._sweep.is_none(),
+            "no sweep at the longest cadence"
+        );
+    }
+
+    /// A store of placement maps at the longest cadence starts no sweep,
+    /// and one line at warn says so when its first map is lent. The line
+    /// names every `index` entry of the hash kind that states the store's
+    /// lifetime and that cadence, and no other: an entry of another
+    /// lifetime at that cadence has a store of its own, and an entry of
+    /// the tree kind of the store's own timing is not named. A store that
+    /// has a sweep writes none.
+    /// The lent token trees say a size no pass holds the same way
+    /// ([`a_size_no_pass_holds_is_said_when_its_trees_are_lent`]).
+    ///
+    /// The classic policy starts no sweep of its own map at an interval of
+    /// zero and writes no line there
+    /// (`model_gateway/src/policies/cache_aware.rs`, `with_config`).
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_store_no_sweep_bounds_is_said_when_its_first_map_is_lent() {
+        const LINE: &str = "No periodic sweep starts";
+        let mut stated = document(1_000, 1);
+        stated.index.insert("*".to_owned(), hashed(60, u32::MAX));
+        stated
+            .index
+            .insert("lasting*".to_owned(), hashed(60, u32::MAX));
+        stated
+            .index
+            .insert("longest*".to_owned(), hashed(90, u32::MAX));
+        stated.index.insert("swept*".to_owned(), hashed(60, 1));
+        stated.index.insert("longer*".to_owned(), hashed(90, 1));
+        let mut tree = entry(1_000, u32::MAX);
+        tree.ttl_s = 60;
+        stated.index.insert("tree*".to_owned(), tree);
+        let maps = owner(stated);
+        maps.placement_map("swept-a");
+        maps.placement_map("longer-a");
+        assert!(!logs_contain(LINE), "a store with a sweep takes no line");
+        maps.placement_map(MODEL);
+        assert!(logs_contain(LINE), "the store's first map takes the line");
+        maps.placement_map("another");
+        maps.placement_map("lasting-a");
+        logs_assert(|lines: &[&str]| {
+            let said: Vec<_> = lines.iter().filter(|line| line.contains(LINE)).collect();
+            let warns = |line: &&&str| {
+                line.contains("WARN")
+                    && line.contains(r#"index=["*", "lasting*"] ttl_s=60 sweep_s=4294967295"#)
+            };
+            match said.as_slice() {
+                [line] if warns(line) => Ok(()),
+                _ => Err(format!("one line at warn for the three maps: {said:?}")),
+            }
+        });
+        assert_eq!(maps.placements.lock().len(), 3, "a store a timing");
+    }
+
+    /// A worker a removal named leaves every placement map, whichever
+    /// lifetime its store is of, and no other worker does. Events that went
+    /// unheard empty every map of the holders written before the purge: a
+    /// holder a request writes behind the purge's instant stays.
+    ///
+    /// The classic policy takes a removed worker out of its own map by the
+    /// store's same call (`model_gateway/src/policies/cache_aware.rs`,
+    /// `remove_worker_by_url`).
+    #[test]
+    fn a_worker_that_left_is_taken_out_of_every_placement_map() {
+        let mut stated = document(1_000, 0);
+        stated
+            .index
+            .insert("brief*".to_owned(), hashed(600, u32::MAX));
+        let maps = owner(stated);
+        let (one, other) = (maps.placement_map(MODEL), maps.placement_map("brief-a"));
+        assert_eq!(maps.placements.lock().len(), 2, "two lifetimes, two stores");
+        let now = Instant::now();
+        for map in [&one, &other] {
+            for worker in ["http://a:1", "http://b:1"] {
+                placed(map, 1, worker, now);
+            }
+            placed(map, 2, "http://b:1", now);
+        }
+
+        let removed = Left {
+            addresses: vec!["http://b:1".to_owned()],
+            unheard: 0,
+        };
+        maps.forget_the_removed(&removed);
+        for map in [&one, &other] {
+            assert_eq!(held(map, 1), ["http://a:1"]);
+            // A key that loses its last holder leaves with it.
+            assert_eq!(map.len(), 1);
+        }
+
+        let later = Instant::now() + Duration::from_secs(60);
+        placed(&one, 3, "http://c:1", later);
+        let unheard = Left {
+            unheard: 1,
+            ..Left::default()
+        };
+        maps.forget_the_removed(&unheard);
+        assert!(held(&one, 1).is_empty() && other.is_empty());
+        assert_eq!(held(&one, 3), ["http://c:1"], "written behind the purge");
+    }
+
+    /// The task that follows the registry takes a worker it lost out of
+    /// the placement maps, as it takes it out of the trees.
+    #[tokio::test]
+    async fn a_worker_the_registry_lost_leaves_the_placement_maps() {
+        let maps = Arc::new(owner(document(1_000, 0)));
+        let registry = WorkerRegistry::new();
+        worker_at(&registry, "http://a:1");
+        worker_at(&registry, "http://b:1");
+        let map = maps.placement_map(MODEL);
+        let now = Instant::now();
+        placed(&map, 1, "http://a:1", now);
+        placed(&map, 1, "http://b:1", now);
+        maps.follow_removals(&registry, &Handle::current());
+
+        registry.remove_by_url("http://b:1").expect("the removal");
+        until("the purge of the placement maps", || {
+            held(&map, 1) == ["http://a:1"]
+        })
+        .await;
+    }
+
+    /// The engine is lent the placement map of a single request's model,
+    /// the owner's own, and none for a pair's side or an encode request.
+    /// Where no owner stands it is lent none.
+    #[test]
+    fn the_engine_is_lent_a_single_requests_placement_map_and_no_sides() {
+        let maps = Arc::new(owner(document(1_000, 0)));
+        let lent = cell(Some(Arc::clone(&maps)));
+        let caches = EngineCaches::of(None, lent, false).expect("the maps");
+        let lent = caches.placement_map(MODEL, Phase::Single).expect("a map");
+        assert!(Arc::ptr_eq(&lent, &maps.placement_map(MODEL)));
+        for side in [Phase::Prefill, Phase::Decode, Phase::Encode] {
+            assert!(caches.placement_map(MODEL, side).is_none(), "{side:?}");
+        }
+        let monitor = Arc::new(KvEventMonitor::new());
+        let caches = EngineCaches::of(Some(monitor), cell(None), false).expect("the monitor");
+        assert!(caches.placement_map(MODEL, Phase::Single).is_none());
+    }
+
+    /// The owner times a model's placement map by the model's `index`
+    /// entry of the document in force at the ask, as it sizes its trees.
+    /// Behind a document that follows, a model whose entry stands as it
+    /// stood is handed the map it had. A model the new document writes
+    /// another lifetime for is handed the map of that entry's store.
+    #[test]
+    fn a_models_placement_map_is_timed_by_the_document_in_force_at_the_ask() {
+        let mut start = document(128, 1);
+        start.index.clear();
+        start.index.insert("*".to_owned(), hashed(60, 1));
+        let maps = owner(start.clone());
+        let (plain, labelled) = (maps.placement_map("plain"), maps.placement_map(MODEL));
+        let mut later = start.clone();
+        later.index.insert(MODEL.to_owned(), hashed(30, 1));
+        assert_eq!(maps.follow(later), start, "the document followed before");
+        assert!(
+            Arc::ptr_eq(&maps.placement_map("plain"), &plain),
+            "its entry stands"
+        );
+        assert!(
+            !Arc::ptr_eq(&maps.placement_map(MODEL), &labelled),
+            "another store"
+        );
+        let stores = maps.placements.lock();
+        let numbers: Vec<(u32, u32)> = stores
+            .iter()
+            .map(|store| (store.ttl_s, store.sweep_s))
+            .collect();
+        assert_eq!(numbers, [(60, 1), (30, 1)]);
     }
 }

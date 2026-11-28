@@ -29,6 +29,7 @@ mod hash_index;
 mod index;
 mod kept_writes;
 mod leaves;
+mod placement_map;
 mod places;
 mod record;
 mod stated;
@@ -132,6 +133,12 @@ struct Host {
     asked: AtomicUsize,
     tree: Option<Arc<TokenTree>>,
     text: Option<Arc<StringTree>>,
+    /// The host's placement map of the prompts it sent, where it keeps one.
+    placed: Option<Arc<PlacementMap>>,
+    /// The host lends that map at every phase: it asks no phase.
+    everywhere: bool,
+    /// How often the host was asked for that map.
+    maps: AtomicUsize,
 }
 
 impl CacheIndexes for Host {
@@ -159,6 +166,64 @@ impl CacheIndexes for Host {
         let single = model == MODEL && phase == Phase::Single;
         self.text.as_ref().filter(|_| single).cloned()
     }
+
+    fn placement_map(&self, model: &str, phase: Phase) -> Option<Arc<PlacementMap>> {
+        self.maps.fetch_add(1, Ordering::Relaxed);
+        let lends = model == MODEL && (self.everywhere || phase == Phase::Single);
+        self.placed.as_ref().filter(|_| lends).cloned()
+    }
+}
+
+/// An engine's affinity over a host that keeps a placement map of the
+/// prompts it sent and lends it, as its policy reads and writes one under a
+/// hash index. With a chain index that holds a block beside it, or with
+/// none. The host too, for how often it was asked.
+fn lending_placed(indexed: bool) -> (Affinity, Arc<Host>, Arc<PlacementMap>) {
+    let placed = Arc::new(PlacementMap::default());
+    let index = indexed.then(|| {
+        let index = Arc::new(ChainIndex::new());
+        store(&index, 0, &[7]);
+        index
+    });
+    let host = Arc::new(Host {
+        index,
+        placed: Some(Arc::clone(&placed)),
+        ..Host::default()
+    });
+    let affinity = Affinity::default();
+    affinity.set_indexes(Arc::clone(&host) as Arc<dyn CacheIndexes>);
+    (affinity, host, placed)
+}
+
+/// An engine's affinity over a host that lends its placement map at every
+/// phase, and keeps no index of cache events. The host too, for how often
+/// it was asked, and its map.
+fn lending_everywhere() -> (Affinity, Arc<Host>, Arc<PlacementMap>) {
+    let placed = Arc::new(PlacementMap::default());
+    let host = Arc::new(Host {
+        placed: Some(Arc::clone(&placed)),
+        everywhere: true,
+        ..Host::default()
+    });
+    let affinity = Affinity::default();
+    affinity.set_indexes(Arc::clone(&host) as Arc<dyn CacheIndexes>);
+    (affinity, host, placed)
+}
+
+/// The cache-aware preset under a hash index for every model: a holder
+/// lives `ttl_s` seconds, and a prompt's heads end at `boundaries` tokens.
+fn hashed_at(boundaries: &[u32], ttl_s: u32) -> AppliedSpec {
+    use crate::document::spec::IndexSpec;
+    let mut document = PolicySpec::preset("cache_aware").expect("a built-in preset");
+    document.generation = 1;
+    document.view.boundaries = boundaries.to_vec();
+    let index = IndexSpec {
+        kind: IndexKind::Hash,
+        ttl_s,
+        ..IndexSpec::default()
+    };
+    document.index.insert("*".into(), index);
+    AppliedSpec::validate(&document).expect("the document validates")
 }
 
 /// An engine's affinity over a host with a chain index, or with none.
@@ -338,8 +403,23 @@ struct Named {
     holders: Vec<(u32, u32, u32)>,
     warming: Vec<u32>,
     thin: bool,
-    /// The match of the lent tree that named the rows, where one did.
+    /// The match of the lent tree that named the rows, where one did: a
+    /// placement map's read states its head's size the same way.
     tree: Option<TreeMatch>,
+}
+
+impl Named {
+    /// The rows a decision was handed, kept for a case's reads.
+    fn of(rows: AffinityRows<'_>) -> Self {
+        let holder =
+            |holder: &AffinityHolder| (holder.row, holder.overlap_blocks, holder.predicted_blocks);
+        Self {
+            holders: rows.holders.iter().map(holder).collect(),
+            warming: rows.warming.to_vec(),
+            thin: rows.thin,
+            tree: rows.tree,
+        }
+    }
 }
 
 fn picked(position: u32, id: WorkerId) -> Decision {
@@ -541,16 +621,7 @@ impl Bed {
             || text,
             |_| true,
             |facts| {
-                named = facts.named.map(|rows| Named {
-                    holders: rows
-                        .holders
-                        .iter()
-                        .map(|holder| (holder.row, holder.overlap_blocks, holder.predicted_blocks))
-                        .collect(),
-                    warming: rows.warming.to_vec(),
-                    thin: rows.thin,
-                    tree: rows.tree,
-                });
+                named = facts.named.map(Named::of);
                 match target {
                     Some(position) => picked(position, self.ids[position as usize]),
                     None => shed(),
@@ -559,6 +630,118 @@ impl Bed {
         );
         assert_eq!(decision.pick().is_some(), target.is_some());
         named
+    }
+
+    /// What a request is named whose host names `key` as its entry in the
+    /// placement map it lends: the prompt's tokens behind `marker` ids of a
+    /// partition's marker. Decided at `now` on the engine's own road, which
+    /// hands the lookup the decision's instant: by picking the worker at
+    /// `target`, which writes the request for it, or by a shed, which
+    /// writes nothing. The entry is asked for at a page of one token.
+    fn placed_at(&self, key: &[u32], marker: usize, target: Option<u32>, now: Instant) -> Named {
+        // No test of a pass's: each head stands as named.
+        self.placed_kept(key, marker, target, now, |_| None)
+    }
+
+    /// [`Self::placed_at`] with `kept`, the test a decision's own pass asks
+    /// of the holders a head names: whether the pass keeps one of them, and
+    /// `None` where the pass alone can say.
+    fn placed_kept(
+        &self,
+        key: &[u32],
+        marker: usize,
+        target: Option<u32>,
+        now: Instant,
+        kept: impl Fn(&[AffinityHolder]) -> Option<bool>,
+    ) -> Named {
+        self.placed_decided(MODEL, key, marker, target, now, kept).0
+    }
+
+    /// [`Self::placed_at`] for a request that names `model`, under no
+    /// partition.
+    fn placed_for(&self, model: &str, key: &[u32], target: Option<u32>, now: Instant) -> Named {
+        self.placed_decided(model, key, 0, target, now, |_| None).0
+    }
+
+    /// What the pick of the worker at `target` states of that worker, for a
+    /// request decided inside the placement map its host lends
+    /// ([`Self::placed_at`]).
+    fn stated_in_map(&self, key: &[u32], target: u32, now: Instant) -> Overlap {
+        let (_, decision) = self.placed_decided(MODEL, key, 0, Some(target), now, |_| None);
+        decision.pick().expect("a pick").overlap()
+    }
+
+    /// [`Self::placed_at`] for a request of `phase`, under no partition.
+    fn placed_in(&self, phase: Phase, key: &[u32], target: Option<u32>, now: Instant) -> Named {
+        self.placed_phased(MODEL, phase, key, 0, target, now, |_| None)
+            .0
+    }
+
+    /// [`Self::placed_kept`] for a request that names `model`, with the
+    /// decision it made.
+    fn placed_decided(
+        &self,
+        model: &str,
+        key: &[u32],
+        marker: usize,
+        target: Option<u32>,
+        now: Instant,
+        kept: impl Fn(&[AffinityHolder]) -> Option<bool>,
+    ) -> (Named, Decision) {
+        self.placed_phased(model, Phase::Single, key, marker, target, now, kept)
+    }
+
+    /// [`Self::placed_decided`] for a request of `phase`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the model, the phase, the entry and its marker, the target, the instant and the pass's test"
+    )]
+    fn placed_phased(
+        &self,
+        model: &str,
+        phase: Phase,
+        key: &[u32],
+        marker: usize,
+        target: Option<u32>,
+        now: Instant,
+        kept: impl Fn(&[AffinityHolder]) -> Option<bool>,
+    ) -> (Named, Decision) {
+        let hashes = hashed(&key[marker..]);
+        let entry = TokenKey {
+            tokens: Cow::Borrowed(key),
+            marker,
+        };
+        let mut named = None;
+        let decision = decide_hashed(
+            &self.affinity,
+            &self.pool,
+            &self.spec,
+            &self.workers,
+            &self.ids,
+            &mut RequestFacts {
+                model,
+                phase,
+                ..request(&hashes, 7, NOW)
+            },
+            None,
+            |page| {
+                assert_eq!(page, 1, "a placement map is keyed by the ids themselves");
+                Some(entry)
+            },
+            || None,
+            |_| true,
+            || None,
+            &|_, holders| kept(holders),
+            || now,
+            |facts| {
+                named = facts.named.map(Named::of);
+                match target {
+                    Some(position) => picked(position, self.ids[position as usize]),
+                    None => shed(),
+                }
+            },
+        );
+        (named.expect("rows named"), decision)
     }
 
     /// What the lookup states of the first target of `answer`, the decision
@@ -1780,8 +1963,13 @@ fn a_stale_kept_write_met_held_leaves_and_the_write_behind_it_is_written() {
         };
         thread::scope(|scope| {
             let keeper = scope.spawn(|| {
-                bed.affinity
+                let named = bed
+                    .affinity
                     .while_held(|| bed.decide(&request(&stale, 7, NOW), Some(1)));
+                // The second shape's kept write begins behind the two blocks
+                // the naming reads at the picked worker.
+                let named = named.expect("the record names its rows").holders;
+                assert_eq!(named, stood, "leading: {leading}");
                 bed.affinity.forget(bed.ids[3]);
                 other
                     .affinity
@@ -1885,6 +2073,7 @@ fn an_answer_made_ahead_of_a_leave_gives_its_worker_no_place() {
             || None,
             |_| true,
             || None,
+            Instant::now,
             leaves,
             made,
         );

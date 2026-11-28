@@ -91,6 +91,16 @@ fn a_shadow_reads_its_live_rows_only_where_it_would_be_handed_them() {
 /// are asked of no row share one naming whatever their filters: no
 /// test reads past either's cap. One such profile beside one whose
 /// filters are asked does not.
+///
+/// Whether the two are held to one test is a word of its own, for a host
+/// that holds a naming to its profile's test under any cap
+/// ([`Engine::shadow_held_alike`]). It says yes for two profiles of the
+/// same filters of the engine's own, and for two whose filters are
+/// asked of no row, whatever those filters. Of two profiles the engine
+/// asks by its own filters it says no where they differ by one, under
+/// no sample too. It says no for two whose filters are asked by a call
+/// each, two of one rule among them. The key's mark is a part of the
+/// test: a profile under it and one that is not are held apart.
 #[test]
 fn a_shadow_of_other_filters_is_named_rows_of_its_own_under_a_sample() {
     use crate::{
@@ -114,7 +124,7 @@ fn a_shadow_of_other_filters_is_named_rows_of_its_own_under_a_sample() {
     let mut catalog = StageRegistry::builtin();
     let added = catalog.filter("whole", || Box::new(Whole));
     added.expect("a free name");
-    let rows = |sample: u32, both: Turn<'_>, shadow: Turn<'_>| {
+    let built = |sample: u32, both: Turn<'_>, shadow: Turn<'_>| {
         let mut document = PolicySpec::preset("cache_aware").expect("a preset");
         let live = document.profiles.values_mut().next();
         let live = live.expect("the preset's profile");
@@ -128,8 +138,13 @@ fn a_shadow_of_other_filters_is_named_rows_of_its_own_under_a_sample() {
         document.profiles.insert("second".into(), second);
         document.bindings[0].shadow = Some(ShadowSpec::Profile("second".into()));
         let engine = document.validate_in(&catalog, &[]);
-        let engine = engine.expect("a binding with a shadow");
-        engine.shadow_for("m", Phase::Single).map(|(_, rows)| rows)
+        engine.expect("a binding with a shadow")
+    };
+    // The shadow's word, and whether the two profiles are held alike.
+    let rows = |sample: u32, both: Turn<'_>, shadow: Turn<'_>| {
+        let engine = built(sample, both, shadow);
+        let due = engine.shadow_for("m", Phase::Single);
+        due.map(|(at, rows)| (rows, engine.shadow_held_alike(at)))
     };
     let as_it_is = |_: &mut ProfileSpec| {};
     let whole = |profile: &mut ProfileSpec| profile.filter.push("whole".into());
@@ -149,22 +164,33 @@ fn a_shadow_of_other_filters_is_named_rows_of_its_own_under_a_sample() {
             .filter
             .push(serde_json::from_str(rule).expect("a rule"));
     };
-    let cases: [(u32, Turn<'_>, Turn<'_>, ShadowRows); 7] = [
-        (16, &as_it_is, &as_it_is, ShadowRows::Same),
-        (16, &as_it_is, &fewer, ShadowRows::Own),
-        (16, &as_it_is, &ruled, ShadowRows::Own),
-        (16, &ruled, &as_it_is, ShadowRows::Own),
-        (0, &as_it_is, &fewer, ShadowRows::Same),
+    let cases: [(u32, Turn<'_>, Turn<'_>, ShadowRows, bool); 8] = [
+        (16, &as_it_is, &as_it_is, ShadowRows::Same, true),
+        (16, &as_it_is, &fewer, ShadowRows::Own, false),
+        (16, &as_it_is, &ruled, ShadowRows::Own, false),
+        // Two profiles of one rule: each is asked by a call a filter.
+        (16, &ruled, &as_it_is, ShadowRows::Own, false),
+        (0, &ruled, &as_it_is, ShadowRows::Same, false),
+        (0, &as_it_is, &fewer, ShadowRows::Same, false),
         // Neither profile's filters are asked of a row: both namings
         // stand as made, whatever the filters.
-        (16, &whole, &first_gone, ShadowRows::Same),
+        (16, &whole, &first_gone, ShadowRows::Same, true),
         // The live profile's are not, and its shadow's are: the
         // shadow drops the filter that is shown the whole view.
-        (16, &whole, &fewer, ShadowRows::Own),
+        (16, &whole, &fewer, ShadowRows::Own, false),
     ];
-    for (at, (sample, both, shadow, wanted)) in cases.into_iter().enumerate() {
-        assert_eq!(rows(sample, both, shadow), Some(wanted), "pairing {at}");
+    for (at, (sample, both, shadow, wanted, alike)) in cases.into_iter().enumerate() {
+        let wanted = Some((wanted, alike));
+        assert_eq!(rows(sample, both, shadow), wanted, "pairing {at}");
     }
+    // The key's mark, set by hand as the validator sets it for the plain
+    // ring's shape: the two profiles of one set of filters are held alike
+    // with both under the mark or neither, and apart with one.
+    let mut marked = built(16, &as_it_is, &as_it_is);
+    marked.places_by_key(0);
+    assert!(!marked.shadow_held_alike(0), "the live profile alone");
+    marked.places_by_key(1);
+    assert!(marked.shadow_held_alike(0), "both under the mark");
 }
 
 /// A pool has one ruling of its warming rows: the live profile's, and

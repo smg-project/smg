@@ -48,7 +48,8 @@ pub use lane_pool::{
 pub use model_trees::ModelTrees;
 pub use path_hash::{hash_node_path, hash_token_path, GLOBAL_EVICTION_HASH};
 pub use placements::{
-    hash_token_head, ModelPlacements, PlacementHolder, PlacementMap, PLACEMENT_HOLDER_CAP,
+    hash_token_head, live_holders_in, record_in, ModelPlacements, PlacementHolder, PlacementMap,
+    PLACEMENT_HOLDER_CAP,
 };
 pub use reference::{request_prefix_hashes, ReferenceIndexer};
 pub use sharded::{ShardedChainIndex, SHARD_SHIFT};

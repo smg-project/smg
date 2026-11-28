@@ -397,7 +397,8 @@ Either way the model is decided inside its lent trees, as classic builds that mo
 its registration. The engine reads them where it next builds the model's table. The gateway takes
 the size and the sweep interval of a model's trees from the model's `index` entry of the document
 in force when the tree is first asked. It lends a tree for a single request's model alone: a
-pair's sides are lent none.
+pair's sides are lent none. Under a hash index the same owner keeps a model's placement map in
+its trees' place, by the entry's lifetime and cadence, and lends it the same way.
 
 A document put in force keeps the stages of a profile that did not change, under the rules of
 section 5.1. Its name and its own block stand in both documents, and the document's `signals` and
@@ -421,7 +422,8 @@ A `cache_aware` label writes its model's own entry of the document's `index` blo
 from what the document answers for that model without it. The block size and the cache boundaries
 stay one for the document, and a label that names another one is refused.
 
-The engine reads one entry and keeps one record of sent prefixes for a model, whatever the phase.
+The engine reads one entry and keeps one record of sent prefixes for a model, whichever of its
+phases read one: a single request decided inside a lent placement map reads none (section 4.5).
 Classic keeps a tree for each policy object, and the gateway lends a tree for a single request's
 model alone. So where one model id is served by labelled regular workers and by a pair at once, the
 pair's side of that model reads the label's entry. It reads the entry's kind, and its bound of the
@@ -748,22 +750,74 @@ Classic reads exactly one record for a request:
 
 This is classic under its default, `--cache-index tree`. Under `--cache-index hash` classic reads
 none of the three: it keeps a table of placements with a time to live for requests with token
-ids, and balances a text request by load. The engine follows it there by its record of sent
-prefixes: under an index of the kind `hash` the record is keyed at `view.boundaries` alone, and
-the settings translate to a `prefix-affinity` threshold of zero and a `warmup-slice` that names
-nobody. So a request of token ids can go back to the worker its head at a boundary was sent to.
-A request that carries fewer block hashes than its first boundary has whole blocks, or one hashed
-by its text, is recorded nowhere. Several
-things differ from classic. The engine keeps no time to live: as a rule a placement stays until
-the record's size bound takes it. As a rule it keeps every worker sent a head as its holder,
+ids, and balances a text request by load.
+
+A host may lend the engine that table (`CacheIndexes::placement_map`). The engine asks for it
+at the single phase alone, and the gateway lends it there. A single request is then decided
+inside the table's read and write, as classic decides it. As a rule the deepest boundary with a
+live holder that the decision's pass keeps names the holders, of three addresses at most. A
+holder that soft filters alone refuse is still named where no other worker passes every filter:
+the pass lets a soft filter step aside there, and says itself which rows stay. The stock filters
+hold one soft filter, the one of the workers a retry tried. So under them a retry that has tried
+every worker is still named its holder. Classic's retry reads its map among them all too, unless
+KV pressure sheds the read.
+The worker the request goes to is written at every boundary the prompt reaches. There the engine
+reads no record of its own and no cache events.
+
+So under a host that lends the table, the table serves the single phase and the engine's record
+every other phase, and neither reads what the other holds. A prompt sent at the single phase and
+again alone at another, over the same workers, can then go to another worker. Under a host that
+lends no table, the phases that read a record of the model read one. The gateway asks for a
+request over one list by the one call (`InProcess::place`) alone, which states the single phase
+for it, so the gateway meets no such prompt.
+
+The table's read and write are classic's own two functions (`live_holders_in`, `record_in`). What
+still differs from classic lies in what the engine asks around them. A route's own rule on a
+worker is asked behind the pick, where classic narrows its workers by it ahead of its read: a
+deepest head whose one kept holder the rule refuses is not passed for the next, and the request
+goes to the pick's next target where it has one.
+A document of an operator's own can list two soft filters, a room rule beside the retry's. The
+holder test does not run the pass, so it has a limit there. Where no worker passes both filters,
+the pass can drop the named holder, and the request is decided with nobody named, where an exact
+reading would try the next head.
+A request the overload fallback steers is written for its worker, where classic's fallback writes
+none. The table is the one of the model the request names, where classic takes its first healthy
+worker's first model: the two part for a model that workers of different first models serve. A
+head of more than 16,777,216 tokens is priced in single precision, where classic's double holds
+every count. And as under a tree index, a pool of more than twice the preset's sample, 32
+workers, can be decided over a draw of 16 rows and the rows the table names, where classic scans
+every worker: a request no holder keeps can then go to another worker.
+
+A head names a row for each worker of the list at a holder's address, and more rows than the
+pick's sample are drawn among. The routing settings sample 16 where a head holds three addresses,
+and the gateway's registry keeps one worker an address. So a document of an operator's own with
+a smaller sample, or a host that lists more workers at one address, may draw a holder out
+untested. In such a document a `prefix-affinity` threshold above zero also follows a head by its
+share of the request, which classic's hash decision does not read: the routing settings write
+zero.
+
+Under either, the routing settings translate to a `prefix-affinity` threshold of zero and a
+`warmup-slice` that names nobody.
+
+Where a host lends no table, and at every phase but the single one, for a side of a pair as for a
+request asked alone there, the engine follows classic by its record of sent prefixes: under an
+index of the kind `hash` the record is keyed at
+`view.boundaries` alone. So a request of token ids can go back to the worker its head at a
+boundary was sent to. A request that carries fewer block hashes than its first boundary has whole
+blocks, or one hashed by its text, is recorded nowhere. Several
+things differ from classic there. The engine keeps no time to live: as a rule a placement stays
+until the record's size bound takes it. As a rule it keeps every worker sent a head as its holder,
 where classic keeps three. A key ends at the last whole block under its boundary and keys every
-request that holds those blocks, where classic asks for the boundary's every token. A boundary of
-more whole blocks than `view.max_block_hashes` keys nothing, where classic keys every boundary the
-prompt reaches. And where the model's index of cache events holds a block, the engine reads
-record A for a request of token ids, which classic under `hash` does not read. The routing
-settings never raise `view.max_block_hashes`, so a gateway whose settings state a boundary past
-those blocks says so at its start in one warning that names the setting, `cache_boundaries`; a
-supplied document states its own view and gets none.
+request that holds those blocks, where classic asks for the boundary's every token. A head is
+priced by those blocks, where classic prices the boundary's tokens. A boundary under one block, or
+of more whole blocks than `view.max_block_hashes`, keys nothing, where classic keys every boundary
+the prompt reaches. The record names a request the deepest head it holds for a worker of the list
+it is read for, ready or not: where the decision refuses that head's every holder, the head is
+not passed for a shallower one, as classic passes it. And where the model's index of cache events
+holds a block, the engine reads record A for a request of token ids, which classic under `hash`
+does not read. The routing settings never raise `view.max_block_hashes`, so a gateway whose
+settings state a boundary past those blocks says so at its start in one warning that names the
+setting, `cache_boundaries`; a supplied document states its own view and gets none.
 
 Both trees are read and written in one walk: the walk finds the longest stored prefix, hands the
 match to the policy, and stores the request for the worker the policy chose. So no write is lost
@@ -777,10 +831,11 @@ A request's prompt is stored under its **cache partition** (cache salt, extra va
 that two tenants' prompts never match. The gateway derives the partition once for each request.
 
 The rest of this section describes the engine under an index of the kind `tree`. Under `hash` it
-asks its host for no tree, and its record keys a request as said above: one given as text has no
-key there. The record's second fault below stands under `hash` too. So does the first rule of its
-third: on a request of token ids, a profile that reads cache events neither reads nor writes the
-record for a worker the index holds a block for.
+asks its host for no tree. A request decided inside a lent table reads no record, so none of the
+record's faults below reaches it. Where the record stands under `hash`, it keys a request as said
+above: one given as text has no key there. Its second fault below stands there too. So does the
+first rule of its third: on a request of token ids, a profile that reads cache events neither
+reads nor writes the record for a worker the index holds a block for.
 
 **The engine today [built].** It reads record A through two small traits that the host
 implements over its own index (`CacheIndexes`, `CacheIndex`, in `engine/in_process/overlap.rs`).
@@ -822,8 +877,10 @@ request goes to.
   request's entry already named under its cache partition (`RequestMaker::token_key`), so the
   naming stays written once, in the host. The engine calls the tree's walk alone. The tree's size
   bound and a worker that left stay the host's to keep.
-- **[built]** A request whose host lends no tree for it, or names no entry, is decided by the
-  hash table as before, unless the index names it alone (the rule below).
+- **[built]** A request whose host lends no tree and no placement map for it, or lends a tree
+  and names no entry, is decided by the hash table as before, unless the index names it alone
+  (the rule below). A request whose host lends a placement map and names no entry is named
+  nobody.
 - **[built]** A request placed by the one call (`InProcess::place`) hands its entry too. Its
   caller states the entry with the prompt (`Prompt::entry`), and the call's own maker asks it
   where a decision reads the tree.
@@ -854,8 +911,8 @@ request goes to.
   pick of any worker the match named states the two numbers, whatever the share, and names the
   tree as where they came from. A holder's row still counts the request's whole blocks, a text's
   windows in bytes: a host's own stage or a plugin's reads those.
-- **[built]** Where no lent tree decides a single request, one record names its holders. Which
-  one is by the prefix stages of its profile and by the request:
+- **[built]** Where no lent tree and no lent placement map decides a single request, one record
+  names its holders. Which one is by the prefix stages of its profile and by the request:
   - no stage reads the index's holders (`source: predictor`): the hash table, for every worker
     of its list, and its holders are named ahead of the index's;
   - one stage reads them, and the request hands token ids under a model whose index holds a
@@ -873,7 +930,8 @@ request goes to.
   model's index whenever the model has one, and the index says whether it holds a block
   (`CacheIndex::holds_a_block`). A decision asks that word where it takes its list's table, and
   a word that moved reads the table again. So a model's first block, and its last block's
-  leaving, decide the next request, as classic asks its index before every request.
+  leaving, decide the next request. Classic asks its index ahead of its trees too, for a request
+  of token ids under a tree index that it does not shed for KV pressure first.
 
   While one decision reads the table again, the others decide by the table that stands. So the
   old word decides for the length of one read. A host of its own may hand no index while its
@@ -881,7 +939,7 @@ request goes to.
   learns of a first block, and of a last block's leaving, with the list's next table, up to a
   second later.
 - **[planned]** The hash table leaves the single decision. Until then it names a single request
-  that no lent tree decides and the index does not name alone.
+  that no lent tree or placement map decides and the index does not name alone.
 - **[built]** A prefill-decode pair decided over worker lists reads the host's index of cache
   events and the hash table for each side, by the side's own list: the index, where the request
   has token ids, for the workers it holds a block for, and the hash table for the others. A
@@ -909,11 +967,14 @@ holds where its model has no index of cache events, or one that holds no block, 
 reads sent prefixes and names the holders' rows. A request the gateway holds as text alone is
 decided inside its string tree, by classic's own key, under such a profile and whatever the
 model's index holds. Where no tree decides a request given as text, it reads the hash table, for
-every worker of its list whatever the index holds. A
+every worker of its list whatever the index holds. Under a tree index a
 single request with token ids of a model whose index holds a block reads the index alone, as
 under classic. Under a profile that reads the hash table alone it reads the hash table first,
 for every worker of its list.
-A prefill-decode pair is lent no tree: each of its sides
+Under a hash index the gateway lends the model's placement map in the trees' place. Under a
+profile that reads sent prefixes and names the holders' rows, a single request with token ids is
+decided inside it whatever the model's index holds, and the engine asks for no index there.
+A prefill-decode pair is lent no tree and no placement map: each of its sides
 reads the hash table, and the index where its model has one, by the side's own list, worker by
 worker: on a request with token ids the index speaks for each worker it holds a block for, and
 the hash table for every other, or for every worker under a side's profile that reads the hash
@@ -1674,8 +1735,10 @@ The types the two engines shared stay where they were moved ahead of the deletio
   the answer (`DecisionGuard::holding`).
 - The record of sent prefixes leaves the single decision. The two trees a request is then
   decided in are the host's own, lent (section 4.5). It has left a request of token ids under a
-  model whose index of cache events holds a block, which is built: the index names that request
-  alone, unless its profile reads the record alone.
+  model whose index of cache events holds a block, which is built: under a tree index the index
+  names that request alone, unless its profile reads the record alone. It has left a request
+  decided inside a placement map its host lends under a hash index too: that map names it alone,
+  whatever the index holds.
 
 `signal_cells` stays, and it is built for a single request: where the request's profile or its
 binding's shadow reads a named signal, the engine fills the field itself, whatever cells its caller
@@ -1828,7 +1891,8 @@ the key. The rule says whether such a request is the profile's own (`rule_placed
 the default, it is: the stages that name them hear its issue and its dispatch,
 every count of sends takes it, and its prompt is recorded as behind any pick. Under
 `untold` it is kept from the profile: no stage hears its issue or its dispatch, no count of sends
-takes it, and neither the engine's record of sent prefixes nor a lent tree takes its prompt.
+takes it, and nothing takes its prompt: not the engine's record of sent prefixes, not a lent tree,
+not a lent placement map.
 The session's pin still follows its dispatch, and its completion and its release are told as any
 request's, so a stage matches an end by the lease's id.
 
@@ -1972,7 +2036,8 @@ A host's start has these steps.
    - its load monitor's channel;
    - its indexes of cache events (the host implements `CacheIndexes` and `CacheIndex`). The same
      hand-over also lends the host's two trees, where it keeps them (`CacheIndexes::token_tree`,
-     `CacheIndexes::string_tree`).
+     `CacheIndexes::string_tree`), and under a hash index its placement map
+     (`CacheIndexes::placement_map`).
 
    A host with no load monitor or no index says `None`. The call answers the engine, which lives
    as long as the process, and the engine's own task.
@@ -2063,7 +2128,7 @@ pub trait RequestMaker {
     fn session_counted_under(&self) -> SessionCountedUnder; // where a worker object counts its session key's requests
     fn workers(&self) -> WorkerLists<'_>;             // the worker list, a pair's two lists, or an encode request's three
     fn loads(&self) -> Option<&Arc<LoadSnapshot>>;    // a request's snapshot of the host's own; without one the engine reads its own
-    fn token_key(&self, page: usize) -> Option<TokenKey<'_>>; // the prompt's entry in the host's token tree, where the host lends one
+    fn token_key(&self, page: usize) -> Option<TokenKey<'_>>; // the prompt's entry in the host's token tree or placement map, where the host lends one
     fn text_key(&self) -> Option<TextKey<'_>>;        // the entry of a prompt the host holds as text in its string tree, where the host lends one
     fn sends_to(&self, target: &Target) -> bool;      // whether its caller sends to this target of a pick: the prompt is stored for the first such
     fn sends_to_encoder(&self, position: u32) -> bool; // whether its caller sends to this encoder of an encode request's pick: the prompt is stored for no target behind one it does not
@@ -2778,7 +2843,8 @@ Counting the characters is the one pass over a plain request's text.
 
 A request decided inside a lent tree has the rule asked inside the tree's walk, of the
 pick's targets best first, so the tree stores the prompt for a worker the rule takes. The call
-takes that answer and asks the rule of that worker no second time.
+takes that answer and asks the rule of that worker no second time. A request decided inside a
+lent placement map has it asked the same way, ahead of the map's write.
 
 **3. Keep the placement with the request.**
 
@@ -2928,7 +2994,7 @@ The design adds no second mechanism where one exists.
 | load reports | the load monitor's `LoadSnapshot` | the last report of a worker whose load call fails, kept beside the snapshot's entries, and the one read that gives it (decision 12) |
 | which worker holds a prompt, by cache events | the kv-index crate's index, through two traits | the gateway's two readers of its index for those traits (section 9.2) |
 | which prefill pairs with which decode | the gateway's pair index (`PdPairIndex`) | the pair classes read from it, one file (section 9.2) |
-| which worker was sent a prompt | the host's own trees, of the kv-index crate's two tree types, under an index of the kind `tree` | one more question on the trait the host already answers for cache events |
+| which worker was sent a prompt | the host's own trees, of the kv-index crate's two tree types, under an index of the kind `tree`, and its placement map under the kind `hash` | one more question on the trait the host already answers for cache events, and one for the map |
 | a request's lifetime on a worker | the load guard every route keeps | one optional field (decision 4) |
 | the place where a worker is chosen | classic's four placement functions | one call in each |
 | the rank a request is sent with | the worker object's own rank, where its registration states one | nothing: no rank choice runs behind the pick of a worker registered rank by rank, and the classic rank option is refused at the start beside the engine (section 9.2 names the two places a rank is still chosen) |
@@ -2984,7 +3050,9 @@ request ──> route (HTTP or gRPC, any family)
   them on its timer, and a worker that left is taken out of them. The trees take the document's
   numbers: its block size is a token tree's page, and a model's `index` entry states the size
   its trees are held to and how often. The longest cadence, a `sweep_s` of 4294967295, starts no
-  pass: the trees under it are held to no size.
+  pass: the trees under it are held to no size. Under a hash index a model has a placement map
+  in its trees' place **[built]**: each sweep takes out the placements older than the entry's
+  `ttl_s`, and a worker that left is taken out of the map.
 
   Where the start's document reads no sent prefixes, the first document a worker's label puts in
   force that reads them makes the trees. Wherever they are made, the trees take the numbers of
@@ -3001,6 +3069,12 @@ request ──> route (HTTP or gRPC, any family)
   and once for a pair, of its prefill. A pick states that share only where its own profile reads who
   holds the prompt, whatever the profile's name. Classic observes a `cache_aware` selection that it
   decides by events or in a tree, so both sides of a pair where both make such a selection.
+
+  Under a hash index a single request decided inside the placement map the gateway lends states
+  no share, so the gateway observes nothing for it, as classic's hash decision observes none. A
+  pair there is lent no map: its pick states its share by what its prefill's column holds, the
+  engine's record of sent prefixes or the model's index of cache events, where classic's hash
+  sides observe none.
 
   For a request of more than 65,535 tokens or characters a pick states both numbers halved
   together, until the request's fits sixteen bits. The share they state is then within one part in
@@ -4097,7 +4171,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | The stage interfaces and a builder's own stages | **[built]** | |
 | The engine over worker lists (`InProcess`) | **[partly]** | refuses a subset hint, and a request that states protocols where a worker of its list is dialed over one it does not state; of the recorded lines only the three hard-demand sheets, `sticky_rank`, `encode_pair`, `pair_named` and `pair_sticky` (134), and 31 lines of `prefix_hash`, replay through it |
 | `round_robin`, `random`, `passthrough`, `least_load`, `power_of_two` on that engine | **[partly]** | no sheet over a healthy pool for four of them |
-| `cache_aware` on that engine | **[partly]** | a single request whose maker names its entry by token ids (`RequestMaker::token_key`) is decided in the host's token tree, where the host lends it, the model has no index of cache events and the profile reads sent prefixes and names the holders' rows, as the preset does: the record's first two faults do not reach it. A single request of token ids under a model whose index of cache events holds a block reads the index alone, as classic does, unless its profile reads the record alone. Every other request the engine names the holders of reads the engine's own record, with its three faults, the third being that a request with token ids reads it for no worker the index holds a block for, unless its profile reads the record alone: a request of text whose caller names no entry is one. A request its host holds as text is decided the same way in a lent string tree (`RequestMaker::text_key`), with or without an index of cache events. The gateway lends its string trees, and names the entry by classic's own key. This row describes an index of the kind `tree`; section 4.5 speaks of the kind `hash` |
+| `cache_aware` on that engine | **[partly]** | a single request whose maker names its entry by token ids (`RequestMaker::token_key`) is decided in the host's token tree, where the host lends it, the model has no index of cache events and the profile reads sent prefixes and names the holders' rows, as the preset does: the record's first two faults do not reach it. A single request of token ids under a model whose index of cache events holds a block reads the index alone, as classic does, unless its profile reads the record alone. Every other request the engine names the holders of reads the engine's own record, with its three faults, the third being that a request with token ids reads it for no worker the index holds a block for, unless its profile reads the record alone: a request of text whose caller names no entry is one. A request its host holds as text is decided the same way in a lent string tree (`RequestMaker::text_key`), with or without an index of cache events. The gateway lends its string trees, and names the entry by classic's own key. This row describes an index of the kind `tree`; section 4.5 speaks of the kind `hash`, under which a single request of token ids is decided inside the placement map its host lends |
 | `consistent_hashing`, `prefix_hash` on that engine | **[partly]** | placed on the ring the host lends (decision 3): through `place` the plain ring at the place the engine reads with the request's keys, and `prefix_hash` at the places the host's ring answers for the request's heads, where it answers for a head; that both are classic's is proven at stage 3; a host that lends none is placed on the crate's ring, which may be another worker than classic's |
 | `manual` and sticky sessions on that engine | **[partly]** | the sheets of `manual` and of the sticky override's single requests (`sticky_override`) replay through the decision function, not through the engine; the override's sheet of pairs (`pair_sticky`) replays through the engine's one call for a host in process, under the document the routing settings give for each line: all 25 lines as recorded, the 2 of a pair with one side under `consistent_hashing` on a ring the replay lends from the line's own answers |
 | `bucket` on that engine | **[partly]** | the same |
@@ -4261,7 +4335,14 @@ every fallback engine".
 ### Decision 7: shadow and explain
 
 The engine runs a single request's shadow, and counts as skipped one that reads affinity
-rows of its own. It runs a pair's shadows by side at the pair's first decision, and the decode
+rows of its own. Inside a lent placement map a head stands by the live profile's test of a
+worker. So a shadow that reads the live rows is counted as skipped too where the engine cannot
+tell that both profiles hold a worker to one test. The rule is of a request that reaches a
+boundary of the map. The engine can tell for two profiles that list the same built-in filters,
+and for two it asks no holder's test of, where each is a plain ring that may hold a key across
+the overload veto or neither is. It cannot for a profile whose filters it asks by a call
+each, as under a room rule of an operator's own. It runs a pair's shadows by side at the pair's
+first decision, and the decode
 side's at a decode decided again, where a host decides in its own process. It counts them by
 side, a decode decided again apart. A side its binding's sessions rule or its picker's
 assignment places has no shadow decision yet: it is counted as skipped. A host reads the shadow

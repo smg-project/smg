@@ -264,7 +264,9 @@ fn a_retry_decided_over_workers_that_stand_alone_reads_the_requests_own_list() {
         retry.facts.seed = seed;
         retry.facts.attempt = 1;
         retry.facts.tried = &tried;
-        let live = records::Live::at(spec.engine(), &own.clock, Instant::now(), None, None)
+        // One instant: the records' and the decision's.
+        let now = Instant::now();
+        let live = records::Live::at(spec.engine(), &own.clock, now, None, None)
             .turning(&members.rotation.0);
         let mut facts = retry.facts;
         let cx = Constraints::default();
@@ -277,6 +279,7 @@ fn a_retry_decided_over_workers_that_stand_alone_reads_the_requests_own_list() {
             &cx,
             &retry,
             None,
+            now,
             WithoutShadow,
         );
         let pick = decision.pick().expect("a pick");

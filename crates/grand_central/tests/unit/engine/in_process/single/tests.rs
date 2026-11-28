@@ -1,6 +1,12 @@
-use std::{borrow::Cow, cell::Cell, collections::BTreeSet, sync::Arc, time::Duration};
+use std::{
+    borrow::Cow,
+    cell::Cell,
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::Duration,
+};
 
-use kv_index::{TenantId, TokenTree, Tree as StringTree};
+use kv_index::{hash_token_head, PlacementMap, TenantId, TokenTree, Tree as StringTree};
 use parking_lot::Mutex;
 use smg_worker::{
     identity::{basic::Worker, builder::BasicWorkerBuilder},
@@ -13,7 +19,9 @@ use smg_worker::{
 use super::{super::InProcess, *};
 use crate::{
     document::spec::{
-        AppliedSpec, Assignment, PolicySpec, RulePlaced, ScoreStage, ShadowSpec, WarmupSliceParams,
+        AppliedSpec, Assignment, Capacity, FilterStage, HasRoomParams, IndexKind, IndexSpec,
+        KvPressureParams, PolicySpec, RulePlaced, ScoreSpec, ScoreStage, ShadowSpec,
+        WarmupSliceParams,
     },
     engine::{
         decision::{LiftedVeto, Overlap, PlacedBy, Target, Targets, MAX_TARGETS},
@@ -1296,6 +1304,793 @@ fn a_long_conversation_goes_back_to_its_worker_under_the_hash_settings() {
             back += u32::from(sent(&said, u64::from(turn)) == first);
         }
         assert_eq!(back, 31, "the turns that went back at {threshold:?}");
+    }
+}
+
+/// A host that keeps a placement map of the prompts it sent to its
+/// workers, as its policy keeps one under a hash index, and lends it. It
+/// keeps no tree and no index of cache events.
+struct LendsMap(Arc<PlacementMap>);
+
+impl overlap::CacheIndexes for LendsMap {
+    fn index(&self, _: &str) -> Option<Arc<dyn overlap::CacheIndex>> {
+        None
+    }
+
+    fn block_size(&self, _: &str) -> Option<u32> {
+        None
+    }
+
+    fn placement_map(&self, _: &str, _: Phase) -> Option<Arc<PlacementMap>> {
+        Some(Arc::clone(&self.0))
+    }
+}
+
+/// The engine of the `cache_aware` preset under a hash index whose heads
+/// end at 64 and 256 tokens, over a host that lends its placement map, and
+/// the host's map. The profile is the one a gateway's flags mean under a
+/// hash index: no warm-up stage, and a match threshold of 0, since the
+/// classic policy's hash decision runs no warm-up and reads no threshold
+/// (`select_worker_scanned` and `select_worker_hash`,
+/// model_gateway/src/policies/cache_aware.rs). `kv` is the fleet's KV
+/// spread and ceiling, where a case sets them.
+fn lending_map(kv: Option<(f32, f32)>) -> (InProcess, Arc<PlacementMap>) {
+    lending_under(&hashed_document(kv))
+}
+
+/// The document of [`lending_map`], for a case that turns it first.
+pub(crate) fn hashed_document(kv: Option<(f32, f32)>) -> PolicySpec {
+    let mut document = PolicySpec::preset("cache_aware").expect("a built-in preset");
+    document.generation = 1;
+    document.view.boundaries = vec![64, 256];
+    let index = IndexSpec {
+        kind: IndexKind::Hash,
+        ..IndexSpec::default()
+    };
+    document.index.insert("*".into(), index);
+    let profile = document.profiles.get_mut("cache_aware");
+    let profile = profile.expect("the preset's profile");
+    profile.score.retain(|stage| stage.name() != "warmup-slice");
+    for stage in &mut profile.score {
+        if let ScoreSpec::Params(ScoreStage::PrefixAffinity(params)) = stage {
+            params.threshold = Some(0.0);
+        }
+        // The preset names its KV stage bare: a case's two values stand in
+        // the stage's own parameters.
+        if let (true, Some((spread, ceiling))) = (stage.name() == "kv-pressure", kv) {
+            let mut params = KvPressureParams::default();
+            (params.spread, params.ceiling) = (Some(spread), Some(ceiling));
+            *stage = ScoreStage::KvPressure(params).into();
+        }
+    }
+    document
+}
+
+/// The engine of `document` over a host that lends its placement map, and
+/// the host's map.
+pub(crate) fn lending_under(document: &PolicySpec) -> (InProcess, Arc<PlacementMap>) {
+    let spec = AppliedSpec::validate(document).expect("the document validates");
+    let engine = InProcess::new(spec);
+    let map = Arc::new(PlacementMap::default());
+    engine
+        .affinity()
+        .set_indexes(Arc::new(LendsMap(Arc::clone(&map))));
+    (engine, map)
+}
+
+/// The place in `members` a request of `tokens` goes to under `engine`,
+/// at `seed`: its host names the tokens as the request's entry, and hands
+/// the decision the snapshot `loads` where it has one.
+fn sent_by_map(
+    engine: &InProcess,
+    members: &PublishedList,
+    tokens: &[u32],
+    seed: u64,
+    loads: Option<Arc<LoadSnapshot>>,
+) -> u32 {
+    sent_by_map_at(engine, members, tokens, seed, loads, Instant::now())
+}
+
+/// [`sent_by_map`] for a request decided at `now`, the instant its caller
+/// hands the engine's entry.
+fn sent_by_map_at(
+    engine: &InProcess,
+    members: &PublishedList,
+    tokens: &[u32],
+    seed: u64,
+    loads: Option<Arc<LoadSnapshot>>,
+    now: Instant,
+) -> u32 {
+    tried_by_map(engine, members, tokens, seed, loads, now, &[])
+}
+
+/// [`sent_by_map_at`] for a retry that tried the workers `tried`.
+fn tried_by_map(
+    engine: &InProcess,
+    members: &PublishedList,
+    tokens: &[u32],
+    seed: u64,
+    loads: Option<Arc<LoadSnapshot>>,
+    now: Instant,
+    tried: &[WorkerId],
+) -> u32 {
+    let mut asked = request();
+    asked.facts.seed = seed;
+    asked.facts.tried = tried;
+    asked_by_map(engine, members, tokens, asked, loads, now)
+}
+
+/// The place in `members` the request `asked` goes to under `engine` at
+/// `now`: its host names `tokens` as the request's entry, and hands the
+/// decision the snapshot `loads` where it has one.
+fn asked_by_map(
+    engine: &InProcess,
+    members: &PublishedList,
+    tokens: &[u32],
+    asked: Request<'_>,
+    loads: Option<Arc<LoadSnapshot>>,
+    now: Instant,
+) -> u32 {
+    let hashes = engine.prompt_hashes(MODEL, Some(tokens), None, HashSeeds::PLAIN);
+    // The request holds the hashes for this call's time alone.
+    let mut asked = asked;
+    hashes.write_to(&mut asked.facts);
+    let asks = Asks {
+        key: Some(tokens),
+        loads,
+        ..Asks::of(asked, Some(members))
+    };
+    let answered = engine.decide_under(GatewayId::LOCAL, &asks, now);
+    let decided = answered.expect("an answer").whole();
+    let decided = decided.expect("a whole decision").0;
+    assert_eq!(asks.keyed.get(), 1, "the entry is asked for once");
+    let pick = decided.decision.pick().expect("a pick");
+    pick.targets.first().expect("a target").position
+}
+
+/// The addresses `map` holds for the head of `tokens` that ends at `end`,
+/// sorted: every holder, whatever its age.
+fn holders_of(map: &PlacementMap, tokens: &[u32], end: usize) -> Vec<String> {
+    let key = (end, hash_token_head(None::<[u32; 2]>, &tokens[..end]));
+    let held = map.get(&key);
+    let mut names: Vec<String> = held.map_or_else(Vec::new, |held| {
+        held.iter()
+            .map(|holder| holder.worker_url.clone())
+            .collect()
+    });
+    names.sort();
+    names
+}
+
+/// A prompt that shares a conversation's first 64 tokens and nothing more.
+fn sharing_the_first_head() -> Vec<u32> {
+    let mut other: Vec<u32> = (0..64).collect();
+    other.extend(9_000_000..9_000_400);
+    other
+}
+
+/// The document of [`lending_map`] with a room rule behind its stock
+/// filters: a worker has room with at most 100 requests in flight.
+fn roomed_document() -> PolicySpec {
+    let mut document = hashed_document(None);
+    let profile = document.profiles.get_mut("cache_aware");
+    let room = HasRoomParams {
+        used: BTreeMap::from([("candidate.in_flight".to_owned(), 1.0)]),
+        capacity: Capacity::Fixed(100.0),
+        headroom: 0.0,
+    };
+    let filters = &mut profile.expect("the preset's profile").filter;
+    filters.push(FilterStage::HasRoom(room).into());
+    document
+}
+
+/// The id of each worker of `list`, in the list's order: a retry names
+/// the workers it tried by them.
+fn ids_of(list: &[Arc<dyn Worker>]) -> Vec<WorkerId> {
+    list.iter()
+        .map(|worker| worker_id(worker.as_ref()))
+        .collect()
+}
+
+/// A conversation of 256 tokens whose deepest head one worker of `list`
+/// holds alone, and whose first head that worker shares with a second:
+/// the two workers' places, the first one first. The second is written
+/// for a prompt that shares the first head, sent as a retry that tried
+/// the first.
+fn two_holders_of_the_first_head(
+    engine: &InProcess,
+    map: &PlacementMap,
+    list: &Arc<[Arc<dyn Worker>]>,
+    now: Instant,
+) -> (Vec<u32>, u32, u32) {
+    let members = PublishedList::new(Arc::clone(list));
+    let said: Vec<u32> = (0..256).collect();
+    let deep = sent_by_map_at(engine, &members, &said, 0, None, now);
+    let tried = [ids_of(list)[deep as usize]];
+    let other = sharing_the_first_head();
+    let shallow = tried_by_map(engine, &members, &other, 1, None, now, &tried);
+    assert_ne!(shallow, deep, "a retry leaves the worker it tried");
+    let address = |at: u32| list[at as usize].url().to_owned();
+    let mut both = [address(deep), address(shallow)];
+    both.sort();
+    assert_eq!(holders_of(map, &said, 64), both);
+    assert_eq!(holders_of(map, &said, 256), [address(deep)]);
+    (said, deep, shallow)
+}
+
+/// A conversation of 256 tokens and the places of the `count` workers of
+/// `list` that hold its head, in the order they were written: each behind
+/// the first by a retry that tried those before it. For an engine of one
+/// boundary, at 256 tokens.
+fn holders_of_one_head(
+    engine: &InProcess,
+    list: &Arc<[Arc<dyn Worker>]>,
+    count: u64,
+    now: Instant,
+) -> (Vec<u32>, Vec<u32>) {
+    let members = PublishedList::new(Arc::clone(list));
+    let said: Vec<u32> = (0..256).collect();
+    let every = ids_of(list);
+    let mut holders: Vec<u32> = Vec::new();
+    for seed in 0..count {
+        let tried: Vec<WorkerId> = holders.iter().map(|&at| every[at as usize]).collect();
+        let went = tried_by_map(engine, &members, &said, seed, None, now, &tried);
+        assert!(!holders.contains(&went), "a retry leaves what it tried");
+        holders.push(went);
+    }
+    (said, holders)
+}
+
+/// Under a hash index a conversation whose host lends its placement map
+/// and names its token ids goes back to the worker its first turn was
+/// sent to, whatever a turn's seed. So does a prompt that shares the
+/// conversation's first head alone: 64 of its 464 tokens, a share under
+/// the preset's own match threshold, which a hash index does not read.
+/// The worker is written at every boundary a request reaches, and the
+/// host is asked for the entry once a decision. The classic policy decides
+/// the same way inside its own map, and follows a live holder whatever
+/// share of the request its head is (`select_worker_hash`,
+/// model_gateway/src/policies/cache_aware.rs).
+#[test]
+fn a_conversation_goes_back_to_its_worker_by_the_placement_map() {
+    let (engine, map) = lending_map(None);
+    let list = pool(8);
+    let members = PublishedList::new(Arc::clone(&list));
+    let mut said: Vec<u32> = (0..256).collect();
+    let first = sent_by_map(&engine, &members, &said, 0, None);
+    for turn in 1..16_u32 {
+        said.extend(turn * 1_000_000..turn * 1_000_000 + 16);
+        let went = sent_by_map(&engine, &members, &said, u64::from(turn), None);
+        assert_eq!(went, first, "turn {turn}");
+    }
+    let other = sharing_the_first_head();
+    let went = sent_by_map(&engine, &members, &other, 99, None);
+    assert_eq!(went, first, "the head of 64 tokens");
+    let address = vec![list[first as usize].url().to_owned()];
+    for (prompt, end) in [(&said, 64), (&said, 256), (&other, 256)] {
+        assert_eq!(holders_of(&map, prompt, end), address, "the head of {end}");
+    }
+    assert_eq!(map.len(), 3, "a key for each head written");
+}
+
+/// A head whose holders the decision's own pass refuses is passed for the
+/// next, on the engine's own road: the pass's test of a row is asked of
+/// the holders a head names ([`Engine::keeps_for`]). The worker that holds
+/// a conversation's deepest head is not ready, so that head is passed and
+/// the turn goes to the worker that holds its first head, at every seed.
+/// With both away no head stands, and the turn goes to neither. The
+/// classic policy reads a head's holders among its healthy workers, the
+/// deepest head first (`select_worker_hash` and `live_holder_candidates`,
+/// model_gateway/src/policies/cache_aware.rs).
+///
+/// [`Engine::keeps_for`]: crate::engine::Engine::keeps_for
+#[test]
+fn a_head_whose_holders_are_not_ready_is_passed_for_the_next() {
+    for seed in 0..16 {
+        let (engine, map) = lending_map(None);
+        let list = pool(8);
+        let members = PublishedList::new(Arc::clone(&list));
+        let said: Vec<u32> = (0..256).collect();
+        let deep = sent_by_map(&engine, &members, &said, 0, None);
+        // A prompt that shares the first head alone, sent while the deep
+        // holder is away: nobody is named, and it is written elsewhere.
+        list[deep as usize].set_status(WorkerStatus::NotReady);
+        let other = sharing_the_first_head();
+        let shallow = sent_by_map(&engine, &members, &other, 1, None);
+        assert_ne!(shallow, deep, "seed {seed}");
+        let both = {
+            let mut both = [deep, shallow].map(|at| list[at as usize].url().to_owned());
+            both.sort();
+            both
+        };
+        assert_eq!(holders_of(&map, &said, 64), both, "seed {seed}");
+        // The deepest head names the worker that is away, alone.
+        let went = sent_by_map(&engine, &members, &said, seed, None);
+        assert_eq!(went, shallow, "seed {seed}: the holder of the first head");
+
+        let fresh: Vec<u32> = (0..64).chain(5_000_000..5_000_400).collect();
+        list[shallow as usize].set_status(WorkerStatus::NotReady);
+        let third = sent_by_map(&engine, &members, &fresh, seed, None);
+        assert!(![deep, shallow].contains(&third), "seed {seed}");
+    }
+}
+
+/// A head whose holders a soft filter alone refuses is passed while
+/// another worker passes every filter, and stands where none does: the
+/// pass then lets the filter step aside ([`Engine::keeps_for`]). The
+/// document's room rule keeps a worker with at most 100 requests in
+/// flight. A holder alone over the rule is passed for the first head's
+/// holder, which has room: the pass would drop it. With every worker over
+/// the rule none passes every filter, the pass lets the rule step aside,
+/// and a conversation goes back to its one holder at every seed. The
+/// classic policy has no room rule: its hash decision reads a head's
+/// holders among the workers it is handed (`select_worker_hash`,
+/// model_gateway/src/policies/cache_aware.rs).
+///
+/// [`Engine::keeps_for`]: crate::engine::Engine::keeps_for
+#[test]
+fn a_head_a_soft_filter_alone_refuses_stands_where_the_filter_steps_aside() {
+    let (engine, _) = lending_under(&roomed_document());
+    let list = pool(4);
+    let members = PublishedList::new(Arc::clone(&list));
+    let said: Vec<u32> = (0..256).collect();
+    let lone: Vec<u32> = (2_000_000..2_000_256).collect();
+    let deep = sent_by_map(&engine, &members, &said, 0, None);
+    let kept = sent_by_map(&engine, &members, &lone, 1, None);
+    // Two hundred requests in flight leave a worker no room.
+    let fill = |at: u32| (0..200).for_each(|_| list[at as usize].increment_load());
+
+    // The deep holder alone has no room. A prompt that shares the first
+    // head is named nobody and sent elsewhere. The conversation's next
+    // turn passes its deepest head for that worker: a holder with room,
+    // though it holds five requests where two workers hold none. That
+    // turn writes the worker at the deepest head too, which names it
+    // for the turns behind.
+    fill(deep);
+    let other = sharing_the_first_head();
+    let shallow = sent_by_map(&engine, &members, &other, 2, None);
+    assert_ne!(shallow, deep);
+    (0..5).for_each(|_| list[shallow as usize].increment_load());
+    for seed in 0..8 {
+        let went = sent_by_map(&engine, &members, &said, seed, None);
+        assert_eq!(went, shallow, "seed {seed}: the holder that has room");
+    }
+
+    // No worker has room: the rule steps aside, and the other
+    // conversation's one holder is named and followed.
+    (0..4).filter(|&at| at != deep).for_each(fill);
+    for seed in 0..16 {
+        let went = sent_by_map(&engine, &members, &lone, seed, None);
+        assert_eq!(
+            went, kept,
+            "seed {seed}: the holder, over the rule as all are"
+        );
+    }
+}
+
+/// A retry inside a lent placement map goes by the pass's own word on the
+/// workers it tried. The worker a retry tried steps aside while another
+/// remains: a conversation whose one holder the request tried is named
+/// nobody and placed elsewhere. Once the request has tried every worker
+/// the filter steps aside, and the conversation goes back to its holder
+/// at every seed. The classic policy hands its map the untried workers
+/// while one is left and the whole pool otherwise (`select_pass`,
+/// model_gateway/src/routers/common/placement.rs).
+#[test]
+fn a_retry_that_tried_every_worker_follows_its_holder_by_the_map() {
+    let (engine, map) = lending_map(None);
+    let list = pool(4);
+    let members = PublishedList::new(Arc::clone(&list));
+    let said: Vec<u32> = (0..256).collect();
+    let now = Instant::now();
+    let holder = sent_by_map_at(&engine, &members, &said, 0, None, now);
+    let address = |at: u32| list[at as usize].url().to_owned();
+    assert_eq!(holders_of(&map, &said, 256), [address(holder)]);
+
+    let every = ids_of(&list);
+    for seed in 0..16 {
+        let went = tried_by_map(&engine, &members, &said, seed, None, now, &every);
+        assert_eq!(went, holder, "seed {seed}: every worker tried");
+    }
+    assert_eq!(holders_of(&map, &said, 256), [address(holder)]);
+
+    let one = [every[holder as usize]];
+    let went = tried_by_map(&engine, &members, &said, 0, None, now, &one);
+    assert_ne!(went, holder, "the tried holder steps aside");
+    let mut both = [address(holder), address(went)];
+    both.sort();
+    assert_eq!(holders_of(&map, &said, 256), both);
+}
+
+/// A head whose every holder a hard filter refuses is passed for the
+/// next, also where no worker passes every filter: no filter that steps
+/// aside puts such a holder back. A conversation's deepest head is held
+/// by a worker that is away, and its first head by that worker and one
+/// more. A retry that tried every worker passes the deepest head and is
+/// named the first head's ready holder. It goes there at every seed,
+/// though that worker holds five requests where the others hold none.
+/// The classic policy reads a head's holders among its available workers,
+/// the deepest head first (`select_worker_hash`,
+/// model_gateway/src/policies/cache_aware.rs).
+#[test]
+fn a_head_the_hard_filters_refuse_is_passed_where_no_worker_passes_every_filter() {
+    for seed in 0..8 {
+        let (engine, map) = lending_map(None);
+        let list = pool(4);
+        let members = PublishedList::new(Arc::clone(&list));
+        let now = Instant::now();
+        let (said, deep, shallow) = two_holders_of_the_first_head(&engine, &map, &list, now);
+        list[deep as usize].set_status(WorkerStatus::NotReady);
+        (0..5).for_each(|_| list[shallow as usize].increment_load());
+        let every = ids_of(&list);
+        let went = tried_by_map(&engine, &members, &said, seed, None, now, &every);
+        assert_eq!(went, shallow, "seed {seed}: the first head's ready holder");
+    }
+}
+
+/// A head stands or is passed by the workers the request may take, and
+/// by no other. A conversation's holder and one more worker are the two
+/// places a retry's caller allows, and the retry tried both. The two
+/// workers outside those places pass every filter, and pass no head for
+/// the retry: its pass runs over the two places alone and lets the filter
+/// step aside. So the retry goes back to the holder at every seed, though
+/// it holds five requests where the other place holds none.
+#[test]
+fn a_worker_outside_a_requests_places_passes_no_head_for_it() {
+    let (engine, _) = lending_map(None);
+    let list = pool(4);
+    let members = PublishedList::new(Arc::clone(&list));
+    let said: Vec<u32> = (0..256).collect();
+    let now = Instant::now();
+    let holder = sent_by_map_at(&engine, &members, &said, 0, None, now);
+    let beside = (holder + 1) % 4;
+    let every = ids_of(&list);
+    let tried = [every[holder as usize], every[beside as usize]];
+    let mut places = [holder, beside];
+    places.sort_unstable();
+    (0..5).for_each(|_| list[holder as usize].increment_load());
+    for seed in 0..8 {
+        let mut asked = request();
+        asked.facts.seed = seed;
+        asked.facts.tried = &tried;
+        asked.constraints.places = Some(&places);
+        let went = asked_by_map(&engine, &members, &said, asked, None, now);
+        assert_eq!(went, holder, "seed {seed}: the holder, tried as both are");
+    }
+}
+
+/// A worker among a request's places that passes every filter passes a
+/// head for it, as a worker of the whole list does for a request that
+/// states no places. A conversation's deepest head is held by one worker,
+/// and its first head by that worker and a second. A retry tried the
+/// first, and its caller allows three places: the two holders and one
+/// more worker. The second holder passes every filter, so the deepest
+/// head is passed and the first head stands by that worker. The retry
+/// goes to it at every seed, though it holds five requests where the
+/// third place holds none: a retry named the deepest head's holder alone
+/// would lose it to the pass and go to the third place.
+#[test]
+fn a_worker_among_a_requests_places_passes_a_head_for_it() {
+    for seed in 0..8 {
+        let (engine, map) = lending_map(None);
+        let list = pool(4);
+        let members = PublishedList::new(Arc::clone(&list));
+        let now = Instant::now();
+        let (said, deep, shallow) = two_holders_of_the_first_head(&engine, &map, &list, now);
+        (0..5).for_each(|_| list[shallow as usize].increment_load());
+        let third = (0..4).find(|at| ![deep, shallow].contains(at));
+        let mut places = [deep, shallow, third.expect("a third worker")];
+        places.sort_unstable();
+        let tried = [ids_of(&list)[deep as usize]];
+        let mut asked = request();
+        asked.facts.seed = seed;
+        asked.facts.tried = &tried;
+        asked.constraints.places = Some(&places);
+        let went = asked_by_map(&engine, &members, &said, asked, None, now);
+        assert_eq!(went, shallow, "seed {seed}: the first head's holder");
+    }
+}
+
+/// A placement map keeps three holders a head, and the test of a head's
+/// holders asks the third as it asks the first. Three workers hold a
+/// conversation's one head. The two of the lower places are away, and the
+/// third is ready with five requests where the one worker that holds
+/// nothing of the head has none. The head stands by the third holder,
+/// which passes every filter, and the turn goes back to it. It goes back
+/// to it too as a retry that tried every worker: the third holder is the
+/// one the hard filters keep, no worker passes every filter, and the pass
+/// lets the filter of the tried workers step aside.
+#[test]
+fn a_head_stands_by_its_third_holder_as_by_its_first() {
+    for seed in 0..8 {
+        for all_tried in [false, true] {
+            // One boundary: a head that is passed leaves no other to stand.
+            let mut document = hashed_document(None);
+            document.view.boundaries = vec![256];
+            let (engine, _) = lending_under(&document);
+            let list = pool(4);
+            let members = PublishedList::new(Arc::clone(&list));
+            let now = Instant::now();
+            let (said, holders) = holders_of_one_head(&engine, &list, 3, now);
+            // A head's holders are read in the order of their places.
+            let third = *holders.iter().max().expect("three holders");
+            for &at in holders.iter().filter(|&&at| at != third) {
+                list[at as usize].set_status(WorkerStatus::NotReady);
+            }
+            (0..5).for_each(|_| list[third as usize].increment_load());
+            let every = ids_of(&list);
+            let tried: &[WorkerId] = if all_tried { &every } else { &[] };
+            let went = tried_by_map(&engine, &members, &said, seed, None, now, tried);
+            assert_eq!(went, third, "seed {seed}: every worker tried ({all_tried})");
+        }
+    }
+}
+
+/// A worker's record is made anew at each read, so a holder's test can
+/// say another word at a second read of one decision. A soft filter of
+/// the row alone stands in for a room rule here: it keeps a row with
+/// fewer than 100 requests in flight. Behind its first two words on one
+/// worker's rows it moves that worker's load, as the requests that end
+/// and start between two reads would. Every worker holds 200 requests,
+/// and a conversation's one head names two holders. One of them is asked
+/// ahead of the pass and refused, and then holds no request. Only the
+/// workers the head does not name are asked whether one of them passes,
+/// and none does, so the head stands as named: a named holder is never
+/// the other worker that passes its own head. The pass reads that holder
+/// with no request and keeps it alone. So the turn goes back to it, be
+/// it the holder written first or the one written second, with the
+/// request's places stated or not, though it then holds 400 requests
+/// where the others hold 200. A test that asked the holder among the
+/// other workers would pass the head, and the turn would be decided with
+/// nobody named.
+///
+/// The same holds for the third of three holders, the other two away: a
+/// map keeps three holders a head, and each is left out of the look for
+/// another worker.
+#[test]
+fn a_holder_that_passes_at_a_second_read_passes_no_head_of_its_own() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use crate::engine::framework::Filter;
+    /// The workers, the place of the one whose load moves once the case
+    /// arms it, and how many words the filter said on that worker's rows.
+    #[derive(Debug)]
+    struct Moved {
+        list: Arc<[Arc<dyn Worker>]>,
+        armed: AtomicU32,
+        said: AtomicU32,
+    }
+    #[derive(Debug)]
+    struct Moves(Arc<Moved>);
+    impl Filter for Moves {
+        fn name(&self) -> &'static str {
+            "moves"
+        }
+
+        fn soft(&self) -> bool {
+            true
+        }
+
+        fn row_wise(&self) -> bool {
+            true
+        }
+
+        fn keep(&self, _: &RequestFacts<'_>, row: &Candidate, _: &Constraints<'_>) -> bool {
+            let Moved { list, armed, said } = &*self.0;
+            if row.position == armed.load(Ordering::Relaxed) {
+                let worker = &list[row.position as usize];
+                match said.fetch_add(1, Ordering::Relaxed) {
+                    0 => (0..200).for_each(|_| worker.decrement_load()),
+                    1 => (0..400).for_each(|_| worker.increment_load()),
+                    _ => {}
+                }
+            }
+            row.in_flight < 100
+        }
+    }
+    /// The engine of one boundary, at 256 tokens, with the filter behind
+    /// its stock ones, over `list`, and the filter's state. One boundary:
+    /// a head that is passed leaves no other to stand.
+    fn moving(list: &Arc<[Arc<dyn Worker>]>) -> (InProcess, Arc<Moved>) {
+        let moved = Arc::new(Moved {
+            list: Arc::clone(list),
+            armed: AtomicU32::new(u32::MAX),
+            said: AtomicU32::new(0),
+        });
+        let mut catalog = StageRegistry::builtin();
+        let state = Arc::clone(&moved);
+        let added = catalog.filter("moves", move || Box::new(Moves(Arc::clone(&state))));
+        added.expect("a free name");
+        let mut document = hashed_document(None);
+        document.view.boundaries = vec![256];
+        let profile = document.profiles.get_mut("cache_aware");
+        let filters = &mut profile.expect("the preset's profile").filter;
+        filters.push("moves".into());
+        let spec = AppliedSpec::validate_in(&document, &catalog, &[]);
+        let engine = InProcess::new(spec.expect("the document validates"));
+        let map = Arc::new(PlacementMap::default());
+        engine.affinity().set_indexes(Arc::new(LendsMap(map)));
+        (engine, moved)
+    }
+    /// Where a conversation's turn goes, and the place of the holder whose
+    /// load moves. Two workers hold the head and all four hold 200
+    /// requests: the mover is the holder written second where `later`
+    /// says so, the one written first otherwise. The request states every
+    /// place as its own where `placed` says so.
+    fn of_two(later: bool, placed: bool, seed: u64) -> (u32, u32) {
+        let list = pool(4);
+        let (engine, moved) = moving(&list);
+        let now = Instant::now();
+        let (said, holders) = holders_of_one_head(&engine, &list, 2, now);
+        for worker in list.iter() {
+            (0..200).for_each(|_| worker.increment_load());
+        }
+        let mover = holders[usize::from(later)];
+        moved.armed.store(mover, Ordering::Relaxed);
+        let every = [0, 1, 2, 3];
+        let mut asked = request();
+        asked.facts.seed = seed;
+        asked.constraints.places = placed.then_some(&every[..]);
+        let members = PublishedList::new(Arc::clone(&list));
+        let went = asked_by_map(&engine, &members, &said, asked, None, now);
+        (went, mover)
+    }
+    /// The same for a head of three holders, which are read in the order
+    /// of their places: the two of the lower places are away, and the
+    /// mover is the third, at 200 requests. The one worker that holds
+    /// nothing of the head holds 100, which the filter refuses.
+    fn of_three(seed: u64) -> (u32, u32) {
+        let list = pool(4);
+        let (engine, moved) = moving(&list);
+        let now = Instant::now();
+        let (said, holders) = holders_of_one_head(&engine, &list, 3, now);
+        let mover = *holders.iter().max().expect("three holders");
+        for at in 0..4_u32 {
+            let worker = &list[at as usize];
+            match (at == mover, holders.contains(&at)) {
+                (true, _) => (0..200).for_each(|_| worker.increment_load()),
+                (false, true) => worker.set_status(WorkerStatus::NotReady),
+                (false, false) => (0..100).for_each(|_| worker.increment_load()),
+            }
+        }
+        moved.armed.store(mover, Ordering::Relaxed);
+        let members = PublishedList::new(Arc::clone(&list));
+        let went = sent_by_map_at(&engine, &members, &said, seed, None, now);
+        (went, mover)
+    }
+    for seed in 0..4 {
+        for (later, placed) in [(false, false), (false, true), (true, false), (true, true)] {
+            let (went, mover) = of_two(later, placed, seed);
+            assert_eq!(
+                went, mover,
+                "seed {seed}: the holder written second moves ({later}), places stated ({placed})"
+            );
+        }
+        let (went, mover) = of_three(seed);
+        assert_eq!(went, mover, "seed {seed}: the third of three holders");
+    }
+}
+
+/// The test asked of a head's holders does not run the pass, and has a
+/// limit: two soft filters in play and no worker that passes both. The
+/// document lists a room rule behind the filter of the workers a retry
+/// tried. A conversation's one holder has room and is the one worker its
+/// retry tried, and every other worker is over the rule. So no worker
+/// passes both filters, and the deepest head stands as named. The pass
+/// then drops the tried holder by the first filter, and lets the rule
+/// step aside for the three workers left. The retry is decided with
+/// nobody named and goes to the less loaded of them. It does not go to
+/// the first head's other holder, the most loaded, which a reading that
+/// ran the pass would name by the next head.
+///
+/// The case pins where the retry goes. A test that passed the deepest
+/// head alone would name the first head's other holder, and the case
+/// tells that. It cannot tell a head that stood and was emptied from a
+/// test that passed every head soft filters alone refuse: either leaves
+/// nobody named here. That such a head stands is held by the cases of
+/// one soft filter above.
+#[test]
+fn two_soft_filters_no_worker_passes_can_leave_a_retry_nobody_named() {
+    for seed in 0..8 {
+        let (engine, map) = lending_under(&roomed_document());
+        let list = pool(4);
+        let members = PublishedList::new(Arc::clone(&list));
+        let now = Instant::now();
+        let (said, deep, shallow) = two_holders_of_the_first_head(&engine, &map, &list, now);
+        // Two hundred requests in flight leave a worker no room, and the
+        // first head's other holder holds fifty more.
+        let fill = |at: u32, by: u32| (0..by).for_each(|_| list[at as usize].increment_load());
+        (0..4).filter(|&at| at != deep).for_each(|at| fill(at, 200));
+        fill(shallow, 50);
+        let tried = [ids_of(&list)[deep as usize]];
+        let went = tried_by_map(&engine, &members, &said, seed, None, now, &tried);
+        assert!(
+            ![deep, shallow].contains(&went),
+            "seed {seed}: nobody is named, and the less loaded worker takes it"
+        );
+    }
+}
+
+/// A lent map is read and written at the instant the decision's caller
+/// hands the engine's entry, and no clock is read for it. A conversation's
+/// worker is written at one instant. While it is away, a prompt that
+/// shares the first head is written for another worker, a second short of
+/// the first one's lifetime. One second past that lifetime the
+/// conversation's deepest head is passed, though its holder is ready
+/// again, and the turn goes to the other worker, the one live holder of
+/// the first head. The map then holds that worker alone at the deepest
+/// head, touched at the turn's own instant: the read dropped the holder
+/// past its lifetime. The classic policy reads its clock once a decision,
+/// and probes and records by that instant (`select_worker_hash`,
+/// model_gateway/src/policies/cache_aware.rs).
+#[test]
+fn a_lent_map_is_read_and_written_at_the_decisions_instant() {
+    let (engine, map) = lending_map(None);
+    let list = pool(8);
+    let members = PublishedList::new(Arc::clone(&list));
+    let life = Duration::from_secs(u64::from(IndexSpec::default().ttl_s));
+    let (began, second) = (Instant::now(), Duration::from_secs(1));
+    let said: Vec<u32> = (0..256).collect();
+    let first = sent_by_map_at(&engine, &members, &said, 0, None, began);
+    list[first as usize].set_status(WorkerStatus::NotReady);
+    let shares = sharing_the_first_head();
+    let other = sent_by_map_at(&engine, &members, &shares, 1, None, began + life - second);
+    assert_ne!(other, first);
+    list[first as usize].set_status(WorkerStatus::Ready);
+
+    let past = began + life + second;
+    let went = sent_by_map_at(&engine, &members, &said, 2, None, past);
+    assert_eq!(went, other, "the first holder is past its lifetime");
+    let key = (256, hash_token_head(None::<[u32; 2]>, &said[..256]));
+    let held = map.get(&key).expect("the deepest head");
+    let touched: Vec<(&str, Instant)> = held
+        .iter()
+        .map(|holder| (holder.worker_url.as_str(), holder.last_touch))
+        .collect();
+    assert_eq!(touched, [(list[other as usize].url(), past)]);
+}
+
+/// Under KV pressure a hash request is placed over every admitted worker
+/// ahead of any holder, and its pick is still written at every boundary
+/// the request reaches. With no pressure a conversation's next turn goes
+/// back to its holder, whatever the queues read. Then the holder reports
+/// a KV use over the ceiling: the next turn goes to the worker with the
+/// shortest queue, which held nothing of it, and the map names that
+/// worker beside the holder at both heads. The classic policy sheds
+/// fleet-wide under KV pressure ahead of its read of the map, and records
+/// the worker it picked at every boundary that applies
+/// (`select_worker_hash` and `hash_expected_wait`,
+/// model_gateway/src/policies/cache_aware.rs).
+#[test]
+fn under_kv_pressure_a_hash_request_goes_by_load_and_is_still_written() {
+    let (engine, map) = lending_map(Some((0.3, 0.9)));
+    let list = pool(4);
+    let members = PublishedList::new(Arc::clone(&list));
+    let said: Vec<u32> = (0..256).collect();
+    let holder = sent_by_map(&engine, &members, &said, 0, None);
+    let light = (holder + 1) % 4;
+    let reports = |pressed: bool| {
+        let reports = (0..4_u32).map(|at| {
+            let queued = if at == light { 0 } else { 90_000 };
+            let used = if pressed && at == holder { 0.95 } else { 0.1 };
+            let url = format!("http://worker-{at}:8000");
+            (url, one_rank_load(queued, used, 1_000.0))
+        });
+        LoadSnapshot::from_loads_for_test(reports.collect())
+    };
+    for seed in 0..8 {
+        let went = sent_by_map(&engine, &members, &said, seed, Some(reports(false)));
+        assert_eq!(went, holder, "seed {seed}: no pressure");
+    }
+    let address = |at: u32| list[at as usize].url().to_owned();
+    assert_eq!(holders_of(&map, &said, 256), [address(holder)]);
+
+    let went = sent_by_map(&engine, &members, &said, 8, Some(reports(true)));
+    assert_eq!(went, light, "the shortest queue, ahead of the holder");
+    let mut both = [address(holder), address(light)];
+    both.sort();
+    for end in [64, 256] {
+        assert_eq!(holders_of(&map, &said, end), both, "the head of {end}");
     }
 }
 

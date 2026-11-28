@@ -136,7 +136,7 @@ Other readers follow their own rules:
 | Field | What it holds | Default |
 |---|---|---|
 | `kind` | `tree` or `hash`. | `tree` |
-| `ttl_s` | How many seconds a placement of the classic hash index lives. The crate's engine does not read it: no placement of its record expires. | 180 |
+| `ttl_s` | How many seconds a placement lives in a placement map a host lends under `hash`. No placement of the crate's own record expires. | 180 |
 | `max_size` | The size bound of a `tree`. The crate's engine bounds its record by it under either kind. | 67108864 |
 | `sweep_s` | How many seconds pass between sweeps. | 120 |
 
@@ -157,14 +157,20 @@ A host can read these settings for an index of its own. The gateway does: at eac
 
 The gateway's flags write an index they never sweep with that cadence. A `tree` then states the largest size, 18446744073709551615, and a `hash` keeps the size the flags name.
 
-The crate's engine reads `kind` and `max_size` alone, for a pool whose profile reads sent prefixes:
+Under `hash` the gateway keeps a model's placement map in its trees' place, and lends it to the engine for a request placed alone. Each sweep takes the placements older than `ttl_s` out of the map. With no sweep the map is held to no size.
+
+The crate's engine reads `kind`, `max_size` and `ttl_s`, for a pool whose profile reads sent prefixes:
 
 - Under `tree`, the engine bounds the model's record of sent prefixes at `max_size` divided by the block size, and at one placement at least. The record holds one placement for each block a worker was sent.
 - At the defaults that is 4,194,304 placements. The record takes about 55 bytes a block, so about 230 MB a model.
 - Under `hash`, the engine keeps the same record under the same bound, keyed at `view.boundaries` alone. For a request of token ids it holds one placement at most for each boundary and each worker sent the request.
-- Under `hash`, a request that carries fewer block hashes than the first boundary has whole blocks, or one hashed by its text, is recorded nowhere.
+- Under `hash`, the record holds nothing for a request that carries fewer block hashes than the first boundary has whole blocks, or for one hashed by its text.
 - A boundary of more whole blocks than `max_block_hashes` keys nothing. A key ends at the last whole block under its boundary, and a request that holds those blocks reaches it. As a rule every worker sent a head stays its holder until the bound takes the placement.
-- The entry read is the one for the model the request names, under the id by which the first worker of its list lists that model. A model that workers list behind their primary one keeps its own record under its own entry.
+- Under `hash`, a host may lend its placement map in the record's place. The engine asks for it for a request of the phase `single`, where the profile names the holders' rows under a cap. Where the host lends it, the pool keeps no record.
+- A request whose host names its token ids is decided inside that map. As a rule it is named the live holders of its deepest head that has one the decision's pass keeps. Its worker is written at every boundary it reaches.
+- A holder lives `ttl_s` seconds from its last touch. A removal of its worker takes it sooner. So does a fourth holder of its head, where it was touched longest ago.
+- Where its host lends the map, the engine reads no index of cache events for the pool.
+- The entry read is the one for the model the request names, under the id by which the first worker of its list lists that model. A model that workers list behind their primary one keeps its own record under its own entry, and is lent its own placement map.
 - A record read for a model behind a first worker's primary one is bounded by the smallest block size any list asked with, for as long as it lives.
 - An id and an alias of one model share one record. A name no model of that worker answers to reads the record and the entry of the worker's primary model id.
 
@@ -490,6 +496,11 @@ A `single` binding can name a second profile, as in `shadow: next`.
 - A pool keeps one warm-up rule and one sent-prefix record at most.
 - Behind a live profile that is named rows of its own, a shadow of another warm-up rule or another record is skipped and counted.
 - The engine reads this from the spec alone: the bindings' model patterns, phase lists and order.
+- One rule is a request's, inside a lent placement map under `hash`. Behind a request that reaches a boundary, the engine may ask the live profile's filters of a head's named holders, and pass a head they refuse.
+- A shadow that reads those rows runs only where the engine can tell its profile would be asked the same way. It can tell for two profiles that list the same built-in filters, in any order.
+- It can tell too for two profiles it asks no holder's test of, as with a host-registered filter in each that is shown the whole pool.
+- For both kinds, each of the two is a plain ring, the shape that can hold a key across the overload veto, or neither is.
+- It cannot tell for a profile whose filters it asks by a call each, as under a `has-room` rule. Beside such a profile the shadow is skipped and counted, also where both list the same rule.
 - A shadow profile that reads no cached blocks is asked over the whole pool, as it decides live.
 
 A pair's side has rules of its own:

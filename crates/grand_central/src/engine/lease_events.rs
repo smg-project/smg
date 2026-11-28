@@ -55,8 +55,8 @@ use crate::tracking::lease::{Lease, Said, Side};
 /// the profile's own and every word of it is told.
 ///
 /// What is kept of where a request's prompt went asks the same: the
-/// record of sent prefixes takes no entry, and a lent tree stores no
-/// prompt, behind a pick the stages do not hear of
+/// record of sent prefixes takes no entry, and a lent tree or placement
+/// map stores no prompt, behind a pick the stages do not hear of
 /// (`in_process::overlap`). A pin the keyed entry followed is handed to
 /// that lookup only where the stages hear of it (`in_process::single`).
 /// So the rule's word has this one reader, at the words of a lease and at

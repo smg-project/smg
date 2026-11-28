@@ -756,6 +756,10 @@ impl RowTests {
     /// The bits of a row's word a row is kept by: a filter's other bits
     /// refuse.
     const KEPT_BY: u64 = 1 | Self::HAS_CAPACITY | Self::HAS_ROOM;
+    /// The tests of the soft filters ([`Filter::soft`]): the room test and
+    /// the test of the request's lists, the workers a retry tried and
+    /// those its host excludes.
+    const SOFT: u64 = Self::HAS_ROOM | Self::NOT_TRIED;
 
     /// `filters` as one set, where each is a filter of this file, known by
     /// its type. A host's own filter is no test the engine holds, one that
@@ -790,6 +794,12 @@ impl RowTests {
     /// The set with `other`'s tests added.
     pub(crate) const fn with(self, other: Self) -> Self {
         Self(self.0 | other.0)
+    }
+
+    /// The set less the tests of its soft filters: what a pass holds a
+    /// row to where every soft filter of the set steps aside.
+    pub(crate) const fn hard(self) -> Self {
+        Self(self.0 & !Self::SOFT)
     }
 
     /// The tests a placement pass that asks for one pick holds itself at a

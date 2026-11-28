@@ -480,6 +480,56 @@ fn a_trees_match_is_priced_in_whole_blocks_and_said_in_its_own_unit() {
     assert_eq!(said(30, 100, 0).1, miss);
 }
 
+/// A head a placement map holds is priced by its whole count, where a
+/// tree's match of as many tokens is priced by its whole blocks
+/// ([`TreeMatch::counted`]). Forty-seven tokens at eight a request are six
+/// requests' worth, and their two whole blocks are four. A holder seven
+/// requests over three idle workers stands under the first margin and
+/// over the second: it keeps the request as a map's holder, and spills it
+/// as a tree's. A head is in tokens whatever the request's hash kind: under
+/// the text kind nothing divides it by four, so the holder keeps the
+/// request there too.
+///
+/// The classic policy prices a hash index's holder by its boundary's
+/// tokens: `select_worker_hash` hands `select_final_from_affinity` the
+/// boundary, and `held_prefix_margin` divides it
+/// (`model_gateway/src/policies/cache_aware.rs`).
+#[test]
+fn a_counted_head_is_priced_by_its_tokens() {
+    let stage = affinity(Some(SpillParams {
+        rel: Some(1.1),
+        prefix_margin_tokens: Some(8),
+        ..SpillParams::default()
+    }));
+    let pool = rows(&[
+        candidate(0, 7, 0),
+        candidate(1, 0, 0),
+        candidate(2, 0, 0),
+        candidate(3, 0, 0),
+    ]);
+    let holders = [AffinityHolder {
+        row: 0,
+        overlap_blocks: 0,
+        predicted_blocks: 2,
+    }];
+    let scored = |tree: TreeMatch, hash_kind: HashKind| {
+        let rows = AffinityRows {
+            tree: Some(tree),
+            ..named(&holders, &[], false)
+        };
+        let facts = RequestFacts {
+            hash_kind,
+            ..facts(6)
+        };
+        scores_named(&stage, &facts, &pool, rows)
+    };
+    let held = [1.0, 0.5, 0.5, 0.5];
+    assert_eq!(scored(TreeMatch::head(47, 96), HashKind::Token), held);
+    assert_eq!(scored(TreeMatch::head(47, 96), HashKind::Text), held);
+    let spilt = [0.0, 0.5, 0.5, 0.5];
+    assert_eq!(scored(TreeMatch::new(47, 96), HashKind::Token), spilt);
+}
+
 /// One holder over the swing's margin and under the priced one: the
 /// stage says the margin held. It says so once, of its own pass, of a
 /// deepest holder, and not behind [`forget_prefix_pass`].

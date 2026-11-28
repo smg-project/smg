@@ -33,6 +33,14 @@
 //! ([`CacheIndexes::string_tree`], [`TextKey`]), whether or not the model
 //! has an index: an index speaks of token blocks.
 //!
+//! Under a hash index a single request is decided inside the placement map
+//! its host lends ([`CacheIndexes::placement_map`]), by the index crate's
+//! own read and write of a head ([`live_holders_in`], [`record_in`]). As a
+//! rule it is named the live holders of its deepest head that has one the
+//! decision's pass keeps, and the worker it goes to is written at every
+//! boundary the request reaches. Such a request reads no index of cache
+//! events, no tree and no record.
+//!
 //! What is kept, and what guards it:
 //!
 //! - **Once a list of workers** ([`PoolAffinity`]): each worker's number in
@@ -60,13 +68,18 @@
 //! - **Once a thread**: the buffers a naming writes into, and the writes
 //!   of a record that met a held lock, eight at most. A decision allocates
 //!   nothing once they have grown, but what a tree's own match and write
-//!   allocate, and the list of a prompt that is hashed on a road that reads
-//!   it.
+//!   allocate, what the record's own write and sweep allocate, what a
+//!   placement map's write keeps for a holder its head did not hold, what
+//!   the host allocates to name the request's entry, the list of a prompt
+//!   that is hashed, and the buffers of a decision asked for from inside
+//!   another on its thread.
 //!
 //! No decision holds a lock across its stages: the naming ends before the
 //! decision runs, and the record is written after it answered. A decision
 //! inside a tree's match runs between the tree's read and its write, which
-//! hold no lock across it.
+//! hold no lock across it. So does one inside a placement map: a head's
+//! guard is held while its holders are named, and let go ahead of the
+//! pass's test of them and of the decision.
 //!
 //! [`WarmUpRule`]: crate::engine::WarmUpRule
 
@@ -78,13 +91,13 @@ use std::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, OnceLock,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use arc_swap::ArcSwapOption;
 use kv_index::{
-    chain_prefix_hash, ChainIndex, ContentHash, GroupViews, SequenceHash, TenantId, TokenTree,
-    Tree as StringTree,
+    chain_prefix_hash, hash_token_head, live_holders_in, record_in, ChainIndex, ContentHash,
+    GroupViews, PlacementMap, SequenceHash, TenantId, TokenTree, Tree as StringTree,
 };
 use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -385,7 +398,8 @@ pub trait CacheIndexes: Send + Sync {
     /// table, up to a second later. An index that holds a block decides a
     /// single request of token ids alone where a prefix stage of its
     /// profile reads cache events: no record of sent prefixes is read or
-    /// written for it.
+    /// written for it. Under a hash index a table that takes the host's
+    /// placement map ([`Self::placement_map`]) asks for no index.
     fn index(&self, model: &str) -> Option<Arc<dyn CacheIndex>>;
 
     /// The size of one cache block of `model` in tokens, as its workers'
@@ -420,6 +434,59 @@ pub trait CacheIndexes: Send + Sync {
     /// the request is named its rows from the record of hashed windows of
     /// its text, which speaks for every worker of its list.
     fn string_tree(&self, model: &str, phase: Phase) -> Option<Arc<StringTree>> {
+        let _ = (model, phase);
+        None
+    }
+
+    /// The host's own placement map of the workers that serve `model` at
+    /// `phase`: for each head of a prompt at a boundary, the workers it was
+    /// sent to within the time to live, named by their addresses. It is the
+    /// map the host's policy reads and writes under a hash index. Where the
+    /// document's index of the model is of that kind ([`IndexKind::Hash`]),
+    /// a request whose host names its entry ([`TokenKey`]) is decided
+    /// inside this map: as a rule it is named the live holders of its
+    /// deepest head that has one the decision's pass keeps, and the worker
+    /// it goes to is written at every boundary the request reaches. Two
+    /// things bend the rule. A head with more rows of the list than the
+    /// profile's cap is named a draw of them. And where the pass alone can
+    /// say which rows stay, a head stands as named. The entry is asked for
+    /// at a page of one token: the map is keyed by the ids themselves,
+    /// behind the two ids of a partition's marker where the request has
+    /// one ([`hash_token_head`]). A request whose host names no entry, and
+    /// an entry whose marker is neither two ids nor none, is named nobody
+    /// and writes nothing: a host that lends the map names the entry. The
+    /// engine reads and writes the map alone: the host makes it, sweeps it
+    /// and takes a worker that left out of it.
+    ///
+    /// The engine asks for the map once a table of the place, where the
+    /// place's profile reads who a prompt was sent to and is named rows
+    /// under a cap. It asks at the single phase alone ([`Phase::Single`]):
+    /// a side of a pair, and a request asked alone at the prefill, the
+    /// decode or the encode phase, are asked for no map and are decided as
+    /// under a host that lends none. Where the host lends it, the engine
+    /// asks for no index of cache events of the model ([`Self::index`]) and
+    /// keeps no record of its own for the place. `None`, the default,
+    /// where the host keeps none: the engine then keeps its own record of
+    /// sent prefixes, keyed at the document's boundaries.
+    ///
+    /// So under a host that lends it, the map serves the single phase and
+    /// the engine's record every other phase, and neither reads what the
+    /// other holds. A prompt sent at the single phase and again alone at
+    /// another, over the same workers, can then go to another worker.
+    /// Under a host that lends no map, the phases that read a record of
+    /// the model read one.
+    ///
+    /// A head's holders are named under the guard of the head's key: each
+    /// named row's worker is asked for its address there, as inside a lent
+    /// tree's match. A worker whose address reads the map there waits on
+    /// that guard without end: a host's worker must not. The pass's test
+    /// of a holder and the write run with the guard let go.
+    ///
+    /// A decision reads and writes the map at its own instant. Of two that
+    /// end out of order, the one that writes last leaves its instant as a
+    /// holder's last touch, though it is the earlier one: the classic
+    /// policy's write does the same.
+    fn placement_map(&self, model: &str, phase: Phase) -> Option<Arc<PlacementMap>> {
         let _ = (model, phase);
         None
     }
@@ -967,6 +1034,16 @@ impl Drop for Reading<'_> {
     }
 }
 
+/// The placement map a host lends a list under a hash index
+/// ([`CacheIndexes::placement_map`]), with what the document says of it.
+struct Placed {
+    map: Arc<PlacementMap>,
+    /// The document's boundaries, in tokens, ascending.
+    boundaries: Box<[usize]>,
+    /// How long a holder lives in the map: the model's `ttl_s`.
+    ttl: Duration,
+}
+
 /// One list of workers as the affinity stages' rows are named from it, for
 /// the decisions of one model and phase: read in one pass over the list and
 /// standing for a second, or until the index hands one of its numbers on
@@ -988,7 +1065,11 @@ struct Table {
     /// The place's own profile reads affinity
     /// ([`Engine::profile_reads_affinity`]): a pick states its worker's
     /// entry. Where the binding's shadow alone reads it, the rows are the
-    /// shadow's and the live pick states nothing.
+    /// shadow's and the live pick states nothing. Where the host lends the
+    /// place a placement map ([`Self::placed`]) the word is no: a single
+    /// request the table decides inside the map states no share, a
+    /// holder's pick and a miss alike, as the classic policy observes no
+    /// match ratio under a hash index.
     ///
     /// [`Engine::profile_reads_affinity`]: crate::engine::Engine::profile_reads_affinity
     states: bool,
@@ -1070,7 +1151,8 @@ struct Table {
     /// request of token ids by one key a boundary it reaches and a request
     /// hashed by its text by none ([`Self::fold_keys`]), as the classic
     /// policy keys its placement map. `None` under a tree index, whose
-    /// record holds a request by every block.
+    /// record holds a request by every block, and where the host lends
+    /// the place its placement map ([`Self::placed`]): no record is kept.
     boundaries: Option<Box<[u32]>>,
     /// The host's token tree for the place, where it lends one, the
     /// profile reads a record and the model has no index of cache events
@@ -1084,13 +1166,22 @@ struct Table {
     /// with an index of cache events too. The host's own tree, as
     /// [`Self::sent`] is.
     sent_text: Option<Arc<StringTree>>,
+    /// The host's placement map for the place under a hash index
+    /// ([`IndexKind::Hash`]), where it lends one: the one answer to whether
+    /// it does, asked at the table's read. The table then reads no index
+    /// of cache events, no tree and no record: a request whose host names
+    /// its entry is decided inside the map's read
+    /// ([`Self::decide_in_map`]). Where the host lends none, the record of
+    /// sent prefixes stands, keyed at [`Self::boundaries`]. The host's own
+    /// map, kept while the table stands.
+    placed: Option<Placed>,
     /// The document's block size, in tokens: what a tree's match is
     /// counted by for a request its host counted with none
     /// ([`Self::blocks_of`]).
     block: u32,
     /// The list's workers by the fingerprint of their address, each with
-    /// its row: where a worker a tree names stands. Empty where the host
-    /// lends the list no tree.
+    /// its row: where a worker a tree or a placement map names stands.
+    /// Empty where the host lends the list neither.
     by_address: Box<[(u64, u32)]>,
     /// The list's workers by id, each with its row: where a worker of the
     /// record stands. Empty where the list keeps no record.
@@ -1117,6 +1208,16 @@ fn millis(micros: u64) -> u32 {
 /// A count as a row's 32 bits, saturating.
 fn count(blocks: usize) -> u32 {
     u32::try_from(blocks).unwrap_or(u32::MAX)
+}
+
+/// A list's workers by the fingerprint of their address, each with its row,
+/// ascending: where a worker stands that a tree or a placement map names by
+/// its address ([`Table::rows_at`]).
+fn rows_by_address(workers: &[Arc<dyn Worker>]) -> Box<[(u64, u32)]> {
+    let print = |worker: &Arc<dyn Worker>| fingerprint(worker.url().as_bytes());
+    let mut by_address: Vec<(u64, u32)> = workers.iter().map(print).zip(0u32..).collect();
+    by_address.sort_unstable();
+    by_address.into()
 }
 
 /// Sets the bit of `at`.
@@ -1174,6 +1275,7 @@ impl Table {
             boundaries: None,
             sent: None,
             sent_text: None,
+            placed: None,
             block: spec.block_size(),
             by_address: Box::default(),
             by_id: Box::default(),
@@ -1189,9 +1291,46 @@ impl Table {
         // The index is its workers' model's, by the id they registered
         // under: a request may name the model by another.
         let registered = first.model_id();
-        let index = affinity
-            .indexes
-            .get()
+        // The record is the model's the request names, and so are its
+        // settings and the trees and the placement map lent for it, by the
+        // id of the first worker's card that answers to the name, an id
+        // ahead of an alias as the registry reads a name: a list of a model
+        // holds workers of different first models. A name no card answers
+        // to is the caller's own word, and reads the first model's record.
+        let mut named = None;
+        first.any_model(&mut |card| {
+            let id = card.id == model;
+            if id || (named.is_none() && card.matches(model)) {
+                named = Some(card.id.clone());
+            }
+            id
+        });
+        let named = named.as_deref().unwrap_or(registered);
+        let settings = spec.index_for(named);
+        let hash = settings.kind == IndexKind::Hash;
+        let record = engine.pool_record_for(model, phase);
+        let lent = affinity.indexes.get();
+        // Under a hash index the host is asked for its placement map of
+        // the place, here and nowhere else, where the profile reads who a
+        // prompt was sent to and its rows are named under a cap. It is
+        // asked at the single phase alone. A list's table at a side's
+        // phase is the one a pair's side fills its column from, whichever
+        // binding a request asked alone there resolves to, and a column
+        // decides inside no map: a map taken there would leave the side no
+        // record. At the single phase the record's reader is the request's
+        // own profile. Where the host lends one the table takes the map
+        // and nothing else: no index of cache events is asked for. Where
+        // it lends none the record of sent prefixes stands, as under a
+        // host that keeps no map.
+        let single = phase == Phase::Single;
+        let placed = lent
+            .filter(|_| hash && single && record.is_some() && cap != 0)
+            .and_then(|indexes| indexes.placement_map(named, phase));
+        // And the table of a lent map states no pick's share: the classic
+        // policy observes no match ratio under a hash index.
+        table.states &= placed.is_none();
+        let index = lent
+            .filter(|_| placed.is_none())
             .and_then(|indexes| indexes.index(registered));
         // The word first, ahead of the count and the numbers: a first block
         // or a last one's leaving under this pass leaves the table a word
@@ -1272,31 +1411,25 @@ impl Table {
             table.first_end = ends.min().unwrap_or(u64::MAX);
             table.warming = warming.into();
         }
-        let record = engine.pool_record_for(model, phase);
-        // The record is the model's the request names, and so are its
-        // settings and the trees lent for it, by the id of the first
-        // worker's card that answers to the name, an id ahead of an alias
-        // as the registry reads a name: a list of a model holds workers of
-        // different first models. A name no card answers to is the
-        // caller's own word, and reads the first model's record.
-        let mut named = None;
-        first.any_model(&mut |card| {
-            let id = card.id == model;
-            if id || (named.is_none() && card.matches(model)) {
-                named = Some(card.id.clone());
-            }
-            id
-        });
-        let named = named.as_deref().unwrap_or(registered);
-        let settings = spec.index_for(named);
+        if let Some(map) = placed {
+            // The map and its lifetime are the named model's, and the
+            // boundaries are the document's.
+            let tokens = |&boundary: &u32| usize::try_from(boundary).unwrap_or(usize::MAX);
+            table.placed = Some(Placed {
+                map,
+                boundaries: spec.boundaries().iter().map(tokens).collect(),
+                ttl: Duration::from_secs(u64::from(settings.ttl_s)),
+            });
+            table.by_address = rows_by_address(workers);
+        }
         // A hash index keeps what it placed and reads no tree: the record
         // is keyed by the request's head at the view's boundaries alone,
         // and its host is asked for no tree. Whom the record speaks for is
         // the reader's own word, as under a tree: where the model's index
         // of cache events holds a block it decides a single request of a
         // reader that reads cache events alone (`Table::index_alone`).
-        let hash = settings.kind == IndexKind::Hash;
-        if let Some(alone) = record {
+        // A table that took a lent map keeps no record.
+        if let Some(alone) = record.filter(|_| table.placed.is_none()) {
             let size = affinity.block_size(registered);
             let size = size.unwrap_or_else(|| spec.block_size()).max(1);
             let behind = named != registered;
@@ -1313,7 +1446,6 @@ impl Table {
             table.side_alone = engine.side_reads_sent_alone(model, phase);
             table.boundaries = boundaries;
             if cap != 0 && !hash {
-                let lent = affinity.indexes.get();
                 if !table.holds {
                     table.sent = lent.and_then(|indexes| indexes.token_tree(named, phase));
                 }
@@ -1322,11 +1454,7 @@ impl Table {
                 table.sent_text = lent.and_then(|indexes| indexes.string_tree(named, phase));
             }
             if table.sent.is_some() || table.sent_text.is_some() {
-                let print = |worker: &Arc<dyn Worker>| fingerprint(worker.url().as_bytes());
-                let mut by_address: Vec<(u64, u32)> =
-                    workers.iter().map(print).zip(0u32..).collect();
-                by_address.sort_unstable();
-                table.by_address = by_address.into();
+                table.by_address = rows_by_address(workers);
             }
             let mut by_id: Vec<(WorkerId, u32)> = ids.iter().copied().zip(0u32..).collect();
             by_id.sort_unstable_by_key(|&(id, _)| id);
@@ -1452,10 +1580,12 @@ impl Table {
     /// of any match that holds something, and the decision reads how much
     /// from the match's own two numbers ([`AffinityRows::tree`]). A request
     /// held to `places` is named the rows among them, and the cap counts no
-    /// other.
-    fn name_sent(
+    /// other. A placement map's read names its rows the same way: `sent`
+    /// is then the addresses of a head's live holders, each holding the
+    /// blocks of that head ([`Self::decide_in_map`]).
+    fn name_sent<'a>(
         &self,
-        sent: &[TenantId],
+        sent: impl IntoIterator<Item = &'a str>,
         blocks: u32,
         workers: &[Arc<dyn Worker>],
         facts: &RequestFacts<'_>,
@@ -2296,10 +2426,11 @@ struct Asked<'a> {
 ///
 /// `token_key` names the request's entry in the host's token tree of sent
 /// prefixes ([`TokenKey`]), given the tree's page in tokens. It is called
-/// at most once, and only where the host lends the place such a tree
-/// ([`CacheIndexes::token_tree`]): its profile reads a record of sent
-/// prefixes and is named rows, and the model has no index of cache events.
-/// A request it names an entry for is decided inside the tree's match.
+/// at most once. Under a tree index it is called only where the host lends
+/// the place such a tree ([`CacheIndexes::token_tree`]): its profile reads
+/// a record of sent prefixes and is named rows, and the model has no index
+/// of cache events. A request it names an entry for is decided inside the
+/// tree's match.
 /// `text_key` names the entry of a request hashed by its text in the host's
 /// string tree ([`TextKey`]). It is called at most once, of such a request
 /// that was named no token entry, and only where the host lends the place
@@ -2307,11 +2438,17 @@ struct Asked<'a> {
 /// index holds. A request it names an entry for is decided inside that
 /// tree's match. `decide` is called once either way.
 ///
+/// Where the host lends the place a placement map under a hash index
+/// ([`CacheIndexes::placement_map`]), `token_key` is called once, at a page
+/// of one token, and no tree is asked for: a request it names an entry for
+/// is decided inside that map.
+///
 /// `sends_to` says whether the request's caller sends it to a target of the
 /// pick ([`RequestMaker::sends_to`]). A decision made inside the tree's
-/// match, and one the record is written behind, asks it of the pick's
-/// targets, best first: the tree stores the request's pages, and the record
-/// its prefix, for the first one it takes. No other decision asks it.
+/// match or a lent placement map, and one the record is written behind,
+/// asks it of the pick's targets, best first: the tree stores the request's
+/// pages, the map its heads and the record its prefix, for the first one it
+/// takes. No other decision asks it.
 ///
 /// A pick states what its first target holds of the request ([`Overlap`]),
 /// from the rows its decision was given: the rows named here, from the
@@ -2331,11 +2468,22 @@ struct Asked<'a> {
 /// the match's share. Past the cap the holders named are a draw, so a
 /// holder the draw left out states a miss too.
 ///
+/// A request decided inside a placement map its host lends states no
+/// share, whoever it goes to: the classic policy observes no match ratio
+/// under a hash index. This entry hands that road no test of a holder: a
+/// head whose holders `decide` then drops is not passed for a shallower
+/// one.
+///
 /// The rows live in the calling thread's buffers until this returns:
 /// `decide` reads them and keeps nothing of them. Nothing is allocated once
 /// the buffers have grown, but where a table is read (once a list, then by
-/// one decision a second and by one behind a number the index handed on)
-/// and by a tree's own match and write.
+/// one decision a second and by one behind a number the index handed on),
+/// by a tree's own match and write, by the record's own write and sweep,
+/// by a placement map's write of a holder its head did not hold (the
+/// holder's address, and the head's list where the head is new), by what
+/// the host's own `token_key` and `text_key` allocate for the entry they
+/// name, and by a decision asked for from inside another on its thread,
+/// which takes buffers of its own.
 ///
 /// [`Engine::needs_for_phase`]: crate::engine::Engine::needs_for_phase
 /// [`RequestMaker::sends_to`]: crate::engine::RequestMaker::sends_to
@@ -2357,8 +2505,24 @@ pub fn decide<'p>(
     decide: impl FnMut(&mut RequestFacts<'_>) -> Decision,
 ) -> Decision {
     let hashed = || None;
+    // No test of the pass's is handed here: a naming stands as made.
+    let kept = |_: &RequestFacts<'_>, _: &[AffinityHolder]| None;
+    // This call is handed no instant: a request that reaches a boundary of
+    // a lent placement map reads the process clock, once.
     decide_hashed(
-        affinity, pool, spec, workers, ids, facts, places, token_key, text_key, sends_to, hashed,
+        affinity,
+        pool,
+        spec,
+        workers,
+        ids,
+        facts,
+        places,
+        token_key,
+        text_key,
+        sends_to,
+        hashed,
+        &kept,
+        Instant::now,
         decide,
     )
 }
@@ -2371,10 +2535,26 @@ pub fn decide<'p>(
 /// facts that holds it. A request decided inside a lent tree's match reads
 /// none of the list, and asks nothing.
 ///
+/// `kept` is the test the decision's own pass asks of a row, for the holders
+/// a lent placement map names ([`Table::decide_in_map`]): asked of the
+/// holders named, it answers whether the pass keeps one of them. It
+/// answers `None` where the pass alone can say which rows stay, and the
+/// naming then stands as made: for a profile whose filters are asked of
+/// no row ahead of the pass ([`Engine::keeps_for`]), and for holders that
+/// soft filters alone refuse where no other worker the request may take
+/// passes every filter, since a soft filter then steps aside in the pass.
+/// No other road asks it.
+///
+/// `now` answers the decision's own instant. It is asked once, by a request
+/// that reaches a boundary of a placement map its host lends
+/// ([`Table::decide_in_map`]), and by no other: the map's holders live and
+/// are written by that instant.
+///
 /// [`Made::hashed_whole`]: super::place::Made::hashed_whole
+/// [`Engine::keeps_for`]: crate::engine::Engine::keeps_for
 #[expect(
     clippy::too_many_arguments,
-    reason = "what `decide` takes, and the prompt's hashes where the request's making left them out"
+    reason = "what `decide` takes, the prompt's hashes where the request's making left them out, the pass's test of a holder, and the decision's instant"
 )]
 pub(super) fn decide_hashed<'p, 'h>(
     affinity: &Affinity,
@@ -2388,6 +2568,8 @@ pub(super) fn decide_hashed<'p, 'h>(
     text_key: impl FnOnce() -> Option<TextKey<'p>>,
     sends_to: impl Fn(&Target) -> bool,
     hashed: impl FnOnce() -> Option<&'h PromptHashes>,
+    kept: &impl Fn(&RequestFacts<'_>, &[AffinityHolder]) -> Option<bool>,
+    now: impl FnOnce() -> Instant,
     mut decide: impl FnMut(&mut RequestFacts<'_>) -> Decision,
 ) -> Decision {
     // No binding of the phase reads affinity: one test, and no table.
@@ -2425,7 +2607,7 @@ pub(super) fn decide_hashed<'p, 'h>(
         pool.with_table(&asked, |table| {
             let keys = (token_key, text_key);
             table.decide(
-                workers, facts, places, buffers, keys, sends_to, hashed, decide,
+                workers, facts, places, buffers, keys, sends_to, hashed, kept, now, decide,
             )
         })
     })
@@ -2450,6 +2632,7 @@ pub(super) fn decide_behind<'p, 'h>(
     text_key: impl FnOnce() -> Option<TextKey<'p>>,
     sends_to: impl Fn(&Target) -> bool,
     hashed: impl FnOnce() -> Option<&'h PromptHashes>,
+    now: impl FnOnce() -> Instant,
     leaves: u64,
     made: Decision,
 ) -> Decision {
@@ -2468,6 +2651,9 @@ pub(super) fn decide_behind<'p, 'h>(
         text_key,
         |target| affinity.leaves() == leaves && sends_to(target),
         hashed,
+        // The answer is made: no holder is tested for it.
+        &|_, _| None,
+        now,
         |_| made,
     )
 }
@@ -2693,9 +2879,10 @@ pub(super) fn state(decision: &mut Decision, feed: Feed<'_>, facts: &RequestFact
 ///
 /// The rule's word is read through that one function by the words of a
 /// lease, the record's two writes here, the store of a prompt in a lent
-/// tree ([`sent_address`]), the hand-over of a pin the keyed entry followed
-/// to this lookup, a pair's two writes behind its pick, and the statement
-/// of what a pick's first target holds ([`state`]). A pair's two writes ask
+/// tree or placement map ([`sent_address`]), the hand-over of a pin the
+/// keyed entry followed to this lookup, a pair's two writes behind its
+/// pick, and the statement of what a pick's first target holds
+/// ([`state`]). A pair's two writes ask
 /// it a side at a time, each of its own side ([`decide_by_columns`]), and
 /// then name the target the request goes to ([`sent_to`]). A pair's first
 /// pick states what its prefill holds by the pick's own word, which is the
@@ -2805,10 +2992,10 @@ impl PoolAffinity {
 /// The target a single decision's request goes to: the first target of a
 /// pick the profile is told of ([`told_target`]) that the request's caller
 /// sends to (`sends_to`), asked best first. It is the worker a tree's
-/// match and the record's two writes keep the request's prefix for. `None`
-/// where the decision picked nobody, the binding's sessions rule keeps the
-/// request from the profile, or the caller sends to none of the pick's
-/// targets: nothing is stored.
+/// match, a placement map's write and the record's two writes keep the
+/// request's prefix for. `None` where the decision picked nobody, the
+/// binding's sessions rule keeps the request from the profile, or the
+/// caller sends to none of the pick's targets: nothing is stored.
 pub(super) fn sent_target(
     decision: &Decision,
     sends_to: impl Fn(&Target) -> bool,
@@ -2861,10 +3048,16 @@ impl Table {
     /// record's write behind a pick. A request whose host names its entry
     /// in a tree it lends is decided inside that tree's match
     /// ([`Self::decide_in_tree`]): by its token ids in the token tree, and
-    /// a request hashed by its text in the string tree.
+    /// a request hashed by its text in the string tree. Where its host
+    /// lends the place a placement map under a hash index, it is decided
+    /// inside that map ([`Self::decide_in_map`]), at the instant `now`
+    /// answers: the decision's own, asked on that road alone, once, where
+    /// the request reaches a boundary.
+    /// That road alone holds the holders it names to the pass's own test,
+    /// `kept`.
     #[expect(
         clippy::too_many_arguments,
-        reason = "the list, the request's facts and its places, the buffers, its entry in each tree and the target its caller takes, its hashes where its making left them out, and the decision"
+        reason = "the list, the request's facts and its places, the buffers, its entry in each tree and the target its caller takes, its hashes where its making left them out, the pass's test of a holder, the decision's instant, and the decision"
     )]
     fn decide<'p, 'h>(
         &self,
@@ -2878,6 +3071,8 @@ impl Table {
         ),
         sends_to: impl Fn(&Target) -> bool,
         hashed: impl FnOnce() -> Option<&'h PromptHashes>,
+        kept: &impl Fn(&RequestFacts<'_>, &[AffinityHolder]) -> Option<bool>,
+        now: impl FnOnce() -> Instant,
         mut decide: impl FnMut(&mut RequestFacts<'_>) -> Decision,
     ) -> Decision {
         if !self.reads {
@@ -2888,6 +3083,16 @@ impl Table {
             let whole = hashed().map(|hashes| hashes.over(facts));
             let facts = whole.as_ref().unwrap_or(facts);
             return self.decide_by_column(facts, buffers, sends_to, decide);
+        }
+        if let Some(placed) = self.placed.as_ref() {
+            // The host lends the place a map: the entry is asked for once,
+            // at a page of one token, since the map is keyed by the ids
+            // themselves. No list of hashes is asked for.
+            let lent = token_key(1).map(|key| (placed, key));
+            let facts = &*facts;
+            return self.decide_in_map(
+                lent, kept, now, sends_to, workers, facts, places, buffers, decide,
+            );
         }
         // The entry is asked for where the host lends the place a tree,
         // once, by the tree's own page.
@@ -3059,7 +3264,8 @@ impl Table {
             // A match of nothing names nobody.
             let found = tree.is_some_and(|tree| tree.matched > 0);
             let holders = if found { holders } else { &[] };
-            self.name_sent(holders, blocks, workers, facts, places, buffers);
+            let sent = holders.iter().map(|tenant| &**tenant);
+            self.name_sent(sent, blocks, workers, facts, places, buffers);
             let named = AffinityRows {
                 tree,
                 ..self.named_rows(buffers)
@@ -3082,6 +3288,138 @@ impl Table {
         // there. Were it not asked, the request is decided here, with no
         // holder named and nothing written: its pick states a miss.
         decided.unwrap_or_else(|| decide_over(&[], None, 0))
+    }
+
+    /// One decision of a request inside the placement map its host lends
+    /// for its place under a hash index, as the classic policy decides
+    /// under that index. `lent` is the map with the request's entry in it:
+    /// its token ids, behind a partition's marker of two ids where it has
+    /// one. The request reaches the boundaries that are at most its ids in
+    /// number, the marker not counted. It is named the live holders of its
+    /// deepest head that names a row of the list, each holding that head's
+    /// blocks, and the decision is made over them. The rows carry the
+    /// head's size and the request's, in tokens ([`AffinityRows::tree`]),
+    /// as a tree's match does: no count is rounded to a block. The head is
+    /// priced by its whole count ([`TreeMatch::counted`]), as the classic
+    /// policy prices a holder by its boundary's tokens.
+    ///
+    /// A head's holders are held to the test the decision's own pass asks
+    /// of a row (`kept`, [`Engine::keeps_for`]), ahead of the decision: a
+    /// head none of whose holders the pass keeps is passed for the next,
+    /// as the classic policy passes a head whose holders are not among its
+    /// available workers. Where the test answers none the head stands as
+    /// named, and the pass drops its rows itself. It answers none where
+    /// the pass alone can say which rows stay. One such head is that
+    /// whose holders soft filters alone refuse while no other worker the
+    /// request may take passes every filter: the pass lets a soft filter
+    /// step aside there. So a retry that tried every worker is named a
+    /// holder the hard filters keep. The classic policy, where KV pressure
+    /// does not shed its read, reads its map among every worker its route
+    /// admits once a retry tried them all.
+    ///
+    /// The test does not run the pass, and one head it leaves standing
+    /// the pass can empty. With two soft filters in play and no worker
+    /// that passes both, the first can drop the named holder before the
+    /// second steps aside. The request is then decided with nobody
+    /// named, where a reading that ran the pass would try the next head.
+    ///
+    /// The worker the request goes to, the first target of the pick its
+    /// caller sends to (`sends_to`), is then written at every boundary the
+    /// request reaches: behind a pick of a holder, behind a pick of any
+    /// other worker, and where nobody was named. The read and the write
+    /// are at `now`, the decision's instant, asked once and only for a
+    /// request that reaches a boundary. The read runs ahead of the
+    /// decision, whatever the decision then does with the holders: one
+    /// that sets them aside for KV pressure, and an answer a pin made
+    /// ahead of the lookup, still read each head down to the one that
+    /// stands, where the classic policy under KV pressure reads none.
+    ///
+    /// A request whose host names no entry, one whose marker is neither
+    /// two ids nor none, and one that reaches no boundary is named nobody
+    /// and writes nothing. No index of cache events, no tree and no record
+    /// of hashed prefixes is read or written.
+    ///
+    /// No pick made here states what its worker holds
+    /// ([`Overlap::NONE`](crate::engine::Overlap::NONE)), behind a holder,
+    /// behind any other worker and where nobody was named: the table of a
+    /// lent map states nothing ([`Self::states`]), as the classic policy
+    /// observes no match ratio under a hash index.
+    ///
+    /// [`Engine::keeps_for`]: crate::engine::Engine::keeps_for
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the map with the request's entry in it, the pass's test of a holder, the decision's instant, the target the caller takes, the list, the request's facts and its places, the buffers, and the decision"
+    )]
+    fn decide_in_map(
+        &self,
+        lent: Option<(&Placed, TokenKey<'_>)>,
+        kept: &impl Fn(&RequestFacts<'_>, &[AffinityHolder]) -> Option<bool>,
+        now: impl FnOnce() -> Instant,
+        sends_to: impl Fn(&Target) -> bool,
+        workers: &[Arc<dyn Worker>],
+        facts: &RequestFacts<'_>,
+        places: Option<&[u32]>,
+        buffers: &mut Buffers,
+        mut decide: impl FnMut(&mut RequestFacts<'_>) -> Decision,
+    ) -> Decision {
+        // What the request reaches of the map: its ids behind the marker,
+        // and the boundaries at most their number.
+        let reached = lent.as_ref().and_then(|(placed, key)| {
+            let ids = key.tokens.get(key.marker..)?;
+            let marker = match *key.tokens.get(..key.marker)? {
+                [] => None,
+                [first, second] => Some([first, second]),
+                // No marker the map is keyed by.
+                _ => return None,
+            };
+            let reached = placed.boundaries.partition_point(|&end| end <= ids.len());
+            let reached = placed.boundaries.get(..reached)?;
+            (!reached.is_empty()).then_some((*placed, marker, ids, reached))
+        });
+        let reached = reached.map(|reached| (reached, now()));
+        // The deepest head first. A head none of whose live holders is a
+        // row of the list is passed for the next, and so is one none of
+        // whose holders the decision's own pass keeps.
+        let mut head = None;
+        if let Some(((placed, marker, ids, reached), now)) = reached {
+            for &end in reached.iter().rev() {
+                let key = (end, hash_token_head(marker, &ids[..end]));
+                let blocks = self.blocks_of(end, facts);
+                let named = live_holders_in(&placed.map, key, now, placed.ttl, |holders| {
+                    let sent = holders.iter().map(|holder| holder.worker_url.as_str());
+                    self.name_sent(sent, blocks, workers, facts, places, buffers);
+                    !buffers.holders.is_empty()
+                });
+                // The test is asked once the key's guard is let go: it
+                // reads the workers' records, and nothing of the map.
+                if named == Some(true) && kept(facts, &buffers.holders) != Some(false) {
+                    head = Some(end);
+                    break;
+                }
+            }
+        }
+        if head.is_none() {
+            self.name_sent(std::iter::empty(), 0, workers, facts, places, buffers);
+        }
+        let tree = reached
+            .map(|((_, _, ids, _), _)| TreeMatch::head(count(head.unwrap_or(0)), count(ids.len())));
+        let named = AffinityRows {
+            tree,
+            ..self.named_rows(buffers)
+        };
+        let mut decision = decide(&mut RequestFacts {
+            named: Some(named),
+            ..*facts
+        });
+        // By the table's own word ([`Self::states`]): a single request it
+        // decides inside a lent map states no share.
+        self.state_named(&mut decision, named, facts);
+        if let Some(((placed, marker, ids, reached), now)) = reached {
+            if let Some(address) = sent_address(workers, &decision, &sends_to) {
+                record_in(&placed.map, marker, ids, reached, address, now, placed.ttl);
+            }
+        }
+        decision
     }
 
     /// One decision of a profile that reads the column whole: the fill, the

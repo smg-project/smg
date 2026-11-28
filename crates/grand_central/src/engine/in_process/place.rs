@@ -21,11 +21,11 @@
 //!   not made at all.
 //!
 //! One thing of the request the engine does not make: the prompt's entry in
-//! a tree its caller lends. The caller names it ([`Prompt::entry`]),
-//! by its own rule for a cache partition, and a decision that reads the
-//! tree asks it. That decision stores the prompt in the tree for the first
-//! of its targets this call can send to ([`RequestMaker::sends_to`]), and
-//! for none where it can send to none.
+//! a tree or a placement map its caller lends. The caller names it
+//! ([`Prompt::entry`]), by its own rule for a cache partition, and a
+//! decision that reads the tree or the map asks it. That decision stores
+//! the prompt there for the first of its targets this call can send to
+//! ([`RequestMaker::sends_to`]), and for none where it can send to none.
 //!
 //! The engine then decides, and takes the first target of the decision that
 //! can be sent to: ready ([`ready`]), and admitted by its route's own rule
@@ -164,15 +164,19 @@ impl HeaderRead for http::HeaderMap {
 /// ([`Prompt::entry`]), as a maker written by hand answers
 /// [`RequestMaker::token_key`] and [`RequestMaker::text_key`].
 ///
-/// A caller that keeps no string tree answers the first alone.
+/// A caller that keeps no string tree answers the first alone. Under a hash
+/// index a decision asks the first for the prompt's entry in the caller's
+/// placement map ([`CacheIndexes::placement_map`]).
 ///
 /// [`CacheIndexes::token_tree`]: crate::engine::CacheIndexes::token_tree
 /// [`CacheIndexes::string_tree`]: crate::engine::CacheIndexes::string_tree
+/// [`CacheIndexes::placement_map`]: crate::engine::CacheIndexes::placement_map
 pub trait PromptEntry {
     /// The entry by token ids for a tree whose page is `page` tokens
     /// ([`TokenKey`]): `None` where the caller holds no token ids of the
     /// prompt. The marker of a cache partition fills whole pages, which is
-    /// why the page is asked with.
+    /// why the page is asked with. A placement map is asked for at a page
+    /// of one token: its marker is the partition's two ids.
     fn token_key(&self, page: usize) -> Option<TokenKey<'_>>;
 
     /// The entry by text for the caller's string tree ([`TextKey`]):
@@ -205,14 +209,17 @@ pub struct Prompt<'a> {
     /// request is then named its holders from the record of hashed
     /// prefixes. One entry answers for every tree the request is decided
     /// in, a pair's two sides too when a pair reads one: the token tree's
-    /// page is that question's argument.
+    /// page is that question's argument. Under a hash index the same
+    /// entry is the prompt's in the placement map the caller lends
+    /// ([`CacheIndexes::placement_map`]), asked for by token ids at a page
+    /// of one token: a request with no entry is then named nobody.
     ///
-    /// It is asked once by each decision of the call that reads the tree,
-    /// and never where no stage of the request's place reads the tree. The
-    /// tree then stores the prompt for the worker the call can send to:
-    /// the first target of that decision that is ready and that the
-    /// route's rule admits ([`PlaceRequest::admits`]), and no worker where
-    /// no target is.
+    /// It is asked once by each decision of the call that reads the tree
+    /// or the map, and never where no stage of the request's place reads
+    /// it. The tree or the map then stores the prompt for the worker the
+    /// call can send to: the first target of that decision that is ready
+    /// and that the route's rule admits ([`PlaceRequest::admits`]), and no
+    /// worker where no target is.
     ///
     /// The object is borrowed as its caller holds it and is not asked to
     /// be [`Sync`], so a prompt is neither [`Send`] nor [`Sync`], whether
@@ -221,6 +228,7 @@ pub struct Prompt<'a> {
     ///
     /// [`CacheIndexes::token_tree`]: crate::engine::CacheIndexes::token_tree
     /// [`CacheIndexes::string_tree`]: crate::engine::CacheIndexes::string_tree
+    /// [`CacheIndexes::placement_map`]: crate::engine::CacheIndexes::placement_map
     pub entry: Option<&'a dyn PromptEntry>,
 }
 
@@ -261,9 +269,9 @@ pub type WorkerRule<'a> = &'a dyn Fn(&dyn Worker) -> bool;
 /// The record gains fields, so no literal of it builds outside this crate.
 ///
 /// A request is not [`Send`]: its headers, its route's rule and its
-/// prompt's entry in a lent tree are borrowed as their caller holds them,
-/// and none is asked to be [`Sync`]. A caller makes one for each call,
-/// between two awaits.
+/// prompt's entry in a lent tree or placement map are borrowed as their
+/// caller holds them, and none is asked to be [`Sync`]. A caller makes one
+/// for each call, between two awaits.
 #[non_exhaustive]
 pub struct PlaceRequest<'a> {
     /// The model the request is for, as its caller resolved it.
@@ -388,15 +396,15 @@ pub struct PlaceRequest<'a> {
     /// `None` for a route that has none. It is asked of the workers the
     /// engine picked: a request whose first pick it admits pays one call
     /// of it, and a pair's request one for each of its two workers. A
-    /// request whose decision stores where its prompt went, in a token
-    /// tree its caller lends ([`Prompt::entry`]) or in the record of sent
-    /// prefixes a `cache_aware` profile keeps, has the rule asked inside
-    /// that decision, ahead of the write, so the prompt is stored for a
-    /// worker the rule takes. The pick takes that answer and asks the rule
-    /// of that worker no second time. A rule asked there runs inside a
-    /// decision: it asks the engine nothing, and where it panics the prompt
-    /// is stored for no worker and the panic reaches the caller behind the
-    /// decision.
+    /// request whose decision stores where its prompt went, in a tree or
+    /// a placement map its caller lends ([`Prompt::entry`]) or in the
+    /// record of sent prefixes a `cache_aware` profile keeps, has the rule
+    /// asked inside that decision, ahead of the write, so the prompt is
+    /// stored for a worker the rule takes. The pick takes that answer and
+    /// asks the rule of that worker no second time. A rule asked there
+    /// runs inside a decision: it asks the engine nothing, and where it
+    /// panics the prompt is stored for no worker and the panic reaches the
+    /// caller behind the decision.
     /// Behind the first decision none of whose picks can be sent to,
     /// whether it refused them or they were not ready, it is asked of
     /// every worker of the list, once a call, and the call decides again
@@ -587,10 +595,10 @@ pub(super) struct Made<'r, 'a> {
 }
 
 /// What a call's maker answered on a decision's targets where the decision
-/// asked which of them a prompt is stored for, in a lent tree or in
-/// the record of sent prefixes: each place asked, and whether the call
-/// sends to it. A pick's targets are asked best first up to the first one
-/// the call sends to, so a pick's targets fit.
+/// asked which of them a prompt is stored for, in a lent tree, in a lent
+/// placement map or in the record of sent prefixes: each place asked, and
+/// whether the call sends to it. A pick's targets are asked best first up
+/// to the first one the call sends to, so a pick's targets fit.
 #[derive(Clone, Copy)]
 struct Sent {
     /// The places asked, in the order asked.
@@ -708,15 +716,17 @@ impl<'r, 'a> Made<'r, 'a> {
 
     /// Whether the request's making leaves the prompt's block hashes to the
     /// lookup that names the request's holders ([`Self::hashed_whole`]): a
-    /// call's request of token ids that names its entry in a token tree,
-    /// over one list, under a document none of whose stages reads the
-    /// hashes itself ([`AppliedSpec::hashes_named_alone`]). That lookup
-    /// reads the list by an index of cache events and by the record of sent
-    /// prefixes, and reads none of it for a request it decides inside a
-    /// lent tree's match. Every other request is hashed at its making: a
-    /// pair's sides read the list in their columns, and a prompt of more
-    /// token ids than a request's size counts is sized by its list. The
-    /// asks of a call answer alike: its decisions are one document's.
+    /// call's request of token ids that names its entry in a token tree or
+    /// a placement map, over one list, under a document none of whose
+    /// stages reads the hashes itself
+    /// ([`AppliedSpec::hashes_named_alone`]). That lookup reads the list by
+    /// an index of cache events and by the record of sent prefixes, and
+    /// reads none of it for a request it decides inside a lent tree's
+    /// match or a lent placement map. Every other request is hashed at its
+    /// making: a pair's sides read the list in their columns, and a prompt
+    /// of more token ids than a request's size counts is sized by its
+    /// list. The asks of a call answer alike: its decisions are one
+    /// document's.
     fn leaves_hashes(&self, spec: &AppliedSpec) -> bool {
         let prompt = self.request.prompt;
         self.of_call.is_some()
@@ -1335,11 +1345,12 @@ impl RequestMaker for Made<'_, '_> {
     }
 
     // The walk's own read of a target, made ahead of the walk for the
-    // write of where the prompt went, a lent tree's or the record's: each
-    // worker of the target ready, and admitted by the route's rule, which
-    // is asked of a worker that is ready and of no other. A single
-    // request's target is its one worker, and a pair's is its prefill and
-    // its decode, in a pair's two lists or an encode request's.
+    // write of where the prompt went, a lent tree's, a lent placement
+    // map's or the record's: each worker of the target ready, and admitted
+    // by the route's rule, which is asked of a worker that is ready and of
+    // no other. A single request's target is its one worker, and a pair's
+    // is its prefill and its decode, in a pair's two lists or an encode
+    // request's.
     //
     // A rule that panics here panics inside a decision, where the engine's
     // own catch would answer it as a decision that faulted. It is the
@@ -2166,8 +2177,8 @@ impl InProcess {
     /// first target all the same.
     ///
     /// Where a prompt went is written otherwise, in the record of sent
-    /// prefixes a `cache_aware` profile keeps and in a tree the
-    /// caller lends ([`Prompt::entry`]). A decision that writes either
+    /// prefixes a `cache_aware` profile keeps and in a tree or a placement
+    /// map the caller lends ([`Prompt::entry`]). A decision that writes one
     /// asks, ahead of the write, which of its targets this call can send
     /// to ([`RequestMaker::sends_to`]): ready, and admitted by the route's
     /// rule. The prompt is stored for the first such target, and the call

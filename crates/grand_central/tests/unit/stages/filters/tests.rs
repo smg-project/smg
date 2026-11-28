@@ -149,6 +149,12 @@ fn a_profiles_filters_as_one_row_test_answer_as_each_filter_asked() {
                 let folded = tests.keeps(&facts, c, cx) && !(masked && cx.masks(c.position));
                 assert_eq!(folded, each, "set {set:#07b}, row {}, {cx:?}", c.position);
                 refused[c.position as usize] += u32::from(!each);
+                // The set less its soft tests answers as the filters that
+                // say they are hard, each asked.
+                let mut hard = filters.iter().filter(|f| !f.soft());
+                let each = hard.all(|f| f.keep(&facts, c, cx));
+                let folded = tests.hard().keeps(&facts, c, cx) && !(masked && cx.masks(c.position));
+                assert_eq!(folded, each, "hard: set {set:#07b}, row {}", c.position);
             }
         }
     }

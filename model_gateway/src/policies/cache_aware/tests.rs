@@ -4763,6 +4763,37 @@ fn sweep_placement_index_drops_expired_and_empty_keys() {
         .is_some());
 }
 
+/// The sweep tells each model's gauge, `smg_cache_placement_entries`, the
+/// keys the model's map keeps, and returns their sum across models.
+#[test]
+fn the_sweep_sets_each_models_placement_gauge() {
+    use crate::observability::metrics::test_support::render_with_recorder;
+
+    let policy = CacheAwarePolicy::with_config(hash_config(&[16]));
+    let one: Vec<u32> = (0..16).collect();
+    let other: Vec<u32> = (500..516).collect();
+    let t0 = Instant::now();
+    for tokens in [&one, &other] {
+        policy.record_placement("m", None, tokens, &[16], "http://w1:8000", t0);
+    }
+    policy.record_placement("n", None, &one, &[16], "http://w1:8000", t0);
+    let ttl = Duration::from_secs(180);
+    let rendered = render_with_recorder(|| {
+        let live = CacheAwarePolicy::sweep_placement_index(&policy.placement_index, ttl, t0);
+        assert_eq!(live, 3);
+    });
+    // One line a model: each is found by its own label.
+    for (model, keys) in [("m", "2"), ("n", "1")] {
+        let label = format!("model=\"{model}\"");
+        let told = rendered.lines().any(|line| {
+            line.starts_with("smg_cache_placement_entries{")
+                && line.contains(&label)
+                && line.ends_with(&format!(" {keys}"))
+        });
+        assert!(told, "no line of {label} at {keys}:\n{rendered}");
+    }
+}
+
 #[test]
 fn live_holder_resolution_skips_dead_holders_and_unknown_keys() {
     let policy = CacheAwarePolicy::with_config(hash_config(&[16]));
@@ -4789,6 +4820,23 @@ fn live_holder_resolution_skips_dead_holders_and_unknown_keys() {
     assert_eq!(
         policy.live_holder_candidates(&url_to_idx, "m", (32, 7), now),
         Vec::<usize>::new()
+    );
+}
+
+#[test]
+fn live_holder_resolution_names_every_healthy_row_of_a_shared_url() {
+    let policy = CacheAwarePolicy::with_config(hash_config(&[16]));
+    let workers = make_workers(&["http://w1:8000", "http://w1:8000", "http://w2:8000"]);
+    let tokens: Vec<u32> = (0..16).collect();
+    let now = Instant::now();
+    let key = (16usize, hash_token_head(None, &tokens[..16]));
+    policy.record_placement("m", None, &tokens, &[16], "http://w1:8000", now);
+
+    // Two healthy rows share the one live holder's URL: both are candidates.
+    let url_to_idx = CacheAwarePolicy::healthy_url_index(&workers, &[0, 1, 2]);
+    assert_eq!(
+        policy.live_holder_candidates(&url_to_idx, "m", key, now),
+        vec![0, 1]
     );
 }
 
