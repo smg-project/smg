@@ -26,10 +26,16 @@
 //! state in its hold of the rows' lock, ahead of the row's clear: the
 //! rows, then the state, then the lane. Nothing takes the rows' lock while
 //! it holds a state or a lane. A take and a feed's opening ask the holder
-//! inside the rows' lock, and the holder asks nothing of the adapter.
+//! inside the rows' lock, and the holder asks nothing of the adapter. The
+//! apply routine writes a batch's counts under its row's state and lane,
+//! and a host's recorder must ask nothing of the adapter there: its call
+//! can wait for the batch it is made under.
 //!
 //! A row opened without that state loses any cached blocks and cursor
-//! before its feed starts.
+//! before its feed starts. A row a leaving stream still clears loses
+//! them at that clear, or at its feed's own reset where that comes
+//! first: the feed can start at the row's old cursor, and the row takes
+//! none of its batches while the mark stands.
 //!
 //! # The ranks of an engine
 //!
@@ -77,13 +83,16 @@
 //! which every row's batch takes, and forgets their entries once those
 //! clears have ended: each stays its row while its mark stands. A stream
 //! that would take one in between passes its batch over, so a removal
-//! clears nothing a new stream wrote. The limits name an exception: two
-//! removals of one row that overlap. The state the adapter kept of each
-//! leaving row is released ahead of its clear, and the state its mark
-//! bears is released from the first. A batch reads the release ahead of
-//! the row's cursor and holds the state through its admission: that runs
-//! ahead of the clear, which takes what it stored, or the batch is
-//! passed over with the cursor where it was.
+//! clears nothing a new stream wrote. A stream's last removal takes its
+//! feed's record in the hold that marks its rows: those rows take no
+//! batch of a feed counted behind that take while their marks stand. A
+//! removal and an opening's release list no row that bears a mark, so no
+//! mark is written over, and each forgets the marks it made. The state the
+//! adapter kept of each leaving row is released ahead of its clear, and
+//! the state its mark bears is released from the first. A batch reads
+//! the release ahead of the row's cursor and holds the state through
+//! its admission: that runs ahead of the clear, which takes what it
+//! stored, or the batch is passed over with the cursor where it was.
 //!
 //! A stream takes a row of another rank only where the holder routes
 //! that rank's batch to the row in the hold that writes the row's entry.
@@ -180,10 +189,9 @@
 //!   reaches again: that row begins from nothing where the stream takes
 //!   it again.
 //! - Two last removals of one row can overlap: a feed opens on the
-//!   first's mark and ends ahead of the first's end. Each forgets the
-//!   row's entry by its key, so the row can stand unmarked while one of
-//!   them has not cleared it. That clear can take what a later feed
-//!   stored, and that removal's end can forget the later feed's entry.
+//!   first's mark and ends ahead of the first's end. The second leaves
+//!   the row to the first, so it can return ahead of the first's clear,
+//!   with the row's blocks and cursor still standing.
 //! - While a row has two feeds open, a batch of the first address's
 //!   stream is the row's stream's as the second's is, at every rank: the
 //!   same rules route it and write it. One that read its route ahead of
@@ -243,9 +251,11 @@ pub struct KvAdapter {
     /// their calls of the tables.
     sizes: Mutex<HashMap<Arc<str>, u32>>,
     /// What each row's open feeds were opened with, by the feeds' own row:
-    /// one record a row, which counts them. Taken alone, or under `sizes`
-    /// by a learning that asks whether its feed still stands: never ahead
-    /// of `sizes`.
+    /// one record a row, which counts them. Taken alone, under `sizes` by
+    /// a learning that asks whether its feed still stands, or under the
+    /// rows' lock by a removal. No road of the adapter waits for another
+    /// lock of the adapter, the tables or the holder while it holds this
+    /// one, and none writes a series under it.
     feeds: Mutex<HashMap<WorkerId, Arc<Feed>>>,
     /// Where the ranks of an engine stand, where a host handed its holder.
     ranks: Option<Arc<dyn Ranks>>,
@@ -307,7 +317,8 @@ struct Written {
     /// mark stands. The stream's last removal marks every row it writes
     /// so, and a feed's opening the rows of other ranks its stream reaches
     /// no longer. Each forgets its rows' entries once their clears have
-    /// ended ([`KvAdapter::leave`]).
+    /// ended ([`KvAdapter::leave`]). Neither lists a row that bears a
+    /// mark, so no mark is written over.
     leaving: bool,
 }
 
@@ -498,7 +509,10 @@ impl<G: Generation> Ranks for Objects<G> {
 /// counts one more and writes the record's words anew, and a removal
 /// counts one less. A removal that leaves a feed open takes nothing: no
 /// record, no row and no mark. The removal of the last takes the record
-/// and the rows.
+/// and marks the rows in one hold of the rows' lock. Another feed's
+/// count runs ahead of that hold's read, and the removal takes nothing,
+/// or behind its take: the removal's rows then take no batch of that
+/// feed while their marks stand.
 ///
 /// An opening releases the rows of other ranks that the row's stream
 /// still writes and reaches no longer ([`KvAdapter::begin`]): behind
@@ -511,7 +525,7 @@ struct Feed {
     /// The URL the feed's worker is named by in the cache-event series.
     url: Box<str>,
     /// The row's open feeds, this record's own among them. Read and
-    /// written under the lock of the adapter's records alone.
+    /// written only under the lock of the adapter's records.
     open: AtomicU32,
 }
 
@@ -650,10 +664,10 @@ impl KvAdapter {
     /// stood under it kept aside. The lock is let go. Each state kept
     /// aside is released under its own lock, with no other lock held.
     /// Each row is cleared in the tables. Each row's entry is forgotten,
-    /// by its key. A stream that would take a row in between passes its
-    /// batch over, so nothing a new stream wrote is cleared here: the
-    /// module's limits name an exception, two removals of one row that
-    /// overlap.
+    /// by its key: it is the mark this call wrote, since `named` lists no
+    /// row that bears one. A stream that would take a row in between
+    /// passes its batch over, so nothing a new stream wrote is cleared
+    /// here.
     ///
     /// The release stands ahead of the clear. A batch locks its row's
     /// state, reads the release and holds the state through its admission
@@ -709,7 +723,7 @@ impl KvAdapter {
     /// rank: it states one where its row's width is above one. Both are asked in
     /// the hold that writes the row's entry: a row laid again behind the
     /// answers is taken from this feed by the stream the holder then
-    /// routes to it, and never by this feed from that stream. The holder's
+    /// routes to it, and by no batch of this feed from that stream. The holder's
     /// ranks are asked once at most: the rows of the row's engine, none
     /// where the row stands at rank 0 no longer, and the same answer
     /// decides what the opening releases.
@@ -992,9 +1006,11 @@ impl KvEventSink for KvAdapter {
     }
 
     fn resync(&self, id: WorkerId, rank: Option<u16>, reason: ResyncReason) {
-        if let Some(feed) = self.feeds.lock().get(&id) {
-            Metrics::record_kv_event_resync(&feed.url, reason.as_str());
-        }
+        // The record is read first and its lock let go. The series is
+        // written last, behind the reset, with no lock held: a recorder
+        // is the host's, and a removal asks for the records' lock under
+        // the rows'.
+        let feed = self.feeds.lock().get(&id).cloned();
         match rank {
             // One rank's reset is its own row's, and a rank with no row
             // holds nothing to reset.
@@ -1011,6 +1027,9 @@ impl KvEventSink for KvAdapter {
                 }
             }
         }
+        if let Some(feed) = feed {
+            Metrics::record_kv_event_resync(&feed.url, reason.as_str());
+        }
     }
 
     fn cursor(&self, id: WorkerId, rank: u16) -> Option<KvCursor> {
@@ -1019,23 +1038,31 @@ impl KvEventSink for KvAdapter {
     }
 
     fn removed(&self, id: WorkerId) {
-        {
-            let mut feeds = self.feeds.lock();
-            // One feed of the row ended. Where another stays open, this
-            // removal takes nothing: the record counts the row's feeds.
-            let stays = |feed: &Arc<Feed>| feed.open.fetch_sub(1, Ordering::Relaxed) > 1;
-            if feeds.get(&id).is_some_and(stays) {
-                return;
-            }
-            // The record goes first: a batch that begins behind this step
-            // is passed over.
-            feeds.remove(&id);
-        }
-        // What the stream still writes goes with it, since no stream feeds
-        // it now: the rows of other ranks, and its own unless another
-        // stream took it.
         self.leave(id, |rows| {
-            let own = rows.written.get(&id).is_none_or(|own| own.stream == id);
+            {
+                // One feed of the row ended. Its record is read in the
+                // hold that marks the rows: they take no batch of a feed
+                // counted behind the record's take while their marks
+                // stand.
+                let mut feeds = self.feeds.lock();
+                // Where another feed stays open, this removal takes
+                // nothing: the record counts the row's feeds.
+                let stays = |feed: &Arc<Feed>| feed.open.fetch_sub(1, Ordering::Relaxed) > 1;
+                if feeds.get(&id).is_some_and(stays) {
+                    return (Vec::new(), ());
+                }
+                // A batch that finds no record is passed over.
+                feeds.remove(&id);
+            }
+            // What the stream still writes goes with it, since no feed of
+            // the row stood open at that take: the rows of other ranks,
+            // and its own. Not its own where another stream took it, or
+            // where an earlier removal still clears it: that removal's
+            // mark stands, and it forgets the row.
+            let own = rows
+                .written
+                .get(&id)
+                .is_none_or(|own| own.stream == id && !own.leaving);
             let mut leaving = rows.fed.remove(&id).unwrap_or_default();
             if own {
                 leaving.push(id);
