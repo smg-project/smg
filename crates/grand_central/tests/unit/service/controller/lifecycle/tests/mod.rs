@@ -44,7 +44,10 @@ use crate::{
         MemoryStore, PickRecord, Registrant, WorkerFacts, WorkersStore,
     },
     tracking::{
-        lease::{Dispatch, Lease, LeaseId, Outcome, ReleaseReason, Side, TransportClass},
+        lease::{
+            Dispatch, EventKind, EventSet, Lease, LeaseId, Outcome, ReleaseReason, Side,
+            TransportClass,
+        },
         DispatchCredit,
     },
 };
@@ -163,6 +166,14 @@ impl Lifecycle for Hears {
             step();
         }
         assert_ne!(lease.id.0, BURSTS, "the stage's call panics");
+    }
+
+    fn hears(&self) -> EventSet {
+        EventSet::of([
+            EventKind::Dispatched,
+            EventKind::Completed,
+            EventKind::Released,
+        ])
     }
 }
 
@@ -1323,6 +1334,10 @@ struct Bursts;
 impl Lifecycle for Bursts {
     fn on_dispatched(&self, lease: &Lease, _: &Target, _: Side, _: u32) {
         assert_eq!(lease.id.0, 0, "the stage's call panics");
+    }
+
+    fn hears(&self) -> EventSet {
+        EventSet::of([EventKind::Dispatched])
     }
 }
 

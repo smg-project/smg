@@ -307,16 +307,23 @@ fn a_decode_named_alone_is_taken_full_and_handed_to_a_retry_again() {
 /// one decode still: the request moves to no other. One the route's rule
 /// takes when it is counted and refuses as a pick is named again by the
 /// call's second ask, which counts as its first did, and the pair is shed
-/// under `target-worker` behind it. One that stops being ready behind the
+/// under `target-worker` behind it, on the decode side: the pair its last
+/// ask named lost its decode alone. One that stops being ready behind the
 /// count sheds the pair under `target-worker`, whatever stage refused it.
-/// One that goes over its thresholds behind the count
-/// is answered by the binding's rule for decodes that are all over them,
-/// which sees that one decode: it is taken where the rule steers, and the
-/// pair is shed under `target-worker` where the rule sheds. The other
-/// decode, which stands, is never taken.
+/// One that goes over its thresholds behind the count is answered by the
+/// binding's rule for decodes that are all over them, which sees that one
+/// decode: it is taken where the rule steers, and the pair is shed under
+/// `target-worker` where the rule sheds. The other decode, which stands,
+/// is never taken.
 ///
-/// The classic policy reads the named worker once more behind the count
-/// and misses it there, and the pair is refused (`CH:156-160`; `P:2919`).
+/// The classic policy reads the named worker's health once more at its
+/// pick: one that left behind that selection's read of the partners is
+/// its miss, and the pair is refused for the decode's role
+/// (`target_among` in `model_gateway/src/policies/consistent_hashing.rs`,
+/// then the decode policy's decline in `pair_pass` in
+/// `model_gateway/src/routers/common/placement.rs`). One the route's rule
+/// refuses at that read of the partners is not counted there: the number
+/// reaches another decode, or none.
 #[test]
 fn a_decode_named_alone_that_cannot_take_the_request_after_all_is_never_replaced() {
     // The route's rule is asked of the named decode when it is counted:
@@ -381,9 +388,66 @@ fn a_decode_named_alone_that_cannot_take_the_request_after_all_is_never_replaced
         admits: Some(&rule),
         ..PlaceRequest::of(MODEL, WorkerLists::Pair(lists.under(&classes, &Open)))
     };
-    assert_eq!(placed(steering, &lists, &request), Err(MISSED));
+    let on_decodes = Err(missed_on(PairSide::Decode));
+    assert_eq!(placed(steering, &lists, &request), on_decodes);
     let asks = "the count's three, the two prefills held, two decisions' picks";
     assert_eq!(rule_asked.get(), 9, "{asks}");
+}
+
+/// A decode named alone is shed on the side its call's last ask lost. The
+/// route's rule takes every worker while the decodes are counted and the
+/// prefills are held, and refuses workers as picks: the call's two asks
+/// name the two prefills, each with the named decode. An ask that loses
+/// its prefill is the prefill's, with the decode or without. One that
+/// loses the decode alone is the decode's. The last ask's side is the
+/// call's, whatever the ask ahead of it lost.
+///
+/// The classic router's pair selection asks the prefill first: where no
+/// prefill can take the request it refuses for the prefill's role and
+/// picks no decode (`P:3302-3320`). Behind a prefill it picked it reads
+/// the pick's partners a second time: with nobody open there, or a number
+/// that reaches none of them, it refuses for the decode's role
+/// (`P:3455-3467`, `P:3492`). The lines are main `b896a65a8`'s.
+#[test]
+fn a_decode_named_alone_is_shed_on_the_side_its_last_ask_lost() {
+    let steering = ring_decode();
+    // What the rule refuses of an ask's pick: its prefill, its decode.
+    let losing = |first: (bool, bool), second: (bool, bool)| {
+        let lists = Lists::of(2, 2);
+        let classes = lists.every();
+        let prefills = [lists.prefills[0].url(), lists.prefills[1].url()];
+        let rule_asked = Cell::new(0_u32);
+        let rule = |worker: &dyn Worker| {
+            rule_asked.set(rule_asked.get() + 1);
+            let (prefill, decode) = match rule_asked.get() {
+                0..=5 => return true,
+                6..=7 => first,
+                _ => second,
+            };
+            if prefills.contains(&worker.url()) {
+                !prefill
+            } else {
+                !decode
+            }
+        };
+        let headers = [(TARGET, "0")];
+        let request = PlaceRequest {
+            headers: &headers,
+            admits: Some(&rule),
+            ..PlaceRequest::of(MODEL, WorkerLists::Pair(lists.under(&classes, &Open)))
+        };
+        let answer = placed(steering, &lists, &request);
+        let asks = "the count's three, the two prefills held, two decisions' picks";
+        assert_eq!(rule_asked.get(), 9, "{asks}");
+        answer
+    };
+    let on_prefills = Err(missed_on(PairSide::Prefill));
+    let on_decodes = Err(missed_on(PairSide::Decode));
+    let (prefill, decode, both) = ((true, false), (false, true), (true, true));
+    assert_eq!(losing(prefill, prefill), on_prefills, "each its prefill");
+    assert_eq!(losing(both, both), on_prefills, "each both workers");
+    assert_eq!(losing(decode, prefill), on_prefills, "the last its prefill");
+    assert_eq!(losing(prefill, decode), on_decodes, "the last its decode");
 }
 
 /// The decodes' count passes over a decode at a place its host masks and

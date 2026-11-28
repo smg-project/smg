@@ -22,6 +22,7 @@ from .constants import (
     DEFAULT_STARTUP_TIMEOUT,
     ENV_MOCK_WIRE,
     ENV_SHOW_WORKER_LOGS,
+    ENV_STARTUP_PROFILE,
     ENV_VLLM_SERVICER_IMPL,
     ENV_WORKER_RUST_LOG,
     HEALTH_CHECK_INTERVAL,
@@ -37,11 +38,14 @@ from .constants import (
     get_runtime,
     get_servicer_impl,
     get_servicer_impl_setting,
+    get_startup_profile,
     get_vllm_mm_processor,
     get_zmq_engine_count,
     host_port,
     moriio_host,
+    profile_startup_timeout,
     sglang_transfer_backend,
+    startup_profile_definition,
     trtllm_runs_engines_own_servicer,
     vllm_kv_backend,
     vllm_moriio_backend,
@@ -63,6 +67,8 @@ from .process_utils import (
     wait_for_health,
     wait_for_process_group_exit,
 )
+from .sglang_gptoss import apply_environment as apply_gptoss_environment
+from .sglang_gptoss import prepare_launch as prepare_gptoss_launch
 
 logger = logging.getLogger(__name__)
 
@@ -533,6 +539,14 @@ class Worker:
         features = spec.get("features", [])
 
         if self.engine == "sglang":
+            model_path, spec = prepare_gptoss_launch(
+                self.engine,
+                self.model_id,
+                model_path,
+                spec,
+                self.extra_engine_args,
+                self.extra_env,
+            )
             if self.mode == ConnectionMode.ZMQ:
                 # The launcher validates the complete engine argument list
                 # (it refuses a DP launch this wire does not carry yet), so
@@ -1165,6 +1179,7 @@ class Worker:
 
         if self.extra_env:
             env.update(self.extra_env)
+        apply_gptoss_environment(self.engine, self.model_id, env, self.extra_env)
         return env
 
     def read_log(self) -> str:
@@ -1325,7 +1340,7 @@ class Worker:
 
     def _wait_grpc_healthy(self, timeout: float) -> None:
         """Wait for a gRPC worker to become healthy."""
-        if self.engine == "trtllm":
+        if self.engine == "trtllm" or get_startup_profile() is not None:
             self._last_trt_model_identity = None
             deadline = time.monotonic() + timeout
             while (remaining := deadline - time.monotonic()) > 0:
@@ -1380,11 +1395,85 @@ def _require_rust_servicer_hook() -> None:
 def worker_startup_timeout(model_id: str, timeout: int = DEFAULT_STARTUP_TIMEOUT) -> int:
     """The bound the harness gives a worker of ``model_id`` to start: its spec's
     ``startup_timeout`` (else ``timeout``), raised to the ``E2E_STARTUP_TIMEOUT``
-    floor. ``start_workers`` waits this long for the worker's health; a gateway
+    floor, unless a declared startup profile selects its frozen value.
+    ``start_workers`` waits this long for the worker's health; a gateway
     that registers the same worker needs the same bound for its own wait, so
     both read it here and a term added to one reaches the other.
     """
-    return effective_startup_timeout(get_model_spec(model_id).get("startup_timeout", timeout))
+    # Prove an opt-in selection before even resolving its model spec.
+    if os.environ.get(ENV_STARTUP_PROFILE, "").strip():
+        get_startup_profile()
+    spec = get_model_spec(model_id)
+    profile_bound = profile_startup_timeout(model_id, spec.get("tp", 1))
+    if profile_bound is not None:
+        return profile_bound
+    return effective_startup_timeout(spec.get("startup_timeout", timeout))
+
+
+def validate_startup_profile_worker(
+    model_id: str,
+    engine: str | None = None,
+    mode: ConnectionMode = ConnectionMode.HTTP,
+    worker_type: WorkerType = WorkerType.REGULAR,
+    count: int = 1,
+    gpus: int | None = None,
+    tp: int | None = None,
+    extra_engine_args: list[str] | None = None,
+    extra_env: dict[str, str] | None = None,
+    wait_ready: bool = True,
+    **_kwargs,
+) -> None:
+    """Validate the opt-in profile before start_workers prepares any worker."""
+    profile = get_startup_profile()
+    if profile is None:
+        return
+    if type(count) is not int or count != 1:
+        raise ValueError(f"{profile} requires exactly one worker group")
+    definition = startup_profile_definition()
+    if definition is None:
+        raise ValueError(f"{profile} has no startup profile definition")
+    if (
+        (engine or get_runtime()) != "vllm"
+        or mode not in definition.modes
+        or worker_type not in (WorkerType.REGULAR, WorkerType.PREFILL, WorkerType.DECODE)
+    ):
+        raise ValueError(f"{profile} requires its original gRPC worker roles")
+    spec = get_model_spec(model_id)
+    actual_tp = spec.get("tp", 1) if tp is None else tp
+    profile_startup_timeout(model_id, actual_tp)
+    profile_startup_timeout(model_id, spec.get("tp", 1))
+    # The rank-pinning case uses TP1 and DP2 on two devices, not two prefills.
+    original_dp2 = (
+        model_id == "meta-llama/Llama-3.2-1B-Instruct"
+        and worker_type == WorkerType.REGULAR
+        and type(gpus) is int
+        and gpus == 2
+        and extra_engine_args == ["--data-parallel-size", "2"]
+    )
+    expected_gpus = 2 if original_dp2 else actual_tp
+    if gpus is not None and (type(gpus) is not int or gpus != expected_gpus):
+        raise ValueError(f"{profile} requires its original per-worker GPU count")
+    if _kwargs.get("kv_backend") not in (None, "mooncake"):
+        raise ValueError(f"{profile} forbids a per-worker KV backend override")
+    for arg in () if original_dp2 else extra_engine_args or ():
+        option = arg.split("=", 1)[0].replace("_", "-")
+        if option in (
+            "--tensor-parallel-size",
+            "--data-parallel-size",
+            "--data-parallel-size-local",
+            "--model",
+            "--tokenizer",
+            "--config",
+            "--kv-transfer-config",
+        ) or option.startswith(("-tp", "-dp")):
+            raise ValueError(f"{profile} forbids an appended model/TP/DP/KV override")
+    if extra_env and any(
+        key.startswith("E2E_")
+        or key in ("SMG_VLLM_SERVICER_WARMUP", "SMG_VLLM_MM_PROCESSOR", "SMG_VLLM_SERVICER_IMPL")
+        for key in extra_env
+    ):
+        raise ValueError(f"{profile} forbids a worker environment override")
+    return
 
 
 def start_workers(
@@ -1427,6 +1516,19 @@ def start_workers(
     Returns:
         List of started Worker instances.
     """
+    validate_startup_profile_worker(
+        model_id=model_id,
+        engine=engine,
+        mode=mode,
+        worker_type=worker_type,
+        count=count,
+        gpus=gpus,
+        tp=tp,
+        extra_engine_args=extra_engine_args,
+        extra_env=extra_env,
+        wait_ready=wait_ready,
+        kv_backend=kv_backend,
+    )
     # The lane's GPU slice: every worker shifts by E2E_GPU_OFFSET.
     gpu_offset += get_gpu_offset()
     if log_dir is None:

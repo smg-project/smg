@@ -58,7 +58,9 @@ use crate::{
         DecodeIssue, DecodeMark, GatewayId, HealthSink, LeaseState, LeasesStore, MembershipChange,
         MemoryStore, Registrant, WorkerFacts, WorkerStatus, WorkersStore,
     },
-    tracking::lease::{Dispatch, Lease, LeaseId, ReleaseReason, Said, Side, DISPATCH_TTL},
+    tracking::lease::{
+        Dispatch, EventKind, EventSet, Lease, LeaseId, ReleaseReason, Said, Side, DISPATCH_TTL,
+    },
     worker_host::{tests::stand, Members, Objects},
 };
 
@@ -69,16 +71,12 @@ impl DecisionSlots {
     }
 }
 
-mod asked_again;
 mod busy;
-mod decode;
 pub(crate) mod encode;
 mod faults;
 mod fence;
 mod gateway;
-mod give_up;
 mod leases;
-mod marks;
 mod measured;
 mod named;
 mod pair;
@@ -1061,6 +1059,10 @@ impl Lifecycle for Told {
 
     fn on_released(&self, lease: &Lease, reason: ReleaseReason) {
         self.0.lock().push((lease.id.0, Some(reason)));
+    }
+
+    fn hears(&self) -> EventSet {
+        EventSet::of([EventKind::Issued, EventKind::Released])
     }
 }
 

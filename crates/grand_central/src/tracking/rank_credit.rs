@@ -274,11 +274,13 @@ pub struct DispatchCounts {
     /// The number of sends.
     pub requests: u32,
     /// The prompt tokens of the sends: the count each one stated, and for
-    /// a send that stated none the bytes of its text over four. A send of
-    /// no tokens and no text adds none. A stage that reads this number
-    /// asks for each request's size
+    /// a send that stated none the bytes of its text over four, each held
+    /// under 2^31. A send of no tokens and no text adds none. A stage that
+    /// reads this number is to ask for each request's size
     /// ([`Needs::prompt_size`](crate::document::Needs::prompt_size)), as
-    /// the document's two stages do where a term names `sent.tokens`.
+    /// the document's two stages do where a term names `sent.tokens`:
+    /// where no stage asks, a host that can send a request on without
+    /// reading its prompt may state no bytes of its text.
     pub tokens: u64,
 }
 
@@ -481,6 +483,12 @@ impl RankCredit {
             self.release_through(through_micros);
         }
         let held = self.held.load(Ordering::Acquire);
+        // A case runs a release here, behind the held word's load and
+        // ahead of the estimates'.
+        #[cfg(test)]
+        if let Some(release) = tests::BETWEEN_A_READS_LOADS.get() {
+            release(self);
+        }
         DispatchCounts {
             // The word's low bits: the narrower type cuts none of them.
             requests: (held & REQUEST_MASK) as u32,
@@ -501,6 +509,12 @@ impl RankCredit {
             self.release_through(through_micros);
         }
         let held = self.held.load(Ordering::Acquire);
+        // A case runs a release here, behind the held word's load and
+        // ahead of the count's.
+        #[cfg(test)]
+        if let Some(release) = tests::BETWEEN_A_READS_LOADS.get() {
+            release(self);
+        }
         SentCredit {
             requests: (held & REQUEST_MASK) as u32,
             tokens: held >> REQUEST_BITS,
@@ -626,8 +640,9 @@ impl RankCredit {
 
     /// The release of a row that holds a dispatch of no tokens: each one
     /// that goes leaves the estimates' word and that count first and the
-    /// held word next, so a read that crosses the release misses the
-    /// price of one dispatch at most.
+    /// held word next. So a read adds no price of a dispatch the held
+    /// word has let go, and misses the price of each one that goes
+    /// between its own loads.
     #[cold]
     #[inline(never)]
     fn release_marked(
@@ -641,6 +656,11 @@ impl RankCredit {
                     self.estimated_held
                         .fetch_sub(u64::from(size.estimate()), Ordering::Relaxed);
                     self.unsized_held.fetch_sub(1, Ordering::Relaxed);
+                }
+                // A case reads the row here, ahead of the held word's write.
+                #[cfg(test)]
+                if let Some(read) = tests::BETWEEN_A_RELEASES_WRITES.get() {
+                    read(self);
                 }
                 self.take_out(size.tokens());
             }

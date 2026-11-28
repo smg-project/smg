@@ -57,6 +57,7 @@
 //! stage's credit of dispatches is released by a report sampled after them
 //! and by no other.
 
+mod pair_drawn;
 pub(crate) mod vetoes;
 pub(crate) mod with_shadow;
 

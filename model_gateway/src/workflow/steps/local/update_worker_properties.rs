@@ -367,11 +367,21 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
             // Same-URL replace preserves the existing shared runtime. If the
             // update disables health checks, force the lifecycle to Ready so
             // the worker does not stay stuck in a non-routable pre-update
-            // status while the manager correctly skips future probes.
+            // status while the manager correctly skips future probes. A
+            // worker its removal is draining stays so, decided under the
+            // worker's lock. The revision is only the call's precondition
+            // and a mesh publication can raise it in place behind the read:
+            // it is read once more.
             if updated_health_config.disable_health_check {
-                let _ = app_context
-                    .worker_registry
-                    .transition_status(&worker_id, WorkerStatus::Ready);
+                let registry = &app_context.worker_registry;
+                let ready_unless_draining = || {
+                    let held = registry.get(&worker_id)?;
+                    registry.apply_if_revision(&worker_id, held.revision(), |held| {
+                        let leaving = held.status() == WorkerStatus::Draining;
+                        ((), (!leaving).then_some(WorkerStatus::Ready))
+                    })
+                };
+                let _ = ready_unless_draining().or_else(ready_unless_draining);
             }
 
             updated_workers.push(new_worker);

@@ -32,10 +32,11 @@ pub struct CreditedDispatches {
     /// each, the bytes of its text over four, and nothing for a send of
     /// no text. A reader that prices such a send by its text adds this to
     /// `tokens`, as a document's `sent.` terms do
-    /// ([`DispatchCounts::tokens`]). Such a reader asks for each request's
-    /// size ([`Needs::prompt_size`](crate::document::Needs::prompt_size)):
-    /// a host that can send a request on without reading its prompt states
-    /// a text's bytes only where a stage asks.
+    /// ([`DispatchCounts::tokens`]). Such a reader is to ask for each
+    /// request's size
+    /// ([`Needs::prompt_size`](crate::document::Needs::prompt_size)):
+    /// where no stage asks, a host that can send a request on without
+    /// reading its prompt may state no bytes of its text.
     pub estimated_tokens: u64,
 }
 

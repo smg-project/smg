@@ -68,7 +68,9 @@ use crate::{
         LeaseRecord, LeaseState, LeasesStore, LookOutcome, MemoryStore, PickRecord, Reachability,
         WorkerFacts, WorkerStatus,
     },
-    tracking::lease::{Dispatch, Lease, LeaseId, Outcome, ReleaseReason, Side, DISPATCH_TTL},
+    tracking::lease::{
+        Dispatch, EventKind, EventSet, Lease, LeaseId, Outcome, ReleaseReason, Side, DISPATCH_TTL,
+    },
     worker_host::{tests::stand, Members, Objects},
 };
 
@@ -289,6 +291,10 @@ impl Lifecycle for Which {
         self.did
             .lock()
             .push((self.made, "issued", lease.generation));
+    }
+
+    fn hears(&self) -> EventSet {
+        EventSet::of([EventKind::Issued])
     }
 }
 
@@ -646,6 +652,10 @@ impl Lifecycle for Told {
     fn on_decision_issued(&self, lease: &Lease, _: &Decision) {
         self.0.lock().push(*lease);
     }
+
+    fn hears(&self) -> EventSet {
+        EventSet::of([EventKind::Issued])
+    }
 }
 
 impl Picker for Told {
@@ -688,6 +698,10 @@ impl Lifecycle for Faulty {
         if lease.side == Side::Decode && lease.tokens == FAULTY_TOKENS {
             resume_unwind(Box::new(Bomb));
         }
+    }
+
+    fn hears(&self) -> EventSet {
+        EventSet::of([EventKind::Issued])
     }
 }
 
@@ -733,6 +747,10 @@ impl Lifecycle for SideWords {
 
     fn on_released(&self, lease: &Lease, _: ReleaseReason) {
         self.0.lock().push(("released", lease.side, lease.booked));
+    }
+
+    fn hears(&self) -> EventSet {
+        EventSet::LEASE
     }
 }
 

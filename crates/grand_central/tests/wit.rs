@@ -4,7 +4,7 @@
 //! types can drift from the file a plugin is built against. A change to
 //! either is committed by `SMG_POLICY_WIT_WRITE=1 cargo test -p
 //! smg-grand-central --test wit`, which rewrites the file (the pattern of
-//! the committed spec schema, `tests/schema.rs`).
+//! the committed spec schema, `tests/document/schema.rs`).
 
 use std::path::PathBuf;
 

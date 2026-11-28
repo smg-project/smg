@@ -12,6 +12,7 @@ const RULE: SessionRule = SessionRule {
     sweep_micros: 100,
     recovery: Recovery::Latest,
     rule_placed: RulePlaced::Told,
+    sides: SessionSides::Any,
 };
 
 const ORIGINAL: SessionRule = SessionRule {
@@ -1085,6 +1086,28 @@ fn a_moved_claim_keeps_the_instant_of_its_decisions_lease() {
     assert_eq!(table.pins(s(1)), Some([id(3), id(0)]), "another's");
     assert_eq!(table.move_claim(s(1), id(3), id(0), 10), pinned);
     assert_eq!(table.pins(s(1)), Some([id(0); 2]), "its own");
+}
+
+/// A withdrawn claim leaves no mark for its lease's next word. A commit
+/// every target refused withdraws its decision's claim. Another decision
+/// is served elsewhere, and a third meets that pin at its cap and moves
+/// to the worker the claim was on. The refusal told again finds no claim
+/// of record, and the move's pin stands.
+#[test]
+fn a_withdrawn_claims_lease_told_again_moves_nothing() {
+    let (id, pinned) = (WorkerId, SessionVerdict::Pinned);
+    let table = SessionTable::new(RULE.sweep_micros);
+    let seen = table.lookup(s(1), 10, &RULE);
+    assert_eq!(table.claim(s(1), seen, id(2), 10), Claim::Made(id(2)));
+    assert_eq!(table.move_claim(s(1), id(2), id(0), 10), pinned);
+    assert_eq!(table.pins(s(1)), Some([id(0); 2]));
+    table.lookup(s(1), 20, &RULE);
+    table.dispatched(s(1), pinned, id(3), 20);
+    table.lookup(s(1), 30, &RULE);
+    table.respilled(s(1), id(2), 30);
+    assert_eq!(table.pins(s(1)), Some([id(2), id(3)]));
+    assert_eq!(table.move_claim(s(1), id(2), id(0), 10), pinned);
+    assert_eq!(table.pins(s(1)), Some([id(2), id(3)]), "the move's pin");
 }
 
 /// The claim's date is the low 32 bits of its lease's instant, so the
@@ -2199,6 +2222,29 @@ fn a_moved_claim_beside_a_pin_the_renames_walk_has_yet_to_reach_takes_the_walks_
     }
 }
 
+/// A refusal on a key with a slot free takes no rename's step. It names
+/// no worker, and the empty id reads as the pin of a free slot, so the
+/// table asks no rename for it. The key's pin stands as written until
+/// the rename's walk reaches it.
+#[test]
+fn a_refusal_on_a_key_with_a_slot_free_takes_no_renames_step() {
+    let (id, pinned) = (WorkerId, SessionVerdict::Pinned);
+    let table = SessionTable::new(RULE.sweep_micros);
+    // Every target refused the commit of the decision that claimed 9.
+    let seen = table.lookup(s(1), 10, &RULE);
+    assert_eq!(table.claim(s(1), seen, id(9), 10), Claim::Made(id(9)));
+    assert_eq!(table.move_claim(s(1), id(9), id(0), 10), pinned);
+    table.lookup(s(1), 20, &RULE);
+    table.dispatched(s(1), pinned, id(1), 20);
+    // The rename's first half: remembered, the shard not yet walked.
+    table.remember(id(1), id(11));
+    // The refusal told again.
+    assert_eq!(table.move_claim(s(1), id(9), id(0), 10), pinned);
+    assert_eq!(table.pins(s(1)), Some([id(1), id(0)]), "as written");
+    table.rename_worker(id(1), id(11));
+    assert_eq!(table.pins(s(1)), Some([id(11), id(0)]));
+}
+
 /// A commit and a respill's move on an id a worker had meet the
 /// worker's own pin where a rename's walk has yet to reach it: the
 /// pin takes the id that stands, the worker is pinned once, and the
@@ -2846,6 +2892,32 @@ fn a_claim_renamed_ahead_of_the_bound_is_withdrawn_by_its_commit() {
     assert_eq!(table.renamed(), 1, "the list started over");
     table.dispatched(s(9), SessionVerdict::Claimed(WorkerId(1)), WorkerId(2), 0);
     assert_eq!(table.pins(s(9)), Some([WorkerId(2), WorkerId(0)]));
+}
+
+/// Its own dispatch confirms such a claim behind a list that started
+/// over too. The dispatch names the id the claim's lease names, and no
+/// rename the table remembers says which id stands for it. The claim of
+/// record does: the key keeps its worker's pin under the id that stands,
+/// a pin the key was served on.
+#[test]
+fn a_claim_renamed_ahead_of_the_bound_is_confirmed_by_its_dispatch() {
+    let table = SessionTable::new(ORIGINAL.sweep_micros);
+    table.lookup(s(9), 10, &ORIGINAL);
+    let claim = table.claim(s(9), [WorkerId(0); 2], WorkerId(1), 0);
+    assert_eq!(claim, Claim::Made(WorkerId(1)));
+    table.rename_worker(WorkerId(1), WorkerId(11));
+    let bound = RENAMED_WORKERS as u64;
+    for life in 0..bound {
+        table.rename_worker(WorkerId(100_000 + life), WorkerId(200_000 + life));
+    }
+    assert_eq!(table.renamed(), 1, "the list started over");
+    table.dispatched(s(9), SessionVerdict::Claimed(WorkerId(1)), WorkerId(1), 0);
+    let led = [WorkerId(11), WorkerId(0)];
+    assert_eq!(table.pins(s(9)), Some(led));
+    // The claim is a pin now: its decision's refusal withdraws nothing.
+    let verdict = table.move_claim(s(9), WorkerId(1), WorkerId(0), 0);
+    assert_eq!(verdict, SessionVerdict::Pinned);
+    assert_eq!(table.pins(s(9)), Some(led));
 }
 
 /// The table remembers a bounded count of renames: at the bound the

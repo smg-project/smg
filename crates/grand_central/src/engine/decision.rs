@@ -392,7 +392,10 @@ pub enum ShedReason {
 /// decision that drew first ([`Trace::drew_first`]) asked the filters about
 /// the rows it drew alone and holds no count of the pool: [`Survivors::get`]
 /// answers `None` there, never a zero, and a reader prints the word, not a
-/// number. The default is a count of zero.
+/// number. A pair decided by each side's draw is no such decision: its draw
+/// is asked only where the whole pass keeps every row, and it writes the
+/// count that pass writes, the size of its prefill list. The default is a
+/// count of zero.
 ///
 /// The count and its absence are one word of the record, written by one
 /// store as the bare count was: a trace that says whether it counted is the
@@ -549,7 +552,10 @@ impl Trace {
     /// is of the rows drawn. A decision by the rows its key names carries
     /// the mark with no draw, a pin followed or a ring walked
     /// ([`Engine::decide_keyed`](crate::engine::Engine::decide_keyed)): no
-    /// pass ran for it either, and `top` is of the rows it hands out.
+    /// pass ran for it either, and `top` is of the rows it hands out. A
+    /// pair decided by each side's draw does not carry it: that draw stands
+    /// for a pass that keeps every row, and the trace holds the count that
+    /// pass writes.
     pub const fn drew_first(&self) -> bool {
         self.survivors.get().is_none()
     }
@@ -935,10 +941,16 @@ pub struct Shed {
     /// parts from it too where a pair stands only among the workers the
     /// demand left out.
     /// The decode side too where the prefill was picked and the decode's
-    /// run refused. A decode decided again names the decode side, and the
-    /// prefill side where the held prefill left its list. A pair whose
+    /// run refused. A decode decided again names the decode side where
+    /// its own run refused, and the prefill side where the held prefill
+    /// left its list. A pair whose
     /// named worker's number reaches nobody (`target-worker`) names the
-    /// side it reaches nobody on, the prefills' first. A call's shed as
+    /// side it reaches nobody on, the prefills' first. A pair whose named
+    /// workers cannot be sent to after all names the decode side where a
+    /// pair of the call's last decision lost its decode alone, and the
+    /// prefill side otherwise: that selection asks the prefill first. It
+    /// names none where the route's rule is asked then and takes no worker
+    /// of a list: the call ends on the rule's refusal. A call's shed as
     /// saturated that stands behind a route's rule names the side of the
     /// list that selection judges among the rule's workers: the prefill
     /// side where none of the rule's prefills can take the request,

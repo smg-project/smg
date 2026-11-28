@@ -794,6 +794,21 @@ impl<G: Generation> Objects<G> {
             .map(|&(_, row)| row)
     }
 
+    /// The rows of every rank of the engine whose rank 0 row is `row`,
+    /// its own among them: the rows that dial the address `row`'s object
+    /// dials. None where the holder holds no object for `row`, or `row`
+    /// stands above rank 0 by the facts it is laid from: such a row's
+    /// stream is routed no rank ([`Self::rank_row`]). One read of the
+    /// entry under its read lock.
+    pub(crate) fn rank_rows(&self, row: WorkerId) -> Vec<WorkerId> {
+        let held = self.held.read();
+        let lowest = held.objects.get(&row);
+        let lowest = lowest.filter(|(_, laid)| laid.remainder.dp_rank == 0);
+        let ranks = lowest.and_then(|(_, laid)| held.ranks.get(engine_of(laid.object.as_ref())));
+        let ranks = ranks.into_iter().flatten();
+        ranks.map(|&(_, ranked)| ranked).collect()
+    }
+
     /// Whether the row `row` stands at rank `rank`, by the facts its
     /// object was laid from. `false` for a row the holder holds no object
     /// for. Asked of the worker a dispatch report names, which may have
@@ -912,23 +927,22 @@ impl<G: Generation> Objects<G> {
 
     /// The status the table holds for the row an object was built from,
     /// where the row stands at that revision still: what an object takes
-    /// from the table. Read under the object's mutation lock, so of two
-    /// such reads the later one's status stands on the object.
-    fn table_status<S: WorkersStore + ?Sized>(
-        store: &S,
-        standing: RowRevision,
-    ) -> Option<ObjectStatus> {
+    /// from the table. It is the store's read of one told status
+    /// ([`MemoryStore::told_status`]): no row is copied. Read under the
+    /// object's mutation lock, so of two such reads the later one's
+    /// status stands on the object.
+    fn table_status(store: &MemoryStore, standing: RowRevision) -> Option<ObjectStatus> {
         store
-            .get(standing.row)
-            .filter(|row| row.revision == standing.revision)
-            .map(|row| status(row.status))
+            .told_status(standing.row, standing.revision)
+            .map(status)
     }
 
-    /// Read the row under the lock the health adapter writes under. The
-    /// object's entry must still name that row and its current revision.
-    /// The registry writes the status it is handed and tells it.
+    /// Read the row's told status under the lock the health adapter
+    /// writes under. The object's entry must still name that row and its
+    /// current revision. The registry writes the status it is handed and
+    /// tells it.
     #[inline(never)]
-    fn copy_status<S: WorkersStore + ?Sized>(&self, store: &S, row: WorkerId) {
+    fn copy_status(&self, store: &MemoryStore, row: WorkerId) {
         let Some(id) = self.object(row) else {
             return;
         };

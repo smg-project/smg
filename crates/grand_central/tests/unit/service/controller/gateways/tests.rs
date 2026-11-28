@@ -789,6 +789,7 @@ async fn the_sweeps_task_ends_the_absence_of_a_key_that_stays_away() {
         sweep_micros: 0,
         recovery: Recovery::default(),
         rule_placed: RulePlaced::default(),
+        sides: Default::default(),
     };
     let world = store.snapshot();
     let table = world.spec().engine().sessions();

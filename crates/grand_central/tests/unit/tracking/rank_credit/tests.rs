@@ -6,6 +6,23 @@ thread_local! {
     /// held word's: the row as a read finds it there.
     pub(crate) static BETWEEN_A_RETIREMENTS_WRITES: Cell<Option<fn(&RankCredit)>> =
         const { Cell::new(None) };
+
+    /// What a case runs on its own thread at each dispatch that a release
+    /// lets go, ahead of the held word's write and, where the dispatch
+    /// stated no size, behind the estimates' and the count's: the row as a
+    /// read finds it between the two. A release of a row that holds no
+    /// such dispatch runs it at none: that release has one write a
+    /// dispatch. The release holds every lane's lock there, so what a
+    /// case runs is to release nothing: a second release would wait for
+    /// those locks without end.
+    pub(crate) static BETWEEN_A_RELEASES_WRITES: Cell<Option<fn(&RankCredit)>> =
+        const { Cell::new(None) };
+
+    /// What a case runs on its own thread inside a read, behind the held
+    /// word's load and ahead of the count's or the estimates': a release
+    /// run there is one the read goes across.
+    pub(crate) static BETWEEN_A_READS_LOADS: Cell<Option<fn(&RankCredit)>> =
+        const { Cell::new(None) };
 }
 
 /// Pins this thread's lane, so a test owns one lane per thread. A lane
@@ -97,77 +114,133 @@ fn a_rank_is_found_behind_one_the_table_dropped() {
     assert_eq!(table.iter().count(), 2);
 }
 
+/// A read loads the held word ahead of the count of the dispatches of
+/// no tokens. The row holds such dispatches alone, and a release that
+/// lets every one go runs whole between those two loads. The read finds
+/// the dispatches the held word counted and none of no tokens: no more
+/// of them than dispatches.
 #[test]
 fn a_read_across_a_release_counts_no_more_unsized_dispatches_than_dispatches() {
-    // One thread releases a row that holds dispatches of no tokens
-    // alone, and this one reads the row's two words as they stand. The
-    // count of those dispatches goes down ahead of the held word at
-    // each one, so no read sees more of them than dispatches. A round
-    // whose reads all land beside the release shows nothing: the
-    // rounds go on until a read lands inside one, a few at most.
-    const HELD: u64 = 6_000;
-    for _ in 0..32 {
-        let row = RankCredit::default();
-        for at in 1..=HELD {
-            row.record(at, SendSize::stated(0));
-        }
-        let crossed = std::thread::scope(|s| {
-            let release = s.spawn(|| row.sent_through(HELD));
-            let mut crossed = false;
-            while !release.is_finished() {
-                // An instant ahead of every dispatch releases none.
-                let read = row.sent_through(0);
-                assert!(
-                    read.unsized_requests <= read.requests,
-                    "{} dispatches of no tokens beside {} dispatches",
-                    read.unsized_requests,
-                    read.requests
-                );
-                crossed |= read.requests != 0 && u64::from(read.requests) != HELD;
-            }
-            crossed
-        });
-        if crossed {
-            return;
-        }
+    const HELD: u32 = 64;
+    fn release(row: &RankCredit) {
+        // The hook takes itself off: it runs inside one read alone.
+        BETWEEN_A_READS_LOADS.set(None);
+        row.release_through(u64::from(HELD));
     }
+    let row = RankCredit::default();
+    for at in 1..=u64::from(HELD) {
+        row.record(at, SendSize::stated(0));
+    }
+    BETWEEN_A_READS_LOADS.set(Some(release));
+    // An instant ahead of every dispatch: the read itself releases none.
+    let read = row.sent_through(0);
+    assert!(
+        BETWEEN_A_READS_LOADS.get().is_none(),
+        "the release ran inside the read"
+    );
+    assert_eq!((read.requests, read.unsized_requests), (HELD, 0));
+    assert_eq!(row.sent_through(0), SentCredit::default());
+}
+
+/// A read of the documents' two numbers loads the held word ahead of
+/// the estimates' word. Every dispatch here is an estimate of three
+/// tokens, and a release that lets every one go runs whole between
+/// those two loads. The read finds the dispatches the held word counted
+/// and no token: it adds no estimate of a dispatch the held word has
+/// let go.
+#[test]
+fn a_read_across_a_release_adds_no_estimate_of_a_dispatch_let_go() {
+    const HELD: u32 = 64;
+    const EACH: u32 = 3;
+    fn release(row: &RankCredit) {
+        // The hook takes itself off: it runs inside one read alone.
+        BETWEEN_A_READS_LOADS.set(None);
+        row.release_through(u64::from(HELD));
+    }
+    let row = RankCredit::default();
+    for at in 1..=u64::from(HELD) {
+        row.record(at, SendSize::estimated(EACH));
+    }
+    BETWEEN_A_READS_LOADS.set(Some(release));
+    // An instant ahead of every dispatch: the read itself releases none.
+    let read = row.counts_through(0);
+    assert!(
+        BETWEEN_A_READS_LOADS.get().is_none(),
+        "the release ran inside the read"
+    );
+    let counts = DispatchCounts {
+        requests: HELD,
+        tokens: 0,
+    };
+    assert_eq!(read, counts);
+    assert_eq!(row.counts_through(0), DispatchCounts::default());
+}
+
+/// The count of the dispatches of no tokens goes down ahead of the held
+/// word at each such dispatch a release lets go. The row holds such
+/// dispatches alone, and a read of the row's two words between the two
+/// writes of each one finds the held word still counting it and the
+/// count not: one dispatch more than dispatches of no tokens, at every
+/// dispatch the release lets go.
+#[test]
+fn a_read_between_a_releases_writes_counts_no_more_unsized_dispatches_than_dispatches() {
+    const HELD: u32 = 64;
+    thread_local!(static READS: Cell<u32> = const { Cell::new(0) });
+    fn read(row: &RankCredit) {
+        // An instant ahead of every dispatch releases none.
+        let read = row.sent_through(0);
+        // The dispatches the release let go ahead of this one.
+        let gone = READS.get();
+        assert_eq!(
+            (read.requests, read.unsized_requests),
+            (HELD - gone, HELD - gone - 1),
+            "the dispatches beside those of no tokens, {gone} let go"
+        );
+        READS.set(gone + 1);
+    }
+    let row = RankCredit::default();
+    for at in 1..=u64::from(HELD) {
+        row.record(at, SendSize::stated(0));
+    }
+    BETWEEN_A_RELEASES_WRITES.set(Some(read));
+    let left = row.sent_through(u64::from(HELD));
+    BETWEEN_A_RELEASES_WRITES.set(None);
+    assert_eq!(READS.get(), HELD, "one read at each dispatch let go");
+    assert_eq!(left, SentCredit::default());
 }
 
 /// The estimates' word goes down ahead of the held word at each
-/// dispatch a release lets go, so a read of the documents' two numbers
-/// that crosses the release adds no estimate of a dispatch the held
-/// word has let go. Every dispatch here is an estimate of three
-/// tokens: no read finds more than three tokens a dispatch. The rounds
-/// go on until a read lands inside a release, a few at most.
+/// dispatch of an estimate that a release lets go. Every dispatch here
+/// is an estimate of three tokens, and a read of the documents' two
+/// numbers between the two writes of each one finds the held word still
+/// counting it and its estimate gone: it adds no estimate of a dispatch
+/// the held word has let go, and reads that one dispatch at no tokens.
 #[test]
-fn a_read_across_a_release_adds_no_estimate_of_a_dispatch_let_go() {
-    const HELD: u64 = 6_000;
+fn a_read_between_a_releases_writes_adds_no_estimate_of_a_dispatch_let_go() {
+    const HELD: u32 = 64;
     const EACH: u32 = 3;
-    for _ in 0..32 {
-        let row = RankCredit::default();
-        for at in 1..=HELD {
-            row.record(at, SendSize::estimated(EACH));
-        }
-        let crossed = std::thread::scope(|s| {
-            let release = s.spawn(|| row.counts_through(HELD));
-            let mut crossed = false;
-            while !release.is_finished() {
-                // An instant ahead of every dispatch releases none.
-                let read = row.counts_through(0);
-                assert!(
-                    read.tokens <= u64::from(EACH) * u64::from(read.requests),
-                    "{} estimated tokens beside {} dispatches",
-                    read.tokens,
-                    read.requests
-                );
-                crossed |= read.requests != 0 && u64::from(read.requests) != HELD;
-            }
-            crossed
-        });
-        if crossed {
-            return;
-        }
+    thread_local!(static READS: Cell<u32> = const { Cell::new(0) });
+    fn read(row: &RankCredit) {
+        // An instant ahead of every dispatch releases none.
+        let read = row.counts_through(0);
+        // The dispatches the release let go ahead of this one.
+        let gone = READS.get();
+        let counts = DispatchCounts {
+            requests: HELD - gone,
+            tokens: u64::from(EACH) * u64::from(HELD - gone - 1),
+        };
+        assert_eq!(read, counts, "the documents' two numbers, {gone} let go");
+        READS.set(gone + 1);
     }
+    let row = RankCredit::default();
+    for at in 1..=u64::from(HELD) {
+        row.record(at, SendSize::estimated(EACH));
+    }
+    BETWEEN_A_RELEASES_WRITES.set(Some(read));
+    let left = row.counts_through(u64::from(HELD));
+    BETWEEN_A_RELEASES_WRITES.set(None);
+    assert_eq!(READS.get(), HELD, "one read at each dispatch let go");
+    assert_eq!(left, DispatchCounts::default());
 }
 
 /// The estimates' word goes down ahead of the held word at a

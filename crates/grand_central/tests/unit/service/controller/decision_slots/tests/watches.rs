@@ -121,6 +121,10 @@ impl Lifecycle for Named {
     fn on_released(&self, _: &Lease, _: ReleaseReason) {
         self.0.lock().push(DecisionSlot::acting());
     }
+
+    fn hears(&self) -> EventSet {
+        EventSet::of([EventKind::Issued, EventKind::Released])
+    }
 }
 
 impl Picker for Named {
@@ -179,6 +183,10 @@ impl Lifecycle for Threads {
     fn on_released(&self, _: &Lease, _: ReleaseReason) {
         let name = thread::current().name().map(str::to_owned);
         self.0.lock().push(name);
+    }
+
+    fn hears(&self) -> EventSet {
+        EventSet::of([EventKind::Released])
     }
 }
 

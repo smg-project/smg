@@ -637,6 +637,64 @@ fn a_refused_tell_leaves_the_object_at_the_status_its_row_holds() {
     assert_eq!(statuses(), (ObjectStatus::Ready, WorkerStatus::Ready));
 }
 
+/// A tell the store takes between the two holds of a told status. The
+/// applier writes the table, and then lays the status on the object
+/// under the object's lock. Where the store's lock went, the case writes
+/// another status on the object and tells the store, which takes the
+/// tell. The applier's lay reads the told status behind that tell, so the
+/// later word stands: here the object and the table state the status the
+/// case wrote. A status handed in place of the read lays the leader's
+/// older word on the object.
+#[test]
+fn a_tell_between_an_appliers_two_holds_leaves_object_and_table_at_one_status() {
+    let (leader, standby) = (Replica::new(), Rc::new(Replica::new()));
+    leader.upsert(facts(1, "gold"));
+    follow(&standby, &leader);
+    let row = standby.one_row(A).id;
+    let id = standby.object(A).expect("the row's object");
+    // Where the told status's write lets the store's locks go: the case
+    // moves the object and tells the store, and the store takes the tell.
+    let (within, target) = (Rc::clone(&standby), id.clone());
+    on_let_go(move || {
+        let registry = within.objects.registry();
+        let revision = registry.get(&target).expect("it stands").revision();
+        let moved = (ObjectStatus::Pending, ObjectStatus::NotReady);
+        let write = |_: &Arc<dyn Worker>| ((), Some(moved.1));
+        registry.apply_if_revision(&target, revision, write);
+        let (store, objects) = (&within.store, &within.objects);
+        let told = objects.tell_status(store, &target, revision, moved, &|| true);
+        assert!(told.stands().is_some(), "the store takes the tell");
+    });
+    let (from, to) = (WorkerStatus::Pending, WorkerStatus::Ready);
+    let told = MembershipChange::StatusChanged { id: row, from, to };
+    assert!(hand(&standby, 1, told, None), "the leader's status lands");
+    let registry = standby.objects.registry();
+    let object = registry.get(&id).expect("it stands").status();
+    let table = standby.store.by_key(A).expect("the row stands").status;
+    assert_eq!(
+        (object, table),
+        (ObjectStatus::NotReady, WorkerStatus::NotReady),
+        "the later word, on both"
+    );
+}
+
+/// A status at the epoch the store holds already is out of place, though
+/// it names the status its row holds: the door's test of the epoch
+/// refuses it. The table, the object and the journal stand as they were.
+#[test]
+fn a_status_at_the_held_epoch_is_refused_though_it_names_the_status_its_row_holds() {
+    let (leader, standby) = (Replica::new(), Replica::new());
+    leader.upsert(facts(1, "gold"));
+    follow(&standby, &leader);
+    let id = standby.one_row(A).id;
+    let (from, to) = (WorkerStatus::Pending, WorkerStatus::Ready);
+    let status = MembershipChange::StatusChanged { id, from, to };
+    assert!(!hand(&standby, 0, status, None), "at the held epoch");
+    assert_eq!(standby.one_row(A).status, WorkerStatus::Pending);
+    assert_eq!(standby.store.epoch(), 1, "the store took nothing");
+    assert!(standby.statuses().is_empty(), "the journal was told none");
+}
+
 /// A told row lays its status too. Its object is laid in the standing
 /// one's place and takes that one's status, which a probe of a term
 /// that ended can have moved ahead of the row's event: the leader's

@@ -254,3 +254,38 @@ def test_structural_tag_vocabulary_entry_writes_the_label_or_nothing(monkeypatch
     monkeypatch.setattr(cd, "installed_xgrammar_version", lambda: "0.1.32")
     cd.structural_tag_vocabulary_entry(args, "llguidance")
     assert "structural_tag_vocabulary" not in args
+
+
+# A JSON answer's schema, its keys out of alphabetical order, and the tag that
+# holds it alone with a bound on the white space.
+ANSWER_SCHEMA = (
+    '{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"integer"}},'
+    '"required":["zeta","alpha"]}'
+)
+ANSWER_TAG = (
+    '{"format":{"type":"json_schema","json_schema":' + ANSWER_SCHEMA + ',"max_whitespace_cnt":32}}'
+)
+
+
+def test_an_answer_tag_goes_as_its_schema_only_to_a_backend_that_takes_no_such_tag():
+    others = ("llguidance", "outlines")
+    # A known backend other than the one the tag is spelled for gets the
+    # schema, its keys in the order the tag carries them.
+    for backend in others:
+        assert cd.answer_schema_in_place_of_tag(ANSWER_TAG, backend, others) == ANSWER_SCHEMA
+    # An option spelling names its backend before the colon.
+    assert (
+        cd.answer_schema_in_place_of_tag(ANSWER_TAG, "guidance:no-fallback", ("guidance",))
+        == ANSWER_SCHEMA
+    )
+    # xgrammar, an engine's default, no backend and a name the servicer does
+    # not know keep the tag.
+    for backend in ("xgrammar", "auto", "", "none", "a-plugin"):
+        assert cd.answer_schema_in_place_of_tag(ANSWER_TAG, backend, others) is None
+    # A call's tag, an answer's tag with a style or with excludes, and text
+    # that is no tag stay as they came.
+    call = '{"format":{"type":"triggered_tags","triggers":["<call>"],"tags":[]}}'
+    styled = ANSWER_TAG.replace('"max_whitespace_cnt":32', '"style":"qwen_xml"')
+    excluding = ANSWER_TAG.replace('"max_whitespace_cnt":32', '"excludes":["<end>"]')
+    for tag in (call, styled, excluding, "not json", "[]"):
+        assert cd.answer_schema_in_place_of_tag(tag, "llguidance", others) is None

@@ -27,11 +27,12 @@ use crate::{
     stages::{Best, HasCapacity, StageRegistry},
     store::GatewayId,
     tracking::{
-        lease::{Dispatch, Outcome, ReleaseReason, Said, TransportClass},
+        lease::{Dispatch, EventKind, EventSet, Outcome, ReleaseReason, Said, TransportClass},
         DecisionGuard,
     },
 };
 
+mod drawn;
 mod side_shadows;
 mod vetoed;
 
@@ -99,6 +100,10 @@ impl Lifecycle for Hears {
 
     fn on_released(&self, lease: &Lease, _: ReleaseReason) {
         self.heard("released", lease, 0);
+    }
+
+    fn hears(&self) -> EventSet {
+        EventSet::LEASE
     }
 }
 
@@ -509,6 +514,20 @@ impl Host {
         places: [Option<&[u32]>; 2],
         vetoes: [[&[u32]; 2]; 2],
     ) -> Decision {
+        let stated = RequestFacts { seed, ..facts() };
+        self.decide_stated(admission, (stated, held), constraints, places, vetoes)
+    }
+
+    /// [`Self::decide_vetoed`] for a request that states `stated` whole:
+    /// a retry names there the workers it tried.
+    fn decide_stated(
+        &self,
+        admission: &dyn PairAdmission,
+        (stated, held): (RequestFacts<'_>, Option<&Target>),
+        constraints: Constraints<'_>,
+        places: [Option<&[u32]>; 2],
+        vetoes: [[&[u32]; 2]; 2],
+    ) -> Decision {
         let [prefill, decode] = &self.lists;
         let classes = every(self.prefills.len(), self.decodes.len() as u32);
         let [[prefill_stalled, prefill_held], [decode_stalled, decode_held]] = vetoes;
@@ -526,7 +545,7 @@ impl Host {
         };
         let mut request = Request {
             id: b"",
-            facts: RequestFacts { seed, ..facts() },
+            facts: stated,
             constraints,
         };
         let (engine, now) = (&self.engine, Instant::now());
@@ -807,6 +826,10 @@ impl Lifecycle for StopsAt {
     fn on_decision_issued(&self, lease: &Lease, _: &Decision) {
         assert!(lease.side != self.0, "this stage panics there");
     }
+
+    fn hears(&self) -> EventSet {
+        EventSet::of([EventKind::Issued])
+    }
 }
 
 impl Picker for StopsAt {
@@ -1028,6 +1051,7 @@ fn a_decode_calls_verdict_hands_the_table_its_pairs_lease_date() {
         sweep_micros: 100,
         recovery: Recovery::Latest,
         rule_placed: RulePlaced::Told,
+        sides: Default::default(),
     };
     // The call's pick: the held prefill (worker 1) with decode 102.
     let call = |verdict: SessionVerdict| {

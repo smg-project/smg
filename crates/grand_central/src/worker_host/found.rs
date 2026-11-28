@@ -155,11 +155,12 @@ fn thresholds(spec: &WorkerSpec) -> Overload {
     }
 }
 
-/// The drain window a row states of an object that waits `checks`' window.
-/// A window the object's registration left at the default is not a fact of
-/// the row: the object built from the row takes the default. A row that
-/// states the default's own number (`standing`) keeps it: its object waits
-/// that number and reads back as its row.
+/// The drain window a row states of an object that waits `checks`' window:
+/// the window itself where it is not the default, or the widest number a
+/// row holds where the window is wider. The object built from a row takes
+/// the default where the row states none. So at the default the window is
+/// a fact of the row only where the row states the default's own number
+/// (`standing`): the row's object waits that number, and it reads back.
 fn window(checks: &HealthCheckConfig, standing: Option<u32>) -> Option<u32> {
     let own = u32::try_from(checks.drain_settle_secs).unwrap_or(u32::MAX);
     let default = HealthCheckConfig::default().drain_settle_secs;
@@ -167,13 +168,16 @@ fn window(checks: &HealthCheckConfig, standing: Option<u32>) -> Option<u32> {
 }
 
 /// The facts `built` states at a write that names `over`: [`facts`], and at
-/// a replacement by id the thresholds and the drain window as its own
-/// registration states them. A replacement is its maker's whole statement
-/// of what a registration can state. So a threshold it leaves out is
-/// cleared, and a window it leaves at the default is read with no word of
-/// the standing row: the row states none. An add finds no row to keep
-/// either from. An upsert and an update keep the standing row's threshold,
-/// and its window where it states the default's number.
+/// a replacement by id the thresholds and the drain window with no word of
+/// the standing row. A threshold the replacement leaves out is cleared, and
+/// a replacement that waits the default window states none.
+///
+/// Every other write reads both over the row that stands, where one does:
+/// an upsert, an update in place, a label refresh, and an add tried again
+/// over a rank that stands. There a threshold the worker leaves out stays
+/// the row's. So does the row's window, where it states the default's
+/// number and the worker waits the default. An add over no standing rank
+/// finds no row to keep either from.
 #[cfg_attr(
     not(any(test, feature = "discovery")),
     expect(dead_code, reason = "the replica's own door reads a worker so")

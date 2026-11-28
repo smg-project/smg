@@ -6,14 +6,52 @@ use std::{path::Path, time::Duration};
 
 use engine_zmq_client::{
     mock_engine::{connect_to_frontend, default_ready_response, MockEngine},
-    protocol::handshake::EngineCoreReadyResponse,
+    protocol::{
+        handshake::EngineCoreReadyResponse, vllm::structured_outputs::StructuredOutputBackend,
+    },
     EngineId,
 };
 use openai_protocol::worker::RuntimeType;
 use smg_grpc_client::vllm_proto as vllm;
 use tempfile::TempDir;
 
-use crate::{client::ZmqEngineClient, eos::EosTokenIds, stream::ZmqGenerateStream};
+use crate::{
+    client::ZmqEngineClient,
+    eos::EosTokenIds,
+    stream::ZmqGenerateStream,
+    structured_outputs::{
+        ConstraintKinds, StructuredOutputsBackendConfig, StructuredOutputsSupport,
+    },
+};
+
+/// A JSON answer's schema with its keys out of alphabet order: a wire that
+/// writes them back sorted is caught.
+pub(crate) const ANSWER_SCHEMA: &str = r#"{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"integer"}},"required":["zeta","alpha"]}"#;
+
+/// [`ANSWER_SCHEMA`] as the structural tag a gateway spells for it: the
+/// schema node alone, under a bound on its white space.
+pub(crate) fn answer_tag() -> String {
+    format!(
+        r#"{{"format":{{"type":"json_schema","json_schema":{ANSWER_SCHEMA},"max_whitespace_cnt":32}}}}"#
+    )
+}
+
+/// A forced call's structural tag: one tool, its parameters between the
+/// template's tags.
+pub(crate) fn call_tag() -> String {
+    format!(
+        r#"{{"format":{{"type":"triggered_tags","triggers":["<tool_call>"],"tags":[{{"begin":"<tool_call>","content":{{"type":"json_schema","json_schema":{ANSWER_SCHEMA}}},"end":"</tool_call>"}}],"at_least_one":true}}}}"#
+    )
+}
+
+/// An engine whose grammar backend is pinned to another name than the one
+/// structural tags are spelled for, compiling every kind.
+pub(crate) fn pinned_other_backend() -> StructuredOutputsSupport {
+    StructuredOutputsSupport::new(
+        StructuredOutputsBackendConfig::Pinned(StructuredOutputBackend::Guidance),
+        ConstraintKinds::ALL,
+    )
+}
 
 /// A connected client of `runtime`'s dialect and the mock engine behind it,
 /// joined over the three ipc endpoints `hs.sock`, `in.sock` and `out.sock`

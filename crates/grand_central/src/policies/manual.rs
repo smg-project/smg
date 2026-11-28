@@ -46,6 +46,7 @@ pub(crate) fn sessions() -> SessionsSpec {
         issue_session_id: false,
         recovery: Recovery::Original,
         rule_placed: RulePlaced::Told,
+        sides: None,
     }
 }
 

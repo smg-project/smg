@@ -136,7 +136,7 @@ target/release/smg-grand-central --controller-id controller-0 --spec-file policy
 - Ask for a worker with `Session` and `Decide` on the gateway listener.
 - The service checks a changed policy spec before it replaces the running one.
 
-[The controller's wire test](tests/controller.rs) shows registration and the decision stream end to end. The service page lists every [flag](docs/service.md#start-the-service) and every [call](docs/service.md#a-gateway-that-calls-the-service).
+[The controller's wire test](tests/controller_cases/decisions.rs) shows registration and the decision stream end to end. The service page lists every [flag](docs/service.md#start-the-service) and every [call](docs/service.md#a-gateway-that-calls-the-service).
 
 ## Presets
 
@@ -161,9 +161,9 @@ Each preset has one profile, the same three filters and a binding for every mode
 
 A host can add stages of its own in three ways:
 
-- **A Rust stage.** Implement `Filter`, `Scorer` or `Picker` and register it in the host's stage catalog. See [Register a Rust stage](REFERENCE.md#register-a-rust-stage) and the [example program](../../examples/grand-central).
-- **A WebAssembly component.** Compile a component for the `smg:policy` package and load it in the host. See [Load a WebAssembly component](REFERENCE.md#load-a-webassembly-component) and the [WIT file](contracts/smg-policy.wit).
-- **A gRPC plugin.** Implement the `PolicyPlugin` service and let the host call it. See [Call a gRPC plugin](REFERENCE.md#call-a-grpc-plugin) and the [service contract](contracts/policy_plugin.proto).
+- **A Rust stage.** Implement `Filter`, `Scorer` or `Picker` and register it in the host's stage catalog. See [Register a Rust stage](docs/extending.md#register-a-rust-stage) and the [example program](../../examples/grand-central).
+- **A WebAssembly component.** Compile a component for the `smg:policy` package and load it in the host. See [Load a WebAssembly component](docs/extending.md#load-a-webassembly-component) and the [WIT file](contracts/smg-policy.wit).
+- **A gRPC plugin.** Implement the `PolicyPlugin` service and let the host call it. See [Call a gRPC plugin](docs/extending.md#call-a-grpc-plugin) and the [service contract](contracts/policy_plugin.proto).
 
 ## Reference
 

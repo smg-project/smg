@@ -292,6 +292,27 @@ fn blocks_declined_at_a_size_cap_are_counted_for_the_worker() {
     });
 }
 
+/// A batch that holds a released state names no series. It took its
+/// row's state ahead of its stream's removal and comes behind it: it is
+/// passed over ahead of the row's cursor, which stays unheard.
+#[test]
+fn a_batch_that_holds_a_released_state_names_no_series() {
+    let series = Series::new();
+    metrics::with_local_recorder(&series.recorder, || {
+        let f = Fixture::single(Some(BLOCK_SIZE));
+        let (_host, sink) = opened(&f);
+        let feed = sink.feeds.lock().get(&f.row).cloned();
+        let feed = feed.expect("the stream's feed");
+        let state = sink.applied(f.row, (f.row, 0)).expect("the row's state");
+        sink.removed(f.row);
+        let late = wide(1, 32);
+        let outcome = sink.admit_under(f.row, (f.row, 0), &feed, state, facts(1), &late);
+        assert_eq!(outcome, BatchOutcome::Skipped);
+        assert!(!series.names_the_worker());
+        assert_eq!(f.tables.cursor(f.row, 0), None);
+    });
+}
+
 /// A stream that left names no series: its batch is passed over and
 /// counted nowhere, and its reset counts under no worker.
 #[test]

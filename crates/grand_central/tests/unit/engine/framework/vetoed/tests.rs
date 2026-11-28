@@ -623,6 +623,7 @@ fn a_claim_made_in_the_gap_is_followed_onto_a_worker_the_lift_keeps() {
         sweep_micros: 0,
         recovery: Recovery::Original,
         rule_placed: RulePlaced::Told,
+        sides: Default::default(),
     };
     let (ringed, _) = ring_with_a_gap(None);
     let (engine, gap) = ring_with_a_gap(Some(rule));
@@ -658,6 +659,7 @@ fn a_followed_claim_names_no_alternate_at_the_rules_cap() {
         sweep_micros: 0,
         recovery: Recovery::Original,
         rule_placed: RulePlaced::Told,
+        sides: Default::default(),
     };
     let (ringed, _) = ring_with_a_gap(None);
     let mut pool = [free(0, 4), free(1, 4), free(2, 4), free(3, 4)];
@@ -701,6 +703,7 @@ fn a_claim_made_in_the_gap_beside_a_standing_pin_is_followed() {
             sweep_micros: 0,
             recovery,
             rule_placed: RulePlaced::Told,
+            sides: Default::default(),
         };
         let (ringed, _) = ring_with_a_gap(None);
         let (engine, gap) = ring_with_a_gap(Some(rule));
@@ -856,6 +859,7 @@ fn a_followed_claim_at_the_rules_cap_hands_the_key_on() {
         sweep_micros: 0,
         recovery: Recovery::Original,
         rule_placed: RulePlaced::Told,
+        sides: Default::default(),
     };
     let (ringed, _) = ring_with_a_gap(None);
     let pool = [free(0, 4), free(1, 4), free(2, 4), free(3, 4)];
@@ -929,6 +933,7 @@ fn a_followed_claim_at_the_cap_hands_the_key_on_under_the_standing_veto() {
         sweep_micros: 0,
         recovery: Recovery::Original,
         rule_placed: RulePlaced::Told,
+        sides: Default::default(),
     };
     let (ringed, _) = ring_with_a_gap(None);
     let pool = [free(0, 4), free(1, 4), free(2, 4), free(3, 4)];
@@ -993,6 +998,7 @@ fn a_key_handed_on_from_a_followed_claim_fronts_its_worker_where_it_is_decided()
         sweep_micros: 0,
         recovery: Recovery::Original,
         rule_placed: RulePlaced::Told,
+        sides: Default::default(),
     };
     let (ringed, _) = ring_with_a_gap(None);
     let pool = [free(0, 4), free(1, 4), free(2, 4), free(3, 4)];
@@ -1069,6 +1075,7 @@ fn a_hand_ons_pass_a_filter_emptied_is_put_to_no_rule() {
         sweep_micros: 0,
         recovery: Recovery::Original,
         rule_placed: RulePlaced::Told,
+        sides: Default::default(),
     };
     let turn = Arc::new(Turn::default());
     let engine = ring_behind(Box::new(Turns(Arc::clone(&turn))), Some(rule));
