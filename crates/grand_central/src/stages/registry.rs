@@ -235,10 +235,11 @@ pub(crate) struct SentSlot {
     /// The count the profile's stages read, from the first ask on.
     pub(crate) asked: Option<Arc<DispatchCredit>>,
     /// The count of an earlier profile of the document under the same
-    /// `sent_ttl_ms` and `sent_report_delay_ms`. The engine records a send
-    /// in every count, so two counts under one pair of settings would hold
-    /// the same sends, and the one whose profile decides no request would
-    /// keep them: only a decision's read lets a send go.
+    /// `sent_ttl_ms` and `sent_report_delay_ms`. The engine tells every
+    /// count each send it counts, so two counts under one pair of settings
+    /// would be told the same sends. A report or a time limit ends a send
+    /// only at a read, and a profile that decides no request would give a
+    /// count of its own no read from its decisions.
     pub(crate) shared: Option<Arc<DispatchCredit>>,
 }
 

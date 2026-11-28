@@ -59,8 +59,8 @@ pub(crate) struct SentSettings {
 /// The profiles of a document that set the same time limit and report
 /// delay read one count: the engine tells every count each send it
 /// counts, and a report or a time limit ends a send only at a read. A
-/// count of its own would get no read under a profile that decides no
-/// request.
+/// profile that decides no request would give a count of its own no read
+/// from its decisions.
 ///
 /// Where a new document keeps a profile that reads a count, its engine
 /// goes on with that count, and the count built for the document's
