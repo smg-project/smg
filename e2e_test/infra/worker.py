@@ -33,6 +33,7 @@ from .constants import (
     WorkerType,
     effective_startup_timeout,
     get_gpu_offset,
+    get_gpu_vendor,
     get_mm_processing,
     get_mock_wire,
     get_runtime,
@@ -547,6 +548,37 @@ class Worker:
                 self.extra_engine_args,
                 self.extra_env,
             )
+            if (
+                self.model_id == "meta-llama/Llama-4-Scout-17B-16E-Instruct"
+                and os.environ.get("E2E_SGLANG_SCOUT_ROCM_ATTENTION_AUTO") == "1"
+                and get_gpu_vendor() == "amd"
+            ):
+                if (
+                    self.mode != ConnectionMode.GRPC
+                    or self.worker_type != WorkerType.REGULAR
+                    or tp_size != 4
+                    or self.extra_engine_args
+                ):
+                    raise ValueError(
+                        "Scout ROCm attention profile requires the original TP4 gRPC worker"
+                    )
+                args = list(spec.get("sglang_args", []))
+                attention_options = {
+                    "--attention-backend",
+                    "--prefill-attention-backend",
+                    "--decode-attention-backend",
+                }
+                if [arg for arg in args if arg.split("=", 1)[0] in attention_options] != [
+                    "--attention-backend=fa3"
+                ]:
+                    raise ValueError(
+                        "Scout ROCm attention profile requires the reference FA3 override"
+                    )
+                # Llama4 in the image pinned by pr-test-rust.yml selects aiter
+                # on HIP when unset (lmsysorg/sglang:v0.5.21-rocm10-mi30x).
+                # Keep the NVIDIA model spec and every other engine argument intact.
+                args.remove("--attention-backend=fa3")
+                spec = {**spec, "sglang_args": args}
             if self.mode == ConnectionMode.ZMQ:
                 # The launcher validates the complete engine argument list
                 # (it refuses a DP launch this wire does not carry yet), so
