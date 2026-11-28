@@ -968,7 +968,7 @@ differs in any other field builds every profile anew.
 
 The exception is safe because no stage is built from the header list. A validation's own stages
 read four values of the view: the block size, the boundaries, the bound of block hashes and the age
-limit of load reports (`check_profile`, `document/spec.rs`). A stage of the host's own is built by a
+limit of load reports (`check_profile`, `document/spec/validate/profile.rs`). A stage of the host's own is built by a
 factory that is handed no header list. Of the view it is handed the age limit of load reports alone
 (`StageBuild::load_report_reader`, `stages/registry.rs`). The keep's own premise holds here too: a
 factory builds from what it is handed.
