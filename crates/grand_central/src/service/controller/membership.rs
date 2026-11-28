@@ -3,7 +3,7 @@
 //! with a refusal. A provider states all ranks in one turn and gets the
 //! outcome of each row in the store's terms.
 //!
-//! A registered row is pending. One whose checks are off gets the store's
+//! A registered row is pending. One whose checks are off is sent the store's
 //! connect signal at once, as a worker with its health checks off starts
 //! ready; the registrant says "do not check", never "healthy", and says it
 //! of its own registration alone: one that states no policy is checked,
@@ -38,7 +38,8 @@
 //! write.** The door is made with the holder of those objects, which the
 //! service's decisions read. A call's write of a row (a registration, a
 //! patch, a removal) is decided over them and the store follows it
-//! ([`Objects::upsert`]): the object stands when the write returns. A drain
+//! ([`Objects::upsert`]): the object the write leaves stands when it
+//! returns, and a removed row's object has left the registry by then. A drain
 //! and a connect signal go through the holder too: the store is told the
 //! status first, and the object moves where the store took it
 //! ([`Objects::drain_row_under`], [`Objects::connect_row_under`]). So a
@@ -71,9 +72,9 @@
 //! and the store moves nothing. The door then asks the term once more and
 //! answers that its store does not lead it, as a drain does
 //! ([`MembershipCalls::unwritten`]). The status the holder tells behind a
-//! change in place goes under that term too. A removal's object left the
-//! registry ahead of the store's word: it is laid again from the row
-//! read off it, in the status the table holds.
+//! change in place goes under that term too. A removal's object leaves
+//! the registry behind the store's yes: a removal that is refused leaves
+//! the object as it stood.
 //!
 //! **A signal that was not written is sent again by an upsert of the same
 //! registration.** Its row waits for it: its checks are off, and it is

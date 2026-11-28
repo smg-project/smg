@@ -14,6 +14,7 @@ use std::sync::atomic::AtomicU64;
 use std::{
     collections::{HashMap, HashSet},
     fmt,
+    panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
     sync::{
         atomic::{AtomicBool, Ordering::Relaxed},
         Arc,
@@ -53,7 +54,7 @@ use crate::{
     },
 };
 use crate::{
-    engine::view::WorkerId,
+    engine::{framework::contained, view::WorkerId},
     store::{MemoryStore, Reachability, WorkerFacts, WorkerRow, WorkersStore},
 };
 
@@ -190,9 +191,10 @@ impl Held {
 ///
 /// A status change builds no object: an object's status leads its row's.
 ///
-/// A row that leaves ends its object. A row registered again under the
-/// same key and incarnation is another life under the same id, and starts
-/// at the same revision: its object is built anew.
+/// A row that leaves ends its object behind the store's write of the
+/// leave: the object stands in the registry until then. A row registered
+/// again under the same key and incarnation is another life under the
+/// same id, and starts at the same revision: its object is built anew.
 ///
 /// A store that took another store's rows whole holds another history: a
 /// row may stand there under the id and the revision an object was built
@@ -715,7 +717,7 @@ impl<G: Generation> Objects<G> {
 
     /// The row the object under `object` stands for, with the revision it
     /// was built from; `None` for an id the holder laid no object under, or
-    /// one whose row went.
+    /// one whose object ended.
     pub fn standing(&self, object: &ObjectId) -> Option<RowRevision> {
         let held = self.held.read();
         held.rows.get(object).map(|laid| laid.remainder.standing)
@@ -1123,6 +1125,44 @@ impl<G: Generation> Objects<G> {
         self.registry
             .set_worker_overloaded(standing, !standing.is_overloaded());
         self.registry.set_worker_overloaded(laid, false);
+    }
+}
+
+/// A removal of the row `id` in its two steps: `told`, the store's write
+/// of it, then `behind`, what the removal does behind the store's yes.
+/// Answers what `told` answers. Where `told` answers yes, `behind` runs.
+/// Where a step unwinds, the store is asked for the row. Where it holds
+/// the row no more, `behind` runs, a second time where it had begun. A
+/// fault of that read or that run stops there ([`contained`]): its payload
+/// is released in the holder's turn, and what the run had not done stays
+/// undone. Once that release returns, the caught unwinding is resumed.
+///
+/// The read takes the store's membership lock and lets it go. `behind`
+/// runs there as it runs behind a yes: in the holder's turn, and under no
+/// lock of the two steps, whose frames have unwound.
+fn leave_whole(
+    store: &MemoryStore,
+    id: WorkerId,
+    told: impl FnOnce() -> bool,
+    behind: impl Fn(),
+) -> bool {
+    let steps = || {
+        let taken = told();
+        if taken {
+            behind();
+        }
+        taken
+    };
+    match catch_unwind(AssertUnwindSafe(steps)) {
+        Ok(taken) => taken,
+        Err(unwinding) => {
+            contained(|| {
+                if store.get(id).is_none() {
+                    behind();
+                }
+            });
+            resume_unwind(unwinding)
+        }
     }
 }
 

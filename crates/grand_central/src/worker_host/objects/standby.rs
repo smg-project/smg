@@ -14,12 +14,13 @@
 //! its object, as at a leader's write: the standby's own log is told from
 //! it. Where no object stands under the row's id, the store tells its own.
 //!
-//! The order is the one of a leader's write. The store is told between the
-//! build and the registry's write, and a removal's object leaves the
-//! registry before the store is told. An event the store does not take
-//! lays nothing: it does not fit the tables, and the applier stops its
-//! batch there. Where the store does not take a removal, the row is
-//! laid again as it was read back.
+//! The order is the one of a leader's write. The store is told first: a
+//! row's object is put in the registry behind the store's yes, and a
+//! removal's object leaves the registry behind it. An event the store does
+//! not take lays nothing: it does not fit the tables, and the applier
+//! stops its batch there. A removal the store does not take leaves its
+//! object as it stood. Where a step of a removal unwinds and the store
+//! holds the row no more, the object's end runs, as at a leader's write.
 //!
 //! The wire tells a row's age, not the instant it was admitted at. A row
 //! an event changes in place keeps the instant its entry holds, as the
@@ -36,10 +37,9 @@
 //! So are the statuses of a cut laid whole, each on its row's object. A
 //! told row lays its status too: an object laid in another's place takes
 //! the standing object's, and a probe of a term that ended can have moved
-//! that one ahead of the row's event. This is one of the three ways from
-//! a table's status to an object's where the objects lead. The others
-//! are a tell the store refuses ([`mod@super::status`]) and a removal
-//! the store refuses for its term ([`mod@super::write`]).
+//! that one ahead of the row's event. This is one of the two ways from
+//! a table's status to an object's where the objects lead. The other is
+//! a tell the store refuses ([`mod@super::status`]).
 //!
 //! A restore is the store's restore and the lay of the cut's own rows in
 //! one turn of the holder. No row of the table is read back to lay an
@@ -63,7 +63,7 @@ use std::sync::Arc;
 
 use smg_worker::registry::Generation;
 
-use super::{status::served, Objects};
+use super::{leave_whole, status::served, Objects};
 use crate::{
     engine::view::WorkerId,
     store::{MembershipChange, MemoryStore, Position, StoreCheckpoint, WorkerRow},
@@ -93,17 +93,14 @@ impl<G: Generation> Objects<G> {
     ) -> bool {
         let _turn = self.turn.lock();
         match (change, row) {
-            // The row is read back, the object leaves the registry, then
-            // the store is told and handed the row. A removal the store
-            // refuses lays the row again, as it was read back.
+            // The row is read back, the store is told and handed the row,
+            // and the object leaves the registry behind its yes. A removal
+            // the store refuses leaves the object as it stood. Where a step
+            // unwinds and the row is gone, the object's end runs.
             (MembershipChange::Removed { id }, None) => {
                 let mut left = self.row(id);
-                self.end(id);
-                let landed = store.follow_landed(at, epoch, change, None, left.as_mut());
-                if let (false, Some(row)) = (landed, &left) {
-                    self.lay(store, row);
-                }
-                landed
+                let told = || store.follow_landed(at, epoch, change, None, left.as_mut());
+                leave_whole(store, id, told, || self.end(id))
             }
             (change, Some(mut row)) => {
                 if matches!(
