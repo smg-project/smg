@@ -24,11 +24,16 @@
 //! `after_id`, `before_id`, `lifecycle`); every other request the OpenAI
 //! ones (`object`, `created`, `owned_by`), the whole inventory. Both list
 //! the self-hosted inventory in id order (the cards, then the aliases).
+//!
+//! `include_external=true` on the list is an opt-in for a recognized gateway
+//! credential: it also lists external workers' registration-time cards, never
+//! their caller-refreshed overrides, and makes no upstream request. External
+//! aliases and the single-model endpoint are outside this opt-in.
 
 use std::collections::HashSet;
 
 use axum::{
-    http::{header, HeaderMap, HeaderValue},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -192,6 +197,41 @@ pub(crate) async fn list_models_with(
         ModelShape::OpenAi => messages::ListModelsQuery::default(),
     };
 
+    let include_external = match external_inventory_requested(query) {
+        Ok(include) => include,
+        Err(why) => {
+            return shape
+                .error(
+                    error::bad_request("invalid_query_parameter", why),
+                    request_id,
+                )
+                .await;
+        }
+    };
+    if include_external {
+        if !bearer_token
+            .as_deref()
+            .is_some_and(|token| gateway_auth.contains_token(token))
+        {
+            return shape
+                .error(
+                    error::create_error(
+                        StatusCode::FORBIDDEN,
+                        "external_inventory_requires_gateway_key",
+                        "External inventory requires a configured gateway credential",
+                    ),
+                    request_id,
+                )
+                .await;
+        }
+        if registry.is_empty() {
+            return shape.no_models(request_id).await;
+        }
+        return shape
+            .list(registered_inventory_cards(registry), &page, request_id)
+            .await;
+    }
+
     // Short-circuit: a token that is one of the gateway's own credentials
     // is answered from the registry. It must never reach the BYOK fan-out
     // below, which would forward it externally.
@@ -254,6 +294,42 @@ pub(crate) async fn retrieve_model_with(
         Some(card) => shape.single(card),
         None => shape.not_found(model_id, request_id).await,
     }
+}
+
+/// The provisional list opt-in: exactly one boolean, absent means false.
+/// Unknown query fields keep the existing endpoint's handling.
+fn external_inventory_requested(query: Option<&str>) -> Result<bool, String> {
+    let mut include = None;
+    for (key, value) in url::form_urlencoded::parse(query.unwrap_or("").as_bytes()) {
+        if key != "include_external" {
+            continue;
+        }
+        if include.is_some() {
+            return Err("include_external: specify the parameter only once".to_owned());
+        }
+        include = Some(match value.as_ref() {
+            "true" => true,
+            "false" => false,
+            _ => return Err("include_external: expected true or false".to_owned()),
+        });
+    }
+    Ok(include.unwrap_or(false))
+}
+
+/// The opt-in inventory adds only immutable external registration cards.
+/// Lazy discovery can replace `worker.models()` with a caller's catalogue;
+/// `metadata.spec.models` stays as registration wrote it. Existing local
+/// cards and aliases win an id collision, and no external aliases are added.
+fn registered_inventory_cards(registry: &WorkerRegistry) -> Vec<ModelCard> {
+    let mut cards = listed_cards(registry);
+    for worker in registry.get_all() {
+        if worker.metadata().spec.runtime_type == RuntimeType::External {
+            cards.extend_from_slice(worker.metadata().spec.models.all());
+        }
+    }
+    cards.sort_by(|a, b| a.id.cmp(&b.id));
+    cards.dedup_by(|a, b| a.id == b.id);
+    cards
 }
 
 /// The caller's credential: a `Bearer` token (case-insensitive scheme per
