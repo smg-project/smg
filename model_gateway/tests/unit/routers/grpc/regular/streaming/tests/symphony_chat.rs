@@ -648,7 +648,9 @@ async fn a_whole_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_finish
 /// call to a function the request does not declare, which that choice keeps. Under a choice that
 /// drops a call with its bytes (none, and a required list, which drops a call to a function the
 /// request does not declare) the start stays where it was: the bytes of a call that never began
-/// are still the answer's content, whichever function it named.
+/// are still the answer's content, whichever function it named. Where one call only is taken
+/// the start stays where it was as well: a later call the output cut behind its name is no
+/// call, and its bytes are the answer's content, as a whole answer gives them.
 #[tokio::test]
 async fn a_streamed_json_call_starts_at_its_name_before_its_arguments_come() {
     let required = json!("required");
@@ -661,6 +663,8 @@ async fn a_streamed_json_call_starts_at_its_name_before_its_arguments_come() {
     };
     let mut forbidden = marked();
     forbidden.symphony.as_mut().expect("assigned").forbids_calls = Forbids::Every;
+    let mut one_call = marked();
+    one_call.first_tool_call_only = true;
     let lookup = vec![("lookup".to_string(), String::new())];
     for (spec, output, finish, calls, content, finished) in [
         (
@@ -709,6 +713,14 @@ async fn a_streamed_json_call_starts_at_its_name_before_its_arguments_come() {
             "length",
             Vec::new(),
             "\n{\"name\": \"lookup\", \"argu",
+            "length",
+        ),
+        (
+            one_call,
+            "<tool_call>\n{\"name\": \"lookup\", \"arguments\": {\"q\": \"x\"}}\n</tool_call>\n<tool_call>\n{\"name\": \"second\", \"argu",
+            "length",
+            vec![("lookup".to_string(), "{\"q\": \"x\"}".to_string())],
+            "\n{\"name\": \"second\", \"argu",
             "length",
         ),
     ] {
