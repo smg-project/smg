@@ -219,7 +219,7 @@ For example, `terms: { load.queued: 11, sent.requests: 11 }` prices a request ju
 - A report sampled at or after the send. Where the profile sets `sent_report_delay_ms`, the report is at least that long after it.
 - The profile's `sent_ttl_ms`.
 - The worker is removed, joins again, is replaced or changes its number of ranks.
-- A row keeps 8,192 sends, and a send past them lets the row's oldest go.
+- As a rule a row keeps 8,192 sends, and a send past them lets the row's oldest go.
 
 These rules hold for the reports:
 

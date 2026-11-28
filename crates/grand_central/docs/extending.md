@@ -229,7 +229,7 @@ A factory of the three `_with` calls takes a build context, `StageBuild`. It rea
 - Membership words end it too, among them a removal, a replacement or a resize of the row's worker and a join told of it.
 - Where the profile sets `sent_report_delay_ms`, the report that ends a send is sampled at least that long after it.
 - In a standalone controller's decision the report is its load monitor's. A spec that holds a stage that keeps reports is given none yet, so there no report ends a send.
-- When a send arrives with 8,192 already held on a row, the tally lets one of the row's sends go at any age: as a rule its oldest. It lets none go where a release made room meanwhile.
+- When a send arrives with 8,192 or more held on a row, the tally lets one of the row's sends go at any age, or none. As a rule it is the oldest. None goes where the row then holds no more than 8,192: a release can have made room.
 
 **The load report reader.**
 
@@ -319,7 +319,7 @@ stages.scorer_with("least-pending", |build| {
 - Stateful scorers and pickers can observe issue, dispatch, completion, release, membership and signals when the host supplies them.
 - The engine tells a stage the issue, the dispatch, the completion and the release only where the stage names the word's kind (`Lifecycle::hears`). By default a stage that declares `needs_lifecycle` names every one, and another names none.
 - The engine reads a scorer's or a picker's answer when the engine is built for a spec. A stage whose answer changes later is told by its first answer still.
-- A fallback stage is the exception: a plugin's scorer or picker adapter passes it each word the adapter is told, whatever the fallback names.
+- A fallback stage is the exception. A plugin's scorer or picker adapter passes it each word the adapter is told, whatever the fallback names, unless the plugin's own call at that word panics.
 - A stage that observes membership may be told a join again of a worker that stands, and a leave of a worker it did not hear join. A stage takes each word as a statement of what stands.
 - Where the host handed a registry, `InProcess::apply` tells the scorers and pickers it builds new the workers that stand there: each as joined, then the list of them. A stage behind one that panics at a word does not hear that word.
 - The call tells a stage kept from the spec before none of them again. [A later spec](embedding.md#a-later-spec) has the rules.
