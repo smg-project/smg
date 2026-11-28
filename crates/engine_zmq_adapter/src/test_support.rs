@@ -44,6 +44,17 @@ pub(crate) fn call_tag() -> String {
     )
 }
 
+/// A forced call as a tag by its `structures` and `triggers`, the spelling
+/// the guidance backend reads: one tool, any JSON object between the
+/// template's tags.
+pub(crate) fn structures_call_tag() -> String {
+    serde_json::json!({"type": "structural_tag",
+        "structures": [{"begin": "<tool_call>", "schema": {"type": "object"},
+                        "end": "</tool_call>"}],
+        "triggers": ["<tool_call>"]})
+    .to_string()
+}
+
 /// An engine whose grammar backend is pinned to another name than the one
 /// structural tags are spelled for, compiling every kind.
 pub(crate) fn pinned_other_backend() -> StructuredOutputsSupport {

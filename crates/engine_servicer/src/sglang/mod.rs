@@ -145,7 +145,9 @@ pub struct SglangModelInfo {
 /// request and aborts it with a 400. `outlines` compiles JSON schemas and
 /// regular expressions and fails the other kinds at compile; `xgrammar` and
 /// `llguidance` compile all four, xgrammar with the schema features it lacks
-/// dropped. A name this servicer does not know is a plugin backend of the
+/// dropped, llguidance a structural tag by its `structures` and `triggers`
+/// alone (the adapter refuses it a tag without them). A name this servicer
+/// does not know is a plugin backend of the
 /// scheduler's: nothing is judged ahead of it. A launcher that wrote no
 /// backend (an older one) leaves the engine's default, xgrammar. The adapter
 /// refuses a constraint outside this before the scheduler, as on every wire.

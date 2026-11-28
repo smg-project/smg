@@ -2230,13 +2230,16 @@ mod tests {
 
     /// A structural tag that is a JSON answer's schema alone reaches an engine
     /// whose backend is pinned to another name than the tags are spelled for
-    /// as that schema, its keys in the order written; a call's tag reaches it
-    /// as it came.
+    /// as that schema, its keys in the order written; a call's tag by its
+    /// `structures` and `triggers`, the spelling that backend reads, reaches
+    /// it as it came.
     #[tokio::test]
     async fn an_answer_tag_reaches_a_pinned_other_backend_as_its_schema() {
         use sglang_proto::sampling_params::Constraint;
 
-        use crate::test_support::{answer_tag, call_tag, pinned_other_backend, ANSWER_SCHEMA};
+        use crate::test_support::{
+            answer_tag, pinned_other_backend, structures_call_tag, ANSWER_SCHEMA,
+        };
 
         let (client, engine, _dir) = connected_pair(RuntimeType::Sglang).await;
         client.set_structured_outputs_support(pinned_other_backend());
@@ -2244,7 +2247,7 @@ mod tests {
         let mut streams = Vec::new();
         for (id, tag, schema) in [
             ("answer", answer_tag(), Some(ANSWER_SCHEMA)),
-            ("call", call_tag(), None),
+            ("call", structures_call_tag(), None),
         ] {
             let req = sglang_proto::GenerateRequest {
                 request_id: id.to_string(),
