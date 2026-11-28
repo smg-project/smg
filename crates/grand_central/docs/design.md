@@ -376,9 +376,10 @@ Under the default policy's own name such an id refuses nothing: the label adds n
 the model runs the main profile.
 
 A profile for each labelled model has a cost. Its stages are built at each apply and compared
-with the standing ones, and its name is kept for the life of the process. The document holds
-65,535 profiles at most. A label whose profile would be one more is refused by its model and its
-policy, as a label past the view's bound of headers is.
+with the standing ones. An apply also finds, once for each such profile, the profile that places
+its model's single requests (below). The document holds 65,535 profiles at most. A label whose
+profile would be one more is refused by its model and its policy, as a label past the view's
+bound of headers is.
 
 What the gateway does: it hands the builder its labels by classic's rule. The registration that
 finds the model with none decides, whatever its worker's role, and so does one that states no
@@ -388,10 +389,14 @@ alone: the document in force stays, and the registration is answered with a warn
 label is not tried again while the model is served.
 
 The gateway asks the crate for a labelled model's profile name and spells the rule nowhere. It
-counts a labelled model's single request, and names its traced row, under the label's policy. The
-crate reads that policy off the profile's name (`RoutingSettings::label_policy`). So a label adds
-no value to the selection metric's `policy` label, and classic's series stand as they are. Under a
-supplied document the profile's name stands as the document gives it.
+counts a single request the engine places, and names that request's traced row, under the label
+of the profile that picked.
+
+The engine labels a labelled model's profile by its policy. Such a profile is named for a preset
+and a model's id, and the document binds that model's single requests to it. Every other profile
+is labelled by its name. So a label adds no value to the selection metric's `policy` label, and
+the engine keeps no name for a model's id. A supplied document that writes such a profile is
+labelled the same way.
 
 The gateway then puts the new document in force on the running engine, under the next generation
 number. It stores again the two answers it keeps of the document in force: the text questions' and a
@@ -4070,7 +4075,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | `canary`, `override: allowed`, `admission` | **[planned]** | in the schema; a document that writes one is refused, and the error names the field |
 | `shadow`, `explain.sample` | **[partly]** | the engine runs a single request's shadow, but not one that reads affinity rows of its own; it runs a pair's shadows by side at the pair's first decision, and the decode side's at a decode decided again, in a host's own process; a gateway takes a document that names them, and no served controller asks them, and `explain.sample` is kept by the served controller and, for a single request and a pair's first decision, by the engine in a gateway's process, where the gateway answers a record at `GET /policy/explain/{request_id}` (decision 7) |
 | The ten presets and the conversion from routing settings | **[built]** | |
-| A worker's `policy` label names its model's policy | **[partly]** | section 3.3: built: the builder of the settings' document takes a label and binds its model, the gateway hands it its labels and puts the document in force, a document put in force keeps the stages of a profile that did not change, and the trees the engine is lent are made where a label's document first reads sent prefixes; open: a profile for each labelled model |
+| A worker's `policy` label names its model's policy | **[partly]** | section 3.3: built: the builder of the settings' document takes a label and binds its model, the gateway hands it its labels and puts the document in force, a document put in force keeps the stages of a profile that did not change, the trees the engine is lent are made where a label's document first reads sent prefixes, and each labelled model runs a profile of its own; open: the differences from classic that section 3.3 names |
 | The stage interfaces and a builder's own stages | **[built]** | |
 | The engine over worker lists (`InProcess`) | **[partly]** | refuses a subset hint, and a request that states protocols where a worker of its list is dialed over one it does not state; of the recorded lines only the three hard-demand sheets, `sticky_rank`, `encode_pair`, `pair_named` and `pair_sticky` (134), and 31 lines of `prefix_hash`, replay through it |
 | `round_robin`, `random`, `passthrough`, `least_load`, `power_of_two` on that engine | **[partly]** | no sheet over a healthy pool for four of them |

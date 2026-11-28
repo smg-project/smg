@@ -751,7 +751,9 @@ impl RoutingSettings {
     /// side of the settings is refused, as two sides of the settings are. A
     /// label's prefix ring counts its key in that block size under every
     /// gateway. In a gateway of many routers the rings of the settings' own
-    /// sides stand as they stood, and a label's is new.
+    /// sides stand as they stood, and a label's is new. A label of the main
+    /// policy is the exception: it writes the settings' own side again, and
+    /// its ring stands as that side's does.
     ///
     /// A label's index is not shared. It stands under the label's own model
     /// id, where it differs from what the document answers for that model
@@ -764,10 +766,13 @@ impl RoutingSettings {
     /// view's list past its bound. The call then answers that refusal and
     /// no document: a host leaves the label out and calls again. The
     /// settings' own document is decided first, with no label, so a label
-    /// never changes which families it binds. Two labels never refuse one
-    /// another: each stands or falls beside the settings alone, so every
-    /// subset of labels that build builds too. A preset this module has
-    /// parted from is no label's refusal: it is answered as itself
+    /// never changes which families it binds. Short of the document's two
+    /// bounds, of its profiles and of its view's headers, two labels never
+    /// refuse one another: each stands or falls beside the settings alone,
+    /// so every subset of labels that build builds too. At a bound the
+    /// label that would pass it is refused, whatever it would be alone. A
+    /// preset this module has parted from is no label's refusal: it is
+    /// answered as itself
     /// ([`RoutingSettingsError::NoStage`], [`RoutingSettingsError::NoPart`],
     /// [`RoutingSettingsError::Document`]), under a label too.
     ///
@@ -815,17 +820,18 @@ impl RoutingSettings {
         format!("{policy}:{model}")
     }
 
-    /// The policy a labelled model's profile is named for. It is read off
-    /// the name by the rule of [`Self::label_profile`]: the text ahead of
-    /// the first colon, where `model`'s id stands behind it.
+    /// The policy a labelled model's profile is named for, and the model's
+    /// id. Both are read off the name by the rule of
+    /// [`Self::label_profile`]: the text ahead of the first colon, and the
+    /// text behind it.
     ///
     /// `None` for a name with no colon, as the settings' own profiles
-    /// bear, and for the profile of another model. A host counts a
-    /// labelled model's requests under its label's policy this way.
+    /// bear. The engine labels such a profile by its policy
+    /// (`engine::in_process::labels`), so no host reads the rule.
+    #[cfg(feature = "in-process")]
     #[must_use]
-    pub fn label_policy<'a>(profile: &'a str, model: &str) -> Option<&'a str> {
-        let (policy, id) = profile.split_once(':')?;
-        (id == model).then_some(policy)
+    pub(crate) fn label_policy(profile: &str) -> Option<(&str, &str)> {
+        profile.split_once(':')
     }
 
     /// The document a gateway of these settings runs. Without a supplied

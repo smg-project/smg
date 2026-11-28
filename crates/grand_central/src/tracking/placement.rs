@@ -142,12 +142,13 @@ pub struct Placement<'a> {
     /// host's in-flight counters. `None` where none was derived. Neither
     /// constructor derives one: the call that places the request writes it.
     pub routing_key: Option<&'a str>,
-    /// The profile whose picker picked, by its label: the profile's name as
-    /// the document writes it, as a string that lives as long as the
-    /// process. What a host counts the decision under. The call that
-    /// decided writes it, so it names the profile of the document that
-    /// decided, whatever document is in force later. The empty label for a
-    /// decision made ahead of every profile.
+    /// The profile whose picker picked, by its label: a labelled model's
+    /// policy, and for any other profile its name as the document writes
+    /// it. A string that lives as long as the process: what a host counts
+    /// the decision under. The call that decided writes it, so it names
+    /// the profile of the document that decided, whatever document is in
+    /// force later. The empty label for a decision made ahead of every
+    /// profile.
     pub profile: &'static str,
     /// The label of the profile that picks a pair's decode side: the
     /// binding's decode profile, and its one profile where it names no

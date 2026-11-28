@@ -1369,24 +1369,27 @@ fn a_labels_profile_is_named_for_its_policy_and_its_model() {
     let tagged = RoutingSettings::label_profile("least_load", "org/m:v1");
     assert_eq!(tagged, "least_load:org/m:v1");
     assert_eq!(tagged.split_once(':'), Some(("least_load", "org/m:v1")));
-    // Read the other way, the name gives its policy for its own model
-    // alone: no other id, and no name without a colon.
-    assert_eq!(
-        RoutingSettings::label_policy(&tagged, "org/m:v1"),
-        Some("least_load")
-    );
-    assert_eq!(RoutingSettings::label_policy(&tagged, "v1"), None);
-    assert_eq!(RoutingSettings::label_policy(&tagged, "org/m"), None);
-    assert_eq!(RoutingSettings::label_policy("least_load", "m"), None);
     for name in PRESETS {
         assert!(!name.contains(':'), "{name}");
+    }
+}
+
+/// Read the other way, a labelled model's profile name gives its policy
+/// and its model's id: the first colon parts them, whatever the id holds.
+/// A name without a colon, as the settings' own profiles bear, gives
+/// neither.
+#[cfg(feature = "in-process")]
+#[test]
+fn a_labels_profile_name_reads_back_its_policy_and_its_model() {
+    let tagged = RoutingSettings::label_profile("least_load", "org/m:v1");
+    let read = RoutingSettings::label_policy(&tagged);
+    assert_eq!(read, Some(("least_load", "org/m:v1")));
+    assert_eq!(RoutingSettings::label_policy("least_load"), None);
+    for name in PRESETS {
         let own = RoutingSettings::label_profile(name, "m");
-        assert_eq!(
-            RoutingSettings::label_policy(&own, "m"),
-            Some(name),
-            "{name}"
-        );
-        assert_eq!(RoutingSettings::label_policy(name, "m"), None, "{name}");
+        let read = RoutingSettings::label_policy(&own);
+        assert_eq!(read, Some((name, "m")), "{name}");
+        assert_eq!(RoutingSettings::label_policy(name), None, "{name}");
     }
 }
 
@@ -1699,11 +1702,12 @@ fn a_label_is_refused_by_its_model_and_its_policy() {
     );
 }
 
-/// A refused label fails alone. Two labels never refuse one another, so
-/// each stands or falls beside the settings alone: the refusal names the
-/// one that falls, and every subset of the labels that build builds. A
-/// subset's document holds its labels' bindings as the whole one holds
-/// them, in their order, ahead of the settings' own, and no other.
+/// A refused label fails alone. Short of the document's bounds two labels
+/// never refuse one another, so each stands or falls beside the settings
+/// alone: the refusal names the one that falls, and every subset of the
+/// labels that build builds. A subset's document holds its labels'
+/// bindings as the whole one holds them, in their order, ahead of the
+/// settings' own, and no other.
 #[test]
 fn labels_stand_or_fall_alone_beside_the_settings() {
     let settings = config(cache_aware_over(32));

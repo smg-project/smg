@@ -417,7 +417,9 @@ fn label_binding(
 /// The settings' own sides are written first and their bindings first, so
 /// a label changes none of them. It adds to the view's headers, and writes
 /// its model's own entry of the index. A label's ring keeps its blocks
-/// under every gateway: no document of a label's stood before it.
+/// under every gateway: no document of a label's stood before it. A label
+/// of the main policy is the exception: it writes the settings' own side
+/// again, and keeps what that side keeps.
 pub(super) fn written_with<'a>(
     config: &'a RoutingSettings,
     (mut document, bindings): Planned<'a>,
@@ -480,9 +482,9 @@ pub(super) fn written_with<'a>(
     // side. A label's side shares the document's one view with the sides
     // above, and a label's ring keeps its blocks beside the size they
     // name, in a gateway of many routers too: a label's ring is a new one.
-    // A label names the size a silent ring counts in, so it moves no ring
-    // of theirs and none of a label before it: its own side is the one to
-    // read.
+    // A label of the main policy is the exception, below. A label names
+    // the size a silent ring counts in, so it moves no ring of theirs and
+    // none of a label before it: its own side is the one to read.
     let single = bindings.iter().rposition(|sides| sides.len() == 1);
     let mut sides_of_labels = Vec::with_capacity(labels.len());
     let mut indexes_of_labels = Vec::with_capacity(labels.len());

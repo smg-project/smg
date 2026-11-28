@@ -136,8 +136,8 @@ async fn a_registration_decides_with_no_label_and_with_one_that_builds_nothing()
 /// shared profile. The model's leave builds the spec again without it.
 ///
 /// Where no binding names the model's id alone, that label stands and
-/// builds nothing. The main profile places the model, under the policy
-/// the label names.
+/// puts no spec in force. The main profile places the model, under the
+/// policy the label names.
 #[tokio::test]
 async fn a_label_of_the_settings_own_policy_gives_its_model_a_profile_of_its_own() {
     let policies = started(&round_robin());
