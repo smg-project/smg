@@ -168,9 +168,10 @@ pub(crate) struct StreamingToolHandler {
     /// call, read when the relay goes on with the turn, is dropped.
     dispatched_tool_call_indices: HashSet<usize>,
     /// The items other than function calls that the upstream opened behind
-    /// a hand-over and has not closed, by upstream output index: each as
-    /// announced, the text streamed for it since laid into its parts. A
-    /// turn cut or stopped there closes them (see [`Self::take_open_items`]).
+    /// a hand-over and whose closing event the client has not read, by
+    /// upstream output index: each as announced, the text streamed for it
+    /// since laid into its parts. A turn cut or stopped there closes them
+    /// (see [`Self::take_open_items`]).
     open_items: Vec<(usize, Value)>,
     /// The upstream output indices of the items other than function calls
     /// that the upstream closed behind a hand-over. The loop keeps those
@@ -292,9 +293,6 @@ impl StreamingToolHandler {
                 let done_output_index = extract_output_index(parsed);
                 if let Some(output_index) = done_output_index {
                     self.ensure_output_index(output_index);
-                    // The upstream closed the item: a cut has nothing to
-                    // close for it.
-                    self.open_items.retain(|(open, _)| *open != output_index);
                 }
                 // Only suppress the umbrella `output_item.done` when it is
                 // closing a tool-call item that we are intercepting — an
@@ -382,6 +380,13 @@ impl StreamingToolHandler {
                     // not match a second time for the same item).
                     StreamAction::Drop
                 } else {
+                    // The client reads this closing event: a cut has
+                    // nothing to close for the item. A closing event
+                    // dropped above (a hosted tool call's first) leaves
+                    // its item open.
+                    if let Some(output_index) = done_output_index {
+                        self.open_items.retain(|(open, _)| *open != output_index);
+                    }
                     // Behind a hand-over an item that is no function call
                     // reaches the client closed: the loop keeps it for the
                     // final response, among its own items. The accumulator
@@ -481,18 +486,25 @@ impl StreamingToolHandler {
     /// under the output index the client reads and closed the way a cut
     /// turn closes it: the item as announced with the text streamed for
     /// it, `incomplete` (a hosted tool call: `failed`, the status the skip
-    /// road gives a call of its type that did not run).
+    /// road gives a call of its type that did not run). An item the
+    /// upstream closed by an event the client did not read (a hosted tool
+    /// call's first `output_item.done`, dropped) is taken as the upstream
+    /// closed it and moves out of the accumulator.
     pub fn take_open_items(&mut self) -> Vec<(usize, Value)> {
         let open_items = std::mem::take(&mut self.open_items);
         open_items
             .into_iter()
             .map(|(upstream_index, mut item)| {
-                let status = match item.get("type").and_then(Value::as_str) {
-                    Some(item_type) if is_tool_call_item_type(item_type) => "failed",
-                    _ => "incomplete",
-                };
-                if let Some(obj) = item.as_object_mut() {
-                    obj.insert("status".to_string(), Value::String(status.to_string()));
+                if let Some(closed) = self.accumulator.take_output_item(upstream_index) {
+                    item = closed;
+                } else {
+                    let status = match item.get("type").and_then(Value::as_str) {
+                        Some(item_type) if is_tool_call_item_type(item_type) => "failed",
+                        _ => "incomplete",
+                    };
+                    if let Some(obj) = item.as_object_mut() {
+                        obj.insert("status".to_string(), Value::String(status.to_string()));
+                    }
                 }
                 let output_index = self
                     .mapped_output_index(upstream_index)

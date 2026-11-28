@@ -354,6 +354,55 @@ fn the_items_a_cut_would_leave_open_are_kept_with_their_text_behind_a_hand_over(
     assert!(handler.take_open_items().is_empty(), "taken once");
 }
 
+/// Behind a hand-over the first `output_item.done` of a hosted tool call
+/// is dropped, so the client has not read the item closed: a turn cut
+/// there closes it, as the upstream closed it. Once the upstream's second
+/// `output_item.done` is forwarded a cut has nothing to close for the item
+/// and the loop keeps it once.
+#[test]
+fn a_hosted_call_stays_open_behind_a_hand_over_until_its_closing_is_forwarded() {
+    fn behind_the_dropped_closing() -> (StreamingToolHandler, Value, Value) {
+        let mut handler = StreamingToolHandler::with_starting_index(3);
+        bootstrap_function_call_added(&mut handler);
+        let action = handler.process_parsed(
+            None,
+            &json!({
+                "type": "response.function_call_arguments.done", "output_index": 0,
+                "item_id": "fc_test", "arguments": "{}"
+            }),
+        );
+        assert!(
+            matches!(action, StreamAction::ExecuteTools { .. }),
+            "{action:?}"
+        );
+        assert_eq!(handler.take_pending_calls().len(), 1);
+
+        let search = json!({"type": "web_search_call", "id": "ws_1", "status": "in_progress"});
+        handler.process_parsed(
+            None,
+            &json!({"type": "response.output_item.added", "output_index": 1, "item": search}),
+        );
+        let closed = json!({
+            "type": "web_search_call", "id": "ws_1", "status": "completed",
+            "action": {"type": "search", "query": "q"}
+        });
+        let done = json!({"type": "response.output_item.done", "output_index": 1, "item": closed});
+        let action = handler.process_parsed(None, &done);
+        assert!(matches!(action, StreamAction::Drop), "{action:?}");
+        (handler, done, closed)
+    }
+
+    let (mut cut, _, closed) = behind_the_dropped_closing();
+    assert_eq!(cut.take_open_items(), [(4, closed)]);
+    assert!(cut.take_closed_items().is_empty());
+
+    let (mut relayed, done, closed) = behind_the_dropped_closing();
+    let action = relayed.process_parsed(None, &done);
+    assert!(matches!(action, StreamAction::Forward), "{action:?}");
+    assert!(relayed.take_open_items().is_empty());
+    assert_eq!(relayed.take_closed_items(), [(4, closed)]);
+}
+
 #[test]
 fn output_item_done_for_unrelated_item_forwards_even_with_pending_call() {
     // Regression for PR #1369 review (chatgpt-codex-connector P1):
