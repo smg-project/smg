@@ -36,9 +36,12 @@ from __future__ import annotations
 
 import importlib.metadata
 import json
+import logging
 import re
 from collections.abc import Callable
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 # The `server_args` keys (SGLang, TokenSpeed) and the `GetServerInfo` fields
 # (vLLM) the Router reads the labels from. The parser rides under a name of its
@@ -333,8 +336,10 @@ def answer_schema_the_engine_judges(
     before a tag carried the bound; a tag without the bound is not one the
     bound brought and stays a tag. ``validate`` hands a plain schema to the
     engine's own validation, which raises where it refuses: no rule of the
-    engine is kept here, and an error of any kind reads as a refusal. An
-    engine that has none (None) gets the schema for every such tag."""
+    engine is kept here, and an error of any kind reads as a refusal. The
+    debug log holds that error, so a request of the engine's own class that
+    a later release no longer takes shows as what it is. An engine that has
+    none (None) gets the schema for every such tag."""
     schema = answer_schema_in_place_of_tag(
         structural_tag, grammar_backend, ("auto", "xgrammar"), bounded=True
     )
@@ -342,6 +347,7 @@ def answer_schema_the_engine_judges(
         return schema
     try:
         validate(schema)
-    except Exception:
+    except Exception as error:
+        logger.debug("the engine's validation raised on the plain schema: %r", error)
         return schema
     return None

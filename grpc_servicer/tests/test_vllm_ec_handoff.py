@@ -472,3 +472,20 @@ def test_an_engine_without_the_judge_gets_the_schema_for_an_answer_tag():
     for backend in ("auto", "xgrammar"):
         assert constrained_decoding.answer_schema_the_engine_judges(tag, backend, None) == schema
     assert constrained_decoding.answer_schema_the_engine_judges(tag, "guidance", None) is None
+
+
+def test_the_judges_error_reaches_the_debug_log(caplog):
+    """An error of the judge reads as a refusal, of whatever kind, and the
+    schema goes as the schema; the debug log holds the error itself, so a
+    request the engine's validation no longer takes does not read as a schema
+    the engine refused."""
+    schema = '{"type":"object"}'
+    tag = '{"format":{"type":"json_schema","json_schema":' + schema + ',"max_whitespace_cnt":32}}'
+
+    def broken(_plain):
+        raise TypeError("an argument the request lacks")
+
+    with caplog.at_level(logging.DEBUG, logger=constrained_decoding.__name__):
+        judged = constrained_decoding.answer_schema_the_engine_judges(tag, "xgrammar", broken)
+    assert judged == schema
+    assert "TypeError('an argument the request lacks')" in caplog.text
