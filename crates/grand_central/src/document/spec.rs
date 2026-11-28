@@ -463,7 +463,8 @@ pub struct ViewSpec {
     /// `x-goog-api-key`, the host's tenant header) is refused. Every header a
     /// binding's `sessions`, `canary` or `match.header` names must be listed
     /// here. At most 256: a view names a header by its position in one byte.
-    #[schemars(length(max = 256))]
+    #[schemars(length(max = 256), inner(regex(pattern = HEADER_NAME_PATTERN)))]
+    #[schemars(extend("uniqueItems" = true))]
     pub headers: Vec<String>,
     /// The token block size the host hashes prefixes by when no engine has
     /// published one; absent, the host's own default. The block size of
@@ -497,14 +498,16 @@ pub struct ViewSpec {
     /// first `=`. A worker's row holds one bit for each selector it meets,
     /// in this order. At most 64; empty for none.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    #[schemars(length(max = 64))]
+    #[schemars(length(max = 64), inner(regex(pattern = LABEL_SELECTOR_PATTERN)))]
+    #[schemars(extend("uniqueItems" = true))]
     pub labels: Vec<String>,
     /// The zones a stage may tell apart. A worker's row names its zone by
     /// its position in this list, from 1; a worker with no zone reads 0,
     /// and so does one whose zone this list does not name. At most 256;
     /// empty for none, where every row reads 0.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    #[schemars(length(max = 256))]
+    #[schemars(length(max = 256), inner(length(min = 1)))]
+    #[schemars(extend("uniqueItems" = true))]
     pub zones: Vec<String>,
     /// The engine families a stage may tell apart, spelled as a worker's
     /// registration spells its own. A worker's row names its family by its
@@ -512,7 +515,8 @@ pub struct ViewSpec {
     /// not name reads 0. At most 64; empty for none, where every row reads
     /// 0.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    #[schemars(length(max = 64))]
+    #[schemars(length(max = 64), inner(length(min = 1)))]
+    #[schemars(extend("uniqueItems" = true))]
     pub engines: Vec<String>,
 }
 
@@ -2223,6 +2227,7 @@ pub struct Bounds<T> {
 #[non_exhaustive]
 pub struct HeaderMatch {
     /// The header's name, lowercase, listed in `view.headers`.
+    #[schemars(extend("pattern" = HEADER_NAME_PATTERN))]
     pub name: String,
     /// The values that match; empty matches the header's presence.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2236,12 +2241,14 @@ pub struct HeaderMatch {
 pub struct Match {
     /// The model id after aliasing: an exact id, `prefix*`, `*suffix` or
     /// `*`.
+    #[schemars(extend("pattern" = MODEL_GLOB_PATTERN))]
     pub model: String,
     /// The phases the binding covers; empty covers every phase. A plan with
     /// several sides names every side's phase or none.
     pub phase: Vec<Phase>,
     /// The tenant the request resolved to.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
     pub tenant: Option<String>,
     /// The priority band the request carries, as a closed range.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2254,6 +2261,7 @@ pub struct Match {
     pub prompt_tokens: Option<Bounds<u32>>,
     /// Registration labels the binding is restricted to.
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schemars(extend("uniqueItems" = true))]
     pub labels: Vec<String>,
 }
 
@@ -2457,11 +2465,14 @@ pub struct SessionsSpec {
     /// Left out where the binding names its key's sources under
     /// `routing_key`: a binding names them once.
     #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[schemars(extend("pattern" = STICKY_HEADER_PATTERN))]
     pub sticky_header: String,
     /// The headers looked up in order for the key, the sticky header among
     /// them; empty means the sticky header alone. Each listed in
     /// `view.headers`. Left out under `routing_key` too.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(inner(regex(pattern = HEADER_NAME_PATTERN)))]
+    #[schemars(extend("uniqueItems" = true))]
     pub headers: Vec<String>,
     /// How long an idle key stays pinned, in seconds, before the rule's
     /// next sweep forgets it; above zero (default 14400), `4294967295` for
@@ -2552,6 +2563,7 @@ pub struct RoutingKeySpec {
     /// The sources, read in order: one to eight, each named once, with up
     /// to four client sources and one target source beside them.
     #[schemars(length(min = 1, max = 13))]
+    #[schemars(extend("uniqueItems" = true))]
     pub sources: Vec<KeySourceSpec>,
     /// Take the turn and retry suffixes off a key, so every turn of a
     /// conversation shares one (`conv_t2_r1` keys as `conv`); default
@@ -2586,6 +2598,7 @@ pub struct KeySourceSpec {
     /// `view.headers`; `cookie` is not. A key from a header `view.headers`
     /// does not list leaves as its fingerprint alone.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("pattern" = HEADER_NAME_PATTERN))]
     pub header: Option<String>,
     /// The request's own id, the `rid` of its body: `true` names it. Under
     /// a ring's prefix form (`prefix_tokens`) its key names the session
@@ -2651,6 +2664,7 @@ pub struct CanarySpec {
     pub percent: Option<u8>,
     /// The tenants whose requests the canary decides.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(extend("uniqueItems" = true))]
     pub tenants: Vec<String>,
     /// A request header that selects the canary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2909,6 +2923,7 @@ const SIGNAL_UNIT_PATTERN: &str = "^[!-~]*$";
 pub struct PolicySpec {
     /// `smg.policy/v1`.
     #[serde(rename = "apiVersion")]
+    #[schemars(extend("const" = API_VERSION))]
     pub api_version: String,
     /// The document's generation: written by the operator, or by the apply
     /// that persisted it.
@@ -2933,6 +2948,7 @@ pub struct PolicySpec {
         deserialize_with = "keyed_once",
         skip_serializing_if = "BTreeMap::is_empty"
     )]
+    #[schemars(extend("propertyNames" = { "pattern": MODEL_GLOB_PATTERN }))]
     pub index: BTreeMap<String, IndexSpec>,
     /// The signals the document's stages read, by name: a lower-case
     /// letter, then lower-case letters, digits and underscores, at most 63
@@ -3191,6 +3207,9 @@ fn at_least_one<T: Into<f64>>(v: T) -> bool {
     v.is_finite() && v >= 1.0
 }
 
+/// A model glob as the schema states it: the forms [`glob_ok`] takes.
+const MODEL_GLOB_PATTERN: &str = r"^(\*[^*]*|[^*]+\*?)$";
+
 /// The matcher understands an id, `prefix*`, `*suffix` and `*`; any other
 /// star would match only its literal self.
 fn glob_ok(model: &str) -> bool {
@@ -3198,6 +3217,16 @@ fn glob_ok(model: &str) -> bool {
     !model.is_empty()
         && (stars == 0 || (stars == 1 && (model.starts_with('*') || model.ends_with('*'))))
 }
+
+/// A header name as the schema states it: one or more of the characters
+/// [`check_header_outside`] takes. The deny-lists have no form in a
+/// pattern: a name on one passes the schema and validation refuses it.
+const HEADER_NAME_PATTERN: &str = r"^[a-z0-9!#$%&'*+.^_`|~-]+$";
+
+/// The sticky header as the schema states it: a header name
+/// ([`HEADER_NAME_PATTERN`]), or nothing where the binding names its key's
+/// sources under `routing_key`.
+const STICKY_HEADER_PATTERN: &str = r"^[a-z0-9!#$%&'*+.^_`|~-]*$";
 
 /// A lowercase header name outside the deny-lists.
 fn check_header_name(name: &str, path: String, denied: &[&str]) -> Result<(), SpecError> {
@@ -3305,6 +3334,10 @@ fn check_view(view: &ViewSpec, denied: &[&str]) -> Result<(), SpecError> {
     check_list(&view.zones, "view.zones", MAX_ZONES)?;
     check_list(&view.engines, "view.engines", MAX_ENGINES)
 }
+
+/// A label selector as the schema states it: `key`, or `key=value` split
+/// at the first `=`, with no empty side, as [`check_view`] takes it.
+const LABEL_SELECTOR_PATTERN: &str = r"^[^=]+(=[\s\S]+)?$";
 
 /// A label selector's two sides: the key, and the value after the first
 /// `=` when it names one.

@@ -8,7 +8,8 @@ use std::{collections::BTreeSet, fs, path::Path};
 use serde_json::Value;
 use smg_grand_central::{
     document::{
-        PolicySpec, MAX_BLOCK_HASHES, MAX_ENGINES, MAX_HEADERS, MAX_LABELS, MAX_SIGNALS, MAX_ZONES,
+        PolicySpec, API_VERSION, MAX_BLOCK_HASHES, MAX_ENGINES, MAX_HEADERS, MAX_LABELS,
+        MAX_SIGNALS, MAX_ZONES,
     },
     stages::StageRegistry,
 };
@@ -393,4 +394,98 @@ fn the_schema_names_every_section_and_refuses_unknown_properties() {
     let profiles = &root["properties"]["profiles"];
     assert_eq!(profiles["minProperties"], 1);
     assert_eq!(profiles["maxProperties"], u16::MAX);
+}
+
+/// A property of one of the schema's definitions.
+fn property<'a>(schema: &'a Value, def: &str, name: &str) -> &'a Value {
+    &schema["$defs"][def]["properties"][name]
+}
+
+/// A header name's characters, as the validator takes them.
+const HEADER_NAME: &str = "^[a-z0-9!#$%&'*+.^_`|~-]+$";
+
+/// A model glob's forms, as the validator takes them.
+const MODEL_GLOB: &str = r"^(\*[^*]*|[^*]+\*?)$";
+
+// The rules the validator holds on one key are the schema's too, so an
+// editor refuses on shape what apply would refuse.
+
+#[test]
+fn the_schema_states_the_api_version() {
+    let schema = serde_json::to_value(PolicySpec::schema()).expect("a JSON value");
+    assert_eq!(schema["properties"]["apiVersion"]["const"], API_VERSION);
+}
+
+#[test]
+fn the_schema_states_a_header_name_wherever_a_document_writes_one() {
+    let schema = serde_json::to_value(PolicySpec::schema()).expect("a JSON value");
+    for (def, list) in [("ViewSpec", "headers"), ("SessionsSpec", "headers")] {
+        assert_eq!(
+            property(&schema, def, list)["items"]["pattern"],
+            HEADER_NAME,
+            "{def}.{list}"
+        );
+    }
+    for (def, name) in [("HeaderMatch", "name"), ("KeySourceSpec", "header")] {
+        assert_eq!(
+            property(&schema, def, name)["pattern"],
+            HEADER_NAME,
+            "{def}.{name}"
+        );
+    }
+    // A binding that names `routing_key` leaves the sticky header out, so
+    // the same characters are taken there with none at all.
+    assert_eq!(
+        property(&schema, "SessionsSpec", "sticky_header")["pattern"],
+        "^[a-z0-9!#$%&'*+.^_`|~-]*$"
+    );
+}
+
+#[test]
+fn the_schema_refuses_an_empty_name() {
+    let schema = serde_json::to_value(PolicySpec::schema()).expect("a JSON value");
+    for list in ["zones", "engines"] {
+        assert_eq!(
+            property(&schema, "ViewSpec", list)["items"]["minLength"],
+            1,
+            "{list}"
+        );
+    }
+    // A label selector is `key` or `key=value` with no empty side.
+    assert_eq!(
+        property(&schema, "ViewSpec", "labels")["items"]["pattern"],
+        r"^[^=]+(=[\s\S]+)?$"
+    );
+    assert_eq!(property(&schema, "Match", "tenant")["minLength"], 1);
+}
+
+#[test]
+fn the_schema_refuses_a_name_listed_twice() {
+    let schema = serde_json::to_value(PolicySpec::schema()).expect("a JSON value");
+    for (def, list) in [
+        ("ViewSpec", "headers"),
+        ("ViewSpec", "labels"),
+        ("ViewSpec", "zones"),
+        ("ViewSpec", "engines"),
+        ("SessionsSpec", "headers"),
+        ("RoutingKeySpec", "sources"),
+        ("Match", "labels"),
+        ("CanarySpec", "tenants"),
+    ] {
+        assert_eq!(
+            property(&schema, def, list)["uniqueItems"],
+            true,
+            "{def}.{list}"
+        );
+    }
+}
+
+#[test]
+fn the_schema_states_the_forms_of_a_model_glob() {
+    let schema = serde_json::to_value(PolicySpec::schema()).expect("a JSON value");
+    assert_eq!(property(&schema, "Match", "model")["pattern"], MODEL_GLOB);
+    assert_eq!(
+        schema["properties"]["index"]["propertyNames"]["pattern"],
+        MODEL_GLOB
+    );
 }
