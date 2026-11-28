@@ -239,7 +239,7 @@ impl TokenSpeedScheduler for MockScheduler {
         if let Some(recorded) = script::recorded_info(MODEL_INFO_CALL) {
             let mut info = ts::GetModelInfoResponse::decode(recorded.as_slice())
                 .map_err(|e| Status::internal(format!("the recorded model info: {e}")))?;
-            if self.cfg.tokenizer_path != self.cfg.model_id {
+            if super::own_tokenizer(&self.cfg) {
                 info.tokenizer_path.clone_from(&self.cfg.tokenizer_path);
             }
             return Ok(Response::new(info));

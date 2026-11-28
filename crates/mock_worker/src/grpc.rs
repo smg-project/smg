@@ -76,17 +76,24 @@ fn recorded_model() -> Option<RecordedModel> {
         .or_else(sglang::recorded_model)
 }
 
+/// Whether a replay was started with a tokenizer of its own, which it then
+/// states in place of the recorded one: a path that is stated (a config
+/// built in process may state none) and is not the model id (what the
+/// command line lays where the flag is absent).
+fn own_tokenizer(cfg: &Config) -> bool {
+    !cfg.tokenizer_path.is_empty() && cfg.tokenizer_path != cfg.model_id
+}
+
 /// Lay the tokenizer path a replay was started with over the entry `key` of
 /// its recorded server arguments. An engine names its tokenizer there as
 /// well as in the model info and a gateway reads both, so the path of the
 /// command line goes in both places. Arguments without the entry stay as
-/// recorded, and so does a replay with no tokenizer of its own: none stated
-/// (a config built in process) or the model id (what the command line lays
-/// where the flag is absent).
+/// recorded, and so does a replay with no tokenizer of its own
+/// ([`own_tokenizer`]).
 fn state_tokenizer(cfg: &Config, args: Option<&mut prost_types::Struct>, key: &str) {
     use prost_types::value::Kind;
 
-    if cfg.tokenizer_path.is_empty() || cfg.tokenizer_path == cfg.model_id {
+    if !own_tokenizer(cfg) {
         return;
     }
     let Some(entry) = args.and_then(|args| args.fields.get_mut(key)) else {
