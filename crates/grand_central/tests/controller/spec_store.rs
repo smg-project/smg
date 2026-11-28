@@ -25,15 +25,15 @@
     dead_code,
     reason = "this binary reads the admin pages alone; the other helpers are the listeners' tests'"
 )]
-#[path = "common/net.rs"]
+#[path = "../common/net.rs"]
 mod net;
 #[expect(
     dead_code,
     reason = "the election's record and the lease object's replicas are the replicas cases'"
 )]
-#[path = "common/replicas.rs"]
+#[path = "../common/replicas.rs"]
 mod replicas;
-#[path = "common/spec.rs"]
+#[path = "../common/spec.rs"]
 mod spec;
 
 use std::{

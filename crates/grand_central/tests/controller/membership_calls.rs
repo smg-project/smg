@@ -21,13 +21,13 @@
     dead_code,
     reason = "this binary reads one admin page; the other helpers are the listeners' tests'"
 )]
-#[path = "common/net.rs"]
+#[path = "../common/net.rs"]
 mod net;
 #[expect(
     dead_code,
     reason = "the failover helpers are the replicas case's and the election cells'"
 )]
-#[path = "common/replicas.rs"]
+#[path = "../common/replicas.rs"]
 mod replicas;
 
 use std::{

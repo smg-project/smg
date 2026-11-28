@@ -89,9 +89,9 @@
     dead_code,
     reason = "this binary's engines run on runtimes of their own; the engine served on the test's runtime is the load path's"
 )]
-#[path = "common/engines.rs"]
+#[path = "../common/engines.rs"]
 mod engines;
-#[path = "common/fleet.rs"]
+#[path = "../common/fleet.rs"]
 mod fleet;
 #[cfg(feature = "wasm")]
 #[expect(
@@ -102,12 +102,12 @@ mod fleet;
     clippy::expect_used,
     reason = "the served plugin runs inside the case; a failure there is the case's failure"
 )]
-#[path = "support/grpc_plugin.rs"]
+#[path = "../support/grpc_plugin.rs"]
 mod grpc_plugin;
 #[expect(dead_code, reason = "this binary reads no admin page")]
-#[path = "common/net.rs"]
+#[path = "../common/net.rs"]
 mod net;
-#[path = "common/pair.rs"]
+#[path = "../common/pair.rs"]
 mod pair;
 #[cfg(feature = "wasm")]
 #[expect(
@@ -118,7 +118,7 @@ mod pair;
     clippy::expect_used,
     reason = "the guest's assembly runs inside the case; a failure there is the case's failure"
 )]
-#[path = "support/wasm_guest.rs"]
+#[path = "../support/wasm_guest.rs"]
 mod wasm_guest;
 
 use std::time::{Duration, Instant};

@@ -19,7 +19,7 @@
     dead_code,
     reason = "the failover helpers are the replicas case's and the election cells'"
 )]
-#[path = "common/replicas.rs"]
+#[path = "../common/replicas.rs"]
 mod replicas;
 
 use std::{
