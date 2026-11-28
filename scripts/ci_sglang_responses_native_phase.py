@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Responses' common native phases; model installers and activation are separate.
+"""Explicit Responses/chat common native phases; installers and activation are separate.
 
 The caller supplies an already owned A5 cohort and retains every model-specific
-preflight, full Responses selection, strict process cleanup and nonce cleanup.
+preflight, full caller selection, strict process cleanup and nonce cleanup.
 This component never discovers providers, patches an SDK or changes a gate.
 """
 
@@ -29,6 +29,72 @@ IMAGE = (
 )
 
 
+CONTEXTS = {
+    "responses": {
+        "binding": "responses_binding",
+        "consumer": "responses_consumer_sha256",
+        "producer": "responses_producer_contract_sha256",
+        "prefix": "responses",
+        "env": (
+            "SMG_RESPONSES_SHA256",
+            "SMG_RESPONSES_COHORT_SHA256",
+            "SMG_GPTOSS_COHORT_MANIFEST_SHA256",
+        ),
+    },
+    "chat": {
+        "binding": "chat_binding",
+        "consumer": "chat_consumer_sha256",
+        "producer": "chat_producer_contract_sha256",
+        "prefix": "chat",
+        "env": (
+            "SMG_CHAT_SHA256",
+            "SMG_CHAT_COHORT_SHA256",
+            "SMG_GPTOSS_CHAT_COHORT_MANIFEST_SHA256",
+        ),
+    },
+}
+
+
+def context_settings(context):
+    if not isinstance(context, str) or context not in CONTEXTS:
+        raise ValueError("Explicit responses or chat native context required")
+    return CONTEXTS[context]
+
+
+def selected_binding(spec, context):
+    config = context_settings(context)
+    other = CONTEXTS["chat" if context == "responses" else "responses"]
+    if (
+        any(other[key] in spec for key in ("binding", "consumer", "producer"))
+        or spec.get("native_consumer_context", "responses") != context
+    ):
+        raise ValueError("Native consumer context or binding differs")
+    if not isinstance(spec.get(config["binding"]), dict):
+        if context == "responses":
+            raise ValueError("Responses Source, workflow or job nonce differs")
+        raise ValueError("Native consumer context or binding differs")
+    if context == "chat":
+        for key in ("consumer", "producer"):
+            pin = spec.get(config[key])
+            if (
+                not isinstance(pin, str)
+                or len(pin) != 64
+                or any(c not in "0123456789abcdef" for c in pin)
+            ):
+                raise ValueError("Complete chat consumer and producer Source pins required")
+    return spec[config["binding"]]
+
+
+def cohort_context(cohort):
+    context = cohort.get("context", "responses")
+    context_settings(context)
+    return context
+
+
+def report_path(directory, cohort, suffix):
+    return directory / (context_settings(cohort_context(cohort))["prefix"] + "-" + suffix + ".json")
+
+
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
@@ -47,7 +113,7 @@ def job_identity():
     return result
 
 
-def active_manifest(path, expected_sha, nonce):
+def active_manifest(path, expected_sha, nonce, context="responses"):
     """Reject missing, foreign or changed cohorts before pip/native execution."""
     path = Path(path).absolute()
     body = path.read_bytes()
@@ -73,7 +139,7 @@ def active_manifest(path, expected_sha, nonce):
         or Path(sys.prefix).resolve() != prefix
     ):
         raise ValueError("Matching active isolated Responses cohort required")
-    binding = spec.get("responses_binding", {})
+    binding = selected_binding(spec, context)
     if (
         binding.get("source_sha256") != source_hashes()
         or binding.get("workflow_sha256")
@@ -95,7 +161,10 @@ def active_manifest(path, expected_sha, nonce):
     require_no_pending_transaction(spec)
     # No model flag is changed here. A5's strict observer retains its original
     # PRE/POST contract; only the separately reviewed model owner may install it.
-    return {"path": path, "sha256": expected_sha, "spec": spec}
+    result = {"path": path, "sha256": expected_sha, "spec": spec}
+    if context != "responses":
+        result["context"] = context
+    return result
 
 
 def require_no_pending_transaction(spec):
@@ -105,21 +174,28 @@ def require_no_pending_transaction(spec):
 
 
 def manifest_identity(cohort):
-    return {
+    context = cohort_context(cohort)
+    config = context_settings(context)
+    identity = {
         "manifest": str(cohort["path"]),
         "sha256": cohort["sha256"],
-        "responses_binding": cohort["spec"]["responses_binding"],
-        "consumer_sha256": cohort["spec"].get("responses_consumer_sha256"),
-        "producer_contract_sha256": cohort["spec"].get("responses_producer_contract_sha256"),
+        config["binding"]: selected_binding(cohort["spec"], context),
+        "consumer_sha256": cohort["spec"].get(config["consumer"]),
+        "producer_contract_sha256": cohort["spec"].get(config["producer"]),
     }
+    if context != "responses":
+        identity["consumer_context"] = context
+    return identity
 
 
 def require_completed_install(directory, cohort):
     require_no_pending_transaction(cohort["spec"])
     identity = manifest_identity(cohort)
     try:
-        installed = json.loads((directory / "responses-cohort-install.json").read_text())
-        committed = json.loads((directory / "responses-native-manifest-commit-2.json").read_text())
+        installed = json.loads(report_path(directory, cohort, "cohort-install").read_text())
+        committed = json.loads(
+            report_path(directory, cohort, "native-manifest-commit-2").read_text()
+        )
     except (OSError, ValueError) as error:
         raise ValueError(
             "Incomplete Responses native installation: receipts missing or invalid"
@@ -195,7 +271,7 @@ def install_native(cohort, directory):
         check=True,
         timeout=60,
     )
-    with (directory / "responses-manifest-before-install.json").open("x") as saved:
+    with report_path(directory, cohort, "manifest-before-install").open("x") as saved:
         saved.write(cohort["path"].read_text())
     for stage, complete in enumerate(
         (["--force-reinstall", "--no-deps", *arguments], arguments), 1
@@ -206,16 +282,12 @@ def install_native(cohort, directory):
         previous = cohort["sha256"]
         rebind_native(cohort, native)
         receipt = {**manifest_identity(cohort), "previous_sha256": previous}
-        with (directory / f"responses-native-manifest-commit-{stage}.json").open("x") as output:
+        with report_path(directory, cohort, f"native-manifest-commit-{stage}").open("x") as output:
             output.write(json.dumps(receipt, indent=2) + "\n")
             output.flush()
             os.fsync(output.fileno())
         with env_file.open("a") as output:
-            for key in (
-                "SMG_RESPONSES_SHA256",
-                "SMG_RESPONSES_COHORT_SHA256",
-                "SMG_GPTOSS_COHORT_MANIFEST_SHA256",
-            ):
+            for key in context_settings(cohort_context(cohort))["env"]:
                 output.write(key + "=" + cohort["sha256"] + "\n")
             output.flush()
             os.fsync(output.fileno())
@@ -298,7 +370,7 @@ def verify_phase(phase, directory, cohort):
         report["error"] = {"type": type(error).__name__, "message": str(error)}
         raise
     finally:
-        with (directory / ("responses-native-" + phase + ".json")).open("x") as output:
+        with report_path(directory, cohort, "native-" + phase).open("x") as output:
             output.write(json.dumps(report, indent=2) + "\n")
     contract = {
         "native": report,
@@ -306,8 +378,10 @@ def verify_phase(phase, directory, cohort):
         "source_sha256": source_hashes(),
         "job": job_identity(),
     }
+    if cohort_context(cohort) != "responses":
+        contract["consumer_context"] = cohort_context(cohort)
     if phase == "final":
-        prepared = json.loads((directory / "responses-cohort-prepared.json").read_text())
+        prepared = json.loads(report_path(directory, cohort, "cohort-prepared").read_text())
         if prepared.get("status") != "passed" or prepared.get("contract") != contract:
             raise ValueError("Prepared/final Responses native contract differs")
     return {"status": "passed", "phase": phase, "contract": contract}
@@ -320,6 +394,7 @@ def main(argv=None):
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--sha256", required=True)
     parser.add_argument("--nonce", required=True)
+    parser.add_argument("--context", choices=tuple(CONTEXTS), default="responses")
     args = parser.parse_args(argv)
     args.directory.mkdir(exist_ok=True)
     result = {
@@ -328,9 +403,16 @@ def main(argv=None):
         "scope": "generic_native_component_only",
         "model_qualification_not_proved": list(MODELS),
     }
-    with (args.directory / ("responses-cohort-" + args.phase + ".json")).open("x") as output:
+    if args.context != "responses":
+        result.pop("model_qualification_not_proved")
+        result.update(consumer_context=args.context, caller_models_not_qualified=True)
+    prefix = context_settings(args.context)["prefix"]
+    with (args.directory / (prefix + "-cohort-" + args.phase + ".json")).open("x") as output:
         try:
-            cohort = active_manifest(args.manifest, args.sha256, args.nonce)
+            if args.context == "responses":
+                cohort = active_manifest(args.manifest, args.sha256, args.nonce)
+            else:
+                cohort = active_manifest(args.manifest, args.sha256, args.nonce, args.context)
             if args.phase == "install":
                 install_native(cohort, args.directory)
                 result["status"] = "passed"

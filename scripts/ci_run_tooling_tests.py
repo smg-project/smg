@@ -16,6 +16,10 @@ BASELINE = (
 COMPONENTS = (
     (
         "scripts/ci_sglang_responses_native_phase.py",
+        "scripts/tests/test_ci_sglang_native_consumer_context.py",
+    ),
+    (
+        "scripts/ci_sglang_responses_native_phase.py",
         "scripts/tests/test_ci_sglang_responses_native_phase.py",
     ),
     (
