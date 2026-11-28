@@ -694,7 +694,9 @@ struct RoutingArgs {
     /// Warm-up slice for cache-aware routing: for this many seconds after a
     /// worker becomes routable, until its index has grown by
     /// --worker-warmup-blocks blocks, one cache miss in 1/--worker-warmup-share
-    /// is routed to it so it builds a cache instead of idling. 0 disables.
+    /// is routed to it so it builds a cache instead of idling. A thin worker
+    /// that holds nothing is thin for as long (--worker-warmup-thin-ratio).
+    /// 0 disables.
     #[arg(long, default_value_t = 60, help_heading = "Routing Policy")]
     worker_warmup_secs: u64,
 
@@ -712,7 +714,9 @@ struct RoutingArgs {
     /// (or nothing) is thin and receives the warm-up slice until it has grown
     /// by --worker-warmup-blocks, whatever emptied it (a resync after a
     /// publisher restart, an out-of-range or data-loss resubscription, an
-    /// engine that came back empty). A finite value from 0.0 to 1.0; 0 keeps
+    /// engine that came back empty). A worker that holds nothing is thin for
+    /// --worker-warmup-secs alone, counted from when it became routable or
+    /// its index was last emptied. A finite value from 0.0 to 1.0; 0 keeps
     /// the age rule alone.
     #[arg(long, default_value_t = 0.5, help_heading = "Routing Policy")]
     worker_warmup_thin_ratio: f32,

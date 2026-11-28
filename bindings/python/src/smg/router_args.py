@@ -1376,7 +1376,8 @@ class RouterArgs:
                 " a worker becomes routable, until its index has grown by"
                 " --worker-warmup-blocks blocks, one cache miss in"
                 " 1/--worker-warmup-share is routed to it so it builds a cache"
-                " instead of idling. 0 disables. Defaults to 60."
+                " instead of idling. A thin worker that holds nothing is thin for"
+                " as long (--worker-warmup-thin-ratio). 0 disables. Defaults to 60."
             ),
         )
         routing_group.add_argument(
@@ -1405,6 +1406,8 @@ class RouterArgs:
                 "A worker whose index holds less than this share of the fleet's"
                 " median (or nothing) is thin and receives the warm-up slice until"
                 " it has grown by --worker-warmup-blocks, whatever emptied it. A"
+                " worker that holds nothing is thin for --worker-warmup-secs alone,"
+                " counted from when it became routable or its index was last emptied. A"
                 " finite value from 0.0 to 1.0; 0 keeps the age rule alone. Defaults to 0.5."
             ),
         )

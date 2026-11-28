@@ -553,11 +553,15 @@ static EPOCH: OnceLock<Instant> = OnceLock::new();
 /// worker (the least-loaded one) so it builds a cache instead of idling behind
 /// the fleet's affinity. A worker is warming for `secs` after it became
 /// routable, until its index has gained `blocks` blocks since (a new worker's
-/// first cache), or, whatever its age, while its index is thin: holding less
-/// than `thin_ratio` of the fleet's level (the median over healthy workers) or
-/// nothing at all. A resync after a publisher restart, an `OUT_OF_RANGE` or
-/// `DATA_LOSS`, or an engine that came back empty leaves a worker whose every
-/// prompt has an overlap elsewhere, so no miss would ever reach it otherwise;
+/// first cache), or, whatever its age, while its index is thin: holding a
+/// block and less than `thin_ratio` of the fleet's level (the median over
+/// healthy workers). A worker that holds nothing warms for `secs` alone,
+/// counted from when it became routable or from when its index was last
+/// emptied: a fleet where no worker joined and no index was emptied sends
+/// nothing to a worker only because it never held a cache. A resync after a
+/// publisher restart, an `OUT_OF_RANGE` or `DATA_LOSS`, or an engine that
+/// came back empty leaves a worker whose every prompt has an overlap
+/// elsewhere, so no miss would ever reach it otherwise; from its first block
 /// it stays warming until it crosses the ratio, however many blocks it regains
 /// on the way (the `blocks` cap bounds the age rule only: on the churn run a
 /// worker that regrew to 1,765 of a 32,767 level was dropped at the cap after
@@ -580,8 +584,12 @@ impl Warmup {
     /// Whether a worker admitted `age` ago, holding `indexed` blocks against a
     /// fleet level of `fleet_level`, whose index has gained `growth` blocks
     /// since its admission (`None` when the index has never seen it; the
-    /// baseline restarts when the count drops), is warming up: thin against
-    /// the fleet, or young and short of its first `blocks`.
+    /// baseline restarts when the count drops), is warming up: holding a
+    /// block and thin against the fleet, or young and short of its first
+    /// `blocks`. A worker that holds nothing is thin for a window alone, on
+    /// the worker's warm-up clock (`Worker::warmup_age`, which starts again
+    /// where its index is emptied): its caller rules that clause, as
+    /// [`Self::is_thin`] of nothing while that clock reads under `secs`.
     pub fn applies(
         &self,
         age: Duration,
@@ -590,7 +598,7 @@ impl Warmup {
         fleet_level: usize,
     ) -> bool {
         self.share > 0.0
-            && (self.is_thin(indexed, fleet_level)
+            && ((indexed > 0 && self.is_thin(indexed, fleet_level))
                 || (age < self.secs && growth.is_none_or(|blocks| blocks < self.blocks)))
     }
 
@@ -2454,7 +2462,21 @@ mod tests {
             warmup.applies(old, Some(180), 180, 30_000),
             "emptied: thin, 180 blocks regrown"
         );
-        assert!(warmup.applies(old, Some(0), 0, 30_000), "empty outright");
+        // Emptied outright it is thin for a window alone, which its caller
+        // rules by the worker's warm-up clock: here a worker that holds
+        // nothing warms only while it is young.
+        assert!(
+            warmup.applies(Duration::from_secs(10), Some(0), 0, 30_000),
+            "empty and young"
+        );
+        assert!(
+            !warmup.applies(old, Some(0), 0, 30_000),
+            "empty and old: its window is its caller's to rule"
+        );
+        assert!(
+            warmup.applies(old, Some(1), 1, 30_000),
+            "from its first block it is thin whatever its age"
+        );
         // Churn c3: the index regrew to 1,765 of a 32,767 level within a
         // minute of the clear (the decode blocks of the requests in flight)
         // and the cap meant for a new worker's first cache ended the warm-up
@@ -2488,11 +2510,11 @@ mod tests {
             "an empty fleet has no level: the age rule alone, and this worker is old"
         );
         assert!(
-            !warmup.applies(old, Some(0), 0, 100),
+            !warmup.applies(old, Some(1), 1, 100),
             "a fleet holding less than the warm-up blocks is not worth catching up to"
         );
         assert!(
-            warmup.applies(old, Some(0), 0, 1_024),
+            warmup.applies(old, Some(1), 1, 1_024),
             "at the warm-up blocks it is"
         );
         let age_only = Warmup {

@@ -588,6 +588,16 @@ pub trait Worker: Any + Send + Sync + fmt::Debug + 'static {
         Duration::MAX
     }
 
+    /// Time since the worker's warm-up clock last started, for the warm-up
+    /// slice: since the worker last became routable, or since
+    /// [`Self::warmup_growth`] last read its index emptied underneath,
+    /// whichever is later. [`Self::admitted_age`] for a worker that keeps no
+    /// such instant; a worker that keeps no admission either reads past
+    /// every window, so it is never thin while its index holds nothing.
+    fn warmup_age(&self) -> Duration {
+        self.admitted_age()
+    }
+
     /// Blocks the worker's index has gained since its current admission, for
     /// the warm-up slice; `indexed` is what the index holds for it now. A
     /// worker that does not track admissions reports the count itself.
@@ -1802,6 +1812,10 @@ impl Worker for BasicWorker {
 
     fn admitted_age(&self) -> Duration {
         self.runtime.load().admitted_age()
+    }
+
+    fn warmup_age(&self) -> Duration {
+        self.runtime.load().warmup_age()
     }
 
     fn warmup_growth(&self, indexed: usize) -> usize {

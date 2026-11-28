@@ -3047,12 +3047,13 @@ fn event_unique_hit_keeps_affinity_and_credits_expected_wait() {
 }
 
 #[test]
-fn a_worker_with_an_emptied_index_gets_the_warm_up_slice_whatever_its_age() {
+fn a_worker_with_an_emptied_index_gets_the_warm_up_slice_inside_its_window() {
     // The soaks' case in miniature: w1 holds a fleet-sized cache (1,100
     // blocks), w2's index was cleared by a resync (nothing indexed), and
     // every request shares a head with w1, so affinity alone would never
     // send w2 a request again. The slice does, on the thin overlap: w2 is
-    // thin against the fleet's level whatever its age.
+    // thin against the fleet's level for its warm-up window, and from its
+    // first block whatever its age.
     let (policy, workers) = initialised_pair();
     update_expected_wait_loads(&policy, &workers, &[0, 0]);
     let held: Vec<u32> = (1..=4_400).collect();

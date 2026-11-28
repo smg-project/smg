@@ -184,7 +184,9 @@ The servicer relays the engine's publisher into `SubscribeKvEvents` through one 
   its routing key, is not steered by the overload thresholds unless `--worker-overload-shed` is set).
 - **Warm-up slice.** A worker that just became routable, or whose index is thin against the
   fleet's (`--worker-warmup-thin-ratio`), receives a share of cache-miss traffic until its index has
-  grown, so an empty index does not starve it while every prompt has a holder elsewhere.
+  grown, so an emptied index does not starve it while every prompt has a holder elsewhere. A worker
+  whose index holds nothing receives it for `--worker-warmup-secs` alone, counted from when it became
+  routable or its index was last emptied.
 - **Completion reporting and the selection layer.** Every request's end reaches the policy that
   placed it through the worker's load guard, on every path; booked state is reconciled with the
   live in-flight count each poll. Worker selection runs through a cost-function selection layer

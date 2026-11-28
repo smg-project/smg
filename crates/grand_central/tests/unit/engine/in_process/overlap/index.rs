@@ -93,8 +93,8 @@ fn a_holder_outside_the_list_takes_no_place_of_the_cap() {
     assert_eq!(bed.holders(&asked, NOW), [(2, 2, 0)]);
 }
 
-/// A worker whose index is empty beside a fleet that holds a level is thin:
-/// it is named as the list's one warming row, whatever its age.
+/// A worker whose index is empty beside a fleet that holds a level is thin
+/// inside its window: it is named as the list's one warming row.
 #[test]
 fn a_worker_with_nothing_indexed_beside_a_warm_fleet_is_named_thin() {
     let (affinity, _, index) = hosted(true);
@@ -107,6 +107,60 @@ fn a_worker_with_nothing_indexed_beside_a_warm_fleet_is_named_thin() {
     let named = bed.decide(&request(&prompt(50_000, 2), 7, NOW), None);
     let named = named.expect("rows");
     assert_eq!((named.warming, named.thin), (vec![3], true));
+}
+
+/// A worker whose index is empty is thin for its window alone: past it the
+/// list names it no more. Blocks taken away under its number start the
+/// window again, on the clock of the emptying and not of the admission.
+#[test]
+fn a_worker_with_nothing_indexed_is_named_thin_for_its_window_alone() {
+    let (affinity, _, index) = hosted(true);
+    let index = index.expect("the index");
+    let held = hashes_of(&prompt(1_000, 8));
+    for at in 0..3 {
+        store(&index, at, &held);
+    }
+    let bed = Bed::new(affinity, warming_by(1), 4);
+    let other = prompt(50_000, 2);
+    let warming = |now| {
+        let named = bed.decide(&request(&other, 7, now), None).expect("rows");
+        (named.warming, named.thin)
+    };
+    // Admitted a moment ago, the empty row is the list's one thin row.
+    assert_eq!(warming(NOW), (vec![3], true));
+    // A row's age is real time: its window of a second over, the table
+    // read again names nobody.
+    thread::sleep(Duration::from_millis(1_050));
+    assert_eq!(warming(NOW + SECOND), (vec![], false));
+    // It gains the fleet's blocks and is no thin row.
+    let (number, mut map) = stored(&index, 3, &held);
+    assert_eq!(warming(NOW + 2 * SECOND), (vec![], false));
+    // It loses them under its number: emptied underneath, its window starts
+    // again at that read, however old its admission.
+    let contents: Vec<ContentHash> = held.iter().map(|&hash| ContentHash(hash)).collect();
+    index.apply_removed(number, &request_prefix_hashes(&contents), &mut map);
+    assert_eq!(warming(NOW + 3 * SECOND), (vec![3], true));
+}
+
+/// Under a window of 0 a worker whose index is empty is never thin, and one
+/// that holds a block under the ratio still is.
+#[test]
+fn a_window_of_none_names_no_worker_with_nothing_indexed() {
+    let (affinity, _, index) = hosted(true);
+    let index = index.expect("the index");
+    let held = hashes_of(&prompt(1_000, 64));
+    for at in 0..3 {
+        store(&index, at, &held);
+    }
+    let bed = Bed::new(affinity, warming_by(0), 4);
+    let other = prompt(50_000, 2);
+    let warming = |now| {
+        let named = bed.decide(&request(&other, 7, now), None).expect("rows");
+        (named.warming, named.thin)
+    };
+    assert_eq!(warming(NOW), (vec![], false));
+    store(&index, 3, &hashes_of(&prompt(1_000, 1)));
+    assert_eq!(warming(NOW + SECOND), (vec![3], true));
 }
 
 /// A fleet that is all young names nobody. A worker still short of its

@@ -49,6 +49,17 @@ impl WarmUpRule {
             && (indexed == 0 || f64::from(indexed) < f64::from(level) * f64::from(self.thin_ratio))
     }
 
+    /// Whether a worker whose warm-up clock started `age_micros` ago and that
+    /// holds `indexed` blocks is thin against the fleet's `level`: holding a
+    /// block and below the ratio of the level whatever its age, or holding
+    /// nothing and within the window. A fleet where no worker joined and no
+    /// index was emptied sends nothing to a worker only because it never
+    /// held a cache.
+    #[inline]
+    pub(crate) fn is_thin_at(&self, age_micros: u64, indexed: u32, level: u32) -> bool {
+        self.is_thin(indexed, level) && (indexed > 0 || age_micros < self.window_micros)
+    }
+
     /// Whether a worker admitted `age_micros` ago whose index grew by
     /// `growth` blocks since is young: within the window and short of its
     /// first blocks.
@@ -74,15 +85,25 @@ impl WarmUpRule {
     /// and `admitted` each row's admission, on the clock `now` is read on,
     /// in microseconds; `scratch` is the host's, for the level. The rows go
     /// to `out`, emptied first, ascending, each with the instant its naming
-    /// ends: the thin whatever the fleet's age, with no end (`u64::MAX`),
-    /// else the young, each until its window is over, as the stage rules a
-    /// column of the same sizes and ages. A row is admitted with nothing
-    /// indexed, so its growth since admission is its size.
+    /// ends: the thin whatever the fleet's age (a row that holds a block
+    /// with no end, `u64::MAX`; a row that holds nothing until the window
+    /// from its admission is over), else the young, each until its window
+    /// is over. A host that knows when a row's index was last emptied may
+    /// hand the later instant as that row's admission: the row is thin from
+    /// it while it holds nothing, and young by it too. The stage rules a
+    /// column of the same sizes and ages alike but for a row that holds
+    /// nothing: a column says when a worker was admitted and not when its
+    /// index was emptied, so there such a row stays thin whatever its age.
+    /// A row is admitted with nothing indexed, so its growth since admission
+    /// is its size.
     ///
     /// The rows stand for every later instant of that clock while the sizes
     /// do: at an instant a host names the rows whose end is past it, and
     /// nobody before [`WarmUpState::from`]. So a host that reads the sizes at
-    /// its own pace still ends a young row's naming on time.
+    /// its own pace still ends a young row's naming on time. One ruling ends:
+    /// where the rows are thin and all hold nothing, a ruling made once the
+    /// last of them ended names the young rows this one left out for the
+    /// thin, so a host that keeps the rows rules again at that instant.
     ///
     /// [`AffinityRows::warming`]: crate::engine::view::AffinityRows::warming
     pub fn list_warming_rows(
@@ -112,6 +133,29 @@ impl WarmUpRule {
         scratch: &mut Vec<u32>,
         out: &mut Vec<(u32, u64)>,
     ) -> WarmUpState {
+        self.list_warming_rows_emptied(sizes, growth, admitted, admitted, now, scratch, out)
+    }
+
+    /// [`Self::list_warming_rows_grown`] for a host that keeps two clocks a
+    /// row: `admitted` holds each row's admission, which a young row is
+    /// young by, and `emptied` the start of each row's warm-up clock (its
+    /// admission, or the instant its index was last emptied, whichever is
+    /// later), which a thin row that holds nothing is named by. So an
+    /// emptied row is thin for a window and is not young again.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the public ruling's inputs and the second clock"
+    )]
+    pub(crate) fn list_warming_rows_emptied(
+        &self,
+        sizes: &[u32],
+        growth: &[u32],
+        admitted: &[u64],
+        emptied: &[u64],
+        now: u64,
+        scratch: &mut Vec<u32>,
+        out: &mut Vec<(u32, u64)>,
+    ) -> WarmUpState {
         out.clear();
         let young = |grown: u32, admitted: u64| self.is_young(now.saturating_sub(admitted), grown);
         let any_indexed = sizes.iter().any(|&size| size > 0);
@@ -130,11 +174,23 @@ impl WarmUpRule {
         } else {
             0
         };
+        let window = self.window_micros;
+        // A thin row that holds a block is named with no end; one that holds
+        // nothing until its window is over.
         out.extend(
             (0u32..)
-                .zip(sizes)
-                .filter(|&(_, &size)| self.is_thin(size, level))
-                .map(|(row, _)| (row, u64::MAX)),
+                .zip(sizes.iter().zip(emptied))
+                .filter(|&(_, (&size, &emptied))| {
+                    self.is_thin_at(now.saturating_sub(emptied), size, level)
+                })
+                .map(|(row, (&size, &emptied))| {
+                    let until = if size > 0 {
+                        u64::MAX
+                    } else {
+                        emptied.saturating_add(window)
+                    };
+                    (row, until)
+                }),
         );
         if !out.is_empty() {
             return WarmUpState {
@@ -142,7 +198,6 @@ impl WarmUpRule {
                 from: 0,
             };
         }
-        let window = self.window_micros;
         out.extend(
             (0u32..)
                 .zip(growth.iter().zip(admitted))
