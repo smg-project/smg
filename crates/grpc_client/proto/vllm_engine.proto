@@ -548,6 +548,11 @@ message GetServerInfoResponse {
   // comma-separated: "cache_salt". "" when the servicer reads none. Flattened
   // into the `cache_partition_fields` worker label.
   string cache_partition_fields = 31;
+
+  // The engine's requested gateway policy: "requested" or "always".
+  // Empty leaves the gateway default unchanged. Flattened into the
+  // constrained_decoding worker label; explicit worker configuration wins.
+  string constrained_decoding = 32;
 }
 
 // =====================

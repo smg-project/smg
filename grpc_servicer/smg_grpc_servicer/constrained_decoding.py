@@ -43,6 +43,8 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+CONSTRAINED_DECODING_POLICIES = ("requested", "always")
+
 # The `server_args` keys (SGLang, TokenSpeed) and the `GetServerInfo` fields
 # (vLLM) the Router reads the labels from. The parser rides under a name of its
 # own: `reasoning_parser` is the per-model parser override the Router reads off

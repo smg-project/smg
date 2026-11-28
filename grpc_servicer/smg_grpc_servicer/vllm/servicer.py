@@ -46,6 +46,7 @@ from smg_grpc_servicer.trace_context import trace_headers
 from smg_grpc_servicer.vllm import attach_vllm_logging, settle_logging
 from smg_grpc_servicer.vllm.admin import flush_cache, start_profile, stop_profile
 from smg_grpc_servicer.vllm.config_view import EngineConfigView, uses_mrope
+from smg_grpc_servicer.vllm.decoding_policy import constrained_decoding_policy
 from smg_grpc_servicer.vllm.errors import GracefulHTTPError, VLLMClientError, grpc_code_for
 from smg_grpc_servicer.vllm.kv_events import (
     rank_sources_for,
@@ -277,6 +278,16 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         from smg_grpc_servicer.vllm.rust import require_python_impl
 
         require_python_impl()
+        self._constrained_decoding = constrained_decoding_policy()
+        if (
+            self._constrained_decoding == "always"
+            and "constrained_decoding"
+            not in vllm_engine_pb2.GetServerInfoResponse.DESCRIPTOR.fields_by_name
+        ):
+            raise ValueError(
+                "The installed smg-grpc-proto cannot advertise constrained_decoding; "
+                "update it to use --constrained-decoding always"
+            )
         # vLLM 0.31+ configures logging after this module is imported: attach
         # again, and end the hold of what was logged before (the launcher
         # configured logging by now, if it was going to).
@@ -1109,6 +1120,8 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             info.structural_tag_vocabulary = structural_tag_vocabulary(
                 str(view.structured_outputs.backend or "auto")
             )
+        if "constrained_decoding" in info.DESCRIPTOR.fields_by_name:
+            info.constrained_decoding = self._constrained_decoding
         ec_config = getattr(self.engine.vllm_config, "ec_transfer_config", None)
         if "supports_ec_transfer" in info.DESCRIPTOR.fields_by_name:
             info.supports_ec_transfer = ec_config is not None

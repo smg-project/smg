@@ -331,6 +331,28 @@ mod tests {
         assert_eq!(labels["ec_role"], "ec_producer");
     }
 
+    /// vLLM discovery preserves an explicit policy and leaves old engines silent.
+    #[test]
+    fn vllm_server_info_discovers_decoding_policy() {
+        for policy in ["", "requested", "always"] {
+            let labels = ServerInfo::Vllm(Box::new(vllm_proto::GetServerInfoResponse {
+                constrained_decoding: policy.to_string(),
+                cache_partition_fields: "cache_salt".to_string(),
+                ..Default::default()
+            }))
+            .to_labels();
+            assert_eq!(labels["cache_partition_fields"], "cache_salt");
+            assert_eq!(
+                labels.get("constrained_decoding").map(String::as_str),
+                if policy.is_empty() {
+                    None
+                } else {
+                    Some(policy)
+                }
+            );
+        }
+    }
+
     /// A vLLM servicer that reads no cache partition field has no label.
     #[test]
     fn vllm_cache_partition_fields_flatten_into_a_label() {
