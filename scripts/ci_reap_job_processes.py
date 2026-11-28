@@ -14,14 +14,20 @@ ancestors alone (the step's shell carries the marker too), and prints what it
 ended; ``--dry-run`` only prints. It exits 0 either way: a teardown reports,
 it does not fail the job on its own.
 
-Usage: ci_reap_job_processes.py [--dry-run] [--grace SECS] [--proc-root DIR] MARKER
+Strict mode uses Linux pidfds, requires complete ownership observations and
+returns nonzero for an unresolved identity or survivor. The default remains
+legacy best-effort behavior. Process cleanup does not prove physical release.
+
+Usage: ci_reap_job_processes.py [--strict | --dry-run] [--grace SECS] MARKER
 """
 
 from __future__ import annotations
 
 import argparse
 import dataclasses
+import math
 import os
+import select
 import signal
 import sys
 import time
@@ -168,10 +174,394 @@ def reap(
     return found
 
 
+@dataclasses.dataclass(frozen=True)
+class OwnedProcess:
+    pid: int
+    ppid: int
+    uid: int
+    starttime: int
+
+
+def _strict_stat(proc_root: str, pid: int) -> tuple[str, int, int] | None:
+    try:
+        with open(os.path.join(proc_root, str(pid), "stat"), "rb") as stream:
+            text = stream.read(8193)
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    # comm is raw kernel bytes, including possible non-UTF-8 characters.
+    fields = text.rpartition(b")")[2].split()
+    if len(text) > 8192 or text.partition(b"(")[0].strip() != str(pid).encode() or len(fields) < 20:
+        raise ValueError(f"cannot establish stat identity for pid {pid}")
+    ppid, starttime = int(fields[1]), int(fields[19])
+    if ppid < 0 or starttime < 0:
+        raise ValueError(f"invalid stat identity for pid {pid}")
+    return fields[0].decode("ascii"), ppid, starttime
+
+
+def _strict_owned(
+    proc_root: str, pid: int, uid: int, entry: bytes, *, group_exited
+) -> OwnedProcess | None:
+    before = _strict_stat(proc_root, pid)
+    if before is None:
+        return None
+    try:
+        with open(os.path.join(proc_root, str(pid), "status"), "rb") as stream:
+            status = stream.read(65537)
+        rows = [line.split()[1:] for line in status.splitlines() if line.startswith(b"Uid:")]
+        if len(status) > 65536 or len(rows) != 1 or len(rows[0]) != 4:
+            raise ValueError(f"cannot establish UID for pid {pid}")
+        uids = tuple(int(value) for value in rows[0])
+        if any(value < 0 for value in uids):
+            raise ValueError(f"invalid UID for pid {pid}")
+        if uids != (uid,) * 4:
+            if uid not in uids:
+                return None  # Clearly foreign UID: never read its environment or signal it.
+            raise ValueError(f"mixed UID ownership for pid {pid}")
+        if before[0] == "Z":
+            # pthread_exit can leave a zombie leader with live worker threads.
+            # A flags=0 pidfd becomes readable only after the entire group exits.
+            if group_exited(pid):
+                return None
+            raise ValueError(f"live thread group behind zombie leader: {pid}")
+        with open(os.path.join(proc_root, str(pid), "environ"), "rb") as stream:
+            environ = stream.read(1048577)
+        if len(environ) > 1048576:
+            raise ValueError(f"incomplete environment observation for pid {pid}")
+    except (FileNotFoundError, ProcessLookupError):
+        if _strict_stat(proc_root, pid) is None:
+            return None
+        raise ValueError(f"ownership files disappeared for live pid {pid}") from None
+    after = _strict_stat(proc_root, pid)
+    if after is None:
+        return None
+    if before[2] != after[2]:
+        raise ValueError(f"PID birth changed during observation: {pid}")
+    if after[0] == "Z":
+        if group_exited(pid):
+            return None
+        raise ValueError(f"thread group exit is not established: {pid}")
+    if not environ.strip(b"\0"):
+        # An exec/exit can release the address space after environ was opened.
+        # Empty bytes cannot establish that a live process lacks our marker.
+        raise ValueError(f"empty environment observation for live pid {pid}")
+    markers = [value for value in environ.split(b"\0") if value.startswith(b"E2E_JOB_MARKER=")]
+    if entry not in markers:
+        return None
+    if markers != [entry]:
+        raise ValueError(f"ambiguous marker for pid {pid}")
+    return OwnedProcess(pid, after[1], uid, after[2])
+
+
+def _strict_census(
+    proc_root: str, on_unresolved: Callable[[int, Exception], None]
+) -> tuple[dict[int, int], bool]:
+    """Record readable PID births without certifying an incomplete census."""
+    found: dict[int, int] = {}
+    complete = True
+    for name in sorted(os.listdir(proc_root)):
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        try:
+            observed = _strict_stat(proc_root, pid)
+        except (OSError, ValueError) as error:
+            on_unresolved(pid, error)
+            complete = False
+            continue
+        if observed is None:
+            complete = False
+        else:
+            found[pid] = observed[2]
+    return found, complete
+
+
+def _pidfd_exited(fd: int) -> bool:
+    poll = select.poll()
+    poll.register(fd, select.POLLIN | select.POLLHUP)
+    events = poll.poll(0)
+    if any(mask & (select.POLLERR | select.POLLNVAL) for _, mask in events):
+        raise ValueError("cannot establish pidfd exit readiness")
+    return any(mask & (select.POLLIN | select.POLLHUP) for _, mask in events)
+
+
+def _strict_ancestors(proc_root: str, pid: int) -> dict[int, tuple[int, int]]:
+    chain: dict[int, tuple[int, int]] = {}
+    while pid > 1:
+        if pid in chain:
+            raise ValueError("cannot establish the cleanup process ancestor chain")
+        before = _strict_stat(proc_root, pid)
+        after = _strict_stat(proc_root, pid)
+        if before is None or after is None or before[1:] != after[1:]:
+            raise ValueError(f"unresolved ancestor identity: {pid}")
+        chain[pid] = after[1:]
+        pid = after[1]
+    return chain
+
+
+def reap_strict(
+    marker: str,
+    *,
+    proc_root: str = "/proc",
+    grace: float = DEFAULT_GRACE_SECS,
+    pidfd_open=None,
+    pidfd_send_signal=None,
+    pidfd_exited=None,
+    close: Callable[[int], None] = os.close,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+    self_pid: int | None = None,
+    uid: int | None = None,
+    log: Callable[[str], None] = print,
+) -> bool:
+    """Signal only verified marker/UID/birth identities through bound pidfds.
+
+    Injectable APIs and proc_root are for CPU fixtures. The production strict
+    CLI permits only /proc. Quiet observations require complete, unchanged PID
+    birth censuses around each scan. This is not an atomic barrier against future
+    spawns and does not prove GPU/container/service release. Each identity gets
+    its own TERM grace; all work still ends at the fixed grace+20 second deadline.
+    """
+    opener = getattr(os, "pidfd_open", None) if pidfd_open is None else pidfd_open
+    sender = (
+        getattr(signal, "pidfd_send_signal", None)
+        if pidfd_send_signal is None
+        else pidfd_send_signal
+    )
+    exited = _pidfd_exited if pidfd_exited is None else pidfd_exited
+    if not callable(opener) or not callable(sender) or not callable(exited):
+        log("::error::strict cleanup requires pidfd_open and pidfd_send_signal")
+        return False
+    if not marker.strip() or not math.isfinite(grace) or grace < 0:
+        log("::error::invalid strict cleanup marker or grace")
+        return False
+    me = os.getpid() if self_pid is None else self_pid
+    owner_uid = os.getuid() if uid is None else uid
+    entry = f"{MARKER_ENV}={marker}".encode()
+    deadline = clock() + grace + 20.0
+    max_scans = max(2, math.ceil((grace + 20.0) / POLL_SECS) + 2)
+    handles: dict[int, tuple[OwnedProcess, int]] = {}
+    seen: dict[int, int] = {}
+    unbound: dict[int, OwnedProcess] = {}
+    sent: set[tuple[int, int, int]] = set()
+    term_sent_at: dict[tuple[int, int], float] = {}
+    clean = False
+    reported_unresolved: set[int] = set()
+
+    def report_unresolved(pid: int, error: Exception) -> None:
+        if pid not in reported_unresolved:
+            log(f"strict unresolved pid {pid}: {type(error).__name__}: {error}")
+            reported_unresolved.add(pid)
+
+    def retire(pid: int) -> None:
+        _, fd = handles.pop(pid)
+        close(fd)
+
+    def group_exited(pid: int) -> bool:
+        if pid in handles:
+            return exited(handles[pid][1])
+        try:
+            fd = opener(pid, 0)
+        except ProcessLookupError:
+            return True
+        try:
+            return exited(fd)
+        finally:
+            close(fd)
+
+    def still_owned(process: OwnedProcess) -> bool | None:
+        if group_exited(process.pid):
+            return False
+        try:
+            current = _strict_owned(
+                proc_root, process.pid, owner_uid, entry, group_exited=group_exited
+            )
+            # Exit may complete during the observation, leaving an unreaped Z
+            # leader in proc. Only the bound fd establishes whole-group exit.
+            if group_exited(process.pid):
+                return False
+            if current is None or (current.uid, current.starttime) != (
+                process.uid,
+                process.starttime,
+            ):
+                return None
+        except (OSError, ValueError):
+            # A normal kernel exit can leave environ inaccessible while the
+            # pidfd is not ready yet. Retain this unresolved handle, never
+            # signal it without current ownership, and continue other workers.
+            return False if group_exited(process.pid) else None
+        return True
+
+    try:
+        protected = _strict_ancestors(proc_root, me)
+        quiet = 0
+        for _ in range(max_scans):
+            if clock() >= deadline:
+                raise TimeoutError("strict cleanup deadline before observation pass")
+            if _strict_ancestors(proc_root, me) != protected:
+                raise ValueError("cleanup process ancestor chain changed")
+            census_before, before_complete = _strict_census(proc_root, report_unresolved)
+            observed: list[OwnedProcess] = []
+            unresolved_observation = False
+            # A previously verified owner still owes a lifecycle resolution even
+            # if a later environment read is marker-negative or unreadable.
+            for pid, process in list(unbound.items()):
+                try:
+                    current = _strict_stat(proc_root, pid)
+                    if current is not None and current[2] != process.starttime:
+                        # A different birth positively retires the old identity;
+                        # seen still prevents retargeting this numeric PID.
+                        del unbound[pid]
+                    elif (current is None or current[0] == "Z") and group_exited(pid):
+                        del unbound[pid]
+                except (OSError, ValueError) as error:
+                    report_unresolved(pid, error)
+                    unresolved_observation = True
+            for pid in sorted(census_before):
+                if pid in protected or pid <= 1:
+                    continue
+                try:
+                    process = _strict_owned(
+                        proc_root, pid, owner_uid, entry, group_exited=group_exited
+                    )
+                except (OSError, ValueError) as error:
+                    report_unresolved(pid, error)
+                    # Complete the scan and bind independently verified peers,
+                    # even before the first handle exists. This pass can
+                    # never count as quiet, even for an unbound process.
+                    unresolved_observation = True
+                    continue
+                if process is not None:
+                    observed.append(process)
+            for process in observed:
+                if process.pid in seen and seen[process.pid] != process.starttime:
+                    # Never retarget an existing numeric PID to another birth,
+                    # but do not abandon independently verified peers either.
+                    unresolved_observation = True
+                    continue
+                seen[process.pid] = process.starttime
+                if process.pid not in handles:
+                    unbound.setdefault(process.pid, process)
+                    if clock() >= deadline:
+                        raise TimeoutError("strict cleanup deadline before pidfd acquisition")
+                    try:
+                        fd = opener(process.pid, 0)
+                    except ProcessLookupError:
+                        continue
+                    except OSError as error:
+                        report_unresolved(process.pid, error)
+                        unresolved_observation = True
+                        continue
+                    try:
+                        current = _strict_owned(
+                            proc_root,
+                            process.pid,
+                            owner_uid,
+                            entry,
+                            group_exited=lambda _pid: exited(fd),
+                        )
+                    except (OSError, ValueError) as error:
+                        close(fd)
+                        report_unresolved(process.pid, error)
+                        unresolved_observation = True
+                        continue
+                    if current is None or (current.uid, current.starttime) != (
+                        process.uid,
+                        process.starttime,
+                    ):
+                        # The fd may name a replacement; never adopt it or erase
+                        # the old obligation before a verified identity handoff.
+                        close(fd)
+                        unresolved_observation = True
+                        continue
+                    handles[process.pid] = (process, fd)
+                    del unbound[process.pid]  # The bound fd now carries this obligation.
+                    # The pidfd and the post-open proc observation must bind the
+                    # same identity. No signal is sent if the numeric PID changed.
+                    if still_owned(process) is False:
+                        retire(process.pid)
+            for pid, (process, fd) in list(handles.items()):
+                ownership = still_owned(process)
+                if ownership is False:
+                    retire(pid)
+                    continue
+                if ownership is None:
+                    continue
+                signals = [signal.SIGTERM]
+                identity = (pid, process.starttime)
+                if identity in term_sent_at and clock() - term_sent_at[identity] >= grace:
+                    signals.append(signal.SIGKILL)
+                for sig in signals:
+                    key = (pid, process.starttime, sig)
+                    if key in sent:
+                        continue
+                    ownership = still_owned(process)
+                    if ownership is False:
+                        retire(pid)
+                        break
+                    if ownership is None:
+                        break
+                    if clock() >= deadline:
+                        raise TimeoutError("strict cleanup signal deadline reached")
+                    try:
+                        sender(fd, sig, None, 0)
+                    except ProcessLookupError:
+                        retire(pid)
+                        break
+                    except PermissionError as error:
+                        report_unresolved(pid, error)
+                        unresolved_observation = True
+                        break
+                    sent.add(key)
+                    if sig == signal.SIGTERM:
+                        term_sent_at[identity] = clock()
+                    log(f"strict signal {sig} pid {pid} uid {owner_uid} birth {process.starttime}")
+            if clock() >= deadline:
+                raise TimeoutError("strict cleanup observation deadline reached")
+            census_after, after_complete = _strict_census(proc_root, report_unresolved)
+            if clock() >= deadline:
+                raise TimeoutError("strict cleanup final census exceeded deadline")
+            stable = before_complete and after_complete and census_before == census_after
+            quiet = (
+                quiet + 1
+                if stable
+                and not unresolved_observation
+                and not observed
+                and not handles
+                and not unbound
+                else 0
+            )
+            if quiet == 2:
+                if clock() >= deadline:
+                    raise TimeoutError("strict cleanup deadline before clean acceptance")
+                clean = True
+                break
+            remaining = deadline - clock()
+            if remaining <= 0:
+                break
+            sleep(min(POLL_SECS, remaining))
+    except (OSError, ValueError, TimeoutError) as error:
+        log(f"::error::strict cleanup incomplete: {type(error).__name__}: {error}")
+    finally:
+        for _, fd in handles.values():
+            try:
+                close(fd)
+            except OSError as error:
+                clean = False
+                log(f"::error::cannot close strict pidfd: {type(error).__name__}")
+        if not clean:
+            bound = [(p.pid, p.uid, p.starttime) for p, _ in handles.values()]
+            pending = [(p.pid, p.uid, p.starttime) for p in unbound.values()]
+            log(f"::error::strict cleanup unresolved identities bound={bound} unbound={pending}")
+    if clean:
+        log("strict owned-process observations are empty; physical resource release is separate")
+    return clean
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("marker", help=f"the value of {MARKER_ENV} the job exported")
     parser.add_argument("--dry-run", action="store_true", help="list the processes, end none")
+    parser.add_argument("--strict", action="store_true", help="require verified pidfd cleanup")
     parser.add_argument(
         "--grace",
         type=float,
@@ -182,6 +572,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if not args.marker.strip():
         parser.error("the marker is empty")
+    if args.strict:
+        if args.proc_root != "/proc":
+            parser.error("--strict requires the actual /proc")
+        if args.dry_run:
+            parser.error("--strict cannot certify cleanup in a dry run")
+        return 0 if reap_strict(args.marker, grace=args.grace) else 1
     reap(args.marker, proc_root=args.proc_root, grace=args.grace, dry_run=args.dry_run)
     return 0
 
