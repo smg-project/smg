@@ -14,6 +14,10 @@ BASELINE = (
     "e2e_test/infra/test_epd_cmd_builders.py",
 )
 COMPONENTS = (
+    (
+        "scripts/ci_install_sglang_gptoss20_sdk.py",
+        "scripts/tests/test_ci_install_sglang_gptoss20_sdk.py",
+    ),
     ("scripts/ci_setup_sglang_rocm_image.sh", "scripts/tests/test_ci_sglang_nixl_rocm.py"),
     ("e2e_test/infra/cloud_credentials.py", "e2e_test/infra/test_cloud_credentials.py"),
     ("scripts/ci/validate_pr_benchmark.py", "scripts/ci/tests/test_validate_pr_benchmark.py"),
