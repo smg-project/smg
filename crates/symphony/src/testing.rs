@@ -574,8 +574,8 @@ pub(crate) fn a_call_terminal_ends_an_invoke_whose_arguments_are_json(
 /// thought closed, where the engine does not say or starts at the first token, the calls at once,
 /// as before, and on every start where the prompt wrote `after` itself after the close it wrote
 /// (thinking switched off); with the thought open, the thought closed by its marker (at the first
-/// token) or the free text that may hold the close (where the engine does not say) comes first,
-/// then `after`, then the calls.
+/// token) or the free text that cannot hold the close and then the close, written or not (where
+/// the engine does not say), comes first, then `after`, then the calls.
 pub(crate) fn a_forced_tag_begins_with_the_templates_text(
     format: &Format,
     tools: &[Tool],
@@ -665,17 +665,29 @@ pub(crate) fn a_forced_tag_begins_with_the_templates_text(
         assert_eq!(elements[0]["end"], close, "{choice}: {first}");
         assert_eq!(elements[1], text, "{choice}: {first}");
         assert_eq!(elements[2], *calls, "{choice}: {first}");
-        // The thought open, where the engine does not say: free text that may hold the close,
-        // `after`, the calls.
+        // The thought open, where the engine does not say: free text that cannot write the
+        // close, the close once or not at all, `after`, the calls.
         let unknown = tag(true, GrammarStart::Unknown);
         let elements = unknown["format"]["elements"]
             .as_array()
             .unwrap_or_else(|| panic!("{choice}: {unknown}"));
         assert_eq!(unknown["format"]["type"], "sequence", "{choice}: {unknown}");
-        assert_eq!(elements.len(), 3, "{choice}: {unknown}");
+        assert_eq!(elements.len(), 4, "{choice}: {unknown}");
         assert_eq!(elements[0]["type"], "any_text", "{choice}: {unknown}");
-        assert_eq!(elements[1], text, "{choice}: {unknown}");
-        assert_eq!(elements[2], *calls, "{choice}: {unknown}");
+        assert_eq!(
+            elements[0]["excludes"]
+                .as_array()
+                .and_then(|excludes| excludes.last()),
+            Some(&value!(close)),
+            "{choice}: {unknown}"
+        );
+        assert_eq!(
+            elements[1],
+            value!({"type": "optional", "content": {"type": "const_string", "value": close}}),
+            "{choice}: {unknown}"
+        );
+        assert_eq!(elements[2], text, "{choice}: {unknown}");
+        assert_eq!(elements[3], *calls, "{choice}: {unknown}");
     }
 }
 

@@ -390,7 +390,7 @@ mod tests {
             .payload();
         let parts = payload["format"]["elements"]
             .as_array()
-            .expect("the prefix, then the block");
+            .expect("the prefix, the thought's close, then the block");
         let excludes = parts[0]["excludes"].as_array().expect("the excluded tags");
         for tag in [
             "<minimax:tool_call>",
@@ -405,10 +405,17 @@ mod tests {
                 "{tag} is excluded from the prefix"
             );
         }
-        assert!(
-            !excludes.contains(&value!("</think>")),
-            "the thought's own close stays writable"
+        // The call is owed: the thought's close leaves the text and follows it, once or not at
+        // all, so nothing stands between a close the model writes and the block.
+        assert_eq!(
+            excludes.last(),
+            Some(&value!("</think>")),
+            "the thought's own close follows the prefix"
         );
-        assert_eq!(parts[1]["elements"][0]["value"], "\n<minimax:tool_call>\n");
+        assert_eq!(
+            parts[1],
+            value!({"type": "optional", "content": {"type": "const_string", "value": "</think>"}})
+        );
+        assert_eq!(parts[2]["elements"][0]["value"], "\n<minimax:tool_call>\n");
     }
 }

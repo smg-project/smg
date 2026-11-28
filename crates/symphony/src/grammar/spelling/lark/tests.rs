@@ -155,6 +155,117 @@ fn free_text_before_a_closing_word_ends_at_the_word_through_a_lazy_head() {
     well_formed(&lark.text).expect("the reference text reads");
 }
 
+/// A fixed word a text may not hold that follows the text or not (a thought's close before a
+/// call the request owes) stays writable in the text: the spelling is that of the same sequence
+/// without the optional word, the text free to hold it. A word the text may hold stays optional.
+#[test]
+fn an_optional_word_a_text_may_not_hold_stays_writable_in_the_text() {
+    let spelled = |elements: Vec<Grammar>| {
+        let lark = Grammar::Sequence(elements)
+            .to_lark(&AddedTokens::default())
+            .expect("free text before a call is spelled");
+        well_formed(&lark.text).expect("the text reads");
+        lark.text
+    };
+    let call = || Grammar::Tag(tag("<call>", any(&["</call>"]), ends("</call>")));
+    let today = spelled(vec![any(&["<call>"]), text("\n\n"), call()]);
+    let one = Grammar::Optional(Box::new(text("</think>")));
+    assert_eq!(
+        spelled(vec![
+            any(&["<call>", "</think>"]),
+            one.clone(),
+            text("\n\n"),
+            call()
+        ]),
+        today,
+        "one close"
+    );
+    let either = Grammar::Optional(Box::new(Grammar::Or(vec![text("</think>"), text("</t>")])));
+    assert_eq!(
+        spelled(vec![
+            any(&["<call>", "</think>", "</t>"]),
+            either,
+            text("\n\n"),
+            call()
+        ]),
+        today,
+        "a choice of closes"
+    );
+    assert_ne!(
+        spelled(vec![any(&["<call>"]), one, text("\n\n"), call()]),
+        today,
+        "a word the text may hold"
+    );
+}
+
+/// On every table, the tag of a call the request owes, with the prompt's thought open and no
+/// start named, is spelled as the same tag whose text may hold the thought's close and has no
+/// optional close behind it: the text this spelling gave before the close left the text.
+#[test]
+fn on_every_table_an_owed_calls_optional_close_is_spelled_as_the_text_that_may_hold_it() {
+    use crate::{
+        formats::registry::Table,
+        grammar::{GrammarStart, Options},
+    };
+    let tools = crate::testing::weather_tools();
+    let spelled = |grammar: Grammar| {
+        grammar
+            .to_lark(&AddedTokens::default())
+            .map(|lark| lark.text)
+            .map_err(|refusal| format!("{refusal:?}"))
+    };
+    let (mut led, mut read) = (0, 0);
+    for table in Table::ALL {
+        let format = table.format();
+        for (one_call, start) in [
+            (false, GrammarStart::Unknown),
+            (true, GrammarStart::Unknown),
+            (false, GrammarStart::Either),
+        ] {
+            let options = Options {
+                at_least_one: true,
+                reasoning_open: true,
+                thought_closed: false,
+                one_call,
+                start,
+            };
+            let Some(Grammar::Sequence(elements)) = format.grammar_for(&tools, options) else {
+                continue;
+            };
+            let [Grammar::AnyText { excludes }, Grammar::Optional(close), rest @ ..] =
+                elements.as_slice()
+            else {
+                continue;
+            };
+            let closes: Vec<&String> = match &**close {
+                Grammar::ConstString(close) => vec![close],
+                Grammar::Or(closes) => closes
+                    .iter()
+                    .filter_map(|close| match close {
+                        Grammar::ConstString(close) => Some(close),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => continue,
+            };
+            let mut before = vec![Grammar::AnyText {
+                excludes: excludes
+                    .iter()
+                    .filter(|excluded| !closes.contains(excluded))
+                    .cloned()
+                    .collect(),
+            }];
+            before.extend(rest.iter().cloned());
+            let now = spelled(Grammar::Sequence(elements.clone()));
+            assert_eq!(now, spelled(Grammar::Sequence(before)), "{}", table.name());
+            led += 1;
+            read += usize::from(now.is_ok());
+        }
+    }
+    assert!(led > 0, "no table leads an owed call with free text");
+    assert!(read > 0, "no such tag has a Lark spelling");
+}
+
 #[test]
 fn a_triggered_call_names_the_tokens_its_free_text_may_hold_and_the_trigger_token() {
     let grammar = Grammar::TriggeredTags {

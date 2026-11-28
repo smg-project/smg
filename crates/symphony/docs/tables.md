@@ -397,7 +397,8 @@ What this table says beyond the DSML one:
   or required call opens with the thought, or the bare `</mm:think>` of an empty one, or nothing,
   then the separator the template writes before `<tool_call>`, optional, then the block; the
   block without the separator, which the grammar forced until now, stays valid. With the thought
-  left open by the prompt, free text that may close it comes first instead (`docs/grammar.md`).
+  left open by the prompt, free text comes first instead, the thought's close behind it, once or
+  not at all, where the request owes the call (`docs/grammar.md`).
   A JSON answer's tag (`response_format`) is led the same way. That shape serves the adaptive
   default, whose generation prompt has no marker. Under `thinking_mode: disabled` the
   generation prompt ends with `</mm:think>`: the template closed the thought in the model's

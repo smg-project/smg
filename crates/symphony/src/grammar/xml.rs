@@ -700,8 +700,8 @@ mod tests {
         // The prompt that leaves the thought to the model (the template's default): the thought,
         // or the bare close of an empty one, or nothing, then the block, which a forced call
         // writes at once. The prompt that opened the thought: free text that writes neither a
-        // call marker nor the separator but may close the thought, nothing owed at its end, then
-        // the block as it is.
+        // call marker nor the separator nor, the call being owed, the thought's close, which
+        // follows it once or not at all, then the block as it is.
         let tools = weather_tools();
         let closed = formats::minimax_m3()
             .grammar(&tools, true, false)
@@ -726,7 +726,9 @@ mod tests {
             value!({"type": "sequence", "elements": [
                 {"type": "any_text", "excludes": [
                     "<tool_call>", "</tool_call>", "<invoke name=\"", "</invoke>", SEP,
+                    "</mm:think>",
                 ]},
+                {"type": "optional", "content": {"type": "const_string", "value": "</mm:think>"}},
                 block,
             ]})
         );

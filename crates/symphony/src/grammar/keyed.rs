@@ -373,14 +373,15 @@ mod tests {
         assert_eq!(ping[0]["value"], "<ifm|tool_call>ping\n");
         assert_eq!(ping[1]["type"], "star");
         assert_eq!(ping[2]["value"], "</ifm|tool_call>");
-        // With the thought open, the same block follows a prefix that excludes the call tags.
+        // With the thought open, the same block follows a prefix that excludes the call tags and,
+        // the call being owed, the thought's close, which stands behind it once or not at all.
         let with_prefix = formats::k2_horizon()
             .grammar(&weather_tools(), true, true)
             .expect("a grammar")
             .payload();
         let parts = with_prefix["format"]["elements"]
             .as_array()
-            .expect("prefix, then the block");
+            .expect("prefix, the thought's close, then the block");
         let excludes = parts[0]["excludes"].as_array().expect("the excluded tags");
         for tag in [
             "<ifm|tool_calls>",
@@ -397,16 +398,26 @@ mod tests {
                 "{tag} is excluded from the prefix"
             );
         }
-        assert_eq!(parts[1]["tags"][0]["begin"], "<ifm|tool_calls>");
+        assert_eq!(excludes.last(), Some(&value!("</ifm|think>")));
+        assert_eq!(
+            parts[1],
+            value!({"type": "optional", "content": {
+                "type": "const_string",
+                "value": "</ifm|think>",
+            }})
+        );
+        assert_eq!(parts[2]["tags"][0]["begin"], "<ifm|tool_calls>");
     }
 
     #[test]
     fn hy4_with_the_reasoning_open_takes_the_prefix_and_its_one_way_in() {
         // Hy4's prompt opens the thought, so this is the path it takes most: the prefix is free
         // text that can write none of the four call terminals nor the four suffixed tags, the
-        // thought's own two allowed so the model may close it where the engine runs the grammar
-        // from the first token, and nothing owed at its end; the block behind it has its one way
-        // in, from content, with no close of its own before the opener.
+        // thought's opener allowed, and nothing owed at its end; the call being owed, the
+        // thought's close leaves the text and follows it once or not at all, so the model may
+        // close it where the engine runs the grammar from the first token and the block follows
+        // that close at once; the block has its one way in, from content, with no close of its
+        // own before the opener.
         let payload = formats::hy4()
             .grammar(&weather_tools(), true, true)
             .expect("a grammar")
@@ -429,9 +440,17 @@ mod tests {
                 "</arg_key:opensource>",
                 "<arg_value:opensource>",
                 "</arg_value:opensource>",
+                "</think:opensource>",
             ])
         );
-        let block = &payload["format"]["elements"][1];
+        assert_eq!(
+            payload["format"]["elements"][1],
+            value!({"type": "optional", "content": {
+                "type": "const_string",
+                "value": "</think:opensource>",
+            }})
+        );
+        let block = &payload["format"]["elements"][2];
         assert_eq!(block["triggers"], value!(["<tool_calls:opensource>"]));
         assert_eq!(block["tags"][0]["begin"], "<tool_calls:opensource>");
         assert_eq!(block["at_least_one"], true);
@@ -473,8 +492,8 @@ mod tests {
         assert_eq!(ping[0]["value"], "<tool_call>ping<tool_sep>\n");
         assert_eq!(ping[1]["type"], "star");
         assert_eq!(ping[2]["value"], "</tool_call>");
-        // The separator is no tag: the prefix before the block excludes the block's markers and
-        // the four tags, and nothing else.
+        // The separator is no tag: the prefix before the block excludes the block's markers, the
+        // four tags and, the call being owed, the thought's close behind them, and nothing else.
         let with_prefix = formats::hy_v3()
             .grammar(&weather_tools(), true, true)
             .expect("a grammar")
@@ -490,6 +509,7 @@ mod tests {
                 "</arg_key>",
                 "<arg_value>",
                 "</arg_value>",
+                "</think>",
             ])
         );
     }

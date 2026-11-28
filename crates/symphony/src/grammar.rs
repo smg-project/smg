@@ -1181,7 +1181,9 @@ impl Format {
     /// `body` after what the model writes before it. With the prompt's thought open, the prefix
     /// for a tag that takes one (`prefixed`, [`Self::after_the_thought`]), and nothing for a tag
     /// whose ways in close the thought themselves, when the engine does not say where it starts
-    /// the grammar; nothing either way for one that starts after its reasoning parser, and the
+    /// the grammar (the prefix of a call the request owes, `owed`, takes the thought's close
+    /// behind its text, once or not at all, and no text after it); nothing either way for one
+    /// that starts after its reasoning parser, and the
     /// thought closed by its own marker either way for one that starts at the first token
     /// ([`Self::after_the_closed_thought`]). With the thought not open, the thought itself
     /// where the table writes one before every call and answer ([`Format::thinks_first`]): the
@@ -1231,9 +1233,10 @@ impl Format {
                 // the close, or the body itself) before the model has thought.
                 GrammarStart::FirstToken => self.after_the_closed_thought(body, after),
                 // The engine does not say, or the engines that may take the request are of
-                // either kind: the prefix that fits both where the tag takes one.
+                // either kind: the prefix that fits both where the tag takes one. Before a call
+                // the request owes, nothing stands between a close the model writes and the call.
                 GrammarStart::Unknown | GrammarStart::Either if prefixed => {
-                    self.after_the_thought(body, after)
+                    self.after_the_thought(body, after, owed)
                 }
                 GrammarStart::Unknown | GrammarStart::Either => Some(body),
             };
@@ -1276,11 +1279,16 @@ impl Format {
 
     /// `body` after the prefix a prompt's open thought takes: free text that can write none of the
     /// table's terminals but the thought's own, nor the call syntax's inner tags, with nothing
-    /// owed at its end, then `after` ([`Self::led`]). A table without a thought has no prefix,
+    /// owed at its end, then `after` ([`Self::led`]). Before a call the request owes (`owed`),
+    /// the text cannot write the thought's close: the close follows the text once or not at
+    /// all, and `after` and `body` follow at once. So an engine that starts at the first token
+    /// gets no prose between the close the model writes and the call, and one that starts after
+    /// its reasoning parser, which has consumed the close, reads the text it read before. A
+    /// table without a thought has no prefix,
     /// and gives `body` as it is; a thought that closes only into the block has no prefix, its
     /// close being its own way in, and gives `None`; one that closes into the text after it takes
     /// the prefix with that close as its own ([`Self::thought_markers`]).
-    fn after_the_thought(&self, body: Grammar, after: &str) -> Option<Grammar> {
+    fn after_the_thought(&self, body: Grammar, after: &str, owed: bool) -> Option<Grammar> {
         let Some(reasoning) = self.state_emitting(Emits::Reasoning) else {
             return Some(body);
         };
@@ -1290,9 +1298,28 @@ impl Format {
         // opener and every close the model writes for it, since the model writes the one its
         // chat template renders, whichever the tags would write.
         let (open, closes) = self.thought_markers(reasoning)?;
-        let own: Vec<&str> = std::iter::once(open).chain(closes).collect();
-        let excludes = self.excluded_but(&own);
-        let mut elements = vec![Grammar::AnyText { excludes }];
+        let own: Vec<&str> = std::iter::once(open)
+            .chain(closes.iter().copied())
+            .collect();
+        let mut excludes = self.excluded_but(&own);
+        let mut elements = Vec::with_capacity(4);
+        if owed {
+            // The close leaves the text and stands behind it, written or not.
+            excludes.extend(closes.iter().map(|close| (*close).to_string()));
+            let close = match closes.as_slice() {
+                [close] => Grammar::ConstString((*close).to_string()),
+                closes => Grammar::Or(
+                    closes
+                        .iter()
+                        .map(|close| Grammar::ConstString((*close).to_string()))
+                        .collect(),
+                ),
+            };
+            elements.push(Grammar::AnyText { excludes });
+            elements.push(Grammar::Optional(Box::new(close)));
+        } else {
+            elements.push(Grammar::AnyText { excludes });
+        }
         elements.extend(after_the_close_then(after, body));
         Some(Grammar::Sequence(elements))
     }
@@ -2029,7 +2056,9 @@ mod tests {
         // `wrap_in_reasoning_prefix(tag, Glm4MoeParser::reasoning_prefix(..))`: a sequence of free
         // text that writes none of the call markers, with nothing owed at its end (an engine that
         // runs a reasoning parser applies the grammar only after the model's own `</think>`, so a
-        // prefix closed by `</think>` would be owed a second time), then the tag.
+        // prefix closed by `</think>` would be owed a second time), then the tag. Before a call
+        // the request owes, the text cannot write `</think>` either: the close follows it, once
+        // or not at all, so the tag follows a close the model writes at once.
         let grammar = formats::glm()
             .grammar(&weather_tools(), true, true)
             .expect("a grammar");
@@ -2037,7 +2066,7 @@ mod tests {
         assert_eq!(payload["format"]["type"], "sequence");
         let elements = payload["format"]["elements"]
             .as_array()
-            .expect("two elements");
+            .expect("three elements");
         assert_eq!(
             elements[0],
             value!({
@@ -2045,10 +2074,15 @@ mod tests {
                 "excludes": [
                     "<tool_call>", "</tool_call>",
                     "<arg_key>", "</arg_key>", "<arg_value>", "</arg_value>",
+                    "</think>",
                 ],
             })
         );
-        assert_eq!(elements[1]["type"], "triggered_tags");
+        assert_eq!(
+            elements[1],
+            value!({"type": "optional", "content": {"type": "const_string", "value": "</think>"}})
+        );
+        assert_eq!(elements[2]["type"], "triggered_tags");
     }
 
     #[test]
@@ -2076,10 +2110,12 @@ mod tests {
     #[test]
     fn the_prefix_excludes_each_tables_own_terminals_and_inner_tags() {
         // No old builder wraps these two, so the derived shape is pinned here: the prefix is free
-        // text whose excludes are the table's terminals in order, the thought's own two left out
-        // so the model may close it where the engine runs the grammar from the first token, and
-        // the syntax's inner tags; nothing is owed at its end; the second element is the tag as
-        // derived without it.
+        // text whose excludes are the table's terminals in order, the thought's own two left out,
+        // and the syntax's inner tags; nothing is owed at its end. The call is owed, so the
+        // thought's close is excluded behind them and follows the text, once or not at all: the
+        // model may close its thought where the engine runs the grammar from the first token,
+        // and the calls follow that close at once. The last element is the tag as derived
+        // without the prefix.
         let tools = weather_tools();
         for (format, excludes) in [
             (
@@ -2094,6 +2130,7 @@ mod tests {
                     "</｜DSML｜ invoke>",
                     "<｜DSML｜ parameter name=\"",
                     "</｜DSML｜ parameter>",
+                    "</think>",
                 ]),
             ),
             (
@@ -2106,11 +2143,12 @@ mod tests {
                     "</｜DSML｜invoke>",
                     "<｜DSML｜parameter name=\"",
                     "</｜DSML｜parameter>",
+                    "</think>",
                 ]),
             ),
             (
                 formats::qwen3(CallSyntax::Json),
-                value!(["<tool_call>", "</tool_call>"]),
+                value!(["<tool_call>", "</tool_call>", "</think>"]),
             ),
         ] {
             let wrapped = format
@@ -2128,8 +2166,17 @@ mod tests {
                 "{}",
                 format.name()
             );
+            assert_eq!(
+                wrapped["elements"][1],
+                value!({"type": "optional", "content": {
+                    "type": "const_string",
+                    "value": "</think>",
+                }}),
+                "{}",
+                format.name()
+            );
             // The calls come last: a table whose layout writes text after the thought's close
-            // (Qwen3's two newlines) puts it between the prefix and them.
+            // (Qwen3's two newlines) puts it between the close and them.
             let last = wrapped["elements"]
                 .as_array()
                 .and_then(|elements| elements.last())
@@ -2616,7 +2663,8 @@ mod tests {
                 ],
             }})
         );
-        // With the thought open, the lead is free text that may close it, then the same block.
+        // With the thought open, the lead is free text, then the thought's close once or not at
+        // all (the call is owed, so the text cannot write the close), then the same block.
         let open = formats::deepseek_v4()
             .grammar(&tools, true, true)
             .expect("a grammar")
@@ -2631,10 +2679,15 @@ mod tests {
                 "</｜DSML｜invoke>",
                 "<｜DSML｜parameter name=\"",
                 "</｜DSML｜parameter>",
+                "</think>",
             ]})
         );
         assert_eq!(
-            open["format"]["elements"][1]["elements"],
+            open["format"]["elements"][1],
+            value!({"type": "optional", "content": {"type": "const_string", "value": "</think>"}})
+        );
+        assert_eq!(
+            open["format"]["elements"][2]["elements"],
             grammar.payload()["format"]["elements"]
         );
     }
@@ -2895,15 +2948,19 @@ mod tests {
         let open = formats::llama_nemotron()
             .grammar(&tools, true, true)
             .expect("a grammar");
+        // The call is owed: the thought's close leaves the text and follows it, once or not at
+        // all.
+        let close = Grammar::Optional(Box::new(Grammar::ConstString("</think>".to_string())));
         assert!(matches!(
             &open,
             Grammar::Sequence(parts)
-                if parts.len() == 2
+                if parts.len() == 3
                     && matches!(&parts[0], Grammar::AnyText { excludes }
                         if excludes.contains(&"<TOOLCALL>".to_string())
                             && excludes.contains(&"</TOOLCALL>".to_string())
                             && !excludes.contains(&"<think>".to_string())
-                            && !excludes.contains(&"</think>".to_string()))
+                            && excludes.last().is_some_and(|last| last == "</think>"))
+                    && parts[1] == close
         ));
     }
 
@@ -3046,19 +3103,23 @@ mod tests {
                 "at_least_one": true,
             }})
         );
-        // The free text keeps the thought's own markers, and the arguments marker too: `[ARGS]`
-        // opens no call without `[TOOL_CALLS]` before it, which the text cannot write.
+        // The free text keeps the thought's opener, and the arguments marker too: `[ARGS]`
+        // opens no call without `[TOOL_CALLS]` before it, which the text cannot write. The call
+        // is owed: the thought's close leaves the text and follows it, once or not at all.
         let open = formats::mistral_v13()
             .grammar(&tools, true, true)
             .expect("a grammar");
+        let close = Grammar::Optional(Box::new(Grammar::ConstString("[/THINK]".to_string())));
         assert!(matches!(
             &open,
             Grammar::Sequence(parts)
-                if parts.len() == 2
+                if parts.len() == 3
                     && matches!(&parts[0], Grammar::AnyText { excludes }
                         if excludes.contains(&"[TOOL_CALLS]".to_string())
                             && !excludes.contains(&"[ARGS]".to_string())
-                            && !excludes.contains(&"[THINK]".to_string()))
+                            && !excludes.contains(&"[THINK]".to_string())
+                            && excludes.last().is_some_and(|last| last == "[/THINK]"))
+                    && parts[1] == close
         ));
     }
 
@@ -3215,9 +3276,16 @@ mod tests {
                     .grammar(&tools, at_least_one, true)
                     .expect("a grammar")
                     .payload();
+                // Before a call the request owes, the thought's close stands between the prefix
+                // and the tags, once or not at all.
+                let tags = if at_least_one {
+                    "/format/elements/2"
+                } else {
+                    "/format/elements/1"
+                };
                 assert_eq!(
                     one_call(&format, &tools, at_least_one, true),
-                    stopping_at(open, "/format/elements/1"),
+                    stopping_at(open, tags),
                     "{}",
                     format.name()
                 );
@@ -3588,8 +3656,9 @@ mod tests {
     fn with_the_thought_open_and_engines_of_either_kind_the_answer_keeps_the_prefix() {
         // The engines a request may run on name different starts: one would force the schema
         // from the first token, inside the open thought, the other applies it after its gate,
-        // and no one tag fits both. The answer keeps the prefix a forced call takes, the
-        // thought's own markers writable so the model closes it, loosely, as before.
+        // and no one tag fits both. The answer keeps the prefix a call the request does not owe
+        // takes, the thought's own markers writable so the model closes it, loosely, as before
+        // (the prefix of an owed call cannot write the close, which follows it).
         let schema = value!({"type": "json_schema", "json_schema": answer_schema()});
         let tools = weather_tools();
         for format in [
@@ -3603,7 +3672,7 @@ mod tests {
                 .grammar_for(
                     &tools,
                     Options {
-                        at_least_one: true,
+                        at_least_one: false,
                         reasoning_open: true,
                         thought_closed: false,
                         one_call: false,
@@ -3626,7 +3695,7 @@ mod tests {
             assert_eq!(
                 call["format"]["elements"][0]["type"],
                 "any_text",
-                "{}: the forced call's prefix",
+                "{}: the prefix of a call that is not owed",
                 format.name()
             );
         }
@@ -4329,8 +4398,15 @@ mod tests {
         assert_eq!(closed["format"]["elements"][2], *calls);
         let unknown = calls_for(true, GrammarStart::Unknown);
         assert_eq!(unknown["format"]["elements"][0]["type"], "any_text");
-        assert_eq!(unknown["format"]["elements"][1], newline);
-        assert_eq!(unknown["format"]["elements"][2], *calls);
+        assert_eq!(
+            unknown["format"]["elements"][1],
+            value!({"type": "optional", "content": {
+                "type": "const_string",
+                "value": "</seed:think>",
+            }})
+        );
+        assert_eq!(unknown["format"]["elements"][2], newline);
+        assert_eq!(unknown["format"]["elements"][3], *calls);
         // The tag for any number of calls the same way, and the `auto` tag (no call owed).
         for (at_least_one, one_call) in [(true, false), (false, false), (false, true)] {
             let tag = format
@@ -4498,6 +4574,13 @@ mod tests {
         assert_eq!(open["format"]["elements"][0]["type"], "any_text");
         assert_eq!(
             open["format"]["elements"][1],
+            value!({"type": "optional", "content": {
+                "type": "const_string",
+                "value": "</mm:think>",
+            }})
+        );
+        assert_eq!(
+            open["format"]["elements"][2],
             closed["format"]["elements"][1]
         );
         let glm = formats::glm()
@@ -5070,15 +5153,23 @@ mod tests {
             answer(&format, true).map(|payload| payload["format"]["begin"].clone()),
             Some(value!("<e></t><a>"))
         );
-        // With the thought open, the prefix a forced call takes keeps both of the thought's closes
-        // writable, and `<e>` inside the one the template renders, but no other marker.
+        // With the thought open, the prefix a forced call takes can write neither of the
+        // thought's closes: one of them follows it, or none. `<e>`, which stands inside the one
+        // the template renders, stays writable, and no other marker.
         let wrapped = format
             .grammar(&weather_tools(), true, true)
             .expect("a grammar")
             .to_json();
         assert_eq!(
             wrapped["elements"][0],
-            value!({"type": "any_text", "excludes": ["<a>", "<c>", "</c>"]})
+            value!({"type": "any_text", "excludes": ["<a>", "<c>", "</c>", "<u>", "<e></t>"]})
+        );
+        assert_eq!(
+            wrapped["elements"][1],
+            value!({"type": "optional", "content": {"type": "or", "elements": [
+                {"type": "const_string", "value": "<u>"},
+                {"type": "const_string", "value": "<e></t>"},
+            ]}})
         );
         // Either close ends the thought, and `<e>` alone is the thought's text.
         let json = "{\"city\": \"Paris\"}";
@@ -5221,8 +5312,10 @@ mod tests {
             assert!(strings
                 .iter()
                 .all(|string| !string["value"].as_str().unwrap_or("").contains("<|\"|>")));
+            // The case with the thought open owes its call: the prefix, the thought's close,
+            // the tags.
             let tags = if reasoning_open {
-                &payload["format"]["elements"][1]
+                &payload["format"]["elements"][2]
             } else {
                 &payload["format"]
             };

@@ -17,7 +17,9 @@
 //! begins with may not start with the word's remaining bytes, a later token of the word read as
 //! its bytes (the head spells a later token as itself or its bytes). A token the text leaves out
 //! (one equal to a word, holding one, inside one between bytes, or beside another token in one)
-//! is read as bytes wherever a word holds it, so it never names a state. The spelling is one Lark
+//! is read as bytes wherever a word holds it, so it never names a state. A fixed word the text
+//! may not hold that follows it or not (an optional constant) stays writable in the text,
+//! since a text ends at one following word. The spelling is one Lark
 //! text, what the engines' grammar fields take; a node the Lark cannot carry refuses the grammar
 //! by name.
 
@@ -317,6 +319,22 @@ fn word_of(node: &Grammar) -> Option<Word> {
     };
     let parts = merge_parts(parts);
     (!parts.is_empty()).then_some(parts)
+}
+
+/// The fixed words of a node that may be left out whole: an optional constant or token, or an
+/// optional choice of them.
+fn left_out(node: &Grammar) -> Option<Vec<String>> {
+    let Grammar::Optional(content) = node else {
+        return None;
+    };
+    let word = |node: &Grammar| match node {
+        Grammar::ConstString(text) | Grammar::Token(text) => Some(text.clone()),
+        _ => None,
+    };
+    match &**content {
+        Grammar::Or(choices) => choices.iter().map(word).collect(),
+        one => word(one).map(|text| vec![text]),
+    }
 }
 
 /// `node` with its leading word `parts` taken away (the head of a text consumed them); `None`
@@ -1061,7 +1079,16 @@ impl<'a> Lowering<'a> {
                 Grammar::AnyText { excludes } => Some(excludes.clone()),
                 _ => None,
             };
-            if let Some(excludes) = text {
+            if let Some(mut excludes) = text {
+                // A fixed word the text may not hold that follows it or not (a thought's close
+                // before a call the request owes): the lexer ends a text at one following word,
+                // so the text holds the word here, and what follows the word follows the text.
+                if let Some(words) = nodes.get(i + 1).and_then(|next| left_out(next.as_ref())) {
+                    if words.iter().all(|word| excludes.contains(word)) {
+                        excludes.retain(|excluded| !words.contains(excluded));
+                        nodes.remove(i + 1);
+                    }
+                }
                 let word = nodes.get(i + 1).and_then(|next| word_of(next.as_ref()));
                 if let Some(word) = word {
                     let Some(rest) = after_word(nodes[i + 1].as_ref(), &word) else {

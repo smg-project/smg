@@ -705,14 +705,19 @@ mod tests {
         assert_eq!(first["format"]["elements"][1], closed["format"]);
         let unknown =
             payload(&[forecast()], forced(true, true, GrammarStart::Unknown)).expect("a tag");
+        // The call is owed: the text cannot write the close, which follows it once or not at all.
         assert_eq!(
             unknown["format"]["elements"][0],
             value!({"type": "any_text", "excludes": [
                 "<｜tool▁calls▁begin｜>", "<｜tool▁calls▁end｜>", "<｜tool▁call▁begin｜>",
-                "<｜tool▁call▁end｜>",
+                "<｜tool▁call▁end｜>", "</think>",
             ]})
         );
-        assert_eq!(unknown["format"]["elements"][1], closed["format"]);
+        assert_eq!(
+            unknown["format"]["elements"][1],
+            value!({"type": "optional", "content": {"type": "const_string", "value": "</think>"}})
+        );
+        assert_eq!(unknown["format"]["elements"][2], closed["format"]);
     }
 
     #[test]
