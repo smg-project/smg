@@ -1461,4 +1461,5 @@ fn runs_into(text: &str, marker: &str, from: usize) -> bool {
 }
 
 #[cfg(test)]
+#[path = "../tests/unit/to_symphony/tests.rs"]
 mod tests;
