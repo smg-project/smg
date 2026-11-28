@@ -57,9 +57,10 @@ pub(crate) struct SentSettings {
 /// its `sent.` terms, and `least-load` for its credit. Under a standalone
 /// controller it counts sends from every gateway through that controller.
 /// The profiles of a document that set the same time limit and report
-/// delay read one count: the engine records a send in every count, and
-/// only a decision's read lets one go, so a count of its own would keep
-/// the sends of a profile that decides no request.
+/// delay read one count: the engine tells every count each send it
+/// counts, and a report or a time limit ends a send only at a read. A
+/// count of its own would get no read under a profile that decides no
+/// request.
 ///
 /// Where a new document keeps a profile that reads a count, its engine
 /// goes on with that count, and the count built for the document's
@@ -75,15 +76,17 @@ pub(crate) struct SentSettings {
 /// the most, and its own reads let go what its own settings end.
 ///
 /// Two stages of a decision read under the same row sample and clock. With
-/// the same membership, their reads differ only if a send lands or another
-/// decision releases sends between them. The later read has the newer count.
+/// the same membership, their reads can still differ: a send can land
+/// between them, a send to a full row can let one go, and another read
+/// can release sends. The later read has the newer count.
 ///
 /// A report sampled at or after a send ends it, as do the profile's time
 /// limit and the row's removal. Under a report delay the report that ends
 /// a send is one sampled that long after the send, or longer: a report
 /// sampled sooner behind it leaves it counted. When a send arrives with
-/// 8,192 already held on a row, the tally lets the row's oldest go to
-/// bound the count. This threshold applies at any age.
+/// 8,192 or more held on a row, the tally lets one of the row's sends go
+/// to bound the count, or none: as a rule the oldest, at any age. None
+/// goes where the row, the new send counted, holds no more than 8,192.
 #[derive(Debug)]
 pub struct DispatchCredit {
     /// The rows' entries of this count's own: what every word of it reads
