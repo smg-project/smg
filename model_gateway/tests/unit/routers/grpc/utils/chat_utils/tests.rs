@@ -96,54 +96,28 @@ fn a_refusal_part_outside_an_assistant_turn_is_refused() {
     assert!(validate_chat_content_parts(&messages).is_ok());
 }
 
-/// A media part is taken in a user message (and in a tool result): in a
-/// system, developer, assistant or root message it is refused at the door in
-/// this door's own sentence (with the role's article), before any fetch, not
-/// after the pipeline ran it and the rendered prompt's anchors did not match
-/// it (none for a system, developer or root part, one too many for an
-/// assistant part).
+/// An image part in a system message is accepted, as a user message's is,
+/// and reaches the request's media plan: the model's template decides
+/// whether the prompt has a place for it.
 #[test]
-fn a_media_part_in_a_text_only_role_message_is_refused_at_the_door() {
-    let parts = [
-        json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,AQ=="}}),
-        json!({"type": "audio_url", "audio_url": {"url": "https://example.com/audio.wav"}}),
-        json!({"type": "input_audio", "input_audio": {"data": "UklGRg==", "format": "wav"}}),
-        json!({"type": "video_url", "video_url": {"url": "https://example.com/video.mp4"}}),
-    ];
-    for (role, phrase) in [
-        ("system", "a system"),
-        ("developer", "a developer"),
-        ("assistant", "an assistant"),
-        ("root", "a root"),
-    ] {
-        for part in &parts {
-            let kind = part["type"].as_str().unwrap();
-            let messages: Vec<ChatMessage> = serde_json::from_value(json!([
-                {"role": role, "content": [{"type": "text", "text": "you see"}, part]},
-                {"role": "user", "content": "describe"}
-            ]))
-            .unwrap();
-            let error = validate_chat_content_parts(&messages).unwrap_err();
-            assert_eq!(
-                error,
-                format!(
-                    "Unsupported chat content part type {kind:?} in {phrase} message for gRPC \
-                     backends: media parts are taken in user and tool messages"
-                )
-            );
-        }
-    }
-    let messages: Vec<ChatMessage> = serde_json::from_value(json!([
-        {"role": "system", "content": [{"type": "text", "text": "you see"}]},
-        {"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQ=="}}
-        ]},
-        {"role": "tool", "tool_call_id": "call_1", "content": [
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQ=="}}
-        ]}
-    ]))
+fn an_image_part_in_a_system_message_is_accepted_and_reaches_the_media_plan() {
+    use crate::routers::grpc::multimodal::media_plan_chat;
+    let request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "m",
+        "messages": [
+            {"role": "system", "content": [
+                {"type": "text", "text": "You see the attached image."},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQ=="}}
+            ]},
+            {"role": "user", "content": "Describe it."}
+        ]
+    }))
     .unwrap();
-    assert!(validate_chat_content_parts(&messages).is_ok());
+    assert_eq!(validate_chat_template_content_parts(&request), Ok(()));
+    assert_eq!(
+        media_plan_chat(&request.messages, &request.other).count(Modality::Image),
+        1
+    );
 }
 
 #[test]
