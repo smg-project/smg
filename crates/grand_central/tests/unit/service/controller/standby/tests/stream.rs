@@ -383,6 +383,21 @@ fn standing_by(
     bed: &Bed,
     quiet: Duration,
 ) -> (Elector, watch::Sender<ElectionObservation>, Standby) {
+    let (elector, standing, standby, _) = standing_by_over(bed, quiet);
+    (elector, standing, standby)
+}
+
+/// The same, with the store and the log the replica's own journal made:
+/// the two its shared state is built over.
+fn standing_by_over(
+    bed: &Bed,
+    quiet: Duration,
+) -> (
+    Elector,
+    watch::Sender<ElectionObservation>,
+    Standby,
+    Replica,
+) {
     let elector = Elector::alone(OWN, ElectionSettings::default())
         .expect("the default settings are in order");
     let (standing, stood) = watch::channel(ElectionObservation::default());
@@ -390,6 +405,7 @@ fn standing_by(
     // lease is one another replica can take.
     let place = LeasePlace::File("shared".into());
     let journal = journaled(&place, 1);
+    let own = (Arc::clone(&journal.0), Arc::clone(&journal.1.log));
     let (id, address) = ("standby-0".to_owned(), "127.0.0.1:1".to_owned());
     let catalog = Arc::new(crate::stages::StageRegistry::builtin());
     let journal = followed(journal);
@@ -401,7 +417,7 @@ fn standing_by(
     // so one late beat is not a silent leader.
     assert_eq!(standby.quiet, 3 * BEAT);
     standby.quiet = quiet;
-    (elector, standing, standby)
+    (elector, standing, standby, own)
 }
 
 fn resync() -> proto::ReplicationBatch {
@@ -591,7 +607,7 @@ async fn a_restored_standby_reads_synced_once_it_applied_what_was_written_during
 #[tokio::test]
 async fn a_standby_that_applied_nothing_says_so_and_joins_at_its_leaders_first_write() {
     let mut bed = Bed::new().await;
-    let (_elector, standing, standby) = standing_by(&bed, FIVE);
+    let (_elector, standing, standby, own) = standing_by_over(&bed, FIVE);
     let leader = led();
     standing.send_replace(bed.holds("leader-1", 1));
     let named = standby.shared.leader_elsewhere();
@@ -620,13 +636,13 @@ async fn a_standby_that_applied_nothing_says_so_and_joins_at_its_leaders_first_w
     let (ended, ()) = tokio::join!(standby.stream(&named, &applied), script);
     assert_eq!((ended.next, ended.applied), (Next::Lease, true));
     assert_eq!(standby.follower.place(), leader.1.head());
-    assert_eq!(start(&standby.shared.feed.log), start(&leader.1));
+    assert_eq!(start(&own.1), start(&leader.1));
 }
 
 #[tokio::test]
 async fn a_resync_is_the_leaders_snapshot_in_parts_on_the_stream_it_holds() {
     let mut bed = Bed::new().await;
-    let (_elector, standing, standby) = standing_by(&bed, FIVE);
+    let (_elector, standing, standby, own) = standing_by_over(&bed, FIVE);
     let leader = led();
     let now = Instant::now();
     a_page_and_one(&leader.0);
@@ -658,7 +674,9 @@ async fn a_resync_is_the_leaders_snapshot_in_parts_on_the_stream_it_holds() {
     let (ended, ()) = tokio::join!(standby.stream(&named, &applied), script);
     assert_eq!((ended.next, ended.applied), (Next::Lease, true));
     assert_eq!(standby.follower.place(), leader.1.head());
-    assert_eq!(held(&standby.shared.store), held(&leader.0));
+    assert_eq!(held(&own.0), held(&leader.0));
+    // The holder the replica decides over counts an object a row.
+    assert_eq!(standby.shared.objects.len(), own.0.all_rows().1.len());
     let lag = standby.shared.lag.age(Instant::now());
     assert!(lag.is_some(), "a restore is a frame applied");
     // One stream and no other call: the snapshot rode it. The leader's
@@ -678,7 +696,7 @@ async fn a_resync_lands_the_generation_its_snapshots_first_part_states() {
     };
 
     let mut bed = Bed::new().await;
-    let (_elector, standing, standby) = standing_by(&bed, FIVE);
+    let (_elector, standing, standby, own) = standing_by_over(&bed, FIVE);
     let leader = led();
     let leading = door(&leader);
     leading
@@ -703,7 +721,7 @@ async fn a_resync_lands_the_generation_its_snapshots_first_part_states() {
     };
     let (ended, ()) = tokio::join!(standby.stream(&named, &applied), script);
     assert_eq!((ended.next, ended.applied), (Next::Lease, true));
-    assert_eq!(held(&standby.shared.store), held(&leader.0));
+    assert_eq!(held(&own.0), held(&leader.0));
     let following = &standby.shared.generations;
     assert_eq!(
         spec_document(following.document(0).expect("held")),
@@ -714,13 +732,13 @@ async fn a_resync_lands_the_generation_its_snapshots_first_part_states() {
 #[tokio::test]
 async fn a_stream_that_ends_inside_a_snapshot_leaves_the_store_as_it_was() {
     let mut bed = Bed::new().await;
-    let (_elector, standing, standby) = standing_by(&bed, FIVE);
+    let (_elector, standing, standby, own) = standing_by_over(&bed, FIVE);
     // The standby follows a leader's first writes.
     let leader = led();
     let now = Instant::now();
     follow(&standby.follower, &leader.1, now);
     let place = standby.follower.place();
-    let before = held(&standby.shared.store);
+    let before = held(&own.0);
     // The leader moves on, and its snapshot is two parts.
     a_page_and_one(&leader.0);
     let parts = snapshot(&leader, now);
@@ -753,7 +771,7 @@ async fn a_stream_that_ends_inside_a_snapshot_leaves_the_store_as_it_was() {
         let (ended, _opened) = tokio::join!(standby.stream(&named, &applied), script);
         assert_eq!((ended.next, ended.applied), (Next::Wait, false), "{what}");
         assert_eq!(standby.follower.place(), place, "{what}");
-        assert_eq!(held(&standby.shared.store), before, "{what}");
+        assert_eq!(held(&own.0), before, "{what}");
     }
     // The whole snapshot on the next stream restores it. The word said
     // again starts the staging over: the parts after it are a
@@ -771,7 +789,7 @@ async fn a_stream_that_ends_inside_a_snapshot_leaves_the_store_as_it_was() {
     };
     let (ended, ()) = tokio::join!(standby.stream(&named, &applied), script);
     assert_eq!((ended.next, ended.applied), (Next::Lease, true));
-    assert_eq!(held(&standby.shared.store), held(&leader.0));
+    assert_eq!(held(&own.0), held(&leader.0));
 }
 
 #[tokio::test]
@@ -1059,14 +1077,14 @@ async fn a_restore_ends_the_ask_and_the_next_hello_names_the_place_restored() {
 #[tokio::test]
 async fn a_snapshot_the_log_does_not_follow_is_left_and_the_lease_read_again() {
     let mut bed = Bed::new().await;
-    let (_elector, standing, standby) = standing_by(&bed, FIVE);
+    let (_elector, standing, standby, own) = standing_by_over(&bed, FIVE);
     // The standby followed a leader into term 9.
     let leader = led();
     leader.0.set_term(9);
     let now = Instant::now();
     follow(&standby.follower, &leader.1, now);
     let place = standby.follower.place();
-    let before = held(&standby.shared.store);
+    let before = held(&own.0);
     // A replica that still believes it leads term 1 restores it.
     let parts = snapshot(&led(), now);
     standing.send_replace(bed.holds("leader-1", 9));
@@ -1088,7 +1106,7 @@ async fn a_snapshot_the_log_does_not_follow_is_left_and_the_lease_read_again() {
         "{why}"
     );
     assert_eq!(standby.follower.place(), place);
-    assert_eq!(held(&standby.shared.store), before);
+    assert_eq!(held(&own.0), before);
 }
 
 #[tokio::test]

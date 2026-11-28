@@ -58,7 +58,7 @@ use crate::{
         proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome, identity::Form},
     },
     stages::StageRegistry,
-    store::{HealthSink, LeasesStore},
+    store::{HealthSink, LeasesStore, MemoryStore},
     tracking::lease::{LeaseId, ReleaseReason, DISPATCH_TTL},
 };
 
@@ -87,6 +87,8 @@ struct Bed {
     /// holds it: the state holds its receiver.
     stop: watch::Sender<bool>,
     shared: Arc<Shared>,
+    /// The store the bed's own `journaled_at` made, which the state holds.
+    store: Arc<MemoryStore>,
     script: Arc<Script>,
     /// The members serving the cases' model in the single role, ready.
     workers: Vec<WorkerId>,
@@ -181,7 +183,7 @@ async fn bed_over(
     let reads = Reads {
         objects,
         loads: frame_loads::tests::silent(),
-        store,
+        store: Arc::clone(&store),
         fence: elector.fence(),
         standing: stood,
         clock,
@@ -208,6 +210,7 @@ async fn bed_over(
         standing,
         stop,
         shared,
+        store,
         script,
         workers,
         addr,
@@ -250,7 +253,7 @@ impl Bed {
     fn takes(&mut self, term: u64) {
         let tick = self.elector.tick(self.now()).expect("the take");
         assert_eq!(tick, TickOutcome::Acquired { term });
-        self.shared.store.set_term(term);
+        self.store.set_term(term);
         self.standing.send_replace(ElectionObservation {
             holder: IDENTITY.to_owned(),
             term,
@@ -1141,13 +1144,13 @@ async fn a_decision_stopped_for_the_fence_gives_its_lease_up_at_the_send() {
     let (step, at_read, release) = hold();
     let bed = bed_with((1, 8), None, [step]).await;
     let heard = Arc::new(Mutex::new(Vec::new()));
-    let later = bed.shared.store.apply(hearing(&heard, 2));
+    let later = bed.store.apply(hearing(&heard, 2));
     later.expect("a later generation");
     let _seat = bed.welcomed(NAME, 1);
     let (_frames, mut stream) = two_queued(&bed, at_read, &release).await;
     let gateway = told(NAME).gateway();
     let id = |count: u64| 1 << 32 | count;
-    let store: &dyn LeasesStore = bed.shared.store.as_ref();
+    let store: &dyn LeasesStore = bed.store.as_ref();
     // Two leases of the stream's decisions and the case's own.
     assert_eq!(store.live(gateway), 3);
     assert_eq!(*heard.lock(), [(id(1), None), (id(2), None), (id(3), None)]);
@@ -1188,13 +1191,13 @@ async fn an_answer_queued_before_its_request_is_asked_again_leaves_with_the_ende
     let (step, at_read, release) = hold();
     let bed = bed_with((1, 8), None, [step]).await;
     let heard = Arc::new(Mutex::new(Vec::new()));
-    let later = bed.shared.store.apply(hearing(&heard, 2));
+    let later = bed.store.apply(hearing(&heard, 2));
     later.expect("a later generation");
     let _seat = bed.welcomed(NAME, 1);
     let (_frames, mut stream) = two_queued(&bed, at_read, &release).await;
     let gateway = told(NAME).gateway();
     let id = |count: u64| 1 << 32 | count;
-    let store: &dyn LeasesStore = bed.shared.store.as_ref();
+    let store: &dyn LeasesStore = bed.store.as_ref();
     assert_eq!(store.live(gateway), 3);
     // Request 1 again, as on a second stream of its gateway, while the
     // answer to its first ask waits in the open stream's queue.
@@ -1238,13 +1241,13 @@ async fn a_stream_that_ends_gives_up_the_leases_of_the_decisions_in_its_queue() 
     let (step, at_read, release) = hold();
     let bed = bed_with((1, 8), None, [step]).await;
     let heard = Arc::new(Mutex::new(Vec::new()));
-    let later = bed.shared.store.apply(hearing(&heard, 2));
+    let later = bed.store.apply(hearing(&heard, 2));
     later.expect("a later generation");
     let _seat = bed.welcomed(NAME, 1);
     let (_frames, stream) = two_queued(&bed, at_read, &release).await;
     let gateway = told(NAME).gateway();
     let id = |count: u64| 1 << 32 | count;
-    let store: &dyn LeasesStore = bed.shared.store.as_ref();
+    let store: &dyn LeasesStore = bed.store.as_ref();
     // Two leases of the stream's decisions and the case's own.
     assert_eq!(store.live(gateway), 3);
     drop(stream);
@@ -1267,7 +1270,7 @@ async fn a_request_asked_again_behind_its_streams_end_finds_no_lease_to_end() {
     let (step, at_read, release) = hold();
     let bed = bed_with((1, 8), None, [step]).await;
     let heard = Arc::new(Mutex::new(Vec::new()));
-    let later = bed.shared.store.apply(hearing(&heard, 2));
+    let later = bed.store.apply(hearing(&heard, 2));
     later.expect("a later generation");
     let _seat = bed.welcomed(NAME, 1);
     let (_frames, stream) = two_queued(&bed, at_read, &release).await;
@@ -1292,7 +1295,7 @@ async fn a_request_asked_again_behind_its_streams_end_finds_no_lease_to_end() {
     // The repeat found no lease that waits: `none` is counted, not `ended`.
     let again = bed.counts().again.each_ref();
     assert_eq!(again.map(|count| count.load(Ordering::Relaxed)), [1, 0]);
-    let store: &dyn LeasesStore = bed.shared.store.as_ref();
+    let store: &dyn LeasesStore = bed.store.as_ref();
     assert_eq!(store.live(gateway), 2);
 }
 
@@ -1306,14 +1309,14 @@ async fn a_stream_that_ends_at_a_watched_file_applies_its_releases_as_it_leaves(
     let (step, at_read, release) = hold();
     let bed = bed_with((2, 8), None, [step]).await;
     let heard = Arc::new(Mutex::new(Vec::new()));
-    let later = bed.shared.store.apply(hearing(&heard, 2));
+    let later = bed.store.apply(hearing(&heard, 2));
     later.expect("a later generation");
     let _seat = bed.welcomed(NAME, 1);
     let (_frames, stream) = two_queued(&bed, at_read, &release).await;
     // Three leases stand on the decider's file, so it keeps its watch
     // there. The watch can start ahead of the case's own request: the
     // case goes on once the decider has left that work too.
-    let store = Arc::clone(&bed.shared.store);
+    let store = Arc::clone(&bed.store);
     settled(|| store.watches() == 1 && store.working() == 0).await;
     let issued: Vec<u64> = heard.lock().iter().map(|&(id, _)| id).collect();
     assert_eq!(issued.len(), 3);
@@ -1335,7 +1338,7 @@ async fn a_decision_sent_past_its_leases_span_leaves_as_busy_and_gives_the_lease
     let (step, at_read, release) = hold();
     let bed = bed_with((1, 8), None, [step]).await;
     let heard = Arc::new(Mutex::new(Vec::new()));
-    let later = bed.shared.store.apply(hearing(&heard, 2));
+    let later = bed.store.apply(hearing(&heard, 2));
     later.expect("a later generation");
     let _seat = bed.welcomed(NAME, 1);
     let (_frames, mut stream) = two_queued(&bed, at_read, &release).await;
@@ -1355,7 +1358,7 @@ async fn a_decision_sent_past_its_leases_span_leaves_as_busy_and_gives_the_lease
         (busy(&second), second.request_id.as_slice(), second.term),
         (Reason::BudgetGoneOnArrival, &[2][..], 1)
     );
-    let store: &dyn LeasesStore = bed.shared.store.as_ref();
+    let store: &dyn LeasesStore = bed.store.as_ref();
     // The lease's release was handed at the send: its file's decider
     // applies it as it leaves its work, or this read does.
     settled(|| store.get(gateway, LeaseId(id(2))).is_none()).await;
@@ -1566,7 +1569,7 @@ async fn a_request_out_of_its_range_ends_the_stream_by_its_fields_name_and_a_pro
 #[tokio::test]
 async fn an_encode_requests_frame_is_answered_its_items_encoders_on_the_stream() {
     let bed = bed().await;
-    let store = &bed.shared.store;
+    let store = &bed.store;
     let later = encode_plan_in(&StageRegistry::builtin(), 2, ["random"; 3]);
     store.apply(later).expect("a later generation");
     let objects = &bed.shared.objects;
@@ -1885,8 +1888,7 @@ async fn a_stream_decides_for_the_gateway_its_principal_names() {
     let _other = bed.welcomed(OTHER, 1);
     let vetoed = bed.workers[0];
     let until = bed.now() + Duration::from_secs(60);
-    bed.shared
-        .store
+    bed.store
         .gateway_veto(told(NAME).gateway(), vetoed, Some(until));
     let mut own = bed.opened(NAME).await;
     let mut theirs = bed.opened(OTHER).await;

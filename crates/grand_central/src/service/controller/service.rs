@@ -33,7 +33,7 @@
 
 use std::{
     future::Future,
-    io,
+    io, mem,
     sync::Arc,
     task::{Context, Poll},
     time::{Duration, Instant, SystemTime},
@@ -65,7 +65,7 @@ use super::{
     replication::{Batches, Replication},
     session,
     snapshot::{self, SnapshotQuery},
-    standby::Lag,
+    standby::{Follower, Lag},
     watch_workers::{self, Feed, Readers, Source, Start, Watching},
     wire, PROTOCOL_FLOOR, PROTOCOL_VERSION,
 };
@@ -84,7 +84,8 @@ use crate::{
         replication::NotLeading,
     },
     stages::registry::StageRegistry,
-    store::{GatewayId, MemoryStore},
+    store::{GatewayId, Hand, LeasesStore, MemoryStore},
+    tracking::lease::ReleaseReason,
     worker_host::{Members, Objects},
 };
 
@@ -159,8 +160,9 @@ pub(crate) struct Shared {
     /// pass on, each at its own instant.
     lead: Leadership,
     /// The controller's store: what the calls feed and read, and the run
-    /// loop's tasks with them.
-    pub(crate) store: Arc<MemoryStore>,
+    /// loop's tasks with them. No method of this state returns it, owned or
+    /// lent.
+    store: Arc<MemoryStore>,
     /// Who is present: the gateways a `Session` welcomed, over this fence
     /// and this store.
     pub(crate) gateways: Arc<Gateways>,
@@ -186,8 +188,9 @@ pub(crate) struct Shared {
     /// The drain alone says it: a listener holds this receiver.
     pub(crate) stop: watch::Receiver<bool>,
     /// The log that store journals to and the wake of its watched writes:
-    /// what a watch of the rows reads.
-    pub(crate) feed: Feed,
+    /// what a watch of the rows reads. No method of this state returns it
+    /// or its log, owned or lent.
+    feed: Feed,
     /// The term this replica leads, if it leads one, told at a change alone
     /// by the run loop's one task: how an idle watch learns its replica
     /// stopped leading, and a task of the lead that another term began.
@@ -409,6 +412,43 @@ impl Shared {
         self.lead.identity()
     }
 
+    /// A stream's hand at the leases' files of this state's store, opened
+    /// for `gateway`'s frames: the one place a [`LeaseHand`] is made.
+    pub(crate) fn hand(&self, gateway: GatewayId) -> LeaseHand {
+        LeaseHand {
+            store: Arc::clone(&self.store),
+            hand: Hand::new(gateway),
+        }
+    }
+
+    /// A standby's applier over this state's store, the log that store
+    /// journals to and the replica's worker objects ([`Follower::new`]).
+    pub(crate) fn follower(&self) -> Follower {
+        Follower::new(
+            Arc::clone(&self.store),
+            Arc::clone(&self.feed.log),
+            Arc::clone(&self.objects),
+        )
+    }
+
+    /// The term of this state's store ([`LeasesStore::term`]).
+    pub(crate) fn store_term(&self) -> u64 {
+        self.store.term()
+    }
+
+    /// The sampled decision `record` as the `Explain` call carries it
+    /// ([`explained`]), over the engine of the store's world at this read
+    /// ([`MemoryStore::deciding`]).
+    pub(crate) fn explained(
+        &self,
+        record: DecisionRecord,
+        request_id: Vec<u8>,
+        gateway_id: String,
+    ) -> proto::DecisionRecord {
+        self.store
+            .deciding(|world| explained(record, world.spec().engine(), request_id, gateway_id))
+    }
+
     /// Opens a watch of the worker rows for `by`, admitted under `term`,
     /// from `start` and for `models`. The stream reads this state's store,
     /// worker objects, feed and fence, and takes its place among the feed's
@@ -509,12 +549,71 @@ impl Shared {
     /// The presence table's task until `stop`: the sweep, and what rides
     /// its clock ([`Gateways::run`]). Of the shared state, the task holds
     /// the table alone.
-    pub(crate) fn sweep(
+    pub(crate) fn presence_task(
         &self,
         stop: watch::Receiver<bool>,
     ) -> impl Future<Output = ()> + Send + use<> {
         let gateways = Arc::clone(&self.gateways);
         async move { gateways.run(stop).await }
+    }
+}
+
+/// A stream's hand at the leases' files of its replica's store: the store's
+/// own hand ([`Hand`]) with the store whose files take its frames. The
+/// store's hand names no store, and a frame goes to the files of the store
+/// the hand is handed through. This type keeps the two together, and
+/// [`Shared::hand`] alone makes one.
+pub(crate) struct LeaseHand {
+    /// The store whose files take the hand's frames.
+    store: Arc<MemoryStore>,
+    /// The store's own hand, opened for one gateway's frames.
+    hand: Hand,
+}
+
+impl LeaseHand {
+    /// A `Dispatched` frame of the hand's gateway, handed on with `now`
+    /// ([`lifecycle::dispatched`]): a lease the frame moves to dispatched
+    /// is dated at `now`.
+    ///
+    /// # Errors
+    ///
+    /// The frame reads wrong: it is refused by its field's name.
+    pub(crate) fn dispatched(&self, frame: &proto::Dispatched, now: Instant) -> Result<(), Status> {
+        lifecycle::dispatched(&self.store, &self.hand, frame, now)
+    }
+
+    /// A `Completed` frame of the hand's gateway
+    /// ([`lifecycle::completed`]).
+    ///
+    /// # Errors
+    ///
+    /// The frame reads wrong: it is refused by its field's name.
+    pub(crate) fn completed(&self, frame: &proto::Completed) -> Result<(), Status> {
+        lifecycle::completed(&self.store, &self.hand, frame)
+    }
+
+    /// A `Released` frame of the hand's gateway ([`lifecycle::released`]).
+    ///
+    /// # Errors
+    ///
+    /// The frame reads wrong: it is refused by its field's name.
+    pub(crate) fn released(&self, frame: &proto::Released) -> Result<(), Status> {
+        lifecycle::released(&self.store, &self.hand, frame)
+    }
+
+    /// Gives `leased` up under `reason`, for an answer that does not leave
+    /// ([`wire::Leased::given_up`]).
+    pub(crate) fn given_up(&self, leased: &wire::Leased, reason: ReleaseReason) {
+        leased.given_up(&self.store, &self.hand, reason);
+    }
+
+    /// The stream's end ([`MemoryStore::hand_back`]): the store looks once
+    /// more at each file the hand handed to. A new hand of the same gateway
+    /// is left in its place, which handed to no file.
+    pub(crate) fn back(&mut self) {
+        let empty = Hand::new(self.hand.gateway());
+        let hand = mem::replace(&mut self.hand, empty);
+        self.store.hand_back(hand);
     }
 }
 
@@ -1029,11 +1128,7 @@ impl GrandCentral for Service {
             self.shared
                 .deciders
                 .explain(term, principal::gateway_id(&gateway_id), &request_id);
-        let answer = record.map(|record| {
-            self.shared
-                .store
-                .deciding(|world| explained(record, world.spec().engine(), request_id, gateway_id))
-        });
+        let answer = record.map(|record| self.shared.explained(record, request_id, gateway_id));
         if self.leading(Instant::now())? != term {
             return Err(Status::unavailable(TAKE_OVER));
         }

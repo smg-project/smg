@@ -26,9 +26,9 @@
 //! with none.
 //!
 //! One arm a kind of frame. `Hello` and `GatewayVeto` are served here, and
-//! the lifecycle's three frames in [`lifecycle`]. The other kinds are
-//! refused by name until the step that serves each adds its arm, as the
-//! service refuses an unserved call.
+//! the lifecycle's three frames in [`lifecycle`](super::lifecycle). The
+//! other kinds are refused by name until the step that serves each adds its
+//! arm, as the service refuses an unserved call.
 //!
 //! A gateway's vetoes ride its `Hello`, whole, and are held before the
 //! `Welcome` leaves: a new leader masks for the gateway from its first
@@ -54,16 +54,14 @@ use super::{
     decide,
     floor::{unbelieved, Told, FLOORS_SPENT_MAX, FLOOR_REACH},
     gateways::{over_kinds, Refused, SessionPlace, Vetoed, KINDS_MAX, VETOES_MAX},
-    lifecycle,
     principal::Principal,
-    service::Shared,
+    service::{LeaseHand, Shared},
     wire::millis,
     PROTOCOL_FLOOR, PROTOCOL_VERSION,
 };
 use crate::{
     engine::view::WorkerId,
     service::proto::{self, controller_frame, gateway_frame::Frame},
-    store::Hand,
     tracking::lease::DISPATCH_TTL,
 };
 
@@ -387,7 +385,7 @@ async fn session(
 
     // The session's hand-over at the leases' file: what its frames say of
     // a lease is handed there, and applied before the session leaves.
-    let hand = Hand::new(gateway);
+    let mut hand = shared.hand(gateway);
     let status = loop {
         tokio::select! {
             frame = inbound.message() => {
@@ -413,7 +411,7 @@ async fn session(
         }
     };
     debug!(gateway = %principal.subject, term, ended = ?status.as_ref().map(Status::code), "a gateway's session ended");
-    shared.store.hand_back(hand);
+    hand.back();
     // The seat's drop starts the gateway's grace period.
     drop(seat);
     status
@@ -579,7 +577,7 @@ fn vetoed(seat: &SessionPlace, veto: &proto::GatewayVeto, now: Instant) -> Optio
 async fn judge(
     shared: &Shared,
     subject: &str,
-    hand: &Hand,
+    hand: &LeaseHand,
     term: u64,
     seat: &SessionPlace,
     frame: &proto::GatewayFrame,
@@ -605,13 +603,9 @@ async fn judge(
         Some(Frame::Hello(_)) => Some(Status::failed_precondition(
             "a session stands on this stream: a second Hello needs a new stream",
         )),
-        Some(Frame::Dispatched(dispatched)) => {
-            lifecycle::dispatched(&shared.store, hand, dispatched, now).err()
-        }
-        Some(Frame::Completed(completed)) => {
-            lifecycle::completed(&shared.store, hand, completed).err()
-        }
-        Some(Frame::Released(released)) => lifecycle::released(&shared.store, hand, released).err(),
+        Some(Frame::Dispatched(dispatched)) => hand.dispatched(dispatched, now).err(),
+        Some(Frame::Completed(completed)) => hand.completed(completed).err(),
+        Some(Frame::Released(released)) => hand.released(released).err(),
         Some(Frame::Veto(veto)) => vetoed(seat, veto, now),
         Some(unserved @ (Frame::HelloPage(_) | Frame::SpecAck(_))) => Some(Status::unimplemented(
             format!("{} is not served by this build", kind(unserved)),
