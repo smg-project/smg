@@ -25,7 +25,8 @@ use crate::{observability::cache_trace, policies::expected_wait::ExpectedWait};
 
 /// Dispatches kept per worker between reports. A worker that never reports
 /// (a dark fleet is scored by its live in-flight count instead) would
-/// otherwise accumulate them without end; past this the oldest are dropped.
+/// otherwise accumulate them without end; past this the oldest entry is
+/// folded into the one behind it.
 const SINCE_POLL_DISPATCHES_KEPT: usize = 8_192;
 
 /// Expected waits within this of the minimum are one tie and are drawn from
@@ -52,63 +53,118 @@ const HELD_GUARD_CANDIDATES: usize = 7;
 
 /// Since-report dispatch tally for one worker: the token-work and request
 /// count of the dispatches no report has reflected yet, with each dispatch's
-/// instant, so a report that says when the engine was sampled releases
-/// exactly the dispatches it saw and keeps the later ones as credit.
+/// instant, so a report that says when the engine was sampled releases the
+/// dispatches it saw and keeps the later ones as credit. A full history
+/// folds its oldest entry into the one behind it, which keeps its own
+/// instant: the newest dispatches, the ones a report is least likely to
+/// reflect yet, keep an entry each. A report sampled at or after a folded
+/// entry's instant releases it whole. One sampled before it seals it: the
+/// history then folds behind it, so the next report can release it, and
+/// the tally exceeds the dispatches no report reflects by at most what one
+/// sealed entry holds.
 #[derive(Clone, Debug, Default)]
 struct SincePollDispatch {
     tokens: u64,
     requests: u64,
-    /// `(dispatched_at, tokens)` per dispatch, oldest first: the instant is
-    /// read under the tally's write guard, so the pushes keep the clock's order.
+    /// `(dispatched_at, tokens)` per entry, oldest first: the instant is
+    /// read under the tally's write guard, so the entries keep the clock's
+    /// order. An entry of several dispatches holds the last one's.
     dispatches: VecDeque<(Instant, u64)>,
+    /// The dispatches folded into the first entry and into the second,
+    /// beyond each entry's own. A fold lands in the first entry, or in the
+    /// second behind a sealed first, so every later entry is one dispatch.
+    folded: [u64; 2],
+    /// The oldest entry is a fold that a report's sample did not reach.
+    sealed: bool,
 }
 
 impl SincePollDispatch {
+    /// Record one dispatch. A full history first folds its oldest entry
+    /// into the one behind it.
+    ///
+    /// Inlined into the decision explicitly: with the fold in its body the
+    /// inliner leaves it a call, which every dispatch then pays (measured
+    /// on the instruction count of one pick).
+    #[inline(always)]
     fn record(&mut self, at: Instant, tokens: u64) {
         debug_assert!(
             self.dispatches.back().is_none_or(|&(last, _)| last <= at),
             "a dispatch recorded out of clock order"
         );
+        // The token total stops at its type's bound and the entry takes what
+        // the total took, so the total stays the sum of the entries.
+        let tokens = tokens.min(u64::MAX - self.tokens);
         self.tokens += tokens;
         self.requests += 1;
-        self.dispatches.push_back((at, tokens));
-        if self.dispatches.len() > SINCE_POLL_DISPATCHES_KEPT {
-            self.pop_oldest();
+        if self.dispatches.len() >= SINCE_POLL_DISPATCHES_KEPT {
+            // A sealed fold stays first and takes no more: the entry behind
+            // it is the oldest one that folds.
+            if self.sealed {
+                self.dispatches.swap(0, 1);
+            }
+            let oldest = self.dispatches.pop_front();
+            if let (Some((_, held)), Some((_, next_held))) =
+                (oldest, self.dispatches.get_mut(usize::from(self.sealed)))
+            {
+                *next_held += held;
+                self.folded = if self.sealed {
+                    [self.folded[0], self.folded[1] + 1]
+                } else {
+                    [self.folded[0] + self.folded[1] + 1, 0]
+                };
+            }
         }
+        self.dispatches.push_back((at, tokens));
     }
 
     /// Release the dispatches a report sampled at `sampled_at` already
-    /// reflects: those made at or before it. Idempotent: the dispatches are
+    /// reflects: the entries at or before it. Idempotent: the entries are
     /// kept oldest first, so the same report read again, or an older sample
-    /// read after a newer one, releases nothing more.
+    /// read after a newer one, releases nothing more. A fold the sample did
+    /// not reach is sealed.
     fn release_through(&mut self, sampled_at: Instant) {
-        while self
-            .dispatches
-            .front()
-            .is_some_and(|&(at, _)| at <= sampled_at)
-        {
+        while let Some(&(at, _)) = self.dispatches.front() {
+            if at > sampled_at {
+                // Stored once for a fold, not on every read: each decision
+                // passes here, and a store would dirty the record for the
+                // other callers.
+                if self.folded[0] > 0 && !self.sealed {
+                    self.sealed = true;
+                }
+                break;
+            }
             self.pop_oldest();
         }
     }
 
     /// The credit a decision reads, `(tokens, requests, release)`: the tally
-    /// less the dispatches made at or before `sampled_at`, which a report
+    /// less the entries at or before `sampled_at`, which a report
     /// sampled then already reflects, read without releasing them.
-    /// `release` says whether any such dispatch is held, so the decision's
-    /// write phase can pop them ([`Self::release_through`]) once it holds
-    /// the guard. No sample instant (no report) reads the whole tally.
+    /// `release` says whether any such entry is held, or a fold to seal,
+    /// so the decision's write phase can pop and seal
+    /// ([`Self::release_through`]) once it holds the guard. No sample
+    /// instant (no report) reads the whole tally.
     fn credit_after(&self, sampled_at: Option<Instant>) -> (u64, u64, bool) {
         let (mut tokens, mut requests) = (self.tokens, self.requests);
         let mut release = false;
         if let Some(sampled_at) = sampled_at {
+            let mut reflected = 0;
             for &(at, dispatched) in &self.dispatches {
                 if at > sampled_at {
                     break;
                 }
                 tokens -= dispatched;
-                requests -= 1;
-                release = true;
+                reflected += 1;
             }
+            // An entry is one dispatch and what was folded into it: the
+            // first two entries alone hold folds.
+            let folded = match reflected {
+                0 => 0,
+                1 => self.folded[0],
+                _ => self.folded[0] + self.folded[1],
+            };
+            requests -= reflected + folded;
+            release = reflected > 0 || (self.folded[0] > 0 && !self.sealed);
         }
         (tokens, requests, release)
     }
@@ -116,7 +172,11 @@ impl SincePollDispatch {
     fn pop_oldest(&mut self) {
         if let Some((_, tokens)) = self.dispatches.pop_front() {
             self.tokens -= tokens;
-            self.requests -= 1;
+            // The entry's own dispatch and the ones folded into it. The
+            // second entry is the first now, and none behind it holds a fold.
+            self.requests -= 1 + self.folded[0];
+            self.folded = [self.folded[1], 0];
+            self.sealed = false;
         }
     }
 }
@@ -250,9 +310,10 @@ struct Candidate {
     since_poll_tokens: u64,
     since_poll_requests: u64,
     /// The report's sample instant, and whether the tally still holds
-    /// dispatches made at or before it for the decision's write phase to
-    /// release (a read under the held guard released them as it read). A
-    /// report without a reading keeps its instant.
+    /// dispatches made at or before it, or a fold to seal, for the
+    /// decision's write phase to release (a read under the held guard
+    /// released them as it read). A report without a reading keeps its
+    /// instant.
     sampled_at: Option<Instant>,
     release: bool,
 }
@@ -1799,14 +1860,56 @@ mod tests {
     fn the_tally_keeps_a_bounded_history_for_a_worker_that_never_reports() {
         let mut dispatch = SincePollDispatch::default();
         let at = Instant::now();
-        for _ in 0..(SINCE_POLL_DISPATCHES_KEPT + 100) {
+        let later = at + std::time::Duration::from_millis(1);
+        let kept = SINCE_POLL_DISPATCHES_KEPT as u64;
+        for _ in 0..kept {
             dispatch.record(at, 7);
         }
+        for _ in 0..100 {
+            dispatch.record(later, 7);
+        }
+        // Past the bound the oldest entry is folded into the one behind it:
+        // the tally counts every dispatch, and a report sampled at the first
+        // instant releases the folded entry and leaves the 100 later ones.
         assert_eq!(dispatch.dispatches.len(), SINCE_POLL_DISPATCHES_KEPT);
-        assert_eq!(dispatch.requests as usize, SINCE_POLL_DISPATCHES_KEPT);
-        assert_eq!(dispatch.tokens as usize, 7 * SINCE_POLL_DISPATCHES_KEPT);
+        assert_eq!(
+            (dispatch.tokens, dispatch.requests),
+            (7 * (kept + 100), kept + 100)
+        );
+        assert_eq!(dispatch.credit_after(Some(at)), (7 * 100, 100, true));
         dispatch.release_through(at);
-        assert_eq!((dispatch.tokens, dispatch.requests), (0, 0));
+        assert_eq!((dispatch.tokens, dispatch.requests), (7 * 100, 100));
+
+        // A worker that takes 10,000 dispatches a report, each report sampled
+        // 9,000 dispatches back: the fold a sample does not reach is sealed
+        // and the next report releases it. The tally settles at 18,190 where
+        // 9,000 dispatches are unreported, and each read asks for the write
+        // phase, the first one for the seal alone.
+        let mut steady = SincePollDispatch::default();
+        let (mut now, mut asked) = (later, Vec::new());
+        for charged in [10_000, 18_191, 18_190, 18_190] {
+            let mut sampled_at = now;
+            for dispatched in 1..=10_000 {
+                now += std::time::Duration::from_nanos(1);
+                steady.record(now, 1);
+                if dispatched == 1_000 {
+                    sampled_at = now;
+                }
+            }
+            asked.push(steady.credit_after(Some(sampled_at)).2);
+            // The read prices what the release leaves, and a report sampled
+            // now leaves nothing: the folds of both entries count in it.
+            assert_eq!(
+                steady.credit_after(Some(sampled_at)),
+                (charged, charged, true)
+            );
+            assert_eq!(steady.credit_after(Some(now)), (0, 0, true));
+            steady.release_through(sampled_at);
+            assert_eq!((steady.tokens, steady.requests), (charged, charged));
+            // Sealed once: a further read of the same report asks for nothing.
+            assert!(!steady.credit_after(Some(sampled_at)).2);
+        }
+        assert_eq!(asked, [true; 4]);
     }
 
     #[test]
