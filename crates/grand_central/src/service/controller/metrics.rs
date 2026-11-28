@@ -135,7 +135,7 @@ pub const LIFECYCLE_FAULTS_TOTAL: &str = "smg_grand_central_lifecycle_faults_tot
 /// each page takes the kinds and the description from the engine's
 /// constants ([`POLICY_FAULT_KINDS`], [`POLICY_FAULTS_HELP`]). The name
 /// stays a literal here, as every series this module declares (the
-/// reference's guard reads them), and a case holds it to the engine's. It
+/// metrics page's guard reads them), and a case holds it to the engine's. It
 /// never starts again at a new document.
 ///
 /// On a controller `upkeep` is a run of the upkeep at the presence sweep's

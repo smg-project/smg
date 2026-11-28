@@ -174,7 +174,7 @@ A host can add stages of its own in three ways:
 - [Overload](docs/policy-spec.md#overload), [sessions](docs/policy-spec.md#sessions), [a request's key](docs/policy-spec.md#the-requests-key), [shadows](docs/policy-spec.md#a-shadow-profile) and [reserved fields](docs/policy-spec.md#reserved-fields)
 - [Signals a decision can read](docs/embedding.md#signals-a-decision-can-read)
 - [Decisions and refusals](docs/guarantees.md#decisions-and-refusals) and [updating a policy spec](docs/guarantees.md#updating-a-spec)
-- [Explain and metrics](REFERENCE.md#explain-and-metrics)
+- [Explain and metrics](docs/metrics.md)
 - [Worker discovery](docs/service.md#worker-discovery) for the standalone service
 - [Cost and regression gates](REFERENCE.md#cost-and-regression-gates)
 - [The design document](docs/design.md)

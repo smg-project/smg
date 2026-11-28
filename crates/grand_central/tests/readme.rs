@@ -5,8 +5,9 @@
 //! `docs/service.md` the service's page, `docs/embedding.md` the page of a
 //! host that embeds the engine, `docs/worker-rows.md` the page of worker
 //! rows and worker jobs, `docs/extending.md` the page of a host's own
-//! stages and plugins and `docs/guarantees.md` the page of what a decision
-//! books and of a spec's update, each cut out and held the same way.
+//! stages and plugins, `docs/guarantees.md` the page of what a decision
+//! books and of a spec's update and `docs/metrics.md` the page of sampled
+//! decisions and the metrics, each cut out and held the same way.
 //! `REFERENCE.md` holds the rest of the detail. Thirteen things are read:
 //!
 //! - every fenced `yaml` block of a page is a whole policy document: it
@@ -24,11 +25,11 @@
 //!   preset table names every preset too, in the crate's order;
 //! - the service's page names, each in a row of its tables, every flag of
 //!   the standalone binary and every call of the controller's contract, and
-//!   the reference names, each in a code span, every series the controller
-//!   exports: each list is read off the files that declare it. Each is read
-//!   the other way too: a row of the service page's flag tables or of its
-//!   call table, or of the reference's metrics table, names none that is
-//!   gone;
+//!   the metrics page's table of series names, each in a row, every series
+//!   the controller exports: each list is read off the files that declare
+//!   it. Each is read the other way too: a row of the service page's flag
+//!   tables or of its call table, or of the table of series, names none
+//!   that is gone;
 //! - the embedding page's table of Cargo features names every feature of
 //!   the crate's manifest and no other, a row a feature, each with the
 //!   features of the crate it turns on and no other word, and the page
@@ -41,7 +42,7 @@
 //! - the guarantees page's table of limits shows the rows its case holds,
 //!   in a file of its own (`readme_cases/limits.rs`), and each row's
 //!   constants stand in the crate's source as written there;
-//! - the README and the seven pages cut out stay inside the bounds a person
+//! - the README and the eight pages cut out stay inside the bounds a person
 //!   reads with ease: no sentence over 30 words, no paragraph over five
 //!   sentences or 100 words, no list item over 50 words, no table cell over
 //!   30 words, no heading over 30 words, and none of the filler words in a
@@ -53,7 +54,7 @@
 //!   them and passes one that stands at a bound, and the reading of a
 //!   page's blocks, headings and links is held to short texts the same
 //!   way;
-//! - every link of the nine pages to a path of the checkout resolves, and
+//! - every link of the ten pages to a path of the checkout resolves, and
 //!   a link that names a heading names one its page holds;
 //! - each command the README shows names what the checkout holds: this
 //!   package, features and an example of its manifest, a unit test of the
@@ -114,6 +115,9 @@ const EXTENDING_DOCUMENTS: usize = 0;
 /// blocks stand under the mark of a refused one.
 const GUARANTEES_DOCUMENTS: usize = 0;
 
+/// The documents the metrics page shows running: none. It fences no block.
+const METRICS_DOCUMENTS: usize = 0;
+
 /// The commands the README shows, counted as its documents are.
 const README_COMMANDS: usize = 4;
 
@@ -139,7 +143,7 @@ const SERIES: usize = 22;
 /// least: a walk that finds fewer has lost the shape of the manifest.
 const FEATURES: usize = 9;
 
-/// The most words a sentence of a short page holds: the README and the seven
+/// The most words a sentence of a short page holds: the README and the eight
 /// pages cut out of the reference are the short pages. Nothing but a
 /// sentence's end splits one, so a chain joined by semicolons is one
 /// sentence.
@@ -224,6 +228,12 @@ fn guarantees() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/guarantees.md")
 }
 
+/// The metrics page: sampled decisions, the service's series, the plugins'
+/// stats and the gateway's routing metrics.
+fn metrics() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/metrics.md")
+}
+
 /// One fenced block of the page.
 struct Block<'a> {
     /// The fence's language: `yaml`, `text`, `rust` or `sh`.
@@ -306,6 +316,7 @@ fn every_document_of_the_page_runs_over_the_stock_catalog() {
         ("worker rows' page", worker_rows(), WORKER_ROWS_DOCUMENTS),
         ("extending page", extending(), EXTENDING_DOCUMENTS),
         ("guarantees page", guarantees(), GUARANTEES_DOCUMENTS),
+        ("metrics page", metrics(), METRICS_DOCUMENTS),
         ("reference", reference(), DOCUMENTS),
     ] {
         let page = fs::read_to_string(path).expect("the page is readable");
@@ -362,6 +373,7 @@ fn a_refused_document_is_refused_in_the_words_the_page_shows() {
         ("worker rows' page", worker_rows()),
         ("extending page", extending()),
         ("guarantees page", guarantees()),
+        ("metrics page", metrics()),
         ("reference", reference()),
     ] {
         let page = fs::read_to_string(path).expect("the page is readable");
@@ -547,14 +559,6 @@ fn feature_entries() -> Vec<(&'static str, Vec<&'static str>)> {
         }
     }
     entries
-}
-
-/// The declared names the page holds in no code span.
-fn left_out<'a>(page: &str, declared: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
-    declared
-        .into_iter()
-        .filter(|name| !page.contains(&format!("`{name}`")))
-        .collect()
 }
 
 /// The rows of a page's flag tables: each line outside a fenced block that
@@ -981,23 +985,29 @@ fn the_extending_page_names_each_registration_call_of_the_stage_table() {
 
 #[test]
 fn the_page_names_every_series_the_controller_exports() {
-    let page = fs::read_to_string(reference()).expect("the reference is readable");
+    let page = fs::read_to_string(metrics()).expect("the metrics page is readable");
     let series = series();
     assert!(
         series.len() >= SERIES,
         "the metrics module declares {} series by this walk",
         series.len()
     );
-    let left_out = left_out(&page, series.iter().copied());
+    // Each series has a row of the table of series: a name that stands
+    // elsewhere on the page is no row.
+    let named = table(&page, "| Metric | What it measures |", 1);
+    let left_out: Vec<&str> = series
+        .iter()
+        .copied()
+        .filter(|name| !named.contains(name))
+        .collect();
     assert!(
         left_out.is_empty(),
-        "the reference's metrics table leaves out {left_out:?}"
+        "the metrics page's table leaves out {left_out:?}"
     );
     // The other way: the table of series names none that is gone.
-    let named = table(&page, "| Metric | What it measures |", 1);
     assert!(
         named.len() >= SERIES,
-        "the reference's metrics table names {} series by this walk",
+        "the metrics page's table names {} series by this walk",
         named.len()
     );
     let gone: Vec<&str> = named
@@ -1007,7 +1017,7 @@ fn the_page_names_every_series_the_controller_exports() {
         .collect();
     assert!(
         gone.is_empty(),
-        "the reference's metrics table names {gone:?}, which the metrics module does not declare"
+        "the metrics page's table names {gone:?}, which the metrics module does not declare"
     );
 }
 
@@ -1367,6 +1377,17 @@ fn the_guarantees_pages_prose_stays_inside_the_same_bounds() {
     );
 }
 
+#[test]
+fn the_metrics_pages_prose_stays_inside_the_same_bounds() {
+    let page = fs::read_to_string(metrics()).expect("the metrics page is readable");
+    let over = over_bounds(&page);
+    assert!(
+        over.is_empty(),
+        "the metrics page is held to the README's bounds, and it is over them:\n{}",
+        over.join("\n")
+    );
+}
+
 /// A sentence of `words` words: a capital first and a full stop last.
 fn sentence(words: usize) -> String {
     let mut sentence = String::from("One");
@@ -1603,6 +1624,7 @@ fn every_link_of_a_page_resolves_heading_and_all() {
         ("worker rows' page", worker_rows()),
         ("extending page", extending()),
         ("guarantees page", guarantees()),
+        ("metrics page", metrics()),
         ("reference", reference()),
     ] {
         let dead = dead_links(&path);
