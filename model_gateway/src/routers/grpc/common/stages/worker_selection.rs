@@ -1539,8 +1539,9 @@ fn unheld_by(
 }
 
 /// The 400 for a context demand no pair of `pairs` holds, among the pairs
-/// on `wire` whose sides `takes_media` admits. `Ok` where a pair holds the
-/// demand, where it binds nobody, and where no window is known.
+/// on `wire` that `takes_media` admits (a prefill, then its partner). `Ok`
+/// where a pair holds the demand, where it binds nobody, and where no window
+/// is known.
 ///
 /// Membership, not health, decides whether a request can ever fit. The
 /// actual partners are read: independently large pools need not pair.
@@ -1549,26 +1550,28 @@ fn pair_unheld_by(
     wire: Option<WireConstraint>,
     context: ContextRequirements,
     model_id: &str,
-    takes_media: &dyn Fn(&dyn Worker) -> bool,
+    takes_media: &dyn Fn(&dyn Worker, &dyn Worker) -> bool,
 ) -> Result<(), Response> {
-    if context.binds_nobody()
-        || pair_admitted_by(pairs, wire, &|worker: &dyn Worker| {
-            takes_media(worker) && context.admits(worker, model_id)
-        })
-    {
+    if context.binds_nobody() {
         return Ok(());
     }
     let mut largest = None;
     let mut widest_decode = None;
     for (prefill, partners) in pairs.prefill.iter().zip(&pairs.partners) {
-        if !WireConstraint::admits(wire, prefill.as_ref()) || !takes_media(prefill.as_ref()) {
+        if !WireConstraint::admits(wire, prefill.as_ref()) {
             continue;
         }
+        let runtime = prefill.metadata().spec.runtime_type;
         for decode in partners.iter().filter(|decode| {
             WireConstraint::admits(wire, decode.as_ref())
-                && takes_media(decode.as_ref())
-                && decode.metadata().spec.runtime_type == prefill.metadata().spec.runtime_type
+                && decode.metadata().spec.runtime_type == runtime
+                && takes_media(prefill.as_ref(), decode.as_ref())
         }) {
+            if context.admits(prefill.as_ref(), model_id)
+                && context.admits(decode.as_ref(), model_id)
+            {
+                return Ok(());
+            }
             let limit = pair_context_length(prefill.as_ref(), decode.as_ref(), model_id);
             largest = largest.max(limit);
             // The budget is judged among the pairs that hold the input: two
@@ -2650,9 +2653,75 @@ impl WorkerSelectionStage {
         };
         let prefill_with_vision =
             move |worker: &dyn Worker| prefill_vision_capable(worker) && admitted(worker);
-        let require_decode_vision = demand.decode && pair_admitted_by(pairs, wire, &with_vision);
+        // A stripped references side may fall back to a decode without the
+        // encoder that takes the references (`takes_refs`), whose side is
+        // made of the prefill's media identity
+        // (`multimodal::decode_takes_media_identity`): only a prefill the
+        // dispatch asks for it returns it (NIXL, or Mooncake with an engine
+        // id), and lenient pairing also pairs such a decode with a prefill
+        // on no connector, whose dispatch refuses the request. The
+        // fallback's pairs are those of such a decode with a prefill that
+        // returns it.
+        let stripped = demand.refs_stripped_decode;
+        let returns_identity = |worker: &dyn Worker| {
+            !matches!(worker.worker_type(), WorkerType::Prefill)
+                || multimodal::prefill_returns_media_identity(worker)
+        };
+        // The fallback's candidates: a prefill that returns the identity, and
+        // any decode but a MoRI-IO one, which the dispatch refuses.
+        let fallback_candidate = move |worker: &dyn Worker| {
+            prefill_with_vision(worker)
+                && match worker.worker_type() {
+                    WorkerType::Prefill => returns_identity(worker),
+                    _ => !is_moriio_worker(worker),
+                }
+        };
+        // Membership's answer and the media demand's, never the attempt's
+        // exclusions (the ledger): a tried fallback pair still counts, as the
+        // context refusal judges by it too. A MoRI-IO decode is no fallback:
+        // the dispatch refuses it.
+        let fallback_side = |worker: &dyn Worker| {
+            takes_refs(worker)
+                && match worker.worker_type() {
+                    WorkerType::Prefill => {
+                        prefill_vision_capable(worker) && returns_identity(worker)
+                    }
+                    _ => {
+                        multimodal::decode_takes_media_identity(worker) && !is_moriio_worker(worker)
+                    }
+                }
+        };
+        let fallback_paired = stripped && pair_admitted_by(pairs, wire, &fallback_side);
+        // A worker that could take the request now: ready (one over the
+        // overload thresholds alone still counts, as the placement steers
+        // such a pool by load), in a window that holds the request.
+        let takes_it_now = |worker: &dyn Worker| {
+            worker.routing_state().eligible_ignoring_overload()
+                && demand.context.admits(worker, model_id)
+        };
+        // While a fallback pair could take the request now (admitted for
+        // this attempt too), the preference counts only the pairs with the
+        // encoder that could as well; a decode with the encoder that is
+        // down or too narrow leaves the request to the fallback. With no
+        // such fallback the preference is membership's, as for every other
+        // request: the request waits for such a decode, is placed on a
+        // stalled one by the placement's liveness fallback, or is refused by
+        // its window.
+        let fallback_ready = fallback_paired
+            && pair_admitted_by(pairs, wire, &|worker: &dyn Worker| {
+                fallback_side(worker) && admitted(worker) && takes_it_now(worker)
+            });
+        let preferred =
+            |worker: &dyn Worker| with_vision(worker) && (!fallback_ready || takes_it_now(worker));
+        let require_decode_vision = demand.decode && pair_admitted_by(pairs, wire, &preferred);
+        // On the fallback, the prefills that return no identity are kept
+        // out; with no fallback paired the pool is used as it is, and the
+        // dispatch names the gap.
+        let identity_pinned = fallback_paired && !require_decode_vision;
         let candidate_filter: Option<CandidateFilter<'_>> = if require_decode_vision {
             Some(&with_vision)
+        } else if identity_pinned {
+            Some(&fallback_candidate)
         } else if demand.prefill {
             Some(&prefill_with_vision)
         } else {
@@ -2660,10 +2729,31 @@ impl WorkerSelectionStage {
         };
         // Capacity refusal ignores attempt-local exclusions (the ledger):
         // a failed large worker does not make the client's prompt oversized.
-        let takes_media = |worker: &dyn Worker| {
+        // While a fallback pair is a member, it judges the pairs by what
+        // they are, whatever the placement prefers now: the fallback's
+        // pairs and those with the encoder alike.
+        let side_takes_media = |worker: &dyn Worker| {
             takes_refs(worker)
                 && (!demand.prefill || prefill_vision_capable(worker))
-                && (!require_decode_vision || !demand.on(worker) || vision_capable(worker))
+                && (fallback_paired
+                    || !require_decode_vision
+                    || !demand.on(worker)
+                    || vision_capable(worker))
+        };
+        // With a fallback pair a member, a pair holds the request for the
+        // refusal by what it is, whatever its readiness or the ledger: a
+        // decode whose side is the identity on a prefill that returns it (a
+        // prompt no such pair holds is the context 400 of their windows), or
+        // a decode with the encoder, on any prefill. A MoRI-IO decode holds
+        // nothing: the fallback's candidates leave it out, and the dispatch
+        // refuses it.
+        let takes_media = |prefill: &dyn Worker, decode: &dyn Worker| {
+            side_takes_media(prefill)
+                && side_takes_media(decode)
+                && (!fallback_paired
+                    || (!is_moriio_worker(decode)
+                        && (!multimodal::decode_takes_media_identity(decode)
+                            || returns_identity(prefill))))
         };
         let fits = |worker: &dyn Worker| {
             candidate_filter.is_none_or(|accepts| accepts(worker))
@@ -8249,8 +8339,26 @@ mod tests {
         labels: &[(&str, &str)],
         connector: Option<&str>,
     ) -> Arc<dyn Worker> {
+        windowed_worker_on(url, model_id, worker_type, labels, connector, None)
+    }
+
+    /// [`labeled_worker_on`] with the context window `window` for
+    /// `model_id`, none stated when `None`.
+    fn windowed_worker_on(
+        url: &str,
+        model_id: &str,
+        worker_type: WorkerType,
+        labels: &[(&str, &str)],
+        connector: Option<&str>,
+        window: Option<u32>,
+    ) -> Arc<dyn Worker> {
+        let card = ModelCard::new(model_id);
+        let card = match window {
+            Some(window) => card.with_context_length(window),
+            None => card,
+        };
         let mut builder = BasicWorkerBuilder::new(url)
-            .model(ModelCard::new(model_id))
+            .model(card)
             .worker_type(worker_type)
             .runtime_type(RuntimeType::Vllm)
             .connection_mode(ConnectionMode::Grpc)
@@ -8539,21 +8647,67 @@ mod tests {
         plan: &multimodal::MediaPlan,
         n: u32,
     ) -> Result<(Vec<String>, bool, bool), Response> {
+        let sampling = serde_json::json!({"n": n});
+        let (pairs, decode_needs_vision, reads_grids) =
+            selected_refs_pairs(registry, plan, sampling).await?;
+        let mut urls: Vec<String> = pairs.into_iter().map(|(_, decode)| decode).collect();
+        urls.sort();
+        urls.dedup();
+        Ok((urls, decode_needs_vision, reads_grids))
+    }
+
+    /// The prefill and decode workers six first selections of a one-image
+    /// references request with the sampling parameters `sampling` pick, as
+    /// sorted pairs of URLs, with the snapshot each leaves. The prompt is
+    /// three tokens long.
+    async fn selected_refs_pairs(
+        registry: &Arc<WorkerRegistry>,
+        plan: &multimodal::MediaPlan,
+        sampling: serde_json::Value,
+    ) -> Result<(Vec<(String, String)>, bool, bool), Response> {
+        selected_refs_pairs_of(registry, plan, sampling, 3).await
+    }
+
+    /// [`selected_refs_pairs`] for a prompt of `prompt_tokens` tokens.
+    async fn selected_refs_pairs_of(
+        registry: &Arc<WorkerRegistry>,
+        plan: &multimodal::MediaPlan,
+        sampling: serde_json::Value,
+        prompt_tokens: usize,
+    ) -> Result<(Vec<(String, String)>, bool, bool), Response> {
         let stage = round_robin_pd_stage(Arc::clone(registry));
+        selected_refs_pairs_on(&stage, registry, plan, sampling, prompt_tokens).await
+    }
+
+    /// [`selected_refs_pairs_of`] on `stage`, whose registry is `registry`.
+    async fn selected_refs_pairs_on(
+        stage: &WorkerSelectionStage,
+        registry: &Arc<WorkerRegistry>,
+        plan: &multimodal::MediaPlan,
+        sampling: serde_json::Value,
+        prompt_tokens: usize,
+    ) -> Result<(Vec<(String, String)>, bool, bool), Response> {
         let mut seen = HashMap::new();
         let mut answers = (true, true);
         for _ in 0..6 {
             let body = serde_json::json!({
                 "model": "test-model",
                 "text": "Hello",
-                "sampling_params": {"n": n}
+                "sampling_params": sampling
             });
             let mut ctx = prepared_ctx_of(Arc::clone(registry), None, body);
+            ctx.state.preparation = Some(PreparationOutput::Generate {
+                original_text: None,
+                token_ids: vec![7; prompt_tokens],
+            });
             ctx.state.multimodal_refs = Some(plan.clone());
             stage.execute(&mut ctx).await?;
             match ctx.state.workers.as_ref().expect("a pair is selected") {
-                WorkerSelection::Disaggregated { decode, .. } => {
-                    *seen.entry(decode.url().to_string()).or_insert(0) += 1;
+                WorkerSelection::Disaggregated {
+                    prefill, decode, ..
+                } => {
+                    let pair = (prefill.url().to_string(), decode.url().to_string());
+                    *seen.entry(pair).or_insert(0) += 1;
                 }
                 WorkerSelection::Single { .. } => panic!("expected a PD selection"),
             }
@@ -8563,9 +8717,670 @@ mod tests {
                 snapshot.language_model_reads_grids,
             );
         }
-        let mut urls: Vec<String> = seen.into_keys().collect();
-        urls.sort();
-        Ok((urls, answers.0, answers.1))
+        let mut pairs: Vec<(String, String)> = seen.into_keys().collect();
+        pairs.sort();
+        Ok((pairs, answers.0, answers.1))
+    }
+
+    /// One worker of [`refs_pool`]: a port on 127.0.0.1, a role, labels, a
+    /// KV connector and a context window.
+    type PoolWorker<'a> = (
+        u16,
+        WorkerType,
+        Vec<(&'static str, &'static str)>,
+        Option<&'a str>,
+        Option<u32>,
+    );
+
+    /// A registry of `model_id` with `workers` ([`PoolWorker`]).
+    fn refs_pool(model_id: &str, workers: &[PoolWorker<'_>]) -> Arc<WorkerRegistry> {
+        let registry = Arc::new(WorkerRegistry::new());
+        for (port, worker_type, labels, connector, window) in workers {
+            registry
+                .register(windowed_worker_on(
+                    &format!("grpc://127.0.0.1:{port}"),
+                    model_id,
+                    *worker_type,
+                    labels,
+                    *connector,
+                    *window,
+                ))
+                .unwrap();
+        }
+        registry
+    }
+
+    /// The URLs of the pair at `prefill` and `decode` on 127.0.0.1.
+    fn pair_at(prefill: u16, decode: u16) -> (String, String) {
+        (
+            format!("grpc://127.0.0.1:{prefill}"),
+            format!("grpc://127.0.0.1:{decode}"),
+        )
+    }
+
+    /// Lenient pairing, the default, also pairs the language-model-only
+    /// decode worker with a prefill worker on no connector, whose dispatch
+    /// asks it for no media identity and refuses the request. The fallback
+    /// keeps such a prefill out while one on NIXL is paired with the decode;
+    /// with none, the pool is used as it is and the dispatch names the gap.
+    #[tokio::test]
+    async fn a_stripped_refs_fallback_pairs_with_a_prefill_that_returns_the_identity() {
+        let nixl = Some(NIXL_CONNECTOR);
+        let prefill = |port, connector| {
+            (
+                port,
+                WorkerType::Prefill,
+                with_refs(VISION_ENCODER),
+                connector,
+                None,
+            )
+        };
+        let lm_only = (
+            9022,
+            WorkerType::Decode,
+            NO_VISION_ENCODER.to_vec(),
+            nixl,
+            None,
+        );
+        let mixed = refs_pool(
+            "test-model",
+            &[prefill(9020, nixl), prefill(9023, None), lm_only.clone()],
+        );
+        let unconnected = refs_pool("test-model", &[prefill(9023, None), lm_only]);
+        let plan = refs_plan(false);
+        let single = || serde_json::json!({"n": 1});
+
+        assert_eq!(
+            selected_refs_pairs(&mixed, &plan, single())
+                .await
+                .ok()
+                .map(|answer| answer.0),
+            Some(vec![pair_at(9020, 9022)]),
+            "the fallback pairs with the prefill on NIXL alone"
+        );
+        assert_eq!(
+            selected_refs_pairs(&unconnected, &plan, single())
+                .await
+                .ok()
+                .map(|answer| answer.0),
+            Some(vec![pair_at(9023, 9022)]),
+            "with no prefill on NIXL the pool is used as it is"
+        );
+
+        // A prompt no NIXL pair holds is the context 400 of their windows,
+        // never a placement 503, though the pairs with the prefill on no
+        // connector would hold it: the dispatch serves each of their
+        // language-model-only decodes the prefill's identity, the one on no
+        // connector that processes references too.
+        let windowed = |port, connector, window| {
+            (
+                port,
+                WorkerType::Prefill,
+                with_refs(VISION_ENCODER),
+                connector,
+                Some(window),
+            )
+        };
+        let narrow_nixl = refs_pool(
+            "test-model",
+            &[
+                windowed(9020, nixl, 64),
+                windowed(9023, None, 4096),
+                (
+                    9022,
+                    WorkerType::Decode,
+                    NO_VISION_ENCODER.to_vec(),
+                    nixl,
+                    Some(4096),
+                ),
+                (
+                    9024,
+                    WorkerType::Decode,
+                    with_refs(NO_VISION_ENCODER),
+                    None,
+                    Some(4096),
+                ),
+            ],
+        );
+        let Err(refusal) = selected_refs_pairs_of(&narrow_nixl, &plan, single(), 1000).await else {
+            panic!("no NIXL pair holds the request");
+        };
+        assert_eq!(refusal.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error::extract_error_code_from_response(&refusal),
+            "context_length_exceeded"
+        );
+
+        // A Mooncake prefill with an engine id returns the identity too, as
+        // the dispatch asks it for one: its pair serves the prompt the
+        // narrow NIXL prefill cannot hold.
+        let mooncake = |port: u16, worker_type, labels: Vec<(&'static str, &'static str)>| {
+            let mut builder = BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
+                .model(ModelCard::new("test-model").with_context_length(4096))
+                .worker_type(worker_type)
+                .runtime_type(RuntimeType::Vllm)
+                .connection_mode(ConnectionMode::Grpc)
+                .health_config(no_health_check())
+                .kv_connector(MOONCAKE_CONNECTOR);
+            if matches!(worker_type, WorkerType::Prefill) {
+                builder = builder.kv_engine_id("engine-a");
+            }
+            for (key, value) in labels {
+                builder = builder.label(key, value);
+            }
+            let worker: Arc<dyn Worker> = Arc::new(builder.build());
+            worker
+        };
+        let with_mooncake = refs_pool(
+            "test-model",
+            &[
+                windowed(9020, nixl, 64),
+                (
+                    9022,
+                    WorkerType::Decode,
+                    NO_VISION_ENCODER.to_vec(),
+                    nixl,
+                    Some(4096),
+                ),
+            ],
+        );
+        for worker in [
+            mooncake(9025, WorkerType::Prefill, with_refs(VISION_ENCODER)),
+            mooncake(9026, WorkerType::Decode, with_refs(NO_VISION_ENCODER)),
+        ] {
+            with_mooncake.register(worker).unwrap();
+        }
+        assert_eq!(
+            selected_refs_pairs_of(&with_mooncake, &plan, single(), 1000)
+                .await
+                .ok()
+                .map(|answer| answer.0),
+            Some(vec![pair_at(9025, 9026)]),
+            "the Mooncake pair serves the prompt"
+        );
+
+        // The same prompt with a vision decode that is down: its pair with
+        // the wide prefill on no connector holds the prompt and needs no
+        // identity, so the request waits for it (a retryable 503) instead of
+        // being refused for its length.
+        let outage = refs_pool(
+            "test-model",
+            &[
+                windowed(9020, nixl, 64),
+                windowed(9023, None, 4096),
+                (
+                    9021,
+                    WorkerType::Decode,
+                    with_refs(VISION_ENCODER),
+                    nixl,
+                    Some(4096),
+                ),
+                (
+                    9022,
+                    WorkerType::Decode,
+                    NO_VISION_ENCODER.to_vec(),
+                    nixl,
+                    Some(4096),
+                ),
+            ],
+        );
+        outage
+            .get_by_url("grpc://127.0.0.1:9021")
+            .expect("registered")
+            .set_status(openai_protocol::worker::WorkerStatus::NotReady);
+        let Err(refusal) = selected_refs_pairs_of(&outage, &plan, single(), 1000).await else {
+            panic!("no ready pair serves the request");
+        };
+        assert_eq!(refusal.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&refusal),
+            "no_available_workers"
+        );
+
+        // With no prefill that returns the identity there is no fallback: a
+        // vision decode that is down keeps the preference, and the request
+        // waits for it (a retryable 503) instead of reaching the
+        // language-model-only decode, whose dispatch would refuse it.
+        let no_fallback = refs_pool(
+            "test-model",
+            &[
+                prefill(9023, None),
+                (
+                    9021,
+                    WorkerType::Decode,
+                    with_refs(VISION_ENCODER),
+                    nixl,
+                    None,
+                ),
+                (
+                    9022,
+                    WorkerType::Decode,
+                    NO_VISION_ENCODER.to_vec(),
+                    nixl,
+                    None,
+                ),
+            ],
+        );
+        no_fallback
+            .get_by_url("grpc://127.0.0.1:9021")
+            .expect("registered")
+            .set_status(openai_protocol::worker::WorkerStatus::NotReady);
+        let Err(refusal) = selected_refs_pairs(&no_fallback, &plan, single()).await else {
+            panic!("the vision decode is down and no fallback is paired");
+        };
+        assert_eq!(refusal.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&refusal),
+            "no_available_workers"
+        );
+    }
+
+    /// A MoRI-IO decode is no fallback, as the dispatch refuses it: under
+    /// `PdPairingMode::Off`, which pairs it with a NIXL prefill, a vision
+    /// decode that is down keeps the preference, and the request waits for
+    /// it (a retryable 503) instead of being placed on the MoRI-IO decode.
+    /// With a NIXL fallback decode beside it, the fallback is placed on that
+    /// decode alone.
+    #[tokio::test]
+    async fn a_moriio_decode_is_no_fallback_for_a_stripped_refs_side() {
+        use smg_worker::identity::basic::MORIIO_CONNECTOR;
+
+        let nixl = Some(NIXL_CONNECTOR);
+        let registry = refs_pool(
+            "test-model",
+            &[
+                (
+                    9020,
+                    WorkerType::Prefill,
+                    with_refs(VISION_ENCODER),
+                    nixl,
+                    None,
+                ),
+                (
+                    9021,
+                    WorkerType::Decode,
+                    with_refs(VISION_ENCODER),
+                    nixl,
+                    None,
+                ),
+                (
+                    9027,
+                    WorkerType::Decode,
+                    with_refs(NO_VISION_ENCODER),
+                    Some(MORIIO_CONNECTOR),
+                    None,
+                ),
+            ],
+        );
+        registry
+            .get_by_url("grpc://127.0.0.1:9021")
+            .expect("registered")
+            .set_status(openai_protocol::worker::WorkerStatus::NotReady);
+        let stage = off_pairing_pd_stage(Arc::clone(&registry));
+        let sampling = serde_json::json!({"n": 1});
+        let Err(refusal) =
+            selected_refs_pairs_on(&stage, &registry, &refs_plan(false), sampling.clone(), 3).await
+        else {
+            panic!("no decode the dispatch accepts is ready");
+        };
+        assert_eq!(refusal.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&refusal),
+            "no_available_workers"
+        );
+
+        // With a NIXL fallback decode beside it, the fallback serves the
+        // request, and never on the MoRI-IO decode.
+        registry
+            .register(labeled_worker_on(
+                "grpc://127.0.0.1:9022",
+                "test-model",
+                WorkerType::Decode,
+                NO_VISION_ENCODER,
+                nixl,
+            ))
+            .unwrap();
+        assert_eq!(
+            selected_refs_pairs_on(&stage, &registry, &refs_plan(false), sampling, 3)
+                .await
+                .ok()
+                .map(|answer| answer.0),
+            Some(vec![pair_at(9020, 9022)]),
+            "the fallback is placed on the NIXL decode alone"
+        );
+
+        // A prompt only a MoRI-IO pair holds is the context 400 of the
+        // fallback's windows: no candidate the fallback may use holds it.
+        let narrow = refs_pool(
+            "test-model",
+            &[
+                (
+                    9020,
+                    WorkerType::Prefill,
+                    with_refs(VISION_ENCODER),
+                    nixl,
+                    Some(4096),
+                ),
+                (
+                    9022,
+                    WorkerType::Decode,
+                    NO_VISION_ENCODER.to_vec(),
+                    nixl,
+                    Some(64),
+                ),
+                (
+                    9027,
+                    WorkerType::Decode,
+                    with_refs(NO_VISION_ENCODER),
+                    Some(MORIIO_CONNECTOR),
+                    Some(4096),
+                ),
+            ],
+        );
+        let narrow_stage = off_pairing_pd_stage(Arc::clone(&narrow));
+        let Err(refusal) = selected_refs_pairs_on(
+            &narrow_stage,
+            &narrow,
+            &refs_plan(false),
+            serde_json::json!({"n": 1}),
+            1000,
+        )
+        .await
+        else {
+            panic!("no pair the fallback may use holds the prompt");
+        };
+        assert_eq!(refusal.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error::extract_error_code_from_response(&refusal),
+            "context_length_exceeded"
+        );
+    }
+
+    /// A prefill/decode stage over `worker_registry` whose pairing compares
+    /// nothing of the KV handoff (`PdPairingMode::Off`), round robin on
+    /// both sides.
+    fn off_pairing_pd_stage(worker_registry: Arc<WorkerRegistry>) -> WorkerSelectionStage {
+        let policy_registry = Arc::new(
+            PolicyRegistry::new(PolicyConfig::RoundRobin)
+                .with_pd_pairing_mode(smg_worker::settings::PdPairingMode::Off),
+        );
+        policy_registry
+            .set_prefill_policy(PolicyFactory::create_from_config(&PolicyConfig::RoundRobin));
+        policy_registry
+            .set_decode_policy(PolicyFactory::create_from_config(&PolicyConfig::RoundRobin));
+        WorkerSelectionStage::new(
+            worker_registry,
+            policy_registry,
+            WorkerSelectionMode::PrefillDecode,
+            None,
+        )
+    }
+
+    /// A stalled vision decode keeps the preference while no fallback pair
+    /// could take the request now (none holds it, or the one that does is
+    /// down): the placement's liveness fallback places the request on it,
+    /// with the wide prefill on no connector, as it would without the
+    /// fallback. A fallback pair that could take the request takes it over
+    /// the stalled decode.
+    #[tokio::test]
+    async fn a_stalled_vision_decode_keeps_the_preference_while_no_fallback_holds_the_request() {
+        use smg_worker::runtime::StallReason;
+
+        let nixl = Some(NIXL_CONNECTOR);
+        let pool = |nixl_prefill_window| {
+            let registry = refs_pool(
+                "test-model",
+                &[
+                    (
+                        9020,
+                        WorkerType::Prefill,
+                        with_refs(VISION_ENCODER),
+                        nixl,
+                        Some(nixl_prefill_window),
+                    ),
+                    (
+                        9023,
+                        WorkerType::Prefill,
+                        with_refs(VISION_ENCODER),
+                        None,
+                        Some(4096),
+                    ),
+                    (
+                        9021,
+                        WorkerType::Decode,
+                        with_refs(VISION_ENCODER),
+                        nixl,
+                        Some(4096),
+                    ),
+                    (
+                        9022,
+                        WorkerType::Decode,
+                        NO_VISION_ENCODER.to_vec(),
+                        nixl,
+                        Some(4096),
+                    ),
+                ],
+            );
+            registry
+                .get_by_url("grpc://127.0.0.1:9021")
+                .expect("registered")
+                .set_stall(Some(StallReason::Wedged));
+            registry
+        };
+        let plan = refs_plan(false);
+        let single = || serde_json::json!({"n": 1});
+
+        assert_eq!(
+            selected_refs_pairs_of(&pool(64), &plan, single(), 1000)
+                .await
+                .ok()
+                .map(|answer| answer.0),
+            Some(vec![pair_at(9023, 9021)]),
+            "the fallback's NIXL prefill is too narrow: the stalled vision decode serves"
+        );
+        assert_eq!(
+            selected_refs_pairs_of(&pool(4096), &plan, single(), 1000)
+                .await
+                .ok()
+                .map(|answer| answer.0),
+            Some(vec![pair_at(9020, 9022)]),
+            "a fallback that holds the request takes it over the stalled decode"
+        );
+        // A fallback that holds the request but cannot take it now (its NIXL
+        // prefill is not ready) leaves the preference membership's too.
+        let down = pool(4096);
+        down.get_by_url("grpc://127.0.0.1:9020")
+            .expect("registered")
+            .set_status(openai_protocol::worker::WorkerStatus::NotReady);
+        assert_eq!(
+            selected_refs_pairs_of(&down, &plan, single(), 1000)
+                .await
+                .ok()
+                .map(|answer| answer.0),
+            Some(vec![pair_at(9023, 9021)]),
+            "the fallback's prefill is down: the stalled vision decode serves"
+        );
+    }
+
+    /// A retry whose ledger excludes the fallback's decode still judges the
+    /// request's length by membership: the excluded pair holds the prompt,
+    /// so the retry waits (a 503) instead of being refused for its length
+    /// by the narrow vision decode left to it.
+    #[tokio::test]
+    async fn a_retry_judges_a_stripped_refs_prompt_by_membership_not_its_ledger() {
+        use crate::routers::grpc::context::{PreparationOutput, RequestType};
+
+        let model_id = "test-model-stripped-refs-ledger";
+        let nixl = Some(NIXL_CONNECTOR);
+        let registry = refs_pool(
+            model_id,
+            &[
+                (
+                    9020,
+                    WorkerType::Prefill,
+                    with_refs(VISION_ENCODER),
+                    nixl,
+                    Some(4096),
+                ),
+                (
+                    9028,
+                    WorkerType::Prefill,
+                    with_refs(VISION_ENCODER),
+                    nixl,
+                    Some(4096),
+                ),
+                (
+                    9021,
+                    WorkerType::Decode,
+                    with_refs(VISION_ENCODER),
+                    nixl,
+                    Some(64),
+                ),
+                (
+                    9022,
+                    WorkerType::Decode,
+                    NO_VISION_ENCODER.to_vec(),
+                    nixl,
+                    Some(4096),
+                ),
+            ],
+        );
+        let stage = round_robin_pd_stage(Arc::clone(&registry));
+        let mut ctx = dispatch_ctx(
+            model_id,
+            WireConstraint {
+                requires_media_refs: true,
+                ..grpc_wire(RuntimeType::Vllm)
+            },
+        );
+        ctx.routing.needs_vision = true;
+        ctx.routing.decode_needs_vision = true;
+        ctx.routing.language_model_reads_grids = false;
+        ctx.routing.context_requirements = ContextRequirements::new(
+            &PreparationOutput::Generate {
+                original_text: None,
+                token_ids: vec![7; 1000],
+            },
+            &RequestType::Completion(Arc::new(
+                serde_json::from_value(serde_json::json!({
+                    "model": model_id,
+                    "prompt": "hi",
+                    "max_tokens": 1,
+                }))
+                .expect("a completion request"),
+            )),
+        );
+        stage
+            .reselect(&mut ctx, &retained_plan(&[1, 2, 3]))
+            .await
+            .expect("the fallback holds the prompt");
+        let fallback = match ctx.workers.as_ref().expect("a pair is selected") {
+            WorkerSelection::Disaggregated { decode, .. } => {
+                assert_eq!(decode.url(), "grpc://127.0.0.1:9022");
+                Arc::clone(decode.worker())
+            }
+            WorkerSelection::Single { .. } => panic!("expected a PD selection"),
+        };
+        let mut failure = error::internal_error("engine_failure", "engine failure");
+        mark_upstream_answer(&mut failure);
+        let pool = registry.get_by_model(model_id);
+        ctx.ledger
+            .settle(&mut failure, std::iter::once(&fallback), pool.iter());
+
+        let refusal = stage
+            .reselect(&mut ctx, &retained_plan(&[1, 2, 3]))
+            .await
+            .expect_err("the fallback decode is tried and the vision decode too narrow");
+        assert_eq!(refusal.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// A decode worker with the encoder holds a stripped references side's
+    /// fallback back only while it can take the request now: one that is not
+    /// ready leaves the request to the language-model-only decode worker,
+    /// and one over the overload thresholds alone keeps it, the placement
+    /// steering the pool by load as it steers any.
+    #[tokio::test]
+    async fn a_vision_decode_holds_the_fallback_back_only_while_it_is_ready() {
+        let registry = stripped_refs_registry("test-model", true, Some(NIXL_CONNECTOR));
+        let vision = registry
+            .get_by_url("grpc://127.0.0.1:9021")
+            .expect("registered");
+        let plan = refs_plan(false);
+
+        registry.set_worker_overloaded(&vision, true);
+        let Ok(overloaded) = selected_refs_decode_workers(&registry, &plan, 1).await else {
+            panic!("an overloaded vision decode serves the request");
+        };
+        assert_eq!(
+            overloaded.0,
+            vec!["grpc://127.0.0.1:9021".to_string()],
+            "an overloaded but ready vision decode stays preferred"
+        );
+
+        registry.set_worker_overloaded(&vision, false);
+        vision.set_status(openai_protocol::worker::WorkerStatus::NotReady);
+        let Ok(down) = selected_refs_decode_workers(&registry, &plan, 1).await else {
+            panic!("the fallback serves the request");
+        };
+        assert_eq!(
+            down.0,
+            vec!["grpc://127.0.0.1:9022".to_string()],
+            "a vision decode that is not ready leaves the request to the fallback"
+        );
+    }
+
+    /// A decode worker with the encoder holds a stripped references side's
+    /// fallback back only for a request its window holds: a longer one goes
+    /// to the wider language-model-only decode worker, never to a context
+    /// refusal, and a short one keeps the preference.
+    #[tokio::test]
+    async fn a_vision_decode_holds_the_fallback_back_only_for_a_request_it_holds() {
+        let nixl = Some(NIXL_CONNECTOR);
+        let registry = refs_pool(
+            "test-model",
+            &[
+                (
+                    9020,
+                    WorkerType::Prefill,
+                    with_refs(VISION_ENCODER),
+                    nixl,
+                    Some(4096),
+                ),
+                (
+                    9021,
+                    WorkerType::Decode,
+                    with_refs(VISION_ENCODER),
+                    nixl,
+                    Some(64),
+                ),
+                (
+                    9022,
+                    WorkerType::Decode,
+                    NO_VISION_ENCODER.to_vec(),
+                    nixl,
+                    Some(4096),
+                ),
+            ],
+        );
+        let plan = refs_plan(false);
+        let budget = |tokens: u32| serde_json::json!({"n": 1, "max_new_tokens": tokens});
+
+        assert_eq!(
+            selected_refs_pairs(&registry, &plan, budget(1))
+                .await
+                .ok()
+                .map(|answer| answer.0),
+            Some(vec![pair_at(9020, 9021)]),
+            "a request the vision decode holds keeps the preference"
+        );
+        assert_eq!(
+            selected_refs_pairs(&registry, &plan, budget(1000))
+                .await
+                .ok()
+                .map(|answer| answer.0),
+            Some(vec![pair_at(9020, 9022)]),
+            "a request too long for the vision decode goes to the wider fallback"
+        );
     }
 
     /// A single-sample media-references request whose model's language

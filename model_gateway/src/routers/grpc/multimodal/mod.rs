@@ -86,8 +86,9 @@ pub(crate) use assemble::{
     assemble_tokenspeed_for_encode, encode_routing_hashes,
 };
 pub(crate) use capability::{
-    ensure_backend_supports_modalities, ensure_model_accepts_media, fleet_reads_format,
-    request_needs_vision, worker_language_model_only, worker_takes_stripped_refs_side, MediaFacts,
+    decode_takes_media_identity, ensure_backend_supports_modalities, ensure_model_accepts_media,
+    fleet_reads_format, prefill_returns_media_identity, request_needs_vision,
+    worker_language_model_only, worker_takes_stripped_refs_side, MediaFacts,
 };
 #[cfg(test)]
 pub(crate) use config::tests::{hub_answering, HubEnv};

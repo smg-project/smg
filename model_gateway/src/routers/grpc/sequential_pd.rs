@@ -2256,6 +2256,75 @@ mod tests {
         }
     }
 
+    /// Selection's reading of whether a prefill returns the media identity
+    /// (`multimodal::prefill_returns_media_identity`) is the dispatch's
+    /// own, connector by connector: NIXL, Mooncake with an engine id, and
+    /// not a Mooncake prefill whose engine id cannot be minted (none, or a
+    /// `dp_size` label that does not parse), nor one on no connector or on
+    /// MoRI-IO.
+    #[test]
+    fn selection_reads_a_prefills_identity_as_the_dispatch_asks_for_it() {
+        use smg_worker::identity::basic::MORIIO_CONNECTOR;
+
+        use crate::routers::grpc::multimodal::prefill_returns_media_identity;
+
+        let prefill = |connector: Option<&str>, engine_id: Option<&str>, dp_label: Option<&str>| {
+            let mut builder = BasicWorkerBuilder::new("grpc://prefill:30000")
+                .worker_type(WorkerType::Prefill)
+                .runtime_type(RuntimeType::Vllm)
+                .connection_mode(ConnectionMode::Grpc)
+                .bootstrap_port(Some(8998));
+            if let Some(connector) = connector {
+                builder = builder.kv_connector(connector);
+            }
+            if let Some(engine_id) = engine_id {
+                builder = builder.kv_engine_id(engine_id);
+            }
+            if let Some(dp_label) = dp_label {
+                builder = builder.label("dp_size", dp_label);
+            }
+            let worker: Arc<dyn Worker> = Arc::new(builder.build());
+            worker
+        };
+        for (name, worker, expected) in [
+            ("NIXL", prefill(Some(NIXL_CONNECTOR), None, None), true),
+            (
+                "Mooncake with an engine id",
+                prefill(Some(MOONCAKE_CONNECTOR), Some("engine-a"), None),
+                true,
+            ),
+            (
+                "Mooncake with an engine id under a valid dp_size label",
+                prefill(Some(MOONCAKE_CONNECTOR), Some("engine-a"), Some("1")),
+                true,
+            ),
+            (
+                "Mooncake without an engine id",
+                prefill(Some(MOONCAKE_CONNECTOR), None, None),
+                false,
+            ),
+            (
+                "Mooncake with a dp_size label that does not parse",
+                prefill(Some(MOONCAKE_CONNECTOR), Some("engine-a"), Some("two")),
+                false,
+            ),
+            ("no connector", prefill(None, None, None), false),
+            (
+                "MoRI-IO",
+                prefill(Some(MORIIO_CONNECTOR), None, None),
+                false,
+            ),
+        ] {
+            let dispatch = solicits_identity(&connector_mode_for_worker(worker.as_ref()), true);
+            assert_eq!(dispatch, expected, "{name}: the dispatch");
+            assert_eq!(
+                prefill_returns_media_identity(worker.as_ref()),
+                dispatch,
+                "{name}: selection"
+            );
+        }
+    }
+
     /// The check of a plan's refusals answers as the plan's own decision
     /// does: the same refusal, by its code, for every pairing and request
     /// the decision refuses, and none where the decision makes a plan.
