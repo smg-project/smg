@@ -363,13 +363,14 @@ mod tests {
         use sha2::{Digest, Sha256};
 
         assert_eq!(output.encoder_input.shape(), &shape, "{grid_key}");
+        let actual = output.model_specific.get(grid_key);
         assert!(
             matches!(
-                output.model_specific.get(grid_key),
+                actual,
                 Some(ModelSpecificValue::IntTensor { data, shape })
                     if data[..] == grid && shape[..] == [1, 3]
             ),
-            "{grid_key} is not {grid:?}"
+            "{grid_key}: {actual:?}, not {grid:?}"
         );
         let bytes = output.encoder_input.write_as(EncoderDtype::Float32);
         let bytes: &[u8] = &bytes;
@@ -389,10 +390,20 @@ mod tests {
     /// family's own bounds: an image 3,136 to 12,845,056 pixels, a clip
     /// frame 128 to 768 merged patches, sized frame by frame. Each input
     /// comes out at another size than under the bounds of
-    /// `Qwen3VLProcessor`, whose fixtures pin the shared base: 37x23, under
-    /// the image floor, at 64x96; 259x194, above it, at 192x256; a 70x100
-    /// frame, under the frame floor, at 448x320, the third frame repeated to
-    /// fill the second temporal patch.
+    /// `Qwen3VLProcessor`, whose fixtures pin the shared base (width x
+    /// height throughout): 37x23, under the image floor, at 96x64; 259x194,
+    /// above it, at 256x192; a 70x100 frame, under the frame floor, at
+    /// 320x448, the third frame repeated to fill the second temporal patch.
+    ///
+    /// The values are what the reference's `Qwen2VLImageProcessor` and
+    /// `Qwen2VLVideoProcessor` (transformers 5.17, torch 2.13, torchvision
+    /// 0.28) return for the same bytes. To make them again: build both with
+    /// `patch_size=16`, `merge_size=2`, `temporal_patch_size=2`, bicubic
+    /// resampling and a mean and std of 0.5; the image class with
+    /// `min_pixels=3136` and `max_pixels=12845056`; the video class with
+    /// `do_sample_frames=False` and
+    /// `size={"shortest_edge": 131072, "longest_edge": 786432}`; then read
+    /// `pixel_values` and `pixel_values_videos` as little-endian `f32`.
     #[test]
     fn images_and_a_clip_match_the_reference_bit_for_bit() {
         let omni = Qwen3OmniVisionProcessor::new();
