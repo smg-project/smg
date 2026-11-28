@@ -1434,9 +1434,7 @@ impl PDRouter {
         let named = failed_side_type(response);
         let mut tried = tried.lock();
         let mut join = |worker: &Arc<dyn Worker>| {
-            if !tried.iter().any(|engine| engine == worker.base_url()) {
-                tried.push(worker.base_url().to_string());
-            }
+            placement::note_tried(&mut tried, worker.base_url());
         };
         if named != Some(WorkerType::Decode) {
             join(prefill);

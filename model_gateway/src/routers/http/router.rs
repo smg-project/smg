@@ -1059,7 +1059,7 @@ impl Router {
         // A replayable failure: the retry re-selects away from this engine
         // while another available worker is left to take the request.
         if is_retryable_response(&response) {
-            note_tried(&mut attempt.tried.lock(), worker.base_url());
+            placement::note_tried(&mut attempt.tried.lock(), worker.base_url());
         }
 
         // Record worker errors for server errors (5xx)
@@ -1358,7 +1358,7 @@ impl Router {
             Ok(res) => res,
             Err(response) => {
                 if moves && is_retryable_response(&response) {
-                    note_tried(&mut attempt.tried.lock(), worker.base_url());
+                    placement::note_tried(&mut attempt.tried.lock(), worker.base_url());
                 }
                 return response;
             }
@@ -1394,7 +1394,7 @@ impl Router {
                 // its sample and the answer is left unread for the next
                 // attempt's.
                 worker_outcome(attempt.ledger, worker.as_ref(), status);
-                note_tried(&mut attempt.tried.lock(), worker.base_url());
+                placement::note_tried(&mut attempt.tried.lock(), worker.base_url());
                 return moved;
             }
             stands = !is_retryable_response(&moved);
@@ -2259,15 +2259,6 @@ impl RouteOutcome<'_> {
             model_label: Cow::Owned(self.model_label.into_owned()),
             endpoint: self.endpoint,
         }
-    }
-}
-
-/// Notes `engine` on a request's tried list, once however many of its
-/// attempts failed there: the list's length is the retry number a placement
-/// is handed, the count of engines the request tried.
-fn note_tried(tried: &mut Vec<String>, engine: &str) {
-    if !tried.iter().any(|noted| noted == engine) {
-        tried.push(engine.to_string());
     }
 }
 

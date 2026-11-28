@@ -2645,6 +2645,17 @@ pub(super) fn was_tried(worker: &dyn Worker, tried: &[String]) -> bool {
     tried.iter().any(|engine| engine == worker.base_url())
 }
 
+/// Notes `engine` among the engines a request tried
+/// ([`PlacementInputs::tried`]), once however many of its attempts failed
+/// there: the list counts the engines the request tried, which a placement
+/// reads as its retry number (a pair's, half of it rounded up). Every
+/// route's retry notes through it.
+pub(crate) fn note_tried(tried: &mut Vec<String>, engine: &str) {
+    if !tried.iter().any(|noted| noted == engine) {
+        tried.push(engine.to_string());
+    }
+}
+
 /// Pick a prefill/decode pair for `model_id` over `pairs`, one worker per
 /// role, each as the placement answers a worker ([`PlacedPair`]). A miss
 /// names the role and carries the verdict.
@@ -4268,6 +4279,17 @@ pub(crate) mod tests {
     fn engine_of(registry: &WorkerRegistry, url: &str) -> String {
         let worker = registry.get_by_url(url).expect("registered");
         worker.base_url().to_string()
+    }
+
+    /// An engine stands among the tried once however often a route notes it,
+    /// in the order the engines failed: the list counts the engines tried.
+    #[test]
+    fn an_engine_noted_twice_stands_once_among_the_tried() {
+        let mut tried = Vec::new();
+        note_tried(&mut tried, "http://a:8000");
+        note_tried(&mut tried, "http://b:8000");
+        note_tried(&mut tried, "http://a:8000");
+        assert_eq!(tried, ["http://a:8000", "http://b:8000"]);
     }
 
     /// A pair's retry steps aside from the engines the request already
