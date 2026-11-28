@@ -667,7 +667,9 @@ fn a_decode_calls_request_is_made_from_the_document_the_call_decides_under() {
             request.facts.seed = spec.generation();
             request
         }
+    }
 
+    impl LendsLists for FromDocument<'_> {
         fn workers(&self) -> WorkerLists<'_> {
             self.asks.workers()
         }

@@ -22,11 +22,9 @@ use crate::{
     document::spec::{AppliedSpec, PolicySpec, ShadowSpec, PRESETS},
     engine::{
         decision::{Decision, ShadowKind, ShedReason, Target},
-        decision_engine::{
-            DecideOutcome, DecisionEngine, DecisionRefused, Request, RequestMaker, WorkerLists,
-        },
+        decision_engine::{DecideOutcome, Decides, DecisionRefused, Request, RequestMaker},
         demands::{DemandFacts, Demands},
-        list_cell::PublishedList,
+        in_process::{lists::PublishedList, LendsLists, WorkerLists},
         pair_classes::PartnerClasses,
         view::{FixedFacts, Phase},
     },
@@ -74,7 +72,7 @@ fn answer(decided: Result<Decision, DecisionRefused>) -> Answer {
 /// The whole decision the leasing entry answers, with its lease.
 fn leased(
     engine: &InProcess,
-    maker: &impl RequestMaker,
+    maker: &impl LendsLists,
     now: Instant,
 ) -> Result<DecideOutcome, DecisionRefused> {
     let decided = engine.decide_under(GatewayId::LOCAL, maker, now)?;
@@ -85,7 +83,7 @@ fn leased(
 /// the entry that issues no lease first, then the leasing entry. For an
 /// answer that no earlier request moves; a policy that takes turns is
 /// asked through [`alike`].
-fn both(engine: &InProcess, maker: &impl RequestMaker, now: Instant) -> (Answer, Answer) {
+fn both(engine: &InProcess, maker: &impl LendsLists, now: Instant) -> (Answer, Answer) {
     let bare = engine.decide_without_lease(maker, now);
     let bare = answer(bare.map(|(decision, _)| decision));
     let theirs = answer(leased(engine, maker, now).map(|outcome| outcome.decision));
@@ -134,7 +132,9 @@ impl RequestMaker for Hands<'_> {
         self.made.set(self.made.get() + 1);
         self.request
     }
+}
 
+impl LendsLists for Hands<'_> {
     fn workers(&self) -> WorkerLists<'_> {
         self.lists
     }

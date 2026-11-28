@@ -712,7 +712,7 @@ impl InProcess {
 
     /// Fills the cells the follow owes a fill. Each model owed is asked of
     /// the program once
-    /// ([`ModelLists::lists_of`](crate::engine::list_cell::ModelLists::lists_of)),
+    /// ([`ModelLists::lists_of`](crate::engine::in_process::lists::ModelLists::lists_of)),
     /// and each list the program hands is asked its value under the
     /// engine's document ([`Self::members_of`]), which fills a cell that
     /// holds none.

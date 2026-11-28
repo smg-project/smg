@@ -84,11 +84,11 @@ use crate::{
     document::{spec::AppliedSpec, KeySources},
     engine::{
         decision::{shed, Decision, Pair, Pick, ShedReason, Target, TARGET_WORKER},
-        decision_engine::{DecisionRefused, DecodeRefused, WorkerLists},
+        decision_engine::{DecisionRefused, DecodeRefused},
         framework::{release, EncodeItems, EncodePlaced},
         in_process::{
             named_worker::{self, Reached, ReachedPair},
-            Loaded,
+            Loaded, WorkerLists,
         },
         lease_events,
         records::PoolRecords,

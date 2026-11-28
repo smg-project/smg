@@ -7,6 +7,7 @@
 //! [`decide_alone`] for a prefill and for a decode frame that stands alone.
 
 use super::*;
+use crate::engine::in_process::LendsLists;
 
 /// A decision whose stages refuse by no report reads no place, though its
 /// decider lent one: a frame left under another file's watch stays there
@@ -393,7 +394,9 @@ impl RequestMaker for Fed<'_> {
         request.facts.affinity = self.column;
         request
     }
+}
 
+impl LendsLists for Fed<'_> {
     fn workers(&self) -> WorkerLists<'_> {
         self.frame.workers()
     }

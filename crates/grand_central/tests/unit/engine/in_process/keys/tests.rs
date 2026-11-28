@@ -20,9 +20,8 @@ use crate::{
     },
     engine::{
         decision::Decision,
-        decision_engine::{DecideOutcome, DecisionEngine, Request, RequestMaker, WorkerLists},
-        in_process::InProcess,
-        list_cell::PublishedList,
+        decision_engine::{DecideOutcome, Decides, DecisionEngine, Request, RequestMaker},
+        in_process::{lists::PublishedList, InProcess, LendsLists, WorkerLists},
         records,
         sticky_sessions::{shards_for_this_host, SessionVerdict},
         view::{Constraints, Identity, Phase, RequestFacts, Session, WorkerId},
@@ -69,7 +68,9 @@ impl RequestMaker for Asks<'_> {
     fn make<'w>(&'w self, _: &'w AppliedSpec) -> Request<'w> {
         self.request
     }
+}
 
+impl LendsLists for Asks<'_> {
     fn workers(&self) -> WorkerLists<'_> {
         WorkerLists::Single(self.members.lent())
     }
@@ -218,7 +219,9 @@ impl RequestMaker for Derives<'_> {
             constraints: Constraints::default(),
         }
     }
+}
 
+impl LendsLists for Derives<'_> {
     fn workers(&self) -> WorkerLists<'_> {
         WorkerLists::Single(self.members.lent())
     }

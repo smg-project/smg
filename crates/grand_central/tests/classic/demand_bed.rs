@@ -24,7 +24,7 @@ use serde::{de::DeserializeOwned, Deserialize};
 use smg_grand_central::{
     document::{AppliedSpec, BindingSpec, OverloadSpec, PolicySpec},
     engine::{
-        Constraints, Decision, DecisionEngine, DemandFacts, FixedFacts, InProcess, LentList,
+        Constraints, Decides, Decision, DemandFacts, FixedFacts, InProcess, LendsLists, LentList,
         ListCell, Request, RequestFacts, RequestMaker, ShedReason, WireModes, WorkerId,
         WorkerLists,
     },
@@ -164,7 +164,9 @@ impl RequestMaker for Asked<'_> {
     fn make<'w>(&'w self, _: &'w AppliedSpec) -> Request<'w> {
         self.request
     }
+}
 
+impl LendsLists for Asked<'_> {
     fn workers(&self) -> WorkerLists<'_> {
         WorkerLists::Single(self.lent)
     }

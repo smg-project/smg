@@ -13,6 +13,9 @@ use smg_worker::{
 
 use super::*;
 use crate::document::spec::{AppliedSpec, PolicySpec};
+// Named by the cases that run under debug assertions alone.
+#[cfg(debug_assertions)]
+use crate::engine::view::WorkerId;
 
 impl PublishedList {
     /// Whether the cell holds a value: whether a decision or the
@@ -361,16 +364,14 @@ fn engines_that_ask_an_empty_cell_at_once_each_get_one_value() {
 #[test]
 fn a_cell_of_many_values_falls_on_a_small_stack() {
     let (engine, list): (_, Arc<[Arc<dyn Worker>]>) = (engine(), Arc::new([]));
-    let unasked = ListCell::default();
-    let lent = LentList {
-        workers: &list,
-        cell: &unasked,
-        facts: None,
-    };
     let mut cell = ListCell::default();
     for under in 0..20_000 {
-        let mut made = Box::new(Made::of(engine.loaded(), lent, under));
-        made.next = cell;
+        // A value with no records made: the fall reads none.
+        let made = Box::new(Made {
+            under,
+            members: engine.pool_members(&list),
+            next: cell,
+        });
         cell = ListCell(OnceLock::from(made));
     }
     let small = thread::Builder::new().stack_size(64 * 1024);

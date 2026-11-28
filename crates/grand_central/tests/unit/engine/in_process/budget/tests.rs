@@ -15,9 +15,9 @@ use smg_worker::{
 use crate::{
     document::spec::{AppliedSpec, PolicySpec},
     engine::{
-        decision_engine::{DecisionEngine, Request, RequestMaker, WorkerLists},
+        decision_engine::{Decides, Request, RequestMaker},
         framework::{DecisionScope, Filter},
-        list_cell::PublishedList,
+        in_process::{lists::PublishedList, LendsLists, WorkerLists},
         view::{Candidate, Constraints, Identity, Phase, PoolFacts, RequestFacts},
         EncodeItems, EncodeLists, EncodePlaced, EncoderFacts, InProcess, PairAdmission, PairLists,
         PartnerClasses, PlaceRequest,
@@ -156,7 +156,9 @@ impl RequestMaker for Hands<'_> {
     fn make<'w>(&'w self, _: &'w AppliedSpec) -> Request<'w> {
         self.0
     }
+}
 
+impl LendsLists for Hands<'_> {
     fn workers(&self) -> WorkerLists<'_> {
         self.1
     }

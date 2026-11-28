@@ -17,12 +17,10 @@ use crate::{
     },
     engine::{
         decision::{LiftedVeto, Overlap, PlacedBy, Target, Targets, MAX_TARGETS},
-        decision_engine::{
-            Decided, DecisionEngine, DecisionRefused, TextKey, TokenKey, WorkerLists,
-        },
+        decision_engine::{Decided, Decides, DecisionEngine, DecisionRefused, TextKey, TokenKey},
         demands::{DemandFacts, Demands},
         framework::{Picker, Place, PoolWord, TieBand, DRAW_FROM},
-        list_cell::PublishedList,
+        in_process::{lists::PublishedList, LendsLists, WorkerLists},
         prompt_hashes::HashSeeds,
         records::worker_id,
         view::{
@@ -251,10 +249,6 @@ impl RequestMaker for Asks<'_> {
         self.request.prompt_bytes()
     }
 
-    fn workers(&self) -> WorkerLists<'_> {
-        self.members
-    }
-
     fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
         self.loads.as_ref()
     }
@@ -269,6 +263,12 @@ impl RequestMaker for Asks<'_> {
         self.worded.set(self.worded.get() + 1);
         let text = Cow::Borrowed(self.text?);
         Some(TextKey { text, marker: 0 })
+    }
+}
+
+impl LendsLists for Asks<'_> {
+    fn workers(&self) -> WorkerLists<'_> {
+        self.members
     }
 }
 
@@ -972,12 +972,14 @@ impl RequestMaker for Whole<'_> {
         self.0.make(spec)
     }
 
-    fn workers(&self) -> WorkerLists<'_> {
-        self.0.workers()
-    }
-
     fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
         self.0.loads()
+    }
+}
+
+impl LendsLists for Whole<'_> {
+    fn workers(&self) -> WorkerLists<'_> {
+        self.0.workers()
     }
 }
 

@@ -17,8 +17,8 @@ use super::*;
 use crate::{
     document::spec::{AppliedSpec, PolicySpec},
     engine::{
-        Constraints, InProcess, LentList, Request, RequestFacts, RequestMaker, WorkerId,
-        WorkerLists,
+        Constraints, InProcess, LendsLists, LentList, Request, RequestFacts, RequestMaker,
+        WorkerId, WorkerLists,
     },
     store::{MemoryStore, Registrant, WorkerFacts},
     worker_host::Objects,
@@ -112,7 +112,9 @@ impl RequestMaker for Asks<'_> {
     fn make<'w>(&'w self, _: &'w AppliedSpec) -> Request<'w> {
         self.0
     }
+}
 
+impl LendsLists for Asks<'_> {
     fn workers(&self) -> WorkerLists<'_> {
         WorkerLists::Single(self.1)
     }

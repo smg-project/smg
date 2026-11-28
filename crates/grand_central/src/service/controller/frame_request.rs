@@ -57,7 +57,8 @@ use super::wire::{Checked, FrameLists};
 use crate::{
     document::spec::AppliedSpec,
     engine::{
-        decision_engine::{Request, RequestMaker, WorkerLists},
+        decision_engine::{Request, RequestMaker},
+        in_process::{LendsLists, WorkerLists},
         view::{Constraints, Identity, RequestFacts, SessionCountedUnder, WireModes},
     },
 };
@@ -267,10 +268,6 @@ impl<const UNKEYED: bool, const NAMES_DECODE: bool> RequestMaker
         }
     }
 
-    fn workers(&self) -> WorkerLists<'_> {
-        self.workers
-    }
-
     fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
         self.loads
     }
@@ -280,6 +277,14 @@ impl<const UNKEYED: bool, const NAMES_DECODE: bool> RequestMaker
     // requests on each worker, under the session's number.
     fn session_counted_under(&self) -> SessionCountedUnder {
         SessionCountedUnder::SessionNumber
+    }
+}
+
+impl<const UNKEYED: bool, const NAMES_DECODE: bool> LendsLists
+    for FrameRequest<'_, UNKEYED, NAMES_DECODE>
+{
+    fn workers(&self) -> WorkerLists<'_> {
+        self.workers
     }
 }
 

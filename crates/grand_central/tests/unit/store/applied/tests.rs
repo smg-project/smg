@@ -16,9 +16,9 @@ use crate::{
     document::{AppliedSpec, PolicySpec},
     engine::{
         decision::Targets,
-        decision_engine::{DecisionRefused, Request, RequestMaker, WorkerLists},
+        decision_engine::{DecisionRefused, Request, RequestMaker},
         framework::{Picker, TieBand},
-        in_process::Loaded,
+        in_process::{LendsLists, Loaded, WorkerLists},
         view::{Candidate, RequestFacts},
         InProcess, Members,
     },
@@ -39,7 +39,9 @@ impl RequestMaker for Unmade {
     fn make<'w>(&'w self, _: &'w AppliedSpec) -> Request<'w> {
         panic!("the case's own panic, inside a decision")
     }
+}
 
+impl LendsLists for Unmade {
     fn workers(&self) -> WorkerLists<'_> {
         WorkerLists::None
     }

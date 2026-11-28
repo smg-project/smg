@@ -11,10 +11,9 @@ use crate::{
     document::spec::{AppliedSpec, DecodePick, PolicySpec},
     engine::{
         decision::{Decision, Target, Targets},
-        decision_engine::{DecisionEngine, Request, RequestMaker, WorkerLists},
+        decision_engine::{Decides, DecisionEngine, Request, RequestMaker},
         framework::{Picker, TieBand},
-        in_process::InProcess,
-        list_cell::PublishedList,
+        in_process::{lists::PublishedList, InProcess, LendsLists, WorkerLists},
         records::worker_id,
         view::{Candidate, Constraints, Phase, RequestFacts, WorkerId},
         PairAdmission, PairLists, PartnerClasses,
@@ -183,7 +182,9 @@ impl RequestMaker for Asks<'_> {
     fn make<'w>(&'w self, _: &'w AppliedSpec) -> Request<'w> {
         self.0
     }
+}
 
+impl LendsLists for Asks<'_> {
     fn workers(&self) -> WorkerLists<'_> {
         self.1
     }

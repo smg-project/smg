@@ -443,8 +443,8 @@ fn the_engine_over_worker_lists_reads_the_count_at_its_next_decision() {
     use crate::{
         document::spec::{AppliedSpec, PolicySpec},
         engine::{
-            Constraints, Decided, InProcess, LentList, Request, RequestFacts, RequestMaker, Role,
-            WorkerLists,
+            Constraints, Decided, InProcess, LendsLists, LentList, Request, RequestFacts,
+            RequestMaker, Role, WorkerLists,
         },
     };
 
@@ -459,7 +459,9 @@ fn the_engine_over_worker_lists_reads_the_count_at_its_next_decision() {
         fn make<'w>(&'w self, _: &'w AppliedSpec) -> Request<'w> {
             self.0
         }
+    }
 
+    impl LendsLists for Asks<'_> {
         fn workers(&self) -> WorkerLists<'_> {
             WorkerLists::Single(self.1)
         }

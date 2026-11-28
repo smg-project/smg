@@ -27,12 +27,14 @@ fn a_keys_count_is_read_under_the_name_its_requests_maker_states() {
             self.0.make(spec)
         }
 
-        fn workers(&self) -> WorkerLists<'_> {
-            self.0.workers()
-        }
-
         fn session_counted_under(&self) -> SessionCountedUnder {
             SessionCountedUnder::SessionNumber
+        }
+    }
+
+    impl LendsLists for ByNumber<'_> {
+        fn workers(&self) -> WorkerLists<'_> {
+            self.0.workers()
         }
     }
 
@@ -43,7 +45,7 @@ fn a_keys_count_is_read_under_the_name_its_requests_maker_states() {
     fn next(
         engine: &InProcess,
         list: &[Arc<dyn Worker>],
-        maker: &impl RequestMaker,
+        maker: &impl LendsLists,
         name: &str,
     ) -> (SessionVerdict, bool) {
         let now = Instant::now();
@@ -124,10 +126,6 @@ impl RequestMaker for Sends<'_> {
         self.asks.plain()
     }
 
-    fn workers(&self) -> WorkerLists<'_> {
-        self.asks.workers()
-    }
-
     fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
         self.asks.loads()
     }
@@ -143,6 +141,12 @@ impl RequestMaker for Sends<'_> {
 
     fn sends_to(&self, _: &Target) -> bool {
         self.to
+    }
+}
+
+impl LendsLists for Sends<'_> {
+    fn workers(&self) -> WorkerLists<'_> {
+        self.asks.workers()
     }
 }
 

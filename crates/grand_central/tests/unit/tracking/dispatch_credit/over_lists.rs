@@ -17,9 +17,8 @@ use super::{catalog, chosen, clock, document, one, send, validated, Readers, DEL
 use crate::{
     document::{AppliedSpec, PolicySpec, API_VERSION},
     engine::{
-        decision_engine::{Request, RequestMaker, WorkerLists},
-        in_process::InProcess,
-        list_cell::PublishedList,
+        decision_engine::{Request, RequestMaker},
+        in_process::{lists::PublishedList, InProcess, LendsLists, WorkerLists},
         Candidate, Constraints, Live, RequestFacts,
     },
     store::{GatewayId, StaleGeneration},
@@ -37,7 +36,9 @@ impl RequestMaker for Asks<'_> {
     fn make<'w>(&'w self, _: &'w AppliedSpec) -> Request<'w> {
         self.0
     }
+}
 
+impl LendsLists for Asks<'_> {
     fn workers(&self) -> WorkerLists<'_> {
         WorkerLists::Single(self.1.lent())
     }

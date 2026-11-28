@@ -26,9 +26,10 @@ use crate::{
     document::spec::{self, AppliedSpec, PolicySpec},
     engine::{
         decision::{Decision, Targets},
-        decision_engine::{Decided, WorkerLists},
+        decision_engine::Decided,
         decision_slot::DecisionSlot,
         framework::{DecisionScope, Filter, Picker, Scorer, TieBand},
+        in_process::WorkerLists,
         view::{
             self, fingerprint, Candidate, Constraints, PoolFacts, RequestFacts, Role, WireModes,
             WorkerId,

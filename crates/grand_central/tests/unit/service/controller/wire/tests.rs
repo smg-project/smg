@@ -9,8 +9,9 @@ use crate::{
             self, Decision, LiftedVeto, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target,
             Targets, Trace,
         },
-        decision_engine::{Request, RequestMaker, WorkerLists},
+        decision_engine::{Request, RequestMaker},
         demands::{Demands, References},
+        in_process::WorkerLists,
         view::{Constraints, Identity, Phase, RequestFacts, WorkerId},
     },
     service::{

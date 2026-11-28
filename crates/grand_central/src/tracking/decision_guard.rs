@@ -74,7 +74,7 @@ use crate::{
     engine::{
         decision::{Decision, Target},
         decision_engine::{
-            DecideOutcome, DecisionEngine, DecisionRefused, DecodeRefused, HeldDecision,
+            DecideOutcome, Decides, DecisionEngine, DecisionRefused, DecodeRefused, HeldDecision,
             HeldDecode, Leased, Request, RequestMaker,
         },
         view::WorkerId,
@@ -212,18 +212,26 @@ pub struct DecisionGuard<D: Deref<Target: DecisionEngine>> {
 
 impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
     /// One decision of `door` for `gateway`'s `request` at `now`, on the
-    /// calling thread ([`DecisionEngine::decide`]), held.
+    /// calling thread ([`Decides::decide_under`]), held: for a request
+    /// its host stated ahead.
     ///
     /// # Errors
     ///
     /// [`DecisionRefused`]: the door made no decision for the request.
-    pub fn decide(
+    pub fn decide<'r>(
         door: D,
         gateway: GatewayId,
-        request: &Request<'_>,
+        request: &Request<'r>,
         now: Instant,
-    ) -> Result<Self, DecisionRefused> {
-        let decided = door.decide(gateway, request, now)?;
+    ) -> Result<Self, DecisionRefused>
+    where
+        D::Target: Decides<Request<'r>>,
+    {
+        // A request stated ahead lends no list, so the crate's engine
+        // answers it no place. A door that lends one of its own may: a
+        // guard has nothing to hold of a place.
+        let decided = door.decide_under(gateway, request, now)?;
+        let (decided, _) = decided.whole().ok_or(DecisionRefused::Faulted)?;
         let later = request.constraints.decode_later;
         Ok(Self::hold(
             Arm::Engine { door, gateway },
@@ -234,7 +242,7 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
     }
 
     /// [`DecisionGuard::decide`] for a request its host makes from the world
-    /// the door decides under ([`DecisionEngine::decide_under`]), where the
+    /// the door decides under ([`Decides::decide_under`]), where the
     /// host hands no single list of its own: the door's answer is then
     /// whole. A host that hands one asks its door itself, since a place
     /// may answer it with nothing to hold, and holds a whole answer by
@@ -243,12 +251,15 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
     /// # Errors
     ///
     /// [`DecisionRefused`]: the door made no decision for the request.
-    pub fn decide_under(
+    pub fn decide_under<M: RequestMaker>(
         door: D,
         gateway: GatewayId,
-        maker: &impl RequestMaker,
+        maker: &M,
         now: Instant,
-    ) -> Result<Self, DecisionRefused> {
+    ) -> Result<Self, DecisionRefused>
+    where
+        D::Target: Decides<M>,
+    {
         let decided = door.decide_under(gateway, maker, now)?;
         let (decided, later) = decided.whole().ok_or(DecisionRefused::Faulted)?;
         Ok(Self::holding(door, gateway, decided, later, now))
@@ -367,25 +378,31 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
     /// dispatched (the prefill is not held), and a pair whose two sides
     /// are owed nothing (a lease that is gone). A handle over a link is
     /// refused as not chosen: no link asks a decode later.
-    pub fn decide_decode(
+    pub fn decide_decode<'r>(
         &mut self,
-        request: &Request<'_>,
+        request: &Request<'r>,
         now: Instant,
-    ) -> Result<&Decision, DecisionRefused> {
-        self.decode_decided(|door, gateway, held| door.decide_decode(gateway, request, held, now))
+    ) -> Result<&Decision, DecisionRefused>
+    where
+        D::Target: Decides<Request<'r>>,
+    {
+        self.decide_decode_under(request, now)
     }
 
     /// [`Self::decide_decode`] for a request its host makes from the world
-    /// the call decides under ([`DecisionEngine::decide_decode_under`]).
+    /// the call decides under ([`Decides::decide_decode_under`]).
     ///
     /// # Errors
     ///
     /// As [`Self::decide_decode`].
-    pub fn decide_decode_under(
+    pub fn decide_decode_under<M: RequestMaker>(
         &mut self,
-        maker: &impl RequestMaker,
+        maker: &M,
         now: Instant,
-    ) -> Result<&Decision, DecisionRefused> {
+    ) -> Result<&Decision, DecisionRefused>
+    where
+        D::Target: Decides<M>,
+    {
         self.decode_decided(|door, gateway, held| {
             door.decide_decode_under(gateway, maker, held, now)
         })
@@ -508,12 +525,15 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
     ///
     /// As [`Self::decide_decode`].
     #[cfg(feature = "in-process")]
-    pub(crate) fn decode_placed_under(
+    pub(crate) fn decode_placed_under<M: RequestMaker>(
         &mut self,
-        maker: &impl RequestMaker,
+        maker: &M,
         now: Instant,
         mut sendable: impl FnMut(&Target) -> bool,
-    ) -> Result<Option<Decision>, DecisionRefused> {
+    ) -> Result<Option<Decision>, DecisionRefused>
+    where
+        D::Target: Decides<M>,
+    {
         let (decision, lease) = (self.decided.decision, self.decided.lease);
         let before = (self.decided.decode_session, self.stated, self.index);
         let (target, chosen) = (self.target, self.decode);

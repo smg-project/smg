@@ -24,11 +24,11 @@ use crate::{
     engine::{
         decision::{Decision, Target},
         decision_engine::{
-            DecideOutcome, Decided, DecisionEngine, DecisionRefused, DecodeRefused, HeldDecision,
-            Plain, Request, RequestMaker, TextKey, TokenKey, WorkerLists,
+            DecideOutcome, Decided, Decides, DecisionEngine, DecisionRefused, DecodeRefused,
+            HeldDecision, Plain, Request, RequestMaker, TextKey, TokenKey,
         },
         framework::{EncodeItems, EncodePlaced, EncoderFacts},
-        list_cell::PublishedList,
+        in_process::{lists::PublishedList, LendsLists, WorkerLists},
         prompt_hashes::{HashSeeds, PromptHashes},
         records::worker_id,
         view::{Constraints, Identity, Phase, RequestFacts, Session, WorkerId},
@@ -121,10 +121,6 @@ impl<M: RequestMaker> RequestMaker for Listed<'_, M> {
         self.0.plain()
     }
 
-    fn workers(&self) -> WorkerLists<'_> {
-        self.1
-    }
-
     fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
         self.0.loads()
     }
@@ -138,24 +134,30 @@ impl<M: RequestMaker> RequestMaker for Listed<'_, M> {
     }
 }
 
-impl DecisionEngine for Door<'_> {
+impl<M: RequestMaker> LendsLists for Listed<'_, M> {
+    fn workers(&self) -> WorkerLists<'_> {
+        self.1
+    }
+}
+
+impl<M: RequestMaker> Decides<M> for Door<'_> {
     fn decide_under(
         &self,
         gateway: GatewayId,
-        maker: &impl RequestMaker,
+        maker: &M,
         now: Instant,
     ) -> Result<Decided, DecisionRefused> {
         if !self.hears(gateway, None) {
             return Err(DecisionRefused::Faulted);
         }
         let listed = Listed(maker, self.lists);
-        DecisionEngine::decide_under(self.engine, gateway, &listed, now)
+        Decides::decide_under(self.engine, gateway, &listed, now)
     }
 
     fn decide_decode_under(
         &self,
         gateway: GatewayId,
-        maker: &impl RequestMaker,
+        maker: &M,
         held: &HeldDecision<'_>,
         now: Instant,
     ) -> Result<DecideOutcome, DecisionRefused> {
@@ -165,9 +167,11 @@ impl DecisionEngine for Door<'_> {
         let lent = ("decode call", held.index, held.decode.chosen);
         self.lent.lock().push(lent);
         let listed = Listed(maker, self.lists);
-        DecisionEngine::decide_decode_under(self.engine, gateway, &listed, held, now)
+        Decides::decide_decode_under(self.engine, gateway, &listed, held, now)
     }
+}
 
+impl DecisionEngine for Door<'_> {
     fn say(&self, gateway: GatewayId, held: &HeldDecision<'_>, said: Said, now: Instant) {
         if !self.hears(gateway, Some(held)) {
             return;
@@ -1162,4 +1166,27 @@ fn a_prefill_taken_behind_a_sent_decode_stays_on_its_prefill() {
     handle.dispatched_decode(now);
     assert_eq!(handle.take(different), None, "another prefill");
     assert_eq!(handle.take(1), Some(alternate), "the same prefill");
+}
+
+/// A guard has nothing to hold of a place. Behind a door that lends a
+/// single list, the engine may answer a plain request a place alone where
+/// the document takes no word of a lease: here it does. The guard refuses
+/// that answer as a fault, for a request stated ahead and for one its
+/// host makes, and no word is said.
+#[test]
+fn a_guard_refuses_a_place_answered_alone_as_a_fault() {
+    let document = PolicySpec::preset("round_robin");
+    let engine = engine(&document.expect("a preset of this build"));
+    let serving = |at: usize| ready_worker(&format!("http://worker-{at}:8000"), MODEL);
+    let list: Arc<[Arc<dyn Worker>]> = (0..3).map(serving).collect();
+    let members = PublishedList::new(list);
+    let door = Door::new(&engine, WorkerLists::Single(members.lent()));
+    let (asked, now) = (stated(Phase::default()), Instant::now());
+    let answered = door.decide_under(GATEWAY, &asked, now);
+    assert!(matches!(answered, Ok(Decided::Alone(_))), "{answered:?}");
+    let stated_ahead = DecisionGuard::decide(&door, GATEWAY, &asked, now);
+    assert_eq!(stated_ahead.err(), Some(DecisionRefused::Faulted));
+    let made = DecisionGuard::decide_under(&door, GATEWAY, &asked, now);
+    assert_eq!(made.err(), Some(DecisionRefused::Faulted));
+    assert_eq!(door.words(), [], "no word is said of a place");
 }

@@ -24,11 +24,10 @@ use crate::{
     document::spec::{AppliedSpec, PolicySpec, ShadowSpec},
     engine::{
         decision::{LiftedVeto, ShedReason, Targets, SUBSET_HINT},
-        decision_engine::{DecisionEngine, HeldDecision, HeldDecode},
+        decision_engine::{Decides, DecisionEngine, HeldDecision, HeldDecode, RequestMaker},
         demands::{DemandFacts, References},
         framework::{DecisionScope, Filter, Picker, TieBand},
-        in_process::pair::PairAdmission,
-        list_cell::PublishedList,
+        in_process::{lists::PublishedList, pair::PairAdmission},
         pair_classes::PartnerClasses,
         prompt_hashes::{HashSeeds, PromptHashes},
         records::worker_id,
@@ -2416,12 +2415,14 @@ impl RequestMaker for Asks<'_> {
         }
     }
 
-    fn workers(&self) -> WorkerLists<'_> {
-        self.lists
-    }
-
     fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
         self.loads
+    }
+}
+
+impl LendsLists for Asks<'_> {
+    fn workers(&self) -> WorkerLists<'_> {
+        self.lists
     }
 }
 
@@ -2443,16 +2444,18 @@ impl RequestMaker for Keyed<'_> {
         request
     }
 
-    fn workers(&self) -> WorkerLists<'_> {
-        self.0.workers()
-    }
-
     fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
         self.0.loads()
     }
 
     fn session_counted_under(&self) -> SessionCountedUnder {
         self.1
+    }
+}
+
+impl LendsLists for Keyed<'_> {
+    fn workers(&self) -> WorkerLists<'_> {
+        self.0.workers()
     }
 }
 

@@ -82,7 +82,7 @@ use smg_worker::{identity::basic::Worker, runtime::RoutingState};
 
 use super::{
     encode::{splits, EncodeLists},
-    InProcess, Loaded,
+    InProcess, LendsLists, Loaded, WorkerLists,
 };
 use crate::{
     document::{
@@ -95,11 +95,11 @@ use crate::{
         },
         decision_engine::{
             AlonePick, DecideOutcome, DecisionRefused, Plain, Request, RequestMaker, TextKey,
-            TokenKey, WorkerLists,
+            TokenKey,
         },
         demands::Demands,
         framework::EncodeItems,
-        list_cell::LentList,
+        in_process::lists::LentList,
         prompt_hashes::{
             prompt_bytes_of, prompt_chars_of, prompt_tokens_of, HashSeeds, PromptHashes,
         },
@@ -511,7 +511,7 @@ pub(super) struct Made<'r, 'a> {
     /// The targets earlier decisions of this call named that could not be
     /// sent to.
     missed: &'r [WorkerId],
-    /// The lists the decision is lent ([`RequestMaker::workers`]): the
+    /// The lists the decision is lent ([`LendsLists::workers`]): the
     /// request's own. A pair's ask, or one of an encode request that
     /// carries items, behind the decision that had the rule asked of the
     /// pair's two lists is lent the same lists with each side's places
@@ -1318,13 +1318,6 @@ impl RequestMaker for Made<'_, '_> {
         prompt_bytes_of(prompt.tokens, prompt.text)
     }
 
-    // The lists the ask is lent: the request's own, but for an ask of a
-    // pair or of an encode request that is held to its route's rule
-    // ([`pair`]).
-    fn workers(&self) -> WorkerLists<'_> {
-        *self.lists
-    }
-
     // The caller's own naming, handed on: nothing else reads the field.
     fn token_key(&self, page: usize) -> Option<TokenKey<'_>> {
         self.request.prompt.entry?.token_key(page)
@@ -1385,6 +1378,15 @@ impl RequestMaker for Made<'_, '_> {
             self.encoders.borrow_mut().0.push((position, sendable));
             sendable
         })
+    }
+}
+
+impl LendsLists for Made<'_, '_> {
+    // The lists the ask is lent: the request's own, but for an ask of a
+    // pair or of an encode request that is held to its route's rule
+    // ([`pair`]).
+    fn workers(&self) -> WorkerLists<'_> {
+        *self.lists
     }
 }
 

@@ -34,10 +34,9 @@ use crate::{
     document::spec::{AcrossRanks, AppliedSpec, Needs, PolicySpec, ShadowSpec, SignalSpec},
     engine::{
         decision::Decision,
-        decision_engine::{DecisionEngine, Request, RequestMaker, WorkerLists},
+        decision_engine::{Decides, Request, RequestMaker},
         framework::{Scorer, TieBand},
-        in_process::InProcess,
-        list_cell::PublishedList,
+        in_process::{lists::PublishedList, InProcess, LendsLists, WorkerLists},
         sticky_sessions::SessionVerdict,
         view::{Candidate, Constraints, Identity, RequestFacts, WorkerId},
     },
@@ -414,12 +413,14 @@ impl RequestMaker for Asks<'_> {
         self.request
     }
 
-    fn workers(&self) -> WorkerLists<'_> {
-        WorkerLists::Single(self.members.lent())
-    }
-
     fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
         self.loads.as_ref()
+    }
+}
+
+impl LendsLists for Asks<'_> {
+    fn workers(&self) -> WorkerLists<'_> {
+        WorkerLists::Single(self.members.lent())
     }
 }
 

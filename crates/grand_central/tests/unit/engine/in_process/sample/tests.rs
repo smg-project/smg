@@ -24,9 +24,9 @@ use super::{
 use crate::{
     document::spec::{AppliedSpec, KeySourceSpec, PolicySpec, RoutingKeySpec, ShadowSpec},
     engine::{
-        decision_engine::{Decided, DecisionEngine, WorkerLists},
+        decision_engine::{Decided, Decides},
         framework::Place,
-        list_cell::PublishedList,
+        in_process::{lists::PublishedList, WorkerLists},
         records::worker_id,
     },
     store::GatewayId,

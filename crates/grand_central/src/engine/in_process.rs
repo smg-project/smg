@@ -9,7 +9,7 @@
 //! gives that pass its pick:
 //!
 //! - **Once a membership.** The gateway publishes each list with an empty
-//!   cell beside it ([`ListCell`](super::list_cell::ListCell)) and lends
+//!   cell beside it ([`ListCell`](lists::ListCell)) and lends
 //!   the two together ([`LentList`]). The engine makes its value of the
 //!   list into the cell at the list's first ask: the list's handle, the
 //!   pool's own word and the list's records. The value stands for as long
@@ -29,9 +29,9 @@
 //!   ([`InProcess::pick_among`]).
 //!
 //! **A whole decision.** A gateway whose routers ask the engine for the
-//! whole decision asks through [`DecisionEngine`], as it asks a controller's
+//! whole decision asks through [`Decides`], as it asks a controller's
 //! engine: the binding, its rules and the profile, over the list its
-//! request's maker hands ([`RequestMaker::workers`]), with a lease the
+//! request's maker hands ([`LendsLists::workers`]), with a lease the
 //! request's guard holds to its end. The engine files no lease and keeps no
 //! note of a request: the guard lends back what a later word needs
 //! ([`HeldDecision`]). A single request is decided in [`single`], and a pair
@@ -56,6 +56,7 @@ mod document;
 pub(super) mod encode;
 mod keys;
 mod labels;
+pub(crate) mod lists;
 pub(super) mod membership;
 pub mod overlap;
 pub(super) mod pair;
@@ -95,19 +96,19 @@ pub(crate) use self::place::target as named_worker;
 use self::{
     document::InForce,
     encode::EncodeLists,
+    lists::{HandedLists, LentList},
     overlap::{Affinity, PoolAffinity},
     place::Made,
 };
 use super::{
     decision_engine::{
-        AlonePick, DecideOutcome, Decided, DecisionEngine, DecisionRefused, HeldDecision, Request,
-        RequestMaker, WorkerLists,
+        AlonePick, DecideOutcome, Decided, Decides, DecisionEngine, DecisionRefused, HeldDecision,
+        Request, RequestMaker,
     },
     framework::{
         release, AloneProfile, Engine, Issuing, NotAlone, Picker, Place, PoolWord, ShadowRows,
     },
     lease_events,
-    list_cell::{HandedLists, LentList},
     prompt_hashes::{HashSeeds, PromptHashes},
     records::{DecisionClock, PoolRecords},
     shadow::Shadowed,
@@ -236,8 +237,61 @@ pub struct InProcess {
     members: membership::Handed,
     /// The host's worker lists, once it handed them ([`Self::set_lists`]):
     /// the engine's own task fills their cells ahead of their requests.
-    pub(super) lists: HandedLists,
+    lists: HandedLists,
 }
+
+/// The workers a request may be sent to, as its host lends them for one
+/// decision: each list with the cell the host keeps beside it
+/// ([`LentList`]). The engine asks a cell for
+/// its own value of the list inside the decision, where it decides over
+/// the list, under the document it decides under: a host holds no value of
+/// a list and asks the engine for none. A plain single request that one
+/// pick does not decide lends its list again behind its making, since a
+/// maker may name its list while it makes the request: a cell the pick
+/// asked is not asked again.
+/// A list is the host's own: the host finds a target's worker at the
+/// target's position in the list it lent, with no lookup by id.
+#[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
+pub enum WorkerLists<'a> {
+    /// The host hands no list.
+    #[default]
+    None,
+    /// A single request's list, and the one list of a request of another
+    /// phase that stands alone.
+    Single(LentList<'a>),
+    /// A pair's two lists, its prefills and its decodes, with the pair
+    /// classes of their workers and the host's reads of its admission.
+    Pair(pair::PairLists<'a>),
+    /// An encode request's three lists: its pair's two and its encoders,
+    /// with what the encode side reads of the workers beside their records
+    /// ([`InProcess::decide_encode_at`]).
+    /// The engine's other entries take no items: through them the three
+    /// are the pair's two, for a request with no item and for a decode
+    /// asked again. Such a decision does not read whether a decode takes
+    /// images, so the encode entry declines a request that states the
+    /// later decode where its decode is held to the ones that take images:
+    /// by its demand, or by the preference of references beside an image
+    /// or a video.
+    Encode(EncodeLists<'a>),
+}
+
+/// A request's maker that lends the engine its host's lists. The crate
+/// implements [`Decides`] on the engine for such a maker.
+pub trait LendsLists: RequestMaker {
+    /// The workers the request may be sent to, where its host holds them:
+    /// the lists the decision's targets name by position
+    /// ([`Target::position`](super::decision::Target::position),
+    /// [`Pair::decode_position`](super::decision::Pair::decode_position)).
+    /// The engine decides over these and refuses a request that hands
+    /// none.
+    fn workers(&self) -> WorkerLists<'_> {
+        WorkerLists::None
+    }
+}
+
+/// A request its host stated ahead lends no list.
+impl LendsLists for Request<'_> {}
 
 /// The document's word of a binding's shadow: the binding's position, and
 /// how its shadow profile reads the live decision's affinity rows.
@@ -330,7 +384,7 @@ impl PoolMembers {
     /// registrations state it: read once a list, at the first call. A
     /// request that dials each of them may be sent to any worker of the
     /// list. A host hands a whole decision such a list
-    /// ([`RequestMaker::workers`]): the pool of its request's route, or a
+    /// ([`LendsLists::workers`]): the pool of its request's route, or a
     /// list of its own for a request held to one wire.
     #[must_use]
     pub fn wires(&self) -> WireModes {
@@ -665,8 +719,8 @@ impl InProcess {
     ///
     /// A lease's issue is such a word at a first decision and at a decode's
     /// own call alike: the call answers its pick and the lease all the same
-    /// ([`DecisionEngine::decide_under`],
-    /// [`DecisionEngine::decide_decode_under`]).
+    /// ([`Decides::decide_under`],
+    /// [`Decides::decide_decode_under`]).
     #[must_use]
     pub fn unheard(&self) -> u64 {
         self.held.words.load(Ordering::Relaxed)
@@ -907,7 +961,7 @@ impl InProcess {
         }
     }
 
-    /// The one entry ([`DecisionEngine::decide_under`]) for a host that
+    /// The one entry ([`Decides::decide_under`]) for a host that
     /// hands a clock and no instant: `clock` is read once, where the
     /// decision is dated. A place ([`Decided::Alone`]) dates nothing, so it
     /// is answered with no read of a clock, and with no copy of a decision:
@@ -920,7 +974,7 @@ impl InProcess {
     /// [`DecisionRefused`]: the engine made no decision for the request.
     pub fn decide_at(
         &self,
-        maker: &impl RequestMaker,
+        maker: &impl LendsLists,
         clock: impl FnOnce() -> Instant,
     ) -> Result<Decided, DecisionRefused> {
         let mut whole = None;
@@ -957,7 +1011,7 @@ impl Loaded<'_, '_> {
     /// its request itself and hands none.
     fn decide_into(
         self,
-        maker: &impl RequestMaker,
+        maker: &impl LendsLists,
         late: Option<&Made<'_, '_>>,
         clock: impl FnOnce() -> Instant,
         whole: &mut Option<(DecideOutcome, bool)>,
@@ -1018,7 +1072,7 @@ impl Loaded<'_, '_> {
     )]
     pub(crate) fn decide_without_lease(
         self,
-        maker: &impl RequestMaker,
+        maker: &impl LendsLists,
         now: Instant,
     ) -> Result<(super::decision::Decision, Option<Shadowed>), DecisionRefused> {
         let own = self;
@@ -1073,7 +1127,7 @@ impl Loaded<'_, '_> {
     /// target its host holds of the pair's first decision, and nothing its
     /// host hears of later ([`Self::decide_without_lease`]). The decision
     /// is the one the leasing entry makes for a guard's decode call
-    /// ([`DecisionEngine::decide_decode_under`]). The host files the decode
+    /// ([`Decides::decide_decode_under`]). The host files the decode
     /// side's issue and tells the stages of it.
     ///
     /// `issued_micros` is the instant the pair's lease was issued at, as
@@ -1098,7 +1152,7 @@ impl Loaded<'_, '_> {
     )]
     pub(crate) fn decide_decode_without_lease(
         self,
-        maker: &impl RequestMaker,
+        maker: &impl LendsLists,
         held: &super::decision::Target,
         claimed: (super::view::Session, WorkerId),
         issued_micros: u64,
@@ -1237,7 +1291,7 @@ impl Loaded<'_, '_> {
     /// decode.
     fn placed_or(
         self,
-        maker: &impl RequestMaker,
+        maker: &impl LendsLists,
         late: Option<&Made<'_, '_>>,
         clock: impl FnOnce() -> Instant,
         whole: &mut Option<(DecideOutcome, bool)>,
@@ -1389,11 +1443,11 @@ impl Loaded<'_, '_> {
 /// issued the lease. For a lease an earlier document issued it is one the
 /// document in force kept that stood then ([`InProcess::apply`]). The
 /// shadow counts are those of the document in force.
-impl DecisionEngine for InProcess {
+impl<M: LendsLists> Decides<M> for InProcess {
     fn decide_under(
         &self,
         _: GatewayId,
-        maker: &impl RequestMaker,
+        maker: &M,
         now: Instant,
     ) -> Result<Decided, DecisionRefused> {
         self.decide_at(maker, move || now)
@@ -1405,7 +1459,7 @@ impl DecisionEngine for InProcess {
     fn decide_decode_under(
         &self,
         _: GatewayId,
-        maker: &impl RequestMaker,
+        maker: &M,
         held: &HeldDecision<'_>,
         now: Instant,
     ) -> Result<DecideOutcome, DecisionRefused> {
@@ -1440,7 +1494,11 @@ impl DecisionEngine for InProcess {
             })
         })
     }
+}
 
+/// What the engine hears of a lease, its upkeep and its reads of the
+/// document in force.
+impl DecisionEngine for InProcess {
     fn say(&self, _: GatewayId, held: &HeldDecision<'_>, said: Said, _: Instant) {
         // A single's word no stage takes is told to nobody. A pair's
         // dispatch may carry its decode's issue: every word of one goes to

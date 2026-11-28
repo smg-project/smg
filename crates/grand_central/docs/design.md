@@ -1629,9 +1629,10 @@ list's conversion where it takes the list's claim, which it tries and never wait
 ### 5.7 One engine **[partly]**
 
 Main has one engine, `InProcess`, behind the trait `DecisionEngine`
-(`engine/decision_engine.rs`). It decides over its host's worker objects, read in place. It keeps
-no lease: the host hands the lease back with each event. This document also calls it the kept
-engine, its name while a second engine stood beside it.
+(`engine/decision_engine.rs`). It implements a second trait, `Decides`, for each maker that lends
+its lists (`LendsLists`): the two deciding entries stand there. It decides over its host's worker
+objects, read in place. It keeps no lease: the host hands the lease back with each event. This
+document also calls it the kept engine, its name while a second engine stood beside it.
 
 A second engine stood beside it: the store-backed engine, also called the old engine here. It
 decided over records copied into the policy store and kept its leases there. Its type is deleted,
@@ -2047,7 +2048,9 @@ time or two other workers end it.
 
 For each request a host implements a small trait and calls the engine. A controller does so for
 each frame it decides. The gateway makes the one call of section 8.2, and the crate implements the
-trait for that call. A host writes `model` and `make`; every other method has a default body:
+trait for that call. A host writes `model` and `make`; every other method has a default body. A
+host of `InProcess` lends its worker lists by a second trait, `LendsLists`, whose one method lends
+none by default:
 
 ```rust
 // engine/decision_engine.rs
@@ -2059,12 +2062,16 @@ pub trait RequestMaker {
     fn prompt_chars(&self) -> u32;                    // the length of its text in characters, asked for a plain request's lease
     fn prompt_bytes(&self) -> u32;                    // the same length in bytes
     fn session_counted_under(&self) -> SessionCountedUnder; // where a worker object counts its session key's requests
-    fn workers(&self) -> WorkerLists<'_>;             // the worker list, a pair's two lists, or an encode request's three
     fn loads(&self) -> Option<&Arc<LoadSnapshot>>;    // a request's snapshot of the host's own; without one the engine reads its own
     fn token_key(&self, page: usize) -> Option<TokenKey<'_>>; // the prompt's entry in the host's token tree, where the host lends one
     fn text_key(&self) -> Option<TextKey<'_>>;        // the entry of a prompt the host holds as text in its string tree, where the host lends one
     fn sends_to(&self, target: &Target) -> bool;      // whether its caller sends to this target of a pick: the prompt is stored for the first such
     fn sends_to_encoder(&self, position: u32) -> bool; // whether its caller sends to this encoder of an encode request's pick: the prompt is stored for no target behind one it does not
+}
+
+// engine/in_process.rs
+pub trait LendsLists: RequestMaker {
+    fn workers(&self) -> WorkerLists<'_>;             // the worker list, a pair's two lists, or an encode request's three
 }
 
 pub enum WorkerLists<'a> {
@@ -2074,6 +2081,7 @@ pub enum WorkerLists<'a> {
     Encode(EncodeLists<'a>), // an encode request's three lists: its pair's two and its encoders
 }
 
+// engine/decision_engine.rs
 pub enum Decided {
     Alone(AlonePick),           // a position in the list; nothing is owed to the engine afterwards
     Whole(DecideOutcome, bool), // a full decision with its lease

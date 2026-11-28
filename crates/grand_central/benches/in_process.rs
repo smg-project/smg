@@ -137,8 +137,8 @@ use parking_lot::{Condvar, Mutex};
 use smg_grand_central::{
     document::{AppliedSpec, PolicySpec, RulePlaced, ShadowSpec},
     engine::{
-        Decided, FixedFacts, Identity, InProcess, Phase, Plain, PromptEntry, PublishedList,
-        Request, RequestFacts, RequestMaker, TokenKey, WorkerId, WorkerLists,
+        Decided, FixedFacts, Identity, InProcess, LendsLists, Phase, Plain, PromptEntry,
+        PublishedList, Request, RequestFacts, RequestMaker, TokenKey, WorkerId, WorkerLists,
     },
     policies::{
         consistent_hashing::{Head, LentRing},
@@ -909,12 +909,14 @@ impl RequestMaker for Stated<'_> {
         self.host.plain
     }
 
-    fn workers(&self) -> WorkerLists<'_> {
-        WorkerLists::Single(self.host.list.lent())
-    }
-
     fn token_key(&self, page: usize) -> Option<TokenKey<'_>> {
         self.prompt?.token_key(page)
+    }
+}
+
+impl LendsLists for Stated<'_> {
+    fn workers(&self) -> WorkerLists<'_> {
+        WorkerLists::Single(self.host.list.lent())
     }
 }
 

@@ -351,7 +351,7 @@ fn the_number_counts_among_the_workers_that_meet_the_requests_demands() {
 /// same list is answered so with no named worker, by its decision.
 #[test]
 fn a_list_refused_at_the_count_is_answered_a_fault() {
-    use crate::engine::list_cell::ListCell;
+    use crate::engine::in_process::lists::ListCell;
 
     let engine = hosted(preset("consistent_hashing"));
     let list = pool(3);
