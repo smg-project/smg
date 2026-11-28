@@ -735,9 +735,9 @@ what the engine says; the file replays later with no engine behind it.
   and under `recorded` the facts of the exchange: the `wire`, the choice's
   `index`, what the request `asked` beyond its prompt, the fold of that
   (`variant`) and the count of output ids its completion carried
-  (`complete_ids`). Each gRPC worker of the process keeps the answers of
-  `GetModelInfo` and `GetServerInfo` once each, as the bytes of the message
-  in hex, in the info file: `PATH` with its extension replaced by
+  (`complete_ids`). The gRPC workers of the process keep the answers of
+  `GetModelInfo` and `GetServerInfo` once each between them, as the bytes of
+  the message in hex, in the info file: `PATH` with its extension replaced by
   `info.jsonl` (`session.jsonl` gives `session.info.jsonl`, and two records
   that differ only in their extension share one info file); an info answer
   whose line the file took nothing of is written by the next answer of its
@@ -749,9 +749,9 @@ what the engine says; the file replays later with no engine behind it.
   while another waits, even where it alone ends well; the next fetch that
   begins with none waiting is kept. A fetch whose chunks sum above 200 MiB,
   what a gateway takes of a bundle at most, passes through and is not kept.
-  Each gRPC worker keeps a fetch of its own, so with `--grpc-count` above
-  one the file may hold one line of the path a worker; a replay reads the
-  first. Of a
+  The gRPC workers of the process share the file: with `--grpc-count` above
+  one a path is kept once between them and one fetch waits at a time. A
+  replay reads the first line of a path. Of a
   `GetServerInfo` answer the SGLang and TokenSpeed wires hand two free-form
   maps, the arguments the engine was started with and its scheduler's
   state, and a start argument may be a key: the info file keeps of each map
