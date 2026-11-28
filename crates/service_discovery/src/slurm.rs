@@ -902,4 +902,5 @@ impl SlurmDiscovery {
 }
 
 #[cfg(test)]
+#[path = "../tests/unit/slurm/tests.rs"]
 mod tests;

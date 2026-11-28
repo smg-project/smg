@@ -2,11 +2,26 @@ use std::sync::Mutex;
 
 use super::*;
 
-const SQUEUE_23_11: &str = include_str!("../testdata/slurm/squeue-23.11.json");
-const SQUEUE_24_11: &str = include_str!("../testdata/slurm/squeue-24.11.json");
-const SQUEUE_21_08: &str = include_str!("../testdata/slurm/squeue-21.08.json");
-const NODES_23_11: &str = include_str!("../testdata/slurm/scontrol-nodes-23.11.json");
-const NODES_24_11: &str = include_str!("../testdata/slurm/scontrol-nodes-24.11.json");
+const SQUEUE_23_11: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/testdata/slurm/squeue-23.11.json"
+));
+const SQUEUE_24_11: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/testdata/slurm/squeue-24.11.json"
+));
+const SQUEUE_21_08: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/testdata/slurm/squeue-21.08.json"
+));
+const NODES_23_11: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/testdata/slurm/scontrol-nodes-23.11.json"
+));
+const NODES_24_11: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/testdata/slurm/scontrol-nodes-24.11.json"
+));
 
 fn discovery_config(job_names: &[&str]) -> SlurmDiscoveryConfig {
     SlurmDiscoveryConfig {

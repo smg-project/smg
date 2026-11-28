@@ -520,4 +520,5 @@ pub(super) async fn reconcile(
 }
 
 #[cfg(test)]
+#[path = "../tests/unit/reconciler/tests.rs"]
 mod tests;
