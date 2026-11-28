@@ -1081,11 +1081,11 @@ impl Scorer for Switched {
 /// word of a lease: each word's list holds it beside the scorers that
 /// name the word, so two lists that differ are both filled. The preset's
 /// own `random` names none: a word that neither scorer names has an empty
-/// list. Where the list is empty in both engines, the lists behind it are
-/// compared still. Where the later build filled it, the two differ. Each
-/// pass is held to its picker: under `hears` the table built one for each
-/// document and the one in force heard the issue and the dispatch, and
-/// under `random` it built none.
+/// list. Where the list is empty in both engines, the compare goes on
+/// behind it. Where the later build filled it, the two differ. Each
+/// pass is held to its picker: under `hears` each document's validation
+/// built one, and the one in force heard the issue and the dispatch.
+/// Under `random` no validation built a `hears`.
 ///
 /// A dispatch under the later document then reaches the scorers that
 /// named it at the build that made them, and no other. Where the two named
@@ -1175,10 +1175,10 @@ fn a_later_document_keeps_a_profile_its_build_listed_as_the_standing_one() {
                 "{pick}, {later:?}: the scorer at {at}"
             );
         }
-        // The pass's picker is each document's own. Under `hears` the
-        // table built one for each of the two, and the one of the profile
-        // in force heard the issue and the dispatch: it stands in every
-        // word's list. Under `random` the table built none.
+        // The pass's picker is each document's own. Under `hears` each
+        // document's validation built one, and the one of the profile in
+        // force heard the issue and the dispatch: it stands in every
+        // word's list. Under `random` no validation built a `hears`.
         if pick == "hears" {
             let in_force = usize::from(!kept);
             assert_eq!(picked.lock().len(), 2, "{later:?}: a picker a document");

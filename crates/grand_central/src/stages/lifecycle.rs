@@ -129,7 +129,7 @@ pub trait Lifecycle: Send + Sync {
     /// no report to an engine none of whose stages keeps one, and such a
     /// stage decides the same untold. The engine lists the stage by its
     /// answer at the engine's build: that answer is the stage's for the
-    /// engine's life, and a later engine asks again. A host may tell
+    /// engine's life, and a later engine may ask again. A host may tell
     /// such a stage under its own locks: a stage that calls from that word a
     /// door of the host that takes one of them waits on itself.
     fn keeps_loads(&self) -> bool {
@@ -173,7 +173,7 @@ pub trait Lifecycle: Send + Sync {
     /// stages takes one costs a request no lease. The engine lists the
     /// stage by its answer at the engine's build: that answer is the
     /// stage's for the engine's life, and a stage whose answer moves
-    /// later is told by the first. A later engine asks again, and keeps
+    /// later is told by the first. A later engine may ask again, and keeps
     /// the stage only where the stage its own build made in that place
     /// named the same words, and answered [`Self::keeps_loads`] the
     /// same: a stage kept is told by its first answers still.

@@ -724,8 +724,8 @@ fn served(host: &Host, key: u64, sent: Sent) -> ((usize, usize), [SideWord; 2], 
 /// word `untold` a stage hears the issue and the dispatch of a side
 /// the stages placed and of no side the rule placed alone, and the end
 /// of both. Under its default word a stage hears every word. The case's
-/// stage names all four words: a stage hears a word only where it names
-/// it (`Lifecycle::hears`).
+/// stage names all four words: the engine tells a stage a word only
+/// where the stage names it (`Lifecycle::hears`).
 ///
 /// So it is for a decode sent with its prefill, for one decided again
 /// behind its prefill, and for one sent there with no call. A decode
