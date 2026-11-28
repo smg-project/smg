@@ -76,6 +76,24 @@ fn the_worker_routes_take_the_types_the_gateway_reads() {
 }
 
 #[test]
+fn the_worker_server_info_route_names_its_parameter_and_its_answers() {
+    let doc = document_value();
+    let get = &doc["paths"]["/workers/{worker_id}/server_info"]["get"];
+
+    assert_eq!(get["operationId"], json!("getWorkerServerInfo"));
+    assert_eq!(get["parameters"][0]["name"], json!("worker_id"));
+    assert_eq!(get["parameters"][0]["in"], json!("path"));
+    assert_eq!(
+        get["responses"]["200"]["content"]["application/json"]["schema"],
+        json!({"type": "object"})
+    );
+    assert_eq!(
+        get["responses"]["4XX"]["content"]["application/json"]["schema"]["$ref"],
+        json!("#/components/schemas/WorkerErrorResponse")
+    );
+}
+
+#[test]
 fn the_input_items_list_names_its_paging_parameters() {
     let doc = document_value();
     let parameters: Vec<_> = doc["paths"]["/v1/responses/{response_id}/input_items"]["get"]

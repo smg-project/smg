@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use axum::{
     body::Body,
-    extract::{Request, State},
+    extract::{MatchedPath, Request, State},
     http::{header, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -94,7 +94,10 @@ pub struct ControlPlaneAuthState {
 
     /// The paths whose reads the `admin` role alone may make: a view that
     /// shows what the `user` role's reads do not. The gate refuses a user
-    /// there like any other control-plane 403, denial line included.
+    /// there like any other control-plane 403, denial line included. An
+    /// entry is a path, or the template of a route with a parameter
+    /// (`/workers/{worker_id}/server_info`): a read is the admin's where
+    /// its path or the template of the route it matched is listed.
     pub admin_only_reads: &'static [&'static str],
 
     /// What a recorded mutation's task takes for its lifetime, when the
@@ -123,7 +126,9 @@ impl ControlPlaneAuthState {
     }
 
     /// The same state with `paths` as the reads the `admin` role alone may
-    /// make; the gateway names them where it attaches the layer.
+    /// make; the gateway names them where it attaches the layer. Each is a
+    /// path or the template of a route: a request is asked by its path and
+    /// by the template of the route it matched.
     #[must_use]
     pub fn with_admin_only_reads(mut self, paths: &'static [&'static str]) -> Self {
         self.admin_only_reads = paths;
@@ -143,9 +148,10 @@ impl ControlPlaneAuthState {
         self
     }
 
-    /// Whether a read of `path` needs the `admin` role.
-    fn is_admin_only_read(&self, path: &str) -> bool {
-        self.admin_only_reads.contains(&path)
+    /// Whether `entry` (a request's path, or the template of the route it
+    /// matched) is one of the reads that need the `admin` role.
+    fn is_admin_only_read(&self, entry: &str) -> bool {
+        self.admin_only_reads.contains(&entry)
     }
 
     /// Create from config, initializing JWT validator if needed.
@@ -270,9 +276,15 @@ struct Attempt {
 impl Attempt {
     fn of(request: &Request<Body>, auth_state: &ControlPlaneAuthState) -> Self {
         let path = request.uri().path();
+        // The template names every path of a route with a parameter; the
+        // path is asked beside it, so a listed path is the admin's under
+        // whichever route matched it.
+        let template = request.extensions().get::<MatchedPath>();
         Self {
             method: request.method().to_string(),
-            admin_only: auth_state.is_admin_only_read(path),
+            admin_only: auth_state.is_admin_only_read(path)
+                || template
+                    .is_some_and(|template| auth_state.is_admin_only_read(template.as_str())),
             path: path.to_string(),
             request_id: request.extensions().get::<RequestId>().map(|r| r.0.clone()),
         }

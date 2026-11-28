@@ -28,6 +28,7 @@ const USER_KEY: &str = "matrix-user-key";
 const READ_ROUTES: &[(&str, &str)] = &[
     ("GET", "/inflight"),
     ("GET", "/workers"),
+    ("GET", "/workers/no-such-worker"),
     ("GET", "/get_loads"),
     ("GET", "/policy/explain/no-such-request"),
     ("GET", "/v1/tokenizers"),
@@ -43,6 +44,11 @@ const WRITE_ROUTES: &[(&str, &str)] = &[
     ("POST", "/stop_profile"),
     ("POST", "/heap_profile"),
 ];
+
+/// Reads kept to the `admin` role by the server's own list
+/// ([`smg::server::ADMIN_ONLY_READS`]): the `user` role is refused there
+/// as on a mutation.
+const ADMIN_ONLY_READ_ROUTES: &[(&str, &str)] = &[("GET", "/workers/no-such-worker/server_info")];
 
 pub(super) fn control_plane_auth() -> ControlPlaneAuthState {
     ControlPlaneAuthState::new(
@@ -102,7 +108,11 @@ async fn control_plane_role_matrix() {
         Some(control_plane_auth()),
     );
 
-    for (method, path) in READ_ROUTES.iter().chain(WRITE_ROUTES) {
+    for (method, path) in READ_ROUTES
+        .iter()
+        .chain(WRITE_ROUTES)
+        .chain(ADMIN_ONLY_READ_ROUTES)
+    {
         assert_eq!(
             status(&app, method, path, None).await,
             StatusCode::UNAUTHORIZED,
@@ -127,7 +137,7 @@ async fn control_plane_role_matrix() {
             "{method} {path} with the user key: {user}"
         );
     }
-    for (method, path) in WRITE_ROUTES {
+    for (method, path) in WRITE_ROUTES.iter().chain(ADMIN_ONLY_READ_ROUTES) {
         assert_eq!(
             status(&app, method, path, Some(USER_KEY)).await,
             StatusCode::FORBIDDEN,

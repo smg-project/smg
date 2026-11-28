@@ -75,6 +75,21 @@ async fn a_worker_replacement_names_its_worker_id_and_a_refusal_or_a_read_names_
         "the accepted replacement names the worker it queued"
     );
 
+    // The worker here speaks HTTP: its engine is not asked, and the read
+    // names no resource either.
+    let info = call(
+        &app,
+        "GET",
+        &format!("/workers/{worker_id}/server_info"),
+        None,
+    )
+    .await;
+    assert_eq!(info.status(), StatusCode::NOT_IMPLEMENTED);
+    assert!(
+        info.extensions().get::<AuditResource>().is_none(),
+        "a read names no resource"
+    );
+
     let refused = call(&app, "POST", "/workers", Some(json!({}))).await;
     assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
     assert!(
