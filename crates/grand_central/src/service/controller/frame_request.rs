@@ -55,7 +55,7 @@ use smg_worker::load::state::LoadSnapshot;
 
 use super::wire::{Checked, FrameLists};
 use crate::{
-    document::spec::AppliedSpec,
+    document::applied::AppliedSpec,
     engine::{
         decision_engine::{Request, RequestMaker, WorkerLists},
         view::{Constraints, Identity, RequestFacts, SessionCountedUnder, WireModes},

@@ -15,7 +15,7 @@ use smg_worker::{registry::WorkerRegistry, test_support::ready_worker};
 
 use super::*;
 use crate::{
-    document::spec::{AppliedSpec, PolicySpec},
+    document::{applied::AppliedSpec, spec::PolicySpec},
     engine::{
         Constraints, InProcess, LentList, Request, RequestFacts, RequestMaker, WorkerId,
         WorkerLists,

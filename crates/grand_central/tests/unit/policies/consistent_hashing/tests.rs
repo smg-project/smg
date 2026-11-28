@@ -1017,7 +1017,7 @@ fn the_bounded_load_rule_takes_its_mean_over_the_survivors_alone() {
 #[test]
 fn a_request_hashed_as_deep_as_its_generation_reads_keeps_its_key() {
     use crate::{
-        document::spec::{AppliedSpec, PolicySpec},
+        document::{applied::AppliedSpec, spec::PolicySpec},
         engine::view::HashKind,
     };
     let mut document = PolicySpec::preset("prefix_hash").expect("a preset of this build");
@@ -1073,7 +1073,7 @@ fn keys_of(scorer: &ConsistentHash, facts: &RequestFacts<'_>) -> Vec<u64> {
 #[test]
 fn a_request_hashed_as_deep_as_its_generation_reads_keeps_its_boundary_keys() {
     use crate::{
-        document::spec::{AppliedSpec, PolicySpec},
+        document::{applied::AppliedSpec, spec::PolicySpec},
         engine::view::HashKind,
     };
     let document: PolicySpec = serde_json::from_str(

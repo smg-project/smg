@@ -11,7 +11,10 @@ use smg_worker::{
 
 use super::*;
 use crate::{
-    document::spec::{AppliedSpec, Assignment, PolicySpec, Recovery, RulePlaced},
+    document::{
+        applied::AppliedSpec,
+        spec::{Assignment, PolicySpec, Recovery, RulePlaced},
+    },
     engine::{
         decision::{Pair, Pick, PlacedBy, Target, Targets},
         decision_engine::{DecisionEngine, HeldDecode, RequestMaker, WorkerLists},

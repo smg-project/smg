@@ -19,7 +19,7 @@ use super::{
     WorkersStore,
 };
 use crate::{
-    document::spec,
+    document::applied::AppliedSpec,
     engine::{
         decision::{self, Target, Targets},
         decision_engine::DecodeRefused,
@@ -94,8 +94,8 @@ fn lease(gateway: GatewayId, id: u64, term: u64, now: Instant) -> LeaseRecord {
 
 /// The manual preset as `generation`, its keys pinned for `ttl_s` and swept
 /// every `sweep_s`.
-fn manual_ruled(generation: u64, ttl_s: u32, sweep_s: u32) -> spec::AppliedSpec {
-    use crate::document::spec::{AppliedSpec, PolicySpec};
+fn manual_ruled(generation: u64, ttl_s: u32, sweep_s: u32) -> AppliedSpec {
+    use crate::document::spec::PolicySpec;
 
     let mut document = PolicySpec::preset("manual").expect("a preset of this build");
     document.generation = generation;

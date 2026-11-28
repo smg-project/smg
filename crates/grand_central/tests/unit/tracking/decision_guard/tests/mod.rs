@@ -11,7 +11,7 @@ use super::DecisionGuard;
 #[cfg(feature = "client")]
 use crate::engine::decision_engine::{DecisionRefused, DecodeRefused};
 use crate::{
-    document::spec::{AppliedSpec, PolicySpec},
+    document::{applied::AppliedSpec, spec::PolicySpec},
     engine::{
         decision::{Decision, Target, Targets},
         decision_engine::{Request, RequestMaker, WorkerLists},

@@ -10,8 +10,9 @@ use super::{
     PoolRows,
 };
 use crate::{
-    document::spec::{
-        AppliedSpec, Assignment, Needs, OverloadSpec, PolicySpec, Recovery, RulePlaced,
+    document::{
+        applied::AppliedSpec,
+        spec::{Assignment, Needs, OverloadSpec, PolicySpec, Recovery, RulePlaced},
     },
     engine::{
         decision::{Decision, Overlap, MAX_TARGETS},

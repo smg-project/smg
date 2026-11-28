@@ -15,7 +15,7 @@ use smg_worker::{
 
 use super::FrameRequest;
 use crate::{
-    document::spec::{AppliedSpec, PolicySpec},
+    document::{applied::AppliedSpec, spec::PolicySpec},
     engine::{
         decision::{Decision, ShedReason, MAX_TARGETS, SUBSET_HINT},
         decision_engine::{Decided, Plain, Request, RequestMaker, WorkerLists},

@@ -85,10 +85,7 @@ use super::{
     InProcess, Loaded,
 };
 use crate::{
-    document::{
-        spec::{AppliedSpec, DecodePick},
-        DerivedKeys, KeySource,
-    },
+    document::{applied::AppliedSpec, spec::DecodePick, DerivedKeys, KeySource},
     engine::{
         decision::{
             Decision, PairSide, Pick, ShedReason, Target, ADMITS, BUDGET, ENCODE_ITEMS, MAX_TARGETS,

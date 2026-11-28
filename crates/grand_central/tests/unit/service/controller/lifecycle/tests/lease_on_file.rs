@@ -25,7 +25,7 @@ use super::{
     a_completed, a_dispatched, a_released, open,
 };
 use crate::{
-    document::spec::{AppliedSpec, PolicySpec},
+    document::{applied::AppliedSpec, spec::PolicySpec},
     engine::{
         decision::{Decision, Target, Targets},
         decision_engine::HeldDecode,

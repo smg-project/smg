@@ -102,7 +102,7 @@ fn scores_beside(
 #[test]
 fn a_request_made_with_no_block_hashed_is_sized_as_the_one_hashed() {
     use crate::{
-        document::spec::AppliedSpec,
+        document::applied::AppliedSpec,
         engine::prompt_hashes::{HashSeeds, PromptHashes},
     };
     let document = PolicySpec::preset("cache_aware").expect("a preset");

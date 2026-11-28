@@ -21,7 +21,7 @@ use std::{future::Future, sync::Arc};
 use smg_worker::load::state::LoadReceiver;
 
 use super::{membership::Members, overlap::CacheIndexes, InProcess};
-use crate::document::spec::AppliedSpec;
+use crate::document::applied::AppliedSpec;
 
 /// Where a program keeps its workers' data: what it hands the engine once,
 /// at the engine's start ([`InProcess::start`]).

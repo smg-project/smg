@@ -16,7 +16,7 @@ use parking_lot::Mutex;
 
 use super::{Entry, Event, Log, LogPositionLost};
 use crate::{
-    document::spec::{AppliedSpec, PolicySpec},
+    document::{applied::AppliedSpec, spec::PolicySpec},
     engine::view::{Role, WorkerId},
     store::{
         identity, GatewayId, HealthSink, Journal, LeasesStore, MembershipChange, MemoryStore,

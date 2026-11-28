@@ -5,7 +5,7 @@
 //! label is one read of it ([`Loaded::label_at`]).
 
 use super::Loaded;
-use crate::{document::spec::AppliedSpec, names::intern};
+use crate::{document::applied::AppliedSpec, names::intern};
 
 /// The labels of `spec`'s profiles, each at its profile's position in the
 /// document. One allocation a distinct name, for the life of the process.

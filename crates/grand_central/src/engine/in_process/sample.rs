@@ -218,7 +218,7 @@ impl InProcess {
     /// and is not counted and not kept where it states none of the three.
     /// A record names its plan, its profile and that profile's stages through
     /// [`DecisionRecord::names`], read under the document's engine
-    /// ([`AppliedSpec::engine`](crate::document::spec::AppliedSpec::engine)).
+    /// ([`AppliedSpec::engine`](crate::document::applied::AppliedSpec::engine)).
     ///
     /// The ring is the document's: a document put in force later
     /// ([`Self::apply`]) starts with an empty ring, and this call reads the

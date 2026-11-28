@@ -115,7 +115,7 @@ use super::{
     view::{FixedFacts, Phase, WireModes, WorkerId},
 };
 use crate::{
-    document::spec::AppliedSpec,
+    document::applied::AppliedSpec,
     stages::Lifecycle,
     store::GatewayId,
     tracking::lease::{EventKind, EventSet, Membership, Said, Side},

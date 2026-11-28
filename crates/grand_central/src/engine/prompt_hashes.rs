@@ -6,7 +6,7 @@ use kv_index::{
 };
 
 use crate::{
-    document::spec::AppliedSpec,
+    document::applied::AppliedSpec,
     engine::view::{HashKind, RequestFacts, TEXT_BYTES_PER_TOKEN},
 };
 

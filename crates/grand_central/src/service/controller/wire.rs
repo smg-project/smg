@@ -55,8 +55,9 @@ use std::{
 
 use crate::{
     document::{
+        applied::AppliedSpec,
         operator::{Document, NeedsRow, Status},
-        spec::{AppliedSpec, MAX_HEADERS},
+        spec::MAX_HEADERS,
     },
     engine::{
         decision::{Decision, ShedReason, Target},

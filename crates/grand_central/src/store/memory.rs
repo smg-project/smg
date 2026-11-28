@@ -27,7 +27,7 @@ use rustc_hash::FxHashMap;
 #[cfg(feature = "controller")]
 use crate::engine::{sticky_sessions::SessionVerdict, CacheIndexes};
 use crate::{
-    document::spec::AppliedSpec,
+    document::applied::AppliedSpec,
     engine::{
         decision_engine::DecodeRefused,
         view::{Session, WorkerId, LOAD_REPORT_CLOCK_HISTORY_MS},

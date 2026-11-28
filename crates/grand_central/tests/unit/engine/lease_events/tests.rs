@@ -14,7 +14,10 @@ use std::{
 use smg_worker::{identity::basic::Worker, test_support::ready_worker};
 
 use crate::{
-    document::spec::{AppliedSpec, Assignment, PolicySpec, RulePlaced},
+    document::{
+        applied::AppliedSpec,
+        spec::{Assignment, PolicySpec, RulePlaced},
+    },
     engine::{
         decision::{Decision, PlacedBy, Target, Targets},
         decision_engine::{Request, RequestMaker, WorkerLists},

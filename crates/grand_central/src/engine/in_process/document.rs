@@ -32,7 +32,7 @@ use parking_lot::Mutex;
 
 use super::{labels, next_applied, InProcess};
 use crate::{
-    document::spec::AppliedSpec,
+    document::applied::AppliedSpec,
     engine::{
         decision::{Decision, PairSide, ShadowKind},
         explain::{DecisionRecord, Samples},

@@ -31,8 +31,9 @@ use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
 };
 
-// The crate's own paths through this module still name the type here.
-pub(crate) use crate::document::applied::AppliedSpec;
+// The applied generation is named only by doc links of this module.
+#[cfg(doc)]
+use crate::document::applied::AppliedSpec;
 use crate::{
     engine::{
         framework::{Binding, Engine, Filter, Picker, Plan, Profile, Scorer, WeightedScorer},

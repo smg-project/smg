@@ -15,11 +15,12 @@ use super::{
 };
 use crate::{
     document::{
+        applied::AppliedSpec,
         operator::{
             test_support::{faulting, standing, stock, with_line, LEAST_LOAD, RANDOM},
             ApplyOutcome, Format,
         },
-        spec::{AppliedSpec, Digest, PolicySpec, SpecError},
+        spec::{Digest, PolicySpec, SpecError},
     },
     service::{
         controller::{wire, worker_wire},

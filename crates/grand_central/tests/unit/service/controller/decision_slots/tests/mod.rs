@@ -23,7 +23,10 @@ use super::{
     Hand, Job, Part, Reads, Refused, LOOK_CAP, LOOK_FLOOR, PARTS, TERM_MARK,
 };
 use crate::{
-    document::spec::{self, AppliedSpec, PolicySpec},
+    document::{
+        applied::AppliedSpec,
+        spec::{self, PolicySpec},
+    },
     engine::{
         decision::{Decision, Targets},
         decision_engine::{Decided, WorkerLists},

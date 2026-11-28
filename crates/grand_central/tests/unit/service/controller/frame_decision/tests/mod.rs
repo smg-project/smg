@@ -30,7 +30,10 @@ use super::{
     issue_pair, Booked, FrameBuffers,
 };
 use crate::{
-    document::spec::{AppliedSpec, Assignment, PolicySpec, SessionsSpec},
+    document::{
+        applied::AppliedSpec,
+        spec::{Assignment, PolicySpec, SessionsSpec},
+    },
     engine::{
         decision::{Decision, ShedReason, Target, Targets, SUBSET_HINT, WIRES},
         decision_engine::{Request, RequestMaker, WorkerLists},

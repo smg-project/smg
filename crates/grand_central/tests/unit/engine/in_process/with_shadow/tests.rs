@@ -31,9 +31,12 @@ use super::super::single::{
     tests::{answered, decided, pool, Asks, MODEL},
 };
 use crate::{
-    document::spec::{
-        AffinitySource, AppliedSpec, Assignment, BestParams, PickStage, PolicySpec,
-        PrefixAffinityParams, ProfileSpec, ScoreStage, ShadowSpec, WarmupSliceParams,
+    document::{
+        applied::AppliedSpec,
+        spec::{
+            AffinitySource, Assignment, BestParams, PickStage, PolicySpec, PrefixAffinityParams,
+            ProfileSpec, ScoreStage, ShadowSpec, WarmupSliceParams,
+        },
     },
     engine::{
         decision::{Decision, ShadowKind, ShedReason, Targets},

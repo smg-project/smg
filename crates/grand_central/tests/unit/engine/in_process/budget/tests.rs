@@ -13,7 +13,7 @@ use smg_worker::{
 };
 
 use crate::{
-    document::spec::{AppliedSpec, PolicySpec},
+    document::{applied::AppliedSpec, spec::PolicySpec},
     engine::{
         decision_engine::{DecisionEngine, Request, RequestMaker, WorkerLists},
         framework::{DecisionScope, Filter},

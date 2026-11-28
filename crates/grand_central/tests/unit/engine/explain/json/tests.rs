@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 
 use super::*;
 use crate::{
-    document::spec::{AppliedSpec, PolicySpec},
+    document::{applied::AppliedSpec, spec::PolicySpec},
     engine::{
         decision::{Pair, Pick, Queue, ShadowKind, Shed, Survivors, Targets, Trace},
         view::fingerprint,

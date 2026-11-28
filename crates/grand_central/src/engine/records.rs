@@ -96,7 +96,7 @@ use super::{
     },
 };
 use crate::{
-    document::spec::AppliedSpec,
+    document::applied::AppliedSpec,
     load::{load_row, signal_values, ReportSignals, SignalCells, SignalColumn},
     policies::round_robin::RoundRobin,
 };

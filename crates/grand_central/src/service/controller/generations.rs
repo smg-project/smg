@@ -74,11 +74,12 @@ pub(crate) use crate::document::operator::{
 };
 use crate::{
     document::{
+        applied::AppliedSpec,
         operator::{
             above, over_bound, Checked, DocumentManager, DryRun, EnforceOutcome, EnforceRefused,
             Entered, FollowerTurn, Held, Line, SerialTurn,
         },
-        spec::{AppliedSpec, Digest, OverloadSwitch, PolicySpec, SpecError},
+        spec::{Digest, OverloadSwitch, PolicySpec, SpecError},
     },
     service::{elector::Fence, proto},
     stages::registry::StageRegistry,

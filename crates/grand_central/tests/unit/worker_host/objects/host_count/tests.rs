@@ -441,7 +441,7 @@ fn a_whole_read_hands_each_standing_object_again() {
 #[test]
 fn the_engine_over_worker_lists_reads_the_count_at_its_next_decision() {
     use crate::{
-        document::spec::{AppliedSpec, PolicySpec},
+        document::{applied::AppliedSpec, spec::PolicySpec},
         engine::{
             Constraints, Decided, InProcess, LentList, Request, RequestFacts, RequestMaker, Role,
             WorkerLists,

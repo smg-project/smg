@@ -19,7 +19,10 @@ use super::super::{
     InProcess,
 };
 use crate::{
-    document::spec::{AppliedSpec, PolicySpec, ShadowSpec, PRESETS},
+    document::{
+        applied::AppliedSpec,
+        spec::{PolicySpec, ShadowSpec, PRESETS},
+    },
     engine::{
         decision::{Decision, ShadowKind, ShedReason, Target},
         decision_engine::{

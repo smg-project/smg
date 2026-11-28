@@ -10,7 +10,7 @@ use super::{
     Replica, DECODE, ENCODE, MODEL, PREFILL,
 };
 use crate::{
-    document::spec::{AppliedSpec, PolicySpec},
+    document::{applied::AppliedSpec, spec::PolicySpec},
     engine::{
         Constraints, EncodeItems, EncodeLists, EncodePlaced, EncoderFacts, Identity, InProcess,
         PairLists, Phase, Request, RequestFacts, Role, WorkerId,

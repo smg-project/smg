@@ -15,8 +15,9 @@ use tokio::task::JoinSet;
 use super::*;
 use crate::{
     document::{
+        applied::AppliedSpec,
         operator::test_support::Validate,
-        spec::{AppliedSpec, Digest, PolicySpec, SpecError},
+        spec::{Digest, PolicySpec, SpecError},
     },
     service::{
         controller::generations::tests::{
