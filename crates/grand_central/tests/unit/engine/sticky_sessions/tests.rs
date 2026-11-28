@@ -1437,6 +1437,84 @@ fn a_move_at_the_cap_writes_nothing_into_a_life_its_decision_did_not_read() {
     }
 }
 
+/// An entry a claim makes again, behind a sweep of its key, is one no
+/// read began: it has no reader's date. So the dispatch of a request
+/// that read the key's entry before is written there, though it is dated
+/// before the claim.
+///
+/// Three requests read an empty key. The first claims worker 1, and the
+/// key's end sweeps its entry. The second claims worker 1 on the entry
+/// its claim makes. The first's dispatch confirms that claim: the key was
+/// served there. The second's commit is refused then and takes back
+/// nothing, and the third follows worker 1.
+///
+/// A gateway's sticky map answers so where it assigns the worker itself
+/// and the third request may take the worker. A selection that comes
+/// behind follows an entry made since its miss, by the first of the
+/// entry's workers the request may take
+/// (`ManualPolicy::select_by_routing_id` in
+/// `model_gateway/src/policies/manual.rs`). A refused send takes no pin
+/// back there.
+#[test]
+fn an_entry_a_claim_makes_again_takes_an_older_requests_dispatch() {
+    let id = WorkerId;
+    let table = SessionTable::new(RULE.sweep_micros);
+    let first = table.lookup(s(7), 1_000, &RULE);
+    let second = table.lookup(s(7), 1_010, &RULE);
+    let third = table.lookup(s(7), 1_020, &RULE);
+    assert_eq!(table.claim(s(7), first, id(1), 1_000), Claim::Made(id(1)));
+    // Another key's read past this key's end sweeps the entry, and the
+    // first claim with it.
+    table.lookup(s(8), 5_000, &RULE);
+    assert_eq!(table.pins(s(7)), None, "swept");
+    assert_eq!(table.claim(s(7), second, id(1), 1_010), Claim::Made(id(1)));
+    let unread = Some(([id(1), id(0)], SessionExpiry::Unread));
+    assert_eq!(table.held(s(7)), unread, "no read began the entry");
+    // The first request is sent to worker 1, under its own date. Every
+    // target then refuses the second's commit.
+    table.dispatched(s(7), SessionVerdict::Claimed(id(1)), id(1), 1_000);
+    table.move_claim(s(7), id(1), id(0), 1_010);
+    assert_eq!(table.pins(s(7)), Some([id(1), id(0)]), "nothing taken back");
+    let followed = Claim::Standing(id(1), [id(1), id(0)]);
+    assert_eq!(table.claim(s(7), third, id(2), 1_020), followed);
+}
+
+/// A move at the cap is written into an entry a claim made again, though
+/// its decision read a pin the key holds no more. That entry has no
+/// reader's date, so the move is no older life's there.
+///
+/// The key was served on worker 1, and a decision reads that pin at its
+/// cap. The key's end sweeps it, two requests read it empty, and its end
+/// sweeps it again. The first of the two claims worker 2 on the entry its
+/// claim makes. The move onto worker 3 comes then: it fronts worker 3,
+/// and the second request follows it.
+///
+/// A gateway's sticky map moves a pin where the capped request's
+/// selection picks another worker under the cap, and tests no date of
+/// that write (`ManualPolicy::pin_front`, called by `select_sticky` in
+/// `model_gateway/src/policies/registry.rs`). A move that reaches the
+/// map behind a new entry fronts its worker there.
+#[test]
+fn an_entry_a_claim_makes_again_takes_an_older_move_at_the_cap() {
+    let id = WorkerId;
+    let table = SessionTable::new(RULE.sweep_micros);
+    table.lookup(s(7), 1_000, &RULE);
+    table.dispatched(s(7), SessionVerdict::Pinned, id(1), 1_000);
+    // The mover reads the pin at its cap.
+    assert_eq!(table.pins_renewed(s(7), 1_001, &RULE), [id(1), id(0)]);
+    table.lookup(s(8), 3_000, &RULE);
+    assert_eq!(table.pins(s(7)), None, "the first sweep");
+    let first = table.lookup(s(7), 3_100, &RULE);
+    let second = table.lookup(s(7), 3_200, &RULE);
+    table.lookup(s(8), 6_000, &RULE);
+    assert_eq!(table.pins(s(7)), None, "the second sweep");
+    assert_eq!(table.claim(s(7), first, id(2), 3_100), Claim::Made(id(2)));
+    // The mover's write comes now, under its own date.
+    table.respilled(s(7), id(3), 1_001);
+    let followed = Claim::Standing(id(3), [id(3), id(2)]);
+    assert_eq!(table.claim(s(7), second, id(9), 3_200), followed);
+}
+
 /// A decode call's date is written into the life the call read, and into
 /// no other. Where the key started over behind the call's read, the new
 /// life keeps its date, and the call's dispatch is an older life's
@@ -1742,6 +1820,37 @@ fn a_decode_calls_tie_to_its_leases_first_claim_reads_no_instant_a_rename_and_a_
     assert_eq!(table.pins(s(1)), Some([id(3), id(0)]), "forgotten");
     table.dispatched(s(1), claimed(id(3)), id(3), 10);
     assert_eq!(table.pins(s(1)), Some([id(3), id(0)]), "nothing more");
+}
+
+/// The id a tied dispatch asks by, in one order of calls. A pair's lease
+/// of 10 claims worker 2 by its first decision and worker 3 by its decode
+/// call. Worker 2 is registered again as 5, the call is taken back, and
+/// the lease's first decode is dispatched on the id 2. The tie is asked
+/// by that id, which the lease's own word names, and the pins are read by
+/// the id that stands. So the call's claim is withdrawn with its mark,
+/// and the key holds worker 5 alone.
+#[test]
+fn a_tied_dispatch_on_the_id_a_worker_had_withdraws_the_calls_claim() {
+    let (id, claimed) = (WorkerId, SessionVerdict::Claimed);
+    // The pair's lease is of 10: its first decision claims 2, and its
+    // decode call claims 3 at 40.
+    let table = SessionTable::new(RULE.sweep_micros);
+    let seen = table.lookup(s(1), 10, &RULE);
+    assert_eq!(table.claim(s(1), seen, id(2), 10), Claim::Made(id(2)));
+    let seen = table.lookup(s(1), 40, &RULE);
+    assert_eq!(table.claim(s(1), seen, id(3), 40), Claim::Made(id(3)));
+    table.told_under(s(1), Some(id(3)), 40, 10, id(2));
+    // The first worker is registered again under 5. The call is taken
+    // back, and the lease's first decode is sent on the id 2.
+    table.rename_worker(id(2), id(5));
+    assert_eq!(table.pins(s(1)), Some([id(3), id(5)]), "renamed");
+    table.dispatched(s(1), claimed(id(2)), id(2), 10);
+    assert_eq!(table.pins(s(1)), Some([id(5), id(0)]), "the first worker");
+    // The call's claim left with its mark: a word of the lease that
+    // would move it finds no claim, and writes nothing.
+    let told = table.move_claim(s(1), id(3), id(7), 10);
+    assert_eq!(told, SessionVerdict::Pinned, "no claim to move");
+    assert_eq!(table.pins(s(1)), Some([id(5), id(0)]), "nothing moved");
 }
 
 /// A decode call's dispatch takes the key's pin with it from the first
