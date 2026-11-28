@@ -36,18 +36,18 @@
     dead_code,
     reason = "this binary serves mock engines and waits by its own bound; the process's CPU time is the load path's"
 )]
-#[path = "common/engines.rs"]
+#[path = "../common/engines.rs"]
 mod engines;
 #[expect(dead_code, reason = "this binary reads no resident size")]
-#[path = "common/net.rs"]
+#[path = "../common/net.rs"]
 mod net;
-#[path = "common/pair.rs"]
+#[path = "../common/pair.rs"]
 mod pair;
 #[expect(
     dead_code,
     reason = "this binary starts a pair over a lease file and kills its leader; the election's record and the other starts are the replicas cases'"
 )]
-#[path = "common/replicas.rs"]
+#[path = "../common/replicas.rs"]
 mod replicas;
 
 use std::{
