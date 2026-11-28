@@ -373,6 +373,10 @@ impl Lag {
     }
 
     /// Stores the frame's instant, and returns what the frame before left.
+    /// What the lag keeps of it is whole microseconds past the origin, never
+    /// more of them than `at` is past it. So the origin plus them is an
+    /// instant the clock holds, and the two sums that make the kept instant
+    /// again ([`Self::turn`], [`Self::read`]) need no check.
     fn store(&self, at: Instant) -> u64 {
         let micros = at.saturating_duration_since(self.origin).as_micros();
         let micros = u64::try_from(micros).unwrap_or(u64::MAX - 1);
@@ -395,16 +399,24 @@ impl Lag {
     }
 
     /// The last frame at the head at `now`, by one read of it: its age, and
-    /// the instant the sync lapses with no further such frame, none where the
-    /// frame is as old as the bound already. `None` where the lag holds no
-    /// frame. This replica is synced while there is such an instant: the
-    /// `Leader` call's `synced` and a follower's readiness are this read.
-    pub(crate) fn read(&self, now: Instant) -> Option<(Duration, Option<Instant>)> {
+    /// when the sync lapses with no further such frame ([`Lapse`]). `None`
+    /// where the lag holds no frame. A replica that follows is synced until
+    /// its sync has lapsed: its `Leader` call's `synced` and, while it
+    /// serves, its readiness are this read.
+    ///
+    /// The sync lapses at the frame's instant as the lag keeps it, a whole
+    /// microsecond, plus the bound. A bound the clock cannot add to that
+    /// instant does not lapse on this clock ([`Lapse::Never`]).
+    pub(crate) fn read(&self, now: Instant) -> Option<(Duration, Lapse)> {
         let frame = self.frame.load(Ordering::Relaxed).checked_sub(1)?;
         let applied = self.origin + Duration::from_micros(frame);
-        let lapse = applied + self.within;
         let age = now.saturating_duration_since(applied);
-        Some((age, (now < lapse).then_some(lapse)))
+        let lapse = match applied.checked_add(self.within) {
+            Some(lapse) if now < lapse => Lapse::At(lapse),
+            Some(_) => Lapse::Lapsed,
+            None => Lapse::Never,
+        };
+        Some((age, lapse))
     }
 
     /// The standby asks its leader to be restored: an event of the
@@ -433,6 +445,37 @@ impl Lag {
     /// silence that had ended the sync.
     pub(crate) fn turns(&self) -> watch::Receiver<u64> {
         self.turns.subscribe()
+    }
+}
+
+/// When a standby's sync lapses with no further frame at the head: the
+/// second word of one read of its lag ([`Lag::read`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Lapse {
+    /// The sync has lapsed: the clock has reached the instant the bound
+    /// ends at.
+    Lapsed,
+    /// The sync lapses at this instant, which the clock has not reached.
+    At(Instant),
+    /// The sync does not lapse on this clock, which cannot hold the instant
+    /// the bound ends at.
+    Never,
+}
+
+impl Lapse {
+    /// Whether a replica that follows is synced: its sync has not lapsed.
+    pub(crate) fn synced(self) -> bool {
+        self != Self::Lapsed
+    }
+
+    /// The instant the clock alone ends the sync at, where there is one.
+    /// A readiness whose fence is closed at its sample says it as the next
+    /// turn, or the fence's next turn where that is the earlier.
+    pub(crate) fn instant(self) -> Option<Instant> {
+        match self {
+            Self::At(lapse) => Some(lapse),
+            Self::Lapsed | Self::Never => None,
+        }
     }
 }
 

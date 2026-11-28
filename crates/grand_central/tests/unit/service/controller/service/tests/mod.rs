@@ -37,6 +37,7 @@ use crate::{
             },
             replication::{journaled_at, tests::journaled_from},
             spec_store::{tests::names, SpecStore},
+            standby::Lag,
             wire::Checked,
             PROTOCOL_FLOOR, PROTOCOL_VERSION,
         },
@@ -1235,6 +1236,71 @@ fn a_follower_says_its_lag_and_reads_synced_under_the_bound() {
     elector.tick(now).expect("the renewal");
     service.shared.lag.applied(now);
     let led = service.leader_info(now);
+    assert!(led.is_leader && !led.synced && led.sync.is_none());
+}
+
+#[test]
+fn a_follower_under_a_bound_its_clock_cannot_add_reads_synced() {
+    // A candidate alone over its lease: it does not lead until its take,
+    // and its take opens the lead at the take's own instant.
+    let mut elector = Elector::alone(IDENTITY, PATIENT).expect("the settings are in order");
+    let (standing, stood) = watch::channel(ElectionObservation::default());
+    // The lag is the case's own, under the bound of the longest interval
+    // a host states: no clock holds a frame's instant plus it.
+    let (stood, stop, role, _) = bed::unserved(stood);
+    let endless = Arc::new(Lag::new(Duration::from_secs(u64::MAX)));
+    let shared = Shared::new(
+        ID.to_owned(),
+        ADDRESS.to_owned(),
+        &elector,
+        (stood, stop, role, endless),
+        bed::followed(journaled_from(&LeasePlace::Process, 0)),
+        (Arc::new(StageRegistry::builtin()), &LeasePlace::Process),
+        1,
+    )
+    .expect("the decider starts");
+    let service = Service::new(vec![Scope::Replication], Arc::new(shared));
+    let at = Instant::now();
+    service.shared.lag.applied(at);
+    // The sync reads the lag alone, whomever the standing names: nobody
+    // before a look at the lease, nobody at a lease no replica holds, and
+    // another replica that holds it, the last two under term 4.
+    let standings = [
+        (ElectionObservation::default(), "", 0),
+        (saw("", 4), "", 4),
+        (saw("controller-1@10.0.0.8:30100", 4), "10.0.0.8:30100", 4),
+    ];
+    // Under each it is synced from the frame on with no further frame: at
+    // once, a day on, and sixty days on. The answer names whom the standing
+    // names, under the standing's term, and says the frame's age in
+    // milliseconds, at sixty days as the most its field holds.
+    let day = Duration::from_secs(86_400);
+    for (seen, address, term) in standings {
+        standing.send_replace(seen);
+        for (behind, said) in [(Duration::ZERO, 0), (day, 86_400_000), (60 * day, u32::MAX)] {
+            let info = service.leader_info(at + behind);
+            assert!(
+                !info.is_leader && info.synced,
+                "{address:?} {term} {behind:?}"
+            );
+            assert_eq!(
+                (info.address.as_str(), info.term),
+                (address, term),
+                "{behind:?}"
+            );
+            let lag = info.sync.map(|sync| sync.replication_lag_ms);
+            assert_eq!(lag, Some(said), "{address:?} {term} {behind:?}");
+        }
+    }
+
+    // A replica that leads follows nobody under such a bound either: it
+    // is not synced and says no sync state, whatever frame its lag holds.
+    let took = Instant::now();
+    assert_eq!(
+        elector.tick(took).expect("the take"),
+        TickOutcome::Acquired { term: 1 }
+    );
+    let led = service.leader_info(took);
     assert!(led.is_leader && !led.synced && led.sync.is_none());
 }
 
