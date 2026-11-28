@@ -8,7 +8,7 @@ use std::{collections::BTreeSet, fs, path::Path};
 use serde_json::Value;
 use smg_grand_central::{
     document::{
-        PolicySpec, API_VERSION, MAX_BLOCK_HASHES, MAX_ENGINES, MAX_HEADERS, MAX_LABELS,
+        PolicySpec, SpecError, API_VERSION, MAX_BLOCK_HASHES, MAX_ENGINES, MAX_HEADERS, MAX_LABELS,
         MAX_SIGNALS, MAX_ZONES,
     },
     stages::StageRegistry,
@@ -488,4 +488,155 @@ fn the_schema_states_the_forms_of_a_model_glob() {
         schema["properties"]["index"]["propertyNames"]["pattern"],
         MODEL_GLOB
     );
+}
+
+// A pattern of the schema and the check validation runs on the same field
+// say one rule. Each test below reads its pattern from the schema and
+// holds it against `PolicySpec::validate` over a small closed set of
+// names, so a change of one side alone fails here.
+
+/// A document of one profile with the sections of `rest` beside it.
+fn document_with(rest: Value) -> serde_json::Result<PolicySpec> {
+    let mut document = serde_json::json!({
+        "apiVersion": API_VERSION,
+        "profiles": { "p": { "pick": "random" } },
+    });
+    if let (Some(document), Value::Object(rest)) = (document.as_object_mut(), rest) {
+        document.extend(rest);
+    }
+    serde_json::from_value(document)
+}
+
+/// Whether validation takes `document`; a refusal must be the one
+/// `refusal` knows.
+fn validates(document: &PolicySpec, refusal: impl Fn(&SpecError) -> bool) -> bool {
+    match document.validate() {
+        Ok(_) => true,
+        Err(error) => {
+            assert!(refusal(&error), "another refusal: {error:?}");
+            false
+        }
+    }
+}
+
+/// Every string of at most five characters over `letters`, the empty one
+/// first.
+fn strings_over(letters: [char; 2]) -> Vec<String> {
+    let mut all = vec![String::new()];
+    let mut last = all.clone();
+    for _ in 0..5 {
+        let mut longer = Vec::with_capacity(last.len() * 2);
+        for shorter in &last {
+            for letter in letters {
+                longer.push(format!("{shorter}{letter}"));
+            }
+        }
+        all.extend(longer.iter().cloned());
+        last = longer;
+    }
+    all
+}
+
+/// The bytes a character class holds: `x-y` is a range, any other
+/// character is itself. The class of a header name escapes nothing.
+fn class_bytes(class: &str) -> BTreeSet<u8> {
+    let mut held = BTreeSet::new();
+    let mut rest = class.as_bytes();
+    loop {
+        match rest {
+            [low, b'-', high, tail @ ..] => {
+                held.extend(*low..=*high);
+                rest = tail;
+            }
+            [one, tail @ ..] => {
+                held.insert(*one);
+                rest = tail;
+            }
+            [] => return held,
+        }
+    }
+}
+
+#[test]
+fn the_header_pattern_and_validation_take_the_same_one_byte_names() {
+    let schema = serde_json::to_value(PolicySpec::schema()).expect("a JSON value");
+    let pattern = property(&schema, "ViewSpec", "headers")["items"]["pattern"]
+        .as_str()
+        .expect("a pattern");
+    assert_eq!(pattern, HEADER_NAME);
+    let class = pattern
+        .strip_prefix("^[")
+        .and_then(|rest| rest.strip_suffix("]+$"))
+        .expect("one or more characters of one class");
+    let held = class_bytes(class);
+    for byte in 0..=127_u8 {
+        let name = char::from(byte).to_string();
+        let document = document_with(serde_json::json!({ "view": { "headers": [name] } }))
+            .expect("a policy document");
+        let taken = validates(
+            &document,
+            |error| matches!(error, SpecError::BadField { path, .. } if path == "view.headers[0]"),
+        );
+        assert_eq!(taken, held.contains(&byte), "the one-byte name {name:?}");
+    }
+}
+
+/// The two forms `MODEL_GLOB` states: a star before a run without a star,
+/// or a run of one or more characters without a star and at most one star
+/// behind it.
+fn in_a_glob_form(model: &str) -> bool {
+    let plain = |part: &str| !part.contains('*');
+    match model.strip_prefix('*') {
+        Some(rest) => plain(rest),
+        None => {
+            let run = model.strip_suffix('*').unwrap_or(model);
+            !run.is_empty() && plain(run)
+        }
+    }
+}
+
+#[test]
+fn the_model_glob_pattern_and_validation_take_the_same_names() {
+    let schema = serde_json::to_value(PolicySpec::schema()).expect("a JSON value");
+    assert_eq!(property(&schema, "Match", "model")["pattern"], MODEL_GLOB);
+    for model in strings_over(['a', '*']) {
+        let document = document_with(serde_json::json!({
+            "bindings": [{ "match": { "model": model }, "profile": "p" }],
+        }))
+        .expect("a policy document");
+        let taken = validates(&document, |error| {
+            matches!(error, SpecError::BadModelGlob { index: 0, .. })
+        });
+        assert_eq!(taken, in_a_glob_form(&model), "the model {model:?}");
+    }
+}
+
+/// A label selector's pattern: a key without `=`, or that key, an `=` and
+/// one or more characters of any kind.
+const LABEL_SELECTOR: &str = r"^[^=]+(=[\s\S]+)?$";
+
+/// The forms `LABEL_SELECTOR` states.
+fn in_a_selector_form(label: &str) -> bool {
+    match label.split_once('=') {
+        Some((key, value)) => !key.is_empty() && !value.is_empty(),
+        None => !label.is_empty(),
+    }
+}
+
+#[test]
+fn the_label_pattern_and_validation_take_the_same_selectors() {
+    let schema = serde_json::to_value(PolicySpec::schema()).expect("a JSON value");
+    assert_eq!(
+        property(&schema, "ViewSpec", "labels")["items"]["pattern"],
+        LABEL_SELECTOR
+    );
+    for label in strings_over(['k', '=']) {
+        let document = document_with(serde_json::json!({ "view": { "labels": [label] } }))
+            .expect("a policy document");
+        let taken = validates(
+            &document,
+            |error| matches!(error, SpecError::BadField { path, .. } if path == "view.labels[0]"),
+        );
+        assert_eq!(taken, in_a_selector_form(&label), "the label {label:?}");
+    }
 }
