@@ -15,7 +15,7 @@ use crate::{
         Constraints, EncodeItems, EncodeLists, EncodePlaced, EncoderFacts, Identity, InProcess,
         PairLists, Phase, Request, RequestFacts, Role, WorkerId,
     },
-    store::{EncodeHandoff, EncodeOffer, Registrant, WorkerFacts, WorkersStore},
+    store::{EncodeHandoff, EncodeOffer, Registrant, WorkerFacts},
     worker_host::OpenAdmission,
 };
 

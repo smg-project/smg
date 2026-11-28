@@ -275,7 +275,7 @@ async fn a_decode_calls_pick_inside_its_workers_registration_window_books_its_co
         ..WorkerFacts::default()
     };
     let late = rewritten(&bed, facts);
-    let row = WorkersStore::get(&*bed.store, late).expect("the row");
+    let row = bed.store.get(late).expect("the row");
     bed.reads
         .objects
         .connect_row(&bed.store, late, row.revision);
@@ -432,7 +432,7 @@ async fn each_refusal_of_the_call_is_a_busy_of_its_own_reason_and_moves_nothing(
     let whole = lease(&bed.ask(pair_frame(2, false)).await);
     let store = Arc::clone(&bed.store);
     let decodes = ["d0", "d1"].map(|name| {
-        let row = WorkersStore::by_key(&*store, &format!("http://{name}:8000"));
+        let row = store.by_key(&format!("http://{name}:8000"));
         row.expect("a decode of the fleet").id
     });
     let file = |bed: &Bed| {

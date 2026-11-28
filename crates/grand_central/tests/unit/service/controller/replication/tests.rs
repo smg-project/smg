@@ -1840,7 +1840,7 @@ fn a_status_entry_names_the_models_its_row_served_at_the_write() {
     let id = leader.writes(0);
     stand(&leader.objects, &leader.store, id, WorkerStatus::Ready);
     // The row's models change in place, and its object moves again.
-    let stood = WorkersStore::get(leader.store.as_ref(), id).expect("the row");
+    let stood = leader.store.get(id).expect("the row");
     let mut wider = stood.facts;
     wider.models.push("n".to_owned());
     assert_eq!(leader.registers(wider), id, "a change in place");

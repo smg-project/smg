@@ -5,10 +5,6 @@
 //! reads the world the store publishes ([`MemoryStore::snapshot`]), not
 //! through these locks.
 
-// A case pauses a snapshot behind its copy of the rows: the store holds
-// that pause in a field, so the two ends of its channel are named here.
-#[cfg(test)]
-use std::sync::mpsc::{Receiver, SyncSender};
 use std::{
     collections::{HashMap, VecDeque},
     mem,
@@ -82,8 +78,6 @@ pub struct MemoryStore {
     /// holds it as a [`Writing`], which tells the journal when the write's
     /// locks are let go.
     workers: Mutex<Workers>,
-    #[cfg(test)]
-    snapshot_pause: Mutex<Option<(SyncSender<()>, Receiver<()>)>>,
     health: Mutex<HealthTables>,
     /// The world's write side: every world is made and shown under this
     /// lock, so the deciders see the worlds in the order they were made. It
@@ -122,11 +116,10 @@ pub struct MemoryStore {
     wake: Mutex<Option<Wake>>,
 }
 
-/// The replicated rows at one place of the log's history. A controller's is
-/// cut from its worker objects by their holder, and the store's own entry
-/// cuts one from its table ([`MemoryStore::checkpoint`]). The contract's
-/// three snapshot messages are built from it: the operator's, the watch's
-/// and the replication's.
+/// The replicated rows at one place of the log's history, cut from a
+/// host's worker objects by their holder (`Objects::checkpoint`, under the
+/// `worker-host` feature). The contract's three snapshot messages are
+/// built from it: the operator's, the watch's and the replication's.
 #[derive(Clone, Debug)]
 #[expect(clippy::exhaustive_structs, reason = "its mark comes with its call")]
 pub struct StoreCheckpoint {
@@ -194,8 +187,6 @@ impl MemoryStore {
         let leases = Leases::empty(0, Arc::clone(&counts), origin);
         Self {
             workers: Mutex::default(),
-            #[cfg(test)]
-            snapshot_pause: Mutex::default(),
             health: Mutex::default(),
             loads: Mutex::new(Loads { writer }),
             files: turn::Files::one(leases),
@@ -226,33 +217,6 @@ impl MemoryStore {
     /// term, and for a store with no journal.
     pub fn followed(&self) -> Option<u64> {
         self.journal.as_ref().and_then(|journal| journal.followed())
-    }
-
-    /// The table's rows as one journaled write left them, with that
-    /// write's position. Taken under the membership lock: every journaled
-    /// write holds its table's lock through its apply and its telling, so
-    /// none stands half told here. A writer of the rows waits for the copy; a
-    /// decision reads the published world and does not.
-    ///
-    /// No product code calls it. What a watcher of the rows starts from,
-    /// what a standby is restored from and what an operator reads are cut
-    /// from the worker objects by their holder, with the status the
-    /// journal told (`MemoryStore::told`, under the `worker-host`
-    /// feature). This cut goes with the table.
-    pub fn checkpoint(&self) -> StoreCheckpoint {
-        // Copied under the lock, sorted after it: a writer waits for the
-        // copy alone.
-        let (at, epoch, mut rows) = {
-            let workers = self.workers.lock();
-            let at = self
-                .journal
-                .as_ref()
-                .map_or_else(Position::default, |journal| journal.head());
-            let rows: Vec<WorkerRow> = workers.rows.values().map(|row| row.row.clone()).collect();
-            (at, workers.epoch, rows)
-        };
-        rows.sort_by(|a, b| a.facts.key.cmp(&b.facts.key));
-        StoreCheckpoint { at, epoch, rows }
     }
 
     /// The tables replaced by `cut`, a leader's snapshot whole: what a
@@ -1790,16 +1754,17 @@ impl MemoryStore {
         self.journal.is_some()
     }
 
-    /// The told status of every row: what the journal last told of its
-    /// id, with the journal's place and the membership epoch,
-    /// all read in one hold of the membership lock.
+    /// The told status of every row: the status its last write left, which
+    /// a journaled store told its journal. It comes with the journal's
+    /// place and the membership epoch, all read in one hold of the
+    /// membership lock. A store with no journal answers the default place.
     /// A status write holds that lock across its telling and its apply,
     /// so no status stands half told here. The hold copies a place and one
     /// status a row, and no row.
     ///
     /// The told status is the log's own word, kept beside the epoch:
     /// no copy of what a decision reads. A decision reads a
-    /// worker's status on its object. The told status has seven readers:
+    /// worker's status on its object. The told status has eight readers:
     ///
     /// - the next status event, which says the status its row moved from
     ///   ([`Self::status_told`]);
@@ -1815,12 +1780,16 @@ impl MemoryStore {
     /// - a holder that follows its leader's log, which lays on an object
     ///   the status the log told of its row (`Objects::copy_status`);
     /// - a removal the store refused for its term, whose holder lays the
-    ///   row's object again in it (`Objects::take_decided`).
+    ///   row's object again in it (`Objects::take_decided`);
+    /// - a status event the store follows, which is written only where
+    ///   its row stands in the status the event left
+    ///   (`Writing::follow_status`).
     ///
-    /// A tell the store refused and a holder that follows its leader's
-    /// log read one row's told status ([`Self::told_status`]). What else
-    /// reads a row's status reads the table's whole row and goes with the
-    /// table: the store's own reads of a row.
+    /// A first copy reads it by this read. A tell the store refused and a
+    /// holder that follows its leader's log read one row's
+    /// ([`Self::told_status`]). The others read it inside a write's body,
+    /// off the row the write is about, whether the write lands or is
+    /// refused: those reads go with the table.
     pub(crate) fn told(&self) -> Told {
         let workers = self.workers.lock();
         let at = self
@@ -1848,9 +1817,12 @@ impl MemoryStore {
     /// A holder of worker objects reads it under an object's mutation
     /// lock, for the status the object takes from the log's word
     /// (`Objects::table_status`). `revision` is the row's revision the
-    /// object was built from. The test of it rests on the table's row,
-    /// which holds the revision today: it goes with the table, and the
-    /// read is then by the id alone.
+    /// object was built from. The test rests on the table's row, which
+    /// holds the revision today. It keeps the status of a row the holder
+    /// has not laid again off the object of the row before. A row of
+    /// another history under the same id and revision passes it. A step
+    /// that takes the table away must keep that by a test of its own: a
+    /// read by the id alone does not.
     pub(crate) fn told_status(&self, id: WorkerId, revision: u64) -> Option<WorkerStatus> {
         let workers = self.workers.lock();
         let held = workers.rows.get(&id)?;
@@ -2011,16 +1983,6 @@ impl MemoryStore {
 }
 
 impl WorkersStore for MemoryStore {
-    fn get(&self, id: WorkerId) -> Option<WorkerRow> {
-        self.workers.lock().rows.get(&id).map(|row| row.row.clone())
-    }
-
-    fn by_key(&self, key: &str) -> Option<WorkerRow> {
-        let workers = self.workers.lock();
-        let id = workers.by_key.get(key)?;
-        workers.rows.get(id).map(|row| row.row.clone())
-    }
-
     fn epoch(&self) -> u64 {
         self.workers.lock().epoch
     }
@@ -2032,21 +1994,6 @@ impl WorkersStore for MemoryStore {
         let workers = self.workers.lock();
         let slot = workers.rows.get(&id).map(|held| held.slot);
         slot.is_some_and(|slot| self.counts.beside(slot, count))
-    }
-
-    fn all_rows(&self) -> (u64, Vec<WorkerRow>) {
-        // Copied under the lock, sorted after it: a writer waits for the
-        // copy alone.
-        let (epoch, mut rows) = {
-            let workers = self.workers.lock();
-            let rows: Vec<WorkerRow> = workers.rows.values().map(|row| row.row.clone()).collect();
-            (workers.epoch, rows)
-        };
-        // A case's pause, between the copy of the rows and their sort.
-        #[cfg(test)]
-        self.pause_snapshot();
-        rows.sort_by(|a, b| a.facts.key.cmp(&b.facts.key));
-        (epoch, rows)
     }
 }
 

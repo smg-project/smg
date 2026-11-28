@@ -22,7 +22,6 @@ use crate::{
     },
     store::{
         GatewayId, HealthPolicy, MemoryStore, Reachability, Registrant, WorkerFacts, WorkerStatus,
-        WorkersStore,
     },
 };
 

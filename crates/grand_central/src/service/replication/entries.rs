@@ -28,10 +28,7 @@ const PUBLISHED: &str = "every replica publishes its own world";
 
 /// The list: `(trait or type, entry, fate)`, each in its file's own order.
 pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
-    ("WorkersStore", "get", EntryReplication::Read),
-    ("WorkersStore", "by_key", EntryReplication::Read),
     ("WorkersStore", "epoch", EntryReplication::Read),
-    ("WorkersStore", "all_rows", EntryReplication::Read),
     // A count is of the replica's own worker object: no journal names it.
     (
         "WorkersStore",
@@ -85,7 +82,6 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
     ("MemoryStore", "with_publish_window", EntryReplication::Read),
     ("MemoryStore", "journaled", EntryReplication::Read),
     ("MemoryStore", "followed", EntryReplication::Read),
-    ("MemoryStore", "checkpoint", EntryReplication::Read),
     (
         "MemoryStore",
         "restore_from",

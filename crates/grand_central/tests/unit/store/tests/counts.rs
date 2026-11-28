@@ -39,7 +39,7 @@ fn a_rows_count_reads_the_leases_on_file_that_book_its_worker() {
     assert!(in_flight(&store).contains(&(c, 0)));
     // A lease of a worker that left ends on its own count, and no other
     // member's moves.
-    let revision = WorkersStore::get(&store, b).expect("the row").revision;
+    let revision = store.get(b).expect("the row").revision;
     assert!(store.remove(b, revision).is_some());
     let leases: &dyn LeasesStore = &store;
     assert!(leases.released(gateway, LeaseId(3), None, ReleaseReason::WorkerRemoved));
@@ -113,7 +113,7 @@ fn a_member_keeps_its_slot_and_a_leavers_slot_is_given_to_no_one() {
                 }
             }
         }
-        let revision = WorkersStore::get(&store, ids[leaver]).expect("the row");
+        let revision = store.get(ids[leaver]).expect("the row");
         assert!(store.remove(ids[leaver], revision.revision).is_some());
         let joined = ready(&store, "http://d:1");
         let stayers = (1..).zip(&ids).filter(|&(_, &id)| id != ids[leaver]);
@@ -139,7 +139,7 @@ fn filed_ahead_of_a_first_build(file: fn(&dyn LeasesStore, GatewayId, &[LeaseRec
     // No build is asked for the second worker: its registration's is owed
     // to the window when its lease is filed.
     let owed = store.upsert(facts("http://b:1", 1)).id();
-    let revision = WorkersStore::get(&store, owed).expect("the row").revision;
+    let revision = store.get(owed).expect("the row").revision;
     store
         .set_status(owed, WorkerStatus::Ready, revision)
         .expect("ready");
@@ -231,7 +231,7 @@ fn a_lease_dispatched_onto_a_worker_inside_its_window_books_its_count() {
     let store = MemoryStore::new();
     let built = ready(&store, "http://a:1");
     let owed = store.upsert(facts("http://b:1", 1)).id();
-    let revision = WorkersStore::get(&store, owed).expect("the row").revision;
+    let revision = store.get(owed).expect("the row").revision;
     store
         .set_status(owed, WorkerStatus::Ready, revision)
         .expect("ready");
@@ -285,7 +285,7 @@ fn a_member_that_leaves_inside_its_window_takes_its_slot_with_it() {
     let (gateway, now) = (GatewayId(1), Instant::now());
     leases.set_term(1);
     assert_eq!(leases.issue(booking(gateway, 1, left, now)), Ok(()));
-    let revision = WorkersStore::get(&store, left).expect("the row").revision;
+    let revision = store.get(left).expect("the row").revision;
     assert!(store.remove(left, revision).is_some());
     let joined = ready(&store, "http://c:1");
     let mut rows = [(built, 0), (joined, 0)];
@@ -321,7 +321,7 @@ fn a_generation_that_builds_no_membership_leaves_a_joiners_slot_on_file() {
     store.apply(manual_ruled(1, 60, 30)).expect("generation 1");
     let built = ready(&store, "http://a:1");
     let owed = store.upsert(facts("http://b:1", 1)).id();
-    let revision = WorkersStore::get(&store, owed).expect("the row").revision;
+    let revision = store.get(owed).expect("the row").revision;
     store
         .set_status(owed, WorkerStatus::Ready, revision)
         .expect("ready");
@@ -358,7 +358,7 @@ fn a_member_given_its_first_model_books_a_lease_inside_that_window() {
     assert_eq!(store.filed_members(), 0, "the build named it, in no pool");
     // The same incarnation with a model: the row and its slot stay.
     assert_eq!(store.upsert(facts("http://b:1", 1)).id(), owed);
-    let revision = WorkersStore::get(&store, owed).expect("the row").revision;
+    let revision = store.get(owed).expect("the row").revision;
     store
         .set_status(owed, WorkerStatus::Ready, revision)
         .expect("ready");
@@ -394,7 +394,7 @@ fn a_lease_on_a_member_in_no_pool_books_its_count() {
     assert_eq!(in_flight(&store), [(built, 0)], "it serves no model");
     assert_eq!(booked_on(&store, owed), Some(1), "booked, in no pool");
     assert_eq!(store.upsert(facts("http://b:1", 1)).id(), owed);
-    let revision = WorkersStore::get(&store, owed).expect("the row").revision;
+    let revision = store.get(owed).expect("the row").revision;
     store
         .set_status(owed, WorkerStatus::Ready, revision)
         .expect("ready");
@@ -427,7 +427,7 @@ fn a_world_names_a_member_in_no_pool_until_it_leaves() {
     assert!(named.is_some(), "named, in no pool");
     assert_ne!(named, listed, "a slot of its own");
     assert_eq!(store.snapshot().booked_of(pooled), listed);
-    let revision = WorkersStore::get(&store, owed).expect("the row").revision;
+    let revision = store.get(owed).expect("the row").revision;
     assert!(store.remove(owed, revision).is_some());
     assert!(store.snapshot().booked_of(owed).is_none(), "it left");
     assert_eq!(store.snapshot().booked_of(pooled), listed);
@@ -469,7 +469,7 @@ fn a_lease_books_on_a_standby_behind_a_followed_refresh() {
         ..facts("http://b:1", 1)
     };
     let owed = leader.upsert(bare).id();
-    let revision = WorkersStore::get(&leader, owed).expect("the row").revision;
+    let revision = leader.get(owed).expect("the row").revision;
     leader
         .set_status(owed, WorkerStatus::Ready, revision)
         .expect("ready");
@@ -480,7 +480,7 @@ fn a_lease_books_on_a_standby_behind_a_followed_refresh() {
     // The leader gives the member its first model and the standby follows.
     let unjournaled = Position::default();
     let refresh = leader.upsert(facts("http://b:1", 1));
-    let row = WorkersStore::get(&leader, owed);
+    let row = leader.get(owed);
     standby.follow(unjournaled, WorkersStore::epoch(&leader), refresh, row);
     assert_eq!(
         (standby.publish_due().is_some(), standby.filed_members()),
@@ -508,7 +508,7 @@ fn a_member_back_under_its_id_is_given_the_next_slot() {
     for id in 1..=2 {
         assert_eq!(leases.issue(booking(gateway, id, leaves, now)), Ok(()));
     }
-    let row = WorkersStore::get(&store, leaves).expect("the row");
+    let row = store.get(leaves).expect("the row");
     assert!(store.remove(leaves, row.revision).is_some());
     // The same key and incarnation after the leave: the same id, and the
     // two leases of the registration that left still on file.

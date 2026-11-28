@@ -14,7 +14,7 @@ use crate::{
         encoding::{EncodeHandoff, EncodeOffer},
         pairing::PairingDescriptor,
         GatewayId, HealthPolicy, MemoryStore, Overload, Reachability, Registrant, Signals,
-        WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore as _,
+        WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus,
     },
     worker_host::{objects::tests::stand, Members, Objects},
 };

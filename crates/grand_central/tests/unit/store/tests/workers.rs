@@ -32,7 +32,7 @@ fn a_registration_is_keyed_and_a_new_incarnation_replaces_it_under_a_new_id() {
     assert_eq!(old, id);
     assert_eq!(new, identity("http://w:8000", 2));
     assert_ne!(old, new);
-    assert!(WorkersStore::get(workers, old).is_none(), "the old id left");
+    assert!(workers.get(old).is_none(), "the old id left");
     assert_eq!(workers.by_key("http://w:8000").map(|row| row.id), Some(new));
     assert_eq!(
         replaced.as_lifecycle(),
@@ -46,7 +46,7 @@ fn a_replacement_carries_a_matching_registrations_status_and_a_changed_one_start
     let id = ready(&store, "http://w:8000");
     let same = store.upsert(facts("http://w:8000", 2)).id();
     assert_eq!(
-        WorkersStore::get(&store, same).expect("the row").status,
+        store.get(same).expect("the row").status,
         WorkerStatus::Ready
     );
     // What a registration states for a hard demand is none of the three
@@ -58,14 +58,14 @@ fn a_replacement_carries_a_matching_registrations_status_and_a_changed_one_start
     };
     let stated = store.upsert(other_runtime).id();
     assert_eq!(
-        WorkersStore::get(&store, stated).expect("the row").status,
+        store.get(stated).expect("the row").status,
         WorkerStatus::Ready
     );
     let mut other_role = facts("http://w:8000", 4);
     other_role.role = Role::Prefill;
     let changed = store.upsert(other_role).id();
     assert_eq!(
-        WorkersStore::get(&store, changed).expect("the row").status,
+        store.get(changed).expect("the row").status,
         WorkerStatus::Pending
     );
     assert_ne!(id, changed);
@@ -76,7 +76,7 @@ fn a_write_under_a_moved_revision_is_refused_and_never_reaches_a_successor() {
     let store = MemoryStore::new();
     let workers = &store;
     let id = workers.upsert(facts("http://w:8000", 1)).id();
-    let stale = WorkersStore::get(workers, id).expect("the row").revision;
+    let stale = workers.get(id).expect("the row").revision;
     assert!(workers
         .patch(id, WorkerPatch::default(), stale)
         .is_some_and(|change| change == MembershipChange::Relabelled { id }));
@@ -85,8 +85,8 @@ fn a_write_under_a_moved_revision_is_refused_and_never_reaches_a_successor() {
         "the patch moved the revision"
     );
     assert!(workers.set_status(id, WorkerStatus::Ready, stale).is_none());
-    assert!(WorkersStore::get(workers, id).is_some(), "the row stands");
-    let current = WorkersStore::get(workers, id).expect("the row").revision;
+    assert!(workers.get(id).is_some(), "the row stands");
+    let current = workers.get(id).expect("the row").revision;
     let status = workers.set_status(id, WorkerStatus::Ready, current);
     assert_eq!(
         status,
@@ -100,7 +100,7 @@ fn a_write_under_a_moved_revision_is_refused_and_never_reaches_a_successor() {
         status.and_then(|change| change.as_lifecycle()).is_none(),
         "a status change is a health signal, not a membership event"
     );
-    let current = WorkersStore::get(workers, id).expect("the row").revision;
+    let current = workers.get(id).expect("the row").revision;
     assert!(
         workers
             .set_status(id, WorkerStatus::Ready, current)
@@ -111,7 +111,7 @@ fn a_write_under_a_moved_revision_is_refused_and_never_reaches_a_successor() {
         workers.remove(id, current),
         Some(MembershipChange::Removed { id })
     );
-    assert!(WorkersStore::get(workers, id).is_none());
+    assert!(workers.get(id).is_none());
 }
 
 #[test]
@@ -129,63 +129,6 @@ fn a_snapshot_holds_every_row_at_its_epoch_ordered_by_key() {
     assert_eq!(rows[0].id, a, "the snapshot is ordered by key");
 }
 
-#[test]
-fn snapshot_sort_does_not_hold_the_workers_lock() {
-    let store = Arc::new(MemoryStore::new());
-    let id = store.upsert(facts("http://c:8000", 1)).id();
-    store.upsert(facts("http://a:8000", 1));
-    store.upsert(facts("http://b:8000", 1));
-    let revision = WorkersStore::get(store.as_ref(), id)
-        .expect("the row")
-        .revision;
-    let epoch = store.epoch();
-    let (cloned, resume) = store.pause_snapshot_after_clone();
-
-    let snapshot_store = Arc::clone(&store);
-    let snapshot = std::thread::spawn(move || WorkersStore::all_rows(snapshot_store.as_ref()));
-    cloned
-        .recv_timeout(PATIENCE)
-        .expect("snapshot reached the sort");
-
-    let writer_store = Arc::clone(&store);
-    let (written_tx, written_rx) = mpsc::channel();
-    let writer = std::thread::spawn(move || {
-        let change = writer_store.set_status(id, WorkerStatus::Ready, revision);
-        written_tx
-            .send(change)
-            .expect("the test receives the write");
-    });
-    let written_while_paused = written_rx.recv_timeout(PATIENCE);
-
-    resume.send(()).expect("resume the snapshot");
-    let (snapshot_epoch, rows) = snapshot.join().expect("snapshot thread");
-    writer.join().expect("writer thread");
-    assert_eq!(snapshot_epoch, epoch, "epoch was read with the rows");
-    assert_eq!(
-        rows.iter()
-            .map(|row| row.facts.key.as_str())
-            .collect::<Vec<_>>(),
-        ["http://a:8000", "http://b:8000", "http://c:8000"],
-        "snapshot rows are ordered by key"
-    );
-    assert_eq!(
-        rows.iter().find(|row| row.id == id).map(|row| row.status),
-        Some(WorkerStatus::Pending),
-        "the snapshot keeps the row copied before the status write"
-    );
-    assert!(
-        matches!(
-            written_while_paused,
-            Ok(Some(MembershipChange::StatusChanged {
-                id: changed,
-                from: WorkerStatus::Pending,
-                to: WorkerStatus::Ready,
-            })) if changed == id
-        ),
-        "status write waited for snapshot sorting"
-    );
-}
-
 /// A status its holder tells says what happened to it, and the status that
 /// stands where it was judged: it moved, it stood, its writer's last word
 /// said no, the row left the revision it was told under, or no row stands.
@@ -199,7 +142,7 @@ fn a_told_status_says_what_happened_and_the_status_that_stands() {
 
     let store = MemoryStore::new();
     let id = store.upsert(facts("http://w:8000", 1)).id();
-    let revision = || WorkersStore::get(&store, id).expect("the row").revision;
+    let revision = || store.get(id).expect("the row").revision;
     // The store has no journal: its holder hands it no models.
     let told = |status, revision, leads: bool| {
         store.status_told(id, status, revision, LeadWord::of(&|| leads), None)
@@ -227,7 +170,7 @@ fn a_told_status_says_what_happened_and_the_status_that_stands() {
         .patch(id, WorkerPatch::default(), left)
         .expect("the patch");
     assert_eq!(told(WorkerStatus::NotReady, left, true), Stale);
-    let stands = WorkersStore::get(&store, id).expect("the row").status;
+    let stands = store.get(id).expect("the row").status;
     assert_eq!((stands, store.epoch()), (WorkerStatus::Ready, epoch + 2));
     // A status told for a worker whose row is gone says no row.
     let last = revision();
@@ -255,7 +198,7 @@ fn a_status_under_a_term_is_journaled_under_it_or_moves_nothing() {
     let store = MemoryStore::journaled(journal);
     store.set_term(3);
     let id = store.upsert(facts("http://w:8000", 1)).id();
-    let revision = WorkersStore::get(&store, id).expect("the row").revision;
+    let revision = store.get(id).expect("the row").revision;
     let under = |status: WorkerStatus, term: u64| {
         let word = LeadWord {
             leads: &|| true,
@@ -264,7 +207,7 @@ fn a_status_under_a_term_is_journaled_under_it_or_moves_nothing() {
         // This writer hands no models: the event names the table's row's.
         store.status_told(id, status, revision, word, None)
     };
-    let stands = || WorkersStore::get(&store, id).expect("the row").status;
+    let stands = || store.get(id).expect("the row").status;
     // Under the term the log leads.
     let before = log.head();
     let ready = Moved {
@@ -365,7 +308,7 @@ fn a_removed_worker_leaves_the_health_tables_and_takes_no_late_write() {
     health.gateway_veto(g1, id, Some(now + Duration::from_secs(60)));
     health.gateway_veto(g2, id, Some(now + Duration::from_secs(1)));
     assert_eq!(store.health_entries(), 2);
-    let revision = WorkersStore::get(&store, id).expect("the row").revision;
+    let revision = store.get(id).expect("the row").revision;
     store.remove(id, revision).expect("removed");
     assert!(
         !health.vetoed(g1, id, now),
@@ -409,22 +352,19 @@ fn a_new_row_takes_its_maker_and_a_standing_row_keeps_it() {
     let id = store
         .upsert_by(facts("http://w:8000", 1), found.clone())
         .id();
-    assert_eq!(WorkersStore::get(&store, id).expect("the row").maker, found);
+    assert_eq!(store.get(id).expect("the row").maker, found);
     // A refresh and a new incarnation keep the maker, whoever calls: the
     // store tests no caller.
     let mut relabelled = facts("http://w:8000", 1);
     relabelled.zone = Some("b".to_string());
     assert_eq!(store.upsert(relabelled).id(), id);
-    assert_eq!(WorkersStore::get(&store, id).expect("the row").maker, found);
+    assert_eq!(store.get(id).expect("the row").maker, found);
     let next = store.upsert(facts("http://w:8000", 2)).id();
     assert_ne!(next, id);
-    assert_eq!(
-        WorkersStore::get(&store, next).expect("the row").maker,
-        found
-    );
+    assert_eq!(store.get(next).expect("the row").maker, found);
     // A row the plain write makes is a control call's.
     let by_hand = store.upsert(facts("http://x:8000", 1)).id();
-    let held = WorkersStore::get(&store, by_hand).expect("the row");
+    let held = store.get(by_hand).expect("the row");
     assert_eq!(held.maker, Registrant::Control);
 }
 

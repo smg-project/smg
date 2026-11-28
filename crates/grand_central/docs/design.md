@@ -3589,7 +3589,8 @@ A fact leaves the remainder when the worker object gets a field that holds it as
    cut is laid in two steps, the store's restore and then its objects, in one turn of the
    keeper. A keeper's own status write takes no turn, so it can fall between the two. It then
    names the standing object's models, where the cut's record is another history's under the
-   same id and revision.
+   same id and revision. A debug build stops there, by the leader's door
+   (`MemoryStore::status_told`).
 
    A second writer is the other way to such a difference: of an object's facts, as said below,
    or of the table around the keeper.
@@ -3641,8 +3642,10 @@ A fact leaves the remainder when the worker object gets a field that holds it as
 
    First the store's log of its changes
    **[built]**, then a cut's read back **[built]** and the store's own write entries **[built]**. Then its read
-   entries with its own cut: the read of one record by its id has no caller in the product
-   **[built]**. Last come the store's reads of the record before a write. The
+   entries with its own cut **[built]**: the reads by a key, of all records and of one record by
+   its id are deleted with that cut. A host reads a record, and cuts a first copy, off the code
+   that keeps the objects. A host that keeps none reads no record of the store. Last come the
+   store's reads of the record before a write. The
    records themselves stay for the published copy's membership build, and go with that copy.
 
    The task is deleted
@@ -3720,15 +3723,18 @@ Three writes move the log's place outside the keeper's turn, and a
 copy stays whole beside each: a status tell changes no fact, and a generation's apply and a
 term's start change no record.
 
-The told status has seven readers: the next status event, for
+The told status has eight readers: the next status event, for
 the status a record moved from, the event of a record changed in place, which carries it, the
 event of a record a write takes out, which is told in it where its writer handed the record, a
 first copy, a tell the store refused, whose object takes it back, and a standby's applier or
 a watcher, which lays it on the object. The seventh is a removal the store refused for its term:
-its record comes back in it, and its object is laid in it. No decision reads it. An operator's read of a few
+its record comes back in it, and its object is laid in it. The eighth is a status event the store
+follows: it is written only where its record stands in the status the event left.
+No decision reads it. An operator's read of a few
 records is read as a first copy is cut, in the keeper's turn and with each record's told status,
 and the store's own read for it is deleted. The store's own
-cut of its table has no caller in the product and ends with step 4.
+cut of its table is deleted too. The cases read the table by a road of their own, which
+ends with step 4.
 
 **A watcher's events through the worker objects [built].** A gateway's watcher hands each
 event of a controller's worker watch, and the watch's first copy at its last page, to the

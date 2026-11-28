@@ -18,7 +18,7 @@ use smg_grand_central::{
         controller::{Config, Controller, LeasePlace, Listener, Readiness, Scope, State},
         proto::{self, replication_event::Event as Sent},
     },
-    store::{EncodeHandoff, EncodeOffer, MemoryStore, Registrant, WorkerFacts, WorkersStore},
+    store::{EncodeHandoff, EncodeOffer, MemoryStore, Registrant, WorkerFacts},
     worker_host::{Members, Objects},
 };
 use tokio::{sync::oneshot, task::JoinSet};
@@ -258,7 +258,7 @@ async fn a_promoted_standby_holds_every_row_of_its_leader() {
         .workers
         .upsert(&leader.store, polled, Registrant::Control);
     let polled = written.expect("the store took the registration").id();
-    let revision = leader.store.get(polled).expect("the row").revision;
+    let revision = leader.workers.read_row(polled).expect("the row").revision;
     leader.workers.connect_row(&leader.store, polled, revision);
     // A row nobody polls, whose offer states a connector past a name's 256
     // bytes, and one that states no offer.
@@ -532,9 +532,15 @@ async fn a_followed_row_reaches_the_published_world_of_a_standby() {
     let mut standby = Replica::serve("replication-1", FOLLOWER, port, shared(&dir)).await;
     standby.reads(State::Follower).await;
     let published = |replica: &Replica| {
-        // The table's row, by the id the holder reads under the key.
+        // The row the holder reads under the key, where the holder's cut
+        // holds it under that key: the rows the holder and the store both
+        // hold.
         let row = replica.workers.read_row_under("http://a:8000");
-        let on_file = row.is_some_and(|row| replica.store.get(row.id).is_some());
+        let cut = replica.workers.checkpoint(&replica.store).rows;
+        let on_file = row.is_some_and(|row| {
+            cut.iter()
+                .any(|told| told.id == row.id && told.facts.key == "http://a:8000")
+        });
         on_file && replica.store.publish_due().is_none()
     };
     assert!(!published(&standby), "no row is written yet");

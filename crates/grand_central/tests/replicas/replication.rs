@@ -51,7 +51,7 @@ use smg_grand_central::{
             replication_event::Event as Sent, worker_event::Event,
         },
     },
-    store::{HealthPolicy, MemoryStore, Registrant, WorkerFacts, WorkerStatus, WorkersStore},
+    store::{HealthPolicy, MemoryStore, Registrant, WorkerFacts, WorkerStatus},
     worker_host::{HealthAdapter, Members, Objects, SoleLead},
 };
 use smg_worker::health::port::{HealthSink, ProbeAnswer};
@@ -687,10 +687,12 @@ fn churn(leader: &impl Hands, stop: &AtomicBool) -> u32 {
                 lays(leader, facts(&name, lives[index], more));
             }
             (Some(row), 3) => {
-                // By the table's status: the object's own leads it. This
-                // thread is the one writer of the leader's rows, so the
-                // table holds the row the holder read a line above.
-                let told = store.get(row.id).expect("the table's row").status;
+                // By the status the store holds, which the holder's cut
+                // states: the object's own leads it. A row the store does
+                // not hold is not in the cut.
+                let cut = workers.checkpoint(store).rows;
+                let told = cut.iter().find(|told| told.id == row.id);
+                let told = told.expect("the store holds the row").status;
                 probed(leader, row.id, told != WorkerStatus::Ready);
             }
             // The other half of the draws writes nothing.

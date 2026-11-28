@@ -16,7 +16,7 @@ use super::{
 };
 use crate::{
     engine::view::WorkerId,
-    store::{MembershipChange, MemoryStore, Signals, WorkerFacts, WorkersStore},
+    store::{MembershipChange, MemoryStore, Signals, WorkerFacts},
     worker_host::kv_cursor::{RankCursor, GAP_CLEAR_THRESHOLD},
 };
 
@@ -478,7 +478,7 @@ fn a_row_leaves_with_its_blocks_and_its_successor_starts_empty() {
     // The row removed: its blocks go. The model's index stays while a row
     // writes it and goes with the last.
     let remove = |id| {
-        let revision = WorkersStore::get(&*store, id).expect("the row").revision;
+        let revision = store.get(id).expect("the row").revision;
         store.remove(id, revision).expect("removed");
     };
     remove(successor);
@@ -588,7 +588,7 @@ fn a_row_past_the_ceiling_stands_counted_until_its_own_write_finds_a_place() {
     // A row leaves, and no write names the row past the ceiling: it is
     // still out, and the place is the next written row's.
     let leave = |id| {
-        let revision = WorkersStore::get(&*store, id).expect("the row").revision;
+        let revision = store.get(id).expect("the row").revision;
         store.remove(id, revision).expect("removed");
     };
     leave(ids[3]);

@@ -679,7 +679,7 @@ mod decided {
             Constraints, DecideOutcome, Decided, Decision, Demands, InProcess, PairLists, Phase,
             Request, RequestFacts, RequestMaker, Role, ShedReason, WorkerId, WorkerLists,
         },
-        store::{Registrant, WorkerFacts, WorkerStatus, WorkersStore},
+        store::{Registrant, WorkerFacts, WorkerStatus},
         worker_host::{
             facts, objects::tests::lay_standing, pairing_descriptor, Members,
             MembershipWriteOutcome, MembershipWriter, Objects, OpenAdmission, Precondition,

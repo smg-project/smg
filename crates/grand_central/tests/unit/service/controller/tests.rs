@@ -48,7 +48,7 @@ use crate::{
         },
         proto::{self, busy::Reason, grand_central_server::GrandCentral as _},
     },
-    store::{HealthPolicy, Registrant, WorkerFacts, WorkerStatus, WorkersStore},
+    store::{HealthPolicy, Registrant, WorkerFacts, WorkerStatus},
 };
 
 /// A lease that stores `writes` writes: the thread that steps it panics

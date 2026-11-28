@@ -17,10 +17,7 @@ use crate::{
         controller::lifecycle::tests::worker,
         elector::{ElectionSettings, Elector, TickOutcome},
     },
-    store::{
-        GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore, MemoryStore, PickRecord,
-        WorkersStore,
-    },
+    store::{GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore, MemoryStore, PickRecord},
     tracking::lease::{Lease, LeaseId},
 };
 
@@ -780,7 +777,7 @@ async fn the_sweeps_task_ends_the_absence_of_a_key_that_stays_away() {
         table.pins(key).map(|pins| pins[0])
     };
     let left = Instant::now();
-    let revision = WorkersStore::get(&*store, w).expect("the row").revision;
+    let revision = store.get(w).expect("the row").revision;
     store.remove(w, revision).expect("removed");
     let never = SessionRule {
         assignment: Assignment::default(),
@@ -975,7 +972,7 @@ fn a_worker_registered_again_starts_clean_and_an_end_past_its_instant_is_not_kep
     let w = worker(&store, "http://a:8000");
     let seat = welcomed(&gateways, A, "gateway-a", TERM, t0);
     assert_eq!(seat.veto(w, BREAKER, Some(t0 + 60 * S), t0), Vetoed::Shown);
-    let revision = WorkersStore::get(&*store, w).expect("the row").revision;
+    let revision = store.get(w).expect("the row").revision;
     store.remove(w, revision).expect("removed");
     assert_eq!(worker(&store, "http://a:8000"), w, "the same id");
     assert!(!store.vetoed(A, w, t0), "the veto left with the row");
@@ -1163,7 +1160,7 @@ fn a_workers_ceiling_of_kinds_leaves_with_its_row() {
         assert_eq!(seat.veto(w, kind, Some(t0 + 60 * S), t0), Vetoed::Shown);
     }
     assert_eq!(seat.veto(w, kinds + 1, Some(t0 + 60 * S), t0), Vetoed::Full);
-    let revision = WorkersStore::get(&*store, w).expect("the row").revision;
+    let revision = store.get(w).expect("the row").revision;
     store.remove(w, revision).expect("removed");
     assert_eq!(worker(&store, "http://a:8000"), w, "the same id");
     assert_eq!(seat.veto(w, kinds + 1, Some(t0 + 5 * S), t0), Vetoed::Shown);
@@ -1258,7 +1255,7 @@ fn a_gateways_ceiling_counts_no_end_of_a_row_that_left() {
     // Every row but the first leaves, and its vetoes with it: the note
     // still holds their ends.
     for &w in &workers[1..] {
-        let revision = WorkersStore::get(&*store, w).expect("the row").revision;
+        let revision = store.get(w).expect("the row").revision;
         store.remove(w, revision).expect("removed");
     }
     assert_eq!(gateways.kept(A), VETOES_MAX);
@@ -1326,9 +1323,7 @@ fn a_noted_worker_removed_under_a_kept_epoch_has_the_store_asked_again() {
     let frame = || seat.veto(one_more, BREAKER, Some(t0 + 60 * S), t0 + S);
     // Refused twice, the second time under the epoch the first kept.
     assert_eq!((frame(), frame()), (Vetoed::Over, Vetoed::Over));
-    let revision = WorkersStore::get(&*store, workers[1])
-        .expect("the row")
-        .revision;
+    let revision = store.get(workers[1]).expect("the row").revision;
     store.remove(workers[1], revision).expect("removed");
     assert_eq!(frame(), Vetoed::Shown);
     assert!(store.vetoed(A, one_more, t0 + S));

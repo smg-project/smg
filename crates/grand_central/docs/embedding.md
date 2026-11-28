@@ -331,7 +331,8 @@ The lists below take the rows in that order.
 ### Feeding the store and the cache index
 
 - An embedded host can implement or use the store's ingress traits for health and leases.
-- One that keeps no worker objects reads its membership through `WorkersStore`, which holds no write, and writes a row as a decided change (`MemoryStore::follow`).
+- One that keeps no worker objects writes a row as a decided change (`MemoryStore::follow`). Its own write hands that call the default place, `Position::default()`. A journaled store journals that write only under a term it took.
+- That host reads no row of the store: it keeps the rows it handed the store. `WorkersStore` gives it the epoch of the store's last write, and holds no write.
 - It feeds cache events through the worker host, under the `worker-host` feature.
 - It hands the holder of its worker objects the KV tables (`worker_host::KvTables`, `Objects::with_kv_tables`). `worker_host::KvHost` over that holder gives each event subscription its row.
 - The holder makes a row's lane where it states the row's facts, and retires it where the row leaves. A row has a lane under its first model, while its signals ask for events.

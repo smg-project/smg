@@ -103,7 +103,7 @@ fn handed(store: &MemoryStore, id: WorkerId) -> Arc<Kept> {
 
 /// Takes the row `id` out of the store.
 fn remove(store: &MemoryStore, id: WorkerId) {
-    let revision = WorkersStore::get(store, id).expect("the row").revision;
+    let revision = store.get(id).expect("the row").revision;
     store.remove(id, revision).expect("removed");
 }
 
@@ -334,9 +334,7 @@ fn a_followed_leaving_takes_the_leases_off_the_count() {
     }
     assert_eq!((kept_removed.held(), kept_replaced.held()), (1, 1));
 
-    let revision = WorkersStore::get(&leader, removed)
-        .expect("the row")
-        .revision;
+    let revision = leader.get(removed).expect("the row").revision;
     let change = leader.remove(removed, revision).expect("removed");
     followed(&leader, &follower, change);
     assert_eq!((kept_removed.held(), kept_removed.dropped()), (0, 1));

@@ -51,7 +51,7 @@ impl Told {
     }
 
     fn row(&self, id: WorkerId) -> WorkerRow {
-        WorkersStore::get(&self.store, id).expect("the row")
+        self.store.get(id).expect("the row")
     }
 
     /// The watch's event for the write the store just took. `before` is
@@ -105,7 +105,7 @@ impl Told {
 /// What two stores must agree on: the epoch, and each row's id, facts,
 /// status and revision. An admission instant crosses as an age.
 fn held(store: &MemoryStore) -> (u64, Vec<(WorkerId, WorkerFacts, WorkerStatus, u64)>) {
-    let (epoch, mut rows) = WorkersStore::all_rows(store);
+    let (epoch, mut rows) = store.all_rows();
     rows.sort_by_key(|row| row.id.0);
     let rows = rows
         .into_iter()
@@ -126,7 +126,7 @@ fn over(store: Arc<MemoryStore>) -> Watcher<Members> {
 /// follows the store here: the watcher's own writes laid them.
 #[track_caller]
 fn laid(watcher: &Watcher<Members>) {
-    let (_, mut rows) = WorkersStore::all_rows(&**watcher.store());
+    let (_, mut rows) = watcher.store().all_rows();
     rows.sort_by_key(|row| row.id.0);
     let objects = watcher.objects();
     let read = |row: &WorkerRow| {

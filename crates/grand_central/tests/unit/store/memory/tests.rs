@@ -11,7 +11,7 @@ use crate::{
 };
 
 /// What the cases read of the store that no entry tells, and how they hold
-/// a lock, pause a snapshot and spend a term's ids.
+/// a lock and spend a term's ids.
 impl MemoryStore {
     /// Holds the loads' lock: a case keeps an entry waiting where the
     /// store's entry waits last.
@@ -48,21 +48,6 @@ impl MemoryStore {
         self.workers.try_lock().is_some()
             && self.files.iter().all(free)
             && self.loads.try_lock().is_some()
-    }
-
-    pub(in crate::store) fn pause_snapshot_after_clone(&self) -> (Receiver<()>, SyncSender<()>) {
-        let (cloned_tx, cloned_rx) = mpsc::sync_channel(0);
-        let (resume_tx, resume_rx) = mpsc::sync_channel(0);
-        *self.snapshot_pause.lock() = Some((cloned_tx, resume_rx));
-        (cloned_rx, resume_tx)
-    }
-
-    pub(super) fn pause_snapshot(&self) {
-        let pause = self.snapshot_pause.lock().take();
-        if let Some((cloned, resume)) = pause {
-            cloned.send(()).expect("snapshot test receives clone point");
-            resume.recv().expect("snapshot test resumes sorting");
-        }
     }
 
     /// Spends the ids of the store's term but for the last `left`: no door
@@ -187,6 +172,51 @@ impl MemoryStore {
             }),
             StatusSet::Stood | StatusSet::Refused => None,
         }
+    }
+}
+
+/// The cases' road to read the table of records: the three read entries the
+/// store's trait held and the store's own cut, for a case that reads a
+/// store's table. Each reads the table as the removed entry did and
+/// states no rule. They leave with the table.
+impl MemoryStore {
+    /// The cases' road: the row under `id`, copied whole. It leaves with
+    /// the table.
+    pub(crate) fn get(&self, id: WorkerId) -> Option<WorkerRow> {
+        self.workers.lock().rows.get(&id).map(|row| row.row.clone())
+    }
+
+    /// The cases' road: the row under a registration key, whatever its
+    /// incarnation. It leaves with the table.
+    pub(crate) fn by_key(&self, key: &str) -> Option<WorkerRow> {
+        let workers = self.workers.lock();
+        let id = workers.by_key.get(key)?;
+        workers.rows.get(id).map(|row| row.row.clone())
+    }
+
+    /// The cases' road: every row with the epoch it stands at, by
+    /// registration key. It leaves with the table.
+    pub(crate) fn all_rows(&self) -> (u64, Vec<WorkerRow>) {
+        let (epoch, mut rows) = {
+            let workers = self.workers.lock();
+            let rows: Vec<WorkerRow> = workers.rows.values().map(|row| row.row.clone()).collect();
+            (workers.epoch, rows)
+        };
+        rows.sort_by(|a, b| a.facts.key.cmp(&b.facts.key));
+        (epoch, rows)
+    }
+
+    /// The cases' road: the table's rows as one journaled write left
+    /// them, with that write's position. It leaves with the table.
+    pub(crate) fn checkpoint(&self) -> StoreCheckpoint {
+        let (at, epoch, mut rows) = {
+            let workers = self.workers.lock();
+            let head = self.journal.as_ref().map(|journal| journal.head());
+            let rows: Vec<WorkerRow> = workers.rows.values().map(|row| row.row.clone()).collect();
+            (head.unwrap_or_default(), workers.epoch, rows)
+        };
+        rows.sort_by(|a, b| a.facts.key.cmp(&b.facts.key));
+        StoreCheckpoint { at, epoch, rows }
     }
 }
 

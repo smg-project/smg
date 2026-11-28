@@ -133,7 +133,7 @@ fn a_watch_snapshot_keeps_a_members_local_tables() {
     assert_eq!(store.snapshot().booked_of(id), Some(slot));
     assert_eq!(in_flight(&store), [(id, 1)]);
     assert!(store.vetoed(gateway, id, now));
-    assert_eq!(WorkersStore::get(&store, id), Some(expected));
+    assert_eq!(store.get(id), Some(expected));
 }
 
 #[test]
@@ -156,7 +156,7 @@ fn a_watch_snapshot_evicts_a_leavers_tables_and_its_lease_moves_no_other_count()
     assert_eq!(leases.get(gateway, lease.lease.id), Some(lease));
     assert_ne!(store.snapshot().booked_of(joined), Some(slot));
     assert_eq!(in_flight(&store), [(joined, 0)]);
-    assert!(WorkersStore::by_key(&store, "http://a:1").is_none());
+    assert!(store.by_key("http://a:1").is_none());
     assert!(!store.vetoed(gateway, left, now));
     assert!(leases.released(gateway, lease.lease.id, None, ReleaseReason::ClientGone));
     assert_eq!(in_flight(&store), [(joined, 0)]);
@@ -178,7 +178,7 @@ fn a_watch_snapshot_gives_a_new_incarnation_its_own_count() {
     let new = source.upsert(facts(key, 2)).id();
     assert!(store.watch_from(source.checkpoint()));
     assert_eq!(store.by_key(key).map(|row| row.id), Some(new));
-    assert!(WorkersStore::get(&store, old).is_none());
+    assert!(store.get(old).is_none());
     assert_eq!(in_flight(&store), [(new, 0)]);
     assert!(leases.released(gateway, lease.lease.id, None, ReleaseReason::ClientGone));
     assert_eq!(in_flight(&store), [(new, 0)]);
@@ -357,10 +357,10 @@ fn a_stage_that_panics_at_the_stores_word_of_membership_is_held_and_counted() {
     // A registration and a removal each tell their word.
     let id = store.upsert(facts("http://a:1", 1)).id();
     assert_eq!(unheard(), 2);
-    let row = WorkersStore::get(&store, id).expect("the row is on file");
+    let row = store.get(id).expect("the row is on file");
     assert!(store.remove(id, row.revision).is_some());
     assert_eq!(unheard(), 3);
-    assert!(WorkersStore::get(&store, id).is_none());
+    assert!(store.get(id).is_none());
     assert_eq!(behind.load(Ordering::Relaxed), 0);
 }
 

@@ -36,7 +36,7 @@ use crate::{
         },
         proto::{self, grand_central_client::GrandCentralClient, worker_event::Event},
     },
-    store::{MemoryStore, WorkerStatus, WorkersStore},
+    store::{MemoryStore, WorkerStatus},
     worker_host::{Members, Objects},
 };
 

@@ -348,7 +348,7 @@ async fn a_pick_inside_its_workers_registration_window_books_its_count() {
         ..WorkerFacts::default()
     };
     let late = rewritten(&bed, facts);
-    let row = WorkersStore::get(&*bed.store, late).expect("the row");
+    let row = bed.store.get(late).expect("the row");
     bed.reads
         .objects
         .connect_row(&bed.store, late, row.revision);

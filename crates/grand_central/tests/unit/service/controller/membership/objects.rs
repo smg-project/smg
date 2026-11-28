@@ -46,7 +46,7 @@ async fn a_decision_behind_an_acknowledged_call_reads_the_fleet_the_call_left() 
         .collect();
     assert_eq!(named(), ids.iter().copied().collect());
     let leave = |id: WorkerId, drain: bool| {
-        let row = WorkersStore::get(&*store, id).expect("the row stands");
+        let row = store.get(id).expect("the row stands");
         let request = proto::DeregisterWorkerRequest {
             worker_id: id.0,
             revision: row.revision,
@@ -65,7 +65,7 @@ async fn a_decision_behind_an_acknowledged_call_reads_the_fleet_the_call_left() 
     // The last worker is drained through the replica's own writer,
     // over the same door: no decision behind its answer names a worker.
     let hosted = ReplicaMembershipWriter::new(Arc::clone(&door), operator(), under(TERM));
-    let last = WorkersStore::get(&*store, ids[2]).expect("the row stands");
+    let last = store.get(ids[2]).expect("the row stands");
     let by = Remover::Registrant(&last.maker);
     assert_eq!(
         hosted.drained(by, "grpc://w2:8000", standing(&last)),

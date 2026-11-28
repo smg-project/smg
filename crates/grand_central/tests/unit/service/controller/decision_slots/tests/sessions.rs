@@ -275,7 +275,7 @@ async fn the_session_table_lists_a_worker_the_store_removed_until_it_returns() {
     };
     let pinned = picked(&bed.ask(keyed(1, 1_001)).await);
     assert_eq!(absent(&bed), 0, "every worker stands");
-    let row = WorkersStore::get(&*bed.store, pinned).expect("the row");
+    let row = bed.store.get(pinned).expect("the row");
     let objects = &bed.reads.objects;
     let removed = objects.remove(&bed.store, pinned, row.revision);
     assert!(removed.is_some(), "the store took the worker out");
