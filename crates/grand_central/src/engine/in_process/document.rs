@@ -84,10 +84,11 @@ pub(in crate::engine) struct InForce {
     /// where its worker reads ready a second time
     /// ([`Self::hears_beside_table`]).
     pub(super) leases_or_samples: bool,
-    /// Each profile's name as a label that lives as long as the process,
-    /// by the profile's position in the document
-    /// ([`Loaded::label_at`]). Made once, here: naming the profile of a
-    /// placement takes no lock.
+    /// The profiles' labels, by their positions in the document
+    /// ([`Loaded::label_at`]): a labelled model's policy, and any other
+    /// profile's name ([`labels::of`]), as strings that live as long as
+    /// the process. Made once, here: naming the profile of a placement
+    /// takes no lock.
     pub(super) labels: Box<[&'static str]>,
     /// Whether a stage of the document reads a named signal
     /// ([`Needs::signal_cells`](crate::document::spec::Needs::signal_cells)),

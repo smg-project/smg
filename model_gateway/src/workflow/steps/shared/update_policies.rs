@@ -442,15 +442,17 @@ mod tests {
             // the four that carried it wrote the line: the engine's two
             // lines below stand alone behind the classic pass too.
             let placing = policies.placing_profile(MODEL);
-            let named = grand_central.then_some("power_of_two");
-            assert_eq!(placing.as_deref(), named);
+            let named = grand_central.then(|| {
+                smg_grand_central::document::RoutingSettings::label_profile("power_of_two", MODEL)
+            });
+            assert_eq!(placing, named);
             written(if grand_central { 0 } else { others.len() });
             for (nth, (url, label)) in others.into_iter().enumerate() {
                 let worker = grpc_worker_at(url, WorkerType::Regular);
                 register(&app_context, worker, &[("policy", label)]).await;
                 written(if grand_central { nth + 1 } else { others.len() });
             }
-            assert_eq!(policies.placing_profile(MODEL).as_deref(), named);
+            assert_eq!(policies.placing_profile(MODEL), named);
         }
     }
 

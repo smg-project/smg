@@ -3,8 +3,6 @@
 //! configuration's settings written over them ([`written`]), a side at a
 //! time, with what the sides of a document and of a binding share.
 
-use std::collections::btree_map::Entry;
-
 use serde::Serialize;
 
 use super::{
@@ -307,32 +305,48 @@ pub(super) fn label_refused(
     }
 }
 
-/// One label's side of the document, written as a side of the settings is:
-/// its policy's preset as a profile of the policy's name, the policy's
-/// settings in that profile and in the places the document's sides share,
-/// and what its one binding holds. Models that name one policy share its
-/// profile, which a second write leaves as the first left it.
+/// One label's side of the document, written as a side of the settings is.
+/// Its policy's preset is its profile. The policy's settings are written
+/// into that profile and into the places the document's sides share, with
+/// what its one binding holds. The profile stands under the label's own
+/// name ([`RoutingSettings::label_profile`]). So each labelled model has a
+/// profile of its own, and no two models run one stage.
+///
+/// The spec holds a bounded count of profiles. Its own check holds that
+/// bound for the whole spec and names no model. So a label whose profile
+/// would pass the bound is refused here, in that check's words, and costs
+/// no other model its spec.
 ///
 /// The index its policy names is answered beside the side and shared with
 /// no other. The document's index is a map by model, so a label's stands
 /// under its own model's id. The settings' sides keep the one they share.
 fn label_side<'a>(
+    model: &str,
     policy: &'a PolicySettings,
     config: &RoutingSettings,
     document: &mut PolicySpec,
     shared: &mut Shared<'a>,
 ) -> Result<(Bound, Option<IndexNumbers>), RoutingSettingsError> {
     let name = policy.name();
-    let profile = match document.profiles.entry(name.to_owned()) {
-        Entry::Occupied(held) => held.into_mut(),
-        Entry::Vacant(place) => {
-            let preset = PolicySpec::preset(name)?.profiles.remove(name);
-            place.insert(preset.ok_or(RoutingSettingsError::NoPart {
-                policy: name,
-                part: "profile",
-            })?)
-        }
-    };
+    let count = document.profiles.len() + 1;
+    if count > usize::from(u16::MAX) {
+        let bound = SpecError::TooManyProfiles {
+            count,
+            max: u16::MAX,
+        };
+        return Err(RoutingSettingsError::Label {
+            model: model.to_owned(),
+            policy: name.to_owned(),
+            reason: bound.to_string(),
+        });
+    }
+    let preset = PolicySpec::preset(name)?.profiles.remove(name);
+    let preset = preset.ok_or(RoutingSettingsError::NoPart {
+        policy: name,
+        part: "profile",
+    })?;
+    let own_name = RoutingSettings::label_profile(name, model);
+    let profile = document.profiles.entry(own_name).or_insert(preset);
     let of_settings = shared.index.take();
     let written = write_policy(policy, config, profile, shared);
     let own = std::mem::replace(&mut shared.index, of_settings);
@@ -347,12 +361,14 @@ fn label_side<'a>(
 }
 
 /// The binding of one label's model: its policy's preset binding, for that
-/// model alone, with what its side holds written as a plan of one side. The
+/// model alone and its own profile ([`RoutingSettings::label_profile`]).
+/// What its side holds is written into it as a plan of one side. The
 /// headers its side lists in the view join the view's list behind the ones
-/// that stand there, each once. The list holds a bounded count, which the
-/// document's own check holds for every model at once: a label whose
-/// headers would pass it is refused here, in that check's words, so it
-/// costs no other model its document.
+/// that stand there, each once.
+///
+/// The list holds a bounded count, which the document's own check holds
+/// for every model at once. A label whose headers would pass it is refused
+/// here, in that check's words, so it costs no other model its document.
 fn label_binding(
     model: &str,
     policy: &PolicySettings,
@@ -370,6 +386,7 @@ fn label_binding(
                 part: "binding",
             })?;
     model.clone_into(&mut binding.matcher.model);
+    binding.profile = Some(RoutingSettings::label_profile(name, model));
     // A side lists each of its headers once. The ones the view holds stay
     // where they stand, and a list the settings' own sides took past the
     // bound is theirs: a label that adds no header is not refused for it.
@@ -400,7 +417,9 @@ fn label_binding(
 /// The settings' own sides are written first and their bindings first, so
 /// a label changes none of them. It adds to the view's headers, and writes
 /// its model's own entry of the index. A label's ring keeps its blocks
-/// under every gateway: no document of a label's stood before it.
+/// under every gateway: no document of a label's stood before it. A label
+/// of the main policy is the exception: it writes the settings' own side
+/// again, and keeps what that side keeps.
 pub(super) fn written_with<'a>(
     config: &'a RoutingSettings,
     (mut document, bindings): Planned<'a>,
@@ -463,9 +482,9 @@ pub(super) fn written_with<'a>(
     // side. A label's side shares the document's one view with the sides
     // above, and a label's ring keeps its blocks beside the size they
     // name, in a gateway of many routers too: a label's ring is a new one.
-    // A label names the size a silent ring counts in, so it moves no ring
-    // of theirs and none of a label before it: its own side is the one to
-    // read.
+    // A label of the main policy is the exception, below. A label names
+    // the size a silent ring counts in, so it moves no ring of theirs and
+    // none of a label before it: its own side is the one to read.
     let single = bindings.iter().rposition(|sides| sides.len() == 1);
     let mut sides_of_labels = Vec::with_capacity(labels.len());
     let mut indexes_of_labels = Vec::with_capacity(labels.len());
@@ -473,10 +492,14 @@ pub(super) fn written_with<'a>(
         for (model, policy) in labels {
             let refused = |refusal: RoutingSettingsError| label_refused(model, policy, refusal);
             let (side, index) =
-                label_side(policy, config, &mut document, &mut shared).map_err(refused)?;
+                label_side(model, policy, config, &mut document, &mut shared).map_err(refused)?;
             let side = (1, side);
-            rings_keep_their_blocks(shared.block_size, std::slice::from_ref(&side))
-                .map_err(refused)?;
+            // A label of the main policy writes the settings' own side
+            // again: what the settings' sides keep, it keeps.
+            if policy.name() != config.policy.name() {
+                rings_keep_their_blocks(shared.block_size, std::slice::from_ref(&side))
+                    .map_err(refused)?;
+            }
             sides_of_labels.push(side);
             indexes_of_labels.push((*model, index));
         }

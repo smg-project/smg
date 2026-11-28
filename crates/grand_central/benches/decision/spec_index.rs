@@ -17,6 +17,16 @@
 //! profiles. A row is the check of the document and its apply: the engine
 //! keeps every profile, each made under a generation of its own, and holds
 //! nothing for an earlier generation.
+//!
+//! Under the same feature, one apply of the routing settings' document
+//! with labelled models, each a profile of its own, on an engine that took
+//! the models one a generation, as a gateway registers them. Ids:
+//! `engine/spec/apply_labelled/<models>` at ten, a hundred and a thousand
+//! models. A row is the check of the document and its apply, which builds
+//! each profile's stages and compares them with the standing ones.
+//!
+//! A row's engine is built where the row runs: a filter that leaves a row
+//! out builds none of it.
 #![expect(
     clippy::expect_used,
     reason = "a bench's setup has no caller to answer; a document that fails to parse is a bug the unit tests catch"
@@ -90,39 +100,66 @@ fn grown(profiles: usize, generation: u64) -> PolicySpec {
     document
 }
 
-/// One apply on an engine whose document grew to its size by one profile
-/// a generation. The apply keeps every profile, each made under a
+/// The routing settings' document under `generation`, with `models`
+/// labelled models, each under round robin, beside a main policy of
+/// `random`.
+#[cfg(feature = "in-process")]
+fn labelled(models: usize, generation: u64) -> PolicySpec {
+    use smg_grand_central::document::RoutingSettings;
+    let labels = (0..models)
+        .map(|n| (format!("model-{n:04}"), "round_robin".to_owned()))
+        .collect();
+    let settings = RoutingSettings::default();
+    let document = settings.policy_document_with_labels(&labels);
+    let mut document = document.expect("the labelled document builds");
+    document.generation = generation;
+    document
+}
+
+/// One apply on an engine whose document, made by `sized`, grew to `size`
+/// by one a generation: under the row `id` of the group. The engine is
+/// built inside the row. The apply keeps every profile, each made under a
 /// generation of its own.
 #[cfg(feature = "in-process")]
-fn spec_apply_grown(c: &mut Criterion) {
+fn apply_row(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    id: &str,
+    size: usize,
+    sized: fn(usize, u64) -> PolicySpec,
+) {
     use smg_grand_central::{document::AppliedSpec, engine::InProcess};
-    let mut group = c.benchmark_group("engine/spec");
-    group.sample_size(20);
-    for profiles in [10, 100, 1_000] {
-        let first = AppliedSpec::validate(&grown(1, 1)).expect("the document validates");
+    group.bench_with_input(BenchmarkId::new(id, size), &size, |b, &size| {
+        let first = AppliedSpec::validate(&sized(1, 1)).expect("the document validates");
         let engine = InProcess::new(first);
         let mut generation = 1;
-        for count in 2..=profiles {
+        for count in 2..=size {
             generation += 1;
-            let next = AppliedSpec::validate(&grown(count, generation));
+            let next = AppliedSpec::validate(&sized(count, generation));
             engine
                 .apply(next.expect("the document validates"))
                 .expect("a later generation");
         }
-        let mut document = grown(profiles, generation);
-        group.bench_with_input(
-            BenchmarkId::new("apply_grown", profiles),
-            &profiles,
-            |b, _| {
-                b.iter(|| {
-                    document.generation += 1;
-                    let next = AppliedSpec::validate(black_box(&document));
-                    engine
-                        .apply(next.expect("the document validates"))
-                        .expect("a later generation");
-                });
-            },
-        );
+        let mut document = sized(size, generation);
+        b.iter(|| {
+            document.generation += 1;
+            let next = AppliedSpec::validate(black_box(&document));
+            engine
+                .apply(next.expect("the document validates"))
+                .expect("a later generation");
+        });
+    });
+}
+
+/// One apply on an engine whose document grew to its size by one profile
+/// a generation: a supplied spec's, and the routing settings' with a
+/// labelled model for each.
+#[cfg(feature = "in-process")]
+fn spec_apply_grown(c: &mut Criterion) {
+    let mut group = c.benchmark_group("engine/spec");
+    group.sample_size(20);
+    for size in [10, 100, 1_000] {
+        apply_row(&mut group, "apply_grown", size, grown);
+        apply_row(&mut group, "apply_labelled", size, labelled);
     }
     group.finish();
 }

@@ -693,10 +693,11 @@ mod tests {
     }
 
     /// The settings' document with labels: each label's model is placed by
-    /// the profile of the policy its label names, right ahead of every
-    /// model's binding, and every other model by the settings' own. With no
-    /// label it is the settings' document. A refused label answers its
-    /// reason, the caller having named its model and policy, and no spec.
+    /// a profile of its own, named for the policy its label names, right
+    /// ahead of every model's binding. Every other model is placed by the
+    /// settings' own. With no label it is the settings' document. A refused
+    /// label answers its reason, the caller having named its model and
+    /// policy, and no spec.
     #[test]
     fn a_label_places_its_model_by_the_profile_of_its_policy() {
         let labels = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
@@ -719,7 +720,8 @@ mod tests {
             let (_, profile) = checked.engine().profile_for(model, Phase::Single)?;
             Some(profile.name.as_str())
         };
-        assert_eq!(placing("llama"), Some("cache_aware"));
+        let own = RoutingSettings::label_profile("cache_aware", "llama");
+        assert_eq!(placing("llama"), Some(own.as_str()));
         assert_eq!(placing("qwen"), Some("round_robin"));
 
         let refused = settings

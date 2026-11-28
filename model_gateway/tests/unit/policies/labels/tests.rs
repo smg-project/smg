@@ -52,13 +52,21 @@ fn placing(policies: &PolicyRegistry, model: &str) -> Option<String> {
     policies.placing_profile(model)
 }
 
+/// The name of the profile a label of `policy` gives `model`, as the crate
+/// names it.
+fn labelled(policy: &str, model: &str) -> String {
+    smg_grand_central::document::RoutingSettings::label_profile(policy, model)
+}
+
 /// The model's first registration decides its policy by its label, and the
-/// spec that names it is put in force: the profile of that policy places
-/// the model's single requests, and every other model stays under the
-/// settings' own. A later registration's label changes nothing and is told
-/// so. The decision goes with the model's last worker: the spec is built
-/// without the label, and the model's next first registration names its
-/// own. No policy object is built at any step.
+/// spec that names it is put in force. A profile of the model's own, named
+/// for that policy, places the model's single requests. Every other model
+/// stays under the settings' own.
+///
+/// A later registration's label changes nothing and is told so. The
+/// decision goes with the model's last worker: the spec is built without
+/// the label, and the model's next first registration names its own. No
+/// policy object is built at any step.
 #[tokio::test]
 async fn the_first_registration_decides_a_models_policy_until_its_last_worker_leaves() {
     let policies = started(&round_robin());
@@ -66,7 +74,10 @@ async fn the_first_registration_decides_a_models_policy_until_its_last_worker_le
     assert_eq!(placing(&policies, MODEL).as_deref(), Some("round_robin"));
 
     policies.on_worker_added(MODEL, Some("cache_aware"));
-    assert_eq!(placing(&policies, MODEL).as_deref(), Some("cache_aware"));
+    assert_eq!(
+        placing(&policies, MODEL),
+        Some(labelled("cache_aware", MODEL))
+    );
     assert_eq!(placing(&policies, "qwen").as_deref(), Some("round_robin"));
     assert_eq!(generation(&policies), start + 1);
     // A label is read in the spellings a classic registry reads it in.
@@ -75,7 +86,10 @@ async fn the_first_registration_decides_a_models_policy_until_its_last_worker_le
     }
 
     policies.on_worker_added(MODEL, Some("random"));
-    assert_eq!(placing(&policies, MODEL).as_deref(), Some("cache_aware"));
+    assert_eq!(
+        placing(&policies, MODEL),
+        Some(labelled("cache_aware", MODEL))
+    );
     assert_eq!(generation(&policies), start + 1);
     assert_eq!(policies.label_places(MODEL, "random"), Some(false));
 
@@ -84,16 +98,14 @@ async fn the_first_registration_decides_a_models_policy_until_its_last_worker_le
     assert_eq!(generation(&policies), start + 2);
 
     policies.on_worker_added(MODEL, Some("random"));
-    assert_eq!(placing(&policies, MODEL).as_deref(), Some("random"));
+    assert_eq!(placing(&policies, MODEL), Some(labelled("random", MODEL)));
     assert_eq!(generation(&policies), start + 3);
     assert_eq!(policies.classic_made_or_asked(), 0);
 }
 
 /// A registration that carries no label decides its model too: a later
-/// one's label does not take the model over. Neither does a label of the
-/// settings' own policy build a spec, in any spelling: that policy places
-/// the model already. A name that is no policy's builds none either, and
-/// is told that it places nothing.
+/// one's label does not take the model over. A name that is no policy's
+/// builds no spec either, and is told that it places nothing.
 #[tokio::test]
 async fn a_registration_decides_with_no_label_and_with_one_that_builds_nothing() {
     let policies = started(&round_robin());
@@ -103,9 +115,8 @@ async fn a_registration_decides_with_no_label_and_with_one_that_builds_nothing()
     policies.on_worker_added(MODEL, Some("cache_aware"));
     assert_eq!(placing(&policies, MODEL).as_deref(), Some("round_robin"));
     assert_eq!(policies.label_places(MODEL, "cache_aware"), Some(false));
-
-    policies.on_worker_added("qwen", Some("RoundRobin"));
-    assert_eq!(policies.label_places("qwen", "RoundRobin"), Some(true));
+    // The settings' own policy places a model that has no label.
+    assert_eq!(policies.label_places(MODEL, "RoundRobin"), Some(true));
 
     policies.on_worker_added("phi", Some("no-such-policy"));
     assert_eq!(policies.label_places("phi", "no-such-policy"), Some(false));
@@ -113,10 +124,47 @@ async fn a_registration_decides_with_no_label_and_with_one_that_builds_nothing()
     assert_eq!(placing(&policies, "phi").as_deref(), Some("round_robin"));
 
     // No leave of such a model builds a spec either.
-    for model in [MODEL, "qwen", "phi"] {
+    for model in [MODEL, "phi"] {
         policies.on_model_unserved(model);
     }
     assert_eq!(generation(&policies), start, "no spec was put in force");
+}
+
+/// A label of the settings' own policy is a label, in any spelling. Its
+/// model runs a profile of its own, as a classic registry builds it an
+/// object of its own. A model with no label stays under the settings'
+/// shared profile. The model's leave builds the spec again without it.
+///
+/// Where no binding names the model's id alone, that label stands and
+/// puts no spec in force. The main profile places the model, under the
+/// policy the label names.
+#[tokio::test]
+async fn a_label_of_the_settings_own_policy_gives_its_model_a_profile_of_its_own() {
+    let policies = started(&round_robin());
+    let start = generation(&policies);
+
+    policies.on_worker_added("qwen", Some("RoundRobin"));
+    assert_eq!(generation(&policies), start + 1);
+    assert_eq!(
+        placing(&policies, "qwen"),
+        Some(labelled("round_robin", "qwen"))
+    );
+    assert_eq!(placing(&policies, MODEL).as_deref(), Some("round_robin"));
+    for spelling in ["round_robin", "RoundRobin"] {
+        assert_eq!(policies.label_places("qwen", spelling), Some(true));
+    }
+    assert_eq!(policies.label_places("qwen", "random"), Some(false));
+
+    policies.on_model_unserved("qwen");
+    assert_eq!(generation(&policies), start + 2);
+    assert_eq!(placing(&policies, "qwen").as_deref(), Some("round_robin"));
+
+    policies.on_worker_added("qw*n", Some("round_robin"));
+    assert_eq!(generation(&policies), start + 2, "no spec was put in force");
+    assert_eq!(placing(&policies, "qw*n").as_deref(), Some("round_robin"));
+    assert_eq!(policies.label_places("qw*n", "RoundRobin"), Some(true));
+    assert_eq!(policies.label_places("qw*n", "random"), Some(false));
+    assert_eq!(policies.classic_made_or_asked(), 0);
 }
 
 /// A label the spec has no binding for fails alone: a model whose id holds
@@ -154,7 +202,7 @@ async fn a_refused_label_fails_alone_and_leaves_the_spec_in_force() {
     });
 
     policies.on_worker_added(MODEL, Some("random"));
-    assert_eq!(placing(&policies, MODEL).as_deref(), Some("random"));
+    assert_eq!(placing(&policies, MODEL), Some(labelled("random", MODEL)));
     assert_eq!(generation(&policies), start + 1);
 
     // The refused model is decided: its next registration builds nothing,
@@ -240,8 +288,11 @@ async fn registrations_of_one_model_at_once_put_one_spec_in_force() {
         }
     });
     assert_eq!(generation(&policies), start + 1);
-    let decided = placing(&policies, MODEL).expect("a profile places the model");
-    assert!(labels.contains(&decided.as_str()), "{decided}");
+    let decided = placing(&policies, MODEL);
+    let named = labels
+        .iter()
+        .filter(|label| Some(labelled(label, MODEL)) == decided);
+    assert_eq!(named.count(), 1, "{decided:?}");
     let stand = labels.map(|label| policies.label_places(MODEL, label));
     assert_eq!(
         stand.iter().filter(|stands| **stands == Some(true)).count(),
@@ -355,7 +406,7 @@ async fn a_spec_a_label_puts_in_force_publishes_the_worker_lists_again() {
     place();
     let published = workers.get_routing_snapshot(STAYS);
     assert!(cell(STAYS).contains("values: 1,"), "{}", cell(STAYS));
-    policies.on_worker_added(STAYS, Some("RoundRobin"));
+    policies.on_worker_added(STAYS, None);
     let stands = workers.get_routing_snapshot(STAYS);
     assert!(Arc::ptr_eq(&published, &stands), "no spec, no publish");
 
@@ -568,4 +619,56 @@ async fn a_refused_apply_puts_the_trees_back_under_the_document_they_followed() 
         start,
         "back under the document they followed"
     );
+}
+
+/// A labelled model's single request is counted under its label's policy,
+/// and its traced row names that policy: what a classic selection writes.
+/// The profile that places the model bears the model's id too, and that
+/// name reaches neither. So a label adds no value to the selection
+/// metric's `policy` label. A model with no label is counted under the
+/// settings' own policy.
+#[tokio::test]
+async fn a_labelled_models_request_is_counted_and_traced_under_its_labels_policy() {
+    use openai_protocol::worker::RuntimeType;
+
+    use crate::{
+        observability::{cache_trace, metrics::test_support::render_with_recorder},
+        routers::common::{
+            placement::{select_single, PlacementInputs, Stated},
+            snapshot::{test_support::grpc_worker, RoutingPool},
+        },
+    };
+
+    const OTHER: &str = "qwen";
+    let (policies, workers) = started_over(&round_robin());
+    for (url, model) in [
+        ("grpc://labelled:9000", MODEL),
+        ("grpc://other:9000", OTHER),
+    ] {
+        let worker = grpc_worker(url, model, RuntimeType::Vllm, &[]);
+        workers.register(worker).expect("a worker");
+    }
+    policies.on_worker_added(MODEL, Some("random"));
+    assert_eq!(placing(&policies, MODEL), Some(labelled("random", MODEL)));
+
+    let pool = RoutingPool::GrpcPipelineRegular;
+    let (rendered, rows) = cache_trace::scope(true, async {
+        let rendered = render_with_recorder(|| {
+            for model in [MODEL, OTHER] {
+                let inputs = PlacementInputs::default();
+                let nothing = Stated::nothing;
+                let placed = select_single(&workers, &policies, model, pool, None, inputs, nothing);
+                assert!(placed.is_some(), "{model}: a worker");
+            }
+        });
+        (rendered, cache_trace::captured_selections())
+    })
+    .await;
+    let named: Vec<_> = rows.iter().map(|row| row["policy"].as_str()).collect();
+    assert_eq!(named, [Some("random"), Some("round_robin")]);
+    for (model, policy) in [(MODEL, "random"), (OTHER, "round_robin")] {
+        let series = format!("model=\"{model}\",policy=\"{policy}\"}} 1");
+        assert!(rendered.contains(&series), "{series}:\n{rendered}");
+    }
+    assert!(!rendered.contains("random:"), "{rendered}");
 }

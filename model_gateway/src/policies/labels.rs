@@ -12,11 +12,16 @@
 //! registration's label changes nothing. A registration that carries no
 //! label decides too, and so does one whose label names no policy.
 //!
-//! A decided label that names a policy other than the settings' own is
-//! handed to the builder of the settings' spec, with every label that
-//! stands ([`RouterConfig::policy_document_with_labels`]). The spec it
-//! writes is checked over the table of stages the start was handed and put
-//! in force on the running engine ([`InProcess::apply`]). A label that
+//! A decided label that names a policy is handed to the builder of the
+//! settings' spec, with every label that stands
+//! ([`RouterConfig::policy_document_with_labels`]). Its model then runs a
+//! profile of its own, as a classic registry builds it an object of its
+//! own. A label that names the settings' own policy is handed too: its
+//! model's profile holds the settings' options.
+//!
+//! The spec the builder writes is checked over the table of stages the
+//! start was handed and put in force on the running engine
+//! ([`InProcess::apply`]). A label that
 //! is refused fails alone: the standing spec stays, the registration goes
 //! on, and one warning names the reason. It is not built again while the
 //! model is served: the model's next first registration decides anew.
@@ -81,9 +86,8 @@ struct Maker {
 /// What the deciding registration of a model said.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Decided {
-    /// The preset its label named, where the label named a policy other
-    /// than the settings' own. `None` for no label, for the settings' own
-    /// policy and for a name that is no policy's.
+    /// The preset its label named, the settings' own policy's too. `None`
+    /// for no label and for a name that is no policy's.
     preset: Option<&'static str>,
     /// Whether the builder took the label: it is handed again with every
     /// later build. False for a label the builder or the check refused.
@@ -132,23 +136,18 @@ impl Labels {
 
     /// A worker of `model` registered, with `hint` as its `policy` label.
     /// Where the model is undecided this registration decides it, and a
-    /// label that names a policy other than `own`, the settings' own
-    /// policy, is built into the spec and put in force on `engine`.
+    /// label that names a policy is built into the spec and put in force
+    /// on `engine`. The settings' own policy is one: its label gives the
+    /// model a profile of its own too.
     ///
     /// Answers whether a spec was put in force: the caller then reads again
     /// what it keeps of the spec.
-    pub(crate) fn registered(
-        &self,
-        engine: &InProcess,
-        model: &str,
-        hint: Option<&str>,
-        own: &str,
-    ) -> bool {
+    pub(crate) fn registered(&self, engine: &InProcess, model: &str, hint: Option<&str>) -> bool {
         let mut decided = self.decided.lock();
         if decided.contains_key(model) {
             return false;
         }
-        let preset = hint.and_then(|hint| preset_named(hint, own));
+        let preset = hint.and_then(policy_named);
         let (stands, applied) = match preset {
             Some(preset) => self.put_in_force(engine, &decided, Some((model, preset))),
             None => (false, false),
@@ -174,14 +173,22 @@ impl Labels {
     /// `model`'s single requests under the spec in force on `engine`.
     ///
     /// Under the spec the settings mean, a model whose label stands is
-    /// placed by the profile of that label's policy, which bears the
-    /// policy's name, and every other model by the settings' own policy,
-    /// `own`. So a label names what places its model where it names the
-    /// policy that stands for the model, or `own` for a model none stands
-    /// for. Beside a `supplied` spec the profile's name alone is read: the
+    /// placed by a profile of its own. The crate names that profile for
+    /// the label's policy and the model ([`label_profile`]). Every other
+    /// model is placed by the settings' own policy, `own`.
+    ///
+    /// One label stands with no profile of its own: `own` for a model
+    /// whose id no binding names alone. The main profile places that
+    /// model, under the policy its label names.
+    ///
+    /// So a label names what places its model where it names the policy
+    /// that stands for the model, or `own` for a model none stands for.
+    /// Beside a `supplied` spec the profile's name alone is read: the
     /// label names what places the model where the profile that places it
     /// bears the policy's name. False for a name that is no policy's, and
     /// where the spec binds no single request of the model.
+    ///
+    /// [`label_profile`]: smg_grand_central::document::RoutingSettings::label_profile
     pub(crate) fn places(
         &self,
         engine: &InProcess,
@@ -206,7 +213,11 @@ impl Labels {
             Some(Decided {
                 preset: Some(preset),
                 stands: true,
-            }) => named == *preset && placing == *preset,
+            }) => {
+                let own_profile =
+                    smg_grand_central::document::RoutingSettings::label_profile(preset, model);
+                named == *preset && (*preset == own || placing == own_profile)
+            }
             _ => named == own,
         }
     }
@@ -303,17 +314,10 @@ impl Labels {
     }
 }
 
-/// The policy `hint` names, as the name of its preset: the name in lower
-/// case, equal to a preset's name or to it without its underscores, as a
-/// classic registry reads a label's spelling. `None` for a name that is no
-/// policy's, and for `own`, the settings' own policy: that policy places
-/// the model already, with the settings' options.
-fn preset_named(hint: &str, own: &str) -> Option<&'static str> {
-    let named = policy_named(hint)?;
-    (named != own).then_some(named)
-}
-
-/// The policy `hint` names by a preset's name, `own` included.
+/// The policy `hint` names, as the name of its preset. The name is read
+/// in lower case, equal to a preset's name or to it without its
+/// underscores, as a classic registry reads a label's spelling. `None` for
+/// a name that is no policy's.
 fn policy_named(hint: &str) -> Option<&'static str> {
     let hint = hint.to_lowercase();
     PRESETS

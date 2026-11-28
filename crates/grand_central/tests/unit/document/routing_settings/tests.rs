@@ -1360,11 +1360,51 @@ fn a_label_builds_two_policies_at_other_numbers_than_their_presets() {
     ));
 }
 
-/// With no label the labelled document is the settings' own, and a
-/// label that names the main policy changes nothing: its model already
-/// runs that profile, with the settings' options.
+/// The rule of a labelled model's profile name: the policy, a colon,
+/// the model's id. No stock policy's name holds a colon, so the first
+/// colon parts the two, whatever the id holds.
 #[test]
-fn no_label_and_a_label_of_the_main_policy_leave_the_settings_document() {
+fn a_labels_profile_is_named_for_its_policy_and_its_model() {
+    assert_eq!(RoutingSettings::label_profile("random", "m"), "random:m");
+    let tagged = RoutingSettings::label_profile("least_load", "org/m:v1");
+    assert_eq!(tagged, "least_load:org/m:v1");
+    assert_eq!(tagged.split_once(':'), Some(("least_load", "org/m:v1")));
+    for name in PRESETS {
+        assert!(!name.contains(':'), "{name}");
+    }
+}
+
+/// Read the other way, a labelled model's profile name gives its policy
+/// and its model's id: the first colon parts them, whatever the id holds.
+/// A name without a colon, as the settings' own profiles bear, gives
+/// neither.
+#[cfg(feature = "in-process")]
+#[test]
+fn a_labels_profile_name_reads_back_its_policy_and_its_model() {
+    let tagged = RoutingSettings::label_profile("least_load", "org/m:v1");
+    let read = RoutingSettings::label_policy(&tagged);
+    assert_eq!(read, Some(("least_load", "org/m:v1")));
+    assert_eq!(RoutingSettings::label_policy("least_load"), None);
+    for name in PRESETS {
+        let own = RoutingSettings::label_profile(name, "m");
+        let read = RoutingSettings::label_policy(&own);
+        assert_eq!(read, Some((name, "m")), "{name}");
+        assert_eq!(RoutingSettings::label_policy(name), None, "{name}");
+    }
+}
+
+/// With no label the labelled document is the settings' own, to the
+/// byte. A label that names the main policy is a label too. Its model
+/// gets a profile of its own: the main profile's text under the label's
+/// name. Its binding is the one of every model's single requests, for
+/// that model alone, right ahead of it. Nothing else of the document
+/// moves.
+///
+/// That label never fails where the settings' own document builds.
+/// Where that document binds no single request, it adds nothing.
+#[test]
+fn a_label_of_the_main_policy_gets_the_main_profiles_text_under_its_own_name() {
+    let mut labelled = 0;
     for name in PRESETS {
         for settings in [
             config(at_flag_defaults(name)),
@@ -1373,9 +1413,59 @@ fn no_label_and_a_label_of_the_main_policy_leave_the_settings_document() {
         ] {
             let own = settings.policy_document();
             assert_eq!(with_labels(&settings, &[]), own, "{name}");
-            assert_eq!(with_labels(&settings, &[("m", name)]), own, "{name}");
+            let said = with_labels(&settings, &[("m", name)]);
+            let Ok(own) = own else {
+                assert_eq!(said, own, "{name}");
+                continue;
+            };
+            let document = said.unwrap_or_else(|refusal| panic!("{name}: {refusal}"));
+            let Some(single) = own.bindings.last().filter(|last| last.profile.is_some()) else {
+                assert_eq!(document, own, "{name}: no single request is bound");
+                continue;
+            };
+            labelled += 1;
+            let own_name = RoutingSettings::label_profile(name, "m");
+            let mut expected = own.clone();
+            let main_profile = own.profiles[name].clone();
+            expected.profiles.insert(own_name.clone(), main_profile);
+            let mut binding = single.clone();
+            binding.matcher.model = "m".to_owned();
+            binding.profile = Some(own_name.clone());
+            let at = own.bindings.len() - 1;
+            expected.bindings.insert(at, binding);
+            assert_eq!(document, expected, "{name}");
+            if validated(&own).is_ok() {
+                assert_eq!(single_profile(&document, "m"), own_name, "{name}");
+                assert_eq!(single_profile(&document, "another"), name, "{name}");
+            }
         }
     }
+    assert!(
+        labelled >= PRESETS.len(),
+        "{labelled} documents took the label"
+    );
+    // A main policy's ring that the settings' own document keeps beside
+    // another block size keeps its label too. Another main policy's
+    // label of that ring is refused there, by the builder's sentence.
+    let sides = pair_mode(Some(cache_aware_over(32)), Some(cache_aware_over(32)));
+    let fleet = |main: &str| RoutingSettings {
+        mode: sides.clone(),
+        ..many_routers(config(at_flag_defaults(main)))
+    };
+    let own = fleet("prefix_hash")
+        .policy_document()
+        .expect("the fleet's own document");
+    assert!(own
+        .bindings
+        .last()
+        .is_some_and(|last| last.profile.is_some()));
+    let document = with_labels(&fleet("prefix_hash"), &[("m", "prefix_hash")]);
+    let document = document.expect("the main policy's own ring as a label");
+    assert_eq!(document.bindings.len(), own.bindings.len() + 1);
+    assert!(matches!(
+        with_labels(&fleet("round_robin"), &[("m", "prefix_hash")]),
+        Err(RoutingSettingsError::Label { reason, .. }) if reason.starts_with("block_size = 16 and 32: ")
+    ));
 }
 
 /// Each stock policy as a label, beside another main policy: the
@@ -1393,10 +1483,11 @@ fn each_stock_policy_as_a_label_binds_its_model_ahead_of_every_model() {
         assert_eq!(document.bindings.len(), 2, "{name}");
         assert_eq!(document.bindings[0].matcher.model, "labelled", "{name}");
         assert!(document.bindings[0].matcher.phase.is_empty(), "{name}");
-        assert_eq!(document.bindings[0].profile.as_deref(), Some(name));
+        let own_name = RoutingSettings::label_profile(name, "labelled");
+        assert_eq!(document.bindings[0].profile, Some(own_name.clone()));
         assert_eq!(document.bindings[1], own.bindings[0], "{name}");
         assert_eq!(document.profiles[main], own.profiles[main], "{name}");
-        assert_eq!(single_profile(&document, "labelled"), name);
+        assert_eq!(single_profile(&document, "labelled"), own_name);
         assert_eq!(single_profile(&document, "another"), main);
     }
 }
@@ -1460,14 +1551,17 @@ fn a_labels_binding_is_the_one_its_policy_gets_as_the_main_policy() {
                 }
             };
             let document = said.unwrap_or_else(|refusal| panic!("{name}, {way}: {refusal}"));
+            let own_name = RoutingSettings::label_profile(name, "m");
             let mut expected = as_main.bindings[0].clone();
             expected.matcher.model = "m".to_owned();
+            expected.profile = Some(own_name.clone());
             assert_eq!(document.bindings[0], expected, "{name}, {way}");
             assert_eq!(document.bindings[1], own.bindings[0], "{name}, {way}");
             assert_eq!(
-                document.profiles[name], as_main.profiles[name],
+                document.profiles[&own_name], as_main.profiles[name],
                 "{name}, {way}"
             );
+            assert!(!document.profiles.contains_key(name), "{name}, {way}");
             assert_eq!(document.profiles[main], own.profiles[main], "{name}, {way}");
             // The label's model reads the index its policy gets as the
             // main policy, and every other model the settings' own.
@@ -1502,7 +1596,7 @@ fn a_labels_binding_is_the_one_its_policy_gets_as_the_main_policy() {
     let cold = config(main_beside("cache_aware"));
     let profile = |settings: &RoutingSettings| {
         let document = with_labels(settings, &[("m", "cache_aware")]).expect("a labelled one");
-        document.profiles["cache_aware"].clone()
+        document.profiles["cache_aware:m"].clone()
     };
     assert_ne!(profile(&warmed), profile(&cold));
     // Under the override a policy that places by the key itself reads
@@ -1540,7 +1634,7 @@ fn a_pair_mode_keeps_its_pair_binding_ahead_of_a_labels() {
         assert_eq!(document.bindings.len(), 3);
         assert_eq!(document.bindings[0], own.bindings[0]);
         assert_eq!(document.bindings[1].matcher.model, "m");
-        assert_eq!(document.bindings[1].profile.as_deref(), Some("random"));
+        assert_eq!(document.bindings[1].profile.as_deref(), Some("random:m"));
         assert_eq!(document.bindings[1].overload, own.bindings[1].overload);
         assert_eq!(document.bindings[2], own.bindings[1]);
         let engine = document
@@ -1557,16 +1651,17 @@ fn a_pair_mode_keeps_its_pair_binding_ahead_of_a_labels() {
             assert!(pairs, "{phase:?}");
         }
         assert_eq!(plan(Phase::Single), Some(Plan::Single));
-        assert_eq!(single_profile(&document, "m"), "random");
+        assert_eq!(single_profile(&document, "m"), "random:m");
         assert_eq!(single_profile(&document, "another"), "least_load");
     }
 }
 
 /// A label the document has no binding for is refused by its model and
-/// its policy: a model's id that holds a `*` or is empty, and a name
-/// with no preset. A label of the main policy adds no binding, so its
-/// model's id refuses nothing. That label is the main policy's name as
-/// a preset spells it: another letter case is a name with no preset.
+/// its policy. Such a label names a model's id that holds a `*` or is
+/// empty, or a name with no preset. A label of the main policy on such
+/// an id is left out and refuses nothing: its model runs the main
+/// policy's profile. That label is the main policy's name as a preset
+/// spells it: another letter case is a name with no preset.
 #[test]
 fn a_label_is_refused_by_its_model_and_its_policy() {
     let settings = config(at_flag_defaults("round_robin"));
@@ -1607,11 +1702,12 @@ fn a_label_is_refused_by_its_model_and_its_policy() {
     );
 }
 
-/// A refused label fails alone. Two labels never refuse one another, so
-/// each stands or falls beside the settings alone: the refusal names the
-/// one that falls, and every subset of the labels that build builds. A
-/// subset's document holds its labels' bindings as the whole one holds
-/// them, in their order, ahead of the settings' own, and no other.
+/// A refused label fails alone. Short of the document's bounds two labels
+/// never refuse one another, so each stands or falls beside the settings
+/// alone: the refusal names the one that falls, and every subset of the
+/// labels that build builds. A subset's document holds its labels'
+/// bindings as the whole one holds them, in their order, ahead of the
+/// settings' own, and no other.
 #[test]
 fn labels_stand_or_fall_alone_beside_the_settings() {
     let settings = config(cache_aware_over(32));
@@ -1631,7 +1727,7 @@ fn labels_stand_or_fall_alone_beside_the_settings() {
         }
         other => panic!("expected the ring's label refused, got {other:?}"),
     }
-    // The main policy is `cache_aware`: its own label adds nothing.
+    // The main policy is `cache_aware`: its own label is a label too.
     let built = [named[0], named[2], named[3], named[4]];
     let whole = with_labels(&settings, &built).expect("the labels that build");
     let models = |document: &PolicySpec| -> Vec<String> {
@@ -1641,7 +1737,7 @@ fn labels_stand_or_fall_alone_beside_the_settings() {
             .map(|binding| binding.matcher.model.clone())
             .collect()
     };
-    assert_eq!(models(&whole), ["a", "c", "e", "*"]);
+    assert_eq!(models(&whole), ["a", "c", "d", "e", "*"]);
     let own = settings.policy_document().expect("the settings' document");
     for picked in 0..(1_u32 << built.len()) {
         let subset: Vec<_> = built
@@ -1727,11 +1823,42 @@ fn a_label_past_a_bound_of_the_document_is_refused_by_name() {
     );
 }
 
-/// Models in the order of their ids, and one profile for each policy:
-/// two models that name one policy share its profile, and the same
+/// The spec holds 65,535 profiles at most, which its own check holds
+/// for the whole spec and for no model by name. Each labelled model is
+/// one profile. So beside the settings' one profile 65,534 labels
+/// build. One more is refused by its model and its policy, in that
+/// check's words: the last one in the ids' order.
+#[test]
+fn a_label_past_the_bound_of_profiles_is_refused_by_name() {
+    let settings = config(at_flag_defaults("round_robin"));
+    let most = usize::from(u16::MAX);
+    let models: Vec<String> = (0..most).map(|at| format!("m{at:05}")).collect();
+    let named = |count: usize| -> BTreeMap<String, String> {
+        let models = models.iter().take(count);
+        models
+            .map(|model| (model.clone(), "random".to_owned()))
+            .collect()
+    };
+    let full = settings
+        .policy_document_with_labels(&named(most - 1))
+        .expect("as many profiles as the spec holds");
+    assert_eq!(full.profiles.len(), most);
+    assert_eq!(full.bindings.len(), most);
+    let too_many = SpecError::TooManyProfiles {
+        count: most + 1,
+        max: u16::MAX,
+    };
+    assert_eq!(
+        settings.policy_document_with_labels(&named(most)),
+        Err(label_error("m65534", "random", &too_many.to_string())),
+    );
+}
+
+/// Models in the order of their ids, and a profile for each. Two models
+/// that name one policy have two profiles of one text, and the same
 /// labels give the same document.
 #[test]
-fn labelled_models_stand_in_id_order_and_share_a_policys_profile() {
+fn labelled_models_stand_in_id_order_each_under_a_profile_of_its_own() {
     let settings = config(at_flag_defaults("round_robin"));
     let named = [
         ("zeta", "random"),
@@ -1747,27 +1874,45 @@ fn labelled_models_stand_in_id_order_and_share_a_policys_profile() {
     assert_eq!(
         bound,
         [
-            ("alpha", Some("least_load")),
-            ("mid", Some("random")),
-            ("zeta", Some("random")),
+            ("alpha", Some("least_load:alpha")),
+            ("mid", Some("random:mid")),
+            ("zeta", Some("random:zeta")),
             ("*", Some("round_robin")),
         ]
     );
     let profiles: Vec<_> = document.profiles.keys().map(String::as_str).collect();
-    assert_eq!(profiles, ["least_load", "random", "round_robin"]);
+    assert_eq!(
+        profiles,
+        [
+            "least_load:alpha",
+            "random:mid",
+            "random:zeta",
+            "round_robin"
+        ]
+    );
+    assert_eq!(
+        document.profiles["random:mid"],
+        document.profiles["random:zeta"]
+    );
     let again = [named[2], named[0], named[1]];
     assert_eq!(with_labels(&settings, &again), Ok(document.clone()));
     assert!(validated(&document).is_ok());
-    assert_eq!(single_profile(&document, "mid"), "random");
-    assert_eq!(single_profile(&document, "alpha"), "least_load");
-    // A policy's profile is written once for each model that names it,
-    // and a second write leaves it as the first left it.
+    assert_eq!(single_profile(&document, "mid"), "random:mid");
+    assert_eq!(single_profile(&document, "alpha"), "least_load:alpha");
+    // A second model that names the policy adds a profile of the first
+    // one's text under its own name, and leaves every other as it was.
     for name in PRESETS {
         let settings = config(main_beside(name));
         let once = with_labels(&settings, &[("a", name)]).expect("one model");
         let twice = with_labels(&settings, &[("a", name), ("b", name)]).expect("two models");
         assert_eq!(twice.bindings.len(), 3, "{name}");
-        assert_eq!(twice.profiles, once.profiles, "{name}");
+        let (of_a, of_b) = (
+            RoutingSettings::label_profile(name, "a"),
+            RoutingSettings::label_profile(name, "b"),
+        );
+        let mut profiles = once.profiles.clone();
+        profiles.insert(of_b.clone(), once.profiles[&of_a].clone());
+        assert_eq!(twice.profiles, profiles, "{name}");
         assert_eq!(twice.view, once.view, "{name}");
         // Each labelled model reads the same index, and no other model
         // reads another than it read.
@@ -1776,26 +1921,33 @@ fn labelled_models_stand_in_id_order_and_share_a_policys_profile() {
         }
         let index = index_of(&twice, "another");
         assert_eq!(index, index_of(&once, "another"), "{name}");
-        // The second model's binding is the first's but for its model:
-        // its key sources and its session rule are written again.
+        // The second model's binding is the first's but for its model
+        // and its profile: its key sources and its session rule are
+        // written again.
         assert_eq!(twice.bindings[0], once.bindings[0], "{name}");
         let mut second = twice.bindings[1].clone();
         assert_eq!(second.matcher.model, "b", "{name}");
+        assert_eq!(second.profile, Some(of_b), "{name}");
         second.matcher.model = "a".to_owned();
+        second.profile = Some(of_a);
         assert_eq!(second, twice.bindings[0], "{name}");
     }
 }
 
-/// Two models that name one policy by their labels are bound to one
-/// profile, so a stage that keeps a history of its own keeps one for
-/// both. Round robin draws the start of a list it sees first from a
-/// count of its own. In one labelled document the second model's first
-/// turn starts where that count stands behind the first model's. In a
-/// document that labels it alone, it starts where the first model's
-/// did: a gateway's own registry builds a policy for each labelled
-/// model, so there every labelled model starts as the first.
+/// Two models that name one policy by their labels have a profile
+/// each, so a stage that keeps a history of its own keeps one for each.
+/// Round robin draws the start of a list it sees first from a count of
+/// its own. In one labelled document the second model's first turn
+/// starts where the first model's did, as in a document that labels it
+/// alone. A gateway's own registry builds a policy for each labelled
+/// model, so there every labelled model starts as the first too.
+///
+/// Models with no label share the main policy's profile, and its
+/// count: the second one starts behind the first. A model whose label
+/// names the main policy has a profile of its own, and starts as the
+/// first.
 #[test]
-fn labelled_models_of_one_policy_share_what_its_stages_count() {
+fn each_labelled_model_keeps_what_its_own_stages_count() {
     use crate::engine::{
         framework::{Engine, Scratch},
         view::{Candidate, Constraints, Health, PoolFacts, RequestFacts, WorkerId},
@@ -1840,13 +1992,24 @@ fn labelled_models_of_one_policy_share_what_its_stages_count() {
     let alone = engine(&[("b", "round_robin")]);
     let b_alone = first_turn(&alone, "b");
     assert_eq!(b_alone, a_first);
-    assert_ne!(b_behind_a, b_alone);
+    assert_eq!(b_behind_a, a_first);
+
+    let turns = config(at_flag_defaults("round_robin"));
+    let shared = with_labels(&turns, &[("a", "round_robin")])
+        .expect("a label of the main policy")
+        .validate_with(&["x-smg-tenant-id"])
+        .expect("the controller's check takes the document");
+    let x_first = first_turn(&shared, "x");
+    let y_behind_x = first_turn(&shared, "y");
+    assert_ne!(y_behind_x, x_first, "models with no label share a count");
+    assert_eq!(first_turn(&shared, "a"), x_first);
 }
 
-/// No name holds two profiles. A pair's sides are named for the side,
-/// so a `bucket` label beside a pair whose prefill policy is `bucket`
-/// adds a profile of its own name, at the numbers a label builds it
-/// with, and leaves the side's at the settings'.
+/// No name holds two profiles. A pair's sides are named for the side
+/// and a label's profile for its policy and its model. So a `bucket`
+/// label beside a pair whose prefill policy is `bucket` adds a profile
+/// of its own name. That profile stands at the numbers a label builds
+/// it with, and the side's stays at the settings'.
 #[test]
 fn a_labels_profile_stands_beside_a_side_of_the_same_policy() {
     let settings = RoutingSettings {
@@ -1858,16 +2021,16 @@ fn a_labels_profile_stands_beside_a_side_of_the_same_policy() {
         .expect("the pair mode's document");
     let document = with_labels(&settings, &[("m", "bucket")]).expect("a labelled one");
     let profiles: Vec<_> = document.profiles.keys().map(String::as_str).collect();
-    assert_eq!(profiles, ["bucket", "decode", "prefill", "round_robin"]);
+    assert_eq!(profiles, ["bucket:m", "decode", "prefill", "round_robin"]);
     for side in ["decode", "prefill", "round_robin"] {
         assert_eq!(document.profiles[side], own.profiles[side], "{side}");
     }
     let by_label = config(PolicySettings::of_label("bucket").expect("the label's policy"))
         .policy_document()
         .expect("the label's policy as a main policy");
-    assert_eq!(document.profiles["bucket"], by_label.profiles["bucket"]);
+    assert_eq!(document.profiles["bucket:m"], by_label.profiles["bucket"]);
     assert_ne!(
-        document.profiles["bucket"].score,
+        document.profiles["bucket:m"].score,
         own.profiles["prefill"].score
     );
 }
