@@ -66,8 +66,9 @@ pub enum Format {
 }
 
 impl Format {
-    /// A file's form by its name: `.json` is JSON, any other name YAML. The
-    /// one rule for every host that starts from a file.
+    /// A file's form by its name: a name that ends in `.json`, in any letter
+    /// case, is JSON, any other name YAML. The one rule for every host that
+    /// starts from a file.
     pub fn of(path: &Path) -> Self {
         let json = path
             .extension()

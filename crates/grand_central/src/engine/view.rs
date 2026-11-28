@@ -943,8 +943,9 @@ pub struct Candidate {
     /// The engine family, as a position into the spec's declared list; `0`
     /// when unspecified.
     pub engine_kind: u16,
-    /// The pairing descriptor's connector, as a position; `0` when none. The
-    /// spec declares no list of connectors.
+    /// The pairing descriptor's connector, as a number a host assigns; `0`
+    /// when none. The spec declares no list of connectors, and the rows this
+    /// crate builds read `0`.
     pub connector: u16,
     /// Requests the deciding host holds on the worker right now: what
     /// [`RequestFacts::in_flight`] reads.

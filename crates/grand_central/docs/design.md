@@ -1144,7 +1144,7 @@ pub struct Candidate {
     pub dp_size: u16,        // how many ranks its engine has
     pub wire_modes: WireModes, // protocols it serves
     pub engine_kind: u16,    // engine family, as a position in the document's list
-    pub connector: u16,      // prefill-decode connector, as a position; the document declares no such list
+    pub connector: u16,      // prefill-decode connector, as a number a host assigns; the document declares no list of them, and the crate's rows read 0
     pub pair_class: u32,     // which decodes a prefill can pair with
     pub zone: u16,           // zone, as a position in the document's list
     pub labels: u64,         // one bit for each label the document declares (at most 64)
