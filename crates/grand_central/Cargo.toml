@@ -320,14 +320,17 @@ required-features = ["controller"]
 
 [[test]]
 name = "operator_door"
+path = "tests/controller/operator_door.rs"
 required-features = ["operator"]
 
 [[test]]
 name = "spec_file"
+path = "tests/controller/spec_file.rs"
 required-features = ["controller"]
 
 [[test]]
 name = "spec_store"
+path = "tests/controller/spec_store.rs"
 required-features = ["controller"]
 
 # The program of the `in_process` example, driven by cases: the example's
@@ -364,6 +367,7 @@ required-features = ["client"]
 
 [[test]]
 name = "fleet"
+path = "tests/controller/fleet.rs"
 required-features = ["client"]
 
 [[test]]
@@ -394,6 +398,7 @@ path = "tests/plugin/contracts.rs"
 
 [[test]]
 name = "membership_calls"
+path = "tests/controller/membership_calls.rs"
 required-features = ["controller"]
 
 [[test]]
@@ -408,12 +413,14 @@ required-features = ["controller"]
 
 [[test]]
 name = "watch_workers"
+path = "tests/controller/watch_workers.rs"
 required-features = ["controller"]
 
 # One case in a process of its own: another bind or TLS call of the process
 # would install the crypto provider first.
 [[test]]
 name = "crypto_provider"
+path = "tests/controller/crypto_provider.rs"
 required-features = ["controller"]
 
 # Roots by subject stand under `benches/decision/`, `placement/`, `plugins/`,
