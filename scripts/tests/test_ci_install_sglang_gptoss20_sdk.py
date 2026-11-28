@@ -1,4 +1,4 @@
-"""Only new owned-origin/observer integration; never execute SDK or patch."""
+"""Owned SDK guards and harmless patch fixtures; never import the real SDK."""
 
 import hashlib
 import importlib.metadata
@@ -28,9 +28,9 @@ def sha(body):
 
 class OwnedSdk(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(dir=SCRIPTS.parent.parent)
+        self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.scope = Path(self.temp.name)
+        self.scope = Path(self.temp.name).resolve()
         self.prefix = self.scope / "interpreter"
         site = self.prefix / "lib/python3.12/site-packages"
         site.mkdir(parents=True)
@@ -70,6 +70,7 @@ class OwnedSdk(unittest.TestCase):
         context = patch.object(
             installer.subprocess, "run", side_effect=AssertionError("No process")
         )
+        self.no_process_context = context
         self.no_process = context.start()
         self.addCleanup(context.stop)
 
@@ -122,6 +123,122 @@ class OwnedSdk(unittest.TestCase):
             code, report = self.invoke()
         self.assertEqual(code, 1)
         self.assertIn("Explicit AMD SGLang", report["error"]["message"])
+
+    def test_vendored_patch_bytes_match_shared_observer(self):
+        self.assertEqual(sha(installer.PATCH.read_bytes()), observer.PATCH_SHA)
+
+    def test_real_patch_on_owned_toy_sources_then_idempotent(self):
+        self.no_process_context.stop()
+        (self.root / "probe.py").write_bytes(b"pre\n")
+        payload = self.scope / "toy.patch"
+        payload.write_text(
+            "--- a/python/sglang/probe.py\n+++ b/python/sglang/probe.py\n@@ -1 +1 @@\n-pre\n+post\n"
+        )
+        files = {"probe.py": (sha(b"pre\n"), sha(b"post\n"))}
+        actual_run = installer.subprocess.run
+        with (
+            patch.object(installer, "FILES", files),
+            patch.object(observer, "FILES", files),
+            patch.object(installer, "PATCH", payload),
+            patch.object(installer, "PATCH_SHA", sha(payload.read_bytes())),
+            patch.object(installer.subprocess, "run", wraps=actual_run) as calls,
+        ):
+            report = installer.install(self.root)
+            self.assertEqual(report["state"], "patched")
+            self.assertEqual((self.root / "probe.py").read_bytes(), b"post\n")
+            self.assertEqual(calls.call_count, 1)
+            installer.install(self.root)
+            self.assertEqual(calls.call_count, 1)
+
+    def test_mixed_toy_pair_refuses_before_patch_process(self):
+        (self.root / "other.py").write_bytes(b"pre-other")
+        files = {
+            "probe.py": (sha(b"pre"), sha(b"post")),
+            "other.py": (sha(b"pre-other"), sha(b"post-other")),
+        }
+        with patch.object(installer, "FILES", files), patch.object(observer, "FILES", files):
+            with self.assertRaisesRegex(RuntimeError, "unknown or mixed"):
+                installer.install(self.root)
+        self.no_process.assert_not_called()
+
+    def test_launcher_and_patched_guard_share_effective_cache(self):
+        # Compile only these stdlib checkpoint guards from the actual vendored
+        # payload. Never import/execute the SDK module or its engine imports.
+        payload = installer.PATCH.read_text()
+
+        def definition(name, following):
+            block = payload.split("\n+def " + name + "(", 1)[1]
+            block = "+def " + name + "(" + block.split("\n+def " + following + "(", 1)[0]
+            return "\n".join(line[1:] for line in block.splitlines() if line.startswith("+"))
+
+        worker_spec = importlib.util.spec_from_file_location(
+            "sdk_checkpoint_worker", SCRIPTS.parent / "e2e_test/infra/sglang_gptoss.py"
+        )
+        worker = importlib.util.module_from_spec(worker_spec)
+        worker_spec.loader.exec_module(worker)
+        documents = {
+            "config.json": b"{}",
+            "model.safetensors.index.json": b'{"weight_map":{"toy":"model.safetensors"}}',
+        }
+        namespace = {
+            "Path": Path,
+            "os": os,
+            "hashlib": hashlib,
+            "json": json,
+            "_GPTOSS_REVISION": worker.REVISION,
+            "_GPTOSS_METADATA_SHA256": {name: sha(body) for name, body in documents.items()},
+        }
+        guards = definition("_original_shared_blob", "_validate_gptoss_local_checkpoint")
+        guards += "\n" + definition(
+            "_validate_gptoss_local_checkpoint", "_validate_gfx942_gptoss_bf16_model"
+        )
+        exec(compile(guards, str(installer.PATCH) + ":checkpoint-guards", "exec"), namespace)
+        scenarios = (
+            (
+                {
+                    "HF_HUB_CACHE": str(self.scope / "cache-a"),
+                    "HF_HOME": str(self.scope / "ignored"),
+                },
+                {},
+            ),
+            ({"HF_HOME": str(self.scope / "home-b")}, {}),
+            (
+                {"HF_HUB_CACHE": str(self.scope / "old-cache")},
+                {"HF_HUB_CACHE": str(self.scope / "cache-c")},
+            ),
+        )
+        for inherited, extra in scenarios:
+            with self.subTest(inherited=inherited, extra=extra):
+                effective = {**inherited, **extra}
+                cache = Path(effective.get("HF_HUB_CACHE") or Path(effective["HF_HOME"]) / "hub")
+                snapshot = cache / "models--openai--gpt-oss-20b/snapshots" / worker.REVISION
+                snapshot.mkdir(parents=True)
+                for name, body in documents.items():
+                    (snapshot / name).write_bytes(body)
+                (snapshot / "model.safetensors").touch()
+                env = {
+                    **os.environ,
+                    **inherited,
+                    "ROUTER_LOCAL_MODEL_PATH": str(self.scope / "unused-map"),
+                }
+                with patch.dict(os.environ, env, clear=True):
+                    selected, _ = worker.prepare_launch(
+                        "sglang", worker.MODEL, worker.MODEL, {}, [], extra
+                    )
+                with patch.dict(os.environ, {**env, **extra}, clear=True):
+                    validate = namespace["_validate_gptoss_local_checkpoint"]
+                    self.assertEqual(validate(selected)["resolved_path"], str(snapshot))
+                    with self.assertRaisesRegex(ValueError, "Unrecognized"):
+                        validate(selected.replace(worker.REVISION, "0" * 40))
+                    (snapshot / "config.json").write_bytes(b"changed")
+                    with self.assertRaisesRegex(ValueError, "metadata differs"):
+                        validate(selected)
+                    outside = self.scope / "foreign-config.json"
+                    outside.write_bytes(documents["config.json"])
+                    (snapshot / "config.json").unlink()
+                    (snapshot / "config.json").symlink_to(outside)
+                    with self.assertRaisesRegex(ValueError, "escapes its original repository"):
+                        validate(selected)
 
 
 if __name__ == "__main__":

@@ -40,7 +40,7 @@
  from dataclasses import replace
  from functools import lru_cache
  from typing import TYPE_CHECKING, List, Optional
-@@ -199,6 +203,215 @@
+@@ -199,6 +203,228 @@
  _is_xpu = is_xpu()
  _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
  _aiter_k3_opt = _use_aiter and get_bool_env_var("SGLANG_AITER_K3_OPT")
@@ -123,27 +123,40 @@
 +def _validate_gptoss_local_checkpoint(model_path):
 +    # model_specs resolves this alias before passing it to the engine. Accept
 +    # copies and cache symlinks only with the fixed original metadata/layout.
-+    configured_root = Path(os.environ.get("ROUTER_LOCAL_MODEL_PATH") or "/models")
-+    if not configured_root.is_absolute():
-+        raise ValueError("An absolute configured model root is required")
-+    root = configured_root.resolve(strict=True)
-+    repository = root / "hub/models--openai--gpt-oss-20b"
-+    snapshot = repository / "snapshots" / _GPTOSS_REVISION
++    # Match the launcher's effective child environment: HF_HUB_CACHE wins,
++    # followed by HF_HOME/hub. Keep the original explicit local-map paths too.
++    cache = Path(
++        os.environ.get("HF_HUB_CACHE")
++        or Path(os.environ.get("HF_HOME") or "/models") / "hub"
++    )
++    model_root = Path(os.environ.get("ROUTER_LOCAL_MODEL_PATH") or "/models")
++    repo_name = Path("models--openai--gpt-oss-20b")
++    revision_path = Path("snapshots") / _GPTOSS_REVISION
++    locations = (
++        (cache, repo_name, repo_name / revision_path, True),
++        (model_root, Path("hub") / repo_name,
++         Path("hub") / repo_name / revision_path, True),
++        (model_root, Path("hub") / repo_name, Path("openai/gpt-oss-20b"), False),
++    )
 +    path = Path(model_path)
-+    allowed = {
-+        base / relative
-+        for base in (configured_root, root)
-+        for relative in (
-+            Path("openai/gpt-oss-20b"),
-+            Path("hub/models--openai--gpt-oss-20b/snapshots") / _GPTOSS_REVISION,
-+        )
-+    }
-+    if not path.is_absolute() or path not in allowed:
++    selected = None
++    if path.is_absolute():
++        for candidate, repo_relative, relative, is_snapshot in locations:
++            if candidate.is_absolute() and path in {
++                candidate / relative, candidate.resolve() / relative
++            }:
++                selected = candidate, repo_relative, is_snapshot
++                break
++    if selected is None:
 +        raise ValueError("Unrecognized local original GPTOSS checkpoint path")
++    configured_root, repo_relative, is_snapshot = selected
++    root = configured_root.resolve(strict=True)
++    repository = root / repo_relative
++    snapshot = repository / revision_path
 +    resolved = path.resolve(strict=True)
 +    if not resolved.is_relative_to(root) or not resolved.is_dir():
 +        raise ValueError("Local GPTOSS checkpoint escapes the configured model root")
-+    if resolved.is_relative_to(root / "hub") and resolved != snapshot:
++    if (is_snapshot or resolved.is_relative_to(root / "hub")) and resolved != snapshot:
 +        raise ValueError("Local GPTOSS checkpoint has a foreign repository or revision")
 +
 +    def checkpoint_file(name):
@@ -256,7 +269,7 @@
  _is_shuffle_moe_mxfp4 = is_gfx95_supported()
  _is_cpu_amx_available = cpu_has_amx_support()
  
-@@ -296,16 +509,31 @@
+@@ -296,16 +522,31 @@
          self,
          ignored_layers: Optional[list[str]] = None,
          is_checkpoint_mxfp4_serialized: bool = False,
@@ -289,7 +302,7 @@
  
          if _is_hip:
              if is_gfx95_supported():
-@@ -342,7 +570,6 @@
+@@ -342,7 +583,6 @@
      def get_quant_method(
          self, layer: torch.nn.Module, prefix: str
      ) -> Optional[QuantizeMethodBase]:
@@ -297,7 +310,7 @@
          from sglang.srt.layers.linear import LinearBase
          from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
          from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-@@ -358,7 +585,10 @@
+@@ -358,7 +598,10 @@
                  return UnquantizedLinearMethod()
          elif isinstance(layer, FusedMoE):
              if self.is_checkpoint_mxfp4_serialized:
@@ -309,7 +322,7 @@
              else:
                  return Mxfp4DynamicQuantMoEMethod()
          else:
-@@ -374,8 +604,12 @@
+@@ -374,8 +617,12 @@
      def __init__(
          self,
          prefix: str,
@@ -322,7 +335,7 @@
  
          self.prefix = prefix
          self.topk_indices_dtype = None
-@@ -437,6 +671,10 @@
+@@ -437,6 +684,10 @@
          with_bias: bool = False,
          **extra_weight_attrs,
      ):
@@ -333,7 +346,7 @@
          self.num_experts = num_experts
          weight_dtype = torch.uint8
          scale_dtype = torch.uint8
-@@ -619,6 +857,33 @@
+@@ -619,6 +870,33 @@
              set_weight_attrs(w2_weight_bias, extra_weight_attrs)
  
      def process_weights_after_loading(self, layer):
@@ -367,7 +380,7 @@
          if self.use_marlin and not self.use_mega_moe:
              from sglang.srt.layers.quantization.marlin_utils import (
                  check_moe_marlin_supports_layer,
-@@ -1580,6 +1845,24 @@
+@@ -1580,6 +1858,24 @@
          layer: torch.nn.Module,
          dispatch_output: StandardDispatchOutput,
      ) -> CombineInput:
@@ -392,7 +405,7 @@
  
          from sglang.srt.layers.moe.token_dispatcher import (
              DispatchOutputChecker,
-@@ -1805,7 +2088,6 @@
+@@ -1805,7 +2101,6 @@
          params_dtype: torch.dtype,
          **extra_weight_attrs,
      ):

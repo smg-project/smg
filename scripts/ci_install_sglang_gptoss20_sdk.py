@@ -29,8 +29,7 @@ from ci_sglang_mxfp4_fallback import (
 PATCH = Path(__file__).with_name("patches") / "sglang-0.5.21-gptoss-gfx942.patch"
 
 
-def owned_sdk_root():
-    """Require the exact active private SDK origin before any SDK write."""
+def require_profile():
     if (
         os.environ.get("E2E_ENGINE") != "sglang"
         or os.environ.get("E2E_GPU_VENDOR") != "amd"
@@ -38,6 +37,11 @@ def owned_sdk_root():
         or os.environ.get("SMG_SGLANG_ROCM_IMAGE") != IMAGE
     ):
         raise RuntimeError("Explicit AMD SGLang fixed-image 20B profile required")
+
+
+def owned_sdk_root():
+    """Require the exact active private SDK origin before any SDK write."""
+    require_profile()
     boot = sys.modules.get("ci_sglang_cohort")
     if boot is None or sys.modules.get("sitecustomize") is not boot:
         raise RuntimeError("Active owned cohort is required before SDK installation")
@@ -67,8 +71,6 @@ def owned_sdk_root():
 def install(root):
     if root != owned_sdk_root():
         raise RuntimeError("Foreign SDK install target")
-    if not enabled():
-        return verify_installed(root)
     actual = source_hashes(root)
     original = {name: pair[0] for name, pair in FILES.items()}
     patched = {name: pair[1] for name, pair in FILES.items()}
@@ -144,13 +146,7 @@ def main(argv=None):
         "patch_sha256": PATCH_SHA,
     }
     try:
-        if (
-            os.environ.get("E2E_ENGINE") != "sglang"
-            or os.environ.get("E2E_GPU_VENDOR") != "amd"
-            or not enabled()
-            or os.environ.get("SMG_SGLANG_ROCM_IMAGE") != IMAGE
-        ):
-            raise RuntimeError("Explicit AMD SGLang fixed-image 20B profile required")
+        require_profile()
         record["sglang_version"] = version("sglang")
         if record["sglang_version"] != "0.5.21":
             raise RuntimeError("Unsupported SGLang version for the checked MXFP4 patch")
