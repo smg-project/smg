@@ -92,9 +92,48 @@ def active_manifest(path, expected_sha, nonce):
         or os.environ.get("E2E_GPU_VENDOR") != "amd"
     ):
         raise ValueError("Explicit owned AMD SGLang Responses context required")
+    require_no_pending_transaction(spec)
     # No model flag is changed here. A5's strict observer retains its original
     # PRE/POST contract; only the separately reviewed model owner may install it.
     return {"path": path, "sha256": expected_sha, "spec": spec}
+
+
+def require_no_pending_transaction(spec):
+    marker = Path(spec["interpreter_prefix"]).parent / ".private-pip-transaction"
+    if marker.exists() or marker.is_symlink():
+        raise ValueError("Incomplete Responses native installation: private pip transaction exists")
+
+
+def manifest_identity(cohort):
+    return {
+        "manifest": str(cohort["path"]),
+        "sha256": cohort["sha256"],
+        "responses_binding": cohort["spec"]["responses_binding"],
+        "consumer_sha256": cohort["spec"].get("responses_consumer_sha256"),
+        "producer_contract_sha256": cohort["spec"].get("responses_producer_contract_sha256"),
+    }
+
+
+def require_completed_install(directory, cohort):
+    require_no_pending_transaction(cohort["spec"])
+    identity = manifest_identity(cohort)
+    try:
+        installed = json.loads((directory / "responses-cohort-install.json").read_text())
+        committed = json.loads((directory / "responses-native-manifest-commit-2.json").read_text())
+    except (OSError, ValueError) as error:
+        raise ValueError(
+            "Incomplete Responses native installation: receipts missing or invalid"
+        ) from error
+    if (
+        digest(cohort["path"]) != cohort["sha256"]
+        or not isinstance(installed, dict)
+        or not isinstance(committed, dict)
+        or installed.get("status") != "passed"
+        or installed.get("phase") != "install"
+        or installed.get("contract") != identity
+        or {key: committed.get(key) for key in identity} != identity
+    ):
+        raise ValueError("Incomplete Responses native installation: committed identity differs")
 
 
 def readonly_borrowed_providers(spec):
@@ -166,14 +205,7 @@ def install_native(cohort, directory):
         # failure never invents a digest from arbitrary current manifest bytes.
         previous = cohort["sha256"]
         rebind_native(cohort, native)
-        receipt = {
-            "manifest": str(cohort["path"]),
-            "previous_sha256": previous,
-            "sha256": cohort["sha256"],
-            "responses_binding": cohort["spec"]["responses_binding"],
-            "consumer_sha256": cohort["spec"].get("responses_consumer_sha256"),
-            "producer_contract_sha256": cohort["spec"].get("responses_producer_contract_sha256"),
-        }
+        receipt = {**manifest_identity(cohort), "previous_sha256": previous}
         with (directory / f"responses-native-manifest-commit-{stage}.json").open("x") as output:
             output.write(json.dumps(receipt, indent=2) + "\n")
             output.flush()
@@ -259,6 +291,7 @@ def verify_phase(phase, directory, cohort):
 
     report = {"verified": False}
     try:
+        require_completed_install(directory, cohort)
         native.verify(report, private_cohort=True)
         report["verified"] = True
     except Exception as error:
@@ -301,6 +334,7 @@ def main(argv=None):
             if args.phase == "install":
                 install_native(cohort, args.directory)
                 result["status"] = "passed"
+                result["contract"] = manifest_identity(cohort)
             else:
                 result.update(verify_phase(args.phase, args.directory, cohort))
         except Exception as error:

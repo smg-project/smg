@@ -123,6 +123,18 @@ def transition(tmp_path, monkeypatch):
 
     def activate():
         with monkeypatch.context() as context:
+            # Simulate the isolated child while keeping this metadata-only
+            # fixture independent of pytest's own interpreter launch flags.
+            flags = SimpleNamespace(
+                **{
+                    name: getattr(sys.flags, name)
+                    for name in dir(sys.flags)
+                    if not name.startswith("_")
+                }
+            )
+            flags.isolated = flags.dont_write_bytecode = 1
+            context.setattr(sys, "flags", flags)
+            context.setattr(sys, "dont_write_bytecode", True)
             context.setattr(sys, "prefix", str(prefix))
             context.setattr(sys, "path", list(sys.path))
             context.setattr(sys, "meta_path", list(sys.meta_path))
@@ -257,3 +269,43 @@ def test_868_pip_failure_marker_blocks_reusing_the_scope(transition, monkeypatch
     assert len(state.calls) == 1
     assert marker.is_file()
     assert not env.read_text()
+
+
+@pytest.mark.parametrize("next_phase", ["prepared", "final"])
+def test_partial_second_stage_cannot_become_a_verified_phase(transition, monkeypatch, next_phase):
+    phase, cohort, logs, env, state, _, _ = transition
+    actual_private_pip_bridge(transition, monkeypatch)
+    state.failure = 2
+    with pytest.raises(RuntimeError, match="pip fixture stage failure"):
+        phase.install_native(cohort, logs)
+    assert len(state.calls) == 2
+    assert env.read_text() == committed_environment(cohort["sha256"])
+    marker = Path(cohort["spec"]["interpreter_prefix"]).parent / ".private-pip-transaction"
+    assert marker.is_file()
+    assert (logs / "responses-native-manifest-commit-1.json").is_file()
+    assert not (logs / "responses-native-manifest-commit-2.json").exists()
+    # The public CLI preserves this failed install result after the exception.
+    (logs / "responses-cohort-install.json").write_text(
+        json.dumps({"status": "failed", "phase": "install"})
+    )
+    verified = []
+    native = sys.modules["ci_verify_sglang_rocm_cohort"]
+    monkeypatch.setattr(native, "verify", lambda report, **kwargs: verified.append(True))
+    monkeypatch.setattr(phase, "job_identity", lambda: {"job": "fixture"})
+    # Even a matching older prepared report must not authorize the final phase.
+    (logs / "responses-cohort-prepared.json").write_text(
+        json.dumps(
+            {
+                "status": "passed",
+                "contract": {
+                    "native": {"verified": True},
+                    "manifest_sha256": cohort["sha256"],
+                    "source_sha256": phase.source_hashes(),
+                    "job": phase.job_identity(),
+                },
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="Incomplete Responses native installation"):
+        phase.verify_phase(next_phase, logs, cohort)
+    assert not verified
