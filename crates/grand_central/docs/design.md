@@ -1782,6 +1782,13 @@ A dispatch and a move at the cap write nothing into the session table when dated
 date a decision read the key's current life under. Neither does a decode call's date where the
 call's own instant is that old. A pair's decode call reads under its lease's date.
 
+A claim or a dispatch makes a key's entry where the table holds none of the key and has room, as
+behind a sweep at the key's end. No read began that entry, so it has no such date: no word is
+dropped there as an older life's, and each is taken in the order it comes, as a gateway's sticky map
+takes each write. A decision's read finds no pin there, and the first read that writes the key
+starts it over. A claim reads the pins as they stand, so a decision that read the key before can
+follow a pin written there.
+
 The table keeps the low 32 bits of the instant. Two claims of one key on one worker that are
 dated alike read as one: at one microsecond, or a whole multiple of 2^32 microseconds apart.
 
