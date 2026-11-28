@@ -5309,6 +5309,23 @@ fn accounting_books_the_dispatch_until_completion() {
     assert_eq!(accounting.pending_prefill_tokens("http://w1:8000"), 0);
 }
 
+/// The policy acts on a request's end only while it books dispatches. With
+/// no accounting, the default, its hook does nothing and it says so, which
+/// lets a registry report a request's end to no policy.
+#[test]
+fn the_policy_hears_a_request_end_only_while_it_books() {
+    assert_eq!(CacheAwareConfig::default().selection_accounting_ttl_ms, 0);
+    let quiet = CacheAwarePolicy::with_config(test_config());
+    assert!(quiet.accounting.is_none());
+    assert!(!quiet.hears_request_complete());
+
+    let booking = CacheAwarePolicy::with_config(CacheAwareConfig {
+        selection_accounting_ttl_ms: 60_000,
+        ..test_config()
+    });
+    assert!(booking.hears_request_complete());
+}
+
 #[test]
 fn reconciliation_releases_bookings_whose_completion_never_arrived() {
     let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
