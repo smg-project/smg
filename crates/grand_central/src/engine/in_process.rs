@@ -60,6 +60,7 @@ pub(super) mod membership;
 pub mod overlap;
 pub(super) mod pair;
 pub(super) mod place;
+pub(super) mod request;
 mod sample;
 mod signals;
 mod single;
@@ -96,7 +97,7 @@ use self::{
     document::InForce,
     encode::EncodeLists,
     overlap::{Affinity, PoolAffinity},
-    place::Made,
+    request::Made,
 };
 use super::{
     decision_engine::{

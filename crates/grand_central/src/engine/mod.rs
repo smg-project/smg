@@ -69,7 +69,9 @@ pub use in_process::overlap::{self, Affinity, CacheIndex, CacheIndexes, PoolAffi
 #[cfg(feature = "in-process")]
 pub use in_process::pair::{prefills_full, PairAdmission, PairLists};
 #[cfg(feature = "in-process")]
-pub use in_process::place::{HeaderRead, PlaceRequest, Prompt, PromptEntry, Unplaced, WorkerRule};
+pub use in_process::place::Unplaced;
+#[cfg(feature = "in-process")]
+pub use in_process::request::{HeaderRead, PlaceRequest, Prompt, PromptEntry, WorkerRule};
 #[cfg(feature = "in-process")]
 pub use in_process::start::WorkerData;
 #[cfg(feature = "in-process")]

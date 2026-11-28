@@ -52,12 +52,15 @@ use std::{
 
 use super::{
     pair::{self, decode_label, sides},
-    raise, ready, walk, Call, Made, PlaceRequest, Unplaced,
+    raise, walk, Unplaced,
 };
 use crate::{
     engine::{
         framework::{EncodeItems, EncodePlaced},
-        in_process::Loaded,
+        in_process::{
+            request::{ready, Call, Made, PlaceRequest},
+            Loaded,
+        },
         prefills_full, EncodeLists, WorkerLists,
     },
     tracking::{Encoders, Placement},

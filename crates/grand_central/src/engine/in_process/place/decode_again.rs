@@ -17,11 +17,15 @@ use std::{panic::resume_unwind, sync::Arc, time::Instant};
 
 use smg_worker::identity::basic::Worker;
 
-use super::{picked, sendable, Made, PlaceRequest, Unplaced};
+use super::{picked, sendable, Unplaced};
 use crate::{
     engine::{
         decision_engine::{DecisionRefused, DecodeRefused, WorkerLists},
-        in_process::{encode::EncodeLists, InProcess},
+        in_process::{
+            encode::EncodeLists,
+            request::{Made, PlaceRequest},
+            InProcess,
+        },
         records::worker_id,
     },
     tracking::DecisionGuard,

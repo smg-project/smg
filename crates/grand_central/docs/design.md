@@ -2231,7 +2231,7 @@ which the gateway hands its own lists.
 **2. For each request, one call.**
 
 ```rust
-// engine/in_process/place.rs, behind the feature `in-process`: built for a single request, a pair and an encode request
+// engine/in_process/request.rs and place.rs, behind the feature `in-process`: built for a single request, a pair and an encode request
 pub struct PlaceRequest<'a> {
     pub model: &'a str,
     pub lists: WorkerLists<'a>,       // one list, a pair's two lists with their pair classes, or an encode request's three
