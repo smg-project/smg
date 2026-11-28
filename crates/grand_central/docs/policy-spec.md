@@ -76,7 +76,7 @@ A send leaves the tally at the first of these events:
 - The worker is removed, joins again, is replaced or changes its number of ranks.
 - The end of `sent_ttl_ms`, where the profile sets it.
 
-The tally keeps 8,192 sends for a worker, and for each rank of a data-parallel worker, whether or not the profile sets `sent_ttl_ms`. One more send lets the oldest of them go.
+As a rule the tally keeps 8,192 sends for a worker, and for each rank of a data-parallel worker: one more send lets the oldest of them go. That holds whether or not the profile sets `sent_ttl_ms`.
 
 A profile that sets `sent_ttl_ms` or `sent_report_delay_ms` is refused unless one of its stages reads the tally. Of the built-in stages, these read it:
 
