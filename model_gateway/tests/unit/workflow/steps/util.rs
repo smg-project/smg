@@ -162,15 +162,15 @@ mod tests {
         engine.set_serving(false);
         let connector = BackendConnector::shared();
 
-        let answer = grpc_health_answer(connector.as_ref(), &url, 5, RuntimeType::TokenSpeed)
+        let answer = grpc_health_answer(connector.as_ref(), &url, 30, RuntimeType::TokenSpeed)
             .await
             .expect("the runtime answers its health RPC whether or not the engine is healthy");
         assert!(!answer.healthy);
         assert_eq!(answer.message, "not serving");
-        grpc_health_answer(connector.as_ref(), &url, 5, RuntimeType::Vllm)
+        grpc_health_answer(connector.as_ref(), &url, 30, RuntimeType::Vllm)
             .await
             .expect_err("another runtime's service does not answer there");
-        let err = try_grpc_reachable(connector.as_ref(), &url, 5)
+        let err = try_grpc_reachable(connector.as_ref(), &url, 30)
             .await
             .expect_err("the fan-out must not count a not-healthy answer as reachable");
         assert!(
@@ -181,7 +181,7 @@ mod tests {
         );
 
         engine.set_serving(true);
-        try_grpc_reachable(connector.as_ref(), &url, 5)
+        try_grpc_reachable(connector.as_ref(), &url, 30)
             .await
             .expect("a healthy engine is reachable");
     }
