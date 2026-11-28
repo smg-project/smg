@@ -99,6 +99,10 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// outcome itself is not carried here: it reaches the worker's circuit
     /// breaker through `record_outcome`, and a policy that wants a failure
     /// signal reads the worker's breaker state.
+    ///
+    /// A policy that gives this a body answers `true` from
+    /// [`Self::hears_request_complete`] (the default): while no policy of a
+    /// registry hears, the registry calls this on no policy.
     fn on_request_complete(&self, _worker_url: &str) {
         // Default: no-op for stateless policies
     }
@@ -110,6 +114,12 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// policies hears, a request's end is reported to no policy. Yes by
     /// default, so a policy that says nothing is told of every end as before;
     /// a policy that leaves `on_request_complete` empty says no.
+    ///
+    /// A policy's answer is a constant for its lifetime: the registry reads
+    /// it once, where the policy enters, so a policy that says no and acts
+    /// on an end later may never be told of one. Once one policy of a
+    /// registry hears, the registry reports every end again, to the policies
+    /// that say no as well.
     fn hears_request_complete(&self) -> bool {
         true
     }
