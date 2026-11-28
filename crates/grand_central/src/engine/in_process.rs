@@ -872,8 +872,7 @@ impl<'d> Loaded<'_, 'd> {
     /// The picker of `profile`.
     #[inline]
     fn picker_of(self, profile: AloneProfile) -> Option<&'d dyn Picker> {
-        let profiles = self.document.spec.engine().profiles();
-        Some(profiles.get(usize::from(profile.0))?.picker.as_ref())
+        self.document.spec.engine().alone_picker(profile)
     }
 
     /// The request `maker` makes, as this engine decides it. A request that

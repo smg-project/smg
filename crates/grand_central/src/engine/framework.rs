@@ -51,6 +51,7 @@ mod engines;
 mod keyed;
 mod pair_pools;
 mod places;
+mod profiles;
 mod vetoed;
 
 pub use alone::{AloneProfile, InTheWay, NotAlone, Place};
@@ -6436,10 +6437,6 @@ impl Engine {
             .and_then(|index| self.profile_needs.get(usize::from(index)))
             .copied()
             .unwrap_or_default()
-    }
-
-    pub fn profiles(&self) -> &[Arc<Profile>] {
-        &self.profiles
     }
 
     /// The first binding that matches, as the spec orders them, and as the
