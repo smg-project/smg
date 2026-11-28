@@ -282,9 +282,12 @@ impl TokenSpeedScheduler for MockScheduler {
     ) -> Result<Response<ts::GetServerInfoResponse>, Status> {
         self.overrides.server_info().refusal("server info")?;
         if let Some(recorded) = script::recorded_info(SERVER_INFO_CALL) {
-            return ts::GetServerInfoResponse::decode(recorded.as_slice())
-                .map(Response::new)
-                .map_err(|e| Status::internal(format!("the recorded server info: {e}")));
+            let mut info = ts::GetServerInfoResponse::decode(recorded.as_slice())
+                .map_err(|e| Status::internal(format!("the recorded server info: {e}")))?;
+            // A gateway publishes this entry beside the tokenizer path of
+            // the model info.
+            super::state_tokenizer(&self.cfg, info.server_args.as_mut(), "tokenizer");
+            return Ok(Response::new(info));
         }
         Ok(Response::new(ts::GetServerInfoResponse {
             server_args: self.server_args(),

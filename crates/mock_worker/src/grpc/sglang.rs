@@ -459,9 +459,12 @@ impl SglangScheduler for MockScheduler {
     ) -> Result<Response<sg::GetServerInfoResponse>, Status> {
         self.overrides.server_info().refusal("server info")?;
         if let Some(recorded) = script::recorded_info(SERVER_INFO_CALL) {
-            return sg::GetServerInfoResponse::decode(recorded.as_slice())
-                .map(Response::new)
-                .map_err(|e| Status::internal(format!("the recorded server info: {e}")));
+            let mut info = sg::GetServerInfoResponse::decode(recorded.as_slice())
+                .map_err(|e| Status::internal(format!("the recorded server info: {e}")))?;
+            // A gateway reads this entry over the tokenizer path of the
+            // model info.
+            super::state_tokenizer(&self.cfg, info.server_args.as_mut(), "tokenizer_path");
+            return Ok(Response::new(info));
         }
         Ok(Response::new(sg::GetServerInfoResponse {
             server_args: self.server_args(),
