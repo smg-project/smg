@@ -1915,6 +1915,7 @@ mod tests {
             "../bindings/golang/src/lib.rs",
             "../bindings/golang/tests/unit/tests.rs",
             "../bindings/python/src/lib.rs",
+            "../bindings/python/tests/unit/tests.rs",
         ] {
             assert!(
                 sources.contains(&package.join(known)),

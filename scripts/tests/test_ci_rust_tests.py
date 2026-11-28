@@ -260,6 +260,20 @@ class ShardTableTests(unittest.TestCase):
         ):
             self.assertFalse(filter_matches(filters["rust-gateway"], path), path)
 
+    def test_the_filters_cover_a_bindings_rust_unit_tests(self):
+        # A binding's Rust unit tests stand under its tests folder once they
+        # have left src. The gateway's integration tests read them as they read
+        # the binding's src, and rust-ci is the only gate for the lint of a
+        # change that touches them alone. So each of the two filters matches
+        # every Rust file under that folder, however deep: a deleted line fails
+        # here, and so does a line narrowed to one level of the folder.
+        filters = path_filters()
+        for binding in ("bindings/python", "bindings/golang"):
+            for file in sorted((REPO / binding / "tests").rglob("*.rs")):
+                path = file.relative_to(REPO).as_posix()
+                for name in ("rust-ci", "rust-gateway"):
+                    self.assertTrue(filter_matches(filters[name], path), f"{name} misses {path}")
+
     def test_the_kv_shard_builds_the_example_policy_plugin_and_requires_it(self):
         # The Grand Central crate's tests load the example plugin as its own build
         # line wrote it: the shard that runs them builds it first, requires
