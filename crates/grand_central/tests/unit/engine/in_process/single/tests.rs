@@ -34,7 +34,7 @@ use crate::{
     stages::registry::StageRegistry,
     store::GatewayId,
     tracking::{
-        lease::{Membership, Outcome, ReleaseReason, TransportClass},
+        lease::{EventSet, Membership, Outcome, ReleaseReason, TransportClass},
         DecisionGuard,
     },
 };

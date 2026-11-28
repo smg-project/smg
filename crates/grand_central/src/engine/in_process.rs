@@ -111,14 +111,14 @@ use super::{
     prompt_hashes::{HashSeeds, PromptHashes},
     records::{DecisionClock, PoolRecords},
     shadow::Shadowed,
-    sticky_sessions::{shards_for_this_host, SessionTable},
+    sticky_sessions::{shards_for_this_host, SessionTable, SessionVerdict},
     view::{FixedFacts, Phase, WireModes, WorkerId},
 };
 use crate::{
     document::spec::AppliedSpec,
     stages::Lifecycle,
     store::GatewayId,
-    tracking::lease::{EventKind, EventSet, Membership, Said, Side},
+    tracking::lease::{EventKind, Membership, Said, Side},
 };
 
 /// How many documents the engines of this process took so far.
@@ -1264,7 +1264,7 @@ impl Loaded<'_, '_> {
                     // A document that keeps a sample and takes no word: the
                     // place is the whole answer all the same, counted
                     // toward the thread's next sample behind the pick.
-                    if !document.hears.intersects(EventSet::LEASE) {
+                    if !document.hears_leases() {
                         sample::place(self, maker, pick, members, clock);
                         return Ok(Some(pick));
                     }
@@ -1274,7 +1274,7 @@ impl Loaded<'_, '_> {
                     // reads ready a second time, as a noted pick's target
                     // is read at its walk. A worker that turned not ready
                     // behind the pick is noted.
-                    if !document.hears_beside_table.intersects(EventSet::LEASE)
+                    if !document.hears_leases_of(SessionVerdict::None)
                         && single::still_ready(pick, members)
                     {
                         if document.samples {
@@ -1458,7 +1458,7 @@ impl DecisionEngine for InProcess {
         let document = self.in_force();
         if held.lease.generation != document.spec.generation() {
             self.told_older(&document, held, said);
-        } else if held.lease.side != Side::Single || document.hears.contains(kind) {
+        } else if held.lease.side != Side::Single || document.takes(kind) {
             let sends = document.spec.engine();
             self.told_of(sends, sends, held, said);
         }

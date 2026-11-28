@@ -906,7 +906,12 @@ fn a_stage_that_needs_the_calls_and_names_no_word_is_told_each() {
             takes: EventSet::NONE,
         }))
     });
-    assert_eq!(engine.in_force().hears, EventSet::LEASE);
+    let document = engine.in_force();
+    assert_eq!(document.spec.engine().hears(), EventSet::LEASE);
+    for &kind in EventKind::ALL {
+        let named = EventSet::LEASE.contains(kind);
+        assert_eq!(document.takes(kind), named, "{kind:?}");
+    }
     assert_eq!(
         told(&engine, &heard, 0),
         ["issued", "dispatched", "completed", "issued", "released"]

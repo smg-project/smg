@@ -81,7 +81,7 @@ use crate::{
         view::{Constraints, Phase, RequestFacts, Session, WorkerId},
     },
     stages::Lifecycle,
-    tracking::lease::{EventKind, EventSet, Lease, LeaseId, LeaseKind, Side, DISPATCH_TTL},
+    tracking::lease::{EventKind, Lease, LeaseId, LeaseKind, Side, DISPATCH_TTL},
 };
 
 thread_local! {
@@ -231,7 +231,7 @@ pub(super) fn noted(
         }),
         decode_session: Session::NONE,
     };
-    if document.hears.contains(EventKind::Issued) {
+    if document.takes(EventKind::Issued) {
         let stages = document.spec.engine();
         own.word_caught(|| stages.on_decision_issued(&lease, &decided.decision));
     }
@@ -376,7 +376,7 @@ pub(super) fn decide(
     // behind a placement, where a kept sample and a stage that takes the
     // issue are the two readers of the best rows of its trace.
     let document = own.document;
-    let read = document.samples || document.hears.contains(EventKind::Issued);
+    let read = document.samples || document.takes(EventKind::Issued);
     let live = records::Live::at(spec.engine(), &own.clock, now, loads, key)
         .turning(&members.rotation.0)
         .unread(late.is_some() && !read);
@@ -691,13 +691,9 @@ pub(super) fn issued(
 ) -> DecideOutcome {
     let facts = &request.facts;
     let document = own.document;
-    let noted = decision.pick().filter(|pick| {
-        let hears = match pick.session_verdict {
-            SessionVerdict::None => document.hears_beside_table,
-            _ => document.hears,
-        };
-        hears.intersects(EventSet::LEASE)
-    });
+    let noted = decision
+        .pick()
+        .filter(|pick| document.hears_leases_of(pick.session_verdict));
     let lease = noted.and_then(|pick| {
         let first = pick.targets.first()?;
         Some(Lease {
@@ -715,7 +711,7 @@ pub(super) fn issued(
             bytes: facts.prompt_bytes,
         })
     });
-    let issue = document.hears.contains(EventKind::Issued);
+    let issue = document.takes(EventKind::Issued);
     if let Some(lease) = lease.as_ref().filter(|_| issue) {
         // Asked behind the document's own word: a document whose stages
         // take no issue reads nothing of the pick here.

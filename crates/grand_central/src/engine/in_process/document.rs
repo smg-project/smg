@@ -38,6 +38,7 @@ use crate::{
         explain::{DecisionRecord, Samples},
         framework::{ShadowRows, Stood, SHADOWS},
         shadow::{ShadowCount, ShadowCounts, ShadowSide, Shadowed, SHADOW_ROWS},
+        sticky_sessions::SessionVerdict,
         view::{fingerprint, Phase},
     },
     stages::Lifecycle,
@@ -61,10 +62,12 @@ pub(in crate::engine) struct InForce {
     pub(in crate::engine) applied: u64,
     /// The kinds of event the document takes ([`Lifecycle::hears`]), read
     /// once, here. A document that takes no word on a lease
-    /// ([`EventSet::LEASE`]) costs a request no lease, no id and no word,
-    /// and its plain requests are answered a place
-    /// ([`Decided::Alone`](crate::engine::Decided::Alone)).
-    pub(super) hears: EventSet,
+    /// ([`EventSet::LEASE`]) costs a single request no lease, no id and no
+    /// word, and a plain one is answered a place where one pick decides its
+    /// place and lands ([`Decided::Alone`](crate::engine::Decided::Alone)). A
+    /// decision asks it by one kind ([`Self::takes`]) or of a lease's four
+    /// ([`Self::hears_leases`]).
+    hears: EventSet,
     /// The kinds the document takes of a pick its session table has no
     /// word for: [`Self::hears`] without the table's own, read once, here.
     /// Under a sessions rule beside which no stage and no count of sends
@@ -72,8 +75,9 @@ pub(in crate::engine) struct InForce {
     /// request no lease either ([`super::single::issued`]), and a place one
     /// pick decided is its request's whole answer where its worker reads
     /// ready a second time ([`super::single::still_ready`]). Where it does
-    /// not, the pick is noted and takes its lease.
-    pub(super) hears_beside_table: EventSet,
+    /// not, the pick is noted and takes its lease. A decision asks it by the
+    /// table's word of its pick ([`Self::hears_leases_of`]).
+    hears_beside_table: EventSet,
     /// Whether a place one pick decided may not be the whole of what the
     /// document asks of its request: a stage, a count of sends or the
     /// session table takes a word on a lease ([`Self::hears`]), or the
@@ -86,9 +90,9 @@ pub(in crate::engine) struct InForce {
     pub(super) leases_or_samples: bool,
     /// Each profile's name as a label that lives as long as the process,
     /// by the profile's position in the document
-    /// ([`Loaded::label_at`]). Made once, here: naming the profile of a
+    /// ([`Self::label_at`]). Made once, here: naming the profile of a
     /// placement takes no lock.
-    pub(super) labels: Box<[&'static str]>,
+    labels: Box<[&'static str]>,
     /// Whether a stage of the document reads a named signal
     /// ([`Needs::signal_cells`](crate::document::spec::Needs::signal_cells)),
     /// read once, here. Under such a document a single request whose
@@ -161,6 +165,47 @@ impl InForce {
             applied: next_applied(),
             shadow_tables: OnceLock::new(),
         }
+    }
+
+    /// Whether `kind` is among the kinds of event the document takes: its
+    /// engine's answer for its stages, its counts of sends and its session
+    /// table together ([`Lifecycle::hears`]). A decision asks it of a word
+    /// on a lease.
+    #[inline]
+    pub(super) fn takes(&self, kind: EventKind) -> bool {
+        self.hears.contains(kind)
+    }
+
+    /// Whether a stage of the document, a count of sends or its session
+    /// table takes a word on a lease ([`EventSet::LEASE`]). Under a document
+    /// where none does, a single request costs no lease, no id and no word.
+    #[inline]
+    pub(super) fn hears_leases(&self) -> bool {
+        self.hears.intersects(EventSet::LEASE)
+    }
+
+    /// Whether the document takes a word on the lease of a pick its session
+    /// table said `verdict` of. Of a pick the table has no word for
+    /// ([`SessionVerdict::None`]) it is the answer of what stands beside
+    /// the table, a stage or a count of sends: the table passes such a
+    /// pick's dispatch by. Of any other pick it is the answer of the table
+    /// too ([`Self::hears_leases`]).
+    #[inline]
+    pub(super) fn hears_leases_of(&self, verdict: SessionVerdict) -> bool {
+        let hears = match verdict {
+            SessionVerdict::None => self.hears_beside_table,
+            _ => self.hears,
+        };
+        hears.intersects(EventSet::LEASE)
+    }
+
+    /// The label of the profile at `position` in the document, and the
+    /// empty label where the document holds no profile there
+    /// ([`Loaded::label_at`]).
+    #[inline]
+    pub(super) fn label_at(&self, position: u16) -> &'static str {
+        let label = self.labels.get(usize::from(position));
+        label.copied().unwrap_or("")
     }
 
     /// What hears a word of a lease issued under `generation`, an earlier
@@ -393,14 +438,14 @@ impl Deref for Loaded<'_, '_> {
 }
 
 impl<'d> Loaded<'_, 'd> {
-    /// Whether a stage of the document this decision runs under takes
-    /// events of `kind` ([`InForce::hears`]): what the call that places a
+    /// Whether the document this decision runs under takes events of
+    /// `kind` ([`InForce::takes`]): what the call that places a
     /// request states of its placement, for the split that keeps something
     /// for a word of that kind
     /// ([`Placement::sides`](crate::tracking::Placement::sides)).
     #[inline]
     pub(crate) fn takes(self, kind: EventKind) -> bool {
-        self.document.hears.contains(kind)
+        self.document.takes(kind)
     }
 
     /// What hears a word of a lease issued under `generation`, by the

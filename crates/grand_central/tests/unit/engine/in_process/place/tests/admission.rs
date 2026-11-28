@@ -4,6 +4,7 @@
 //! decisions at most, and which workers its later decisions are held to.
 
 use super::*;
+use crate::engine::sticky_sessions::SessionVerdict;
 
 /// A worker can be sent to while it is ready and its circuit breaker lets
 /// requests through: either one alone holds a send back. The overload veto
@@ -93,12 +94,9 @@ fn a_place_under_a_table_that_alone_takes_a_word_is_read_ready_a_second_time() {
     profile.expect("the preset's profile").pick = "turns".into();
     let spec = AppliedSpec::validate_in(&ruled_ahead(document), &stages, &[]);
     let engine = hosted(InProcess::new(spec.expect("the stages hold the picker")));
-    let hears = engine.in_force().hears.intersects(EventSet::LEASE);
-    let beside = engine.in_force().hears_beside_table;
-    assert!(
-        hears && !beside.intersects(EventSet::LEASE),
-        "the session table alone takes a word"
-    );
+    let hears = engine.in_force().hears_leases();
+    let beside = engine.in_force().hears_leases_of(SessionVerdict::None);
+    assert!(hears && !beside, "the session table alone takes a word");
     let members = PublishedList::new(Arc::clone(&list));
     let request = PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()));
     let placement = engine.place(&request).expect("a placement");
@@ -107,6 +105,38 @@ fn a_place_under_a_table_that_alone_takes_a_word_is_read_ready_a_second_time() {
         Arc::ptr_eq(&placement.worker, &list[1]),
         "the worker that is ready"
     );
+}
+
+/// Under a document that keeps a sample and takes no word on a lease, a
+/// plain request's place is the whole answer: where its picker turned its
+/// worker behind the pick, the request is placed on that worker all the
+/// same, and no lease takes an id.
+#[test]
+fn a_place_under_a_document_that_takes_no_word_stands_where_its_worker_turned() {
+    let list = pool(2);
+    let first = Arc::clone(&list[0]);
+    let mut stages = StageRegistry::builtin();
+    let added = stages.picker("turns", move || Box::new(Turns(Arc::clone(&first))));
+    added.expect("a free name");
+    let mut document = PolicySpec::preset("random").expect("a built-in preset");
+    let profile = document.profiles.get_mut("random");
+    profile.expect("the preset's profile").pick = "turns".into();
+    document.explain.sample = 1;
+    let spec = AppliedSpec::validate_in(&document, &stages, &[]);
+    let engine = hosted(InProcess::new(spec.expect("the stages hold the picker")));
+    let sampled = engine.in_force().samples;
+    let hears = engine.in_force().hears_leases();
+    assert!(sampled && !hears, "a sample and no word");
+    let members = PublishedList::new(Arc::clone(&list));
+    let request = PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()));
+    let placement = engine.place(&request).expect("a placement");
+    assert!(!ready(list[0].as_ref()), "the pick turned its worker");
+    assert!(
+        Arc::ptr_eq(&placement.worker, &list[0]),
+        "the worker the pick turned"
+    );
+    let ids = engine.leases.0.load(atomic::Ordering::Relaxed);
+    assert_eq!(ids, 0, "no id taken");
 }
 
 /// A retry states the worker it tried: it is decided whole and placed on

@@ -155,12 +155,9 @@ fn a_place_picked_under_a_table_that_alone_takes_a_word_is_the_whole_answer() {
     let document = PolicySpec::preset("round_robin").expect("a built-in preset");
     let spec = AppliedSpec::validate(&ruled_ahead(document)).expect("the document validates");
     let engine = InProcess::new(spec);
-    let hears = engine.in_force().hears.intersects(EventSet::LEASE);
-    let beside = engine.in_force().hears_beside_table;
-    assert!(
-        hears && !beside.intersects(EventSet::LEASE),
-        "the session table alone takes a word"
-    );
+    let hears = engine.in_force().hears_leases();
+    let beside = engine.in_force().hears_leases_of(SessionVerdict::None);
+    assert!(hears && !beside, "the session table alone takes a word");
     let list = pool(4);
     let members = PublishedList::new(Arc::clone(&list));
     let mut plain = request();
@@ -169,6 +166,29 @@ fn a_place_picked_under_a_table_that_alone_takes_a_word_is_the_whole_answer() {
     placed(&engine, &asks);
     assert_eq!(asks.made.get(), 0, "the pick read no fact of a request");
     assert_eq!(engine.leases.0.load(Ordering::Relaxed), 0, "no id taken");
+}
+
+/// Under a document whose one stage names a signal alone, the document
+/// takes the signal and no word on a lease, whatever its session table
+/// said of a pick. A plain request of a place one pick decides is answered
+/// the place: no request is made, no lease takes an id and the stage is
+/// told no word.
+#[test]
+fn a_place_picked_under_a_document_that_names_a_signal_alone_is_the_whole_answer() {
+    let (engine, heard) = hearing_as(false, true, EventSet::NONE.with(EventKind::Signal));
+    let document = engine.in_force();
+    let taken = EventKind::ALL.iter().filter(|&&kind| document.takes(kind));
+    assert_eq!(taken.collect::<Vec<_>>(), [&EventKind::Signal]);
+    let said = [SessionVerdict::None, SessionVerdict::Pinned];
+    let of_a_pick = said.map(|verdict| document.hears_leases_of(verdict));
+    assert_eq!((document.hears_leases(), of_a_pick), (false, [false; 2]));
+    let list = pool(4);
+    let members = PublishedList::new(Arc::clone(&list));
+    let asks = Asks::of(request(), Some(&members));
+    placed(&engine, &asks);
+    assert_eq!(asks.made.get(), 0, "the pick read no fact of a request");
+    assert_eq!(engine.leases.0.load(Ordering::Relaxed), 0, "no id taken");
+    assert!(heard.lock().is_empty(), "no word told");
 }
 
 /// A request that is not plain, and a plain one the turn finds no
