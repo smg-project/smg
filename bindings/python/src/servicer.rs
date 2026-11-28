@@ -705,7 +705,8 @@ fn native_media_options(
     // reported them; the pipeline refuses the entries that reach the family
     // (every rule the default loader reads for a family on that loader, the
     // flag rules for a family whose loader the engine registers for its
-    // processor class, none for a sampler that never followed a loader).
+    // processor class, none for a sampler that never followed a loader) and
+    // takes a `video.fps` entry as the rate of the interval walk.
     let video_frame_budget = count("video_frame_budget")?;
     // The engine's encoder budget, the most feature tokens one item may
     // carry; absent when the launcher could not tell, which leaves an item's

@@ -311,7 +311,8 @@ def smg_media_options(
     entries that reach the family (every rule the default loader reads for a
     family on that loader, the flag rules for a family whose loader the engine
     registers for its processor class, none for a sampler that never followed
-    a loader) and passes the rest. The engine's encoder budget goes along as
+    a loader), takes a ``video.fps`` entry as the rate of the interval walk
+    and passes the rest. The engine's encoder budget goes along as
     well (``encoder_budget`` when the caller derived it, else derived here):
     the pipeline refuses an item above it before the engine, which would admit
     the item and never schedule it.
@@ -425,7 +426,9 @@ VIDEO_SAMPLING_KEYS = ("fps", "max_frames", "min_frames", "temporal_patch_size")
 
 def video_loader_rule(model_config, environ: Mapping[str, str] | None = None) -> str | None:
     """The sampling rules of the engine's video loader that the smg pipeline
-    cannot follow, each named the way the launcher was given it, or ``None``:
+    cannot follow (but for the interval walk, which takes a reported
+    ``video.fps`` as its rate), each named the way the launcher was given it,
+    or ``None``:
     an explicit ``video.video_backend`` in ``--media-io-kwargs``, whatever its
     value (vLLM's media connector adds the loader it registers for a processor
     class only when the kwargs name none, so an explicit kwarg wins over that
@@ -443,8 +446,10 @@ def video_loader_rule(model_config, environ: Mapping[str, str] | None = None) ->
     processor class (the Qwen2-VL line, Qwen3-Omni, the GLM-5 family and the
     Qwen3-VL family: the environment variable never reaches that loader, an
     explicit ``opencv`` swaps it), the flag rules alone; and none for the
-    families with a sampler of their own, which never followed the loader and
-    start as before, so a fleet-wide loader setting does not block them."""
+    families with a sampler of their own, which start as before, so a
+    fleet-wide loader setting does not block them: they never followed the
+    loader, but for the interval walk, which takes a reported ``fps`` as its
+    rate."""
     source = os.environ if environ is None else environ
     mm_config = multimodal_config(model_config)
     kwargs = getattr(mm_config, "media_io_kwargs", None) or {}

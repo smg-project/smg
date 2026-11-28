@@ -376,7 +376,7 @@ fn video_sampling_reads_the_processors_config() {
     );
 
     assert_eq!(
-        video_sampling(spec, &shared_only, None, None),
+        video_sampling(spec, &shared_only, None, None, None),
         (
             Some(1.0),
             FrameSampling::TemporalGroups {
@@ -386,7 +386,7 @@ fn video_sampling_reads_the_processors_config() {
         )
     );
     assert_eq!(
-        video_sampling(spec, &with_video, None, None),
+        video_sampling(spec, &with_video, None, None, None),
         (
             Some(2.0),
             FrameSampling::TemporalGroups {
@@ -395,11 +395,18 @@ fn video_sampling_reads_the_processors_config() {
             }
         )
     );
-    // A rate the request states goes ahead of the config's.
+    // A rate the engine's start states goes ahead of the config's, and a rate
+    // the request states ahead of both.
     assert_eq!(
-        video_sampling(spec, &with_video, None, Some(0.5)).0,
-        Some(0.5)
+        video_sampling(spec, &with_video, None, Some(4.0), None).0,
+        Some(4.0)
     );
+    for start_fps in [None, Some(4.0)] {
+        assert_eq!(
+            video_sampling(spec, &with_video, None, start_fps, Some(0.5)).0,
+            Some(0.5)
+        );
+    }
 }
 
 #[test]

@@ -594,6 +594,10 @@ pub(crate) struct MultimodalComponents {
     /// the way its loader does (the worker-side pipeline knows it; `None`
     /// keeps each spec's own constant).
     pub video_frame_budget: Option<usize>,
+    /// The rate the engine's start states for a clip, for a spec whose
+    /// sampler walks a clip at a rate the way the engine's loader for it does
+    /// (the worker-side pipeline knows it; `None` keeps the spec's default).
+    pub video_start_fps: Option<f64>,
     /// The role whose workers take a request's pixels in the router's mode
     /// (`Mode::pixels_go_to`); the regular workers unless the router says
     /// otherwise.
@@ -689,6 +693,7 @@ impl MultimodalComponents {
             drain_fetches_on_error: false,
             inflight,
             video_frame_budget: None,
+            video_start_fps: None,
             pixels_go_to: WorkerType::Regular,
         })
     }
