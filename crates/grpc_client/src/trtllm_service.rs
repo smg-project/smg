@@ -141,6 +141,15 @@ impl TrtllmServiceClient {
         multimodal_input: Option<proto::MultimodalInput>,
         constraint: OutputConstraint,
     ) -> Result<proto::GenerateRequest, String> {
+        if body
+            .resolved_thinking_token_budget()
+            .map_err(|e| e.to_string())?
+            .is_some()
+        {
+            return Err(
+                "thinking_token_budget is unsupported by the TensorRT-LLM gRPC protocol".into(),
+            );
+        }
         refuse_logit_bias(body.logit_bias.as_ref())?;
         // Build sampling config
         let sampling_config = Self::build_sampling_config_from_chat(body);
@@ -685,6 +694,30 @@ pub fn status_healthy(status: &str) -> bool {
 mod tests {
     use super::*;
     use crate::channel::{testing::refused_endpoint, DEFAULT_CONNECT_TIMEOUT};
+
+    #[test]
+    fn chat_rejects_a_thinking_budget_the_trtllm_wire_cannot_carry() {
+        let build = |budget: i64| {
+            let chat = serde_json::from_value(serde_json::json!({
+                "model": "m", "messages": [{"role": "user", "content": "hi"}],
+                "max_completion_tokens": 32, "thinking_token_budget": budget
+            }))
+            .unwrap();
+            TrtllmServiceClient::build_generate_request_from_chat_parts(
+                "r".into(),
+                &chat,
+                "hi".into(),
+                vec![1],
+                None,
+                OutputConstraint::default(),
+            )
+        };
+
+        assert!(build(0)
+            .unwrap_err()
+            .contains("unsupported by the TensorRT-LLM gRPC protocol"));
+        assert_eq!(build(-1).unwrap().max_tokens, 32);
+    }
 
     /// A request with a `logit_bias` is refused: the wire has no sparse map.
     /// (The completion builder keeps a receiver, and a lazy channel needs the

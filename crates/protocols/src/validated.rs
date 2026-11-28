@@ -2600,6 +2600,23 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn invalid_effective_thinking_token_budget_returns_400_before_routing() {
+        for (canonical, param) in [
+            (json!(-2), "thinking_token_budget"),
+            (Value::Null, "custom_params.thinking_budget"),
+        ] {
+            let body = json!({
+                "model": "m", "messages": [{"role": "user", "content": "hi"}],
+                "thinking_token_budget": canonical, "custom_params": {"thinking_budget": "invalid"}
+            });
+            let (status, error) = chat_request(&body.to_string()).await.unwrap_err();
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(error["error"]["code"], "invalid_thinking_token_budget");
+            assert_eq!(error["error"]["param"], param);
+        }
+    }
+
     /// The Chat Completions extractor applies the Flash budget to model names
     /// and registered aliases, preserving both wire fields and their precedence.
     #[tokio::test]
