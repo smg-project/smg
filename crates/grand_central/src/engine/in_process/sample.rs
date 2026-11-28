@@ -5,8 +5,11 @@
 //! kept as it stands. A plain request of a place one pick decides is still
 //! answered that pick: every Nth of them is kept as the decision that names
 //! the worker at its place alone ([`AlonePick::decision`]), a drawn pick's
-//! trace with one target and no survivor counted. No whole decision is
-//! made for a record, so a request takes one turn of its pool.
+//! trace with one target and no survivor counted. A plain request whose
+//! whole decision is asked ahead of its making
+//! ([`super::single::ahead`]) is kept as that decision stands, as a
+//! whole pass's is. No whole decision is made for a record, so a request
+//! takes one turn of its pool.
 //!
 //! **The count is the calling thread's own** ([`COUNT`]): no decision
 //! writes a word another thread's decision reads. It starts over under
@@ -122,8 +125,10 @@ fn made_and_counted(
 /// A noted place's step toward a sample ([`super::single::noted`]): the
 /// decision that names the worker at the place, as the pass wrote it into
 /// `written`, is kept as a whole decision is ([`whole`]), under the id
-/// `maker` states. Under a document that keeps no sample the pass runs
-/// this one test of the step.
+/// `maker` states. A whole decision asked ahead of its request's making
+/// takes the same step ([`super::single::ahead`]), a pick or not: no
+/// request was made for it either. Under a document that keeps no sample
+/// the pass runs this one test of the step.
 #[inline(always)]
 pub(super) fn noted(
     own: Loaded<'_, '_>,
@@ -226,9 +231,11 @@ impl InProcess {
     ///
     /// A sample changes no answer. A request one pick of a picker decided
     /// is kept as that pick: its record holds a drawn pick's trace, with
-    /// one target and no survivor counted. A record is one decision of the
-    /// engine: a call that decides again, past a target it could not send
-    /// to, counts each of its decisions.
+    /// one target and no survivor counted. A request whose whole decision
+    /// was asked ahead of its making is kept as that decision stands, as a
+    /// whole pass's is. A record is one decision of the engine: a call
+    /// that decides again, past a target it could not send to, counts each
+    /// of its decisions.
     #[must_use]
     pub fn explained(&self, request_id: &[u8]) -> Option<DecisionRecord> {
         self.in_force().kept_sample(request_id)

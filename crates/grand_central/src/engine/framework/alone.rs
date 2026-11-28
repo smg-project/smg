@@ -135,6 +135,9 @@ impl Engine {
     ///
     /// [`Picker::pick_alone`]: super::Picker::pick_alone
     #[must_use]
+    // In line at every caller: left out of line, a request under a second
+    // model name counted 18 instructions more through the placing call.
+    #[inline(always)]
     pub fn place_for(&self, model: &str, phase: Phase) -> Place<'_> {
         let found = self.binding_position(model, phase);
         let Some((at, binding)) = found.and_then(|at| Some((at, self.binding_at(at)?))) else {
@@ -160,6 +163,63 @@ impl Engine {
                 in_the_way,
             },
         }
+    }
+
+    /// The profile of the place of `model` and `phase` whose whole
+    /// decision reads of a request its model, its phase, its seed and the
+    /// instant alone: its picker and each scorer of it are stages of the
+    /// crate that read no more of a request, which the crate tells by
+    /// their names ([`PICKS_BY_ITS_SEED`], [`SCORES_BY_ITS_ROWS`]). `None`
+    /// where the place is no such place, as under a picker or a scorer of
+    /// a host's own. Its filters are the ones a place
+    /// one pick decides holds, and the first stage past them that asks
+    /// more of a decision is a scorer ([`Self::stage_in_the_way`]). The
+    /// profile draws for every request and asks nothing else ahead of its
+    /// run, its stages declare no need beyond the workers' load reports
+    /// ([`Needs::loads`]), which is all such a decision is fed, and its
+    /// binding states no sessions rule and names no shadow.
+    ///
+    /// [`PICKS_BY_ITS_SEED`]: super::PICKS_BY_ITS_SEED
+    /// [`SCORES_BY_ITS_ROWS`]: super::SCORES_BY_ITS_ROWS
+    #[cfg(feature = "in-process")]
+    pub(crate) fn place_ahead_for(&self, model: &str, phase: Phase) -> Option<AloneProfile> {
+        let at = self.binding_position(model, phase)?;
+        let binding = self.binding_at(at)?;
+        let index = profile_index(binding, phase)?;
+        let profile = self.profiles.get(usize::from(index))?;
+        let scored = matches!(
+            self.stage_in_the_way(index, profile, phase),
+            Some(InTheWay::Scorer(_))
+        );
+        let unread = || {
+            let mut scorers = profile.scorers.iter();
+            scorers.all(|weighted| super::SCORES_BY_ITS_ROWS.contains(&weighted.scorer.name()))
+        };
+        let seeded = super::PICKS_BY_ITS_SEED.contains(&profile.picker.name());
+        // The engines' mark says the picker's unit, as power of two's is,
+        // and no fact of a list: it stands beside the draw's. A list that
+        // holds an engine of several workers is left to the whole pass by
+        // its own records, where the draws are asked.
+        let draws = self
+            .marks
+            .get(usize::from(index))
+            .is_some_and(|marks| marks.0 & !Marks::ENGINES == Marks::DRAWS_FIRST);
+        let place = Named {
+            at,
+            binding,
+            phase,
+            index,
+            profile,
+        };
+        let reports = Needs {
+            loads: true,
+            ..Needs::default()
+        };
+        let needs = self.profile_needs.get(usize::from(index));
+        let fed = needs.is_some_and(|needs| needs.within(reports));
+        let sessions = binding.plan == Plan::Single && binding.sessions.is_some();
+        let alone = scored && draws && fed && seeded && unread();
+        (alone && !sessions && !self.shadowed(place)).then_some(AloneProfile(index))
     }
 
     /// The first place a binding of the document names that is not decided
@@ -288,6 +348,9 @@ impl Engine {
     /// The first stage of `profile`, which stands at `index`, that asks
     /// more of a decision than one pick of its picker at a place of
     /// `phase`. `None` where no stage does.
+    // In line at every caller: left out of line, a request under a second
+    // model name counted 18 instructions more through the placing call.
+    #[inline(always)]
     fn stage_in_the_way(&self, index: u16, profile: &Profile, phase: Phase) -> Option<InTheWay> {
         let held = RowTests::held_by_a_pass(phase);
         let mut tests = RowTests::none();

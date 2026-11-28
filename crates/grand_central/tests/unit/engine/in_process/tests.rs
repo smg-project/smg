@@ -712,3 +712,34 @@ fn a_request_is_made_from_the_document_its_decision_is_made_under() {
     assert_eq!(generation, document.generation);
     assert_eq!(pick.trace.generation, generation);
 }
+
+/// The unit tests' way to a decision asked ahead with a seed they state.
+/// The placing call's seed is drawn fresh, so a test that compares such a
+/// decision with the made request's states the seed here, and the pass
+/// reads it in a test build alone (`seed_ahead`).
+pub(in crate::engine::in_process) mod seed_hook {
+    use std::cell::Cell;
+
+    thread_local! {
+        static SEED: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+
+    /// The seed stated on this thread, if a test states one now.
+    pub(in crate::engine::in_process) fn seed() -> Option<u64> {
+        SEED.get()
+    }
+
+    /// Runs `run` with `seed` stated on this thread: a pass inside it
+    /// may decide its request ahead of the making, whoever stated the
+    /// request, and such a decision draws from `seed`.
+    pub(in crate::engine::in_process) fn stated<T>(seed: u64, run: impl FnOnce() -> T) -> T {
+        struct Restored(Option<u64>);
+        impl Drop for Restored {
+            fn drop(&mut self) {
+                SEED.set(self.0);
+            }
+        }
+        let _restored = Restored(SEED.replace(Some(seed)));
+        run()
+    }
+}
