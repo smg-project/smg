@@ -208,16 +208,20 @@ impl Sides {
     /// The three lists as the host hands them for one request.
     fn lists<'a>(&'a self, host: &'a Host) -> EncodeLists<'a> {
         let places = |list: usize| Some(self.places.as_ref()?[list].as_slice());
-        let mut pair = PairLists::of(host.list.lent(), self.decodes.lent(), &self.classes, &Open);
-        pair.prefill_places = places(0);
-        pair.decode_places = places(1);
-        let mut encode_lists = EncodeLists::of(
-            pair,
-            self.encoders.lent(),
-            &self.facts,
-            &self.prefill_classes,
-        );
-        encode_lists.encoders_places = places(2);
+        let prefill = host.list.lent();
+        let decode = self.decodes.lent();
+        let prefill_places = places(0);
+        let decode_places = places(1);
+        let pair = {
+            let mut pair = PairLists::of(prefill, decode, &self.classes, &Open);
+            pair.prefill_places = prefill_places;
+            pair.decode_places = decode_places;
+            pair
+        };
+        let encoders = self.encoders.lent();
+        let encoders_places = places(2);
+        let mut encode_lists = EncodeLists::of(pair, encoders, &self.facts, &self.prefill_classes);
+        encode_lists.encoders_places = encoders_places;
         encode_lists
     }
 
@@ -327,12 +331,17 @@ impl Sides {
         ring: Option<&dyn LentRing>,
         rule: bool,
     ) -> Option<u32> {
-        let mut request = PlaceRequest::of(MODEL, WorkerLists::Encode(self.lists(host)));
-        request.prompt.tokens = Some(&place::PROMPT);
-        request.media = images();
-        request.encode = Some(items);
-        request.ring = ring;
-        request.admits = ruled::admits(rule);
+        let media = images();
+        let admits = ruled::admits(rule);
+        let request = {
+            let mut request = PlaceRequest::of(MODEL, WorkerLists::Encode(self.lists(host)));
+            request.prompt.tokens = Some(&place::PROMPT);
+            request.media = media;
+            request.encode = Some(items);
+            request.ring = ring;
+            request.admits = admits;
+            request
+        };
         let mut answer = host.engine.place(&request);
         let placement = answer.as_mut().ok()?;
         if placement.encoders.workers().len() != ITEMS {

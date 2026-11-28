@@ -92,11 +92,18 @@ pub(super) fn lent(host: &Host) -> Option<&'static dyn LentRing> {
 /// the place this says is the first. With `rule` the request states a
 /// route's rule ([`ruled::admits`]), and it lends `ring` ([`lent`]).
 pub(super) fn one(host: &Host, rule: bool, ring: Option<&'static dyn LentRing>) -> Option<u32> {
-    let mut request = PlaceRequest::of(MODEL, WorkerLists::Single(host.list.lent()));
-    request.prompt.tokens = Some(&PROMPT);
-    request.prompt.entry = Some(&Whole);
-    request.admits = ruled::admits(rule);
-    request.ring = ring;
+    // The route's rule is read before the request starts. The request then
+    // starts in a block of its own, with nothing between its start and its
+    // assignments, so that it can be written once.
+    let admits = ruled::admits(rule);
+    let request = {
+        let mut request = PlaceRequest::of(MODEL, WorkerLists::Single(host.list.lent()));
+        request.prompt.tokens = Some(&PROMPT);
+        request.prompt.entry = Some(&Whole);
+        request.admits = admits;
+        request.ring = ring;
+        request
+    };
     let mut answer = host.engine.place(&request);
     let placement = answer.as_mut().ok()?;
     if placement.owes_events() {
@@ -121,10 +128,14 @@ pub(super) fn asks() -> Option<bool> {
 /// the turn states a route's rule ([`ruled::admits`]), which a decision
 /// made inside the tree asks ahead of the tree's write.
 pub(super) fn turn(host: &Host, prompt: &conversations::Turn<'_>, rule: bool) -> Option<u32> {
-    let mut request = PlaceRequest::of(MODEL, WorkerLists::Single(host.list.lent()));
-    request.prompt.tokens = Some(prompt.tokens);
-    request.prompt.entry = Some(prompt);
-    request.admits = ruled::admits(rule);
+    let admits = ruled::admits(rule);
+    let request = {
+        let mut request = PlaceRequest::of(MODEL, WorkerLists::Single(host.list.lent()));
+        request.prompt.tokens = Some(prompt.tokens);
+        request.prompt.entry = Some(prompt);
+        request.admits = admits;
+        request
+    };
     let mut answer = host.engine.place(&request);
     let placement = answer.as_mut().ok()?;
     let worker = placement.id().0 as u32;
