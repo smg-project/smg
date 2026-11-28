@@ -2006,10 +2006,12 @@ impl<G: Generation> WorkerMonitor<G> {
     /// go when the report at the URL is the worker's own, or none is there,
     /// and the series the report fed are set to the sentinel with it
     /// ([`Self::clear_series`]). A report another worker started ahead of
-    /// this eviction stays, with what the sink holds at the URL: both are
-    /// that worker's. The worker's mark of a stream that pushes stays too:
-    /// the stale rule still judges a worker that stays registered, and the
-    /// stop alone takes the mark off ([`Self::stop`]).
+    /// this eviction stays, with what the sink holds at the URL: the flag
+    /// and the receipts are that worker's; rank loads a poll of the worker
+    /// that left laid stay too, and name their worker. The worker's mark of
+    /// a stream that pushes stays too: the stale rule still judges a worker
+    /// that stays registered, and the stop alone takes the mark off
+    /// ([`Self::stop`]).
     fn evict_worker_loads(&self, worker: &Arc<dyn Worker>) {
         let url = worker.url();
         self.native_loads_memo
