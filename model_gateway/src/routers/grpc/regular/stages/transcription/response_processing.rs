@@ -9,6 +9,7 @@ use axum::response::Response;
 use crate::{
     observability::metrics::metrics_labels,
     routers::{
+        common::retry::mark_non_retryable,
         error,
         grpc::{
             common::{response_formatting::TokenCounts, stages::ProcessStage},
@@ -72,10 +73,15 @@ impl ProcessStage for TranscriptionResponseProcessingStage {
             .map(|response| response.text.as_str())
             .filter(|text| !text.trim().is_empty())
             .ok_or_else(|| {
-                error::internal_error(
+                // Never retried: the engine answered whole and the gateway
+                // refuses what it said, so another attempt would run an
+                // engine again on the same audio for the same reading.
+                let mut response = error::internal_error(
                     "empty_transcription_response",
                     format!("{} returned no transcription text", spec.family.name()),
-                )
+                );
+                mark_non_retryable(&mut response);
+                response
             })?;
 
         let text = spec.family.parse_transcript(raw);

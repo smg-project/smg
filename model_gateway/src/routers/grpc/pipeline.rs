@@ -1472,6 +1472,7 @@ impl RequestPipeline {
         components: Arc<SharedComponents>,
         tenant_request_meta: Option<TenantRequestMeta>,
         rate_limit_cell: Option<Arc<RateLimitCell>>,
+        retry_config: Option<&RetryConfig>,
     ) -> Response {
         // Same label the HTTP layer records for /v1/audio/transcriptions, so
         // the endpoint's metrics don't split across backends.
@@ -1482,7 +1483,7 @@ impl RequestPipeline {
             ));
             ctx.input.tenant_request_meta = tenant_request_meta;
             ctx.input.rate_limit_cell = rate_limit_cell;
-            self.run(ctx, Some(ENDPOINT), None)
+            self.run(ctx, Some(ENDPOINT), retry_config)
         };
         match run.await {
             Ok(RunOutcome::Early(response)) => response,

@@ -91,6 +91,9 @@ pub struct GrpcRouter {
     responses_context: Option<ResponsesContext>,
     harmony_responses_context: Option<ResponsesContext>,
     retry_config: RetryConfig,
+    /// The router config's `max_buffered_request_bytes`: a transcription
+    /// whose audio is larger gets one attempt, as on the HTTP router.
+    max_buffered_request_bytes: u64,
 }
 
 impl GrpcRouter {
@@ -278,12 +281,14 @@ impl GrpcRouter {
             responses_context,
             harmony_responses_context,
             retry_config: ctx.router_config.effective_retry_config(),
+            max_buffered_request_bytes: ctx.router_config.max_buffered_request_bytes,
         })
     }
 
     /// The per-model retry override registered by a worker, else the router
     /// default. Applied at every retrying endpoint
-    /// (chat/generate/messages/completion) in every mode.
+    /// (chat/generate/messages/completion) in every mode, and at a
+    /// transcription, which Regular mode alone serves.
     ///
     /// Retry overrides are keyed by canonical model ID, so `model_id` must
     /// already be canonical (e.g. via [`Self::resolve_canonical_model_id`]) --
@@ -1293,19 +1298,31 @@ impl RouterTrait for GrpcRouter {
                 "Audio transcriptions not implemented",
             );
         };
-        // One dispatch, no retry loop, as before.
+        // Canonicalize once, up front -- see `resolve_canonical_model_id`'s
+        // doc comment. Rewrite the body's `model` field to match; see
+        // `chat_request_for_pipeline`.
+        let model_id = self.resolve_canonical_model_id(model_id);
+        let mut canonical_body = body.clone();
+        canonical_body.model.clone_from(&model_id);
+        // A failed attempt moves to another worker under the model's retry
+        // settings, as a chat's does: the transcript is read whole, so no
+        // early answer closes the retry window. Audio larger than
+        // `max_buffered_request_bytes` gets one attempt, as on the HTTP
+        // router: a retry holds the built request beside the one it sends.
+        let retried = audio.bytes.len() as u64 <= self.max_buffered_request_bytes;
         self.execute_reserved(
-            model_id.to_string(),
-            |model_id, rate_limit_cell, _retry_config| async move {
+            model_id,
+            |model_id, rate_limit_cell, retry_config| async move {
                 pipeline
                     .execute_transcription(
-                        Arc::new(body.clone()),
+                        Arc::new(canonical_body),
                         Arc::new(audio),
                         headers.cloned(),
                         model_id,
                         Arc::clone(&self.shared_components),
                         Some(tenant_meta.clone()),
                         Some(rate_limit_cell),
+                        retried.then_some(&retry_config),
                     )
                     .await
             },

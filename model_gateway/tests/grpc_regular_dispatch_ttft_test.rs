@@ -31,7 +31,7 @@ use common::{
     engine_answers::{VllmAnswers, VllmGenerateStream},
     grpc_harness::{
         build_grpc_router, grpc_router, grpc_router_config, grpc_test_context_with_tokenizer,
-        grpc_workers, serve_engine,
+        grpc_worker, grpc_workers, serve_engine,
     },
     metrics_capture::{self, render_after},
     mock_mcp_server::MockMCPServer,
@@ -42,16 +42,20 @@ use llm_tokenizer::{
     traits::{MediaHandling, RendererCapabilities},
     MockTokenizer,
 };
-use openai_protocol::transcription::{AudioFile, TranscriptionRequest};
+use openai_protocol::{
+    model_card::ModelCard,
+    transcription::{AudioFile, TranscriptionRequest},
+};
 use smg::{
-    config::RetryConfig,
+    app_context::AppContext,
+    config::{RetryConfig, RouterConfigBuilder},
     middleware::{RequestStarted, TenantRequestMeta},
     routers::RouterTrait,
     tenant::TenantKey,
 };
 use smg_grpc_client::vllm_proto as proto;
 use smg_test_harness as common;
-use smg_worker::identity::basic::{RuntimeType, WorkerType};
+use smg_worker::identity::basic::{RuntimeType, Worker, WorkerType};
 use tonic::{Request, Response, Status};
 
 const MODEL: &str = "regular-dispatch-ttft-test-model";
@@ -60,8 +64,14 @@ const HARMONY_MODEL: &str = "gpt-oss-dispatch-ttft-test-model";
 /// A model id the one transcription family recognises: a transcription is a
 /// chat-shaped generation to the engine.
 const ASR_MODEL: &str = "qwen3-asr-dispatch-ttft-test-model";
+/// An alias a case's workers give `ASR_MODEL`.
+const ASR_ALIAS: &str = "dispatch-ttft-test-transcription-alias";
+/// The audio of every transcription request here.
+const CLIP: &[u8] = b"not real audio";
 /// The ids the transcription case's engine answers, words of its tokenizer.
 const TRANSCRIPT_IDS: [u32; 3] = [100, 101, 102];
+/// An id the transcription case's tokenizer decodes to a blank.
+const BLANK_ID: u32 = 103;
 const OUTPUT_TOKENS: u32 = 3;
 const HELD_HEADERS_DELAY: Duration = Duration::from_millis(300);
 const POST_FIRST_DELAY: Duration = Duration::from_millis(600);
@@ -123,12 +133,20 @@ async fn regular_router() -> Box<dyn RouterTrait> {
     router_over(&[port], MODEL, None).await
 }
 
-/// A regular router serving `ASR_MODEL` over one held-headers engine. Its
-/// mock tokenizer renders media as template text, so the audio turn needs no
-/// media processing, and it names the engine's ids, so the transcript is text.
+/// A regular router serving `ASR_MODEL` over one held-headers engine.
 async fn transcription_router() -> Box<dyn RouterTrait> {
     let engine = held_headers_engine(Some(TRANSCRIPT_IDS.to_vec()));
     let port = serve_engine(engine.into_server()).await;
+    transcription_router_over(&[port], None).await
+}
+
+/// The test context of a regular router under `config` that serves
+/// `ASR_MODEL`. Its mock tokenizer renders media as template text, so the
+/// audio turn needs no media processing, and it names the engines' ids, so
+/// the transcript is text.
+fn transcription_context(
+    config: RouterConfigBuilder,
+) -> impl std::future::Future<Output = Arc<AppContext>> {
     let tokenizer = MockTokenizer::new()
         .with_renderer_capabilities(RendererCapabilities {
             media_handling: MediaHandling::TemplateText,
@@ -138,16 +156,28 @@ async fn transcription_router() -> Box<dyn RouterTrait> {
             ("spoken", TRANSCRIPT_IDS[0]),
             ("words", TRANSCRIPT_IDS[1]),
             ("here", TRANSCRIPT_IDS[2]),
+            (" ", BLANK_ID),
         ]);
-    let config = grpc_router_config()
-        .regular_mode(vec![])
-        .random_policy()
-        .build_unchecked();
-    let app_context =
-        grpc_test_context_with_tokenizer(config, ASR_MODEL, Arc::new(tokenizer)).await;
+    grpc_test_context_with_tokenizer(config.build_unchecked(), ASR_MODEL, Arc::new(tokenizer))
+}
+
+/// A regular router serving `ASR_MODEL` over the engines of `ports`.
+async fn transcription_router_over(
+    ports: &[u16],
+    retries: Option<RetryConfig>,
+) -> Box<dyn RouterTrait> {
+    let mut config = grpc_router_config().regular_mode(vec![]).random_policy();
+    if let Some(retries) = retries {
+        config = config.retry_config(retries);
+    }
+    let app_context = transcription_context(config).await;
+    let workers: Vec<(u16, WorkerType)> = ports
+        .iter()
+        .map(|&port| (port, WorkerType::Regular))
+        .collect();
     grpc_router(
         &app_context,
-        grpc_workers(&[(port, WorkerType::Regular)], RuntimeType::Vllm, ASR_MODEL),
+        grpc_workers(&workers, RuntimeType::Vllm, ASR_MODEL),
     )
     .await
 }
@@ -212,6 +242,22 @@ fn chat_request(model: &str, streaming: bool) -> serde_json::Value {
     })
 }
 
+/// The answer of one transcription request for `model`, its body unread.
+async fn transcribe(router: &dyn RouterTrait, model: &str) -> axum::response::Response {
+    let request = TranscriptionRequest {
+        model: model.to_string(),
+        ..Default::default()
+    };
+    let audio = AudioFile {
+        bytes: bytes::Bytes::from_static(CLIP),
+        file_name: "clip.wav".to_string(),
+        content_type: Some("audio/wav".to_string()),
+    };
+    router
+        .route_audio_transcriptions(None, &tenant(), &request, audio, model)
+        .await
+}
+
 /// The answer of one request on `route`: what the route's handler returns,
 /// its body unread.
 #[expect(clippy::expect_used, reason = "test helper")]
@@ -230,20 +276,7 @@ async fn route_request(
                 .route_chat(None, &tenant, Arc::new(request), model)
                 .await
         }
-        Route::Transcriptions => {
-            let request = TranscriptionRequest {
-                model: model.to_string(),
-                ..Default::default()
-            };
-            let audio = AudioFile {
-                bytes: bytes::Bytes::from_static(b"not real audio"),
-                file_name: "clip.wav".to_string(),
-                content_type: Some("audio/wav".to_string()),
-            };
-            router
-                .route_audio_transcriptions(None, &tenant, &request, audio, model)
-                .await
-        }
+        Route::Transcriptions => transcribe(router, model).await,
         Route::Messages => {
             let request = serde_json::from_value(serde_json::json!({
                 "model": model,
@@ -890,6 +923,172 @@ fn a_retried_dispatch_anchors_at_the_answering_attempt() {
         wait + ttft >= floor,
         "chat: dispatch wait {wait} and TTFT {ttft} add up to the time to first token from the request's entry ({floor})"
     );
+}
+
+/// A transcription whose first attempt fails with a retryable status answers
+/// from the other worker, as a chat does: the route hands the pipeline the
+/// retry settings it resolved.
+#[tokio::test]
+async fn a_transcription_answers_on_its_retry() {
+    let calls = Arc::new(AtomicU32::new(0));
+    let engine = FailsFirstEngine {
+        calls: Arc::clone(&calls),
+        answering: held_headers_engine(Some(TRANSCRIPT_IDS.to_vec())),
+    };
+    let first = serve_engine(engine.clone().into_server()).await;
+    let second = serve_engine(engine.into_server()).await;
+    let retries = RetryConfig {
+        max_retries: 2,
+        initial_backoff_ms: 1,
+        max_backoff_ms: 2,
+        ..Default::default()
+    };
+    let router = transcription_router_over(&[first, second], Some(retries)).await;
+    // A 200 with the transcript, or this fails on the first attempt's status.
+    request_entered(router.as_ref(), Route::Transcriptions, false, None).await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "one failed attempt, one answer"
+    );
+}
+
+/// An engine that counts its generate calls, across every worker it serves,
+/// and answers each as the held-headers engine does.
+#[derive(Clone)]
+struct CountedEngine {
+    calls: Arc<AtomicU32>,
+    answering: HeldHeadersEngine,
+}
+
+#[tonic::async_trait]
+impl VllmAnswers for CountedEngine {
+    async fn generate(
+        &self,
+        request: Request<proto::GenerateRequest>,
+    ) -> Result<Response<VllmGenerateStream>, Status> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.answering.generate(request).await
+    }
+}
+
+/// A transcript of nothing but blanks is refused by the gateway itself, on a
+/// whole engine answer: the caller reads that 500 behind one dispatch, and no
+/// retry runs an engine again on the same audio for the same reading.
+#[tokio::test]
+async fn a_blank_transcript_is_refused_behind_one_dispatch() {
+    let calls = Arc::new(AtomicU32::new(0));
+    let engine = CountedEngine {
+        calls: Arc::clone(&calls),
+        answering: held_headers_engine(Some(vec![BLANK_ID; TRANSCRIPT_IDS.len()])),
+    };
+    let first = serve_engine(engine.clone().into_server()).await;
+    let second = serve_engine(engine.into_server()).await;
+    let retries = RetryConfig {
+        max_retries: 3,
+        initial_backoff_ms: 1,
+        max_backoff_ms: 2,
+        ..Default::default()
+    };
+    let router = transcription_router_over(&[first, second], Some(retries)).await;
+    let response = route_request(router.as_ref(), Route::Transcriptions, false).await;
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap_or_default();
+    let body = String::from_utf8_lossy(&bytes);
+    assert_eq!(status, http::StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert!(body.contains("empty_transcription_response"), "{body}");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "one dispatch and no retry: {body}"
+    );
+}
+
+/// A transcription asked for by a model's alias retries under that model's
+/// own retry settings, as a chat does: the router's allow one attempt here
+/// and the model's two, and the second attempt answers.
+#[tokio::test]
+async fn a_transcription_by_an_alias_retries_under_its_model_s_settings() {
+    let calls = Arc::new(AtomicU32::new(0));
+    let engine = FailsFirstEngine {
+        calls: Arc::clone(&calls),
+        answering: held_headers_engine(Some(TRANSCRIPT_IDS.to_vec())),
+    };
+    let first = serve_engine(engine.clone().into_server()).await;
+    let second = serve_engine(engine.into_server()).await;
+    let one_attempt = RetryConfig {
+        max_retries: 1,
+        ..Default::default()
+    };
+    let config = grpc_router_config()
+        .regular_mode(vec![])
+        .random_policy()
+        .retry_config(one_attempt);
+    let app_context = transcription_context(config).await;
+    let workers = [first, second]
+        .into_iter()
+        .map(|port| {
+            let card = ModelCard::new(ASR_MODEL).with_alias(ASR_ALIAS);
+            Arc::new(grpc_worker(port, WorkerType::Regular, RuntimeType::Vllm, card).build())
+                as Arc<dyn Worker>
+        })
+        .collect();
+    let router = grpc_router(&app_context, workers).await;
+    let two_attempts = RetryConfig {
+        max_retries: 2,
+        initial_backoff_ms: 1,
+        max_backoff_ms: 2,
+        ..Default::default()
+    };
+    app_context
+        .worker_registry
+        .set_model_retry_config(ASR_MODEL, two_attempts, true);
+
+    let response = transcribe(router.as_ref(), ASR_ALIAS).await;
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "one failed attempt, one answer"
+    );
+}
+
+/// A transcription whose audio is larger than `max_buffered_request_bytes`
+/// gets one attempt, as on the HTTP router: the caller reads the first
+/// attempt's failure, and no second dispatch runs.
+#[tokio::test]
+async fn a_transcription_above_the_buffer_bound_gets_one_attempt() {
+    let calls = Arc::new(AtomicU32::new(0));
+    let engine = FailsFirstEngine {
+        calls: Arc::clone(&calls),
+        answering: held_headers_engine(Some(TRANSCRIPT_IDS.to_vec())),
+    };
+    let first = serve_engine(engine.clone().into_server()).await;
+    let second = serve_engine(engine.into_server()).await;
+    let retries = RetryConfig {
+        max_retries: 2,
+        initial_backoff_ms: 1,
+        max_backoff_ms: 2,
+        ..Default::default()
+    };
+    let config = grpc_router_config()
+        .regular_mode(vec![])
+        .random_policy()
+        .retry_config(retries)
+        .max_buffered_request_bytes(CLIP.len() as u64 - 1);
+    let app_context = transcription_context(config).await;
+    let workers = [(first, WorkerType::Regular), (second, WorkerType::Regular)];
+    let router = grpc_router(
+        &app_context,
+        grpc_workers(&workers, RuntimeType::Vllm, ASR_MODEL),
+    )
+    .await;
+
+    let response = transcribe(router.as_ref(), ASR_MODEL).await;
+    assert!(response.status().is_server_error(), "the first failure");
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "one attempt and no retry");
 }
 
 /// A client that leaves after the first chunk records nothing: no TTFT,
