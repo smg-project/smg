@@ -209,10 +209,7 @@ fn run(ranks: usize, pinned: Option<usize>, steps: &[Step]) -> Vec<Option<usize>
                             None => cache.remove_worker(&url),
                         }
                     } else if load.has_absolute_token_data() && load.ranks_are_dp_ranks() {
-                        cache.update_dp_loads(&HashMap::from([(
-                            url.clone(),
-                            dp_rank_token_loads(&load),
-                        )]));
+                        cache.update_dp_loads(vec![(&worker, dp_rank_token_loads(&load))]);
                     } else {
                         cache.remove_workers(std::slice::from_ref(&url));
                     }

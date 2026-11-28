@@ -129,6 +129,7 @@ use crate::{
         writers::{registered_engine_role, LoadTest, Metrics},
     },
     registry::{event::WorkerEvent, worker_model_ids, Generation, WorkerRegistry},
+    runtime::WorkerRuntime,
     value_bounds,
     worker::{
         LoadRecord, LoadTelemetry, RuntimeType, SchedulerLoadSnapshot, WorkerGroupKey,
@@ -150,11 +151,15 @@ pub(crate) const ENGINE_LOADS_ROUTE: &str = "/v1/loads";
 /// is a failed fetch.
 const MAX_LOAD_ANSWER_BYTES: usize = 64 * 1024 * 1024;
 
+/// The rank loads one poll laid for one worker: the worker and its
+/// `<dp_rank, load>`.
+type PolledRankLoads<'a> = (&'a Arc<dyn Worker>, HashMap<isize, isize>);
+
 /// The rank loads by worker as the update line writes them: each address
 /// masked. A worker's address may hold a credential in its userinfo or a
 /// token in its query. The address is read when the line is written, so
 /// nothing is parsed while debug logging is off.
-struct MaskedLoads<'a>(&'a HashMap<String, HashMap<isize, isize>>);
+struct MaskedLoads<'a>(&'a [PolledRankLoads<'a>]);
 
 impl Debug for MaskedLoads<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -162,9 +167,46 @@ impl Debug for MaskedLoads<'_> {
             .entries(
                 self.0
                     .iter()
-                    .map(|(url, ranks)| (Endpoint::redacted_str(url), ranks)),
+                    .map(|(worker, ranks)| (Endpoint::redacted_str(worker.url()), ranks)),
             )
             .finish()
+    }
+}
+
+/// The rank loads a poll laid at a URL, and whose they are. A URL outlives
+/// the worker registered at it, and the loads of a worker that left can
+/// still stand there when the next one takes requests: a poll that ends
+/// behind its worker's eviction lays them, and an eviction that finds the
+/// pushed report of the worker that came leaves them. So the loads name the
+/// worker whose poll laid them and the runtime it counts on. That worker
+/// reads them, and so does one that counts on its runtime (a same-URL
+/// `replace()` hands the worker that comes the runtime of the handle that
+/// leaves); a worker registered anew at the URL has no telemetry in them.
+#[derive(Debug)]
+struct RankLoads {
+    loads: HashMap<isize, isize>,
+    layer: Weak<dyn Worker>,
+    runtime: Option<Weak<WorkerRuntime>>,
+}
+
+impl RankLoads {
+    fn laid_by(worker: &Arc<dyn Worker>, loads: HashMap<isize, isize>) -> Self {
+        Self {
+            loads,
+            layer: Arc::downgrade(worker),
+            runtime: worker
+                .runtime_state()
+                .map(|runtime| Arc::downgrade(&runtime)),
+        }
+    }
+
+    fn is_of(&self, worker: &dyn Worker) -> bool {
+        std::ptr::addr_eq(self.layer.as_ptr(), std::ptr::from_ref(worker))
+            || self.runtime.as_ref().is_some_and(|laid| {
+                worker
+                    .runtime_state()
+                    .is_some_and(|runtime| std::ptr::eq(laid.as_ptr(), Arc::as_ptr(&runtime)))
+            })
     }
 }
 
@@ -180,8 +222,8 @@ impl Debug for MaskedLoads<'_> {
 /// that streams brings its own feed.
 #[derive(Debug, Default)]
 pub struct WorkerLoadManager {
-    /// `<worker_url, <dp_rank, load>>`
-    dp_cached_loads: RwLock<HashMap<String, HashMap<isize, isize>>>,
+    /// `<worker_url, <dp_rank, load>>`, with the worker that laid them.
+    dp_cached_loads: RwLock<HashMap<String, RankLoads>>,
 }
 
 impl WorkerLoadManager {
@@ -192,24 +234,30 @@ impl WorkerLoadManager {
     }
 
     /// Replace cached rank loads for the supplied workers, preserving other workers.
-    pub(crate) fn update_dp_loads(&self, loads: &HashMap<String, HashMap<isize, isize>>) {
+    pub(crate) fn update_dp_loads(&self, loads: Vec<PolledRankLoads<'_>>) {
         debug!(
             "WorkerLoadManager update_dp_loads map:{:?}",
-            MaskedLoads(loads)
+            MaskedLoads(&loads)
         );
         let mut cached = self.dp_cached_loads.write();
-        cached.extend(loads.iter().map(|(k, v)| (k.clone(), v.clone())));
+        for (worker, loads) in loads {
+            cached.insert(worker.url().to_string(), RankLoads::laid_by(worker, loads));
+        }
     }
 
     /// Select and increment the least-loaded eligible rank. A virtual worker
-    /// can only select its pinned rank; missing telemetry returns `None`.
+    /// can only select its pinned rank; missing telemetry returns `None`, and
+    /// so do loads another worker laid at the URL (`RankLoads`).
     pub fn select_and_increment_lowest_dp_load(
         &self,
         worker: &dyn Worker,
         increment: isize,
     ) -> Option<isize> {
         let mut cached = self.dp_cached_loads.write();
-        let loads = cached.get_mut(worker.url())?;
+        let loads = &mut cached
+            .get_mut(worker.url())
+            .filter(|laid| laid.is_of(worker))?
+            .loads;
         let (&dp_rank, _) = loads
             .iter()
             .filter(|(rank, _)| {
@@ -243,8 +291,8 @@ impl WorkerLoadManager {
         let Ok(rank) = isize::try_from(rank) else {
             return;
         };
-        if let Some(loads) = self.dp_cached_loads.write().get_mut(url) {
-            loads.remove(&rank);
+        if let Some(laid) = self.dp_cached_loads.write().get_mut(url) {
+            laid.loads.remove(&rank);
         }
     }
 
@@ -1958,10 +2006,12 @@ impl<G: Generation> WorkerMonitor<G> {
     /// go when the report at the URL is the worker's own, or none is there,
     /// and the series the report fed are set to the sentinel with it
     /// ([`Self::clear_series`]). A report another worker started ahead of
-    /// this eviction stays, with what the sink holds at the URL: both are
-    /// that worker's. The worker's mark of a stream that pushes stays too:
-    /// the stale rule still judges a worker that stays registered, and the
-    /// stop alone takes the mark off ([`Self::stop`]).
+    /// this eviction stays, with what the sink holds at the URL: the flag
+    /// and the receipts are that worker's; rank loads a poll of the worker
+    /// that left laid stay too, and name their worker. The worker's mark of
+    /// a stream that pushes stays too: the stale rule still judges a worker
+    /// that stays registered, and the stop alone takes the mark off
+    /// ([`Self::stop`]).
     fn evict_worker_loads(&self, worker: &Arc<dyn Worker>) {
         let url = worker.url();
         self.native_loads_memo
@@ -6240,10 +6290,7 @@ mod native_loads_tests {
             // Simulate a previously cached backend-wide snapshot under this URL.
             monitor
                 .worker_load_manager
-                .update_dp_loads(&HashMap::from([(
-                    worker.url().to_string(),
-                    HashMap::from([(0, 100), (1, 200)]),
-                )]));
+                .update_dp_loads(vec![(&worker, HashMap::from([(0, 100), (1, 200)]))]);
             let key = WorkerGroupKey {
                 model_id: "a".to_string(),
                 worker_type: WorkerType::Regular,
@@ -6251,7 +6298,10 @@ mod native_loads_tests {
             };
             poll_group_once(&monitor, &key, Duration::from_secs(10), Instant::now()).await;
             let cached = monitor.worker_load_manager.dp_cached_loads.read();
-            let ranks = cached.get(worker.url()).expect("other cached rank remains");
+            let ranks = &cached
+                .get(worker.url())
+                .expect("other cached rank remains")
+                .loads;
             assert_eq!(ranks.get(&0), Some(&100));
             assert_eq!(ranks.get(&1), if missing { None } else { Some(&200) });
             drop(cached);
@@ -6429,6 +6479,66 @@ mod native_loads_tests {
         );
     }
 
+    /// A worker that comes at the URL of one that left can push its first
+    /// record before the removal's eviction is said. The eviction then finds
+    /// the report of the worker that came and leaves the sink alone, and a
+    /// worker its stream serves is asked by no poll: the counts a poll of
+    /// the worker that left laid are not the ones it is given a rank by.
+    #[tokio::test]
+    async fn a_worker_that_came_ahead_of_an_eviction_is_given_no_rank_of_the_worker_that_left() {
+        const LEFT: &str = r#"{"dp_rank_count":2,"loads":[
+            {"dp_rank":0,"num_used_tokens":900,"max_total_num_tokens":1000},
+            {"dp_rank":1,"num_used_tokens":100,"max_total_num_tokens":1000}]}"#;
+        let app = axum::Router::new().route(
+            "/v1/loads",
+            axum::routing::get(|| async { (StatusCode::OK, LEFT) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("stub serve");
+        });
+
+        let (registry, monitor) = monitor_with_readers(LoadReaders::Blind);
+        let worker = gauge_worker(&url);
+        worker.set_status(WorkerStatus::Ready);
+        let left = registry.register(Arc::clone(&worker)).unwrap();
+        let key = WorkerGroupKey {
+            model_id: "a".to_string(),
+            worker_type: WorkerType::Regular,
+            connection_mode: ConnectionMode::Http,
+        };
+        poll_group_once(&monitor, &key, Duration::from_secs(10), Instant::now()).await;
+        assert!(
+            monitor
+                .worker_load_manager
+                .select_and_increment_lowest_dp_load(worker.as_ref(), 0)
+                .is_some(),
+            "the poll laid no counts of the worker"
+        );
+
+        // The worker leaves, the next one registers at its URL and its first
+        // record lands; the eviction of the removal is said behind it.
+        assert!(registry.remove(&left).is_some());
+        let came = gauge_worker(&url);
+        came.set_status(WorkerStatus::Ready);
+        registry.register(Arc::clone(&came)).unwrap();
+        monitor.apply_pushed_load(&came, 0, &PushedRecord::requests(3, 0), Instant::now());
+        monitor.evict_worker_loads(&worker);
+
+        assert_eq!(
+            monitor
+                .worker_load_manager
+                .select_and_increment_lowest_dp_load(came.as_ref(), 0),
+            None,
+            "the worker that came is given a rank by the counts of the worker that left"
+        );
+    }
+
     /// Empty polls retract old ranks without discarding concurrent stream records.
     #[tokio::test]
     async fn empty_poll_does_not_resurrect_stale_pushed_ranks() {
@@ -6491,7 +6601,7 @@ mod native_loads_tests {
                 let cached = monitor.worker_load_manager.dp_cached_loads.read();
                 assert!(cached
                     .get(worker.url())
-                    .is_none_or(|ranks| !ranks.contains_key(&1)));
+                    .is_none_or(|ranks| !ranks.loads.contains_key(&1)));
             }
         }
     }
@@ -6776,10 +6886,7 @@ mod native_loads_tests {
         // away.
         monitor
             .worker_load_manager
-            .update_dp_loads(&HashMap::from([(
-                stub.url.clone(),
-                HashMap::from([(0, 150), (1, 250)]),
-            )]));
+            .update_dp_loads(vec![(&worker, HashMap::from([(0, 150), (1, 250)]))]);
         monitor.apply_pushed_load(&worker, 0, &record(2, 0, 200), t0);
         monitor.apply_pushed_load(&worker, 1, &record(8, 0, 500), t0);
 
@@ -6811,7 +6918,7 @@ mod native_loads_tests {
             let cached = monitor.worker_load_manager.dp_cached_loads.read();
             cached
                 .get(stub.url.as_str())
-                .map(|ranks| (ranks.get(&0).copied(), ranks.get(&1).copied()))
+                .map(|ranks| (ranks.loads.get(&0).copied(), ranks.loads.get(&1).copied()))
         };
         // The worker's next record publishes the report on file.
         let next = pushed_at + Duration::from_millis(1);
@@ -7009,10 +7116,7 @@ mod native_loads_tests {
             .collect();
         monitor
             .worker_load_manager
-            .update_dp_loads(&HashMap::from([(
-                stub.url.clone(),
-                earlier_poll.iter().copied().collect(),
-            )]));
+            .update_dp_loads(vec![(&worker, earlier_poll.iter().copied().collect())]);
         monitor.apply_pushed_load(&worker, 0, &record(10, 8, 900), t0);
         monitor.apply_pushed_load(&worker, 1, &record(8, 0, 500), t0);
         for &rank in also_quiet {
@@ -7027,6 +7131,7 @@ mod native_loads_tests {
             let loads = monitor.worker_load_manager.dp_cached_loads.read();
             loads.get(stub.url.as_str()).map(|ranks| {
                 let mut ranks: Vec<(isize, isize)> = ranks
+                    .loads
                     .iter()
                     .map(|(&rank, &tokens)| (rank, tokens))
                     .collect();
@@ -7291,10 +7396,7 @@ mod native_loads_tests {
         let last_entry = HashMap::from([(0, 900), (1, 500)]);
         monitor
             .worker_load_manager
-            .update_dp_loads(&HashMap::from([(
-                worker.url().to_string(),
-                last_entry.clone(),
-            )]));
+            .update_dp_loads(vec![(&worker, last_entry.clone())]);
 
         // A core-only record, then one that carries a token count and its
         // capacity for a rank the entry names.
@@ -7310,7 +7412,7 @@ mod native_loads_tests {
                     .dp_cached_loads
                     .read()
                     .get(worker.url())
-                    .cloned(),
+                    .map(|laid| laid.loads.clone()),
                 Some(last_entry.clone()),
                 "no record writes over the last entry"
             );
