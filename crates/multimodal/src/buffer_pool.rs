@@ -7,10 +7,11 @@
 //! mapping, or pages the allocator had given back), so every request faulted
 //! them in page by page and the kernel zeroed each page right before the
 //! producer overwrote it: about 5,200 minor faults and 20 MB of page zeroing
-//! per 1024x768 request. The producers write every byte they ask for, so
-//! nothing in those buffers has to be zero: this pool keeps them. A producer
-//! takes a buffer of the length it needs and fills it; the buffer comes back
-//! when the request is done with it: the frame dropped
+//! per 1024x768 request. Most producers write every byte they ask for, so
+//! nothing in their buffers has to be zero: this pool keeps them. A producer
+//! takes a buffer of the length it needs and fills it (one that may leave a
+//! byte unwritten takes its buffer cleared, `take_zeroed`); the buffer
+//! comes back when the request is done with it: the frame dropped
 //! ([`ImageFrame`](crate::types::ImageFrame) returns its pixels), the wire
 //! payload sent ([`recycled_bytes`]), the patches written in another dtype
 //! ([`EncoderInput::into_bytes_as`](crate::encoder_inputs::EncoderInput::into_bytes_as)).
@@ -41,9 +42,10 @@
 //! holds. A host that never calls it keeps the idle buffers for the life of
 //! the process.
 //!
-//! In a debug build a buffer is handed out filled with [`SENTINEL`] rather
-//! than a previous request's bytes, so a producer that left a byte unwritten
-//! shows it in every test that compares its output with a reference.
+//! In a debug build a plain take is handed out filled with [`SENTINEL`]
+//! rather than a previous request's bytes, so a producer that left a byte
+//! unwritten shows it in every test that compares its output with a
+//! reference; a cleared take reads zero in every build.
 
 use std::{
     collections::TryReserveError,
