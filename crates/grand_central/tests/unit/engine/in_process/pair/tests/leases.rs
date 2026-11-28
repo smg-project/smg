@@ -558,7 +558,7 @@ fn hearing_only(kind: EventKind) -> (AppliedSpec, Arc<Mutex<Vec<Word>>>) {
 /// unsent: a document whose one stage takes one kind of word hears that
 /// kind of each side that says it and no other.
 #[test]
-fn a_pairs_word_is_told_wherever_the_document_hears_any_word() {
+fn a_pairs_word_is_told_wherever_the_document_hears_a_word_of_a_lease() {
     let told_of = |kind: EventKind| {
         let host = Host::under(hearing_only(kind), 1, 1);
         assert_eq!(host.engine.in_force().hears, EventSet::of([kind]));
