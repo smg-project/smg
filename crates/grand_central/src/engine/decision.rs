@@ -1157,6 +1157,26 @@ pub(crate) const CONTEXT_WINDOW: &str = "context-window";
 /// ([`UnmetDemand::Decoding`](crate::engine::demands::UnmetDemand::Decoding)).
 pub(crate) const DECODING: &str = "decoding";
 
+impl crate::engine::UnmetDemand {
+    /// The stage a pool this demand left nobody is shed under. A runtime is
+    /// the rest of a request's wire, and is shed as its gateway's wires
+    /// are. Vision is shed under the word of the `epd` plan's vision rule.
+    /// An encode request's encoders are shed under none of these: the
+    /// encode pass keeps their part of a demand in its one test of an
+    /// encoder, and names what they lack in its own order.
+    #[must_use]
+    pub const fn stage(self) -> &'static str {
+        match self {
+            Self::Runtime => WIRES,
+            Self::Vision => VISION,
+            Self::References => REFERENCES,
+            Self::Pipeline => PIPELINE,
+            Self::Window => CONTEXT_WINDOW,
+            Self::Decoding => DECODING,
+        }
+    }
+}
+
 /// The stage a decision names when it is refused for its affinity column:
 /// what a host counts its sheds under.
 pub(crate) const AFFINITY_COLUMN: &str = "affinity-column";

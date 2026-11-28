@@ -1,4 +1,5 @@
-use super::{DemandFacts, Demands, References, Role, UnmetDemand};
+use super::{DemandFacts, Demands, References, UnmetDemand};
+use crate::engine::view::Role;
 
 /// A request that demands nothing is met by every worker, and one that
 /// demands a runtime by the workers that registered its number alone: a

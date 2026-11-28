@@ -62,6 +62,26 @@ impl From<smg_worker::worker::WorkerType> for Role {
     }
 }
 
+impl crate::engine::Demands {
+    /// What a worker of `role`'s pool is held to: the request's demands,
+    /// less its completion's bound and the way its constraint was decided
+    /// for a prefill worker. A prefill runs the input: the decode beside it
+    /// holds the budget and generates the tokens a constraint holds. The
+    /// door reads a request's demands through this where it judges rows:
+    /// the role is the door's to know.
+    #[must_use]
+    pub const fn held_by(self, role: Role) -> Self {
+        match role {
+            Role::Prefill => Self {
+                output_window: 0,
+                decoding: 0,
+                ..self
+            },
+            Role::Single | Role::Decode | Role::Encode => self,
+        }
+    }
+}
+
 /// Which phase of a request a decision is for.
 #[derive(
     Clone,

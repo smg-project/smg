@@ -44,8 +44,6 @@
 //! items', vision with the request's pixels. So the name follows the
 //! pass's order whether a request states a fact as a demand or as its own.
 
-use crate::engine::{decision, view::Role};
-
 /// Where a request's media by reference may be processed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -68,6 +66,10 @@ pub enum References {
 /// nothing. Further demands add their fields: a host starts from
 /// `Demands::default()` and assigns the demands it states, since no literal
 /// of the record builds outside this crate.
+///
+/// [`Self::held_by`] is written beside [`Role`](crate::engine::Role), in
+/// `engine/view.rs`: it reads a role, and no code of this file names
+/// another module of the engine.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Demands {
@@ -178,24 +180,6 @@ impl Demands {
         None
     }
 
-    /// What a worker of `role`'s pool is held to: the request's demands,
-    /// less its completion's bound and the way its constraint was decided
-    /// for a prefill worker. A prefill runs the input: the decode beside it
-    /// holds the budget and generates the tokens a constraint holds. The
-    /// door reads a request's demands through this where it judges rows:
-    /// the role is the door's to know.
-    #[must_use]
-    pub const fn held_by(self, role: Role) -> Self {
-        match role {
-            Role::Prefill => Self {
-                output_window: 0,
-                decoding: 0,
-                ..self
-            },
-            Role::Single | Role::Decode | Role::Encode => self,
-        }
-    }
-
     /// What an encoder is held to where a pair takes the request beside
     /// it: these demands less both windows and the way the constraint was
     /// decided. Such an encoder runs neither the input nor the completion:
@@ -277,6 +261,10 @@ pub struct DemandFacts {
 /// request, then to the workers that decide its constraint as it was
 /// decided. Further demands add their cases: a host's match keeps an arm
 /// for the rest.
+///
+/// [`Self::stage`] is written beside the stage names it answers, in
+/// `engine/decision.rs`: no code of this file names another module of
+/// the engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[non_exhaustive]
 pub enum UnmetDemand {
@@ -294,26 +282,6 @@ pub enum UnmetDemand {
     /// The worker decides a constraint another way than the request's was
     /// decided, or states no way.
     Decoding,
-}
-
-impl UnmetDemand {
-    /// The stage a pool this demand left nobody is shed under. A runtime is
-    /// the rest of a request's wire, and is shed as its gateway's wires
-    /// are. Vision is shed under the word of the `epd` plan's vision rule.
-    /// An encode request's encoders are shed under none of these: the
-    /// encode pass keeps their part of a demand in its one test of an
-    /// encoder, and names what they lack in its own order.
-    #[must_use]
-    pub const fn stage(self) -> &'static str {
-        match self {
-            Self::Runtime => decision::WIRES,
-            Self::Vision => decision::VISION,
-            Self::References => decision::REFERENCES,
-            Self::Pipeline => decision::PIPELINE,
-            Self::Window => decision::CONTEXT_WINDOW,
-            Self::Decoding => decision::DECODING,
-        }
-    }
 }
 
 #[cfg(test)]
