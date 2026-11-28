@@ -221,11 +221,11 @@ fn loader_rule_conflict(
 /// `fps` of the media kwargs as its rate, so the engine's own server walks a
 /// clip at the rate its start states, and the pipeline does the same. A value
 /// that is no number inside the range a part's own rate is held to is no
-/// rate (the engine's own default, `-1`, among them): the walk keeps the
-/// spec's default, as under a start that states none, and says so in one
-/// warning unless the value is non-positive. No other sampler takes
-/// a rate from the rules: [`loader_rule_conflict`] refuses the loader-style
-/// ones, and the rest never followed a loader.
+/// rate: the walk keeps the spec's default, as under a start that states
+/// none, and says so in one warning that names the key and the range. The
+/// engine's own default, `-1`, alone gets no warning: it states no rate. No
+/// other sampler takes a rate from the rules: [`loader_rule_conflict`]
+/// refuses the loader-style ones, and the rest never followed a loader.
 fn interval_walk_start_fps(rule: Option<&str>, sampling: FrameSampling) -> Option<f64> {
     if sampling != FrameSampling::Interval {
         return None;
@@ -241,12 +241,12 @@ fn interval_walk_start_fps(rule: Option<&str>, sampling: FrameSampling) -> Optio
         .trim();
     match stated.parse::<f64>() {
         Ok(fps) if llm_multimodal::sample_fps_in_range(fps) => Some(fps),
-        Ok(fps) if fps <= 0.0 => None,
+        Ok(-1.0) => None,
         _ => {
             warn!(
                 stated,
-                "the video rate of the engine's start is outside the range the interval walk takes; \
-                 the walk keeps the processor's default rate"
+                "the video.fps of the engine's start is no rate from 0.2 to 5, the range the \
+                 interval walk takes; the walk keeps the processor's default rate"
             );
             None
         }
@@ -2394,6 +2394,7 @@ mod processor_kwargs_tests {
 #[cfg(test)]
 mod unsupported_model_tests {
     use llm_tokenizer::MockTokenizer;
+    use tracing_test::traced_test;
 
     use super::{tests::pipeline_settings, *};
 
@@ -2567,6 +2568,47 @@ mod unsupported_model_tests {
             interval_walk_start_fps(Some(stated), FrameSampling::Even),
             None
         );
+    }
+
+    /// A stated rate the interval walk does not take is named in one warning
+    /// with its key and the range, zero and the negatives too. The engine's
+    /// own default, `-1`, and a rate inside the range, its edges included,
+    /// stay silent.
+    #[test]
+    #[traced_test]
+    fn a_start_rate_the_interval_walk_does_not_take_is_warned() {
+        for (stated, rate, warned) in [
+            ("0.2", Some(0.2), false),
+            ("5", Some(5.0), false),
+            ("-1", None, false),
+            ("-1.0", None, false),
+            ("0", None, true),
+            ("-2", None, true),
+            ("0.19", None, true),
+            ("5.01", None, true),
+            ("NaN", None, true),
+            ("fast", None, true),
+        ] {
+            let rule = format!("--media-io-kwargs video.fps={stated}");
+            assert_eq!(
+                interval_walk_start_fps(Some(&rule), FrameSampling::Interval),
+                rate,
+                "{stated}"
+            );
+            let field = format!("stated=\"{stated}\"");
+            logs_assert(|lines: &[&str]| {
+                let said: Vec<&&str> = lines.iter().filter(|line| line.contains(&field)).collect();
+                let named = said
+                    .iter()
+                    .filter(|line| line.contains("video.fps") && line.contains("0.2 to 5"))
+                    .count();
+                if (said.len(), named) == (usize::from(warned), usize::from(warned)) {
+                    Ok(())
+                } else {
+                    Err(format!("{stated}: {said:?}"))
+                }
+            });
+        }
     }
 
     /// A family on the engine's default loader passes the rules that loader
