@@ -1,5 +1,6 @@
 //! The cases of a request with an encode request's three lists.
 
+mod limit;
 mod rows;
 mod ruled;
 
@@ -961,12 +962,13 @@ fn three_lists_with_no_item_are_placed_as_their_pair() {
     assert_eq!(*heard.lock(), [issued(prefill)]);
 }
 
-/// Prefills that are all at their caller's admission limit answer the word
-/// on which the caller waits for room, as a pair's do, and nothing is
-/// issued. A decision that panics is refused and costs its request alone:
-/// the next request over the same lists is placed. So is one placed while
-/// this thread's list of encoders is lent, as a stage places a request from
-/// inside a decision: it takes a list of its own.
+/// Prefills that all stand but for their caller's admission limit, each
+/// beside an open partner, answer the word on which the caller waits for
+/// room, as a pair's do, and nothing is issued. A decision that panics is
+/// refused and costs its request alone: the next request over the same
+/// lists is placed. So is one placed while this thread's list of encoders
+/// is lent, as a stage places a request from inside a decision: it takes a
+/// list of its own.
 ///
 /// The classic router answers the same way where a prefill at its limit
 /// has a partner that can be sent to

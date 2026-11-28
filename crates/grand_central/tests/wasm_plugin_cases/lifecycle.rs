@@ -101,9 +101,9 @@ fn a_withheld_session_key_is_withheld_from_the_lifecycle_too() {
 }
 
 /// A plugin bound to two profiles of one build observes each lifecycle
-/// event once: the engine broadcasts to every profile, and the bound sets
-/// the build took from its one binder share one observer, the first adapter
-/// made.
+/// event once: an event the engine tells may reach a stage of each
+/// profile, and the bound sets the build took from its one binder share
+/// one observer, the first adapter made.
 #[test]
 fn a_plugin_bound_to_two_profiles_observes_each_event_once() {
     let runtime = runtime();

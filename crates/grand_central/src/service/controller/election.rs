@@ -1,14 +1,22 @@
 //! The election wired into the run loop (design 5.3): where the lease lives,
 //! the identity this replica holds it under, the thread that steps the
-//! elector, and the standing the `Leader` call answers from on a replica
-//! that does not lead.
+//! elector, the standing the `Leader` call answers from on a replica that
+//! does not lead, and the reader of who leads ([`Leadership`]).
 //!
 //! One path in every mode: a controller with no shared lease elects itself
-//! over a record in its own process, so the [`Fence`](crate::service::elector::Fence)
+//! over a record in its own process, so the [`Fence`]
 //! a shard thread reads is the same object whether one replica runs or
 //! three. The fence is the one judge of "leader": readiness, the state gauge
 //! and the `Leader` call read it at the instant they answer, and nothing is
 //! told its role by a message that can be late.
+//!
+//! The reader holds that fence, the identity, the standing and the log the
+//! replica's store journals to, each a private field. The service's calls
+//! ask it through their shared state, each at its own instant, and hand it
+//! no term: it derives the leader from its own read of the fence, and it
+//! checks the log for a call that needs a led store ([`Leadership::led`]).
+//! The source of a watch of the worker rows alone takes the fence itself
+//! from it ([`Leadership::fence`]).
 //!
 //! The thread is a plain thread, never a runtime worker: a backend call
 //! blocks it alone. It steps the elector every renew period, hands the term
@@ -58,8 +66,12 @@ use tracing::{debug, info, warn};
 #[cfg(feature = "kubernetes")]
 use crate::service::elector::KubernetesLease;
 use crate::{
-    service::elector::{
-        term_said, ElectError, ElectionSettings, Elector, FileLease, LeaseBackend, TickOutcome,
+    service::{
+        elector::{
+            term_said, ElectError, ElectionSettings, Elector, Fence, FileLease, LeaseBackend,
+            TickOutcome,
+        },
+        replication::{Log, NotLeading},
     },
     store::{LeasesStore, MemoryStore},
 };
@@ -145,7 +157,7 @@ pub(crate) fn identity(controller_id: &str, address: Option<&str>) -> String {
 
 /// A holder identity as its controller id and its address; the address is
 /// empty when the identity carries none.
-pub(crate) fn split_identity(identity: &str) -> (&str, &str) {
+fn split_identity(identity: &str) -> (&str, &str) {
     identity.split_once('@').unwrap_or((identity, ""))
 }
 
@@ -269,6 +281,183 @@ pub(crate) struct ElectionObservation {
     /// Whether a look at the lease has succeeded: readiness waits for the
     /// first, so a replica that cannot reach its lease never reads ready.
     pub(crate) looked: bool,
+}
+
+/// Who leads, as this replica knows it by its fence's verdict at one
+/// instant.
+pub(crate) struct Leader {
+    /// The leader's id; empty when nobody is named.
+    pub(crate) controller_id: String,
+    /// Its dialable address; empty when nobody is named or it has none.
+    pub(crate) address: String,
+    /// The fence's term where this replica leads. Elsewhere the higher of
+    /// two: the standing's term, and the term of the last lease this
+    /// replica held.
+    pub(crate) term: u64,
+    /// Whether the leader is this replica.
+    pub(crate) is_leader: bool,
+}
+
+/// Why a call that needs a led store is not served ([`Leadership::led`]).
+pub(crate) enum NotLed {
+    /// The fence is closed at the call's instant: this replica does not
+    /// lead.
+    Elsewhere {
+        /// The holder's dialable address; empty when no leader is known or
+        /// it has none.
+        holder: String,
+    },
+    /// The fence shows a term the store's log does not lead.
+    Store(NotLeading),
+}
+
+/// The reader of who leads that the service's calls ask through their
+/// shared state. It holds the controller's fence, the identity the replica
+/// elects under, the election's last sight of the lease and the log its
+/// store journals to, each a private field, with the id and the address it
+/// names itself by. No method of it takes a term from its caller: the
+/// leader is derived from its own reads.
+pub(crate) struct Leadership {
+    /// This controller's id.
+    controller_id: String,
+    /// Its dialable address, `host:port`; empty when no client could be
+    /// told one.
+    address: String,
+    /// The holder identity it elects under.
+    identity: String,
+    /// The controller's one fence: the judge of "leader" at every answer.
+    fence: Arc<Fence>,
+    /// The election's last sight of the lease.
+    standing: watch::Receiver<ElectionObservation>,
+    /// The log the replica's store journals to: it says whether the store
+    /// leads a term.
+    log: Arc<Log>,
+}
+
+impl Leadership {
+    /// The reader of the replica `elector` stands for, named by
+    /// `controller_id` and `address`. The identity and the fence are the
+    /// elector's, `standing` receives its thread's sights of the lease, and
+    /// `log` is the one the replica's store journals to.
+    pub(crate) fn new(
+        controller_id: String,
+        address: String,
+        elector: &Elector,
+        standing: watch::Receiver<ElectionObservation>,
+        log: Arc<Log>,
+    ) -> Self {
+        Self {
+            controller_id,
+            address,
+            identity: elector.identity().to_owned(),
+            fence: elector.fence(),
+            standing,
+            log,
+        }
+    }
+
+    /// The term this replica leads under at `now`, or `None`: one read of
+    /// the fence ([`Fence::leader_term`]).
+    pub(crate) fn leading(&self, now: Instant) -> Option<u64> {
+        self.fence.leader_term(now)
+    }
+
+    /// The term of the last lease this replica held, `0` before any
+    /// ([`Fence::term`]).
+    pub(crate) fn held_term(&self) -> u64 {
+        self.fence.term()
+    }
+
+    /// Who leads, by the fence's verdict at `now` ([`Self::leading`]). A
+    /// replica whose fence is open names itself under the fence's term. Any
+    /// other answers as [`Self::leader_elsewhere`] does, which reads the
+    /// fence once more, for the term of the last lease held. Under the
+    /// standing the election's own thread publishes, no answer falls in
+    /// term: that standing's term is the highest its elector saw or was
+    /// told, and that elector takes no term under its highest.
+    pub(crate) fn leader(&self, now: Instant) -> Leader {
+        match self.leading(now) {
+            Some(term) => Leader {
+                controller_id: self.controller_id.clone(),
+                address: self.address.clone(),
+                term,
+                is_leader: true,
+            },
+            None => self.leader_elsewhere(),
+        }
+    }
+
+    /// Who leads, for a replica whose fence read closed. It names the
+    /// holder its last look at the lease saw, or nobody (an empty address:
+    /// no leader known) when the lease is free, when that look failed, when
+    /// it read a term under the highest this replica saw, when the record
+    /// still names this replica behind a closed fence, and when this
+    /// replica's own take is newer than that look: a holder is named under
+    /// a term one write of the lease stored for it. The term is the higher
+    /// of two: the standing's, and the term of the last lease this replica
+    /// held ([`Fence::term`]).
+    pub(crate) fn leader_elsewhere(&self) -> Leader {
+        let standing = self.standing.borrow();
+        let fenced = self.fence.term();
+        let term = standing.term.max(fenced);
+        let (controller_id, address) = if standing.holder.is_empty()
+            || standing.holder == self.identity
+            || fenced > standing.term
+        {
+            (String::new(), String::new())
+        } else {
+            let (id, address) = split_identity(&standing.holder);
+            (id.to_owned(), address.to_owned())
+        };
+        Leader {
+            controller_id,
+            address,
+            term,
+            is_leader: false,
+        }
+    }
+
+    /// The term this replica leads under at `now`, once its store leads it:
+    /// the fence's verdict at `now` ([`Self::leading`]), then one read of
+    /// the log ([`Log::leads`]), whose refusal says whether it is a moment
+    /// or the whole lead. Where the fence is closed, the refusal names the
+    /// holder's address by a second verdict of the fence at `now`
+    /// ([`Self::leader`]): where that second verdict is open, the address
+    /// is this replica's own.
+    ///
+    /// # Errors
+    ///
+    /// [`NotLed::Elsewhere`] where the fence is closed at `now`, and
+    /// [`NotLed::Store`] where the log does not lead the term it shows.
+    pub(crate) fn led(&self, now: Instant) -> Result<u64, NotLed> {
+        match self.leading(now) {
+            Some(term) => match self.log.leads(term) {
+                Ok(()) => Ok(term),
+                Err(refused) => Err(NotLed::Store(refused)),
+            },
+            None => Err(NotLed::Elsewhere {
+                holder: self.leader(now).address,
+            }),
+        }
+    }
+
+    /// A receiver of the election's sights of the lease: a copy of this
+    /// reader's own.
+    pub(crate) fn steps(&self) -> watch::Receiver<ElectionObservation> {
+        self.standing.clone()
+    }
+
+    /// The holder identity this replica elects under.
+    pub(crate) fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    /// The fence itself, for the source of a watch of the worker rows
+    /// alone: the watch asks it whether this replica still leads under the
+    /// term it was admitted under.
+    pub(crate) fn fence(&self) -> Arc<Fence> {
+        Arc::clone(&self.fence)
+    }
 }
 
 /// A word to the election thread.

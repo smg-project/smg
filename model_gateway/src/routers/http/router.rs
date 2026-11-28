@@ -1047,10 +1047,7 @@ impl Router {
         // A replayable failure: the retry re-selects away from this engine
         // while another available worker is left to take the request.
         if is_retryable_response(&response) {
-            let mut tried = attempt.tried.lock();
-            if !tried.iter().any(|engine| engine == worker.base_url()) {
-                tried.push(worker.base_url().to_string());
-            }
+            note_tried(&mut attempt.tried.lock(), worker.base_url());
         }
 
         // Record worker errors for server errors (5xx)
@@ -1349,7 +1346,7 @@ impl Router {
             Ok(res) => res,
             Err(response) => {
                 if moves && is_retryable_response(&response) {
-                    attempt.tried.lock().push(worker.base_url().to_string());
+                    note_tried(&mut attempt.tried.lock(), worker.base_url());
                 }
                 return response;
             }
@@ -1385,7 +1382,7 @@ impl Router {
                 // its sample and the answer is left unread for the next
                 // attempt's.
                 worker_outcome(attempt.ledger, worker.as_ref(), status);
-                attempt.tried.lock().push(worker.base_url().to_string());
+                note_tried(&mut attempt.tried.lock(), worker.base_url());
                 return moved;
             }
             stands = !is_retryable_response(&moved);
@@ -2245,6 +2242,15 @@ impl RouteOutcome<'_> {
             model_label: Cow::Owned(self.model_label.into_owned()),
             endpoint: self.endpoint,
         }
+    }
+}
+
+/// Notes `engine` on a request's tried list, once however many of its
+/// attempts failed there: the list's length is the retry number a placement
+/// is handed, the count of engines the request tried.
+fn note_tried(tried: &mut Vec<String>, engine: &str) {
+    if !tried.iter().any(|noted| noted == engine) {
+        tried.push(engine.to_string());
     }
 }
 
@@ -3648,7 +3654,7 @@ mod tests {
     /// as well: the sends of the moved attempts and of the last one.
     #[tokio::test]
     async fn a_transcription_whose_sends_fail_charges_its_worker_one_failure() {
-        let (dead, _) = flaky_upstream(usize::MAX).await;
+        let (dead, accepted) = flaky_upstream(usize::MAX).await;
         let mut router = breaker_router(&[&format!("http://{dead}")], fast_retry_config(3), 2);
         router.max_buffered_request_bytes = b"RIFF-clip".len() as u64;
         let worker = router.worker_registry.get_all().remove(0);
@@ -3656,7 +3662,93 @@ mod tests {
         let response = transcribe_clip(&router).await;
 
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            accepted.load(AtomicOrdering::SeqCst),
+            6,
+            "three attempts reach the worker, each a send and its resend"
+        );
         assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+    }
+
+    /// The tried list behind two attempts of one transcription that each
+    /// move on from `url`, the lone worker of its router. The attempts share
+    /// the list as `route_multipart_transcription` hands it to them.
+    async fn tried_behind_two_attempts(url: &str) -> Vec<String> {
+        let mut router = breaker_router(&[url], fast_retry_config(3), 5);
+        router.max_buffered_request_bytes = b"RIFF-clip".len() as u64;
+        let body = TranscriptionRequest {
+            model: "m".to_string(),
+            ..Default::default()
+        };
+        let audio = AudioFile {
+            bytes: Bytes::from_static(b"RIFF-clip"),
+            file_name: "clip.wav".to_string(),
+            content_type: Some("audio/wav".to_string()),
+        };
+        let route = "/v1/audio/transcriptions";
+        let routing = router.routing_derivatives(None, &body);
+        let outcome = router.begin_route(route, UNKNOWN_MODEL_ID, false);
+        let tried = parking_lot::Mutex::new(Vec::new());
+        let ledger = AttemptLedger::default();
+        let attempt = TranscriptionAttempt {
+            headers: None,
+            body: &body,
+            route,
+            model_id: UNKNOWN_MODEL_ID,
+            canonical_model: None,
+            routing: &routing,
+            is_stream: false,
+            outcome: &outcome,
+            start: Instant::now(),
+            ledger: &ledger,
+            tried: &tried,
+        };
+        for _ in 0..2 {
+            let moved = router
+                .transcription_attempt(&attempt, &audio, true, true)
+                .await;
+            assert!(is_retryable_response(&moved), "the attempt moves on");
+        }
+        let engines = tried.lock().clone();
+        engines
+    }
+
+    /// A worker that answers a retryable status to two attempts of one
+    /// transcription is one engine on the tried list, as on the typed route:
+    /// the list's length is the retry number a placement reads.
+    #[tokio::test]
+    async fn a_transcription_answered_twice_by_a_worker_tried_it_once() {
+        let (url, hits) = fixed_status_upstream(
+            &["/v1/audio/transcriptions"],
+            StatusCode::SERVICE_UNAVAILABLE,
+        )
+        .await;
+
+        let tried = tried_behind_two_attempts(&url).await;
+
+        assert_eq!(
+            hits.load(AtomicOrdering::SeqCst),
+            2,
+            "both attempts reach it"
+        );
+        assert_eq!(tried, [url]);
+    }
+
+    /// A worker whose sends fail in two attempts of one transcription is one
+    /// engine on the tried list as well.
+    #[tokio::test]
+    async fn a_transcription_whose_sends_failed_twice_tried_its_worker_once() {
+        let (dead, accepted) = flaky_upstream(usize::MAX).await;
+        let url = format!("http://{dead}");
+
+        let tried = tried_behind_two_attempts(&url).await;
+
+        assert_eq!(
+            accepted.load(AtomicOrdering::SeqCst),
+            4,
+            "both attempts reach it, each a send and its resend"
+        );
+        assert_eq!(tried, [url]);
     }
 
     /// A 500 the worker itself answered is its verdict on the audio: a lone

@@ -497,6 +497,8 @@ pub trait Picker: Lifecycle {
 // What a stage may hear about the requests it helped place. All optional.
 pub trait Lifecycle {
     // on_decision_issued, on_dispatched, on_completed, on_released, on_membership, on_signal
+    // hears: which of the first four the engine tells the stage. By default all four where
+    // needs_lifecycle is true, and none otherwise. The engine reads the answer when it is built
 }
 ```
 
@@ -1387,7 +1389,9 @@ pub struct Trace {
 A pair's refusal names the side it is for (`Shed::side`): the role the gateway's own pair
 selection names in the same refusal, for which a host answers. It is the prefill side where the
 prefill's picker declined, and where the prefills stand at their admission limit. It is the decode
-side where the prefill was picked and the decode's own run refused.
+side where the prefill was picked and the decode's own run refused. A decode decided again names
+the decode side where its own run refused, and the prefill side where the held prefill left its
+list.
 
 Where the prefill side places nobody else, the side is the first of these that holds, in that
 selection's order (`pair_pass` in `model_gateway/src/routers/common/placement.rs`):
@@ -1412,7 +1416,11 @@ to the cut. So does its cut of the prefills, where no prefill it leaves pairs wi
 it cut does.
 
 A pair whose named worker's number reaches nobody names the side it reaches nobody on, the
-prefills' first. A call's shed as saturated that stands behind a route's rule names the side of
+prefills' first. A named pair that cannot be sent to after all names the decode side where a pair
+of the call's last decision lost its decode alone. It names the prefill side otherwise, as that
+selection asks the prefill first (section 8.2).
+
+A call's shed as saturated that stands behind a route's rule names the side of
 the list that selection judges among the rule's workers. It is the prefill side where none of the
 rule's prefills can take the request, whichever list the decision said (section 8.2). A shed made
 where no prefill of the lists pairs with a decode keeps its side under a route's rule: the rule is
@@ -1424,6 +1432,10 @@ No side is named for:
 - a pair refused before either side was read: no binding takes it, or it states what a pair's
   decision does not honour;
 - a call's shed with no endpoint that stands behind a route's rule, whose lists the rule narrowed;
+- a call's own refusals of no one list: under the route's rule's name, under the budget, and for
+  what the call does not place;
+- a pair held to its prefill alone, behind a rule that then takes no worker of a list
+  (section 8.2);
 - an answer that came over a link: the protocol's `Shed` has no field for it.
 
 An encode request's refusal for a hard demand names a side as its pair's alone does. Over lists
@@ -2404,6 +2416,24 @@ veto ended the pass. That is the decode list whole beside a prefill that stands,
 prefills that pair, each where wholly over its thresholds. The count is read there for that word
 alone, and names no shed.
 
+Over whole lists and behind a part alike, a shed under the prefill side's admission limit says a
+wait for room. A picker's decline aside, where the side's own run sheds the request, the decision
+names that limit for a prefill with an open partner that stands but for its limit. It names it too
+where the pair's default takes a prefill at its limit, under a profile that lists the limit as a
+hard filter.
+
+The wait can answer a call ahead of the route's rule. So a host can wait for a prefill its rule
+refuses, where the gateway's own selection asks its route's test first.
+
+Behind the pair's default and its question of saturation, where no prefill at the request's places
+stands but for its limit, the limit names no shed. The prefill side's stage is read there with the
+limit set aside. So the limit's place among the prefill side's filters changes no answer there,
+under filters whose word on a row does not turn on how often they are asked.
+
+Under this rule the limit is set aside on the prefill side alone. A decode side that lists the
+limit reads it in its own profile's order, where the pass over the partners names the shed. That
+pass can end at the limit.
+
 The pass takes the decision's word back where it cut a list: to the prefills an open encoder
 serves, or to the decodes that take the images. The places a host states for the prefills or the
 decodes hand the decision the workers at them, and it counts those. Places are judged as stated,
@@ -2611,11 +2641,31 @@ those partners of the prefill reached, and the pair's one decision is held to th
 to the prefill's place and the decode is its own profile's pick.
 
 A named prefill at the admission
-limit is waited for (`Unplaced::PrefillsFull`), as classic waits for it. A named decode with no
+limit is waited for (`Unplaced::PrefillsFull`) where the count reached its pair and the decision
+held to it says the wait. Classic's selection tests the capacity of its prefill pick too, ahead
+of its decode. A named decode with no
 free room is taken, because the `has-room` filter is soft (classic,
 `retain_decodes_with_a_room`). A retry is handed the pair again. A number that reaches no worker
 on a side sheds the pair under `target-worker` and names that side, as classic refuses for the
 role whose policy found no target.
+
+A named pair that cannot be sent to after all is shed under `target-worker` too, and moves to no
+other worker. Its side follows the order of classic's reads, the prefill's first. The shed names
+the decode side where a pair of the call's last decision lost its decode alone. It names the
+prefill side otherwise: a pair that lost both workers is no such pair.
+
+Classic's hash policy reads the health of the worker at the named place once more at its pick. One
+that is not healthy and eligible then is that policy's miss: the pair is declined for the prefill's
+role, and no decode is picked. Behind the prefill's pick classic reads the pick's partners a second
+time. It refuses for the decode's role where none is open, or where its number reaches none.
+
+One such refusal names no side, for a pair held to its prefill alone. Behind an ask of it that sent
+to nobody, the route's rule is asked of the named prefill's place, and of the decodes where it
+takes that prefill. A pair held on both sides is asked no second time. Where the rule takes no
+worker of a list, the call ends on the rule's refusal there, under `target-worker`. That needs a
+rule that took the worker at the count and refuses it later in the same call. Classic asks such a
+rule at other reads than the engine's, so its answer there can differ: it names a role, or places
+the pair.
 
 Where no decode can be
 sent to, a decode over its thresholds alone counts as a partner, and the decode goes by load, as
@@ -2951,9 +3001,14 @@ request ──> route (HTTP or gRPC, any family)
   itself, by classic's own judgement of the pool. The engine's word for the refusal goes to a log
   line and no further: at `debug`, or at `warn` where the engine refused the decision itself.
 
-  A pair's route answers by the engine's word. A pair's prefills all at their admission limit make
-  the route wait for a slot, as under classic. A pair the policy spec in force binds no pair plan
-  for is refused with a 501 under the code `no_policy_plan_for_model`, with no retry hint.
+  A pair's route answers by the engine's word. It is told to wait for a slot where the prefill
+  side's filters leave its run nobody and a prefill with an open partner stands but for its
+  admission limit. It is told so too where the pair's default takes a prefill at that limit, under
+  a profile that lists it as a hard filter. That word can come ahead of the route's own test,
+  where classic asks that test first.
+
+  A pair the policy spec in force binds no pair plan for is refused with a 501 under the code
+  `no_policy_plan_for_model`, with no retry hint.
   A model with no worker on a side, or with no pair that shares a transfer protocol, is answered
   for that ahead of the engine, as under classic.
   A pair the engine declined under any other name is answered as classic answers a policy that
@@ -3315,10 +3370,9 @@ client states for no request.
   with the controller (10.2), and a gateway's own process counts in the order of its own list. It
   ends when a gateway under a controller follows the controller's list and keeps its order
   (section 11) **[planned]**.
-- **A named prefill at its admission limit is not waited for.** A gateway's own process waits for
-  the prefill a pair names where it stands at that gateway's admission limit (section 8.2). A
-  controller keeps no gate: its count takes the prefill, and the gateway finds the limit. It ends
-  when a controller keeps a pair's admission **[planned]**.
+- **A named prefill at its admission limit is not waited for.** A gateway's own process can wait
+  for it (section 8.2). A controller keeps no gate: its count takes the prefill, and the gateway
+  finds the limit. It ends when a controller keeps a pair's admission **[planned]**.
 - **A later decode is booked at its dispatch.** A gateway's own process books the decode a pair
   names with its prefill. A controller files it chosen, as the contract has a later decode, and
   books it where a dispatch names it.
@@ -3420,7 +3474,7 @@ tells the data once more:
 |---|---|---|
 | the worker record | the store's table of records (`store/memory.rs`) | the code that keeps the objects, among its reads: a record's status where a leader's log tells it, and a first copy, for the status the log told of each record; and the store itself, for its published copy and the membership log's event |
 | the worker object | the worker-crate registry | the health checker, the follower of cache events, a decision, and a watcher's, a standby's and an operator's first copy |
-| the remainder: 17 of the 24 facts and one bit of an eighteenth, with the record's id and revision | beside each worker object (`worker_host/remainder.rs`) | a decision, for the record's id, whether the worker takes images, its wire modes and from where it is reached. A pair's classes read the worker's engine kind and its pairing descriptor too, and for a record that states no descriptor the pairing facts its worker object derives of its labels. What the worker states for a request's hard demands is lent with the list, and a frame that states a demand is held to it. The follower of cache events asks here whether a worker's events are indexed: its signals stand here and its models on the object (`worker_host/kv_feed.rs:191`, through `Objects::row_of`) |
+| the remainder: 17 of the 24 facts and one bit of an eighteenth, with the record's id and revision | beside each worker object (`worker_host/remainder.rs`) | a decision, for the record's id, whether the worker takes images, its wire modes and from where it is reached. A pair's classes read the worker's engine kind, as the worker crate reads a name it knows, and its pairing descriptor too, and for a record that states no descriptor the pairing facts its worker object derives of its labels. What the worker states for a request's hard demands is lent with the list, and a frame that states a demand is held to it. The follower of cache events asks here whether a worker's events are indexed: its signals stand here and its models on the object (`worker_host/kv_feed.rs:191`, through `Objects::row_of`) |
 | the published copy: of a record its id alone, beside its slot in the counts and in a gateway's vetoes by pool; with them each pool's index by model and role, the generation and the clock | the store | a pick's booking and a gateway's vetoes; every other loader reads the generation; no row of a record stands in it and no request is decided over it |
 | the membership log's event | `service/replication/log.rs` | a watcher behind its first copy; a standby |
 
@@ -3443,7 +3497,8 @@ the objects writes one with every object it builds. `Objects::row_of` gives a wo
 whole record back from the object and its remainder, with no read of the store's table.
 A decision reads the remainder's facts, among them the record's id, whether the worker takes
 images, its wire modes and from where it is reached. A pair's classes read the worker's engine
-kind and its pairing descriptor too. A record that states no descriptor is read by what its
+kind, as the worker crate reads a name it knows, and its pairing descriptor too. A record that
+states no descriptor is read by what its
 worker object offers a partner: the pairing facts the object derives of the record's labels and
 engine kind, as a gateway reads them of its own worker. The controller's door lays no
 descriptor, since its log holds none, so a controller's workers pair by their labels; its
@@ -3864,8 +3919,8 @@ Five things follow, and they are the first work of section 16.
    `least_load` and `consistent_hashing`. Their only recorded lines are over pools in trouble.
    New recorders are decision 2.
 4. **One limit on "as classic recorded".** A pair's refusal names its side in the engine's
-   answer (`Shed::side`). The four pair sheets' refusals are compared by their reason and by
-   their role, where classic names the role.
+   answer (`Shed::side`). The four pair sheets that hold a refusal have theirs compared by
+   reason and by role, where classic names the role.
 
    They hold 54 recorded refusals on 27 lines, and all 54 agree on both: the pair's decision
    judges one list for its refusal, as classic's selection does (section 8.2).

@@ -462,10 +462,10 @@ fn a_pair_of_first_partners_is_placed_ahead_of_every_other() {
     assert!(taken[0] > 0 && taken[1] > 0, "{taken:?}");
 }
 
-/// Prefills that are all at their caller's admission limit answer the word
-/// on which the caller waits for room, and no refusal: no lease was issued
-/// and nothing is said. With one prefill under its limit the request is
-/// placed on it.
+/// Prefills that all stand but for their caller's admission limit, each
+/// beside an open partner, answer the word on which the caller waits for
+/// room, and no refusal: no lease was issued and nothing is said. With one
+/// prefill under its limit the request is placed on it.
 ///
 /// The classic router answers the same way where each prefill at its limit
 /// has a partner that can be sent to: "Selection was not run; the request

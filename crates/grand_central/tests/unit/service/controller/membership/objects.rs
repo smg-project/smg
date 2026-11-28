@@ -1,6 +1,7 @@
 //! The cases of the worker objects behind a call: a decision behind an
-//! acknowledged call reads the fleet the call left, and a call builds a
-//! row's object at its write, its status behind it.
+//! acknowledged call reads the fleet the call left, a call builds a row's
+//! object at its write, its status behind it, and the holder pairs two
+//! registered rows by the worker crate's reading of their runtime names.
 
 use super::*;
 
@@ -133,4 +134,49 @@ fn a_call_builds_a_rows_object_at_its_write_and_its_status_follows() {
         "{wrote:?}"
     );
     assert_eq!(told(), ["registered", "status"]);
+}
+
+/// A registration states its runtime's name as its host writes it, and
+/// the row keeps that spelling. The replica's holder hands the pair rule
+/// the worker crate's reading of the name, so a prefill and a decode whose
+/// registrations spell one runtime two ways pair.
+#[test]
+fn two_registrations_that_spell_one_runtime_two_ways_pair() {
+    use smg_worker::worker::RuntimeType;
+
+    use crate::document::spec::Pairing;
+
+    let name = RuntimeType::Generic.as_str();
+    let (store, door) = door();
+    let sides = [
+        (
+            "grpc://10.0.3.1:8000",
+            proto::Role::Prefill,
+            name.to_uppercase(),
+        ),
+        ("grpc://10.0.3.2:8000", proto::Role::Decode, name.to_owned()),
+    ];
+    for (url, role, runtime) in &sides {
+        let stated = proto::WorkerSpec {
+            role: *role as i32,
+            runtime: runtime.clone(),
+            ..unchecked(url)
+        };
+        door.register(&operator(), under(TERM), &ask(stated, Mode::Add))
+            .expect("one row");
+        let row = store.by_key(url).expect("the registered row");
+        assert_eq!(&row.facts.engine_kind, runtime, "{url}");
+    }
+    let registry = door.objects.registry();
+    let generation = registry
+        .model_generation("model-a")
+        .expect("the model's generation");
+    for mode in [Pairing::Off, Pairing::Lenient] {
+        let classes = door.objects.pair_classes(&generation, mode);
+        assert_eq!(
+            (classes.prefills(), classes.decodes()),
+            (&[1][..], &[1][..]),
+            "{mode:?}"
+        );
+    }
 }
