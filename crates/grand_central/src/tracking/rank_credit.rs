@@ -43,13 +43,14 @@ pub(crate) struct RankCredit {
     /// of a lease that states no size, in a count of sends. As wide as the
     /// held word's count of requests, which bounds it. A word of its own,
     /// written behind the held word at a record and lowered ahead of it
-    /// at a release and at a retirement, so it never counts a dispatch
-    /// the held word does not. The held word's subtraction there is a
-    /// `Release` and the read of both words loads the held word with
-    /// `Acquire`, so a reader finds that order on every target. A read
-    /// loads the two words apart: across a record, a release or a
+    /// at a release and at a retirement ([`Self::unprice`]), so it never
+    /// counts a dispatch the held word does not. The held word's
+    /// subtraction there is a `Release` and the read of both words loads
+    /// the held word with `Acquire`, so a reader finds that order on every
+    /// target. A read loads the two words apart: across a record or a
     /// retirement it may see one without the other for the dispatch in
-    /// flight.
+    /// flight, and across a release for each dispatch that its held word
+    /// counts and that goes between its two loads.
     unsized_held: AtomicU16,
     /// The estimates of the held dispatches that stated no size, summed:
     /// what a reader that prices such a send by its text adds to the
@@ -61,9 +62,10 @@ pub(crate) struct RankCredit {
     /// record it may see a dispatch in one word and not in the other: its
     /// request without its estimate, or the estimate of a dispatch that
     /// landed behind the read of the held word. Across a release or a
-    /// retirement it may miss the estimate of a dispatch the held word
-    /// still counts, and reads that send at no tokens: it never adds the
-    /// estimate of a dispatch the held word has let go.
+    /// retirement it may miss the estimate of a dispatch the held word it
+    /// loaded still counts, and reads that send at no tokens: at a
+    /// release, each such dispatch that goes between its two loads. It
+    /// never adds the estimate of a dispatch the held word has let go.
     estimated_held: AtomicU64,
     /// The lowest of the lanes' front instants; `u64::MAX` when none. A
     /// dispatch lowers it under its lane's lock; a release recomputes it
@@ -333,6 +335,23 @@ impl Default for RankCredit {
     }
 }
 
+/// A dispatch on its way out of a row: the held word still counts it, and
+/// its price is out of the row's other two words. Where it stated no size,
+/// [`RankCredit::unprice`] took its estimate out of the estimates' word
+/// and its mark out of the count of no stated size. One that stated its
+/// size has no such price, and the release of a row that holds no dispatch
+/// of no stated size makes this value with no first step
+/// ([`RankCredit::unpriced_stated`]). The held word's step takes the value:
+/// the dispatch leaves that word behind its price, or a retirement at the
+/// row's bound keeps it and puts its price back.
+#[must_use = "the held word still counts the dispatch"]
+struct Unpriced(SendSize);
+
+/// A row's held word as one load found it ([`RankCredit::held_word`]). The
+/// loads of the row's other two words take this value: a read hands them
+/// the one its own load made, so it loads them behind the held word.
+struct HeldWord(u64);
+
 impl RankCredit {
     /// One dispatch as the held word counts it.
     fn weight(tokens: u32) -> u64 {
@@ -373,12 +392,67 @@ impl RankCredit {
         }
     }
 
-    /// Takes a dispatch of `tokens` its lane let go out of the held word.
-    /// The subtraction is a `Release`: a read that loads the word with
-    /// `Acquire` finds every write made ahead of it, the count of the
-    /// dispatches of no tokens among them ([`Self::sent_through`]).
-    fn take_out(&self, tokens: u32) {
-        self.held.fetch_sub(Self::weight(tokens), Ordering::Release);
+    /// The first step of a dispatch's leaving the row, at a release and at
+    /// a retirement: where it stated no size, its estimate leaves the
+    /// estimates' word and its mark the count of no stated size. The held
+    /// word still counts it, and that word's step takes the value handed
+    /// back ([`Self::take_out`], [`Self::take_out_past_bound`]).
+    #[inline(always)]
+    fn unprice(&self, size: SendSize) -> Unpriced {
+        if size.is_unsized() {
+            self.estimated_held
+                .fetch_sub(u64::from(size.estimate()), Ordering::Relaxed);
+            self.unsized_held.fetch_sub(1, Ordering::Relaxed);
+        }
+        Unpriced(size)
+    }
+
+    /// The value of a dispatch that stated its size, made with no first
+    /// step: such a dispatch has no price to leave. A debug build checks
+    /// that the size is stated.
+    #[inline(always)]
+    fn unpriced_stated(size: SendSize) -> Unpriced {
+        debug_assert!(!size.is_unsized(), "the dispatch stated its size");
+        Unpriced(size)
+    }
+
+    /// The second step at a release: takes the dispatch its lane let go
+    /// out of the held word. The subtraction is a `Release`: a read that
+    /// loads the word with `Acquire` finds every write made ahead of it,
+    /// the count of the dispatches of no tokens among them
+    /// ([`Self::sent_through`]).
+    #[inline(always)]
+    fn take_out(&self, gone: Unpriced) {
+        let Unpriced(size) = gone;
+        self.held
+            .fetch_sub(Self::weight(size.tokens()), Ordering::Release);
+    }
+
+    /// The second step at a retirement: takes the dispatch out of the held
+    /// word where the row stands past its bound, and says whether it did.
+    /// The bound and the subtraction are one step of that word: a
+    /// retirement under another lane's lock reads the same word, and one
+    /// of the two takes the last dispatch past the bound. Where the row
+    /// stands at its bound the dispatch stays, and its price goes back
+    /// into its two words.
+    #[inline(always)]
+    fn take_out_past_bound(&self, gone: Unpriced) -> bool {
+        let Unpriced(size) = gone;
+        let weight = Self::weight(size.tokens());
+        let taken = self
+            .held
+            .try_update(Ordering::Release, Ordering::Relaxed, |held| {
+                (held & REQUEST_MASK > RANK_CREDIT_KEPT).then(|| held - weight)
+            });
+        if taken.is_err() {
+            if size.is_unsized() {
+                self.unsized_held.fetch_add(1, Ordering::Relaxed);
+                self.estimated_held
+                    .fetch_add(u64::from(size.estimate()), Ordering::Relaxed);
+            }
+            return false;
+        }
+        true
     }
 
     /// Every lane's dispatches under their locks, taken in lane order: the
@@ -432,32 +506,11 @@ impl RankCredit {
                 continue;
             };
             // The estimate and the count of no stated size first and the
-            // held word next, as a release lowers them. The bound and the
-            // subtraction are one step of that word: a retirement under
-            // another lane's lock reads the same word, and one of the two
-            // takes the last dispatch past the bound.
-            if size.is_unsized() {
-                self.estimated_held
-                    .fetch_sub(u64::from(size.estimate()), Ordering::Relaxed);
-                self.unsized_held.fetch_sub(1, Ordering::Relaxed);
-            }
-            // A case reads the row here, between the two writes.
-            #[cfg(test)]
-            if let Some(read) = tests::BETWEEN_A_RETIREMENTS_WRITES.get() {
-                read(self);
-            }
-            let weight = Self::weight(size.tokens());
-            let taken = self
-                .held
-                .try_update(Ordering::Release, Ordering::Relaxed, |held| {
-                    (held & REQUEST_MASK > RANK_CREDIT_KEPT).then(|| held - weight)
-                });
-            if taken.is_err() {
-                if size.is_unsized() {
-                    self.unsized_held.fetch_add(1, Ordering::Relaxed);
-                    self.estimated_held
-                        .fetch_add(u64::from(size.estimate()), Ordering::Relaxed);
-                }
+            // held word next, as a release lowers them. Where a retirement
+            // under another lane's lock took the last dispatch past the
+            // bound, this one stays.
+            let gone = self.unprice(size);
+            if !self.take_out_past_bound(gone) {
                 return;
             }
             dispatches.0.pop_front();
@@ -482,18 +535,8 @@ impl RankCredit {
         if self.reaches(through_micros) {
             self.release_through(through_micros);
         }
-        let held = self.held.load(Ordering::Acquire);
-        // A case runs a release here, behind the held word's load and
-        // ahead of the estimates'.
-        #[cfg(test)]
-        if let Some(release) = tests::BETWEEN_A_READS_LOADS.get() {
-            release(self);
-        }
-        DispatchCounts {
-            // The word's low bits: the narrower type cuts none of them.
-            requests: (held & REQUEST_MASK) as u32,
-            tokens: (held >> REQUEST_BITS) + self.estimated(),
-        }
+        let held = self.held_word();
+        self.counts_behind(&held)
     }
 
     /// The held requests and stated token-work of [`Self::counts_through`]
@@ -508,24 +551,64 @@ impl RankCredit {
         if self.reaches(through_micros) {
             self.release_through(through_micros);
         }
-        let held = self.held.load(Ordering::Acquire);
-        // A case runs a release here, behind the held word's load and
-        // ahead of the count's.
-        #[cfg(test)]
-        if let Some(release) = tests::BETWEEN_A_READS_LOADS.get() {
-            release(self);
+        let held = self.held_word();
+        self.sent_behind(&held)
+    }
+
+    /// The four numbers of a whole read once the dispatches made at or
+    /// before `through_micros` are released: the three of
+    /// [`Self::sent_through`], and the estimates of the held dispatches
+    /// that stated no size, summed. Inlined into a reader's row loop: four
+    /// loads and a compare a row, the row's oldest instant, the held word
+    /// and, behind it, the count and the estimates, with the release
+    /// behind a call.
+    #[inline(always)]
+    pub(crate) fn credited_through(&self, through_micros: u64) -> (SentCredit, u64) {
+        if self.reaches(through_micros) {
+            self.release_through(through_micros);
         }
+        let held = self.held_word();
+        (self.sent_behind(&held), self.estimated_behind(&held))
+    }
+
+    /// The first step of a read: the held word, loaded with `Acquire`
+    /// against the `Release` of a release's and a retirement's
+    /// subtraction. A read hands the value to the loads of the row's other
+    /// two words, and so finds each as it stood at that subtraction or
+    /// later.
+    #[inline(always)]
+    fn held_word(&self) -> HeldWord {
+        HeldWord(self.held.load(Ordering::Acquire))
+    }
+
+    /// The second step of [`Self::counts_through`]: the requests the held
+    /// word counts and their tokens, stated or estimated, with the
+    /// estimates' word loaded behind it.
+    #[inline(always)]
+    fn counts_behind(&self, held: &HeldWord) -> DispatchCounts {
+        DispatchCounts {
+            // The word's low bits: the narrower type cuts none of them.
+            requests: (held.0 & REQUEST_MASK) as u32,
+            tokens: (held.0 >> REQUEST_BITS) + self.estimated_behind(held),
+        }
+    }
+
+    /// The second step of [`Self::sent_through`]: the requests and the
+    /// stated tokens the held word counts, with the count of the
+    /// dispatches of no tokens loaded behind it.
+    #[inline(always)]
+    fn sent_behind(&self, held: &HeldWord) -> SentCredit {
         SentCredit {
-            requests: (held & REQUEST_MASK) as u32,
-            tokens: held >> REQUEST_BITS,
+            requests: (held.0 & REQUEST_MASK) as u32,
+            tokens: held.0 >> REQUEST_BITS,
             unsized_requests: u32::from(self.unsized_held.load(Ordering::Relaxed)),
         }
     }
 
-    /// The estimates of the held dispatches that stated no size, as the
-    /// word stands: read behind the held word ([`Self::estimated_held`]).
+    /// The estimates of the held dispatches that stated no size, as their
+    /// word stands behind the held word's load ([`Self::estimated_held`]).
     #[inline(always)]
-    pub(crate) fn estimated(&self) -> u64 {
+    fn estimated_behind(&self, _held: &HeldWord) -> u64 {
         self.estimated_held.load(Ordering::Relaxed)
     }
 
@@ -617,13 +700,16 @@ impl RankCredit {
         // No dispatch lands under every lane's lock, so the count of the
         // held dispatches of no tokens stands still here: a row that
         // holds none releases by the loop it ran before that count was
-        // kept.
+        // kept. Each of its dispatches stated its size, as long as that
+        // count has not wrapped: it is as wide as the held word's count
+        // of requests and counts no dispatch that word does not, so it
+        // wraps only where that word's count has overflowed.
         if self.unsized_held.load(Ordering::Relaxed) != 0 {
             self.release_marked(held_lanes, sampled_at_micros);
         } else {
             for (at, dispatches) in held_lanes.iter_mut().enumerate() {
                 while let Some(size) = dispatches.let_go(sampled_at_micros) {
-                    self.take_out(size.tokens());
+                    self.take_out(Self::unpriced_stated(size));
                 }
                 self.fronts.publish(at, dispatches);
             }
@@ -641,8 +727,8 @@ impl RankCredit {
     /// The release of a row that holds a dispatch of no tokens: each one
     /// that goes leaves the estimates' word and that count first and the
     /// held word next. So a read adds no price of a dispatch the held
-    /// word has let go, and misses the price of each one that goes
-    /// between its own loads.
+    /// word has let go, and may miss the price of each one that its held
+    /// word counts and that goes between its own loads.
     #[cold]
     #[inline(never)]
     fn release_marked(
@@ -652,17 +738,8 @@ impl RankCredit {
     ) {
         for (at, dispatches) in held_lanes.iter_mut().enumerate() {
             while let Some(size) = dispatches.let_go(sampled_at_micros) {
-                if size.is_unsized() {
-                    self.estimated_held
-                        .fetch_sub(u64::from(size.estimate()), Ordering::Relaxed);
-                    self.unsized_held.fetch_sub(1, Ordering::Relaxed);
-                }
-                // A case reads the row here, ahead of the held word's write.
-                #[cfg(test)]
-                if let Some(read) = tests::BETWEEN_A_RELEASES_WRITES.get() {
-                    read(self);
-                }
-                self.take_out(size.tokens());
+                let gone = self.unprice(size);
+                self.take_out(gone);
             }
             self.fronts.publish(at, dispatches);
         }

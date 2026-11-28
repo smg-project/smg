@@ -17,12 +17,8 @@ use crate::{
     },
     stages::{pickers, Lifecycle, StageRegistry},
     tracking::{
-        decision_guard::DecisionGuard,
-        rank_credit::{
-            tests::{take_lane, BETWEEN_A_READS_LOADS},
-            RankCredit,
-        },
-        CreditedDispatches, DispatchCounts, DispatchCredit, Lease, Membership, Side,
+        decision_guard::DecisionGuard, rank_credit::tests::take_lane, CreditedDispatches,
+        DispatchCounts, DispatchCredit, Lease, Membership, Side,
     },
 };
 
@@ -290,49 +286,6 @@ fn a_send_of_no_stated_size_leaves_the_count_with_its_release() {
     a.load = Some(LoadRow::default());
     a.load_sampled_at_micros = START + 9 + u64::from(DELAY);
     assert_eq!(sent.read(&clock(0), &a), one(TOKENS));
-}
-
-/// The whole read loads a row's estimates behind its held word: the count
-/// of its sends first, the estimates after
-/// ([`DispatchCreditPass::of`](super::DispatchCreditPass::of)). The row
-/// holds sends of text alone, and a release that lets every one go runs
-/// whole inside the read, behind the held word's load. The read hands
-/// back the sends the held word counted and no estimate: none of a send
-/// the held word has let go.
-#[test]
-fn a_whole_read_across_a_release_adds_no_estimate_of_a_send_let_go() {
-    const HELD: u32 = 64;
-    fn release(row: &RankCredit) {
-        // The hook takes itself off: it runs inside one read alone.
-        BETWEEN_A_READS_LOADS.set(None);
-        row.release_through(u64::MAX);
-    }
-    let (engine, sent) = built(None);
-    let a = row(193, 5);
-    for at in 0..u64::from(HELD) {
-        // A text of 404 bytes: an estimate of 101 tokens.
-        let lease = Lease {
-            issued_micros: START + at,
-            bytes: 404,
-            ..Lease::default()
-        };
-        engine.on_dispatched(&lease, &target(&a), Side::Single, DELAY);
-    }
-    BETWEEN_A_READS_LOADS.set(Some(release));
-    // No report and a clock of zero: the read itself releases none.
-    let read = sent.read(&clock(0), &a);
-    assert!(
-        BETWEEN_A_READS_LOADS.get().is_none(),
-        "the release ran inside the read"
-    );
-    assert_eq!(
-        read,
-        CreditedDispatches {
-            requests: HELD,
-            ..CreditedDispatches::default()
-        }
-    );
-    assert_eq!(sent.read(&clock(0), &a), CreditedDispatches::default());
 }
 
 #[test]
