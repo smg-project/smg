@@ -7,7 +7,15 @@
 //! - MCP tool execution loops within streaming responses
 //! - Event transformation and output index remapping
 
-use std::{borrow::Cow, io, sync::Arc};
+use std::{
+    borrow::Cow,
+    collections::VecDeque,
+    future::Future,
+    io,
+    pin::{pin, Pin},
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use axum::{
     body::Body,
@@ -54,10 +62,11 @@ use crate::{
     openai::{
         context::{RequestContext, StreamingEventContext, StreamingRequest},
         mcp::{
-            execute_streaming_tool_calls, inject_mcp_metadata_last, prepare_mcp_tools_as_functions,
-            resume_payload_in_place, retained_output_items, send_mcp_list_tools_events,
-            skip_streaming_tool_calls, StreamAction, StreamingToolHandler, ToolLoopState,
-            TOOL_CALL_LIMIT_REASON,
+            close_streaming_open_items, execute_streaming_tool_calls, inject_mcp_metadata_last,
+            prepare_mcp_tools_as_functions, resume_payload_in_place, retained_output_items,
+            send_mcp_list_tools_events, skip_streaming_tool_calls, StreamAction,
+            StreamingToolHandler, ToolLoopState, NOT_EXECUTED_AT_STREAM_BREAK,
+            NOT_EXECUTED_AT_TOOL_CALL_LIMIT, TOOL_CALL_LIMIT_REASON,
         },
     },
     persistence_utils::persist_conversation_items_owned,
@@ -810,11 +819,107 @@ pub(super) async fn handle_simple_streaming_passthrough(
     response
 }
 
+/// The most a turn's read-ahead holds, in bytes: what was taken off the
+/// upstream's stream while a tool call ran and the relay has not read yet.
+const READ_AHEAD_BOUND: usize = 8 * 1024 * 1024;
+
+/// One upstream turn's byte stream, read ahead while the turn's tool calls
+/// run. What `read_during` takes off the stream waits here in order, up to
+/// `bound` bytes, and is yielded before the stream is polled again. At the
+/// bound the rest of the turn waits unread until the calls are done.
+struct TurnStream<S> {
+    upstream: S,
+    read_ahead: VecDeque<reqwest::Result<Bytes>>,
+    /// The bytes waiting in `read_ahead`.
+    read_ahead_bytes: usize,
+    /// `READ_AHEAD_BOUND`, or a test's own.
+    bound: usize,
+    /// The stream ended or broke under `read_during`: it is not polled
+    /// again.
+    ended: bool,
+    /// A call of this turn ran under `read_during`: from here on an error
+    /// of the stream ends the turn, not the request.
+    handed_over: bool,
+}
+
+impl<S: Stream<Item = reqwest::Result<Bytes>> + Unpin> TurnStream<S> {
+    fn new(upstream: S) -> Self {
+        Self {
+            upstream,
+            read_ahead: VecDeque::new(),
+            read_ahead_bytes: 0,
+            bound: READ_AHEAD_BOUND,
+            ended: false,
+            handed_over: false,
+        }
+    }
+
+    /// Runs `work` to its end and reads the stream meanwhile, up to the
+    /// read-ahead's bound.
+    async fn read_during<T>(&mut self, work: impl Future<Output = T>) -> T {
+        tokio::pin!(work);
+        self.handed_over = true;
+        loop {
+            tokio::select! {
+                output = &mut work => return output,
+                read = futures_util::future::poll_fn(|cx| self.poll_upstream(cx)), if !self.ended && !self.read_ahead_is_full() => match read {
+                    Some(chunk) => {
+                        match &chunk {
+                            Ok(bytes) => self.read_ahead_bytes += bytes.len(),
+                            Err(_) => self.ended = true,
+                        }
+                        self.read_ahead.push_back(chunk);
+                    }
+                    None => self.ended = true,
+                },
+            }
+        }
+    }
+
+    /// Whether the read-ahead holds its bound: the stream waits unread.
+    fn read_ahead_is_full(&self) -> bool {
+        self.read_ahead_bytes >= self.bound
+    }
+
+    fn poll_upstream(&mut self, cx: &mut Context<'_>) -> Poll<Option<reqwest::Result<Bytes>>> {
+        if self.ended {
+            return Poll::Ready(None);
+        }
+        let read = self.upstream.poll_next_unpin(cx);
+        if matches!(read, Poll::Ready(Some(Err(_)) | None)) {
+            self.ended = true;
+        }
+        read
+    }
+}
+
+impl<S: Stream<Item = reqwest::Result<Bytes>> + Unpin> Stream for TurnStream<S> {
+    type Item = reqwest::Result<Bytes>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(chunk) = self.read_ahead.pop_front() {
+            if let Ok(bytes) = &chunk {
+                self.read_ahead_bytes -= bytes.len();
+            }
+            return Poll::Ready(Some(chunk));
+        }
+        if self.ended {
+            return Poll::Ready(None);
+        }
+        self.poll_upstream(cx)
+    }
+}
+
 /// What one relayed upstream stream ended with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RelayEnd {
-    /// The model finished without asking for a tool.
+    /// The stream ended with no call waiting in the handler: the model's
+    /// answer, or the end of a turn whose calls the loop has run.
     Answered,
+    /// The turn was cut behind a call of it the loop ran (its stream broke,
+    /// carried a terminal other than `response.completed`, or ended with
+    /// none): the turn ends there and the loop asks the upstream again.
+    Broke,
     /// The handler holds complete tool calls; the loop executes them.
     ToolCalls,
     /// The client is gone or the stream broke (its error event sent):
@@ -831,18 +936,36 @@ struct RelayFlags {
     mcp_list_tools_sent: bool,
 }
 
+/// The cause an upstream terminal other than `response.completed` names, a
+/// short word: a failed response's error code, an incomplete response's
+/// reason, the `error` event's code. The upstream's free text stays out of
+/// the log.
+fn unfinished_turn_cause(event: &Value) -> Option<&str> {
+    [
+        "/response/error/code",
+        "/response/incomplete_details/reason",
+        "/code",
+    ]
+    .iter()
+    .find_map(|pointer| event.pointer(pointer).and_then(Value::as_str))
+}
+
 /// Relays one upstream event stream to the client: every block but the
 /// upstream's end sentinel (the loop ends the client's stream with its own)
 /// goes through the handler and is forwarded, buffered or dropped as it says;
 /// the MCP list-tools items (the loop's, built once with its session; none
 /// without one) go out at the first `in_progress` of the first stream; a
 /// tool-call trigger ends the relay with the calls pending in the handler.
+/// The caller runs them and relays the same stream again: `chunk_processor`
+/// keeps the blocks this relay split off and did not read, so the next relay
+/// goes on from where this one stopped.
 #[expect(
     clippy::too_many_arguments,
     reason = "The relay reads the loop's client side as the loop's own text did (the sender, the encoder, the sequence number) beside the handler and its two flags; a struct for one call would be a type the loop's other phases do not share."
 )]
 async fn relay_upstream_stream(
-    upstream_stream: &mut (impl Stream<Item = reqwest::Result<Bytes>> + Unpin),
+    upstream_stream: &mut TurnStream<impl Stream<Item = reqwest::Result<Bytes>> + Unpin>,
+    chunk_processor: &mut ChunkProcessor,
     handler: &mut StreamingToolHandler,
     flags: &mut RelayFlags,
     list_tools_items: &[Value],
@@ -851,9 +974,11 @@ async fn relay_upstream_stream(
     streaming_ctx: &StreamingEventContext<'_>,
     sequence_number: &mut u64,
 ) -> RelayEnd {
-    let mut chunk_processor = ChunkProcessor::new();
     let mut seen_in_progress = false;
-    while let Some(chunk_result) = upstream_stream.next().await {
+    // An empty chunk first: the blocks an earlier relay of this turn left in
+    // the processor are read before the stream is awaited again.
+    let mut chunk_result: reqwest::Result<Bytes> = Ok(Bytes::new());
+    loop {
         match chunk_result {
             Ok(chunk) => {
                 chunk_processor.push_chunk(&chunk);
@@ -877,6 +1002,35 @@ async fn relay_upstream_stream(
 
                     match action {
                         StreamAction::Forward => {
+                            // Behind a call of this turn the loop ran, an
+                            // upstream terminal other than
+                            // `response.completed` ends the turn as a broken
+                            // stream does: it is not forwarded (the loop
+                            // writes the request's one terminal) and the
+                            // upstream is asked again.
+                            if upstream_stream.handed_over {
+                                let terminal = parsed
+                                    .as_ref()
+                                    .and_then(|v| v.get("type"))
+                                    .and_then(|t| t.as_str())
+                                    .filter(|kind| {
+                                        matches!(
+                                            *kind,
+                                            ResponseEvent::INCOMPLETE
+                                                | ResponseEvent::FAILED
+                                                | "error"
+                                        )
+                                    });
+                                if let Some(terminal) = terminal {
+                                    warn!(
+                                        event = terminal,
+                                        cause = parsed.as_ref().and_then(unfinished_turn_cause),
+                                        "An upstream turn ended unfinished behind a tool call of that turn: the turn ends there and the upstream is asked again"
+                                    );
+                                    return RelayEnd::Broke;
+                                }
+                            }
+
                             // Skip response.created and response.in_progress on subsequent iterations
                             let should_skip = if flags.first_iteration {
                                 false
@@ -958,7 +1112,11 @@ async fn relay_upstream_stream(
                             // is the LAST event for a given item.
                             // Unlike `ExecuteTools`, this does NOT
                             // kick the tool loop — there is no
-                            // dispatched call to finish.
+                            // dispatched call to finish. The same
+                            // holds for the upstream's own
+                            // `output_item.done` of a call the loop
+                            // took already: the loop writes that
+                            // call's umbrella itself.
                         }
                         StreamAction::ExecuteTools {
                             forward_triggering_event,
@@ -996,11 +1154,33 @@ async fn relay_upstream_stream(
                 }
             }
             Err(e) => {
+                // Behind a call of this turn the loop ran, the turn ends at
+                // the error and the upstream is asked again, as it was asked
+                // after every call before one stream served a whole turn.
+                if upstream_stream.handed_over {
+                    warn!(
+                        error = %e.without_url(),
+                        "The stream of an upstream turn broke behind a tool call of that turn: the turn ends there and the upstream is asked again"
+                    );
+                    return RelayEnd::Broke;
+                }
                 let message = format!("Stream error: {}", e.without_url());
                 send_error_event(tx, sse_encoder, sequence_number, STREAM_ERROR, &message).await;
                 return RelayEnd::Stopped;
             }
         }
+        chunk_result = match upstream_stream.next().await {
+            Some(next) => next,
+            None => break,
+        };
+    }
+    // Behind a call of this turn the loop ran, a stream that ends without
+    // the turn's `response.completed` is a cut turn as well.
+    if upstream_stream.handed_over && !handler.accumulator.is_completed() {
+        warn!(
+            "The stream of an upstream turn ended without its terminal event behind a tool call of that turn: the turn ends there and the upstream is asked again"
+        );
+        return RelayEnd::Broke;
     }
     RelayEnd::Answered
 }
@@ -1071,7 +1251,9 @@ pub(super) fn handle_streaming_with_tool_interception(
         let auth_header =
             provider.extract_auth_header(headers_opt.as_ref(), worker_api_key.as_ref());
 
-        let (handler, end) = loop {
+        // The read-ahead's bound is logged once a request.
+        let mut read_ahead_full_logged = false;
+        let (handler, end) = 'turns: loop {
             // Make streaming request
             let mut request_builder = client_clone.post(&url_clone).json(&current_payload);
             request_builder = provider.apply_headers(request_builder, auth_header.as_ref());
@@ -1102,96 +1284,183 @@ pub(super) fn handle_streaming_with_tool_interception(
                 return;
             }
 
-            let mut upstream_stream = response.bytes_stream();
+            let mut upstream_stream = TurnStream::new(response.bytes_stream());
             let mut handler = StreamingToolHandler::with_starting_index(next_output_index);
             if let Some(ref id) = preserved_response_id {
                 handler.original_response_id = Some(id.clone());
             }
-            let end = relay_upstream_stream(
-                &mut upstream_stream,
-                &mut handler,
-                &mut flags,
-                state.mcp_list_tools_items(&session),
-                &tx,
-                &mut sse_encoder,
-                &streaming_ctx,
-                &mut sequence_number,
-            )
-            .await;
-            if end == RelayEnd::Stopped {
-                return;
-            }
+            // One upstream turn. The relay hands over at each complete call,
+            // the call runs, and the relay reads the same stream on from
+            // where it stopped: a turn that asks for several tools is served
+            // call by call in this one round trip, and the model is not asked
+            // for the rest again.
+            let mut chunk_processor = ChunkProcessor::new();
+            let mut calls_ran = false;
+            loop {
+                let end = relay_upstream_stream(
+                    &mut upstream_stream,
+                    &mut chunk_processor,
+                    &mut handler,
+                    &mut flags,
+                    state.mcp_list_tools_items(&session),
+                    &tx,
+                    &mut sse_encoder,
+                    &streaming_ctx,
+                    &mut sequence_number,
+                )
+                .await;
+                if end == RelayEnd::Stopped {
+                    return;
+                }
 
-            next_output_index = handler.next_output_index();
-            if let Some(id) = handler.original_response_id().map(|s| s.to_string()) {
-                preserved_response_id = Some(id);
+                next_output_index = handler.next_output_index();
+                if let Some(id) = handler.original_response_id().map(|s| s.to_string()) {
+                    preserved_response_id = Some(id);
+                }
+
+                // The stream's end: this turn has nothing more to hand over.
+                if end == RelayEnd::Answered {
+                    break;
+                }
+                // The turn was cut behind a call of it: the turn ends there.
+                // A call it left half-open is closed as not executed, any
+                // other item it left half-open as incomplete with what was
+                // streamed, and the upstream is asked again with the calls
+                // that ran.
+                if end == RelayEnd::Broke {
+                    let half_open = handler.take_pending_calls();
+                    if !skip_streaming_tool_calls(
+                        half_open,
+                        NOT_EXECUTED_AT_STREAM_BREAK,
+                        &session,
+                        &format_registry,
+                        &tx,
+                        &mut state,
+                        &mut sequence_number,
+                    )
+                    .await
+                        || !close_streaming_open_items(
+                            handler.take_open_items(),
+                            &tx,
+                            &mut state,
+                            &mut sequence_number,
+                        )
+                        .await
+                    {
+                        return;
+                    }
+                    break;
+                }
+                calls_ran = true;
+
+                // Execute tools
+                let mut pending_calls = handler.take_pending_calls();
+
+                // Check iteration limit
+                state.iteration += 1;
+                state.total_calls += pending_calls.len();
+
+                // Record tool loop iteration metric: one a hand-over, so the
+                // calls of a turn count the same whether the upstream is
+                // asked once for them all or once for each.
+                Metrics::record_mcp_tool_iteration(&original_request.model);
+
+                let effective_limit = match max_tool_calls {
+                    Some(user_max) => user_max.min(DEFAULT_MAX_ITERATIONS),
+                    None => DEFAULT_MAX_ITERATIONS,
+                };
+
+                // The calls that fit the request's remaining allowance run, as
+                // the non-streamed loop runs them; the rest of the batch is the
+                // stop, the loop's end before an answer.
+                let over_limit = state.total_calls.saturating_sub(effective_limit);
+                let skipped =
+                    pending_calls.split_off(pending_calls.len().saturating_sub(over_limit));
+
+                // Execute all pending tool calls. Pass the caller-declared tools so
+                // hosted-tool overrides (e.g. image_generation size/quality) are
+                // merged into dispatch args before MCP execution. The request-level
+                // `user` is also forwarded into hosted-tool dispatch args.
+                // The turn's stream goes on being read while the calls run,
+                // up to the read-ahead's bound. The calls' future stays in
+                // this task's own state and is handed over pinned: it is
+                // neither moved into the read's future nor boxed.
+                let executed = {
+                    let calls = pin!(execute_streaming_tool_calls(
+                        pending_calls,
+                        &session,
+                        &format_registry,
+                        &tx,
+                        &mut state,
+                        &mut sequence_number,
+                        &original_request.model,
+                        original_request.tools.as_deref().unwrap_or(&[]),
+                        original_request.user.as_deref(),
+                    ));
+                    upstream_stream.read_during(calls).await
+                };
+                if !executed {
+                    return;
+                }
+                if upstream_stream.read_ahead_is_full() && !read_ahead_full_logged {
+                    read_ahead_full_logged = true;
+                    warn!(
+                        bound_bytes = READ_AHEAD_BOUND,
+                        "The read-ahead of an upstream turn reached its bound while a tool call ran: the rest of the turn waits unread"
+                    );
+                }
+
+                if !skipped.is_empty() {
+                    warn!(
+                        effective_limit,
+                        skipped = skipped.len(),
+                        "Reached the tool call limit during streaming: the remaining calls are not executed"
+                    );
+                    if !skip_streaming_tool_calls(
+                        skipped,
+                        NOT_EXECUTED_AT_TOOL_CALL_LIMIT,
+                        &session,
+                        &format_registry,
+                        &tx,
+                        &mut state,
+                        &mut sequence_number,
+                    )
+                    .await
+                        // The stop ends the turn where it stands: an item
+                        // the upstream still holds open there is closed as
+                        // a cut turn's is.
+                        || !close_streaming_open_items(
+                            handler.take_open_items(),
+                            &tx,
+                            &mut state,
+                            &mut sequence_number,
+                        )
+                        .await
+                    {
+                        return;
+                    }
+                    // The final response of this stop is built from this
+                    // turn's handler: the items the upstream closed behind
+                    // a call of the turn leave it for their places among
+                    // the loop's items, by the output index the client
+                    // read, and are not listed behind the calls.
+                    for (output_index, item) in handler.take_closed_items() {
+                        state.retain_streamed_item(output_index, item);
+                    }
+                    break 'turns (handler, ToolLoopEnd::ToolCallLimit);
+                }
             }
 
             // The model answered without asking for a tool: the loop's end.
-            if end == RelayEnd::Answered {
+            if !calls_ran {
                 break (handler, ToolLoopEnd::Answered);
             }
 
-            // Execute tools
-            let mut pending_calls = handler.take_pending_calls();
-
-            // Check iteration limit
-            state.iteration += 1;
-            state.total_calls += pending_calls.len();
-
-            // Record tool loop iteration metric
-            Metrics::record_mcp_tool_iteration(&original_request.model);
-
-            let effective_limit = match max_tool_calls {
-                Some(user_max) => user_max.min(DEFAULT_MAX_ITERATIONS),
-                None => DEFAULT_MAX_ITERATIONS,
-            };
-
-            // The calls that fit the request's remaining allowance run, as
-            // the non-streamed loop runs them; the rest of the batch is the
-            // stop, the loop's end before an answer.
-            let over_limit = state.total_calls.saturating_sub(effective_limit);
-            let skipped = pending_calls.split_off(pending_calls.len().saturating_sub(over_limit));
-
-            // Execute all pending tool calls. Pass the caller-declared tools so
-            // hosted-tool overrides (e.g. image_generation size/quality) are
-            // merged into dispatch args before MCP execution. The request-level
-            // `user` is also forwarded into hosted-tool dispatch args.
-            if !execute_streaming_tool_calls(
-                pending_calls,
-                &session,
-                &format_registry,
-                &tx,
-                &mut state,
-                &mut sequence_number,
-                &original_request.model,
-                original_request.tools.as_deref().unwrap_or(&[]),
-                original_request.user.as_deref(),
-            )
-            .await
-            {
-                return;
-            }
-
-            if !skipped.is_empty() {
-                warn!(
-                    effective_limit,
-                    skipped = skipped.len(),
-                    "Reached the tool call limit during streaming: the remaining calls are not executed"
-                );
-                if !skip_streaming_tool_calls(
-                    skipped,
-                    &session,
-                    &format_registry,
-                    &tx,
-                    &mut state,
-                    &mut sequence_number,
-                )
-                .await
-                {
-                    return;
-                }
-                break (handler, ToolLoopEnd::ToolCallLimit);
+            // The next turn's handler replaces this one: the items the
+            // upstream closed behind a call of this turn stay for the final
+            // response, each at the output index the client read for it.
+            for (output_index, item) in handler.take_closed_items() {
+                state.retain_streamed_item(output_index, item);
             }
 
             // The next turn's payload: this one, the calls just executed

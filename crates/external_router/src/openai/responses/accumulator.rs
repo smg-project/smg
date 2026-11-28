@@ -67,6 +67,28 @@ impl StreamingResponseAccumulator {
         self.build_fallback_response()
     }
 
+    /// Whether the stream carried its `response.completed`.
+    pub fn is_completed(&self) -> bool {
+        self.completed_response.is_some()
+    }
+
+    /// Moves the item the stream closed at the upstream output index
+    /// `index` out of the collected output items: a caller that places the
+    /// item itself does not meet it in the fallback response again. Where
+    /// the stream closed that index more than once, every such item leaves
+    /// and the last is returned.
+    pub fn take_output_item(&mut self, index: usize) -> Option<Value> {
+        let mut taken = None;
+        self.output_items.retain_mut(|(closed_at, item)| {
+            if *closed_at != index {
+                return true;
+            }
+            taken = Some(item.take());
+            false
+        });
+        taken
+    }
+
     pub fn encountered_error(&self) -> Option<&Value> {
         self.encountered_error.as_ref()
     }

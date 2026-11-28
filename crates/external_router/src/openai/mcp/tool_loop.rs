@@ -48,6 +48,9 @@ pub(crate) struct ToolLoopState {
     pub existing_mcp_list_tools_labels: HashSet<String>,
     /// Transformed output items (mcp_call, web_search_call, etc.) - stored to avoid reconstruction
     pub mcp_call_items: Vec<Value>,
+    /// The output index the client read for each of `mcp_call_items`, kept
+    /// by the streamed loop alone (see [`Self::retain_streamed_item`]).
+    streamed_item_indices: Vec<usize>,
     /// The `mcp_list_tools` items this loop renders, built at their first use
     /// and kept (see [`Self::mcp_list_tools_items`]).
     mcp_list_tools_items: Option<Vec<Value>>,
@@ -68,6 +71,7 @@ impl ToolLoopState {
             conversation_history: Vec::new(),
             existing_mcp_list_tools_labels: known_labels,
             mcp_call_items: Vec::new(),
+            streamed_item_indices: Vec::new(),
             mcp_list_tools_items: None,
             history_in_payload: 0,
         }
@@ -153,6 +157,33 @@ impl ToolLoopState {
                 self.mcp_call_items.extend(openai_output_items);
             }
         }
+    }
+
+    /// Says that the items recorded since the last one placed are those of
+    /// the streamed call the client read at `output_index`: the call's own
+    /// item and the items its output carried.
+    fn streamed_call_recorded(&mut self, output_index: usize) {
+        self.streamed_item_indices
+            .resize(self.mcp_call_items.len(), output_index);
+    }
+
+    /// Keeps an item of a streamed turn that the last turn's own output
+    /// does not carry (a call that did not run, an item a cut turn or the
+    /// tool-call limit left half-open, an item the upstream closed behind a
+    /// call of an earlier turn or of the turn that limit ended) for the
+    /// final response, at
+    /// the place of `output_index`, the index the client read for it: before
+    /// the first kept item of a higher index. So the response lists a turn's
+    /// items in the order the stream numbered them, whatever the order they
+    /// were closed in.
+    pub fn retain_streamed_item(&mut self, output_index: usize, item: Value) {
+        let at = self
+            .streamed_item_indices
+            .iter()
+            .position(|&index| index > output_index)
+            .unwrap_or(self.streamed_item_indices.len());
+        self.streamed_item_indices.insert(at, output_index);
+        self.mcp_call_items.insert(at, item);
     }
 }
 
@@ -408,6 +439,7 @@ async fn close_streaming_call(
     {
         return false;
     }
+    let output_index = call.effective_output_index();
     state.record_call(
         dispatch.session.is_builtin_tool(&call.name),
         call.call_id,
@@ -416,21 +448,27 @@ async fn close_streaming_call(
         output_str,
         mcp_call_item,
     );
+    state.streamed_call_recorded(output_index);
     true
 }
 
-/// The calls of a batch beyond the request's tool-call allowance: none runs.
-/// Each is closed on the wire under the type the stream announced for it,
-/// with the item the non-streamed loop renders for the same call
-/// ([`not_executed_tool_call_item`]): an `mcp_call` gets
+/// The calls the streamed loop does not run: those of a batch beyond the
+/// request's tool-call allowance ([`NOT_EXECUTED_AT_TOOL_CALL_LIMIT`]), or a
+/// call an upstream turn left half-open when its stream broke
+/// ([`NOT_EXECUTED_AT_STREAM_BREAK`]); `error` says which. None runs. Each
+/// is closed on the wire under the type the stream announced for it, with
+/// the item of [`not_executed_tool_call_item`] (the item the non-streamed
+/// loop renders for a call past the allowance): an `mcp_call` gets
 /// `response.mcp_call.failed` and then its `response.output_item.done`; a
 /// call in a hosted format gets its `response.output_item.done` alone (the
 /// API has no failed sub-event for those item types; the item's status says
-/// it). So no item the stream announced stays open, and each takes its place
-/// among the final response's items after the calls that ran. Returns false
-/// when the client left.
+/// it). So no item the stream announced stays open, and each takes the place
+/// of its output index among the final response's items (see
+/// [`ToolLoopState::retain_streamed_item`]). Returns false when the client
+/// left.
 pub(crate) async fn skip_streaming_tool_calls(
     skipped: Vec<FunctionCallInProgress>,
+    error: &str,
     session: &McpToolSession<'_>,
     format_registry: &FormatRegistry,
     tx: &SseSender,
@@ -453,6 +491,7 @@ pub(crate) async fn skip_streaming_tool_calls(
             &server_label,
             &call.name,
             arguments,
+            error,
         );
         if let Some(obj) = item.as_object_mut() {
             obj.insert("id".to_string(), Value::String(item_id.clone()));
@@ -493,7 +532,43 @@ pub(crate) async fn skip_streaming_tool_calls(
             return false;
         }
 
-        state.mcp_call_items.push(item);
+        state.retain_streamed_item(output_index, item);
+    }
+    true
+}
+
+/// The items other than function calls that an upstream turn left half-open
+/// when it was cut behind a call that ran or stopped there at the tool-call
+/// limit, as
+/// [`super::StreamingToolHandler::take_open_items`] hands them over: each gets the
+/// `response.output_item.done` the upstream did not write, with the item as
+/// closed there, and takes the place of its output index among the final
+/// response's items (see [`ToolLoopState::retain_streamed_item`]). Returns
+/// false when the client left.
+pub(crate) async fn close_streaming_open_items(
+    open_items: Vec<(usize, Value)>,
+    tx: &SseSender,
+    state: &mut ToolLoopState,
+    sequence_number: &mut u64,
+) -> bool {
+    for (output_index, item) in open_items {
+        let done_payload = json!({
+            "type": OutputItemEvent::DONE,
+            "sequence_number": *sequence_number,
+            "output_index": output_index,
+            "item": item
+        });
+        *sequence_number += 1;
+        let done_event = format!(
+            "event: {}\ndata: {}\n\n",
+            OutputItemEvent::DONE,
+            done_payload
+        );
+        if tx.send(Ok(Bytes::from(done_event))).await.is_err() {
+            return false;
+        }
+
+        state.retain_streamed_item(output_index, item);
     }
     true
 }
@@ -1142,12 +1217,18 @@ pub(crate) const TOOL_CALL_LIMIT_REASON: &str = "max_tool_calls";
 /// allowance was spent before it, in both modes.
 pub(crate) const NOT_EXECUTED_AT_TOOL_CALL_LIMIT: &str =
     "Not executed - response stopped due to limit";
+/// The error of a call the streamed loop did not run because the upstream
+/// turn's stream broke before the call was complete.
+pub(crate) const NOT_EXECUTED_AT_STREAM_BREAK: &str =
+    "Not executed - the upstream stream ended before this call was complete";
 
-/// The item of a call the loop did not run because the request's tool-call
-/// allowance was spent before it, in the call's own format, in both modes:
-/// an `mcp_call` that `failed` with [`NOT_EXECUTED_AT_TOOL_CALL_LIMIT`], or,
-/// for a tool answered in a hosted format, the item type the stream announces
-/// for the call (`web_search_call`, ...) with the status `failed`. The id is
+/// The item of a call the loop did not run, in the call's own format, in
+/// both modes: an `mcp_call` that `failed` with `error`
+/// ([`NOT_EXECUTED_AT_TOOL_CALL_LIMIT`] where the request's tool-call
+/// allowance was spent before the call, [`NOT_EXECUTED_AT_STREAM_BREAK`]
+/// where the turn's stream broke before the call was complete), or, for a
+/// tool answered in a hosted format, the item type the stream announces for
+/// the call (`web_search_call`, ...) with the status `failed`. The id is
 /// derived from the call's, as an executed call's is.
 fn not_executed_tool_call_item(
     response_format: ResponseFormat,
@@ -1155,16 +1236,11 @@ fn not_executed_tool_call_item(
     server_label: &str,
     tool_name: &str,
     arguments: &str,
+    error: &str,
 ) -> Value {
     if response_format == ResponseFormat::Passthrough {
-        let mut item = build_mcp_call_item(
-            tool_name,
-            arguments,
-            "",
-            server_label,
-            false,
-            Some(NOT_EXECUTED_AT_TOOL_CALL_LIMIT),
-        );
+        let mut item =
+            build_mcp_call_item(tool_name, arguments, "", server_label, false, Some(error));
         if let Some(obj) = item.as_object_mut() {
             obj.insert(
                 "id".to_string(),
@@ -1174,7 +1250,7 @@ fn not_executed_tool_call_item(
         return item;
     }
     let mut item = build_transformed_mcp_call_item(
-        &json!({ "error": NOT_EXECUTED_AT_TOOL_CALL_LIMIT }),
+        &json!({ "error": error }),
         response_format,
         item_id_source,
         server_label,
@@ -1473,6 +1549,7 @@ fn build_incomplete_response(
                     &resolved_label,
                     tool_name,
                     args,
+                    NOT_EXECUTED_AT_TOOL_CALL_LIMIT,
                 ));
             }
         }

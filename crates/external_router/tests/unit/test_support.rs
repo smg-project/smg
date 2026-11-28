@@ -41,14 +41,19 @@ pub(crate) const CREDENTIALED_WORKER_URL: &str = "https://user:secret@127.0.0.1:
 pub(crate) const MASKED_WORKER_URL: &str = "https://***@127.0.0.1:1";
 
 /// The tests' HTTP client, the process TLS crypto provider installed first.
+pub(crate) fn http_client() -> reqwest::Client {
+    http_client_with_deadline(Duration::from_secs(5))
+}
+
+/// The same client with a deadline of the test's own.
 #[expect(
     clippy::disallowed_methods,
     reason = "a test binary's client factory; the process TLS crypto provider is installed first"
 )]
-pub(crate) fn http_client() -> reqwest::Client {
+pub(crate) fn http_client_with_deadline(deadline: Duration) -> reqwest::Client {
     let _ = default_provider().install_default();
     reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
+        .timeout(deadline)
         .build()
         .expect("a client")
 }

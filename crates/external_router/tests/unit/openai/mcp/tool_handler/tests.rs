@@ -215,6 +215,194 @@ fn arguments_done_triggers_execute_tools_with_forwarding() {
     }
 }
 
+/// The relay reads a turn on after the loop took a call: the upstream's
+/// own `output_item.done` of that call is dropped (the loop writes the
+/// call's umbrella itself) and does not kick the loop again.
+#[test]
+fn the_upstreams_done_of_a_call_the_loop_took_is_dropped() {
+    let mut handler = StreamingToolHandler::with_starting_index(0);
+    bootstrap_function_call_added(&mut handler);
+    let args_done = r#"{
+      "type": "response.function_call_arguments.done",
+      "output_index": 0,
+      "item_id": "fc_test",
+      "arguments": "{}"
+    }"#;
+    let action = handler.process_event(Some("response.function_call_arguments.done"), args_done);
+    assert!(
+        matches!(action, StreamAction::ExecuteTools { .. }),
+        "{action:?}"
+    );
+    assert_eq!(handler.take_pending_calls().len(), 1);
+
+    let item_done = r#"{
+      "type": "response.output_item.done",
+      "output_index": 0,
+      "item": {
+        "type": "function_call",
+        "id": "fc_test",
+        "call_id": "call_test",
+        "name": "image_generation",
+        "arguments": "{}",
+        "status": "completed"
+      }
+    }"#;
+    let action = handler.process_event(Some("response.output_item.done"), item_done);
+    assert!(
+        matches!(action, StreamAction::Drop),
+        "expected Drop for the umbrella of a call the loop took, got {action:?}"
+    );
+    assert!(handler.take_pending_calls().is_empty());
+}
+
+/// Behind a hand-over the handler keeps an item other than a function call
+/// from its `output_item.added` until the upstream closes it, the text
+/// streamed for it laid into its parts, so a cut turn can close it: a
+/// message and a reasoning item are taken `incomplete` under the output
+/// index the client reads, a hosted tool call `failed`; an item the
+/// upstream closed is not taken, and before the hand-over nothing is kept.
+#[test]
+fn the_items_a_cut_would_leave_open_are_kept_with_their_text_behind_a_hand_over() {
+    fn added(index: usize, item: Value) -> Value {
+        json!({"type": "response.output_item.added", "output_index": index, "item": item})
+    }
+    fn delta(kind: &str, index: usize, part: (&str, usize), text: &str) -> Value {
+        let mut event = json!({"type": kind, "output_index": index, "delta": text});
+        event[part.0] = json!(part.1);
+        event
+    }
+    let mut handler = StreamingToolHandler::with_starting_index(3);
+
+    let preamble = json!({"type": "message", "id": "msg_0", "role": "assistant", "content": []});
+    handler.process_parsed(None, &added(0, preamble));
+    assert!(
+        handler.take_open_items().is_empty(),
+        "nothing is kept before a hand-over"
+    );
+
+    let call = json!({
+        "type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "lookup",
+        "arguments": ""
+    });
+    handler.process_parsed(None, &added(1, call));
+    let action = handler.process_parsed(
+        None,
+        &json!({
+            "type": "response.function_call_arguments.done", "output_index": 1,
+            "item_id": "fc_1", "arguments": "{}"
+        }),
+    );
+    assert!(
+        matches!(action, StreamAction::ExecuteTools { .. }),
+        "{action:?}"
+    );
+    assert_eq!(handler.take_pending_calls().len(), 1);
+
+    let message = json!({
+        "type": "message", "id": "msg_2", "status": "in_progress", "role": "assistant",
+        "content": []
+    });
+    handler.process_parsed(None, &added(2, message));
+    let text = "response.output_text.delta";
+    handler.process_parsed(None, &delta(text, 2, ("content_index", 0), "so "));
+    handler.process_parsed(None, &delta(text, 2, ("content_index", 0), "far"));
+    let refusal = "response.refusal.delta";
+    handler.process_parsed(None, &delta(refusal, 2, ("content_index", 1), "no"));
+    let reasoning = json!({"type": "reasoning", "id": "rs_3", "summary": []});
+    handler.process_parsed(None, &added(3, reasoning));
+    let summary = "response.reasoning_summary_text.delta";
+    handler.process_parsed(None, &delta(summary, 3, ("summary_index", 0), "why"));
+    let raw = "response.reasoning_text.delta";
+    handler.process_parsed(None, &delta(raw, 3, ("content_index", 0), "raw"));
+    let search = json!({"type": "web_search_call", "id": "ws_4", "status": "in_progress"});
+    handler.process_parsed(None, &added(4, search));
+    let closed = json!({"type": "message", "id": "msg_5", "role": "assistant", "content": []});
+    handler.process_parsed(None, &added(5, closed.clone()));
+    handler.process_parsed(
+        None,
+        &json!({"type": "response.output_item.done", "output_index": 5, "item": closed}),
+    );
+
+    assert_eq!(
+        handler.take_open_items(),
+        [
+            (
+                5,
+                json!({
+                    "type": "message", "id": "msg_2", "status": "incomplete",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "output_text", "text": "so far", "annotations": []},
+                        {"type": "refusal", "refusal": "no"}
+                    ]
+                })
+            ),
+            (
+                6,
+                json!({
+                    "type": "reasoning", "id": "rs_3", "status": "incomplete",
+                    "summary": [{"type": "summary_text", "text": "why"}],
+                    "content": [{"type": "reasoning_text", "text": "raw"}]
+                })
+            ),
+            (
+                7,
+                json!({"type": "web_search_call", "id": "ws_4", "status": "failed"})
+            ),
+        ]
+    );
+    assert!(handler.take_open_items().is_empty(), "taken once");
+}
+
+/// Behind a hand-over the first `output_item.done` of a hosted tool call
+/// is dropped, so the client has not read the item closed: a turn cut
+/// there closes it, as the upstream closed it. Once the upstream's second
+/// `output_item.done` is forwarded a cut has nothing to close for the item
+/// and the loop keeps it once.
+#[test]
+fn a_hosted_call_stays_open_behind_a_hand_over_until_its_closing_is_forwarded() {
+    fn behind_the_dropped_closing() -> (StreamingToolHandler, Value, Value) {
+        let mut handler = StreamingToolHandler::with_starting_index(3);
+        bootstrap_function_call_added(&mut handler);
+        let action = handler.process_parsed(
+            None,
+            &json!({
+                "type": "response.function_call_arguments.done", "output_index": 0,
+                "item_id": "fc_test", "arguments": "{}"
+            }),
+        );
+        assert!(
+            matches!(action, StreamAction::ExecuteTools { .. }),
+            "{action:?}"
+        );
+        assert_eq!(handler.take_pending_calls().len(), 1);
+
+        let search = json!({"type": "web_search_call", "id": "ws_1", "status": "in_progress"});
+        handler.process_parsed(
+            None,
+            &json!({"type": "response.output_item.added", "output_index": 1, "item": search}),
+        );
+        let closed = json!({
+            "type": "web_search_call", "id": "ws_1", "status": "completed",
+            "action": {"type": "search", "query": "q"}
+        });
+        let done = json!({"type": "response.output_item.done", "output_index": 1, "item": closed});
+        let action = handler.process_parsed(None, &done);
+        assert!(matches!(action, StreamAction::Drop), "{action:?}");
+        (handler, done, closed)
+    }
+
+    let (mut cut, _, closed) = behind_the_dropped_closing();
+    assert_eq!(cut.take_open_items(), [(4, closed)]);
+    assert!(cut.take_closed_items().is_empty());
+
+    let (mut relayed, done, closed) = behind_the_dropped_closing();
+    let action = relayed.process_parsed(None, &done);
+    assert!(matches!(action, StreamAction::Forward), "{action:?}");
+    assert!(relayed.take_open_items().is_empty());
+    assert_eq!(relayed.take_closed_items(), [(4, closed)]);
+}
+
 #[test]
 fn output_item_done_for_unrelated_item_forwards_even_with_pending_call() {
     // Regression for PR #1369 review (chatgpt-codex-connector P1):

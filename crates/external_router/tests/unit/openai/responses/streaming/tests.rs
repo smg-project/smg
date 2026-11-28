@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use openai_protocol::responses::ResponseInput;
 
 use super::*;
@@ -492,10 +494,11 @@ async fn relayed(
     let rx = connected.then_some(rx);
     let mut encoder = SseEncoder::new();
     let mut sequence_number = 0;
-    let mut upstream = chunks(blocks);
+    let mut upstream = TurnStream::new(chunks(blocks));
     let relay = async {
         let end = relay_upstream_stream(
             &mut upstream,
+            &mut ChunkProcessor::new(),
             handler,
             flags,
             &[],
@@ -603,6 +606,925 @@ async fn a_completed_tool_call_ends_the_relay_with_the_call_pending() {
     assert_eq!(end, RelayEnd::ToolCalls);
     assert_eq!(unread, 1, "the completed after the trigger is not read");
     assert_eq!(handler.take_pending_calls().len(), 1);
+}
+
+const CALL_ITEM_DONE: &str = "event: response.output_item.done\ndata: {\"type\":\
+                              \"response.output_item.done\",\"sequence_number\":3,\
+                              \"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\
+                              \"fc_1\",\"call_id\":\"call_1\",\"name\":\"lookup\",\
+                              \"arguments\":\"{}\",\"status\":\"completed\"}}";
+const SECOND_CALL_ADDED: &str = "event: response.output_item.added\ndata: {\"type\":\
+                                 \"response.output_item.added\",\"sequence_number\":4,\
+                                 \"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\
+                                 \"fc_2\",\"call_id\":\"call_2\",\"name\":\"lookup\",\
+                                 \"arguments\":\"\"}}";
+const SECOND_CALL_DONE: &str = "event: response.function_call_arguments.done\ndata: {\"type\":\
+                                \"response.function_call_arguments.done\",\"sequence_number\":5,\
+                                \"item_id\":\"fc_2\",\"output_index\":1,\"arguments\":\"{}\"}";
+const SECOND_CALL_ITEM_DONE: &str = "event: response.output_item.done\ndata: {\"type\":\
+                                     \"response.output_item.done\",\"sequence_number\":6,\
+                                     \"output_index\":1,\"item\":{\"type\":\"function_call\",\
+                                     \"id\":\"fc_2\",\"call_id\":\"call_2\",\"name\":\"lookup\",\
+                                     \"arguments\":\"{}\",\"status\":\"completed\"}}";
+/// One upstream turn that asks for two tools, each call streamed whole
+/// before the next opens, the way the public API streams a turn. It ends
+/// with the end sentinel some upstreams send after every stream.
+const TWO_CALL_TURN: [&str; 10] = [
+    CREATED,
+    IN_PROGRESS,
+    CALL_ADDED,
+    CALL_DONE,
+    CALL_ITEM_DONE,
+    SECOND_CALL_ADDED,
+    SECOND_CALL_DONE,
+    SECOND_CALL_ITEM_DONE,
+    COMPLETED,
+    "data: [DONE]",
+];
+
+/// Relays one upstream turn the way the loop does: again on the same
+/// stream and processor after every hand-over, the pending calls taken
+/// each time, until the relay ends with no call. Returns the call ids of
+/// each hand-over and the frames the client read.
+async fn relayed_turn(
+    upstream: &mut (impl Stream<Item = reqwest::Result<Bytes>> + Unpin),
+) -> (Vec<Vec<String>>, Vec<String>) {
+    let mut upstream = TurnStream::new(upstream);
+    let request = ResponsesRequest {
+        model: "m".to_string(),
+        input: ResponseInput::Text("hi".to_string()),
+        ..Default::default()
+    };
+    let ctx = StreamingEventContext {
+        original_request: &request,
+        previous_response_id: None,
+        session: None,
+        mcp_format_registry: None,
+    };
+    let (tx, mut rx) = sse_channel();
+    let mut encoder = SseEncoder::new();
+    let mut sequence_number = 0;
+    let mut flags = RelayFlags {
+        first_iteration: true,
+        mcp_list_tools_sent: false,
+    };
+    let mut handler = StreamingToolHandler::with_starting_index(0);
+    let mut chunk_processor = ChunkProcessor::new();
+    let relay = async {
+        let mut handed_over = Vec::new();
+        loop {
+            let end = relay_upstream_stream(
+                &mut upstream,
+                &mut chunk_processor,
+                &mut handler,
+                &mut flags,
+                &[],
+                &tx,
+                &mut encoder,
+                &ctx,
+                &mut sequence_number,
+            )
+            .await;
+            if end != RelayEnd::ToolCalls {
+                assert_eq!(end, RelayEnd::Answered);
+                break;
+            }
+            let calls = handler.take_pending_calls();
+            handed_over.push(calls.into_iter().map(|call| call.call_id).collect());
+        }
+        drop(tx);
+        handed_over
+    };
+    let read = async {
+        let mut frames = Vec::new();
+        while let Some(frame) = rx.recv().await {
+            let frame = frame.expect("a frame");
+            frames.push(String::from_utf8(frame.to_vec()).expect("utf-8"));
+        }
+        frames
+    };
+    tokio::join!(relay, read)
+}
+
+/// One upstream turn that asks for two tools is handed over call by
+/// call: the first relay ends at the first call with that call alone
+/// pending; the next, on the same stream, drops the upstream's own
+/// `output_item.done` of the call the loop took, opens the second call
+/// and hands it over; the last ends at the stream's end with nothing
+/// pending. The client reads the first call's events before the second
+/// call's, no closing event of the upstream's, no `response.completed`
+/// of the upstream's and not its end sentinel. It reads the same when the whole turn comes in one
+/// chunk: the blocks a relay left in the processor are the next relay's
+/// first.
+#[tokio::test]
+async fn a_turn_of_two_calls_is_handed_over_call_by_call_from_one_stream() {
+    for one_chunk in [false, true] {
+        let frames: Vec<reqwest::Result<Bytes>> = if one_chunk {
+            vec![Ok(Bytes::from(TWO_CALL_TURN.join("\n\n") + "\n\n"))]
+        } else {
+            TWO_CALL_TURN
+                .iter()
+                .map(|block| Ok(Bytes::from(format!("{block}\n\n"))))
+                .collect()
+        };
+        let mut upstream = futures_util::stream::iter(frames);
+        let (handed_over, wire) = relayed_turn(&mut upstream).await;
+        assert_eq!(
+            handed_over,
+            [vec!["call_1".to_string()], vec!["call_2".to_string()]],
+            "in one chunk: {one_chunk}"
+        );
+        let events: Vec<(&str, Option<u64>)> = wire
+            .iter()
+            .map(|frame| {
+                let name = frame
+                    .lines()
+                    .find_map(|line| line.strip_prefix("event: "))
+                    .unwrap_or_default();
+                let index = frame
+                    .lines()
+                    .find_map(|line| line.strip_prefix("data: "))
+                    .and_then(|data| serde_json::from_str::<Value>(data).ok())
+                    .and_then(|data| data["output_index"].as_u64());
+                (name, index)
+            })
+            .collect();
+        assert!(
+            !events.iter().any(|(name, _)| {
+                *name == "response.output_item.done" || *name == "response.completed"
+            }),
+            "in one chunk: {one_chunk}: {events:?}"
+        );
+        assert!(
+            !wire.iter().any(|frame| frame.contains("[DONE]")),
+            "in one chunk: {one_chunk}: {wire:?}"
+        );
+        let indexes: Vec<u64> = events.iter().filter_map(|(_, index)| *index).collect();
+        assert!(
+            indexes.contains(&0) && indexes.contains(&1) && indexes.is_sorted(),
+            "in one chunk: {one_chunk}: {events:?}"
+        );
+    }
+}
+
+/// The loop over an upstream turn of two calls: both calls are run in
+/// the turn's one round trip, in the stream's order, so the next request
+/// carries both results and the upstream is asked twice in all (the turn
+/// and the answer). The upstream's own end sentinel after the tool turn
+/// is not passed on: the client reads one, the loop's, at the end. A loop
+/// that left the turn at its first call would send the next request with
+/// one result and never read the second call.
+#[tokio::test]
+async fn a_turn_of_two_calls_costs_one_upstream_round_trip() {
+    use std::sync::{Arc, Mutex};
+
+    use axum::{
+        http::{header::CONTENT_TYPE, StatusCode},
+        routing::any,
+        Json, Router,
+    };
+    use smg_data_connector::{
+        MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+    };
+    use smg_mcp::McpConfig;
+
+    use crate::{
+        openai::context::StorageHandles, openai_bridge::FormatRegistry, test_support::http_client,
+    };
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a listener");
+    let port = listener.local_addr().expect("an address").port();
+    let tool_turn = TWO_CALL_TURN.join("\n\n") + "\n\n";
+    let answer = [CREATED, IN_PROGRESS, DELTA, COMPLETED].join("\n\n") + "\n\n";
+    let requests: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let seen = Arc::clone(&requests);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test stub upstream answering one event stream per request; aborted at the test's end"
+    )]
+    let upstream = tokio::spawn(async move {
+        let app = Router::new().fallback(any(move |Json(body): Json<Value>| {
+            let resumed = body["input"].as_array().is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| item["type"] == "function_call_output")
+            });
+            seen.lock().expect("the request list").push(body);
+            let text = if resumed {
+                answer.clone()
+            } else {
+                tool_turn.clone()
+            };
+            async move { ([(CONTENT_TYPE, "text/event-stream")], text) }
+        }));
+        axum::serve(listener, app).await.expect("the stub serves");
+    });
+
+    let orchestrator = Arc::new(
+        McpOrchestrator::new(McpConfig::default())
+            .await
+            .expect("an orchestrator with no servers"),
+    );
+    let client = http_client();
+    let request: ResponsesRequest =
+        serde_json::from_value(json!({"model": "m", "input": "hi", "stream": true}))
+            .expect("a request");
+    let req = StreamingRequest {
+        url: format!("http://127.0.0.1:{port}/v1/responses"),
+        payload: json!({"model": "m", "input": "hi", "stream": true}),
+        original_body: request,
+        previous_response_id: None,
+        existing_mcp_list_tools_labels: Vec::new(),
+        storage: StorageHandles {
+            response: Arc::new(MemoryResponseStorage::new()),
+            conversation: Arc::new(MemoryConversationStorage::new()),
+            conversation_item: Arc::new(MemoryConversationItemStorage::new()),
+            request_context: None,
+            tenant: None,
+        },
+    };
+    let response = handle_streaming_with_tool_interception(
+        &client,
+        None,
+        None,
+        req,
+        &orchestrator,
+        FormatRegistry::new(),
+        Vec::new(),
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("the stream to its end");
+    let text = String::from_utf8(bytes.to_vec()).expect("utf-8");
+    upstream.abort();
+
+    let requests = requests.lock().expect("the request list");
+    assert_eq!(requests.len(), 2, "the turn and the answer: {text}");
+    let results: Vec<&str> = requests[1]["input"]
+        .as_array()
+        .expect("an input list")
+        .iter()
+        .filter(|item| item["type"] == "function_call_output")
+        .filter_map(|item| item["call_id"].as_str())
+        .collect();
+    assert_eq!(results, ["call_1", "call_2"], "{text}");
+    assert_eq!(
+        text.matches("data: [DONE]").count(),
+        1,
+        "one end sentinel, the loop's own: {text}"
+    );
+    assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+}
+
+const MESSAGE_ADDED: &str = "event: response.output_item.added\ndata: {\"type\":\
+                             \"response.output_item.added\",\"sequence_number\":4,\
+                             \"output_index\":1,\"item\":{\"type\":\"message\",\"id\":\"msg_2\",\
+                             \"status\":\"in_progress\",\"role\":\"assistant\",\"content\":[]}}";
+const MESSAGE_DELTA: &str = "event: response.output_text.delta\ndata: {\"type\":\
+                             \"response.output_text.delta\",\"sequence_number\":5,\"item_id\":\
+                             \"msg_2\",\"output_index\":1,\"content_index\":0,\"delta\":\"so f\"}";
+/// The upstream's own close of the message of [`MESSAGE_ADDED`].
+const MESSAGE_ITEM_DONE: &str = "event: response.output_item.done\ndata: {\"type\":\
+                                 \"response.output_item.done\",\"sequence_number\":6,\
+                                 \"output_index\":1,\"item\":{\"type\":\"message\",\"id\":\"msg_2\",\
+                                 \"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\
+                                 \"type\":\"output_text\",\"text\":\"so far\",\"annotations\":[]}]}}";
+/// A call that opens behind the message of [`MESSAGE_ADDED`], at the next
+/// output index, whether or not that message is still open.
+const LATER_CALL_ADDED: &str = "event: response.output_item.added\ndata: {\"type\":\
+                                \"response.output_item.added\",\"sequence_number\":6,\
+                                \"output_index\":2,\"item\":{\"type\":\"function_call\",\"id\":\
+                                \"fc_3\",\"call_id\":\"call_3\",\"name\":\"lookup\",\
+                                \"arguments\":\"\"}}";
+const LATER_CALL_DONE: &str = "event: response.function_call_arguments.done\ndata: {\"type\":\
+                               \"response.function_call_arguments.done\",\"sequence_number\":7,\
+                               \"item_id\":\"fc_3\",\"output_index\":2,\"arguments\":\"{}\"}";
+const LATER_CALL_ITEM_DONE: &str = "event: response.output_item.done\ndata: {\"type\":\
+                                    \"response.output_item.done\",\"sequence_number\":8,\
+                                    \"output_index\":2,\"item\":{\"type\":\"function_call\",\
+                                    \"id\":\"fc_3\",\"call_id\":\"call_3\",\"name\":\"lookup\",\
+                                    \"arguments\":\"{}\",\"status\":\"completed\"}}";
+const INCOMPLETE: &str = "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\
+                          \"sequence_number\":5,\"response\":{\"id\":\"resp_1\",\"object\":\
+                          \"response\",\"created_at\":1,\"model\":\"m\",\"status\":\
+                          \"incomplete\",\"incomplete_details\":{\"reason\":\
+                          \"max_output_tokens\"},\"output\":[]}}";
+const FAILED: &str = "event: response.failed\ndata: {\"type\":\"response.failed\",\
+                      \"sequence_number\":5,\"response\":{\"id\":\"resp_1\",\"object\":\
+                      \"response\",\"created_at\":1,\"model\":\"m\",\"status\":\"failed\",\
+                      \"output\":[]}}";
+const ERROR: &str = "event: error\ndata: {\"type\":\"error\",\"sequence_number\":5,\"code\":\
+                     \"server_error\",\"message\":\"the upstream failed\",\"param\":null}";
+
+/// What the stub upstream of [`a_turn_cut_behind_its_first_call`] does
+/// behind the first complete call of its tool turn.
+#[derive(Clone, Copy)]
+enum Cut {
+    /// The second call's item opens and the connection breaks.
+    Break,
+    /// The stream stays open and writes nothing more.
+    Stall,
+    /// The second call's item opens, the upstream writes this terminal
+    /// event and ends the stream.
+    Terminal(&'static str),
+    /// The second call's item opens and the stream ends with no terminal
+    /// event.
+    End,
+    /// A message opens, part of its text is streamed and the connection
+    /// breaks.
+    Message,
+    /// A message opens, part of its text is streamed, a later call's item
+    /// opens and the connection breaks.
+    MessageThenOpenCall,
+    /// A message opens, part of its text is streamed, a later call is
+    /// streamed whole and the connection breaks.
+    MessageThenWholeCall,
+    /// A message is streamed whole, a later call is streamed whole and the
+    /// turn ends with its terminal event: the turn is cut nowhere.
+    Nowhere,
+}
+
+/// [`a_limited_turn_cut_behind_its_first_call`] for a request with no
+/// `max_tool_calls`.
+async fn a_turn_cut_behind_its_first_call(
+    cut: Cut,
+    client: reqwest::Client,
+) -> (Vec<Value>, String) {
+    a_limited_turn_cut_behind_its_first_call(cut, None, client).await
+}
+
+/// Serves one streamed request, with the `max_tool_calls` given, from a
+/// stub upstream whose tool turn is cut behind its first complete call; the
+/// request that carries a tool's output is answered whole. Returns the
+/// bodies the upstream got and the stream the client read.
+async fn a_limited_turn_cut_behind_its_first_call(
+    cut: Cut,
+    max_tool_calls: Option<u32>,
+    client: reqwest::Client,
+) -> (Vec<Value>, String) {
+    use std::sync::{Arc, Mutex};
+
+    use axum::{
+        body::Body,
+        http::{header::CONTENT_TYPE, StatusCode},
+        routing::any,
+        Json, Router,
+    };
+    use futures_util::stream::{self, BoxStream};
+    use smg_data_connector::{
+        MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+    };
+    use smg_mcp::McpConfig;
+
+    use crate::{openai::context::StorageHandles, openai_bridge::FormatRegistry};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a listener");
+    let port = listener.local_addr().expect("an address").port();
+    let first_call = [CREATED, IN_PROGRESS, CALL_ADDED, CALL_DONE, CALL_ITEM_DONE];
+    let cut_turn = match cut {
+        Cut::Break | Cut::End => [&first_call[..], &[SECOND_CALL_ADDED][..]].concat(),
+        Cut::Terminal(event) => [&first_call[..], &[SECOND_CALL_ADDED, event][..]].concat(),
+        Cut::Message => [&first_call[..], &[MESSAGE_ADDED, MESSAGE_DELTA][..]].concat(),
+        Cut::MessageThenOpenCall => [
+            &first_call[..],
+            &[MESSAGE_ADDED, MESSAGE_DELTA, LATER_CALL_ADDED][..],
+        ]
+        .concat(),
+        Cut::MessageThenWholeCall => [
+            &first_call[..],
+            &[
+                MESSAGE_ADDED,
+                MESSAGE_DELTA,
+                LATER_CALL_ADDED,
+                LATER_CALL_DONE,
+                LATER_CALL_ITEM_DONE,
+            ][..],
+        ]
+        .concat(),
+        Cut::Nowhere => [
+            &first_call[..],
+            &[
+                MESSAGE_ADDED,
+                MESSAGE_DELTA,
+                MESSAGE_ITEM_DONE,
+                LATER_CALL_ADDED,
+                LATER_CALL_DONE,
+                LATER_CALL_ITEM_DONE,
+                COMPLETED,
+            ][..],
+        ]
+        .concat(),
+        Cut::Stall => first_call.to_vec(),
+    }
+    .join("\n\n")
+        + "\n\n";
+    let answer = [CREATED, IN_PROGRESS, DELTA, COMPLETED].join("\n\n") + "\n\n";
+    let requests: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let seen = Arc::clone(&requests);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test stub upstream answering one event stream per request; aborted at the test's end"
+    )]
+    let upstream = tokio::spawn(async move {
+        let app = Router::new().fallback(any(move |Json(body): Json<Value>| {
+            let resumed = body["input"].as_array().is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| item["type"] == "function_call_output")
+            });
+            seen.lock().expect("the request list").push(body);
+            let frames: BoxStream<'static, io::Result<Bytes>> = if resumed {
+                stream::iter([Ok(Bytes::from(answer.clone()))]).boxed()
+            } else {
+                let head = stream::iter([Ok(Bytes::from(cut_turn.clone()))]);
+                match cut {
+                    // The frames are on the wire before the connection breaks.
+                    Cut::Break
+                    | Cut::Message
+                    | Cut::MessageThenOpenCall
+                    | Cut::MessageThenWholeCall => head
+                        .chain(stream::once(async {
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            Err(io::Error::other("the upstream broke"))
+                        }))
+                        .boxed(),
+                    Cut::Stall => head.chain(stream::pending()).boxed(),
+                    Cut::Terminal(_) | Cut::End | Cut::Nowhere => head.boxed(),
+                }
+            };
+            async move {
+                (
+                    [(CONTENT_TYPE, "text/event-stream")],
+                    Body::from_stream(frames),
+                )
+            }
+        }));
+        axum::serve(listener, app).await.expect("the stub serves");
+    });
+
+    let orchestrator = Arc::new(
+        McpOrchestrator::new(McpConfig::default())
+            .await
+            .expect("an orchestrator with no servers"),
+    );
+    let mut body = json!({"model": "m", "input": "hi", "stream": true});
+    if let Some(limit) = max_tool_calls {
+        body["max_tool_calls"] = json!(limit);
+    }
+    let request: ResponsesRequest = serde_json::from_value(body.clone()).expect("a request");
+    let req = StreamingRequest {
+        url: format!("http://127.0.0.1:{port}/v1/responses"),
+        payload: body,
+        original_body: request,
+        previous_response_id: None,
+        existing_mcp_list_tools_labels: Vec::new(),
+        storage: StorageHandles {
+            response: Arc::new(MemoryResponseStorage::new()),
+            conversation: Arc::new(MemoryConversationStorage::new()),
+            conversation_item: Arc::new(MemoryConversationItemStorage::new()),
+            request_context: None,
+            tenant: None,
+        },
+    };
+    let response = handle_streaming_with_tool_interception(
+        &client,
+        None,
+        None,
+        req,
+        &orchestrator,
+        FormatRegistry::new(),
+        Vec::new(),
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("the stream to its end");
+    let text = String::from_utf8(bytes.to_vec()).expect("utf-8");
+    upstream.abort();
+
+    let requests = requests.lock().expect("the request list").clone();
+    (requests, text)
+}
+
+/// The request of a turn cut behind its first call is served: the upstream
+/// is asked again with that call's output alone, no error event goes out,
+/// and the stream ends with the terminal event and the sentinel.
+fn assert_served_from_the_first_call(requests: &[Value], text: &str) {
+    assert_eq!(
+        requests.len(),
+        2,
+        "the cut turn, then the turn asked again: {text}"
+    );
+    let results: Vec<&str> = requests[1]["input"]
+        .as_array()
+        .expect("an input list")
+        .iter()
+        .filter(|item| item["type"] == "function_call_output")
+        .filter_map(|item| item["call_id"].as_str())
+        .collect();
+    assert_eq!(results, ["call_1"], "{text}");
+    assert!(!text.contains("event: error"), "no error event: {text}");
+    assert!(text.contains("event: response.completed"), "{text}");
+    assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+}
+
+/// A turn's stream that breaks behind a call the loop ran ends the turn,
+/// not the request: the call that ran stays, the item the stream left open
+/// is closed with the error of a broken stream (not the one of a spent
+/// tool-call allowance), and the upstream is asked again, the way it was
+/// asked after every call before one stream served a whole turn.
+#[tokio::test]
+async fn a_stream_that_breaks_behind_a_call_that_ran_ends_the_turn_not_the_request() {
+    use crate::test_support::http_client;
+
+    let (requests, text) = a_turn_cut_behind_its_first_call(Cut::Break, http_client()).await;
+    assert_served_from_the_first_call(&requests, &text);
+    assert_the_half_open_call_is_closed(&text);
+}
+
+/// No item the cut turn announced stays open, and the call it left
+/// half-open says that the stream ended, not that the tool-call allowance
+/// was spent.
+fn assert_the_half_open_call_is_closed(text: &str) {
+    assert_eq!(
+        text.matches("event: response.output_item.added").count(),
+        text.matches("event: response.output_item.done").count(),
+        "no item the stream announced stays open: {text}"
+    );
+    assert_eq!(
+        text.split("\n\n")
+            .filter(|frame| frame.starts_with("event: response.output_item.done\n"))
+            .filter(|frame| frame.contains(NOT_EXECUTED_AT_STREAM_BREAK))
+            .count(),
+        1,
+        "the half-open call says that the stream broke: {text}"
+    );
+    assert!(
+        !text.contains(NOT_EXECUTED_AT_TOOL_CALL_LIMIT),
+        "no call reads as stopped at the limit: {text}"
+    );
+}
+
+/// A turn the upstream ends unfinished behind a call that ran, with its
+/// `response.incomplete`, `response.failed` or `error` event, is cut the
+/// way a broken stream cuts it: that event is not forwarded, the call the
+/// turn left half-open is closed, the upstream is asked again, and the
+/// client reads one terminal event, the loop's own.
+#[tokio::test]
+async fn an_upstream_terminal_behind_a_call_that_ran_ends_the_turn_not_the_request() {
+    use crate::test_support::http_client;
+
+    for event in [INCOMPLETE, FAILED, ERROR] {
+        let (requests, text) =
+            a_turn_cut_behind_its_first_call(Cut::Terminal(event), http_client()).await;
+        assert_served_from_the_first_call(&requests, &text);
+        assert_the_half_open_call_is_closed(&text);
+        let terminals: Vec<&str> = text
+            .split("\n\n")
+            .filter_map(|frame| frame.strip_prefix("event: "))
+            .filter_map(|frame| frame.split('\n').next())
+            .filter(|name| {
+                matches!(
+                    *name,
+                    "response.completed" | "response.incomplete" | "response.failed" | "error"
+                )
+            })
+            .collect();
+        assert_eq!(terminals, ["response.completed"], "{text}");
+    }
+}
+
+/// The same turn on a stream that ends with no terminal event behind the
+/// call: the turn ends there, the half-open call is closed and the
+/// upstream is asked again.
+#[tokio::test]
+async fn a_stream_that_ends_without_its_terminal_behind_a_call_that_ran_ends_the_turn() {
+    use crate::test_support::http_client;
+
+    let (requests, text) = a_turn_cut_behind_its_first_call(Cut::End, http_client()).await;
+    assert_served_from_the_first_call(&requests, &text);
+    assert_the_half_open_call_is_closed(&text);
+}
+
+/// A message the cut turn left half-open behind the call is closed on the
+/// wire as incomplete with the text streamed for it, under its output
+/// index, and the final response keeps that item.
+#[tokio::test]
+async fn a_message_a_cut_turn_left_half_open_is_closed_as_incomplete_and_kept() {
+    use crate::test_support::http_client;
+
+    let (requests, text) = a_turn_cut_behind_its_first_call(Cut::Message, http_client()).await;
+    assert_served_from_the_first_call(&requests, &text);
+    assert_eq!(
+        text.matches("event: response.output_item.added").count(),
+        text.matches("event: response.output_item.done").count(),
+        "no item the stream announced stays open: {text}"
+    );
+    let events: Vec<Value> = text
+        .split("\n\n")
+        .filter_map(|frame| frame.split_once("\ndata: "))
+        .filter_map(|(_, data)| serde_json::from_str(data).ok())
+        .collect();
+    let closed = events
+        .iter()
+        .find(|event| {
+            event["type"] == "response.output_item.done" && event["item"]["id"] == "msg_2"
+        })
+        .unwrap_or_else(|| panic!("the message's closing event: {text}"));
+    assert_eq!(closed["output_index"], 1, "{text}");
+    assert_eq!(
+        closed["item"],
+        json!({
+            "type": "message", "id": "msg_2", "status": "incomplete", "role": "assistant",
+            "content": [{"type": "output_text", "text": "so f", "annotations": []}]
+        }),
+        "{text}"
+    );
+    let kept: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["type"] == "response.completed")
+        .filter_map(|event| event["response"]["output"].as_array())
+        .flatten()
+        .filter(|item| item["id"] == "msg_2")
+        .collect();
+    assert_eq!(kept, [&closed["item"]], "{text}");
+}
+
+/// The ids of the items the stream closed, in the order of the output
+/// indices the client read for them, and the ids of those items in the
+/// final response, in the response's order.
+fn closed_by_index_and_kept(text: &str) -> (Vec<String>, Vec<String>) {
+    let events: Vec<Value> = text
+        .split("\n\n")
+        .filter_map(|frame| frame.split_once("\ndata: "))
+        .filter_map(|(_, data)| serde_json::from_str(data).ok())
+        .collect();
+    let mut closed: Vec<(u64, String)> = events
+        .iter()
+        .filter(|event| event["type"] == "response.output_item.done")
+        .filter_map(|event| {
+            let index = event["output_index"].as_u64()?;
+            Some((index, event["item"]["id"].as_str()?.to_string()))
+        })
+        .collect();
+    closed.sort();
+    let closed: Vec<String> = closed.into_iter().map(|(_, id)| id).collect();
+    let kept = events
+        .iter()
+        .filter(|event| event["type"] == "response.completed")
+        .filter_map(|event| event["response"]["output"].as_array())
+        .flatten()
+        .filter_map(|item| item["id"].as_str())
+        .filter(|id| closed.iter().any(|closed| closed == id))
+        .map(str::to_string)
+        .collect();
+    (closed, kept)
+}
+
+/// The items a cut turn left half-open stand in the final response in the
+/// order of the output indices the client read for them: a message that
+/// opened before the call the cut left half-open stands before that call,
+/// though the call is closed first.
+#[tokio::test]
+async fn the_items_a_cut_turn_left_half_open_keep_the_order_of_their_indices() {
+    use crate::test_support::http_client;
+
+    let (requests, text) =
+        a_turn_cut_behind_its_first_call(Cut::MessageThenOpenCall, http_client()).await;
+    assert_served_from_the_first_call(&requests, &text);
+    assert_the_half_open_call_is_closed(&text);
+    let (closed, kept) = closed_by_index_and_kept(&text);
+    assert_eq!(
+        closed.len(),
+        3,
+        "the call that ran, the message and the half-open call: {text}"
+    );
+    assert_eq!(closed[1], "msg_2", "{text}");
+    assert_eq!(kept, closed, "{text}");
+}
+
+/// A message a cut turn left half-open stands in the final response before
+/// a later call of that turn that ran, as the stream numbered them.
+#[tokio::test]
+async fn a_half_open_message_stands_before_a_later_call_that_ran() {
+    use crate::test_support::http_client;
+
+    let (requests, text) =
+        a_turn_cut_behind_its_first_call(Cut::MessageThenWholeCall, http_client()).await;
+    assert_eq!(
+        requests.len(),
+        2,
+        "the cut turn, then one request with the outputs of both calls: {text}"
+    );
+    assert_eq!(
+        text.matches("event: response.output_item.added").count(),
+        text.matches("event: response.output_item.done").count(),
+        "no item the stream announced stays open: {text}"
+    );
+    let (closed, kept) = closed_by_index_and_kept(&text);
+    assert_eq!(
+        closed.len(),
+        3,
+        "the two calls that ran and the message between them: {text}"
+    );
+    assert_eq!(closed[1], "msg_2", "{text}");
+    assert_eq!(kept, closed, "{text}");
+}
+
+/// A message the upstream completes behind a call of a turn stands in the
+/// final response whole, at the output index the client read for it,
+/// between the turn's two calls: the next turn does not take it away.
+#[tokio::test]
+async fn a_message_completed_behind_a_call_stays_in_the_final_response() {
+    use crate::test_support::http_client;
+
+    let (requests, text) = a_turn_cut_behind_its_first_call(Cut::Nowhere, http_client()).await;
+    assert_eq!(
+        requests.len(),
+        2,
+        "the turn, then one request with the outputs of both calls: {text}"
+    );
+    let (closed, kept) = closed_by_index_and_kept(&text);
+    assert_eq!(
+        closed.len(),
+        3,
+        "the two calls that ran and the message between them: {text}"
+    );
+    assert_eq!(closed[1], "msg_2", "{text}");
+    assert_eq!(kept, closed, "{text}");
+    let terminal = text
+        .split("\n\n")
+        .find(|frame| frame.starts_with("event: response.completed\n"))
+        .unwrap_or_else(|| panic!("the terminal event: {text}"));
+    assert!(
+        terminal.contains("\"text\":\"so far\""),
+        "the message as the upstream closed it: {text}"
+    );
+}
+
+/// A message the upstream still holds open when the request's tool-call
+/// allowance is spent is closed as incomplete with what was streamed, the
+/// way a cut turn closes it, and stands in the final response at its output
+/// index, between the call that ran and the call that did not.
+#[tokio::test]
+async fn a_message_left_open_at_the_tool_call_limit_is_closed_and_kept() {
+    use crate::test_support::http_client;
+
+    let (requests, text) =
+        a_limited_turn_cut_behind_its_first_call(Cut::MessageThenWholeCall, Some(1), http_client())
+            .await;
+    assert_eq!(
+        requests.len(),
+        1,
+        "the loop stops at the allowance and asks nothing again: {text}"
+    );
+    assert_eq!(
+        text.matches("event: response.output_item.added").count(),
+        text.matches("event: response.output_item.done").count(),
+        "no item the stream announced stays open: {text}"
+    );
+    let closing = text
+        .split("\n\n")
+        .filter(|frame| frame.starts_with("event: response.output_item.done\n"))
+        .find(|frame| frame.contains("\"id\":\"msg_2\""))
+        .unwrap_or_else(|| panic!("the message's closing event: {text}"));
+    assert!(
+        closing.contains("\"status\":\"incomplete\"") && closing.contains("\"text\":\"so f\""),
+        "incomplete, with what was streamed: {text}"
+    );
+    let (closed, kept) = closed_by_index_and_kept(&text);
+    assert_eq!(
+        closed.len(),
+        3,
+        "the call that ran, the message and the call over the limit: {text}"
+    );
+    assert_eq!(closed[1], "msg_2", "{text}");
+    assert_eq!(kept, closed, "{text}");
+}
+
+/// A message the upstream completes before the request's tool-call
+/// allowance is spent stands in the final response at its output index
+/// too, between the call that ran and the call that did not.
+#[tokio::test]
+async fn a_message_completed_before_the_tool_call_limit_keeps_its_index() {
+    use crate::test_support::http_client;
+
+    let (requests, text) =
+        a_limited_turn_cut_behind_its_first_call(Cut::Nowhere, Some(1), http_client()).await;
+    assert_eq!(
+        requests.len(),
+        1,
+        "the loop stops at the allowance and asks nothing again: {text}"
+    );
+    let (closed, kept) = closed_by_index_and_kept(&text);
+    assert_eq!(
+        closed.len(),
+        3,
+        "the call that ran, the message and the call over the limit: {text}"
+    );
+    assert_eq!(closed[1], "msg_2", "{text}");
+    assert_eq!(kept, closed, "{text}");
+}
+
+/// The same turn on a stream that stalls behind the call until the
+/// client's deadline: the turn ends at the deadline, not the request.
+#[tokio::test]
+async fn a_stream_that_stalls_past_the_deadline_behind_a_call_that_ran_ends_the_turn() {
+    use crate::test_support::http_client_with_deadline;
+
+    let client = http_client_with_deadline(Duration::from_millis(500));
+    let (requests, text) = a_turn_cut_behind_its_first_call(Cut::Stall, client).await;
+    assert_served_from_the_first_call(&requests, &text);
+}
+
+/// The turn's stream is read while a call runs. The work here ends only
+/// when the stream has taken two of its three chunks (the channel has
+/// one slot, so the third can rest in it), the way a tool's run outlasts
+/// a request's deadline on a stream left unread. What was read meanwhile
+/// comes out afterwards in order, then the stream's end. A turn under
+/// the read-ahead's bound does not fill it.
+#[tokio::test]
+async fn the_turns_stream_is_read_while_a_call_runs() {
+    use tokio::sync::mpsc;
+
+    let (chunks, upstream) = mpsc::channel::<reqwest::Result<Bytes>>(1);
+    let mut stream = TurnStream::new(ReceiverStream::new(upstream));
+    let work = async move {
+        for chunk in ["one", "two", "three"] {
+            chunks
+                .send(Ok(Bytes::from_static(chunk.as_bytes())))
+                .await
+                .expect("a reader");
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), stream.read_during(work))
+        .await
+        .expect("the work ends once the stream is read");
+    assert!(!stream.read_ahead_is_full());
+    let mut read = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        read.push(chunk.expect("a chunk"));
+    }
+    assert_eq!(read, ["one", "two", "three"]);
+}
+
+/// The read-ahead stops at its bound: the rest of the turn waits unread
+/// while the call runs and is read after it, in order. The whole turn is
+/// in the channel before the work starts and the work gives the reader
+/// every chance, so what the read-ahead holds is the bound's doing: the
+/// chunk that reached it, and no more.
+#[tokio::test]
+async fn the_read_ahead_stops_at_its_bound_and_the_rest_is_read_after_the_call() {
+    use tokio::sync::mpsc;
+
+    let (chunks, upstream) = mpsc::channel::<reqwest::Result<Bytes>>(4);
+    for chunk in ["one", "two", "three", "four"] {
+        chunks
+            .send(Ok(Bytes::from_static(chunk.as_bytes())))
+            .await
+            .expect("a free slot");
+    }
+    drop(chunks);
+    let mut stream = TurnStream {
+        bound: 4,
+        ..TurnStream::new(ReceiverStream::new(upstream))
+    };
+    stream
+        .read_during(async {
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+    assert!(stream.read_ahead_is_full());
+    assert_eq!(stream.read_ahead_bytes, 6, "one and two");
+    let mut read = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        read.push(chunk.expect("a chunk"));
+    }
+    assert_eq!(read, ["one", "two", "three", "four"]);
+    assert_eq!(stream.read_ahead_bytes, 0);
+}
+
+/// A turn's stream that ended while a call ran is not polled again: the
+/// client's deadline may have passed by then, and a body read past it
+/// answers with the deadline's error, not with the end.
+#[tokio::test]
+async fn a_turn_stream_that_ended_while_a_call_ran_is_not_polled_again() {
+    let mut polls = 0;
+    let upstream = futures_util::stream::poll_fn(move |_| {
+        polls += 1;
+        assert_eq!(polls, 1, "an ended stream is polled again");
+        Poll::Ready(None::<reqwest::Result<Bytes>>)
+    });
+    let mut stream = TurnStream::new(upstream);
+    stream.read_during(tokio::task::yield_now()).await;
+    assert!(stream.next().await.is_none());
 }
 
 /// A client that is gone before the first frame stops the relay at that
