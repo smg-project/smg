@@ -13,6 +13,7 @@
 use std::{
     cell::RefCell,
     collections::HashMap,
+    io,
     sync::{Arc, LazyLock},
 };
 
@@ -62,11 +63,34 @@ struct Kept {
 /// What an entry costs kept: its key, the values ([`kept_weight`]) and the
 /// `tojson` texts its tools keep as the renders go, up to
 /// [`PreparedTools::KEPT_TOJSON_TEXTS_PER_TOOL`] per tool, charged at that cap
-/// as the tool's share of the key bytes each (about a compact form's size; an
-/// `indent` form runs about twice that, and the values' term dominates, so
-/// the table's bound stays close whatever the template asks of the filter).
+/// as the tool's share of the set's compact text each ([`serialized_len`]:
+/// the key is shorter than that text; an `indent` form runs about twice it,
+/// and the values' term dominates, so the table's bound stays close whatever
+/// the template asks of the filter).
 fn set_weight(key_len: usize, values: &[Value]) -> usize {
-    key_len * (1 + PreparedTools::KEPT_TOJSON_TEXTS_PER_TOOL) + kept_weight(values)
+    let texts = serialized_len(values) * PreparedTools::KEPT_TOJSON_TEXTS_PER_TOOL;
+    key_len + texts + kept_weight(values)
+}
+
+/// The length of the values' compact JSON text, counted and not written. It
+/// runs for a set that was not kept yet, never for one that is found.
+fn serialized_len(values: &[Value]) -> usize {
+    struct Count(usize);
+    impl io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    // JSON values always serialize and the counter takes every write, so
+    // the count is whole either way.
+    let _ = serde_json::to_writer(&mut count, values);
+    count.0
 }
 
 /// What a set's values cost kept, estimated from its JSON values: the bytes
@@ -122,8 +146,11 @@ const OBJECT: u8 = 7;
 /// request with tools pays the walk on every lookup, at a fraction of the
 /// serialization it stands for (a string is copied whole, where a JSON writer
 /// reads its every byte for an escape). The key of a set within the size
-/// bound is no longer than the set serialized, so what the bounds admitted
-/// by the serialized bytes they still admit.
+/// bound is no longer than the set serialized, so what the key bound admitted
+/// by the serialized bytes it still admits. The weight bounds charge a tool
+/// with no schema a little more than the serialized bytes did: its kept
+/// texts hold the `null` schema ([`tool_value`]), 18 bytes a text that the
+/// tool serialized does not, and [`set_weight`] counts them.
 fn write_key(key: &mut Vec<u8>, tools: &[Tool]) -> Result<(), serde_json::Error> {
     for tool in tools {
         // Taken apart whole: a field added to either record does not build
