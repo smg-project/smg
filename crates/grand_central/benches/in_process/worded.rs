@@ -39,9 +39,12 @@ pub(super) fn stated(run: &Run) -> bool {
 /// entry says them ([`place::one`]). It lends `ring` as that entry does
 /// ([`place::lent`]).
 pub(super) fn one(host: &Host, ring: Option<&'static dyn LentRing>) -> Option<u32> {
-    let mut request = PlaceRequest::of(MODEL, WorkerLists::Single(host.list.lent()));
-    request.prompt.text = Some(TEXT);
-    request.ring = ring;
+    let request = {
+        let mut request = PlaceRequest::of(MODEL, WorkerLists::Single(host.list.lent()));
+        request.prompt.text = Some(TEXT);
+        request.ring = ring;
+        request
+    };
     let mut answer = host.engine.place(&request);
     let placement = answer.as_mut().ok()?;
     if placement.owes_events() {
