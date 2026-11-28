@@ -1285,8 +1285,9 @@ pub fn usage() -> String {
                                 its answer back as it came (with --record); --script, --engine and\n\
                                 --worker-type do not reach a gRPC worker that records\n\
        --record <path>          with --record-upstream: append each Generate exchange to <path> as\n\
-                                lines --script replays, and the engine's info answers to <path>\n\
-                                with its extension replaced by info.jsonl\n\
+                                lines --script replays, and the engine's info answers and one\n\
+                                tokenizer fetch to <path> with its extension replaced by\n\
+                                info.jsonl\n\
      \n\
      Realistic engine simulator (vLLM pass loop over a block-level KV pool; opt-in):\n\
        --engine <canned|realistic>  engine mode (default canned)\n\

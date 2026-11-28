@@ -38,6 +38,7 @@ use crate::{
 /// beside a record file ([`script::recorded_info`]).
 const MODEL_INFO_CALL: &str = "/vllm.grpc.engine.VllmEngine/GetModelInfo";
 const SERVER_INFO_CALL: &str = "/vllm.grpc.engine.VllmEngine/GetServerInfo";
+const TOKENIZER_CALL: &str = "/vllm.grpc.engine.VllmEngine/GetTokenizer";
 
 /// The model of a record file made on this wire ([`super::recorded_model`]).
 pub(super) fn recorded_model() -> Option<super::RecordedModel> {
@@ -502,7 +503,12 @@ impl VllmEngine for MockScheduler {
         &self,
         _request: Request<common::GetTokenizerRequest>,
     ) -> Result<Response<Self::GetTokenizerStream>, Status> {
-        Err(Status::unimplemented("mock-worker"))
+        // A replay hands back the fetch its record holds; the mock has no
+        // tokenizer artifacts of its own to serve.
+        match super::recorded_tokenizer(&self.cfg, TOKENIZER_CALL)? {
+            Some(chunks) => Ok(Response::new(chunks)),
+            None => Err(Status::unimplemented("mock-worker")),
+        }
     }
 
     async fn subscribe_kv_events(

@@ -782,6 +782,31 @@ pub(crate) type FrameStream = Pin<Box<dyn Stream<Item = Result<Frame, Status>> +
 pub(crate) type TokenizerStream =
     Pin<Box<dyn Stream<Item = Result<common::GetTokenizerChunk, Status>> + Send>>;
 
+/// The tokenizer fetch a replay hands back: the chunks its record holds for
+/// `call`, as the engine sent them. `None` where the record holds no fetch,
+/// and where the replay was started with a tokenizer path of its own: it
+/// states that path in its model info, and the recorded bundle is the one
+/// of another path.
+fn recorded_tokenizer(cfg: &Config, call: &str) -> Result<Option<TokenizerStream>, Status> {
+    use prost::Message as _;
+
+    if !cfg.tokenizer_path.is_empty() && cfg.tokenizer_path != cfg.model_id {
+        return Ok(None);
+    }
+    let Some(recorded) = script::recorded_info(call) else {
+        return Ok(None);
+    };
+    let mut rest = recorded.as_slice();
+    let mut chunks = Vec::new();
+    while !rest.is_empty() {
+        let chunk = common::GetTokenizerChunk::decode_length_delimited(&mut rest)
+            .map_err(|e| Status::internal(format!("the recorded tokenizer: {e}")))?;
+        chunks.push(Ok(chunk));
+    }
+    let chunks: TokenizerStream = Box::pin(stream::iter(chunks));
+    Ok(Some(chunks))
+}
+
 /// The KV transport a disaggregated mock worker advertises on every wire (as
 /// a transfer backend, or as the connector that carries it): the mock moves
 /// no KV cache, and the gateway pairs its workers on this one transport.
