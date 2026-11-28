@@ -5668,13 +5668,20 @@ static OVER_WHITE: [[u8; 256]; 256] = {
 };
 
 /// Composite straight-alpha RGBA over opaque white: per channel one read of
-/// [`OVER_WHITE`], in the row the pixel's alpha names. The output is a buffer
-/// of the pool, and every pixel of the image writes its three bytes.
+/// [`OVER_WHITE`], in the row the pixel's alpha names. The row of a full
+/// alpha returns the value it is given, so the leading blocks in which every
+/// pixel is opaque keep their stored colour without those reads, and the
+/// table takes the image from the first block that holds a transparent pixel.
+/// The output is a buffer of the pool, and every pixel of the image writes
+/// its three bytes.
 fn composite_over_white(rgba: &image::RgbaImage) -> image::RgbImage {
     let (width, height) = rgba.dimensions();
     let (pixels, _) = rgba.as_raw()[..4 * width as usize * height as usize].as_chunks::<4>();
     let mut out = buffer_pool::take(3 * pixels.len());
-    for (rgb, px) in out.as_chunks_mut::<3>().0.iter_mut().zip(pixels) {
+    let lead = opaque_lead(pixels, &mut out);
+    let (_, blended) = pixels.split_at(lead);
+    let (_, rest) = out.split_at_mut(3 * lead);
+    for (rgb, px) in rest.as_chunks_mut::<3>().0.iter_mut().zip(blended) {
         let over_white = &OVER_WHITE[usize::from(px[3])];
         *rgb = [px[0], px[1], px[2]].map(|value| over_white[usize::from(value)]);
     }
@@ -5683,6 +5690,41 @@ fn composite_over_white(rgba: &image::RgbaImage) -> image::RgbImage {
         reason = "out holds exactly width * height * 3 bytes by construction"
     )]
     image::RgbImage::from_raw(width, height, out).expect("buffer matches image dimensions")
+}
+
+/// The pixels one step of [`opaque_lead`] takes: a block is read for its
+/// alpha and copied while the first-level cache still holds it, and an image
+/// with a transparent pixel pays that read for one block alone.
+const OPAQUE_BLOCK: usize = 1024;
+
+/// Writes the three colour bytes, as stored, of the leading blocks of
+/// `pixels` in which no pixel is transparent to any degree (the alpha bytes
+/// of the block, ANDed, are still the full alpha) into `out`, and returns how
+/// many pixels those blocks hold. Nothing is written for the first block that
+/// holds a transparent pixel, nor for any pixel behind it.
+#[cfg_attr(
+    target_arch = "x86_64",
+    multiversion::multiversion(targets("x86_64+avx2"))
+)]
+fn opaque_lead(pixels: &[[u8; 4]], out: &mut [u8]) -> usize {
+    let mut lead = 0;
+    for (block, stored) in pixels
+        .chunks(OPAQUE_BLOCK)
+        .zip(out.chunks_mut(3 * OPAQUE_BLOCK))
+    {
+        let [.., alpha] = block
+            .iter()
+            .fold(u32::MAX, |all, px| all & u32::from_ne_bytes(*px))
+            .to_ne_bytes();
+        if alpha != u8::MAX {
+            break;
+        }
+        for (rgb, px) in stored.as_chunks_mut::<3>().0.iter_mut().zip(block) {
+            *rgb = [px[0], px[1], px[2]];
+        }
+        lead += block.len();
+    }
+    lead
 }
 
 /// [`decode_frame_bytes`] for bytes whose header nobody read first.
