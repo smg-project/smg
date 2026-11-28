@@ -3228,6 +3228,158 @@ fn a_call_that_names_a_removed_worker_keeps_no_lock_for_it() {
     assert!(registry.worker_mutation_locks.is_empty(), "a removal");
 }
 
+/// A registration reads the id its URL maps to before it holds that id's
+/// lock. A removal that runs in between takes the mapping and the lock's
+/// entry with its worker: the registration lays both again for the id it
+/// read, so the worker it enters is the one the URL finds, under the lock
+/// every later call takes.
+#[test]
+fn a_registration_behind_a_removal_at_its_url_is_found_by_the_url() {
+    let url = "http://w1:8080";
+    let at_the_url = || -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .build(),
+        )
+    };
+    let registry = WorkerRegistry::new();
+    let first = registry
+        .register(at_the_url())
+        .expect("the first worker registers");
+    let lock_of = |id: &WorkerId| {
+        registry
+            .worker_mutation_locks
+            .get(id)
+            .map(|entry| Arc::clone(entry.value()))
+    };
+    let held = lock_of(&first).expect("the first worker has a lock");
+    let second = at_the_url();
+
+    let id = registry
+        .with_another_write_before_the_lock(
+            |registry| registry.register(Arc::clone(&second)),
+            |registry| {
+                assert!(registry.remove(&first).is_some(), "the first worker left");
+            },
+        )
+        .expect("the second worker registers");
+
+    assert_eq!(id, first, "under the id it read");
+    let found = registry.get_by_url(url).expect("the URL finds a worker");
+    assert!(
+        Arc::ptr_eq(&found, &second),
+        "the worker the URL finds is the one that registered"
+    );
+    assert_eq!(registry.get_id_by_url(url), Some(id.clone()));
+    assert!(
+        registry.is_current_handle(&second),
+        "it is the handle the registry holds for its URL"
+    );
+    assert_eq!(
+        registry.worker_mutation_locks.len(),
+        1,
+        "the lock it registered under is the one the map holds"
+    );
+    let standing = lock_of(&id).expect("the id has a lock");
+    assert!(
+        Arc::ptr_eq(&standing, &held),
+        "the lock put back is the one the registration held"
+    );
+}
+
+/// Behind that race a later registration at the same URL is refused, as at
+/// any URL that has a worker: the registry holds one worker for the URL.
+#[test]
+fn a_later_registration_at_the_url_of_that_race_is_refused() {
+    let url = "http://w1:8080";
+    let at_the_url = || -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .build(),
+        )
+    };
+    let registry = WorkerRegistry::new();
+    let first = registry
+        .register(at_the_url())
+        .expect("the first worker registers");
+    registry
+        .with_another_write_before_the_lock(
+            |registry| registry.register(at_the_url()),
+            |registry| {
+                assert!(registry.remove(&first).is_some(), "the first worker left");
+            },
+        )
+        .expect("the second worker registers");
+
+    let later = registry.register(at_the_url());
+
+    assert_eq!(
+        (later.is_some(), registry.len()),
+        (false, 1),
+        "a later registration at the URL is refused: one worker for the one URL"
+    );
+}
+
+/// A lock another call laid for the id while a registration waited behind a
+/// removal is not the one the registration holds, so a later call on the id
+/// does not wait for the registration. Under it the registration lays no
+/// mapping for its URL: a removal by URL finds nothing to take while the
+/// worker is being entered, as it found nothing before.
+#[test]
+fn a_registration_under_another_lock_of_its_id_lays_no_mapping() {
+    let url = "http://w1:8080";
+    let at_the_url = || -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .build(),
+        )
+    };
+    let registry = WorkerRegistry::new();
+    let first = registry
+        .register(at_the_url())
+        .expect("the first worker registers");
+    let second = at_the_url();
+    let of_another_call = Arc::new(parking_lot::Mutex::new(()));
+
+    let id = registry
+        .with_another_write_before_the_lock(
+            |registry| registry.register(Arc::clone(&second)),
+            |registry| {
+                assert!(registry.remove(&first).is_some(), "the first worker left");
+                registry
+                    .worker_mutation_locks
+                    .insert(first.clone(), Arc::clone(&of_another_call));
+            },
+        )
+        .expect("the second worker registers");
+
+    assert_eq!(id, first, "under the id it read");
+    let standing = registry
+        .worker_mutation_locks
+        .get(&id)
+        .map(|entry| Arc::clone(entry.value()))
+        .expect("the id has a lock");
+    assert!(
+        Arc::ptr_eq(&standing, &of_another_call),
+        "the lock another call laid stays"
+    );
+    assert_eq!(
+        registry.get_id_by_url(url),
+        None,
+        "no mapping is laid under a lock the registration does not hold"
+    );
+    assert!(
+        registry.remove_by_url(url).is_none(),
+        "a removal by URL finds nothing to take"
+    );
+}
+
 /// The lines a rendered scrape holds for the worker at `url`, sorted.
 fn series_of(rendered: &str, url: &str) -> Vec<String> {
     let label = format!("worker=\"{url}\"");
