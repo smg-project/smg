@@ -1,0 +1,1667 @@
+import ast
+import copy
+import errno
+import importlib.util
+import inspect
+import io
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
+import unittest
+import urllib.request
+from pathlib import Path
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[2]
+spec = importlib.util.spec_from_file_location(
+    "publication", ROOT / "scripts/ci_moriio_image_publication.py"
+)
+p = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(p)
+
+
+def exercise_bake_processes(source, directory):
+    """Execute the real command closure/call sites; mock only the process boundary.
+
+    Buildx's context read is implicit inside cwd; the only extra grant is the
+    exact recipe directory. No Docker or network process runs in this test.
+    """
+    tree = ast.parse(textwrap.dedent(source))
+    publish = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "publish")
+    command = next(
+        n for n in publish.body if isinstance(n, ast.FunctionDef) and n.name == "command"
+    )
+    bake_assignment = next(
+        n
+        for n in ast.walk(publish)
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "bake" for t in n.targets)
+    )
+    phases = {"bake_plan", "full_build", "publish_cached_target"}
+    calls = [
+        n
+        for n in ast.walk(publish)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "command"
+        and n.args
+        and isinstance(n.args[0], ast.Constant)
+        and n.args[0].value in phases
+    ]
+    assert len(calls) == 3
+    calls.sort(key=lambda node: node.lineno)
+    output = Path(directory)
+    context = output / "source"
+    context.mkdir()
+    observed = []
+
+    actual_popen = subprocess.Popen
+
+    def fake_popen(argv, **kwargs):
+        assert not {
+            "DOCKER_CONTEXT",
+            "DOCKER_HOST",
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "MORIIO_PUBLISH_TOKEN",
+        }.intersection(kwargs["env"]), "Use the production token/context exclusions"
+        if "bake" in argv:
+            grants = {
+                Path(a.removeprefix("--allow=fs.read="))
+                for a in argv
+                if a.startswith("--allow=fs.read=")
+            }
+            assert grants == {p.RECIPE}, "Do not widen the recipe read grant"
+            cwd = Path(kwargs.get("cwd") or p.ROOT)
+            if not context.is_relative_to(cwd) and not any(
+                context.is_relative_to(g) for g in grants
+            ):
+                raise PermissionError(
+                    "Owned source context is outside cwd and precise recipe grant"
+                )
+            assert cwd == context
+        else:
+            assert kwargs.get("cwd") is None, "Preflight/cleanup cannot require the exported source"
+        observed.append((argv, kwargs.get("cwd")))
+        return actual_popen([sys.executable, "-I", "-S", "-B", "-c", "print('{}')"], **kwargs)
+
+    namespace = dict(
+        p.__dict__,
+        deadline=time.monotonic() + 30,
+        output=output,
+        buildx_config=output / "buildx-config",
+        event=lambda *_args, **_kwargs: None,
+        state={"events": []},
+        docker=["docker"],
+        builder="owned-test-builder",
+        image="candidate",
+        metadata=output / "metadata.json",
+    )
+    control = next(
+        n
+        for n in publish.body
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "client_control" for t in n.targets)
+    )
+    environment = [
+        node
+        for node in publish.body
+        if (
+            isinstance(node, ast.Assign)
+            and any(
+                (isinstance(target, ast.Name) and target.id == "env")
+                or (
+                    isinstance(target, ast.Subscript)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "env"
+                )
+                for target in node.targets
+            )
+        )
+        or (
+            isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Attribute)
+            and isinstance(node.value.func.value, ast.Name)
+            and node.value.func.value.id == "env"
+            and node.value.func.attr == "update"
+        )
+    ]
+    assert len(environment) == 3
+    module = ast.Module(body=[*environment, control, command, bake_assignment], type_ignores=[])
+    exec(
+        compile(ast.fix_missing_locations(module), "<actual publisher command boundary>", "exec"),
+        namespace,
+    )
+    with (
+        mock.patch.object(p.subprocess, "Popen", side_effect=fake_popen),
+        mock.patch.object(p.os, "killpg", side_effect=ProcessLookupError) as kill,
+    ):
+        for call in calls:
+            eval(compile(ast.Expression(call), "<actual bake invocation>", "eval"), namespace)
+        # The source may not exist during early diagnosis or final cleanup.
+        shutil.rmtree(context)
+        namespace["command"]("metadata_without_source", ["docker", "info"])
+        namespace["command"]("cleanup_without_source", ["docker", "inspect", "owned"])
+        assert all(call.args[1] == 0 for call in kill.call_args_list)
+    return observed
+
+
+class PublicationControls(unittest.TestCase):
+    def test_bake_context_is_readable_from_all_three_actual_process_invocations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            calls = exercise_bake_processes(inspect.getsource(p.publish), directory)
+            self.assertEqual(len(calls), 5)
+            self.assertEqual([cwd for _, cwd in calls[:3]], [Path(directory) / "source"] * 3)
+            self.assertEqual([cwd for _, cwd in calls[3:]], [None, None])
+
+    def test_bake_real_child_can_load_required_private_library(self):
+        actual_popen = subprocess.Popen
+        children = []
+        library = next(
+            Path(line.split()[-1])
+            for line in Path("/proc/self/maps").read_text().splitlines()
+            if "/libc.so." in line
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            loader = Path(directory) / "native-loader"
+            loader.mkdir()
+            (loader / "libmoriio_loader_fixture.so").symlink_to(library)
+
+            def loading_child(_argv, **kwargs):
+                child = actual_popen(
+                    [
+                        sys.executable,
+                        "-I",
+                        "-S",
+                        "-B",
+                        "-c",
+                        "import ctypes; ctypes.CDLL('libmoriio_loader_fixture.so'); print('{}')",
+                    ],
+                    **kwargs,
+                )
+                children.append(child)
+                return child
+
+            library_path = os.pathsep.join(
+                path for path in (str(loader), os.environ.get("LD_LIBRARY_PATH")) if path
+            )
+            with (
+                mock.patch.dict(os.environ, {"LD_LIBRARY_PATH": library_path}),
+                mock.patch.object(subprocess, "Popen", side_effect=loading_child),
+            ):
+                source = inspect.getsource(p.publish)
+                calls = exercise_bake_processes(source, directory)
+                missing_loader = source.replace(
+                    'not in ("DOCKER_CONTEXT",',
+                    'not in ("LD_LIBRARY_PATH", "DOCKER_CONTEXT",',
+                    1,
+                )
+                self.assertNotEqual(missing_loader, source)
+                negative = Path(directory) / "missing-production-loader"
+                negative.mkdir()
+                with self.assertRaises(AssertionError):
+                    exercise_bake_processes(missing_loader, negative)
+            self.assertEqual(len(calls), 5)
+            self.assertEqual(len(children), 6)
+            self.assertEqual([child.returncode for child in children[:5]], [0] * 5)
+            self.assertNotEqual(children[-1].returncode, 0)
+
+    def test_bake_processes_keep_production_token_exclusions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = inspect.getsource(p.publish)
+            with mock.patch.dict(os.environ, GH_TOKEN="private", GITHUB_TOKEN="private"):
+                calls = exercise_bake_processes(source, directory)
+            self.assertEqual(len(calls), 5)
+
+    def test_actual_recipe_manifest_and_material_pins(self):
+        self.assertEqual(len(p.check_recipe()), 64)
+        self.assertEqual(len(p.CONTEXTS), 3)
+
+    def test_pr_cannot_reach_output_or_docker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / "new"
+            with mock.patch.dict(
+                os.environ,
+                {"GITHUB_REPOSITORY": "smg-project/smg", "GITHUB_EVENT_NAME": "pull_request"},
+            ):
+                with (
+                    mock.patch.object(p.subprocess, "Popen") as start,
+                    self.assertRaises(AssertionError),
+                ):
+                    p.publish(Path(directory), out)
+                start.assert_not_called()
+                self.assertFalse(out.exists())
+
+    def test_foreign_repository_cannot_publish(self):
+        with mock.patch.dict(os.environ, {"GITHUB_REPOSITORY": "foreign/smg"}):
+            with (
+                mock.patch.object(p.subprocess, "Popen") as start,
+                self.assertRaises(AssertionError),
+            ):
+                p.publish(Path("/unused"), Path("/unused"))
+            start.assert_not_called()
+
+    def test_wrong_main_ref_cannot_publish(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GITHUB_REPOSITORY": "smg-project/smg",
+                "GITHUB_EVENT_NAME": "push",
+                "GITHUB_REF": "refs/heads/proposal",
+            },
+        ):
+            with (
+                mock.patch.object(p.subprocess, "Popen") as start,
+                self.assertRaises(AssertionError),
+            ):
+                p.publish(Path("/unused"), Path("/unused"))
+            start.assert_not_called()
+
+    def v2(self, directory, swap="0", memory=None, cpu=None):
+        root = Path(directory)
+        leaf = root / "owned"
+        leaf.mkdir()
+        (leaf / "cpu.max").write_text(cpu or f"{p.QUOTA} {p.PERIOD}")
+        (leaf / "memory.max").write_text(memory or str(p.MEMORY))
+        (leaf / "memory.swap.max").write_text(swap)
+        member = Path(f"/proc/{os.getpid()}/cgroup").read_text()
+        return member, {"unified": (leaf, root)}
+
+    def test_v2_exact_kernel_limits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(p, "cgroup_paths", return_value=self.v2(directory)):
+                result = p.limits(os.getpid())
+                self.assertEqual(result["controllers"][0]["swap"], "0")
+
+    def test_v2_extra_swap_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(p, "cgroup_paths", return_value=self.v2(directory, swap="1")):
+                with self.assertRaises(AssertionError):
+                    p.limits(os.getpid())
+
+    def test_worker_ancestor_capacity_is_required(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(
+                p, "cgroup_paths", return_value=self.v2(directory, memory=str(p.MEMORY - 1))
+            ):
+                with self.assertRaises(AssertionError):
+                    p.limits(os.getpid(), capacity=True)
+
+    def test_v1_memory_memsw_total(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            leaf = root / "owned"
+            leaf.mkdir()
+            for name, value in {
+                "cpu.cfs_quota_us": p.QUOTA,
+                "cpu.cfs_period_us": p.PERIOD,
+                "memory.limit_in_bytes": p.MEMORY,
+                "memory.memsw.limit_in_bytes": p.MEMORY,
+            }.items():
+                (leaf / name).write_text(str(value))
+            member = Path(f"/proc/{os.getpid()}/cgroup").read_text()
+            with mock.patch.object(
+                p,
+                "cgroup_paths",
+                return_value=(member, {"cpu": (leaf, root), "memory": (leaf, root)}),
+            ):
+                p.limits(os.getpid())
+                (leaf / "memory.memsw.limit_in_bytes").write_text(str(p.MEMORY + 1))
+                with self.assertRaises(AssertionError):
+                    p.limits(os.getpid())
+
+    def test_redirect_does_not_forward_registry_bearer_to_cdn(self):
+        request = urllib.request.Request(
+            "https://ghcr.io/v2/repo/blobs/sha256:a", headers={"Authorization": "Bearer fake"}
+        )
+        redirected = p.RegistryRedirect().redirect_request(
+            request, None, 307, "", {}, "https://cdn.example/blob?fake=1"
+        )
+        self.assertIsNone(redirected.get_header("Authorization"))
+
+    def test_redirect_http_is_rejected(self):
+        request = urllib.request.Request("https://ghcr.io/v2/repo/manifests/a")
+        with self.assertRaises(AssertionError):
+            p.RegistryRedirect().redirect_request(
+                request, None, 307, "", {}, "http://cdn.example/blob"
+            )
+
+    def test_registry_raw_config_digest_not_version_string(self):
+        config = json.dumps(
+            {"os": "linux", "architecture": "amd64", "rootfs": {"diff_ids": ["sha256:layer"]}}
+        ).encode()
+        manifest = json.dumps(
+            {
+                "config": {"digest": "sha256:" + p.digest(config)},
+                "layers": [{"digest": "sha256:layer"}],
+            }
+        ).encode()
+        token = mock.MagicMock()
+        token.__enter__.return_value = io.BytesIO(b'{"token":"fake"}')
+        with (
+            mock.patch.object(p, "registry_open", return_value=token),
+            mock.patch.object(p, "registry_get", side_effect=[manifest, config]),
+        ):
+            result = p.image_identity(
+                "ghcr.io/smg-project/smg", "sha256:" + p.digest(manifest), p.time.monotonic() + 30
+            )
+            self.assertEqual(result["config_sha256"], p.digest(config))
+        with (
+            mock.patch.object(p, "registry_open", return_value=token),
+            mock.patch.object(p, "registry_get", side_effect=[manifest, config + b"\n"]),
+        ):
+            token.__enter__.return_value = io.BytesIO(b'{"token":"fake"}')
+            with self.assertRaises(AssertionError):
+                p.image_identity(
+                    "ghcr.io/smg-project/smg",
+                    "sha256:" + p.digest(manifest),
+                    p.time.monotonic() + 30,
+                )
+
+    def test_expired_registry_deadline_stops_before_network(self):
+        with (
+            mock.patch.object(p.urllib.request, "build_opener") as opener,
+            self.assertRaises(AssertionError),
+        ):
+            p.registry_open(urllib.request.Request("https://ghcr.io/token"), p.time.monotonic() - 1)
+        opener.assert_not_called()
+
+
+def actual_client_namespace(directory, hook=None):
+    """Compile the exact production closures; only external faults are injected."""
+    tree = ast.parse(textwrap.dedent(inspect.getsource(p.publish)))
+    publish = tree.body[0]
+    nodes = [
+        node
+        for node in publish.body
+        if (
+            isinstance(node, ast.FunctionDef)
+            and node.name in {"persist", "event", "command", "interrupted", "creation_ack"}
+        )
+        or (
+            isinstance(node, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "client_control" for t in node.targets)
+        )
+    ]
+    output = Path(directory)
+    namespace = dict(
+        p.__dict__,
+        deadline=time.monotonic() + 15,
+        output=output,
+        record=output / "result.json",
+        state={"events": []},
+        env={
+            "PATH": "/usr/bin:/bin",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            **(
+                {"LD_LIBRARY_PATH": os.environ["LD_LIBRARY_PATH"]}
+                if "LD_LIBRARY_PATH" in os.environ
+                else {}
+            ),
+        },
+    )
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])),
+            "<actual publisher client closures>",
+            "exec",
+        ),
+        namespace,
+    )
+    actual_event = namespace["event"]
+
+    def event(phase, **extra):
+        if hook:
+            hook(phase, extra, namespace)
+        actual_event(phase, **extra)
+
+    namespace["event"] = event
+    return namespace
+
+
+class OwnedClientLifecycle(unittest.TestCase):
+    def run_owned(
+        self, directory, namespace, code, *, during_popen=None, after_communicate=None, until=None
+    ):
+        """Every child is ours; even an old/failing implementation is safely reaped."""
+        born = []
+        popen = subprocess.Popen
+        handlers = {
+            sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGALRM)
+        }
+        for sig in handlers:
+            signal.signal(sig, namespace["interrupted"])
+
+        def start(*args, **kwargs):
+            child = popen(*args, **kwargs)
+            born.append(child)
+            if after_communicate:
+                communicate = child.communicate
+
+                def completed(*args, **kwargs):
+                    result = communicate(*args, **kwargs)
+                    after_communicate()
+                    return result
+
+                child.communicate = completed
+                actual_wait = child.wait
+                delivered = False
+
+                def waited(*args, **kwargs):
+                    nonlocal delivered
+                    result = actual_wait(*args, **kwargs)
+                    if not delivered:
+                        delivered = True
+                        after_communicate()
+                    return result
+
+                child.wait = waited
+            if during_popen:
+                during_popen()
+            return child
+
+        try:
+            with mock.patch.object(p.subprocess, "Popen", side_effect=start):
+                return namespace["command"](
+                    "client",
+                    [sys.executable, "-I", "-S", "-B", "-c", code],
+                    until=until,
+                    capture=True,
+                )
+        finally:
+            for sig, old in handlers.items():
+                signal.signal(sig, old)
+            observations = []
+            for child in born:
+                live = child.poll() is None
+                observations.append(
+                    {"PID": child.pid, "live_after_command": live, "returncode": child.returncode}
+                )
+                # Cleanup belongs to this test, and cannot certify the production path.
+                if live:
+                    self.assertEqual(os.getpgid(child.pid), child.pid)
+                    os.killpg(child.pid, signal.SIGKILL)
+                child.wait(timeout=3)
+                with self.assertRaises(ProcessLookupError):
+                    os.killpg(child.pid, 0)
+                if child.stdout:
+                    child.stdout.close()
+                if child.stderr:
+                    child.stderr.close()
+            print(json.dumps({"owned_client_observations": observations}))
+            self.assertTrue(all(not item["live_after_command"] for item in observations))
+
+    def assert_closed(self, namespace):
+        client = namespace["state"]["clients"][-1]
+        self.assertTrue(client["reaped"])
+        self.assertIs(client["PG_gone"], True)
+        self.assertTrue(client["pipes_closed"])
+        self.assertFalse(client["cleanup_unknown"])
+
+    def test_running_event_failure_reaps_actual_client(self):
+        def fail(phase, _extra, _namespace):
+            if phase.endswith("_running"):
+                raise OSError("injected durable HANDLE event failure")
+
+        with tempfile.TemporaryDirectory() as directory:
+            ns = actual_client_namespace(directory, fail)
+            with self.assertRaisesRegex(OSError, "HANDLE"):
+                self.run_owned(directory, ns, "import time; time.sleep(30)")
+            self.assert_closed(ns)
+
+    def test_signals_between_actual_popen_and_handle_are_deferred_then_reaped(self):
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGALRM):
+            with self.subTest(signal=sig), tempfile.TemporaryDirectory() as directory:
+                ns = actual_client_namespace(directory)
+                with self.assertRaisesRegex(RuntimeError, "cancellation pending"):
+                    self.run_owned(
+                        directory,
+                        ns,
+                        "import time; time.sleep(30)",
+                        during_popen=lambda: os.kill(os.getpid(), sig),
+                    )
+                self.assert_closed(ns)
+                self.assertEqual(ns["client_control"]["pending_signal"], sig)
+
+    def test_completed_communicate_delivers_pending_before_direct_consumer(self):
+        publish = ast.parse(textwrap.dedent(inspect.getsource(p.publish))).body[0]
+        direct_consumer = next(
+            node
+            for node in ast.walk(publish)
+            if isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "export_source"
+        )
+        for sig in (signal.SIGTERM, signal.SIGALRM):
+            with self.subTest(signal=sig), tempfile.TemporaryDirectory() as directory:
+                ns = actual_client_namespace(directory)
+                ns["engine_checkout"] = Path(directory)
+                consumer = mock.Mock()
+                ns["export_source"] = consumer
+                with self.assertRaisesRegex(RuntimeError, "cancellation pending"):
+                    self.run_owned(
+                        directory,
+                        ns,
+                        "print('completed')",
+                        after_communicate=lambda: os.kill(os.getpid(), sig),
+                    )
+                    exec(
+                        compile(
+                            ast.fix_missing_locations(
+                                ast.Module(body=[direct_consumer], type_ignores=[])
+                            ),
+                            "<actual next direct consumer>",
+                            "exec",
+                        ),
+                        ns,
+                    )
+                consumer.assert_not_called()
+                self.assert_closed(ns)
+                self.assertTrue(ns["state"]["clients"][-1]["pending_cancel_delivered"])
+
+    def test_pending_before_admission_never_spawns(self):
+        def cancel(phase, _extra, ns):
+            if phase.endswith("_submitted"):
+                ns["interrupted"](signal.SIGTERM, None)
+
+        with tempfile.TemporaryDirectory() as directory:
+            ns = actual_client_namespace(directory, cancel)
+            with mock.patch.object(p.subprocess, "Popen") as spawn:
+                with self.assertRaisesRegex(RuntimeError, "cancellation pending"):
+                    ns["command"]("client", ["not-executed"])
+                spawn.assert_not_called()
+            self.assertFalse(ns["state"]["clients"][-1]["Popen_attempted"])
+            self.assert_closed(ns)
+
+    def test_healthy_actual_child_capture_and_unblocked_exec_signals(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns = actual_client_namespace(directory)
+            result = self.run_owned(
+                directory,
+                ns,
+                "import json,signal; print(json.dumps(sorted(int(s) for s in "
+                "signal.pthread_sigmask(signal.SIG_BLOCK, []))))",
+            )
+            blocked = json.loads(result)
+            self.assertTrue(
+                all(sig not in blocked for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGALRM))
+            )
+            self.assert_closed(ns)
+
+    def test_deadline_timeout_reaps_actual_client(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns = actual_client_namespace(directory)
+            before = time.monotonic()
+            with self.assertRaisesRegex(AssertionError, "deadline expired"):
+                self.run_owned(directory, ns, "import time; time.sleep(30)", until=before + 3.15)
+            self.assertLess(time.monotonic() - before, 3)
+            self.assert_closed(ns)
+
+    def test_nonzero_actual_child_is_failure_and_reaped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns = actual_client_namespace(directory)
+            with self.assertRaisesRegex(AssertionError, "failed"):
+                self.run_owned(directory, ns, "raise SystemExit(7)")
+            self.assertEqual(ns["state"]["clients"][-1]["returncode"], 7)
+            self.assert_closed(ns)
+
+    def test_cleanup_phase_runs_bounded_owned_child_despite_pending(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns = actual_client_namespace(directory)
+            ns["client_control"]["cleaning"] = True
+            ns["interrupted"](signal.SIGTERM, None)
+            self.assertEqual(self.run_owned(directory, ns, "print('cleanup')"), b"cleanup\n")
+            self.assert_closed(ns)
+
+    def test_outside_command_signals_still_raise(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns = actual_client_namespace(directory)
+            with self.assertRaisesRegex(RuntimeError, "publisher interrupted"):
+                ns["interrupted"](signal.SIGTERM, None)
+
+    def test_actual_export_source_direct_git_still_interrupted(self):
+        # Real export_source -> check_output/run/communicate, only the external
+        # Git executable is replaced by our harmless sleeping Python child.
+        with tempfile.TemporaryDirectory() as directory:
+            ns = actual_client_namespace(directory)
+            born = []
+            popen = subprocess.Popen
+            previous = signal.getsignal(signal.SIGALRM)
+
+            def harmless_git(*args, **kwargs):
+                self.assertEqual(args[0][0], "git")
+                kwargs["start_new_session"] = True
+                child = popen(
+                    [sys.executable, "-I", "-S", "-B", "-c", "import time; time.sleep(30)"],
+                    **kwargs,
+                )
+                born.append(child)
+                return child
+
+            signal.signal(signal.SIGALRM, ns["interrupted"])
+            started = time.monotonic()
+            try:
+                signal.setitimer(signal.ITIMER_REAL, 0.05)
+                with mock.patch.object(p.subprocess, "Popen", side_effect=harmless_git):
+                    with self.assertRaisesRegex(RuntimeError, "publisher interrupted"):
+                        p.export_source(Path(directory), Path(directory) / "source")
+                self.assertLess(time.monotonic() - started, 2)
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, previous)
+                live = [child for child in born if child.poll() is None]
+                for child in born:
+                    if child.poll() is None:
+                        self.assertEqual(os.getpgid(child.pid), child.pid)
+                        os.killpg(child.pid, signal.SIGKILL)
+                    child.wait(timeout=3)
+                    with self.assertRaises(ProcessLookupError):
+                        os.killpg(child.pid, 0)
+                self.assertEqual(live, [])
+
+    def test_constructor_without_process_object_remains_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns = actual_client_namespace(directory)
+            with mock.patch.object(p.subprocess, "Popen", side_effect=OSError("constructor")):
+                with self.assertRaisesRegex(OSError, "constructor"):
+                    ns["command"]("client", ["not-executed"])
+            client = ns["state"]["clients"][-1]
+            self.assertTrue(client["Popen_attempted"])
+            self.assertFalse(client["reaped"])
+            self.assertIsNone(client["PG_gone"])
+            self.assertTrue(client["cleanup_unknown"])
+            self.assertTrue(ns["state"]["owned_client_cleanup_unknown"])
+
+    def test_pre_spawn_event_error_has_closed_no_spawn_receipt(self):
+        def fail(phase, _extra, _namespace):
+            if phase.endswith("_submitted"):
+                raise OSError("pre-spawn event")
+
+        with tempfile.TemporaryDirectory() as directory:
+            ns = actual_client_namespace(directory, fail)
+            with mock.patch.object(p.subprocess, "Popen") as spawn:
+                with self.assertRaisesRegex(OSError, "pre-spawn"):
+                    ns["command"]("client", ["not-executed"])
+                spawn.assert_not_called()
+            self.assert_closed(ns)
+
+    def test_returned_receipt_failure_preserves_closed_actual_child(self):
+        def fail(phase, _extra, _namespace):
+            if phase.endswith("_returned"):
+                raise OSError("returned receipt")
+
+        with tempfile.TemporaryDirectory() as directory:
+            ns = actual_client_namespace(directory, fail)
+            with self.assertRaisesRegex(OSError, "returned receipt"):
+                self.run_owned(directory, ns, "print('finite')")
+            self.assert_closed(ns)
+
+
+def exercise_owned_cleanup_fault(
+    directory, fault, *, foreign=False, cleanup_stop_stderr=None, source=None
+):
+    """Run actual publisher teardown and real harmless clients, never Docker.
+
+    Only the productive try-body is replaced by a fault after exact ownership
+    binding. Command/identity/except/finally and final outcome stay production.
+    """
+    publish = ast.parse(textwrap.dedent(source or inspect.getsource(p.publish))).body[0]
+    nodes = [
+        copy.deepcopy(node)
+        for node in publish.body
+        if (
+            isinstance(node, ast.FunctionDef)
+            and node.name
+            in {
+                "persist",
+                "event",
+                "command",
+                "inspect",
+                "verify_owned",
+                "bind_created_storage",
+                "registration_identity",
+                "interrupted",
+            }
+        )
+        or (
+            isinstance(node, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "client_control" for t in node.targets)
+        )
+    ]
+    operation = next(node for node in publish.body if isinstance(node, ast.Try))
+    operation = copy.deepcopy(operation)
+    operation.body = ast.parse("write_json(record, state)").body
+    if fault == "post_final_check_exception":
+        operation.body = ast.parse("raise RuntimeError('original exceptional publisher exit')").body
+    tail = publish.body[
+        publish.body.index(next(n for n in publish.body if isinstance(n, ast.Try))) + 1 :
+    ]
+    output = Path(directory)
+    state = {
+        "events": [],
+        "public_pull_verified": True,
+        "owned_builder_container_id": "a" * 64,
+        "status": "candidate_published_requires_fresh_actual_GPU_qualification",
+        "registration_submitted": True,
+        "builder_endpoint": "docker-container://" + "a" * 64 + "?context=default",
+    }
+    if not fault.startswith(("registration", "unwitnessed", "creation_lost_ack")):
+        state["container_creation_receipt"] = {"Id": "a" * 64}
+    if fault == "changed_state_mount":
+        state["created_anonymous_state_volume"] = "d" * 64
+    if fault == "creation_lost_ack":
+        state["clients"] = [{"phase": "container_create", "Popen_attempted": True}]
+        state["registration_submitted"] = False
+    buildx_config = output / "buildx-config"
+    buildx_config.mkdir(mode=0o700)
+    config_stat = buildx_config.lstat()
+    instances = buildx_config / "instances"
+    instances.mkdir(mode=0o700)
+    registration = instances / "smg-moriio-123-1"
+    registration.write_text(
+        json.dumps(
+            {
+                "Name": "smg-moriio-123-1",
+                "Driver": "foreign" if foreign else "remote",
+                "Nodes": [
+                    {
+                        "Name": "smg-moriio-123-10",
+                        "Endpoint": state["builder_endpoint"],
+                        "DriverOpts": {},
+                    }
+                ],
+            }
+        )
+    )
+    registration.chmod(0o600)
+    if fault == "registration_fifo":
+        registration.unlink()
+        os.mkfifo(registration, mode=0o600)
+    if fault == "registration_symlink":
+        target = output / "foreign-instances"
+        instances.rename(target)
+        instances.symlink_to(target, target_is_directory=True)
+    namespace = dict(
+        p.__dict__,
+        buildx_config=buildx_config,
+        builder_config_identity=(config_stat.st_dev, config_stat.st_ino, config_stat.st_uid),
+        output=output,
+        record=output / "result.json",
+        state=state,
+        start=time.monotonic(),
+        deadline=time.monotonic() + 15,
+        builder="smg-moriio-123-1",
+        name="buildx_buildkit_smg-moriio-123-10",
+        owned_id=None
+        if fault.startswith(("registration", "unwitnessed", "creation_lost_ack"))
+        else "a" * 64,
+        creation_submitted=True,
+        docker=["docker"],
+        failure=None,
+        env={
+            "PATH": "/usr/bin:/bin",
+            "BUILDX_CONFIG": str(buildx_config),
+            **(
+                {"LD_LIBRARY_PATH": os.environ["LD_LIBRARY_PATH"]}
+                if "LD_LIBRARY_PATH" in os.environ
+                else {}
+            ),
+        },
+    )
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])),
+            "<exact publisher cleanup closures>",
+            "exec",
+        ),
+        namespace,
+    )
+    actual_write = p.write_json
+    calls, children = [], []
+    interrupted = False
+    actual_open = Path.open
+
+    def record_write(path, value):
+        nonlocal interrupted
+        if path == namespace["record"]:
+            if fault == "cleanup_first_then_receipt" and any(
+                c.get("error_type") for c in state.get("clients", [])
+            ):
+                raise OSError("later final receipt fault")
+            if fault == "late_signal" and "pending_signal" in state and not interrupted:
+                interrupted = True
+                namespace["interrupted"](signal.SIGTERM, None)
+            if fault == "persistent":
+                raise OSError(errno.ENOSPC, "original persistent receipt fault")
+            if fault == "interrupt" and not interrupted:
+                interrupted = True
+
+                def partial(value, stream, **kwargs):
+                    stream.write('{"partial":')
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    raise AssertionError("SIGTERM handler did not stop the direct write")
+
+                with mock.patch.object(p.json, "dump", side_effect=partial):
+                    return actual_write(path, value)
+        return actual_write(path, value)
+
+    def open_with_failed_log(path, *args, **kwargs):
+        if fault == "persistent" and path.suffix == ".log":
+            raise OSError(errno.ENOSPC, "persistent owned log fault")
+        return actual_open(path, *args, **kwargs)
+
+    if fault == "registration_replaced_config":
+        namespace["builder_config_identity"] = (
+            config_stat.st_dev,
+            config_stat.st_ino + 1,
+            config_stat.st_uid,
+        )
+    actual_popen = subprocess.Popen
+
+    def harmless_client(argv, **kwargs):
+        calls.append(list(argv))
+        assert argv[0] == "docker"
+        if argv[1] == "inspect":
+            stopped = any(a[1] == "stop" for a in calls)
+            payload = json.dumps(
+                [
+                    {
+                        "Id": "a" * 64,
+                        "Name": "/" + namespace["name"],
+                        "Config": {"Image": "foreign" if foreign else p.BUILDKIT},
+                        "State": {"Running": not stopped, "Pid": 0 if stopped else 123},
+                        "Mounts": [
+                            {
+                                "Destination": "/var/lib/buildkit",
+                                "Type": "volume",
+                                "Driver": "local",
+                                "RW": True,
+                                "Name": "c" * 64,
+                            },
+                            {
+                                "Destination": "/etc/buildkit/buildkitd.toml",
+                                "Type": "bind",
+                                "RW": False,
+                                "Source": str(output / "buildkitd.toml"),
+                            },
+                        ],
+                    }
+                ]
+            )
+        elif argv[1] == "stop":
+            assert argv == ["docker", "stop", "--time", "5", "a" * 64]
+            payload = "stopped"
+        elif argv[1] == "rm":
+            assert argv == ["docker", "rm", "--volumes", "a" * 64]
+            payload = "removed exact owned container and anonymous state"
+        elif argv[1:3] == ["buildx", "inspect"]:
+            raise AssertionError("Buildx 0.21 inspect does not support --format")
+        elif argv[1:3] == ["buildx", "ls"]:
+            payload = ""
+        elif argv[1:3] == ["buildx", "rm"]:
+            expected = ["docker", "buildx", "rm"] + ["--keep-daemon"] + [namespace["builder"]]
+            assert argv == expected
+            payload = "removed"
+        elif argv[1] == "ps":
+            assert "id=" + "a" * 64 in argv or "name=^/" + namespace["name"] + "$" in argv
+            payload = "a" * 64 if fault.startswith("unwitnessed") else ""
+        elif argv[1:3] == ["volume", "ls"]:
+            assert "name=^" + "c" * 64 + "$" in argv
+            payload = ""
+        else:
+            raise AssertionError("No productive or unknown Docker command is allowed")
+        code = "print(" + repr(payload) + ")"
+        if argv[1] == "inspect" and fault.startswith("registration"):
+            code = "import sys; print('No such container',file=sys.stderr); raise SystemExit(1)"
+        if argv[1] == "stop" and cleanup_stop_stderr is not None:
+            code = "import os; os.write(2, " + repr(cleanup_stop_stderr) + "); raise SystemExit(17)"
+        child = actual_popen([sys.executable, "-I", "-S", "-B", "-c", code], **kwargs)
+        children.append(child)
+        return child
+
+    error = None
+    handlers = {
+        sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGALRM)
+    }
+    for sig in handlers:
+        signal.signal(sig, namespace["interrupted"])
+    prior_trace = sys.gettrace()
+    namespace["final_signal_injections"] = 0
+    exceptional_frames = set()
+
+    def final_return_signal(frame, event, _arg):
+        nonlocal interrupted
+        if frame.f_code.co_filename != "<exact publisher finally and outcome>":
+            return final_return_signal
+        if event == "exception":
+            exceptional_frames.add(id(frame))
+        if (
+            fault in ("post_final_check_signal", "post_final_check_exception")
+            and not interrupted
+            and event == "return"
+            and id(frame) not in exceptional_frames
+            and namespace.get("terminal_assert_completed", False)
+        ):
+            interrupted = True
+            namespace["final_signal_injections"] += 1
+            os.kill(os.getpid(), signal.SIGTERM)
+        return final_return_signal
+
+    try:
+        if fault in ("post_final_check_signal", "post_final_check_exception"):
+            sys.settrace(final_return_signal)
+        with (
+            mock.patch.object(p, "write_json", side_effect=record_write),
+            mock.patch.object(Path, "open", open_with_failed_log),
+            mock.patch.object(p.subprocess, "Popen", side_effect=harmless_client),
+        ):
+            namespace["write_json"] = p.write_json
+            exec(
+                compile(
+                    ast.fix_missing_locations(
+                        ast.Module(
+                            body=[
+                                operation,
+                                *tail,
+                                *ast.parse("terminal_assert_completed = True").body,
+                            ],
+                            type_ignores=[],
+                        )
+                    ),
+                    "<exact publisher finally and outcome>",
+                    "exec",
+                ),
+                namespace,
+            )
+    except BaseException as exc:
+        error = exc
+    finally:
+        sys.settrace(prior_trace)
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        for sig, previous in handlers.items():
+            signal.signal(sig, previous)
+        for child in children:
+            if child.poll() is None:
+                os.killpg(child.pid, signal.SIGKILL)
+            child.wait(timeout=3)
+            try:
+                os.killpg(child.pid, 0)
+            except ProcessLookupError:
+                pass
+            else:
+                raise AssertionError("test-owned client group survived")
+    print(
+        json.dumps(
+            {
+                "cleanup_fault": fault,
+                "foreign": foreign,
+                "actual_Docker_argv_mapped_to_harmless_clients": calls,
+                "children_reaped": all(c.returncode is not None for c in children),
+                "error": type(error).__name__ if error else None,
+                "message": str(error),
+                "state": state,
+            }
+        )
+    )
+    return namespace, calls, error
+
+
+class ReceiptFaultCleanup(unittest.TestCase):
+    def test_interrupted_record_retains_original_error_and_cleans_exact_builder(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns, calls, error = exercise_owned_cleanup_fault(directory, "interrupt")
+            self.assertIsInstance(error, RuntimeError)
+            self.assertIn("publisher interrupted " + str(signal.SIGTERM), str(error))
+            self.assertTrue(ns["state"].get("cleanup_verified_absent"))
+            self.assertIn(["docker", "stop", "--time", "5", "a" * 64], calls)
+            self.assertFalse(list(Path(directory).glob("result*.new")))
+
+    def test_persistent_receipt_and_log_fault_still_stops_and_removes_owned_builder(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns, calls, error = exercise_owned_cleanup_fault(directory, "persistent")
+            self.assertIsInstance(error, OSError)
+            self.assertIn("original persistent receipt fault", str(error))
+            self.assertTrue(ns["state"].get("cleanup_verified_absent"))
+            self.assertIn(["docker", "rm", "--volumes", "a" * 64], calls)
+            self.assertTrue(ns["state"].get("receipt_failures"))
+            self.assertTrue(
+                all(c["reaped"] and c["PG_gone"] is True for c in ns["state"]["clients"])
+            )
+
+    def test_failed_receipt_does_not_authorize_foreign_builder_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns, calls, error = exercise_owned_cleanup_fault(directory, "persistent", foreign=True)
+            self.assertIsInstance(error, OSError)
+            self.assertTrue(ns["state"].get("cleanup_failure"))
+            self.assertFalse(ns["state"].get("cleanup_verified_absent", False))
+            self.assertTrue(any(a[1] == "inspect" for a in calls))
+            self.assertFalse(any(a[1] in {"stop", "buildx"} for a in calls))
+
+    def test_receipt_failure_refuses_later_productive_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns = actual_client_namespace(directory)
+            with mock.patch.object(p, "write_json", side_effect=OSError("writer fault")):
+                ns["write_json"] = p.write_json
+                with self.assertRaises(OSError):
+                    ns["event"]("prior_receipt")
+            with mock.patch.object(p.subprocess, "Popen") as spawn:
+                with self.assertRaisesRegex(RuntimeError, "receipt"):
+                    ns["command"]("full_build", ["not-executed"])
+                spawn.assert_not_called()
+
+    def test_healthy_cleanup_and_old_unrelated_temp_are_safe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stale = Path(directory) / "result.new"
+            stale.write_text("unrelated old file")
+            ns, calls, error = exercise_owned_cleanup_fault(directory, "healthy")
+            self.assertIsNone(error)
+            self.assertTrue(ns["state"]["cleanup_verified_absent"])
+            self.assertEqual(stale.read_text(), "unrelated old file")
+            self.assertTrue(calls)
+
+
+class CleanupStderrDiagnostics(unittest.TestCase):
+    run_owned = OwnedClientLifecycle.run_owned
+    assert_closed = OwnedClientLifecycle.assert_closed
+
+    def cleanup_client(self, directory, stderr, exitcode):
+        ns = actual_client_namespace(directory)
+        ns["client_control"]["cleaning"] = True
+        code = "import os; os.write(1, b'cleanup stdout'); os.write(2, " + repr(stderr) + ")"
+        code += "; raise SystemExit(" + str(exitcode) + ")"
+        if exitcode:
+            with self.assertRaises(AssertionError):
+                self.run_owned(directory, ns, code)
+        else:
+            self.assertEqual(self.run_owned(directory, ns, code), b"cleanup stdout")
+        self.assert_closed(ns)
+        self.assertEqual(ns["state"]["clients"][-1]["returncode"], exitcode)
+        return ns
+
+    def test_nonzero_cleanup_keeps_real_stderr_and_exit(self):
+        diagnostic = b"actual owned cleanup: daemon unavailable\n"
+        with tempfile.TemporaryDirectory() as directory:
+            ns = self.cleanup_client(directory, diagnostic, 7)
+            client = ns["state"]["clients"][-1]
+            self.assertEqual(client["stderr_sha256"], p.digest(diagnostic))
+            self.assertEqual(client["stderr_tail"], diagnostic.decode())
+            self.assertEqual(client["error_type"], "AssertionError")
+            saved = json.loads((Path(directory) / "result.json").read_text())
+            self.assertEqual(saved["clients"][-1]["stderr_tail"], diagnostic.decode())
+            self.assertFalse((Path(directory) / "client.log").exists())
+
+    def test_healthy_cleanup_retains_metadata_and_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns = self.cleanup_client(directory, b"healthy cleanup note", 0)
+            client = ns["state"]["clients"][-1]
+            self.assertEqual(client["stderr_tail"], "healthy cleanup note")
+            self.assertEqual(client["stderr_sha256"], p.digest(b"healthy cleanup note"))
+            self.assertNotIn("error_type", client)
+
+    def test_cleanup_tail_is_bounded_and_replaces_non_utf8(self):
+        diagnostic = b"not-retained-prefix:" + b"a" * 5000 + b"\xff\xfe-tail"
+        with tempfile.TemporaryDirectory() as directory:
+            ns = self.cleanup_client(directory, diagnostic, 9)
+            client = ns["state"]["clients"][-1]
+            self.assertEqual(client["stderr_sha256"], p.digest(diagnostic))
+            self.assertLessEqual(len(client["stderr_tail"].encode("utf-8")), 4096)
+            self.assertTrue(client["stderr_tail"].endswith("\ufffd\ufffd-tail"))
+            self.assertNotIn("not-retained-prefix", client["stderr_tail"])
+
+    def test_failed_writer_fallback_keeps_nonzero_cleanup_diagnostic(self):
+        diagnostic = b"actual owned stop: permission denied\n"
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch("sys.stderr", new_callable=io.StringIO) as fallback:
+                ns, calls, error = exercise_owned_cleanup_fault(
+                    directory, "persistent", cleanup_stop_stderr=diagnostic
+                )
+            self.assertIsInstance(error, OSError)
+            self.assertIn("original persistent receipt fault", str(error))
+            stop = next(c for c in ns["state"]["clients"] if c["phase"] == "cleanup_stop")
+            self.assertEqual(stop["returncode"], 17)
+            self.assertEqual(stop["stderr_sha256"], p.digest(diagnostic))
+            self.assertEqual(stop["stderr_tail"], diagnostic.decode())
+            payload = json.loads(fallback.getvalue())
+            saved = next(c for c in payload["cleanup_clients"] if c["phase"] == "cleanup_stop")
+            self.assertEqual(saved["stderr_tail"], diagnostic.decode())
+            self.assertTrue(any(a[1] == "stop" for a in calls))
+            self.assertFalse(any(a[1:3] == ["buildx", "rm"] for a in calls))
+            self.assertTrue(all(c["reaped"] and c["PG_gone"] for c in ns["state"]["clients"]))
+
+    def test_failed_writer_healthy_owned_cleanup_still_completes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch("sys.stderr", new_callable=io.StringIO) as fallback:
+                ns, calls, error = exercise_owned_cleanup_fault(directory, "persistent")
+            self.assertIsInstance(error, OSError)
+            self.assertTrue(ns["state"]["cleanup_verified_absent"])
+            payload = json.loads(fallback.getvalue())
+            self.assertTrue(payload["cleanup_verified_absent"])
+            self.assertIn(["docker", "rm", "--volumes", "a" * 64], calls)
+            self.assertTrue(all("stderr_tail" in c for c in payload["cleanup_clients"]))
+            self.assertTrue(all(c["reaped"] and c["PG_gone"] for c in ns["state"]["clients"]))
+
+
+class CurrentBoundaryControls(unittest.TestCase):
+    run_owned = OwnedClientLifecycle.run_owned
+    assert_closed = OwnedClientLifecycle.assert_closed
+
+    def test_streaming_limit_stops_actual_child_before_its_wait(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns = actual_client_namespace(directory)
+            ns["client_control"]["cleaning"] = True
+            before = time.monotonic()
+            with self.assertRaisesRegex(AssertionError, "output too large"):
+                self.run_owned(
+                    directory,
+                    ns,
+                    "import os,time; os.write(1,b'x'*(5*1024**2)); time.sleep(30)",
+                    until=before + 3.4,
+                )
+            self.assertLess(time.monotonic() - before, 2)
+            self.assert_closed(ns)
+            client = ns["state"]["clients"][-1]
+            self.assertTrue(client["stdout_truncated"])
+            self.assertLessEqual(client["stdout_bytes_retained"], 4 * 1024**2)
+            self.assertEqual(client["stdout_sha256_scope"], "observed_prefix")
+
+    def test_late_signal_at_final_receipt_cannot_report_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns, calls, error = exercise_owned_cleanup_fault(directory, "late_signal")
+            self.assertIsInstance(error, RuntimeError)
+            self.assertIn("cancel", str(error))
+            self.assertTrue(ns["state"]["cleanup_verified_absent"])
+            saved = json.loads((Path(directory) / "result.json").read_text())
+            self.assertEqual(saved["pending_signal"], signal.SIGTERM)
+            self.assertEqual(saved["status"], "failed_or_published_incomplete_requires_readback")
+
+    def test_cleanup_first_error_survives_later_receipt_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns, calls, error = exercise_owned_cleanup_fault(
+                directory, "cleanup_first_then_receipt", cleanup_stop_stderr=b"first stop error"
+            )
+            self.assertIsInstance(error, AssertionError)
+            self.assertIn("cleanup_stop", str(error))
+            self.assertTrue(ns["state"].get("receipt_failures"))
+            self.assertEqual(ns["state"]["cleanup_failure"], "AssertionError")
+
+    def test_private_registration_without_bootstrap_is_removed_only_after_proof(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns, calls, error = exercise_owned_cleanup_fault(directory, "registration")
+            self.assertIsNone(error)
+            self.assertTrue(ns["state"]["registration_cleanup_verified"])
+            self.assertTrue(ns["state"]["cleanup_verified_no_container"])
+            self.assertNotIn("cleanup_verified_stopped_PID0", ns["state"])
+            self.assertIn(["docker", "buildx", "rm", "--keep-daemon", ns["builder"]], calls)
+            self.assertFalse(any(a[1] == "stop" for a in calls))
+
+    def test_foreign_registration_remains_hold_without_remove(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns, calls, error = exercise_owned_cleanup_fault(directory, "registration", foreign=True)
+            self.assertIsInstance(error, AssertionError)
+            self.assertFalse(ns["state"].get("registration_cleanup_verified", False))
+            self.assertFalse(any(a[1:3] == ["buildx", "rm"] for a in calls))
+
+    def test_unmatched_private_config_identity_keeps_registration_hold(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns, calls, error = exercise_owned_cleanup_fault(
+                directory, "registration_replaced_config"
+            )
+            self.assertIsInstance(error, AssertionError)
+            self.assertFalse(ns["state"].get("cleanup_verified_absent", False))
+            self.assertFalse(any(a[1:3] == ["buildx", "rm"] for a in calls))
+
+    def test_symlinked_registration_store_cannot_authorize_removal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns, calls, error = exercise_owned_cleanup_fault(directory, "registration_symlink")
+            self.assertIsInstance(error, OSError)
+            self.assertFalse(ns["state"].get("cleanup_verified_absent", False))
+            self.assertFalse(any(a[1] == "stop" or a[1:3] == ["buildx", "rm"] for a in calls))
+
+    def test_nonregular_registration_cannot_block_before_identity_check(self):
+        code = (
+            "import importlib.util,tempfile\n"
+            f"s=importlib.util.spec_from_file_location('owned_fixture', {__file__!r})\n"
+            "m=importlib.util.module_from_spec(s); s.loader.exec_module(m)\n"
+            "with tempfile.TemporaryDirectory() as directory:\n"
+            " ns,calls,error=m.exercise_owned_cleanup_fault(directory,'registration_fifo')\n"
+            " assert isinstance(error,AssertionError),repr(error)\n"
+            " assert not any(a[1]=='stop' or a[1:3]==['buildx','rm'] for a in calls)\n"
+            " print('FIFO rejected before removal')\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            ns = actual_client_namespace(directory)
+            result = self.run_owned(directory, ns, code, until=time.monotonic() + 4)
+            self.assertIn(b"FIFO rejected before removal", result)
+            self.assert_closed(ns)
+
+    def test_closed_fallback_stderr_preserves_first_receipt_error(self):
+        closed = io.StringIO()
+        closed.close()
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch("sys.stderr", closed):
+                ns, calls, error = exercise_owned_cleanup_fault(directory, "persistent")
+            self.assertIsInstance(error, OSError)
+            self.assertIn("original persistent receipt fault", str(error))
+            self.assertTrue(ns["state"]["cleanup_verified_absent"])
+            self.assertTrue(ns["state"]["fallback_receipt_unavailable"])
+
+    def test_exceptional_return_does_not_inject_a_late_signal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns, _calls, error = exercise_owned_cleanup_fault(
+                directory, "post_final_check_exception"
+            )
+            self.assertEqual(ns["final_signal_injections"], 0)
+            self.assertIsInstance(error, RuntimeError)
+            self.assertIn("original exceptional publisher exit", str(error))
+
+    def test_after_final_read_oracle_detects_missing_handler_receipt(self):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(p.publish)))
+        publish = tree.body[0]
+        interrupted = next(
+            node
+            for node in publish.body
+            if isinstance(node, ast.FunctionDef) and node.name == "interrupted"
+        )
+
+        class DropHandlerReceipt(ast.NodeTransformer):
+            def visit_Expr(self, node):
+                if (
+                    isinstance(node.value, ast.Call)
+                    and isinstance(node.value.func, ast.Name)
+                    and node.value.func.id == "persist"
+                ):
+                    return ast.copy_location(ast.Pass(), node)
+                return self.generic_visit(node)
+
+        DropHandlerReceipt().visit(interrupted)
+        with tempfile.TemporaryDirectory() as directory:
+            ns, _calls, error = exercise_owned_cleanup_fault(
+                directory, "post_final_check_signal", source=ast.unparse(tree)
+            )
+            self.assertEqual(ns["final_signal_injections"], 1)
+            self.assertIsInstance(error, RuntimeError)
+            self.assertEqual(ns["state"]["pending_signal"], signal.SIGTERM)
+            saved = json.loads((Path(directory) / "result.json").read_text())
+            self.assertIsNone(saved["pending_signal"])
+            self.assertNotEqual(saved["status"], "failed_or_published_incomplete_requires_readback")
+
+    def test_unwitnessed_matching_container_is_not_adopted_or_stopped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns, calls, error = exercise_owned_cleanup_fault(directory, "unwitnessed")
+            self.assertFalse(any(a[1] == "stop" or a[1:3] == ["buildx", "rm"] for a in calls))
+            self.assertIsInstance(error, RuntimeError)
+            self.assertTrue(ns["state"].get("cleanup_unwitnessed_container"))
+            self.assertIsNone(ns["owned_id"])
+            self.assertFalse(ns["state"].get("cleanup_verified_absent", False))
+            self.assertFalse(any(a[1] == "stop" or a[1:3] == ["buildx", "rm"] for a in calls))
+            handoff = ns["state"]["unresolved_builder_handoff"]
+            self.assertEqual(handoff["builder"], ns["builder"])
+            self.assertEqual(handoff["container_name"], ns["name"])
+            self.assertEqual(handoff["observed_container_ids"], ["a" * 64])
+            self.assertIsNone(handoff["creation_returned_id"])
+            self.assertIn("verify", handoff["next_action"])
+            saved = json.loads((Path(directory) / "result.json").read_text())
+            self.assertEqual(saved["unresolved_builder_handoff"], handoff)
+
+    def test_signal_after_final_pending_check_persists_failure_before_raising(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns, _calls, error = exercise_owned_cleanup_fault(directory, "post_final_check_signal")
+            self.assertEqual(ns["final_signal_injections"], 1)
+            self.assertIsInstance(error, RuntimeError)
+            saved = json.loads((Path(directory) / "result.json").read_text())
+            self.assertEqual(saved["pending_signal"], signal.SIGTERM)
+            self.assertEqual(saved["status"], "failed_or_published_incomplete_requires_readback")
+            self.assertTrue(ns["state"]["cleanup_verified_absent"])
+
+
+class AttributableCreation(unittest.TestCase):
+    def run_create(self, directory, code, hook=None, namespace=None):
+        ns = namespace or actual_client_namespace(directory, hook)
+        ns["state"].update(
+            docker_daemon_id="qualified-test-daemon", container_create_argv=["docker", "create"]
+        )
+        value = ns["command"](
+            "container_create",
+            [sys.executable, "-I", "-S", "-B", "-c", code],
+            capture=True,
+            on_success=ns["creation_ack"],
+        )
+        return ns, value
+
+    def test_actual_successful_client_id_is_bound_before_return(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns, value = self.run_create(directory, "print('a'*64)")
+            receipt = ns["state"]["container_creation_receipt"]
+            self.assertEqual(value, b"a" * 64 + b"\n")
+            self.assertEqual(receipt["Id"], "a" * 64)
+            self.assertEqual(receipt["actual_exit"], 0)
+            self.assertEqual(receipt["endpoint"], "unix:///var/run/docker.sock")
+            self.assertEqual(receipt["client_handle"], ns["state"]["clients"][-1]["handle"])
+            self.assertTrue(ns["state"]["clients"][-1]["reaped"])
+            self.assertEqual(
+                json.loads((Path(directory) / "result.json").read_text())[
+                    "container_creation_receipt"
+                ],
+                receipt,
+            )
+
+    def test_nonzero_client_cannot_authorize_even_valid_id_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns = actual_client_namespace(directory)
+            with self.assertRaises(AssertionError):
+                self.run_create(directory, "print('a'*64); raise SystemExit(125)", namespace=ns)
+            self.assertNotIn("container_creation_receipt", ns["state"])
+            self.assertTrue(ns["state"]["clients"][-1]["reaped"])
+
+    def test_success_with_malformed_or_multiple_id_is_not_adopted(self):
+        for text in ["a" * 63, "z" * 64, "a" * 64 + "\n" + "b" * 64]:
+            with self.subTest(text=text), tempfile.TemporaryDirectory() as directory:
+                ns = actual_client_namespace(directory)
+                with self.assertRaises(AssertionError):
+                    self.run_create(directory, "print(" + repr(text) + ")", namespace=ns)
+                self.assertNotIn("container_creation_receipt", ns["state"])
+
+    def test_returned_event_failure_retains_successful_creation_identity(self):
+        def fail(phase, _extra, _ns):
+            if phase == "container_create_returned":
+                raise OSError("actual returned-receipt fault")
+
+        with tempfile.TemporaryDirectory() as directory:
+            ns = actual_client_namespace(directory, fail)
+            with self.assertRaisesRegex(OSError, "returned-receipt"):
+                self.run_create(directory, "print('a'*64)", namespace=ns)
+            self.assertEqual(ns["state"]["container_creation_receipt"]["Id"], "a" * 64)
+            self.assertTrue(ns["state"]["clients"][-1]["reaped"])
+
+    def test_cancellation_after_response_retains_id_before_delivery(self):
+        def cancel(phase, _extra, ns):
+            if phase == "container_create_returned":
+                ns["interrupted"](signal.SIGTERM, None)
+
+        with tempfile.TemporaryDirectory() as directory:
+            ns = actual_client_namespace(directory, cancel)
+            with self.assertRaisesRegex(RuntimeError, "cancellation pending"):
+                self.run_create(directory, "print('a'*64)", namespace=ns)
+            self.assertEqual(ns["state"]["container_creation_receipt"]["Id"], "a" * 64)
+            self.assertTrue(ns["state"]["clients"][-1]["pending_cancel_delivered"])
+
+    def test_lost_create_ack_stays_hold_even_when_name_scan_is_empty(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns, calls, error = exercise_owned_cleanup_fault(directory, "creation_lost_ack")
+            self.assertIsInstance(error, RuntimeError)
+            self.assertIsNone(ns["owned_id"])
+            self.assertTrue(ns["state"]["cleanup_unwitnessed_container"])
+            self.assertFalse(ns["state"].get("cleanup_verified_absent", False))
+            self.assertFalse(any(a[1] in {"start", "stop", "rm", "buildx"} for a in calls))
+
+    def test_failed_creation_receipt_retains_known_id_and_blocks_productive_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns = actual_client_namespace(directory)
+            original = ns["write_json"]
+
+            def fail_receipt(path, value):
+                if "container_creation_receipt" in value:
+                    raise OSError("creation receipt unavailable")
+                return original(path, value)
+
+            ns["write_json"] = fail_receipt
+            with self.assertRaisesRegex(OSError, "creation receipt"):
+                self.run_create(directory, "print('a'*64)", namespace=ns)
+            self.assertEqual(ns["state"]["container_creation_receipt"]["Id"], "a" * 64)
+            self.assertTrue(ns["client_control"]["receipt_failed"])
+            before = len(ns["state"]["clients"])
+            with self.assertRaises(Exception):
+                ns["command"]("later_productive", [sys.executable, "-c", "pass"])
+            self.assertTrue(all(not c["Popen_attempted"] for c in ns["state"]["clients"][before:]))
+
+    def flow(self, directory, fault=None, daemon_info=None):
+        """Exact productive creation statements with protocol responses, never Docker."""
+        pub = ast.parse(textwrap.dedent(inspect.getsource(p.publish))).body[0]
+        body = next(n for n in pub.body if isinstance(n, ast.Try)).body
+        first = next(
+            i
+            for i, n in enumerate(body)
+            if isinstance(n, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "create" for t in n.targets)
+        )
+        last = next(
+            i
+            for i, n in enumerate(body[first:], first)
+            if isinstance(n, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "actual" for t in n.targets)
+        )
+        out = Path(directory)
+        ns = dict(
+            p.__dict__,
+            state={"docker_daemon_id": "qualified-test-daemon"},
+            docker=["docker"],
+            output=out,
+            config=out / "buildkitd.toml",
+            builder="owned-builder",
+            name="owned-container",
+            owned_id=None,
+            info=daemon_info or {"SecurityOptions": [], "CgroupDriver": "systemd"},
+        )
+        ns["persist"] = lambda: p.write_json(out / "result.json", ns["state"])
+        ns["event"] = lambda *_a, **_k: None
+        selected = [
+            n
+            for n in pub.body
+            if isinstance(n, ast.FunctionDef)
+            and n.name in {"inspect", "verify_owned", "creation_ack", "bind_created_storage"}
+        ]
+        exec(
+            compile(
+                ast.fix_missing_locations(ast.Module(body=selected, type_ignores=[])),
+                "<actual creation closures>",
+                "exec",
+            ),
+            ns,
+        )
+        calls = []
+
+        def command(phase, argv, **kwargs):
+            calls.append((phase, argv))
+            if phase == "container_create":
+                if fault == "foreign_conflict":
+                    raise RuntimeError("create conflict; foreign matching container")
+                if fault == "require_userns" and "--userns=host" not in argv:
+                    raise RuntimeError("daemon rejects privileged creation with userns-remap")
+                if (
+                    fault == "require_cgroup_parent"
+                    and "--cgroup-parent=/docker/buildx" not in argv
+                ):
+                    raise RuntimeError("cgroupfs creation left the original Buildx parent")
+                kwargs["on_success"](
+                    b"a" * 64 + b"\n", {"handle": {"pid": 123, "start_ticks": 456}}
+                )
+                return b"a" * 64 + b"\n"
+            if "inspect" in phase:
+                started = any(x[0] == "start" for x in calls)
+                return json.dumps(
+                    [
+                        {
+                            "Id": "b" * 64 if fault == "replaced_id" else "a" * 64,
+                            "Name": "/owned-container",
+                            "Config": {"Image": p.BUILDKIT},
+                            "State": {"Running": started, "Pid": 123 if started else 0},
+                            "HostConfig": {
+                                "CpuQuota": p.QUOTA,
+                                "CpuPeriod": p.PERIOD,
+                                "Memory": p.MEMORY,
+                                "MemorySwap": p.MEMORY,
+                                "NetworkMode": "bridge",
+                                "UsernsMode": "host"
+                                if "--userns=host" in ns["state"]["container_create_argv"]
+                                and fault != "userns_unapplied"
+                                else "",
+                                "CgroupParent": "/docker/buildx"
+                                if "--cgroup-parent=/docker/buildx"
+                                in ns["state"]["container_create_argv"]
+                                and fault != "cgroup_unapplied"
+                                else "",
+                            },
+                            "Mounts": [
+                                {
+                                    "Destination": "/var/lib/buildkit",
+                                    "Type": "volume",
+                                    "Driver": "local",
+                                    "RW": True,
+                                    "Name": "c" * 64,
+                                },
+                                {
+                                    "Destination": "/etc/buildkit/buildkitd.toml",
+                                    "Type": "bind",
+                                    "RW": False,
+                                    "Source": "/foreign/config"
+                                    if fault == "wrong_config"
+                                    else str(ns["config"]),
+                                },
+                            ],
+                        }
+                    ]
+                ).encode()
+            return b""
+
+        ns["command"] = command
+        ns["registration_identity"] = lambda: (
+            None
+        )  # Registration byte identity has separate real-file tests.
+        error = None
+        try:
+            exec(
+                compile(
+                    ast.fix_missing_locations(ast.Module(body=body[first:last], type_ignores=[])),
+                    "<actual productive creation>",
+                    "exec",
+                ),
+                ns,
+            )
+        except Exception as exc:
+            error = exc
+        return ns, calls, error
+
+    def test_productive_path_uses_returned_id_and_readonly_remote_registration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns, calls, error = self.flow(directory)
+            self.assertIsNone(error)
+            self.assertEqual(ns["owned_id"], "a" * 64)
+            self.assertIn(("start", ["docker", "start", "a" * 64]), calls)
+            register = next(argv for phase, argv in calls if phase == "register")
+            self.assertEqual(
+                register[-3:],
+                ["--driver", "remote", "docker-container://" + "a" * 64 + "?context=default"],
+            )
+            self.assertTrue(
+                all(argv[-1] == "a" * 64 for phase, argv in calls if "inspect" in phase)
+            )
+            create = calls[0][1]
+            self.assertIn("type=volume,volume-driver=local,dst=/var/lib/buildkit", create)
+            self.assertFalse(any("src=" in arg for arg in create if "type=volume" in arg))
+
+    def test_conflict_does_not_adopt_matching_foreign_container_or_start_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns, calls, error = self.flow(directory, "foreign_conflict")
+            self.assertIsInstance(error, RuntimeError)
+            self.assertIsNone(ns["owned_id"])
+            self.assertEqual([phase for phase, _ in calls], ["container_create"])
+
+    def test_returned_id_replacement_stops_before_registration_start_or_build(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _ns, calls, error = self.flow(directory, "replaced_id")
+            self.assertIsInstance(error, AssertionError)
+            self.assertFalse(
+                any(phase in {"register", "start", "bootstrap", "full_build"} for phase, _ in calls)
+            )
+
+    def test_wrong_readonly_configuration_binding_cannot_start_builder(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _ns, calls, error = self.flow(directory, "wrong_config")
+            self.assertIsInstance(error, AssertionError)
+            self.assertFalse(any(phase == "start" for phase, _ in calls))
+
+    def test_changed_state_mount_cannot_authorize_container_or_volume_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns, calls, error = exercise_owned_cleanup_fault(directory, "changed_state_mount")
+            self.assertIsInstance(error, AssertionError)
+            self.assertFalse(ns["state"].get("cleanup_verified_absent", False))
+            self.assertFalse(any(a[1] in {"stop", "rm"} for a in calls))
+
+
+class DaemonCompatibility(unittest.TestCase):
+    def flow(self, directory, fault=None, daemon_info=None):
+        return AttributableCreation.flow(self, directory, fault, daemon_info)
+
+    def test_privileged_userns_remap_completes_witnessed_creation(self):
+        for security in [["name=seccomp,profile=builtin", "name=userns"], ["userns"]]:
+            with self.subTest(security=security), tempfile.TemporaryDirectory() as directory:
+                info = {"SecurityOptions": security, "CgroupDriver": "systemd"}
+                ns, calls, error = self.flow(directory, "require_userns", info)
+                self.assertIsNone(error)
+                self.assertEqual(ns["state"]["container_creation_receipt"]["Id"], "a" * 64)
+                self.assertIn(("start", ["docker", "start", "a" * 64]), calls)
+                self.assertEqual(
+                    ns["state"]["container_create_daemon_configuration"]["security_options"],
+                    security,
+                )
+
+    def test_cgroupfs_preserves_original_buildx_parent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            info = {"SecurityOptions": [], "CgroupDriver": "cgroupfs"}
+            ns, calls, error = self.flow(directory, "require_cgroup_parent", info)
+            self.assertIsNone(error)
+            self.assertIn("--cgroup-parent=/docker/buildx", calls[0][1])
+            self.assertEqual(ns["owned_id"], "a" * 64)
+            self.assertIn(("start", ["docker", "start", "a" * 64]), calls)
+
+    def test_combined_remap_cgroupfs_keeps_both_settings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            info = {"SecurityOptions": ["name=userns"], "CgroupDriver": "cgroupfs"}
+            _ns, calls, error = self.flow(directory, daemon_info=info)
+            self.assertIsNone(error)
+            self.assertIn("--userns=host", calls[0][1])
+            self.assertIn("--cgroup-parent=/docker/buildx", calls[0][1])
+
+    def test_other_daemon_settings_retain_their_defaults(self):
+        for security in [
+            None,
+            [],
+            ["name=seccomp,profile=userns"],
+            ["apparmor", "name=userns-other"],
+        ]:
+            with self.subTest(security=security), tempfile.TemporaryDirectory() as directory:
+                info = {"SecurityOptions": security, "CgroupDriver": "systemd"}
+                _ns, calls, error = self.flow(directory, daemon_info=info)
+                self.assertIsNone(error)
+                self.assertNotIn("--userns=host", calls[0][1])
+                self.assertFalse(any(arg.startswith("--cgroup-parent=") for arg in calls[0][1]))
+
+    def test_malformed_security_options_stop_before_create(self):
+        for security in [["name=userns,broken"], ["name="], [False], "name=userns"]:
+            with self.subTest(security=security), tempfile.TemporaryDirectory() as directory:
+                info = {"SecurityOptions": security, "CgroupDriver": "cgroupfs"}
+                ns, calls, error = self.flow(directory, daemon_info=info)
+                self.assertIsInstance(error, AssertionError)
+                self.assertEqual(calls, [])
+                self.assertNotIn("container_creation_receipt", ns["state"])
+
+    def test_unapplied_namespace_or_parent_cannot_start_builder(self):
+        for fault in ["userns_unapplied", "cgroup_unapplied"]:
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                info = {"SecurityOptions": ["name=userns"], "CgroupDriver": "cgroupfs"}
+                ns, calls, error = self.flow(directory, fault, info)
+                self.assertIsInstance(error, AssertionError)
+                self.assertEqual(ns["owned_id"], "a" * 64)
+                self.assertFalse(any(phase == "start" for phase, _ in calls))
+
+
+if __name__ == "__main__":
+    unittest.main()
