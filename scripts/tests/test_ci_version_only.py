@@ -560,3 +560,125 @@ def test_the_lanes_step_skips_the_card_tier_on_an_inherited_change_alone(
         **on_pull_request,
     )
     assert all(value == "false" for key, value in matrix.items() if key.startswith("skip-"))
+
+
+# --- the standalone benchmarks: skipped where a pull request's paths reach no e2e lane -------
+
+# The benchmarks job's condition, clause by clause: the two it held and the lanes step's own.
+BENCHMARKS_IF = (
+    "needs.detect-changes.outputs.docs-only != 'true'",
+    "needs.detect-changes.outputs.card-tier-from == ''",
+    "needs.detect-changes.outputs.skip-benchmarks != 'true'",
+)
+# A path whose row of the tier table reaches no lane, and a path of the benchmarks' own.
+NO_LANE = "crates/grand_central/src/engine/in_process.rs"
+BENCHMARK = "e2e_test/benchmarks/test_regular_perf.py"
+
+
+def benchmarks_run(decisions: dict[str, str], card_tier_from: str = "") -> bool:
+    """The benchmarks job's `if`, over the lanes step's decisions and the classify step's."""
+    return (
+        decisions["docs-only"] != "true"
+        and card_tier_from == ""
+        and decisions["skip-benchmarks"] != "true"
+    )
+
+
+def test_the_benchmarks_job_reads_the_lanes_steps_decision(workflow) -> None:
+    """The lanes step decides whether the standalone benchmarks skip, the job's output carries
+    the decision, and the benchmarks job's `if` adds it to the two conditions it held."""
+    jobs, _ = workflow
+    assert jobs["detect-changes"]["outputs"]["skip-benchmarks"] == (
+        "${{ steps.lanes.outputs.skip-benchmarks }}"
+    )
+    assert " ".join(jobs["benchmarks"]["if"].split()) == " && ".join(BENCHMARKS_IF)
+
+
+@pytest.mark.parametrize(
+    "files,env,skipped,runs",
+    [
+        pytest.param([NO_LANE], {}, "true", False, id="a crate no lane reaches"),
+        pytest.param(
+            [NO_LANE, "scripts/tau2/run_ab.py", ".github/workflows/ci-tooling-tests.yml"],
+            {},
+            "true",
+            False,
+            id="paths of no lane",
+        ),
+        pytest.param(
+            ["e2e_test/mlx/test_chat.py"], {}, "true", False, id="a suite of another workflow"
+        ),
+        pytest.param([BENCHMARK], {}, "false", True, id="the benchmarks themselves"),
+        pytest.param(
+            [NO_LANE, BENCHMARK], {}, "false", True, id="the benchmarks beside such a crate"
+        ),
+        pytest.param(
+            ["model_gateway/src/routers/common/placement.rs"], {}, "false", True, id="the gateway"
+        ),
+        pytest.param(
+            [NO_LANE, "model_gateway/src/policies/registry.rs"],
+            {},
+            "false",
+            True,
+            id="the gateway beside such a crate",
+        ),
+        pytest.param(["new-subsystem/source.py"], {}, "false", True, id="a path no row places"),
+        pytest.param([NO_LANE], {"FORCE_FULL": "true"}, "false", True, id="the label ci:full"),
+        pytest.param([NO_LANE], {"PULL_REQUEST": "false"}, "false", True, id="a push"),
+        pytest.param(None, {}, "false", True, id="no list of the changed files"),
+        pytest.param(
+            ["docs/example.md"],
+            {"DOCS": "true", "NON_DOCS": "false"},
+            "true",
+            False,
+            id="docs alone",
+        ),
+    ],
+)
+def test_the_lanes_step_skips_the_benchmarks_where_no_path_reaches_a_lane(
+    workflow, tmp_path: Path, files, env, skipped, runs
+) -> None:
+    """A pull request whose changed paths reach no e2e lane skips the standalone benchmarks,
+    unless it changes the benchmarks themselves: their row of the tier table reaches no lane,
+    because no e2e lane runs them. The label, a push and a run with no list of the changed
+    files keep the benchmarks, as before."""
+    _, steps = workflow
+    decisions = run_lanes_step(
+        steps["lanes"]["run"],
+        tmp_path,
+        **{
+            "PULL_REQUEST": "true",
+            "FORCE_FULL": "false",
+            "CARD_TIER_FROM": "",
+            "CHANGED_FILES": "" if files is None else json.dumps(files),
+            "DOCS": "false",
+            "NON_DOCS": "true",
+            "TESTS": "false",
+            **env,
+        },
+    )
+    assert decisions["skip-benchmarks"] == skipped
+    assert benchmarks_run(decisions) is runs
+
+
+def test_an_inherited_card_tier_skips_the_benchmarks_by_its_own_condition(
+    workflow, tmp_path: Path
+) -> None:
+    """A version-only change reaches every lane by its paths, so the lanes step keeps the
+    benchmarks: the job skips them by the card tier the change inherits, as before."""
+    _, steps = workflow
+    bump = json.dumps(["Cargo.lock", "model_gateway/Cargo.toml", "deploy/helm/smg/Chart.yaml"])
+    decisions = run_lanes_step(
+        steps["lanes"]["run"],
+        tmp_path,
+        PULL_REQUEST="true",
+        FORCE_FULL="false",
+        CARD_TIER_FROM="a" * 40,
+        CHANGED_FILES=bump,
+        DOCS="false",
+        NON_DOCS="true",
+        TESTS="false",
+    )
+    assert decisions["skip-benchmarks"] == "false"
+    assert not benchmarks_run(decisions, card_tier_from="a" * 40)
+    assert benchmarks_run(decisions)
