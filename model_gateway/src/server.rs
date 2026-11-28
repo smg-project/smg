@@ -3042,8 +3042,8 @@ const SHUTDOWN_NOTICE: Duration = Duration::from_millis(250);
 /// listeners have stopped and this drain has ended (see
 /// [`drain_before_teardown`]). Returns the end of the grace, the deadline
 /// the phases share, for the caller's own wait to end by; `None` when this
-/// drain gave up, which it said, and what it gave up on has left or that
-/// deadline has come: the caller has nothing left to wait for or to say.
+/// drain gave up, which it said, and ran to that deadline with work still
+/// in flight: the caller has nothing left to wait for or to say.
 async fn graceful_shutdown(
     inflight_tracker: &InFlightRequestTracker,
     budget: ShutdownBudget,
@@ -3108,10 +3108,13 @@ async fn graceful_shutdown(
                 "Drain timed out, forcing shutdown with requests still in-flight"
             );
             // Who still waits for a handler answers now, a 503 that names
-            // the shutdown, and has the notice to leave in.
+            // the shutdown, and has the notice to leave in. Where all of it
+            // left inside the notice, this drain ended ahead of the deadline
+            // after all, and what is admitted since gets what is left.
             inflight_tracker.give_up_drain();
-            inflight_tracker.wait_for_drain(notice).await;
-            return None;
+            if !inflight_tracker.wait_for_drain(notice).await {
+                return None;
+            }
         }
     }
     // Phase 3: the teardown is the main task's, once the listeners have
@@ -3673,7 +3676,7 @@ mod graceful_shutdown_tests {
         use axum::{body::Body, http::StatusCode, routing::post, Router};
         use tower::ServiceExt;
 
-        use crate::middleware;
+        use crate::middleware::{self, shutdown_notice::SERVER_SHUTTING_DOWN_CODE};
 
         let tracker = InFlightRequestTracker::new();
         let app = super::attach_edge_layers(
@@ -3695,6 +3698,14 @@ mod graceful_shutdown_tests {
             .expect("a request that parks after the giving up is answered at once")
             .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-smg-error-code")
+                .map(http::HeaderValue::as_bytes),
+            Some(SERVER_SHUTTING_DOWN_CODE.as_bytes()),
+            "a Messages client reads the code in the header"
+        );
         let body = axum::body::to_bytes(response.into_body(), 1024)
             .await
             .unwrap();
@@ -4211,14 +4222,9 @@ mod tests {
 
     /// A recorded control-plane mutation whose handler waits at a gate, sent
     /// through the real edge stack over the control-plane layer with the
-    /// state the gateway attaches. Returns the call, polled once (the
-    /// handler waits and the client is still there), and the gate that lets
-    /// the handler answer.
-    fn a_mutation_at_its_gate(
-        tracker: &Arc<InFlightRequestTracker>,
-    ) -> (ClientCall, Arc<tokio::sync::Notify>) {
-        use std::task::{Context, Waker};
-
+    /// state the gateway attaches. Returns the call, not polled yet, and the
+    /// gate that lets the handler answer.
+    fn a_mutation(tracker: &Arc<InFlightRequestTracker>) -> (ClientCall, Arc<tokio::sync::Notify>) {
         use axum::{body::Body, extract::State, middleware::from_fn_with_state};
         use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, ControlPlaneAuthState, Role};
         use tokio::sync::Notify;
@@ -4263,7 +4269,18 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let mut call: ClientCall = Box::pin(app.oneshot(request));
+        let call: ClientCall = Box::pin(app.oneshot(request));
+        (call, gate)
+    }
+
+    /// That mutation with its call polled once: the handler waits and the
+    /// client is still there.
+    fn a_mutation_at_its_gate(
+        tracker: &Arc<InFlightRequestTracker>,
+    ) -> (ClientCall, Arc<tokio::sync::Notify>) {
+        use std::task::{Context, Waker};
+
+        let (mut call, gate) = a_mutation(tracker);
         let mut cx = Context::from_waker(Waker::noop());
         assert!(
             call.as_mut().poll(&mut cx).is_pending(),
@@ -4603,6 +4620,60 @@ mod tests {
                 times,
                 (secs(7), secs(exit_at)),
                 "the mutation answers at {answers_at:?} s"
+            );
+        }
+    }
+
+    /// The same once the task's drain gave up: what it gave up on left
+    /// inside the notice, so that drain too ended ahead of the deadline, and
+    /// a mutation admitted after it, while the listeners still close their
+    /// connections, and whose client leaves, is waited for until it answers,
+    /// or to the end of the grace when it never does.
+    #[tokio::test(start_paused = true)]
+    async fn a_mutation_admitted_after_the_notice_emptied_the_count_holds_the_exit() {
+        use std::task::{Context, Poll, Waker};
+
+        let secs = Duration::from_secs;
+        // The drain of a grace of 30 s gives up one notice ahead of its end.
+        // What it gives up on leaves a fifth into the notice, the mutation
+        // is admitted a fifth later, and the listeners, stopped at 5 s, have
+        // closed their connections a fifth after that.
+        let (gave_up, fifth) = (secs(30) - SHUTDOWN_NOTICE, SHUTDOWN_NOTICE / 5);
+        let (left_at, admitted_at, closed_at) =
+            (gave_up + fifth, gave_up + 2 * fifth, gave_up + 3 * fifth);
+        for (answers_at, exit_at) in [
+            (Some(gave_up + 4 * fifth), gave_up + 4 * fifth),
+            (None, secs(30)),
+        ] {
+            let tracker = InFlightRequestTracker::new();
+            let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+            let given_up_on = tracker.track();
+            let admitted = async {
+                tokio::time::sleep(left_at).await;
+                drop(given_up_on);
+                tokio::time::sleep(admitted_at - left_at).await;
+                // The drain gave up: the notice answers the client at the
+                // first poll, and the mutation runs on, in the count.
+                let (mut call, gate) = a_mutation(&tracker);
+                let mut cx = Context::from_waker(Waker::noop());
+                let Poll::Ready(Ok(answer)) = call.as_mut().poll(&mut cx) else {
+                    panic!("the notice answers at the first poll");
+                };
+                assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
+                drop((answer, call));
+                if let Some(at) = answers_at {
+                    tokio::time::sleep(at - admitted_at).await;
+                    gate.notify_one();
+                }
+            };
+            let (times, ()) = tokio::join!(
+                exit(&tracker, budget, WayOut::Signal, closed_at - secs(5)),
+                admitted
+            );
+            assert_eq!(
+                times,
+                (closed_at, exit_at),
+                "the mutation answers at {answers_at:?}"
             );
         }
     }
