@@ -9,7 +9,7 @@ use crate::{
     engine::{
         decision::{self, Pair},
         sticky_sessions::{DecodeVerdict, SessionExpiry, SessionSides},
-        view::{self, Health, Identity, MediaCounts, Role, Session, WorkerId},
+        view::{self, AffinityFacts, Health, Identity, MediaCounts, Role, Session, WorkerId},
     },
     policies::{
         manual::Manual,
