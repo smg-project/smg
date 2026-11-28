@@ -268,7 +268,9 @@ fn k3_tokenizer_answers_the_renderer_s_thinking_mode() {
 /// the text ids on either side are untouched and no separator is added.
 #[test]
 fn image_part_adds_exactly_one_anchor_token() {
-    let model_dir = common::ensure_kimi_k3_cached();
+    let Some(model_dir) = common::ensure_kimi_k3_cached() else {
+        return;
+    };
     let tok = TiktokenTokenizer::from_dir(&model_dir).expect("K3 tokenizer should load");
     let anchor = tok.token_to_id("<|media_pad|>").expect("anchor id");
     let sep = tok.token_to_id("<|sep|>").expect("sep id");
@@ -319,7 +321,9 @@ fn image_part_adds_exactly_one_anchor_token() {
 /// message): the anchor id comes from an image part only.
 #[test]
 fn media_anchor_spelling_in_user_text_stays_text() {
-    let model_dir = common::ensure_kimi_k3_cached();
+    let Some(model_dir) = common::ensure_kimi_k3_cached() else {
+        return;
+    };
     let tok = TiktokenTokenizer::from_dir(&model_dir).expect("K3 tokenizer should load");
     let anchor = tok.token_to_id("<|media_pad|>").expect("anchor id");
     let ids = |content: Value| {
@@ -366,7 +370,9 @@ fn media_anchor_spelling_in_user_text_stays_text() {
 /// checkpoint directory instead.
 #[test]
 fn segment_encoding_matches_vendor_token_ids() {
-    let model_dir = common::ensure_kimi_k3_cached();
+    let Some(model_dir) = common::ensure_kimi_k3_cached() else {
+        return;
+    };
     let tok = TiktokenTokenizer::from_dir(&model_dir).expect("K3 tokenizer should load");
 
     let raw = fs::read_to_string(
@@ -441,7 +447,9 @@ fn segment_encoding_matches_vendor_token_ids() {
 /// the `tiktoken` library with the checkpoint's windows on the same text.
 #[test]
 fn long_text_encodes_in_the_checkpoint_windows() {
-    let model_dir = common::ensure_kimi_k3_cached();
+    let Some(model_dir) = common::ensure_kimi_k3_cached() else {
+        return;
+    };
     let tok = TiktokenTokenizer::from_dir(&model_dir).expect("K3 tokenizer should load");
     let text = "The quick brown fox jumps over the lazy dog. ".repeat(9_000);
     assert_eq!(text.chars().count(), 405_000);

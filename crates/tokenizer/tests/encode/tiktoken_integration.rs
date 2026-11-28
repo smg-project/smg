@@ -5,14 +5,10 @@
 //! tiktoken-based models.
 //!
 //! All tests are `#[ignore]` by default — run with `cargo test --ignored` or
-//! `cargo test -- --ignored` to exercise them. They require network access.
+//! `cargo test -- --ignored` to exercise them. They need the model hub: with
+//! it unreachable each case prints a skipping line and returns.
 
-use std::{
-    fs,
-    path::PathBuf,
-    sync::{Mutex, OnceLock},
-    time::Duration,
-};
+use std::{fs, path::PathBuf};
 
 use llm_tokenizer::{
     chat_template::ChatTemplateParams,
@@ -29,15 +25,13 @@ const KIMI_K2_MODEL_ID: &str = "moonshotai/Kimi-K2-Instruct";
 /// Default pinned revision. Override with KIMI_K2_REVISION env var.
 const KIMI_K2_DEFAULT_REVISION: &str = "main";
 const CACHE_DIR: &str = ".tokenizer_cache/kimi_k2";
-const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 
-const KIMI_K2_FILES: &[&str] = &[
-    "tiktoken.model",
-    "tokenizer_config.json",
-    "chat_template.jinja",
+/// The tokenizer's files, each with the least size a whole copy has.
+const KIMI_K2_FILES: &[(&str, usize)] = &[
+    ("tiktoken.model", 1_000_000),
+    ("tokenizer_config.json", 500),
+    ("chat_template.jinja", 100),
 ];
-
-static DOWNLOAD_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn kimi_k2_base_url() -> String {
     let rev =
@@ -46,61 +40,31 @@ fn kimi_k2_base_url() -> String {
 }
 
 /// Downloads the Kimi-K2-Instruct tokenizer files from HuggingFace if not already cached.
-/// Returns the path to the cached directory containing all tokenizer files.
-#[expect(clippy::unwrap_used, reason = "test helper — panics are intentional")]
+/// Returns the path to the cached directory containing all tokenizer files, or `None`
+/// only when offline (the repository is unreachable): a wrong answer or an unwritable
+/// cache panics, so the cases cannot be skipped silently.
 #[expect(clippy::expect_used, reason = "test helper — panics are intentional")]
-#[expect(clippy::panic, reason = "test helper — panics are intentional")]
-#[expect(clippy::print_stdout, reason = "test diagnostic output")]
-fn ensure_kimi_k2_cached() -> PathBuf {
-    let mutex = DOWNLOAD_MUTEX.get_or_init(|| Mutex::new(()));
-    let _guard = mutex.lock().unwrap();
+fn ensure_kimi_k2_cached() -> Option<PathBuf> {
+    let _guard = common::hub_fetch::download_lock();
 
     let cache_dir = PathBuf::from(CACHE_DIR);
     if !cache_dir.exists() {
         fs::create_dir_all(&cache_dir).expect("Failed to create Kimi K2 cache directory");
     }
 
-    let client = common::http_client_builder()
-        .timeout(DOWNLOAD_TIMEOUT)
-        .build()
-        .expect("Failed to build reqwest client");
-
     let base_url = kimi_k2_base_url();
 
-    for filename in KIMI_K2_FILES {
-        let file_path = cache_dir.join(filename);
-        if file_path.exists() {
+    for (filename, min_bytes) in KIMI_K2_FILES {
+        if cache_dir.join(filename).exists() {
             continue;
         }
-
-        let url = format!("{base_url}/{filename}");
-        println!("Downloading Kimi-K2 {filename}...");
-
-        let response = client
-            .get(&url)
-            .send()
-            .unwrap_or_else(|e| panic!("Failed to download {filename}: {e}"));
-
-        assert!(
-            response.status().is_success(),
-            "Failed to download {filename}: HTTP {}",
-            response.status()
-        );
-
-        let content = response
-            .bytes()
-            .unwrap_or_else(|e| panic!("Failed to read {filename} content: {e}"));
-
-        fs::write(&file_path, &content)
-            .unwrap_or_else(|e| panic!("Failed to write {filename} to cache: {e}"));
-
-        println!(
-            "  {filename} cached ({} bytes)",
-            file_path.metadata().unwrap().len()
-        );
+        if !common::download_tokenizer_file("Kimi-K2", &base_url, &cache_dir, filename, *min_bytes)
+        {
+            return None;
+        }
     }
 
-    cache_dir
+    Some(cache_dir)
 }
 
 // -- Tests --
@@ -108,7 +72,9 @@ fn ensure_kimi_k2_cached() -> PathBuf {
 #[test]
 #[ignore = "downloads the tokenizer files; run with --ignored"]
 fn test_tiktoken_from_dir_loads_kimi_k2() {
-    let dir = ensure_kimi_k2_cached();
+    let Some(dir) = ensure_kimi_k2_cached() else {
+        return;
+    };
     let tokenizer = TiktokenTokenizer::from_dir(&dir).expect("Failed to load Kimi K2 tokenizer");
 
     // Kimi K2 has 163,584 base BPE tokens + 256 special token slots = 163,840
@@ -126,7 +92,9 @@ fn test_tiktoken_from_dir_loads_kimi_k2() {
 #[test]
 #[ignore = "downloads the tokenizer files; run with --ignored"]
 fn test_tiktoken_kimi_k2_special_tokens() {
-    let dir = ensure_kimi_k2_cached();
+    let Some(dir) = ensure_kimi_k2_cached() else {
+        return;
+    };
     let tokenizer = TiktokenTokenizer::from_dir(&dir).expect("Failed to load Kimi K2 tokenizer");
 
     let special = tokenizer.get_special_tokens();
@@ -141,7 +109,9 @@ fn test_tiktoken_kimi_k2_special_tokens() {
 #[test]
 #[ignore = "downloads the tokenizer files; run with --ignored"]
 fn test_tiktoken_kimi_k2_encode_decode_roundtrip() {
-    let dir = ensure_kimi_k2_cached();
+    let Some(dir) = ensure_kimi_k2_cached() else {
+        return;
+    };
     let tokenizer = TiktokenTokenizer::from_dir(&dir).expect("Failed to load Kimi K2 tokenizer");
 
     let prompts = [
@@ -176,7 +146,9 @@ fn test_tiktoken_kimi_k2_encode_decode_roundtrip() {
 #[test]
 #[ignore = "downloads the tokenizer files; run with --ignored"]
 fn test_tiktoken_kimi_k2_token_to_id() {
-    let dir = ensure_kimi_k2_cached();
+    let Some(dir) = ensure_kimi_k2_cached() else {
+        return;
+    };
     let tokenizer = TiktokenTokenizer::from_dir(&dir).expect("Failed to load Kimi K2 tokenizer");
 
     // Known special tokens from tokenizer_config.json
@@ -190,7 +162,9 @@ fn test_tiktoken_kimi_k2_token_to_id() {
 #[test]
 #[ignore = "downloads the tokenizer files; run with --ignored"]
 fn test_tiktoken_kimi_k2_id_to_token() {
-    let dir = ensure_kimi_k2_cached();
+    let Some(dir) = ensure_kimi_k2_cached() else {
+        return;
+    };
     let tokenizer = TiktokenTokenizer::from_dir(&dir).expect("Failed to load Kimi K2 tokenizer");
 
     assert_eq!(tokenizer.id_to_token(163584), Some("[BOS]".to_string()));
@@ -204,7 +178,9 @@ fn test_tiktoken_kimi_k2_id_to_token() {
 #[test]
 #[ignore = "downloads the tokenizer files; run with --ignored"]
 fn test_tiktoken_kimi_k2_chat_template() {
-    let dir = ensure_kimi_k2_cached();
+    let Some(dir) = ensure_kimi_k2_cached() else {
+        return;
+    };
     let tokenizer = TiktokenTokenizer::from_dir(&dir).expect("Failed to load Kimi K2 tokenizer");
 
     let messages = vec![serde_json::json!({"role": "user", "content": "Hello, who are you?"})];
@@ -240,7 +216,9 @@ fn test_tiktoken_kimi_k2_chat_template() {
 #[test]
 #[ignore = "downloads the tokenizer files; run with --ignored"]
 fn test_tiktoken_kimi_k2_chat_template_multi_turn() {
-    let dir = ensure_kimi_k2_cached();
+    let Some(dir) = ensure_kimi_k2_cached() else {
+        return;
+    };
     let tokenizer = TiktokenTokenizer::from_dir(&dir).expect("Failed to load Kimi K2 tokenizer");
 
     let messages = vec![
@@ -273,7 +251,9 @@ fn test_tiktoken_kimi_k2_chat_template_multi_turn() {
 #[test]
 #[ignore = "downloads the tokenizer files; run with --ignored"]
 fn test_factory_creates_tiktoken_from_directory() {
-    let dir = ensure_kimi_k2_cached();
+    let Some(dir) = ensure_kimi_k2_cached() else {
+        return;
+    };
     let dir_str = dir.to_str().unwrap();
 
     // create_tokenizer should detect tiktoken.model in the directory
@@ -293,7 +273,9 @@ fn test_factory_creates_tiktoken_from_directory() {
 #[test]
 #[ignore = "downloads the tokenizer files; run with --ignored"]
 fn test_factory_creates_tiktoken_from_model_file_path() {
-    let dir = ensure_kimi_k2_cached();
+    let Some(dir) = ensure_kimi_k2_cached() else {
+        return;
+    };
     let model_path = dir.join("tiktoken.model");
     let model_path_str = model_path.to_str().unwrap();
 
@@ -314,7 +296,9 @@ fn test_factory_creates_tiktoken_from_model_file_path() {
 #[test]
 #[ignore = "downloads the tokenizer files; run with --ignored"]
 fn test_tiktoken_kimi_k2_batch_encode() {
-    let dir = ensure_kimi_k2_cached();
+    let Some(dir) = ensure_kimi_k2_cached() else {
+        return;
+    };
     let tokenizer = TiktokenTokenizer::from_dir(&dir).expect("Failed to load Kimi K2 tokenizer");
 
     let texts = vec!["Hello", "World", "Testing batch encoding"];
@@ -392,7 +376,9 @@ fn test_factory_creates_tiktoken_from_hf_model_id() {
 #[test]
 #[ignore = "downloads the tokenizer files; run with --ignored"]
 fn test_tiktoken_kimi_k2_encoding_stability() {
-    let dir = ensure_kimi_k2_cached();
+    let Some(dir) = ensure_kimi_k2_cached() else {
+        return;
+    };
     let tokenizer = TiktokenTokenizer::from_dir(&dir).expect("Failed to load Kimi K2 tokenizer");
 
     // Encode the same text twice — token IDs must be identical
