@@ -233,6 +233,85 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          differently (smg-project/smg#2783)",
     ),
     (
+        "inkling-2-small/render/native-parallel-calls-history",
+        "the reference is the render of the template the checkpoint ships, which writes the \
+         tool's name as an author in the header of a history call and an empty text message \
+         before the call; the gateway's native encoder follows the model's request format \
+         instead, where a call carries its name in its JSON alone (crates/tokenizer/README.md; \
+         pinned by `tools_use_sorted_native_json_and_http_author_rules`), and writes no text \
+         message for a turn whose content is empty beside its call",
+    ),
+    (
+        "inkling-2-small/render/native-reasoning-effort-number",
+        "the gateway's native encoder writes the effort line with two decimals, a tie going \
+         to the even digit, so 0.125 reads 0.12 (pinned by \
+         `effort_follows_leading_system_and_has_no_assistant_opener`); the reference, the \
+         render of the template the checkpoint ships, reads 0.125",
+    ),
+    (
+        "inkling-2-small/render/native-tool-call-and-result",
+        "the reference is the render of the template the checkpoint ships, which writes the \
+         tool's name as an author in the header of a history call and an empty text message \
+         before the call; the gateway's native encoder follows the model's request format \
+         instead, where a call carries its name in its JSON alone (crates/tokenizer/README.md; \
+         pinned by `tools_use_sorted_native_json_and_http_author_rules`), and writes no text \
+         message for a turn whose content is empty beside its call",
+    ),
+    (
+        "inkling-2-small/render/thinking-kwarg-off",
+        "the format has no thinking switch (its effort is a prompt line, not a toggle) and \
+         the gateway's native encoder refuses a template argument it does not read, \
+         `enable_thinking` here, where the reference is a render of the template the \
+         checkpoint ships",
+    ),
+    (
+        "inkling-2-small/render/thinking-kwarg-on",
+        "the format has no thinking switch (its effort is a prompt line, not a toggle) and \
+         the gateway's native encoder refuses a template argument it does not read, \
+         `enable_thinking` here, where the reference is a render of the template the \
+         checkpoint ships",
+    ),
+    (
+        "inkling-2-small/render/tools-call-arguments-object",
+        "the reference is the render of the template the checkpoint ships, which writes the \
+         tool's name as an author in the header of a history call; the gateway's native \
+         encoder follows the model's request format instead, where a call carries its name \
+         in its JSON alone (crates/tokenizer/README.md; pinned by \
+         `tools_use_sorted_native_json_and_http_author_rules`)",
+    ),
+    (
+        "inkling-2-small/render/tools-history-content-and-call",
+        "the reference is the render of the template the checkpoint ships, which writes the \
+         tool's name as an author in the header of a history call; the gateway's native \
+         encoder follows the model's request format instead, where a call carries its name \
+         in its JSON alone (crates/tokenizer/README.md; pinned by \
+         `tools_use_sorted_native_json_and_http_author_rules`)",
+    ),
+    (
+        "inkling-2-small/render/tools-history-parallel-calls",
+        "the reference is the render of the template the checkpoint ships, which writes the \
+         tool's name as an author in the header of a history call; the gateway's native \
+         encoder follows the model's request format instead, where a call carries its name \
+         in its JSON alone (crates/tokenizer/README.md; pinned by \
+         `tools_use_sorted_native_json_and_http_author_rules`)",
+    ),
+    (
+        "inkling-2-small/render/tools-history-results-reordered",
+        "the reference is the render of the template the checkpoint ships, which writes the \
+         tool's name as an author in the header of a history call; the gateway's native \
+         encoder follows the model's request format instead, where a call carries its name \
+         in its JSON alone (crates/tokenizer/README.md; pinned by \
+         `tools_use_sorted_native_json_and_http_author_rules`)",
+    ),
+    (
+        "inkling-2-small/render/tools-history-single-call",
+        "the reference is the render of the template the checkpoint ships, which writes the \
+         tool's name as an author in the header of a history call; the gateway's native \
+         encoder follows the model's request format instead, where a call carries its name \
+         in its JSON alone (crates/tokenizer/README.md; pinned by \
+         `tools_use_sorted_native_json_and_http_author_rules`)",
+    ),
+    (
         "kimi-k3/render/continue-final-message",
         "the checkpoint's own encoder, which the gateway ports (smg-project/smg#1968), reads no \
          `continue_final_message`: the vendor-code reference renders the final assistant \
