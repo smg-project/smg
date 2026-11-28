@@ -34,6 +34,8 @@ use super::found::pairing_descriptor;
 #[cfg(feature = "in-process")]
 use super::members::{EncodeColumns, Members, Stated};
 #[cfg(feature = "in-process")]
+use super::object::runtime;
+#[cfg(feature = "in-process")]
 use super::reach::{ListReach, Reach};
 use super::{
     credentials::{Credentials, RegistrationInFlight},
@@ -1249,6 +1251,10 @@ impl Objects<Members> {
     /// that goes later. The generation is the registry's old one by then,
     /// and its classes stand as its lists do.
     ///
+    /// The rule is handed a row's engine kind as the worker crate reads
+    /// the name, and as the row wrote it where that crate does not know
+    /// the name.
+    ///
     /// A generation keeps one set of classes a pairing mode, derived at
     /// the first ask under the mode. What a set is derived from does not
     /// move under a generation: a write that moves a row's wires, its
@@ -1276,7 +1282,8 @@ impl Objects<Members> {
     /// every worker of both lists takes class `0`.
     fn derive_pairs(&self, generation: &Members, mode: Pairing) -> PartnerClasses {
         /// A row as the rule reads it: by the descriptor it states, else by
-        /// `own`, what its worker object offers a partner.
+        /// `own`, what its worker object offers a partner, and by its engine
+        /// kind as [`runtime`] hands it.
         fn member<'a>(
             row: &'a Arc<RowRemainder>,
             own: Option<&'a PairingDescriptor>,
@@ -1285,7 +1292,7 @@ impl Objects<Members> {
             Member::new(
                 row.standing.row,
                 row.wire_modes,
-                &row.engine_kind,
+                runtime(&row.engine_kind),
                 descriptor,
             )
         }
@@ -1341,6 +1348,9 @@ impl Objects<Members> {
     /// there: an encoder of class `0`, which takes no item, and a prefill
     /// no encoder hands to.
     ///
+    /// The rule is handed a row's engine kind as the pair rule is
+    /// ([`Self::pair_classes`]).
+    ///
     /// The rule runs over whatever is lent. Where no prefill is lent, an
     /// encoder keeps the class of its end, and the pair's own decision
     /// answers for the side that is missing.
@@ -1360,23 +1370,22 @@ impl Objects<Members> {
 
     /// The encode columns of `generation`'s two lists as lent, derived now.
     fn derive_encode(&self, generation: &Members) -> EncodeColumns {
-        /// A lent worker as the rule reads it: its row's engine kind and
-        /// offer, and for a worker no row stands for an unknown runtime
-        /// with `none`, the offer that states nothing.
+        /// The offer the rule reads of a lent worker: its row's, and for a
+        /// worker no row stands for `none`, the offer that states nothing.
+        fn offer<'a>(row: Option<&'a Arc<RowRemainder>>, none: &'a EncodeOffer) -> &'a EncodeOffer {
+            row.map_or(none, |row| &row.encode)
+        }
+        /// A lent worker as the rule reads it: its row's engine kind as
+        /// [`runtime`] hands it, and its offer. A worker no row stands for
+        /// is of an unknown runtime.
         fn member<'a>(
             row: Option<&'a Arc<RowRemainder>>,
             none: &'a EncodeOffer,
         ) -> EncodeMember<'a> {
-            row.map_or(
-                EncodeMember {
-                    runtime: "",
-                    offer: none,
-                },
-                |row| EncodeMember {
-                    runtime: &row.engine_kind,
-                    offer: &row.encode,
-                },
-            )
+            EncodeMember {
+                runtime: row.map_or("", |row| runtime(&row.engine_kind)),
+                offer: offer(row, none),
+            }
         }
         let lists = [Role::Encode, Role::Prefill].map(|role| self.lent(generation, role));
         let [encoders, prefills] = self.remainders(lists);
@@ -1385,7 +1394,7 @@ impl Objects<Members> {
             encoders.iter().map(|row| member(row.as_ref(), &none)),
             prefills.iter().map(|row| member(row.as_ref(), &none)),
         );
-        let offers = encoders.iter().map(|row| member(row.as_ref(), &none).offer);
+        let offers = encoders.iter().map(|row| offer(row.as_ref(), &none));
         let prefill_classes = (0..prefills.len()).map(|at| classes.prefill_class(at));
         EncodeColumns::new(classes.encoder_facts(offers), prefill_classes.collect())
     }

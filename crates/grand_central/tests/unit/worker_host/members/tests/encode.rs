@@ -6,7 +6,7 @@ use std::{ptr, sync::Arc, time::Instant};
 use smg_worker::registry::Generation;
 
 use super::{
-    pairs::{pair_side, state, stray_prefill},
+    pairs::{no_runtime_in_title_case, pair_side, state, stray_prefill},
     Replica, DECODE, ENCODE, MODEL, PREFILL,
 };
 use crate::{
@@ -134,6 +134,51 @@ fn the_encode_columns_are_by_the_lent_lists_places_under_the_stores_rule() {
     let again = replica.objects.encode_columns(&generation);
     assert!(ptr::eq(again, columns), "derived once");
     assert_eq!(replica.objects.unstated(), 1, "the lists were cut once");
+}
+
+/// The encode rule is handed the worker crate's reading of a row's runtime
+/// name, as the pair rule is. Each encoder here and its prefill offer a
+/// rendezvous. Two spellings of one runtime then state one end on either
+/// side, and so do two names that crate reads as one runtime. That crate's
+/// word for no runtime states no end, in any letter case. A name that
+/// crate does not know and that is not empty is the row's own word: one
+/// end where both rows write it alike, and two ends in two spellings.
+#[test]
+fn an_end_reads_its_rows_runtime_name_as_the_worker_crate_reads_it() {
+    use smg_worker::worker::RuntimeType;
+
+    let name = RuntimeType::Generic.as_str();
+    let none = RuntimeType::default().as_str();
+    let mixed = no_runtime_in_title_case();
+    // An encoder's name and a prefill's on a rendezvous, the encoder's
+    // class, and whether the prefill names that class.
+    let rows = [
+        (name.to_uppercase(), name.to_string(), 1, true),
+        (name.to_string(), name.to_uppercase(), 1, true),
+        ("TensorRT-LLM".to_string(), "trtllm".to_string(), 1, true),
+        (none.to_string(), none.to_string(), 0, false),
+        (mixed.clone(), mixed, 0, false),
+        (none.to_uppercase(), name.to_string(), 0, false),
+        ("one".to_string(), "one".to_string(), 1, true),
+        ("ONE".to_string(), "one".to_string(), 1, false),
+    ];
+    for (encoder, prefill, class, hands) in rows {
+        let replica = Replica::new();
+        state(&replica, end(ENCODE, Role::Encode, &encoder, rendezvous()));
+        state(
+            &replica,
+            end(PREFILL, Role::Prefill, &prefill, rendezvous()),
+        );
+        let generation = replica.generation();
+        let columns = replica.objects.encode_columns(&generation);
+        assert_eq!(columns.facts(), [meets(class)], "{encoder} and {prefill}");
+        let named = if hands { class } else { 0 };
+        assert_eq!(
+            columns.prefill_classes(),
+            [named],
+            "{encoder} and {prefill}"
+        );
+    }
 }
 
 /// Each column holds one entry a worker of its list where the rule holds

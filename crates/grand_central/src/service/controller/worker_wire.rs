@@ -1041,7 +1041,9 @@ pub(crate) fn rank_registration(
 ///
 /// A name is taken as written, so one that holds a blank or a control
 /// character is refused, never mended: the URL, the runtime and each model
-/// id key the store's rows, its pools and its classes.
+/// id key the store's rows, its pools and its classes. One reading stands
+/// apart: a pair's classes and the encode classes key the runtime as the
+/// worker crate reads a name it knows.
 ///
 /// A registration of one rank makes the row under its URL. One that states
 /// more is laid a rank at a time ([`rank_registration`]): `rank` is that

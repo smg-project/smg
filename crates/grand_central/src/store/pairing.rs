@@ -158,13 +158,17 @@ pub struct Member<'a> {
 /// with a compare a member.
 type Offer<'a> = (bool, Option<&'a str>, &'a PairingDescriptor);
 
-/// A runtime as an offer reads it: `None` when it is unknown, which a row
-/// writes as the empty string. Two unknown runtimes are compared so and
-/// never as strings: the C library's compare of two empty strings that
+/// A runtime as an offer reads it: `None` when it is unknown, which a
+/// member states as the empty string. Two unknown runtimes are compared so
+/// and never as strings: the C library's compare of two empty strings that
 /// hold no buffer takes a slow path (about 200 ns by a probe, where two
-/// strings of four bytes take 3). An engine kind is a kind's name, which
-/// a worker object's builder parses as written too, so it is read as
-/// written: a descriptor's free text is what the door normalizes.
+/// strings of four bytes take 3). A runtime's name is compared as it is
+/// handed and is never read: whoever makes a member hands the reading. A
+/// worker host hands the worker crate's reading of a row's engine kind:
+/// every spelling that crate knows of one runtime is one name there, its
+/// word for no runtime is the empty string, and a kind it does not know is
+/// the row's own text. A descriptor's free text is what the door
+/// normalizes.
 pub(crate) fn known(runtime: &str) -> Option<&str> {
     (!runtime.is_empty()).then_some(runtime)
 }
