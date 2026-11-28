@@ -39,7 +39,7 @@ fn a_key_registered_again_as_the_worker_it_was_takes_its_pins() {
     pinned(&store, 12, b);
     pinned(&store, 13, a);
     let of = |key: u64| pin_of(&store, key);
-    let revision = WorkersStore::get(&store, a).expect("the row").revision;
+    let revision = store.get(a).expect("the row").revision;
     store.remove(a, revision).expect("removed");
     // The removal drops none: the key may be registered again.
     assert_eq!((of(11), of(13)), (Some(a), Some(a)));
@@ -51,7 +51,7 @@ fn a_key_registered_again_as_the_worker_it_was_takes_its_pins() {
     assert_ne!(life, b);
     assert_eq!(of(12), Some(life), "a new life of the same worker");
     // Removed again, then registered in another role: another worker.
-    let revision = WorkersStore::get(&store, again).expect("the row").revision;
+    let revision = store.get(again).expect("the row").revision;
     store.remove(again, revision).expect("removed");
     store.upsert(WorkerFacts {
         role: Role::Decode,
@@ -161,7 +161,7 @@ fn registrations_of_one_key_rename_its_pins_in_their_order() {
     // A key that left: registered again, and that life replaced at once.
     let b = ready(&store, "http://b:8000");
     pinned(&store, 12, b);
-    let revision = WorkersStore::get(&*store, b).expect("the row").revision;
+    let revision = store.get(b).expect("the row").revision;
     store.remove(b, revision).expect("removed");
     let third = third_behind("http://b:8000");
     store.upsert(facts("http://b:8000", 2));
@@ -179,7 +179,7 @@ fn a_returned_keys_old_pins_are_forgotten_behind_the_workers_lock() {
     let store = Rc::new(MemoryStore::journaled(Arc::new(AtTheRelease)));
     let a = ready(&store, "http://a:8000");
     pinned(&store, 11, a);
-    let revision = WorkersStore::get(&*store, a).expect("the row").revision;
+    let revision = store.get(a).expect("the row").revision;
     store.remove(a, revision).expect("removed");
     let at_release = Rc::new(Cell::new(None));
     let (behind, seen) = (Rc::clone(&store), Rc::clone(&at_release));
@@ -201,7 +201,7 @@ fn a_key_registered_again_past_the_absences_time_takes_no_pin() {
     store.apply(ruled).expect("above the unbound start");
     let a = ready(&store, "http://a:8000");
     pinned(&store, 11, a);
-    let revision = WorkersStore::get(&store, a).expect("the row").revision;
+    let revision = store.get(a).expect("the row").revision;
     store.remove(a, revision).expect("removed");
     assert_eq!(pin_of(&store, 11), Some(a), "inside its time");
     std::thread::sleep(Duration::from_millis(1_100));
@@ -218,7 +218,7 @@ fn the_tick_ends_the_absence_of_a_key_that_stays_away() {
     store.apply(ruled).expect("above the unbound start");
     let a = ready(&store, "http://a:8000");
     pinned(&store, 21, a);
-    let revision = WorkersStore::get(&store, a).expect("the row").revision;
+    let revision = store.get(a).expect("the row").revision;
     store.remove(a, revision).expect("removed");
     store.end_gone(Instant::now());
     assert_eq!(pin_of(&store, 21), Some(a), "inside its time");
@@ -240,7 +240,7 @@ fn a_followed_key_registered_again_as_the_worker_it_was_takes_its_pins() {
         change.id()
     };
     let leave = |id: WorkerId| {
-        let revision = WorkersStore::get(&leader, id).expect("the row").revision;
+        let revision = leader.get(id).expect("the row").revision;
         let change = leader.remove(id, revision).expect("removed");
         followed(&leader, &follower, change);
     };
@@ -284,7 +284,7 @@ fn a_followed_key_registered_again_past_the_absences_time_takes_no_pin() {
     let leader = MemoryStore::new();
     let followers = [MemoryStore::new(), MemoryStore::new()];
     let joined = leader.upsert(facts("http://a:8000", 1));
-    let revision = WorkersStore::get(&leader, joined.id()).expect("the row");
+    let revision = leader.get(joined.id()).expect("the row");
     for follower in &followers {
         follower
             .apply(manual_ruled(1, 1, 1))
@@ -315,7 +315,7 @@ fn a_key_a_follower_saw_leave_takes_its_pins_at_the_followers_own_write() {
     let joined = leader.upsert(facts("http://a:8000", 1));
     followed(&leader, &follower, joined);
     pinned(&follower, 11, joined.id());
-    let revision = WorkersStore::get(&leader, joined.id()).expect("the row");
+    let revision = leader.get(joined.id()).expect("the row");
     let removed = leader.remove(joined.id(), revision.revision);
     followed(&leader, &follower, removed.expect("removed"));
     let again = follower.upsert(facts("http://a:8000", 2)).id();
@@ -354,7 +354,7 @@ fn a_snapshot_moves_the_pins_of_the_rows_it_drops() {
         let of = |key: u64| pin_of(&follower, key);
         // The follower hears none of these writes.
         let leave = |id: WorkerId| {
-            let revision = WorkersStore::get(&leader, id).expect("the row").revision;
+            let revision = leader.get(id).expect("the row").revision;
             leader.remove(id, revision).expect("removed");
         };
         leave(a);
@@ -390,7 +390,7 @@ fn a_snapshot_returns_a_key_that_had_left_to_its_pins() {
     pinned(&follower, 12, b);
     let of = |key: u64| pin_of(&follower, key);
     for id in [a, b] {
-        let revision = WorkersStore::get(&leader, id).expect("the row").revision;
+        let revision = leader.get(id).expect("the row").revision;
         let change = leader.remove(id, revision).expect("removed");
         followed(&leader, &follower, change);
     }

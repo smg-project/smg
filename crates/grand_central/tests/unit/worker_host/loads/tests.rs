@@ -8,9 +8,7 @@ use smg_worker::{
 use super::*;
 use crate::{
     engine::view::{WireModes, WorkerId},
-    store::{
-        GatewayId, MemoryStore, Overload, Reachability, Registrant, WorkerFacts, WorkersStore,
-    },
+    store::{GatewayId, MemoryStore, Overload, Reachability, Registrant, WorkerFacts},
     worker_host::Members,
 };
 
@@ -37,7 +35,7 @@ impl Replica {
     fn add(&self, facts: WorkerFacts) -> (WorkerId, Arc<dyn Worker>) {
         let written = self.objects.upsert(&self.store, facts, Registrant::Control);
         let id = written.expect("the store takes the write").id();
-        let stored = WorkersStore::get(&self.store, id).expect("the registered record");
+        let stored = self.store.get(id).expect("the registered record");
         self.objects.connect_row(&self.store, id, stored.revision);
         self.store.publish_now();
         let registry = self.objects.registry();

@@ -668,13 +668,10 @@ async fn the_store_holds_the_rows_the_door_answered() {
                     !told.health_policy.is_some_and(|policy| policy.disabled)
                 )
             );
-            // The holder's read by the row's id states those facts, and so
-            // does the store's table.
+            // The holder's read by the row's id states those facts.
             let facts = Some(&stored.facts);
             let read = workers.read_row(stored.id);
             assert_eq!(read.as_ref().map(|row| &row.facts), facts, "by id");
-            let held = store.get(stored.id);
-            assert_eq!(held.as_ref().map(|row| &row.facts), facts, "the table");
         }
         assert_eq!(
             rows.iter().map(|row| row.status).collect::<Vec<_>>(),
@@ -730,16 +727,18 @@ async fn the_store_holds_the_rows_the_door_answered() {
             panic!("no ranks in {ranks:?}");
         };
         assert_eq!(answer.rows.len(), 2);
+        // The holder's cut: the rows the holder and the store both hold.
+        let cut = workers.checkpoint(&store).rows;
         for rank in 0..2 {
             let url = format!("http://127.0.0.1:9/c@{rank}");
             let id = workers.read_row_under(&url).map(|row| row.id);
             assert!(id.is_some(), "{url}");
-            let held = id.and_then(|id| store.get(id));
-            assert!(held.is_some(), "{url}: the table's row");
+            let told = cut.iter().any(|row| Some(row.id) == id);
+            assert!(told, "{url}: the store tells the row");
         }
 
-        // A removal through the door leaves the holder and the store's
-        // table without the row.
+        // A removal through the door leaves the holder without the row, and
+        // the store at the epoch the answer names.
         let removal = proto::DeregisterWorkerRequest {
             worker_id: told[0].id,
             revision: told[0].revision,
@@ -751,7 +750,6 @@ async fn the_store_holds_the_rows_the_door_answered() {
             .expect("removed")
             .into_inner();
         assert_eq!(workers.read_row_under("http://127.0.0.1:9/a"), None);
-        assert_eq!(store.get(rows[0].id), None, "the table drops it too");
         assert_eq!(store.epoch(), removed.membership_epoch);
 
         stop.send(()).expect("the serve still runs");

@@ -11,7 +11,7 @@ use crate::{
     document::spec::{AppliedSpec, PolicySpec},
     engine::view::{Role, WireModes, WorkerId},
     service::proto::{self, busy::Reason, decision::Outcome},
-    store::{LeaseState, LeasesStore, WorkersStore},
+    store::{LeaseState, LeasesStore},
     tracking::lease::{LeaseId, Side, DISPATCH_TTL},
 };
 
@@ -48,7 +48,7 @@ fn rings_bed() -> (Bed, [Vec<WorkerId>; 2]) {
     let generation = generation.expect("the model's members");
     let listed = [Role::Prefill, Role::Decode].map(|role| {
         let lent = objects.lent(&generation, role);
-        let member = |url: &str| WorkersStore::by_key(&*bed.store, url);
+        let member = |url: &str| bed.store.by_key(url);
         let ids = lent
             .workers
             .iter()

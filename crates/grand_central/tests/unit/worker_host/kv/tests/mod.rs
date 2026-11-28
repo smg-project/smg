@@ -12,7 +12,7 @@ use smg_worker::{
 
 use super::*;
 use crate::{
-    store::{MemoryStore, Registrant, Signals, WorkerFacts, WorkersStore},
+    store::{MemoryStore, Registrant, Signals, WorkerFacts},
     worker_host::{objects::tests::lay_standing, Members},
 };
 

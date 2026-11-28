@@ -12,7 +12,6 @@ use crate::{
     engine::view::{Role, WorkerId},
     store::{
         GatewayId, HealthSink, LeasesStore, MemoryStore, Reachability, VetoWrite, WorkerFacts,
-        WorkersStore,
     },
 };
 
@@ -293,9 +292,7 @@ fn a_veto_that_left_is_read_no_more() {
     let all = [doubt(leaving), doubt(ending), doubt(staying)];
     assert_eq!(read(&store, MODEL, ASKER, t0), all);
 
-    let revision = WorkersStore::get(&store, leaving)
-        .expect("the row")
-        .revision;
+    let revision = store.get(leaving).expect("the row").revision;
     store.remove(leaving, revision).expect("removed");
     store.publish_now();
     assert_eq!(

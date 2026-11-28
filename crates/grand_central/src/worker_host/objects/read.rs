@@ -115,14 +115,9 @@ impl<G: Generation> Objects<G> {
     /// too, under its place and its statuses. A store that tells no
     /// journal states the default place.
     ///
-    /// In the holder's turn. Every
-    /// writer of a row's facts holds that turn from its decision to the
-    /// journal's telling, so the objects state each row the journal told
-    /// and none it did not. A row's status is the one the store holds,
+    /// In the holder's turn. A row's status is the one the store holds,
     /// read with the place and the epoch in one hold of the store's
-    /// membership lock. A status tell takes no turn of the holder: it
-    /// changes no fact, and the copy holds its status where the place
-    /// holds its event.
+    /// membership lock.
     ///
     /// The store's lock is held for the place and the statuses, and the
     /// holder's turn for the rows. A door's write and a standby's applier

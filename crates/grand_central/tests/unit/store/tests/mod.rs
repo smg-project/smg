@@ -1,5 +1,7 @@
 //! The contract tests of the store ingress, run over [`MemoryStore`] through
-//! the trait objects: what every implementation of a trait promises.
+//! the trait objects: what every implementation of a trait promises. A case
+//! that reads a row of the table, or the table whole, reads it by the
+//! cases' road, which is the memory store's own.
 
 use std::{
     cell::{Cell, RefCell},
@@ -64,7 +66,7 @@ fn facts(key: &str, incarnation: u64) -> WorkerFacts {
 fn ready(store: &MemoryStore, key: &str) -> WorkerId {
     let id = store.upsert(facts(key, 1)).id();
     store.publish_now();
-    let revision = WorkersStore::get(store, id).expect("the row").revision;
+    let revision = store.get(id).expect("the row").revision;
     store
         .set_status(id, WorkerStatus::Ready, revision)
         .expect("ready");
@@ -110,7 +112,7 @@ fn manual_ruled(generation: u64, ttl_s: u32, sweep_s: u32) -> spec::AppliedSpec 
 fn followed(leader: &MemoryStore, follower: &MemoryStore, change: MembershipChange) {
     let row = match change {
         MembershipChange::Registered { id } | MembershipChange::Replaced { new: id, .. } => {
-            WorkersStore::get(leader, id)
+            leader.get(id)
         }
         _ => None,
     };

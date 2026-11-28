@@ -149,11 +149,13 @@ fn store_of(fleet: &[WorkerFacts]) -> MemoryStore {
     // The first row's pool: its own model's, where a fleet holds several.
     if let Some(first) = fleet.first() {
         let model = first.models.first().map_or(MODEL, String::as_str);
-        let rows = fleet
+        let pool = fleet
             .iter()
-            .filter(|facts| facts.role == first.role && facts.models == first.models)
-            .count();
-        filled::filled(&store, model, first.role, rows);
+            .filter(|facts| facts.role == first.role && facts.models == first.models);
+        let ids: Vec<_> = pool
+            .map(|facts| identity(&facts.key, facts.incarnation))
+            .collect();
+        filled::filled(&store, &ids, model);
     }
     store
 }

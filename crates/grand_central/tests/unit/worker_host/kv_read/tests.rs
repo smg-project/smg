@@ -11,7 +11,7 @@ use crate::{
         view::{AffinityHolder, RequestFacts, WorkerId},
         Affinity, PoolAffinity,
     },
-    store::{MemoryStore, Registrant, Signals, WorkerFacts, WorkersStore},
+    store::{MemoryStore, Registrant, Signals, WorkerFacts},
     worker_host::{objects::tests::stored_chain, Members},
 };
 

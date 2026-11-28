@@ -1,6 +1,6 @@
 # Worker rows and jobs
 
-The controller keeps one row a worker. This page covers a row's bounds, the door a host writes rows through and the controller's probes. It also covers the worker jobs of a host that keeps the store in its own process.
+The controller keeps one row a worker. This page covers a row's bounds, the door a host writes rows through, what a host reads back and the controller's probes. It also covers the worker jobs of a host that keeps the store in its own process.
 
 [Run the service](service.md#worker-discovery) covers worker discovery, and [Embed the engine](embedding.md#worker-objects) the worker objects a host keeps beside its rows.
 
@@ -61,6 +61,7 @@ A host's registration and removal steps write rows at a membership door, `worker
 - `Objects::read_row` reads a row by its id, and `Objects::read_row_under` by its exact registration key.
 - `Objects::checkpoint` cuts the rows that the holder and the store both hold, in one turn of the holder. It states the log's place, or the default place for a store that keeps no log. It takes the store that the holder's write calls tell.
 - Each read takes the holder's turn, so a writer of a row waits for it and no decision does.
+- Code that runs inside that turn calls none of these reads: the read never returns there. The store calls its journal inside the turn of a holder's write of a row, `Journal::released` too, and of its cut (`Journal::head`).
 - A row read so carries the models its worker object serves now. A row read alone carries the status that object states, and a row of the cut carries the status the store holds.
 - The cut reads the place with the store's word in one hold of the store's lock: the rows that stand, their statuses and the epoch.
 - Models that a host sets on worker objects through the registry are read row by row. A cut may hold one object's new list beside another's old one, and a list the log holds no word of yet.

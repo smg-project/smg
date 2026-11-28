@@ -231,7 +231,7 @@ async fn the_services_calls_write_the_worker_objects_its_decisions_read() {
     let ids = ["w0", "w1", "w2"].map(register);
     assert_eq!(named(), BTreeSet::from(ids));
     let leave = |id: WorkerId, drain: bool| {
-        let row = WorkersStore::get(&*store, id).expect("the row stands");
+        let row = store.get(id).expect("the row stands");
         let request = proto::DeregisterWorkerRequest {
             worker_id: id.0,
             revision: row.revision,

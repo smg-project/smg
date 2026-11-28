@@ -19,7 +19,7 @@ use crate::{
         Constraints, Decision, InProcess, PairAdmission, PairLists, Phase, Request, RequestFacts,
         Role, WireModes, WorkerId,
     },
-    store::{pairing::PairingDescriptor, Registrant, WorkerFacts, WorkersStore},
+    store::{pairing::PairingDescriptor, Registrant, WorkerFacts},
     worker_host::OpenAdmission,
 };
 

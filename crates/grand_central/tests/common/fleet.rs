@@ -74,7 +74,7 @@ use smg_grand_central::{
     stages::StageRegistry,
     store::{
         GatewayId, HealthPolicy, LeaseState, MemoryStore, Position, Registrant, Signals,
-        WorkerFacts, WorkerStatus, WorkersStore,
+        WorkerFacts, WorkerStatus,
     },
     tracking::LeaseId,
     worker_host::{KvTables, Members, Objects},
@@ -1274,8 +1274,9 @@ impl Harness {
         }
         for id in ids {
             let row = self
-                .store
-                .get(id)
+                .replica
+                .workers
+                .read_row(id)
                 .ok_or("a rank of the engine holds no row")?;
             let mut request = Request::new(proto::PatchWorkerRequest {
                 worker_id: id.0,
@@ -1314,7 +1315,7 @@ impl Harness {
             if !engines.contains(engine) {
                 return true;
             }
-            let row = WorkersStore::get(self.store.as_ref(), *id);
+            let row = self.replica.workers.read_row(*id);
             row.is_some_and(|row| {
                 let report = snapshot.report(&row.facts.key);
                 report.is_some_and(|(_, sampled)| sampled >= since)

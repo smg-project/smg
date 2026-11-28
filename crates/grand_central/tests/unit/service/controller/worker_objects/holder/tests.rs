@@ -9,9 +9,7 @@ use crate::{
     document::spec::{OVERLOAD_TOKEN_USAGE, OVERLOAD_WAITING_REQUESTS},
     engine::view::WireModes,
     service::controller::Config,
-    store::{
-        HealthPolicy, HealthWrite, Overload, Registrant, WorkerFacts, WorkerStatus, WorkersStore,
-    },
+    store::{HealthPolicy, HealthWrite, Overload, Registrant, WorkerFacts, WorkerStatus},
 };
 
 impl WorkerObjects {
@@ -154,7 +152,7 @@ fn two_moves_in_a_row_end_with_the_table_at_the_objects_newest_status() {
         };
         holder.tell_status(&store, &id, revision, (old, new), &|| true)
     };
-    let table = || WorkersStore::get(&*store, row).map(|row| row.status);
+    let table = || store.get(row).map(|row| row.status);
     let statuses = || (table(), object().status());
     // The first move, told.
     assert!(tell(probe(true)).moved().is_some());

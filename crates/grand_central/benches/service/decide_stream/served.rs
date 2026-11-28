@@ -15,7 +15,7 @@ use smg_grand_central::{
     document::{AppliedSpec, PolicySpec, ShadowSpec},
     engine::Role,
     service::controller::{Config, Controller, Listener, Scope, State},
-    store::{MemoryStore, Registrant, WorkerFacts, WorkersStore},
+    store::{MemoryStore, Registrant, WorkerFacts, WorkerRow},
     worker_host::{Members, Objects},
 };
 use tokio::{runtime, sync::oneshot};
@@ -179,7 +179,7 @@ fn fill(store: &MemoryStore, objects: &Objects<Members>, shape: Shape) {
             };
             let written = objects.upsert(store, facts, Registrant::Control);
             let id = written.expect("the store takes the write").id();
-            let revision = WorkersStore::get(store, id).expect("the row").revision;
+            let revision = objects.read_row(id).expect("the row").revision;
             objects.connect_row(store, id, revision);
         }
     }
@@ -208,8 +208,13 @@ fn fill(store: &MemoryStore, objects: &Objects<Members>, shape: Shape) {
     let spec = AppliedSpec::validate(&document).expect("the document validates");
     store.apply(spec).expect("above the unbound start");
     store.publish_now();
+    // The first model's members of each side, read off the holder's cut.
+    let (first, on_file) = (model(0), objects.checkpoint(store).rows);
     for &(role, _) in sides {
-        filled::filled(store, &model(0), role, shape.members as usize);
+        let serves = |row: &&WorkerRow| row.facts.role == role && row.facts.models.contains(&first);
+        let ids: Vec<_> = on_file.iter().filter(serves).map(|row| row.id).collect();
+        assert_eq!(ids.len(), shape.members as usize, "the {role:?} members");
+        filled::filled(store, &ids, &first);
     }
 }
 

@@ -7,7 +7,7 @@ use super::{
     *,
 };
 use crate::{
-    store::{identity, Registrant, WorkerFacts, WorkerPatch, WorkerStatus, WorkersStore},
+    store::{identity, Registrant, WorkerFacts, WorkerPatch, WorkerStatus},
     worker_host::Members,
 };
 
@@ -151,18 +151,31 @@ fn a_record_carries_the_status_its_object_states() {
 /// of its table states: the rows by key, the epoch and the place.
 /// Behind a registration, a change in place, a patch, a told status, a
 /// key's next life, a second key and a removal.
+///
+/// The store's cut is the cases' road now, with the table's three other
+/// reads. This case holds the four to the holder's cut behind each
+/// write, for a row that stands and for one that left.
 #[test]
 fn a_first_copy_states_the_rows_the_table_holds() {
     const B: &str = "http://b:8000";
     let replica = Replica::new();
     let (store, objects) = (&replica.store, &replica.objects);
+    let (first, second) = (identity(A, 1), identity(A, 2));
     let same = |what: &str| {
         let (cut, table) = (objects.checkpoint(store), store.checkpoint());
         assert_eq!((cut.at, cut.epoch), (table.at, table.epoch), "{what}");
         assert_eq!(cut.rows, table.rows, "{what}");
+        assert_eq!(store.all_rows(), (cut.epoch, cut.rows.clone()), "{what}");
+        for key in [A, B] {
+            let stands = cut.rows.iter().find(|row| row.facts.key == key);
+            assert_eq!(store.by_key(key).as_ref(), stands, "{what}: {key}");
+        }
+        for id in [first, second, identity(B, 1)] {
+            let stands = cut.rows.iter().find(|row| row.id == id);
+            assert_eq!(store.get(id).as_ref(), stands, "{what}: {id:?}");
+        }
         cut.rows.len()
     };
-    let (first, second) = (identity(A, 1), identity(A, 2));
     assert_eq!(same("an empty store"), 0);
     replica.upsert(facts(1, "gold"));
     assert_eq!(same("a registration"), 1);

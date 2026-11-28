@@ -1186,7 +1186,7 @@ mod status_tells {
 
     use smg_grand_central::{
         service::replication::Log,
-        store::{MemoryStore, Registrant, WorkerFacts, WorkerStatus, WorkersStore},
+        store::{MemoryStore, Registrant, WorkerFacts, WorkerStatus},
         worker_host::{Members, Objects},
     };
     use smg_worker::registry::WorkerRegistry;
@@ -1219,11 +1219,17 @@ mod status_tells {
             };
             let laid = objects.upsert(&store, facts, Registrant::Control);
             let id = laid.expect("a registration").id();
-            let row = WorkersStore::get(&store, id).expect("the row");
+            let row = objects.read_row(id).expect("the row");
             let signal = || objects.connect_row(&store, id, row.revision);
             let ((), allocations) = allocations_during(signal);
-            let stands = WorkersStore::get(&store, id).expect("the row").status;
-            assert_eq!(stands, WorkerStatus::Ready, "the signal readied the row");
+            // The status the store holds: the holder's cut states it.
+            let cut = objects.checkpoint(&store).rows;
+            let stands = cut.iter().find(|row| row.id == id).map(|row| row.status);
+            assert_eq!(
+                stands,
+                Some(WorkerStatus::Ready),
+                "the signal readied the row"
+            );
             allocations
         };
         (0..8).map(one).min().expect("eight rows")

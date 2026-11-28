@@ -16,7 +16,7 @@ use super::*;
 use crate::{
     engine::view::WireModes,
     service::controller::{frame_loads::FrameLoads, Config},
-    store::{GatewayId, MemoryStore, Reachability, Registrant, WorkerFacts, WorkersStore},
+    store::{GatewayId, MemoryStore, Reachability, Registrant, WorkerFacts},
 };
 
 const A: &str = "grpc://a:9000";

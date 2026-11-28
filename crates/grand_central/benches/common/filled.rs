@@ -1,25 +1,26 @@
-//! Where a bench's fill ends: the store holds the rows the fill registered,
-//! and their build is paid.
+//! Where a bench's fill ends: the fill named no member twice, and the build
+//! of its rows is paid.
 //!
 //! A membership write leaves its build owed, so a fill that asks for no
 //! build would time a world built of no member, and no failure would say
 //! so. A bench that fills a store through its doors ends the fill here.
+//!
+//! A store gives its host no read of a row. That each write of a fill
+//! landed is the fill's own word: the store's epoch counts the writes it
+//! took. A holder of worker objects cuts the rows that it and the store
+//! both hold.
 
-use smg_grand_central::{
-    engine::Role,
-    store::{MemoryStore, WorkersStore},
-};
+use std::collections::BTreeSet;
 
-/// `rows` members on file serve `model` in `role`, and no build is owed.
-pub fn filled(store: &MemoryStore, model: &str, role: Role, rows: usize) {
-    let (_, on_file) = WorkersStore::all_rows(store);
-    let serving = on_file
-        .iter()
-        .filter(|row| row.facts.role == role && row.facts.models.iter().any(|named| named == model))
-        .count();
+use smg_grand_central::{engine::WorkerId, store::MemoryStore};
+
+/// No id of the fill of `model` is named twice, and no build is owed.
+pub fn filled(store: &MemoryStore, ids: &[WorkerId], model: &str) {
+    let distinct: BTreeSet<WorkerId> = ids.iter().copied().collect();
     assert_eq!(
-        serving, rows,
-        "the {role:?} members of {model} after the fill"
+        distinct.len(),
+        ids.len(),
+        "the fill of {model} names a member twice"
     );
     assert_eq!(
         store.publish_due(),

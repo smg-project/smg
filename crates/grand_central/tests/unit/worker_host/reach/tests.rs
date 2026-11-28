@@ -12,7 +12,7 @@ use smg_worker::{
 use super::{ListReach, Reach};
 use crate::{
     engine::{view::WireModes, Role},
-    store::{GatewayId, MemoryStore, Reachability, Registrant, WorkerFacts, WorkersStore as _},
+    store::{GatewayId, MemoryStore, Reachability, Registrant, WorkerFacts},
     worker_host::{remainder::RowRemainder, Members, Objects},
 };
 

@@ -24,7 +24,7 @@ use crate::{
     },
     engine::view::WorkerId,
     service::elector::Fence,
-    store::{MemoryStore, Registrant, WorkerFacts, WorkerStatus, WorkersStore},
+    store::{MemoryStore, Registrant, WorkerFacts, WorkerStatus},
     worker_host::{Members, Objects},
 };
 

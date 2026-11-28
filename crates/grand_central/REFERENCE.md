@@ -366,7 +366,7 @@ The gates run three interleaved measurements per side when timing is needed. Eac
 
 ## A worker's row
 
-A worker's row, its bounds, the door that writes it and the worker jobs of a host with a local store stand on [a page of their own](docs/worker-rows.md).
+A worker's row, its bounds and the door that writes it stand on [a page of their own](docs/worker-rows.md). So do the reads of a host that keeps worker objects, and the worker jobs of a host with a local store.
 
 ## What is not built yet
 

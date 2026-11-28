@@ -66,7 +66,7 @@ fn a_noted_veto_is_written_only_while_its_note_stands() {
     // The row leaves and comes back under the same id, and its vetoes left
     // with it. A write that says its note stands writes nothing: the row
     // registered again takes no end of the row before it.
-    let revision = WorkersStore::get(&store, w).expect("the row").revision;
+    let revision = store.get(w).expect("the row").revision;
     store.remove(w, revision).expect("removed");
     assert_eq!(ready(&store, "http://a:8000"), w, "the same id");
     for until in [Some(second), None] {
