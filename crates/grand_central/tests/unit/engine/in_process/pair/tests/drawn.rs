@@ -134,20 +134,31 @@ fn a_binding_says_at_one_byte_whether_its_pair_draws() {
 
 /// The pair of each of 256 seeds over `host`'s two lists, decided by its
 /// draws and decided whole, the two answers of a seed held together: the
-/// places every seed's pair names.
+/// places every seed's pair names. The records a seed's first decision
+/// writes say that its draws decided it.
 fn both_ways(host: &Host, prefills: usize, decodes: usize) -> Vec<(usize, usize)> {
+    use crate::engine::records::RECORDS_WRITTEN;
+
     let every_prefill: Vec<u32> = (0..prefills as u32).collect();
     let mut picks = Vec::new();
     for seed in 0..256 {
         // The draw: every place is asked once ahead of it, and the rows
         // it writes ask no place again.
         let counted = Counted::default();
+        RECORDS_WRITTEN.with(|written| written.set(0));
         let drawn = host.decide_vetoed(
             &counted,
             (seed, None),
             Constraints::default(),
             [None, None],
             UNMASKED,
+        );
+        // Two records a side, whatever the lists hold: a pair that fell
+        // to the whole pass writes every row of both lists.
+        assert_eq!(
+            RECORDS_WRITTEN.with(Cell::get),
+            4,
+            "seed {seed}: the pair is decided by its draws"
         );
         assert_eq!(
             counted.asked(),
@@ -200,6 +211,61 @@ fn a_pick_of_two_pair_is_decided_by_its_draws_as_the_whole_pass_decides_it() {
             level, loaded,
             "the loads move a pick over {prefills} and {decodes}"
         );
+    }
+}
+
+/// [`drawing`]'s host with each side's picker named: the count-first pick
+/// of two is a form of the preset's profile, not a preset of its own.
+fn drawing_by(picks: [&'static str; 2], prefills: usize, decodes: usize) -> Host {
+    let mut document =
+        PolicySpec::pair_presets("power_of_two", "power_of_two").expect("the pair presets");
+    document.generation = 3;
+    for (side, pick) in ["prefill", "decode"].into_iter().zip(picks) {
+        let profile = document.profiles.get_mut(side).expect("the side's profile");
+        profile.pick = pick.into();
+    }
+    let spec = AppliedSpec::validate(&document).expect("a valid document");
+    // The binding's byte: a pair of these two pickers is asked by its draws.
+    let (unsaid, plain) = (pool(&[]), Constraints::default());
+    let draws = spec
+        .engine()
+        .pair_drawn_for(&facts(), &unsaid, [prefills, decodes], &plain)
+        .is_some();
+    assert!(draws, "{picks:?} over {prefills} and {decodes}");
+    Host::under((spec, Arc::default()), prefills, decodes)
+}
+
+/// The count-first pick of two draws its two rows as the plain one does
+/// and compares their requests in flight ahead of their scores. A pair
+/// with it on both sides, or on one side beside the plain pick, is decided
+/// by its draws as the whole pass decides it.
+#[test]
+fn a_count_first_side_of_a_pair_is_decided_by_its_draw_as_the_whole_pass_decides_it() {
+    const PLAIN: &str = "power-of-two";
+    const COUNT_FIRST: &str = "power-of-two-count-first";
+    for picks in [
+        [COUNT_FIRST, COUNT_FIRST],
+        [COUNT_FIRST, PLAIN],
+        [PLAIN, COUNT_FIRST],
+    ] {
+        for (prefills, decodes) in [(8_usize, 8_usize), (16, 9), (64, 64)] {
+            // Every count equal: the two rows a side draws tie, and the
+            // request's seed orders them.
+            let level = both_ways(&drawing_by(picks, prefills, decodes), prefills, decodes);
+            // Counts that differ: the row with fewer requests in flight
+            // leads, and two rows of one count still tie.
+            let host = drawing_by(picks, prefills, decodes);
+            for (at, worker) in host.prefills.iter().chain(host.decodes.iter()).enumerate() {
+                for _ in 0..at % 3 {
+                    worker.increment_load();
+                }
+            }
+            let loaded = both_ways(&host, prefills, decodes);
+            assert_ne!(
+                level, loaded,
+                "the counts move a pick of {picks:?} over {prefills} and {decodes}"
+            );
+        }
     }
 }
 
