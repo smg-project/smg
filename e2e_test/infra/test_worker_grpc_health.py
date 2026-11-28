@@ -30,6 +30,7 @@ from infra.constants import (
     ConnectionMode,
     host_port,
 )
+from infra.no_startup_profile import no_startup_profile  # noqa: F401
 from infra.worker import Worker
 
 pytest.importorskip("grpc")

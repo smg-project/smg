@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 from fixtures import hooks
 from infra import constants
+from infra.no_startup_profile import no_startup_profile  # noqa: F401
 
 pytest_plugins = ["pytester"]
 

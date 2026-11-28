@@ -15,6 +15,7 @@ from infra.constants import (
     get_startup_timeout,
 )
 from infra.model_specs import MODEL_SPECS
+from infra.no_startup_profile import no_startup_profile  # noqa: F401
 from infra.worker import worker_startup_timeout
 
 _SERVICER_WARMUP = (

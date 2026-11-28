@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 from infra import ConnectionMode
 from infra import worker as worker_module
+from infra.no_startup_profile import no_startup_profile  # noqa: F401
 from infra.servicer_warmup import (
     LEVEL_FAST,
     LEVEL_FULL,

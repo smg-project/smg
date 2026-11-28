@@ -11,6 +11,7 @@ import time
 
 import pytest
 from infra.constants import DEFAULT_HOST, ENV_SHOW_WORKER_LOGS, ConnectionMode
+from infra.no_startup_profile import no_startup_profile  # noqa: F401
 from infra.worker import LOG_EXCERPT_CHARS, Worker
 
 pytest.importorskip("grpc")

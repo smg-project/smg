@@ -5,6 +5,7 @@ from itertools import count
 import pytest
 from infra import worker as worker_module
 from infra.constants import ENV_STARTUP_TIMEOUT, WorkerType
+from infra.no_startup_profile import no_startup_profile  # noqa: F401
 
 
 @pytest.fixture

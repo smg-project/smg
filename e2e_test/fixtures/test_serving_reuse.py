@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 from fixtures import hooks
 from fixtures import setup_backend as setup_backend_fixture
+from infra.no_startup_profile import no_startup_profile  # noqa: F401
 
 # Import the module rather than fixtures.__init__'s exported fixture function.
 setup = importlib.import_module("fixtures.setup_backend")
